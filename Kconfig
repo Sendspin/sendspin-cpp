@@ -1,0 +1,43 @@
+menu "sendspin-cpp"
+
+    config SENDSPIN_CPP_WS_SUPPORT
+        bool
+        default y
+        select HTTPD_WS_SUPPORT
+
+    config SENDSPIN_CPP_ENABLE_PLAYER
+        bool "Enable player role (audio streaming)"
+        default n
+        help
+            Enable the player role for receiving and playing synchronized audio.
+            Requires micro-flac and micro-opus libraries.
+
+    config SENDSPIN_CPP_ENABLE_CONTROLLER
+        bool "Enable controller role (playback commands)"
+        default n
+        help
+            Enable the controller role for sending playback commands
+            (play, pause, next, volume, etc.) to the server.
+
+    config SENDSPIN_CPP_ENABLE_METADATA
+        bool "Enable metadata role (track info)"
+        default n
+        help
+            Enable the metadata role for receiving track information
+            (title, artist, album, progress, etc.) from the server.
+
+    config SENDSPIN_CPP_ENABLE_ARTWORK
+        bool "Enable artwork role (album art)"
+        default n
+        help
+            Enable the artwork role for receiving album artwork images
+            from the server.
+
+    config SENDSPIN_CPP_ENABLE_VISUALIZER
+        bool "Enable visualizer role (spectrum/beat data)"
+        default n
+        help
+            Enable the visualizer role for receiving spectrum analysis
+            and beat detection data from the server.
+
+endmenu

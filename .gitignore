@@ -1,0 +1,17 @@
+# Build directories
+build/
+build-*/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compilation artifacts
+*.o
+*.a
+*.so
+*.dylib

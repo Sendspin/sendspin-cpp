@@ -1,0 +1,27 @@
+add_executable(basic_client main.cpp)
+target_link_libraries(basic_client PRIVATE sendspin)
+target_compile_features(basic_client PRIVATE cxx_std_20)
+
+# mDNS service advertisement via dns_sd.h
+# macOS: built-in (no extra link flags needed — dns_sd is in libSystem)
+# Linux: requires libavahi-compat-libdnssd-dev (link with -ldns_sd)
+if(NOT APPLE)
+    target_link_libraries(basic_client PRIVATE dns_sd)
+endif()
+
+# PortAudio (optional — enables audio playback via PortAudioSink)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(PORTAUDIO portaudio-2.0)
+endif()
+
+if(PORTAUDIO_FOUND)
+    target_sources(basic_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common/portaudio_sink.cpp)
+    target_include_directories(basic_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common ${PORTAUDIO_INCLUDE_DIRS})
+    target_link_directories(basic_client PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
+    target_link_libraries(basic_client PRIVATE ${PORTAUDIO_LINK_LIBRARIES})
+    target_compile_definitions(basic_client PRIVATE SENDSPIN_HAS_PORTAUDIO=1)
+    message(STATUS "PortAudio found — PortAudioSink enabled")
+else()
+    message(STATUS "PortAudio not found — PortAudioSink will not be available")
+endif()

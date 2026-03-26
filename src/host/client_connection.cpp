@@ -1,0 +1,175 @@
+// Copyright 2026 Sendspin Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "client_connection.h"
+
+#include "platform/logging.h"
+#include "platform/time.h"
+
+#include <chrono>
+#include <cstring>
+
+namespace sendspin {
+
+static const char* const TAG = "sendspin.client_connection";
+
+SendspinClientConnection::SendspinClientConnection(std::string url) : url_(std::move(url)) {}
+
+SendspinClientConnection::~SendspinClientConnection() {
+    if (this->ws_) {
+        this->ws_->stop();
+        this->ws_.reset();
+    }
+}
+
+void SendspinClientConnection::start() {
+    if (this->ws_) {
+        SS_LOGW(TAG, "Client already started, stopping first");
+        this->ws_->stop();
+        this->ws_.reset();
+    }
+
+    this->ws_ = std::make_unique<ix::WebSocket>();
+    this->ws_->setUrl(this->url_);
+    this->ws_->disableAutomaticReconnection();
+
+    this->setup_callbacks_();
+
+    this->ws_->start();
+    SS_LOGD(TAG, "Client connection starting to %s", this->url_.c_str());
+}
+
+void SendspinClientConnection::setup_callbacks_() {
+    this->ws_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
+        int64_t receive_time = platform_time_us();
+
+        switch (msg->type) {
+            case ix::WebSocketMessageType::Open:
+                SS_LOGD(TAG, "WebSocket connected to %s", this->url_.c_str());
+                this->connected_ = true;
+                if (this->on_connected) {
+                    this->on_connected(this);
+                }
+                break;
+
+            case ix::WebSocketMessageType::Close:
+                SS_LOGD(TAG, "WebSocket disconnected from %s", this->url_.c_str());
+                this->connected_ = false;
+                this->client_hello_sent_ = false;
+                this->server_hello_received_ = false;
+                this->pending_time_message_ = false;
+                this->reset_websocket_payload_();
+                if (this->on_disconnected) {
+                    this->on_disconnected(this);
+                }
+                break;
+
+            case ix::WebSocketMessageType::Message: {
+                // IXWebSocket delivers complete reassembled messages
+                const std::string& data = msg->str;
+                bool is_binary = msg->binary;
+
+                if (!data.empty()) {
+                    uint8_t* dest = this->prepare_receive_buffer_(data.size());
+                    if (dest == nullptr) {
+                        SS_LOGE(TAG, "Allocation failed, dropping connection");
+                        this->connected_ = false;
+                        if (this->on_disconnected) {
+                            this->on_disconnected(this);
+                        }
+                        return;
+                    }
+                    std::memcpy(dest, data.data(), data.size());
+                    this->commit_receive_buffer_(data.size());
+                }
+                this->dispatch_completed_message_(!is_binary, receive_time);
+                break;
+            }
+
+            case ix::WebSocketMessageType::Error:
+                SS_LOGE(TAG, "WebSocket error on connection to %s: %s", this->url_.c_str(),
+                        msg->errorInfo.reason.c_str());
+                break;
+
+            default:
+                break;
+        }
+    });
+}
+
+void SendspinClientConnection::loop() {
+    // Handle auto-reconnect
+    if (!this->is_connected() && this->auto_reconnect_) {
+        uint32_t now =
+            static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count());
+        if (now - this->last_reconnect_attempt_ > this->reconnect_interval_ms_) {
+            this->last_reconnect_attempt_ = now;
+            SS_LOGD(TAG, "Attempting to reconnect to %s", this->url_.c_str());
+            this->start();
+        }
+    }
+}
+
+void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
+                                          std::function<void()> on_complete) {
+    if (!this->is_connected()) {
+        if (on_complete) {
+            on_complete();
+        }
+        return;
+    }
+
+    // Send goodbye message then stop
+    this->send_goodbye_reason(reason, [this, on_complete](bool /*success*/, int64_t) {
+        if (this->ws_) {
+            this->ws_->stop();
+        }
+        if (on_complete) {
+            on_complete();
+        }
+    });
+}
+
+bool SendspinClientConnection::is_connected() const {
+    return this->connected_;
+}
+
+SsErr SendspinClientConnection::send_text_message(const std::string& message,
+                                                  SendCompleteCallback cb) {
+    if (!this->is_connected()) {
+        if (cb) {
+            cb(false, 0);
+        }
+        return SsErr::INVALID_STATE;
+    }
+
+    auto info = this->ws_->send(message);
+    int64_t after_send_time = platform_time_us();
+    bool success = info.success;
+
+    if (cb) {
+        cb(success, after_send_time);
+    }
+
+    if (!success) {
+        SS_LOGE(TAG, "Failed to send text message");
+        return SsErr::FAIL;
+    }
+
+    return SsErr::OK;
+}
+
+}  // namespace sendspin

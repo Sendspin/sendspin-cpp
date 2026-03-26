@@ -1,0 +1,39 @@
+# sendspin-cpp
+
+Standalone C++ library implementing the Sendspin synchronized audio streaming protocol. Builds on both ESP-IDF (ESP32) and host platforms (macOS/Linux). Designed to be consumed by ESPHome but has no ESPHome dependencies.
+
+[![A project from the Open Home Foundation](https://www.openhomefoundation.org/badges/ohf-project.png)](https://www.openhomefoundation.org/)
+
+## Features
+
+- WebSocket-based audio streaming with server time synchronization
+- FLAC, Opus, and PCM audio decoding
+- Cross-platform: ESP-IDF (ESP32) and host (macOS/Linux)
+
+## Build
+
+### Host (macOS/Linux)
+
+```bash
+cmake -B build
+cmake --build build
+```
+
+Dependencies (fetched automatically via CMake FetchContent): ArduinoJson, micro-flac, micro-opus, IXWebSocket.
+
+### ESP-IDF
+
+Used as an IDF component. Add to your project's `idf_component.yml`.
+
+### PlatformIO
+
+Add via `library.json`.
+
+## Examples
+
+- **`examples/basic_client/`** -- Standalone host example with PortAudio audio output
+- **`examples/tui_client/`** -- Terminal UI host example with PortAudio audio output
+
+## License
+
+Apache 2.0

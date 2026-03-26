@@ -1,0 +1,33 @@
+{
+  "name": "sendspin-cpp",
+  "version": "0.1.0",
+  "description": "Sendspin synchronized audio streaming client for ESP32",
+  "keywords": ["sendspin", "audio", "streaming", "sync", "websocket", "esp32"],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/esphome-libs/sendspin-cpp.git"
+  },
+  "authors": [
+    {
+      "name": "Kevin Ahrendt",
+      "email": "kevin.ahrendt@openhomefoundation.org",
+      "maintainer": true
+    }
+  ],
+  "frameworks": ["espidf"],
+  "platforms": ["espressif32"],
+  "export": {
+    "include": [
+      "src/*",
+      "include/*",
+      "cmake/*",
+      "CMakeLists.txt",
+      "Kconfig",
+      "LICENSE",
+      "README.md",
+      "library.json",
+      "idf_component.yml"
+    ]
+  }
+}
