@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "audio_stream_info.h"
 
 namespace sendspin {
@@ -53,5 +51,3 @@ bool AudioStreamInfo::operator==(const AudioStreamInfo& rhs) const {
 }
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

@@ -14,8 +14,6 @@
 
 #pragma once
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include <cstddef>
 #include <cstdint>
 
@@ -69,5 +67,3 @@ inline void pack_q31_as_audio_sample(int32_t sample, uint8_t* data, size_t bytes
 }
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

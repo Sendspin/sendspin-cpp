@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "transfer_buffer.h"
 
 #include <cstring>
@@ -108,5 +106,3 @@ void TransferBuffer::deallocate_buffer_() {
 }
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

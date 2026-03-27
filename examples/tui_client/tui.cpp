@@ -598,9 +598,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             set_highlight(state, "Space");
         }
         if (current == SendspinPlaybackState::PLAYING) {
-            client.send_command(SendspinControllerCommand::PAUSE);
+            client.controller()->send_command(SendspinControllerCommand::PAUSE);
         } else {
-            client.send_command(SendspinControllerCommand::PLAY);
+            client.controller()->send_command(SendspinControllerCommand::PLAY);
         }
         return true;
     }
@@ -611,7 +611,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, ">");
         }
-        client.send_command(SendspinControllerCommand::NEXT);
+        client.controller()->send_command(SendspinControllerCommand::NEXT);
         return true;
     }
 
@@ -621,7 +621,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, "<");
         }
-        client.send_command(SendspinControllerCommand::PREVIOUS);
+        client.controller()->send_command(SendspinControllerCommand::PREVIOUS);
         return true;
     }
 
@@ -631,9 +631,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, "Up/Dn");
         }
-        uint8_t vol = client.get_volume();
+        uint8_t vol = client.player()->get_volume();
         uint8_t new_vol = static_cast<uint8_t>(std::min(100, vol + 5));
-        client.update_volume(new_vol);
+        client.player()->update_volume(new_vol);
         return true;
     }
 
@@ -643,9 +643,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, "Up/Dn");
         }
-        uint8_t vol = client.get_volume();
+        uint8_t vol = client.player()->get_volume();
         uint8_t new_vol = static_cast<uint8_t>(std::max(0, vol - 5));
-        client.update_volume(new_vol);
+        client.player()->update_volume(new_vol);
         return true;
     }
 
@@ -655,9 +655,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, "[ / ]");
         }
-        auto& cs = client.get_controller_state();
+        auto& cs = client.controller()->get_controller_state();
         uint8_t new_vol = static_cast<uint8_t>(std::min(100, cs.volume + 5));
-        client.send_command(SendspinControllerCommand::VOLUME, new_vol);
+        client.controller()->send_command(SendspinControllerCommand::VOLUME, new_vol);
         return true;
     }
 
@@ -667,9 +667,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, "[ / ]");
         }
-        auto& cs = client.get_controller_state();
+        auto& cs = client.controller()->get_controller_state();
         uint8_t new_vol = static_cast<uint8_t>(std::max(0, cs.volume - 5));
-        client.send_command(SendspinControllerCommand::VOLUME, new_vol);
+        client.controller()->send_command(SendspinControllerCommand::VOLUME, new_vol);
         return true;
     }
 
@@ -679,7 +679,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, "m");
         }
-        client.update_muted(!client.get_muted());
+        client.player()->update_muted(!client.player()->get_muted());
         return true;
     }
 
@@ -689,8 +689,8 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, "M");
         }
-        auto& cs = client.get_controller_state();
-        client.send_command(SendspinControllerCommand::MUTE, std::nullopt, !cs.muted);
+        auto& cs = client.controller()->get_controller_state();
+        client.controller()->send_command(SendspinControllerCommand::MUTE, std::nullopt, !cs.muted);
         return true;
     }
 
@@ -704,13 +704,13 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         }
         switch (current) {
             case SendspinRepeatMode::OFF:
-                client.send_command(SendspinControllerCommand::REPEAT_ALL);
+                client.controller()->send_command(SendspinControllerCommand::REPEAT_ALL);
                 break;
             case SendspinRepeatMode::ALL:
-                client.send_command(SendspinControllerCommand::REPEAT_ONE);
+                client.controller()->send_command(SendspinControllerCommand::REPEAT_ONE);
                 break;
             case SendspinRepeatMode::ONE:
-                client.send_command(SendspinControllerCommand::REPEAT_OFF);
+                client.controller()->send_command(SendspinControllerCommand::REPEAT_OFF);
                 break;
         }
         return true;
@@ -724,8 +724,8 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             current = state.shuffle;
             set_highlight(state, "x");
         }
-        client.send_command(current ? SendspinControllerCommand::UNSHUFFLE
-                                    : SendspinControllerCommand::SHUFFLE);
+        client.controller()->send_command(current ? SendspinControllerCommand::UNSHUFFLE
+                                                  : SendspinControllerCommand::SHUFFLE);
         return true;
     }
 
@@ -735,7 +735,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, "g");
         }
-        client.send_command(SendspinControllerCommand::SWITCH);
+        client.controller()->send_command(SendspinControllerCommand::SWITCH);
         return true;
     }
 
@@ -745,8 +745,8 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, ", / .");
         }
-        uint16_t delay = client.get_static_delay_ms();
-        client.update_static_delay(delay + 10);
+        uint16_t delay = client.player()->get_static_delay_ms();
+        client.player()->update_static_delay(delay + 10);
         return true;
     }
 
@@ -756,8 +756,8 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, ", / .");
         }
-        uint16_t delay = client.get_static_delay_ms();
-        client.update_static_delay(delay >= 10 ? delay - 10 : 0);
+        uint16_t delay = client.player()->get_static_delay_ms();
+        client.player()->update_static_delay(delay >= 10 ? delay - 10 : 0);
         return true;
     }
 
@@ -781,18 +781,20 @@ Component create_tui_component(SendspinClient& client, TuiState& state,
 
 void update_polled_state(TuiState& state, SendspinClient& client) {
     std::lock_guard<std::mutex> lock(state.mutex);
-    state.track_progress_ms = client.get_track_progress_ms();
-    state.track_duration_ms = client.get_track_duration_ms();
+    state.track_progress_ms = client.metadata() ? client.metadata()->get_track_progress_ms() : 0;
+    state.track_duration_ms = client.metadata() ? client.metadata()->get_track_duration_ms() : 0;
     state.connected = client.is_connected();
     state.time_synced = client.is_time_synced();
-    state.static_delay_ms = client.get_static_delay_ms();
-    state.player_volume = client.get_volume();
-    state.player_muted = client.get_muted();
+    state.static_delay_ms = client.player() ? client.player()->get_static_delay_ms() : 0;
+    state.player_volume = client.player() ? client.player()->get_volume() : 0;
+    state.player_muted = client.player() ? client.player()->get_muted() : false;
     state.group_name = client.get_group_name();
 
-    auto& cs = client.get_controller_state();
-    state.group_volume = cs.volume;
-    state.group_muted = cs.muted;
+    if (client.controller()) {
+        auto& cs = client.controller()->get_controller_state();
+        state.group_volume = cs.volume;
+        state.group_muted = cs.muted;
+    }
 }
 
 }  // namespace sendspin

@@ -193,17 +193,6 @@ int main(int argc, char* argv[]) {
     config.product_name = "sendspin-cpp host example";
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
-    config.controller = true;
-    config.metadata = true;
-
-    // Support common audio formats
-    config.audio_formats = {
-        {SendspinCodecFormat::FLAC, 2, 44100, 16},
-        {SendspinCodecFormat::FLAC, 2, 48000, 16},
-        {SendspinCodecFormat::OPUS, 2, 48000, 16},
-        {SendspinCodecFormat::PCM, 2, 44100, 16},
-        {SendspinCodecFormat::PCM, 2, 48000, 16},
-    };
 
     // Create audio sink and client
 #ifdef SENDSPIN_HAS_PORTAUDIO
@@ -213,11 +202,26 @@ int main(int argc, char* argv[]) {
 #endif
 
     SendspinClient client(std::move(config));
-    client.set_audio_sink(&audio_sink);
+
+    // Add roles
+    PlayerRole::Config player_config;
+    player_config.audio_formats = {
+        {SendspinCodecFormat::FLAC, 2, 44100, 16},
+        {SendspinCodecFormat::FLAC, 2, 48000, 16},
+        {SendspinCodecFormat::OPUS, 2, 48000, 16},
+        {SendspinCodecFormat::PCM, 2, 44100, 16},
+        {SendspinCodecFormat::PCM, 2, 48000, 16},
+    };
+    auto& player = client.add_player(std::move(player_config), &audio_sink);
+    auto& controller = client.add_controller();
+    auto& metadata = client.add_metadata();
+
+    // Suppress unused variable warnings for roles used only for their side effects
+    (void)controller;
 
 #ifdef SENDSPIN_HAS_PORTAUDIO
-    audio_sink.on_frames_played = [&client](uint32_t frames, int64_t timestamp) {
-        client.notify_audio_played(frames, timestamp);
+    audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
+        player.notify_audio_played(frames, timestamp);
     };
 #endif
 
@@ -225,10 +229,10 @@ int main(int argc, char* argv[]) {
     client.is_network_ready = []() { return true; };
 
     // Log callbacks
-    client.on_stream_start = [&]() {
+    player.on_stream_start = [&]() {
         fprintf(stderr, ">>> Stream started\n");
 #ifdef SENDSPIN_HAS_PORTAUDIO
-        auto& params = client.get_current_stream_params();
+        auto& params = player.get_current_stream_params();
         if (params.sample_rate.has_value() && params.channels.has_value() &&
             params.bit_depth.has_value()) {
             audio_sink.configure(*params.sample_rate, *params.channels, *params.bit_depth);
@@ -238,32 +242,32 @@ int main(int argc, char* argv[]) {
 #endif
     };
 
-    client.on_stream_end = [&]() {
+    player.on_stream_end = [&]() {
         fprintf(stderr, ">>> Stream ended\n");
 #ifdef SENDSPIN_HAS_PORTAUDIO
         audio_sink.clear();
 #endif
     };
 
-    client.on_stream_clear = [&]() {
+    player.on_stream_clear = [&]() {
         fprintf(stderr, ">>> Stream clear\n");
 #ifdef SENDSPIN_HAS_PORTAUDIO
         audio_sink.clear();
 #endif
     };
 
-    client.on_metadata = [](const ServerMetadataStateObject& metadata) {
-        if (metadata.title.has_value()) {
+    metadata.on_metadata = [](const ServerMetadataStateObject& md) {
+        if (md.title.has_value()) {
             fprintf(stderr, ">>> Metadata: %s - %s\n",
-                    metadata.artist.value_or("Unknown").c_str(), metadata.title->c_str());
+                    md.artist.value_or("Unknown").c_str(), md.title->c_str());
         }
     };
 
 #ifdef SENDSPIN_HAS_PORTAUDIO
-    client.on_volume_changed = [&audio_sink](uint8_t vol) {
+    player.on_volume_changed = [&audio_sink](uint8_t vol) {
         audio_sink.set_volume(vol);
     };
-    client.on_mute_changed = [&audio_sink](bool muted) {
+    player.on_mute_changed = [&audio_sink](bool muted) {
         audio_sink.set_muted(muted);
     };
 #endif
@@ -305,8 +309,8 @@ int main(int argc, char* argv[]) {
 #ifdef SENDSPIN_HAS_PORTAUDIO
         // Sync audio sink volume periodically (catches all volume change sources)
         if (++tick % 25 == 0) {
-            audio_sink.set_volume(client.get_volume());
-            audio_sink.set_muted(client.get_muted());
+            audio_sink.set_volume(player.get_volume());
+            audio_sink.set_muted(player.get_muted());
         }
 #else
         ++tick;

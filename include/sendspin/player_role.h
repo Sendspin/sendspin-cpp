@@ -1,0 +1,198 @@
+// Copyright 2026 Sendspin Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include "sendspin/audio_sink.h"
+#include "sendspin/protocol.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <vector>
+
+namespace sendspin {
+
+class SendspinClient;
+class SyncTask;
+struct ClientBridge;
+struct SyncTimeProvider;
+
+/// @brief Player role: owns SyncTask and AudioSink, handles audio playback.
+class PlayerRole {
+    friend class SendspinClient;
+
+public:
+    /// @brief Configuration for the player role.
+    struct Config {
+        std::vector<AudioSupportedFormatObject> audio_formats;
+        size_t audio_buffer_capacity{1000000};
+        int32_t fixed_delay_us{0};
+        uint16_t initial_static_delay_ms{0};
+    };
+
+    PlayerRole(Config config, AudioSink* sink);
+    ~PlayerRole();
+
+    // --- Audio ---
+
+    /// @brief Sets the audio sink for decoded audio output.
+    void set_audio_sink(AudioSink* sink);
+
+    /// @brief Called by the audio output when it has played audio frames. Thread-safe.
+    void notify_audio_played(uint32_t frames, int64_t timestamp);
+
+    /// @brief Writes an audio chunk to the sync task's ring buffer.
+    bool write_audio_chunk(const uint8_t* data, size_t size, int64_t timestamp, ChunkType type,
+                           uint32_t timeout_ms);
+
+    // --- State updates ---
+
+    /// @brief Updates the volume and publishes client state to the server.
+    void update_volume(uint8_t volume);
+
+    /// @brief Updates the mute state and publishes client state to the server.
+    void update_muted(bool muted);
+
+    /// @brief Updates the static delay and publishes client state to the server.
+    void update_static_delay(uint16_t delay_ms);
+
+    /// @brief Enables or disables the static delay adjustment command.
+    void set_static_delay_adjustable(bool adjustable);
+
+    // --- Queries ---
+
+    /// @brief Returns the current static delay in milliseconds.
+    uint16_t get_static_delay_ms() const {
+        return this->static_delay_ms_;
+    }
+
+    /// @brief Returns the fixed delay in microseconds (from config).
+    int32_t get_fixed_delay_us() const {
+        return this->config_.fixed_delay_us;
+    }
+
+    /// @brief Returns the current volume level.
+    uint8_t get_volume() const {
+        return this->volume_;
+    }
+
+    /// @brief Returns true if currently muted.
+    bool get_muted() const {
+        return this->muted_;
+    }
+
+    /// @brief Returns the audio buffer capacity from config.
+    size_t get_buffer_size() const {
+        return this->config_.audio_buffer_capacity;
+    }
+
+    /// @brief Returns a reference to the current stream parameters.
+    ServerPlayerStreamObject& get_current_stream_params() {
+        return this->current_stream_params_;
+    }
+
+    // --- Callbacks ---
+
+    std::function<void()> on_stream_start;
+    std::function<void()> on_stream_end;
+    std::function<void()> on_stream_clear;
+    std::function<void(uint8_t)> on_volume_changed;
+    std::function<void(bool)> on_mute_changed;
+    std::function<void(uint16_t)> on_static_delay_changed;
+
+    // --- Persistence hooks ---
+
+    std::function<bool(uint16_t)> save_static_delay;
+    std::function<std::optional<uint16_t>()> load_static_delay;
+
+private:
+    // --- Deferred event types ---
+
+    enum class StreamCallbackType : uint8_t {
+        STREAM_START,
+        STREAM_END,
+        STREAM_CLEAR,
+    };
+
+    struct StreamCallbackEvent {
+        explicit StreamCallbackEvent(StreamCallbackType t) : type(t) {}
+        StreamCallbackType type;
+        std::optional<ServerPlayerStreamObject> player_stream;
+    };
+
+    struct ServerCommandEvent {
+        ServerCommandMessage command;
+    };
+
+    // --- Private integration methods ---
+
+    void attach(ClientBridge* bridge);
+    bool start(bool psram_stack);
+    void contribute_hello(ClientHelloMessage& msg);
+    void contribute_state(ClientStateMessage& msg);
+    void handle_binary(const uint8_t* data, size_t len, int64_t timestamp);
+    void handle_stream_start(const StreamStartMessage& stream_msg);
+    void handle_stream_end();
+    void handle_stream_clear();
+    void handle_server_command(const ServerCommandMessage& cmd);
+    void drain_events(std::vector<StreamCallbackEvent>& stream_events,
+                      std::vector<ServerCommandEvent>& command_events,
+                      std::vector<SendspinClientState>& state_events);
+    void cleanup();
+
+    // --- Helpers ---
+
+    bool send_audio_chunk_(const uint8_t* data, size_t data_size, int64_t timestamp,
+                           ChunkType chunk_type, uint32_t timeout_ms);
+    SyncTimeProvider make_sync_time_provider_();
+    void load_static_delay_();
+    void persist_static_delay_();
+
+    // --- Configuration ---
+
+    Config config_;
+
+    // --- Bridge ---
+
+    ClientBridge* bridge_{nullptr};
+
+    // --- Player state ---
+
+    uint8_t volume_{0};
+    bool muted_{false};
+    uint16_t static_delay_ms_{0};
+    bool static_delay_adjustable_{false};
+    bool high_performance_requested_for_playback_{false};
+    ServerPlayerStreamObject current_stream_params_{};
+
+    // --- Sync task ---
+
+    std::unique_ptr<SyncTask> sync_task_;
+    AudioSink* audio_sink_{nullptr};
+
+    // --- Deferred event queues ---
+
+    std::vector<StreamCallbackEvent> pending_stream_callback_events_;
+    std::vector<ServerCommandEvent> pending_command_events_;
+    std::vector<SendspinClientState> pending_state_events_;
+
+    // --- Stream end/clear callbacks waiting for sync task to go idle (main thread only) ---
+
+    std::vector<StreamCallbackEvent> awaiting_sync_idle_events_;
+};
+
+}  // namespace sendspin

@@ -25,6 +25,13 @@ function(sendspin_get_sources BASE_DIR)
         # Connection management
         ${BASE_DIR}/src/connection_manager.cpp
 
+        # Role classes
+        ${BASE_DIR}/src/player_role.cpp
+        ${BASE_DIR}/src/controller_role.cpp
+        ${BASE_DIR}/src/metadata_role.cpp
+        ${BASE_DIR}/src/artwork_role.cpp
+        ${BASE_DIR}/src/visualizer_role.cpp
+
         # Client orchestration
         ${BASE_DIR}/src/client.cpp
 

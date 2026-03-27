@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "audio_ring_buffer.h"
 
 #include "platform/logging.h"
@@ -93,5 +91,3 @@ void SendspinAudioRingBuffer::reset() {
 }
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

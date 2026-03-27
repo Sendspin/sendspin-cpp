@@ -14,8 +14,6 @@
 
 #pragma once
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "platform/memory.h"
 #include "sendspin/audio_sink.h"
 
@@ -97,5 +95,3 @@ protected:
 };
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

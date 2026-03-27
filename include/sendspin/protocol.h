@@ -27,8 +27,6 @@ namespace sendspin {
 // Player types
 // ============================================================================
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 // Implementation-specific details not defined in the protocol specification.
 // Used internally for audio chunk handling between components.
 enum ChunkType : uint8_t {
@@ -148,13 +146,9 @@ struct ServerCommandMessage {
     std::optional<ServerPlayerCommandObject> player;
 };
 
-#endif  // SENDSPIN_ENABLE_PLAYER
-
 // ============================================================================
 // Artwork types
 // ============================================================================
-
-#ifdef SENDSPIN_ENABLE_ARTWORK
 
 enum class SendspinImageFormat {
     JPEG,
@@ -247,13 +241,9 @@ struct ClientArtworkRequestObject {
     std::optional<uint16_t> media_height;
 };
 
-#endif  // SENDSPIN_ENABLE_ARTWORK
-
 // ============================================================================
 // Visualizer types
 // ============================================================================
-
-#ifdef SENDSPIN_ENABLE_VISUALIZER
 
 enum class VisualizerDataType : uint8_t {
     BEAT,
@@ -317,13 +307,9 @@ struct ServerVisualizerStreamObject {
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 
-#endif  // SENDSPIN_ENABLE_VISUALIZER
-
 // ============================================================================
 // Controller types
 // ============================================================================
-
-#ifdef SENDSPIN_ENABLE_CONTROLLER
 
 enum class SendspinControllerCommand {
     PLAY,
@@ -417,13 +403,9 @@ struct ServerStateControllerObject {
     bool muted;
 };
 
-#endif  // SENDSPIN_ENABLE_CONTROLLER
-
 // ============================================================================
 // Metadata types
 // ============================================================================
-
-#ifdef SENDSPIN_ENABLE_METADATA
 
 struct MetadataProgressObject {
     uint32_t track_progress;
@@ -474,8 +456,6 @@ struct ServerMetadataStateObject {
     std::optional<bool> shuffle;
 };
 
-#endif  // SENDSPIN_ENABLE_METADATA
-
 // ============================================================================
 // Common types (always available)
 // ============================================================================
@@ -503,15 +483,9 @@ inline const char* to_cstr(SendspinClientState state) {
 // Typically bits 7-2 for role type, bits 1-0 for message slot (4 IDs per role)
 // Roles with expanded allocations use bits 2-0 for message slot (8 IDs)
 enum SendspinBinaryRole : uint8_t {
-#ifdef SENDSPIN_ENABLE_PLAYER
-    SENDSPIN_ROLE_PLAYER = 1,  // 000001xx (4-7)
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    SENDSPIN_ROLE_ARTWORK = 2,  // 000010xx (8-11)
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
+    SENDSPIN_ROLE_PLAYER = 1,      // 000001xx (4-7)
+    SENDSPIN_ROLE_ARTWORK = 2,     // 000010xx (8-11)
     SENDSPIN_ROLE_VISUALIZER = 4,  // 00010xxx (16-23) - expanded allocation
-#endif
 };
 
 // Helper to extract role from binary message type (for standard 4-slot roles)
@@ -525,16 +499,10 @@ inline uint8_t get_binary_slot(uint8_t type) {
 
 // Common binary message types
 enum SendspinBinaryType : uint8_t {
-#ifdef SENDSPIN_ENABLE_PLAYER
-    SENDSPIN_BINARY_PLAYER_AUDIO = 4,  // Player slot 0
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    SENDSPIN_BINARY_ARTWORK_IMAGE = 8,  // Artwork slot 0
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
+    SENDSPIN_BINARY_PLAYER_AUDIO = 4,      // Player slot 0
+    SENDSPIN_BINARY_ARTWORK_IMAGE = 8,     // Artwork slot 0
     SENDSPIN_BINARY_VISUALIZER = 16,       // Visualizer data (loudness, f_peak, spectrum)
     SENDSPIN_BINARY_VISUALIZER_BEAT = 17,  // Visualizer beat events
-#endif
 };
 
 enum class SendspinServerToClientMessageType {
@@ -654,41 +622,27 @@ struct ClientHelloMessage {
     std::optional<DeviceInfoObject> device_info;
     uint8_t version;
     std::vector<SendspinRole> supported_roles;
-#ifdef SENDSPIN_ENABLE_PLAYER
     std::optional<PlayerSupportObject> player_v1_support;
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
     std::optional<ArtworkSupportObject> artwork_v1_support;
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
     std::optional<VisualizerSupportObject> visualizer_support;
-#endif
 };
 
 struct ClientStateMessage {
     SendspinClientState state;
-#ifdef SENDSPIN_ENABLE_PLAYER
     std::optional<ClientPlayerStateObject> player;
-#endif
 };
 
-#ifdef SENDSPIN_ENABLE_CONTROLLER
 struct ClientCommandMessage {
     std::optional<ClientCommandControllerObject> controller;
 };
-#endif
 
 struct ClientGoodbyeMessage {
     SendspinGoodbyeReason reason;
 };
 
 struct ServerStateMessage {
-#ifdef SENDSPIN_ENABLE_CONTROLLER
     std::optional<ServerStateControllerObject> controller;
-#endif
-#ifdef SENDSPIN_ENABLE_METADATA
     std::optional<ServerMetadataStateObject> metadata;
-#endif
 };
 
 struct ServerInformationObject {
@@ -737,24 +691,14 @@ struct GroupUpdateMessage {
 };
 
 struct StreamStartMessage {
-#ifdef SENDSPIN_ENABLE_PLAYER
     std::optional<ServerPlayerStreamObject> player;
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
     std::optional<ServerArtworkStreamObject> artwork;
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
     std::optional<ServerVisualizerStreamObject> visualizer;
-#endif
 };
 
 struct StreamRequestFormatMessage {
-#ifdef SENDSPIN_ENABLE_PLAYER
     std::optional<ServerPlayerStreamObject> player;
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
     std::optional<ClientArtworkRequestObject> artwork;
-#endif
 };
 
 struct StreamEndMessage {
@@ -783,9 +727,7 @@ bool process_server_time_message(JsonObject root, int64_t timestamp,
 bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg);
 void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObject& updates);
 
-#ifdef SENDSPIN_ENABLE_PLAYER
 bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg);
-#endif
 
 bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg);
 
@@ -793,10 +735,8 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
 bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg);
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg);
 
-#ifdef SENDSPIN_ENABLE_METADATA
 void apply_metadata_state_deltas(ServerMetadataStateObject* current,
                                  const ServerMetadataStateObject& updates);
-#endif
 
 /// @brief Formats a client hello message as a JSON string for sending to the server.
 /// @param msg (ClientHelloMessage *) Message to serialize
@@ -809,10 +749,8 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
 
 std::string format_client_goodbye_message(SendspinGoodbyeReason reason);
 
-#ifdef SENDSPIN_ENABLE_CONTROLLER
 std::string format_client_command_message(SendspinControllerCommand command,
                                           std::optional<uint8_t> volume = std::nullopt,
                                           std::optional<bool> mute = std::nullopt);
-#endif
 
 }  // namespace sendspin

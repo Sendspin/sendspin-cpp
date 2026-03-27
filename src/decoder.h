@@ -14,8 +14,6 @@
 
 #pragma once
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "audio_stream_info.h"
 #include "platform/memory.h"
 #include "sendspin/protocol.h"  // For ChunkType, DummyHeader, SendspinCodecFormat
@@ -77,5 +75,3 @@ protected:
 };
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

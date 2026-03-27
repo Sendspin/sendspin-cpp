@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "sync_task.h"
 
 #include "audio_utils.h"
@@ -749,5 +747,3 @@ void SyncTask::sync_task(void* params) {
 }
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

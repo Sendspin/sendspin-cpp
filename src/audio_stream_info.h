@@ -14,8 +14,6 @@
 
 #pragma once
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include <cstddef>
 #include <cstdint>
 
@@ -88,5 +86,3 @@ protected:
 };
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

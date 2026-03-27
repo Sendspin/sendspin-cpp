@@ -8,13 +8,33 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 
 ### Key classes
 
-- `SendspinClient` (`client.h`) — main orchestration class, owns everything
+- `SendspinClient` (`client.h`) — main orchestration class, owns connections, time sync, and message routing
+- `PlayerRole` (`player_role.h`) — audio streaming role, owns `SyncTask` and `AudioSink`
+- `ControllerRole` (`controller_role.h`) — sends playback commands to the server
+- `MetadataRole` (`metadata_role.h`) — receives track metadata and progress
+- `ArtworkRole` (`artwork_role.h`) — receives album artwork images
+- `VisualizerRole` (`visualizer_role.h`) — receives spectrum/beat visualization data
 - `SyncTask` (`sync_task.h`) — decodes encoded audio, synchronizes to server timestamps, writes PCM to an `AudioSink`
 - `SendspinConnection` (`connection.h`) — abstract WebSocket connection base
 - `SendspinServerConnection` / `SendspinClientConnection` — platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
 - `SendspinTimeFilter` (`time_filter.h`) — 2D Kalman filter for NTP-style time sync
 - `SendspinTimeBurst` (`time_burst.h`) — burst-based time message coordinator
 - `SendspinDecoder` (`decoder.h`) — FLAC/Opus/PCM decoder wrapper
+- `ClientBridge` (`client_bridge.h`) — private struct providing roles with access to shared client services
+
+### Role composition
+
+Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role is a concrete class that owns its state, event queues, and callbacks. The client dispatches messages to roles via null-pointer checks — no preprocessor guards or virtual dispatch.
+
+```cpp
+SendspinClient client(config);
+auto& player = client.add_player(player_config, &audio_sink);
+player.on_stream_start = [&]() { /* ... */ };
+auto& metadata = client.add_metadata();
+metadata.on_metadata = [&](const auto& m) { /* ... */ };
+client.add_controller();
+client.start_server(5);
+```
 
 ### Platform integration
 
@@ -28,7 +48,7 @@ The platform (e.g., ESPHome) provides:
 ## Project layout
 
 ```text
-include/sendspin/     — Public API headers (client.h, protocol.h, audio_sink.h)
+include/sendspin/     — Public API headers (client.h, protocol.h, audio_sink.h, *_role.h)
 src/                        — Cross-platform source files (.cpp) and private headers (.h)
 src/platform/               — Platform abstraction headers and host-only source files
 src/esp/                    — ESP-IDF networking implementations and headers
@@ -41,7 +61,7 @@ examples/tui_client/        — Terminal UI host example with PortAudio audio ou
 
 ### Header visibility
 
-- **Public** (`include/sendspin/`): Only `client.h`, `protocol.h`, `audio_sink.h`. These are the consumer-facing API.
+- **Public** (`include/sendspin/`): `client.h`, `protocol.h`, `audio_sink.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`). These are the consumer-facing API.
 - **Private** (`src/`): All internal headers (decoder, sync_task, time_filter, ring buffers, etc.). Not exposed to consumers.
 - **Platform-specific** (`src/esp/`, `src/host/`): Networking headers with the same names (`client_connection.h`, `server_connection.h`, `ws_server.h`) but different implementations per platform.
 
@@ -76,7 +96,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards — all platfor
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
 - Memory: `platform_malloc`/`platform_realloc`/`platform_free` from `platform/memory.h` (not raw `heap_caps_malloc`)
 - Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer.
-- Feature flags: `SENDSPIN_ENABLE_PLAYER`, `SENDSPIN_ENABLE_CONTROLLER`, `SENDSPIN_ENABLE_METADATA`, `SENDSPIN_ENABLE_ARTWORK`, `SENDSPIN_ENABLE_VISUALIZER`. Defined as CMake compile definitions — `cmake/esp-idf.cmake` translates Kconfig options, `cmake/host.cmake` enables all unconditionally.
+- Role composition: Roles are added at runtime via `add_player()`, `add_metadata()`, etc. No compile-time feature flags in library code. The CMake option `SENDSPIN_ENABLE_PLAYER` only controls whether audio codec dependencies (micro-flac, micro-opus) are fetched and linked.
 - Apache 2.0 license headers on all files
 
 ## Pre-commit hooks

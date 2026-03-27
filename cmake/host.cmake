@@ -28,19 +28,9 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     )
 
     # =========================================================================
-    # Feature flags — host builds enable all features by default
+    # Player codec dependencies — can be disabled to build without audio codecs
     # =========================================================================
-    option(SENDSPIN_ENABLE_PLAYER "Enable player feature" ON)
-    option(SENDSPIN_ENABLE_CONTROLLER "Enable controller feature" ON)
-    option(SENDSPIN_ENABLE_METADATA "Enable metadata feature" ON)
-    option(SENDSPIN_ENABLE_ARTWORK "Enable artwork feature" ON)
-    option(SENDSPIN_ENABLE_VISUALIZER "Enable visualizer feature" ON)
-
-    foreach(_flag PLAYER CONTROLLER METADATA ARTWORK VISUALIZER)
-        if(SENDSPIN_ENABLE_${_flag})
-            target_compile_definitions(${TARGET_LIB} PUBLIC SENDSPIN_ENABLE_${_flag})
-        endif()
-    endforeach()
+    option(SENDSPIN_ENABLE_PLAYER "Fetch and link player audio codec libraries (micro-flac, micro-opus)" ON)
 
     # =========================================================================
     # Compiler settings

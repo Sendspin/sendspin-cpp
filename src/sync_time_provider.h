@@ -14,8 +14,6 @@
 
 #pragma once
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "sendspin/protocol.h"
 
 #include <cstdint>
@@ -43,5 +41,3 @@ struct SyncTimeProvider {
 };
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

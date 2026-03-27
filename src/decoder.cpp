@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "decoder.h"
 
 #include "platform/logging.h"
@@ -188,5 +186,3 @@ bool SendspinDecoder::decode_dummy_header_(const uint8_t* data, size_t data_size
 }
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

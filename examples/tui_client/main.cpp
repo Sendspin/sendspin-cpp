@@ -245,7 +245,7 @@ private:
         ServiceKey key{name, regtype, domain};
 
         if (flags & kDNSServiceFlagsAdd) {
-            // Service appeared — resolve it
+            // Service appeared -- resolve it
             auto* ctx = new ResolveContext{browser, key, name, 0, ""};
 
             DNSServiceRef resolve_ref = nullptr;
@@ -397,16 +397,32 @@ int main(int argc, char* argv[]) {
     config.product_name = "sendspin-cpp host TUI";
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
-    config.controller = true;
-    config.metadata = true;
 
-    config.audio_formats = {
+    // Create audio sink
+#ifdef SENDSPIN_HAS_PORTAUDIO
+    PortAudioSink audio_sink;
+#else
+    NullAudioSink audio_sink;
+#endif
+
+    SendspinClient client(std::move(config));
+
+    // Add roles
+    PlayerRole::Config player_config;
+    player_config.audio_formats = {
         {SendspinCodecFormat::FLAC, 2, 44100, 16}, {SendspinCodecFormat::FLAC, 2, 48000, 16},
         {SendspinCodecFormat::OPUS, 2, 48000, 16}, {SendspinCodecFormat::PCM, 2, 44100, 16},
         {SendspinCodecFormat::PCM, 2, 48000, 16},
     };
+    auto& player = client.add_player(std::move(player_config), &audio_sink);
+    auto& controller = client.add_controller();
+    auto& metadata = client.add_metadata();
+
+    // Suppress unused variable warning
+    (void)controller;
 
     // Visualizer support (disabled with -V flag)
+    VisualizerRole* vis_role = nullptr;
     if (enable_visualizer) {
         VisualizerSupportObject vis;
         vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
@@ -420,22 +436,12 @@ int main(int argc, char* argv[]) {
             .f_max = 16000,
             .rate_max = 30,
         };
-        config.visualizer = vis;
+        vis_role = &client.add_visualizer(VisualizerRole::Config{.support = vis});
     }
 
-    // Create audio sink
 #ifdef SENDSPIN_HAS_PORTAUDIO
-    PortAudioSink audio_sink;
-#else
-    NullAudioSink audio_sink;
-#endif
-
-    SendspinClient client(std::move(config));
-    client.set_audio_sink(&audio_sink);
-
-#ifdef SENDSPIN_HAS_PORTAUDIO
-    audio_sink.on_frames_played = [&client](uint32_t frames, int64_t timestamp) {
-        client.notify_audio_played(frames, timestamp);
+    audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
+        player.notify_audio_played(frames, timestamp);
     };
 #endif
 
@@ -445,22 +451,22 @@ int main(int argc, char* argv[]) {
     TuiState state;
 
     // Wire callbacks to update TUI state
-    client.on_metadata = [&state](const ServerMetadataStateObject& metadata) {
+    metadata.on_metadata = [&state](const ServerMetadataStateObject& md) {
         std::lock_guard<std::mutex> lock(state.mutex);
-        if (metadata.title.has_value()) {
-            state.title = *metadata.title;
+        if (md.title.has_value()) {
+            state.title = *md.title;
         }
-        if (metadata.artist.has_value()) {
-            state.artist = *metadata.artist;
+        if (md.artist.has_value()) {
+            state.artist = *md.artist;
         }
-        if (metadata.album.has_value()) {
-            state.album = *metadata.album;
+        if (md.album.has_value()) {
+            state.album = *md.album;
         }
-        if (metadata.repeat.has_value()) {
-            state.repeat_mode = *metadata.repeat;
+        if (md.repeat.has_value()) {
+            state.repeat_mode = *md.repeat;
         }
-        if (metadata.shuffle.has_value()) {
-            state.shuffle = *metadata.shuffle;
+        if (md.shuffle.has_value()) {
+            state.shuffle = *md.shuffle;
         }
     };
 
@@ -474,7 +480,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    client.on_volume_changed = [&state
+    player.on_volume_changed = [&state
 #ifdef SENDSPIN_HAS_PORTAUDIO
                                 ,
                                 &audio_sink
@@ -489,7 +495,7 @@ int main(int argc, char* argv[]) {
 #endif
     };
 
-    client.on_mute_changed = [&state
+    player.on_mute_changed = [&state
 #ifdef SENDSPIN_HAS_PORTAUDIO
                                ,
                                &audio_sink
@@ -504,12 +510,12 @@ int main(int argc, char* argv[]) {
 #endif
     };
 
-    client.on_static_delay_changed = [&state](uint16_t delay) {
+    player.on_static_delay_changed = [&state](uint16_t delay) {
         std::lock_guard<std::mutex> lock(state.mutex);
         state.static_delay_ms = delay;
     };
 
-    client.on_stream_start = [&state, &client
+    player.on_stream_start = [&state, &player
 #ifdef SENDSPIN_HAS_PORTAUDIO
                               ,
                               &audio_sink
@@ -517,7 +523,7 @@ int main(int argc, char* argv[]) {
     ]() {
         {
             std::lock_guard<std::mutex> lock(state.mutex);
-            auto& params = client.get_current_stream_params();
+            auto& params = player.get_current_stream_params();
             state.codec = params.codec;
             state.sample_rate = params.sample_rate;
             state.bit_depth = params.bit_depth;
@@ -525,7 +531,7 @@ int main(int argc, char* argv[]) {
             state.streaming = true;
         }
 #ifdef SENDSPIN_HAS_PORTAUDIO
-        auto& params = client.get_current_stream_params();
+        auto& params = player.get_current_stream_params();
         if (params.sample_rate.has_value() && params.channels.has_value() &&
             params.bit_depth.has_value()) {
             audio_sink.configure(*params.sample_rate, *params.channels, *params.bit_depth);
@@ -533,7 +539,7 @@ int main(int argc, char* argv[]) {
 #endif
     };
 
-    client.on_stream_end = [&state
+    player.on_stream_end = [&state
 #ifdef SENDSPIN_HAS_PORTAUDIO
                             ,
                             &audio_sink
@@ -552,7 +558,7 @@ int main(int argc, char* argv[]) {
 #endif
     };
 
-    client.on_stream_clear = [
+    player.on_stream_clear = [
 #ifdef SENDSPIN_HAS_PORTAUDIO
                                &audio_sink
 #endif
@@ -563,114 +569,116 @@ int main(int argc, char* argv[]) {
     };
 
     // Visualizer callbacks
-    client.on_visualizer_stream_start = [&state](const ServerVisualizerStreamObject& vis_stream) {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        state.visualizer_active = true;
-        state.vis_active_types = vis_stream.types;
-        if (vis_stream.spectrum.has_value()) {
-            state.vis_stream_bin_count = vis_stream.spectrum->n_disp_bins;
-            state.vis_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0);
-            state.vis_display_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0.0f);
-        }
-        state.vis_display_loudness = 0.0f;
-        state.vis_frames.clear();
-        state.vis_beat_times.clear();
-    };
-
-    client.on_visualizer_stream_end = [&state]() {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        state.visualizer_active = false;
-        state.vis_frames.clear();
-        state.vis_beat_times.clear();
-        state.vis_loudness = 0;
-        state.vis_peak_freq = 0;
-        std::fill(state.vis_spectrum.begin(), state.vis_spectrum.end(), uint16_t{0});
-        std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
-        state.vis_display_loudness = 0.0f;
-        state.vis_beat = false;
-    };
-
-    client.on_visualizer_stream_clear = [&state]() {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        state.vis_frames.clear();
-        state.vis_beat_times.clear();
-        state.vis_loudness = 0;
-        state.vis_peak_freq = 0;
-        std::fill(state.vis_spectrum.begin(), state.vis_spectrum.end(), uint16_t{0});
-        std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
-        state.vis_display_loudness = 0.0f;
-        state.vis_beat = false;
-    };
-
-    client.on_visualizer_data = [&state](const uint8_t* data, size_t len) {
-        // Binary format: [type=16][num_frames][per-frame data...]
-        if (len < 2) return;
-        // byte 0 is type (16), byte 1 is num_frames
-        uint8_t num_frames = data[1];
-        size_t offset = 2;
-
-        std::lock_guard<std::mutex> lock(state.mutex);
-
-        bool has_loudness = false;
-        bool has_f_peak = false;
-        bool has_spectrum = false;
-        for (auto t : state.vis_active_types) {
-            if (t == VisualizerDataType::LOUDNESS) has_loudness = true;
-            if (t == VisualizerDataType::F_PEAK) has_f_peak = true;
-            if (t == VisualizerDataType::SPECTRUM) has_spectrum = true;
-        }
-        uint8_t bin_count = state.vis_stream_bin_count;
-
-        for (uint8_t i = 0; i < num_frames; ++i) {
-            if (offset + 8 > len) break;
-            VisFrame frame;
-            frame.server_time = be64(data + offset);
-            offset += 8;
-
-            if (has_loudness) {
-                if (offset + 2 > len) break;
-                frame.loudness = be16(data + offset);
-                offset += 2;
+    if (vis_role) {
+        vis_role->on_visualizer_stream_start = [&state](const ServerVisualizerStreamObject& vis_stream) {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.visualizer_active = true;
+            state.vis_active_types = vis_stream.types;
+            if (vis_stream.spectrum.has_value()) {
+                state.vis_stream_bin_count = vis_stream.spectrum->n_disp_bins;
+                state.vis_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0);
+                state.vis_display_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0.0f);
             }
-            if (has_f_peak) {
-                if (offset + 2 > len) break;
-                frame.peak_freq = be16(data + offset);
-                offset += 2;
+            state.vis_display_loudness = 0.0f;
+            state.vis_frames.clear();
+            state.vis_beat_times.clear();
+        };
+
+        vis_role->on_visualizer_stream_end = [&state]() {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.visualizer_active = false;
+            state.vis_frames.clear();
+            state.vis_beat_times.clear();
+            state.vis_loudness = 0;
+            state.vis_peak_freq = 0;
+            std::fill(state.vis_spectrum.begin(), state.vis_spectrum.end(), uint16_t{0});
+            std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
+            state.vis_display_loudness = 0.0f;
+            state.vis_beat = false;
+        };
+
+        vis_role->on_visualizer_stream_clear = [&state]() {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.vis_frames.clear();
+            state.vis_beat_times.clear();
+            state.vis_loudness = 0;
+            state.vis_peak_freq = 0;
+            std::fill(state.vis_spectrum.begin(), state.vis_spectrum.end(), uint16_t{0});
+            std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
+            state.vis_display_loudness = 0.0f;
+            state.vis_beat = false;
+        };
+
+        vis_role->on_visualizer_data = [&state](const uint8_t* data, size_t len) {
+            // Binary format: [type=16][num_frames][per-frame data...]
+            if (len < 2) return;
+            // byte 0 is type (16), byte 1 is num_frames
+            uint8_t num_frames = data[1];
+            size_t offset = 2;
+
+            std::lock_guard<std::mutex> lock(state.mutex);
+
+            bool has_loudness = false;
+            bool has_f_peak = false;
+            bool has_spectrum = false;
+            for (auto t : state.vis_active_types) {
+                if (t == VisualizerDataType::LOUDNESS) has_loudness = true;
+                if (t == VisualizerDataType::F_PEAK) has_f_peak = true;
+                if (t == VisualizerDataType::SPECTRUM) has_spectrum = true;
             }
-            if (has_spectrum) {
-                frame.spectrum.resize(bin_count);
-                for (uint8_t b = 0; b < bin_count; ++b) {
+            uint8_t bin_count = state.vis_stream_bin_count;
+
+            for (uint8_t i = 0; i < num_frames; ++i) {
+                if (offset + 8 > len) break;
+                VisFrame frame;
+                frame.server_time = be64(data + offset);
+                offset += 8;
+
+                if (has_loudness) {
                     if (offset + 2 > len) break;
-                    frame.spectrum[b] = be16(data + offset);
+                    frame.loudness = be16(data + offset);
                     offset += 2;
                 }
-            }
+                if (has_f_peak) {
+                    if (offset + 2 > len) break;
+                    frame.peak_freq = be16(data + offset);
+                    offset += 2;
+                }
+                if (has_spectrum) {
+                    frame.spectrum.resize(bin_count);
+                    for (uint8_t b = 0; b < bin_count; ++b) {
+                        if (offset + 2 > len) break;
+                        frame.spectrum[b] = be16(data + offset);
+                        offset += 2;
+                    }
+                }
 
-            state.vis_frames.push_back(std::move(frame));
-            // Cap buffer size to avoid unbounded growth
-            if (state.vis_frames.size() > 512) {
-                state.vis_frames.pop_front();
+                state.vis_frames.push_back(std::move(frame));
+                // Cap buffer size to avoid unbounded growth
+                if (state.vis_frames.size() > 512) {
+                    state.vis_frames.pop_front();
+                }
             }
-        }
-    };
+        };
 
-    client.on_beat_data = [&state](const uint8_t* data, size_t len) {
-        // Binary format: [type=17][num_beats][per-beat: 8 bytes timestamp]
-        if (len < 2) return;
-        uint8_t num_beats = data[1];
-        size_t offset = 2;
+        vis_role->on_beat_data = [&state](const uint8_t* data, size_t len) {
+            // Binary format: [type=17][num_beats][per-beat: 8 bytes timestamp]
+            if (len < 2) return;
+            uint8_t num_beats = data[1];
+            size_t offset = 2;
 
-        std::lock_guard<std::mutex> lock(state.mutex);
-        for (uint8_t i = 0; i < num_beats; ++i) {
-            if (offset + 8 > len) break;
-            int64_t server_time = be64(data + offset);
-            offset += 8;
-            state.vis_beat_times.push_back(server_time);
-            if (state.vis_beat_times.size() > 128) {
-                state.vis_beat_times.pop_front();
+            std::lock_guard<std::mutex> lock(state.mutex);
+            for (uint8_t i = 0; i < num_beats; ++i) {
+                if (offset + 8 > len) break;
+                int64_t server_time = be64(data + offset);
+                offset += 8;
+                state.vis_beat_times.push_back(server_time);
+                if (state.vis_beat_times.size() > 128) {
+                    state.vis_beat_times.pop_front();
+                }
             }
-        }
-    };
+        };
+    }
 
     // Start the server
     if (!client.start_server(5)) {
@@ -804,8 +812,8 @@ int main(int argc, char* argv[]) {
                 // Sync audio sink volume with client state every poll cycle.
                 // This catches all volume sources: key presses (update_volume),
                 // server commands (on_volume_changed), and polling updates.
-                audio_sink.set_volume(client.get_volume());
-                audio_sink.set_muted(client.get_muted());
+                audio_sink.set_volume(player.get_volume());
+                audio_sink.set_muted(player.get_muted());
 #endif
                 // Update discovered servers list
                 {

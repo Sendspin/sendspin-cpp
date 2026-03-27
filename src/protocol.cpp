@@ -179,8 +179,6 @@ void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObje
     }
 }
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 static bool process_player_stream_object(const JsonObject player_object,
                                          ServerPlayerStreamObject* player_obj,
                                          bool require_all_fields) {
@@ -230,10 +228,6 @@ static bool process_player_stream_object(const JsonObject player_object,
     return true;
 }
 
-#endif  // SENDSPIN_ENABLE_PLAYER
-
-#ifdef SENDSPIN_ENABLE_ARTWORK
-
 static bool process_artwork_channel_object(const JsonObject channel_object,
                                            ServerArtworkChannelObject* channel,
                                            bool require_all_fields) {
@@ -272,8 +266,6 @@ static bool process_artwork_channel_object(const JsonObject channel_object,
     return true;
 }
 
-#endif  // SENDSPIN_ENABLE_ARTWORK
-
 bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg) {
     if (stream_msg == nullptr) {
         return true;
@@ -281,7 +273,6 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
 
     (void)root;
 
-#ifdef SENDSPIN_ENABLE_PLAYER
     if (root["payload"]["player"].is<JsonObject>()) {
         ServerPlayerStreamObject player_obj;
         if (process_player_stream_object(root["payload"]["player"], &player_obj, true)) {
@@ -294,9 +285,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             return false;
         }
     }
-#endif  // SENDSPIN_ENABLE_PLAYER
 
-#ifdef SENDSPIN_ENABLE_ARTWORK
     if (root["payload"]["artwork"]["channels"].is<JsonArray>()) {
         ServerArtworkStreamObject artwork_obj;
         std::vector<ServerArtworkChannelObject> channels;
@@ -317,9 +306,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         artwork_obj.channels = channels;
         stream_msg->artwork = artwork_obj;
     }
-#endif  // SENDSPIN_ENABLE_ARTWORK
 
-#ifdef SENDSPIN_ENABLE_VISUALIZER
     if (root["payload"]["visualizer"].is<JsonObject>()) {
         ServerVisualizerStreamObject vis_obj;
         JsonObject vis_json = root["payload"]["visualizer"];
@@ -368,7 +355,6 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
 
         stream_msg->visualizer = vis_obj;
     }
-#endif  // SENDSPIN_ENABLE_VISUALIZER
 
     return true;
 }
@@ -413,8 +399,6 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
     return true;
 }
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 static bool process_server_player_command_object(const JsonObject player_object,
                                                  ServerPlayerCommandObject* player_cmd) {
     if (player_cmd == nullptr || !player_object["command"].is<JsonVariant>()) {
@@ -457,10 +441,6 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
     }
     return true;
 }
-
-#endif  // SENDSPIN_ENABLE_PLAYER
-
-#ifdef SENDSPIN_ENABLE_METADATA
 
 static bool process_server_metadata_state_object(const JsonObject metadata_object,
                                                  ServerMetadataStateObject* metadata_state) {
@@ -603,8 +583,6 @@ void apply_metadata_state_deltas(ServerMetadataStateObject* current,
     }
 }
 
-#endif  // SENDSPIN_ENABLE_METADATA
-
 bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg) {
     if (state_msg == nullptr) {
         return true;
@@ -612,7 +590,6 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
 
     (void)root;
 
-#ifdef SENDSPIN_ENABLE_METADATA
     // Parse optional metadata object
     if (root["payload"]["metadata"].is<JsonObject>()) {
         ServerMetadataStateObject metadata_state;
@@ -620,9 +597,7 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
             state_msg->metadata = metadata_state;
         }
     }
-#endif  // SENDSPIN_ENABLE_METADATA
 
-#ifdef SENDSPIN_ENABLE_CONTROLLER
     if (root["payload"]["controller"].is<JsonObject>()) {
         ServerStateControllerObject controller_state;
         JsonObject controller_object = root["payload"]["controller"];
@@ -655,7 +630,6 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
 
         state_msg->controller = controller_state;
     }
-#endif  // SENDSPIN_ENABLE_CONTROLLER
 
     return true;
 }
@@ -685,7 +659,6 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         supported_roles_list.add(to_cstr(role));
     }
 
-#ifdef SENDSPIN_ENABLE_PLAYER
     if (msg->player_v1_support.has_value()) {
         JsonArray formats_list =
             root["payload"]["player@v1_support"]["supported_formats"].to<JsonArray>();
@@ -704,9 +677,7 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             commands_list.add(to_cstr(cmd));
         }
     }
-#endif  // SENDSPIN_ENABLE_PLAYER
 
-#ifdef SENDSPIN_ENABLE_ARTWORK
     if (msg->artwork_v1_support.has_value()) {
         JsonArray channels_list = root["payload"]["artwork@v1_support"]["channels"].to<JsonArray>();
         for (const auto& channel : msg->artwork_v1_support.value().channels) {
@@ -717,9 +688,7 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             channel_obj["media_height"] = channel.media_height;
         }
     }
-#endif  // SENDSPIN_ENABLE_ARTWORK
 
-#ifdef SENDSPIN_ENABLE_VISUALIZER
     if (msg->visualizer_support.has_value()) {
         const auto& vis = msg->visualizer_support.value();
         JsonArray types_list =
@@ -740,7 +709,6 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["rate_max"] = spec.rate_max;
         }
     }
-#endif  // SENDSPIN_ENABLE_VISUALIZER
 
     std::string output;
     serializeJson(doc, output);
@@ -754,7 +722,6 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
     root["type"] = "client/state";
     root["payload"]["state"] = to_cstr(msg->state);
 
-#ifdef SENDSPIN_ENABLE_PLAYER
     if (msg->player.has_value()) {
         const ClientPlayerStateObject& player_state = msg->player.value();
         root["payload"]["player"]["volume"] = player_state.volume;
@@ -768,7 +735,6 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
             }
         }
     }
-#endif  // SENDSPIN_ENABLE_PLAYER
 
     std::string output;
     serializeJson(doc, output);
@@ -783,7 +749,6 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
 
     root["type"] = "stream/request-format";
 
-#ifdef SENDSPIN_ENABLE_PLAYER
     if (msg->player.has_value()) {
         const auto& player = msg->player.value();
         if (player.codec.has_value()) {
@@ -799,9 +764,7 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
             root["payload"]["player"]["bit_depth"] = player.bit_depth.value();
         }
     }
-#endif  // SENDSPIN_ENABLE_PLAYER
 
-#ifdef SENDSPIN_ENABLE_ARTWORK
     if (msg->artwork.has_value()) {
         const auto& artwork = msg->artwork.value();
         root["payload"]["artwork"]["channel"] = artwork.channel;
@@ -818,14 +781,11 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
             root["payload"]["artwork"]["media_height"] = artwork.media_height.value();
         }
     }
-#endif  // SENDSPIN_ENABLE_ARTWORK
 
     std::string output;
     serializeJson(doc, output);
     return output;
 }
-
-#ifdef SENDSPIN_ENABLE_CONTROLLER
 
 std::string format_client_command_message(SendspinControllerCommand command,
                                           std::optional<uint8_t> volume, std::optional<bool> mute) {
@@ -845,8 +805,6 @@ std::string format_client_command_message(SendspinControllerCommand command,
     serializeJson(doc, output);
     return output;
 }
-
-#endif  // SENDSPIN_ENABLE_CONTROLLER
 
 std::string format_client_goodbye_message(SendspinGoodbyeReason reason) {
     JsonDocument doc = make_json_document();

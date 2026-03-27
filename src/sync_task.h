@@ -14,8 +14,6 @@
 
 #pragma once
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "audio_ring_buffer.h"
 #include "audio_stream_info.h"
 #include "decoder.h"
@@ -246,5 +244,3 @@ protected:
 };
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER
