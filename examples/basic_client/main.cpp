@@ -241,7 +241,14 @@ int main(int argc, char* argv[]) {
     client.on_stream_end = [&]() {
         fprintf(stderr, ">>> Stream ended\n");
 #ifdef SENDSPIN_HAS_PORTAUDIO
-        audio_sink.stop();
+        audio_sink.clear();
+#endif
+    };
+
+    client.on_stream_clear = [&]() {
+        fprintf(stderr, ">>> Stream clear\n");
+#ifdef SENDSPIN_HAS_PORTAUDIO
+        audio_sink.clear();
 #endif
     };
 

@@ -48,14 +48,21 @@ public:
     /// @brief Returns the number of bytes that can be written.
     size_t free_space() const;
 
-    /// @brief Discards all buffered data.
+    /// @brief Request the consumer to discard all buffered data.
+    /// Safe to call while the PA callback is active — the consumer performs the
+    /// actual drain on its next read(), preserving the SPSC invariant.
     void clear();
+
+    /// @brief Hard reset of all positions. Only safe when no concurrent readers/writers
+    /// (i.e., after stopping the PA stream).
+    void reset();
 
 private:
     std::vector<uint8_t> buffer_;
     size_t capacity_;
     std::atomic<size_t> write_pos_{0};
     std::atomic<size_t> read_pos_{0};
+    std::atomic<bool> clear_requested_{false};
 };
 
 /// @brief AudioSink implementation that plays audio through PortAudio.
@@ -80,6 +87,9 @@ public:
     /// @brief Stop playback and clear the ring buffer.
     void stop();
 
+    /// @brief Discard all buffered audio without stopping the PortAudio stream.
+    void clear();
+
     /// @brief Set the playback volume (0-100, where 100 = full scale).
     void set_volume(uint8_t volume);
 
@@ -101,11 +111,12 @@ private:
     uint8_t bits_per_sample_{0};
     size_t bytes_per_frame_{0};
 
-    // Condition variable for blocking write() until PA callback frees space.
-    // This mimics the ESP I2S ring buffer's blocking behavior — write() sleeps
-    // until the consumer (PA callback) signals that space is available.
+    // Mutex/CV for blocking write() until PA callback frees space, and for
+    // serializing ring buffer mutations (write vs reset) across threads.
+    // The PA callback itself never acquires this mutex — it stays lock-free.
     std::mutex write_mutex_;
     std::condition_variable write_cv_;
+    std::atomic<bool> abort_write_{false};
 
     // Software volume control using Q32 fixed-point math.
     // UINT32_MAX = 1.0 (full scale), 0 = silence. Updated atomically so the

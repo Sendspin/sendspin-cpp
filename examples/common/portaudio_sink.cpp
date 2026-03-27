@@ -59,6 +59,17 @@ size_t PortAudioRingBuffer::write(const uint8_t* data, size_t len) {
 }
 
 size_t PortAudioRingBuffer::read(uint8_t* dest, size_t len) {
+    // Check if a clear was requested. The consumer handles the actual drain so
+    // that read_pos_ is only ever written by the consumer thread, preserving
+    // the SPSC invariant and eliminating the race where an externally-modified
+    // read_pos_ could cause the consumer to compute a bogus available count.
+    if (clear_requested_.load(std::memory_order_acquire)) {
+        clear_requested_.store(false, std::memory_order_relaxed);
+        read_pos_.store(write_pos_.load(std::memory_order_acquire), std::memory_order_release);
+        std::memset(dest, 0, len);
+        return 0;
+    }
+
     size_t read_pos = read_pos_.load(std::memory_order_relaxed);
     size_t write_pos = write_pos_.load(std::memory_order_acquire);
 
@@ -95,6 +106,11 @@ size_t PortAudioRingBuffer::free_space() const {
 }
 
 void PortAudioRingBuffer::clear() {
+    clear_requested_.store(true, std::memory_order_release);
+}
+
+void PortAudioRingBuffer::reset() {
+    clear_requested_.store(false, std::memory_order_relaxed);
     read_pos_.store(0, std::memory_order_relaxed);
     write_pos_.store(0, std::memory_order_release);
 }
@@ -120,16 +136,24 @@ size_t PortAudioSink::write(uint8_t* data, size_t length, uint32_t timeout_ms) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
     while (total_written < length) {
-        size_t written = ring_buffer_.write(data + total_written, length - total_written);
-        total_written += written;
+        {
+            // Hold the mutex during ring_buffer_.write() so that stop()/reset()
+            // on another thread cannot mutate the ring buffer positions mid-write.
+            std::lock_guard<std::mutex> lock(write_mutex_);
+            if (abort_write_.load(std::memory_order_acquire)) {
+                break;
+            }
+            size_t written = ring_buffer_.write(data + total_written, length - total_written);
+            total_written += written;
+        }
 
         if (total_written < length) {
-            // Block until the PA callback frees space (or timeout).
-            // This mimics the ESP I2S ring buffer: write() blocks for the real
-            // duration it takes the hardware to play through buffered audio.
+            // Block until the PA callback frees space, abort is requested, or timeout.
             std::unique_lock<std::mutex> lock(write_mutex_);
-            if (!write_cv_.wait_until(lock, deadline,
-                                      [this]() { return ring_buffer_.free_space() > 0; })) {
+            if (!write_cv_.wait_until(lock, deadline, [this]() {
+                    return ring_buffer_.free_space() > 0 ||
+                           abort_write_.load(std::memory_order_acquire);
+                })) {
                 break;  // Timed out
             }
         }
@@ -140,6 +164,7 @@ size_t PortAudioSink::write(uint8_t* data, size_t length, uint32_t timeout_ms) {
 
 bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample) {
     stop();
+    abort_write_.store(false, std::memory_order_release);
 
     sample_rate_ = sample_rate;
     channels_ = channels;
@@ -183,11 +208,22 @@ bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bi
 }
 
 void PortAudioSink::stop() {
+    // Signal any blocked writer to abort, then wake it.
+    abort_write_.store(true, std::memory_order_release);
+    write_cv_.notify_all();
+
     if (stream_ != nullptr) {
         Pa_StopStream(stream_);
         Pa_CloseStream(stream_);
         stream_ = nullptr;
     }
+
+    // Acquire the mutex so we don't reset while a writer is mid-memcpy.
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    ring_buffer_.reset();
+}
+
+void PortAudioSink::clear() {
     ring_buffer_.clear();
 }
 

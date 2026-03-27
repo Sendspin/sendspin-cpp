@@ -548,7 +548,17 @@ int main(int argc, char* argv[]) {
             state.channels = std::nullopt;
         }
 #ifdef SENDSPIN_HAS_PORTAUDIO
-        audio_sink.stop();
+        audio_sink.clear();
+#endif
+    };
+
+    client.on_stream_clear = [
+#ifdef SENDSPIN_HAS_PORTAUDIO
+                               &audio_sink
+#endif
+    ]() {
+#ifdef SENDSPIN_HAS_PORTAUDIO
+        audio_sink.clear();
 #endif
     };
 
