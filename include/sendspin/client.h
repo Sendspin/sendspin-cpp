@@ -48,6 +48,7 @@ class SendspinTimeBurst;
 class SendspinWsServer;
 #ifdef SENDSPIN_ENABLE_PLAYER
 class SyncTask;
+struct SyncTimeProvider;
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
@@ -151,7 +152,7 @@ struct HelloRetryState {
 
 /// @brief Main orchestration class for the sendspin-cpp library.
 ///
-/// Replaces ESPHome's SendspinHub. Manages connections, message routing, time sync,
+/// Manages connections, message routing, time sync,
 /// audio playback, and all Sendspin protocol interactions. This is the public API surface
 /// of the library.
 ///
@@ -497,6 +498,9 @@ protected:
 
     /// @brief Persists the current static delay.
     void persist_static_delay_();
+
+    /// @brief Constructs a SyncTimeProvider that delegates to this client's methods.
+    SyncTimeProvider make_sync_time_provider_();
 #endif
 
     // --- Configuration ---
@@ -591,6 +595,9 @@ protected:
     std::vector<StreamCallbackEvent> pending_stream_callback_events_;
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     std::vector<ServerStateControllerObject> pending_controller_state_events_;
+#endif
+#ifdef SENDSPIN_ENABLE_PLAYER
+    std::vector<SendspinClientState> pending_state_events_;
 #endif
     bool dying_connection_ready_to_release_{false};
 

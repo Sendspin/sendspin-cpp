@@ -22,6 +22,7 @@
 #include "platform/event_flags.h"
 #include "platform/thread_safe_queue.h"
 #include "sendspin/audio_sink.h"
+#include "sync_time_provider.h"
 #include "transfer_buffer.h"
 
 #include <atomic>
@@ -29,8 +30,6 @@
 #include <thread>
 
 namespace sendspin {
-
-class SendspinClient;
 
 // Stores the timing information of audio played received from the speaker
 struct PlaybackProgress {
@@ -106,11 +105,11 @@ public:
     ~SyncTask();
 
     /// @brief Initializes queues and creates the encoded ring buffer.
-    /// @param client Pointer to the SendspinClient providing time sync and stream info.
+    /// @param time_provider Provides time sync, delay, and state callbacks.
     /// @param audio_sink Pointer to the AudioSink to write decoded audio to.
     /// @param buffer_size Size of the encoded audio ring buffer in bytes.
     /// @return true on success, false on allocation failure.
-    bool init(SendspinClient* client, AudioSink* audio_sink, size_t buffer_size);
+    bool init(SyncTimeProvider time_provider, AudioSink* audio_sink, size_t buffer_size);
 
     /// @brief Creates and starts the persistent sync background thread.
     /// Call once after init(). The thread idles until a codec header arrives in the ring buffer.
@@ -145,7 +144,7 @@ public:
     void signal_stream_start();
 
     /// @brief Writes an encoded audio chunk into the ring buffer.
-    /// Called from the hub's audio chunk callback (may be any thread).
+    /// Called from the client's audio chunk callback (may be any thread).
     /// @param data Pointer to the audio data.
     /// @param data_size Size of the audio data in bytes.
     /// @param timestamp Server timestamp for this chunk.
@@ -236,8 +235,8 @@ protected:
     ThreadSafeQueue<PlaybackProgress> playback_progress_queue_;
     std::thread sync_thread_;
 
-    // Pointer to the client providing time sync, stream params, and state updates
-    SendspinClient* client_{nullptr};
+    // Provides time sync, delay, and state callbacks (set by init)
+    SyncTimeProvider time_provider_;
 
     // Pointer to the audio sink for writing decoded audio
     AudioSink* audio_sink_{nullptr};

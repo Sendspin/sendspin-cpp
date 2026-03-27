@@ -120,6 +120,23 @@ LogLevel SendspinClient::get_log_level() {
     return static_cast<LogLevel>(platform_get_log_level());
 }
 
+#ifdef SENDSPIN_ENABLE_PLAYER
+SyncTimeProvider SendspinClient::make_sync_time_provider_() {
+    return SyncTimeProvider{
+        .get_client_time =
+            [this](int64_t server_time) { return this->get_client_time(server_time); },
+        .is_time_synced = [this]() { return this->is_time_synced(); },
+        .get_static_delay_ms = [this]() { return this->get_static_delay_ms(); },
+        .get_fixed_delay_us = [this]() { return this->get_fixed_delay_us(); },
+        .update_state =
+            [this](SendspinClientState state) {
+                std::lock_guard<std::mutex> lock(this->event_mutex_);
+                this->pending_state_events_.push_back(state);
+            },
+    };
+}
+#endif  // SENDSPIN_ENABLE_PLAYER
+
 // --- Lifecycle ---
 
 bool SendspinClient::start_server(unsigned priority) {
@@ -134,7 +151,8 @@ bool SendspinClient::start_server(unsigned priority) {
     // May already be initialized if set_audio_sink() was called before start_server().
     if (!this->config_.audio_formats.empty() && this->audio_sink_ != nullptr &&
         !this->sync_task_->is_initialized()) {
-        if (!this->sync_task_->init(this, this->audio_sink_, this->config_.audio_buffer_capacity)) {
+        if (!this->sync_task_->init(this->make_sync_time_provider_(), this->audio_sink_,
+                                    this->config_.audio_buffer_capacity)) {
             SS_LOGE(TAG, "Failed to initialize sync task");
             return false;
         }
@@ -379,6 +397,9 @@ void SendspinClient::loop() {
 #ifdef SENDSPIN_ENABLE_CONTROLLER
         std::vector<ServerStateControllerObject> controller_state_events;
 #endif
+#ifdef SENDSPIN_ENABLE_PLAYER
+        std::vector<SendspinClientState> state_events;
+#endif
 
         {
             std::lock_guard<std::mutex> lock(this->event_mutex_);
@@ -391,6 +412,9 @@ void SendspinClient::loop() {
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
             controller_state_events.swap(this->pending_controller_state_events_);
+#endif
+#ifdef SENDSPIN_ENABLE_PLAYER
+            state_events.swap(this->pending_state_events_);
 #endif
             group_events.swap(this->pending_group_events_);
         }
@@ -405,6 +429,13 @@ void SendspinClient::loop() {
                 this->on_connection_handshake_complete_(event.conn);
             }
         }
+
+#ifdef SENDSPIN_ENABLE_PLAYER
+        // --- Client state events (deferred from sync task thread) ---
+        if (!state_events.empty()) {
+            this->update_state(state_events.back());
+        }
+#endif
 
         // --- Time sync events ---
         for (const auto& event : time_events) {
@@ -552,7 +583,8 @@ void SendspinClient::set_audio_sink(AudioSink* sink) {
         !this->sync_task_->is_initialized()) {
         SS_LOGI(TAG, "Initializing sync task (buffer: %zu bytes, formats: %zu)",
                 this->config_.audio_buffer_capacity, this->config_.audio_formats.size());
-        if (!this->sync_task_->init(this, sink, this->config_.audio_buffer_capacity)) {
+        if (!this->sync_task_->init(this->make_sync_time_provider_(), sink,
+                                    this->config_.audio_buffer_capacity)) {
             SS_LOGE(TAG, "Failed to initialize sync task");
         } else if (!this->sync_task_->start(this->config_.psram_stack)) {
             SS_LOGE(TAG, "Failed to start sync task thread");

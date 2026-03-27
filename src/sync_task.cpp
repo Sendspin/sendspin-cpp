@@ -19,8 +19,6 @@
 #include "audio_utils.h"
 #include "platform/logging.h"
 #include "platform/thread.h"
-#include "sendspin/client.h"
-#include "sendspin/protocol.h"
 
 #include <algorithm>
 #include <chrono>
@@ -47,8 +45,8 @@ SyncTask::~SyncTask() {
     this->stop_();
 }
 
-bool SyncTask::init(SendspinClient* client, AudioSink* audio_sink, size_t buffer_size) {
-    this->client_ = client;
+bool SyncTask::init(SyncTimeProvider time_provider, AudioSink* audio_sink, size_t buffer_size) {
+    this->time_provider_ = std::move(time_provider);
     this->audio_sink_ = audio_sink;
 
     if (!this->event_flags_.create()) {
@@ -432,9 +430,9 @@ DecodeResult SyncTask::sync_decode_audio_(SyncContext& sync_context) {
     } else if ((sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) &&
                (sync_context.encoded_entry->chunk_type == CHUNK_TYPE_ENCODED_AUDIO)) {
         int64_t client_timestamp =
-            this->client_->get_client_time(sync_context.encoded_entry->timestamp) -
-            static_cast<int64_t>(this->client_->get_static_delay_ms()) * 1000 -
-            this->client_->get_fixed_delay_us();
+            this->time_provider_.get_client_time(sync_context.encoded_entry->timestamp) -
+            static_cast<int64_t>(this->time_provider_.get_static_delay_ms()) * 1000 -
+            this->time_provider_.get_fixed_delay_us();
 
         if (client_timestamp < sync_context.new_audio_client_playtime - HARD_SYNC_THRESHOLD_US) {
             // This chunk will arrive too late to be played, skip it!
@@ -495,7 +493,7 @@ SyncTaskState SyncTask::sync_handle_initial_sync_(SyncContext& sync_context) {
 }
 
 SyncTaskState SyncTask::sync_handle_load_chunk_(SyncContext& sync_context) {
-    if (!this->client_->is_time_synced()) {
+    if (!this->time_provider_.is_time_synced()) {
         // Wait for the time filter to receive its first measurement before processing audio chunks.
         // Without a valid time offset, server timestamps can't be correctly converted to client
         // timestamps.
@@ -692,7 +690,7 @@ void SyncTask::sync_task(void* params) {
 
         this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
 
-        this_task->client_->update_state(SendspinClientState::SYNCHRONIZED);
+        this_task->time_provider_.update_state(SendspinClientState::SYNCHRONIZED);
 
         // Decode the initial codec header
         if (sync_context.encoded_entry != nullptr) {
