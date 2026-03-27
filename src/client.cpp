@@ -83,6 +83,9 @@ LogLevel SendspinClient::get_log_level() {
 // --- Bridge ---
 
 ClientBridge* SendspinClient::make_bridge_() {
+    if (this->bridge_) {
+        return this->bridge_.get();
+    }
     this->bridge_ = std::make_unique<ClientBridge>(ClientBridge{
         .get_client_time =
             [this](int64_t server_time) { return this->get_client_time(server_time); },
