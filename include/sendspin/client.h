@@ -41,11 +41,9 @@ enum class LogLevel : int {
 };
 
 // Forward declarations
-class SendspinClientConnection;
+class ConnectionManager;
 class SendspinConnection;
-class SendspinServerConnection;
 class SendspinTimeBurst;
-class SendspinWsServer;
 #ifdef SENDSPIN_ENABLE_PLAYER
 class SyncTask;
 struct SyncTimeProvider;
@@ -102,13 +100,6 @@ struct TimeResponseEvent {
     int64_t timestamp;
 };
 
-/// @brief Deferred server hello event, processed in loop().
-struct ServerHelloEvent {
-    SendspinConnection* conn;  ///< Connection that received the hello (must still be valid)
-    ServerInformationObject server;
-    SendspinConnectionReason connection_reason;
-};
-
 /// @brief Deferred server command event, processed in loop().
 struct ServerCommandEvent {
     ServerCommandMessage command;
@@ -139,15 +130,6 @@ struct StreamCallbackEvent {
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     std::optional<ServerVisualizerStreamObject> visualizer_stream;
 #endif
-};
-
-/// @brief Hello retry state for exponential backoff.
-struct HelloRetryState {
-    SendspinConnection* conn{
-        nullptr};              ///< Connection awaiting hello (must match current_ or pending_)
-    int64_t retry_time_us{0};  ///< Next retry time in microseconds (0 = no pending retry)
-    uint32_t delay_ms{100};    ///< Current backoff delay
-    uint8_t attempts{3};       ///< Remaining retry attempts
 };
 
 /// @brief Main orchestration class for the sendspin-cpp library.
@@ -316,9 +298,7 @@ public:
     }
 
     /// @brief Returns the current active connection (or nullptr).
-    SendspinConnection* get_current_connection() const {
-        return this->current_connection_.get();
-    }
+    SendspinConnection* get_current_connection() const;
 
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     /// @brief Returns the current controller state from the server.
@@ -409,57 +389,11 @@ public:
 #endif  // SENDSPIN_ENABLE_VISUALIZER
 
 protected:
-    /// @brief FNV-1 hash function for strings.
-    static uint32_t fnv1_hash(const char* str);
-
-    // --- Hello handshake ---
-
-    /// @brief Initiates hello handshake with exponential backoff.
-    /// @param conn The connection to send the hello message to.
-    void initiate_hello_(SendspinConnection* conn);
-
-    /// @brief Attempts to send the hello message.
-    /// @param remaining_attempts Number of retry attempts remaining.
-    /// @param conn The connection to send the hello message to.
-    /// @return true if done (success or non-recoverable), false if should retry.
-    bool send_hello_message_(uint8_t remaining_attempts, SendspinConnection* conn);
-
-    // --- Connection management ---
-
-    /// @brief Called when a new server connection is accepted by the WebSocket server.
-    /// @param conn The new connection (ownership transferred to client).
-    void on_new_connection_(std::unique_ptr<SendspinServerConnection> conn);
-
-    /// @brief Called when a connection completes its hello handshake.
-    /// @param conn Pointer to the connection that completed its handshake.
-    void on_connection_handshake_complete_(SendspinConnection* conn);
-
-    /// @brief Called when a server connection's socket is closed.
-    /// @param sockfd The socket file descriptor of the closed connection.
-    void on_connection_closed_(int sockfd);
-
-    /// @brief Handles a connection being lost (closed or disconnected).
-    /// @param conn Pointer to the connection that was lost.
-    void on_connection_lost_(SendspinConnection* conn);
-
-    /// @brief Determines whether to switch from current connection to a new one during handoff.
-    /// @param current Pointer to the current active connection.
-    /// @param new_conn Pointer to the new pending connection.
-    /// @return true if should switch to new connection, false to keep current.
-    bool should_switch_to_new_server_(SendspinConnection* current, SendspinConnection* new_conn);
-
-    /// @brief Completes the handoff process by disconnecting the loser.
-    /// @param switch_to_new true to promote pending to current, false to keep current.
-    void complete_handoff_(bool switch_to_new);
-
-    /// @brief Disconnects a connection and keeps it alive until goodbye completes.
-    /// @param conn The connection to disconnect (ownership transferred).
-    /// @param reason The goodbye reason to send.
-    void disconnect_and_release_(std::unique_ptr<SendspinConnection> conn,
-                                 SendspinGoodbyeReason reason);
-
     /// @brief Cleans up playback state when the active streaming connection is removed.
     void cleanup_connection_state_();
+
+    /// @brief Builds the formatted client hello message from config.
+    std::string build_hello_message_();
 
     // --- Message processing ---
 
@@ -507,12 +441,9 @@ protected:
 
     SendspinClientConfig config_;
 
-    // --- Connection state ---
+    // --- Connection management ---
 
-    std::unique_ptr<SendspinConnection> current_connection_;
-    std::unique_ptr<SendspinConnection> pending_connection_;
-    std::shared_ptr<SendspinConnection> dying_connection_;
-    std::unique_ptr<SendspinWsServer> ws_server_;
+    std::unique_ptr<ConnectionManager> connection_manager_;
 
     // --- Time sync ---
 
@@ -521,15 +452,6 @@ protected:
 #ifdef SENDSPIN_ENABLE_PLAYER
     bool high_performance_requested_for_playback_{false};
 #endif
-
-    // --- Hello retry state ---
-
-    HelloRetryState hello_retry_;
-
-    // --- Handoff state ---
-
-    uint32_t last_played_server_hash_{0};
-    bool has_last_played_server_{false};
 
     // --- Player state ---
 
@@ -588,9 +510,6 @@ protected:
     std::vector<ServerMetadataStateObject> pending_metadata_events_;
 #endif
     std::vector<GroupUpdateObject> pending_group_events_;
-    std::vector<int> pending_close_events_;
-    std::vector<SendspinConnection*> pending_disconnect_events_;
-    std::vector<ServerHelloEvent> pending_hello_events_;
     std::vector<ServerCommandEvent> pending_command_events_;
     std::vector<StreamCallbackEvent> pending_stream_callback_events_;
 #ifdef SENDSPIN_ENABLE_CONTROLLER
@@ -599,17 +518,12 @@ protected:
 #ifdef SENDSPIN_ENABLE_PLAYER
     std::vector<SendspinClientState> pending_state_events_;
 #endif
-    bool dying_connection_ready_to_release_{false};
 
     // --- Stream end/clear callbacks waiting for sync task to go idle (main thread only) ---
 
 #ifdef SENDSPIN_ENABLE_PLAYER
     std::vector<StreamCallbackEvent> awaiting_sync_idle_events_;
 #endif
-
-    // --- Server task priority (stored for ws_server start) ---
-
-    unsigned task_priority_{17};
 };
 
 }  // namespace sendspin

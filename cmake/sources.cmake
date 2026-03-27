@@ -22,6 +22,9 @@ function(sendspin_get_sources BASE_DIR)
         ${BASE_DIR}/src/decoder.cpp
         ${BASE_DIR}/src/sync_task.cpp
 
+        # Connection management
+        ${BASE_DIR}/src/connection_manager.cpp
+
         # Client orchestration
         ${BASE_DIR}/src/client.cpp
 
