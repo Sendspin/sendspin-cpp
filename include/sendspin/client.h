@@ -110,7 +110,7 @@ public:
     // --- Role registration (call before start_server) ---
 
     /// @brief Adds the player role. Returns a reference for setting callbacks.
-    PlayerRole& add_player(PlayerRole::Config config, AudioSink* sink);
+    PlayerRole& add_player(PlayerRole::Config config);
 
     /// @brief Adds the controller role. Returns a reference for setting callbacks.
     ControllerRole& add_controller();

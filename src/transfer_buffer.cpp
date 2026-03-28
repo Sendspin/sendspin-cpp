@@ -53,8 +53,9 @@ void TransferBuffer::increase_buffer_length(size_t bytes) {
 
 size_t TransferBuffer::transfer_data_to_sink(uint32_t timeout_ms, bool post_shift) {
     size_t bytes_written = 0;
-    if (this->available() > 0 && this->sink_ != nullptr) {
-        bytes_written = this->sink_->write(this->data_start_, this->available(), timeout_ms);
+    if (this->available() > 0 && this->audio_write_callback_) {
+        bytes_written =
+            this->audio_write_callback_(this->data_start_, this->available(), timeout_ms);
         this->decrease_buffer_length(bytes_written);
     }
 

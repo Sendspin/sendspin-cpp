@@ -49,8 +49,8 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
 
 // --- Constructor / Destructor ---
 
-PlayerRole::PlayerRole(Config config, AudioSink* sink)
-    : config_(std::move(config)), sync_task_(std::make_unique<SyncTask>()), audio_sink_(sink) {}
+PlayerRole::PlayerRole(Config config)
+    : config_(std::move(config)), sync_task_(std::make_unique<SyncTask>()) {}
 
 PlayerRole::~PlayerRole() {
     // Stop the sync task thread first, before destroying other members.
@@ -60,25 +60,6 @@ PlayerRole::~PlayerRole() {
 }
 
 // --- Public API ---
-
-void PlayerRole::set_audio_sink(AudioSink* sink) {
-    this->audio_sink_ = sink;
-
-    if (sink != nullptr && !this->config_.audio_formats.empty() &&
-        !this->sync_task_->is_initialized()) {
-        SS_LOGI(TAG, "Initializing sync task (buffer: %zu bytes, formats: %zu)",
-                this->config_.audio_buffer_capacity, this->config_.audio_formats.size());
-        if (!this->sync_task_->init(this->make_sync_time_provider_(), sink,
-                                    this->config_.audio_buffer_capacity)) {
-            SS_LOGE(TAG, "Failed to initialize sync task");
-        } else if (!this->sync_task_->start(false)) {
-            SS_LOGE(TAG, "Failed to start sync task thread");
-        }
-    } else if (sink != nullptr && !this->sync_task_->is_initialized()) {
-        SS_LOGW(TAG, "Audio sink set but no audio formats configured (%zu formats)",
-                this->config_.audio_formats.size());
-    }
-}
 
 void PlayerRole::notify_audio_played(uint32_t frames, int64_t timestamp) {
     if (this->sync_task_ && this->sync_task_->is_running()) {
@@ -132,9 +113,9 @@ void PlayerRole::attach(ClientBridge* bridge) {
 bool PlayerRole::start(bool psram_stack) {
     this->load_static_delay_();
 
-    if (!this->config_.audio_formats.empty() && this->audio_sink_ != nullptr &&
+    if (!this->config_.audio_formats.empty() && this->on_audio_write &&
         !this->sync_task_->is_initialized()) {
-        if (!this->sync_task_->init(this->make_sync_time_provider_(), this->audio_sink_,
+        if (!this->sync_task_->init(this->make_sync_time_provider_(), this->on_audio_write,
                                     this->config_.audio_buffer_capacity)) {
             SS_LOGE(TAG, "Failed to initialize sync task");
             return false;

@@ -49,21 +49,8 @@ using namespace sendspin;
 static const uint16_t SENDSPIN_PORT = 8928;
 static const char* SENDSPIN_PATH = "/sendspin";
 
-// Audio sink that discards all audio data
-class NullAudioSink : public AudioSink {
-public:
-    size_t write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
-        total_bytes_ += length;
-        return length;
-    }
-
-    size_t total_bytes() const {
-        return total_bytes_;
-    }
-
-private:
-    size_t total_bytes_{0};
-};
+// Tracks total audio bytes received (used when PortAudio is unavailable)
+static size_t null_audio_total_bytes = 0;
 
 // Manages mDNS service advertisement via dns_sd.h
 class MdnsAdvertiser {
@@ -194,11 +181,9 @@ int main(int argc, char* argv[]) {
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
 
-    // Create audio sink and client
+    // Create audio output and client
 #ifdef SENDSPIN_HAS_PORTAUDIO
     PortAudioSink audio_sink;
-#else
-    NullAudioSink audio_sink;
 #endif
 
     SendspinClient client(std::move(config));
@@ -212,7 +197,7 @@ int main(int argc, char* argv[]) {
         {SendspinCodecFormat::PCM, 2, 44100, 16},
         {SendspinCodecFormat::PCM, 2, 48000, 16},
     };
-    auto& player = client.add_player(std::move(player_config), &audio_sink);
+    auto& player = client.add_player(std::move(player_config));
     auto& controller = client.add_controller();
     auto& metadata = client.add_metadata();
 
@@ -220,8 +205,16 @@ int main(int argc, char* argv[]) {
     (void)controller;
 
 #ifdef SENDSPIN_HAS_PORTAUDIO
+    player.on_audio_write = [&audio_sink](uint8_t* data, size_t length, uint32_t timeout_ms) {
+        return audio_sink.write(data, length, timeout_ms);
+    };
     audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
         player.notify_audio_played(frames, timestamp);
+    };
+#else
+    player.on_audio_write = [](uint8_t*, size_t length, uint32_t) -> size_t {
+        null_audio_total_bytes += length;
+        return length;
     };
 #endif
 
@@ -323,7 +316,7 @@ int main(int argc, char* argv[]) {
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
 
 #ifndef SENDSPIN_HAS_PORTAUDIO
-    fprintf(stderr, "Total audio bytes received: %zu\n", audio_sink.total_bytes());
+    fprintf(stderr, "Total audio bytes received: %zu\n", null_audio_total_bytes);
 #endif
     return 0;
 }

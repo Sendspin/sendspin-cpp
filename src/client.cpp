@@ -119,12 +119,12 @@ ClientBridge* SendspinClient::make_bridge_() {
 
 // --- Role registration ---
 
-PlayerRole& SendspinClient::add_player(PlayerRole::Config config, AudioSink* sink) {
+PlayerRole& SendspinClient::add_player(PlayerRole::Config config) {
     if (this->started_) {
         SS_LOGW(TAG,
                 "add_player() called after start_server() — role may not initialize correctly");
     }
-    this->player_ = std::make_unique<PlayerRole>(std::move(config), sink);
+    this->player_ = std::make_unique<PlayerRole>(std::move(config));
     this->player_->attach(this->make_bridge_());
     return *this->player_;
 }

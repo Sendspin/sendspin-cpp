@@ -9,12 +9,12 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 ### Key classes
 
 - `SendspinClient` (`client.h`) — main orchestration class, owns connections, time sync, and message routing
-- `PlayerRole` (`player_role.h`) — audio streaming role, owns `SyncTask` and `AudioSink`
+- `PlayerRole` (`player_role.h`) — audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_write` callback
 - `ControllerRole` (`controller_role.h`) — sends playback commands to the server
 - `MetadataRole` (`metadata_role.h`) — receives track metadata and progress
 - `ArtworkRole` (`artwork_role.h`) — receives album artwork images
 - `VisualizerRole` (`visualizer_role.h`) — receives spectrum/beat visualization data
-- `SyncTask` (`sync_task.h`) — decodes encoded audio, synchronizes to server timestamps, writes PCM to an `AudioSink`
+- `SyncTask` (`sync_task.h`) — decodes encoded audio, synchronizes to server timestamps, writes PCM via audio write callback
 - `SendspinConnection` (`connection.h`) — abstract WebSocket connection base
 - `SendspinServerConnection` / `SendspinClientConnection` — platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
 - `SendspinTimeFilter` (`time_filter.h`) — 2D Kalman filter for NTP-style time sync
@@ -28,7 +28,10 @@ Roles are added to the client at runtime via `add_player()`, `add_metadata()`, e
 
 ```cpp
 SendspinClient client(config);
-auto& player = client.add_player(player_config, &audio_sink);
+auto& player = client.add_player(player_config);
+player.on_audio_write = [&](uint8_t* data, size_t len, uint32_t timeout_ms) -> size_t {
+    return audio_output.write(data, len, timeout_ms);
+};
 player.on_stream_start = [&]() { /* ... */ };
 auto& metadata = client.add_metadata();
 metadata.on_metadata = [&](const auto& m) { /* ... */ };
@@ -40,7 +43,7 @@ client.start_server(5);
 
 The platform (e.g., ESPHome) provides:
 
-- An `AudioSink` implementation to receive decoded PCM audio
+- An `on_audio_write` callback on `PlayerRole` to receive decoded PCM audio
 - Persistence callbacks for saving/loading preferences
 - Network readiness and WiFi power management callbacks
 - Playback progress feedback via `notify_audio_played()`
@@ -48,7 +51,7 @@ The platform (e.g., ESPHome) provides:
 ## Project layout
 
 ```text
-include/sendspin/     — Public API headers (client.h, types.h, audio_sink.h, *_role.h)
+include/sendspin/     — Public API headers (client.h, types.h, *_role.h)
 src/                        — Cross-platform source files (.cpp) and private headers (.h)
 src/platform/               — Platform abstraction headers and host-only source files
 src/esp/                    — ESP-IDF networking implementations and headers
@@ -61,7 +64,7 @@ examples/tui_client/        — Terminal UI host example with PortAudio audio ou
 
 ### Header visibility
 
-- **Public** (`include/sendspin/`): `client.h`, `types.h`, `audio_sink.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`). These are the consumer-facing API. Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles.
+- **Public** (`include/sendspin/`): `client.h`, `types.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`). These are the consumer-facing API. Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles.
 - **Private** (`src/`): All internal headers (decoder, sync_task, time_filter, ring buffers, protocol_messages, etc.). Not exposed to consumers. `protocol_messages.h` contains message envelope structs, internal protocol enums, and protocol function declarations.
 - **Platform-specific** (`src/esp/`, `src/host/`): Networking headers with the same names (`client_connection.h`, `server_connection.h`, `ws_server.h`) but different implementations per platform.
 

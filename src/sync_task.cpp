@@ -43,9 +43,10 @@ SyncTask::~SyncTask() {
     this->stop_();
 }
 
-bool SyncTask::init(SyncTimeProvider time_provider, AudioSink* audio_sink, size_t buffer_size) {
+bool SyncTask::init(SyncTimeProvider time_provider, AudioWriteCallback audio_write_callback,
+                    size_t buffer_size) {
     this->time_provider_ = std::move(time_provider);
-    this->audio_sink_ = audio_sink;
+    this->audio_write_callback_ = std::move(audio_write_callback);
 
     if (!this->event_flags_.create()) {
         SS_LOGE(TAG, "Couldn't create event flags.");
@@ -413,8 +414,9 @@ DecodeResult SyncTask::sync_decode_audio_(SyncContext& sync_context) {
                     sync_context.encoded_entry = nullptr;
                     return DecodeResult::ALLOCATION_FAILED;
                 }
-                if (sync_context.audio_sink != nullptr) {
-                    sync_context.decode_buffer->set_sink(sync_context.audio_sink);
+                if (sync_context.audio_write_callback) {
+                    sync_context.decode_buffer->set_audio_write_callback(
+                        sync_context.audio_write_callback);
                 }
             } else if (needed > sync_context.decode_buffer->capacity()) {
                 if (!sync_context.decode_buffer->reallocate(needed)) {
@@ -615,9 +617,10 @@ void SyncTask::sync_task(void* params) {
         return;
     }
 
-    sync_context.audio_sink = this_task->audio_sink_;
-    if (sync_context.audio_sink != nullptr) {
-        sync_context.interpolation_transfer_buffer->set_sink(sync_context.audio_sink);
+    sync_context.audio_write_callback = this_task->audio_write_callback_;
+    if (sync_context.audio_write_callback) {
+        sync_context.interpolation_transfer_buffer->set_audio_write_callback(
+            sync_context.audio_write_callback);
     }
     sync_context.decoder = std::make_unique<SendspinDecoder>();
 

@@ -70,13 +70,10 @@ static int64_t now_us() {
         .count();
 }
 
-// Audio sink that discards all audio data (used when PortAudio is not available)
-class NullAudioSink : public AudioSink {
-public:
-    size_t write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
-        return length;
-    }
-};
+// Null audio write callback (used when PortAudio is not available)
+static size_t null_audio_write(uint8_t*, size_t length, uint32_t) {
+    return length;
+}
 
 // Manages mDNS service advertisement via dns_sd.h
 class MdnsAdvertiser {
@@ -398,11 +395,9 @@ int main(int argc, char* argv[]) {
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
 
-    // Create audio sink
+    // Create audio output
 #ifdef SENDSPIN_HAS_PORTAUDIO
     PortAudioSink audio_sink;
-#else
-    NullAudioSink audio_sink;
 #endif
 
     SendspinClient client(std::move(config));
@@ -414,7 +409,7 @@ int main(int argc, char* argv[]) {
         {SendspinCodecFormat::OPUS, 2, 48000, 16}, {SendspinCodecFormat::PCM, 2, 44100, 16},
         {SendspinCodecFormat::PCM, 2, 48000, 16},
     };
-    auto& player = client.add_player(std::move(player_config), &audio_sink);
+    auto& player = client.add_player(std::move(player_config));
     auto& controller = client.add_controller();
     auto& metadata = client.add_metadata();
 
@@ -440,9 +435,14 @@ int main(int argc, char* argv[]) {
     }
 
 #ifdef SENDSPIN_HAS_PORTAUDIO
+    player.on_audio_write = [&audio_sink](uint8_t* data, size_t length, uint32_t timeout_ms) {
+        return audio_sink.write(data, length, timeout_ms);
+    };
     audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
         player.notify_audio_played(frames, timestamp);
     };
+#else
+    player.on_audio_write = null_audio_write;
 #endif
 
     client.is_network_ready = []() { return true; };

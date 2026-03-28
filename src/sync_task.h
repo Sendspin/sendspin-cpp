@@ -19,7 +19,6 @@
 #include "decoder.h"
 #include "platform/event_flags.h"
 #include "platform/thread_safe_queue.h"
-#include "sendspin/audio_sink.h"
 #include "sync_time_provider.h"
 #include "transfer_buffer.h"
 
@@ -58,7 +57,7 @@ struct SyncContext {
 
     // Raw pointers (4 bytes each on ESP32)
     AudioRingBufferEntry* encoded_entry{nullptr};
-    AudioSink* audio_sink{nullptr};  // Owned by task stack, outlives this context
+    AudioWriteCallback audio_write_callback;  // Set from task owner, outlives this context
 
     // 64-bit members
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
@@ -104,10 +103,11 @@ public:
 
     /// @brief Initializes queues and creates the encoded ring buffer.
     /// @param time_provider Provides time sync, delay, and state callbacks.
-    /// @param audio_sink Pointer to the AudioSink to write decoded audio to.
+    /// @param audio_write_callback Callback for writing decoded PCM audio to the output.
     /// @param buffer_size Size of the encoded audio ring buffer in bytes.
     /// @return true on success, false on allocation failure.
-    bool init(SyncTimeProvider time_provider, AudioSink* audio_sink, size_t buffer_size);
+    bool init(SyncTimeProvider time_provider, AudioWriteCallback audio_write_callback,
+              size_t buffer_size);
 
     /// @brief Creates and starts the persistent sync background thread.
     /// Call once after init(). The thread idles until a codec header arrives in the ring buffer.
@@ -236,8 +236,8 @@ protected:
     // Provides time sync, delay, and state callbacks (set by init)
     SyncTimeProvider time_provider_;
 
-    // Pointer to the audio sink for writing decoded audio
-    AudioSink* audio_sink_{nullptr};
+    // Callback for writing decoded audio to the output
+    AudioWriteCallback audio_write_callback_;
 
     // Tracks whether the last task run ended with an error
     bool last_run_had_error_{false};

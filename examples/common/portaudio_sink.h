@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <sendspin/audio_sink.h>
 #include <portaudio.h>
 
 #include <atomic>
@@ -65,21 +64,21 @@ private:
     std::atomic<bool> clear_requested_{false};
 };
 
-/// @brief AudioSink implementation that plays audio through PortAudio.
+/// @brief Plays audio through PortAudio.
 ///
-/// Bridges the push model (SyncTask calls write()) with PortAudio's pull/callback
+/// Bridges the push model (on_audio_write callback) with PortAudio's pull/callback
 /// model using a lock-free SPSC ring buffer.
-class PortAudioSink : public AudioSink {
+class PortAudioSink {
 public:
     PortAudioSink();
-    ~PortAudioSink() override;
+    ~PortAudioSink();
 
     // Not copyable or movable (PortAudio stream holds a pointer to this)
     PortAudioSink(const PortAudioSink&) = delete;
     PortAudioSink& operator=(const PortAudioSink&) = delete;
 
     /// @brief Writes decoded PCM audio data into the ring buffer.
-    size_t write(uint8_t* data, size_t length, uint32_t timeout_ms) override;
+    size_t write(uint8_t* data, size_t length, uint32_t timeout_ms);
 
     /// @brief Configure audio format and (re)open the PortAudio stream.
     bool configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);

@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include "sendspin/audio_sink.h"
 #include "sendspin/types.h"
 
 #include <cstddef>
@@ -158,7 +157,7 @@ struct ServerCommandMessage {
     std::optional<ServerPlayerCommandObject> player;
 };
 
-/// @brief Player role: owns SyncTask and AudioSink, handles audio playback.
+/// @brief Player role: owns SyncTask, handles audio playback.
 class PlayerRole {
     friend class SendspinClient;
 
@@ -171,13 +170,10 @@ public:
         uint16_t initial_static_delay_ms{0};
     };
 
-    PlayerRole(Config config, AudioSink* sink);
+    explicit PlayerRole(Config config);
     ~PlayerRole();
 
     // --- Audio ---
-
-    /// @brief Sets the audio sink for decoded audio output.
-    void set_audio_sink(AudioSink* sink);
 
     /// @brief Called by the audio output when it has played audio frames. Thread-safe.
     void notify_audio_played(uint32_t frames, int64_t timestamp);
@@ -231,6 +227,13 @@ public:
     ServerPlayerStreamObject& get_current_stream_params() {
         return this->current_stream_params_;
     }
+
+    // --- Audio output ---
+
+    /// @brief Callback for writing decoded PCM audio to the platform's audio output.
+    /// Called from the sync task's background thread. May block up to timeout_ms.
+    /// Must return the number of bytes actually written.
+    std::function<size_t(uint8_t* data, size_t length, uint32_t timeout_ms)> on_audio_write;
 
     // --- Callbacks ---
 
@@ -308,7 +311,6 @@ private:
     // --- Sync task ---
 
     std::unique_ptr<SyncTask> sync_task_;
-    AudioSink* audio_sink_{nullptr};
 
     // --- Deferred event queues ---
 
