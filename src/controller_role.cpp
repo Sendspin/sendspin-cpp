@@ -45,6 +45,9 @@ void ControllerRole::drain_events(std::vector<ServerStateControllerObject>& even
     for (auto& controller_state : events) {
         this->controller_state_ = std::move(controller_state);
     }
+    if (!events.empty() && this->on_controller_state) {
+        this->on_controller_state(this->controller_state_);
+    }
 }
 
 void ControllerRole::cleanup() {

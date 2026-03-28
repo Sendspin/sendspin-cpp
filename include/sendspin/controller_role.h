@@ -16,6 +16,7 @@
 
 #include "sendspin/protocol.h"
 
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -39,6 +40,9 @@ public:
     const ServerStateControllerObject& get_controller_state() const {
         return this->controller_state_;
     }
+
+    /// @brief Callback fired when the server sends updated controller state.
+    std::function<void(const ServerStateControllerObject&)> on_controller_state;
 
 private:
     void attach(ClientBridge* bridge);
