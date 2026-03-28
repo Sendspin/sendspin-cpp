@@ -15,7 +15,7 @@
 #pragma once
 
 #include "sendspin/audio_sink.h"
-#include "sendspin/protocol.h"
+#include "sendspin/types.h"
 
 #include <cstddef>
 #include <cstdint>

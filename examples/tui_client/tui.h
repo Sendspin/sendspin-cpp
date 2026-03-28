@@ -15,7 +15,6 @@
 #pragma once
 
 #include "sendspin/client.h"
-#include "sendspin/protocol.h"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>

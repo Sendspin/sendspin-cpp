@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "sendspin/protocol.h"
-
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "protocol_messages.h"

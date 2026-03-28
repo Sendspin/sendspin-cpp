@@ -48,7 +48,7 @@ The platform (e.g., ESPHome) provides:
 ## Project layout
 
 ```text
-include/sendspin/     — Public API headers (client.h, protocol.h, audio_sink.h, *_role.h)
+include/sendspin/     — Public API headers (client.h, types.h, audio_sink.h, *_role.h)
 src/                        — Cross-platform source files (.cpp) and private headers (.h)
 src/platform/               — Platform abstraction headers and host-only source files
 src/esp/                    — ESP-IDF networking implementations and headers
@@ -61,8 +61,8 @@ examples/tui_client/        — Terminal UI host example with PortAudio audio ou
 
 ### Header visibility
 
-- **Public** (`include/sendspin/`): `client.h`, `protocol.h`, `audio_sink.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`). These are the consumer-facing API.
-- **Private** (`src/`): All internal headers (decoder, sync_task, time_filter, ring buffers, etc.). Not exposed to consumers.
+- **Public** (`include/sendspin/`): `client.h`, `types.h`, `audio_sink.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`). These are the consumer-facing API. Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles.
+- **Private** (`src/`): All internal headers (decoder, sync_task, time_filter, ring buffers, protocol_messages, etc.). Not exposed to consumers. `protocol_messages.h` contains message envelope structs, internal protocol enums, and protocol function declarations.
 - **Platform-specific** (`src/esp/`, `src/host/`): Networking headers with the same names (`client_connection.h`, `server_connection.h`, `ws_server.h`) but different implementations per platform.
 
 ### Platform abstraction

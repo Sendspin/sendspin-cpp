@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "sendspin/protocol.h"
+#include "sendspin/types.h"
 
 #include <cstdint>
 #include <functional>

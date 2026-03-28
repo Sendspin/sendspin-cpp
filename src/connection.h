@@ -17,7 +17,7 @@
 #include "platform/memory.h"
 #include "platform/thread_safe_queue.h"
 #include "platform/types.h"
-#include "sendspin/protocol.h"
+#include "protocol_messages.h"
 #include "time_filter.h"
 
 #include <functional>
