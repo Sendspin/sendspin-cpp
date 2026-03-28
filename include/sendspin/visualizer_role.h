@@ -39,11 +39,6 @@ public:
 
     explicit VisualizerRole(Config config);
 
-    /// @brief Sets the visualizer support configuration.
-    void set_visualizer_support(const VisualizerSupportObject& support) {
-        this->visualizer_support_ = support;
-    }
-
     /// @brief Returns the visualizer support configuration (nullopt if not configured).
     const std::optional<VisualizerSupportObject>& get_visualizer_support() const {
         return this->visualizer_support_;
