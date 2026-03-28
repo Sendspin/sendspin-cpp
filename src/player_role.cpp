@@ -25,6 +25,18 @@
 
 static const char* const TAG = "sendspin.player";
 
+/// @brief Size of the big-endian 64-bit timestamp at the start of player binary messages.
+static const size_t BINARY_TIMESTAMP_SIZE = 8;
+
+/// @brief Swaps bytes of a big-endian 64-bit value to host byte order.
+static int64_t be64_to_host(const uint8_t* bytes) {
+    uint64_t val = 0;
+    for (int i = 0; i < 8; ++i) {
+        val = (val << 8) | bytes[i];
+    }
+    return static_cast<int64_t>(val);
+}
+
 namespace sendspin {
 
 // --- Helpers ---
@@ -160,11 +172,18 @@ void PlayerRole::contribute_state(ClientStateMessage& msg) {
     msg.player = player_state;
 }
 
-void PlayerRole::handle_binary(const uint8_t* data, size_t len, int64_t timestamp) {
-    if (!this->config_.audio_formats.empty()) {
-        if (!this->send_audio_chunk_(data, len, timestamp, CHUNK_TYPE_ENCODED_AUDIO, 0)) {
-            SS_LOGW(TAG, "Failed to send audio chunk");
-        }
+void PlayerRole::handle_binary(const uint8_t* data, size_t len) {
+    if (this->config_.audio_formats.empty()) {
+        return;
+    }
+    if (len < BINARY_TIMESTAMP_SIZE) {
+        SS_LOGW(TAG, "Binary message too short for timestamp");
+        return;
+    }
+    int64_t timestamp = be64_to_host(data);
+    if (!this->send_audio_chunk_(data + BINARY_TIMESTAMP_SIZE, len - BINARY_TIMESTAMP_SIZE,
+                                 timestamp, CHUNK_TYPE_ENCODED_AUDIO, 0)) {
+        SS_LOGW(TAG, "Failed to send audio chunk");
     }
 }
 

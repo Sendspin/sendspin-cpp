@@ -15,9 +15,24 @@
 #include "sendspin/artwork_role.h"
 
 #include "client_bridge.h"
+#include "platform/logging.h"
 #include "protocol_messages.h"
 
 #include <mutex>
+
+static const char* const TAG = "sendspin.artwork";
+
+/// @brief Size of the big-endian 64-bit timestamp at the start of artwork binary messages.
+static const size_t BINARY_TIMESTAMP_SIZE = 8;
+
+/// @brief Swaps bytes of a big-endian 64-bit value to host byte order.
+static int64_t be64_to_host(const uint8_t* bytes) {
+    uint64_t val = 0;
+    for (int i = 0; i < 8; ++i) {
+        val = (val << 8) | bytes[i];
+    }
+    return static_cast<int64_t>(val);
+}
 
 namespace sendspin {
 
@@ -42,17 +57,26 @@ void ArtworkRole::contribute_hello(ClientHelloMessage& msg) {
     msg.artwork_v1_support = artwork_support;
 }
 
-void ArtworkRole::handle_binary(uint8_t slot, const uint8_t* data, size_t len, int64_t timestamp) {
-    if (!this->preferred_image_formats_.empty() && this->on_image) {
-        SendspinImageFormat image_format = SendspinImageFormat::JPEG;
-        for (const auto& pref : this->preferred_image_formats_) {
-            if (pref.slot == slot) {
-                image_format = pref.format;
-                break;
-            }
-        }
-        this->on_image(slot, data, len, image_format, timestamp);
+void ArtworkRole::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
+    if (this->preferred_image_formats_.empty() || !this->on_image) {
+        return;
     }
+    if (len < BINARY_TIMESTAMP_SIZE) {
+        SS_LOGW(TAG, "Binary message too short for timestamp");
+        return;
+    }
+    int64_t timestamp = be64_to_host(data);
+    const uint8_t* image_data = data + BINARY_TIMESTAMP_SIZE;
+    size_t image_len = len - BINARY_TIMESTAMP_SIZE;
+
+    SendspinImageFormat image_format = SendspinImageFormat::JPEG;
+    for (const auto& pref : this->preferred_image_formats_) {
+        if (pref.slot == slot) {
+            image_format = pref.format;
+            break;
+        }
+    }
+    this->on_image(slot, image_data, image_len, image_format, timestamp);
 }
 
 void ArtworkRole::handle_stream_end() {

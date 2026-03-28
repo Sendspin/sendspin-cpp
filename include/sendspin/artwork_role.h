@@ -152,7 +152,7 @@ public:
 private:
     void attach(ClientBridge* bridge);
     void contribute_hello(ClientHelloMessage& msg);
-    void handle_binary(uint8_t slot, const uint8_t* data, size_t len, int64_t timestamp);
+    void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
     void handle_stream_end();
     void drain_events(std::vector<bool>& pending_stream_end);
     void cleanup();

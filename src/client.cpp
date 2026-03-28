@@ -29,17 +29,6 @@
 
 static const char* const TAG = "sendspin.client";
 
-static const size_t SENDSPIN_BINARY_CHUNK_HEADER_SIZE = 9;
-
-/// @brief Swaps bytes of a big-endian 64-bit value to host byte order.
-static int64_t be64_to_host(const uint8_t* bytes) {
-    uint64_t val = 0;
-    for (int i = 0; i < 8; ++i) {
-        val = (val << 8) | bytes[i];
-    }
-    return static_cast<int64_t>(val);
-}
-
 namespace sendspin {
 
 // --- Constructor / Destructor ---
@@ -434,17 +423,15 @@ void SendspinClient::process_binary_message_(uint8_t* payload, size_t len) {
     uint8_t role = get_binary_role(binary_type);
     uint8_t slot = get_binary_slot(binary_type);
 
+    // Strip the type byte — each role parses its own binary format from here
+    const uint8_t* data = payload + 1;
+    size_t data_len = len - 1;
+
     switch (role) {
         case SENDSPIN_ROLE_PLAYER: {
             if (this->player_) {
-                if (len < SENDSPIN_BINARY_CHUNK_HEADER_SIZE) {
-                    return;
-                }
-                int64_t server_timestamp = be64_to_host(payload + 1);
                 if (slot == 0) {
-                    this->player_->handle_binary(payload + SENDSPIN_BINARY_CHUNK_HEADER_SIZE,
-                                                 len - SENDSPIN_BINARY_CHUNK_HEADER_SIZE,
-                                                 server_timestamp);
+                    this->player_->handle_binary(data, data_len);
                 } else {
                     SS_LOGW(TAG, "Unknown player binary slot %d", slot);
                 }
@@ -453,19 +440,13 @@ void SendspinClient::process_binary_message_(uint8_t* payload, size_t len) {
         }
         case SENDSPIN_ROLE_ARTWORK: {
             if (this->artwork_) {
-                if (len < SENDSPIN_BINARY_CHUNK_HEADER_SIZE) {
-                    return;
-                }
-                int64_t server_timestamp = be64_to_host(payload + 1);
-                this->artwork_->handle_binary(slot, payload + SENDSPIN_BINARY_CHUNK_HEADER_SIZE,
-                                              len - SENDSPIN_BINARY_CHUNK_HEADER_SIZE,
-                                              server_timestamp);
+                this->artwork_->handle_binary(slot, data, data_len);
             }
             break;
         }
         case SENDSPIN_ROLE_VISUALIZER: {
             if (this->visualizer_) {
-                this->visualizer_->handle_binary(binary_type, payload, len);
+                this->visualizer_->handle_binary(binary_type, data, data_len);
             }
             break;
         }

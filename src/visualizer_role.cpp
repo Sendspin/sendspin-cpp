@@ -39,10 +39,8 @@ void VisualizerRole::handle_binary(uint8_t binary_type, const uint8_t* data, siz
         if (this->on_beat_data) {
             this->on_beat_data(data, len);
         }
-    } else {
-        if (this->on_visualizer_data) {
-            this->on_visualizer_data(data, len);
-        }
+    } else if (this->on_visualizer_data) {
+        this->on_visualizer_data(data, len);
     }
 }
 
