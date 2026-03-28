@@ -258,6 +258,7 @@ protected:
     // --- Client state ---
 
     SendspinClientState state_{SendspinClientState::SYNCHRONIZED};
+    bool started_{false};
 
     // --- Server and group state ---
 

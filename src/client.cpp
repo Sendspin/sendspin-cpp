@@ -119,30 +119,46 @@ ClientBridge* SendspinClient::make_bridge_() {
 // --- Role registration ---
 
 PlayerRole& SendspinClient::add_player(PlayerRole::Config config, AudioSink* sink) {
+    if (this->started_) {
+        SS_LOGW(TAG,
+                "add_player() called after start_server() — role may not initialize correctly");
+    }
     this->player_ = std::make_unique<PlayerRole>(std::move(config), sink);
     this->player_->attach(this->make_bridge_());
     return *this->player_;
 }
 
 ControllerRole& SendspinClient::add_controller() {
+    if (this->started_) {
+        SS_LOGW(TAG, "add_controller() called after start_server()");
+    }
     this->controller_ = std::make_unique<ControllerRole>();
     this->controller_->attach(this->make_bridge_());
     return *this->controller_;
 }
 
 MetadataRole& SendspinClient::add_metadata() {
+    if (this->started_) {
+        SS_LOGW(TAG, "add_metadata() called after start_server()");
+    }
     this->metadata_ = std::make_unique<MetadataRole>();
     this->metadata_->attach(this->make_bridge_());
     return *this->metadata_;
 }
 
 ArtworkRole& SendspinClient::add_artwork() {
+    if (this->started_) {
+        SS_LOGW(TAG, "add_artwork() called after start_server()");
+    }
     this->artwork_ = std::make_unique<ArtworkRole>();
     this->artwork_->attach(this->make_bridge_());
     return *this->artwork_;
 }
 
 VisualizerRole& SendspinClient::add_visualizer(VisualizerRole::Config config) {
+    if (this->started_) {
+        SS_LOGW(TAG, "add_visualizer() called after start_server()");
+    }
     this->visualizer_ = std::make_unique<VisualizerRole>(std::move(config));
     this->visualizer_->attach(this->make_bridge_());
     return *this->visualizer_;
@@ -151,6 +167,8 @@ VisualizerRole& SendspinClient::add_visualizer(VisualizerRole::Config config) {
 // --- Lifecycle ---
 
 bool SendspinClient::start_server(unsigned priority) {
+    this->started_ = true;
+
     // Load persisted state
     this->load_last_played_server_();
 
@@ -266,8 +284,7 @@ void SendspinClient::loop() {
 
         // --- Player events ---
         if (this->player_) {
-            this->player_->drain_events(player_stream_events, player_command_events,
-                                        player_state_events);
+            this->player_->drain_events(player_stream_events, player_command_events);
         }
 
         // --- Metadata events ---

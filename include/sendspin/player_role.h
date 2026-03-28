@@ -150,8 +150,7 @@ private:
     void handle_stream_clear();
     void handle_server_command(const ServerCommandMessage& cmd);
     void drain_events(std::vector<StreamCallbackEvent>& stream_events,
-                      std::vector<ServerCommandEvent>& command_events,
-                      std::vector<SendspinClientState>& state_events);
+                      std::vector<ServerCommandEvent>& command_events);
     void cleanup();
 
     // --- Helpers ---

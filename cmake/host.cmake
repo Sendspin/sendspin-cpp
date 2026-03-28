@@ -28,11 +28,6 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     )
 
     # =========================================================================
-    # Player codec dependencies — can be disabled to build without audio codecs
-    # =========================================================================
-    option(SENDSPIN_ENABLE_PLAYER "Fetch and link player audio codec libraries (micro-flac, micro-opus)" ON)
-
-    # =========================================================================
     # Compiler settings
     # =========================================================================
     target_compile_features(${TARGET_LIB} PUBLIC cxx_std_20)
@@ -67,28 +62,26 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         ARDUINOJSON_USE_LONG_LONG=1
     )
 
-    # micro-flac and micro-opus (only needed for player feature)
-    if(SENDSPIN_ENABLE_PLAYER)
-        FetchContent_Declare(
-            micro_flac
-            GIT_REPOSITORY https://github.com/esphome-libs/micro-flac.git
-            GIT_TAG        main
-            GIT_SHALLOW    TRUE
-            GIT_SUBMODULES "lib/micro-ogg-demuxer"
-        )
-        FetchContent_MakeAvailable(micro_flac)
-        target_link_libraries(${TARGET_LIB} PUBLIC micro_flac)
+    # micro-flac and micro-opus (audio codec libraries, required by decoder)
+    FetchContent_Declare(
+        micro_flac
+        GIT_REPOSITORY https://github.com/esphome-libs/micro-flac.git
+        GIT_TAG        main
+        GIT_SHALLOW    TRUE
+        GIT_SUBMODULES "lib/micro-ogg-demuxer"
+    )
+    FetchContent_MakeAvailable(micro_flac)
+    target_link_libraries(${TARGET_LIB} PUBLIC micro_flac)
 
-        FetchContent_Declare(
-            micro_opus
-            GIT_REPOSITORY https://github.com/esphome-libs/micro-opus.git
-            GIT_TAG        v0.3.5
-            GIT_SHALLOW    TRUE
-            GIT_SUBMODULES "lib/opus" "lib/micro-ogg-demuxer"
-        )
-        FetchContent_MakeAvailable(micro_opus)
-        target_link_libraries(${TARGET_LIB} PUBLIC micro_opus)
-    endif()
+    FetchContent_Declare(
+        micro_opus
+        GIT_REPOSITORY https://github.com/esphome-libs/micro-opus.git
+        GIT_TAG        v0.3.5
+        GIT_SHALLOW    TRUE
+        GIT_SUBMODULES "lib/opus" "lib/micro-ogg-demuxer"
+    )
+    FetchContent_MakeAvailable(micro_opus)
+    target_link_libraries(${TARGET_LIB} PUBLIC micro_opus)
 
     # IXWebSocket (WebSocket server/client for host networking)
     set(USE_TLS OFF CACHE BOOL "" FORCE)

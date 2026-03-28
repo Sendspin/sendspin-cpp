@@ -285,8 +285,7 @@ void PlayerRole::handle_server_command(const ServerCommandMessage& cmd) {
 }
 
 void PlayerRole::drain_events(std::vector<StreamCallbackEvent>& stream_events,
-                              std::vector<ServerCommandEvent>& command_events,
-                              std::vector<SendspinClientState>& /*state_events*/) {
+                              std::vector<ServerCommandEvent>& command_events) {
     // --- Server command events (volume, mute, static delay) ---
     for (const auto& cmd_event : command_events) {
         const auto& cmd_msg = cmd_event.command;
