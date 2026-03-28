@@ -85,7 +85,10 @@ void MetadataRole::drain_events(std::vector<ServerMetadataStateObject>& events) 
 }
 
 void MetadataRole::cleanup() {
-    // No-op for metadata
+    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
+
+    // Discard stale events from the dead connection
+    this->pending_metadata_events_.clear();
 }
 
 }  // namespace sendspin

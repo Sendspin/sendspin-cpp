@@ -372,10 +372,24 @@ void PlayerRole::drain_events(std::vector<StreamCallbackEvent>& stream_events,
 }
 
 void PlayerRole::cleanup() {
+    // Clear all buffered audio immediately
     this->sync_task_->signal_stream_clear();
-    if (this->on_stream_end) {
-        this->on_stream_end();
+
+    {
+        std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
+
+        // Discard stale events from the dead connection
+        this->pending_stream_callback_events_.clear();
+        this->pending_command_events_.clear();
+        this->pending_state_events_.clear();
+
+        // Enqueue a clean STREAM_END — drain_events() will fire the callback
+        this->pending_stream_callback_events_.push_back(
+            StreamCallbackEvent{StreamCallbackType::STREAM_END});
     }
+
+    // Clear awaiting events too (main-thread only, no mutex needed)
+    this->awaiting_sync_idle_events_.clear();
 
     if (this->high_performance_requested_for_playback_) {
         this->bridge_->release_high_performance();

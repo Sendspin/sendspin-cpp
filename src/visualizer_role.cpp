@@ -90,9 +90,15 @@ void VisualizerRole::drain_events(std::vector<Event>& events) {
 }
 
 void VisualizerRole::cleanup() {
-    if (this->on_visualizer_stream_end) {
-        this->on_visualizer_stream_end();
-    }
+    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
+
+    // Discard stale events from the dead connection
+    this->pending_events_.clear();
+
+    // Enqueue a clean STREAM_END — drain_events() will fire the callback
+    Event event;
+    event.type = EventType::STREAM_END;
+    this->pending_events_.push_back(std::move(event));
 }
 
 }  // namespace sendspin

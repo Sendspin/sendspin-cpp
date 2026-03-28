@@ -402,7 +402,15 @@ void SendspinClient::cleanup_connection_state_() {
     if (this->player_) {
         this->player_->cleanup();
     }
-
+    if (this->controller_) {
+        this->controller_->cleanup();
+    }
+    if (this->metadata_) {
+        this->metadata_->cleanup();
+    }
+    if (this->artwork_) {
+        this->artwork_->cleanup();
+    }
     if (this->visualizer_) {
         this->visualizer_->cleanup();
     }

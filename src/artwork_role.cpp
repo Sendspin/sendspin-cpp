@@ -70,7 +70,13 @@ void ArtworkRole::drain_events(std::vector<bool>& events) {
 }
 
 void ArtworkRole::cleanup() {
-    // No-op for artwork
+    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
+
+    // Discard stale events from the dead connection
+    this->pending_stream_end_.clear();
+
+    // Enqueue a stream end so drain_events() sends null images to clear each slot
+    this->pending_stream_end_.push_back(true);
 }
 
 }  // namespace sendspin

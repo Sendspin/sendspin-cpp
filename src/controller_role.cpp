@@ -51,7 +51,10 @@ void ControllerRole::drain_events(std::vector<ServerStateControllerObject>& even
 }
 
 void ControllerRole::cleanup() {
-    // No-op for controller
+    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
+
+    // Discard stale events from the dead connection
+    this->pending_controller_state_events_.clear();
 }
 
 }  // namespace sendspin
