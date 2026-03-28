@@ -102,6 +102,11 @@ struct VisualizerFrame {
 };
 
 /// @brief Visualizer role: receives real-time audio visualization data from the server.
+///
+/// Lifecycle callbacks (on_visualizer_stream_start/end/clear) fire on the main loop thread.
+/// Data callbacks (on_visualizer_frame, on_beat) fire on a dedicated drain thread at the
+/// correct timestamp. Users must handle thread safety in data callbacks (copy data quickly,
+/// defer heavy processing). This is the same contract as the player role's audio write callback.
 class VisualizerRole {
     friend class SendspinClient;
 
@@ -119,19 +124,19 @@ public:
         return this->visualizer_support_;
     }
 
-    /// @brief Callback for parsed visualizer frames (loudness, f_peak, spectrum).
+    /// @brief Callback for parsed visualizer frames. Fires on the drain thread.
     std::function<void(const VisualizerFrame&)> on_visualizer_frame;
 
-    /// @brief Callback for beat events (client timestamp in microseconds).
+    /// @brief Callback for beat events. Fires on the drain thread.
     std::function<void(int64_t)> on_beat;
 
-    /// @brief Callback when a visualizer stream starts.
+    /// @brief Callback when a visualizer stream starts. Fires on the main loop thread.
     std::function<void(const ServerVisualizerStreamObject&)> on_visualizer_stream_start;
 
-    /// @brief Callback when a visualizer stream ends.
+    /// @brief Callback when a visualizer stream ends. Fires on the main loop thread.
     std::function<void()> on_visualizer_stream_end;
 
-    /// @brief Callback when a visualizer stream is cleared.
+    /// @brief Callback when a visualizer stream is cleared. Fires on the main loop thread.
     std::function<void()> on_visualizer_stream_clear;
 
 private:
@@ -149,6 +154,8 @@ private:
     };
 
     void attach(ClientBridge* bridge);
+    bool start();
+    void stop_();
     void contribute_hello(ClientHelloMessage& msg);
     void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len);
     void handle_stream_start(const ServerVisualizerStreamObject& stream);
@@ -156,30 +163,26 @@ private:
     void handle_stream_clear();
     void drain_events(std::vector<Event>& events);
     void cleanup();
-    void flush_ring_buffers_();
+    void flush_ring_buffer_();
+
+    static void drain_thread_func_(VisualizerRole* self);
 
     ClientBridge* bridge_{nullptr};
     std::optional<VisualizerSupportObject> visualizer_support_;
     std::vector<Event> pending_events_;
 
-    // Ring buffer storage (pimpl to avoid exposing platform headers)
-    struct RingBuffers;
-    std::unique_ptr<RingBuffers> ring_buffers_;
+    // Drain task (pimpl to avoid exposing platform headers)
+    struct DrainTask;
+    std::unique_ptr<DrainTask> drain_task_;
 
-    // Cached stream config (written on network thread by handle_stream_start,
-    // read on main thread by drain_events — safe via happens-before from event_mutex)
+    // Cached stream config (written and read only on network thread by
+    // handle_stream_start and handle_binary — no cross-thread access)
     bool stream_active_{false};
     bool has_loudness_{false};
     bool has_f_peak_{false};
     bool has_spectrum_{false};
     uint8_t spectrum_bin_count_{0};
     size_t raw_frame_size_{0};
-
-    // Pending items held between drain_events calls (not yet ready for display)
-    void* pending_frame_{nullptr};
-    size_t pending_frame_size_{0};
-    void* pending_beat_{nullptr};
-    size_t pending_beat_size_{0};
 };
 
 }  // namespace sendspin

@@ -15,15 +15,43 @@
 #include "sendspin/visualizer_role.h"
 
 #include "client_bridge.h"
+#include "platform/event_flags.h"
+#include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/spsc_ring_buffer.h"
+#include "platform/thread.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
 
+#include <cstring>
 #include <mutex>
+#include <thread>
 
-static constexpr size_t BEAT_BUFFER_SIZE = 1024;
-static constexpr int64_t TOO_OLD_THRESHOLD_US = 30000;  // 20ms
+static const char* const TAG = "sendspin.visualizer";
+
+// --- Entry format constants ---
+
+// Type tag in first byte of each ring buffer entry
+static constexpr uint8_t ENTRY_BEAT = 0x00;
+static constexpr uint8_t ENTRY_FRAME = 0x80;  // bit 7 distinguishes frame from beat
+
+// Frame field flags packed into bits 0-2 of the type byte
+static constexpr uint8_t FLAG_HAS_LOUDNESS = (1 << 0);
+static constexpr uint8_t FLAG_HAS_F_PEAK = (1 << 1);
+static constexpr uint8_t FLAG_HAS_SPECTRUM = (1 << 2);
+
+// Entry header sizes (before the 8-byte server timestamp)
+static constexpr size_t FRAME_HEADER_SIZE = 2;  // type+flags byte, bin_count byte
+static constexpr size_t BEAT_HEADER_SIZE = 1;   // type byte only
+static constexpr size_t TIMESTAMP_SIZE = 8;
+
+// Event flag bits for drain thread signaling
+static constexpr uint32_t COMMAND_STOP = (1 << 0);
+static constexpr uint32_t COMMAND_FLUSH = (1 << 1);
+
+static constexpr int64_t TOO_OLD_THRESHOLD_US = 200000;  // 200ms
+
+// --- Big-endian helpers ---
 
 static int64_t read_be64(const uint8_t* p) {
     uint64_t val = 0;
@@ -39,38 +67,55 @@ static uint16_t read_be16(const uint8_t* p) {
 
 namespace sendspin {
 
-// --- Ring buffer pimpl ---
+// --- Drain task pimpl ---
 
-struct VisualizerRole::RingBuffers {
-    SpscRingBuffer frame_rb;
-    PlatformBuffer frame_storage;
-    SpscRingBuffer beat_rb;
-    PlatformBuffer beat_storage;
+struct VisualizerRole::DrainTask {
+    SpscRingBuffer ring_buffer;
+    PlatformBuffer ring_storage;
+    EventFlags event_flags;
+    std::thread drain_thread;
 };
 
 // --- Lifecycle ---
 
 VisualizerRole::VisualizerRole(Config config) : visualizer_support_(std::move(config.support)) {
     if (this->visualizer_support_.has_value()) {
-        this->ring_buffers_ = std::make_unique<RingBuffers>();
+        this->drain_task_ = std::make_unique<DrainTask>();
 
-        size_t frame_capacity = this->visualizer_support_->buffer_capacity;
-        if (this->ring_buffers_->frame_storage.allocate(frame_capacity)) {
-            this->ring_buffers_->frame_rb.create(frame_capacity,
-                                                 this->ring_buffers_->frame_storage.data());
-        }
-
-        if (this->ring_buffers_->beat_storage.allocate(BEAT_BUFFER_SIZE)) {
-            this->ring_buffers_->beat_rb.create(BEAT_BUFFER_SIZE,
-                                                this->ring_buffers_->beat_storage.data());
+        size_t capacity = this->visualizer_support_->buffer_capacity;
+        if (this->drain_task_->ring_storage.allocate(capacity)) {
+            this->drain_task_->ring_buffer.create(capacity, this->drain_task_->ring_storage.data());
         }
     }
 }
 
-VisualizerRole::~VisualizerRole() = default;
+VisualizerRole::~VisualizerRole() {
+    this->stop_();
+}
 
 void VisualizerRole::attach(ClientBridge* bridge) {
     this->bridge_ = bridge;
+}
+
+bool VisualizerRole::start() {
+    if (!this->drain_task_ || !this->drain_task_->ring_buffer.is_created()) {
+        return false;
+    }
+    if (this->drain_task_->drain_thread.joinable()) {
+        return true;  // Already running
+    }
+
+    platform_configure_thread("SsVis", 4096, 2, false);
+    this->drain_task_->drain_thread = std::thread(drain_thread_func_, this);
+    return true;
+}
+
+void VisualizerRole::stop_() {
+    if (!this->drain_task_ || !this->drain_task_->drain_thread.joinable()) {
+        return;
+    }
+    this->drain_task_->event_flags.set(COMMAND_STOP);
+    this->drain_task_->drain_thread.join();
 }
 
 void VisualizerRole::contribute_hello(ClientHelloMessage& msg) {
@@ -83,10 +128,19 @@ void VisualizerRole::contribute_hello(ClientHelloMessage& msg) {
 // --- Binary handling (network thread) ---
 
 void VisualizerRole::handle_binary(uint8_t binary_type, const uint8_t* data, size_t len) {
-    if (!this->stream_active_ || !this->ring_buffers_ ||
-        !this->ring_buffers_->frame_rb.is_created() || !this->ring_buffers_->beat_rb.is_created()) {
+    if (!this->stream_active_ || !this->drain_task_ ||
+        !this->drain_task_->ring_buffer.is_created()) {
         return;
     }
+
+    // Build the frame flags byte from cached config
+    uint8_t flags = ENTRY_FRAME;
+    if (this->has_loudness_)
+        flags |= FLAG_HAS_LOUDNESS;
+    if (this->has_f_peak_)
+        flags |= FLAG_HAS_F_PEAK;
+    if (this->has_spectrum_)
+        flags |= FLAG_HAS_SPECTRUM;
 
     if (binary_type == SENDSPIN_BINARY_VISUALIZER_BEAT) {
         // Beat format: [num_beats(1)][per-beat: server_timestamp(8)]
@@ -96,10 +150,16 @@ void VisualizerRole::handle_binary(uint8_t binary_type, const uint8_t* data, siz
         size_t offset = 1;
 
         for (uint8_t i = 0; i < num_beats; ++i) {
-            if (offset + 8 > len)
+            if (offset + TIMESTAMP_SIZE > len)
                 break;
-            this->ring_buffers_->beat_rb.send(data + offset, 8, 0);
-            offset += 8;
+
+            // Build beat entry: [ENTRY_BEAT][8-byte server_ts]
+            uint8_t entry[BEAT_HEADER_SIZE + TIMESTAMP_SIZE];
+            entry[0] = ENTRY_BEAT;
+            std::memcpy(entry + BEAT_HEADER_SIZE, data + offset, TIMESTAMP_SIZE);
+
+            this->drain_task_->ring_buffer.send(entry, sizeof(entry), 0);
+            offset += TIMESTAMP_SIZE;
         }
     } else {
         // Visualizer data format: [num_frames(1)][per-frame: timestamp(8) + fields...]
@@ -107,13 +167,26 @@ void VisualizerRole::handle_binary(uint8_t binary_type, const uint8_t* data, siz
             return;
         uint8_t num_frames = data[0];
         size_t offset = 1;
-        size_t entry_size = 8 + this->raw_frame_size_;
+        size_t wire_frame_size = TIMESTAMP_SIZE + this->raw_frame_size_;
+        size_t entry_size = FRAME_HEADER_SIZE + TIMESTAMP_SIZE + this->raw_frame_size_;
 
         for (uint8_t i = 0; i < num_frames; ++i) {
-            if (offset + entry_size > len)
+            if (offset + wire_frame_size > len)
                 break;
-            this->ring_buffers_->frame_rb.send(data + offset, entry_size, 0);
-            offset += entry_size;
+
+            // Build frame entry: [flags][bin_count][8-byte server_ts][raw field bytes]
+            // Use acquire+commit to avoid double-copy
+            void* dest = this->drain_task_->ring_buffer.acquire(entry_size, 0);
+            if (dest == nullptr)
+                break;  // Buffer full, drop remaining frames
+
+            auto* entry = static_cast<uint8_t*>(dest);
+            entry[0] = flags;
+            entry[1] = this->spectrum_bin_count_;
+            std::memcpy(entry + FRAME_HEADER_SIZE, data + offset, wire_frame_size);
+
+            this->drain_task_->ring_buffer.commit(dest);
+            offset += wire_frame_size;
         }
     }
 }
@@ -123,7 +196,7 @@ void VisualizerRole::handle_binary(uint8_t binary_type, const uint8_t* data, siz
 void VisualizerRole::handle_stream_start(const ServerVisualizerStreamObject& stream) {
     std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
 
-    // Cache stream config for binary parsing (same thread as handle_binary)
+    // Cache stream config for handle_binary (same thread)
     this->has_loudness_ = false;
     this->has_f_peak_ = false;
     this->has_spectrum_ = false;
@@ -145,7 +218,12 @@ void VisualizerRole::handle_stream_start(const ServerVisualizerStreamObject& str
                             (this->has_spectrum_ ? 2 * this->spectrum_bin_count_ : 0);
     this->stream_active_ = true;
 
-    // Enqueue the stream_start event for main-thread delivery
+    // Signal drain thread to flush old data
+    if (this->drain_task_) {
+        this->drain_task_->event_flags.set(COMMAND_FLUSH);
+    }
+
+    // Enqueue lifecycle event for main-thread delivery
     Event event;
     event.type = EventType::STREAM_START;
     event.visualizer_stream = stream;
@@ -154,6 +232,10 @@ void VisualizerRole::handle_stream_start(const ServerVisualizerStreamObject& str
 
 void VisualizerRole::handle_stream_end() {
     this->stream_active_ = false;
+
+    if (this->drain_task_) {
+        this->drain_task_->event_flags.set(COMMAND_FLUSH);
+    }
 
     std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
     Event event;
@@ -164,165 +246,48 @@ void VisualizerRole::handle_stream_end() {
 void VisualizerRole::handle_stream_clear() {
     this->stream_active_ = false;
 
+    if (this->drain_task_) {
+        this->drain_task_->event_flags.set(COMMAND_FLUSH);
+    }
+
     std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
     Event event;
     event.type = EventType::STREAM_CLEAR;
     this->pending_events_.push_back(std::move(event));
 }
 
-// --- Event draining (main thread) ---
+// --- Event draining (main thread) — lifecycle events only ---
 
 void VisualizerRole::drain_events(std::vector<Event>& events) {
-    // Process lifecycle events first
     for (auto& event : events) {
         switch (event.type) {
             case EventType::STREAM_START:
-                this->flush_ring_buffers_();
                 if (event.visualizer_stream.has_value() && this->on_visualizer_stream_start) {
                     this->on_visualizer_stream_start(event.visualizer_stream.value());
                 }
                 break;
             case EventType::STREAM_END:
-                this->flush_ring_buffers_();
                 if (this->on_visualizer_stream_end) {
                     this->on_visualizer_stream_end();
                 }
                 break;
             case EventType::STREAM_CLEAR:
-                this->flush_ring_buffers_();
                 if (this->on_visualizer_stream_clear) {
                     this->on_visualizer_stream_clear();
                 }
                 break;
         }
     }
-
-    // Drain ring buffers with timestamp-gated release
-    if (!this->ring_buffers_ || !this->ring_buffers_->frame_rb.is_created() || !this->bridge_ ||
-        !this->bridge_->is_time_synced()) {
-        return;
-    }
-
-    int64_t now = platform_time_us();
-
-    // Drain visualizer frames
-    if (this->on_visualizer_frame) {
-        while (true) {
-            void* item;
-            size_t item_size;
-
-            if (this->pending_frame_ != nullptr) {
-                item = this->pending_frame_;
-                item_size = this->pending_frame_size_;
-                this->pending_frame_ = nullptr;
-                this->pending_frame_size_ = 0;
-            } else {
-                item = this->ring_buffers_->frame_rb.receive(&item_size, 0);
-                if (item == nullptr)
-                    break;
-            }
-
-            auto* raw = static_cast<const uint8_t*>(item);
-            int64_t server_ts = read_be64(raw);
-            int64_t client_ts = this->bridge_->get_client_time(server_ts);
-
-            if (client_ts == 0) {
-                // Time sync lost — stash and stop
-                this->pending_frame_ = item;
-                this->pending_frame_size_ = item_size;
-                break;
-            }
-
-            if (client_ts > now) {
-                // Future frame — stash for next drain cycle
-                this->pending_frame_ = item;
-                this->pending_frame_size_ = item_size;
-                break;
-            }
-
-            if (now - client_ts > TOO_OLD_THRESHOLD_US) {
-                // Too old, drop
-                this->ring_buffers_->frame_rb.return_item(item);
-                continue;
-            }
-
-            // Parse the frame fields after the 8-byte timestamp
-            VisualizerFrame frame;
-            frame.timestamp = client_ts;
-            const uint8_t* fields = raw + 8;
-            size_t data_len = item_size - 8;
-            size_t offset = 0;
-
-            if (this->has_loudness_ && offset + 2 <= data_len) {
-                frame.loudness = read_be16(fields + offset);
-                offset += 2;
-            }
-            if (this->has_f_peak_ && offset + 2 <= data_len) {
-                frame.peak_freq = read_be16(fields + offset);
-                offset += 2;
-            }
-            if (this->has_spectrum_ && this->spectrum_bin_count_ > 0) {
-                frame.spectrum.resize(this->spectrum_bin_count_);
-                for (uint8_t b = 0; b < this->spectrum_bin_count_ && offset + 2 <= data_len; ++b) {
-                    frame.spectrum[b] = read_be16(fields + offset);
-                    offset += 2;
-                }
-            }
-
-            this->ring_buffers_->frame_rb.return_item(item);
-            this->on_visualizer_frame(frame);
-        }
-    }
-
-    // Drain beat events
-    if (this->on_beat) {
-        while (true) {
-            void* item;
-            size_t item_size;
-
-            if (this->pending_beat_ != nullptr) {
-                item = this->pending_beat_;
-                item_size = this->pending_beat_size_;
-                this->pending_beat_ = nullptr;
-                this->pending_beat_size_ = 0;
-            } else {
-                item = this->ring_buffers_->beat_rb.receive(&item_size, 0);
-                if (item == nullptr)
-                    break;
-            }
-
-            auto* raw = static_cast<const uint8_t*>(item);
-            int64_t server_ts = read_be64(raw);
-            int64_t client_ts = this->bridge_->get_client_time(server_ts);
-
-            if (client_ts == 0) {
-                this->pending_beat_ = item;
-                this->pending_beat_size_ = item_size;
-                break;
-            }
-
-            if (client_ts > now) {
-                this->pending_beat_ = item;
-                this->pending_beat_size_ = item_size;
-                break;
-            }
-
-            if (now - client_ts > TOO_OLD_THRESHOLD_US) {
-                this->ring_buffers_->beat_rb.return_item(item);
-                continue;
-            }
-
-            this->ring_buffers_->beat_rb.return_item(item);
-            this->on_beat(client_ts);
-        }
-    }
 }
 
-// --- Cleanup ---
+// --- Cleanup (main thread) ---
 
 void VisualizerRole::cleanup() {
     this->stream_active_ = false;
-    this->flush_ring_buffers_();
+
+    if (this->drain_task_) {
+        this->drain_task_->event_flags.set(COMMAND_FLUSH);
+    }
 
     std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
     this->pending_events_.clear();
@@ -332,31 +297,127 @@ void VisualizerRole::cleanup() {
     this->pending_events_.push_back(std::move(event));
 }
 
-void VisualizerRole::flush_ring_buffers_() {
-    if (!this->ring_buffers_)
+// --- Drain thread ---
+
+void VisualizerRole::flush_ring_buffer_() {
+    if (!this->drain_task_)
         return;
-
-    // Return any pending (checked-out) items first
-    if (this->pending_frame_ != nullptr) {
-        this->ring_buffers_->frame_rb.return_item(this->pending_frame_);
-        this->pending_frame_ = nullptr;
-        this->pending_frame_size_ = 0;
-    }
-    if (this->pending_beat_ != nullptr) {
-        this->ring_buffers_->beat_rb.return_item(this->pending_beat_);
-        this->pending_beat_ = nullptr;
-        this->pending_beat_size_ = 0;
-    }
-
-    // Drain remaining items
     size_t item_size = 0;
     void* item = nullptr;
-    while ((item = this->ring_buffers_->frame_rb.receive(&item_size, 0)) != nullptr) {
-        this->ring_buffers_->frame_rb.return_item(item);
+    while ((item = this->drain_task_->ring_buffer.receive(&item_size, 0)) != nullptr) {
+        this->drain_task_->ring_buffer.return_item(item);
     }
-    while ((item = this->ring_buffers_->beat_rb.receive(&item_size, 0)) != nullptr) {
-        this->ring_buffers_->beat_rb.return_item(item);
+}
+
+void VisualizerRole::drain_thread_func_(VisualizerRole* self) {
+    SS_LOGD(TAG, "Drain thread started");
+
+    auto& rb = self->drain_task_->ring_buffer;
+    auto& flags = self->drain_task_->event_flags;
+
+    while (true) {
+        // Non-blocking check for commands
+        uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, 0);
+        if (cmd & COMMAND_STOP)
+            break;
+        if (cmd & COMMAND_FLUSH) {
+            self->flush_ring_buffer_();
+            continue;
+        }
+
+        // Blocking receive with 50ms timeout (allows periodic command checks)
+        size_t item_size = 0;
+        void* item = rb.receive(&item_size, 50);
+        if (item == nullptr)
+            continue;
+
+        // Wait for time sync
+        if (!self->bridge_ || !self->bridge_->is_time_synced()) {
+            rb.return_item(item);
+            continue;
+        }
+
+        auto* raw = static_cast<const uint8_t*>(item);
+        uint8_t type_byte = raw[0];
+        bool is_frame = (type_byte & ENTRY_FRAME) != 0;
+
+        // Read server timestamp
+        size_t ts_offset = is_frame ? FRAME_HEADER_SIZE : BEAT_HEADER_SIZE;
+        if (item_size < ts_offset + TIMESTAMP_SIZE) {
+            rb.return_item(item);
+            continue;
+        }
+        int64_t server_ts = read_be64(raw + ts_offset);
+        int64_t client_ts = self->bridge_->get_client_time(server_ts);
+
+        if (client_ts == 0) {
+            rb.return_item(item);
+            continue;
+        }
+
+        // Sleep until display time (interruptible via event flags)
+        int64_t now = platform_time_us();
+        if (client_ts > now) {
+            uint32_t wait_ms = static_cast<uint32_t>((client_ts - now) / 1000);
+            if (wait_ms > 0) {
+                cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, wait_ms);
+                if (cmd & COMMAND_STOP) {
+                    rb.return_item(item);
+                    break;
+                }
+                if (cmd & COMMAND_FLUSH) {
+                    rb.return_item(item);
+                    self->flush_ring_buffer_();
+                    continue;
+                }
+            }
+        }
+
+        // Check if too old after waking
+        now = platform_time_us();
+        if (now - client_ts > TOO_OLD_THRESHOLD_US) {
+            rb.return_item(item);
+            continue;
+        }
+
+        // Parse and deliver
+        if (is_frame && self->on_visualizer_frame) {
+            uint8_t frame_flags = type_byte & 0x7F;
+            uint8_t bin_count = raw[1];
+            const uint8_t* fields = raw + FRAME_HEADER_SIZE + TIMESTAMP_SIZE;
+            size_t data_len = item_size - FRAME_HEADER_SIZE - TIMESTAMP_SIZE;
+            size_t offset = 0;
+
+            VisualizerFrame frame;
+            frame.timestamp = client_ts;
+
+            if ((frame_flags & FLAG_HAS_LOUDNESS) && offset + 2 <= data_len) {
+                frame.loudness = read_be16(fields + offset);
+                offset += 2;
+            }
+            if ((frame_flags & FLAG_HAS_F_PEAK) && offset + 2 <= data_len) {
+                frame.peak_freq = read_be16(fields + offset);
+                offset += 2;
+            }
+            if ((frame_flags & FLAG_HAS_SPECTRUM) && bin_count > 0) {
+                frame.spectrum.resize(bin_count);
+                for (uint8_t b = 0; b < bin_count && offset + 2 <= data_len; ++b) {
+                    frame.spectrum[b] = read_be16(fields + offset);
+                    offset += 2;
+                }
+            }
+
+            rb.return_item(item);
+            self->on_visualizer_frame(frame);
+        } else if (!is_frame && self->on_beat) {
+            rb.return_item(item);
+            self->on_beat(client_ts);
+        } else {
+            rb.return_item(item);
+        }
     }
+
+    SS_LOGD(TAG, "Drain thread stopped");
 }
 
 }  // namespace sendspin

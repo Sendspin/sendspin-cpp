@@ -57,8 +57,9 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
       time_burst_(std::make_unique<SendspinTimeBurst>()) {}
 
 SendspinClient::~SendspinClient() {
-    // Stop the player's sync task thread first, before tearing down connections.
+    // Stop background threads before tearing down connections.
     this->player_.reset();
+    this->visualizer_.reset();
     this->connection_manager_.reset();
 }
 
@@ -164,6 +165,12 @@ bool SendspinClient::start_server(unsigned priority) {
 
     if (this->player_) {
         if (!this->player_->start(this->config_.psram_stack)) {
+            return false;
+        }
+    }
+
+    if (this->visualizer_) {
+        if (!this->visualizer_->start()) {
             return false;
         }
     }
