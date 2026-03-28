@@ -22,6 +22,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace sendspin {
@@ -29,7 +30,133 @@ namespace sendspin {
 class SendspinClient;
 class SyncTask;
 struct ClientBridge;
+struct ClientHelloMessage;
+struct ClientStateMessage;
+struct StreamStartMessage;
 struct SyncTimeProvider;
+
+// ============================================================================
+// Player types
+// ============================================================================
+
+// Implementation-specific details not defined in the protocol specification.
+// Used internally for audio chunk handling between components.
+enum ChunkType : uint8_t {
+    CHUNK_TYPE_ENCODED_AUDIO = 0,
+    CHUNK_TYPE_DECODED_AUDIO,
+    CHUNK_TYPE_PCM_DUMMY_HEADER,
+    CHUNK_TYPE_OPUS_DUMMY_HEADER,
+    CHUNK_TYPE_FLAC_HEADER,
+};
+
+struct DummyHeader {
+    uint32_t sample_rate;
+    uint8_t bits_per_sample;
+    uint8_t channels;
+};
+
+enum class SendspinCodecFormat {
+    FLAC,
+    OPUS,
+    PCM,
+    UNSUPPORTED,
+};
+
+inline const char* to_cstr(SendspinCodecFormat format) {
+    switch (format) {
+        case SendspinCodecFormat::FLAC:
+            return "flac";
+        case SendspinCodecFormat::OPUS:
+            return "opus";
+        case SendspinCodecFormat::PCM:
+            return "pcm";
+        default:
+            return "unsupported";
+    }
+}
+
+inline std::optional<SendspinCodecFormat> codec_format_from_string(const std::string& str) {
+    if (str == "flac")
+        return SendspinCodecFormat::FLAC;
+    if (str == "opus")
+        return SendspinCodecFormat::OPUS;
+    if (str == "pcm")
+        return SendspinCodecFormat::PCM;
+    return std::nullopt;
+}
+
+struct AudioSupportedFormatObject {
+    SendspinCodecFormat codec;
+    uint8_t channels;
+    uint32_t sample_rate;
+    uint8_t bit_depth;
+};
+
+enum class SendspinPlayerCommand {
+    VOLUME,
+    MUTE,
+    SET_STATIC_DELAY,
+};
+
+inline const char* to_cstr(SendspinPlayerCommand cmd) {
+    switch (cmd) {
+        case SendspinPlayerCommand::VOLUME:
+            return "volume";
+        case SendspinPlayerCommand::MUTE:
+            return "mute";
+        case SendspinPlayerCommand::SET_STATIC_DELAY:
+            return "set_static_delay";
+        default:
+            return "unknown";
+    }
+}
+
+inline std::optional<SendspinPlayerCommand> player_command_from_string(const std::string& str) {
+    if (str == "volume")
+        return SendspinPlayerCommand::VOLUME;
+    if (str == "mute")
+        return SendspinPlayerCommand::MUTE;
+    if (str == "set_static_delay")
+        return SendspinPlayerCommand::SET_STATIC_DELAY;
+    return std::nullopt;
+}
+
+struct PlayerSupportObject {
+    std::vector<AudioSupportedFormatObject> supported_formats;
+    size_t buffer_capacity;
+    std::vector<SendspinPlayerCommand> supported_commands;
+};
+
+struct ClientPlayerStateObject {
+    uint8_t volume;
+    bool muted;
+    uint16_t static_delay_ms;
+    std::vector<SendspinPlayerCommand> supported_commands;
+};
+
+struct ServerPlayerStreamObject {
+    std::optional<SendspinCodecFormat> codec;
+    std::optional<uint32_t> sample_rate;
+    std::optional<uint8_t> channels;
+    std::optional<uint8_t> bit_depth;
+    std::optional<std::string> codec_header;
+
+    bool is_complete() const {
+        return codec.has_value() && sample_rate.has_value() && channels.has_value() &&
+               bit_depth.has_value();
+    }
+};
+
+struct ServerPlayerCommandObject {
+    SendspinPlayerCommand command;
+    std::optional<uint8_t> volume;
+    std::optional<bool> mute;
+    std::optional<uint16_t> static_delay_ms;
+};
+
+struct ServerCommandMessage {
+    std::optional<ServerPlayerCommandObject> player;
+};
 
 /// @brief Player role: owns SyncTask and AudioSink, handles audio playback.
 class PlayerRole {

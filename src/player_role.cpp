@@ -17,6 +17,7 @@
 #include "client_bridge.h"
 #include "platform/base64.h"
 #include "platform/logging.h"
+#include "protocol_messages.h"
 #include "sync_task.h"
 #include "sync_time_provider.h"
 

@@ -16,14 +16,113 @@
 
 #include "sendspin/protocol.h"
 
+#include <cstdint>
 #include <functional>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace sendspin {
 
 class SendspinClient;
 struct ClientBridge;
+struct ClientHelloMessage;
+
+// ============================================================================
+// Controller types
+// ============================================================================
+
+enum class SendspinControllerCommand {
+    PLAY,
+    PAUSE,
+    STOP,
+    NEXT,
+    PREVIOUS,
+    VOLUME,
+    MUTE,
+    REPEAT_OFF,
+    REPEAT_ONE,
+    REPEAT_ALL,
+    SHUFFLE,
+    UNSHUFFLE,
+    SWITCH,
+};
+
+inline const char* to_cstr(SendspinControllerCommand cmd) {
+    switch (cmd) {
+        case SendspinControllerCommand::PLAY:
+            return "play";
+        case SendspinControllerCommand::PAUSE:
+            return "pause";
+        case SendspinControllerCommand::STOP:
+            return "stop";
+        case SendspinControllerCommand::NEXT:
+            return "next";
+        case SendspinControllerCommand::PREVIOUS:
+            return "previous";
+        case SendspinControllerCommand::VOLUME:
+            return "volume";
+        case SendspinControllerCommand::MUTE:
+            return "mute";
+        case SendspinControllerCommand::REPEAT_OFF:
+            return "repeat_off";
+        case SendspinControllerCommand::REPEAT_ONE:
+            return "repeat_one";
+        case SendspinControllerCommand::REPEAT_ALL:
+            return "repeat_all";
+        case SendspinControllerCommand::SHUFFLE:
+            return "shuffle";
+        case SendspinControllerCommand::UNSHUFFLE:
+            return "unshuffle";
+        case SendspinControllerCommand::SWITCH:
+            return "switch";
+        default:
+            return "unknown";
+    }
+}
+
+inline std::optional<SendspinControllerCommand> controller_command_from_string(
+    const std::string& str) {
+    if (str == "play")
+        return SendspinControllerCommand::PLAY;
+    if (str == "pause")
+        return SendspinControllerCommand::PAUSE;
+    if (str == "stop")
+        return SendspinControllerCommand::STOP;
+    if (str == "next")
+        return SendspinControllerCommand::NEXT;
+    if (str == "previous")
+        return SendspinControllerCommand::PREVIOUS;
+    if (str == "volume")
+        return SendspinControllerCommand::VOLUME;
+    if (str == "mute")
+        return SendspinControllerCommand::MUTE;
+    if (str == "repeat_off")
+        return SendspinControllerCommand::REPEAT_OFF;
+    if (str == "repeat_one")
+        return SendspinControllerCommand::REPEAT_ONE;
+    if (str == "repeat_all")
+        return SendspinControllerCommand::REPEAT_ALL;
+    if (str == "shuffle")
+        return SendspinControllerCommand::SHUFFLE;
+    if (str == "unshuffle")
+        return SendspinControllerCommand::UNSHUFFLE;
+    if (str == "switch")
+        return SendspinControllerCommand::SWITCH;
+    return std::nullopt;
+}
+
+struct ClientCommandControllerObject {
+    SendspinControllerCommand command;
+    std::optional<uint8_t> volume;
+    std::optional<bool> mute;
+};
+
+struct ServerStateControllerObject {
+    std::vector<SendspinControllerCommand> supported_commands;
+    uint8_t volume;
+    bool muted;
+};
 
 /// @brief Controller role: read-only server state and outbound commands.
 class ControllerRole {

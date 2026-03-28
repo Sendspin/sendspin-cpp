@@ -20,6 +20,7 @@
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/time.h"
+#include "protocol_messages.h"
 #include "time_burst.h"
 #include <ArduinoJson.h>
 

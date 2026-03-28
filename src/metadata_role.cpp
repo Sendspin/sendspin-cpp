@@ -16,6 +16,7 @@
 
 #include "client_bridge.h"
 #include "platform/time.h"
+#include "protocol_messages.h"
 
 #include <algorithm>
 #include <mutex>

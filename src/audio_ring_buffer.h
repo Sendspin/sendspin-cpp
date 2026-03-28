@@ -16,7 +16,7 @@
 
 #include "platform/memory.h"
 #include "platform/spsc_ring_buffer.h"
-#include "sendspin/protocol.h"
+#include "sendspin/player_role.h"
 
 #include <cstddef>
 #include <cstdint>

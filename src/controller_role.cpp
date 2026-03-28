@@ -15,6 +15,7 @@
 #include "sendspin/controller_role.h"
 
 #include "client_bridge.h"
+#include "protocol_messages.h"
 
 #include <mutex>
 

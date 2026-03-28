@@ -26,6 +26,73 @@ namespace sendspin {
 
 class SendspinClient;
 struct ClientBridge;
+struct ClientHelloMessage;
+
+// ============================================================================
+// Visualizer types
+// ============================================================================
+
+enum class VisualizerDataType : uint8_t {
+    BEAT,
+    LOUDNESS,
+    F_PEAK,
+    SPECTRUM,
+};
+
+inline const char* to_cstr(VisualizerDataType type) {
+    switch (type) {
+        case VisualizerDataType::BEAT:
+            return "beat";
+        case VisualizerDataType::LOUDNESS:
+            return "loudness";
+        case VisualizerDataType::F_PEAK:
+            return "f_peak";
+        case VisualizerDataType::SPECTRUM:
+            return "spectrum";
+        default:
+            return "unknown";
+    }
+}
+
+enum class VisualizerSpectrumScale : uint8_t {
+    MEL,
+    LOG,
+    LIN,
+};
+
+inline const char* to_cstr(VisualizerSpectrumScale scale) {
+    switch (scale) {
+        case VisualizerSpectrumScale::MEL:
+            return "mel";
+        case VisualizerSpectrumScale::LOG:
+            return "log";
+        case VisualizerSpectrumScale::LIN:
+            return "lin";
+        default:
+            return "mel";
+    }
+}
+
+struct VisualizerSpectrumConfig {
+    uint8_t n_disp_bins;
+    VisualizerSpectrumScale scale;
+    uint16_t f_min;
+    uint16_t f_max;
+    uint16_t rate_max;
+};
+
+struct VisualizerSupportObject {
+    std::vector<VisualizerDataType> types;
+    size_t buffer_capacity;
+    uint8_t batch_max;
+    std::optional<VisualizerSpectrumConfig> spectrum;
+};
+
+struct ServerVisualizerStreamObject {
+    std::vector<VisualizerDataType> types;
+    uint8_t batch_max;
+    std::optional<VisualizerSpectrumConfig> spectrum;
+};
 
 /// @brief Visualizer role: receives real-time audio visualization data from the server.
 class VisualizerRole {

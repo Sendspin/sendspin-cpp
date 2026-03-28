@@ -18,12 +18,68 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace sendspin {
 
 class SendspinClient;
 struct ClientBridge;
+struct ClientHelloMessage;
+
+// ============================================================================
+// Metadata types
+// ============================================================================
+
+struct MetadataProgressObject {
+    uint32_t track_progress;
+    uint32_t track_duration;
+    uint32_t playback_speed;
+};
+
+enum class SendspinRepeatMode {
+    OFF,
+    ONE,
+    ALL,
+};
+
+inline const char* to_cstr(SendspinRepeatMode mode) {
+    switch (mode) {
+        case SendspinRepeatMode::OFF:
+            return "off";
+        case SendspinRepeatMode::ONE:
+            return "one";
+        case SendspinRepeatMode::ALL:
+            return "all";
+        default:
+            return "off";
+    }
+}
+
+inline std::optional<SendspinRepeatMode> repeat_mode_from_string(const std::string& str) {
+    if (str == "off")
+        return SendspinRepeatMode::OFF;
+    if (str == "one")
+        return SendspinRepeatMode::ONE;
+    if (str == "all")
+        return SendspinRepeatMode::ALL;
+    return std::nullopt;
+}
+
+struct ServerMetadataStateObject {
+    int64_t timestamp;
+    std::optional<std::string> title;
+    std::optional<std::string> artist;
+    std::optional<std::string> album_artist;
+    std::optional<std::string> album;
+    std::optional<std::string> artwork_url;
+    std::optional<uint16_t> year;
+    std::optional<uint16_t> track;
+    std::optional<MetadataProgressObject> progress;
+    std::optional<SendspinRepeatMode> repeat;
+    std::optional<bool> shuffle;
+};
 
 /// @brief Metadata role: provides track metadata and progress information.
 class MetadataRole {

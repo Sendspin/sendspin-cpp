@@ -19,12 +19,110 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace sendspin {
 
 class SendspinClient;
 struct ClientBridge;
+struct ClientHelloMessage;
+
+// ============================================================================
+// Artwork types
+// ============================================================================
+
+enum class SendspinImageFormat {
+    JPEG,
+    PNG,
+    BMP,
+};
+
+inline const char* to_cstr(SendspinImageFormat format) {
+    switch (format) {
+        case SendspinImageFormat::JPEG:
+            return "jpeg";
+        case SendspinImageFormat::PNG:
+            return "png";
+        case SendspinImageFormat::BMP:
+            return "bmp";
+        default:
+            return "jpeg";
+    }
+}
+
+inline std::optional<SendspinImageFormat> image_format_from_string(const std::string& str) {
+    if (str == "jpeg")
+        return SendspinImageFormat::JPEG;
+    if (str == "png")
+        return SendspinImageFormat::PNG;
+    if (str == "bmp")
+        return SendspinImageFormat::BMP;
+    return std::nullopt;
+}
+
+enum class SendspinImageSource {
+    ALBUM,
+    ARTIST,
+    NONE,
+};
+
+inline const char* to_cstr(SendspinImageSource source) {
+    switch (source) {
+        case SendspinImageSource::ALBUM:
+            return "album";
+        case SendspinImageSource::ARTIST:
+            return "artist";
+        case SendspinImageSource::NONE:
+        default:
+            return "none";
+    }
+}
+
+inline std::optional<SendspinImageSource> image_source_from_string(const std::string& str) {
+    if (str == "album")
+        return SendspinImageSource::ALBUM;
+    if (str == "artist")
+        return SendspinImageSource::ARTIST;
+    if (str == "none")
+        return SendspinImageSource::NONE;
+    return std::nullopt;
+}
+
+struct ArtworkChannelFormatObject {
+    SendspinImageSource source;
+    SendspinImageFormat format;
+    uint16_t media_width;
+    uint16_t media_height;
+};
+
+struct ArtworkSupportObject {
+    std::vector<ArtworkChannelFormatObject> channels;
+};
+
+struct ServerArtworkChannelObject {
+    std::optional<SendspinImageSource> source;
+    std::optional<SendspinImageFormat> format;
+    std::optional<uint16_t> width;
+    std::optional<uint16_t> height;
+
+    bool is_complete() const {
+        return source.has_value() && format.has_value() && width.has_value() && height.has_value();
+    }
+};
+
+struct ServerArtworkStreamObject {
+    std::optional<std::vector<ServerArtworkChannelObject>> channels;
+};
+
+struct ClientArtworkRequestObject {
+    uint8_t channel;
+    std::optional<SendspinImageSource> source;
+    std::optional<SendspinImageFormat> format;
+    std::optional<uint16_t> media_width;
+    std::optional<uint16_t> media_height;
+};
 
 /// @brief Preference for an image slot's format and resolution.
 struct ImageSlotPreference {
