@@ -49,7 +49,7 @@ static constexpr size_t TIMESTAMP_SIZE = 8;
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
 static constexpr uint32_t COMMAND_FLUSH = (1 << 1);
 
-static constexpr int64_t TOO_OLD_THRESHOLD_US = 200000;  // 200ms
+static constexpr int64_t TOO_OLD_THRESHOLD_US = 20000;  // 20ms
 
 // --- Big-endian helpers ---
 
@@ -82,7 +82,10 @@ VisualizerRole::VisualizerRole(Config config) : visualizer_support_(std::move(co
     if (this->visualizer_support_.has_value()) {
         this->drain_task_ = std::make_unique<DrainTask>();
 
-        size_t capacity = this->visualizer_support_->buffer_capacity;
+        // The ring buffer needs more space than the raw data capacity because each entry
+        // has internal overhead: an 8-byte ItemHeader plus our 1-2 byte entry header, all
+        // aligned to 8 bytes. Allocate 3x the advertised capacity to account for this.
+        size_t capacity = this->visualizer_support_->buffer_capacity * 3;
         if (this->drain_task_->ring_storage.allocate(capacity)) {
             this->drain_task_->ring_buffer.create(capacity, this->drain_task_->ring_storage.data());
         }
