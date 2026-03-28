@@ -53,17 +53,6 @@ static const uint16_t SENDSPIN_PORT = 8928;
 static const char* SENDSPIN_PATH = "/sendspin";
 
 // Big-endian helpers for binary visualizer data parsing
-static int64_t be64(const uint8_t* p) {
-    return static_cast<int64_t>(p[0]) << 56 | static_cast<int64_t>(p[1]) << 48 |
-           static_cast<int64_t>(p[2]) << 40 | static_cast<int64_t>(p[3]) << 32 |
-           static_cast<int64_t>(p[4]) << 24 | static_cast<int64_t>(p[5]) << 16 |
-           static_cast<int64_t>(p[6]) << 8 | static_cast<int64_t>(p[7]);
-}
-
-static uint16_t be16(const uint8_t* p) {
-    return static_cast<uint16_t>(p[0]) << 8 | static_cast<uint16_t>(p[1]);
-}
-
 static int64_t now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -573,22 +562,16 @@ int main(int argc, char* argv[]) {
         vis_role->on_visualizer_stream_start = [&state](const ServerVisualizerStreamObject& vis_stream) {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.visualizer_active = true;
-            state.vis_active_types = vis_stream.types;
             if (vis_stream.spectrum.has_value()) {
-                state.vis_stream_bin_count = vis_stream.spectrum->n_disp_bins;
                 state.vis_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0);
                 state.vis_display_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0.0f);
             }
             state.vis_display_loudness = 0.0f;
-            state.vis_frames.clear();
-            state.vis_beat_times.clear();
         };
 
         vis_role->on_visualizer_stream_end = [&state]() {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.visualizer_active = false;
-            state.vis_frames.clear();
-            state.vis_beat_times.clear();
             state.vis_loudness = 0;
             state.vis_peak_freq = 0;
             std::fill(state.vis_spectrum.begin(), state.vis_spectrum.end(), uint16_t{0});
@@ -599,8 +582,6 @@ int main(int argc, char* argv[]) {
 
         vis_role->on_visualizer_stream_clear = [&state]() {
             std::lock_guard<std::mutex> lock(state.mutex);
-            state.vis_frames.clear();
-            state.vis_beat_times.clear();
             state.vis_loudness = 0;
             state.vis_peak_freq = 0;
             std::fill(state.vis_spectrum.begin(), state.vis_spectrum.end(), uint16_t{0});
@@ -609,74 +590,24 @@ int main(int argc, char* argv[]) {
             state.vis_beat = false;
         };
 
-        vis_role->on_visualizer_data = [&state](const uint8_t* data, size_t len) {
-            // Binary format: [type=16][num_frames][per-frame data...]
-            if (len < 2) return;
-            // byte 0 is type (16), byte 1 is num_frames
-            uint8_t num_frames = data[1];
-            size_t offset = 2;
-
+        vis_role->on_visualizer_frame = [&state](const VisualizerFrame& frame) {
             std::lock_guard<std::mutex> lock(state.mutex);
-
-            bool has_loudness = false;
-            bool has_f_peak = false;
-            bool has_spectrum = false;
-            for (auto t : state.vis_active_types) {
-                if (t == VisualizerDataType::LOUDNESS) has_loudness = true;
-                if (t == VisualizerDataType::F_PEAK) has_f_peak = true;
-                if (t == VisualizerDataType::SPECTRUM) has_spectrum = true;
+            if (frame.loudness.has_value()) {
+                state.vis_loudness = *frame.loudness;
             }
-            uint8_t bin_count = state.vis_stream_bin_count;
-
-            for (uint8_t i = 0; i < num_frames; ++i) {
-                if (offset + 8 > len) break;
-                VisFrame frame;
-                frame.server_time = be64(data + offset);
-                offset += 8;
-
-                if (has_loudness) {
-                    if (offset + 2 > len) break;
-                    frame.loudness = be16(data + offset);
-                    offset += 2;
-                }
-                if (has_f_peak) {
-                    if (offset + 2 > len) break;
-                    frame.peak_freq = be16(data + offset);
-                    offset += 2;
-                }
-                if (has_spectrum) {
-                    frame.spectrum.resize(bin_count);
-                    for (uint8_t b = 0; b < bin_count; ++b) {
-                        if (offset + 2 > len) break;
-                        frame.spectrum[b] = be16(data + offset);
-                        offset += 2;
-                    }
-                }
-
-                state.vis_frames.push_back(std::move(frame));
-                // Cap buffer size to avoid unbounded growth
-                if (state.vis_frames.size() > 512) {
-                    state.vis_frames.pop_front();
-                }
+            if (frame.peak_freq.has_value()) {
+                state.vis_peak_freq = *frame.peak_freq;
+            }
+            if (!frame.spectrum.empty()) {
+                state.vis_spectrum = frame.spectrum;
             }
         };
 
-        vis_role->on_beat_data = [&state](const uint8_t* data, size_t len) {
-            // Binary format: [type=17][num_beats][per-beat: 8 bytes timestamp]
-            if (len < 2) return;
-            uint8_t num_beats = data[1];
-            size_t offset = 2;
-
+        vis_role->on_beat = [&state](int64_t /*client_timestamp*/) {
             std::lock_guard<std::mutex> lock(state.mutex);
-            for (uint8_t i = 0; i < num_beats; ++i) {
-                if (offset + 8 > len) break;
-                int64_t server_time = be64(data + offset);
-                offset += 8;
-                state.vis_beat_times.push_back(server_time);
-                if (state.vis_beat_times.size() > 128) {
-                    state.vis_beat_times.pop_front();
-                }
-            }
+            int64_t current_us = now_us();
+            state.vis_beat = true;
+            state.vis_beat_expire_us = current_us + 100000;  // 100ms flash
         };
     }
 
@@ -711,31 +642,10 @@ int main(int argc, char* argv[]) {
         while (running.load()) {
             client.loop();
 
-            // Process visualizer frames every tick (10ms) for smooth display
+            // Smooth visualizer display values every tick (10ms)
             {
                 int64_t current_us = now_us();
                 std::lock_guard<std::mutex> lock(state.mutex);
-
-                // Process visualizer data frames
-                while (!state.vis_frames.empty()) {
-                    auto& frame = state.vis_frames.front();
-                    int64_t display_time = client.get_client_time(frame.server_time);
-                    if (display_time == 0) {
-                        // Time sync not ready, discard
-                        state.vis_frames.pop_front();
-                        continue;
-                    }
-                    if (display_time > current_us) {
-                        break;  // Not time yet
-                    }
-                    // Apply this frame to target state
-                    state.vis_loudness = frame.loudness;
-                    state.vis_peak_freq = frame.peak_freq;
-                    if (!frame.spectrum.empty()) {
-                        state.vis_spectrum = frame.spectrum;
-                    }
-                    state.vis_frames.pop_front();
-                }
 
                 // Smooth decay: display values chase target values each tick.
                 // Rise fast (attack ~30ms), fall slow (decay ~200ms).
@@ -770,22 +680,6 @@ int main(int argc, char* argv[]) {
                     float current = state.vis_display_loudness;
                     float alpha = (target > current) ? ATTACK_ALPHA : DECAY_ALPHA;
                     state.vis_display_loudness = current + alpha * (target - current);
-                }
-
-                // Process beat timestamps
-                while (!state.vis_beat_times.empty()) {
-                    int64_t server_time = state.vis_beat_times.front();
-                    int64_t display_time = client.get_client_time(server_time);
-                    if (display_time == 0) {
-                        state.vis_beat_times.pop_front();
-                        continue;
-                    }
-                    if (display_time > current_us) {
-                        break;
-                    }
-                    state.vis_beat = true;
-                    state.vis_beat_expire_us = current_us + 100000;  // 100ms flash
-                    state.vis_beat_times.pop_front();
                 }
 
                 // Expire beat flash
