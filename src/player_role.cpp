@@ -281,8 +281,25 @@ void PlayerRole::handle_server_command(const ServerCommandMessage& cmd) {
     }
     this->event_state_->shadow_command.merge(
         [](ServerCommandMessage& current, ServerCommandMessage&& delta) {
-            if (delta.player.has_value()) {
+            if (!delta.player.has_value()) {
+                return;
+            }
+            if (!current.player.has_value()) {
                 current.player = std::move(delta.player);
+                return;
+            }
+            // Overlay individual optional fields so different command types
+            // don't clobber each other when merged between drain ticks
+            const auto& dp = delta.player.value();
+            auto& cp = current.player.value();
+            if (dp.volume.has_value()) {
+                cp.volume = dp.volume;
+            }
+            if (dp.mute.has_value()) {
+                cp.mute = dp.mute;
+            }
+            if (dp.static_delay_ms.has_value()) {
+                cp.static_delay_ms = dp.static_delay_ms;
             }
         },
         cmd);
@@ -302,28 +319,28 @@ void PlayerRole::drain_events() {
     }
 
     // --- Server command events (volume, mute, static delay) ---
+    // Check each field independently since multiple command types may have been
+    // merged into one shadow slot between drain ticks.
     ServerCommandMessage cmd_msg;
     if (this->event_state_->shadow_command.take(cmd_msg)) {
         if (cmd_msg.player.has_value()) {
             const ServerPlayerCommandObject& player_cmd = cmd_msg.player.value();
 
-            if (player_cmd.command == SendspinPlayerCommand::VOLUME &&
-                player_cmd.volume.has_value()) {
+            if (player_cmd.volume.has_value()) {
                 this->update_volume(player_cmd.volume.value());
                 if (this->on_volume_changed) {
                     this->on_volume_changed(player_cmd.volume.value());
                 }
             }
 
-            if (player_cmd.command == SendspinPlayerCommand::MUTE && player_cmd.mute.has_value()) {
+            if (player_cmd.mute.has_value()) {
                 this->update_muted(player_cmd.mute.value());
                 if (this->on_mute_changed) {
                     this->on_mute_changed(player_cmd.mute.value());
                 }
             }
 
-            if (player_cmd.command == SendspinPlayerCommand::SET_STATIC_DELAY &&
-                player_cmd.static_delay_ms.has_value()) {
+            if (player_cmd.static_delay_ms.has_value()) {
                 this->update_static_delay(player_cmd.static_delay_ms.value());
                 if (this->on_static_delay_changed) {
                     this->on_static_delay_changed(player_cmd.static_delay_ms.value());
