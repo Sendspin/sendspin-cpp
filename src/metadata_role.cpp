@@ -99,6 +99,7 @@ void MetadataRole::drain_events() {
 
 void MetadataRole::cleanup() {
     this->event_state_->shadow.reset();
+    this->metadata_ = {};
 }
 
 }  // namespace sendspin

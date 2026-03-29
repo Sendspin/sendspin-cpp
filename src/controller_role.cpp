@@ -60,6 +60,7 @@ void ControllerRole::drain_events() {
 
 void ControllerRole::cleanup() {
     this->event_state_->shadow.reset();
+    this->controller_state_ = {};
 }
 
 }  // namespace sendspin
