@@ -258,16 +258,6 @@ private:
         STREAM_CLEAR,
     };
 
-    struct StreamCallbackEvent {
-        explicit StreamCallbackEvent(StreamCallbackType t) : type(t) {}
-        StreamCallbackType type;
-        std::optional<ServerPlayerStreamObject> player_stream;
-    };
-
-    struct ServerCommandEvent {
-        ServerCommandMessage command;
-    };
-
     // --- Private integration methods ---
 
     void attach(ClientBridge* bridge);
@@ -279,8 +269,7 @@ private:
     void handle_stream_end();
     void handle_stream_clear();
     void handle_server_command(const ServerCommandMessage& cmd);
-    void drain_events(std::vector<StreamCallbackEvent>& stream_events,
-                      std::vector<ServerCommandEvent>& command_events);
+    void drain_events();
     void cleanup();
 
     // --- Helpers ---
@@ -312,15 +301,14 @@ private:
 
     std::unique_ptr<SyncTask> sync_task_;
 
-    // --- Deferred event queues ---
+    // --- Event state (PIMPL — hides platform queue/shadow headers) ---
 
-    std::vector<StreamCallbackEvent> pending_stream_callback_events_;
-    std::vector<ServerCommandEvent> pending_command_events_;
-    std::vector<SendspinClientState> pending_state_events_;
+    struct EventState;
+    std::unique_ptr<EventState> event_state_;
 
     // --- Stream end/clear callbacks waiting for sync task to go idle (main thread only) ---
 
-    std::vector<StreamCallbackEvent> awaiting_sync_idle_events_;
+    std::vector<StreamCallbackType> awaiting_sync_idle_events_;
 };
 
 }  // namespace sendspin

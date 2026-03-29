@@ -19,6 +19,8 @@
 #include "connection_manager.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
+#include "platform/shadow_slot.h"
+#include "platform/thread_safe_queue.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
 #include "time_burst.h"
@@ -30,6 +32,11 @@
 static const char* const TAG = "sendspin.client";
 
 namespace sendspin {
+
+struct SendspinClient::EventState {
+    ThreadSafeQueue<TimeResponseEvent> time_queue;
+    ShadowSlot<GroupUpdateObject> shadow_group;
+};
 
 // --- Constructor / Destructor ---
 
@@ -54,7 +61,10 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
               return this->is_network_ready && this->is_network_ready();
           },
       })),
-      time_burst_(std::make_unique<SendspinTimeBurst>()) {}
+      time_burst_(std::make_unique<SendspinTimeBurst>()),
+      event_state_(std::make_unique<EventState>()) {
+    this->event_state_->time_queue.create(16);
+}
 
 SendspinClient::~SendspinClient() {
     // Stop background threads before tearing down connections.
@@ -83,6 +93,7 @@ ClientBridge* SendspinClient::make_bridge_() {
         .is_time_synced = [this]() { return this->is_time_synced(); },
         .publish_state =
             [this]() { this->publish_client_state_(this->connection_manager_->current()); },
+        .update_state = [this](SendspinClientState state) { this->update_state(state); },
         .send_text =
             [this](const std::string& text) {
                 auto* conn = this->connection_manager_->current();
@@ -102,7 +113,6 @@ ClientBridge* SendspinClient::make_bridge_() {
                     this->on_release_high_performance();
                 }
             },
-        .event_mutex = this->event_mutex_,
     });
     return this->bridge_.get();
 }
@@ -215,101 +225,50 @@ void SendspinClient::loop() {
 
     // Process deferred events -- all state mutations and user callbacks happen here,
     // on the main loop thread, to avoid cross-thread data races.
+    // Each role drains its own queues/shadows internally.
+
+    // --- Time sync events ---
     {
-        std::vector<TimeResponseEvent> time_events;
-        std::vector<GroupUpdateObject> group_events;
-
-        // Player event vectors
-        std::vector<PlayerRole::StreamCallbackEvent> player_stream_events;
-        std::vector<PlayerRole::ServerCommandEvent> player_command_events;
-        std::vector<SendspinClientState> player_state_events;
-
-        // Controller event vectors
-        std::vector<ServerStateControllerObject> controller_state_events;
-
-        // Metadata event vectors
-        std::vector<ServerMetadataStateObject> metadata_events;
-
-        // Artwork event vectors
-        std::vector<bool> artwork_stream_end_events;
-
-        // Visualizer event vectors
-        std::vector<VisualizerRole::Event> visualizer_events;
-
-        {
-            std::lock_guard<std::mutex> lock(this->event_mutex_);
-            time_events.swap(this->pending_time_events_);
-            group_events.swap(this->pending_group_events_);
-
-            if (this->player_) {
-                player_stream_events.swap(this->player_->pending_stream_callback_events_);
-                player_command_events.swap(this->player_->pending_command_events_);
-                player_state_events.swap(this->player_->pending_state_events_);
-            }
-            if (this->controller_) {
-                controller_state_events.swap(this->controller_->pending_controller_state_events_);
-            }
-            if (this->metadata_) {
-                metadata_events.swap(this->metadata_->pending_metadata_events_);
-            }
-            if (this->artwork_) {
-                artwork_stream_end_events.swap(this->artwork_->pending_stream_end_);
-            }
-            if (this->visualizer_) {
-                visualizer_events.swap(this->visualizer_->pending_events_);
-            }
-        }
-
-        // --- Client state events (deferred from sync task thread) ---
-        if (this->player_ && !player_state_events.empty()) {
-            this->update_state(player_state_events.back());
-        }
-
-        // --- Time sync events ---
-        for (const auto& event : time_events) {
+        TimeResponseEvent time_event;
+        while (this->event_state_->time_queue.receive(time_event, 0)) {
             auto* current = this->connection_manager_->current();
             if (current != nullptr) {
-                this->time_burst_->on_time_response(current, event.offset, event.max_error,
-                                                    event.timestamp);
+                this->time_burst_->on_time_response(current, time_event.offset,
+                                                    time_event.max_error, time_event.timestamp);
             }
         }
+    }
 
-        // --- Controller events ---
-        if (this->controller_) {
-            this->controller_->drain_events(controller_state_events);
-        }
+    // --- Role events (each role handles its own synchronization) ---
+    if (this->player_) {
+        this->player_->drain_events();
+    }
+    if (this->controller_) {
+        this->controller_->drain_events();
+    }
+    if (this->metadata_) {
+        this->metadata_->drain_events();
+    }
+    if (this->artwork_) {
+        this->artwork_->drain_events();
+    }
+    if (this->visualizer_) {
+        this->visualizer_->drain_events();
+    }
 
-        // --- Player events ---
-        if (this->player_) {
-            this->player_->drain_events(player_stream_events, player_command_events);
-        }
-
-        // --- Metadata events ---
-        if (this->metadata_) {
-            this->metadata_->drain_events(metadata_events);
-        }
-
-        // --- Artwork events ---
-        if (this->artwork_) {
-            this->artwork_->drain_events(artwork_stream_end_events);
-        }
-
-        // --- Visualizer events ---
-        if (this->visualizer_) {
-            this->visualizer_->drain_events(visualizer_events);
-        }
-
-        // --- Group update events ---
-        for (const auto& group_update : group_events) {
-            apply_group_update_deltas(&this->group_state_, group_update);
+    // --- Group update events ---
+    {
+        GroupUpdateObject group_delta;
+        if (this->event_state_->shadow_group.take(group_delta)) {
+            apply_group_update_deltas(&this->group_state_, group_delta);
 
             if (this->on_group_update) {
-                this->on_group_update(group_update);
+                this->on_group_update(group_delta);
             }
 
             // Persist last played server when playback starts
-            if (group_update.playback_state.has_value() &&
-                group_update.playback_state.value() == SendspinPlaybackState::PLAYING) {
+            if (group_delta.playback_state.has_value() &&
+                group_delta.playback_state.value() == SendspinPlaybackState::PLAYING) {
                 auto* current = this->connection_manager_->current();
                 if (current != nullptr) {
                     const std::string& server_id = current->get_server_id();
@@ -395,6 +354,10 @@ std::string SendspinClient::build_hello_message_() {
 
 void SendspinClient::cleanup_connection_state_() {
     SS_LOGV(TAG, "Cleaning up connection state");
+
+    // Reset client event state
+    this->event_state_->time_queue.reset();
+    this->event_state_->shadow_group.reset();
 
     if (this->player_) {
         this->player_->cleanup();
@@ -589,8 +552,7 @@ bool SendspinClient::process_json_message_(SendspinConnection* conn, const std::
             int64_t max_error;
             if (process_server_time_message(root, timestamp, conn->peek_time_replacement(), &offset,
                                             &max_error)) {
-                std::lock_guard<std::mutex> lock(this->event_mutex_);
-                this->pending_time_events_.push_back({offset, max_error, timestamp});
+                this->event_state_->time_queue.send({offset, max_error, timestamp}, 0);
             }
             break;
         }
@@ -619,8 +581,11 @@ bool SendspinClient::process_json_message_(SendspinConnection* conn, const std::
         case SendspinServerToClientMessageType::GROUP_UPDATE: {
             GroupUpdateMessage group_msg;
             if (process_group_update_message(root, &group_msg)) {
-                std::lock_guard<std::mutex> lock(this->event_mutex_);
-                this->pending_group_events_.push_back(group_msg.group);
+                this->event_state_->shadow_group.merge(
+                    [](GroupUpdateObject& current, GroupUpdateObject&& delta) {
+                        apply_group_update_deltas(&current, delta);
+                    },
+                    std::move(group_msg.group));
             }
             break;
         }

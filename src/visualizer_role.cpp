@@ -18,13 +18,14 @@
 #include "platform/event_flags.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
+#include "platform/shadow_slot.h"
 #include "platform/spsc_ring_buffer.h"
 #include "platform/thread.h"
+#include "platform/thread_safe_queue.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
 
 #include <cstring>
-#include <mutex>
 #include <thread>
 
 static const char* const TAG = "sendspin.visualizer";
@@ -76,9 +77,17 @@ struct VisualizerRole::DrainTask {
     std::thread drain_thread;
 };
 
+struct VisualizerRole::EventState {
+    ThreadSafeQueue<VisualizerRole::EventType> queue;
+    ShadowSlot<ServerVisualizerStreamObject> shadow_config;
+};
+
 // --- Lifecycle ---
 
-VisualizerRole::VisualizerRole(Config config) : visualizer_support_(std::move(config.support)) {
+VisualizerRole::VisualizerRole(Config config)
+    : visualizer_support_(std::move(config.support)), event_state_(std::make_unique<EventState>()) {
+    this->event_state_->queue.create(8);
+
     if (this->visualizer_support_.has_value()) {
         this->drain_task_ = std::make_unique<DrainTask>();
 
@@ -197,8 +206,6 @@ void VisualizerRole::handle_binary(uint8_t binary_type, const uint8_t* data, siz
 // --- Stream lifecycle (network thread) ---
 
 void VisualizerRole::handle_stream_start(const ServerVisualizerStreamObject& stream) {
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-
     // Cache stream config for handle_binary (same thread)
     this->has_loudness_ = false;
     this->has_f_peak_ = false;
@@ -226,11 +233,9 @@ void VisualizerRole::handle_stream_start(const ServerVisualizerStreamObject& str
         this->drain_task_->event_flags.set(COMMAND_FLUSH);
     }
 
-    // Enqueue lifecycle event for main-thread delivery
-    Event event;
-    event.type = EventType::STREAM_START;
-    event.visualizer_stream = stream;
-    this->pending_events_.push_back(std::move(event));
+    // Shadow the config for main-thread callback, then signal
+    this->event_state_->shadow_config.write(stream);
+    this->event_state_->queue.send(EventType::STREAM_START, 0);
 }
 
 void VisualizerRole::handle_stream_end() {
@@ -240,10 +245,7 @@ void VisualizerRole::handle_stream_end() {
         this->drain_task_->event_flags.set(COMMAND_FLUSH);
     }
 
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-    Event event;
-    event.type = EventType::STREAM_END;
-    this->pending_events_.push_back(std::move(event));
+    this->event_state_->queue.send(EventType::STREAM_END, 0);
 }
 
 void VisualizerRole::handle_stream_clear() {
@@ -253,22 +255,23 @@ void VisualizerRole::handle_stream_clear() {
         this->drain_task_->event_flags.set(COMMAND_FLUSH);
     }
 
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-    Event event;
-    event.type = EventType::STREAM_CLEAR;
-    this->pending_events_.push_back(std::move(event));
+    this->event_state_->queue.send(EventType::STREAM_CLEAR, 0);
 }
 
 // --- Event draining (main thread) — lifecycle events only ---
 
-void VisualizerRole::drain_events(std::vector<Event>& events) {
-    for (auto& event : events) {
-        switch (event.type) {
-            case EventType::STREAM_START:
-                if (event.visualizer_stream.has_value() && this->on_visualizer_stream_start) {
-                    this->on_visualizer_stream_start(event.visualizer_stream.value());
+void VisualizerRole::drain_events() {
+    EventType event_type;
+    while (this->event_state_->queue.receive(event_type, 0)) {
+        switch (event_type) {
+            case EventType::STREAM_START: {
+                ServerVisualizerStreamObject config;
+                if (this->event_state_->shadow_config.take(config) &&
+                    this->on_visualizer_stream_start) {
+                    this->on_visualizer_stream_start(config);
                 }
                 break;
+            }
             case EventType::STREAM_END:
                 if (this->on_visualizer_stream_end) {
                     this->on_visualizer_stream_end();
@@ -292,12 +295,9 @@ void VisualizerRole::cleanup() {
         this->drain_task_->event_flags.set(COMMAND_FLUSH);
     }
 
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-    this->pending_events_.clear();
-
-    Event event;
-    event.type = EventType::STREAM_END;
-    this->pending_events_.push_back(std::move(event));
+    this->event_state_->queue.reset();
+    this->event_state_->shadow_config.reset();
+    this->event_state_->queue.send(EventType::STREAM_END, 0);
 }
 
 // --- Drain thread ---

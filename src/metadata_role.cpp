@@ -15,13 +15,21 @@
 #include "sendspin/metadata_role.h"
 
 #include "client_bridge.h"
+#include "platform/shadow_slot.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
 
 #include <algorithm>
-#include <mutex>
 
 namespace sendspin {
+
+struct MetadataRole::EventState {
+    ShadowSlot<ServerMetadataStateObject> shadow;
+};
+
+MetadataRole::MetadataRole() : event_state_(std::make_unique<EventState>()) {}
+
+MetadataRole::~MetadataRole() = default;
 
 void MetadataRole::attach(ClientBridge* bridge) {
     this->bridge_ = bridge;
@@ -32,8 +40,11 @@ void MetadataRole::contribute_hello(ClientHelloMessage& msg) {
 }
 
 void MetadataRole::handle_server_state(ServerMetadataStateObject state) {
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-    this->pending_metadata_events_.push_back(std::move(state));
+    this->event_state_->shadow.merge(
+        [](ServerMetadataStateObject& current, ServerMetadataStateObject&& delta) {
+            apply_metadata_state_deltas(&current, delta);
+        },
+        std::move(state));
 }
 
 uint32_t MetadataRole::get_track_progress_ms() const {
@@ -76,9 +87,10 @@ uint32_t MetadataRole::get_track_duration_ms() const {
     return this->metadata_.progress.value().track_duration;
 }
 
-void MetadataRole::drain_events(std::vector<ServerMetadataStateObject>& events) {
-    for (const auto& metadata_update : events) {
-        apply_metadata_state_deltas(&this->metadata_, metadata_update);
+void MetadataRole::drain_events() {
+    ServerMetadataStateObject delta;
+    if (this->event_state_->shadow.take(delta)) {
+        apply_metadata_state_deltas(&this->metadata_, delta);
         if (this->on_metadata) {
             this->on_metadata(this->metadata_);
         }
@@ -86,10 +98,7 @@ void MetadataRole::drain_events(std::vector<ServerMetadataStateObject>& events) 
 }
 
 void MetadataRole::cleanup() {
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-
-    // Discard stale events from the dead connection
-    this->pending_metadata_events_.clear();
+    this->event_state_->shadow.reset();
 }
 
 }  // namespace sendspin

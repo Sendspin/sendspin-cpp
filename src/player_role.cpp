@@ -17,11 +17,11 @@
 #include "client_bridge.h"
 #include "platform/base64.h"
 #include "platform/logging.h"
+#include "platform/shadow_slot.h"
+#include "platform/thread_safe_queue.h"
 #include "protocol_messages.h"
 #include "sync_task.h"
 #include "sync_time_provider.h"
-
-#include <mutex>
 
 static const char* const TAG = "sendspin.player";
 
@@ -59,10 +59,24 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
     return output;
 }
 
+// --- Event state (PIMPL) ---
+
+struct PlayerRole::EventState {
+    ThreadSafeQueue<PlayerRole::StreamCallbackType> stream_queue;
+    ThreadSafeQueue<SendspinClientState> state_queue;
+    ShadowSlot<ServerPlayerStreamObject> shadow_stream_params;
+    ShadowSlot<ServerCommandMessage> shadow_command;
+};
+
 // --- Constructor / Destructor ---
 
 PlayerRole::PlayerRole(Config config)
-    : config_(std::move(config)), sync_task_(std::make_unique<SyncTask>()) {}
+    : config_(std::move(config)),
+      sync_task_(std::make_unique<SyncTask>()),
+      event_state_(std::make_unique<EventState>()) {
+    this->event_state_->stream_queue.create(8);
+    this->event_state_->state_queue.create(4);
+}
 
 PlayerRole::~PlayerRole() {
     // Stop the sync task thread first, before destroying other members.
@@ -190,9 +204,7 @@ void PlayerRole::handle_binary(const uint8_t* data, size_t len) {
 void PlayerRole::handle_stream_start(const StreamStartMessage& stream_msg) {
     if (this->config_.audio_formats.empty()) {
         // No audio formats, just defer stream start callback
-        std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-        this->pending_stream_callback_events_.push_back(
-            StreamCallbackEvent{StreamCallbackType::STREAM_START});
+        this->event_state_->stream_queue.send(StreamCallbackType::STREAM_START, 0);
         return;
     }
 
@@ -239,41 +251,27 @@ void PlayerRole::handle_stream_start(const StreamStartMessage& stream_msg) {
         if (!header_sent) {
             SS_LOGE(TAG, "Failed to send codec header");
             this->sync_task_->signal_stream_end();
-            std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-            this->pending_stream_callback_events_.push_back(
-                StreamCallbackEvent{StreamCallbackType::STREAM_END});
+            this->event_state_->stream_queue.send(StreamCallbackType::STREAM_END, 0);
             return;
         }
 
-        // Defer stream params update and callback to loop()
-        {
-            std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-            StreamCallbackEvent event{StreamCallbackType::STREAM_START};
-            event.player_stream = player_obj;
-            this->pending_stream_callback_events_.push_back(std::move(event));
-        }
+        // Shadow stream params for main thread, then signal
+        this->event_state_->shadow_stream_params.write(player_obj);
+        this->event_state_->stream_queue.send(StreamCallbackType::STREAM_START, 0);
     } else {
         // No player in stream start -- sync task is already running (idle)
-        {
-            std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-            this->pending_stream_callback_events_.push_back(
-                StreamCallbackEvent{StreamCallbackType::STREAM_START});
-        }
+        this->event_state_->stream_queue.send(StreamCallbackType::STREAM_START, 0);
     }
 }
 
 void PlayerRole::handle_stream_end() {
     this->sync_task_->signal_stream_end();
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-    this->pending_stream_callback_events_.push_back(
-        StreamCallbackEvent{StreamCallbackType::STREAM_END});
+    this->event_state_->stream_queue.send(StreamCallbackType::STREAM_END, 0);
 }
 
 void PlayerRole::handle_stream_clear() {
     this->sync_task_->signal_stream_clear();
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-    this->pending_stream_callback_events_.push_back(
-        StreamCallbackEvent{StreamCallbackType::STREAM_CLEAR});
+    this->event_state_->stream_queue.send(StreamCallbackType::STREAM_CLEAR, 0);
 }
 
 void PlayerRole::handle_server_command(const ServerCommandMessage& cmd) {
@@ -281,47 +279,63 @@ void PlayerRole::handle_server_command(const ServerCommandMessage& cmd) {
         SS_LOGV(TAG, "Server command has no player commands");
         return;
     }
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-    this->pending_command_events_.push_back({cmd});
+    this->event_state_->shadow_command.merge(
+        [](ServerCommandMessage& current, ServerCommandMessage&& delta) {
+            if (delta.player.has_value()) {
+                current.player = std::move(delta.player);
+            }
+        },
+        cmd);
 }
 
-void PlayerRole::drain_events(std::vector<StreamCallbackEvent>& stream_events,
-                              std::vector<ServerCommandEvent>& command_events) {
+void PlayerRole::drain_events() {
+    // --- Client state events (from sync task) ---
+    SendspinClientState state;
+    SendspinClientState last_state{};
+    bool has_state = false;
+    while (this->event_state_->state_queue.receive(state, 0)) {
+        last_state = state;
+        has_state = true;
+    }
+    if (has_state && this->bridge_) {
+        this->bridge_->update_state(last_state);
+    }
+
     // --- Server command events (volume, mute, static delay) ---
-    for (const auto& cmd_event : command_events) {
-        const auto& cmd_msg = cmd_event.command;
-        if (!cmd_msg.player.has_value()) {
-            continue;
-        }
+    ServerCommandMessage cmd_msg;
+    if (this->event_state_->shadow_command.take(cmd_msg)) {
+        if (cmd_msg.player.has_value()) {
+            const ServerPlayerCommandObject& player_cmd = cmd_msg.player.value();
 
-        const ServerPlayerCommandObject& player_cmd = cmd_msg.player.value();
-
-        if (player_cmd.command == SendspinPlayerCommand::VOLUME && player_cmd.volume.has_value()) {
-            this->update_volume(player_cmd.volume.value());
-            if (this->on_volume_changed) {
-                this->on_volume_changed(player_cmd.volume.value());
+            if (player_cmd.command == SendspinPlayerCommand::VOLUME &&
+                player_cmd.volume.has_value()) {
+                this->update_volume(player_cmd.volume.value());
+                if (this->on_volume_changed) {
+                    this->on_volume_changed(player_cmd.volume.value());
+                }
             }
-        }
 
-        if (player_cmd.command == SendspinPlayerCommand::MUTE && player_cmd.mute.has_value()) {
-            this->update_muted(player_cmd.mute.value());
-            if (this->on_mute_changed) {
-                this->on_mute_changed(player_cmd.mute.value());
+            if (player_cmd.command == SendspinPlayerCommand::MUTE && player_cmd.mute.has_value()) {
+                this->update_muted(player_cmd.mute.value());
+                if (this->on_mute_changed) {
+                    this->on_mute_changed(player_cmd.mute.value());
+                }
             }
-        }
 
-        if (player_cmd.command == SendspinPlayerCommand::SET_STATIC_DELAY &&
-            player_cmd.static_delay_ms.has_value()) {
-            this->update_static_delay(player_cmd.static_delay_ms.value());
-            if (this->on_static_delay_changed) {
-                this->on_static_delay_changed(player_cmd.static_delay_ms.value());
+            if (player_cmd.command == SendspinPlayerCommand::SET_STATIC_DELAY &&
+                player_cmd.static_delay_ms.has_value()) {
+                this->update_static_delay(player_cmd.static_delay_ms.value());
+                if (this->on_static_delay_changed) {
+                    this->on_static_delay_changed(player_cmd.static_delay_ms.value());
+                }
             }
         }
     }
 
     // --- Stream lifecycle callback events ---
-    for (auto& stream_event : stream_events) {
-        this->awaiting_sync_idle_events_.push_back(std::move(stream_event));
+    StreamCallbackType stream_event;
+    while (this->event_state_->stream_queue.receive(stream_event, 0)) {
+        this->awaiting_sync_idle_events_.push_back(stream_event);
     }
 
     // --- Process awaiting sync idle events ---
@@ -330,13 +344,13 @@ void PlayerRole::drain_events(std::vector<StreamCallbackEvent>& stream_events,
         size_t processed = 0;
 
         for (auto& event : this->awaiting_sync_idle_events_) {
-            if ((event.type == StreamCallbackType::STREAM_END ||
-                 event.type == StreamCallbackType::STREAM_CLEAR) &&
+            if ((event == StreamCallbackType::STREAM_END ||
+                 event == StreamCallbackType::STREAM_CLEAR) &&
                 !sync_idle) {
                 break;  // Wait for sync task to go idle before firing this and anything after it
             }
 
-            switch (event.type) {
+            switch (event) {
                 case StreamCallbackType::STREAM_END:
                     if (this->on_stream_end) {
                         this->on_stream_end();
@@ -351,15 +365,17 @@ void PlayerRole::drain_events(std::vector<StreamCallbackEvent>& stream_events,
                         this->on_stream_clear();
                     }
                     break;
-                case StreamCallbackType::STREAM_START:
-                    if (event.player_stream.has_value()) {
-                        this->current_stream_params_ = std::move(event.player_stream.value());
+                case StreamCallbackType::STREAM_START: {
+                    ServerPlayerStreamObject stream_params;
+                    if (this->event_state_->shadow_stream_params.take(stream_params)) {
+                        this->current_stream_params_ = std::move(stream_params);
                     }
                     if (this->on_stream_start) {
                         this->on_stream_start();
                     }
                     this->sync_task_->signal_stream_start();
                     break;
+                }
             }
             ++processed;
         }
@@ -376,18 +392,14 @@ void PlayerRole::cleanup() {
     // Clear all buffered audio immediately
     this->sync_task_->signal_stream_clear();
 
-    {
-        std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
+    // Discard stale events from the dead connection
+    this->event_state_->stream_queue.reset();
+    this->event_state_->state_queue.reset();
+    this->event_state_->shadow_stream_params.reset();
+    this->event_state_->shadow_command.reset();
 
-        // Discard stale events from the dead connection
-        this->pending_stream_callback_events_.clear();
-        this->pending_command_events_.clear();
-        this->pending_state_events_.clear();
-
-        // Enqueue a clean STREAM_END — drain_events() will fire the callback
-        this->pending_stream_callback_events_.push_back(
-            StreamCallbackEvent{StreamCallbackType::STREAM_END});
-    }
+    // Enqueue a clean STREAM_END — drain_events() will fire the callback
+    this->event_state_->stream_queue.send(StreamCallbackType::STREAM_END, 0);
 
     // Clear awaiting events too (main-thread only, no mutex needed)
     this->awaiting_sync_idle_events_.clear();
@@ -418,10 +430,7 @@ SyncTimeProvider PlayerRole::make_sync_time_provider_() {
         .get_static_delay_ms = [this]() { return this->get_static_delay_ms(); },
         .get_fixed_delay_us = [this]() { return this->get_fixed_delay_us(); },
         .update_state =
-            [this](SendspinClientState state) {
-                std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-                this->pending_state_events_.push_back(state);
-            },
+            [this](SendspinClientState state) { this->event_state_->state_queue.send(state, 0); },
     };
 }
 

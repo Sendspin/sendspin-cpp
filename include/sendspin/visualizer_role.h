@@ -147,12 +147,6 @@ private:
         STREAM_CLEAR,
     };
 
-    /// @brief Deferred visualizer event.
-    struct Event {
-        EventType type;
-        std::optional<ServerVisualizerStreamObject> visualizer_stream;
-    };
-
     void attach(ClientBridge* bridge);
     bool start();
     void stop_();
@@ -161,7 +155,7 @@ private:
     void handle_stream_start(const ServerVisualizerStreamObject& stream);
     void handle_stream_end();
     void handle_stream_clear();
-    void drain_events(std::vector<Event>& events);
+    void drain_events();
     void cleanup();
     void flush_ring_buffer_();
 
@@ -169,7 +163,9 @@ private:
 
     ClientBridge* bridge_{nullptr};
     std::optional<VisualizerSupportObject> visualizer_support_;
-    std::vector<Event> pending_events_;
+
+    struct EventState;
+    std::unique_ptr<EventState> event_state_;
 
     // Drain task (pimpl to avoid exposing platform headers)
     struct DrainTask;

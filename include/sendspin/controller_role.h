@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -127,7 +128,8 @@ class ControllerRole {
     friend class SendspinClient;
 
 public:
-    ControllerRole() = default;
+    ControllerRole();
+    ~ControllerRole();
 
     /// @brief Sends a controller command to the server.
     void send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume = {},
@@ -145,12 +147,14 @@ private:
     void attach(ClientBridge* bridge);
     void contribute_hello(ClientHelloMessage& msg);
     void handle_server_state(ServerStateControllerObject state);
-    void drain_events(std::vector<ServerStateControllerObject>& events);
+    void drain_events();
     void cleanup();
 
     ClientBridge* bridge_{nullptr};
     ServerStateControllerObject controller_state_{};
-    std::vector<ServerStateControllerObject> pending_controller_state_events_;
+
+    struct EventState;
+    std::unique_ptr<EventState> event_state_;
 };
 
 }  // namespace sendspin

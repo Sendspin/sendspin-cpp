@@ -16,9 +16,9 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
-#include <vector>
 
 namespace sendspin {
 
@@ -84,7 +84,8 @@ class MetadataRole {
     friend class SendspinClient;
 
 public:
-    MetadataRole() = default;
+    MetadataRole();
+    ~MetadataRole();
 
     /// @brief Returns the interpolated track progress in milliseconds.
     uint32_t get_track_progress_ms() const;
@@ -99,12 +100,14 @@ private:
     void attach(ClientBridge* bridge);
     void contribute_hello(ClientHelloMessage& msg);
     void handle_server_state(ServerMetadataStateObject state);
-    void drain_events(std::vector<ServerMetadataStateObject>& events);
+    void drain_events();
     void cleanup();
 
     ClientBridge* bridge_{nullptr};
     ServerMetadataStateObject metadata_{};
-    std::vector<ServerMetadataStateObject> pending_metadata_events_;
+
+    struct EventState;
+    std::unique_ptr<EventState> event_state_;
 };
 
 }  // namespace sendspin

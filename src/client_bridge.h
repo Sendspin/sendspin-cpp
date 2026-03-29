@@ -14,8 +14,9 @@
 
 #pragma once
 
+#include "sendspin/types.h"
+
 #include <functional>
-#include <mutex>
 #include <string>
 
 namespace sendspin {
@@ -25,10 +26,10 @@ struct ClientBridge {
     std::function<int64_t(int64_t)> get_client_time;
     std::function<bool()> is_time_synced;
     std::function<void()> publish_state;
+    std::function<void(SendspinClientState)> update_state;
     std::function<void(const std::string&)> send_text;
     std::function<void()> request_high_performance;
     std::function<void()> release_high_performance;
-    std::mutex& event_mutex;
 };
 
 }  // namespace sendspin

@@ -16,9 +16,8 @@
 
 #include "client_bridge.h"
 #include "platform/logging.h"
+#include "platform/thread_safe_queue.h"
 #include "protocol_messages.h"
-
-#include <mutex>
 
 static const char* const TAG = "sendspin.artwork";
 
@@ -35,6 +34,16 @@ static int64_t be64_to_host(const uint8_t* bytes) {
 }
 
 namespace sendspin {
+
+struct ArtworkRole::EventState {
+    ThreadSafeQueue<uint8_t> stream_end_queue;
+};
+
+ArtworkRole::ArtworkRole() : event_state_(std::make_unique<EventState>()) {
+    this->event_state_->stream_end_queue.create(4);
+}
+
+ArtworkRole::~ArtworkRole() = default;
 
 void ArtworkRole::attach(ClientBridge* bridge) {
     this->bridge_ = bridge;
@@ -80,12 +89,12 @@ void ArtworkRole::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
 }
 
 void ArtworkRole::handle_stream_end() {
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-    this->pending_stream_end_.push_back(true);
+    this->event_state_->stream_end_queue.send(1, 0);
 }
 
-void ArtworkRole::drain_events(std::vector<bool>& events) {
-    for (size_t i = 0; i < events.size(); ++i) {
+void ArtworkRole::drain_events() {
+    uint8_t dummy;
+    while (this->event_state_->stream_end_queue.receive(dummy, 0)) {
         if (this->on_image) {
             for (const auto& pref : this->preferred_image_formats_) {
                 this->on_image(pref.slot, nullptr, 0, pref.format, 0);
@@ -95,13 +104,10 @@ void ArtworkRole::drain_events(std::vector<bool>& events) {
 }
 
 void ArtworkRole::cleanup() {
-    std::lock_guard<std::mutex> lock(this->bridge_->event_mutex);
-
-    // Discard stale events from the dead connection
-    this->pending_stream_end_.clear();
+    this->event_state_->stream_end_queue.reset();
 
     // Enqueue a stream end so drain_events() sends null images to clear each slot
-    this->pending_stream_end_.push_back(true);
+    this->event_state_->stream_end_queue.send(1, 0);
 }
 
 }  // namespace sendspin

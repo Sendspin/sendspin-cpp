@@ -24,7 +24,6 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -265,11 +264,10 @@ protected:
     ServerInformationObject server_information_{};
     GroupUpdateObject group_state_{};
 
-    // --- Deferred event queues (thread-safe, processed in loop()) ---
+    // --- Deferred event state (PIMPL — hides platform queue/shadow headers) ---
 
-    std::mutex event_mutex_;
-    std::vector<TimeResponseEvent> pending_time_events_;
-    std::vector<GroupUpdateObject> pending_group_events_;
+    struct EventState;
+    std::unique_ptr<EventState> event_state_;
 
     // --- Roles ---
 

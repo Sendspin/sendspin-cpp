@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -136,7 +137,8 @@ class ArtworkRole {
     friend class SendspinClient;
 
 public:
-    ArtworkRole() = default;
+    ArtworkRole();
+    ~ArtworkRole();
 
     /// @brief Adds a preferred image format for an artwork slot.
     void add_image_preferred_format(const ImageSlotPreference& pref);
@@ -154,13 +156,15 @@ private:
     void contribute_hello(ClientHelloMessage& msg);
     void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
     void handle_stream_end();
-    void drain_events(std::vector<bool>& pending_stream_end);
+    void drain_events();
     void cleanup();
 
     ClientBridge* bridge_{nullptr};
     std::vector<ImageSlotPreference> preferred_image_formats_;
     std::vector<ArtworkChannelFormatObject> artwork_channels_;
-    std::vector<bool> pending_stream_end_;
+
+    struct EventState;
+    std::unique_ptr<EventState> event_state_;
 };
 
 }  // namespace sendspin
