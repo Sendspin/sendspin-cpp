@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -171,9 +172,9 @@ private:
     struct DrainTask;
     std::unique_ptr<DrainTask> drain_task_;
 
-    // Cached stream config (written and read only on network thread by
-    // handle_stream_start and handle_binary — no cross-thread access)
-    bool stream_active_{false};
+    // Cached stream config (network thread only, except stream_active_ which
+    // is also cleared by cleanup() on the main thread)
+    std::atomic<bool> stream_active_{false};
     bool has_loudness_{false};
     bool has_f_peak_{false};
     bool has_spectrum_{false};
