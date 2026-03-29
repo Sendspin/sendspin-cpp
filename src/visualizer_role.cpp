@@ -116,6 +116,9 @@ bool VisualizerRole::start() {
     if (this->drain_task_->drain_thread.joinable()) {
         return true;  // Already running
     }
+    if (!this->drain_task_->event_flags.is_created() && !this->drain_task_->event_flags.create()) {
+        return false;
+    }
 
     platform_configure_thread("SsVis", 4096, 2, false);
     this->drain_task_->drain_thread = std::thread(drain_thread_func_, this);
