@@ -149,6 +149,8 @@ public:
     }
 
     /// @brief Callback fired when an image is received (or cleared with nullptr data).
+    /// For received images, fires on the network thread — callback must be thread-safe.
+    /// For image clears (nullptr data), fires on the main loop thread.
     std::function<void(uint8_t, const uint8_t*, size_t, SendspinImageFormat, int64_t)> on_image;
 
 private:

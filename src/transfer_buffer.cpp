@@ -51,17 +51,12 @@ void TransferBuffer::increase_buffer_length(size_t bytes) {
     this->buffer_length_ += bytes;
 }
 
-size_t TransferBuffer::transfer_data_to_sink(uint32_t timeout_ms, bool post_shift) {
+size_t TransferBuffer::transfer_data_to_sink(uint32_t timeout_ms) {
     size_t bytes_written = 0;
     if (this->available() > 0 && this->audio_write_callback_) {
         bytes_written =
             this->audio_write_callback_(this->data_start_, this->available(), timeout_ms);
         this->decrease_buffer_length(bytes_written);
-    }
-
-    if (post_shift && this->buffer_length_ > 0) {
-        std::memmove(this->buffer_.data(), this->data_start_, this->buffer_length_);
-        this->data_start_ = this->buffer_.data();
     }
 
     return bytes_written;

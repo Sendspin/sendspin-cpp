@@ -51,9 +51,8 @@ public:
     /// @brief Writes buffered data to the sink.
     /// @param timeout_ms Milliseconds to block while waiting for the sink (UINT32_MAX = wait
     /// forever).
-    /// @param post_shift If true, shifts remaining data to the start of the buffer after transfer.
     /// @return Number of bytes written to the sink.
-    size_t transfer_data_to_sink(uint32_t timeout_ms, bool post_shift = true);
+    size_t transfer_data_to_sink(uint32_t timeout_ms);
 
     /// @brief Returns a pointer to the start of available data.
     uint8_t* get_buffer_start() const {

@@ -140,7 +140,8 @@ public:
         return this->controller_state_;
     }
 
-    /// @brief Callback fired when the server sends updated controller state.
+    /// @brief Callback fired when the server sends updated controller state. Fires on the main
+    /// loop thread.
     std::function<void(const ServerStateControllerObject&)> on_controller_state;
 
 private:

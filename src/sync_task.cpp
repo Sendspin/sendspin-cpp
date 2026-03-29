@@ -155,7 +155,7 @@ bool SyncTask::sync_transfer_audio_(SyncContext& sync_context) {
         decode_available + sync_context.interpolation_transfer_buffer->available());
 
     size_t bytes_written = sync_context.interpolation_transfer_buffer->transfer_data_to_sink(
-        duration_in_transfer_buffers / 2, false);
+        duration_in_transfer_buffers / 2);
     this->sync_track_sent_audio_(sync_context, bytes_written);
 
     if ((bytes_written > 0) && sync_context.initial_decode) {
@@ -167,8 +167,8 @@ bool SyncTask::sync_transfer_audio_(SyncContext& sync_context) {
     if (sync_context.interpolation_transfer_buffer->available() == 0 &&
         sync_context.release_chunk) {
         // No interpolation bytes available, send main audio data
-        size_t decode_bytes_written = sync_context.decode_buffer->transfer_data_to_sink(
-            3 * duration_in_transfer_buffers / 2, false);
+        size_t decode_bytes_written =
+            sync_context.decode_buffer->transfer_data_to_sink(3 * duration_in_transfer_buffers / 2);
         this->sync_track_sent_audio_(sync_context, decode_bytes_written);
     }
 
@@ -472,7 +472,7 @@ SyncTaskState SyncTask::sync_handle_initial_sync_(SyncContext& sync_context) {
         const uint32_t duration_in_transfer_buffers = sync_context.current_stream_info.bytes_to_ms(
             sync_context.interpolation_transfer_buffer->available());
         size_t bytes_written = sync_context.interpolation_transfer_buffer->transfer_data_to_sink(
-            duration_in_transfer_buffers / 2, false);
+            duration_in_transfer_buffers / 2);
         this->sync_track_sent_audio_(sync_context, bytes_written);
         if ((bytes_written > 0) && sync_context.initial_decode) {
             // Sent initial zeros, delay slightly to give it some time to work through the audio

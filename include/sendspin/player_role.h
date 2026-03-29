@@ -224,7 +224,7 @@ public:
     }
 
     /// @brief Returns a reference to the current stream parameters.
-    ServerPlayerStreamObject& get_current_stream_params() {
+    const ServerPlayerStreamObject& get_current_stream_params() const {
         return this->current_stream_params_;
     }
 
@@ -235,7 +235,7 @@ public:
     /// Must return the number of bytes actually written.
     std::function<size_t(uint8_t* data, size_t length, uint32_t timeout_ms)> on_audio_write;
 
-    // --- Callbacks ---
+    // --- Callbacks (all fire on the main loop thread) ---
 
     std::function<void()> on_stream_start;
     std::function<void()> on_stream_end;

@@ -93,7 +93,7 @@ public:
     /// @brief Returns the track duration in milliseconds. 0 means unknown/live.
     uint32_t get_track_duration_ms() const;
 
-    /// @brief Callback fired when metadata is updated.
+    /// @brief Callback fired when metadata is updated. Fires on the main loop thread.
     std::function<void(const ServerMetadataStateObject&)> on_metadata;
 
 private:
