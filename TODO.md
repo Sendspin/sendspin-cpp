@@ -2,8 +2,9 @@
 
 ## Improvements
 
-- [ ] Redesign queued events in the loop function to be more embedded friendly
+- [x] Redesign queued events in the loop function to be more embedded friendly
 - [ ] Standardize the API
+- [ ] Ensure connection is fully torn down (no more callbacks) before cleanup runs to prevent stale events from a dead connection sneaking into role queues
 
 ## Known Issues
 
