@@ -185,33 +185,53 @@ public:
 
     // --- Role access (nullptr if not added) ---
 
+    /// @brief Returns the player role, or nullptr if not added.
+    /// @return Pointer to the player role, or nullptr.
     PlayerRole* player() {
         return this->player_.get();
     }
+    /// @brief Returns the player role (const), or nullptr if not added.
+    /// @return Const pointer to the player role, or nullptr.
     const PlayerRole* player() const {
         return this->player_.get();
     }
+    /// @brief Returns the metadata role, or nullptr if not added.
+    /// @return Pointer to the metadata role, or nullptr.
     MetadataRole* metadata() {
         return this->metadata_.get();
     }
+    /// @brief Returns the metadata role (const), or nullptr if not added.
+    /// @return Const pointer to the metadata role, or nullptr.
     const MetadataRole* metadata() const {
         return this->metadata_.get();
     }
+    /// @brief Returns the controller role, or nullptr if not added.
+    /// @return Pointer to the controller role, or nullptr.
     ControllerRole* controller() {
         return this->controller_.get();
     }
+    /// @brief Returns the controller role (const), or nullptr if not added.
+    /// @return Const pointer to the controller role, or nullptr.
     const ControllerRole* controller() const {
         return this->controller_.get();
     }
+    /// @brief Returns the artwork role, or nullptr if not added.
+    /// @return Pointer to the artwork role, or nullptr.
     ArtworkRole* artwork() {
         return this->artwork_.get();
     }
+    /// @brief Returns the artwork role (const), or nullptr if not added.
+    /// @return Const pointer to the artwork role, or nullptr.
     const ArtworkRole* artwork() const {
         return this->artwork_.get();
     }
+    /// @brief Returns the visualizer role, or nullptr if not added.
+    /// @return Pointer to the visualizer role, or nullptr.
     VisualizerRole* visualizer() {
         return this->visualizer_.get();
     }
+    /// @brief Returns the visualizer role (const), or nullptr if not added.
+    /// @return Const pointer to the visualizer role, or nullptr.
     const VisualizerRole* visualizer() const {
         return this->visualizer_.get();
     }
@@ -231,11 +251,13 @@ public:
     SendspinConnection* get_current_connection() const;
 
     /// @brief Returns the current group ID (empty string if none).
+    /// @return Current group ID string, or empty string if not in a group.
     std::string get_group_id() const {
         return this->group_state_.group_id.value_or("");
     }
 
     /// @brief Returns the current group name (empty string if none).
+    /// @return Current group name string, or empty string if not in a group.
     std::string get_group_name() const {
         return this->group_state_.group_name.value_or("");
     }

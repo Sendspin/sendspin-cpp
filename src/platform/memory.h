@@ -135,15 +135,23 @@ public:
         }
     }
 
+    /// @brief Returns a pointer to the allocated buffer.
+    /// @return Pointer to the buffer, or nullptr if not allocated.
     uint8_t* data() {
         return this->ptr_;
     }
+    /// @brief Returns a const pointer to the allocated buffer.
+    /// @return Const pointer to the buffer, or nullptr if not allocated.
     const uint8_t* data() const {
         return this->ptr_;
     }
+    /// @brief Returns the current allocation size in bytes.
+    /// @return Size of the allocated buffer in bytes.
     size_t size() const {
         return this->size_;
     }
+    /// @brief Returns true if the buffer holds an allocation.
+    /// @return true if memory is currently allocated.
     explicit operator bool() const {
         return this->ptr_ != nullptr;
     }

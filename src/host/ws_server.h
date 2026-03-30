@@ -47,6 +47,8 @@ public:
 
     void stop();
 
+    /// @brief Returns true if the WebSocket server has been started.
+    /// @return true if the server is currently running.
     bool is_started() const {
         return this->server_ != nullptr;
     }

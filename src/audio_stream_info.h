@@ -29,12 +29,18 @@ public:
     AudioStreamInfo() : AudioStreamInfo(16, 1, 16000) {}
     AudioStreamInfo(uint8_t bits_per_sample, uint8_t channels, uint32_t sample_rate);
 
+    /// @brief Returns the number of bits per audio sample.
+    /// @return Bits per sample (e.g., 16).
     uint8_t get_bits_per_sample() const {
         return this->bits_per_sample_;
     }
+    /// @brief Returns the number of audio channels.
+    /// @return Channel count (e.g., 1 for mono, 2 for stereo).
     uint8_t get_channels() const {
         return this->channels_;
     }
+    /// @brief Returns the audio sample rate.
+    /// @return Sample rate in Hz (e.g., 44100).
     uint32_t get_sample_rate() const {
         return this->sample_rate_;
     }

@@ -44,6 +44,8 @@ public:
         return this->handle_ != nullptr;
     }
 
+    /// @brief Returns true if the event flags group has been successfully created.
+    /// @return true if the event group is ready for use.
     bool is_created() const {
         return this->handle_ != nullptr;
     }
@@ -103,6 +105,8 @@ public:
         return true;
     }
 
+    /// @brief Returns true if the event flags group has been successfully created.
+    /// @return true if the event group is ready for use.
     bool is_created() const {
         return this->created_;
     }

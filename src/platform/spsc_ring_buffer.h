@@ -48,6 +48,8 @@ public:
         return this->handle_ != nullptr;
     }
 
+    /// @brief Returns true if the ring buffer has been successfully created.
+    /// @return true if the ring buffer is ready for use.
     bool is_created() const {
         return this->handle_ != nullptr;
     }
@@ -123,6 +125,8 @@ public:
         return true;
     }
 
+    /// @brief Returns true if the ring buffer has been successfully created.
+    /// @return true if the ring buffer is ready for use.
     bool is_created() const {
         return this->created_;
     }

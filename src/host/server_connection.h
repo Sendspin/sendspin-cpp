@@ -42,6 +42,8 @@ public:
 
     void trigger_close();
 
+    /// @brief Returns the underlying socket file descriptor for this connection.
+    /// @return Socket file descriptor, or -1 if not connected.
     int get_sockfd() const override {
         return this->sockfd_;
     }

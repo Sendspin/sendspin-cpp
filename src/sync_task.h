@@ -115,12 +115,14 @@ public:
     bool start(bool task_stack_in_psram = false);
 
     /// @brief Returns true if init() has been called successfully.
+    /// @return true if the sync task has been initialized, false otherwise.
     bool is_initialized() const {
         return this->event_flags_.is_created();
     }
 
     /// @brief Returns true if the sync task is actively processing a stream.
     /// Returns false when idle (waiting for a stream) or stopped.
+    /// @return true if actively decoding and syncing a stream.
     bool is_running() const;
 
     /// @brief Signals the sync task to end the current stream. Non-blocking.
@@ -158,11 +160,13 @@ public:
     void notify_audio_played(uint32_t frames, int64_t timestamp);
 
     /// @brief Gets the event flags for monitoring task lifecycle.
+    /// @return Reference to the internal event flags object.
     EventFlags& get_event_flags() {
         return this->event_flags_;
     }
 
     /// @brief Checks if the last run ended with an error.
+    /// @return true if the most recent stream run encountered an error.
     bool had_error() const {
         return this->last_run_had_error_;
     }
