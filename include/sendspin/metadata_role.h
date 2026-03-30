@@ -34,10 +34,11 @@ struct MetadataProgressObject {
     uint32_t playback_speed;
 };
 
+/// @brief Repeat mode for playback
 enum class SendspinRepeatMode {
-    OFF,
-    ONE,
-    ALL,
+    OFF,  // No repeat
+    ONE,  // Repeat current track
+    ALL,  // Repeat entire queue
 };
 
 inline const char* to_cstr(SendspinRepeatMode mode) {

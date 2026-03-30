@@ -30,10 +30,11 @@ struct ClientHelloMessage;
 // Artwork types
 // ============================================================================
 
+/// @brief Image format for artwork
 enum class SendspinImageFormat {
-    JPEG,
-    PNG,
-    BMP,
+    JPEG,  // JPEG compressed image
+    PNG,   // PNG image
+    BMP,   // BMP image
 };
 
 inline const char* to_cstr(SendspinImageFormat format) {
@@ -59,10 +60,11 @@ inline std::optional<SendspinImageFormat> image_format_from_string(const std::st
     return std::nullopt;
 }
 
+/// @brief Source type for an artwork image
 enum class SendspinImageSource {
-    ALBUM,
-    ARTIST,
-    NONE,
+    ALBUM,   // Album cover art
+    ARTIST,  // Artist photo
+    NONE,    // No image
 };
 
 inline const char* to_cstr(SendspinImageSource source) {

@@ -29,20 +29,21 @@ struct ClientHelloMessage;
 // Controller types
 // ============================================================================
 
+/// @brief Playback commands the controller role can send to the server
 enum class SendspinControllerCommand {
-    PLAY,
-    PAUSE,
-    STOP,
-    NEXT,
-    PREVIOUS,
-    VOLUME,
-    MUTE,
-    REPEAT_OFF,
-    REPEAT_ONE,
-    REPEAT_ALL,
-    SHUFFLE,
-    UNSHUFFLE,
-    SWITCH,
+    PLAY,        // Resume or start playback
+    PAUSE,       // Pause playback
+    STOP,        // Stop playback
+    NEXT,        // Skip to next track
+    PREVIOUS,    // Skip to previous track
+    VOLUME,      // Set volume level
+    MUTE,        // Set mute state
+    REPEAT_OFF,  // Disable repeat
+    REPEAT_ONE,  // Repeat current track
+    REPEAT_ALL,  // Repeat entire queue
+    SHUFFLE,     // Enable shuffle
+    UNSHUFFLE,   // Disable shuffle
+    SWITCH,      // Switch playback source
 };
 
 inline const char* to_cstr(SendspinControllerCommand cmd) {

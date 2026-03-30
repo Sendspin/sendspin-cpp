@@ -36,18 +36,20 @@ struct PlaybackProgress {
     int64_t finish_timestamp;  // The timestamp when the audio frames should finish playing
 };
 
+/// @brief States of the sync task's inner decode/playback loop
 enum class SyncTaskState : uint8_t {
-    INITIAL_SYNC,
-    LOAD_CHUNK,
-    SYNCHRONIZE_AUDIO,
-    TRANSFER_AUDIO,
+    INITIAL_SYNC,       // Priming the audio pipeline with silence before playback
+    LOAD_CHUNK,         // Loading and decoding the next encoded chunk
+    SYNCHRONIZE_AUDIO,  // Applying sync corrections (hard or soft) to align playback
+    TRANSFER_AUDIO,     // Sending buffered PCM frames to the audio sink
 };
 
+/// @brief Result of decoding a single encoded audio chunk
 enum class DecodeResult : uint8_t {
     SUCCESS,            // Audio decoded successfully (or header processed)
-    SKIPPED,            // Chunk skipped because it can't be played in time
+    SKIPPED,            // Chunk skipped because it cannot be played in time
     FAILED,             // Decoder failed to decode the chunk
-    ALLOCATION_FAILED,  // Buffer allocation failed, task should stop
+    ALLOCATION_FAILED,  // Buffer allocation failed; task should stop
 };
 
 // Stores all the variables needed by segments of the sync task
@@ -75,17 +77,18 @@ struct SyncContext {
     bool hard_syncing{true};  // Starts true so initial sync uses tight settle threshold
 };
 
+/// @brief Event flag bits used for sync task lifecycle and command signaling
 enum EventGroupBits : uint32_t {
-    COMMAND_STOP = (1 << 0),
-    COMMAND_STREAM_END = (1 << 1),
-    COMMAND_STREAM_CLEAR = (1 << 2),
-    COMMAND_START = (1 << 3),
-    TASK_STARTING = (1 << 7),
-    TASK_RUNNING = (1 << 8),
-    TASK_STOPPING = (1 << 9),
-    TASK_STOPPED = (1 << 10),
-    TASK_ERROR = (1 << 11),
-    TASK_IDLE = (1 << 12),
+    COMMAND_STOP = (1 << 0),          // Signal task to stop
+    COMMAND_STREAM_END = (1 << 1),    // Signal end of current stream
+    COMMAND_STREAM_CLEAR = (1 << 2),  // Signal immediate buffer clear
+    COMMAND_START = (1 << 3),         // Signal stream start acknowledged
+    TASK_STARTING = (1 << 7),         // Task thread is starting up
+    TASK_RUNNING = (1 << 8),          // Task is actively processing a stream
+    TASK_STOPPING = (1 << 9),         // Task is in the process of stopping
+    TASK_STOPPED = (1 << 10),         // Task thread has exited
+    TASK_ERROR = (1 << 11),           // Task encountered a fatal error
+    TASK_IDLE = (1 << 12),            // Task is idle, waiting for a new stream
 };
 
 /// @brief Self-contained sync task for Sendspin synchronized audio playback.

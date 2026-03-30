@@ -33,13 +33,14 @@ namespace sendspin {
 // Internal protocol types
 // ============================================================================
 
-// Binary message ID structure:
-// Typically bits 7-2 for role type, bits 1-0 for message slot (4 IDs per role)
-// Roles with expanded allocations use bits 2-0 for message slot (8 IDs)
+/// @brief Role field values for binary message type bytes
+///
+/// Bits 7-2 encode the role (upper 6 bits of the type byte); bits 1-0 encode
+/// the slot. Each role therefore has 4 slots (IDs = role << 2 through role << 2 + 3).
 enum SendspinBinaryRole : uint8_t {
-    SENDSPIN_ROLE_PLAYER = 1,      // 000001xx (4-7)
-    SENDSPIN_ROLE_ARTWORK = 2,     // 000010xx (8-11)
-    SENDSPIN_ROLE_VISUALIZER = 4,  // 00010xxx (16-23) - expanded allocation
+    SENDSPIN_ROLE_PLAYER = 1,      // 000001xx (IDs 4-7)
+    SENDSPIN_ROLE_ARTWORK = 2,     // 000010xx (IDs 8-11)
+    SENDSPIN_ROLE_VISUALIZER = 4,  // 000100xx (IDs 16-19)
 };
 
 /// @brief Extracts the role field from a standard 4-slot binary message type byte
@@ -55,41 +56,44 @@ inline uint8_t get_binary_slot(uint8_t type) {
     return type & 0x03;
 }
 
-// Common binary message types
+/// @brief Binary message type byte values for known message kinds
 enum SendspinBinaryType : uint8_t {
-    SENDSPIN_BINARY_PLAYER_AUDIO = 4,      // Player slot 0
-    SENDSPIN_BINARY_ARTWORK_IMAGE = 8,     // Artwork slot 0
-    SENDSPIN_BINARY_VISUALIZER = 16,       // Visualizer data (loudness, f_peak, spectrum)
-    SENDSPIN_BINARY_VISUALIZER_BEAT = 17,  // Visualizer beat events
+    SENDSPIN_BINARY_PLAYER_AUDIO = 4,      // Player slot 0: encoded audio chunk
+    SENDSPIN_BINARY_ARTWORK_IMAGE = 8,     // Artwork slot 0: image data
+    SENDSPIN_BINARY_VISUALIZER = 16,       // Visualizer slot 0: loudness, f_peak, spectrum
+    SENDSPIN_BINARY_VISUALIZER_BEAT = 17,  // Visualizer slot 1: beat events
 };
 
+/// @brief JSON message types sent from the server to the client
 enum class SendspinServerToClientMessageType {
-    SERVER_HELLO,
-    SERVER_TIME,
-    SERVER_STATE,
-    SERVER_COMMAND,
-    STREAM_START,
-    STREAM_END,
-    STREAM_CLEAR,
-    GROUP_UPDATE,
-    UNKNOWN,
+    SERVER_HELLO,    // server/hello handshake
+    SERVER_TIME,     // server/time clock sync reply
+    SERVER_STATE,    // server/state playback state update
+    SERVER_COMMAND,  // server/command player command
+    STREAM_START,    // stream/start new stream parameters
+    STREAM_END,      // stream/end normal stream completion
+    STREAM_CLEAR,    // stream/clear immediate buffer flush
+    GROUP_UPDATE,    // group/update group membership change
+    UNKNOWN,         // Unrecognized message type
 };
 
+/// @brief JSON message types sent from the client to the server
 enum class SendspinClientToServerMessageType {
-    CLIENT_HELLO,
-    CLIENT_TIME,
-    CLIENT_STATE,
-    CLIENT_COMMAND,
-    STREAM_REQUEST_FORMAT,
-    CLIENT_GOODBYE,
+    CLIENT_HELLO,           // client/hello handshake
+    CLIENT_TIME,            // client/time clock sync request
+    CLIENT_STATE,           // client/state playback state report
+    CLIENT_COMMAND,         // client/command playback command
+    STREAM_REQUEST_FORMAT,  // stream/request_format codec negotiation
+    CLIENT_GOODBYE,         // client/goodbye disconnect notification
 };
 
+/// @brief Protocol role identifiers used in hello messages and role negotiation
 enum class SendspinRole {
-    PLAYER,
-    CONTROLLER,
-    METADATA,
-    ARTWORK,
-    VISUALIZER,
+    PLAYER,      // Audio playback role
+    CONTROLLER,  // Playback command/state role
+    METADATA,    // Track metadata role
+    ARTWORK,     // Album artwork role
+    VISUALIZER,  // Audio visualization role
 };
 
 /// @brief Converts a SendspinRole value to its protocol wire string representation
@@ -112,9 +116,10 @@ inline const char* to_cstr(SendspinRole role) {
     }
 }
 
+/// @brief Connection reason reported in server/hello messages
 enum class SendspinConnectionReason {
-    DISCOVERY,
-    PLAYBACK,
+    DISCOVERY,  // Server connected for device discovery only
+    PLAYBACK,   // Server connected for active audio playback
 };
 
 /// @brief Converts a SendspinConnectionReason value to its protocol string representation

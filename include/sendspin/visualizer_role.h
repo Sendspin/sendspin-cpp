@@ -30,11 +30,12 @@ struct ClientHelloMessage;
 // Visualizer types
 // ============================================================================
 
+/// @brief Visualizer data stream types
 enum class VisualizerDataType : uint8_t {
-    BEAT,
-    LOUDNESS,
-    F_PEAK,
-    SPECTRUM,
+    BEAT,      // Beat detection events
+    LOUDNESS,  // Overall loudness level
+    F_PEAK,    // Peak frequency
+    SPECTRUM,  // Full frequency spectrum bins
 };
 
 inline const char* to_cstr(VisualizerDataType type) {
@@ -52,10 +53,11 @@ inline const char* to_cstr(VisualizerDataType type) {
     }
 }
 
+/// @brief Frequency scale used for spectrum visualization bins
 enum class VisualizerSpectrumScale : uint8_t {
-    MEL,
-    LOG,
-    LIN,
+    MEL,  // Mel perceptual scale
+    LOG,  // Logarithmic scale
+    LIN,  // Linear scale
 };
 
 inline const char* to_cstr(VisualizerSpectrumScale scale) {

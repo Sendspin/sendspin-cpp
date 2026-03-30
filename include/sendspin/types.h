@@ -24,10 +24,11 @@ namespace sendspin {
 // Common types
 // ============================================================================
 
+/// @brief Client playback state reported to the server
 enum class SendspinClientState {
-    SYNCHRONIZED,
-    ERROR,
-    EXTERNAL_SOURCE,
+    SYNCHRONIZED,     // Client is synchronized and playing from the server
+    ERROR,            // Client encountered a playback error
+    EXTERNAL_SOURCE,  // Client is playing from a non-Sendspin source
 };
 
 /// @brief Converts a SendspinClientState value to its protocol string representation
@@ -46,11 +47,12 @@ inline const char* to_cstr(SendspinClientState state) {
     }
 }
 
+/// @brief Reason sent in a client/goodbye message when disconnecting
 enum class SendspinGoodbyeReason {
-    ANOTHER_SERVER,
-    SHUTDOWN,
-    RESTART,
-    USER_REQUEST,
+    ANOTHER_SERVER,  // Client is switching to another server
+    SHUTDOWN,        // Client is shutting down
+    RESTART,         // Client is restarting
+    USER_REQUEST,    // User explicitly requested disconnect
 };
 
 /// @brief Converts a SendspinGoodbyeReason value to its protocol string representation
@@ -97,9 +99,10 @@ struct ServerInformationObject {
     std::string name;
 };
 
+/// @brief Overall group playback state
 enum class SendspinPlaybackState {
-    PLAYING,
-    STOPPED,
+    PLAYING,  // Group is actively playing
+    STOPPED,  // Group playback is stopped
 };
 
 /// @brief Converts a SendspinPlaybackState value to its protocol string representation
