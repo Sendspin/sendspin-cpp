@@ -185,7 +185,7 @@ private:
     struct DrainTask;
     std::unique_ptr<DrainTask> drain_task_;
 
-    // Cached stream config — written by the network thread in handle_stream_start(),
+    // Cached stream config, written by the network thread in handle_stream_start(),
     // read by the network thread in handle_binary(). stream_active_ is also cleared
     // by cleanup() on the main thread.
     std::atomic<bool> stream_active_{false};

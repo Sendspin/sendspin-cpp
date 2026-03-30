@@ -46,7 +46,7 @@ void ConnectionManager::connect_to(const std::string& url) {
 
     this->setup_connection_callbacks_(client_conn.get());
     client_conn->on_disconnected = [this](SendspinConnection* conn) {
-        // Defer to loop() — this callback runs on IXWebSocket's internal thread
+        // Defer to loop(); this callback runs on IXWebSocket's internal thread
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
         this->pending_disconnect_events_.push_back(conn);
     };
@@ -102,7 +102,7 @@ void ConnectionManager::init_server(SendspinClient* client, bool psram_stack, un
             this->pending_connection_->get_sockfd() == sockfd) {
             return static_cast<SendspinServerConnection*>(this->pending_connection_.get());
         }
-        // Deliberately excludes dying_connection_ — it has already been through cleanup and its
+        // Deliberately excludes dying_connection_; it has already been through cleanup and its
         // message dispatch is disabled. Returning it here would let httpd route stale messages
         // from the old connection into freshly-reset role queues.
         return nullptr;

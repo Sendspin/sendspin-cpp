@@ -334,7 +334,7 @@ private:
     ServerInformationObject server_information_{};
     GroupUpdateObject group_state_{};
 
-    // --- Deferred event state (PIMPL — hides platform queue/shadow headers) ---
+    // --- Deferred event state (PIMPL, hides platform queue/shadow headers) ---
 
     struct EventState;
     std::unique_ptr<EventState> event_state_;

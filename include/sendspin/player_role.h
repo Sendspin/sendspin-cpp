@@ -317,7 +317,7 @@ private:
 
     std::unique_ptr<SyncTask> sync_task_;
 
-    // --- Event state (PIMPL — hides platform queue/shadow headers) ---
+    // --- Event state (PIMPL, hides platform queue/shadow headers) ---
 
     struct EventState;
     std::unique_ptr<EventState> event_state_;

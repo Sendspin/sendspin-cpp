@@ -71,8 +71,8 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
         // Trigger close regardless of send success
         this->trigger_close();
 
-        // Invoke user-provided completion callback if provided
-        // Note: This is already running in httpd worker thread context (async_send_text),
+        // Invoke user-provided completion callback if provided.
+        // Already running in httpd worker thread context (async_send_text),
         // so caller should use defer() if they need main loop context
         if (on_complete) {
             on_complete();

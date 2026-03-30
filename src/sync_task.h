@@ -135,8 +135,8 @@ public:
 
     /// @brief Signals the sync task that the client has processed the stream start.
     /// The sync task waits for this after finding a codec header before transitioning
-    /// to the active state. This ensures the client's stream lifecycle callbacks
-    /// (end/clear → start) fire before the task begins decoding.
+    /// to the active state, so the client's stream lifecycle callbacks
+    /// (end/clear -> start) fire before the task begins decoding.
     /// Thread-safe: may be called from any context.
     void signal_stream_start();
 

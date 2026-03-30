@@ -605,7 +605,7 @@ void SyncTask::sync_task(void* params) {
 
     this_task->event_flags_.set(EventGroupBits::TASK_STARTING);
 
-    // Allocate SyncContext once on the task stack — reused across streams.
+    // Allocate SyncContext once on the task stack, reused across streams.
     SyncContext sync_context;
     sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
 
