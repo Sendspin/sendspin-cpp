@@ -62,7 +62,7 @@ LogLevel SendspinClient::get_log_level() {
     return static_cast<LogLevel>(platform_get_log_level());
 }
 
-// --- ClientBridge overrides ---
+// --- Role services ---
 
 void SendspinClient::publish_state() {
     this->publish_client_state_(this->connection_manager_->current());
@@ -75,49 +75,27 @@ void SendspinClient::send_text(const std::string& text) {
     }
 }
 
-void SendspinClient::request_high_performance() {
-    if (this->listener_) {
+void SendspinClient::acquire_high_performance() {
+    if (this->high_performance_ref_count_.fetch_add(1) == 0 && this->listener_) {
         this->listener_->on_request_high_performance();
     }
 }
 
 void SendspinClient::release_high_performance() {
-    if (this->listener_) {
+    if (this->high_performance_ref_count_.load() == 0) {
+        return;
+    }
+    if (this->high_performance_ref_count_.fetch_sub(1) == 1 && this->listener_) {
         this->listener_->on_release_high_performance();
     }
 }
 
-// --- ConnectionManagerCallbacks overrides ---
+// --- Connection event handlers ---
 
-bool SendspinClient::on_json_message(SendspinConnection* conn, const std::string& message,
-                                     int64_t timestamp) {
-    return this->process_json_message_(conn, message, timestamp);
-}
-
-void SendspinClient::on_binary_message(uint8_t* payload, size_t len) {
-    this->process_binary_message_(payload, len);
-}
-
-std::string SendspinClient::build_hello_message() {
-    return this->build_hello_message_();
-}
-
-void SendspinClient::on_handshake_complete(SendspinConnection* conn,
-                                           ServerInformationObject server) {
+void SendspinClient::on_handshake_complete_(SendspinConnection* conn,
+                                            ServerInformationObject server) {
     this->server_information_ = std::move(server);
     this->publish_client_state_(conn);
-}
-
-void SendspinClient::on_active_connection_lost() {
-    this->cleanup_connection_state_();
-}
-
-void SendspinClient::reset_time_burst() {
-    this->time_burst_->reset();
-}
-
-bool SendspinClient::is_network_ready() {
-    return this->network_provider_ && this->network_provider_->is_network_ready();
 }
 
 // --- Role registration ---
@@ -127,8 +105,8 @@ PlayerRole& SendspinClient::add_player(PlayerRole::Config config) {
         SS_LOGW(TAG,
                 "add_player() called after start_server() — role may not initialize correctly");
     }
-    this->player_ = std::make_unique<PlayerRole>(std::move(config));
-    this->player_->attach(this, this->persistence_provider_);
+    this->player_ =
+        std::make_unique<PlayerRole>(std::move(config), this, this->persistence_provider_);
     return *this->player_;
 }
 
@@ -136,8 +114,7 @@ ControllerRole& SendspinClient::add_controller() {
     if (this->started_) {
         SS_LOGW(TAG, "add_controller() called after start_server()");
     }
-    this->controller_ = std::make_unique<ControllerRole>();
-    this->controller_->attach(this);
+    this->controller_ = std::make_unique<ControllerRole>(this);
     return *this->controller_;
 }
 
@@ -145,8 +122,7 @@ MetadataRole& SendspinClient::add_metadata() {
     if (this->started_) {
         SS_LOGW(TAG, "add_metadata() called after start_server()");
     }
-    this->metadata_ = std::make_unique<MetadataRole>();
-    this->metadata_->attach(this);
+    this->metadata_ = std::make_unique<MetadataRole>(this);
     return *this->metadata_;
 }
 
@@ -154,8 +130,7 @@ ArtworkRole& SendspinClient::add_artwork() {
     if (this->started_) {
         SS_LOGW(TAG, "add_artwork() called after start_server()");
     }
-    this->artwork_ = std::make_unique<ArtworkRole>();
-    this->artwork_->attach(this);
+    this->artwork_ = std::make_unique<ArtworkRole>(this);
     return *this->artwork_;
 }
 
@@ -163,8 +138,7 @@ VisualizerRole& SendspinClient::add_visualizer(VisualizerRole::Config config) {
     if (this->started_) {
         SS_LOGW(TAG, "add_visualizer() called after start_server()");
     }
-    this->visualizer_ = std::make_unique<VisualizerRole>(std::move(config));
-    this->visualizer_->attach(this);
+    this->visualizer_ = std::make_unique<VisualizerRole>(std::move(config), this);
     return *this->visualizer_;
 }
 
@@ -211,14 +185,13 @@ void SendspinClient::loop() {
     if (conn != nullptr) {
         auto result = this->time_burst_->loop(conn);
 
-        if (result.sent && !this->high_performance_requested_for_time_ && this->listener_) {
-            this->listener_->on_request_high_performance();
-            this->high_performance_requested_for_time_ = true;
+        if (result.sent && !this->high_performance_held_for_time_) {
+            this->acquire_high_performance();
+            this->high_performance_held_for_time_ = true;
         }
-        if (result.burst_completed && this->high_performance_requested_for_time_ &&
-            this->listener_) {
-            this->listener_->on_release_high_performance();
-            this->high_performance_requested_for_time_ = false;
+        if (result.burst_completed && this->high_performance_held_for_time_) {
+            this->release_high_performance();
+            this->high_performance_held_for_time_ = false;
         }
         if (result.burst_completed && this->listener_ && conn->get_time_filter()) {
             this->listener_->on_time_sync_updated(
@@ -379,9 +352,9 @@ void SendspinClient::cleanup_connection_state_() {
     }
 
     // Release high-performance networking for time sync
-    if (this->high_performance_requested_for_time_ && this->listener_) {
-        this->listener_->on_release_high_performance();
-        this->high_performance_requested_for_time_ = false;
+    if (this->high_performance_held_for_time_) {
+        this->release_high_performance();
+        this->high_performance_held_for_time_ = false;
     }
 }
 

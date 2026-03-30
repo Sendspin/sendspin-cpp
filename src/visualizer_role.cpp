@@ -84,8 +84,10 @@ struct VisualizerRole::EventState {
 
 // --- Lifecycle ---
 
-VisualizerRole::VisualizerRole(Config config)
-    : visualizer_support_(std::move(config.support)), event_state_(std::make_unique<EventState>()) {
+VisualizerRole::VisualizerRole(Config config, SendspinClient* client)
+    : client_(client),
+      visualizer_support_(std::move(config.support)),
+      event_state_(std::make_unique<EventState>()) {
     this->event_state_->queue.create(8);
 
     if (this->visualizer_support_.has_value()) {
@@ -103,10 +105,6 @@ VisualizerRole::VisualizerRole(Config config)
 
 VisualizerRole::~VisualizerRole() {
     this->stop_();
-}
-
-void VisualizerRole::attach(ClientBridge* bridge) {
-    this->bridge_ = bridge;
 }
 
 bool VisualizerRole::start() {
@@ -337,7 +335,7 @@ void VisualizerRole::drain_thread_func_(VisualizerRole* self) {
             continue;
 
         // Wait for time sync
-        if (!self->bridge_ || !self->bridge_->is_time_synced()) {
+        if (!self->client_->is_time_synced()) {
             rb.return_item(item);
             continue;
         }
@@ -353,7 +351,7 @@ void VisualizerRole::drain_thread_func_(VisualizerRole* self) {
             continue;
         }
         int64_t server_ts = read_be64(raw + ts_offset);
-        int64_t client_ts = self->bridge_->get_client_time(server_ts);
+        int64_t client_ts = self->client_->get_client_time(server_ts);
 
         if (client_ts == 0) {
             rb.return_item(item);

@@ -28,7 +28,6 @@ namespace sendspin {
 class SendspinClient;
 class SendspinPersistenceProvider;
 class SyncTask;
-class ClientBridge;
 struct ClientHelloMessage;
 struct ClientStateMessage;
 struct StreamStartMessage;
@@ -202,7 +201,7 @@ public:
         uint16_t initial_static_delay_ms{0};
     };
 
-    explicit PlayerRole(Config config);
+    PlayerRole(Config config, SendspinClient* client, SendspinPersistenceProvider* persistence);
     ~PlayerRole();
 
     /// @brief Sets the listener for player events. The listener must outlive this role.
@@ -276,7 +275,6 @@ private:
 
     // --- Private integration methods ---
 
-    void attach(ClientBridge* bridge, SendspinPersistenceProvider* persistence);
     bool start(bool psram_stack);
     void contribute_hello(ClientHelloMessage& msg);
     void contribute_state(ClientStateMessage& msg);
@@ -300,11 +298,11 @@ private:
 
     Config config_;
 
-    // --- Listener and bridge ---
+    // --- Listener and client ---
 
     PlayerRoleListener* listener_{nullptr};
-    SendspinPersistenceProvider* persistence_{nullptr};
-    ClientBridge* bridge_{nullptr};
+    SendspinPersistenceProvider* persistence_;
+    SendspinClient* client_;
 
     // --- Player state ---
 

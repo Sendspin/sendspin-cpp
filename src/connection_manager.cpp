@@ -19,6 +19,7 @@
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "server_connection.h"
+#include "time_burst.h"
 #include "ws_server.h"
 
 namespace sendspin {
@@ -27,8 +28,7 @@ static const char* const TAG = "sendspin.conn_mgr";
 
 // --- Constructor / Destructor ---
 
-ConnectionManager::ConnectionManager(ConnectionManagerCallbacks* callbacks)
-    : callbacks_(callbacks) {}
+ConnectionManager::ConnectionManager(SendspinClient* client) : client_(client) {}
 
 ConnectionManager::~ConnectionManager() {
     this->current_connection_.reset();
@@ -112,7 +112,8 @@ void ConnectionManager::init_server(SendspinClient* client, bool psram_stack, un
 void ConnectionManager::loop() {
     // Start WS server when network becomes ready
     if (this->ws_server_ != nullptr && !this->ws_server_->is_started()) {
-        if (this->callbacks_->is_network_ready()) {
+        if (this->client_->network_provider_ &&
+            this->client_->network_provider_->is_network_ready()) {
             this->ws_server_->start(this->client_, this->psram_stack_, this->task_priority_);
         }
     }
@@ -161,7 +162,7 @@ void ConnectionManager::loop() {
             }
 
             // Notify client (stores server info, publishes state)
-            this->callbacks_->on_handshake_complete(event.conn, std::move(event.server));
+            this->client_->on_handshake_complete_(event.conn, std::move(event.server));
 
             SS_LOGI(TAG, "Connection handshake complete: server_id=%s, connection_reason=%s",
                     event.conn->get_server_id().c_str(),
@@ -244,10 +245,10 @@ void ConnectionManager::setup_connection_callbacks_(SendspinConnection* conn) {
     conn->on_connected = [this](SendspinConnection* c) { this->initiate_hello_(c); };
     conn->on_json_message = [this](SendspinConnection* c, const std::string& message,
                                    int64_t timestamp) {
-        this->callbacks_->on_json_message(c, message, timestamp);
+        this->client_->process_json_message_(c, message, timestamp);
     };
     conn->on_binary_message = [this](SendspinConnection* /*c*/, uint8_t* payload, size_t len) {
-        this->callbacks_->on_binary_message(payload, len);
+        this->client_->process_binary_message_(payload, len);
     };
     conn->on_handshake_complete = [](SendspinConnection* /*c*/) {
         // Handshake completion is handled via deferred hello events in loop()
@@ -301,7 +302,7 @@ bool ConnectionManager::send_hello_message_(uint8_t remaining_attempts, Sendspin
         return true;
     }
 
-    std::string hello_message = this->callbacks_->build_hello_message();
+    std::string hello_message = this->client_->build_hello_message_();
 
     SsErr err =
         conn->send_text_message(hello_message, [conn](bool success, int64_t actual_send_time) {
@@ -337,8 +338,8 @@ void ConnectionManager::on_connection_lost_(SendspinConnection* conn) {
     if (this->current_connection_ != nullptr && this->current_connection_.get() == conn) {
         SS_LOGI(TAG, "Current connection lost");
         conn->disable_message_dispatch();
-        this->callbacks_->reset_time_burst();
-        this->callbacks_->on_active_connection_lost();
+        this->client_->time_burst_->reset();
+        this->client_->cleanup_connection_state_();
         this->current_connection_.reset();
 
         if (this->pending_connection_ != nullptr) {
@@ -394,8 +395,8 @@ void ConnectionManager::complete_handoff_(bool switch_to_new) {
         SS_LOGD(TAG, "Completing handoff: switching to new server");
         if (this->current_connection_ != nullptr) {
             this->current_connection_->disable_message_dispatch();
-            this->callbacks_->reset_time_burst();
-            this->callbacks_->on_active_connection_lost();
+            this->client_->time_burst_->reset();
+            this->client_->cleanup_connection_state_();
             auto old_current = std::move(this->current_connection_);
             this->current_connection_ = std::move(this->pending_connection_);
             this->disconnect_and_release_(std::move(old_current),

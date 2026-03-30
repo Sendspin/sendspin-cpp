@@ -69,8 +69,11 @@ struct PlayerRole::EventState {
 
 // --- Constructor / Destructor ---
 
-PlayerRole::PlayerRole(Config config)
+PlayerRole::PlayerRole(Config config, SendspinClient* client,
+                       SendspinPersistenceProvider* persistence)
     : config_(std::move(config)),
+      persistence_(persistence),
+      client_(client),
       sync_task_(std::make_unique<SyncTask>()),
       event_state_(std::make_unique<EventState>()) {
     this->event_state_->stream_queue.create(8);
@@ -99,16 +102,12 @@ bool PlayerRole::write_audio_chunk(const uint8_t* data, size_t size, int64_t tim
 
 void PlayerRole::update_volume(uint8_t volume) {
     this->volume_ = volume;
-    if (this->bridge_) {
-        this->bridge_->publish_state();
-    }
+    this->client_->publish_state();
 }
 
 void PlayerRole::update_muted(bool muted) {
     this->muted_ = muted;
-    if (this->bridge_) {
-        this->bridge_->publish_state();
-    }
+    this->client_->publish_state();
 }
 
 void PlayerRole::update_static_delay(uint16_t delay_ms) {
@@ -117,31 +116,22 @@ void PlayerRole::update_static_delay(uint16_t delay_ms) {
     }
     this->static_delay_ms_ = delay_ms;
     this->persist_static_delay_();
-    if (this->bridge_) {
-        this->bridge_->publish_state();
-    }
+    this->client_->publish_state();
 }
 
 void PlayerRole::set_static_delay_adjustable(bool adjustable) {
     this->static_delay_adjustable_ = adjustable;
-    if (this->bridge_) {
-        this->bridge_->publish_state();
-    }
+    this->client_->publish_state();
 }
 
 // --- Private integration methods ---
-
-void PlayerRole::attach(ClientBridge* bridge, SendspinPersistenceProvider* persistence) {
-    this->bridge_ = bridge;
-    this->persistence_ = persistence;
-}
 
 bool PlayerRole::start(bool psram_stack) {
     this->load_static_delay_();
 
     if (!this->config_.audio_formats.empty() && this->listener_ &&
         !this->sync_task_->is_initialized()) {
-        if (!this->sync_task_->init(this, this->config_.audio_buffer_capacity)) {
+        if (!this->sync_task_->init(this, this->client_, this->config_.audio_buffer_capacity)) {
             SS_LOGE(TAG, "Failed to initialize sync task");
             return false;
         }
@@ -209,7 +199,7 @@ void PlayerRole::handle_stream_start(const StreamStartMessage& stream_msg) {
 
     // Request high-performance networking for playback
     if (!this->high_performance_requested_for_playback_) {
-        this->bridge_->request_high_performance();
+        this->client_->acquire_high_performance();
         this->high_performance_requested_for_playback_ = true;
     }
 
@@ -313,8 +303,8 @@ void PlayerRole::drain_events() {
         last_state = state;
         has_state = true;
     }
-    if (has_state && this->bridge_) {
-        this->bridge_->update_state(last_state);
+    if (has_state) {
+        this->client_->update_state(last_state);
     }
 
     // --- Server command events (volume, mute, static delay) ---
@@ -372,7 +362,7 @@ void PlayerRole::drain_events() {
                         this->listener_->on_stream_end();
                     }
                     if (this->high_performance_requested_for_playback_) {
-                        this->bridge_->release_high_performance();
+                        this->client_->release_high_performance();
                         this->high_performance_requested_for_playback_ = false;
                     }
                     break;
@@ -421,7 +411,7 @@ void PlayerRole::cleanup() {
     this->awaiting_sync_idle_events_.clear();
 
     if (this->high_performance_requested_for_playback_) {
-        this->bridge_->release_high_performance();
+        this->client_->release_high_performance();
         this->high_performance_requested_for_playback_ = false;
     }
 }

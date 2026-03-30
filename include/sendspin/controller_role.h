@@ -23,7 +23,6 @@
 namespace sendspin {
 
 class SendspinClient;
-class ClientBridge;
 struct ClientHelloMessage;
 
 // ============================================================================
@@ -136,7 +135,7 @@ class ControllerRole {
     friend class SendspinClient;
 
 public:
-    ControllerRole();
+    explicit ControllerRole(SendspinClient* client);
     ~ControllerRole();
 
     /// @brief Sets the listener for controller events. The listener must outlive this role.
@@ -154,14 +153,13 @@ public:
     }
 
 private:
-    void attach(ClientBridge* bridge);
     void contribute_hello(ClientHelloMessage& msg);
     void handle_server_state(ServerStateControllerObject state);
     void drain_events();
     void cleanup();
 
     ControllerRoleListener* listener_{nullptr};
-    ClientBridge* bridge_{nullptr};
+    SendspinClient* client_;
     ServerStateControllerObject controller_state_{};
 
     struct EventState;

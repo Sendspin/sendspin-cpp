@@ -51,7 +51,7 @@ struct HelloRetryState {
 /// handshake, server handoff, and graceful disconnection.
 class ConnectionManager {
 public:
-    explicit ConnectionManager(ConnectionManagerCallbacks* callbacks);
+    explicit ConnectionManager(SendspinClient* client);
     ~ConnectionManager();
 
     // --- Public API ---
@@ -112,17 +112,14 @@ private:
     void disconnect_and_release_(std::unique_ptr<SendspinConnection> conn,
                                  SendspinGoodbyeReason reason);
 
-    // --- Callbacks ---
-    ConnectionManagerCallbacks* callbacks_;
-
     // --- Connections ---
     std::unique_ptr<SendspinConnection> current_connection_;
     std::unique_ptr<SendspinConnection> pending_connection_;
     std::shared_ptr<SendspinConnection> dying_connection_;
     std::unique_ptr<SendspinWsServer> ws_server_;
 
-    // --- Server start params (stored from init_server, used when network becomes ready) ---
-    SendspinClient* client_{nullptr};
+    // --- Client and server start params ---
+    SendspinClient* client_;
     bool psram_stack_{false};
     unsigned task_priority_{17};
 

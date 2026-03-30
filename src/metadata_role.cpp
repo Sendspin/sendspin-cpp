@@ -27,13 +27,10 @@ struct MetadataRole::EventState {
     ShadowSlot<ServerMetadataStateObject> shadow;
 };
 
-MetadataRole::MetadataRole() : event_state_(std::make_unique<EventState>()) {}
+MetadataRole::MetadataRole(SendspinClient* client)
+    : client_(client), event_state_(std::make_unique<EventState>()) {}
 
 MetadataRole::~MetadataRole() = default;
-
-void MetadataRole::attach(ClientBridge* bridge) {
-    this->bridge_ = bridge;
-}
 
 void MetadataRole::contribute_hello(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::METADATA);
@@ -59,11 +56,7 @@ uint32_t MetadataRole::get_track_progress_ms() const {
         return progress.track_progress;
     }
 
-    if (!this->bridge_) {
-        return progress.track_progress;
-    }
-
-    int64_t client_target = this->bridge_->get_client_time(this->metadata_.timestamp);
+    int64_t client_target = this->client_->get_client_time(this->metadata_.timestamp);
     if (client_target == 0) {
         return progress.track_progress;
     }

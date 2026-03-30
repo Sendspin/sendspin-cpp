@@ -39,15 +39,12 @@ struct ArtworkRole::EventState {
     ThreadSafeQueue<uint8_t> stream_end_queue;
 };
 
-ArtworkRole::ArtworkRole() : event_state_(std::make_unique<EventState>()) {
+ArtworkRole::ArtworkRole(SendspinClient* client)
+    : client_(client), event_state_(std::make_unique<EventState>()) {
     this->event_state_->stream_end_queue.create(4);
 }
 
 ArtworkRole::~ArtworkRole() = default;
-
-void ArtworkRole::attach(ClientBridge* bridge) {
-    this->bridge_ = bridge;
-}
 
 void ArtworkRole::add_image_preferred_format(const ImageSlotPreference& pref) {
     this->preferred_image_formats_.push_back(pref);

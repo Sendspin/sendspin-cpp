@@ -21,6 +21,7 @@
 #include "sendspin/types.h"
 #include "sendspin/visualizer_role.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -97,45 +98,11 @@ enum class LogLevel : int {
     VERBOSE = 5,
 };
 
-/// @brief Interface from roles to the client, providing access to shared client services.
-/// Roles store a ClientBridge pointer and use it to query time sync, publish state, and send
-/// messages without depending on the SendspinClient class directly.
-class ClientBridge {
-public:
-    virtual ~ClientBridge() = default;
-
-    virtual int64_t get_client_time(int64_t server_time) const = 0;
-    virtual bool is_time_synced() const = 0;
-    virtual void publish_state() = 0;
-    virtual void update_state(SendspinClientState state) = 0;
-    virtual void send_text(const std::string& text) = 0;
-    virtual void request_high_performance() = 0;
-    virtual void release_high_performance() = 0;
-};
-
 // Forward declarations
 class ConnectionManager;
 class SendspinConnection;
 class SendspinTimeBurst;
 struct ServerInformationObject;
-
-/// @brief Interface from ConnectionManager back to the client.
-/// ConnectionManager calls these methods to route messages, signal lifecycle events,
-/// and query network readiness.
-class ConnectionManagerCallbacks {
-public:
-    virtual ~ConnectionManagerCallbacks() = default;
-
-    virtual bool on_json_message(SendspinConnection* conn, const std::string& message,
-                                 int64_t timestamp) = 0;
-    virtual void on_binary_message(uint8_t* payload, size_t len) = 0;
-    virtual std::string build_hello_message() = 0;
-    virtual void on_handshake_complete(SendspinConnection* conn,
-                                       ServerInformationObject server) = 0;
-    virtual void on_active_connection_lost() = 0;
-    virtual void reset_time_burst() = 0;
-    virtual bool is_network_ready() = 0;
-};
 
 /// @brief Configuration for a SendspinClient instance.
 /// Filled in by the platform (e.g., ESPHome) before calling start_server().
@@ -168,7 +135,9 @@ struct TimeResponseEvent {
 /// 4. Set listeners on the role objects and providers on the client
 /// 5. Call start_server() to begin listening for connections
 /// 6. Call loop() periodically from the main loop
-class SendspinClient : public ClientBridge, public ConnectionManagerCallbacks {
+class SendspinClient {
+    friend class ConnectionManager;
+
 public:
     explicit SendspinClient(SendspinClientConfig config);
     ~SendspinClient();
@@ -253,10 +222,10 @@ public:
     bool is_connected() const;
 
     /// @brief Returns true if the time filter has received at least one measurement.
-    bool is_time_synced() const override;
+    bool is_time_synced() const;
 
     /// @brief Converts a server timestamp to the equivalent client timestamp.
-    int64_t get_client_time(int64_t server_time) const override;
+    int64_t get_client_time(int64_t server_time) const;
 
     /// @brief Returns the current active connection (or nullptr).
     SendspinConnection* get_current_connection() const;
@@ -274,7 +243,7 @@ public:
     // --- State updates ---
 
     /// @brief Updates the client state (synchronized, error, external_source) and publishes.
-    void update_state(SendspinClientState state) override;
+    void update_state(SendspinClientState state);
 
     // --- Listener and provider setters ---
 
@@ -294,7 +263,21 @@ public:
         this->persistence_provider_ = provider;
     }
 
-protected:
+    // --- Role services (called by roles via SendspinClient pointer) ---
+
+    /// @brief Publishes the current client state to the active connection.
+    void publish_state();
+
+    /// @brief Sends a text message over the active connection.
+    void send_text(const std::string& text);
+
+    /// @brief Acquires a ref-counted high-performance networking request.
+    void acquire_high_performance();
+
+    /// @brief Releases a ref-counted high-performance networking request.
+    void release_high_performance();
+
+private:
     /// @brief Cleans up playback state when the active streaming connection is removed.
     void cleanup_connection_state_();
 
@@ -323,23 +306,9 @@ protected:
     /// @brief Persists the server ID as the last played server (hashed).
     void persist_last_played_server_(const std::string& server_id);
 
-    // --- ClientBridge overrides (used by roles via base class pointer) ---
+    // --- Connection event handlers (called by ConnectionManager via friend access) ---
 
-    void publish_state() override;
-    void send_text(const std::string& text) override;
-    void request_high_performance() override;
-    void release_high_performance() override;
-
-    // --- ConnectionManagerCallbacks overrides ---
-
-    bool on_json_message(SendspinConnection* conn, const std::string& message,
-                         int64_t timestamp) override;
-    void on_binary_message(uint8_t* payload, size_t len) override;
-    std::string build_hello_message() override;
-    void on_handshake_complete(SendspinConnection* conn, ServerInformationObject server) override;
-    void on_active_connection_lost() override;
-    void reset_time_burst() override;
-    bool is_network_ready() override;
+    void on_handshake_complete_(SendspinConnection* conn, ServerInformationObject server);
 
     // --- Configuration ---
 
@@ -352,7 +321,8 @@ protected:
     // --- Time sync ---
 
     std::unique_ptr<SendspinTimeBurst> time_burst_;
-    bool high_performance_requested_for_time_{false};
+    std::atomic<uint8_t> high_performance_ref_count_{0};
+    bool high_performance_held_for_time_{false};
 
     // --- Client state ---
 

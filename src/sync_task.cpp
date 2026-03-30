@@ -45,8 +45,9 @@ SyncTask::~SyncTask() {
     this->stop_();
 }
 
-bool SyncTask::init(PlayerRole* player, size_t buffer_size) {
+bool SyncTask::init(PlayerRole* player, SendspinClient* client, size_t buffer_size) {
     this->player_ = player;
+    this->client_ = client;
 
     if (!this->event_flags_.create()) {
         SS_LOGE(TAG, "Couldn't create event flags.");
@@ -429,7 +430,7 @@ DecodeResult SyncTask::sync_decode_audio_(SyncContext& sync_context) {
     } else if ((sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) &&
                (sync_context.encoded_entry->chunk_type == CHUNK_TYPE_ENCODED_AUDIO)) {
         int64_t client_timestamp =
-            this->player_->bridge_->get_client_time(sync_context.encoded_entry->timestamp) -
+            this->client_->get_client_time(sync_context.encoded_entry->timestamp) -
             static_cast<int64_t>(this->player_->get_static_delay_ms()) * 1000 -
             this->player_->get_fixed_delay_us();
 
@@ -492,7 +493,7 @@ SyncTaskState SyncTask::sync_handle_initial_sync_(SyncContext& sync_context) {
 }
 
 SyncTaskState SyncTask::sync_handle_load_chunk_(SyncContext& sync_context) {
-    if (!this->player_->bridge_->is_time_synced()) {
+    if (!this->client_->is_time_synced()) {
         // Wait for the time filter to receive its first measurement before processing audio chunks.
         // Without a valid time offset, server timestamps can't be correctly converted to client
         // timestamps.

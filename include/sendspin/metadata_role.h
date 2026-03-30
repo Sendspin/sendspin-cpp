@@ -22,7 +22,6 @@
 namespace sendspin {
 
 class SendspinClient;
-class ClientBridge;
 struct ClientHelloMessage;
 
 // ============================================================================
@@ -92,7 +91,7 @@ class MetadataRole {
     friend class SendspinClient;
 
 public:
-    MetadataRole();
+    explicit MetadataRole(SendspinClient* client);
     ~MetadataRole();
 
     /// @brief Sets the listener for metadata events. The listener must outlive this role.
@@ -107,14 +106,13 @@ public:
     uint32_t get_track_duration_ms() const;
 
 private:
-    void attach(ClientBridge* bridge);
     void contribute_hello(ClientHelloMessage& msg);
     void handle_server_state(ServerMetadataStateObject state);
     void drain_events();
     void cleanup();
 
     MetadataRoleListener* listener_{nullptr};
-    ClientBridge* bridge_{nullptr};
+    SendspinClient* client_;
     ServerMetadataStateObject metadata_{};
 
     struct EventState;

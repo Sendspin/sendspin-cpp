@@ -24,7 +24,6 @@
 namespace sendspin {
 
 class SendspinClient;
-class ClientBridge;
 struct ClientHelloMessage;
 
 // ============================================================================
@@ -141,7 +140,7 @@ public:
         VisualizerSupportObject support;
     };
 
-    explicit VisualizerRole(Config config);
+    VisualizerRole(Config config, SendspinClient* client);
     ~VisualizerRole();
 
     /// @brief Sets the listener for visualizer events. The listener must outlive this role.
@@ -162,7 +161,6 @@ private:
         STREAM_CLEAR,
     };
 
-    void attach(ClientBridge* bridge);
     bool start();
     void stop_();
     void contribute_hello(ClientHelloMessage& msg);
@@ -177,7 +175,7 @@ private:
     static void drain_thread_func_(VisualizerRole* self);
 
     VisualizerRoleListener* listener_{nullptr};
-    ClientBridge* bridge_{nullptr};
+    SendspinClient* client_;
     std::optional<VisualizerSupportObject> visualizer_support_;
 
     struct EventState;

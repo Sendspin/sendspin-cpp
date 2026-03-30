@@ -24,7 +24,6 @@
 namespace sendspin {
 
 class SendspinClient;
-class ClientBridge;
 struct ClientHelloMessage;
 
 // ============================================================================
@@ -156,7 +155,7 @@ class ArtworkRole {
     friend class SendspinClient;
 
 public:
-    ArtworkRole();
+    explicit ArtworkRole(SendspinClient* client);
     ~ArtworkRole();
 
     /// @brief Sets the listener for artwork events. The listener must outlive this role.
@@ -173,7 +172,6 @@ public:
     }
 
 private:
-    void attach(ClientBridge* bridge);
     void contribute_hello(ClientHelloMessage& msg);
     void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
     void handle_stream_end();
@@ -181,7 +179,7 @@ private:
     void cleanup();
 
     ArtworkRoleListener* listener_{nullptr};
-    ClientBridge* bridge_{nullptr};
+    SendspinClient* client_;
     std::vector<ImageSlotPreference> preferred_image_formats_;
     std::vector<ArtworkChannelFormatObject> artwork_channels_;
 

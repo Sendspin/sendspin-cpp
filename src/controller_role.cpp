@@ -24,20 +24,15 @@ struct ControllerRole::EventState {
     ShadowSlot<ServerStateControllerObject> shadow;
 };
 
-ControllerRole::ControllerRole() : event_state_(std::make_unique<EventState>()) {}
+ControllerRole::ControllerRole(SendspinClient* client)
+    : client_(client), event_state_(std::make_unique<EventState>()) {}
 
 ControllerRole::~ControllerRole() = default;
 
-void ControllerRole::attach(ClientBridge* bridge) {
-    this->bridge_ = bridge;
-}
-
 void ControllerRole::send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume,
                                   std::optional<bool> mute) {
-    if (this->bridge_) {
-        std::string command_message = format_client_command_message(cmd, volume, mute);
-        this->bridge_->send_text(command_message);
-    }
+    std::string command_message = format_client_command_message(cmd, volume, mute);
+    this->client_->send_text(command_message);
 }
 
 void ControllerRole::contribute_hello(ClientHelloMessage& msg) {

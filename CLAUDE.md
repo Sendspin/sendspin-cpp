@@ -20,11 +20,10 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `SendspinTimeFilter` (`time_filter.h`) — 2D Kalman filter for NTP-style time sync
 - `SendspinTimeBurst` (`time_burst.h`) — burst-based time message coordinator
 - `SendspinDecoder` (`decoder.h`) — FLAC/Opus/PCM decoder wrapper
-- `ClientBridge` (`client.h`) — abstract interface providing roles with access to shared client services; `SendspinClient` implements it
 
 ### Role composition
 
-Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role is a concrete class that owns its state and event queues. The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers — no preprocessor guards.
+Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role receives a `SendspinClient*` at construction time and uses it to access shared services (time sync, state publishing, message sending). The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers — no preprocessor guards.
 
 ```cpp
 // Implement listener interfaces

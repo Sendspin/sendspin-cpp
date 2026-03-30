@@ -28,6 +28,7 @@
 namespace sendspin {
 
 class PlayerRole;
+class SendspinClient;
 
 // Stores the timing information of audio played received from the speaker
 struct PlaybackProgress {
@@ -90,7 +91,7 @@ enum EventGroupBits : uint32_t {
 /// @brief Self-contained sync task for Sendspin synchronized audio playback.
 ///
 /// Manages a persistent background thread that reads encoded audio from the ring buffer,
-/// decodes it, synchronizes it to server timestamps, and writes PCM data to an AudioSink.
+/// decodes it, synchronizes it to server timestamps, and writes PCM data via the player listener.
 /// The thread starts once during initialization and idles between streams to avoid
 /// thread create/destroy churn on embedded devices.
 ///
@@ -105,7 +106,7 @@ public:
     /// @param player The owning PlayerRole, used for time sync, delay, and audio write access.
     /// @param buffer_size Size of the encoded audio ring buffer in bytes.
     /// @return true on success, false on allocation failure.
-    bool init(PlayerRole* player, size_t buffer_size);
+    bool init(PlayerRole* player, SendspinClient* client, size_t buffer_size);
 
     /// @brief Creates and starts the persistent sync background thread.
     /// Call once after init(). The thread idles until a codec header arrives in the ring buffer.
@@ -231,8 +232,9 @@ protected:
     ThreadSafeQueue<PlaybackProgress> playback_progress_queue_;
     std::thread sync_thread_;
 
-    // Owning player role (set by init, outlives this task)
+    // Owning player role and client (set by init, both outlive this task)
     PlayerRole* player_{nullptr};
+    SendspinClient* client_{nullptr};
 
     // Tracks whether the last task run ended with an error
     bool last_run_had_error_{false};
