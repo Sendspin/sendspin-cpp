@@ -33,6 +33,7 @@ public:
     ShadowSlot& operator=(const ShadowSlot&) = delete;
 
     /// @brief Overwrite the slot with a new value (latest-wins)
+    /// @param value The new value to store.
     void write(T value) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->slot_ = std::move(value);
@@ -40,6 +41,8 @@ public:
     }
 
     /// @brief Merge a delta into the slot using a callable: fn(T& current, T&& delta)
+    /// @param fn Callable that merges `delta` into the current slot value.
+    /// @param delta The new partial value to merge in.
     template <typename MergeFn>
     void merge(MergeFn&& fn, T delta) {
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -47,7 +50,9 @@ public:
         this->dirty_ = true;
     }
 
-    /// @brief Move the accumulated value out if dirty. Returns true if a value was taken
+    /// @brief Move the accumulated value out if dirty
+    /// @param[out] out Receives the stored value if the slot is dirty.
+    /// @return true if a value was taken, false if the slot was clean.
     bool take(T& out) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         if (!this->dirty_) {

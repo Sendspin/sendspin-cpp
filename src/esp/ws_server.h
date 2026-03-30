@@ -92,7 +92,8 @@ public:
         this->connection_closed_callback_ = std::move(callback);
     }
 
-    /// @brief Sets callback to find a connection by socket fd.
+    /// @brief Sets callback to find a connection by socket fd
+    /// @param callback The callback function.
     void set_find_connection_callback(FindConnectionCallback&& callback) {
         this->find_connection_callback_ = std::move(callback);
     }

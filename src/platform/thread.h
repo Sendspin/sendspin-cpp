@@ -26,6 +26,10 @@ namespace sendspin {
 /// @brief Configures the next std::thread created on this calling thread
 /// On ESP-IDF, sets stack size, priority, name, and optionally SPIRAM stack allocation
 /// via esp_pthread_set_cfg.
+/// @param name Thread name shown in the RTOS task list.
+/// @param stack_size Stack size in bytes.
+/// @param priority FreeRTOS task priority.
+/// @param stack_in_psram If true, allocates the stack in PSRAM.
 inline void platform_configure_thread(const char* name, size_t stack_size, int priority,
                                       bool stack_in_psram) {
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();

@@ -36,6 +36,8 @@ enum class SsErr : int32_t {
 };
 
 /// @brief Returns a human-readable name for an error code
+/// @param err The error code to look up.
+/// @return String literal name of the error code, or "UNKNOWN".
 inline const char* ss_err_to_name(SsErr err) {
     switch (err) {
         case SsErr::OK:
@@ -63,6 +65,8 @@ inline const char* ss_err_to_name(SsErr err) {
 
 #ifdef ESP_PLATFORM
 /// @brief Converts an ESP-IDF error code to SsErr (for use in ESP-IDF-specific code)
+/// @param err The ESP-IDF error code to convert.
+/// @return The equivalent SsErr value.
 inline SsErr from_esp_err(esp_err_t err) {
     return static_cast<SsErr>(err);
 }

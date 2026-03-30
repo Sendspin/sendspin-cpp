@@ -222,9 +222,9 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
 void apply_metadata_state_deltas(ServerMetadataStateObject* current,
                                  const ServerMetadataStateObject& updates);
 
-/// @brief Formats a client hello message as a JSON string for sending to the server.
-/// @param msg (ClientHelloMessage *) Message to serialize
-/// @return (std::string) Hello message serialized into JSON format
+/// @brief Formats a client hello message as a JSON string for sending to the server
+/// @param msg Message to serialize.
+/// @return Hello message serialized into JSON format.
 std::string format_client_hello_message(const ClientHelloMessage* msg);
 
 std::string format_client_state_message(const ClientStateMessage* msg);

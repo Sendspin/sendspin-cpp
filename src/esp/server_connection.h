@@ -73,8 +73,8 @@ public:
     bool is_connected() const override;
 
     /// @brief Sends a text message to the server with a completion callback.
-    /// @param msg The message string to send.
-    /// @param cb Callback invoked after send completes.
+    /// @param message The message string to send.
+    /// @param on_complete Callback invoked after send completes.
     /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete) override;
 
