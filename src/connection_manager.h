@@ -15,9 +15,9 @@
 #pragma once
 
 #include "protocol_messages.h"
+#include "sendspin/client.h"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -47,37 +47,11 @@ struct HelloRetryState {
     uint8_t attempts{3};       ///< Remaining retry attempts
 };
 
-/// @brief Callbacks from ConnectionManager back to SendspinClient.
-struct ConnectionManagerCallbacks {
-    /// @brief Routes a JSON message to the client for processing.
-    std::function<bool(SendspinConnection*, const std::string&, int64_t)> on_json_message;
-
-    /// @brief Routes a binary message to the client for processing.
-    std::function<void(uint8_t*, size_t)> on_binary_message;
-
-    /// @brief Builds the formatted hello message string from client config.
-    std::function<std::string()> build_hello_message;
-
-    /// @brief Called when a connection's handshake completes.
-    /// Client stores server info and publishes state.
-    std::function<void(SendspinConnection*, ServerInformationObject)> on_handshake_complete;
-
-    /// @brief Called when the active streaming connection is lost.
-    /// Client handles sync task cleanup, user callbacks, and high-performance release.
-    std::function<void()> on_active_connection_lost;
-
-    /// @brief Resets the time burst (called when active connection changes).
-    std::function<void()> reset_time_burst;
-
-    /// @brief Returns true if the network is ready for connections.
-    std::function<bool()> is_network_ready;
-};
-
 /// @brief Manages WebSocket connection lifecycle: accepts/creates connections, handles hello
 /// handshake, server handoff, and graceful disconnection.
 class ConnectionManager {
 public:
-    explicit ConnectionManager(ConnectionManagerCallbacks callbacks);
+    explicit ConnectionManager(ConnectionManagerCallbacks* callbacks);
     ~ConnectionManager();
 
     // --- Public API ---
@@ -139,7 +113,7 @@ private:
                                  SendspinGoodbyeReason reason);
 
     // --- Callbacks ---
-    ConnectionManagerCallbacks callbacks_;
+    ConnectionManagerCallbacks* callbacks_;
 
     // --- Connections ---
     std::unique_ptr<SendspinConnection> current_connection_;

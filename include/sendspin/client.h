@@ -117,6 +117,25 @@ public:
 class ConnectionManager;
 class SendspinConnection;
 class SendspinTimeBurst;
+struct ServerInformationObject;
+
+/// @brief Interface from ConnectionManager back to the client.
+/// ConnectionManager calls these methods to route messages, signal lifecycle events,
+/// and query network readiness.
+class ConnectionManagerCallbacks {
+public:
+    virtual ~ConnectionManagerCallbacks() = default;
+
+    virtual bool on_json_message(SendspinConnection* conn, const std::string& message,
+                                 int64_t timestamp) = 0;
+    virtual void on_binary_message(uint8_t* payload, size_t len) = 0;
+    virtual std::string build_hello_message() = 0;
+    virtual void on_handshake_complete(SendspinConnection* conn,
+                                       ServerInformationObject server) = 0;
+    virtual void on_active_connection_lost() = 0;
+    virtual void reset_time_burst() = 0;
+    virtual bool is_network_ready() = 0;
+};
 
 /// @brief Configuration for a SendspinClient instance.
 /// Filled in by the platform (e.g., ESPHome) before calling start_server().
@@ -149,7 +168,7 @@ struct TimeResponseEvent {
 /// 4. Set listeners on the role objects and providers on the client
 /// 5. Call start_server() to begin listening for connections
 /// 6. Call loop() periodically from the main loop
-class SendspinClient : public ClientBridge {
+class SendspinClient : public ClientBridge, public ConnectionManagerCallbacks {
 public:
     explicit SendspinClient(SendspinClientConfig config);
     ~SendspinClient();
@@ -310,6 +329,17 @@ protected:
     void send_text(const std::string& text) override;
     void request_high_performance() override;
     void release_high_performance() override;
+
+    // --- ConnectionManagerCallbacks overrides ---
+
+    bool on_json_message(SendspinConnection* conn, const std::string& message,
+                         int64_t timestamp) override;
+    void on_binary_message(uint8_t* payload, size_t len) override;
+    std::string build_hello_message() override;
+    void on_handshake_complete(SendspinConnection* conn, ServerInformationObject server) override;
+    void on_active_connection_lost() override;
+    void reset_time_burst() override;
+    bool is_network_ready() override;
 
     // --- Configuration ---
 

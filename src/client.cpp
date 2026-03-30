@@ -41,25 +41,7 @@ struct SendspinClient::EventState {
 
 SendspinClient::SendspinClient(SendspinClientConfig config)
     : config_(std::move(config)),
-      connection_manager_(std::make_unique<ConnectionManager>(ConnectionManagerCallbacks{
-          .on_json_message =
-              [this](SendspinConnection* conn, const std::string& message, int64_t timestamp) {
-                  return this->process_json_message_(conn, message, timestamp);
-              },
-          .on_binary_message = [this](uint8_t* payload,
-                                      size_t len) { this->process_binary_message_(payload, len); },
-          .build_hello_message = [this]() { return this->build_hello_message_(); },
-          .on_handshake_complete =
-              [this](SendspinConnection* conn, ServerInformationObject server) {
-                  this->server_information_ = std::move(server);
-                  this->publish_client_state_(conn);
-              },
-          .on_active_connection_lost = [this]() { this->cleanup_connection_state_(); },
-          .reset_time_burst = [this]() { this->time_burst_->reset(); },
-          .is_network_ready = [this]() -> bool {
-              return this->network_provider_ && this->network_provider_->is_network_ready();
-          },
-      })),
+      connection_manager_(std::make_unique<ConnectionManager>(this)),
       time_burst_(std::make_unique<SendspinTimeBurst>()),
       event_state_(std::make_unique<EventState>()) {
     this->event_state_->time_queue.create(16);
@@ -103,6 +85,39 @@ void SendspinClient::release_high_performance() {
     if (this->listener_) {
         this->listener_->on_release_high_performance();
     }
+}
+
+// --- ConnectionManagerCallbacks overrides ---
+
+bool SendspinClient::on_json_message(SendspinConnection* conn, const std::string& message,
+                                     int64_t timestamp) {
+    return this->process_json_message_(conn, message, timestamp);
+}
+
+void SendspinClient::on_binary_message(uint8_t* payload, size_t len) {
+    this->process_binary_message_(payload, len);
+}
+
+std::string SendspinClient::build_hello_message() {
+    return this->build_hello_message_();
+}
+
+void SendspinClient::on_handshake_complete(SendspinConnection* conn,
+                                           ServerInformationObject server) {
+    this->server_information_ = std::move(server);
+    this->publish_client_state_(conn);
+}
+
+void SendspinClient::on_active_connection_lost() {
+    this->cleanup_connection_state_();
+}
+
+void SendspinClient::reset_time_burst() {
+    this->time_burst_->reset();
+}
+
+bool SendspinClient::is_network_ready() {
+    return this->network_provider_ && this->network_provider_->is_network_ready();
 }
 
 // --- Role registration ---
