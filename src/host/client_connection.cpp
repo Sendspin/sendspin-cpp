@@ -50,64 +50,6 @@ void SendspinClientConnection::start() {
     SS_LOGD(TAG, "Client connection starting to %s", this->url_.c_str());
 }
 
-void SendspinClientConnection::setup_callbacks_() {
-    this->ws_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
-        int64_t receive_time = platform_time_us();
-
-        switch (msg->type) {
-            case ix::WebSocketMessageType::Open:
-                SS_LOGD(TAG, "WebSocket connected to %s", this->url_.c_str());
-                this->connected_ = true;
-                if (this->on_connected) {
-                    this->on_connected(this);
-                }
-                break;
-
-            case ix::WebSocketMessageType::Close:
-                SS_LOGD(TAG, "WebSocket disconnected from %s", this->url_.c_str());
-                this->connected_ = false;
-                this->client_hello_sent_ = false;
-                this->server_hello_received_ = false;
-                this->pending_time_message_ = false;
-                this->reset_websocket_payload_();
-                if (this->on_disconnected) {
-                    this->on_disconnected(this);
-                }
-                break;
-
-            case ix::WebSocketMessageType::Message: {
-                // IXWebSocket delivers complete reassembled messages
-                const std::string& data = msg->str;
-                bool is_binary = msg->binary;
-
-                if (!data.empty()) {
-                    uint8_t* dest = this->prepare_receive_buffer_(data.size());
-                    if (dest == nullptr) {
-                        SS_LOGE(TAG, "Allocation failed, dropping connection");
-                        this->connected_ = false;
-                        if (this->on_disconnected) {
-                            this->on_disconnected(this);
-                        }
-                        return;
-                    }
-                    std::memcpy(dest, data.data(), data.size());
-                    this->commit_receive_buffer_(data.size());
-                }
-                this->dispatch_completed_message_(!is_binary, receive_time);
-                break;
-            }
-
-            case ix::WebSocketMessageType::Error:
-                SS_LOGE(TAG, "WebSocket error on connection to %s: %s", this->url_.c_str(),
-                        msg->errorInfo.reason.c_str());
-                break;
-
-            default:
-                break;
-        }
-    });
-}
-
 void SendspinClientConnection::loop() {
     // Handle auto-reconnect
     if (!this->is_connected() && this->auto_reconnect_) {
@@ -170,6 +112,64 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     }
 
     return SsErr::OK;
+}
+
+void SendspinClientConnection::setup_callbacks_() {
+    this->ws_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
+        int64_t receive_time = platform_time_us();
+
+        switch (msg->type) {
+            case ix::WebSocketMessageType::Open:
+                SS_LOGD(TAG, "WebSocket connected to %s", this->url_.c_str());
+                this->connected_ = true;
+                if (this->on_connected) {
+                    this->on_connected(this);
+                }
+                break;
+
+            case ix::WebSocketMessageType::Close:
+                SS_LOGD(TAG, "WebSocket disconnected from %s", this->url_.c_str());
+                this->connected_ = false;
+                this->client_hello_sent_ = false;
+                this->server_hello_received_ = false;
+                this->pending_time_message_ = false;
+                this->reset_websocket_payload_();
+                if (this->on_disconnected) {
+                    this->on_disconnected(this);
+                }
+                break;
+
+            case ix::WebSocketMessageType::Message: {
+                // IXWebSocket delivers complete reassembled messages
+                const std::string& data = msg->str;
+                bool is_binary = msg->binary;
+
+                if (!data.empty()) {
+                    uint8_t* dest = this->prepare_receive_buffer_(data.size());
+                    if (dest == nullptr) {
+                        SS_LOGE(TAG, "Allocation failed, dropping connection");
+                        this->connected_ = false;
+                        if (this->on_disconnected) {
+                            this->on_disconnected(this);
+                        }
+                        return;
+                    }
+                    std::memcpy(dest, data.data(), data.size());
+                    this->commit_receive_buffer_(data.size());
+                }
+                this->dispatch_completed_message_(!is_binary, receive_time);
+                break;
+            }
+
+            case ix::WebSocketMessageType::Error:
+                SS_LOGE(TAG, "WebSocket error on connection to %s: %s", this->url_.c_str(),
+                        msg->errorInfo.reason.c_str());
+                break;
+
+            default:
+                break;
+        }
+    });
 }
 
 }  // namespace sendspin

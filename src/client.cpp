@@ -275,15 +275,6 @@ void SendspinClient::loop() {
 }
 
 // ============================================================================
-// State updates
-// ============================================================================
-
-void SendspinClient::update_state(SendspinClientState state) {
-    this->state_ = state;
-    this->publish_client_state_(this->connection_manager_->current());
-}
-
-// ============================================================================
 // Queries
 // ============================================================================
 
@@ -303,6 +294,15 @@ int64_t SendspinClient::get_client_time(int64_t server_time) const {
 
 SendspinConnection* SendspinClient::get_current_connection() const {
     return this->connection_manager_->current();
+}
+
+// ============================================================================
+// State updates
+// ============================================================================
+
+void SendspinClient::update_state(SendspinClientState state) {
+    this->state_ = state;
+    this->publish_client_state_(this->connection_manager_->current());
 }
 
 // ============================================================================

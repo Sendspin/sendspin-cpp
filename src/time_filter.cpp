@@ -175,14 +175,14 @@ void SendspinTimeFilter::reset() {
     this->use_drift_ = false;
 }
 
-bool SendspinTimeFilter::has_update() const {
-    std::lock_guard<std::mutex> lock(this->state_mutex_);
-    return this->count_ >= 1;
-}
-
 int64_t SendspinTimeFilter::get_error() const {
     std::lock_guard<std::mutex> lock(this->state_mutex_);
     return std::round(sqrt(this->offset_covariance_));
+}
+
+bool SendspinTimeFilter::has_update() const {
+    std::lock_guard<std::mutex> lock(this->state_mutex_);
+    return this->count_ >= 1;
 }
 
 int64_t SendspinTimeFilter::get_covariance() const {
