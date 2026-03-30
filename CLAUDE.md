@@ -20,7 +20,7 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `SendspinTimeFilter` (`time_filter.h`) — 2D Kalman filter for NTP-style time sync
 - `SendspinTimeBurst` (`time_burst.h`) — burst-based time message coordinator
 - `SendspinDecoder` (`decoder.h`) — FLAC/Opus/PCM decoder wrapper
-- `ClientBridge` (`client_bridge.h`) — private struct providing roles with access to shared client services
+- `ClientBridge` (`client.h`) — abstract interface providing roles with access to shared client services; `SendspinClient` implements it
 
 ### Role composition
 

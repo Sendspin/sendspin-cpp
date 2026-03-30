@@ -97,11 +97,26 @@ enum class LogLevel : int {
     VERBOSE = 5,
 };
 
+/// @brief Interface from roles to the client, providing access to shared client services.
+/// Roles store a ClientBridge pointer and use it to query time sync, publish state, and send
+/// messages without depending on the SendspinClient class directly.
+class ClientBridge {
+public:
+    virtual ~ClientBridge() = default;
+
+    virtual int64_t get_client_time(int64_t server_time) const = 0;
+    virtual bool is_time_synced() const = 0;
+    virtual void publish_state() = 0;
+    virtual void update_state(SendspinClientState state) = 0;
+    virtual void send_text(const std::string& text) = 0;
+    virtual void request_high_performance() = 0;
+    virtual void release_high_performance() = 0;
+};
+
 // Forward declarations
 class ConnectionManager;
 class SendspinConnection;
 class SendspinTimeBurst;
-struct ClientBridge;
 
 /// @brief Configuration for a SendspinClient instance.
 /// Filled in by the platform (e.g., ESPHome) before calling start_server().
@@ -134,7 +149,7 @@ struct TimeResponseEvent {
 /// 4. Set listeners on the role objects and providers on the client
 /// 5. Call start_server() to begin listening for connections
 /// 6. Call loop() periodically from the main loop
-class SendspinClient {
+class SendspinClient : public ClientBridge {
 public:
     explicit SendspinClient(SendspinClientConfig config);
     ~SendspinClient();
@@ -219,10 +234,10 @@ public:
     bool is_connected() const;
 
     /// @brief Returns true if the time filter has received at least one measurement.
-    bool is_time_synced() const;
+    bool is_time_synced() const override;
 
     /// @brief Converts a server timestamp to the equivalent client timestamp.
-    int64_t get_client_time(int64_t server_time) const;
+    int64_t get_client_time(int64_t server_time) const override;
 
     /// @brief Returns the current active connection (or nullptr).
     SendspinConnection* get_current_connection() const;
@@ -240,7 +255,7 @@ public:
     // --- State updates ---
 
     /// @brief Updates the client state (synchronized, error, external_source) and publishes.
-    void update_state(SendspinClientState state);
+    void update_state(SendspinClientState state) override;
 
     // --- Listener and provider setters ---
 
@@ -289,8 +304,12 @@ protected:
     /// @brief Persists the server ID as the last played server (hashed).
     void persist_last_played_server_(const std::string& server_id);
 
-    /// @brief Creates a ClientBridge struct for role attachment.
-    ClientBridge* make_bridge_();
+    // --- ClientBridge overrides (used by roles via base class pointer) ---
+
+    void publish_state() override;
+    void send_text(const std::string& text) override;
+    void request_high_performance() override;
+    void release_high_performance() override;
 
     // --- Configuration ---
 
@@ -333,10 +352,6 @@ protected:
     std::unique_ptr<MetadataRole> metadata_;
     std::unique_ptr<ArtworkRole> artwork_;
     std::unique_ptr<VisualizerRole> visualizer_;
-
-    // --- Bridge (owned, stable pointer for role lifetime) ---
-
-    std::unique_ptr<ClientBridge> bridge_;
 };
 
 }  // namespace sendspin

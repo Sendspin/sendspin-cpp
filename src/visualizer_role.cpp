@@ -14,7 +14,6 @@
 
 #include "sendspin/visualizer_role.h"
 
-#include "client_bridge.h"
 #include "platform/event_flags.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
@@ -24,6 +23,7 @@
 #include "platform/thread_safe_queue.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
+#include "sendspin/client.h"
 
 #include <cstring>
 #include <thread>

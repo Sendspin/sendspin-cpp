@@ -14,9 +14,9 @@
 
 #include "sendspin/controller_role.h"
 
-#include "client_bridge.h"
 #include "platform/shadow_slot.h"
 #include "protocol_messages.h"
+#include "sendspin/client.h"
 
 namespace sendspin {
 
@@ -34,7 +34,7 @@ void ControllerRole::attach(ClientBridge* bridge) {
 
 void ControllerRole::send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume,
                                   std::optional<bool> mute) {
-    if (this->bridge_ && this->bridge_->send_text) {
+    if (this->bridge_) {
         std::string command_message = format_client_command_message(cmd, volume, mute);
         this->bridge_->send_text(command_message);
     }

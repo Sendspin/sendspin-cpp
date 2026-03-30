@@ -14,7 +14,6 @@
 
 #include "sendspin/player_role.h"
 
-#include "client_bridge.h"
 #include "platform/base64.h"
 #include "platform/logging.h"
 #include "platform/shadow_slot.h"

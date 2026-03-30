@@ -23,7 +23,7 @@
 namespace sendspin {
 
 class SendspinClient;
-struct ClientBridge;
+class ClientBridge;
 struct ClientHelloMessage;
 
 // ============================================================================

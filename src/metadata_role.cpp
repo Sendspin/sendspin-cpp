@@ -14,10 +14,10 @@
 
 #include "sendspin/metadata_role.h"
 
-#include "client_bridge.h"
 #include "platform/shadow_slot.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
+#include "sendspin/client.h"
 
 #include <algorithm>
 

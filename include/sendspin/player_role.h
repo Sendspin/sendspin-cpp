@@ -28,7 +28,7 @@ namespace sendspin {
 class SendspinClient;
 class SendspinPersistenceProvider;
 class SyncTask;
-struct ClientBridge;
+class ClientBridge;
 struct ClientHelloMessage;
 struct ClientStateMessage;
 struct StreamStartMessage;

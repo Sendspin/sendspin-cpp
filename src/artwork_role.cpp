@@ -14,10 +14,10 @@
 
 #include "sendspin/artwork_role.h"
 
-#include "client_bridge.h"
 #include "platform/logging.h"
 #include "platform/thread_safe_queue.h"
 #include "protocol_messages.h"
+#include "sendspin/client.h"
 
 static const char* const TAG = "sendspin.artwork";
 

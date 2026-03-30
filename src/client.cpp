@@ -14,7 +14,6 @@
 
 #include "sendspin/client.h"
 
-#include "client_bridge.h"
 #include "connection.h"
 #include "connection_manager.h"
 #include "platform/logging.h"
@@ -81,40 +80,29 @@ LogLevel SendspinClient::get_log_level() {
     return static_cast<LogLevel>(platform_get_log_level());
 }
 
-// --- Bridge ---
+// --- ClientBridge overrides ---
 
-ClientBridge* SendspinClient::make_bridge_() {
-    if (this->bridge_) {
-        return this->bridge_.get();
+void SendspinClient::publish_state() {
+    this->publish_client_state_(this->connection_manager_->current());
+}
+
+void SendspinClient::send_text(const std::string& text) {
+    auto* conn = this->connection_manager_->current();
+    if (conn != nullptr && conn->is_connected()) {
+        conn->send_text_message(text, nullptr);
     }
-    this->bridge_ = std::make_unique<ClientBridge>(ClientBridge{
-        .get_client_time =
-            [this](int64_t server_time) { return this->get_client_time(server_time); },
-        .is_time_synced = [this]() { return this->is_time_synced(); },
-        .publish_state =
-            [this]() { this->publish_client_state_(this->connection_manager_->current()); },
-        .update_state = [this](SendspinClientState state) { this->update_state(state); },
-        .send_text =
-            [this](const std::string& text) {
-                auto* conn = this->connection_manager_->current();
-                if (conn != nullptr && conn->is_connected()) {
-                    conn->send_text_message(text, nullptr);
-                }
-            },
-        .request_high_performance =
-            [this]() {
-                if (this->listener_) {
-                    this->listener_->on_request_high_performance();
-                }
-            },
-        .release_high_performance =
-            [this]() {
-                if (this->listener_) {
-                    this->listener_->on_release_high_performance();
-                }
-            },
-    });
-    return this->bridge_.get();
+}
+
+void SendspinClient::request_high_performance() {
+    if (this->listener_) {
+        this->listener_->on_request_high_performance();
+    }
+}
+
+void SendspinClient::release_high_performance() {
+    if (this->listener_) {
+        this->listener_->on_release_high_performance();
+    }
 }
 
 // --- Role registration ---
@@ -125,7 +113,7 @@ PlayerRole& SendspinClient::add_player(PlayerRole::Config config) {
                 "add_player() called after start_server() — role may not initialize correctly");
     }
     this->player_ = std::make_unique<PlayerRole>(std::move(config));
-    this->player_->attach(this->make_bridge_(), this->persistence_provider_);
+    this->player_->attach(this, this->persistence_provider_);
     return *this->player_;
 }
 
@@ -134,7 +122,7 @@ ControllerRole& SendspinClient::add_controller() {
         SS_LOGW(TAG, "add_controller() called after start_server()");
     }
     this->controller_ = std::make_unique<ControllerRole>();
-    this->controller_->attach(this->make_bridge_());
+    this->controller_->attach(this);
     return *this->controller_;
 }
 
@@ -143,7 +131,7 @@ MetadataRole& SendspinClient::add_metadata() {
         SS_LOGW(TAG, "add_metadata() called after start_server()");
     }
     this->metadata_ = std::make_unique<MetadataRole>();
-    this->metadata_->attach(this->make_bridge_());
+    this->metadata_->attach(this);
     return *this->metadata_;
 }
 
@@ -152,7 +140,7 @@ ArtworkRole& SendspinClient::add_artwork() {
         SS_LOGW(TAG, "add_artwork() called after start_server()");
     }
     this->artwork_ = std::make_unique<ArtworkRole>();
-    this->artwork_->attach(this->make_bridge_());
+    this->artwork_->attach(this);
     return *this->artwork_;
 }
 
@@ -161,7 +149,7 @@ VisualizerRole& SendspinClient::add_visualizer(VisualizerRole::Config config) {
         SS_LOGW(TAG, "add_visualizer() called after start_server()");
     }
     this->visualizer_ = std::make_unique<VisualizerRole>(std::move(config));
-    this->visualizer_->attach(this->make_bridge_());
+    this->visualizer_->attach(this);
     return *this->visualizer_;
 }
 
