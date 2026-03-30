@@ -21,7 +21,7 @@
 
 namespace sendspin {
 
-/// @brief A server-side WebSocket connection for Sendspin.
+/// @brief A server-side WebSocket connection for Sendspin
 ///
 /// This class represents a single incoming WebSocket connection from a Sendspin server.
 /// It inherits from SendspinConnection and implements the connection interface for
@@ -40,7 +40,7 @@ namespace sendspin {
 /// 4. disconnect() is called to gracefully close with goodbye message
 class SendspinServerConnection : public SendspinConnection {
 public:
-    /// @brief Constructs a server connection with the given httpd handle and socket.
+    /// @brief Constructs a server connection with the given httpd handle and socket
     /// @param server The httpd handle (owned by the server listener).
     /// @param sockfd The socket file descriptor for this connection.
     SendspinServerConnection(httpd_handle_t server, int sockfd);
@@ -49,13 +49,13 @@ public:
 
     // SendspinConnection interface implementation
 
-    /// @brief Starts the connection (initializes time filter, prepares for messages).
+    /// @brief Starts the connection (initializes time filter, prepares for messages)
     void start() override;
 
-    /// @brief Periodic loop processing (handles time message sending).
+    /// @brief Periodic loop processing (handles time message sending)
     void loop() override;
 
-    /// @brief Gracefully disconnects by sending a goodbye message, then closing.
+    /// @brief Gracefully disconnects by sending a goodbye message, then closing
     ///
     /// This is the high-level API for disconnection. It:
     /// 1. Sends a goodbye message with the specified reason
@@ -68,17 +68,17 @@ public:
     ///                    needed.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
-    /// @brief Checks if the socket connection is valid.
+    /// @brief Checks if the socket connection is valid
     /// @return true if connected, false otherwise.
     bool is_connected() const override;
 
-    /// @brief Sends a text message to the server with a completion callback.
+    /// @brief Sends a text message to the server with a completion callback
     /// @param message The message string to send.
     /// @param on_complete Callback invoked after send completes.
     /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete) override;
 
-    /// @brief Triggers the underlying socket to close.
+    /// @brief Triggers the underlying socket to close
     ///
     /// This is a low-level method that directly triggers the httpd session to close.
     /// It does NOT send a goodbye message first.
@@ -92,31 +92,31 @@ public:
     /// need to force-close without sending goodbye (e.g., after goodbye is already sent).
     void trigger_close();
 
-    /// @brief Gets the socket file descriptor.
+    /// @brief Gets the socket file descriptor
     /// @return The socket fd, or -1 if not connected.
     int get_sockfd() const override {
         return this->sockfd_;
     }
 
-    /// @brief Handles incoming WebSocket data.
+    /// @brief Handles incoming WebSocket data
     /// @param req The httpd request containing the WebSocket frame.
     /// @param receive_time Timestamp when the data was received.
     /// @return ESP_OK on success, error code on failure.
     esp_err_t handle_data(httpd_req_t* req, int64_t receive_time);
 
 protected:
-    /// @brief httpd_queue_work callback that sends a queued text frame over the WebSocket.
+    /// @brief httpd_queue_work callback that sends a queued text frame over the WebSocket
     /// @param arg Pointer to the AsyncRespArg context allocated by send_text_message().
     static void async_send_text(void* arg);
 
     // Pointer fields
 
-    /// @brief The httpd server handle (owned by SendspinWsServer).
+    /// @brief The httpd server handle (owned by SendspinWsServer)
     httpd_handle_t server_;
 
     // 32-bit fields
 
-    /// @brief The socket file descriptor for this connection.
+    /// @brief The socket file descriptor for this connection
     int sockfd_{-1};
 };
 

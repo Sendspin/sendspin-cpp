@@ -81,7 +81,7 @@ inline void platform_free(void* ptr) {
 
 namespace sendspin {
 
-/// @brief RAII wrapper for platform-allocated memory buffers.
+/// @brief RAII wrapper for platform-allocated memory buffers
 ///
 /// Owns a block of memory obtained via platform_malloc. Automatically frees on destruction.
 /// Supports reallocation and move semantics. Not copyable.
@@ -117,7 +117,7 @@ public:
     PlatformBuffer(const PlatformBuffer&) = delete;
     PlatformBuffer& operator=(const PlatformBuffer&) = delete;
 
-    /// @brief Allocates a new buffer. Any previously held memory is freed.
+    /// @brief Allocates a new buffer. Any previously held memory is freed
     /// @return true if allocation succeeded.
     bool allocate(size_t size) {
         if (this->ptr_ != nullptr) {
@@ -128,7 +128,7 @@ public:
         return this->ptr_ != nullptr;
     }
 
-    /// @brief Reallocates the buffer to a new size, preserving existing data.
+    /// @brief Reallocates the buffer to a new size, preserving existing data
     /// On failure, the original buffer remains valid.
     /// @return true if reallocation succeeded.
     bool realloc(size_t new_size) {
@@ -141,7 +141,7 @@ public:
         return true;
     }
 
-    /// @brief Frees the held memory.
+    /// @brief Frees the held memory
     void reset() {
         if (this->ptr_ != nullptr) {
             platform_free(this->ptr_);
@@ -150,28 +150,28 @@ public:
         }
     }
 
-    /// @brief Returns a pointer to the allocated buffer.
+    /// @brief Returns a pointer to the allocated buffer
     /// @return Pointer to the buffer, or nullptr if not allocated.
     uint8_t* data() {
         return this->ptr_;
     }
-    /// @brief Returns a const pointer to the allocated buffer.
+    /// @brief Returns a const pointer to the allocated buffer
     /// @return Const pointer to the buffer, or nullptr if not allocated.
     const uint8_t* data() const {
         return this->ptr_;
     }
-    /// @brief Returns the current allocation size in bytes.
+    /// @brief Returns the current allocation size in bytes
     /// @return Size of the allocated buffer in bytes.
     size_t size() const {
         return this->size_;
     }
-    /// @brief Returns true if the buffer holds an allocation.
+    /// @brief Returns true if the buffer holds an allocation
     /// @return true if memory is currently allocated.
     explicit operator bool() const {
         return this->ptr_ != nullptr;
     }
 
-    /// @brief Returns a typed pointer into the buffer at a byte offset.
+    /// @brief Returns a typed pointer into the buffer at a byte offset
     template <typename T>
     T* as(size_t byte_offset = 0) {
         return reinterpret_cast<T*>(this->ptr_ + byte_offset);

@@ -22,7 +22,7 @@
 
 namespace sendspin {
 
-/// @brief A client-side WebSocket connection for Sendspin.
+/// @brief A client-side WebSocket connection for Sendspin
 ///
 /// This class represents an outgoing WebSocket connection to a Sendspin server.
 /// It inherits from SendspinConnection and implements the connection interface for
@@ -42,7 +42,7 @@ namespace sendspin {
 /// 4. disconnect() is called to gracefully close with goodbye message
 class SendspinClientConnection : public SendspinConnection {
 public:
-    /// @brief Constructs a client connection with the given server URL.
+    /// @brief Constructs a client connection with the given server URL
     /// @param url The WebSocket server URL (e.g., "ws://server.local:8927/sendspin").
     explicit SendspinClientConnection(std::string url);
 
@@ -50,24 +50,24 @@ public:
 
     // SendspinConnection interface implementation
 
-    /// @brief Starts the connection (initializes websocket client and connects).
+    /// @brief Starts the connection (initializes websocket client and connects)
     void start() override;
 
-    /// @brief Periodic loop processing (handles reconnection attempts).
+    /// @brief Periodic loop processing (handles reconnection attempts)
     void loop() override;
 
-    /// @brief Disconnects from the server with a goodbye message.
+    /// @brief Disconnects from the server with a goodbye message
     /// @param reason The reason for disconnecting.
     /// @param on_complete Optional callback invoked after goodbye send completes (or fails).
     ///                    For client connections, goodbye is synchronous, so callback is invoked
     ///                    immediately.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
-    /// @brief Checks if the websocket connection is established.
+    /// @brief Checks if the websocket connection is established
     /// @return true if connected, false otherwise.
     bool is_connected() const override;
 
-    /// @brief Sends a text message to the server with a completion callback.
+    /// @brief Sends a text message to the server with a completion callback
     /// @param msg The message string to send.
     /// @param cb Callback invoked after send completes.
     /// @return SsErr::OK if sent successfully, error code otherwise.
@@ -75,14 +75,14 @@ public:
 
     // Client connection-specific configuration
 
-    /// @brief Sets whether to automatically reconnect on connection loss.
+    /// @brief Sets whether to automatically reconnect on connection loss
     /// @param enabled True to enable auto-reconnect, false to disable.
     void set_auto_reconnect(bool enabled) {
         this->auto_reconnect_ = enabled;
     }
 
 protected:
-    /// @brief Static event handler for ESP-IDF websocket client events.
+    /// @brief Static event handler for ESP-IDF websocket client events
     /// @param handler_args User context (pointer to this SendspinClientConnection instance).
     /// @param base Event base.
     /// @param event_id Event ID.
@@ -90,37 +90,37 @@ protected:
     static void websocket_event_handler(void* handler_args, esp_event_base_t base, int32_t event_id,
                                         void* event_data);
 
-    /// @brief Handles websocket connected event.
+    /// @brief Handles websocket connected event
     void handle_connected_();
 
-    /// @brief Handles websocket disconnected event.
+    /// @brief Handles websocket disconnected event
     void handle_disconnected_();
 
-    /// @brief Handles websocket data event.
+    /// @brief Handles websocket data event
     /// @param data Pointer to websocket event data.
     /// @param receive_time Timestamp when the event was received (for time synchronization).
     void handle_data_(const esp_websocket_event_data_t* data, int64_t receive_time);
 
-    /// @brief Handles websocket error event.
+    /// @brief Handles websocket error event
     void handle_error_();
 
     // Pointer fields
 
-    /// @brief The ESP-IDF websocket client handle.
+    /// @brief The ESP-IDF websocket client handle
     esp_websocket_client_handle_t client_{nullptr};
 
-    /// @brief The WebSocket server URL.
+    /// @brief The WebSocket server URL
     std::string url_;
 
     // 32-bit fields
 
-    /// @brief Auto-reconnect configuration.
+    /// @brief Auto-reconnect configuration
     uint32_t last_reconnect_attempt_{0};
     uint32_t reconnect_interval_ms_{5000};
 
     // 8-bit fields
 
-    /// @brief Whether the websocket is currently connected.
+    /// @brief Whether the websocket is currently connected
     bool auto_reconnect_{true};
     bool connected_{false};
 };

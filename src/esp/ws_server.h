@@ -25,7 +25,7 @@ namespace sendspin {
 class SendspinClient;
 class SendspinServerConnection;
 
-/// @brief WebSocket server listener for Sendspin.
+/// @brief WebSocket server listener for Sendspin
 ///
 /// This class manages the HTTP server (httpd) that listens for incoming WebSocket
 /// connections from Sendspin servers. It does not own the connections long-term;
@@ -46,47 +46,47 @@ public:
     SendspinWsServer() = default;
     ~SendspinWsServer();
 
-    /// @brief Callback type for notifying the client of new connections.
+    /// @brief Callback type for notifying the client of new connections
     /// The client receives ownership of the connection and must decide whether to keep it.
     using NewConnectionCallback = std::function<void(std::unique_ptr<SendspinServerConnection>)>;
 
-    /// @brief Callback type for notifying the client when a socket closes.
+    /// @brief Callback type for notifying the client when a socket closes
     /// The client needs to identify which connection owns this sockfd and clean it up.
     using ConnectionClosedCallback = std::function<void(int sockfd)>;
 
-    /// @brief Callback type for looking up a connection by sockfd.
+    /// @brief Callback type for looking up a connection by sockfd
     using FindConnectionCallback = std::function<SendspinServerConnection*(int sockfd)>;
 
-    /// @brief Starts the HTTP server and begins listening for WebSocket connections.
+    /// @brief Starts the HTTP server and begins listening for WebSocket connections
     /// @param client Pointer to the SendspinClient (used for context in callbacks).
     /// @param task_stack_in_psram Whether to allocate the HTTP server task stack in PSRAM.
     /// @param task_priority Priority for the HTTP server task.
     /// @return true if server started successfully, false otherwise.
     bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority);
 
-    /// @brief Stops the HTTP server.
+    /// @brief Stops the HTTP server
     void stop();
 
-    /// @brief Checks if the server is currently running.
+    /// @brief Checks if the server is currently running
     /// @return true if the server is started, false otherwise.
     bool is_started() const {
         return this->server_ != nullptr;
     }
 
-    /// @brief Configures the maximum number of simultaneous connections.
+    /// @brief Configures the maximum number of simultaneous connections
     /// Default is 2 to support the handoff protocol (one active + one pending).
     /// @param max_connections Maximum number of open sockets (1-7).
     void set_max_connections(uint8_t max_connections) {
         this->max_connections_ = max_connections;
     }
 
-    /// @brief Sets the callback to invoke when a new connection is accepted.
+    /// @brief Sets the callback to invoke when a new connection is accepted
     /// @param callback The callback function.
     void set_new_connection_callback(NewConnectionCallback&& callback) {
         this->new_connection_callback_ = std::move(callback);
     }
 
-    /// @brief Sets the callback to invoke when a socket closes.
+    /// @brief Sets the callback to invoke when a socket closes
     /// @param callback The callback function.
     void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
         this->connection_closed_callback_ = std::move(callback);
@@ -98,50 +98,50 @@ public:
         this->find_connection_callback_ = std::move(callback);
     }
 
-    /// @brief Gets the httpd handle (for use by connections).
+    /// @brief Gets the httpd handle (for use by connections)
     /// @return The httpd server handle, or nullptr if not started.
     httpd_handle_t get_server() const {
         return this->server_;
     }
 
 protected:
-    /// @brief Callback invoked when a new client opens a connection.
+    /// @brief Callback invoked when a new client opens a connection
     /// Creates a SendspinServerConnection and notifies the client.
     /// @param handle The httpd server handle.
     /// @param sockfd The socket file descriptor for the new connection.
     /// @return ESP_OK on success.
     static esp_err_t open_callback(httpd_handle_t handle, int sockfd);
 
-    /// @brief Callback invoked when a client closes a connection.
+    /// @brief Callback invoked when a client closes a connection
     /// @param handle The httpd server handle.
     /// @param sockfd The socket file descriptor being closed.
     static void close_callback(httpd_handle_t handle, int sockfd);
 
-    /// @brief WebSocket message handler registered with httpd.
+    /// @brief WebSocket message handler registered with httpd
     static esp_err_t websocket_handler(httpd_req_t* req);
 
     // Struct fields
 
-    /// @brief Callback to notify the client when a socket closes.
+    /// @brief Callback to notify the client when a socket closes
     ConnectionClosedCallback connection_closed_callback_;
 
-    /// @brief Callback to find a connection by socket fd.
+    /// @brief Callback to find a connection by socket fd
     FindConnectionCallback find_connection_callback_;
 
-    /// @brief Callback to notify the client of new connections.
+    /// @brief Callback to notify the client of new connections
     NewConnectionCallback new_connection_callback_;
 
     // Pointer fields
 
-    /// @brief Pointer to the SendspinClient (stored as user context for callbacks).
+    /// @brief Pointer to the SendspinClient (stored as user context for callbacks)
     SendspinClient* client_{nullptr};
 
-    /// @brief The HTTP server handle.
+    /// @brief The HTTP server handle
     httpd_handle_t server_{nullptr};
 
     // 8-bit fields
 
-    /// @brief Maximum number of simultaneous connections (default: 2 for handoff).
+    /// @brief Maximum number of simultaneous connections (default: 2 for handoff)
     uint8_t max_connections_{2};
 };
 
