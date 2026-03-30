@@ -178,13 +178,15 @@ private:
     void drain_events();
     void cleanup();
 
-    ArtworkRoleListener* listener_{nullptr};
-    SendspinClient* client_;
-    std::vector<ImageSlotPreference> preferred_image_formats_;
+    // Struct fields
     std::vector<ArtworkChannelFormatObject> artwork_channels_;
-
     struct EventState;
+    std::vector<ImageSlotPreference> preferred_image_formats_;
+
+    // Pointer fields
+    SendspinClient* client_;
     std::unique_ptr<EventState> event_state_;
+    ArtworkRoleListener* listener_{nullptr};
 };
 
 }  // namespace sendspin

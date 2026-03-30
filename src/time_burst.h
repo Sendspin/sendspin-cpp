@@ -56,17 +56,18 @@ protected:
     static const int64_t BURST_INTERVAL_MS = 10000;
     static const int64_t RESPONSE_TIMEOUT_MS = 10000;
 
-    uint8_t burst_index_{BURST_SIZE};  // starts "complete" so first loop triggers a burst
-    int64_t last_burst_complete_time_{0};
-    int64_t current_message_sent_time_{0};
-
-    // Flag set by on_time_response() when burst completes, consumed by loop()
-    bool pending_burst_completed_{false};
-
+    // 64-bit fields
     // Best measurement in current burst
     int64_t best_max_error_{std::numeric_limits<int64_t>::max()};
     int64_t best_offset_{0};
     int64_t best_timestamp_{0};
+    int64_t current_message_sent_time_{0};
+    int64_t last_burst_complete_time_{0};
+
+    // 8-bit fields
+    uint8_t burst_index_{BURST_SIZE};  // starts "complete" so first loop triggers a burst
+    // Flag set by on_time_response() when burst completes, consumed by loop()
+    bool pending_burst_completed_{false};
 };
 
 }  // namespace sendspin

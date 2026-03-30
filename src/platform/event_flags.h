@@ -75,6 +75,7 @@ public:
     }
 
 private:
+    // Pointer fields
     EventGroupHandle_t handle_{nullptr};
 };
 
@@ -155,9 +156,14 @@ public:
     }
 
 private:
-    mutable std::mutex mtx_;
+    // Struct fields
     std::condition_variable cv_;
+    mutable std::mutex mtx_;
+
+    // 32-bit fields
     uint32_t bits_{0};
+
+    // 8-bit fields
     bool created_{false};
 };
 

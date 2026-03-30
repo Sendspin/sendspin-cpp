@@ -86,8 +86,11 @@ public:
     }
 
 private:
-    RingbufHandle_t handle_{nullptr};
+    // Struct fields
     StaticRingbuffer_t structure_;
+
+    // Pointer fields
+    RingbufHandle_t handle_{nullptr};
 };
 
 }  // namespace sendspin
@@ -297,14 +300,21 @@ private:
         return nullptr;
     }
 
-    std::mutex mtx_;
-    std::condition_variable cv_write_;
+    // Struct fields
     std::condition_variable cv_read_;
+    std::condition_variable cv_write_;
+    std::mutex mtx_;
+
+    // Pointer fields
     uint8_t* storage_{nullptr};
+
+    // size_t fields
+    size_t free_bytes_{0};
+    size_t read_offset_{0};
     size_t storage_size_{0};
     size_t write_offset_{0};
-    size_t read_offset_{0};
-    size_t free_bytes_{0};
+
+    // 8-bit fields
     bool created_{false};
 };
 

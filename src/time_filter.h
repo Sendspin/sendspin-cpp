@@ -132,26 +132,26 @@ public:
     int64_t get_covariance() const;
 
 protected:
-    int64_t last_update_;
-
-    double offset_;
-    double drift_;
-
-    double offset_covariance_;
-    double offset_drift_covariance_;
-    double drift_covariance_;
-
-    const double process_variance_;
-    const double drift_process_variance_;
-    const double forget_variance_factor_;
-    const double adaptive_forgetting_cutoff_;
-    const double drift_significance_threshold_squared_;
-
+    // Struct fields
     mutable std::mutex state_mutex_;
 
-    bool use_drift_;
+    // 64-bit fields
+    const double adaptive_forgetting_cutoff_;
+    double drift_;
+    double drift_covariance_;
+    const double drift_process_variance_;
+    const double drift_significance_threshold_squared_;
+    const double forget_variance_factor_;
+    int64_t last_update_;
+    double offset_;
+    double offset_covariance_;
+    double offset_drift_covariance_;
+    const double process_variance_;
+
+    // 8-bit fields
     uint8_t count_;
     const uint8_t min_samples_for_forgetting_;
+    bool use_drift_;
 };
 
 }  // namespace sendspin

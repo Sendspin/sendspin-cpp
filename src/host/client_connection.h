@@ -44,12 +44,17 @@ public:
 protected:
     void setup_callbacks_();
 
+    // Pointer fields
     std::string url_;
     std::unique_ptr<ix::WebSocket> ws_;
-    bool connected_{false};
-    bool auto_reconnect_{true};
-    uint32_t reconnect_interval_ms_{5000};
+
+    // 32-bit fields
     uint32_t last_reconnect_attempt_{0};
+    uint32_t reconnect_interval_ms_{5000};
+
+    // 8-bit fields
+    bool auto_reconnect_{true};
+    bool connected_{false};
 };
 
 }  // namespace sendspin

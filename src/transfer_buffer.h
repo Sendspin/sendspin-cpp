@@ -88,9 +88,14 @@ protected:
     bool allocate_buffer_(size_t buffer_size);
     void deallocate_buffer_();
 
-    PlayerRoleListener* listener_{nullptr};
+    // Struct fields
     PlatformBuffer buffer_;
+
+    // Pointer fields
     uint8_t* data_start_{nullptr};
+    PlayerRoleListener* listener_{nullptr};
+
+    // size_t fields
     size_t buffer_length_{0};
 };
 

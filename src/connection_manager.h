@@ -112,30 +112,28 @@ private:
     void disconnect_and_release_(std::unique_ptr<SendspinConnection> conn,
                                  SendspinGoodbyeReason reason);
 
-    // --- Connections ---
-    std::unique_ptr<SendspinConnection> current_connection_;
-    std::unique_ptr<SendspinConnection> pending_connection_;
-    std::shared_ptr<SendspinConnection> dying_connection_;
-    std::unique_ptr<SendspinWsServer> ws_server_;
-
-    // --- Client and server start params ---
-    SendspinClient* client_;
-    bool psram_stack_{false};
-    unsigned task_priority_{17};
-
-    // --- Hello retry ---
+    // Struct fields
+    std::mutex conn_mutex_;  // Protects deferred lifecycle events
     HelloRetryState hello_retry_;
-
-    // --- Handoff state ---
-    uint32_t last_played_server_hash_{0};
-    bool has_last_played_server_{false};
-
-    // --- Deferred lifecycle events (protected by conn_mutex_) ---
-    std::mutex conn_mutex_;
     std::vector<int> pending_close_events_;
     std::vector<SendspinConnection*> pending_disconnect_events_;
     std::vector<ServerHelloEvent> pending_hello_events_;
+
+    // Pointer fields
+    SendspinClient* client_;
+    std::unique_ptr<SendspinConnection> current_connection_;
+    std::shared_ptr<SendspinConnection> dying_connection_;
+    std::unique_ptr<SendspinConnection> pending_connection_;
+    std::unique_ptr<SendspinWsServer> ws_server_;
+
+    // 32-bit fields
+    uint32_t last_played_server_hash_{0};
+    unsigned task_priority_{17};
+
+    // 8-bit fields
     bool dying_connection_ready_to_release_{false};
+    bool has_last_played_server_{false};
+    bool psram_stack_{false};
 };
 
 }  // namespace sendspin

@@ -294,37 +294,27 @@ private:
     void load_static_delay_();
     void persist_static_delay_();
 
-    // --- Configuration ---
-
+    // Struct fields
     Config config_;
+    ServerPlayerStreamObject current_stream_params_{};
+    struct EventState;
+    std::vector<StreamCallbackType> awaiting_sync_idle_events_;
 
-    // --- Listener and client ---
-
+    // Pointer fields
+    SendspinClient* client_;
+    std::unique_ptr<EventState> event_state_;
     PlayerRoleListener* listener_{nullptr};
     SendspinPersistenceProvider* persistence_;
-    SendspinClient* client_;
-
-    // --- Player state ---
-
-    uint8_t volume_{0};
-    bool muted_{false};
-    uint16_t static_delay_ms_{0};
-    bool static_delay_adjustable_{false};
-    bool high_performance_requested_for_playback_{false};
-    ServerPlayerStreamObject current_stream_params_{};
-
-    // --- Sync task ---
-
     std::unique_ptr<SyncTask> sync_task_;
 
-    // --- Event state (PIMPL, hides platform queue/shadow headers) ---
+    // 16-bit fields
+    uint16_t static_delay_ms_{0};
 
-    struct EventState;
-    std::unique_ptr<EventState> event_state_;
-
-    // --- Stream end/clear callbacks waiting for sync task to go idle (main thread only) ---
-
-    std::vector<StreamCallbackType> awaiting_sync_idle_events_;
+    // 8-bit fields
+    bool high_performance_requested_for_playback_{false};
+    bool muted_{false};
+    bool static_delay_adjustable_{false};
+    uint8_t volume_{0};
 };
 
 }  // namespace sendspin

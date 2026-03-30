@@ -310,48 +310,32 @@ private:
 
     void on_handshake_complete_(SendspinConnection* conn, ServerInformationObject server);
 
-    // --- Configuration ---
-
+    // Struct fields
     SendspinClientConfig config_;
-
-    // --- Connection management ---
-
-    std::unique_ptr<ConnectionManager> connection_manager_;
-
-    // --- Time sync ---
-
-    std::unique_ptr<SendspinTimeBurst> time_burst_;
-    std::atomic<uint8_t> high_performance_ref_count_{0};
-    bool high_performance_held_for_time_{false};
-
-    // --- Client state ---
-
-    SendspinClientState state_{SendspinClientState::SYNCHRONIZED};
-    bool started_{false};
-
-    // --- Server and group state ---
-
-    ServerInformationObject server_information_{};
     GroupUpdateObject group_state_{};
-
-    // --- Deferred event state (PIMPL, hides platform queue/shadow headers) ---
-
+    ServerInformationObject server_information_{};
     struct EventState;
+
+    // Pointer fields
+    std::unique_ptr<ArtworkRole> artwork_;
+    std::unique_ptr<ConnectionManager> connection_manager_;
+    std::unique_ptr<ControllerRole> controller_;
     std::unique_ptr<EventState> event_state_;
-
-    // --- Listeners and providers ---
-
     SendspinClientListener* listener_{nullptr};
+    std::unique_ptr<MetadataRole> metadata_;
     SendspinNetworkProvider* network_provider_{nullptr};
     SendspinPersistenceProvider* persistence_provider_{nullptr};
-
-    // --- Roles ---
-
     std::unique_ptr<PlayerRole> player_;
-    std::unique_ptr<ControllerRole> controller_;
-    std::unique_ptr<MetadataRole> metadata_;
-    std::unique_ptr<ArtworkRole> artwork_;
+    std::unique_ptr<SendspinTimeBurst> time_burst_;
     std::unique_ptr<VisualizerRole> visualizer_;
+
+    // 32-bit fields
+    SendspinClientState state_{SendspinClientState::SYNCHRONIZED};
+
+    // 8-bit fields
+    std::atomic<uint8_t> high_performance_ref_count_{0};
+    bool high_performance_held_for_time_{false};
+    bool started_{false};
 };
 
 }  // namespace sendspin

@@ -67,8 +67,11 @@ public:
     }
 
 private:
+    // Struct fields
     std::mutex mutex_;
     T slot_{};
+
+    // 8-bit fields
     bool dirty_{false};
 };
 

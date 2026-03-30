@@ -104,19 +104,25 @@ protected:
     /// @brief Handles websocket error event.
     void handle_error_();
 
-    /// @brief The WebSocket server URL.
-    std::string url_;
+    // Pointer fields
 
     /// @brief The ESP-IDF websocket client handle.
     esp_websocket_client_handle_t client_{nullptr};
 
-    /// @brief Whether the websocket is currently connected.
-    bool connected_{false};
+    /// @brief The WebSocket server URL.
+    std::string url_;
+
+    // 32-bit fields
 
     /// @brief Auto-reconnect configuration.
-    bool auto_reconnect_{true};
-    uint32_t reconnect_interval_ms_{5000};
     uint32_t last_reconnect_attempt_{0};
+    uint32_t reconnect_interval_ms_{5000};
+
+    // 8-bit fields
+
+    /// @brief Whether the websocket is currently connected.
+    bool auto_reconnect_{true};
+    bool connected_{false};
 };
 
 }  // namespace sendspin

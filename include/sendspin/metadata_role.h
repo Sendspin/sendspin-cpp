@@ -111,12 +111,14 @@ private:
     void drain_events();
     void cleanup();
 
-    MetadataRoleListener* listener_{nullptr};
-    SendspinClient* client_;
+    // Struct fields
     ServerMetadataStateObject metadata_{};
-
     struct EventState;
+
+    // Pointer fields
+    SendspinClient* client_;
     std::unique_ptr<EventState> event_state_;
+    MetadataRoleListener* listener_{nullptr};
 };
 
 }  // namespace sendspin

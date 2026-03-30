@@ -174,26 +174,30 @@ private:
 
     static void drain_thread_func_(VisualizerRole* self);
 
-    VisualizerRoleListener* listener_{nullptr};
-    SendspinClient* client_;
+    // Struct fields
+    struct DrainTask;
+    struct EventState;
     std::optional<VisualizerSupportObject> visualizer_support_;
 
-    struct EventState;
-    std::unique_ptr<EventState> event_state_;
-
+    // Pointer fields
+    SendspinClient* client_;
     // Drain task (pimpl to avoid exposing platform headers)
-    struct DrainTask;
     std::unique_ptr<DrainTask> drain_task_;
+    std::unique_ptr<EventState> event_state_;
+    VisualizerRoleListener* listener_{nullptr};
 
+    // size_t fields
     // Cached stream config, written by the network thread in handle_stream_start(),
     // read by the network thread in handle_binary(). stream_active_ is also cleared
     // by cleanup() on the main thread.
-    std::atomic<bool> stream_active_{false};
-    std::atomic<bool> has_loudness_{false};
-    std::atomic<bool> has_f_peak_{false};
-    std::atomic<bool> has_spectrum_{false};
-    std::atomic<uint8_t> spectrum_bin_count_{0};
     std::atomic<size_t> raw_frame_size_{0};
+
+    // 8-bit fields
+    std::atomic<bool> has_f_peak_{false};
+    std::atomic<bool> has_loudness_{false};
+    std::atomic<bool> has_spectrum_{false};
+    std::atomic<bool> stream_active_{false};
+    std::atomic<uint8_t> spectrum_bin_count_{0};
 };
 
 }  // namespace sendspin

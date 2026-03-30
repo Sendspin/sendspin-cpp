@@ -78,6 +78,7 @@ public:
     }
 
 private:
+    // Pointer fields
     QueueHandle_t handle_{nullptr};
 };
 
@@ -187,10 +188,15 @@ public:
     }
 
 private:
-    mutable std::mutex mtx_;
+    // Struct fields
     std::condition_variable cv_;
     std::deque<T> items_;
+    mutable std::mutex mtx_;
+
+    // size_t fields
     size_t max_depth_{0};
+
+    // 8-bit fields
     bool created_{false};
 };
 

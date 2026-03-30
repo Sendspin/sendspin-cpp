@@ -65,12 +65,17 @@ public:
 protected:
     bool decode_dummy_header_(const uint8_t* data, size_t data_size, AudioStreamInfo* stream_info);
 
-    std::unique_ptr<micro_flac::FLACDecoder> flac_decoder_;
+    // Struct fields
+    AudioStreamInfo current_stream_info_;
     PlatformBuffer opus_decoder_buf_;
 
+    // Pointer fields
+    std::unique_ptr<micro_flac::FLACDecoder> flac_decoder_;
+
+    // size_t fields
     size_t maximum_decoded_size_{0};
 
-    AudioStreamInfo current_stream_info_;
+    // 32-bit fields
     SendspinCodecFormat current_codec_ = SendspinCodecFormat::UNSUPPORTED;
 };
 

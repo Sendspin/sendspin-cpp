@@ -158,12 +158,14 @@ private:
     void drain_events();
     void cleanup();
 
-    ControllerRoleListener* listener_{nullptr};
-    SendspinClient* client_;
+    // Struct fields
     ServerStateControllerObject controller_state_{};
-
     struct EventState;
+
+    // Pointer fields
+    SendspinClient* client_;
     std::unique_ptr<EventState> event_state_;
+    ControllerRoleListener* listener_{nullptr};
 };
 
 }  // namespace sendspin

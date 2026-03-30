@@ -78,11 +78,16 @@ public:
     }
 
 protected:
+    // size_t fields
+    size_t bytes_per_sample_;
+
+    // 32-bit fields
+    uint32_t ms_sample_rate_gcd_;
+    uint32_t sample_rate_;
+
+    // 8-bit fields
     uint8_t bits_per_sample_;
     uint8_t channels_;
-    uint32_t sample_rate_;
-    uint32_t ms_sample_rate_gcd_;
-    size_t bytes_per_sample_;
 };
 
 }  // namespace sendspin

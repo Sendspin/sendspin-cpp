@@ -119,14 +119,7 @@ protected:
     /// @brief WebSocket message handler registered with httpd.
     static esp_err_t websocket_handler(httpd_req_t* req);
 
-    /// @brief The HTTP server handle.
-    httpd_handle_t server_{nullptr};
-
-    /// @brief Maximum number of simultaneous connections (default: 2 for handoff).
-    uint8_t max_connections_{2};
-
-    /// @brief Callback to notify the client of new connections.
-    NewConnectionCallback new_connection_callback_;
+    // Struct fields
 
     /// @brief Callback to notify the client when a socket closes.
     ConnectionClosedCallback connection_closed_callback_;
@@ -134,8 +127,21 @@ protected:
     /// @brief Callback to find a connection by socket fd.
     FindConnectionCallback find_connection_callback_;
 
+    /// @brief Callback to notify the client of new connections.
+    NewConnectionCallback new_connection_callback_;
+
+    // Pointer fields
+
     /// @brief Pointer to the SendspinClient (stored as user context for callbacks).
     SendspinClient* client_{nullptr};
+
+    /// @brief The HTTP server handle.
+    httpd_handle_t server_{nullptr};
+
+    // 8-bit fields
+
+    /// @brief Maximum number of simultaneous connections (default: 2 for handoff).
+    uint8_t max_connections_{2};
 };
 
 }  // namespace sendspin

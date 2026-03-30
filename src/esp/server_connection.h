@@ -107,8 +107,12 @@ public:
 protected:
     static void async_send_text(void* arg);
 
+    // Pointer fields
+
     /// @brief The httpd server handle (owned by SendspinWsServer).
     httpd_handle_t server_;
+
+    // 32-bit fields
 
     /// @brief The socket file descriptor for this connection.
     int sockfd_{-1};

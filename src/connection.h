@@ -245,31 +245,6 @@ protected:
     /// @brief Resets the write offset without freeing the buffer (reuses it for the next message).
     void reset_websocket_payload_();
 
-    // Per-connection state (moved from hub)
-
-    /// Time synchronization filter (Kalman-based).
-    std::unique_ptr<SendspinTimeFilter> time_filter_;
-
-    /// Server identity (from server/hello message).
-    std::string server_id_;
-    std::string server_name_;
-
-    /// Connection reason (discovery or playback, from server/hello).
-    SendspinConnectionReason connection_reason_{SendspinConnectionReason::DISCOVERY};
-
-    /// Hello handshake state.
-    bool client_hello_sent_{false};
-    bool server_hello_received_{false};
-
-    /// Time message state.
-    bool pending_time_message_{false};
-    int64_t last_sent_time_message_{0};
-
-    /// Thread-safe single-slot buffer for time replacement data.
-    /// Written by the send callback (which may run on httpd/websocket thread),
-    /// read by the receive handler (which may run on a different thread).
-    ThreadSafeQueue<TimeTransmittedReplacement> time_replacement_queue_;
-
     /// @brief Allocates or grows the websocket payload buffer and returns a pointer to the write
     /// position.
     ///
@@ -295,17 +270,54 @@ protected:
     /// @param receive_time Timestamp when the data was received (microseconds).
     void dispatch_completed_message_(bool is_text, int64_t receive_time);
 
-    /// When false, dispatch_completed_message_() silently drops incoming messages.
-    /// Set to false on the main thread before cleanup; checked on the network thread.
-    std::atomic<bool> message_dispatch_enabled_{true};
+    // Struct fields
+
+    /// Thread-safe single-slot buffer for time replacement data.
+    /// Written by the send callback (which may run on httpd/websocket thread),
+    /// read by the receive handler (which may run on a different thread).
+    ThreadSafeQueue<TimeTransmittedReplacement> time_replacement_queue_;
 
     /// Message buffering (for websocket frame assembly).
     PlatformBuffer websocket_payload_;
+
+    // Pointer fields
+
+    /// Time synchronization filter (Kalman-based).
+    std::unique_ptr<SendspinTimeFilter> time_filter_;
+
+    /// Server identity (from server/hello message).
+    std::string server_id_;
+    std::string server_name_;
+
+    // 64-bit fields
+
+    /// Time message state.
+    int64_t last_sent_time_message_{0};
+
+    // size_t fields
     size_t websocket_write_offset_{0};
+
+    // 32-bit fields
+
+    /// Connection reason (discovery or playback, from server/hello).
+    SendspinConnectionReason connection_reason_{SendspinConnectionReason::DISCOVERY};
+
+    // 8-bit fields
+
+    /// Hello handshake state.
+    bool client_hello_sent_{false};
 
     /// @brief Tracks whether the current message being assembled is text (true) or binary (false).
     /// @note Needed because WebSocket continuation frames don't carry the original frame type.
     bool is_text_frame_{false};
+
+    /// When false, dispatch_completed_message_() silently drops incoming messages.
+    /// Set to false on the main thread before cleanup; checked on the network thread.
+    std::atomic<bool> message_dispatch_enabled_{true};
+
+    /// Time message state.
+    bool pending_time_message_{false};
+    bool server_hello_received_{false};
 };
 
 }  // namespace sendspin

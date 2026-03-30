@@ -68,14 +68,17 @@ public:
     }
 
 protected:
-    std::unique_ptr<ix::WebSocketServer> server_;
-    uint8_t max_connections_{2};
-
-    NewConnectionCallback new_connection_callback_;
+    // Struct fields
     ConnectionClosedCallback connection_closed_callback_;
     FindConnectionCallback find_connection_callback_;
+    NewConnectionCallback new_connection_callback_;
 
+    // Pointer fields
     SendspinClient* client_{nullptr};
+    std::unique_ptr<ix::WebSocketServer> server_;
+
+    // 8-bit fields
+    uint8_t max_connections_{2};
 };
 
 }  // namespace sendspin

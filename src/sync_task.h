@@ -224,18 +224,17 @@ protected:
     /// @brief Signals the task to stop and waits for the thread to finish.
     void stop_();
 
-    // Smart pointers
-    std::unique_ptr<SendspinAudioRingBuffer> encoded_ring_buffer_;
-
-    // Platform-agnostic concurrency primitives
+    // Struct fields
     EventFlags event_flags_;
     ThreadSafeQueue<PlaybackProgress> playback_progress_queue_;
     std::thread sync_thread_;
 
-    // Owning player role and client (set by init, both outlive this task)
-    PlayerRole* player_{nullptr};
+    // Pointer fields
     SendspinClient* client_{nullptr};
+    std::unique_ptr<SendspinAudioRingBuffer> encoded_ring_buffer_;
+    PlayerRole* player_{nullptr};
 
+    // 8-bit fields
     // Tracks whether the last task run ended with an error
     bool last_run_had_error_{false};
 };

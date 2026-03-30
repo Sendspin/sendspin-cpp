@@ -51,7 +51,10 @@ public:
     void handle_message(const std::string& data, bool is_binary, int64_t receive_time);
 
 protected:
+    // Pointer fields
     std::shared_ptr<ix::WebSocket> ws_;
+
+    // 32-bit fields
     int sockfd_{-1};
 };
 

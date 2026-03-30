@@ -160,7 +160,10 @@ public:
     }
 
 private:
+    // Pointer fields
     uint8_t* ptr_{nullptr};
+
+    // size_t fields
     size_t size_{0};
 };
 
