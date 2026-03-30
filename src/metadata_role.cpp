@@ -91,8 +91,8 @@ void MetadataRole::drain_events() {
     ServerMetadataStateObject delta;
     if (this->event_state_->shadow.take(delta)) {
         apply_metadata_state_deltas(&this->metadata_, delta);
-        if (this->on_metadata) {
-            this->on_metadata(this->metadata_);
+        if (this->listener_) {
+            this->listener_->on_metadata(this->metadata_);
         }
     }
 }

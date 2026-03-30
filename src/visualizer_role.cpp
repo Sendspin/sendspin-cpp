@@ -269,20 +269,19 @@ void VisualizerRole::drain_events() {
         switch (event_type) {
             case EventType::STREAM_START: {
                 ServerVisualizerStreamObject config;
-                if (this->event_state_->shadow_config.take(config) &&
-                    this->on_visualizer_stream_start) {
-                    this->on_visualizer_stream_start(config);
+                if (this->event_state_->shadow_config.take(config) && this->listener_) {
+                    this->listener_->on_visualizer_stream_start(config);
                 }
                 break;
             }
             case EventType::STREAM_END:
-                if (this->on_visualizer_stream_end) {
-                    this->on_visualizer_stream_end();
+                if (this->listener_) {
+                    this->listener_->on_visualizer_stream_end();
                 }
                 break;
             case EventType::STREAM_CLEAR:
-                if (this->on_visualizer_stream_clear) {
-                    this->on_visualizer_stream_clear();
+                if (this->listener_) {
+                    this->listener_->on_visualizer_stream_clear();
                 }
                 break;
         }
@@ -387,7 +386,7 @@ void VisualizerRole::drain_thread_func_(VisualizerRole* self) {
         }
 
         // Parse and deliver
-        if (is_frame && self->on_visualizer_frame) {
+        if (is_frame && self->listener_) {
             uint8_t frame_flags = type_byte & 0x7F;
             uint8_t bin_count = raw[1];
             const uint8_t* fields = raw + FRAME_HEADER_SIZE + TIMESTAMP_SIZE;
@@ -414,10 +413,10 @@ void VisualizerRole::drain_thread_func_(VisualizerRole* self) {
             }
 
             rb.return_item(item);
-            self->on_visualizer_frame(frame);
-        } else if (!is_frame && self->on_beat) {
+            self->listener_->on_visualizer_frame(frame);
+        } else if (!is_frame && self->listener_) {
             rb.return_item(item);
-            self->on_beat(client_ts);
+            self->listener_->on_beat(client_ts);
         } else {
             rb.return_item(item);
         }

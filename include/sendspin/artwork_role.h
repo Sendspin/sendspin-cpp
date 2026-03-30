@@ -16,7 +16,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -132,6 +131,26 @@ struct ImageSlotPreference {
     uint16_t height;
 };
 
+/// @brief Listener for artwork role events.
+///
+/// THREAD SAFETY: on_image() is called from two different contexts:
+/// - From the network thread when image data is received (data != nullptr)
+/// - From the main loop thread when images are cleared (data == nullptr)
+/// Implementations must be thread-safe.
+class ArtworkRoleListener {
+public:
+    virtual ~ArtworkRoleListener() = default;
+
+    /// @brief Called when an image is received or cleared.
+    /// @param slot The artwork slot index.
+    /// @param data Image data, or nullptr for clears.
+    /// @param length Length of image data in bytes.
+    /// @param format Image format.
+    /// @param timestamp Server timestamp (0 for clears).
+    virtual void on_image(uint8_t /*slot*/, const uint8_t* /*data*/, size_t /*length*/,
+                          SendspinImageFormat /*format*/, int64_t /*timestamp*/) {}
+};
+
 /// @brief Artwork role: receives artwork images from the server.
 class ArtworkRole {
     friend class SendspinClient;
@@ -139,6 +158,11 @@ class ArtworkRole {
 public:
     ArtworkRole();
     ~ArtworkRole();
+
+    /// @brief Sets the listener for artwork events. The listener must outlive this role.
+    void set_listener(ArtworkRoleListener* listener) {
+        this->listener_ = listener;
+    }
 
     /// @brief Adds a preferred image format for an artwork slot.
     void add_image_preferred_format(const ImageSlotPreference& pref);
@@ -148,11 +172,6 @@ public:
         return this->preferred_image_formats_;
     }
 
-    /// @brief Callback fired when an image is received (or cleared with nullptr data).
-    /// For received images, fires on the network thread — callback must be thread-safe.
-    /// For image clears (nullptr data), fires on the main loop thread.
-    std::function<void(uint8_t, const uint8_t*, size_t, SendspinImageFormat, int64_t)> on_image;
-
 private:
     void attach(ClientBridge* bridge);
     void contribute_hello(ClientHelloMessage& msg);
@@ -161,6 +180,7 @@ private:
     void drain_events();
     void cleanup();
 
+    ArtworkRoleListener* listener_{nullptr};
     ClientBridge* bridge_{nullptr};
     std::vector<ImageSlotPreference> preferred_image_formats_;
     std::vector<ArtworkChannelFormatObject> artwork_channels_;

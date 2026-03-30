@@ -15,7 +15,6 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -79,6 +78,15 @@ struct ServerMetadataStateObject {
     std::optional<bool> shuffle;
 };
 
+/// @brief Listener for metadata role events. All methods fire on the main loop thread.
+class MetadataRoleListener {
+public:
+    virtual ~MetadataRoleListener() = default;
+
+    /// @brief Called when metadata is updated by the server.
+    virtual void on_metadata(const ServerMetadataStateObject& /*metadata*/) {}
+};
+
 /// @brief Metadata role: provides track metadata and progress information.
 class MetadataRole {
     friend class SendspinClient;
@@ -87,14 +95,16 @@ public:
     MetadataRole();
     ~MetadataRole();
 
+    /// @brief Sets the listener for metadata events. The listener must outlive this role.
+    void set_listener(MetadataRoleListener* listener) {
+        this->listener_ = listener;
+    }
+
     /// @brief Returns the interpolated track progress in milliseconds.
     uint32_t get_track_progress_ms() const;
 
     /// @brief Returns the track duration in milliseconds. 0 means unknown/live.
     uint32_t get_track_duration_ms() const;
-
-    /// @brief Callback fired when metadata is updated. Fires on the main loop thread.
-    std::function<void(const ServerMetadataStateObject&)> on_metadata;
 
 private:
     void attach(ClientBridge* bridge);
@@ -103,6 +113,7 @@ private:
     void drain_events();
     void cleanup();
 
+    MetadataRoleListener* listener_{nullptr};
     ClientBridge* bridge_{nullptr};
     ServerMetadataStateObject metadata_{};
 

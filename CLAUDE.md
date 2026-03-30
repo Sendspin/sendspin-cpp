@@ -24,17 +24,35 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 
 ### Role composition
 
-Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role is a concrete class that owns its state, event queues, and callbacks. The client dispatches messages to roles via null-pointer checks — no preprocessor guards or virtual dispatch.
+Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role is a concrete class that owns its state and event queues. The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers — no preprocessor guards.
 
 ```cpp
+// Implement listener interfaces
+struct MyPlayerListener : PlayerRoleListener {
+    size_t on_audio_write(uint8_t* data, size_t len, uint32_t timeout_ms) override {
+        return audio_output.write(data, len, timeout_ms);
+    }
+    void on_stream_start() override { /* ... */ }
+};
+
+struct MyMetadataListener : MetadataRoleListener {
+    void on_metadata(const ServerMetadataStateObject& m) override { /* ... */ }
+};
+
+struct MyNetworkProvider : SendspinNetworkProvider {
+    bool is_network_ready() override { return true; }
+};
+
+MyPlayerListener player_listener;
+MyMetadataListener metadata_listener;
+MyNetworkProvider network_provider;
+
 SendspinClient client(config);
 auto& player = client.add_player(player_config);
-player.on_audio_write = [&](uint8_t* data, size_t len, uint32_t timeout_ms) -> size_t {
-    return audio_output.write(data, len, timeout_ms);
-};
-player.on_stream_start = [&]() { /* ... */ };
+player.set_listener(&player_listener);
 auto& metadata = client.add_metadata();
-metadata.on_metadata = [&](const auto& m) { /* ... */ };
+metadata.set_listener(&metadata_listener);
+client.set_network_provider(&network_provider);
 client.add_controller();
 client.start_server(5);
 ```
@@ -43,9 +61,10 @@ client.start_server(5);
 
 The platform (e.g., ESPHome) provides:
 
-- An `on_audio_write` callback on `PlayerRole` to receive decoded PCM audio
-- Persistence callbacks for saving/loading preferences
-- Network readiness and WiFi power management callbacks
+- A `PlayerRoleListener` implementation with `on_audio_write()` to receive decoded PCM audio
+- An optional `SendspinPersistenceProvider` for saving/loading preferences
+- A `SendspinNetworkProvider` for network readiness
+- An optional `SendspinClientListener` for high-performance WiFi power management callbacks
 - Playback progress feedback via `notify_audio_played()`
 
 ## Project layout

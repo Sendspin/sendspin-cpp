@@ -204,72 +204,96 @@ int main(int argc, char* argv[]) {
     // Suppress unused variable warnings for roles used only for their side effects
     (void)controller;
 
+    // --- Listener implementations ---
+
+    struct BasicPlayerListener : PlayerRoleListener {
 #ifdef SENDSPIN_HAS_PORTAUDIO
-    player.on_audio_write = [&audio_sink](uint8_t* data, size_t length, uint32_t timeout_ms) {
-        return audio_sink.write(data, length, timeout_ms);
+        PortAudioSink& sink;
+        PlayerRole& player;
+        BasicPlayerListener(PortAudioSink& s, PlayerRole& p) : sink(s), player(p) {}
+#endif
+
+        size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
+#ifdef SENDSPIN_HAS_PORTAUDIO
+            return sink.write(data, length, timeout_ms);
+#else
+            (void)data;
+            (void)timeout_ms;
+            null_audio_total_bytes += length;
+            return length;
+#endif
+        }
+
+        void on_stream_start() override {
+            fprintf(stderr, ">>> Stream started\n");
+#ifdef SENDSPIN_HAS_PORTAUDIO
+            auto& params = player.get_current_stream_params();
+            if (params.sample_rate.has_value() && params.channels.has_value() &&
+                params.bit_depth.has_value()) {
+                sink.configure(*params.sample_rate, *params.channels, *params.bit_depth);
+            } else {
+                fprintf(stderr, ">>> Stream params not yet available for PortAudio\n");
+            }
+#endif
+        }
+
+        void on_stream_end() override {
+            fprintf(stderr, ">>> Stream ended\n");
+#ifdef SENDSPIN_HAS_PORTAUDIO
+            sink.clear();
+#endif
+        }
+
+        void on_stream_clear() override {
+            fprintf(stderr, ">>> Stream clear\n");
+#ifdef SENDSPIN_HAS_PORTAUDIO
+            sink.clear();
+#endif
+        }
+
+#ifdef SENDSPIN_HAS_PORTAUDIO
+        void on_volume_changed(uint8_t vol) override { sink.set_volume(vol); }
+        void on_mute_changed(bool muted) override { sink.set_muted(muted); }
+#endif
     };
+
+    struct BasicMetadataListener : MetadataRoleListener {
+        void on_metadata(const ServerMetadataStateObject& md) override {
+            if (md.title.has_value()) {
+                fprintf(stderr, ">>> Metadata: %s - %s\n",
+                        md.artist.value_or("Unknown").c_str(), md.title->c_str());
+            }
+        }
+    };
+
+    struct BasicClientListener : SendspinClientListener {
+        void on_time_sync_updated(float error) override {
+            if (SendspinClient::get_log_level() >= LogLevel::DEBUG) {
+                fprintf(stderr, ">>> Time sync error: %.1f us\n", error);
+            }
+        }
+    };
+
+    struct HostNetworkProvider : SendspinNetworkProvider {
+        bool is_network_ready() override { return true; }
+    };
+
+#ifdef SENDSPIN_HAS_PORTAUDIO
+    BasicPlayerListener player_listener(audio_sink, player);
     audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
         player.notify_audio_played(frames, timestamp);
     };
 #else
-    player.on_audio_write = [](uint8_t*, size_t length, uint32_t) -> size_t {
-        null_audio_total_bytes += length;
-        return length;
-    };
+    BasicPlayerListener player_listener;
 #endif
+    BasicMetadataListener metadata_listener;
+    BasicClientListener client_listener;
+    HostNetworkProvider network_provider;
 
-    // Network is always ready on host
-    client.is_network_ready = []() { return true; };
-
-    // Log callbacks
-    player.on_stream_start = [&]() {
-        fprintf(stderr, ">>> Stream started\n");
-#ifdef SENDSPIN_HAS_PORTAUDIO
-        auto& params = player.get_current_stream_params();
-        if (params.sample_rate.has_value() && params.channels.has_value() &&
-            params.bit_depth.has_value()) {
-            audio_sink.configure(*params.sample_rate, *params.channels, *params.bit_depth);
-        } else {
-            fprintf(stderr, ">>> Stream params not yet available for PortAudio\n");
-        }
-#endif
-    };
-
-    player.on_stream_end = [&]() {
-        fprintf(stderr, ">>> Stream ended\n");
-#ifdef SENDSPIN_HAS_PORTAUDIO
-        audio_sink.clear();
-#endif
-    };
-
-    player.on_stream_clear = [&]() {
-        fprintf(stderr, ">>> Stream clear\n");
-#ifdef SENDSPIN_HAS_PORTAUDIO
-        audio_sink.clear();
-#endif
-    };
-
-    metadata.on_metadata = [](const ServerMetadataStateObject& md) {
-        if (md.title.has_value()) {
-            fprintf(stderr, ">>> Metadata: %s - %s\n",
-                    md.artist.value_or("Unknown").c_str(), md.title->c_str());
-        }
-    };
-
-#ifdef SENDSPIN_HAS_PORTAUDIO
-    player.on_volume_changed = [&audio_sink](uint8_t vol) {
-        audio_sink.set_volume(vol);
-    };
-    player.on_mute_changed = [&audio_sink](bool muted) {
-        audio_sink.set_muted(muted);
-    };
-#endif
-
-    client.on_time_sync_updated = [](float error) {
-        if (SendspinClient::get_log_level() >= LogLevel::DEBUG) {
-            fprintf(stderr, ">>> Time sync error: %.1f us\n", error);
-        }
-    };
+    player.set_listener(&player_listener);
+    metadata.set_listener(&metadata_listener);
+    client.set_listener(&client_listener);
+    client.set_network_provider(&network_provider);
 
     // Start the server
     fprintf(stderr, "Starting Sendspin basic client on port %u...\n", SENDSPIN_PORT);

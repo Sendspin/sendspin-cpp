@@ -18,7 +18,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,6 +26,7 @@
 namespace sendspin {
 
 class SendspinClient;
+class SendspinPersistenceProvider;
 class SyncTask;
 struct ClientBridge;
 struct ClientHelloMessage;
@@ -157,6 +157,38 @@ struct ServerCommandMessage {
     std::optional<ServerPlayerCommandObject> player;
 };
 
+/// @brief Listener for player role events.
+///
+/// on_audio_write() is called from the sync task's background thread and must be thread-safe.
+/// All other methods fire on the main loop thread.
+class PlayerRoleListener {
+public:
+    virtual ~PlayerRoleListener() = default;
+
+    /// @brief Writes decoded PCM audio to the platform's audio output.
+    /// Called from the sync task's background thread. May block up to timeout_ms.
+    /// Must return the number of bytes actually written.
+    virtual size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) = 0;
+
+    /// @brief Called when a new audio stream starts.
+    virtual void on_stream_start() {}
+
+    /// @brief Called when the audio stream ends.
+    virtual void on_stream_end() {}
+
+    /// @brief Called when the audio stream is cleared.
+    virtual void on_stream_clear() {}
+
+    /// @brief Called when the volume is changed by the server.
+    virtual void on_volume_changed(uint8_t /*volume*/) {}
+
+    /// @brief Called when the mute state is changed by the server.
+    virtual void on_mute_changed(bool /*muted*/) {}
+
+    /// @brief Called when the static delay is changed by the server.
+    virtual void on_static_delay_changed(uint16_t /*delay_ms*/) {}
+};
+
 /// @brief Player role: owns SyncTask, handles audio playback.
 class PlayerRole {
     friend class SendspinClient;
@@ -172,6 +204,11 @@ public:
 
     explicit PlayerRole(Config config);
     ~PlayerRole();
+
+    /// @brief Sets the listener for player events. The listener must outlive this role.
+    void set_listener(PlayerRoleListener* listener) {
+        this->listener_ = listener;
+    }
 
     // --- Audio ---
 
@@ -228,27 +265,6 @@ public:
         return this->current_stream_params_;
     }
 
-    // --- Audio output ---
-
-    /// @brief Callback for writing decoded PCM audio to the platform's audio output.
-    /// Called from the sync task's background thread. May block up to timeout_ms.
-    /// Must return the number of bytes actually written.
-    std::function<size_t(uint8_t* data, size_t length, uint32_t timeout_ms)> on_audio_write;
-
-    // --- Callbacks (all fire on the main loop thread) ---
-
-    std::function<void()> on_stream_start;
-    std::function<void()> on_stream_end;
-    std::function<void()> on_stream_clear;
-    std::function<void(uint8_t)> on_volume_changed;
-    std::function<void(bool)> on_mute_changed;
-    std::function<void(uint16_t)> on_static_delay_changed;
-
-    // --- Persistence hooks ---
-
-    std::function<bool(uint16_t)> save_static_delay;
-    std::function<std::optional<uint16_t>()> load_static_delay;
-
 private:
     // --- Deferred event types ---
 
@@ -260,7 +276,7 @@ private:
 
     // --- Private integration methods ---
 
-    void attach(ClientBridge* bridge);
+    void attach(ClientBridge* bridge, SendspinPersistenceProvider* persistence);
     bool start(bool psram_stack);
     void contribute_hello(ClientHelloMessage& msg);
     void contribute_state(ClientStateMessage& msg);
@@ -284,8 +300,10 @@ private:
 
     Config config_;
 
-    // --- Bridge ---
+    // --- Listener and bridge ---
 
+    PlayerRoleListener* listener_{nullptr};
+    SendspinPersistenceProvider* persistence_{nullptr};
     ClientBridge* bridge_{nullptr};
 
     // --- Player state ---

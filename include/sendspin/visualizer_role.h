@@ -17,7 +17,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -102,12 +101,37 @@ struct VisualizerFrame {
     std::vector<uint16_t> spectrum;
 };
 
+/// @brief Listener for visualizer role events.
+///
+/// THREAD SAFETY: on_visualizer_frame() and on_beat() fire on a dedicated drain thread.
+/// Implementations must be thread-safe for these two methods (copy data quickly, defer heavy
+/// processing). on_visualizer_stream_start/end/clear fire on the main loop thread.
+class VisualizerRoleListener {
+public:
+    virtual ~VisualizerRoleListener() = default;
+
+    /// @brief Called with a parsed visualizer frame at the correct playback timestamp.
+    /// Fires on the drain thread.
+    virtual void on_visualizer_frame(const VisualizerFrame& /*frame*/) {}
+
+    /// @brief Called on beat events. Fires on the drain thread.
+    virtual void on_beat(int64_t /*client_timestamp*/) {}
+
+    /// @brief Called when a visualizer stream starts. Fires on the main loop thread.
+    virtual void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) {}
+
+    /// @brief Called when a visualizer stream ends. Fires on the main loop thread.
+    virtual void on_visualizer_stream_end() {}
+
+    /// @brief Called when a visualizer stream is cleared. Fires on the main loop thread.
+    virtual void on_visualizer_stream_clear() {}
+};
+
 /// @brief Visualizer role: receives real-time audio visualization data from the server.
 ///
-/// Lifecycle callbacks (on_visualizer_stream_start/end/clear) fire on the main loop thread.
+/// Lifecycle callbacks fire on the main loop thread.
 /// Data callbacks (on_visualizer_frame, on_beat) fire on a dedicated drain thread at the
-/// correct timestamp. Users must handle thread safety in data callbacks (copy data quickly,
-/// defer heavy processing). This is the same contract as the player role's audio write callback.
+/// correct timestamp. This is the same contract as the player role's audio write callback.
 class VisualizerRole {
     friend class SendspinClient;
 
@@ -120,25 +144,15 @@ public:
     explicit VisualizerRole(Config config);
     ~VisualizerRole();
 
+    /// @brief Sets the listener for visualizer events. The listener must outlive this role.
+    void set_listener(VisualizerRoleListener* listener) {
+        this->listener_ = listener;
+    }
+
     /// @brief Returns the visualizer support configuration (nullopt if not configured).
     const std::optional<VisualizerSupportObject>& get_visualizer_support() const {
         return this->visualizer_support_;
     }
-
-    /// @brief Callback for parsed visualizer frames. Fires on the drain thread.
-    std::function<void(const VisualizerFrame&)> on_visualizer_frame;
-
-    /// @brief Callback for beat events. Fires on the drain thread.
-    std::function<void(int64_t)> on_beat;
-
-    /// @brief Callback when a visualizer stream starts. Fires on the main loop thread.
-    std::function<void(const ServerVisualizerStreamObject&)> on_visualizer_stream_start;
-
-    /// @brief Callback when a visualizer stream ends. Fires on the main loop thread.
-    std::function<void()> on_visualizer_stream_end;
-
-    /// @brief Callback when a visualizer stream is cleared. Fires on the main loop thread.
-    std::function<void()> on_visualizer_stream_clear;
 
 private:
     /// @brief Deferred visualizer event types.
@@ -162,6 +176,7 @@ private:
 
     static void drain_thread_func_(VisualizerRole* self);
 
+    VisualizerRoleListener* listener_{nullptr};
     ClientBridge* bridge_{nullptr};
     std::optional<VisualizerSupportObject> visualizer_support_;
 

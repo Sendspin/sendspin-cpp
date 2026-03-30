@@ -67,7 +67,7 @@ void ArtworkRole::contribute_hello(ClientHelloMessage& msg) {
 }
 
 void ArtworkRole::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
-    if (this->preferred_image_formats_.empty() || !this->on_image) {
+    if (this->preferred_image_formats_.empty() || !this->listener_) {
         return;
     }
     if (len < BINARY_TIMESTAMP_SIZE) {
@@ -85,7 +85,7 @@ void ArtworkRole::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
             break;
         }
     }
-    this->on_image(slot, image_data, image_len, image_format, timestamp);
+    this->listener_->on_image(slot, image_data, image_len, image_format, timestamp);
 }
 
 void ArtworkRole::handle_stream_end() {
@@ -95,9 +95,9 @@ void ArtworkRole::handle_stream_end() {
 void ArtworkRole::drain_events() {
     uint8_t dummy;
     while (this->event_state_->stream_end_queue.receive(dummy, 0)) {
-        if (this->on_image) {
+        if (this->listener_) {
             for (const auto& pref : this->preferred_image_formats_) {
-                this->on_image(pref.slot, nullptr, 0, pref.format, 0);
+                this->listener_->on_image(pref.slot, nullptr, 0, pref.format, 0);
             }
         }
     }

@@ -15,7 +15,6 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -123,6 +122,15 @@ struct ServerStateControllerObject {
     bool muted;
 };
 
+/// @brief Listener for controller role events. All methods fire on the main loop thread.
+class ControllerRoleListener {
+public:
+    virtual ~ControllerRoleListener() = default;
+
+    /// @brief Called when the server sends updated controller state.
+    virtual void on_controller_state(const ServerStateControllerObject& /*state*/) {}
+};
+
 /// @brief Controller role: read-only server state and outbound commands.
 class ControllerRole {
     friend class SendspinClient;
@@ -130,6 +138,11 @@ class ControllerRole {
 public:
     ControllerRole();
     ~ControllerRole();
+
+    /// @brief Sets the listener for controller events. The listener must outlive this role.
+    void set_listener(ControllerRoleListener* listener) {
+        this->listener_ = listener;
+    }
 
     /// @brief Sends a controller command to the server.
     void send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume = {},
@@ -140,10 +153,6 @@ public:
         return this->controller_state_;
     }
 
-    /// @brief Callback fired when the server sends updated controller state. Fires on the main
-    /// loop thread.
-    std::function<void(const ServerStateControllerObject&)> on_controller_state;
-
 private:
     void attach(ClientBridge* bridge);
     void contribute_hello(ClientHelloMessage& msg);
@@ -151,6 +160,7 @@ private:
     void drain_events();
     void cleanup();
 
+    ControllerRoleListener* listener_{nullptr};
     ClientBridge* bridge_{nullptr};
     ServerStateControllerObject controller_state_{};
 

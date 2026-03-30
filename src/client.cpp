@@ -58,7 +58,7 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
           .on_active_connection_lost = [this]() { this->cleanup_connection_state_(); },
           .reset_time_burst = [this]() { this->time_burst_->reset(); },
           .is_network_ready = [this]() -> bool {
-              return this->is_network_ready && this->is_network_ready();
+              return this->network_provider_ && this->network_provider_->is_network_ready();
           },
       })),
       time_burst_(std::make_unique<SendspinTimeBurst>()),
@@ -103,14 +103,14 @@ ClientBridge* SendspinClient::make_bridge_() {
             },
         .request_high_performance =
             [this]() {
-                if (this->on_request_high_performance) {
-                    this->on_request_high_performance();
+                if (this->listener_) {
+                    this->listener_->on_request_high_performance();
                 }
             },
         .release_high_performance =
             [this]() {
-                if (this->on_release_high_performance) {
-                    this->on_release_high_performance();
+                if (this->listener_) {
+                    this->listener_->on_release_high_performance();
                 }
             },
     });
@@ -125,7 +125,7 @@ PlayerRole& SendspinClient::add_player(PlayerRole::Config config) {
                 "add_player() called after start_server() — role may not initialize correctly");
     }
     this->player_ = std::make_unique<PlayerRole>(std::move(config));
-    this->player_->attach(this->make_bridge_());
+    this->player_->attach(this->make_bridge_(), this->persistence_provider_);
     return *this->player_;
 }
 
@@ -208,18 +208,18 @@ void SendspinClient::loop() {
     if (conn != nullptr) {
         auto result = this->time_burst_->loop(conn);
 
-        if (result.sent && !this->high_performance_requested_for_time_ &&
-            this->on_request_high_performance) {
-            this->on_request_high_performance();
+        if (result.sent && !this->high_performance_requested_for_time_ && this->listener_) {
+            this->listener_->on_request_high_performance();
             this->high_performance_requested_for_time_ = true;
         }
         if (result.burst_completed && this->high_performance_requested_for_time_ &&
-            this->on_release_high_performance) {
-            this->on_release_high_performance();
+            this->listener_) {
+            this->listener_->on_release_high_performance();
             this->high_performance_requested_for_time_ = false;
         }
-        if (result.burst_completed && this->on_time_sync_updated && conn->get_time_filter()) {
-            this->on_time_sync_updated(static_cast<float>(conn->get_time_filter()->get_error()));
+        if (result.burst_completed && this->listener_ && conn->get_time_filter()) {
+            this->listener_->on_time_sync_updated(
+                static_cast<float>(conn->get_time_filter()->get_error()));
         }
     }
 
@@ -262,8 +262,8 @@ void SendspinClient::loop() {
         if (this->event_state_->shadow_group.take(group_delta)) {
             apply_group_update_deltas(&this->group_state_, group_delta);
 
-            if (this->on_group_update) {
-                this->on_group_update(group_delta);
+            if (this->listener_) {
+                this->listener_->on_group_update(group_delta);
             }
 
             // Persist last played server when playback starts
@@ -376,8 +376,8 @@ void SendspinClient::cleanup_connection_state_() {
     }
 
     // Release high-performance networking for time sync
-    if (this->high_performance_requested_for_time_ && this->on_release_high_performance) {
-        this->on_release_high_performance();
+    if (this->high_performance_requested_for_time_ && this->listener_) {
+        this->listener_->on_release_high_performance();
         this->high_performance_requested_for_time_ = false;
     }
 }
@@ -618,11 +618,11 @@ void SendspinClient::publish_client_state_(SendspinConnection* conn) {
 // --- Persistence ---
 
 void SendspinClient::load_last_played_server_() {
-    if (!this->load_last_server_hash) {
+    if (!this->persistence_provider_) {
         return;
     }
 
-    auto hash = this->load_last_server_hash();
+    auto hash = this->persistence_provider_->load_last_server_hash();
     if (hash.has_value() && hash.value() != 0) {
         this->connection_manager_->set_last_played_server_hash(hash.value());
         SS_LOGI(TAG, "Loaded last played server hash: 0x%08X", hash.value());
@@ -637,8 +637,8 @@ void SendspinClient::persist_last_played_server_(const std::string& server_id) {
     uint32_t hash = ConnectionManager::fnv1_hash(server_id.c_str());
     this->connection_manager_->set_last_played_server_hash(hash);
 
-    if (this->save_last_server_hash) {
-        if (this->save_last_server_hash(hash)) {
+    if (this->persistence_provider_) {
+        if (this->persistence_provider_->save_last_server_hash(hash)) {
             SS_LOGD(TAG, "Persisted last played server: %s (hash: 0x%08X)", server_id.c_str(),
                     hash);
         } else {

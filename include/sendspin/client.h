@@ -22,13 +22,70 @@
 #include "sendspin/visualizer_role.h"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace sendspin {
+
+// Forward declarations for listener types
+struct GroupUpdateObject;
+
+/// @brief Listener for SendspinClient events. All methods fire on the main loop thread.
+class SendspinClientListener {
+public:
+    virtual ~SendspinClientListener() = default;
+
+    /// @brief Called when the group state is updated by the server.
+    virtual void on_group_update(const GroupUpdateObject& /*group*/) {}
+
+    /// @brief Called after a time sync burst completes with the Kalman filter error.
+    virtual void on_time_sync_updated(float /*error*/) {}
+
+    /// @brief Called when the library needs high-performance networking (e.g., disable WiFi
+    /// power saving).
+    virtual void on_request_high_performance() {}
+
+    /// @brief Called when the library no longer needs high-performance networking.
+    virtual void on_release_high_performance() {}
+};
+
+/// @brief Platform hook for network readiness. Must be set before start_server().
+class SendspinNetworkProvider {
+public:
+    virtual ~SendspinNetworkProvider() = default;
+
+    /// @brief Returns true if the network (WiFi/Ethernet) is ready for connections.
+    virtual bool is_network_ready() = 0;
+};
+
+/// @brief Optional persistence provider for saving/loading client and role state.
+/// All methods fire on the main loop thread.
+class SendspinPersistenceProvider {
+public:
+    virtual ~SendspinPersistenceProvider() = default;
+
+    /// @brief Saves the FNV1 hash of the last server that was playing. Returns true on success.
+    virtual bool save_last_server_hash(uint32_t /*hash*/) {
+        return false;
+    }
+
+    /// @brief Loads the persisted last-played server hash. Returns nullopt if none saved.
+    virtual std::optional<uint32_t> load_last_server_hash() {
+        return std::nullopt;
+    }
+
+    /// @brief Saves the player's static delay. Returns true on success.
+    virtual bool save_static_delay(uint16_t /*delay_ms*/) {
+        return false;
+    }
+
+    /// @brief Loads the player's persisted static delay. Returns nullopt if none saved.
+    virtual std::optional<uint16_t> load_static_delay() {
+        return std::nullopt;
+    }
+};
 
 /// @brief Log severity levels for host builds. Has no effect on ESP-IDF builds.
 enum class LogLevel : int {
@@ -74,7 +131,7 @@ struct TimeResponseEvent {
 /// 1. Create a SendspinClientConfig and fill in capabilities
 /// 2. Create a SendspinClient with the config
 /// 3. Add roles via add_player(), add_controller(), etc.
-/// 4. Set callbacks on the role objects and platform hooks on the client
+/// 4. Set listeners on the role objects and providers on the client
 /// 5. Call start_server() to begin listening for connections
 /// 6. Call loop() periodically from the main loop
 class SendspinClient {
@@ -185,29 +242,23 @@ public:
     /// @brief Updates the client state (synchronized, error, external_source) and publishes.
     void update_state(SendspinClientState state);
 
-    // --- Event callbacks ---
+    // --- Listener and provider setters ---
 
-    std::function<void(const GroupUpdateObject&)> on_group_update;
-    std::function<void(float)> on_time_sync_updated;  ///< Kalman error value after burst completes
+    /// @brief Sets the listener for client events. The listener must outlive this client.
+    void set_listener(SendspinClientListener* listener) {
+        this->listener_ = listener;
+    }
 
-    // --- Platform hooks ---
+    /// @brief Sets the network provider (required before start_server()).
+    /// The provider must outlive this client.
+    void set_network_provider(SendspinNetworkProvider* provider) {
+        this->network_provider_ = provider;
+    }
 
-    /// @brief Returns true if the network (WiFi/Ethernet) is ready for connections.
-    std::function<bool()> is_network_ready;
-
-    /// @brief Called when the library needs high-performance networking.
-    std::function<void()> on_request_high_performance;
-
-    /// @brief Called when the library no longer needs high-performance networking.
-    std::function<void()> on_release_high_performance;
-
-    // --- Persistence hooks (optional) ---
-
-    /// @brief Saves the FNV1 hash of the last server that was playing. Returns true on success.
-    std::function<bool(uint32_t)> save_last_server_hash;
-
-    /// @brief Loads the persisted last-played server hash. Returns nullopt if none saved.
-    std::function<std::optional<uint32_t>()> load_last_server_hash;
+    /// @brief Sets the optional persistence provider. The provider must outlive this client.
+    void set_persistence_provider(SendspinPersistenceProvider* provider) {
+        this->persistence_provider_ = provider;
+    }
 
 protected:
     /// @brief Cleans up playback state when the active streaming connection is removed.
@@ -268,6 +319,12 @@ protected:
 
     struct EventState;
     std::unique_ptr<EventState> event_state_;
+
+    // --- Listeners and providers ---
+
+    SendspinClientListener* listener_{nullptr};
+    SendspinNetworkProvider* network_provider_{nullptr};
+    SendspinPersistenceProvider* persistence_provider_{nullptr};
 
     // --- Roles ---
 

@@ -52,8 +52,8 @@ void ControllerRole::drain_events() {
     ServerStateControllerObject state;
     if (this->event_state_->shadow.take(state)) {
         this->controller_state_ = std::move(state);
-        if (this->on_controller_state) {
-            this->on_controller_state(this->controller_state_);
+        if (this->listener_) {
+            this->listener_->on_controller_state(this->controller_state_);
         }
     }
 }

@@ -20,8 +20,10 @@
 #include "platform/shadow_slot.h"
 #include "platform/thread_safe_queue.h"
 #include "protocol_messages.h"
+#include "sendspin/client.h"
 #include "sync_task.h"
 #include "sync_time_provider.h"
+#include "transfer_buffer.h"
 
 static const char* const TAG = "sendspin.player";
 
@@ -132,16 +134,20 @@ void PlayerRole::set_static_delay_adjustable(bool adjustable) {
 
 // --- Private integration methods ---
 
-void PlayerRole::attach(ClientBridge* bridge) {
+void PlayerRole::attach(ClientBridge* bridge, SendspinPersistenceProvider* persistence) {
     this->bridge_ = bridge;
+    this->persistence_ = persistence;
 }
 
 bool PlayerRole::start(bool psram_stack) {
     this->load_static_delay_();
 
-    if (!this->config_.audio_formats.empty() && this->on_audio_write &&
+    if (!this->config_.audio_formats.empty() && this->listener_ &&
         !this->sync_task_->is_initialized()) {
-        if (!this->sync_task_->init(this->make_sync_time_provider_(), this->on_audio_write,
+        AudioWriteCallback write_cb = [this](uint8_t* data, size_t length, uint32_t timeout_ms) {
+            return this->listener_->on_audio_write(data, length, timeout_ms);
+        };
+        if (!this->sync_task_->init(this->make_sync_time_provider_(), std::move(write_cb),
                                     this->config_.audio_buffer_capacity)) {
             SS_LOGE(TAG, "Failed to initialize sync task");
             return false;
@@ -328,22 +334,22 @@ void PlayerRole::drain_events() {
 
             if (player_cmd.volume.has_value()) {
                 this->update_volume(player_cmd.volume.value());
-                if (this->on_volume_changed) {
-                    this->on_volume_changed(player_cmd.volume.value());
+                if (this->listener_) {
+                    this->listener_->on_volume_changed(player_cmd.volume.value());
                 }
             }
 
             if (player_cmd.mute.has_value()) {
                 this->update_muted(player_cmd.mute.value());
-                if (this->on_mute_changed) {
-                    this->on_mute_changed(player_cmd.mute.value());
+                if (this->listener_) {
+                    this->listener_->on_mute_changed(player_cmd.mute.value());
                 }
             }
 
             if (player_cmd.static_delay_ms.has_value()) {
                 this->update_static_delay(player_cmd.static_delay_ms.value());
-                if (this->on_static_delay_changed) {
-                    this->on_static_delay_changed(player_cmd.static_delay_ms.value());
+                if (this->listener_) {
+                    this->listener_->on_static_delay_changed(player_cmd.static_delay_ms.value());
                 }
             }
         }
@@ -369,8 +375,8 @@ void PlayerRole::drain_events() {
 
             switch (event) {
                 case StreamCallbackType::STREAM_END:
-                    if (this->on_stream_end) {
-                        this->on_stream_end();
+                    if (this->listener_) {
+                        this->listener_->on_stream_end();
                     }
                     if (this->high_performance_requested_for_playback_) {
                         this->bridge_->release_high_performance();
@@ -378,8 +384,8 @@ void PlayerRole::drain_events() {
                     }
                     break;
                 case StreamCallbackType::STREAM_CLEAR:
-                    if (this->on_stream_clear) {
-                        this->on_stream_clear();
+                    if (this->listener_) {
+                        this->listener_->on_stream_clear();
                     }
                     break;
                 case StreamCallbackType::STREAM_START: {
@@ -387,8 +393,8 @@ void PlayerRole::drain_events() {
                     if (this->event_state_->shadow_stream_params.take(stream_params)) {
                         this->current_stream_params_ = std::move(stream_params);
                     }
-                    if (this->on_stream_start) {
-                        this->on_stream_start();
+                    if (this->listener_) {
+                        this->listener_->on_stream_start();
                     }
                     this->sync_task_->signal_stream_start();
                     break;
@@ -452,8 +458,8 @@ SyncTimeProvider PlayerRole::make_sync_time_provider_() {
 }
 
 void PlayerRole::load_static_delay_() {
-    if (!this->load_static_delay) {
-        // No persistence callback - use initial value from config
+    if (!this->persistence_) {
+        // No persistence provider - use initial value from config
         if (this->config_.initial_static_delay_ms > 0) {
             this->static_delay_ms_ = this->config_.initial_static_delay_ms;
             SS_LOGI(TAG, "Using initial static delay from config: %u ms", this->static_delay_ms_);
@@ -461,7 +467,7 @@ void PlayerRole::load_static_delay_() {
         return;
     }
 
-    auto delay = this->load_static_delay();
+    auto delay = this->persistence_->load_static_delay();
     if (delay.has_value()) {
         if (delay.value() <= 5000) {
             this->static_delay_ms_ = delay.value();
@@ -476,8 +482,8 @@ void PlayerRole::load_static_delay_() {
 }
 
 void PlayerRole::persist_static_delay_() {
-    if (this->save_static_delay) {
-        if (this->save_static_delay(this->static_delay_ms_)) {
+    if (this->persistence_) {
+        if (this->persistence_->save_static_delay(this->static_delay_ms_)) {
             SS_LOGD(TAG, "Persisted static delay: %u ms", this->static_delay_ms_);
         } else {
             SS_LOGW(TAG, "Failed to persist static delay");

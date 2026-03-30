@@ -423,143 +423,136 @@ int main(int argc, char* argv[]) {
         vis_role = &client.add_visualizer(VisualizerRole::Config{.support = vis});
     }
 
+    // --- Listener implementations ---
+
+    struct TuiPlayerListener : PlayerRoleListener {
+        TuiState& state;
+        PlayerRole& player;
 #ifdef SENDSPIN_HAS_PORTAUDIO
-    player.on_audio_write = [&audio_sink](uint8_t* data, size_t length, uint32_t timeout_ms) {
-        return audio_sink.write(data, length, timeout_ms);
-    };
-    audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
-        player.notify_audio_played(frames, timestamp);
-    };
+        PortAudioSink& sink;
+        TuiPlayerListener(TuiState& s, PlayerRole& p, PortAudioSink& a)
+            : state(s), player(p), sink(a) {}
 #else
-    player.on_audio_write = null_audio_write;
+        TuiPlayerListener(TuiState& s, PlayerRole& p) : state(s), player(p) {}
 #endif
 
-    client.is_network_ready = []() { return true; };
-
-    // Shared TUI state
-    TuiState state;
-
-    // Wire callbacks to update TUI state
-    metadata.on_metadata = [&state](const ServerMetadataStateObject& md) {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        if (md.title.has_value()) {
-            state.title = *md.title;
-        }
-        if (md.artist.has_value()) {
-            state.artist = *md.artist;
-        }
-        if (md.album.has_value()) {
-            state.album = *md.album;
-        }
-        if (md.repeat.has_value()) {
-            state.repeat_mode = *md.repeat;
-        }
-        if (md.shuffle.has_value()) {
-            state.shuffle = *md.shuffle;
-        }
-    };
-
-    client.on_group_update = [&state](const GroupUpdateObject& group) {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        if (group.playback_state.has_value()) {
-            state.playback_state = *group.playback_state;
-        }
-        if (group.group_name.has_value()) {
-            state.group_name = *group.group_name;
-        }
-    };
-
-    player.on_volume_changed = [&state
+        size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
 #ifdef SENDSPIN_HAS_PORTAUDIO
-                                ,
-                                &audio_sink
+            return sink.write(data, length, timeout_ms);
+#else
+            return null_audio_write(data, length, timeout_ms);
 #endif
-    ](uint8_t vol) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            state.player_volume = vol;
         }
-#ifdef SENDSPIN_HAS_PORTAUDIO
-        audio_sink.set_volume(vol);
-#endif
-    };
 
-    player.on_mute_changed = [&state
+        void on_stream_start() override {
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                auto& params = player.get_current_stream_params();
+                state.codec = params.codec;
+                state.sample_rate = params.sample_rate;
+                state.bit_depth = params.bit_depth;
+                state.channels = params.channels;
+                state.streaming = true;
+            }
 #ifdef SENDSPIN_HAS_PORTAUDIO
-                               ,
-                               &audio_sink
-#endif
-    ](bool muted) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            state.player_muted = muted;
-        }
-#ifdef SENDSPIN_HAS_PORTAUDIO
-        audio_sink.set_muted(muted);
-#endif
-    };
-
-    player.on_static_delay_changed = [&state](uint16_t delay) {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        state.static_delay_ms = delay;
-    };
-
-    player.on_stream_start = [&state, &player
-#ifdef SENDSPIN_HAS_PORTAUDIO
-                              ,
-                              &audio_sink
-#endif
-    ]() {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
             auto& params = player.get_current_stream_params();
-            state.codec = params.codec;
-            state.sample_rate = params.sample_rate;
-            state.bit_depth = params.bit_depth;
-            state.channels = params.channels;
-            state.streaming = true;
-        }
-#ifdef SENDSPIN_HAS_PORTAUDIO
-        auto& params = player.get_current_stream_params();
-        if (params.sample_rate.has_value() && params.channels.has_value() &&
-            params.bit_depth.has_value()) {
-            audio_sink.configure(*params.sample_rate, *params.channels, *params.bit_depth);
-        }
+            if (params.sample_rate.has_value() && params.channels.has_value() &&
+                params.bit_depth.has_value()) {
+                sink.configure(*params.sample_rate, *params.channels, *params.bit_depth);
+            }
 #endif
-    };
+        }
 
-    player.on_stream_end = [&state
+        void on_stream_end() override {
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.streaming = false;
+                state.codec = std::nullopt;
+                state.sample_rate = std::nullopt;
+                state.bit_depth = std::nullopt;
+                state.channels = std::nullopt;
+            }
 #ifdef SENDSPIN_HAS_PORTAUDIO
-                            ,
-                            &audio_sink
+            sink.clear();
 #endif
-    ]() {
-        {
+        }
+
+        void on_stream_clear() override {
+#ifdef SENDSPIN_HAS_PORTAUDIO
+            sink.clear();
+#endif
+        }
+
+        void on_volume_changed(uint8_t vol) override {
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.player_volume = vol;
+            }
+#ifdef SENDSPIN_HAS_PORTAUDIO
+            sink.set_volume(vol);
+#endif
+        }
+
+        void on_mute_changed(bool muted) override {
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.player_muted = muted;
+            }
+#ifdef SENDSPIN_HAS_PORTAUDIO
+            sink.set_muted(muted);
+#endif
+        }
+
+        void on_static_delay_changed(uint16_t delay) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            state.streaming = false;
-            state.codec = std::nullopt;
-            state.sample_rate = std::nullopt;
-            state.bit_depth = std::nullopt;
-            state.channels = std::nullopt;
+            state.static_delay_ms = delay;
         }
-#ifdef SENDSPIN_HAS_PORTAUDIO
-        audio_sink.clear();
-#endif
     };
 
-    player.on_stream_clear = [
-#ifdef SENDSPIN_HAS_PORTAUDIO
-                               &audio_sink
-#endif
-    ]() {
-#ifdef SENDSPIN_HAS_PORTAUDIO
-        audio_sink.clear();
-#endif
+    struct TuiMetadataListener : MetadataRoleListener {
+        TuiState& state;
+        explicit TuiMetadataListener(TuiState& s) : state(s) {}
+
+        void on_metadata(const ServerMetadataStateObject& md) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (md.title.has_value()) {
+                state.title = *md.title;
+            }
+            if (md.artist.has_value()) {
+                state.artist = *md.artist;
+            }
+            if (md.album.has_value()) {
+                state.album = *md.album;
+            }
+            if (md.repeat.has_value()) {
+                state.repeat_mode = *md.repeat;
+            }
+            if (md.shuffle.has_value()) {
+                state.shuffle = *md.shuffle;
+            }
+        }
     };
 
-    // Visualizer callbacks
-    if (vis_role) {
-        vis_role->on_visualizer_stream_start = [&state](const ServerVisualizerStreamObject& vis_stream) {
+    struct TuiClientListener : SendspinClientListener {
+        TuiState& state;
+        explicit TuiClientListener(TuiState& s) : state(s) {}
+
+        void on_group_update(const GroupUpdateObject& group) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (group.playback_state.has_value()) {
+                state.playback_state = *group.playback_state;
+            }
+            if (group.group_name.has_value()) {
+                state.group_name = *group.group_name;
+            }
+        }
+    };
+
+    struct TuiVisualizerListener : VisualizerRoleListener {
+        TuiState& state;
+        explicit TuiVisualizerListener(TuiState& s) : state(s) {}
+
+        void on_visualizer_stream_start(const ServerVisualizerStreamObject& vis_stream) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.visualizer_active = true;
             if (vis_stream.spectrum.has_value()) {
@@ -567,9 +560,9 @@ int main(int argc, char* argv[]) {
                 state.vis_display_spectrum.resize(vis_stream.spectrum->n_disp_bins, 0.0f);
             }
             state.vis_display_loudness = 0.0f;
-        };
+        }
 
-        vis_role->on_visualizer_stream_end = [&state]() {
+        void on_visualizer_stream_end() override {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.visualizer_active = false;
             state.vis_loudness = 0;
@@ -578,9 +571,9 @@ int main(int argc, char* argv[]) {
             std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
             state.vis_display_loudness = 0.0f;
             state.vis_beat = false;
-        };
+        }
 
-        vis_role->on_visualizer_stream_clear = [&state]() {
+        void on_visualizer_stream_clear() override {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.vis_loudness = 0;
             state.vis_peak_freq = 0;
@@ -588,9 +581,9 @@ int main(int argc, char* argv[]) {
             std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
             state.vis_display_loudness = 0.0f;
             state.vis_beat = false;
-        };
+        }
 
-        vis_role->on_visualizer_frame = [&state](const VisualizerFrame& frame) {
+        void on_visualizer_frame(const VisualizerFrame& frame) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             if (frame.loudness.has_value()) {
                 state.vis_loudness = *frame.loudness;
@@ -601,14 +594,43 @@ int main(int argc, char* argv[]) {
             if (!frame.spectrum.empty()) {
                 state.vis_spectrum = frame.spectrum;
             }
-        };
+        }
 
-        vis_role->on_beat = [&state](int64_t /*client_timestamp*/) {
+        void on_beat(int64_t /*client_timestamp*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             int64_t current_us = now_us();
             state.vis_beat = true;
             state.vis_beat_expire_us = current_us + 100000;  // 100ms flash
-        };
+        }
+    };
+
+    struct HostNetworkProvider : SendspinNetworkProvider {
+        bool is_network_ready() override { return true; }
+    };
+
+    // Shared TUI state
+    TuiState state;
+
+    // Create and wire listeners
+#ifdef SENDSPIN_HAS_PORTAUDIO
+    TuiPlayerListener player_listener(state, player, audio_sink);
+    audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
+        player.notify_audio_played(frames, timestamp);
+    };
+#else
+    TuiPlayerListener player_listener(state, player);
+#endif
+    TuiMetadataListener metadata_listener(state);
+    TuiClientListener client_listener(state);
+    TuiVisualizerListener visualizer_listener(state);
+    HostNetworkProvider network_provider;
+
+    player.set_listener(&player_listener);
+    metadata.set_listener(&metadata_listener);
+    client.set_listener(&client_listener);
+    client.set_network_provider(&network_provider);
+    if (vis_role) {
+        vis_role->set_listener(&visualizer_listener);
     }
 
     // Start the server
