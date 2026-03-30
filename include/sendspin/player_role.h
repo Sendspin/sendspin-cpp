@@ -234,30 +234,6 @@ public:
 
     // --- Queries ---
 
-    /// @brief Returns the current static delay in milliseconds.
-    /// @return Static playback delay in milliseconds.
-    uint16_t get_static_delay_ms() const {
-        return this->static_delay_ms_;
-    }
-
-    /// @brief Returns the fixed delay in microseconds (from config).
-    /// @return Fixed pipeline delay in microseconds.
-    int32_t get_fixed_delay_us() const {
-        return this->config_.fixed_delay_us;
-    }
-
-    /// @brief Returns the current volume level.
-    /// @return Current volume level (0-255).
-    uint8_t get_volume() const {
-        return this->volume_;
-    }
-
-    /// @brief Returns true if currently muted.
-    /// @return true if muted, false otherwise.
-    bool get_muted() const {
-        return this->muted_;
-    }
-
     /// @brief Returns the audio buffer capacity from config.
     /// @return Audio ring buffer capacity in bytes.
     size_t get_buffer_size() const {
@@ -268,6 +244,30 @@ public:
     /// @return Const reference to the active stream parameters.
     const ServerPlayerStreamObject& get_current_stream_params() const {
         return this->current_stream_params_;
+    }
+
+    /// @brief Returns the fixed delay in microseconds (from config).
+    /// @return Fixed pipeline delay in microseconds.
+    int32_t get_fixed_delay_us() const {
+        return this->config_.fixed_delay_us;
+    }
+
+    /// @brief Returns true if currently muted.
+    /// @return true if muted, false otherwise.
+    bool get_muted() const {
+        return this->muted_;
+    }
+
+    /// @brief Returns the current static delay in milliseconds.
+    /// @return Static playback delay in milliseconds.
+    uint16_t get_static_delay_ms() const {
+        return this->static_delay_ms_;
+    }
+
+    /// @brief Returns the current volume level.
+    /// @return Current volume level (0-255).
+    uint8_t get_volume() const {
+        return this->volume_;
     }
 
 private:

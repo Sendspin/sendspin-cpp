@@ -110,6 +110,14 @@ public:
     /// new measurements to re-establish synchronization.
     void reset();
 
+    /// @brief Returns the offset variance in microseconds squared.
+    ///
+    /// Provides the raw variance value from the Kalman filter's covariance matrix. This represents
+    /// the statistical uncertainty in the offset estimate.
+    ///
+    /// @return Variance of the offset estimate in microseconds squared.
+    int64_t get_covariance() const;
+
     /// @brief Returns the estimated standard deviation of the offset in microseconds.
     ///
     /// Provides a measure of the current synchronization accuracy by computing the square root of
@@ -122,14 +130,6 @@ public:
     /// @brief Returns true if the filter has received at least one measurement.
     /// @return True if the filter has been updated with at least one time measurement.
     bool has_update() const;
-
-    /// @brief Returns the offset variance in microseconds squared.
-    ///
-    /// Provides the raw variance value from the Kalman filter's covariance matrix. This represents
-    /// the statistical uncertainty in the offset estimate.
-    ///
-    /// @return Variance of the offset estimate in microseconds squared.
-    int64_t get_covariance() const;
 
 protected:
     // Struct fields

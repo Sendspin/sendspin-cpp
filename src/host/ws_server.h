@@ -47,10 +47,12 @@ public:
 
     void stop();
 
-    /// @brief Returns true if the WebSocket server has been started.
-    /// @return true if the server is currently running.
-    bool is_started() const {
-        return this->server_ != nullptr;
+    void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
+        this->connection_closed_callback_ = std::move(callback);
+    }
+
+    void set_find_connection_callback(FindConnectionCallback&& callback) {
+        this->find_connection_callback_ = std::move(callback);
     }
 
     void set_max_connections(uint8_t max_connections) {
@@ -61,12 +63,10 @@ public:
         this->new_connection_callback_ = std::move(callback);
     }
 
-    void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
-        this->connection_closed_callback_ = std::move(callback);
-    }
-
-    void set_find_connection_callback(FindConnectionCallback&& callback) {
-        this->find_connection_callback_ = std::move(callback);
+    /// @brief Returns true if the WebSocket server has been started.
+    /// @return true if the server is currently running.
+    bool is_started() const {
+        return this->server_ != nullptr;
     }
 
 protected:

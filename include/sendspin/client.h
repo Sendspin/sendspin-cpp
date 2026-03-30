@@ -185,25 +185,15 @@ public:
 
     // --- Role access (nullptr if not added) ---
 
-    /// @brief Returns the player role, or nullptr if not added.
-    /// @return Pointer to the player role, or nullptr.
-    PlayerRole* player() {
-        return this->player_.get();
+    /// @brief Returns the artwork role, or nullptr if not added.
+    /// @return Pointer to the artwork role, or nullptr.
+    ArtworkRole* artwork() {
+        return this->artwork_.get();
     }
-    /// @brief Returns the player role (const), or nullptr if not added.
-    /// @return Const pointer to the player role, or nullptr.
-    const PlayerRole* player() const {
-        return this->player_.get();
-    }
-    /// @brief Returns the metadata role, or nullptr if not added.
-    /// @return Pointer to the metadata role, or nullptr.
-    MetadataRole* metadata() {
-        return this->metadata_.get();
-    }
-    /// @brief Returns the metadata role (const), or nullptr if not added.
-    /// @return Const pointer to the metadata role, or nullptr.
-    const MetadataRole* metadata() const {
-        return this->metadata_.get();
+    /// @brief Returns the artwork role (const), or nullptr if not added.
+    /// @return Const pointer to the artwork role, or nullptr.
+    const ArtworkRole* artwork() const {
+        return this->artwork_.get();
     }
     /// @brief Returns the controller role, or nullptr if not added.
     /// @return Pointer to the controller role, or nullptr.
@@ -215,15 +205,25 @@ public:
     const ControllerRole* controller() const {
         return this->controller_.get();
     }
-    /// @brief Returns the artwork role, or nullptr if not added.
-    /// @return Pointer to the artwork role, or nullptr.
-    ArtworkRole* artwork() {
-        return this->artwork_.get();
+    /// @brief Returns the metadata role, or nullptr if not added.
+    /// @return Pointer to the metadata role, or nullptr.
+    MetadataRole* metadata() {
+        return this->metadata_.get();
     }
-    /// @brief Returns the artwork role (const), or nullptr if not added.
-    /// @return Const pointer to the artwork role, or nullptr.
-    const ArtworkRole* artwork() const {
-        return this->artwork_.get();
+    /// @brief Returns the metadata role (const), or nullptr if not added.
+    /// @return Const pointer to the metadata role, or nullptr.
+    const MetadataRole* metadata() const {
+        return this->metadata_.get();
+    }
+    /// @brief Returns the player role, or nullptr if not added.
+    /// @return Pointer to the player role, or nullptr.
+    PlayerRole* player() {
+        return this->player_.get();
+    }
+    /// @brief Returns the player role (const), or nullptr if not added.
+    /// @return Const pointer to the player role, or nullptr.
+    const PlayerRole* player() const {
+        return this->player_.get();
     }
     /// @brief Returns the visualizer role, or nullptr if not added.
     /// @return Pointer to the visualizer role, or nullptr.

@@ -54,16 +54,16 @@ public:
     bool decode_audio_chunk(const uint8_t* data, size_t data_size, uint8_t* output_buffer,
                             size_t output_buffer_size, size_t* decoded_size);
 
-    /// @brief Returns the maximum number of bytes a single decoded frame can produce.
-    /// @return Maximum decoded output size in bytes.
-    size_t get_maximum_decoded_size() const {
-        return this->maximum_decoded_size_;
-    }
-
     /// @brief Returns the currently active codec format.
     /// @return The codec format in use for decoding.
     SendspinCodecFormat get_current_codec() const {
         return this->current_codec_;
+    }
+
+    /// @brief Returns the maximum number of bytes a single decoded frame can produce.
+    /// @return Maximum decoded output size in bytes.
+    size_t get_maximum_decoded_size() const {
+        return this->maximum_decoded_size_;
     }
 
 protected:

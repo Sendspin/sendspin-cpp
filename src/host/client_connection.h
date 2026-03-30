@@ -34,12 +34,13 @@ public:
     void start() override;
     void loop() override;
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
-    bool is_connected() const override;
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb) override;
 
     void set_auto_reconnect(bool enabled) {
         this->auto_reconnect_ = enabled;
     }
+
+    bool is_connected() const override;
 
 protected:
     void setup_callbacks_();

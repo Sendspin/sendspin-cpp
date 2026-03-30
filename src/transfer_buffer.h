@@ -48,9 +48,9 @@ public:
     /// @return Number of bytes written to the sink.
     size_t transfer_data_to_sink(uint32_t timeout_ms);
 
-    /// @brief Returns a pointer to the start of available data.
-    uint8_t* get_buffer_start() const {
-        return this->data_start_;
+    /// @brief Returns the number of bytes available to read.
+    size_t available() const {
+        return this->buffer_length_;
     }
 
     /// @brief Returns a pointer past the end of available data (where new data can be written).
@@ -58,9 +58,9 @@ public:
         return this->data_start_ + this->buffer_length_;
     }
 
-    /// @brief Returns the number of bytes available to read.
-    size_t available() const {
-        return this->buffer_length_;
+    /// @brief Returns a pointer to the start of available data.
+    uint8_t* get_buffer_start() const {
+        return this->data_start_;
     }
 
     /// @brief Returns the allocated capacity in bytes.

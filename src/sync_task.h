@@ -114,6 +114,18 @@ public:
     /// @return true if thread started successfully, false otherwise.
     bool start(bool task_stack_in_psram = false);
 
+    /// @brief Gets the event flags for monitoring task lifecycle.
+    /// @return Reference to the internal event flags object.
+    EventFlags& get_event_flags() {
+        return this->event_flags_;
+    }
+
+    /// @brief Checks if the last run ended with an error.
+    /// @return true if the most recent stream run encountered an error.
+    bool had_error() const {
+        return this->last_run_had_error_;
+    }
+
     /// @brief Returns true if init() has been called successfully.
     /// @return true if the sync task has been initialized, false otherwise.
     bool is_initialized() const {
@@ -158,18 +170,6 @@ public:
     /// @param frames Number of audio frames played.
     /// @param timestamp Client timestamp when the audio finished playing.
     void notify_audio_played(uint32_t frames, int64_t timestamp);
-
-    /// @brief Gets the event flags for monitoring task lifecycle.
-    /// @return Reference to the internal event flags object.
-    EventFlags& get_event_flags() {
-        return this->event_flags_;
-    }
-
-    /// @brief Checks if the last run ended with an error.
-    /// @return true if the most recent stream run encountered an error.
-    bool had_error() const {
-        return this->last_run_had_error_;
-    }
 
 protected:
     static void sync_task(void* params);
