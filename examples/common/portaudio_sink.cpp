@@ -25,7 +25,7 @@ namespace sendspin {
 // Ring buffer capacity. With condition-variable-based blocking in write(),
 // backpressure is driven by the PA callback rate (not buffer fullness), so this
 // can be larger without causing the initial-sync zero-stuffing problem.
-// 16KB ~= 85ms at 48kHz/16-bit/stereo — enough headroom for scheduling jitter.
+// 16KB ~= 85ms at 48kHz/16-bit/stereo, enough headroom for scheduling jitter.
 static constexpr size_t RING_BUFFER_CAPACITY = 16384;
 
 // ============================================================================
@@ -243,7 +243,7 @@ int PortAudioSink::pa_callback(const void* /*input*/, void* output, unsigned lon
         apply_volume_(out, bytes_requested, bps, vol);
     }
 
-    // Wake the producer thread — space is now available in the ring buffer.
+    // Wake the producer thread; space is now available in the ring buffer.
     // notify_one() is safe to call from the PA callback on desktop platforms.
     self->write_cv_.notify_one();
 

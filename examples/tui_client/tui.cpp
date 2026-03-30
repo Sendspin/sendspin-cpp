@@ -544,10 +544,10 @@ static bool handle_selector_key(const Event& event, SendspinClient& client, TuiS
         return true;
     }
 
-    // Refresh — handled in main.cpp via on_selector_refresh callback; just a no-op here
+    // Refresh: handled in main.cpp via on_selector_refresh callback; just a no-op here
     if (event == Event::Character('r')) {
         // The refresh is signaled by setting a flag that the browser monitors.
-        // For now, this is a visual acknowledgement — browsing is continuous.
+        // For now, this is a visual acknowledgement; browsing is continuous.
         return true;
     }
 

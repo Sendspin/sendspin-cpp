@@ -159,7 +159,7 @@ void ConnectionManager::loop() {
             this->dying_connection_.reset();
         }
 
-        // Server hello events — handshake completion and handoff
+        // Server hello events: handshake completion and handoff
         for (auto& event : hello_events) {
             // Verify the connection is still one we manage
             if (event.conn != this->current_connection_.get() &&

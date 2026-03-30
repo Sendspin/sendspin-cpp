@@ -122,7 +122,7 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, int64_t offse
 // ============================================================================
 
 void SendspinTimeBurst::reset() {
-    this->burst_index_ = BURST_SIZE;  // "complete" state — next loop will wait for interval
+    this->burst_index_ = BURST_SIZE;  // "complete" state; next loop will wait for interval
     this->last_burst_complete_time_ = 0;
     this->current_message_sent_time_ = 0;
     this->pending_burst_completed_ = false;

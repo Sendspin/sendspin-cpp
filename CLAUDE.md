@@ -8,22 +8,22 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 
 ### Key classes
 
-- `SendspinClient` (`client.h`) — main orchestration class, owns connections, time sync, and message routing
-- `PlayerRole` (`player_role.h`) — audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_write` callback
-- `ControllerRole` (`controller_role.h`) — sends playback commands to the server
-- `MetadataRole` (`metadata_role.h`) — receives track metadata and progress
-- `ArtworkRole` (`artwork_role.h`) — receives album artwork images
-- `VisualizerRole` (`visualizer_role.h`) — receives spectrum/beat visualization data
-- `SyncTask` (`sync_task.h`) — decodes encoded audio, synchronizes to server timestamps, writes PCM via audio write callback
-- `SendspinConnection` (`connection.h`) — abstract WebSocket connection base
-- `SendspinServerConnection` / `SendspinClientConnection` — platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
-- `SendspinTimeFilter` (`time_filter.h`) — 2D Kalman filter for NTP-style time sync
-- `SendspinTimeBurst` (`time_burst.h`) — burst-based time message coordinator
-- `SendspinDecoder` (`decoder.h`) — FLAC/Opus/PCM decoder wrapper
+- `SendspinClient` (`client.h`): main orchestration class, owns connections, time sync, and message routing
+- `PlayerRole` (`player_role.h`): audio streaming role, owns `SyncTask`, writes decoded audio via `on_audio_write` callback
+- `ControllerRole` (`controller_role.h`): sends playback commands to the server
+- `MetadataRole` (`metadata_role.h`): receives track metadata and progress
+- `ArtworkRole` (`artwork_role.h`): receives album artwork images
+- `VisualizerRole` (`visualizer_role.h`): receives spectrum/beat visualization data
+- `SyncTask` (`sync_task.h`): decodes encoded audio, synchronizes to server timestamps, writes PCM via audio write callback
+- `SendspinConnection` (`connection.h`): abstract WebSocket connection base
+- `SendspinServerConnection` / `SendspinClientConnection`: platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
+- `SendspinTimeFilter` (`time_filter.h`): 2D Kalman filter for NTP-style time sync
+- `SendspinTimeBurst` (`time_burst.h`): burst-based time message coordinator
+- `SendspinDecoder` (`decoder.h`): FLAC/Opus/PCM decoder wrapper
 
 ### Role composition
 
-Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role receives a `SendspinClient*` at construction time and uses it to access shared services (time sync, state publishing, message sending). The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers — no preprocessor guards.
+Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role receives a `SendspinClient*` at construction time and uses it to access shared services (time sync, state publishing, message sending). The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers; no preprocessor guards.
 
 ```cpp
 // Implement listener interfaces
@@ -69,15 +69,15 @@ The platform (e.g., ESPHome) provides:
 ## Project layout
 
 ```text
-include/sendspin/     — Public API headers (client.h, types.h, *_role.h)
-src/                        — Cross-platform source files (.cpp) and private headers (.h)
-src/platform/               — Platform abstraction headers and host-only source files
-src/esp/                    — ESP-IDF networking implementations and headers
-src/host/                   — Host (IXWebSocket) networking implementations and headers
-cmake/                      — CMake modules (sources.cmake, host.cmake)
-examples/common/            — Shared PortAudio audio sink used by host examples
-examples/basic_client/      — Standalone host example with PortAudio audio output
-examples/tui_client/        — Terminal UI host example with PortAudio audio output
+include/sendspin/     - Public API headers (client.h, types.h, *_role.h)
+src/                        - Cross-platform source files (.cpp) and private headers (.h)
+src/platform/               - Platform abstraction headers and host-only source files
+src/esp/                    - ESP-IDF networking implementations and headers
+src/host/                   - Host (IXWebSocket) networking implementations and headers
+cmake/                      - CMake modules (sources.cmake, host.cmake)
+examples/common/            - Shared PortAudio audio sink used by host examples
+examples/basic_client/      - Standalone host example with PortAudio audio output
+examples/tui_client/        - Terminal UI host example with PortAudio audio output
 ```
 
 ### Header visibility
@@ -90,17 +90,17 @@ examples/tui_client/        — Terminal UI host example with PortAudio audio ou
 
 Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs across platforms:
 
-- `logging.h` — `SS_LOGE`/`SS_LOGW`/`SS_LOGI`/`SS_LOGD`/`SS_LOGV` macros (ESP: `esp_log.h`, host: `printf`-based)
-- `memory.h` — `platform_malloc`/`platform_realloc`/`platform_free` (ESP: SPIRAM-preferring `heap_caps_malloc`, host: standard `malloc`)
-- `thread.h` — threading utilities
-- `time.h` — time utilities
-- `base64.h` — base64 encoding/decoding
-- `types.h` — platform type abstractions
-- `spsc_ring_buffer.h` — single-producer/single-consumer ring buffer (ESP: FreeRTOS `xRingbuffer`, host: mutex/condition variable)
-- `thread_safe_queue.h` — thread-safe queue (ESP: FreeRTOS queue, host: mutex/condition variable)
-- `event_flags.h` — event flag group (ESP: FreeRTOS event group, host: mutex/condition variable)
+- `logging.h`: `SS_LOGE`/`SS_LOGW`/`SS_LOGI`/`SS_LOGD`/`SS_LOGV` macros (ESP: `esp_log.h`, host: `printf`-based)
+- `memory.h`: `platform_malloc`/`platform_realloc`/`platform_free` (ESP: SPIRAM-preferring `heap_caps_malloc`, host: standard `malloc`)
+- `thread.h`: threading utilities
+- `time.h`: time utilities
+- `base64.h`: base64 encoding/decoding
+- `types.h`: platform type abstractions
+- `spsc_ring_buffer.h`: single-producer/single-consumer ring buffer (ESP: FreeRTOS `xRingbuffer`, host: mutex/condition variable)
+- `thread_safe_queue.h`: thread-safe queue (ESP: FreeRTOS queue, host: mutex/condition variable)
+- `event_flags.h`: event flag group (ESP: FreeRTOS event group, host: mutex/condition variable)
 
-Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards — all platform differences are isolated to the platform layer and the `src/esp/`/`src/host/` directories.
+Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform differences are isolated to the platform layer and the `src/esp/`/`src/host/` directories.
 
 ## Build
 

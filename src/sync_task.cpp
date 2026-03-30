@@ -333,7 +333,7 @@ bool SyncTask::sync_idle_wait_for_header_(SyncContext& sync_context) {
         !(this->event_flags_.get() & (COMMAND_STOP | COMMAND_STREAM_END | COMMAND_STREAM_CLEAR))) {
         auto* entry = this->encoded_ring_buffer_->receive_chunk(IDLE_RECEIVE_TIMEOUT_MS);
         if (entry == nullptr) {
-            continue;  // Timeout — check flags and try again
+            continue;  // Timed out; check flags and try again
         }
         if (entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO &&
             entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO) {
@@ -358,7 +358,7 @@ void SyncTask::sync_drain_ring_buffer_(SyncContext& sync_context) {
         }
         if (entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO &&
             entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO) {
-            // Codec header for the next stream — hold onto it
+            // Codec header for the next stream; hold onto it
             sync_context.encoded_entry = entry;
             break;
         }
@@ -692,7 +692,7 @@ void SyncTask::sync_task(void* params) {
             break;
         }
 
-        // A new clear/end arrived while waiting — loop back to idle to process it
+        // A new clear/end arrived while waiting; loop back to idle to process it
         if (this_task->event_flags_.get() &
             (EventGroupBits::COMMAND_STREAM_END | EventGroupBits::COMMAND_STREAM_CLEAR)) {
             if (sync_context.encoded_entry != nullptr) {
@@ -763,7 +763,7 @@ void SyncTask::sync_task(void* params) {
         this_task->last_run_had_error_ =
             (this_task->event_flags_.get() & EventGroupBits::TASK_ERROR) != 0;
 
-        // Don't drain the ring buffer here — the idle wait loop already discards
+        // Don't drain the ring buffer here; the idle wait loop already discards
         // stale audio and stops at codec headers. Draining here would throw away
         // a codec header that arrived during a rapid seek (STREAM_END → STREAM_START).
     }

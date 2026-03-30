@@ -194,8 +194,7 @@ void SendspinClient::loop() {
 
 PlayerRole& SendspinClient::add_player(PlayerRole::Config config) {
     if (this->started_) {
-        SS_LOGW(TAG,
-                "add_player() called after start_server() — role may not initialize correctly");
+        SS_LOGW(TAG, "add_player() called after start_server(); role may not initialize correctly");
     }
     this->player_ =
         std::make_unique<PlayerRole>(std::move(config), this, this->persistence_provider_);

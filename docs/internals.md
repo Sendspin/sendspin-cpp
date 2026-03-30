@@ -10,12 +10,12 @@ The library uses a small number of long-lived threads. All state mutations and u
 
 | Thread | Name | Created by | Stack (ESP) | Priority (ESP) | Purpose |
 |--------|------|-----------|-------------|-----------------|---------|
-| **Main loop** | (caller's) | User code | — | — | Drives `SendspinClient::loop()`. All role event processing and listener callbacks run here. |
+| **Main loop** | (caller's) | User code | - | - | Drives `SendspinClient::loop()`. All role event processing and listener callbacks run here. |
 | **Sync task** | `Sendspin` | `PlayerRole::start()` → `SyncTask::start()` | 6192 B | 2 | Decodes audio, synchronizes to server timestamps, writes PCM to the audio sink via `on_audio_write`. |
 | **Visualizer drain** | `SsVis` | `VisualizerRole::start()` | 4096 B | 2 | Reads visualization frames from a ring buffer and delivers them to the listener at the correct playback time. |
-| **Network** | (library-internal) | IXWebSocket (host) or esp_http_server (ESP) | — | — | WebSocket I/O. Callbacks fire on these threads and must defer work to the main loop. |
+| **Network** | (library-internal) | IXWebSocket (host) or esp_http_server (ESP) | - | - | WebSocket I/O. Callbacks fire on these threads and must defer work to the main loop. |
 
-On host builds, `platform_configure_thread()` is a no-op — threads use OS defaults. On ESP-IDF it calls `esp_pthread_set_cfg()` to set stack size, priority, name, and optional PSRAM allocation before the `std::thread` is constructed.
+On host builds, `platform_configure_thread()` is a no-op; threads use OS defaults. On ESP-IDF it calls `esp_pthread_set_cfg()` to set stack size, priority, name, and optional PSRAM allocation before the `std::thread` is constructed.
 
 ### Thread Lifecycle
 
@@ -67,8 +67,8 @@ Fixed-depth FIFO queue with timed send/receive. Used to defer events from networ
 | `PlayerRole::state_queue` | 4 | `SendspinClientState` | Sync task thread | Main loop (`drain_events`) |
 | `SyncTask::playback_progress_queue_` | 50 | `PlaybackProgress` | Audio output callback | Sync task thread |
 | `Client::time_queue` | 16 | `TimeResponseEvent` | Network thread | Main loop (`loop`) |
-| `ArtworkRole::stream_end_queue` | — | `uint8_t` (dummy) | Network thread | Main loop (`drain_events`) |
-| `VisualizerRole::queue` | — | `EventType` | Network thread | Main loop (`drain_events`) |
+| `ArtworkRole::stream_end_queue` | - | `uint8_t` (dummy) | Network thread | Main loop (`drain_events`) |
+| `VisualizerRole::queue` | - | `EventType` | Network thread | Main loop (`drain_events`) |
 
 ### ShadowSlot (`src/platform/shadow_slot.h`)
 
@@ -96,11 +96,11 @@ Used for:
 
 ### Other Primitives
 
-- **`std::mutex`** on `ConnectionManager::conn_mutex_` — protects deferred connection event vectors.
-- **`std::mutex`** on `SendspinTimeFilter::state_mutex_` — protects Kalman filter state (offset, drift, covariance).
-- **`std::atomic<bool>`** on `SendspinConnection::message_dispatch_enabled_` — allows the main loop to instantly suppress message delivery from the network thread.
-- **`std::atomic<bool/uint8_t/size_t>`** on `VisualizerRole` — network thread writes stream config atomically; drain thread reads it.
-- **`std::atomic<uint8_t>`** on `SendspinClient::high_performance_ref_count_` — ref-counted high-performance networking requests from time sync and playback.
+- **`std::mutex`** on `ConnectionManager::conn_mutex_`: protects deferred connection event vectors.
+- **`std::mutex`** on `SendspinTimeFilter::state_mutex_`: protects Kalman filter state (offset, drift, covariance).
+- **`std::atomic<bool>`** on `SendspinConnection::message_dispatch_enabled_`: allows the main loop to instantly suppress message delivery from the network thread.
+- **`std::atomic<bool/uint8_t/size_t>`** on `VisualizerRole`: network thread writes stream config atomically; drain thread reads it.
+- **`std::atomic<uint8_t>`** on `SendspinClient::high_performance_ref_count_`: ref-counted high-performance networking requests from time sync and playback.
 
 ## Message Flow
 
@@ -113,7 +113,7 @@ Network thread (IXWebSocket / esp_http_server)
   │  (connection.cpp: prepare_receive_buffer_ / commit_receive_buffer_)
   │
   ├─ Checks message_dispatch_enabled_ atomic flag
-  │  (returns immediately if disabled — used during teardown)
+  │  (returns immediately if disabled; used during teardown)
   │
   └─ Invokes callback on network thread:
      ├─ Text → SendspinClient::process_json_message_()
@@ -141,9 +141,9 @@ Network thread (IXWebSocket / esp_http_server)
 
 | Binary Type | Handler |
 |-------------|---------|
-| Player audio | `PlayerRole::handle_binary()` — writes to encoded audio ring buffer |
-| Artwork image | `ArtworkRole::handle_binary()` — delivers image data to listener directly on network thread |
-| Visualizer frame/beat | `VisualizerRole::handle_binary()` — writes to visualizer ring buffer |
+| Player audio | `PlayerRole::handle_binary()`: writes to encoded audio ring buffer |
+| Artwork image | `ArtworkRole::handle_binary()`: delivers image data to listener directly on network thread |
+| Visualizer frame/beat | `VisualizerRole::handle_binary()`: writes to visualizer ring buffer |
 
 ### Main Loop Processing
 
@@ -177,7 +177,7 @@ Network thread (IXWebSocket / esp_http_server)
    └─ Apply group deltas, fire on_group_update, persist last played server
 ```
 
-This ordering matters — connection lifecycle events are processed before role events, and time sync before audio processing, so that roles always see a consistent connection and time state.
+This ordering matters: connection lifecycle events are processed before role events, and time sync before audio processing, so that roles always see a consistent connection and time state.
 
 ## Role Event Draining
 
@@ -187,11 +187,11 @@ Each role implements `drain_events()` to process its deferred events on the main
 
 Three stages, processed in order:
 
-**1. Client state updates** — Drains `state_queue` (last value wins). Calls `client_->update_state()`.
+**1. Client state updates**: Drains `state_queue` (last value wins). Calls `client_->update_state()`.
 
-**2. Server commands** — Takes from `shadow_command`. Checks each field independently (volume, mute, static_delay) and fires the corresponding listener callback.
+**2. Server commands**: Takes from `shadow_command`. Checks each field independently (volume, mute, static_delay) and fires the corresponding listener callback.
 
-**3. Stream lifecycle** — The most complex part:
+**3. Stream lifecycle**: The most complex part:
 
 ```api
 stream_queue → awaiting_sync_idle_events_ list

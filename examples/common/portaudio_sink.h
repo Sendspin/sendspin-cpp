@@ -48,7 +48,7 @@ public:
     size_t free_space() const;
 
     /// @brief Request the consumer to discard all buffered data.
-    /// Safe to call while the PA callback is active — the consumer performs the
+    /// Safe to call while the PA callback is active; the consumer performs the
     /// actual drain on its next read(), preserving the SPSC invariant.
     void clear();
 
@@ -112,7 +112,7 @@ private:
 
     // Mutex/CV for blocking write() until PA callback frees space, and for
     // serializing ring buffer mutations (write vs reset) across threads.
-    // The PA callback itself never acquires this mutex — it stays lock-free.
+    // The PA callback itself never acquires this mutex; it stays lock-free.
     std::mutex write_mutex_;
     std::condition_variable write_cv_;
     std::atomic<bool> abort_write_{false};
