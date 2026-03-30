@@ -59,6 +59,10 @@ uint32_t MetadataRole::get_track_progress_ms() const {
         return progress.track_progress;
     }
 
+    if (!this->bridge_) {
+        return progress.track_progress;
+    }
+
     int64_t client_target = this->bridge_->get_client_time(this->metadata_.timestamp);
     if (client_target == 0) {
         return progress.track_progress;

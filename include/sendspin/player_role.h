@@ -32,7 +32,6 @@ class ClientBridge;
 struct ClientHelloMessage;
 struct ClientStateMessage;
 struct StreamStartMessage;
-struct SyncTimeProvider;
 
 // ============================================================================
 // Player types
