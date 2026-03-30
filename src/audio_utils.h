@@ -47,7 +47,8 @@ inline int32_t unpack_audio_sample_to_q31(const uint8_t* data, size_t bytes_per_
 }
 
 /// @brief Packs a Q31 fixed-point number as an audio sample with the specified number of bytes per
-/// sample. Packs the most significant bits - no dithering is applied.
+/// sample.
+/// @note Packs the most significant bits - no dithering is applied.
 /// @param sample Q31 fixed-point number to pack.
 /// @param data Pointer to data array to store the packed sample.
 /// @param bytes_per_sample The audio data's bytes per sample (1-4).

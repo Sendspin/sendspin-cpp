@@ -117,8 +117,10 @@ protected:
 
     // 32-bit fields
 
-    /// @brief Auto-reconnect configuration
+    /// @brief Monotonic timestamp (ms) of the last reconnection attempt
     uint32_t last_reconnect_attempt_{0};
+
+    /// @brief Delay in milliseconds between reconnection attempts
     uint32_t reconnect_interval_ms_{5000};
 
     // 8-bit fields

@@ -61,7 +61,7 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
 }
 
 // ============================================================================
-// Event state (PIMPL)
+// Event state (PIMPL, hides platform queue/shadow headers)
 // ============================================================================
 
 /// @brief PIMPL event state: queues and shadow slots used to pass data from background threads
