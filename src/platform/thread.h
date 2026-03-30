@@ -23,7 +23,7 @@
 
 namespace sendspin {
 
-/// Configures the next std::thread created on this calling thread.
+/// @brief Configures the next std::thread created on this calling thread
 /// On ESP-IDF, sets stack size, priority, name, and optionally SPIRAM stack allocation
 /// via esp_pthread_set_cfg.
 inline void platform_configure_thread(const char* name, size_t stack_size, int priority,

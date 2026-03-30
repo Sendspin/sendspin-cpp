@@ -26,10 +26,10 @@
 
 namespace sendspin {
 
-/// No-op on ESP-IDF — log levels are controlled at compile time.
+/// @brief No-op on ESP-IDF — log levels are controlled at compile time
 inline void platform_set_log_level(int /*level*/) {}
 
-/// Returns INFO on ESP-IDF — runtime log level is not available.
+/// @brief Returns INFO on ESP-IDF — runtime log level is not available
 inline int platform_get_log_level() {
     return 3;
 }

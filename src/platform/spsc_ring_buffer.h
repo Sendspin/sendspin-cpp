@@ -52,7 +52,7 @@ public:
         return this->handle_ != nullptr;
     }
 
-    /// Two-phase write: acquire contiguous space.
+    /// @brief Two-phase write: acquire contiguous space
     /// @return Pointer to acquired space, or nullptr on timeout.
     void* acquire(size_t size, uint32_t timeout_ms) {
         void* ptr = nullptr;
@@ -63,24 +63,24 @@ public:
         return ptr;
     }
 
-    /// Two-phase write: commit previously acquired space.
+    /// @brief Two-phase write: commit previously acquired space
     bool commit(void* ptr) {
         return xRingbufferSendComplete(this->handle_, ptr) == pdTRUE;
     }
 
-    /// One-phase write: copy data into the ring buffer.
+    /// @brief One-phase write: copy data into the ring buffer
     bool send(const void* data, size_t size, uint32_t timeout_ms) {
         return xRingbufferSend(this->handle_, data, size, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
     }
 
-    /// Receive the next item. Caller must call return_item() when done.
+    /// @brief Receive the next item. Caller must call return_item() when done
     /// @param[out] item_size Set to the size of the received item.
     /// @return Pointer to item data, or nullptr on timeout.
     void* receive(size_t* item_size, uint32_t timeout_ms) {
         return xRingbufferReceive(this->handle_, item_size, pdMS_TO_TICKS(timeout_ms));
     }
 
-    /// Return a previously received item to the ring buffer.
+    /// @brief Return a previously received item to the ring buffer
     void return_item(void* ptr) {
         vRingbufferReturnItem(this->handle_, ptr);
     }

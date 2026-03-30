@@ -35,7 +35,7 @@ enum class SsErr : int32_t {
     TIMEOUT = 0x107,
 };
 
-/// Returns a human-readable name for an error code.
+/// @brief Returns a human-readable name for an error code
 inline const char* ss_err_to_name(SsErr err) {
     switch (err) {
         case SsErr::OK:
@@ -62,7 +62,7 @@ inline const char* ss_err_to_name(SsErr err) {
 }
 
 #ifdef ESP_PLATFORM
-/// Converts an ESP-IDF error code to SsErr (for use in ESP-IDF-specific code).
+/// @brief Converts an ESP-IDF error code to SsErr (for use in ESP-IDF-specific code)
 inline SsErr from_esp_err(esp_err_t err) {
     return static_cast<SsErr>(err);
 }

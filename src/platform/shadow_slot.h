@@ -19,7 +19,7 @@
 
 namespace sendspin {
 
-/// Thread-safe shadow slot for passing state between threads.
+/// @brief Thread-safe shadow slot for passing state between threads
 /// The writer (e.g., network thread) locks briefly to write or merge a value.
 /// The reader (e.g., main loop) locks briefly to move the value out if dirty.
 template <typename T>
@@ -32,14 +32,14 @@ public:
     ShadowSlot(const ShadowSlot&) = delete;
     ShadowSlot& operator=(const ShadowSlot&) = delete;
 
-    /// Overwrite the slot with a new value (latest-wins).
+    /// @brief Overwrite the slot with a new value (latest-wins)
     void write(T value) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->slot_ = std::move(value);
         this->dirty_ = true;
     }
 
-    /// Merge a delta into the slot using a callable: fn(T& current, T&& delta).
+    /// @brief Merge a delta into the slot using a callable: fn(T& current, T&& delta)
     template <typename MergeFn>
     void merge(MergeFn&& fn, T delta) {
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -47,7 +47,7 @@ public:
         this->dirty_ = true;
     }
 
-    /// Move the accumulated value out if dirty. Returns true if a value was taken.
+    /// @brief Move the accumulated value out if dirty. Returns true if a value was taken
     bool take(T& out) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         if (!this->dirty_) {
@@ -59,7 +59,7 @@ public:
         return true;
     }
 
-    /// Discard any pending value.
+    /// @brief Discard any pending value
     void reset() {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->slot_ = T{};

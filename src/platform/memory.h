@@ -25,19 +25,19 @@
 
 namespace sendspin {
 
-/// Allocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM.
+/// @brief Allocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM
 inline void* platform_malloc(size_t size) {
     return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
                                    MALLOC_CAP_INTERNAL);
 }
 
-/// Reallocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM.
+/// @brief Reallocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM
 inline void* platform_realloc(void* ptr, size_t size) {
     return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
                                     MALLOC_CAP_INTERNAL);
 }
 
-/// Frees memory allocated by platform_malloc or platform_realloc.
+/// @brief Frees memory allocated by platform_malloc or platform_realloc
 inline void platform_free(void* ptr) {
     heap_caps_free(ptr);
 }
@@ -167,7 +167,7 @@ private:
     size_t size_{0};
 };
 
-/// ArduinoJson allocator that routes through platform_malloc/platform_realloc/platform_free,
+/// @brief ArduinoJson allocator that routes through platform_malloc/platform_realloc/platform_free
 /// so JSON processing uses PSRAM on ESP32.
 class PsramJsonAllocator : public ArduinoJson::Allocator {
 public:

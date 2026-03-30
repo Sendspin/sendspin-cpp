@@ -48,17 +48,17 @@ public:
         return this->handle_ != nullptr;
     }
 
-    /// Sets the specified bits. Returns the resulting bit pattern.
+    /// @brief Sets the specified bits. Returns the resulting bit pattern
     uint32_t set(uint32_t bits) {
         return xEventGroupSetBits(this->handle_, bits);
     }
 
-    /// Clears the specified bits. Returns the bits BEFORE clearing.
+    /// @brief Clears the specified bits. Returns the bits BEFORE clearing
     uint32_t clear(uint32_t bits) {
         return xEventGroupClearBits(this->handle_, bits);
     }
 
-    /// Returns the current bit pattern.
+    /// @brief Returns the current bit pattern
     uint32_t get() const {
         return xEventGroupGetBits(this->handle_);
     }

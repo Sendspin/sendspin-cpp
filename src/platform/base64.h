@@ -23,7 +23,7 @@
 
 namespace sendspin {
 
-/// Decodes base64 data.
+/// @brief Decodes base64 data
 /// @return 0 on success, non-zero on error.
 inline int platform_base64_decode(uint8_t* dst, size_t dlen, size_t* olen, const uint8_t* src,
                                   size_t slen) {
@@ -51,7 +51,7 @@ static constexpr unsigned char BASE64_DECODE_TABLE[128] = {
 };
 // clang-format on
 
-/// Decodes base64 data (host implementation).
+/// @brief Decodes base64 data (host implementation)
 /// @return 0 on success, non-zero on error.
 inline int platform_base64_decode(uint8_t* dst, size_t dlen, size_t* olen, const uint8_t* src,
                                   size_t slen) {

@@ -22,7 +22,7 @@
 
 namespace sendspin {
 
-/// Returns monotonic time in microseconds.
+/// @brief Returns monotonic time in microseconds
 inline int64_t platform_time_us() {
     return esp_timer_get_time();
 }
