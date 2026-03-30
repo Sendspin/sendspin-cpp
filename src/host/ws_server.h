@@ -30,6 +30,30 @@ namespace sendspin {
 class SendspinClient;
 class SendspinServerConnection;
 
+/**
+ * @brief WebSocket server that listens for incoming Sendspin client connections (host build)
+ *
+ * Wraps an IXWebSocket server listening on port 8928. When a client connects, a
+ * SendspinServerConnection is created and delivered via the NewConnectionCallback.
+ * Connection close events are reported via ConnectionClosedCallback.
+ *
+ * Usage:
+ * 1. Set the new_connection, connection_closed, and find_connection callbacks
+ * 2. Optionally set the maximum connection count with set_max_connections()
+ * 3. Call start() to begin accepting connections
+ * 4. Call stop() to shut down the server
+ *
+ * @code
+ * SendspinWsServer server;
+ * server.set_new_connection_callback([&](auto conn) {
+ *     store_connection(std::move(conn));
+ * });
+ * server.set_connection_closed_callback([&](int fd) {
+ *     remove_connection(fd);
+ * });
+ * server.start(&client, false, 5);
+ * @endcode
+ */
 class SendspinWsServer {
 public:
     SendspinWsServer() = default;

@@ -200,7 +200,35 @@ public:
     virtual void on_static_delay_changed(uint16_t /*delay_ms*/) {}
 };
 
-/// @brief Player role: owns SyncTask, handles audio playback.
+/**
+ * @brief Audio streaming role that decodes and synchronizes playback to server timestamps
+ *
+ * Owns a SyncTask that runs on a background thread. Encoded audio chunks arrive from the
+ * WebSocket network thread, are written into an audio ring buffer, then decoded and
+ * scheduled for output against the server clock via the time filter. Decoded PCM frames
+ * are delivered to the platform through the PlayerRoleListener::on_audio_write() callback.
+ *
+ * Usage:
+ * 1. Implement PlayerRoleListener with at minimum on_audio_write()
+ * 2. Add the role to the client via SendspinClient::add_player()
+ * 3. Call set_listener() with your listener implementation
+ * 4. Call notify_audio_played() from the audio output to report consumed frames
+ *
+ * @code
+ * struct MyPlayerListener : PlayerRoleListener {
+ *     size_t on_audio_write(uint8_t* data, size_t len, uint32_t timeout_ms) override {
+ *         return audio_output.write(data, len, timeout_ms);
+ *     }
+ *     void on_stream_start() override { audio_output.prepare(); }
+ * };
+ *
+ * MyPlayerListener listener;
+ * PlayerRole::Config config;
+ * config.audio_formats = {{SendspinCodecFormat::FLAC, 2, 44100, 16}};
+ * auto& player = client.add_player(config);
+ * player.set_listener(&listener);
+ * @endcode
+ */
 class PlayerRole {
     friend class SendspinClient;
     friend class SyncTask;

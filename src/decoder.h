@@ -27,6 +27,32 @@
 
 namespace sendspin {
 
+/**
+ * @brief Audio decoder wrapper supporting FLAC, Opus, and raw PCM codec formats
+ *
+ * Manages codec state for a single active stream. The caller first passes a header chunk
+ * via process_header() to initialize the decoder and populate an AudioStreamInfo, then
+ * calls decode_audio_chunk() for each subsequent encoded chunk. FLAC uses micro_flac,
+ * Opus uses libopus. PCM and dummy headers bypass decoding and copy data directly.
+ *
+ * Usage:
+ * 1. Call process_header() with the first chunk to initialize the codec and stream info
+ * 2. Allocate an output buffer of at least get_maximum_decoded_size() bytes
+ * 3. Call decode_audio_chunk() for each encoded chunk to fill the output buffer
+ * 4. Call reset_decoders() when the stream ends or a new stream starts
+ *
+ * @code
+ * SendspinDecoder decoder;
+ * AudioStreamInfo stream_info;
+ *
+ * decoder.process_header(header_data, header_size, CHUNK_TYPE_FLAC_HEADER, &stream_info);
+ *
+ * std::vector<uint8_t> output(decoder.get_maximum_decoded_size());
+ * size_t decoded_size = 0;
+ * decoder.decode_audio_chunk(encoded_data, encoded_size,
+ *                            output.data(), output.size(), &decoded_size);
+ * @endcode
+ */
 class SendspinDecoder {
 public:
     ~SendspinDecoder() {

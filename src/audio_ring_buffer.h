@@ -49,14 +49,36 @@ struct AudioRingBufferEntry {
     }
 };
 
-/// @brief Pre-allocated ring buffer for audio chunks using FreeRTOS RINGBUF_TYPE_NOSPLIT.
-///
-/// Threading model: Single-Producer Single-Consumer (SPSC)
-/// - Producer (WS callback thread) calls write_chunk()
-/// - Consumer (sync task) calls receive_chunk() / return_chunk()
-///
-/// Zero per-chunk heap allocation: all data is stored contiguously in the pre-allocated ring
-/// buffer.
+/**
+ * @brief Pre-allocated SPSC ring buffer for zero-copy encoded audio chunk transfer between
+ * the network thread and sync task
+ *
+ * Each entry stores an AudioRingBufferEntry header followed immediately by the variable-
+ * length audio payload. All storage is pre-allocated at construction; there are no per-
+ * chunk heap allocations. The SPSC contract is: one producer (WebSocket callback thread)
+ * calls write_chunk(), and one consumer (sync task) calls receive_chunk() / return_chunk().
+ *
+ * Usage:
+ * 1. Call create() to allocate and initialize the ring buffer
+ * 2. Producer calls write_chunk() to insert encoded audio chunks
+ * 3. Consumer calls receive_chunk() to obtain a pointer to the next entry
+ * 4. Consumer processes the entry, then calls return_chunk() to release it
+ * 5. Call reset() to drain all items when stopping the consumer task
+ *
+ * @code
+ * auto buf = SendspinAudioRingBuffer::create(512 * 1024);
+ *
+ * // Producer thread:
+ * buf->write_chunk(data, size, timestamp, CHUNK_TYPE_ENCODED_AUDIO, 100);
+ *
+ * // Consumer thread:
+ * AudioRingBufferEntry* entry = buf->receive_chunk(UINT32_MAX);
+ * if (entry) {
+ *     process(entry->data(), entry->data_size);
+ *     buf->return_chunk(entry);
+ * }
+ * @endcode
+ */
 class SendspinAudioRingBuffer {
 public:
     /// @brief Creates a ring buffer with the specified total storage size.

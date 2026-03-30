@@ -125,19 +125,49 @@ struct TimeResponseEvent {
     int64_t timestamp;
 };
 
-/// @brief Main orchestration class for the sendspin-cpp library.
-///
-/// Manages connections, message routing, time sync,
-/// audio playback, and all Sendspin protocol interactions. This is the public API surface
-/// of the library.
-///
-/// Usage:
-/// 1. Create a SendspinClientConfig and fill in capabilities
-/// 2. Create a SendspinClient with the config
-/// 3. Add roles via add_player(), add_controller(), etc.
-/// 4. Set listeners on the role objects and providers on the client
-/// 5. Call start_server() to begin listening for connections
-/// 6. Call loop() periodically from the main loop
+/**
+ * @brief Main orchestration class for the sendspin-cpp library
+ *
+ * Manages WebSocket connections, message routing, NTP-style time synchronization,
+ * audio playback, and all Sendspin protocol interactions. Roles are added at runtime
+ * and each receives events via a listener interface. Only roles that are added will
+ * participate in the protocol.
+ *
+ * Usage:
+ * 1. Fill in a SendspinClientConfig with the device identity fields
+ * 2. Construct a SendspinClient with that config
+ * 3. Add roles via add_player(), add_controller(), add_metadata(), etc.
+ * 4. Set listeners on each role and set the network provider on the client
+ * 5. Call start_server() to start the WebSocket server and background tasks
+ * 6. Call loop() periodically from the platform main loop
+ *
+ * @code
+ * struct MyPlayerListener : PlayerRoleListener {
+ *     size_t on_audio_write(uint8_t* data, size_t len, uint32_t timeout_ms) override {
+ *         return audio_output.write(data, len, timeout_ms);
+ *     }
+ * };
+ *
+ * struct MyNetworkProvider : SendspinNetworkProvider {
+ *     bool is_network_ready() override { return true; }
+ * };
+ *
+ * MyPlayerListener player_listener;
+ * MyNetworkProvider network_provider;
+ *
+ * SendspinClientConfig config{"device-id", "My Device", "Speaker", "Acme", "1.0.0"};
+ * SendspinClient client(config);
+ * auto& player = client.add_player(PlayerRole::Config{});
+ * player.set_listener(&player_listener);
+ * client.add_controller();
+ * client.set_network_provider(&network_provider);
+ * client.start_server(5);
+ *
+ * while (true) {
+ *     client.loop();
+ * }
+ * @endcode
+ */
 class SendspinClient {
     friend class ConnectionManager;
 

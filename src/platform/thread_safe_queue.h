@@ -31,6 +31,30 @@
 
 namespace sendspin {
 
+/**
+ * @brief Bounded FIFO queue that is safe to use from multiple threads
+ *
+ * Backed by a FreeRTOS queue on ESP and a mutex/condition-variable deque on host.
+ * Blocking send() and receive() calls wait up to a caller-specified timeout when
+ * the queue is full or empty. A non-blocking overwrite() path is available for
+ * single-item mailbox use.
+ *
+ * Usage:
+ * 1. Declare a ThreadSafeQueue<T> member and call create() with the desired depth
+ * 2. Push items with send() from producer threads
+ * 3. Pop items with receive() from consumer threads
+ * 4. Call reset() to discard all pending items if needed
+ *
+ * @code
+ * ThreadSafeQueue<int> q;
+ * q.create(8);
+ *
+ * q.send(42, 100);
+ *
+ * int val;
+ * q.receive(val, UINT32_MAX);
+ * @endcode
+ */
 template <typename T>
 class ThreadSafeQueue {
 public:

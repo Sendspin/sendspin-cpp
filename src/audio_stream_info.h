@@ -23,11 +23,27 @@
 
 namespace sendspin {
 
-/// @brief Audio stream format descriptor with unit conversion helpers.
-///
-/// Provides conversions between bytes, samples, frames, and durations for a given audio format.
-///  - A sample is a single value for one channel.
-///  - A frame is one sample per channel (e.g., 2 samples for stereo).
+/**
+ * @brief Audio stream format descriptor with unit conversion helpers for bytes, frames,
+ * samples, and durations
+ *
+ * Stores bits_per_sample, channels, and sample_rate for a single audio stream and
+ * provides arithmetic conversions between those units. A sample is a single value for
+ * one channel; a frame is one sample per channel (e.g., 2 samples for stereo).
+ *
+ * Usage:
+ * 1. Construct with the stream's bits_per_sample, channels, and sample_rate
+ * 2. Use the conversion methods to translate between bytes, frames, samples, and time
+ * 3. Use operator== to detect format changes between streams
+ *
+ * @code
+ * AudioStreamInfo info(16, 2, 44100);  // 16-bit stereo at 44.1 kHz
+ *
+ * size_t bytes_for_100ms = info.ms_to_bytes(100);
+ * uint32_t frames        = info.bytes_to_frames(bytes_for_100ms);
+ * uint32_t duration_us   = info.frames_to_microseconds(frames);
+ * @endcode
+ */
 class AudioStreamInfo {
 public:
     AudioStreamInfo() : AudioStreamInfo(16, 1, 16000) {}

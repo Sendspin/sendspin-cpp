@@ -29,6 +29,33 @@
 
 namespace sendspin {
 
+/**
+ * @brief Single-producer/single-consumer ring buffer with caller-provided storage
+ *
+ * Backed by a FreeRTOS NOSPLIT ring buffer on ESP and a mutex/condition-variable
+ * implementation on host. Items are written as contiguous blobs and read back in
+ * the same order. Supports both a one-phase send() and a two-phase acquire()/commit()
+ * path for zero-copy writes.
+ *
+ * Usage:
+ * 1. Allocate a storage buffer, then call create() with a pointer to it
+ * 2. Write data with send() or acquire()/commit() from the producer thread
+ * 3. Read data with receive() from the consumer thread
+ * 4. Call return_item() after processing each received item
+ *
+ * @code
+ * static uint8_t buf[4096];
+ * SpscRingBuffer rb;
+ * rb.create(sizeof(buf), buf);
+ *
+ * rb.send(data, data_len, 100);
+ *
+ * size_t sz;
+ * void* item = rb.receive(&sz, UINT32_MAX);
+ * // process item...
+ * rb.return_item(item);
+ * @endcode
+ */
 class SpscRingBuffer {
 public:
     SpscRingBuffer() = default;

@@ -28,6 +28,30 @@
 
 namespace sendspin {
 
+/**
+ * @brief Bit-flag group that supports blocking waits on one or more bits
+ *
+ * Backed by a FreeRTOS event group on ESP and a mutex/condition-variable pair on host.
+ * Threads can block until any or all of a set of bits are set, with an optional timeout.
+ * Call create() before any other method.
+ *
+ * Usage:
+ * 1. Declare an EventFlags member and call create() during initialization
+ * 2. Set bits from any thread with set()
+ * 3. Block a thread until desired bits appear with wait()
+ * 4. Clear bits explicitly with clear() when no longer needed
+ *
+ * @code
+ * EventFlags flags;
+ * flags.create();
+ *
+ * // In one thread:
+ * flags.set(0x01);
+ *
+ * // In another thread:
+ * uint32_t bits = flags.wait(0x01, false, true, 1000);
+ * @endcode
+ */
 class EventFlags {
 public:
     EventFlags() = default;

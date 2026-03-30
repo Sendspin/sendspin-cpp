@@ -25,6 +25,26 @@
 
 namespace sendspin {
 
+/**
+ * @brief Inbound WebSocket connection from a client to the host server (host build, IXWebSocket)
+ *
+ * Wraps a shared IXWebSocket that is handed off by SendspinWsServer when a client connects.
+ * Incoming messages are delivered by calling handle_message() from the server's callback thread.
+ * start() and loop() are no-ops because the transport is already open on construction.
+ *
+ * Usage:
+ * 1. Obtain an instance via the NewConnectionCallback set on SendspinWsServer
+ * 2. Pass the unique_ptr to SendspinClient for ownership and routing
+ * 3. Incoming data arrives via handle_message() called from the server thread
+ * 4. Call disconnect() to send a goodbye and close the connection
+ *
+ * @code
+ * ws_server.set_new_connection_callback([&](auto conn) {
+ *     int fd = conn->get_sockfd();
+ *     // store conn; incoming data arrives via handle_message() on the server thread
+ * });
+ * @endcode
+ */
 class SendspinServerConnection : public SendspinConnection {
 public:
     /// @brief Constructs a server connection wrapping an IXWebSocket.

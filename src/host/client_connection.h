@@ -26,6 +26,28 @@
 
 namespace sendspin {
 
+/**
+ * @brief Outbound WebSocket connection to a Sendspin server (host build, IXWebSocket)
+ *
+ * Connects to a server URL, delivers incoming messages via the base class callbacks,
+ * and automatically reconnects after connection loss. Call loop() periodically to
+ * drive the reconnect timer.
+ *
+ * Usage:
+ * 1. Construct with the server WebSocket URL
+ * 2. Set the message and state callbacks on the base SendspinConnection
+ * 3. Call start() to open the connection
+ * 4. Call loop() from the client's periodic task
+ * 5. Call disconnect() to close the connection cleanly
+ *
+ * @code
+ * auto conn = std::make_unique<SendspinClientConnection>("ws://192.168.1.10:8928");
+ * conn->on_json_message = [](SendspinConnection*, const std::string& msg, int64_t) { handle(msg);
+ * }; conn->start();
+ * // periodically:
+ * conn->loop();
+ * @endcode
+ */
 class SendspinClientConnection : public SendspinConnection {
 public:
     /// @brief Constructs a client connection to the given WebSocket URL

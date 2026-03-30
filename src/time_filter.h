@@ -31,21 +31,35 @@ static constexpr double TIME_FILTER_ADAPTIVE_CUTOFF = 2.0;
 static constexpr uint8_t TIME_FILTER_MIN_SAMPLES = 100;
 static constexpr double TIME_FILTER_DRIFT_SIGNIFICANCE_THRESHOLD = 2.0;
 
-/// @brief Two-dimensional Kalman filter for NTP-style time synchronization between client and
-/// server.
-///
-/// This class implements a time synchronization filter that tracks both the timestamp offset and
-/// clock drift rate between a client and server. It processes measurements obtained with NTP-style
-/// time messages that contain round-trip timing information to optimally estimate the time
-/// relationship while accounting for network latency uncertainty.
-///
-/// The filter maintains a 2D state vector [offset, drift] with associated covariance matrix to
-/// track estimation uncertainty. An adaptive forgetting factor helps the filter recover quickly
-/// from network disruptions or server clock adjustments.
-///
-/// All computations use double precision arithmetic to maintain microsecond-level accuracy over
-/// extended periods. Thread-safe access to the current time transformation is provided via
-/// std::mutex.
+/**
+ * @brief Two-dimensional Kalman filter for NTP-style time synchronization between client and server
+ *
+ * Tracks both clock offset and drift rate between a client and server using a 2D state
+ * vector [offset, drift] with an associated covariance matrix. Measurements come from
+ * NTP-style round-trip exchanges. An adaptive forgetting factor allows the filter to
+ * recover from network disruptions or server clock adjustments. All arithmetic is double
+ * precision to maintain microsecond accuracy over extended periods. Time conversion
+ * methods are thread-safe via an internal mutex.
+ *
+ * Usage:
+ * 1. Construct with tuning parameters (or use the TIME_FILTER_* constants)
+ * 2. Call update() each time a time burst measurement arrives
+ * 3. Call compute_client_time() or compute_server_time() to convert timestamps
+ * 4. Call reset() when the connection drops and a new sync sequence starts
+ *
+ * @code
+ * SendspinTimeFilter filter(
+ *     TIME_FILTER_PROCESS_STD_DEV,
+ *     TIME_FILTER_DRIFT_PROCESS_STD_DEV,
+ *     TIME_FILTER_FORGET_FACTOR);
+ *
+ * // After receiving an NTP-style time exchange:
+ * filter.update(offset_us, max_error_us, client_timestamp_us);
+ *
+ * int64_t client_now = get_current_time_us();
+ * int64_t server_now = filter.compute_server_time(client_now);
+ * @endcode
+ */
 class SendspinTimeFilter {
 public:
     /// @brief Constructs a Kalman filter for time synchronization.
