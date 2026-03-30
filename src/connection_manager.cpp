@@ -102,9 +102,9 @@ void ConnectionManager::init_server(SendspinClient* client, bool psram_stack, un
             this->pending_connection_->get_sockfd() == sockfd) {
             return static_cast<SendspinServerConnection*>(this->pending_connection_.get());
         }
-        if (this->dying_connection_ != nullptr && this->dying_connection_->get_sockfd() == sockfd) {
-            return static_cast<SendspinServerConnection*>(this->dying_connection_.get());
-        }
+        // Deliberately excludes dying_connection_ — it has already been through cleanup and its
+        // message dispatch is disabled. Returning it here would let httpd route stale messages
+        // from the old connection into freshly-reset role queues.
         return nullptr;
     });
 }
@@ -336,6 +336,7 @@ void ConnectionManager::on_connection_lost_(SendspinConnection* conn) {
 
     if (this->current_connection_ != nullptr && this->current_connection_.get() == conn) {
         SS_LOGI(TAG, "Current connection lost");
+        conn->disable_message_dispatch();
         this->callbacks_->reset_time_burst();
         this->callbacks_->on_active_connection_lost();
         this->current_connection_.reset();
@@ -392,6 +393,7 @@ void ConnectionManager::complete_handoff_(bool switch_to_new) {
     if (switch_to_new) {
         SS_LOGD(TAG, "Completing handoff: switching to new server");
         if (this->current_connection_ != nullptr) {
+            this->current_connection_->disable_message_dispatch();
             this->callbacks_->reset_time_burst();
             this->callbacks_->on_active_connection_lost();
             auto old_current = std::move(this->current_connection_);

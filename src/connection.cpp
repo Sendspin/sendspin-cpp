@@ -114,6 +114,11 @@ void SendspinConnection::dispatch_completed_message_(bool is_text, int64_t recei
         return;
     }
 
+    if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
+        this->reset_websocket_payload_();
+        return;
+    }
+
     if (is_text) {
         // Create string from payload for JSON processing
         const std::string message(this->websocket_payload_.data(),

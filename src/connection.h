@@ -20,6 +20,7 @@
 #include "protocol_messages.h"
 #include "time_filter.h"
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -62,6 +63,15 @@ public:
     /// @brief Checks if the transport connection is established.
     /// @return true if connected, false otherwise.
     virtual bool is_connected() const = 0;
+
+    /// @brief Prevents any further message callbacks from firing on the network thread.
+    ///
+    /// Called on the main thread before connection cleanup to ensure no stale events from a dying
+    /// connection can sneak into role queues after they've been reset. Thread-safe: the flag is
+    /// checked atomically in dispatch_completed_message_() which runs on the network thread.
+    void disable_message_dispatch() {
+        this->message_dispatch_enabled_.store(false, std::memory_order_release);
+    }
 
     /// @brief Checks if the hello handshake has completed successfully.
     /// @return true if handshake complete (hello exchange done), false otherwise.
@@ -284,6 +294,10 @@ protected:
     /// @param is_text True if this is a text message, false for binary.
     /// @param receive_time Timestamp when the data was received (microseconds).
     void dispatch_completed_message_(bool is_text, int64_t receive_time);
+
+    /// When false, dispatch_completed_message_() silently drops incoming messages.
+    /// Set to false on the main thread before cleanup; checked on the network thread.
+    std::atomic<bool> message_dispatch_enabled_{true};
 
     /// Message buffering (for websocket frame assembly).
     PlatformBuffer websocket_payload_;
