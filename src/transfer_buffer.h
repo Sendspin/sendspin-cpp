@@ -18,22 +18,16 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 
 namespace sendspin {
 
-/// @brief Callback type for writing decoded audio to the platform's audio output.
-/// @param data Pointer to the PCM audio data.
-/// @param length Number of bytes to write.
-/// @param timeout_ms Milliseconds to block while waiting for output to accept data.
-/// @return Number of bytes actually written.
-using AudioWriteCallback = std::function<size_t(uint8_t* data, size_t length, uint32_t timeout_ms)>;
+class PlayerRoleListener;
 
 /// @brief Simple transfer buffer for moving decoded audio data to the audio output.
 ///
 /// Manages a flat byte array with read/write cursors. Data is written at get_buffer_end() and
-/// read from get_buffer_start(). The audio write callback is invoked via transfer_data_to_sink().
+/// read from get_buffer_start(). The player listener is invoked via transfer_data_to_sink().
 class TransferBuffer {
 public:
     ~TransferBuffer();
@@ -43,9 +37,9 @@ public:
     /// @return unique_ptr if successfully allocated, nullptr otherwise.
     static std::unique_ptr<TransferBuffer> create(size_t buffer_size);
 
-    /// @brief Sets the audio write callback for transfer_data_to_sink().
-    void set_audio_write_callback(AudioWriteCallback callback) {
-        this->audio_write_callback_ = std::move(callback);
+    /// @brief Sets the player listener for transfer_data_to_sink().
+    void set_listener(PlayerRoleListener* listener) {
+        this->listener_ = listener;
     }
 
     /// @brief Writes buffered data to the sink.
@@ -94,7 +88,7 @@ protected:
     bool allocate_buffer_(size_t buffer_size);
     void deallocate_buffer_();
 
-    AudioWriteCallback audio_write_callback_;
+    PlayerRoleListener* listener_{nullptr};
     PlatformBuffer buffer_;
     uint8_t* data_start_{nullptr};
     size_t buffer_length_{0};

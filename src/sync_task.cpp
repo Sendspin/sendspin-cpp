@@ -414,9 +414,8 @@ DecodeResult SyncTask::sync_decode_audio_(SyncContext& sync_context) {
                     sync_context.encoded_entry = nullptr;
                     return DecodeResult::ALLOCATION_FAILED;
                 }
-                if (sync_context.audio_write_callback) {
-                    sync_context.decode_buffer->set_audio_write_callback(
-                        sync_context.audio_write_callback);
+                if (this->player_->listener_) {
+                    sync_context.decode_buffer->set_listener(this->player_->listener_);
                 }
             } else if (needed > sync_context.decode_buffer->capacity()) {
                 if (!sync_context.decode_buffer->reallocate(needed)) {
@@ -618,12 +617,7 @@ void SyncTask::sync_task(void* params) {
     }
 
     if (this_task->player_->listener_) {
-        sync_context.audio_write_callback = [player = this_task->player_](
-                                                uint8_t* data, size_t length, uint32_t timeout_ms) {
-            return player->listener_->on_audio_write(data, length, timeout_ms);
-        };
-        sync_context.interpolation_transfer_buffer->set_audio_write_callback(
-            sync_context.audio_write_callback);
+        sync_context.interpolation_transfer_buffer->set_listener(this_task->player_->listener_);
     }
     sync_context.decoder = std::make_unique<SendspinDecoder>();
 

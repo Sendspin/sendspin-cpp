@@ -58,7 +58,6 @@ struct SyncContext {
 
     // Raw pointers (4 bytes each on ESP32)
     AudioRingBufferEntry* encoded_entry{nullptr};
-    AudioWriteCallback audio_write_callback;  // Set from task owner, outlives this context
 
     // 64-bit members
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
