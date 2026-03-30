@@ -172,14 +172,15 @@ private:
     struct DrainTask;
     std::unique_ptr<DrainTask> drain_task_;
 
-    // Cached stream config (network thread only, except stream_active_ which
-    // is also cleared by cleanup() on the main thread)
+    // Cached stream config — written by the network thread in handle_stream_start(),
+    // read by the network thread in handle_binary(). stream_active_ is also cleared
+    // by cleanup() on the main thread.
     std::atomic<bool> stream_active_{false};
-    bool has_loudness_{false};
-    bool has_f_peak_{false};
-    bool has_spectrum_{false};
-    uint8_t spectrum_bin_count_{0};
-    size_t raw_frame_size_{0};
+    std::atomic<bool> has_loudness_{false};
+    std::atomic<bool> has_f_peak_{false};
+    std::atomic<bool> has_spectrum_{false};
+    std::atomic<uint8_t> spectrum_bin_count_{0};
+    std::atomic<size_t> raw_frame_size_{0};
 };
 
 }  // namespace sendspin
