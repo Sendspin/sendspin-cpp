@@ -30,7 +30,7 @@ public:
         this->reset_decoders();
     }
 
-    // Reset the state of the FLAC and Opus decoders
+    /// @brief Resets the state of the FLAC and Opus decoders
     void reset_decoders();
 
     /// @brief Sets up the appropriate decoder and processes the codec header (which may be a dummy

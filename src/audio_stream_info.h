@@ -45,40 +45,71 @@ public:
         return this->sample_rate_;
     }
 
+    /// @brief Converts a byte count to milliseconds of audio
+    /// @param bytes Number of bytes of PCM data.
+    /// @return Duration in milliseconds.
     uint32_t bytes_to_ms(size_t bytes) const {
         return bytes * 1000 / (this->sample_rate_ * this->bytes_per_sample_ * this->channels_);
     }
 
+    /// @brief Converts a byte count to the number of audio frames
+    /// @param bytes Number of bytes of PCM data.
+    /// @return Number of frames.
     uint32_t bytes_to_frames(size_t bytes) const {
         return bytes / (this->bytes_per_sample_ * this->channels_);
     }
 
+    /// @brief Converts a byte count to the number of audio samples
+    /// @param bytes Number of bytes of PCM data.
+    /// @return Number of samples (across all channels).
     uint32_t bytes_to_samples(size_t bytes) const {
         return bytes / this->bytes_per_sample_;
     }
 
+    /// @brief Converts a frame count to bytes
+    /// @param frames Number of audio frames.
+    /// @return Number of bytes.
     size_t frames_to_bytes(uint32_t frames) const {
         return frames * this->bytes_per_sample_ * this->channels_;
     }
 
+    /// @brief Converts a sample count to bytes
+    /// @param samples Number of audio samples (across all channels).
+    /// @return Number of bytes.
     size_t samples_to_bytes(uint32_t samples) const {
         return samples * this->bytes_per_sample_;
     }
 
+    /// @brief Converts milliseconds to the number of audio frames
+    /// @param ms Duration in milliseconds.
+    /// @return Number of frames.
     uint32_t ms_to_frames(uint32_t ms) const {
         return (ms * this->sample_rate_) / 1000;
     }
 
+    /// @brief Converts milliseconds to bytes of PCM data
+    /// @param ms Duration in milliseconds.
+    /// @return Number of bytes.
     size_t ms_to_bytes(uint32_t ms) const {
         return (ms * this->bytes_per_sample_ * this->channels_ * this->sample_rate_) / 1000;
     }
 
+    /// @brief Converts a frame count to microseconds
+    /// @param frames Number of audio frames.
+    /// @return Duration in microseconds.
     uint32_t frames_to_microseconds(uint32_t frames) const;
 
     /// @brief Converts frames to milliseconds, updating frames with the remainder.
     uint32_t frames_to_milliseconds_with_remainder(uint32_t* frames) const;
 
+    /// @brief Returns true if both AudioStreamInfo objects describe the same format
+    /// @param rhs The other AudioStreamInfo to compare against.
+    /// @return true if bits_per_sample, channels, and sample_rate all match.
     bool operator==(const AudioStreamInfo& rhs) const;
+
+    /// @brief Returns true if both AudioStreamInfo objects describe different formats
+    /// @param rhs The other AudioStreamInfo to compare against.
+    /// @return true if any of bits_per_sample, channels, or sample_rate differ.
     bool operator!=(const AudioStreamInfo& rhs) const {
         return !operator==(rhs);
     }

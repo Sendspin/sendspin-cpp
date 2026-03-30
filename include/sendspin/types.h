@@ -30,6 +30,9 @@ enum class SendspinClientState {
     EXTERNAL_SOURCE,
 };
 
+/// @brief Converts a SendspinClientState value to its protocol string representation
+/// @param state The client state to convert.
+/// @return Null-terminated string representation of the state.
 inline const char* to_cstr(SendspinClientState state) {
     switch (state) {
         case SendspinClientState::SYNCHRONIZED:
@@ -50,6 +53,9 @@ enum class SendspinGoodbyeReason {
     USER_REQUEST,
 };
 
+/// @brief Converts a SendspinGoodbyeReason value to its protocol string representation
+/// @param reason The goodbye reason to convert.
+/// @return Null-terminated string representation of the reason.
 inline const char* to_cstr(SendspinGoodbyeReason reason) {
     switch (reason) {
         case SendspinGoodbyeReason::ANOTHER_SERVER:
@@ -65,6 +71,9 @@ inline const char* to_cstr(SendspinGoodbyeReason reason) {
     }
 }
 
+/// @brief Parses a protocol string into a SendspinGoodbyeReason
+/// @param str The string to parse.
+/// @return The matching enum value, or std::nullopt if the string is unrecognized.
 inline std::optional<SendspinGoodbyeReason> goodbye_reason_from_string(const std::string& str) {
     if (str == "another_server")
         return SendspinGoodbyeReason::ANOTHER_SERVER;
@@ -93,6 +102,9 @@ enum class SendspinPlaybackState {
     STOPPED,
 };
 
+/// @brief Converts a SendspinPlaybackState value to its protocol string representation
+/// @param state The playback state to convert.
+/// @return Null-terminated string representation of the state.
 inline const char* to_cstr(SendspinPlaybackState state) {
     switch (state) {
         case SendspinPlaybackState::PLAYING:
@@ -103,6 +115,9 @@ inline const char* to_cstr(SendspinPlaybackState state) {
     }
 }
 
+/// @brief Parses a protocol string into a SendspinPlaybackState
+/// @param str The string to parse.
+/// @return The matching enum value, or std::nullopt if the string is unrecognized.
 inline std::optional<SendspinPlaybackState> playback_state_from_string(const std::string& str) {
     if (str == "playing")
         return SendspinPlaybackState::PLAYING;

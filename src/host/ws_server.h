@@ -45,20 +45,29 @@ public:
     /// @return true if server started successfully.
     bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority);
 
+    /// @brief Stops the WebSocket server and releases its resources
     void stop();
 
+    /// @brief Sets the callback invoked when a client connection closes
+    /// @param callback Function called with the socket fd of the closed connection.
     void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
         this->connection_closed_callback_ = std::move(callback);
     }
 
+    /// @brief Sets the callback used to look up an existing connection by socket fd
+    /// @param callback Function that returns the connection for a given socket fd, or nullptr.
     void set_find_connection_callback(FindConnectionCallback&& callback) {
         this->find_connection_callback_ = std::move(callback);
     }
 
+    /// @brief Sets the maximum number of simultaneous client connections
+    /// @param max_connections Maximum connection count.
     void set_max_connections(uint8_t max_connections) {
         this->max_connections_ = max_connections;
     }
 
+    /// @brief Sets the callback invoked when a new client connection is accepted
+    /// @param callback Function called with ownership of the new SendspinServerConnection.
     void set_new_connection_callback(NewConnectionCallback&& callback) {
         this->new_connection_callback_ = std::move(callback);
     }

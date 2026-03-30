@@ -32,9 +32,14 @@ struct AudioRingBufferEntry {
     ChunkType chunk_type;
     size_t data_size;
 
+    /// @brief Returns a pointer to the variable-length audio data following this header
+    /// @return Pointer to the audio data bytes immediately after this struct.
     uint8_t* data() {
         return reinterpret_cast<uint8_t*>(this) + sizeof(AudioRingBufferEntry);
     }
+
+    /// @brief Returns a const pointer to the variable-length audio data following this header
+    /// @return Const pointer to the audio data bytes immediately after this struct.
     const uint8_t* data() const {
         return reinterpret_cast<const uint8_t*>(this) + sizeof(AudioRingBufferEntry);
     }

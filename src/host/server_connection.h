@@ -34,12 +34,28 @@ public:
 
     ~SendspinServerConnection() override = default;
 
+    /// @brief No-op on server connections; the transport is already established when this is called
     void start() override;
+
+    /// @brief No-op on server connections; state is event-driven via handle_message()
     void loop() override;
+
+    /// @brief Sends a goodbye message and closes the connection
+    /// @param reason Reason for disconnecting.
+    /// @param on_complete Callback invoked after the connection is closed.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
+
+    /// @brief Returns true if the underlying WebSocket connection is open
+    /// @return true if connected, false otherwise.
     bool is_connected() const override;
+
+    /// @brief Sends a text message to the connected client
+    /// @param message The message string to send.
+    /// @param on_complete Callback invoked after send completes (success, actual_send_time).
+    /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete) override;
 
+    /// @brief Requests the WebSocket connection to close
     void trigger_close();
 
     /// @brief Returns the underlying socket file descriptor for this connection.

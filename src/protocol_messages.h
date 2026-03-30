@@ -42,11 +42,15 @@ enum SendspinBinaryRole : uint8_t {
     SENDSPIN_ROLE_VISUALIZER = 4,  // 00010xxx (16-23) - expanded allocation
 };
 
-// Helper to extract role from binary message type (for standard 4-slot roles)
+/// @brief Extracts the role field from a standard 4-slot binary message type byte
+/// @param type Binary message type byte.
+/// @return Role portion of the type (bits 7-2).
 inline uint8_t get_binary_role(uint8_t type) {
     return type >> 2;
 }
-// Helper to extract slot from binary message type (for standard 4-slot roles)
+/// @brief Extracts the slot field from a standard 4-slot binary message type byte
+/// @param type Binary message type byte.
+/// @return Slot portion of the type (bits 1-0).
 inline uint8_t get_binary_slot(uint8_t type) {
     return type & 0x03;
 }
@@ -88,6 +92,9 @@ enum class SendspinRole {
     VISUALIZER,
 };
 
+/// @brief Converts a SendspinRole value to its protocol wire string representation
+/// @param role The role to convert.
+/// @return Null-terminated protocol string for the role (e.g., "player@v1").
 inline const char* to_cstr(SendspinRole role) {
     switch (role) {
         case SendspinRole::PLAYER:
@@ -110,6 +117,9 @@ enum class SendspinConnectionReason {
     PLAYBACK,
 };
 
+/// @brief Converts a SendspinConnectionReason value to its protocol string representation
+/// @param reason The connection reason to convert.
+/// @return Null-terminated string representation of the reason.
 inline const char* to_cstr(SendspinConnectionReason reason) {
     switch (reason) {
         case SendspinConnectionReason::DISCOVERY:
@@ -121,6 +131,9 @@ inline const char* to_cstr(SendspinConnectionReason reason) {
     }
 }
 
+/// @brief Parses a protocol string into a SendspinConnectionReason
+/// @param str The string to parse.
+/// @return The matching enum value, or std::nullopt if the string is unrecognized.
 inline std::optional<SendspinConnectionReason> connection_reason_from_string(
     const std::string& str) {
     if (str == "discovery")
@@ -202,23 +215,72 @@ struct StreamClearMessage {
 // Protocol functions
 // ============================================================================
 
+/// @brief Determines the message type of an incoming server-to-client JSON message
+/// @param root Parsed JSON object from the message.
+/// @return The matching message type, or UNKNOWN if not recognized.
 SendspinServerToClientMessageType determine_message_type(JsonObject root);
 
+/// @brief Parses a server/hello JSON message into the provided struct
+/// @param root Parsed JSON object from the message.
+/// @param hello_msg [out] Struct to populate with parsed fields.
+/// @return true if parsing succeeded, false on missing required fields.
 bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg);
+
+/// @brief Parses a server/time JSON message and computes time offset and max error
+/// @param root Parsed JSON object from the message.
+/// @param timestamp Client timestamp when the message was received (microseconds).
+/// @param time_replacement Actual send time replacement from the outgoing time message.
+/// @param offset [out] Computed time offset between server and client clocks (microseconds).
+/// @param max_error [out] Upper bound on clock error from the round-trip (microseconds).
+/// @return true if parsing and computation succeeded, false otherwise.
 bool process_server_time_message(JsonObject root, int64_t timestamp,
                                  TimeTransmittedReplacement time_replacement, int64_t* offset,
                                  int64_t* max_error);
+
+/// @brief Parses a group/update JSON message into the provided struct
+/// @param root Parsed JSON object from the message.
+/// @param group_msg [out] Struct to populate with parsed fields.
+/// @return true if parsing succeeded, false on missing required fields.
 bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg);
+
+/// @brief Merges a GroupUpdateObject delta into the current group state
+/// @param current [out] Current group state to update in place.
+/// @param updates Delta object containing only the fields that changed.
 void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObject& updates);
 
+/// @brief Parses a server/command JSON message into the provided struct
+/// @param root Parsed JSON object from the message.
+/// @param cmd_msg [out] Struct to populate with parsed fields.
+/// @return true if parsing succeeded, false on missing required fields.
 bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg);
 
+/// @brief Parses a server/state JSON message into the provided struct
+/// @param root Parsed JSON object from the message.
+/// @param state_msg [out] Struct to populate with parsed fields.
+/// @return true if parsing succeeded, false on missing required fields.
 bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg);
 
+/// @brief Parses a stream/start JSON message into the provided struct
+/// @param root Parsed JSON object from the message.
+/// @param stream_msg [out] Struct to populate with parsed fields.
+/// @return true if parsing succeeded, false on missing required fields.
 bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg);
+
+/// @brief Parses a stream/end JSON message into the provided struct
+/// @param root Parsed JSON object from the message.
+/// @param end_msg [out] Struct to populate with parsed fields.
+/// @return true if parsing succeeded, false on missing required fields.
 bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg);
+
+/// @brief Parses a stream/clear JSON message into the provided struct
+/// @param root Parsed JSON object from the message.
+/// @param clear_msg [out] Struct to populate with parsed fields.
+/// @return true if parsing succeeded, false on missing required fields.
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg);
 
+/// @brief Merges a ServerMetadataStateObject delta into the current metadata state
+/// @param current [out] Current metadata state to update in place.
+/// @param updates Delta object containing only the fields that changed.
 void apply_metadata_state_deltas(ServerMetadataStateObject* current,
                                  const ServerMetadataStateObject& updates);
 
@@ -227,12 +289,26 @@ void apply_metadata_state_deltas(ServerMetadataStateObject* current,
 /// @return Hello message serialized into JSON format.
 std::string format_client_hello_message(const ClientHelloMessage* msg);
 
+/// @brief Formats a client state message as a JSON string for sending to the server
+/// @param msg Message to serialize.
+/// @return State message serialized into JSON format.
 std::string format_client_state_message(const ClientStateMessage* msg);
 
+/// @brief Formats a stream/request_format message as a JSON string for sending to the server
+/// @param msg Message to serialize.
+/// @return Stream request format message serialized into JSON format.
 std::string format_stream_request_format_message(const StreamRequestFormatMessage* msg);
 
+/// @brief Formats a client/goodbye message as a JSON string for sending to the server
+/// @param reason The reason for disconnecting.
+/// @return Goodbye message serialized into JSON format.
 std::string format_client_goodbye_message(SendspinGoodbyeReason reason);
 
+/// @brief Formats a client/command message as a JSON string for sending to the server
+/// @param command The playback command to send.
+/// @param volume Optional volume level to include (0-100).
+/// @param mute Optional mute state to include.
+/// @return Command message serialized into JSON format.
 std::string format_client_command_message(SendspinControllerCommand command,
                                           std::optional<uint8_t> volume = std::nullopt,
                                           std::optional<bool> mute = std::nullopt);

@@ -28,18 +28,36 @@ namespace sendspin {
 
 class SendspinClientConnection : public SendspinConnection {
 public:
+    /// @brief Constructs a client connection to the given WebSocket URL
+    /// @param url WebSocket URL of the Sendspin server to connect to.
     explicit SendspinClientConnection(std::string url);
     ~SendspinClientConnection() override;
 
+    /// @brief Initiates the WebSocket connection to the server
     void start() override;
+
+    /// @brief Drives periodic connection maintenance (reconnect timer, state machine)
     void loop() override;
+
+    /// @brief Sends a goodbye message and closes the connection
+    /// @param reason Reason for disconnecting.
+    /// @param on_complete Callback invoked after the connection is closed.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
+
+    /// @brief Sends a text message to the server
+    /// @param message The message string to send.
+    /// @param cb Callback invoked after send completes (success, actual_send_time).
+    /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb) override;
 
+    /// @brief Enables or disables automatic reconnection after connection loss
+    /// @param enabled True to reconnect automatically, false to stay disconnected.
     void set_auto_reconnect(bool enabled) {
         this->auto_reconnect_ = enabled;
     }
 
+    /// @brief Returns true if the WebSocket connection is currently open
+    /// @return true if connected, false otherwise.
     bool is_connected() const override;
 
 protected:
