@@ -51,7 +51,7 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
         // Fall through to send first message
     }
 
-    // State 2: Waiting for response — check timeout
+    // State 2: Waiting for response - check timeout
     if (conn->is_pending_time_message()) {
         if (now_ms - this->current_message_sent_time_ > RESPONSE_TIMEOUT_MS) {
             SS_LOGW(TAG, "Time message %u/%u timed out", this->burst_index_ + 1, BURST_SIZE);

@@ -47,7 +47,7 @@ namespace sendspin {
  */
 class SendspinServerConnection : public SendspinConnection {
 public:
-    /// @brief Constructs a server connection wrapping an IXWebSocket.
+    /// @brief Constructs a server connection wrapping an IXWebSocket
     /// @param ws The IXWebSocket shared pointer from the server.
     /// @param sockfd Synthetic socket identifier for connection lookup.
     SendspinServerConnection(std::shared_ptr<ix::WebSocket> ws, int sockfd);
@@ -78,7 +78,7 @@ public:
     /// @brief Requests the WebSocket connection to close
     void trigger_close();
 
-    /// @brief Returns the underlying socket file descriptor for this connection.
+    /// @brief Returns the underlying socket file descriptor for this connection
     /// @return Socket file descriptor, or -1 if not connected.
     int get_sockfd() const override {
         return this->sockfd_;
@@ -90,9 +90,13 @@ public:
 
 protected:
     // Pointer fields
+
+    /// @brief The IXWebSocket instance for this connection (shared with the server)
     std::shared_ptr<ix::WebSocket> ws_;
 
     // 32-bit fields
+
+    /// @brief Synthetic socket file descriptor used for connection lookup
     int sockfd_{-1};
 };
 

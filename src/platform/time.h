@@ -26,6 +26,7 @@
 namespace sendspin {
 
 /// @brief Returns monotonic time in microseconds
+/// @return Microseconds elapsed since boot.
 inline int64_t platform_time_us() {
     return esp_timer_get_time();
 }
@@ -38,6 +39,8 @@ inline int64_t platform_time_us() {
 
 namespace sendspin {
 
+/// @brief Returns monotonic time in microseconds
+/// @return Microseconds elapsed since an arbitrary epoch (steady_clock).
 inline int64_t platform_time_us() {
     auto now = std::chrono::steady_clock::now();
     return std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();

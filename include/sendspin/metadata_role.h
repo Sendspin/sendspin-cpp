@@ -88,11 +88,38 @@ class MetadataRoleListener {
 public:
     virtual ~MetadataRoleListener() = default;
 
-    /// @brief Called when metadata is updated by the server.
+    /// @brief Called when metadata is updated by the server
     virtual void on_metadata(const ServerMetadataStateObject& /*metadata*/) {}
 };
 
-/// @brief Metadata role: provides track metadata and progress information.
+/**
+ * @brief Metadata role that receives track metadata and playback progress from the server
+ *
+ * Maintains a local shadow of the server's metadata state, including track title, artist,
+ * album, artwork URL, repeat/shuffle mode, and playback progress. Incoming metadata deltas
+ * are merged into the shadow and delivered to the listener on the main loop thread. Progress
+ * is interpolated locally using the server timestamp so callers always get a current value.
+ *
+ * Usage:
+ * 1. Implement MetadataRoleListener to receive metadata updates
+ * 2. Add the role to the client via SendspinClient::add_metadata()
+ * 3. Call set_listener() with your listener implementation
+ * 4. Poll get_track_progress_ms() and get_track_duration_ms() as needed for UI updates
+ *
+ * @code
+ * struct MyMetadataListener : MetadataRoleListener {
+ *     void on_metadata(const ServerMetadataStateObject& m) override {
+ *         if (m.title) display_title(*m.title);
+ *         if (m.artist) display_artist(*m.artist);
+ *     }
+ * };
+ *
+ * MyMetadataListener listener;
+ * auto& metadata = client.add_metadata();
+ * metadata.set_listener(&listener);
+ * uint32_t progress = metadata.get_track_progress_ms();
+ * @endcode
+ */
 class MetadataRole {
     friend class SendspinClient;
 
@@ -105,22 +132,25 @@ public:
         this->listener_ = listener;
     }
 
-    /// @brief Returns the interpolated track progress in milliseconds.
+    /// @brief Returns the interpolated track progress in milliseconds
+    /// @return Estimated playback position in milliseconds, interpolated from the last server
+    /// update
     uint32_t get_track_progress_ms() const;
 
-    /// @brief Returns the track duration in milliseconds. 0 means unknown/live.
+    /// @brief Returns the track duration in milliseconds
+    /// @return Track duration in milliseconds, or 0 if unknown or the stream is live
     uint32_t get_track_duration_ms() const;
 
 private:
-    /// @brief Adds the metadata role to the supported roles list in the hello message.
+    /// @brief Adds the metadata role to the supported roles list in the hello message
     /// @param msg The hello message being assembled.
     void contribute_hello(ClientHelloMessage& msg);
-    /// @brief Merges an incoming server metadata delta into the pending shadow state.
+    /// @brief Merges an incoming server metadata delta into the pending shadow state
     /// @param state The metadata delta received from the server.
     void handle_server_state(ServerMetadataStateObject state);
-    /// @brief Applies any pending metadata delta and notifies the listener.
+    /// @brief Applies any pending metadata delta and notifies the listener
     void drain_events();
-    /// @brief Resets the metadata state and clears any pending events.
+    /// @brief Resets the metadata state and clears any pending events
     void cleanup();
 
     // Struct fields

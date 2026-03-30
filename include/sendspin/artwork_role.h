@@ -131,7 +131,7 @@ struct ClientArtworkRequestObject {
     std::optional<uint16_t> media_height;
 };
 
-/// @brief Preference for an image slot's format and resolution.
+/// @brief Preference for an image slot's format and resolution
 struct ImageSlotPreference {
     uint8_t slot;
     SendspinImageSource source;
@@ -140,7 +140,7 @@ struct ImageSlotPreference {
     uint16_t height;
 };
 
-/// @brief Listener for artwork role events.
+/// @brief Listener for artwork role events
 ///
 /// THREAD SAFETY: on_image() is called from two different contexts:
 /// - From the network thread when image data is received (data != nullptr)
@@ -160,7 +160,35 @@ public:
                           SendspinImageFormat /*format*/, int64_t /*timestamp*/) {}
 };
 
-/// @brief Artwork role: receives artwork images from the server.
+/**
+ * @brief Artwork role that receives album art and artist images from the server
+ *
+ * Receives binary image payloads from the server and delivers them to the platform
+ * through the ArtworkRoleListener::on_image() callback, timestamped for synchronized
+ * display. Supports multiple image slots with configurable format and resolution preferences.
+ *
+ * Usage:
+ * 1. Implement ArtworkRoleListener with at minimum on_image()
+ * 2. Add the role to the client via SendspinClient::add_artwork()
+ * 3. Call add_image_preferred_format() for each slot/format/resolution desired
+ * 4. Call set_listener() with your listener implementation
+ *
+ * @code
+ * struct MyArtworkListener : ArtworkRoleListener {
+ *     void on_image(uint8_t slot, const uint8_t* data, size_t length,
+ *                   SendspinImageFormat format, int64_t timestamp) override {
+ *         if (data) display.show_image(slot, data, length, format);
+ *         else display.clear_slot(slot);
+ *     }
+ * };
+ *
+ * MyArtworkListener listener;
+ * auto& artwork = client.add_artwork();
+ * artwork.add_image_preferred_format({0, SendspinImageSource::ALBUM,
+ *                                     SendspinImageFormat::JPEG, 240, 240});
+ * artwork.set_listener(&listener);
+ * @endcode
+ */
 class ArtworkRole {
     friend class SendspinClient;
 
@@ -177,6 +205,8 @@ public:
     void add_image_preferred_format(const ImageSlotPreference& pref);
 
     /// @brief Returns all configured image format preferences.
+    /// @return Vector of slot/format/resolution preferences registered via
+    ///         add_image_preferred_format().
     const std::vector<ImageSlotPreference>& get_image_preferred_formats() const {
         return this->preferred_image_formats_;
     }
@@ -198,9 +228,10 @@ private:
     /// @brief Resets pending events and enqueues a stream-end to clear all slots on next drain.
     void cleanup();
 
+    struct EventState;
+
     // Struct fields
     std::vector<ArtworkChannelFormatObject> artwork_channels_;
-    struct EventState;
     std::vector<ImageSlotPreference> preferred_image_formats_;
 
     // Pointer fields

@@ -59,11 +59,16 @@ public:
     SendspinWsServer() = default;
     ~SendspinWsServer();
 
+    /// @brief Callback type for notifying the client of new connections
     using NewConnectionCallback = std::function<void(std::unique_ptr<SendspinServerConnection>)>;
+
+    /// @brief Callback type for notifying the client when a socket closes
     using ConnectionClosedCallback = std::function<void(int sockfd)>;
+
+    /// @brief Callback type for looking up a connection by sockfd
     using FindConnectionCallback = std::function<SendspinServerConnection*(int sockfd)>;
 
-    /// @brief Starts the WebSocket server on port 8928.
+    /// @brief Starts the WebSocket server on port 8928
     /// @param client Pointer to the SendspinClient (stored for context).
     /// @param task_stack_in_psram Ignored on host builds.
     /// @param task_priority Ignored on host builds.
@@ -97,7 +102,7 @@ public:
         this->new_connection_callback_ = std::move(callback);
     }
 
-    /// @brief Returns true if the WebSocket server has been started.
+    /// @brief Returns true if the WebSocket server has been started
     /// @return true if the server is currently running.
     bool is_started() const {
         return this->server_ != nullptr;
@@ -105,15 +110,27 @@ public:
 
 protected:
     // Struct fields
+
+    /// @brief Callback to notify the client when a socket closes
     ConnectionClosedCallback connection_closed_callback_;
+
+    /// @brief Callback to find a connection by socket fd
     FindConnectionCallback find_connection_callback_;
+
+    /// @brief Callback to notify the client of new connections
     NewConnectionCallback new_connection_callback_;
 
     // Pointer fields
+
+    /// @brief Pointer to the SendspinClient (stored as user context for callbacks)
     SendspinClient* client_{nullptr};
+
+    /// @brief The IXWebSocket server instance
     std::unique_ptr<ix::WebSocketServer> server_;
 
     // 8-bit fields
+
+    /// @brief Maximum number of simultaneous connections (default: 2 for handoff)
     uint8_t max_connections_{2};
 };
 

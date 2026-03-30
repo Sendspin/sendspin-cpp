@@ -24,6 +24,10 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.client_connection";
 
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
 SendspinClientConnection::SendspinClientConnection(std::string url) : url_(std::move(url)) {}
 
 SendspinClientConnection::~SendspinClientConnection() {
@@ -49,6 +53,10 @@ void SendspinClientConnection::start() {
     this->ws_->start();
     SS_LOGD(TAG, "Client connection starting to %s", this->url_.c_str());
 }
+
+// ============================================================================
+// Public API
+// ============================================================================
 
 void SendspinClientConnection::loop() {
     // Handle auto-reconnect
@@ -113,6 +121,10 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
 
     return SsErr::OK;
 }
+
+// ============================================================================
+// Private helpers / callbacks
+// ============================================================================
 
 void SendspinClientConnection::setup_callbacks_() {
     this->ws_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {

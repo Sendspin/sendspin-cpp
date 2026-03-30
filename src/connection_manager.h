@@ -35,14 +35,14 @@ class SendspinConnection;
 class SendspinServerConnection;
 class SendspinWsServer;
 
-/// @brief Deferred server hello event, processed in ConnectionManager::loop().
+/// @brief Deferred server hello event, processed in ConnectionManager::loop()
 struct ServerHelloEvent {
     SendspinConnection* conn;  ///< Connection that received the hello (must still be valid)
     ServerInformationObject server;
     SendspinConnectionReason connection_reason;
 };
 
-/// @brief Hello retry state for exponential backoff.
+/// @brief Hello retry state for exponential backoff
 struct HelloRetryState {
     SendspinConnection* conn{
         nullptr};              ///< Connection awaiting hello (must match current_ or pending_)
@@ -51,8 +51,31 @@ struct HelloRetryState {
     uint8_t attempts{3};       ///< Remaining retry attempts
 };
 
-/// @brief Manages WebSocket connection lifecycle: accepts/creates connections, handles hello
-/// handshake, server handoff, and graceful disconnection.
+/**
+ * @brief Manages WebSocket connection lifecycle.
+ *
+ * Accepts and creates connections, handles the hello handshake, orchestrates server handoff
+ * decisions, and performs graceful disconnection with deferred cleanup.
+ *
+ * Typical usage:
+ *  1. Construct with a `SendspinClient*`.
+ *  2. Call `init_server()` once to create and configure the WebSocket server.
+ *  3. Call `loop()` periodically to drive connection state, process deferred events, and retry
+ *     hellos.
+ *  4. Call `connect_to()` to initiate an outgoing client connection when needed.
+ *  5. Call `disconnect()` to gracefully close the active connection.
+ *
+ * @code
+ * ConnectionManager manager(client);
+ * manager.init_server(client, use_psram, priority);
+ *
+ * while (running) {
+ *     manager.loop();
+ * }
+ *
+ * manager.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+ * @endcode
+ */
 class ConnectionManager {
 public:
     explicit ConnectionManager(SendspinClient* client);
@@ -63,9 +86,11 @@ public:
     // ========================================
 
     /// @brief Initiates a client connection to a Sendspin server.
+    /// @param url WebSocket URL of the server to connect to.
     void connect_to(const std::string& url);
 
     /// @brief Disconnects from the current server.
+    /// @param reason The goodbye reason to send before closing.
     void disconnect(SendspinGoodbyeReason reason);
 
     // ========================================
@@ -74,6 +99,8 @@ public:
 
     /// @brief Creates the WebSocket server and configures callbacks. Call once from start_server().
     /// @param client Client pointer passed through to ws_server (required by ws_server API).
+    /// @param psram_stack True to allocate the server task stack from PSRAM.
+    /// @param priority FreeRTOS task priority for the server task.
     void init_server(SendspinClient* client, bool psram_stack, unsigned priority);
 
     /// @brief Drives connection state: starts server when network ready, processes lifecycle
@@ -84,20 +111,24 @@ public:
     // Connection queries
     // ========================================
 
-    /// @brief Returns the current active connection, or nullptr.
+    /// @brief Returns the current active connection.
+    /// @return Pointer to the current connection, or nullptr if none.
     SendspinConnection* current() const;
 
-    /// @brief Returns the pending handoff connection, or nullptr.
-    SendspinConnection* pending() const;
-
     /// @brief Returns true if there is an active connection with completed handshake.
+    /// @return True if connected and handshake is complete, false otherwise.
     bool is_connected() const;
+
+    /// @brief Returns the pending handoff connection.
+    /// @return Pointer to the pending connection, or nullptr if none.
+    SendspinConnection* pending() const;
 
     // ========================================
     // Event queuing (thread-safe)
     // ========================================
 
     /// @brief Enqueues a server hello event for deferred processing in loop().
+    /// @param event The server hello event to enqueue (moved).
     void enqueue_hello(ServerHelloEvent event);
 
     // ========================================
@@ -105,6 +136,7 @@ public:
     // ========================================
 
     /// @brief Sets the last-played server hash for handoff preference decisions.
+    /// @param hash FNV-1 hash of the last-played server ID.
     void set_last_played_server_hash(uint32_t hash);
 
     /// @brief FNV-1 hash function for strings.

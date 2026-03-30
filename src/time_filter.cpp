@@ -123,7 +123,7 @@ void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t 
     this->drift_ += drift_gain * residual;
 
     // Covariance update: P_k|k = (I - K*H) * P_k|k-1
-    // Using simplified form to ensure numerical stability
+    // Using simplified form for numerical stability
     this->drift_covariance_ = new_drift_covariance - drift_gain * new_offset_drift_covariance;
     this->offset_drift_covariance_ =
         new_offset_drift_covariance - drift_gain * new_offset_covariance;
@@ -175,6 +175,11 @@ void SendspinTimeFilter::reset() {
     this->use_drift_ = false;
 }
 
+int64_t SendspinTimeFilter::get_covariance() const {
+    std::lock_guard<std::mutex> lock(this->state_mutex_);
+    return std::round(this->offset_covariance_);
+}
+
 int64_t SendspinTimeFilter::get_error() const {
     std::lock_guard<std::mutex> lock(this->state_mutex_);
     return std::round(sqrt(this->offset_covariance_));
@@ -183,11 +188,6 @@ int64_t SendspinTimeFilter::get_error() const {
 bool SendspinTimeFilter::has_update() const {
     std::lock_guard<std::mutex> lock(this->state_mutex_);
     return this->count_ >= 1;
-}
-
-int64_t SendspinTimeFilter::get_covariance() const {
-    std::lock_guard<std::mutex> lock(this->state_mutex_);
-    return std::round(this->offset_covariance_);
 }
 
 }  // namespace sendspin

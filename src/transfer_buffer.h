@@ -42,6 +42,7 @@ public:
     static std::unique_ptr<TransferBuffer> create(size_t buffer_size);
 
     /// @brief Sets the player listener for transfer_data_to_sink().
+    /// @param listener Pointer to the listener that receives audio data via on_audio_write().
     void set_listener(PlayerRoleListener* listener) {
         this->listener_ = listener;
     }
@@ -53,32 +54,39 @@ public:
     size_t transfer_data_to_sink(uint32_t timeout_ms);
 
     /// @brief Returns the number of bytes available to read.
+    /// @return Number of bytes currently held in the buffer.
     size_t available() const {
         return this->buffer_length_;
     }
 
     /// @brief Returns a pointer past the end of available data (where new data can be written).
+    /// @return Pointer to the first writable byte after the current data.
     uint8_t* get_buffer_end() const {
         return this->data_start_ + this->buffer_length_;
     }
 
     /// @brief Returns a pointer to the start of available data.
+    /// @return Pointer to the first byte of buffered data ready to be read.
     uint8_t* get_buffer_start() const {
         return this->data_start_;
     }
 
     /// @brief Returns the allocated capacity in bytes.
+    /// @return Total size of the backing allocation in bytes.
     size_t capacity() const {
         return this->buffer_.size();
     }
 
     /// @brief Returns the number of free bytes available to write.
+    /// @return Number of bytes that can be written before the buffer is full.
     size_t free() const;
 
     /// @brief Advances the read cursor after data has been consumed.
+    /// @param bytes Number of bytes consumed from the start of the buffer.
     void decrease_buffer_length(size_t bytes);
 
     /// @brief Advances the write cursor after data has been written.
+    /// @param bytes Number of bytes written past the current end of the buffer.
     void increase_buffer_length(size_t bytes);
 
     /// @brief Reallocates the buffer, preserving existing data.

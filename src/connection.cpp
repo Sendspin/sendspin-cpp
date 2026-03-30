@@ -32,19 +32,6 @@ static const char* const TAG = "sendspin.connection";
 SendspinConnection::~SendspinConnection() = default;
 
 // ============================================================================
-// WebSocket payload buffer management
-// ============================================================================
-
-void SendspinConnection::deallocate_websocket_payload_() {
-    this->websocket_payload_.reset();
-    this->websocket_write_offset_ = 0;
-}
-
-void SendspinConnection::reset_websocket_payload_() {
-    this->websocket_write_offset_ = 0;
-}
-
-// ============================================================================
 // Time filter
 // ============================================================================
 
@@ -98,6 +85,19 @@ bool SendspinConnection::send_time_message(SendCompleteCallback cb) {
 SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
                                               SendCompleteCallback on_complete) {
     return this->send_text_message(format_client_goodbye_message(reason), std::move(on_complete));
+}
+
+// ============================================================================
+// WebSocket payload buffer management
+// ============================================================================
+
+void SendspinConnection::deallocate_websocket_payload_() {
+    this->websocket_payload_.reset();
+    this->websocket_write_offset_ = 0;
+}
+
+void SendspinConnection::reset_websocket_payload_() {
+    this->websocket_write_offset_ = 0;
 }
 
 uint8_t* SendspinConnection::prepare_receive_buffer_(size_t data_len) {

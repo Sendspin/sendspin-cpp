@@ -16,6 +16,10 @@
 
 namespace sendspin {
 
+// ============================================================================
+// Static helpers
+// ============================================================================
+
 static uint32_t gcd(uint32_t a, uint32_t b) {
     while (b != 0) {
         uint32_t t = b;
@@ -25,11 +29,19 @@ static uint32_t gcd(uint32_t a, uint32_t b) {
     return a;
 }
 
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
 AudioStreamInfo::AudioStreamInfo(uint8_t bits_per_sample, uint8_t channels, uint32_t sample_rate)
     : bits_per_sample_(bits_per_sample), channels_(channels), sample_rate_(sample_rate) {
     this->ms_sample_rate_gcd_ = gcd(1000, this->sample_rate_);
     this->bytes_per_sample_ = (this->bits_per_sample_ + 7) / 8;
 }
+
+// ============================================================================
+// Public API
+// ============================================================================
 
 uint32_t AudioStreamInfo::frames_to_microseconds(uint32_t frames) const {
     return (frames * 1000000 + (this->sample_rate_ >> 1)) / this->sample_rate_;

@@ -63,11 +63,11 @@ public:
     void reset_decoders();
 
     /// @brief Sets up the appropriate decoder and processes the codec header (which may be a dummy
-    /// header).
+    /// header)
     /// @param data Pointer to the header data.
     /// @param data_size Size of the header data in bytes.
     /// @param chunk_type Type of header chunk.
-    /// @param stream_info Pointer to AudioStreamInfo that will be filled out when decoding the
+    /// @param[out] stream_info Pointer to AudioStreamInfo that will be filled out when decoding the
     /// header.
     /// @return True if successful, false otherwise.
     bool process_header(const uint8_t* data, size_t data_size, ChunkType chunk_type,
@@ -78,7 +78,7 @@ public:
     /// @param data_size Size of the encoded audio data in bytes.
     /// @param output_buffer Pointer to the buffer where decoded audio will be written.
     /// @param output_buffer_size Size of the output buffer in bytes.
-    /// @param decoded_size Pointer to store the number of decoded bytes written.
+    /// @param[out] decoded_size Pointer to store the number of decoded bytes written.
     /// @return True if successful, false otherwise.
     bool decode_audio_chunk(const uint8_t* data, size_t data_size, uint8_t* output_buffer,
                             size_t output_buffer_size, size_t* decoded_size);

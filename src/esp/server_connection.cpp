@@ -29,7 +29,7 @@ static const char* const TAG = "sendspin.server_connection";
 // Static helpers
 // ============================================================================
 
-// Structure holding connection context and payload data for async send operations.
+/// @brief Structure holding connection context and payload data for async send operations
 struct AsyncRespArg {
     void* context;
     uint8_t* payload;

@@ -62,7 +62,7 @@ static constexpr double TIME_FILTER_DRIFT_SIGNIFICANCE_THRESHOLD = 2.0;
  */
 class SendspinTimeFilter {
 public:
-    /// @brief Constructs a Kalman filter for time synchronization.
+    /// @brief Constructs a Kalman filter for time synchronization
     ///
     /// @param process_std_dev Standard deviation of the offset process noise in microseconds,
     /// modeling clock jitter.
@@ -89,7 +89,7 @@ public:
                        double adaptive_cutoff = 0.75, uint8_t min_samples = 100,
                        double drift_significance_threshold = 2.0);
 
-    /// @brief Processes a new time synchronization measurement through the Kalman filter.
+    /// @brief Processes a new time synchronization measurement through the Kalman filter
     ///
     /// Updates the filter's offset and drift estimates using a two-stage Kalman filter algorithm:
     /// predict based on the drift model then correct using the new measurement. The measurement
@@ -103,7 +103,7 @@ public:
     /// @param time_added Client timestamp when this measurement was taken in microseconds.
     void update(int64_t measurement, int64_t max_error, int64_t time_added);
 
-    /// @brief Converts a client timestamp to the equivalent server timestamp.
+    /// @brief Converts a client timestamp to the equivalent server timestamp
     ///
     /// Applies the current offset and drift compensation to transform from client time domain to
     /// server time domain. The transformation accounts for both static offset and dynamic drift
@@ -113,7 +113,7 @@ public:
     /// @return Equivalent server timestamp in microseconds.
     int64_t compute_server_time(int64_t client_time) const;
 
-    /// @brief Converts a server timestamp to the equivalent client timestamp.
+    /// @brief Converts a server timestamp to the equivalent client timestamp
     ///
     /// Inverts the time transformation to convert from server time domain to client time domain.
     /// Accounts for both offset and drift effects in the inverse transformation.
@@ -122,13 +122,13 @@ public:
     /// @return Equivalent client timestamp in microseconds.
     int64_t compute_client_time(int64_t server_time) const;
 
-    /// @brief Resets the filter to its initial uninitialized state.
+    /// @brief Resets the filter to its initial uninitialized state
     ///
     /// Clears all state estimates and resets covariances to initial values. The filter will require
     /// new measurements to re-establish synchronization.
     void reset();
 
-    /// @brief Returns the offset variance in microseconds squared.
+    /// @brief Returns the offset variance in microseconds squared
     ///
     /// Provides the raw variance value from the Kalman filter's covariance matrix. This represents
     /// the statistical uncertainty in the offset estimate.
@@ -136,7 +136,7 @@ public:
     /// @return Variance of the offset estimate in microseconds squared.
     int64_t get_covariance() const;
 
-    /// @brief Returns the estimated standard deviation of the offset in microseconds.
+    /// @brief Returns the estimated standard deviation of the offset in microseconds
     ///
     /// Provides a measure of the current synchronization accuracy by computing the square root of
     /// the offset covariance. Smaller values indicate higher confidence in the time
@@ -145,7 +145,7 @@ public:
     /// @return Standard deviation of the offset estimate in microseconds.
     int64_t get_error() const;
 
-    /// @brief Returns true if the filter has received at least one measurement.
+    /// @brief Returns true if the filter has received at least one measurement
     /// @return True if the filter has been updated with at least one time measurement.
     bool has_update() const;
 

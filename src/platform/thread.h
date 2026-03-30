@@ -52,9 +52,14 @@ inline void platform_configure_thread(const char* name, size_t stack_size, int p
 
 namespace sendspin {
 
+/// @brief No-op on host; std::thread uses OS-default stack and scheduling
+/// @param name Ignored on host.
+/// @param stack_size Ignored on host.
+/// @param priority Ignored on host.
+/// @param stack_in_psram Ignored on host.
 inline void platform_configure_thread(const char* /*name*/, size_t /*stack_size*/, int /*priority*/,
                                       bool /*stack_in_psram*/) {
-    // No-op on host — std::thread uses OS defaults.
+    // No-op on host - std::thread uses OS defaults.
 }
 
 }  // namespace sendspin

@@ -168,7 +168,7 @@ struct ServerCommandMessage {
     std::optional<ServerPlayerCommandObject> player;
 };
 
-/// @brief Listener for player role events.
+/// @brief Listener for player role events
 ///
 /// on_audio_write() is called from the sync task's background thread and must be thread-safe.
 /// All other methods fire on the main loop thread.
@@ -358,9 +358,9 @@ private:
     Config config_;
     ServerPlayerStreamObject current_stream_params_{};
     struct EventState;
-    std::vector<StreamCallbackType> awaiting_sync_idle_events_;
 
     // Pointer fields
+    std::vector<StreamCallbackType> awaiting_sync_idle_events_;
     SendspinClient* client_;
     std::unique_ptr<EventState> event_state_;
     PlayerRoleListener* listener_{nullptr};

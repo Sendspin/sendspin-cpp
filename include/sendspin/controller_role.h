@@ -133,11 +133,37 @@ class ControllerRoleListener {
 public:
     virtual ~ControllerRoleListener() = default;
 
-    /// @brief Called when the server sends updated controller state.
+    /// @brief Called when the server sends updated controller state
     virtual void on_controller_state(const ServerStateControllerObject& /*state*/) {}
 };
 
-/// @brief Controller role: read-only server state and outbound commands.
+/**
+ * @brief Playback controller role that sends commands to and receives state from the server
+ *
+ * Maintains a local copy of the server's controller state (volume, mute, supported commands)
+ * and provides a send_command() method for dispatching playback control messages. State
+ * updates from the server are queued and delivered to the listener on the main loop thread.
+ *
+ * Usage:
+ * 1. Implement ControllerRoleListener to receive server state updates
+ * 2. Add the role to the client via SendspinClient::add_controller()
+ * 3. Call set_listener() with your listener implementation
+ * 4. Call send_command() to dispatch playback commands to the server
+ *
+ * @code
+ * struct MyControllerListener : ControllerRoleListener {
+ *     void on_controller_state(const ServerStateControllerObject& state) override {
+ *         update_volume_ui(state.volume, state.muted);
+ *     }
+ * };
+ *
+ * MyControllerListener listener;
+ * auto& controller = client.add_controller();
+ * controller.set_listener(&listener);
+ * controller.send_command(SendspinControllerCommand::PLAY);
+ * controller.send_command(SendspinControllerCommand::VOLUME, 128);
+ * @endcode
+ */
 class ControllerRole {
     friend class SendspinClient;
 
@@ -150,26 +176,27 @@ public:
         this->listener_ = listener;
     }
 
-    /// @brief Sends a controller command to the server.
+    /// @brief Sends a controller command to the server
     void send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume = {},
                       std::optional<bool> mute = {});
 
-    /// @brief Returns the current controller state from the server.
+    /// @brief Returns the current controller state from the server
+    /// @return Const reference to the last received server controller state
     const ServerStateControllerObject& get_controller_state() const {
         return this->controller_state_;
     }
 
 private:
-    /// @brief Adds the controller role to the supported roles list in the hello message.
+    /// @brief Adds the controller role to the supported roles list in the hello message
     /// @param msg The hello message being assembled.
     void contribute_hello(ClientHelloMessage& msg);
-    /// @brief Stores an incoming server controller state update for delivery on the main thread.
+    /// @brief Stores an incoming server controller state update for delivery on the main thread
     /// Only the most recent update is retained; earlier pending updates are overwritten.
     /// @param state The controller state received from the server.
     void handle_server_state(ServerStateControllerObject state);
-    /// @brief Delivers any pending controller state update to the listener.
+    /// @brief Delivers any pending controller state update to the listener
     void drain_events();
-    /// @brief Resets the controller state and clears any pending events.
+    /// @brief Resets the controller state and clears any pending events
     void cleanup();
 
     // Struct fields

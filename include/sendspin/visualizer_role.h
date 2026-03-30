@@ -100,15 +100,15 @@ struct ServerVisualizerStreamObject {
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 
-/// @brief A parsed visualizer frame with client-domain timestamp.
+/// @brief A parsed visualizer frame with client-domain timestamp
 struct VisualizerFrame {
-    int64_t timestamp;  ///< Client timestamp in microseconds.
+    int64_t timestamp;  ///< Client timestamp in microseconds
     std::optional<uint16_t> loudness;
     std::optional<uint16_t> peak_freq;
     std::vector<uint16_t> spectrum;
 };
 
-/// @brief Listener for visualizer role events.
+/// @brief Listener for visualizer role events
 ///
 /// THREAD SAFETY: on_visualizer_frame() and on_beat() fire on a dedicated drain thread.
 /// Implementations must be thread-safe for these two methods (copy data quickly, defer heavy
@@ -134,11 +134,39 @@ public:
     virtual void on_visualizer_stream_clear() {}
 };
 
-/// @brief Visualizer role: receives real-time audio visualization data from the server.
-///
-/// Lifecycle callbacks fire on the main loop thread.
-/// Data callbacks (on_visualizer_frame, on_beat) fire on a dedicated drain thread at the
-/// correct timestamp. This is the same contract as the player role's audio write callback.
+/**
+ * @brief Visualizer role that receives real-time audio visualization data from the server
+ *
+ * Receives timestamped spectrum, loudness, peak frequency, and beat data from the server
+ * and delivers frames to the platform through VisualizerRoleListener callbacks at the
+ * correct playback timestamp. A dedicated drain thread handles timing and delivery of
+ * data callbacks; lifecycle callbacks fire on the main loop thread.
+ *
+ * Usage:
+ * 1. Implement VisualizerRoleListener with on_visualizer_frame() and/or on_beat()
+ * 2. Build a VisualizerSupportObject describing supported data types and buffer capacity
+ * 3. Add the role to the client via SendspinClient::add_visualizer()
+ * 4. Call set_listener() with your listener implementation
+ *
+ * @code
+ * struct MyVisualizerListener : VisualizerRoleListener {
+ *     void on_visualizer_frame(const VisualizerFrame& frame) override {
+ *         display.update_spectrum(frame.spectrum);
+ *     }
+ *     void on_beat(int64_t client_timestamp) override {
+ *         display.flash_beat();
+ *     }
+ * };
+ *
+ * MyVisualizerListener listener;
+ * VisualizerRole::Config config;
+ * config.support.types = {VisualizerDataType::SPECTRUM, VisualizerDataType::BEAT};
+ * config.support.buffer_capacity = 4096;
+ * config.support.batch_max = 4;
+ * auto& visualizer = client.add_visualizer(config);
+ * visualizer.set_listener(&listener);
+ * @endcode
+ */
 class VisualizerRole {
     friend class SendspinClient;
 
@@ -156,7 +184,8 @@ public:
         this->listener_ = listener;
     }
 
-    /// @brief Returns the visualizer support configuration (nullopt if not configured).
+    /// @brief Returns the visualizer support configuration.
+    /// @return The VisualizerSupportObject advertised to the server, or nullopt if not configured.
     const std::optional<VisualizerSupportObject>& get_visualizer_support() const {
         return this->visualizer_support_;
     }
@@ -201,9 +230,10 @@ private:
     /// @param self The VisualizerRole instance that owns this thread.
     static void drain_thread_func_(VisualizerRole* self);
 
-    // Struct fields
     struct DrainTask;
     struct EventState;
+
+    // Struct fields
     std::optional<VisualizerSupportObject> visualizer_support_;
 
     // Pointer fields
@@ -223,8 +253,8 @@ private:
     std::atomic<bool> has_f_peak_{false};
     std::atomic<bool> has_loudness_{false};
     std::atomic<bool> has_spectrum_{false};
-    std::atomic<bool> stream_active_{false};
     std::atomic<uint8_t> spectrum_bin_count_{0};
+    std::atomic<bool> stream_active_{false};
 };
 
 }  // namespace sendspin

@@ -50,7 +50,9 @@ public:
 
     ~SendspinServerConnection() override = default;
 
+    // ========================================
     // SendspinConnection interface implementation
+    // ========================================
 
     /// @brief Starts the connection (initializes time filter, prepares for messages)
     void start() override;

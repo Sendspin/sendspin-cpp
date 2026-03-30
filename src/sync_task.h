@@ -58,24 +58,24 @@ enum class DecodeResult : uint8_t {
 
 /// @brief Working state shared across the sync task's inner decode/sync/transfer loop
 struct SyncContext {
-    // Smart pointers (4 bytes each on ESP32)
+    // Pointer fields
     std::unique_ptr<TransferBuffer> decode_buffer;  // Reusable decode + output buffer
     std::unique_ptr<TransferBuffer> interpolation_transfer_buffer;
     std::unique_ptr<SendspinDecoder> decoder;
-
-    // Raw pointers (4 bytes each on ESP32)
     AudioRingBufferEntry* encoded_entry{nullptr};
 
-    // 64-bit members
+    // 64-bit fields
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
     int64_t new_audio_client_playtime{0};
 
-    // 32-bit members
-    uint32_t buffered_frames{0};
+    // size_t fields
     size_t bytes_per_frame{0};
+
+    // 32-bit fields
+    uint32_t buffered_frames{0};
     AudioStreamInfo current_stream_info;  // Contains uint32_t and smaller members
 
-    // 8-bit members
+    // 8-bit fields
     bool release_chunk{false};
     bool initial_decode{false};
     bool hard_syncing{true};  // Starts true so initial sync uses tight settle threshold
@@ -111,6 +111,7 @@ public:
 
     /// @brief Initializes queues and creates the encoded ring buffer.
     /// @param player The owning PlayerRole, used for time sync, delay, and audio write access.
+    /// @param client The owning SendspinClient, used for shared services.
     /// @param buffer_size Size of the encoded audio ring buffer in bytes.
     /// @return true on success, false on allocation failure.
     bool init(PlayerRole* player, SendspinClient* client, size_t buffer_size);
@@ -179,6 +180,8 @@ public:
     void notify_audio_played(uint32_t frames, int64_t timestamp);
 
 protected:
+    /// @brief Entry point for the persistent sync background thread.
+    /// @param params Pointer to the owning SyncTask instance.
     static void sync_task(void* params);
 
     /// @brief Handles the INITIAL_SYNC state: feeds zeros to prime the audio pipeline.

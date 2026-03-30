@@ -51,7 +51,9 @@ public:
 
     ~SendspinClientConnection() override;
 
+    // ========================================
     // SendspinConnection interface implementation
+    // ========================================
 
     /// @brief Starts the connection (initializes websocket client and connects)
     void start() override;
@@ -76,7 +78,9 @@ public:
     /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb) override;
 
+    // ========================================
     // Client connection-specific configuration
+    // ========================================
 
     /// @brief Sets whether to automatically reconnect on connection loss
     /// @param enabled True to enable auto-reconnect, false to disable.
@@ -125,8 +129,10 @@ protected:
 
     // 8-bit fields
 
-    /// @brief Whether the websocket is currently connected
+    /// @brief Whether to automatically reconnect after connection loss
     bool auto_reconnect_{true};
+
+    /// @brief Whether the websocket is currently connected
     bool connected_{false};
 };
 

@@ -102,6 +102,8 @@ public:
     bool send_time_message(SendCompleteCallback cb);
 
     /// @brief Sends a goodbye message with completion callback.
+    /// @param reason The reason for disconnecting.
+    /// @param on_complete Callback invoked after the goodbye message is sent (or fails).
     /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_goodbye_reason(SendspinGoodbyeReason reason, SendCompleteCallback on_complete);
 
@@ -109,16 +111,16 @@ public:
     // Server information accessors (populated after server/hello message is received)
     // ========================================
 
-    /// @brief Gets the server ID from the server/hello message.
-    /// @return The server ID string (empty until hello is received).
-    const std::string& get_server_id() const {
-        return this->server_id_;
-    }
-
     /// @brief Gets the connection reason from the server/hello message.
     /// @return The connection reason (discovery or playback).
     SendspinConnectionReason get_connection_reason() const {
         return this->connection_reason_;
+    }
+
+    /// @brief Gets the server ID from the server/hello message.
+    /// @return The server ID string (empty until hello is received).
+    const std::string& get_server_id() const {
+        return this->server_id_;
     }
 
     // ========================================
@@ -224,17 +226,8 @@ public:
     // Time message state accessors
     // ========================================
 
-    /// @brief Checks if a time message is pending (waiting for response).
-    bool is_pending_time_message() const {
-        return this->pending_time_message_;
-    }
-
-    /// @brief Sets the pending time message flag.
-    void set_pending_time_message(bool pending) {
-        this->pending_time_message_ = pending;
-    }
-
     /// @brief Gets the timestamp of the last sent time message.
+    /// @return Timestamp in microseconds of the last sent time message (0 if none sent).
     int64_t get_last_sent_time_message() const {
         return this->last_sent_time_message_;
     }
@@ -242,6 +235,17 @@ public:
     /// @brief Sets the timestamp of the last sent time message.
     void set_last_sent_time_message(int64_t timestamp) {
         this->last_sent_time_message_ = timestamp;
+    }
+
+    /// @brief Checks if a time message is pending (waiting for response).
+    /// @return True if a time message has been sent and a response is expected, false otherwise.
+    bool is_pending_time_message() const {
+        return this->pending_time_message_;
+    }
+
+    /// @brief Sets the pending time message flag.
+    void set_pending_time_message(bool pending) {
+        this->pending_time_message_ = pending;
     }
 
     /// @brief Thread-safe peek at the last time replacement data.
@@ -294,12 +298,12 @@ protected:
 
     // Pointer fields
 
-    /// Time synchronization filter (Kalman-based).
-    std::unique_ptr<SendspinTimeFilter> time_filter_;
-
     /// Server identity (from server/hello message).
     std::string server_id_;
     std::string server_name_;
+
+    /// Time synchronization filter (Kalman-based).
+    std::unique_ptr<SendspinTimeFilter> time_filter_;
 
     // 64-bit fields
 

@@ -251,6 +251,15 @@ void ConnectionManager::set_last_played_server_hash(uint32_t hash) {
     this->has_last_played_server_ = true;
 }
 
+uint32_t ConnectionManager::fnv1_hash(const char* str) {
+    uint32_t hash = 2166136261UL;
+    while (*str) {
+        hash *= 16777619UL;
+        hash ^= static_cast<uint8_t>(*str++);
+    }
+    return hash;
+}
+
 // ============================================================================
 // Connection setup
 // ============================================================================
@@ -277,7 +286,7 @@ void ConnectionManager::on_new_connection_(std::unique_ptr<SendspinServerConnect
 
     this->setup_connection_callbacks_(conn.get());
     conn->on_disconnected = [](SendspinConnection* /*c*/) {
-        // Cleanup happens in on_connection_closed_ triggered by the server
+        // Cleanup happens in on_connection_lost_ triggered by the server
     };
 
     if (this->current_connection_ == nullptr) {
@@ -441,19 +450,6 @@ void ConnectionManager::disconnect_and_release_(std::unique_ptr<SendspinConnecti
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
         this->dying_connection_ready_to_release_ = true;
     });
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-uint32_t ConnectionManager::fnv1_hash(const char* str) {
-    uint32_t hash = 2166136261UL;
-    while (*str) {
-        hash *= 16777619UL;
-        hash ^= static_cast<uint8_t>(*str++);
-    }
-    return hash;
 }
 
 }  // namespace sendspin

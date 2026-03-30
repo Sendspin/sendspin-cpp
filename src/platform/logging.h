@@ -30,9 +30,11 @@
 namespace sendspin {
 
 /// @brief No-op on ESP-IDF; log levels are controlled at compile time
+/// @param level Ignored on ESP-IDF.
 inline void platform_set_log_level(int /*level*/) {}
 
 /// @brief Returns INFO on ESP-IDF; runtime log level is not available
+/// @return Always returns 3 (INFO) on ESP-IDF.
 inline int platform_get_log_level() {
     return 3;
 }
@@ -51,7 +53,7 @@ inline int platform_get_log_level() {
 #define SS_LOG_DEBUG 4
 #define SS_LOG_VERBOSE 5
 
-// Runtime log level — defaults to INFO, settable by the application (e.g., via command line)
+// Runtime log level - defaults to INFO, settable by the application (e.g., via command line)
 inline int ss_host_log_level = SS_LOG_INFO;
 
 // clang-format off

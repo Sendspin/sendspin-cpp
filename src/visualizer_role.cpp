@@ -30,7 +30,9 @@
 
 static const char* const TAG = "sendspin.visualizer";
 
-// --- Entry format constants ---
+// ============================================================================
+// Entry format constants
+// ============================================================================
 
 // Type tag in first byte of each ring buffer entry
 static constexpr uint8_t ENTRY_BEAT = 0x00;
@@ -52,7 +54,9 @@ static constexpr uint32_t COMMAND_FLUSH = (1 << 1);
 
 static constexpr int64_t TOO_OLD_THRESHOLD_US = 20000;  // 20ms
 
-// --- Big-endian helpers ---
+// ============================================================================
+// Big-endian helpers
+// ============================================================================
 
 static int64_t read_be64(const uint8_t* p) {
     uint64_t val = 0;
@@ -68,7 +72,9 @@ static uint16_t read_be16(const uint8_t* p) {
 
 namespace sendspin {
 
-// --- Drain task pimpl ---
+// ============================================================================
+// Drain task pimpl
+// ============================================================================
 
 struct VisualizerRole::DrainTask {
     SpscRingBuffer ring_buffer;
@@ -82,7 +88,9 @@ struct VisualizerRole::EventState {
     ShadowSlot<ServerVisualizerStreamObject> shadow_config;
 };
 
-// --- Lifecycle ---
+// ============================================================================
+// Lifecycle
+// ============================================================================
 
 VisualizerRole::VisualizerRole(Config config, SendspinClient* client)
     : client_(client),
@@ -138,7 +146,9 @@ void VisualizerRole::contribute_hello(ClientHelloMessage& msg) {
     }
 }
 
-// --- Binary handling (network thread) ---
+// ============================================================================
+// Binary handling (network thread)
+// ============================================================================
 
 void VisualizerRole::handle_binary(uint8_t binary_type, const uint8_t* data, size_t len) {
     if (!this->stream_active_ || !this->drain_task_ ||
@@ -204,7 +214,9 @@ void VisualizerRole::handle_binary(uint8_t binary_type, const uint8_t* data, siz
     }
 }
 
-// --- Stream lifecycle (network thread) ---
+// ============================================================================
+// Stream lifecycle (network thread)
+// ============================================================================
 
 void VisualizerRole::handle_stream_start(const ServerVisualizerStreamObject& stream) {
     // Cache stream config for handle_binary (same thread)
@@ -259,7 +271,9 @@ void VisualizerRole::handle_stream_clear() {
     this->event_state_->queue.send(EventType::STREAM_CLEAR, 0);
 }
 
-// --- Event draining (main thread) — lifecycle events only ---
+// ============================================================================
+// Event draining (main thread) - lifecycle events only
+// ============================================================================
 
 void VisualizerRole::drain_events() {
     EventType event_type;
@@ -286,7 +300,9 @@ void VisualizerRole::drain_events() {
     }
 }
 
-// --- Cleanup (main thread) ---
+// ============================================================================
+// Cleanup (main thread)
+// ============================================================================
 
 void VisualizerRole::cleanup() {
     this->stream_active_ = false;
@@ -300,7 +316,9 @@ void VisualizerRole::cleanup() {
     this->event_state_->queue.send(EventType::STREAM_END, 0);
 }
 
-// --- Drain thread ---
+// ============================================================================
+// Drain thread
+// ============================================================================
 
 void VisualizerRole::flush_ring_buffer_() {
     if (!this->drain_task_)

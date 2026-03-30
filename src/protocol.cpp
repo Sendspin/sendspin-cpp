@@ -402,6 +402,69 @@ void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObje
     }
 }
 
+bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg) {
+    if (cmd_msg != nullptr && root["payload"]["player"].is<JsonObject>()) {
+        ServerPlayerCommandObject player_cmd;
+        if (process_server_player_command_object(root["payload"]["player"], &player_cmd)) {
+            cmd_msg->player = player_cmd;
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg) {
+    if (state_msg == nullptr) {
+        return true;
+    }
+
+    (void)root;
+
+    // Parse optional metadata object
+    if (root["payload"]["metadata"].is<JsonObject>()) {
+        ServerMetadataStateObject metadata_state;
+        if (process_server_metadata_state_object(root["payload"]["metadata"], &metadata_state)) {
+            state_msg->metadata = metadata_state;
+        }
+    }
+
+    if (root["payload"]["controller"].is<JsonObject>()) {
+        ServerStateControllerObject controller_state;
+        JsonObject controller_object = root["payload"]["controller"];
+
+        // Parse supported_commands array
+        if (controller_object["supported_commands"].is<JsonArray>()) {
+            std::vector<SendspinControllerCommand> commands;
+            JsonArray commands_array = controller_object["supported_commands"].as<JsonArray>();
+            for (JsonVariant command_var : commands_array) {
+                if (command_var.is<const char*>()) {
+                    std::string command_str = command_var.as<std::string>();
+                    auto command = controller_command_from_string(command_str);
+                    if (command.has_value()) {
+                        commands.push_back(command.value());
+                    }
+                }
+            }
+            controller_state.supported_commands = commands;
+        }
+
+        // Parse volume
+        if (controller_object["volume"].is<JsonVariant>()) {
+            controller_state.volume = controller_object["volume"].as<uint8_t>();
+        }
+
+        // Parse muted
+        if (controller_object["muted"].is<JsonVariant>()) {
+            controller_state.muted = controller_object["muted"].as<bool>();
+        }
+
+        state_msg->controller = controller_state;
+    }
+
+    return true;
+}
+
 bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg) {
     if (stream_msg == nullptr) {
         return true;
@@ -535,18 +598,6 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
     return true;
 }
 
-bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg) {
-    if (cmd_msg != nullptr && root["payload"]["player"].is<JsonObject>()) {
-        ServerPlayerCommandObject player_cmd;
-        if (process_server_player_command_object(root["payload"]["player"], &player_cmd)) {
-            cmd_msg->player = player_cmd;
-            return true;
-        }
-        return false;
-    }
-    return true;
-}
-
 void apply_metadata_state_deltas(ServerMetadataStateObject* current,
                                  const ServerMetadataStateObject& updates) {
     if (current == nullptr) {
@@ -596,57 +647,6 @@ void apply_metadata_state_deltas(ServerMetadataStateObject* current,
     if (updates.shuffle.has_value()) {
         current->shuffle = updates.shuffle;
     }
-}
-
-bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg) {
-    if (state_msg == nullptr) {
-        return true;
-    }
-
-    (void)root;
-
-    // Parse optional metadata object
-    if (root["payload"]["metadata"].is<JsonObject>()) {
-        ServerMetadataStateObject metadata_state;
-        if (process_server_metadata_state_object(root["payload"]["metadata"], &metadata_state)) {
-            state_msg->metadata = metadata_state;
-        }
-    }
-
-    if (root["payload"]["controller"].is<JsonObject>()) {
-        ServerStateControllerObject controller_state;
-        JsonObject controller_object = root["payload"]["controller"];
-
-        // Parse supported_commands array
-        if (controller_object["supported_commands"].is<JsonArray>()) {
-            std::vector<SendspinControllerCommand> commands;
-            JsonArray commands_array = controller_object["supported_commands"].as<JsonArray>();
-            for (JsonVariant command_var : commands_array) {
-                if (command_var.is<const char*>()) {
-                    std::string command_str = command_var.as<std::string>();
-                    auto command = controller_command_from_string(command_str);
-                    if (command.has_value()) {
-                        commands.push_back(command.value());
-                    }
-                }
-            }
-            controller_state.supported_commands = commands;
-        }
-
-        // Parse volume
-        if (controller_object["volume"].is<JsonVariant>()) {
-            controller_state.volume = controller_object["volume"].as<uint8_t>();
-        }
-
-        // Parse muted
-        if (controller_object["muted"].is<JsonVariant>()) {
-            controller_state.muted = controller_object["muted"].as<bool>();
-        }
-
-        state_msg->controller = controller_state;
-    }
-
-    return true;
 }
 
 // ============================================================================
@@ -806,6 +806,18 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
     return output;
 }
 
+std::string format_client_goodbye_message(SendspinGoodbyeReason reason) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/goodbye";
+    root["payload"]["reason"] = to_cstr(reason);
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
 std::string format_client_command_message(SendspinControllerCommand command,
                                           std::optional<uint8_t> volume, std::optional<bool> mute) {
     JsonDocument doc = make_json_document();
@@ -819,18 +831,6 @@ std::string format_client_command_message(SendspinControllerCommand command,
     if (command == SendspinControllerCommand::MUTE && mute.has_value()) {
         root["payload"]["controller"]["mute"] = mute.value();
     }
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
-}
-
-std::string format_client_goodbye_message(SendspinGoodbyeReason reason) {
-    JsonDocument doc = make_json_document();
-    JsonObject root = doc.to<JsonObject>();
-
-    root["type"] = "client/goodbye";
-    root["payload"]["reason"] = to_cstr(reason);
 
     std::string output;
     serializeJson(doc, output);

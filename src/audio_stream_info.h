@@ -120,6 +120,9 @@ public:
     uint32_t frames_to_microseconds(uint32_t frames) const;
 
     /// @brief Converts frames to milliseconds, updating frames with the remainder.
+    /// @param[out] frames Pointer to the frame count; updated in place with the leftover frames
+    ///             that could not be converted to a whole millisecond.
+    /// @return Whole milliseconds represented by the converted frames.
     uint32_t frames_to_milliseconds_with_remainder(uint32_t* frames) const;
 
     /// @brief Returns true if both AudioStreamInfo objects describe the same format

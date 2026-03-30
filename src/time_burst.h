@@ -31,11 +31,34 @@ struct TimeBurstResult {
     bool burst_completed;  ///< The burst just finished (Kalman filter updated).
 };
 
-/// @brief Burst-based time synchronization helper for Sendspin
-///
-/// Sends a rapid burst of time messages, picks the one with the smallest RTT (max_error),
-/// and feeds only that best measurement to the Kalman filter. This reduces noise from
-/// variable network latency by selecting the cleanest sample per burst.
+/**
+ * @brief Burst-based time synchronization coordinator for a single connection
+ *
+ * Sends a rapid burst of time messages over a WebSocket connection, tracks each RTT
+ * measurement, and feeds only the best sample (lowest round-trip delay) to the
+ * connection's Kalman filter. Waiting for the inter-burst interval between rounds
+ * reduces filter update frequency while still capturing clean measurements.
+ *
+ * Usage:
+ * 1. Call loop() on each iteration of the hub's main loop, passing the active connection
+ * 2. Call on_time_response() when a SERVER_TIME response arrives for that connection
+ * 3. Call reset() when the connection is lost or replaced
+ * 4. Check TimeBurstResult::burst_completed to know when to act on updated time estimates
+ *
+ * @code
+ * SendspinTimeBurst burst;
+ * burst.reset();
+ *
+ * // In the hub loop:
+ * TimeBurstResult result = burst.loop(conn);
+ * if (result.burst_completed) {
+ *     int64_t server_now = conn->get_time_filter()->compute_server_time(platform_time_us());
+ * }
+ *
+ * // When a SERVER_TIME response arrives:
+ * burst.on_time_response(conn, offset, max_error, timestamp);
+ * @endcode
+ */
 class SendspinTimeBurst {
 public:
     /// @brief Drive the burst state machine. Called from hub's loop()

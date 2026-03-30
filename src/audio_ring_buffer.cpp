@@ -20,6 +20,10 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.ring_buffer";
 
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
 std::unique_ptr<SendspinAudioRingBuffer> SendspinAudioRingBuffer::create(size_t buffer_size) {
     auto rb = std::unique_ptr<SendspinAudioRingBuffer>(new SendspinAudioRingBuffer());
 
@@ -40,6 +44,10 @@ std::unique_ptr<SendspinAudioRingBuffer> SendspinAudioRingBuffer::create(size_t 
 }
 
 SendspinAudioRingBuffer::~SendspinAudioRingBuffer() = default;
+
+// ============================================================================
+// Public API
+// ============================================================================
 
 bool SendspinAudioRingBuffer::write_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
                                           ChunkType chunk_type, uint32_t timeout_ms) {

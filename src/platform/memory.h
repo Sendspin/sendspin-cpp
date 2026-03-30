@@ -85,10 +85,28 @@ inline void platform_free(void* ptr) {
 
 namespace sendspin {
 
-/// @brief RAII wrapper for platform-allocated memory buffers
-///
-/// Owns a block of memory obtained via platform_malloc. Automatically frees on destruction.
-/// Supports reallocation and move semantics. Not copyable.
+/**
+ * @brief RAII wrapper for platform-allocated memory buffers
+ *
+ * Owns a block of memory obtained via platform_malloc. Automatically frees on destruction.
+ * Supports reallocation and move semantics. Not copyable.
+ *
+ * Usage:
+ * 1. Default-construct a PlatformBuffer, then call allocate() with the desired size
+ * 2. Access the raw memory with data() or via the typed as<T>() accessor
+ * 3. Optionally grow the buffer in-place with realloc()
+ * 4. Memory is freed automatically on destruction, or explicitly via reset()
+ *
+ * @code
+ * PlatformBuffer buf;
+ * buf.allocate(1024);
+ *
+ * auto* header = buf.as<MyHeader>();
+ * header->magic = 0xDEAD;
+ *
+ * buf.realloc(2048);
+ * @endcode
+ */
 class PlatformBuffer {
 public:
     PlatformBuffer() = default;
@@ -176,11 +194,16 @@ public:
     }
 
     /// @brief Returns a typed pointer into the buffer at a byte offset
+    /// @param byte_offset Byte offset from the start of the buffer.
+    /// @return Typed pointer to the buffer at the given offset.
     template <typename T>
     T* as(size_t byte_offset = 0) {
         return reinterpret_cast<T*>(this->ptr_ + byte_offset);
     }
 
+    /// @brief Returns a const typed pointer into the buffer at a byte offset
+    /// @param byte_offset Byte offset from the start of the buffer.
+    /// @return Const typed pointer to the buffer at the given offset.
     template <typename T>
     const T* as(size_t byte_offset = 0) const {
         return reinterpret_cast<const T*>(this->ptr_ + byte_offset);
@@ -195,26 +218,39 @@ private:
 };
 
 /// @brief ArduinoJson allocator that routes through platform_malloc/platform_realloc/platform_free
-/// so JSON processing uses PSRAM on ESP32.
+/// so JSON processing uses PSRAM on ESP32
 class PsramJsonAllocator : public ArduinoJson::Allocator {
 public:
+    /// @brief Allocates a block of memory via platform_malloc
+    /// @param size Number of bytes to allocate.
+    /// @return Pointer to the allocated memory, or nullptr on failure.
     void* allocate(size_t size) override {
         return platform_malloc(size);
     }
+
+    /// @brief Frees a block of memory via platform_free
+    /// @param ptr Pointer to the block to free.
     void deallocate(void* ptr) override {
         platform_free(ptr);
     }
+
+    /// @brief Reallocates a block of memory via platform_realloc
+    /// @param ptr Pointer to the block to reallocate.
+    /// @param new_size New size in bytes.
+    /// @return Pointer to the reallocated memory, or nullptr on failure.
     void* reallocate(void* ptr, size_t new_size) override {
         return platform_realloc(ptr, new_size);
     }
 
+    /// @brief Returns the singleton allocator instance
+    /// @return Pointer to the shared PsramJsonAllocator instance.
     static PsramJsonAllocator* instance() {
         static PsramJsonAllocator instance;
         return &instance;
     }
 };
 
-/// Creates a JsonDocument that uses PSRAM-preferring allocation.
+/// @brief Creates a JsonDocument that uses PSRAM-preferring allocation
 inline JsonDocument make_json_document() {
     return JsonDocument(PsramJsonAllocator::instance());
 }

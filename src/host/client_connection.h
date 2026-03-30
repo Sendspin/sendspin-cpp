@@ -84,19 +84,31 @@ public:
 
 protected:
     /// @brief Registers the IXWebSocket message callback to handle open, close, data, and error
-    /// events.
+    /// events
     void setup_callbacks_();
 
     // Pointer fields
+
+    /// @brief The WebSocket server URL
     std::string url_;
+
+    /// @brief The IXWebSocket instance managing the connection
     std::unique_ptr<ix::WebSocket> ws_;
 
     // 32-bit fields
+
+    /// @brief Monotonic timestamp (ms) of the last reconnection attempt
     uint32_t last_reconnect_attempt_{0};
+
+    /// @brief Delay in milliseconds between reconnection attempts
     uint32_t reconnect_interval_ms_{5000};
 
     // 8-bit fields
+
+    /// @brief Whether to automatically reconnect after connection loss
     bool auto_reconnect_{true};
+
+    /// @brief Whether the websocket is currently connected
     bool connected_{false};
 };
 

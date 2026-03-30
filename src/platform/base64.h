@@ -28,7 +28,7 @@
 namespace sendspin {
 
 /// @brief Decodes base64 data
-/// @param dst Output buffer, or nullptr for a size query.
+/// @param[out] dst Output buffer, or nullptr for a size query.
 /// @param dlen Capacity of the output buffer in bytes.
 /// @param[out] olen Set to the number of decoded bytes written.
 /// @param src Pointer to the base64-encoded input data.
@@ -61,7 +61,7 @@ static constexpr unsigned char BASE64_DECODE_TABLE[128] = {
 // clang-format on
 
 /// @brief Decodes base64 data (host implementation)
-/// @param dst Output buffer, or nullptr for a size query.
+/// @param[out] dst Output buffer, or nullptr for a size query.
 /// @param dlen Capacity of the output buffer in bytes.
 /// @param[out] olen Set to the number of decoded bytes written.
 /// @param src Pointer to the base64-encoded input data.

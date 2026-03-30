@@ -96,7 +96,7 @@ PlayerRole::~PlayerRole() {
 }
 
 // ============================================================================
-// Public API
+// Audio
 // ============================================================================
 
 void PlayerRole::notify_audio_played(uint32_t frames, int64_t timestamp) {
@@ -109,6 +109,10 @@ bool PlayerRole::write_audio_chunk(const uint8_t* data, size_t size, int64_t tim
                                    ChunkType type, uint32_t timeout_ms) {
     return this->sync_task_->write_audio_chunk(data, size, timestamp, type, timeout_ms);
 }
+
+// ============================================================================
+// State updates
+// ============================================================================
 
 void PlayerRole::update_volume(uint8_t volume) {
     this->volume_ = volume;
@@ -416,7 +420,7 @@ void PlayerRole::cleanup() {
     this->event_state_->shadow_stream_params.reset();
     this->event_state_->shadow_command.reset();
 
-    // Enqueue a clean STREAM_END — drain_events() will fire the callback
+    // Enqueue a clean STREAM_END - drain_events() will fire the callback
     this->event_state_->stream_queue.send(StreamCallbackType::STREAM_END, 0);
 
     // Clear awaiting events too (main-thread only, no mutex needed)

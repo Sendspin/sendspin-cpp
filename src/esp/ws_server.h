@@ -76,6 +76,18 @@ public:
         return this->server_ != nullptr;
     }
 
+    /// @brief Sets the callback to invoke when a socket closes
+    /// @param callback The callback function.
+    void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
+        this->connection_closed_callback_ = std::move(callback);
+    }
+
+    /// @brief Sets callback to find a connection by socket fd
+    /// @param callback The callback function.
+    void set_find_connection_callback(FindConnectionCallback&& callback) {
+        this->find_connection_callback_ = std::move(callback);
+    }
+
     /// @brief Configures the maximum number of simultaneous connections
     /// Default is 2 to support the handoff protocol (one active + one pending).
     /// @param max_connections Maximum number of open sockets (1-7).
@@ -87,18 +99,6 @@ public:
     /// @param callback The callback function.
     void set_new_connection_callback(NewConnectionCallback&& callback) {
         this->new_connection_callback_ = std::move(callback);
-    }
-
-    /// @brief Sets the callback to invoke when a socket closes
-    /// @param callback The callback function.
-    void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
-        this->connection_closed_callback_ = std::move(callback);
-    }
-
-    /// @brief Sets callback to find a connection by socket fd
-    /// @param callback The callback function.
-    void set_find_connection_callback(FindConnectionCallback&& callback) {
-        this->find_connection_callback_ = std::move(callback);
     }
 
     /// @brief Gets the httpd handle (for use by connections)

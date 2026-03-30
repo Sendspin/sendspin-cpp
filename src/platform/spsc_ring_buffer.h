@@ -79,7 +79,7 @@ public:
         return this->handle_ != nullptr;
     }
 
-    /// @brief Returns true if the ring buffer has been successfully created.
+    /// @brief Returns true if the ring buffer has been successfully created
     /// @return true if the ring buffer is ready for use.
     bool is_created() const {
         return this->handle_ != nullptr;
@@ -147,6 +147,32 @@ private:
 
 namespace sendspin {
 
+/**
+ * @brief Single-producer/single-consumer ring buffer with caller-provided storage
+ *
+ * Backed by a mutex/condition-variable implementation on host. Items are written as
+ * contiguous blobs and read back in the same order. Supports both a one-phase send()
+ * and a two-phase acquire()/commit() path for zero-copy writes.
+ *
+ * Usage:
+ * 1. Allocate a storage buffer, then call create() with a pointer to it
+ * 2. Write data with send() or acquire()/commit() from the producer thread
+ * 3. Read data with receive() from the consumer thread
+ * 4. Call return_item() after processing each received item
+ *
+ * @code
+ * static uint8_t buf[4096];
+ * SpscRingBuffer rb;
+ * rb.create(sizeof(buf), buf);
+ *
+ * rb.send(data, data_len, 100);
+ *
+ * size_t sz;
+ * void* item = rb.receive(&sz, UINT32_MAX);
+ * // process item...
+ * rb.return_item(item);
+ * @endcode
+ */
 class SpscRingBuffer {
 public:
     SpscRingBuffer() = default;
@@ -170,7 +196,7 @@ public:
         return true;
     }
 
-    /// @brief Returns true if the ring buffer has been successfully created.
+    /// @brief Returns true if the ring buffer has been successfully created
     /// @return true if the ring buffer is ready for use.
     bool is_created() const {
         return this->created_;
@@ -311,14 +337,17 @@ private:
     static_assert(sizeof(ItemHeader) % ALIGNMENT == 0,
                   "ItemHeader size must be a multiple of ALIGNMENT");
 
+    /// @brief Rounds n up to the nearest multiple of ALIGNMENT
     static size_t align_(size_t n) {
         return (n + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
     }
 
+    /// @brief Returns the total storage occupied by one item including its header and alignment
     static size_t item_total_size_(size_t data_size) {
         return sizeof(ItemHeader) + align_(data_size);
     }
 
+    /// @brief Attempts to reserve space for an item of total bytes; returns offset or SIZE_MAX
     size_t try_acquire_(size_t total) {
         if (this->free_bytes_ < total) {
             return SIZE_MAX;
@@ -345,6 +374,7 @@ private:
         return SIZE_MAX;
     }
 
+    /// @brief Attempts to read the next committed item; returns a pointer or nullptr if none ready
     void* try_read_(size_t* item_size) {
         while (this->read_offset_ != this->write_offset_ || this->free_bytes_ == 0) {
             if (this->read_offset_ >= this->storage_size_) {
