@@ -265,6 +265,7 @@ public:
     }
 
 private:
+    /// @brief Per-item metadata stored inline in the ring buffer ahead of each item's payload
     struct ItemHeader {
         uint32_t size;
         uint32_t flags;

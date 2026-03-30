@@ -110,12 +110,14 @@ inline std::optional<SendspinControllerCommand> controller_command_from_string(
     return std::nullopt;
 }
 
+/// @brief A playback command sent from the client to the server via client/command messages
 struct ClientCommandControllerObject {
     SendspinControllerCommand command;
     std::optional<uint8_t> volume;
     std::optional<bool> mute;
 };
 
+/// @brief Controller state received from the server in server/state messages
 struct ServerStateControllerObject {
     std::vector<SendspinControllerCommand> supported_commands;
     uint8_t volume;

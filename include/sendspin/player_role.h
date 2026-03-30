@@ -47,6 +47,7 @@ enum ChunkType : uint8_t {
     CHUNK_TYPE_FLAC_HEADER,        // FLAC stream header block
 };
 
+/// @brief Synthetic codec header for PCM and Opus streams that lack a real header block
 struct DummyHeader {
     uint32_t sample_rate;
     uint8_t bits_per_sample;
@@ -84,6 +85,7 @@ inline std::optional<SendspinCodecFormat> codec_format_from_string(const std::st
     return std::nullopt;
 }
 
+/// @brief One supported audio format entry advertised by the player in the hello message
 struct AudioSupportedFormatObject {
     SendspinCodecFormat codec;
     uint8_t channels;
@@ -121,12 +123,14 @@ inline std::optional<SendspinPlayerCommand> player_command_from_string(const std
     return std::nullopt;
 }
 
+/// @brief Player capabilities advertised to the server during the hello handshake
 struct PlayerSupportObject {
     std::vector<AudioSupportedFormatObject> supported_formats;
     size_t buffer_capacity;
     std::vector<SendspinPlayerCommand> supported_commands;
 };
 
+/// @brief Player state reported by the client to the server in client/state messages
 struct ClientPlayerStateObject {
     uint8_t volume;
     bool muted;
@@ -134,6 +138,7 @@ struct ClientPlayerStateObject {
     std::vector<SendspinPlayerCommand> supported_commands;
 };
 
+/// @brief Stream parameters sent by the server in stream/start messages
 struct ServerPlayerStreamObject {
     std::optional<SendspinCodecFormat> codec;
     std::optional<uint32_t> sample_rate;
@@ -147,6 +152,7 @@ struct ServerPlayerStreamObject {
     }
 };
 
+/// @brief A single player command sent by the server, with optional parameter fields
 struct ServerPlayerCommandObject {
     SendspinPlayerCommand command;
     std::optional<uint8_t> volume;
@@ -154,6 +160,7 @@ struct ServerPlayerCommandObject {
     std::optional<uint16_t> static_delay_ms;
 };
 
+/// @brief Parsed server/command message envelope, containing per-role command objects
 struct ServerCommandMessage {
     std::optional<ServerPlayerCommandObject> player;
 };

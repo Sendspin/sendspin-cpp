@@ -30,7 +30,7 @@ namespace sendspin {
 class PlayerRole;
 class SendspinClient;
 
-// Stores the timing information of audio played received from the speaker
+/// @brief Timing feedback from the audio output: frames played and the finish timestamp
 struct PlaybackProgress {
     uint32_t frames_played;    // Number of audio frames played since last progress update
     int64_t finish_timestamp;  // The timestamp when the audio frames should finish playing
@@ -52,7 +52,7 @@ enum class DecodeResult : uint8_t {
     ALLOCATION_FAILED,  // Buffer allocation failed; task should stop
 };
 
-// Stores all the variables needed by segments of the sync task
+/// @brief Working state shared across the sync task's inner decode/sync/transfer loop
 struct SyncContext {
     // Smart pointers (4 bytes each on ESP32)
     std::unique_ptr<TransferBuffer> decode_buffer;  // Reusable decode + output buffer

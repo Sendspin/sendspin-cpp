@@ -88,12 +88,14 @@ inline std::optional<SendspinGoodbyeReason> goodbye_reason_from_string(const std
     return std::nullopt;
 }
 
+/// @brief Optional hardware and software identity fields sent in client/hello messages
 struct DeviceInfoObject {
     std::optional<std::string> product_name;
     std::optional<std::string> manufacturer;
     std::optional<std::string> software_version;
 };
 
+/// @brief Server identity fields received in server/hello messages
 struct ServerInformationObject {
     std::string server_id;
     std::string name;
@@ -129,6 +131,7 @@ inline std::optional<SendspinPlaybackState> playback_state_from_string(const std
     return std::nullopt;
 }
 
+/// @brief Group membership and playback state delta received in group/update messages
 struct GroupUpdateObject {
     std::optional<SendspinPlaybackState> playback_state;
     std::optional<std::string> group_id;

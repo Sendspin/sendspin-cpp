@@ -148,6 +148,11 @@ inline std::optional<SendspinConnectionReason> connection_reason_from_string(
     return std::nullopt;
 }
 
+/// @brief Holds the planned and actual transmit timestamps for a client/time message
+///
+/// When a client/time message is queued, the intended transmit time is stored. After the
+/// WebSocket layer sends it, the actual send time replaces the placeholder so the server
+/// can compute round-trip latency more accurately.
 struct TimeTransmittedReplacement {
     int64_t transmitted_time = 0;
     int64_t actual_transmit_time = 0;
@@ -157,6 +162,7 @@ struct TimeTransmittedReplacement {
 // Message envelope structs
 // ============================================================================
 
+/// @brief Outgoing client/hello handshake message sent at connection startup
 struct ClientHelloMessage {
     std::string client_id;
     std::string name;
@@ -168,24 +174,29 @@ struct ClientHelloMessage {
     std::optional<VisualizerSupportObject> visualizer_support;
 };
 
+/// @brief Outgoing client/state message reporting client playback state to the server
 struct ClientStateMessage {
     SendspinClientState state;
     std::optional<ClientPlayerStateObject> player;
 };
 
+/// @brief Outgoing client/command message carrying a playback command to the server
 struct ClientCommandMessage {
     std::optional<ClientCommandControllerObject> controller;
 };
 
+/// @brief Outgoing client/goodbye message sent before a clean disconnect
 struct ClientGoodbyeMessage {
     SendspinGoodbyeReason reason;
 };
 
+/// @brief Parsed server/state message containing per-role state updates
 struct ServerStateMessage {
     std::optional<ServerStateControllerObject> controller;
     std::optional<ServerMetadataStateObject> metadata;
 };
 
+/// @brief Parsed server/hello handshake message received at connection startup
 struct ServerHelloMessage {
     ServerInformationObject server;
     uint16_t version;
@@ -193,25 +204,30 @@ struct ServerHelloMessage {
     SendspinConnectionReason connection_reason;
 };
 
+/// @brief Parsed group/update message containing the group state delta
 struct GroupUpdateMessage {
     GroupUpdateObject group;
 };
 
+/// @brief Parsed stream/start message with per-role stream parameters
 struct StreamStartMessage {
     std::optional<ServerPlayerStreamObject> player;
     std::optional<ServerArtworkStreamObject> artwork;
     std::optional<ServerVisualizerStreamObject> visualizer;
 };
 
+/// @brief Outgoing stream/request_format message used for codec and artwork format negotiation
 struct StreamRequestFormatMessage {
     std::optional<ServerPlayerStreamObject> player;
     std::optional<ClientArtworkRequestObject> artwork;
 };
 
+/// @brief Parsed stream/end message listing which roles the stream end applies to
 struct StreamEndMessage {
     std::optional<std::vector<std::string>> roles;
 };
 
+/// @brief Parsed stream/clear message listing which roles the buffer flush applies to
 struct StreamClearMessage {
     std::optional<std::vector<std::string>> roles;
 };

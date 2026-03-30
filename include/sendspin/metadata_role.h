@@ -28,6 +28,7 @@ struct ClientHelloMessage;
 // Metadata types
 // ============================================================================
 
+/// @brief Playback progress fields embedded in a metadata state update
 struct MetadataProgressObject {
     uint32_t track_progress;
     uint32_t track_duration;
@@ -64,6 +65,7 @@ inline std::optional<SendspinRepeatMode> repeat_mode_from_string(const std::stri
     return std::nullopt;
 }
 
+/// @brief Track metadata and playback state received from the server
 struct ServerMetadataStateObject {
     int64_t timestamp;
     std::optional<std::string> title;

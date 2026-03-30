@@ -73,6 +73,7 @@ inline const char* to_cstr(VisualizerSpectrumScale scale) {
     }
 }
 
+/// @brief Spectrum visualization parameters: bin count, frequency range, scale, and rate cap
 struct VisualizerSpectrumConfig {
     uint8_t n_disp_bins;
     VisualizerSpectrumScale scale;
@@ -81,6 +82,7 @@ struct VisualizerSpectrumConfig {
     uint16_t rate_max;
 };
 
+/// @brief Visualizer capabilities advertised to the server during the hello handshake
 struct VisualizerSupportObject {
     std::vector<VisualizerDataType> types;
     size_t buffer_capacity;
@@ -88,6 +90,7 @@ struct VisualizerSupportObject {
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 
+/// @brief Visualizer stream parameters sent by the server in stream/start messages
 struct ServerVisualizerStreamObject {
     std::vector<VisualizerDataType> types;
     uint8_t batch_max;

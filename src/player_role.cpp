@@ -60,6 +60,8 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
 
 // --- Event state (PIMPL) ---
 
+/// @brief PIMPL event state: queues and shadow slots used to pass data from background threads
+/// (network thread and sync task thread) to the main loop thread for the player role
 struct PlayerRole::EventState {
     ThreadSafeQueue<PlayerRole::StreamCallbackType> stream_queue;
     ThreadSafeQueue<SendspinClientState> state_queue;
