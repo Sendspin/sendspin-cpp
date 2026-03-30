@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file thread_safe_queue.h
+/// @brief Platform-abstracted bounded thread-safe queue backed by a FreeRTOS queue on ESP and a
+/// mutex/condition-variable deque on host
+
 #pragma once
 
 #include <cstddef>

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file audio_utils.h
+/// @brief Inline helpers for packing and unpacking PCM audio samples to and from Q31 fixed-point
+
 #pragma once
 
 #include <cstddef>

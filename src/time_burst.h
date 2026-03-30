@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file time_burst.h
+/// @brief Burst-based time synchronization coordinator that selects the best RTT sample per burst
+/// for Kalman filter input
+
 #pragma once
 
 #include <cstdint>

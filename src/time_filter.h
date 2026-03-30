@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file time_filter.h
+/// @brief Two-dimensional Kalman filter for NTP-style clock offset and drift estimation between
+/// client and server
+
 #pragma once
 
 #include <cstdint>

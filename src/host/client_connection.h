@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// @file Host build version of client_connection.h (IXWebSocket-based).
-/// ESP-IDF version lives in src/esp/sendspin/client_connection.h.
+/// @file client_connection.h
+/// @brief Host build WebSocket client connection using IXWebSocket
 
 #pragma once
 

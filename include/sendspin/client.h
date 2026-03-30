@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file client.h
+/// @brief Main public API for the Sendspin synchronized audio streaming client
+
 #pragma once
 
 #include "sendspin/artwork_role.h"

@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file thread.h
+/// @brief Platform-abstracted thread configuration helper for setting stack size, priority, name,
+/// and PSRAM stack allocation before spawning a std::thread
+
 #pragma once
 
 #include <cstddef>

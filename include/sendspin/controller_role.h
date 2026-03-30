@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file controller_role.h
+/// @brief Playback controller role that sends commands to and receives state from the Sendspin
+/// server
+
 #pragma once
 
 #include <cstdint>

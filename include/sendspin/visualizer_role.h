@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file visualizer_role.h
+/// @brief Visualizer role that receives real-time audio visualization data from the server
+
 #pragma once
 
 #include <atomic>

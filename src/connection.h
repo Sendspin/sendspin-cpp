@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file connection.h
+/// @brief Abstract base class for Sendspin WebSocket connections, providing handshake, time sync,
+/// and message buffering
+
 #pragma once
 
 #include "platform/memory.h"

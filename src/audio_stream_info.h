@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file audio_stream_info.h
+/// @brief Audio stream format descriptor with unit conversion helpers for bytes, frames, samples,
+/// and durations
+
 #pragma once
 
 #include <cstddef>

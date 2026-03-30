@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file transfer_buffer.h
+/// @brief Simple flat byte buffer with read/write cursors for transferring decoded audio to the
+/// audio output sink
+
 #pragma once
 
 #include "platform/memory.h"

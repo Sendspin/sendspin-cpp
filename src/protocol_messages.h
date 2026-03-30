@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file protocol_messages.h
+/// @brief Internal protocol types, message envelope structs, and JSON serialization/parsing
+/// functions for the Sendspin wire protocol
+
 #pragma once
 
 #include "sendspin/artwork_role.h"

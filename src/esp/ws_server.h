@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file ws_server.h
+/// @brief ESP-IDF WebSocket server listener that accepts incoming Sendspin server connections
+
 #pragma once
 
 #include <esp_http_server.h>

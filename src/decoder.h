@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file decoder.h
+/// @brief Audio decoder wrapper supporting FLAC, Opus, and raw PCM codec formats
+
 #pragma once
 
 #include "audio_stream_info.h"

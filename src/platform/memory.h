@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file memory.h
+/// @brief Platform-abstracted memory allocation preferring SPIRAM on ESP, plus RAII buffer and
+/// ArduinoJson allocator helpers
+
 #pragma once
 
 #include <ArduinoJson.h>

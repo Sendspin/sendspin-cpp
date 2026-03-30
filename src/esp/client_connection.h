@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file client_connection.h
+/// @brief ESP-IDF WebSocket client connection using esp_websocket_client
+
 #pragma once
 
 #include "connection.h"

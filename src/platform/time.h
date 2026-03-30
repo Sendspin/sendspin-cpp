@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file time.h
+/// @brief Platform-abstracted monotonic time source providing microsecond resolution
+
 #pragma once
 
 #include <cstdint>

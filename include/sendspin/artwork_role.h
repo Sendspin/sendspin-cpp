@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file artwork_role.h
+/// @brief Artwork role that receives artwork images from the server
+
 #pragma once
 
 #include <cstddef>

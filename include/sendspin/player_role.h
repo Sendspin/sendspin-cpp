@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file player_role.h
+/// @brief Audio streaming role that decodes and synchronizes playback via a listener callback
+
 #pragma once
 
 #include "sendspin/types.h"

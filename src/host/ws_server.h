@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// @file Host build version of ws_server.h (IXWebSocket-based).
-/// ESP-IDF version lives in src/esp/sendspin/ws_server.h.
+/// @file ws_server.h
+/// @brief Host build WebSocket server listener that accepts incoming Sendspin server connections
+/// using IXWebSocket
 
 #pragma once
 

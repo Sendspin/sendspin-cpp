@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file base64.h
+/// @brief Platform-abstracted base64 decoder wrapping mbedTLS on ESP and a built-in implementation
+/// on host
+
 #pragma once
 
 #include <cstddef>

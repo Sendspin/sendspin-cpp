@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file audio_ring_buffer.h
+/// @brief Pre-allocated SPSC ring buffer for zero-copy encoded audio chunk transfer between the
+/// network and sync task
+
 #pragma once
 
 #include "platform/memory.h"

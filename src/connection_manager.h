@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file connection_manager.h
+/// @brief Manages WebSocket connection lifecycle including server handoff, hello handshake, and
+/// graceful disconnection
+
 #pragma once
 
 #include "protocol_messages.h"

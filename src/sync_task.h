@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file sync_task.h
+/// @brief Background sync task that decodes encoded audio, synchronizes to server timestamps, and
+/// writes PCM to the audio sink
+
 #pragma once
 
 #include "audio_ring_buffer.h"

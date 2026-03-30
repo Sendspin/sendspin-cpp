@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file event_flags.h
+/// @brief Platform-abstracted event flag group backed by a FreeRTOS event group on ESP and
+/// condition variables on host
+
 #pragma once
 
 #include <cstdint>

@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file shadow_slot.h
+/// @brief Thread-safe single-slot buffer for passing the latest state value between a writer thread
+/// and a reader thread
+
 #pragma once
 
 #include <mutex>

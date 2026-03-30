@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file metadata_role.h
+/// @brief Metadata role that receives track metadata and playback progress from the server
+
 #pragma once
 
 #include <cstdint>

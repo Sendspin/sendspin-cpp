@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file logging.h
+/// @brief Platform-abstracted logging macros mapping SS_LOG* to ESP-IDF or printf-based output
+
 #pragma once
 
 #ifdef ESP_PLATFORM

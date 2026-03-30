@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file types.h
+/// @brief Platform-agnostic error code enum and utility functions for Sendspin APIs
+
 #pragma once
 
 #include <cstdint>

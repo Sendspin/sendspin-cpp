@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file spsc_ring_buffer.h
+/// @brief Platform-abstracted single-producer/single-consumer ring buffer backed by a FreeRTOS
+/// NOSPLIT ring buffer on ESP and a mutex/condition-variable implementation on host
+
 #pragma once
 
 #include <cstddef>
