@@ -21,8 +21,6 @@
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 #include "sync_task.h"
-#include "sync_time_provider.h"
-#include "transfer_buffer.h"
 
 static const char* const TAG = "sendspin.player";
 
@@ -143,11 +141,7 @@ bool PlayerRole::start(bool psram_stack) {
 
     if (!this->config_.audio_formats.empty() && this->listener_ &&
         !this->sync_task_->is_initialized()) {
-        AudioWriteCallback write_cb = [this](uint8_t* data, size_t length, uint32_t timeout_ms) {
-            return this->listener_->on_audio_write(data, length, timeout_ms);
-        };
-        if (!this->sync_task_->init(this->make_sync_time_provider_(), std::move(write_cb),
-                                    this->config_.audio_buffer_capacity)) {
+        if (!this->sync_task_->init(this, this->config_.audio_buffer_capacity)) {
             SS_LOGE(TAG, "Failed to initialize sync task");
             return false;
         }
@@ -444,16 +438,8 @@ bool PlayerRole::send_audio_chunk_(const uint8_t* data, size_t data_size, int64_
     return this->sync_task_->write_audio_chunk(data, data_size, timestamp, chunk_type, timeout_ms);
 }
 
-SyncTimeProvider PlayerRole::make_sync_time_provider_() {
-    return SyncTimeProvider{
-        .get_client_time =
-            [this](int64_t server_time) { return this->bridge_->get_client_time(server_time); },
-        .is_time_synced = [this]() { return this->bridge_->is_time_synced(); },
-        .get_static_delay_ms = [this]() { return this->get_static_delay_ms(); },
-        .get_fixed_delay_us = [this]() { return this->get_fixed_delay_us(); },
-        .update_state =
-            [this](SendspinClientState state) { this->event_state_->state_queue.send(state, 0); },
-    };
+void PlayerRole::enqueue_state_update_(SendspinClientState state) {
+    this->event_state_->state_queue.send(state, 0);
 }
 
 void PlayerRole::load_static_delay_() {

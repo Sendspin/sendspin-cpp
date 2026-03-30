@@ -19,7 +19,6 @@
 #include "decoder.h"
 #include "platform/event_flags.h"
 #include "platform/thread_safe_queue.h"
-#include "sync_time_provider.h"
 #include "transfer_buffer.h"
 
 #include <atomic>
@@ -27,6 +26,8 @@
 #include <thread>
 
 namespace sendspin {
+
+class PlayerRole;
 
 // Stores the timing information of audio played received from the speaker
 struct PlaybackProgress {
@@ -102,12 +103,10 @@ public:
     ~SyncTask();
 
     /// @brief Initializes queues and creates the encoded ring buffer.
-    /// @param time_provider Provides time sync, delay, and state callbacks.
-    /// @param audio_write_callback Callback for writing decoded PCM audio to the output.
+    /// @param player The owning PlayerRole, used for time sync, delay, and audio write access.
     /// @param buffer_size Size of the encoded audio ring buffer in bytes.
     /// @return true on success, false on allocation failure.
-    bool init(SyncTimeProvider time_provider, AudioWriteCallback audio_write_callback,
-              size_t buffer_size);
+    bool init(PlayerRole* player, size_t buffer_size);
 
     /// @brief Creates and starts the persistent sync background thread.
     /// Call once after init(). The thread idles until a codec header arrives in the ring buffer.
@@ -233,11 +232,8 @@ protected:
     ThreadSafeQueue<PlaybackProgress> playback_progress_queue_;
     std::thread sync_thread_;
 
-    // Provides time sync, delay, and state callbacks (set by init)
-    SyncTimeProvider time_provider_;
-
-    // Callback for writing decoded audio to the output
-    AudioWriteCallback audio_write_callback_;
+    // Owning player role (set by init, outlives this task)
+    PlayerRole* player_{nullptr};
 
     // Tracks whether the last task run ended with an error
     bool last_run_had_error_{false};

@@ -17,6 +17,8 @@
 #include "audio_utils.h"
 #include "platform/logging.h"
 #include "platform/thread.h"
+#include "sendspin/client.h"
+#include "sendspin/player_role.h"
 
 #include <algorithm>
 #include <chrono>
@@ -43,10 +45,8 @@ SyncTask::~SyncTask() {
     this->stop_();
 }
 
-bool SyncTask::init(SyncTimeProvider time_provider, AudioWriteCallback audio_write_callback,
-                    size_t buffer_size) {
-    this->time_provider_ = std::move(time_provider);
-    this->audio_write_callback_ = std::move(audio_write_callback);
+bool SyncTask::init(PlayerRole* player, size_t buffer_size) {
+    this->player_ = player;
 
     if (!this->event_flags_.create()) {
         SS_LOGE(TAG, "Couldn't create event flags.");
@@ -430,9 +430,9 @@ DecodeResult SyncTask::sync_decode_audio_(SyncContext& sync_context) {
     } else if ((sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) &&
                (sync_context.encoded_entry->chunk_type == CHUNK_TYPE_ENCODED_AUDIO)) {
         int64_t client_timestamp =
-            this->time_provider_.get_client_time(sync_context.encoded_entry->timestamp) -
-            static_cast<int64_t>(this->time_provider_.get_static_delay_ms()) * 1000 -
-            this->time_provider_.get_fixed_delay_us();
+            this->player_->bridge_->get_client_time(sync_context.encoded_entry->timestamp) -
+            static_cast<int64_t>(this->player_->get_static_delay_ms()) * 1000 -
+            this->player_->get_fixed_delay_us();
 
         if (client_timestamp < sync_context.new_audio_client_playtime - HARD_SYNC_THRESHOLD_US) {
             // This chunk will arrive too late to be played, skip it!
@@ -493,7 +493,7 @@ SyncTaskState SyncTask::sync_handle_initial_sync_(SyncContext& sync_context) {
 }
 
 SyncTaskState SyncTask::sync_handle_load_chunk_(SyncContext& sync_context) {
-    if (!this->time_provider_.is_time_synced()) {
+    if (!this->player_->bridge_->is_time_synced()) {
         // Wait for the time filter to receive its first measurement before processing audio chunks.
         // Without a valid time offset, server timestamps can't be correctly converted to client
         // timestamps.
@@ -617,8 +617,11 @@ void SyncTask::sync_task(void* params) {
         return;
     }
 
-    sync_context.audio_write_callback = this_task->audio_write_callback_;
-    if (sync_context.audio_write_callback) {
+    if (this_task->player_->listener_) {
+        sync_context.audio_write_callback = [player = this_task->player_](
+                                                uint8_t* data, size_t length, uint32_t timeout_ms) {
+            return player->listener_->on_audio_write(data, length, timeout_ms);
+        };
         sync_context.interpolation_transfer_buffer->set_audio_write_callback(
             sync_context.audio_write_callback);
     }
@@ -691,7 +694,7 @@ void SyncTask::sync_task(void* params) {
 
         this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
 
-        this_task->time_provider_.update_state(SendspinClientState::SYNCHRONIZED);
+        this_task->player_->enqueue_state_update_(SendspinClientState::SYNCHRONIZED);
 
         // Decode the initial codec header
         if (sync_context.encoded_entry != nullptr) {

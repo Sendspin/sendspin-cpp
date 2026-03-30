@@ -192,6 +192,7 @@ public:
 /// @brief Player role: owns SyncTask, handles audio playback.
 class PlayerRole {
     friend class SendspinClient;
+    friend class SyncTask;
 
 public:
     /// @brief Configuration for the player role.
@@ -292,7 +293,7 @@ private:
 
     bool send_audio_chunk_(const uint8_t* data, size_t data_size, int64_t timestamp,
                            ChunkType chunk_type, uint32_t timeout_ms);
-    SyncTimeProvider make_sync_time_provider_();
+    void enqueue_state_update_(SendspinClientState state);
     void load_static_delay_();
     void persist_static_delay_();
 
