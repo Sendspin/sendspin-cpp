@@ -41,7 +41,8 @@ public:
     ThreadSafeQueue(const ThreadSafeQueue&) = delete;
     ThreadSafeQueue& operator=(const ThreadSafeQueue&) = delete;
 
-    /// Creates the queue with the given maximum depth.
+    /// @brief Creates the queue with the given maximum depth
+    /// @param max_depth Maximum number of items the queue can hold.
     /// @param memory_caps ESP-IDF memory capability flags (e.g., MALLOC_CAP_SPIRAM).
     /// @return true on success.
     bool create(size_t max_depth, uint32_t memory_caps = 0) {
@@ -59,22 +60,37 @@ public:
         return this->handle_ != nullptr;
     }
 
+    /// @brief Sends an item to the back of the queue; blocks up to timeout_ms if full
+    /// @param item Item to send.
+    /// @param timeout_ms Milliseconds to wait if the queue is full (UINT32_MAX = wait forever).
+    /// @return true if the item was sent successfully.
     bool send(const T& item, uint32_t timeout_ms) {
         return xQueueSend(this->handle_, &item, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
     }
 
+    /// @brief Receives an item from the front of the queue; blocks up to timeout_ms if empty
+    /// @param[out] item Populated with the received item on success.
+    /// @param timeout_ms Milliseconds to wait if the queue is empty (UINT32_MAX = wait forever).
+    /// @return true if an item was received successfully.
     bool receive(T& item, uint32_t timeout_ms) {
         return xQueueReceive(this->handle_, &item, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
     }
 
+    /// @brief Peeks at the front item without removing it; returns false if empty
+    /// @param[out] item Populated with the front item on success.
+    /// @return true if the queue was non-empty.
     bool peek(T& item) const {
         return xQueuePeek(this->handle_, &item, 0) == pdTRUE;
     }
 
+    /// @brief Overwrites the back item (or enqueues if empty); never blocks
+    /// @param item Item to write.
+    /// @return true on success.
     bool overwrite(const T& item) {
         return xQueueOverwrite(this->handle_, &item) == pdTRUE;
     }
 
+    /// @brief Discards all items in the queue
     void reset() {
         xQueueReset(this->handle_);
     }
@@ -106,7 +122,8 @@ public:
     ThreadSafeQueue(const ThreadSafeQueue&) = delete;
     ThreadSafeQueue& operator=(const ThreadSafeQueue&) = delete;
 
-    /// Creates the queue with the given maximum depth.
+    /// @brief Creates the queue with the given maximum depth
+    /// @param max_depth Maximum number of items the queue can hold.
     /// @param memory_caps Ignored on host.
     /// @return true on success.
     bool create(size_t max_depth, uint32_t /*memory_caps*/ = 0) {
@@ -121,6 +138,10 @@ public:
         return this->created_;
     }
 
+    /// @brief Sends an item to the back of the queue; blocks up to timeout_ms if full
+    /// @param item Item to send.
+    /// @param timeout_ms Milliseconds to wait if the queue is full (UINT32_MAX = wait forever).
+    /// @return true if the item was sent successfully.
     bool send(const T& item, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);
         if (this->items_.size() >= this->max_depth_) {
@@ -141,6 +162,10 @@ public:
         return true;
     }
 
+    /// @brief Receives an item from the front of the queue; blocks up to timeout_ms if empty
+    /// @param[out] item Populated with the received item on success.
+    /// @param timeout_ms Milliseconds to wait if the queue is empty (UINT32_MAX = wait forever).
+    /// @return true if an item was received successfully.
     bool receive(T& item, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);
         if (this->items_.empty()) {
@@ -165,6 +190,9 @@ public:
         return true;
     }
 
+    /// @brief Peeks at the front item without removing it; returns false if empty
+    /// @param[out] item Populated with the front item on success.
+    /// @return true if the queue was non-empty.
     bool peek(T& item) const {
         std::lock_guard<std::mutex> lock(this->mtx_);
         if (this->items_.empty()) {
@@ -174,6 +202,9 @@ public:
         return true;
     }
 
+    /// @brief Overwrites the back item (or enqueues if empty); never blocks
+    /// @param item Item to write.
+    /// @return true on success.
     bool overwrite(const T& item) {
         std::lock_guard<std::mutex> lock(this->mtx_);
         if (this->items_.empty()) {
@@ -185,6 +216,7 @@ public:
         return true;
     }
 
+    /// @brief Discards all items in the queue
     void reset() {
         std::lock_guard<std::mutex> lock(this->mtx_);
         this->items_.clear();

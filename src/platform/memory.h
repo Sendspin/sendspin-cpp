@@ -26,18 +26,24 @@
 namespace sendspin {
 
 /// @brief Allocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM
+/// @param size Number of bytes to allocate.
+/// @return Pointer to the allocated memory, or nullptr on failure.
 inline void* platform_malloc(size_t size) {
     return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
                                    MALLOC_CAP_INTERNAL);
 }
 
 /// @brief Reallocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM
+/// @param ptr Pointer to the block to reallocate, or nullptr to allocate a new block.
+/// @param size New size in bytes.
+/// @return Pointer to the reallocated memory, or nullptr on failure.
 inline void* platform_realloc(void* ptr, size_t size) {
     return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
                                     MALLOC_CAP_INTERNAL);
 }
 
 /// @brief Frees memory allocated by platform_malloc or platform_realloc
+/// @param ptr Pointer to the block to free, or nullptr.
 inline void platform_free(void* ptr) {
     heap_caps_free(ptr);
 }
@@ -48,14 +54,23 @@ inline void platform_free(void* ptr) {
 
 namespace sendspin {
 
+/// @brief Allocates a block of memory
+/// @param size Number of bytes to allocate.
+/// @return Pointer to the allocated memory, or nullptr on failure.
 inline void* platform_malloc(size_t size) {
     return malloc(size);
 }
 
+/// @brief Reallocates a previously allocated block of memory
+/// @param ptr Pointer to the block to reallocate, or nullptr to allocate a new block.
+/// @param size New size in bytes.
+/// @return Pointer to the reallocated memory, or nullptr on failure.
 inline void* platform_realloc(void* ptr, size_t size) {
     return realloc(ptr, size);
 }
 
+/// @brief Frees memory allocated by platform_malloc or platform_realloc
+/// @param ptr Pointer to the block to free, or nullptr.
 inline void platform_free(void* ptr) {
     free(ptr);
 }

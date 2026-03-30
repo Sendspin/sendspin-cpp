@@ -37,7 +37,7 @@ public:
     EventFlags(const EventFlags&) = delete;
     EventFlags& operator=(const EventFlags&) = delete;
 
-    /// Creates the event flags group.
+    /// @brief Creates the event flags group
     /// @return true on success.
     bool create() {
         this->handle_ = xEventGroupCreate();
@@ -50,22 +50,27 @@ public:
         return this->handle_ != nullptr;
     }
 
-    /// @brief Sets the specified bits. Returns the resulting bit pattern
+    /// @brief Sets the specified bits
+    /// @param bits Bitmask of bits to set.
+    /// @return Resulting bit pattern after the set.
     uint32_t set(uint32_t bits) {
         return xEventGroupSetBits(this->handle_, bits);
     }
 
-    /// @brief Clears the specified bits. Returns the bits BEFORE clearing
+    /// @brief Clears the specified bits
+    /// @param bits Bitmask of bits to clear.
+    /// @return Bit pattern captured before clearing.
     uint32_t clear(uint32_t bits) {
         return xEventGroupClearBits(this->handle_, bits);
     }
 
     /// @brief Returns the current bit pattern
+    /// @return Current bit pattern.
     uint32_t get() const {
         return xEventGroupGetBits(this->handle_);
     }
 
-    /// Waits for bits to be set.
+    /// @brief Waits for bits to be set
     /// @param bits_to_wait Bitmask of bits to wait for.
     /// @param wait_all If true, wait for ALL bits; if false, wait for ANY bit.
     /// @param clear_on_exit If true, clear the waited bits before returning.
@@ -100,6 +105,8 @@ public:
     EventFlags(const EventFlags&) = delete;
     EventFlags& operator=(const EventFlags&) = delete;
 
+    /// @brief Creates the event flags group
+    /// @return true on success.
     bool create() {
         this->created_ = true;
         return true;
@@ -111,6 +118,9 @@ public:
         return this->created_;
     }
 
+    /// @brief Sets the specified bits
+    /// @param bits Bitmask of bits to set.
+    /// @return Resulting bit pattern after the set.
     uint32_t set(uint32_t bits) {
         std::lock_guard<std::mutex> lock(this->mtx_);
         this->bits_ |= bits;
@@ -118,6 +128,9 @@ public:
         return this->bits_;
     }
 
+    /// @brief Clears the specified bits
+    /// @param bits Bitmask of bits to clear.
+    /// @return Bit pattern captured before clearing.
     uint32_t clear(uint32_t bits) {
         std::lock_guard<std::mutex> lock(this->mtx_);
         uint32_t old = this->bits_;
@@ -125,11 +138,19 @@ public:
         return old;
     }
 
+    /// @brief Returns the current bit pattern
+    /// @return Current bit pattern.
     uint32_t get() const {
         std::lock_guard<std::mutex> lock(this->mtx_);
         return this->bits_;
     }
 
+    /// @brief Waits for bits to be set
+    /// @param bits_to_wait Bitmask of bits to wait for.
+    /// @param wait_all If true, wait for ALL bits; if false, wait for ANY bit.
+    /// @param clear_on_exit If true, clear the waited bits before returning.
+    /// @param timeout_ms Milliseconds to wait (UINT32_MAX = wait forever).
+    /// @return The bit pattern at the time the wait completed or timed out.
     uint32_t wait(uint32_t bits_to_wait, bool wait_all, bool clear_on_exit, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);
 

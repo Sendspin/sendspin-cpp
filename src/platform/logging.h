@@ -61,10 +61,14 @@ inline int ss_host_log_level = SS_LOG_INFO;
 
 namespace sendspin {
 
+/// @brief Sets the runtime log level
+/// @param level One of the SS_LOG_* constants.
 inline void platform_set_log_level(int level) {
     ss_host_log_level = level;
 }
 
+/// @brief Returns the current runtime log level
+/// @return One of the SS_LOG_* constants.
 inline int platform_get_log_level() {
     return ss_host_log_level;
 }

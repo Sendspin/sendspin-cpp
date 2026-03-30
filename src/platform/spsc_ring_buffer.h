@@ -38,7 +38,7 @@ public:
     SpscRingBuffer(const SpscRingBuffer&) = delete;
     SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
 
-    /// Creates the ring buffer with caller-provided storage.
+    /// @brief Creates the ring buffer with caller-provided storage
     /// @param size Total storage size in bytes.
     /// @param storage Pointer to pre-allocated storage (must outlive this object).
     /// @return true on success.
@@ -55,6 +55,8 @@ public:
     }
 
     /// @brief Two-phase write: acquire contiguous space
+    /// @param size Number of bytes to acquire.
+    /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
     /// @return Pointer to acquired space, or nullptr on timeout.
     void* acquire(size_t size, uint32_t timeout_ms) {
         void* ptr = nullptr;
@@ -66,23 +68,31 @@ public:
     }
 
     /// @brief Two-phase write: commit previously acquired space
+    /// @param ptr Pointer returned by a prior call to acquire().
+    /// @return true on success.
     bool commit(void* ptr) {
         return xRingbufferSendComplete(this->handle_, ptr) == pdTRUE;
     }
 
     /// @brief One-phase write: copy data into the ring buffer
+    /// @param data Pointer to the data to copy.
+    /// @param size Number of bytes to copy.
+    /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
+    /// @return true if the data was written successfully.
     bool send(const void* data, size_t size, uint32_t timeout_ms) {
         return xRingbufferSend(this->handle_, data, size, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
     }
 
-    /// @brief Receive the next item. Caller must call return_item() when done
+    /// @brief Receive the next item; caller must call return_item() when done
     /// @param[out] item_size Set to the size of the received item.
+    /// @param timeout_ms Milliseconds to wait if no item is available (UINT32_MAX = wait forever).
     /// @return Pointer to item data, or nullptr on timeout.
     void* receive(size_t* item_size, uint32_t timeout_ms) {
         return xRingbufferReceive(this->handle_, item_size, pdMS_TO_TICKS(timeout_ms));
     }
 
     /// @brief Return a previously received item to the ring buffer
+    /// @param ptr Pointer returned by a prior call to receive().
     void return_item(void* ptr) {
         vRingbufferReturnItem(this->handle_, ptr);
     }
@@ -115,6 +125,10 @@ public:
     SpscRingBuffer(const SpscRingBuffer&) = delete;
     SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
 
+    /// @brief Creates the ring buffer with caller-provided storage
+    /// @param size Total storage size in bytes.
+    /// @param storage Pointer to pre-allocated storage (must outlive this object).
+    /// @return true on success.
     bool create(size_t size, uint8_t* storage) {
         this->storage_ = storage;
         this->storage_size_ = size;
@@ -131,6 +145,10 @@ public:
         return this->created_;
     }
 
+    /// @brief Two-phase write: acquire contiguous space
+    /// @param size Number of bytes to acquire.
+    /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
+    /// @return Pointer to acquired space, or nullptr on timeout.
     void* acquire(size_t size, uint32_t timeout_ms) {
         size_t total = item_total_size_(size);
         std::unique_lock<std::mutex> lock(this->mtx_);
@@ -171,6 +189,9 @@ public:
         return ptr;
     }
 
+    /// @brief Two-phase write: commit previously acquired space
+    /// @param ptr Pointer returned by a prior call to acquire().
+    /// @return true on success.
     bool commit(void* ptr) {
         std::lock_guard<std::mutex> lock(this->mtx_);
         auto* header =
@@ -180,6 +201,11 @@ public:
         return true;
     }
 
+    /// @brief One-phase write: copy data into the ring buffer
+    /// @param data Pointer to the data to copy.
+    /// @param size Number of bytes to copy.
+    /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
+    /// @return true if the data was written successfully.
     bool send(const void* data, size_t size, uint32_t timeout_ms) {
         void* dest = acquire(size, timeout_ms);
         if (dest == nullptr) {
@@ -189,6 +215,10 @@ public:
         return commit(dest);
     }
 
+    /// @brief Receive the next item; caller must call return_item() when done
+    /// @param[out] item_size Set to the size of the received item.
+    /// @param timeout_ms Milliseconds to wait if no item is available (UINT32_MAX = wait forever).
+    /// @return Pointer to item data, or nullptr on timeout.
     void* receive(size_t* item_size, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);
 
@@ -216,6 +246,8 @@ public:
         return result;
     }
 
+    /// @brief Return a previously received item to the ring buffer
+    /// @param ptr Pointer returned by a prior call to receive().
     void return_item(void* ptr) {
         std::lock_guard<std::mutex> lock(this->mtx_);
         auto* header =
