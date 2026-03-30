@@ -109,9 +109,15 @@ public:
     uint32_t get_track_duration_ms() const;
 
 private:
+    /// @brief Adds the metadata role to the supported roles list in the hello message.
+    /// @param msg The hello message being assembled.
     void contribute_hello(ClientHelloMessage& msg);
+    /// @brief Merges an incoming server metadata delta into the pending shadow state.
+    /// @param state The metadata delta received from the server.
     void handle_server_state(ServerMetadataStateObject state);
+    /// @brief Applies any pending metadata delta and notifies the listener.
     void drain_events();
+    /// @brief Resets the metadata state and clears any pending events.
     void cleanup();
 
     // Struct fields

@@ -179,10 +179,20 @@ public:
     }
 
 private:
+    /// @brief Adds the artwork role and configured channels to the hello message.
+    /// @param msg The hello message being assembled.
     void contribute_hello(ClientHelloMessage& msg);
+    /// @brief Decodes the timestamp and delivers an image chunk directly to the listener.
+    /// @param slot Artwork slot index this image belongs to.
+    /// @param data Pointer to the binary payload (8-byte big-endian timestamp followed by image
+    /// data).
+    /// @param len Length of the binary payload in bytes.
     void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
+    /// @brief Enqueues a stream-end event to be delivered on the main thread.
     void handle_stream_end();
+    /// @brief Sends null images to the listener for each configured slot to signal stream end.
     void drain_events();
+    /// @brief Resets pending events and enqueues a stream-end to clear all slots on next drain.
     void cleanup();
 
     // Struct fields

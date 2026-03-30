@@ -156,9 +156,16 @@ public:
     }
 
 private:
+    /// @brief Adds the controller role to the supported roles list in the hello message.
+    /// @param msg The hello message being assembled.
     void contribute_hello(ClientHelloMessage& msg);
+    /// @brief Stores an incoming server controller state update for delivery on the main thread.
+    /// Only the most recent update is retained; earlier pending updates are overwritten.
+    /// @param state The controller state received from the server.
     void handle_server_state(ServerStateControllerObject state);
+    /// @brief Delivers any pending controller state update to the listener.
     void drain_events();
+    /// @brief Resets the controller state and clears any pending events.
     void cleanup();
 
     // Struct fields

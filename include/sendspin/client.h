@@ -330,6 +330,9 @@ private:
 
     // --- Connection event handlers (called by ConnectionManager via friend access) ---
 
+    /// @brief Stores server information and publishes the initial client state after handshake.
+    /// @param conn The connection that completed the handshake.
+    /// @param server Server information received during the handshake.
     void on_handshake_complete_(SendspinConnection* conn, ServerInformationObject server);
 
     // Struct fields

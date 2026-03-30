@@ -166,17 +166,36 @@ private:
         STREAM_CLEAR,
     };
 
+    /// @brief Starts the drain thread if the ring buffer is ready.
+    /// @return True if the thread is running, false if the ring buffer is not initialized.
     bool start();
+    /// @brief Signals the drain thread to stop and waits for it to exit.
     void stop_();
+    /// @brief Adds the visualizer role and support config to the hello message.
+    /// @param msg The hello message being assembled.
     void contribute_hello(ClientHelloMessage& msg);
+    /// @brief Parses incoming visualizer binary frames and writes them to the ring buffer.
+    /// @param binary_type Protocol binary type tag identifying the frame format.
+    /// @param data Pointer to the raw frame data.
+    /// @param len Length of the frame data in bytes.
     void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len);
+    /// @brief Caches stream config, signals the drain thread to flush, and enqueues a start event.
+    /// @param stream Stream parameters received from the server.
     void handle_stream_start(const ServerVisualizerStreamObject& stream);
+    /// @brief Marks the stream inactive, flushes the ring buffer, and enqueues a stream-end event.
     void handle_stream_end();
+    /// @brief Marks the stream inactive, flushes the ring buffer, and enqueues a stream-clear
+    /// event.
     void handle_stream_clear();
+    /// @brief Delivers pending stream lifecycle events (start, end, clear) to the listener.
     void drain_events();
+    /// @brief Resets pending events, flushes the ring buffer, and enqueues a stream-end event.
     void cleanup();
+    /// @brief Drains all pending items from the ring buffer without delivering them.
     void flush_ring_buffer_();
 
+    /// @brief Entry point for the drain thread; reads ring buffer items and calls the listener.
+    /// @param self The VisualizerRole instance that owns this thread.
     static void drain_thread_func_(VisualizerRole* self);
 
     // Struct fields

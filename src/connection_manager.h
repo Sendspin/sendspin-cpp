@@ -98,17 +98,39 @@ public:
 
 private:
     // --- Connection setup ---
+    /// @brief Attaches message and lifecycle callbacks to a connection.
+    /// @param conn The connection to configure.
     void setup_connection_callbacks_(SendspinConnection* conn);
+    /// @brief Accepts an incoming server connection as current or pending for handoff.
+    /// @param conn The newly accepted server connection.
     void on_new_connection_(std::unique_ptr<SendspinServerConnection> conn);
 
     // --- Hello handshake ---
+    /// @brief Arms the hello retry state so loop() will send the hello after a 100ms initial delay.
+    /// @param conn The connection to send the hello to.
     void initiate_hello_(SendspinConnection* conn);
+    /// @brief Sends the hello message to a connection, returning true if no retry is needed.
+    /// @param remaining_attempts Number of send attempts remaining before giving up.
+    /// @param conn The connection to send the hello to.
+    /// @return True if done (sent or connection invalid), false if the send failed and should
+    /// retry.
     bool send_hello_message_(uint8_t remaining_attempts, SendspinConnection* conn);
 
     // --- Connection lifecycle ---
+    /// @brief Tears down a lost connection and promotes the pending connection if one exists.
+    /// @param conn The connection that was lost.
     void on_connection_lost_(SendspinConnection* conn);
+    /// @brief Decides whether to switch from the current connection to the new one.
+    /// @param current The existing active connection.
+    /// @param new_conn The newly connected candidate connection.
+    /// @return True if the new connection should become current, false to keep the existing one.
     bool should_switch_to_new_server_(SendspinConnection* current, SendspinConnection* new_conn);
+    /// @brief Completes a server handoff by promoting or discarding the pending connection.
+    /// @param switch_to_new True to promote the pending connection, false to discard it.
     void complete_handoff_(bool switch_to_new);
+    /// @brief Sends a goodbye, then defers destruction of the connection until loop() runs.
+    /// @param conn The connection to disconnect and release.
+    /// @param reason The goodbye reason to send before closing.
     void disconnect_and_release_(std::unique_ptr<SendspinConnection> conn,
                                  SendspinGoodbyeReason reason);
 

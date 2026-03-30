@@ -61,6 +61,8 @@ public:
     bool is_connected() const override;
 
 protected:
+    /// @brief Registers the IXWebSocket message callback to handle open, close, data, and error
+    /// events.
     void setup_callbacks_();
 
     // Pointer fields

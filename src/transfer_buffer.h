@@ -85,7 +85,10 @@ public:
 protected:
     TransferBuffer() = default;
 
+    /// @brief Allocates the backing buffer and resets tracking state.
+    /// @return True if allocation succeeded, false otherwise.
     bool allocate_buffer_(size_t buffer_size);
+    /// @brief Releases the backing buffer and resets all tracking state.
     void deallocate_buffer_();
 
     // Struct fields
