@@ -25,7 +25,15 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.connection";
 
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
 SendspinConnection::~SendspinConnection() = default;
+
+// ============================================================================
+// WebSocket payload buffer management
+// ============================================================================
 
 void SendspinConnection::deallocate_websocket_payload_() {
     this->websocket_payload_.reset();
@@ -35,6 +43,10 @@ void SendspinConnection::deallocate_websocket_payload_() {
 void SendspinConnection::reset_websocket_payload_() {
     this->websocket_write_offset_ = 0;
 }
+
+// ============================================================================
+// Time filter
+// ============================================================================
 
 void SendspinConnection::init_time_filter() {
     this->time_filter_ = std::make_unique<SendspinTimeFilter>(
@@ -51,6 +63,10 @@ TimeTransmittedReplacement SendspinConnection::peek_time_replacement() const {
     this->time_replacement_queue_.peek(replacement);
     return replacement;
 }
+
+// ============================================================================
+// Message sending
+// ============================================================================
 
 bool SendspinConnection::send_time_message(SendCompleteCallback cb) {
     int64_t now = platform_time_us();

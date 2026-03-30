@@ -148,7 +148,9 @@ public:
     /// @brief Returns the current log level (host builds only, INFO on ESP-IDF).
     static LogLevel get_log_level();
 
-    // --- Lifecycle ---
+    // ========================================
+    // Lifecycle
+    // ========================================
 
     /// @brief Starts the WebSocket server and initializes the sync task (if audio is configured).
     /// @param priority FreeRTOS task priority for the WS server and sync task.
@@ -166,7 +168,9 @@ public:
     /// @brief Processes events, drives time sync, checks network. Call from main loop.
     void loop();
 
-    // --- Role registration (call before start_server) ---
+    // ========================================
+    // Role registration (call before start_server)
+    // ========================================
 
     /// @brief Adds the player role. Returns a reference for setting callbacks.
     PlayerRole& add_player(PlayerRole::Config config);
@@ -183,7 +187,9 @@ public:
     /// @brief Adds the visualizer role. Returns a reference for setting callbacks.
     VisualizerRole& add_visualizer(VisualizerRole::Config config);
 
-    // --- Role access (nullptr if not added) ---
+    // ========================================
+    // Role access (nullptr if not added)
+    // ========================================
 
     /// @brief Returns the artwork role, or nullptr if not added.
     /// @return Pointer to the artwork role, or nullptr.
@@ -236,7 +242,9 @@ public:
         return this->visualizer_.get();
     }
 
-    // --- Queries ---
+    // ========================================
+    // Queries
+    // ========================================
 
     /// @brief Returns true if there is an active connection with completed handshake.
     bool is_connected() const;
@@ -262,12 +270,16 @@ public:
         return this->group_state_.group_name.value_or("");
     }
 
-    // --- State updates ---
+    // ========================================
+    // State updates
+    // ========================================
 
     /// @brief Updates the client state (synchronized, error, external_source) and publishes.
     void update_state(SendspinClientState state);
 
-    // --- Listener and provider setters ---
+    // ========================================
+    // Listener and provider setters
+    // ========================================
 
     /// @brief Sets the listener for client events. The listener must outlive this client.
     void set_listener(SendspinClientListener* listener) {
@@ -285,7 +297,9 @@ public:
         this->persistence_provider_ = provider;
     }
 
-    // --- Role services (called by roles via SendspinClient pointer) ---
+    // ========================================
+    // Role services (called by roles via SendspinClient pointer)
+    // ========================================
 
     /// @brief Publishes the current client state to the active connection.
     void publish_state();
@@ -306,7 +320,9 @@ private:
     /// @brief Builds the formatted client hello message from config.
     std::string build_hello_message_();
 
-    // --- Message processing ---
+    // ========================================
+    // Message processing
+    // ========================================
 
     /// @brief Processes a JSON message from a connection.
     bool process_json_message_(SendspinConnection* conn, const std::string& message,
@@ -315,12 +331,16 @@ private:
     /// @brief Processes a binary message from a connection.
     void process_binary_message_(uint8_t* payload, size_t len);
 
-    // --- State publishing ---
+    // ========================================
+    // State publishing
+    // ========================================
 
     /// @brief Publishes the current client state to the specified connection.
     void publish_client_state_(SendspinConnection* conn);
 
-    // --- Persistence ---
+    // ========================================
+    // Persistence
+    // ========================================
 
     /// @brief Loads the last played server hash from persistence.
     void load_last_played_server_();
@@ -328,7 +348,9 @@ private:
     /// @brief Persists the server ID as the last played server (hashed).
     void persist_last_played_server_(const std::string& server_id);
 
-    // --- Connection event handlers (called by ConnectionManager via friend access) ---
+    // ========================================
+    // Connection event handlers (called by ConnectionManager via friend access)
+    // ========================================
 
     /// @brief Stores server information and publishes the initial client state after handshake.
     /// @param conn The connection that completed the handshake.

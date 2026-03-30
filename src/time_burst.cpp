@@ -23,6 +23,10 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.time_burst";
 
+// ============================================================================
+// Public API
+// ============================================================================
+
 TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
     // Consume burst completion flag set by on_time_response() (called between loop() invocations)
     bool burst_completed_by_response = this->pending_burst_completed_;
@@ -112,6 +116,10 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, int64_t offse
 
     return false;
 }
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
 
 void SendspinTimeBurst::reset() {
     this->burst_index_ = BURST_SIZE;  // "complete" state — next loop will wait for interval

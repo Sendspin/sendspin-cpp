@@ -219,7 +219,9 @@ public:
         this->listener_ = listener;
     }
 
-    // --- Audio ---
+    // ========================================
+    // Audio
+    // ========================================
 
     /// @brief Called by the audio output when it has played audio frames. Thread-safe.
     void notify_audio_played(uint32_t frames, int64_t timestamp);
@@ -228,7 +230,9 @@ public:
     bool write_audio_chunk(const uint8_t* data, size_t size, int64_t timestamp, ChunkType type,
                            uint32_t timeout_ms);
 
-    // --- State updates ---
+    // ========================================
+    // State updates
+    // ========================================
 
     /// @brief Updates the volume and publishes client state to the server.
     void update_volume(uint8_t volume);
@@ -242,7 +246,9 @@ public:
     /// @brief Enables or disables the static delay adjustment command.
     void set_static_delay_adjustable(bool adjustable);
 
-    // --- Queries ---
+    // ========================================
+    // Queries
+    // ========================================
 
     /// @brief Returns the audio buffer capacity from config.
     /// @return Audio ring buffer capacity in bytes.
@@ -281,7 +287,9 @@ public:
     }
 
 private:
-    // --- Deferred event types ---
+    // ========================================
+    // Deferred event types
+    // ========================================
 
     /// @brief Deferred stream lifecycle callback types queued from the network thread
     enum class StreamCallbackType : uint8_t {
@@ -290,7 +298,9 @@ private:
         STREAM_CLEAR,  // Stream cleared immediately
     };
 
-    // --- Private integration methods ---
+    // ========================================
+    // Private integration methods
+    // ========================================
 
     bool start(bool psram_stack);
     void contribute_hello(ClientHelloMessage& msg);
@@ -303,7 +313,9 @@ private:
     void drain_events();
     void cleanup();
 
-    // --- Helpers ---
+    // ========================================
+    // Helpers
+    // ========================================
 
     bool send_audio_chunk_(const uint8_t* data, size_t data_size, int64_t timestamp,
                            ChunkType chunk_type, uint32_t timeout_ms);

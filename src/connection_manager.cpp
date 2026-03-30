@@ -26,7 +26,9 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.conn_mgr";
 
-// --- Constructor / Destructor ---
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
 
 ConnectionManager::ConnectionManager(SendspinClient* client) : client_(client) {}
 
@@ -36,7 +38,9 @@ ConnectionManager::~ConnectionManager() {
     this->dying_connection_.reset();
 }
 
-// --- Public API ---
+// ============================================================================
+// Public API
+// ============================================================================
 
 void ConnectionManager::connect_to(const std::string& url) {
     SS_LOGI(TAG, "Initiating client connection to: %s", url.c_str());
@@ -69,7 +73,9 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
     }
 }
 
-// --- Server lifecycle ---
+// ============================================================================
+// Server lifecycle
+// ============================================================================
 
 void ConnectionManager::init_server(SendspinClient* client, bool psram_stack, unsigned priority) {
     this->client_ = client;
@@ -210,7 +216,9 @@ void ConnectionManager::loop() {
     }
 }
 
-// --- Connection queries ---
+// ============================================================================
+// Connection queries
+// ============================================================================
 
 SendspinConnection* ConnectionManager::current() const {
     return this->current_connection_.get();
@@ -225,21 +233,27 @@ bool ConnectionManager::is_connected() const {
            this->current_connection_->is_handshake_complete();
 }
 
-// --- Event queuing ---
+// ============================================================================
+// Event queuing
+// ============================================================================
 
 void ConnectionManager::enqueue_hello(ServerHelloEvent event) {
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->pending_hello_events_.push_back(std::move(event));
 }
 
-// --- Handoff support ---
+// ============================================================================
+// Handoff support
+// ============================================================================
 
 void ConnectionManager::set_last_played_server_hash(uint32_t hash) {
     this->last_played_server_hash_ = hash;
     this->has_last_played_server_ = true;
 }
 
-// --- Connection setup ---
+// ============================================================================
+// Connection setup
+// ============================================================================
 
 void ConnectionManager::setup_connection_callbacks_(SendspinConnection* conn) {
     conn->on_connected = [this](SendspinConnection* c) { this->initiate_hello_(c); };
@@ -280,7 +294,9 @@ void ConnectionManager::on_new_connection_(std::unique_ptr<SendspinServerConnect
     }
 }
 
-// --- Hello handshake ---
+// ============================================================================
+// Hello handshake
+// ============================================================================
 
 void ConnectionManager::initiate_hello_(SendspinConnection* conn) {
     // Set up retry state: 100ms initial delay, 3 attempts
@@ -328,7 +344,9 @@ bool ConnectionManager::send_hello_message_(uint8_t remaining_attempts, Sendspin
     return false;
 }
 
-// --- Connection lifecycle ---
+// ============================================================================
+// Connection lifecycle
+// ============================================================================
 
 void ConnectionManager::on_connection_lost_(SendspinConnection* conn) {
     if (conn == nullptr) {
@@ -425,7 +443,9 @@ void ConnectionManager::disconnect_and_release_(std::unique_ptr<SendspinConnecti
     });
 }
 
-// --- Helpers ---
+// ============================================================================
+// Helpers
+// ============================================================================
 
 uint32_t ConnectionManager::fnv1_hash(const char* str) {
     uint32_t hash = 2166136261UL;

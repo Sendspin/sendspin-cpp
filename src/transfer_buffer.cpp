@@ -20,6 +20,10 @@
 
 namespace sendspin {
 
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
 TransferBuffer::~TransferBuffer() = default;
 
 std::unique_ptr<TransferBuffer> TransferBuffer::create(size_t buffer_size) {
@@ -31,6 +35,10 @@ std::unique_ptr<TransferBuffer> TransferBuffer::create(size_t buffer_size) {
 
     return buffer;
 }
+
+// ============================================================================
+// Public API
+// ============================================================================
 
 size_t TransferBuffer::free() const {
     if (this->buffer_.size() == 0) {
@@ -86,6 +94,10 @@ bool TransferBuffer::reallocate(size_t new_buffer_size) {
     this->data_start_ = this->buffer_.data();
     return true;
 }
+
+// ============================================================================
+// Private helpers
+// ============================================================================
 
 bool TransferBuffer::allocate_buffer_(size_t buffer_size) {
     if (!this->buffer_.allocate(buffer_size)) {

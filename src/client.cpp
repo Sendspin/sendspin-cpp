@@ -37,7 +37,9 @@ struct SendspinClient::EventState {
     ShadowSlot<GroupUpdateObject> shadow_group;
 };
 
-// --- Constructor / Destructor ---
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
 
 SendspinClient::SendspinClient(SendspinClientConfig config)
     : config_(std::move(config)),
@@ -62,7 +64,9 @@ LogLevel SendspinClient::get_log_level() {
     return static_cast<LogLevel>(platform_get_log_level());
 }
 
-// --- Role services ---
+// ============================================================================
+// Role services
+// ============================================================================
 
 void SendspinClient::publish_state() {
     this->publish_client_state_(this->connection_manager_->current());
@@ -90,7 +94,9 @@ void SendspinClient::release_high_performance() {
     }
 }
 
-// --- Connection event handlers ---
+// ============================================================================
+// Connection event handlers
+// ============================================================================
 
 void SendspinClient::on_handshake_complete_(SendspinConnection* conn,
                                             ServerInformationObject server) {
@@ -98,7 +104,9 @@ void SendspinClient::on_handshake_complete_(SendspinConnection* conn,
     this->publish_client_state_(conn);
 }
 
-// --- Role registration ---
+// ============================================================================
+// Role registration
+// ============================================================================
 
 PlayerRole& SendspinClient::add_player(PlayerRole::Config config) {
     if (this->started_) {
@@ -142,7 +150,9 @@ VisualizerRole& SendspinClient::add_visualizer(VisualizerRole::Config config) {
     return *this->visualizer_;
 }
 
-// --- Lifecycle ---
+// ============================================================================
+// Lifecycle
+// ============================================================================
 
 bool SendspinClient::start_server(unsigned priority) {
     this->started_ = true;
@@ -264,14 +274,18 @@ void SendspinClient::loop() {
     }
 }
 
-// --- State updates ---
+// ============================================================================
+// State updates
+// ============================================================================
 
 void SendspinClient::update_state(SendspinClientState state) {
     this->state_ = state;
     this->publish_client_state_(this->connection_manager_->current());
 }
 
-// --- Queries ---
+// ============================================================================
+// Queries
+// ============================================================================
 
 bool SendspinClient::is_connected() const {
     return this->connection_manager_->is_connected();
@@ -291,7 +305,9 @@ SendspinConnection* SendspinClient::get_current_connection() const {
     return this->connection_manager_->current();
 }
 
-// --- Hello message construction ---
+// ============================================================================
+// Hello message construction
+// ============================================================================
 
 std::string SendspinClient::build_hello_message_() {
     ClientHelloMessage msg;
@@ -326,7 +342,9 @@ std::string SendspinClient::build_hello_message_() {
     return format_client_hello_message(&msg);
 }
 
-// --- Connection state cleanup ---
+// ============================================================================
+// Connection state cleanup
+// ============================================================================
 
 void SendspinClient::cleanup_connection_state_() {
     SS_LOGV(TAG, "Cleaning up connection state");
@@ -358,7 +376,9 @@ void SendspinClient::cleanup_connection_state_() {
     }
 }
 
-// --- Message processing ---
+// ============================================================================
+// Message processing
+// ============================================================================
 
 void SendspinClient::process_binary_message_(uint8_t* payload, size_t len) {
     if (len < 2) {
@@ -573,7 +593,9 @@ bool SendspinClient::process_json_message_(SendspinConnection* conn, const std::
     return true;
 }
 
-// --- State publishing ---
+// ============================================================================
+// State publishing
+// ============================================================================
 
 void SendspinClient::publish_client_state_(SendspinConnection* conn) {
     if (conn == nullptr || !conn->is_connected() || !conn->is_handshake_complete()) {
@@ -591,7 +613,9 @@ void SendspinClient::publish_client_state_(SendspinConnection* conn) {
     conn->send_text_message(state_message, nullptr);
 }
 
-// --- Persistence ---
+// ============================================================================
+// Persistence
+// ============================================================================
 
 void SendspinClient::load_last_played_server_() {
     if (!this->persistence_provider_) {

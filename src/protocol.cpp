@@ -21,6 +21,10 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.protocol";
 
+// ============================================================================
+// Message type determination
+// ============================================================================
+
 SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     if (!root["type"].is<const char*>()) {
         return SendspinServerToClientMessageType::UNKNOWN;
@@ -47,6 +51,10 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
 
     return SendspinServerToClientMessageType::UNKNOWN;
 }
+
+// ============================================================================
+// Message processing
+// ============================================================================
 
 bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg) {
     if (!root["payload"]["server_id"].is<JsonVariant>() ||
@@ -157,6 +165,10 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
     return true;
 }
 
+// ============================================================================
+// State delta application
+// ============================================================================
+
 void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObject& updates) {
     if (current == nullptr) {
         return;
@@ -177,6 +189,10 @@ void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObje
         current->group_name = updates.group_name;
     }
 }
+
+// ============================================================================
+// Static helpers
+// ============================================================================
 
 static bool process_player_stream_object(const JsonObject player_object,
                                          ServerPlayerStreamObject* player_obj,
@@ -632,6 +648,10 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
 
     return true;
 }
+
+// ============================================================================
+// Message formatting
+// ============================================================================
 
 std::string format_client_hello_message(const ClientHelloMessage* msg) {
     JsonDocument doc = make_json_document();

@@ -54,7 +54,9 @@ public:
     explicit ConnectionManager(SendspinClient* client);
     ~ConnectionManager();
 
-    // --- Public API ---
+    // ========================================
+    // Public API
+    // ========================================
 
     /// @brief Initiates a client connection to a Sendspin server.
     void connect_to(const std::string& url);
@@ -62,7 +64,9 @@ public:
     /// @brief Disconnects from the current server.
     void disconnect(SendspinGoodbyeReason reason);
 
-    // --- Server lifecycle ---
+    // ========================================
+    // Server lifecycle
+    // ========================================
 
     /// @brief Creates the WebSocket server and configures callbacks. Call once from start_server().
     /// @param client Client pointer passed through to ws_server (required by ws_server API).
@@ -72,7 +76,9 @@ public:
     /// events, retries hello, calls loop() on active connections.
     void loop();
 
-    // --- Connection queries ---
+    // ========================================
+    // Connection queries
+    // ========================================
 
     /// @brief Returns the current active connection, or nullptr.
     SendspinConnection* current() const;
@@ -83,12 +89,16 @@ public:
     /// @brief Returns true if there is an active connection with completed handshake.
     bool is_connected() const;
 
-    // --- Event queuing (thread-safe) ---
+    // ========================================
+    // Event queuing (thread-safe)
+    // ========================================
 
     /// @brief Enqueues a server hello event for deferred processing in loop().
     void enqueue_hello(ServerHelloEvent event);
 
-    // --- Handoff support ---
+    // ========================================
+    // Handoff support
+    // ========================================
 
     /// @brief Sets the last-played server hash for handoff preference decisions.
     void set_last_played_server_hash(uint32_t hash);
@@ -97,7 +107,9 @@ public:
     static uint32_t fnv1_hash(const char* str);
 
 private:
-    // --- Connection setup ---
+    // ========================================
+    // Connection setup
+    // ========================================
     /// @brief Attaches message and lifecycle callbacks to a connection.
     /// @param conn The connection to configure.
     void setup_connection_callbacks_(SendspinConnection* conn);
@@ -105,7 +117,9 @@ private:
     /// @param conn The newly accepted server connection.
     void on_new_connection_(std::unique_ptr<SendspinServerConnection> conn);
 
-    // --- Hello handshake ---
+    // ========================================
+    // Hello handshake
+    // ========================================
     /// @brief Arms the hello retry state so loop() will send the hello after a 100ms initial delay.
     /// @param conn The connection to send the hello to.
     void initiate_hello_(SendspinConnection* conn);
@@ -116,7 +130,9 @@ private:
     /// retry.
     bool send_hello_message_(uint8_t remaining_attempts, SendspinConnection* conn);
 
-    // --- Connection lifecycle ---
+    // ========================================
+    // Connection lifecycle
+    // ========================================
     /// @brief Tears down a lost connection and promotes the pending connection if one exists.
     /// @param conn The connection that was lost.
     void on_connection_lost_(SendspinConnection* conn);

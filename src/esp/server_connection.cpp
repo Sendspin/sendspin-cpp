@@ -25,10 +25,11 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.server_connection";
 
-/*
- * Structure holding connection context
- * and payload data for async send operations.
- */
+// ============================================================================
+// Static helpers
+// ============================================================================
+
+// Structure holding connection context and payload data for async send operations.
 struct AsyncRespArg {
     void* context;
     uint8_t* payload;

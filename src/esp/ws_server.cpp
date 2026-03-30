@@ -21,27 +21,29 @@
 
 namespace sendspin {
 
-/*
- * SendspinWsServer manages the HTTP server (httpd) that accepts incoming WebSocket connections.
- *
- * Key Design Points:
- * - The server listener ACCEPTS connections but doesn't OWN them long-term
- * - When a client connects, it creates a SendspinServerConnection and hands it to the
- * SendspinClient
- * - The SendspinClient decides whether to keep or reject the connection (for handoff logic)
- * - Supports max_connections=2 by default to enable handoff protocol:
- *   - One active connection is managed by the client
- *   - A second connection can be accepted temporarily during handoff
- *   - The client completes the handshake and decides which to keep
- *
- * Lifecycle:
- * 1. SendspinClient calls start() with callbacks and configuration
- * 2. Server listens on port 8928 at /sendspin
- * 3. open_callback() creates SendspinServerConnection instances
- * 4. SendspinClient receives connection via new_connection_callback
- * 5. SendspinClient manages connection ownership and handoff logic
- * 6. close_callback() handles socket cleanup
- */
+// ============================================================================
+// SendspinWsServer
+// ============================================================================
+//
+// Manages the HTTP server (httpd) that accepts incoming WebSocket connections.
+//
+// Key Design Points:
+// - The server listener ACCEPTS connections but doesn't OWN them long-term
+// - When a client connects, it creates a SendspinServerConnection and hands it to the
+//   SendspinClient
+// - The SendspinClient decides whether to keep or reject the connection (for handoff logic)
+// - Supports max_connections=2 by default to enable handoff protocol:
+//   - One active connection is managed by the client
+//   - A second connection can be accepted temporarily during handoff
+//   - The client completes the handshake and decides which to keep
+//
+// Lifecycle:
+// 1. SendspinClient calls start() with callbacks and configuration
+// 2. Server listens on port 8928 at /sendspin
+// 3. open_callback() creates SendspinServerConnection instances
+// 4. SendspinClient receives connection via new_connection_callback
+// 5. SendspinClient manages connection ownership and handoff logic
+// 6. close_callback() handles socket cleanup
 
 static const char* const TAG = "sendspin.ws_server";
 

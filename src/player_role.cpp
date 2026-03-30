@@ -38,7 +38,9 @@ static int64_t be64_to_host(const uint8_t* bytes) {
 
 namespace sendspin {
 
-// --- Helpers ---
+// ============================================================================
+// Helpers
+// ============================================================================
 
 /// @brief Decodes a base64-encoded string into a byte vector.
 static std::vector<uint8_t> base64_decode(const std::string& input) {
@@ -58,7 +60,9 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
     return output;
 }
 
-// --- Event state (PIMPL) ---
+// ============================================================================
+// Event state (PIMPL)
+// ============================================================================
 
 /// @brief PIMPL event state: queues and shadow slots used to pass data from background threads
 /// (network thread and sync task thread) to the main loop thread for the player role
@@ -69,7 +73,9 @@ struct PlayerRole::EventState {
     ShadowSlot<ServerCommandMessage> shadow_command;
 };
 
-// --- Constructor / Destructor ---
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
 
 PlayerRole::PlayerRole(Config config, SendspinClient* client,
                        SendspinPersistenceProvider* persistence)
@@ -89,7 +95,9 @@ PlayerRole::~PlayerRole() {
     this->sync_task_.reset();
 }
 
-// --- Public API ---
+// ============================================================================
+// Public API
+// ============================================================================
 
 void PlayerRole::notify_audio_played(uint32_t frames, int64_t timestamp) {
     if (this->sync_task_ && this->sync_task_->is_running()) {
@@ -126,7 +134,9 @@ void PlayerRole::set_static_delay_adjustable(bool adjustable) {
     this->client_->publish_state();
 }
 
-// --- Private integration methods ---
+// ============================================================================
+// Private integration methods
+// ============================================================================
 
 bool PlayerRole::start(bool psram_stack) {
     this->load_static_delay_();
@@ -418,7 +428,9 @@ void PlayerRole::cleanup() {
     }
 }
 
-// --- Helpers ---
+// ============================================================================
+// Helpers
+// ============================================================================
 
 bool PlayerRole::send_audio_chunk_(const uint8_t* data, size_t data_size, int64_t timestamp,
                                    ChunkType chunk_type, uint32_t timeout_ms) {

@@ -29,6 +29,10 @@ namespace sendspin {
 
 #define SENDSPIN_SYNC_TASK_DEBUG
 
+// ============================================================================
+// Static helpers
+// ============================================================================
+
 static const int64_t HARD_SYNC_THRESHOLD_US = 5000;
 static const int64_t HARD_SYNC_SETTLE_THRESHOLD_US =
     500;  // Tighter threshold used while settling after a hard sync
@@ -40,6 +44,10 @@ static const size_t SYNC_TASK_STACK_SIZE = 6192;  // Opus uses more stack than F
 static const int SYNC_TASK_PRIORITY = 2;
 
 static const char* const TAG = "sendspin_sync_task";
+
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
 
 SyncTask::~SyncTask() {
     this->stop_();
@@ -98,6 +106,10 @@ bool SyncTask::start(bool task_stack_in_psram) {
     return true;
 }
 
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
 void SyncTask::stop_() {
     if (!this->sync_thread_.joinable()) {
         return;
@@ -106,6 +118,10 @@ void SyncTask::stop_() {
     this->event_flags_.set(EventGroupBits::COMMAND_STOP);
     this->sync_thread_.join();
 }
+
+// ============================================================================
+// Public API
+// ============================================================================
 
 bool SyncTask::is_running() const {
     return this->event_flags_.get() & EventGroupBits::TASK_RUNNING;
@@ -138,6 +154,10 @@ void SyncTask::notify_audio_played(uint32_t frames, int64_t timestamp) {
         SS_LOGE(TAG, "Playback info queue was full");
     }
 }
+
+// ============================================================================
+// Private sync helpers
+// ============================================================================
 
 void SyncTask::sync_track_sent_audio_(SyncContext& sync_context, size_t bytes_sent) {
     uint32_t frames_sent = sync_context.current_stream_info.bytes_to_frames(bytes_sent);
@@ -599,6 +619,10 @@ SyncTaskState SyncTask::sync_handle_transfer_audio_(SyncContext& sync_context) {
     }
     return SyncTaskState::LOAD_CHUNK;
 }
+
+// ============================================================================
+// Sync task thread
+// ============================================================================
 
 void SyncTask::sync_task(void* params) {
     SyncTask* this_task = static_cast<SyncTask*>(params);

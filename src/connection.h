@@ -101,7 +101,9 @@ public:
     /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_goodbye_reason(SendspinGoodbyeReason reason, SendCompleteCallback on_complete);
 
+    // ========================================
     // Server information accessors (populated after server/hello message is received)
+    // ========================================
 
     /// @brief Gets the server ID from the server/hello message.
     /// @return The server ID string (empty until hello is received).
@@ -115,7 +117,9 @@ public:
         return this->connection_reason_;
     }
 
+    // ========================================
     // Callbacks set by the hub to receive notifications
+    // ========================================
 
     /// @brief Callback invoked when a JSON message is received.
     /// @param conn Pointer to this connection.
@@ -173,7 +177,9 @@ public:
     /// @brief Initializes the time filter with Kalman parameters.
     void init_time_filter();
 
+    // ========================================
     // Configuration setters (called by hub after receiving server/hello message)
+    // ========================================
 
     /// @brief Sets the server ID (from server/hello message).
     /// @param server_id The server ID string.
@@ -210,7 +216,9 @@ public:
         this->server_hello_received_ = received;
     }
 
+    // ========================================
     // Time message state accessors
+    // ========================================
 
     /// @brief Checks if a time message is pending (waiting for response).
     bool is_pending_time_message() const {
