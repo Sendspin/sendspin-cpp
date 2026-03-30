@@ -369,7 +369,7 @@ void SendspinClient::process_binary_message_(uint8_t* payload, size_t len) {
     uint8_t role = get_binary_role(binary_type);
     uint8_t slot = get_binary_slot(binary_type);
 
-    // Strip the type byte — each role parses its own binary format from here
+    // Strip the type byte; each role parses its own binary format from here
     const uint8_t* data = payload + 1;
     size_t data_len = len - 1;
 

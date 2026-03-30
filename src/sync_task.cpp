@@ -643,7 +643,7 @@ void SyncTask::sync_task(void* params) {
 
         if (!got_header) {
             // Woke due to STREAM_END or STREAM_CLEAR during idle.
-            // Only drain audio on STREAM_CLEAR — codec headers are preserved.
+            // Only drain audio on STREAM_CLEAR; codec headers are preserved.
             if (this_task->event_flags_.get() & COMMAND_STREAM_CLEAR) {
                 this_task->sync_drain_ring_buffer_(sync_context);
                 // If the drain found a codec header, treat it as if we got one

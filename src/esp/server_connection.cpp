@@ -47,8 +47,7 @@ SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int so
 }
 
 void SendspinServerConnection::start() {
-    // Initialize any per-connection state
-    // Time filter is initialized by the hub when it sets up the connection
+    // Time filter is initialized by the hub when it sets up the connection.
 }
 
 void SendspinServerConnection::loop() {

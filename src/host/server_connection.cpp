@@ -25,7 +25,7 @@ SendspinServerConnection::SendspinServerConnection(std::shared_ptr<ix::WebSocket
 }
 
 void SendspinServerConnection::start() {
-    // Connection is already established by the server — no action needed.
+    // Connection is already established by the server; no action needed.
     // The on_connected callback is invoked from the ws_server message handler
     // when the WebSocket Open message arrives.
 }
