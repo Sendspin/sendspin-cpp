@@ -7,6 +7,7 @@ Checks: >
   -bugprone-easily-swappable-parameters,
   -bugprone-narrowing-conversions,
   clang-analyzer-*,
+  -clang-analyzer-cplusplus.NewDeleteLeaks,
   cppcoreguidelines-init-variables,
   cppcoreguidelines-prefer-member-initializer,
   cppcoreguidelines-pro-type-member-init,
@@ -54,7 +55,7 @@ Checks: >
 
 WarningsAsErrors: '*'
 
-HeaderFilterRegex: '(include/sendspin|src)/.*\.h$'
+HeaderFilterRegex: 'sendspin-cpp/(include|src)/.*\.h$'
 
 CheckOptions:
   # Naming conventions matching existing code style

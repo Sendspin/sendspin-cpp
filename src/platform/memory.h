@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file memory.h
+/// @brief Platform-abstracted memory allocation preferring SPIRAM on ESP, plus RAII buffer and
+/// ArduinoJson allocator helpers
+
 #pragma once
 
 #include <ArduinoJson.h>
@@ -25,19 +29,25 @@
 
 namespace sendspin {
 
-/// Allocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM.
+/// @brief Allocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM
+/// @param size Number of bytes to allocate.
+/// @return Pointer to the allocated memory, or nullptr on failure.
 inline void* platform_malloc(size_t size) {
     return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
                                    MALLOC_CAP_INTERNAL);
 }
 
-/// Reallocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM.
+/// @brief Reallocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM
+/// @param ptr Pointer to the block to reallocate, or nullptr to allocate a new block.
+/// @param size New size in bytes.
+/// @return Pointer to the reallocated memory, or nullptr on failure.
 inline void* platform_realloc(void* ptr, size_t size) {
     return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
                                     MALLOC_CAP_INTERNAL);
 }
 
-/// Frees memory allocated by platform_malloc or platform_realloc.
+/// @brief Frees memory allocated by platform_malloc or platform_realloc
+/// @param ptr Pointer to the block to free, or nullptr.
 inline void platform_free(void* ptr) {
     heap_caps_free(ptr);
 }
@@ -48,14 +58,23 @@ inline void platform_free(void* ptr) {
 
 namespace sendspin {
 
+/// @brief Allocates a block of memory
+/// @param size Number of bytes to allocate.
+/// @return Pointer to the allocated memory, or nullptr on failure.
 inline void* platform_malloc(size_t size) {
     return malloc(size);
 }
 
+/// @brief Reallocates a previously allocated block of memory
+/// @param ptr Pointer to the block to reallocate, or nullptr to allocate a new block.
+/// @param size New size in bytes.
+/// @return Pointer to the reallocated memory, or nullptr on failure.
 inline void* platform_realloc(void* ptr, size_t size) {
     return realloc(ptr, size);
 }
 
+/// @brief Frees memory allocated by platform_malloc or platform_realloc
+/// @param ptr Pointer to the block to free, or nullptr.
 inline void platform_free(void* ptr) {
     free(ptr);
 }
@@ -66,10 +85,28 @@ inline void platform_free(void* ptr) {
 
 namespace sendspin {
 
-/// @brief RAII wrapper for platform-allocated memory buffers.
-///
-/// Owns a block of memory obtained via platform_malloc. Automatically frees on destruction.
-/// Supports reallocation and move semantics. Not copyable.
+/**
+ * @brief RAII wrapper for platform-allocated memory buffers
+ *
+ * Owns a block of memory obtained via platform_malloc. Automatically frees on destruction.
+ * Supports reallocation and move semantics. Not copyable.
+ *
+ * Usage:
+ * 1. Default-construct a PlatformBuffer, then call allocate() with the desired size
+ * 2. Access the raw memory with data() or via the typed as<T>() accessor
+ * 3. Optionally grow the buffer in-place with realloc()
+ * 4. Memory is freed automatically on destruction, or explicitly via reset()
+ *
+ * @code
+ * PlatformBuffer buf;
+ * buf.allocate(1024);
+ *
+ * auto* header = buf.as<MyHeader>();
+ * header->magic = 0xDEAD;
+ *
+ * buf.realloc(2048);
+ * @endcode
+ */
 class PlatformBuffer {
 public:
     PlatformBuffer() = default;
@@ -102,7 +139,7 @@ public:
     PlatformBuffer(const PlatformBuffer&) = delete;
     PlatformBuffer& operator=(const PlatformBuffer&) = delete;
 
-    /// @brief Allocates a new buffer. Any previously held memory is freed.
+    /// @brief Allocates a new buffer. Any previously held memory is freed
     /// @return true if allocation succeeded.
     bool allocate(size_t size) {
         if (this->ptr_ != nullptr) {
@@ -113,7 +150,7 @@ public:
         return this->ptr_ != nullptr;
     }
 
-    /// @brief Reallocates the buffer to a new size, preserving existing data.
+    /// @brief Reallocates the buffer to a new size, preserving existing data
     /// On failure, the original buffer remains valid.
     /// @return true if reallocation succeeded.
     bool realloc(size_t new_size) {
@@ -126,7 +163,7 @@ public:
         return true;
     }
 
-    /// @brief Frees the held memory.
+    /// @brief Frees the held memory
     void reset() {
         if (this->ptr_ != nullptr) {
             platform_free(this->ptr_);
@@ -135,56 +172,86 @@ public:
         }
     }
 
+    /// @brief Returns a pointer to the allocated buffer
+    /// @return Pointer to the buffer, or nullptr if not allocated.
     uint8_t* data() {
         return this->ptr_;
     }
+    /// @brief Returns a const pointer to the allocated buffer
+    /// @return Const pointer to the buffer, or nullptr if not allocated.
     const uint8_t* data() const {
         return this->ptr_;
     }
+    /// @brief Returns the current allocation size in bytes
+    /// @return Size of the allocated buffer in bytes.
     size_t size() const {
         return this->size_;
     }
+    /// @brief Returns true if the buffer holds an allocation
+    /// @return true if memory is currently allocated.
     explicit operator bool() const {
         return this->ptr_ != nullptr;
     }
 
-    /// @brief Returns a typed pointer into the buffer at a byte offset.
+    /// @brief Returns a typed pointer into the buffer at a byte offset
+    /// @param byte_offset Byte offset from the start of the buffer.
+    /// @return Typed pointer to the buffer at the given offset.
     template <typename T>
     T* as(size_t byte_offset = 0) {
         return reinterpret_cast<T*>(this->ptr_ + byte_offset);
     }
 
+    /// @brief Returns a const typed pointer into the buffer at a byte offset
+    /// @param byte_offset Byte offset from the start of the buffer.
+    /// @return Const typed pointer to the buffer at the given offset.
     template <typename T>
     const T* as(size_t byte_offset = 0) const {
         return reinterpret_cast<const T*>(this->ptr_ + byte_offset);
     }
 
 private:
+    // Pointer fields
     uint8_t* ptr_{nullptr};
+
+    // size_t fields
     size_t size_{0};
 };
 
-/// ArduinoJson allocator that routes through platform_malloc/platform_realloc/platform_free,
-/// so JSON processing uses PSRAM on ESP32.
+/// @brief ArduinoJson allocator that routes through platform_malloc/platform_realloc/platform_free
+/// so JSON processing uses PSRAM on ESP32
 class PsramJsonAllocator : public ArduinoJson::Allocator {
 public:
+    /// @brief Allocates a block of memory via platform_malloc
+    /// @param size Number of bytes to allocate.
+    /// @return Pointer to the allocated memory, or nullptr on failure.
     void* allocate(size_t size) override {
         return platform_malloc(size);
     }
+
+    /// @brief Frees a block of memory via platform_free
+    /// @param ptr Pointer to the block to free.
     void deallocate(void* ptr) override {
         platform_free(ptr);
     }
+
+    /// @brief Reallocates a block of memory via platform_realloc
+    /// @param ptr Pointer to the block to reallocate.
+    /// @param new_size New size in bytes.
+    /// @return Pointer to the reallocated memory, or nullptr on failure.
     void* reallocate(void* ptr, size_t new_size) override {
         return platform_realloc(ptr, new_size);
     }
 
+    /// @brief Returns the singleton allocator instance
+    /// @return Pointer to the shared PsramJsonAllocator instance.
     static PsramJsonAllocator* instance() {
         static PsramJsonAllocator instance;
         return &instance;
     }
 };
 
-/// Creates a JsonDocument that uses PSRAM-preferring allocation.
+/// @brief Creates a JsonDocument that uses PSRAM-preferring allocation
+/// @return A JsonDocument configured to use the platform's PSRAM-preferring allocator
 inline JsonDocument make_json_document() {
     return JsonDocument(PsramJsonAllocator::instance());
 }

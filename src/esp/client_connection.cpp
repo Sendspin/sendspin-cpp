@@ -22,7 +22,19 @@
 namespace sendspin {
 
 static const char* const TAG = "sendspin.client_connection";
-static const uint32_t WEBSOCKET_SEND_TIMEOUT_MS = 10;
+static constexpr uint32_t WEBSOCKET_SEND_TIMEOUT_MS = 10U;
+
+// WebSocket frame opcodes (RFC 6455)
+static constexpr uint8_t WS_OP_CONTINUATION = 0x00U;
+static constexpr uint8_t WS_OP_TEXT = 0x01U;
+static constexpr uint8_t WS_OP_BINARY = 0x02U;
+static constexpr uint8_t WS_OP_CLOSE = 0x08U;
+static constexpr uint8_t WS_OP_PING = 0x09U;
+static constexpr uint8_t WS_OP_PONG = 0x0AU;
+
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
 
 SendspinClientConnection::SendspinClientConnection(std::string url) : url_(std::move(url)) {}
 
@@ -46,6 +58,7 @@ void SendspinClientConnection::start() {
     esp_websocket_client_config_t config = {};
     config.uri = this->url_.c_str();
     config.disable_auto_reconnect = true;  // We handle reconnection ourselves
+    config.task_prio = static_cast<int>(this->task_priority_);
 
     // Create the client
     this->client_ = esp_websocket_client_init(&config);
@@ -69,6 +82,10 @@ void SendspinClientConnection::start() {
 
     SS_LOGD(TAG, "Client connection starting to %s", this->url_.c_str());
 }
+
+// ============================================================================
+// SendspinConnection interface implementation
+// ============================================================================
 
 void SendspinClientConnection::loop() {
     // Handle auto-reconnect
@@ -143,6 +160,10 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     return SsErr::OK;
 }
 
+// ============================================================================
+// Private helpers / callbacks
+// ============================================================================
+
 void SendspinClientConnection::websocket_event_handler(void* handler_args, esp_event_base_t base,
                                                        int32_t event_id, void* event_data) {
     // Capture receive time immediately for accurate time synchronization
@@ -152,58 +173,58 @@ void SendspinClientConnection::websocket_event_handler(void* handler_args, esp_e
 
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
-            conn->handle_connected_();
+            conn->handle_connected();
             break;
         case WEBSOCKET_EVENT_DISCONNECTED:
-            conn->handle_disconnected_();
+            conn->handle_disconnected();
             break;
         case WEBSOCKET_EVENT_DATA:
-            conn->handle_data_(static_cast<esp_websocket_event_data_t*>(event_data), receive_time);
+            conn->handle_data(static_cast<esp_websocket_event_data_t*>(event_data), receive_time);
             break;
         case WEBSOCKET_EVENT_ERROR:
-            conn->handle_error_();
+            conn->handle_error();
             break;
         default:
             break;
     }
 }
 
-void SendspinClientConnection::handle_connected_() {
+void SendspinClientConnection::handle_connected() {
     SS_LOGD(TAG, "WebSocket connected to %s", this->url_.c_str());
     this->connected_ = true;
 
-    // Invoke the on_connected callback if set (hub uses this to initiate hello handshake)
-    if (this->on_connected) {
-        this->on_connected(this);
+    // Invoke the on_connected_cb callback if set (hub uses this to initiate hello handshake)
+    if (this->on_connected_cb) {
+        this->on_connected_cb(this);
     }
 }
 
-void SendspinClientConnection::handle_disconnected_() {
+void SendspinClientConnection::handle_disconnected() {
     SS_LOGD(TAG, "WebSocket disconnected from %s", this->url_.c_str());
     this->connected_ = false;
     this->client_hello_sent_ = false;
     this->server_hello_received_ = false;
     this->pending_time_message_ = false;
-    this->reset_websocket_payload_();
+    this->reset_websocket_payload();
 
     // Invoke the disconnected callback if set
-    if (this->on_disconnected) {
-        this->on_disconnected(this);
+    if (this->on_disconnected_cb) {
+        this->on_disconnected_cb(this);
     }
 }
 
-void SendspinClientConnection::handle_data_(const esp_websocket_event_data_t* data,
-                                            int64_t receive_time) {
+void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* data,
+                                           int64_t receive_time) {
     if (data == nullptr) {
         return;
     }
 
     // Determine frame type: text (0x01), binary (0x02), or continuation (0x00)
-    if (data->op_code == 0x01 || data->op_code == 0x02) {
+    if (data->op_code == WS_OP_TEXT || data->op_code == WS_OP_BINARY) {
         // First frame of a new message - remember the type for continuation frames
-        this->is_text_frame_ = (data->op_code == 0x01);
-    } else if (data->op_code != 0x00) {
-        // Control frames (ping 0x09, pong 0x0A, close 0x08) - ignore
+        this->is_text_frame_ = (data->op_code == WS_OP_TEXT);
+    } else if (data->op_code != WS_OP_CONTINUATION) {
+        // Control frames (ping, pong, close) - ignore
         return;
     }
 
@@ -212,14 +233,14 @@ void SendspinClientConnection::handle_data_(const esp_websocket_event_data_t* da
     // write into the existing buffer without reallocation.
     if (data->data_len > 0) {
         size_t prepare_len = (data->payload_offset == 0) ? data->payload_len : data->data_len;
-        uint8_t* dest = this->prepare_receive_buffer_(prepare_len);
+        uint8_t* dest = this->prepare_receive_buffer(prepare_len);
         if (dest == nullptr) {
             SS_LOGE(TAG, "Allocation failed, dropping connection");
-            this->handle_disconnected_();
+            this->handle_disconnected();
             return;
         }
         std::memcpy(dest, data->data_ptr, data->data_len);
-        this->commit_receive_buffer_(data->data_len);
+        this->commit_receive_buffer(data->data_len);
     }
 
     // A complete message requires both:
@@ -227,11 +248,11 @@ void SendspinClientConnection::handle_data_(const esp_websocket_event_data_t* da
     // 2. All data for this frame received (handles ESP-IDF buffer-level fragmentation,
     //    where a single frame's payload is delivered across multiple events)
     if (data->fin && (data->payload_offset + data->data_len >= data->payload_len)) {
-        this->dispatch_completed_message_(this->is_text_frame_, receive_time);
+        this->dispatch_completed_message(this->is_text_frame_, receive_time);
     }
 }
 
-void SendspinClientConnection::handle_error_() {
+void SendspinClientConnection::handle_error() {
     SS_LOGE(TAG, "WebSocket error on connection to %s", this->url_.c_str());
     // Error will typically be followed by a disconnect event
 }

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "decoder.h"
 
 #include "platform/logging.h"
@@ -71,12 +69,13 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
                 AudioStreamInfo(static_cast<uint8_t>(info.bits_per_sample()),
                                 static_cast<uint8_t>(info.num_channels()), info.sample_rate());
             *stream_info = this->current_stream_info_;
-            this->maximum_decoded_size_ =
-                info.max_block_size() * info.num_channels() * info.bytes_per_sample();
+            this->maximum_decoded_size_ = static_cast<size_t>(info.max_block_size()) *
+                                          static_cast<size_t>(info.num_channels()) *
+                                          static_cast<size_t>(info.bytes_per_sample());
             break;
         }
         case CHUNK_TYPE_OPUS_DUMMY_HEADER: {
-            if (!this->decode_dummy_header_(data, data_size, stream_info)) {
+            if (!this->decode_dummy_header(data, data_size, stream_info)) {
                 return false;
             }
 
@@ -96,19 +95,22 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
                 return false;
             }
 
+            static constexpr uint32_t OPUS_MAX_FRAME_MS = 120U;
             this->maximum_decoded_size_ =
-                stream_info->ms_to_bytes(120);  // Opus max frame size is 120ms
+                stream_info->ms_to_bytes(OPUS_MAX_FRAME_MS);  // Opus max frame size is 120ms
             this->current_stream_info_ = *stream_info;
             this->current_codec_ = SendspinCodecFormat::OPUS;
             break;
         }
         case CHUNK_TYPE_PCM_DUMMY_HEADER: {
-            if (!this->decode_dummy_header_(data, data_size, stream_info)) {
+            if (!this->decode_dummy_header(data, data_size, stream_info)) {
                 return false;
             }
             this->current_stream_info_ = *stream_info;
             this->current_codec_ = SendspinCodecFormat::PCM;
-            this->maximum_decoded_size_ = stream_info->ms_to_bytes(120);  // PCM max chunk size
+            static constexpr uint32_t PCM_MAX_CHUNK_MS = 120U;
+            this->maximum_decoded_size_ =
+                stream_info->ms_to_bytes(PCM_MAX_CHUNK_MS);  // PCM max chunk size
             break;
         }
         default: {
@@ -171,15 +173,15 @@ bool SendspinDecoder::decode_audio_chunk(const uint8_t* data, size_t data_size,
     return true;
 }
 
-bool SendspinDecoder::decode_dummy_header_(const uint8_t* data, size_t data_size,
-                                           AudioStreamInfo* stream_info) {
+bool SendspinDecoder::decode_dummy_header(const uint8_t* data, size_t data_size,
+                                          AudioStreamInfo* stream_info) {
     if (data_size < sizeof(DummyHeader)) {
         SS_LOGE(TAG, "Invalid dummy codec header: size %zu < %zu", data_size, sizeof(DummyHeader));
         return false;
     }
 
     // Copy into local struct to avoid alignment issues
-    DummyHeader header;
+    DummyHeader header{};
     std::memcpy(&header, data, sizeof(DummyHeader));
     this->current_stream_info_ =
         AudioStreamInfo(header.bits_per_sample, header.channels, header.sample_rate);
@@ -188,5 +190,3 @@ bool SendspinDecoder::decode_dummy_header_(const uint8_t* data, size_t data_size
 }
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

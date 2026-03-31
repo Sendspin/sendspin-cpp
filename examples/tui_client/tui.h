@@ -15,14 +15,12 @@
 #pragma once
 
 #include "sendspin/client.h"
-#include "sendspin/protocol.h"
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
 #include <chrono>
 #include <cstdint>
-#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -36,14 +34,6 @@ struct DiscoveredServer {
     std::string host;  ///< Resolved IP address or hostname
     uint16_t port{0};  ///< Server port
     std::string path;  ///< WebSocket path from TXT record (e.g., "/sendspin")
-};
-
-/// @brief A buffered visualizer frame with server timestamp.
-struct VisFrame {
-    int64_t server_time{0};
-    uint16_t loudness{0};
-    uint16_t peak_freq{0};
-    std::vector<uint16_t> spectrum;
 };
 
 /// @brief Shared state between SendspinClient callbacks and the TUI render thread.
@@ -95,18 +85,12 @@ struct TuiState {
 
     // Visualizer
     bool visualizer_active{false};
-    std::vector<VisualizerDataType> vis_active_types;
-    uint8_t vis_stream_bin_count{0};
     uint16_t vis_loudness{0};
     uint16_t vis_peak_freq{0};
     std::vector<uint16_t> vis_spectrum;         // raw target values from server
     std::vector<float> vis_display_spectrum;     // smoothed display values (decay toward target)
     float vis_display_loudness{0.0f};            // smoothed loudness for display
     bool vis_beat{false};
-
-    // Visualizer buffering (protected by mutex)
-    std::deque<VisFrame> vis_frames;
-    std::deque<int64_t> vis_beat_times;
     int64_t vis_beat_expire_us{0};
 
     // Tab state

@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <sendspin/audio_sink.h>
 #include <portaudio.h>
 
 #include <atomic>
@@ -49,7 +48,7 @@ public:
     size_t free_space() const;
 
     /// @brief Request the consumer to discard all buffered data.
-    /// Safe to call while the PA callback is active — the consumer performs the
+    /// Safe to call while the PA callback is active; the consumer performs the
     /// actual drain on its next read(), preserving the SPSC invariant.
     void clear();
 
@@ -65,21 +64,21 @@ private:
     std::atomic<bool> clear_requested_{false};
 };
 
-/// @brief AudioSink implementation that plays audio through PortAudio.
+/// @brief Plays audio through PortAudio.
 ///
-/// Bridges the push model (SyncTask calls write()) with PortAudio's pull/callback
+/// Bridges the push model (on_audio_write callback) with PortAudio's pull/callback
 /// model using a lock-free SPSC ring buffer.
-class PortAudioSink : public AudioSink {
+class PortAudioSink {
 public:
     PortAudioSink();
-    ~PortAudioSink() override;
+    ~PortAudioSink();
 
     // Not copyable or movable (PortAudio stream holds a pointer to this)
     PortAudioSink(const PortAudioSink&) = delete;
     PortAudioSink& operator=(const PortAudioSink&) = delete;
 
     /// @brief Writes decoded PCM audio data into the ring buffer.
-    size_t write(uint8_t* data, size_t length, uint32_t timeout_ms) override;
+    size_t write(uint8_t* data, size_t length, uint32_t timeout_ms);
 
     /// @brief Configure audio format and (re)open the PortAudio stream.
     bool configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);
@@ -113,7 +112,7 @@ private:
 
     // Mutex/CV for blocking write() until PA callback frees space, and for
     // serializing ring buffer mutations (write vs reset) across threads.
-    // The PA callback itself never acquires this mutex — it stays lock-free.
+    // The PA callback itself never acquires this mutex; it stays lock-free.
     std::mutex write_mutex_;
     std::condition_variable write_cv_;
     std::atomic<bool> abort_write_{false};

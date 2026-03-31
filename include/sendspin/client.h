@@ -12,26 +12,96 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file client.h
+/// @brief Main public API for the Sendspin synchronized audio streaming client
+
 #pragma once
 
-#include "sendspin/protocol.h"
+#include "sendspin/artwork_role.h"
+#include "sendspin/controller_role.h"
+#include "sendspin/metadata_role.h"
+#include "sendspin/player_role.h"
+#include "sendspin/types.h"
+#include "sendspin/visualizer_role.h"
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-#include "sendspin/audio_sink.h"
-#endif
-
+#include <atomic>
 #include <cstdint>
-#include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace sendspin {
 
-/// @brief Log severity levels for host builds. Has no effect on ESP-IDF builds.
-enum class LogLevel : int {
+// Forward declarations for listener types
+struct GroupUpdateObject;
+
+/// @brief Listener for SendspinClient events
+/// All methods fire on the main loop thread
+class SendspinClientListener {
+public:
+    virtual ~SendspinClientListener() = default;
+
+    /// @brief Called when the group state is updated by the server
+    virtual void on_group_update(const GroupUpdateObject& /*group*/) {}
+
+    /// @brief Called after a time sync burst completes with the Kalman filter error
+    virtual void on_time_sync_updated(float /*error*/) {}
+
+    /// @brief Called when the library needs high-performance networking (e.g., disable WiFi
+    /// power saving)
+    virtual void on_request_high_performance() {}
+
+    /// @brief Called when the library no longer needs high-performance networking
+    virtual void on_release_high_performance() {}
+};
+
+/// @brief Platform hook for network readiness
+/// Must be set before start_server()
+class SendspinNetworkProvider {
+public:
+    virtual ~SendspinNetworkProvider() = default;
+
+    /// @brief Returns true if the network (WiFi/Ethernet) is ready for connections
+    virtual bool is_network_ready() = 0;
+};
+
+/// @brief Optional persistence provider for saving/loading client and role state
+/// All methods fire on the main loop thread
+class SendspinPersistenceProvider {
+public:
+    virtual ~SendspinPersistenceProvider() = default;
+
+    /// @brief Saves the FNV1 hash of the last server that was playing
+    /// @param hash FNV1 hash of the last played server ID
+    /// @return true on success, false on failure
+    virtual bool save_last_server_hash(uint32_t /*hash*/) {
+        return false;
+    }
+
+    /// @brief Loads the persisted last-played server hash
+    /// @return The saved hash, or nullopt if none saved
+    virtual std::optional<uint32_t> load_last_server_hash() {
+        return std::nullopt;
+    }
+
+    /// @brief Saves the player's static delay
+    /// @param delay_ms Static delay in milliseconds
+    /// @return true on success, false on failure
+    virtual bool save_static_delay(uint16_t /*delay_ms*/) {
+        return false;
+    }
+
+    /// @brief Loads the player's persisted static delay
+    /// @return The saved delay in milliseconds, or nullopt if none saved
+    virtual std::optional<uint16_t> load_static_delay() {
+        return std::nullopt;
+    }
+};
+
+/// @brief Log severity levels for host builds
+/// Has no effect on ESP-IDF builds
+enum class LogLevel : uint8_t {
     NONE = 0,
     ERROR = 1,
     WARN = 2,
@@ -44,24 +114,9 @@ enum class LogLevel : int {
 class ConnectionManager;
 class SendspinConnection;
 class SendspinTimeBurst;
-#ifdef SENDSPIN_ENABLE_PLAYER
-class SyncTask;
-struct SyncTimeProvider;
-#endif
 
-#ifdef SENDSPIN_ENABLE_ARTWORK
-/// @brief Preference for an image slot's format and resolution.
-struct ImageSlotPreference {
-    uint8_t slot;
-    SendspinImageSource source;
-    SendspinImageFormat format;
-    uint16_t width;
-    uint16_t height;
-};
-#endif  // SENDSPIN_ENABLE_ARTWORK
-
-/// @brief Configuration for a SendspinClient instance.
-/// Filled in by the platform (e.g., ESPHome) before calling start_server().
+/// @brief Configuration for a SendspinClient instance
+/// Filled in by the platform (e.g., ESPHome) before calling start_server()
 struct SendspinClientConfig {
     std::string client_id;         ///< Unique client identifier (e.g., MAC address)
     std::string name;              ///< Friendly display name
@@ -69,461 +124,353 @@ struct SendspinClientConfig {
     std::string manufacturer;      ///< Manufacturer name (e.g., "ESPHome")
     std::string software_version;  ///< Software version string
 
-    // Capabilities (filled by platform based on configuration)
-#ifdef SENDSPIN_ENABLE_PLAYER
-    std::vector<AudioSupportedFormatObject> audio_formats;  ///< Empty = no player support
-    size_t audio_buffer_capacity{1000000};                  ///< Ring buffer size for encoded audio
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    std::vector<ArtworkChannelFormatObject> artwork_channels;  ///< Empty = no artwork support
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    std::optional<VisualizerSupportObject> visualizer;  ///< nullopt = no visualizer support
-#endif
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    bool controller{false};  ///< Whether controller role is supported
-#endif
-#ifdef SENDSPIN_ENABLE_METADATA
-    bool metadata{false};  ///< Whether metadata role is supported
-#endif
-    bool psram_stack{false};  ///< Whether to allocate task stacks in PSRAM
-#ifdef SENDSPIN_ENABLE_PLAYER
-    int32_t fixed_delay_us{0};            ///< Fixed audio delay in microseconds
-    uint16_t initial_static_delay_ms{0};  ///< Default static delay if no persisted value
-#endif
+    bool sync_task_psram_stack{false};   ///< Allocate sync task stack in PSRAM (ESP-IDF only)
+    bool httpd_psram_stack{false};       ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
+    bool visualizer_psram_stack{false};  ///< Allocate visualizer drain thread stack in PSRAM
+                                         ///< (ESP-IDF only)
+    bool artwork_psram_stack{false};     ///< Allocate artwork drain thread stack in PSRAM
+                                         ///< (ESP-IDF only)
+
+    /// @brief Default FreeRTOS priority for the HTTP server task (ESP-IDF only)
+    static constexpr unsigned DEFAULT_HTTPD_PRIORITY = 17U;
+
+    unsigned sync_task_priority{2};  ///< FreeRTOS priority for the sync/decode task
+                                     ///< (ESP-IDF only)
+    unsigned httpd_priority{DEFAULT_HTTPD_PRIORITY};  ///< FreeRTOS priority for the HTTP server
+                                                      ///< task (ESP-IDF only)
+    unsigned websocket_priority{5};   ///< FreeRTOS priority for the WebSocket client task
+                                      ///< (ESP-IDF only)
+    unsigned visualizer_priority{2};  ///< FreeRTOS priority for the visualizer drain thread
+                                      ///< (ESP-IDF only)
+    unsigned artwork_priority{2};     ///< FreeRTOS priority for the artwork drain thread
+                                      ///< (ESP-IDF only)
+
+    uint8_t server_max_connections{2};  ///< Maximum simultaneous connections (default: 2 for
+                                        ///< handoff protocol)
+    uint16_t httpd_ctrl_port{0};        ///< ESP-IDF httpd control port; 0 = ESP_HTTPD_DEF_CTRL_PORT
+                                        ///< + 1 (avoids conflict with web_server component)
+
+    static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
+    static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
+
+    uint8_t time_burst_size{8};  ///< Number of messages per time sync burst
+    int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};  ///< Milliseconds between bursts
+    int64_t time_burst_response_timeout_ms{
+        DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
 };
 
-/// @brief Deferred event from a callback thread, processed in loop().
+/// @brief Deferred event from a callback thread, processed in loop()
 struct TimeResponseEvent {
     int64_t offset;
     int64_t max_error;
     int64_t timestamp;
 };
 
-/// @brief Deferred server command event, processed in loop().
-struct ServerCommandEvent {
-    ServerCommandMessage command;
-};
-
-/// @brief Deferred stream lifecycle callback event, processed in loop().
-enum class StreamCallbackType : uint8_t {
-    STREAM_START,
-    STREAM_END,
-    STREAM_CLEAR,
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    ARTWORK_STREAM_END,
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    VISUALIZER_STREAM_START,
-    VISUALIZER_STREAM_END,
-    VISUALIZER_STREAM_CLEAR,
-#endif
-};
-
-/// @brief Deferred stream callback event, processed in loop().
-struct StreamCallbackEvent {
-    explicit StreamCallbackEvent(StreamCallbackType t) : type(t) {}
-    StreamCallbackType type;
-#ifdef SENDSPIN_ENABLE_PLAYER
-    std::optional<ServerPlayerStreamObject> player_stream;  ///< Stream params for STREAM_START
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    std::optional<ServerVisualizerStreamObject> visualizer_stream;
-#endif
-};
-
-/// @brief Main orchestration class for the sendspin-cpp library.
-///
-/// Manages connections, message routing, time sync,
-/// audio playback, and all Sendspin protocol interactions. This is the public API surface
-/// of the library.
-///
-/// Usage:
-/// 1. Create a SendspinClientConfig and fill in capabilities
-/// 2. Create a SendspinClient with the config
-/// 3. Set callbacks (on_metadata, on_stream_start, etc.)
-/// 4. Set platform hooks (is_network_ready, persistence callbacks, etc.)
-/// 5. Call start_server() to begin listening for connections
-/// 6. Call loop() periodically from the main loop
+/**
+ * @brief Main orchestration class for the sendspin-cpp library
+ *
+ * Manages WebSocket connections, message routing, NTP-style time synchronization,
+ * audio playback, and all Sendspin protocol interactions. Roles are added at runtime
+ * and each receives events via a listener interface. Only roles that are added will
+ * participate in the protocol.
+ *
+ * Usage:
+ * 1. Fill in a SendspinClientConfig with the device identity fields
+ * 2. Construct a SendspinClient with that config
+ * 3. Add roles via add_player(), add_controller(), add_metadata(), etc.
+ * 4. Set listeners on each role and set the network provider on the client
+ * 5. Call start_server() to start the WebSocket server and background tasks
+ * 6. Call loop() periodically from the platform main loop
+ *
+ * @code
+ * struct MyPlayerListener : PlayerRoleListener {
+ *     size_t on_audio_write(uint8_t* data, size_t len, uint32_t timeout_ms) override {
+ *         return audio_output.write(data, len, timeout_ms);
+ *     }
+ * };
+ *
+ * struct MyNetworkProvider : SendspinNetworkProvider {
+ *     bool is_network_ready() override { return true; }
+ * };
+ *
+ * MyPlayerListener player_listener;
+ * MyNetworkProvider network_provider;
+ *
+ * SendspinClientConfig config;
+ * config.client_id = "device-id";
+ * config.name = "My Device";
+ * config.product_name = "Speaker";
+ * config.manufacturer = "Acme";
+ * config.software_version = "1.0.0";
+ * SendspinClient client(config);
+ * auto& player = client.add_player(PlayerRole::Config{});
+ * player.set_listener(&player_listener);
+ * client.add_controller();
+ * client.set_network_provider(&network_provider);
+ * client.start_server();
+ *
+ * while (true) {
+ *     client.loop();
+ * }
+ * @endcode
+ */
 class SendspinClient {
+    friend class ConnectionManager;
+
 public:
     explicit SendspinClient(SendspinClientConfig config);
     ~SendspinClient();
 
-    /// @brief Sets the library-wide log level (host builds only, no-op on ESP-IDF).
+    /// @brief Sets the library-wide log level (host builds only, no-op on ESP-IDF)
+    /// @param level The desired log level
     static void set_log_level(LogLevel level);
 
-    /// @brief Returns the current log level (host builds only, INFO on ESP-IDF).
+    /// @brief Returns the current log level (host builds only, INFO on ESP-IDF)
+    /// @return The current log level
     static LogLevel get_log_level();
 
-    // --- Lifecycle ---
+    // ========================================
+    // Lifecycle
+    // ========================================
 
-    /// @brief Starts the WebSocket server and initializes the sync task (if audio is configured).
-    /// @param priority FreeRTOS task priority for the WS server and sync task.
-    /// @return true on success, false on failure.
-    bool start_server(unsigned priority);
+    /// @brief Starts the WebSocket server and initializes the sync task (if audio is configured)
+    /// Task priorities and PSRAM settings are taken from SendspinClientConfig
+    /// @return true on success, false on failure
+    bool start_server();
 
-    /// @brief Initiates a client connection to a Sendspin server at the given URL.
-    /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin").
+    /// @brief Initiates a client connection to a Sendspin server at the given URL
+    /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
-    /// @brief Disconnects from the current server with the given reason.
-    /// @param reason The goodbye reason to send.
+    /// @brief Disconnects from the current server with the given reason
+    /// @param reason The goodbye reason to send
     void disconnect(SendspinGoodbyeReason reason);
 
-    /// @brief Processes events, drives time sync, checks network. Call from main loop.
+    /// @brief Processes events, drives time sync, checks network. Call from main loop
     void loop();
 
-    // --- Audio ---
+    // ========================================
+    // Role registration (call before start_server)
+    // ========================================
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-    /// @brief Sets the audio sink for decoded audio output. Must be set before start_server().
-    /// @param sink Pointer to the audio sink (owned by caller, must outlive client).
-    void set_audio_sink(AudioSink* sink);
+    /// @brief Adds the player role. Returns a reference for setting callbacks
+    PlayerRole& add_player(PlayerRole::Config config);
 
-    /// @brief Called by the audio output when it has played audio frames.
-    /// Thread-safe: may be called from any context (e.g., I2S callback).
-    /// @param frames Number of audio frames played.
-    /// @param timestamp Client timestamp when the audio finished playing.
-    void notify_audio_played(uint32_t frames, int64_t timestamp);
+    /// @brief Adds the controller role. Returns a reference for setting callbacks
+    ControllerRole& add_controller();
 
-    /// @brief Writes an audio chunk to the sync task's ring buffer.
-    /// @param data Pointer to the audio data.
-    /// @param size Size of the audio data in bytes.
-    /// @param timestamp Server timestamp for this chunk.
-    /// @param type Type of audio chunk.
-    /// @param timeout_ms Milliseconds to wait if buffer is full (UINT32_MAX = wait forever).
-    /// @return true if successfully written, false on error.
-    bool write_audio_chunk(const uint8_t* data, size_t size, int64_t timestamp, ChunkType type,
-                           uint32_t timeout_ms);
-#endif  // SENDSPIN_ENABLE_PLAYER
+    /// @brief Adds the metadata role. Returns a reference for setting callbacks
+    MetadataRole& add_metadata();
 
-    // --- State updates ---
+    /// @brief Adds the artwork role. Returns a reference for setting callbacks
+    ArtworkRole& add_artwork(ArtworkRole::Config config);
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-    /// @brief Updates the volume and publishes client state to the server.
-    /// @param volume Volume level (0-100).
-    void update_volume(uint8_t volume);
+    /// @brief Adds the visualizer role. Returns a reference for setting callbacks
+    VisualizerRole& add_visualizer(VisualizerRole::Config config);
 
-    /// @brief Updates the mute state and publishes client state to the server.
-    /// @param muted True if muted.
-    void update_muted(bool muted);
+    // ========================================
+    // Role access (nullptr if not added)
+    // ========================================
 
-    /// @brief Updates the static delay and publishes client state to the server.
-    /// The value is clamped to 5000 ms and persisted if a save callback is set.
-    /// @param delay_ms Static delay in milliseconds.
-    void update_static_delay(uint16_t delay_ms);
+    /// @brief Returns the artwork role, or nullptr if not added
+    /// @return Pointer to the artwork role, or nullptr
+    ArtworkRole* artwork() {
+        return this->artwork_.get();
+    }
+    /// @brief Returns the artwork role (const), or nullptr if not added
+    /// @return Const pointer to the artwork role, or nullptr
+    const ArtworkRole* artwork() const {
+        return this->artwork_.get();
+    }
+    /// @brief Returns the controller role, or nullptr if not added
+    /// @return Pointer to the controller role, or nullptr
+    ControllerRole* controller() {
+        return this->controller_.get();
+    }
+    /// @brief Returns the controller role (const), or nullptr if not added
+    /// @return Const pointer to the controller role, or nullptr
+    const ControllerRole* controller() const {
+        return this->controller_.get();
+    }
+    /// @brief Returns the metadata role, or nullptr if not added
+    /// @return Pointer to the metadata role, or nullptr
+    MetadataRole* metadata() {
+        return this->metadata_.get();
+    }
+    /// @brief Returns the metadata role (const), or nullptr if not added
+    /// @return Const pointer to the metadata role, or nullptr
+    const MetadataRole* metadata() const {
+        return this->metadata_.get();
+    }
+    /// @brief Returns the player role, or nullptr if not added
+    /// @return Pointer to the player role, or nullptr
+    PlayerRole* player() {
+        return this->player_.get();
+    }
+    /// @brief Returns the player role (const), or nullptr if not added
+    /// @return Const pointer to the player role, or nullptr
+    const PlayerRole* player() const {
+        return this->player_.get();
+    }
+    /// @brief Returns the visualizer role, or nullptr if not added
+    /// @return Pointer to the visualizer role, or nullptr
+    VisualizerRole* visualizer() {
+        return this->visualizer_.get();
+    }
+    /// @brief Returns the visualizer role (const), or nullptr if not added
+    /// @return Const pointer to the visualizer role, or nullptr
+    const VisualizerRole* visualizer() const {
+        return this->visualizer_.get();
+    }
 
-    /// @brief Enables or disables the static delay adjustment command.
-    /// @param adjustable True to advertise SET_STATIC_DELAY as a supported command.
-    void set_static_delay_adjustable(bool adjustable);
-#endif  // SENDSPIN_ENABLE_PLAYER
+    // ========================================
+    // Queries
+    // ========================================
 
-    /// @brief Updates the client state (synchronized, error, external_source) and publishes.
-    /// @param state The new client state.
-    void update_state(SendspinClientState state);
-
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    /// @brief Sends a controller command to the server.
-    /// @param cmd The command to send.
-    /// @param volume Optional volume value (for VOLUME command).
-    /// @param mute Optional mute value (for MUTE command).
-    void send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume = {},
-                      std::optional<bool> mute = {});
-#endif  // SENDSPIN_ENABLE_CONTROLLER
-
-    // --- Queries ---
-
-    /// @brief Returns true if there is an active connection with completed handshake.
+    /// @brief Returns true if there is an active connection with completed handshake
+    /// @return true if connected with a completed handshake, false otherwise
     bool is_connected() const;
 
-    /// @brief Returns true if the time filter has received at least one measurement.
+    /// @brief Returns the server information from the active connection's hello handshake
+    /// @return ServerInformationObject if connected with a completed handshake, nullopt otherwise
+    std::optional<ServerInformationObject> get_server_information() const;
+
+    /// @brief Returns true if the time filter has received at least one measurement
+    /// @return true if time synchronization has been established, false otherwise
     bool is_time_synced() const;
 
-    /// @brief Converts a server timestamp to the equivalent client timestamp.
-    /// @param server_time Server timestamp in microseconds.
-    /// @return Equivalent client timestamp in microseconds (0 if no active connection).
+    /// @brief Converts a server timestamp to the equivalent client timestamp
+    /// @param server_time Server-side timestamp in microseconds
+    /// @return Equivalent client-side timestamp in microseconds
     int64_t get_client_time(int64_t server_time) const;
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-    /// @brief Returns the current static delay in milliseconds.
-    uint16_t get_static_delay_ms() const {
-        return this->static_delay_ms_;
-    }
-
-    /// @brief Returns the fixed delay in microseconds (from config).
-    int32_t get_fixed_delay_us() const {
-        return this->config_.fixed_delay_us;
-    }
-
-    /// @brief Returns the current volume level.
-    uint8_t get_volume() const {
-        return this->volume_;
-    }
-
-    /// @brief Returns true if currently muted.
-    bool get_muted() const {
-        return this->muted_;
-    }
-
-    /// @brief Returns the audio buffer capacity from config.
-    size_t get_buffer_size() const {
-        return this->config_.audio_buffer_capacity;
-    }
-
-    /// @brief Returns a reference to the current stream parameters.
-    ServerPlayerStreamObject& get_current_stream_params() {
-        return this->current_stream_params_;
-    }
-#endif  // SENDSPIN_ENABLE_PLAYER
-
-#ifdef SENDSPIN_ENABLE_METADATA
-    /// @brief Returns the interpolated track progress in milliseconds.
-    /// Accounts for playback speed and time elapsed since last server update.
-    /// Returns 0 if no progress data is available.
-    uint32_t get_track_progress_ms() const;
-
-    /// @brief Returns the track duration in milliseconds. 0 means unknown/live.
-    uint32_t get_track_duration_ms() const;
-#endif  // SENDSPIN_ENABLE_METADATA
-
-    /// @brief Returns the current group ID (empty string if none).
-    std::string get_group_id() const {
-        return this->group_state_.group_id.value_or("");
-    }
-
-    /// @brief Returns the current group name (empty string if none).
+    /// @brief Returns the current group name (empty string if none)
+    /// @return Current group name string, or empty string if not in a group
     std::string get_group_name() const {
         return this->group_state_.group_name.value_or("");
     }
 
-    /// @brief Returns the current active connection (or nullptr).
-    SendspinConnection* get_current_connection() const;
+    // ========================================
+    // State updates
+    // ========================================
 
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    /// @brief Returns the current controller state from the server.
-    const ServerStateControllerObject& get_controller_state() const {
-        return this->controller_state_;
-    }
-#endif  // SENDSPIN_ENABLE_CONTROLLER
+    /// @brief Updates the client state (synchronized, error, external_source) and publishes
+    /// @param state The new client state to publish
+    void update_state(SendspinClientState state);
 
-    // --- Event callbacks (set by platform before start) ---
+    // ========================================
+    // Listener and provider setters
+    // ========================================
 
-#ifdef SENDSPIN_ENABLE_METADATA
-    std::function<void(const ServerMetadataStateObject&)> on_metadata;
-#endif
-    std::function<void(const GroupUpdateObject&)> on_group_update;
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    std::function<void(uint8_t, const uint8_t*, size_t, SendspinImageFormat, int64_t)> on_image;
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    std::function<void(const uint8_t*, size_t)> on_visualizer_data;
-    std::function<void(const uint8_t*, size_t)> on_beat_data;
-    std::function<void(const ServerVisualizerStreamObject&)> on_visualizer_stream_start;
-    std::function<void()> on_visualizer_stream_end;
-    std::function<void()> on_visualizer_stream_clear;
-#endif
-#ifdef SENDSPIN_ENABLE_PLAYER
-    std::function<void()> on_stream_start;
-    std::function<void()> on_stream_end;
-    std::function<void()> on_stream_clear;
-    std::function<void(uint8_t)> on_volume_changed;
-    std::function<void(bool)> on_mute_changed;
-    std::function<void(uint16_t)> on_static_delay_changed;
-#endif
-    std::function<void(float)> on_time_sync_updated;  ///< Kalman error value after burst completes
-
-    // --- Platform hooks ---
-
-    /// @brief Returns true if the network (WiFi/Ethernet) is ready for connections.
-    std::function<bool()> is_network_ready;
-
-    /// @brief Called when the library needs high-performance networking (e.g., during time sync
-    /// burst).
-    std::function<void()> on_request_high_performance;
-
-    /// @brief Called when the library no longer needs high-performance networking.
-    std::function<void()> on_release_high_performance;
-
-    // --- Persistence hooks (optional) ---
-
-    /// @brief Saves the FNV1 hash of the last server that was playing. Returns true on success.
-    std::function<bool(uint32_t)> save_last_server_hash;
-
-    /// @brief Loads the persisted last-played server hash. Returns nullopt if none saved.
-    std::function<std::optional<uint32_t>()> load_last_server_hash;
-
-#ifdef SENDSPIN_ENABLE_PLAYER
-    /// @brief Saves the static delay value. Returns true on success.
-    std::function<bool(uint16_t)> save_static_delay;
-
-    /// @brief Loads the persisted static delay value. Returns nullopt if none saved.
-    std::function<std::optional<uint16_t>()> load_static_delay;
-#endif
-
-    // --- Image slot management ---
-
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    /// @brief Adds a preferred image format for an artwork slot.
-    void add_image_preferred_format(const ImageSlotPreference& pref);
-
-    /// @brief Returns all configured image format preferences.
-    const std::vector<ImageSlotPreference>& get_image_preferred_formats() const {
-        return this->preferred_image_formats_;
-    }
-#endif  // SENDSPIN_ENABLE_ARTWORK
-
-    // --- Visualizer support ---
-
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    /// @brief Sets the visualizer support configuration.
-    void set_visualizer_support(const VisualizerSupportObject& support) {
-        this->visualizer_support_ = support;
-        this->config_.visualizer = support;
+    /// @brief Sets the listener for client events. The listener must outlive this client
+    void set_listener(SendspinClientListener* listener) {
+        this->listener_ = listener;
     }
 
-    /// @brief Returns the visualizer support configuration (nullopt if not configured).
-    const std::optional<VisualizerSupportObject>& get_visualizer_support() const {
-        return this->visualizer_support_;
+    /// @brief Sets the network provider (required before start_server())
+    /// The provider must outlive this client
+    void set_network_provider(SendspinNetworkProvider* provider) {
+        this->network_provider_ = provider;
     }
-#endif  // SENDSPIN_ENABLE_VISUALIZER
 
-protected:
-    /// @brief Cleans up playback state when the active streaming connection is removed.
-    void cleanup_connection_state_();
+    /// @brief Sets the optional persistence provider. The provider must outlive this client
+    void set_persistence_provider(SendspinPersistenceProvider* provider) {
+        this->persistence_provider_ = provider;
+    }
 
-    /// @brief Builds the formatted client hello message from config.
-    std::string build_hello_message_();
+    // ========================================
+    // Role services (called by roles via SendspinClient pointer)
+    // ========================================
 
-    // --- Message processing ---
+    /// @brief Publishes the current client state to the active connection
+    void publish_state();
 
-    /// @brief Processes a JSON message from a connection.
-    /// @return true if message was successfully processed, false otherwise.
-    bool process_json_message_(SendspinConnection* conn, const std::string& message,
-                               int64_t timestamp);
+    /// @brief Sends a text message over the active connection
+    /// @param text The text message to send
+    void send_text(const std::string& text);
 
-    /// @brief Processes a binary message from a connection.
-    void process_binary_message_(uint8_t* payload, size_t len);
+    /// @brief Acquires a ref-counted high-performance networking request
+    void acquire_high_performance();
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-    /// @brief Sends an audio chunk to the sync task's ring buffer.
-    /// @return true if successfully written, false on error.
-    bool send_audio_chunk_(const uint8_t* data, size_t data_size, int64_t timestamp,
-                           ChunkType chunk_type, uint32_t timeout_ms);
-#endif
+    /// @brief Releases a ref-counted high-performance networking request
+    void release_high_performance();
 
-    // --- State publishing ---
+private:
+    /// @brief Cleans up playback state when the active streaming connection is removed
+    void cleanup_connection_state();
 
-    /// @brief Publishes the current client state to the specified connection.
-    /// @param conn Connection to send the state to.
-    void publish_client_state_(SendspinConnection* conn);
+    /// @brief Builds the formatted client hello message from config
+    std::string build_hello_message();
 
-    // --- Persistence ---
+    // ========================================
+    // Message processing
+    // ========================================
 
-    /// @brief Loads the last played server hash from persistence.
-    void load_last_played_server_();
+    /// @brief Processes a JSON message from a connection
+    /// @param conn The connection that received the message
+    /// @param message The raw JSON text
+    /// @param timestamp Receive timestamp in microseconds
+    /// @return true if the message was handled, false on parse failure
+    bool process_json_message(SendspinConnection* conn, const std::string& message,
+                              int64_t timestamp);
 
-    /// @brief Persists the server ID as the last played server (hashed).
-    void persist_last_played_server_(const std::string& server_id);
+    /// @brief Processes a binary message from a connection
+    /// @param payload Pointer to the raw binary data
+    /// @param len Length of the binary data in bytes
+    void process_binary_message(const uint8_t* payload, size_t len);
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-    /// @brief Loads the static delay from persistence.
-    void load_static_delay_();
+    // ========================================
+    // State publishing
+    // ========================================
 
-    /// @brief Persists the current static delay.
-    void persist_static_delay_();
+    /// @brief Publishes the current client state to the specified connection
+    /// @param conn The connection to publish to
+    void publish_client_state(SendspinConnection* conn);
 
-    /// @brief Constructs a SyncTimeProvider that delegates to this client's methods.
-    SyncTimeProvider make_sync_time_provider_();
-#endif
+    // ========================================
+    // Persistence
+    // ========================================
 
-    // --- Configuration ---
+    /// @brief Loads the last played server hash from persistence
+    void load_last_played_server();
 
+    /// @brief Persists the server ID as the last played server (hashed)
+    void persist_last_played_server(const std::string& server_id);
+
+    // ========================================
+    // Connection event handlers (called by ConnectionManager via friend access)
+    // ========================================
+
+    /// @brief Publishes the initial client state after handshake completes
+    /// @param conn The connection that completed the handshake
+    void on_handshake_complete(SendspinConnection* conn);
+
+    struct EventState;
+
+    // Struct fields
     SendspinClientConfig config_;
-
-    // --- Connection management ---
-
-    std::unique_ptr<ConnectionManager> connection_manager_;
-
-    // --- Time sync ---
-
-    std::unique_ptr<SendspinTimeBurst> time_burst_;
-    bool high_performance_requested_for_time_{false};
-#ifdef SENDSPIN_ENABLE_PLAYER
-    bool high_performance_requested_for_playback_{false};
-#endif
-
-    // --- Player state ---
-
-#ifdef SENDSPIN_ENABLE_PLAYER
-    uint8_t volume_{0};
-    bool muted_{false};
-    uint16_t static_delay_ms_{0};
-    bool static_delay_adjustable_{false};
-    SendspinClientState state_{SendspinClientState::SYNCHRONIZED};
-    ServerPlayerStreamObject current_stream_params_{};
-#else
-    SendspinClientState state_{SendspinClientState::SYNCHRONIZED};
-#endif
-
-    // --- Controller state ---
-
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    ServerStateControllerObject controller_state_{};
-#endif
-
-    // --- Metadata state ---
-
-#ifdef SENDSPIN_ENABLE_METADATA
-    ServerMetadataStateObject metadata_{};
-#endif
-
-    // --- Group state ---
-
-    ServerInformationObject server_information_{};
     GroupUpdateObject group_state_{};
 
-    // --- Artwork ---
+    // Pointer fields
+    std::unique_ptr<ArtworkRole> artwork_;
+    std::unique_ptr<ConnectionManager> connection_manager_;
+    std::unique_ptr<ControllerRole> controller_;
+    std::unique_ptr<EventState> event_state_;
+    SendspinClientListener* listener_{nullptr};
+    std::unique_ptr<MetadataRole> metadata_;
+    SendspinNetworkProvider* network_provider_{nullptr};
+    SendspinPersistenceProvider* persistence_provider_{nullptr};
+    std::unique_ptr<PlayerRole> player_;
+    std::unique_ptr<SendspinTimeBurst> time_burst_;
+    std::unique_ptr<VisualizerRole> visualizer_;
 
-#ifdef SENDSPIN_ENABLE_ARTWORK
-    std::vector<ImageSlotPreference> preferred_image_formats_;
-#endif
+    // 32-bit fields
+    SendspinClientState state_{SendspinClientState::SYNCHRONIZED};
 
-    // --- Visualizer ---
-
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    std::optional<VisualizerSupportObject> visualizer_support_;
-#endif
-
-    // --- Sync task ---
-
-#ifdef SENDSPIN_ENABLE_PLAYER
-    std::unique_ptr<SyncTask> sync_task_;
-    AudioSink* audio_sink_{nullptr};
-#endif
-
-    // --- Deferred event queues (thread-safe, processed in loop()) ---
-
-    std::mutex event_mutex_;
-    std::vector<TimeResponseEvent> pending_time_events_;
-#ifdef SENDSPIN_ENABLE_METADATA
-    std::vector<ServerMetadataStateObject> pending_metadata_events_;
-#endif
-    std::vector<GroupUpdateObject> pending_group_events_;
-    std::vector<ServerCommandEvent> pending_command_events_;
-    std::vector<StreamCallbackEvent> pending_stream_callback_events_;
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    std::vector<ServerStateControllerObject> pending_controller_state_events_;
-#endif
-#ifdef SENDSPIN_ENABLE_PLAYER
-    std::vector<SendspinClientState> pending_state_events_;
-#endif
-
-    // --- Stream end/clear callbacks waiting for sync task to go idle (main thread only) ---
-
-#ifdef SENDSPIN_ENABLE_PLAYER
-    std::vector<StreamCallbackEvent> awaiting_sync_idle_events_;
-#endif
+    // 8-bit fields
+    bool high_performance_held_for_time_{false};
+    std::atomic<uint8_t> high_performance_ref_count_{0};
+    bool started_{false};
 };
 
 }  // namespace sendspin

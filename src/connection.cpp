@@ -25,16 +25,15 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.connection";
 
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
 SendspinConnection::~SendspinConnection() = default;
 
-void SendspinConnection::deallocate_websocket_payload_() {
-    this->websocket_payload_.reset();
-    this->websocket_write_offset_ = 0;
-}
-
-void SendspinConnection::reset_websocket_payload_() {
-    this->websocket_write_offset_ = 0;
-}
+// ============================================================================
+// Time filter
+// ============================================================================
 
 void SendspinConnection::init_time_filter() {
     this->time_filter_ = std::make_unique<SendspinTimeFilter>(
@@ -51,6 +50,10 @@ TimeTransmittedReplacement SendspinConnection::peek_time_replacement() const {
     this->time_replacement_queue_.peek(replacement);
     return replacement;
 }
+
+// ============================================================================
+// Message sending
+// ============================================================================
 
 bool SendspinConnection::send_time_message(SendCompleteCallback cb) {
     int64_t now = platform_time_us();
@@ -84,7 +87,20 @@ SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
     return this->send_text_message(format_client_goodbye_message(reason), std::move(on_complete));
 }
 
-uint8_t* SendspinConnection::prepare_receive_buffer_(size_t data_len) {
+// ============================================================================
+// WebSocket payload buffer management
+// ============================================================================
+
+void SendspinConnection::deallocate_websocket_payload() {
+    this->websocket_payload_.reset();
+    this->websocket_write_offset_ = 0;
+}
+
+void SendspinConnection::reset_websocket_payload() {
+    this->websocket_write_offset_ = 0;
+}
+
+uint8_t* SendspinConnection::prepare_receive_buffer(size_t data_len) {
     if (!this->websocket_payload_) {
         // First fragment - allocate new buffer
         if (!this->websocket_payload_.allocate(data_len)) {
@@ -97,7 +113,7 @@ uint8_t* SendspinConnection::prepare_receive_buffer_(size_t data_len) {
         size_t new_len = this->websocket_write_offset_ + data_len;
         if (!this->websocket_payload_.realloc(new_len)) {
             SS_LOGE(TAG, "Failed to expand websocket payload to %zu bytes", new_len);
-            this->deallocate_websocket_payload_();
+            this->deallocate_websocket_payload();
             return nullptr;
         }
     }
@@ -105,12 +121,17 @@ uint8_t* SendspinConnection::prepare_receive_buffer_(size_t data_len) {
     return this->websocket_payload_.data() + this->websocket_write_offset_;
 }
 
-void SendspinConnection::commit_receive_buffer_(size_t data_len) {
+void SendspinConnection::commit_receive_buffer(size_t data_len) {
     this->websocket_write_offset_ += data_len;
 }
 
-void SendspinConnection::dispatch_completed_message_(bool is_text, int64_t receive_time) {
+void SendspinConnection::dispatch_completed_message(bool is_text, int64_t receive_time) {
     if (!this->websocket_payload_) {
+        return;
+    }
+
+    if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
+        this->reset_websocket_payload();
         return;
     }
 
@@ -120,19 +141,19 @@ void SendspinConnection::dispatch_completed_message_(bool is_text, int64_t recei
                                   this->websocket_payload_.data() + this->websocket_write_offset_);
 
         // Invoke JSON message callback
-        if (this->on_json_message) {
-            this->on_json_message(this, message, receive_time);
+        if (this->on_json_message_cb) {
+            this->on_json_message_cb(this, message, receive_time);
         }
     } else {
         // Binary message - connection retains buffer ownership, callback reads in-place
-        if (this->on_binary_message) {
-            this->on_binary_message(this, this->websocket_payload_.data(),
-                                    this->websocket_write_offset_);
+        if (this->on_binary_message_cb) {
+            this->on_binary_message_cb(this, this->websocket_payload_.data(),
+                                       this->websocket_write_offset_);
         }
     }
 
     // Reset write offset for next message; keep buffer allocated for reuse
-    this->reset_websocket_payload_();
+    this->reset_websocket_payload();
 }
 
 }  // namespace sendspin

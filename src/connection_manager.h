@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file connection_manager.h
+/// @brief Manages WebSocket connection lifecycle including server handoff, hello handshake, and
+/// graceful disconnection
+
 #pragma once
 
-#include "sendspin/protocol.h"
+#include "protocol_messages.h"
+#include "sendspin/client.h"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -31,140 +35,176 @@ class SendspinConnection;
 class SendspinServerConnection;
 class SendspinWsServer;
 
-/// @brief Deferred server hello event, processed in ConnectionManager::loop().
+/// @brief Deferred server hello event, processed in ConnectionManager::loop()
 struct ServerHelloEvent {
     SendspinConnection* conn;  ///< Connection that received the hello (must still be valid)
-    ServerInformationObject server;
     SendspinConnectionReason connection_reason;
 };
 
-/// @brief Hello retry state for exponential backoff.
+/// @brief Hello retry state for exponential backoff
 struct HelloRetryState {
     SendspinConnection* conn{
         nullptr};              ///< Connection awaiting hello (must match current_ or pending_)
     int64_t retry_time_us{0};  ///< Next retry time in microseconds (0 = no pending retry)
-    uint32_t delay_ms{100};    ///< Current backoff delay
-    uint8_t attempts{3};       ///< Remaining retry attempts
+    static constexpr uint32_t INITIAL_RETRY_DELAY_MS = 100U;  ///< Initial backoff delay in ms
+    uint32_t delay_ms{INITIAL_RETRY_DELAY_MS};                ///< Current backoff delay
+    uint8_t attempts{3};                                      ///< Remaining retry attempts
 };
 
-/// @brief Callbacks from ConnectionManager back to SendspinClient.
-struct ConnectionManagerCallbacks {
-    /// @brief Routes a JSON message to the client for processing.
-    std::function<bool(SendspinConnection*, const std::string&, int64_t)> on_json_message;
-
-    /// @brief Routes a binary message to the client for processing.
-    std::function<void(uint8_t*, size_t)> on_binary_message;
-
-    /// @brief Builds the formatted hello message string from client config.
-    std::function<std::string()> build_hello_message;
-
-    /// @brief Called when a connection's handshake completes.
-    /// Client stores server info and publishes state.
-    std::function<void(SendspinConnection*, ServerInformationObject)> on_handshake_complete;
-
-    /// @brief Called when the active streaming connection is lost.
-    /// Client handles sync task cleanup, user callbacks, and high-performance release.
-    std::function<void()> on_active_connection_lost;
-
-    /// @brief Resets the time burst (called when active connection changes).
-    std::function<void()> reset_time_burst;
-
-    /// @brief Returns true if the network is ready for connections.
-    std::function<bool()> is_network_ready;
-};
-
-/// @brief Manages WebSocket connection lifecycle: accepts/creates connections, handles hello
-/// handshake, server handoff, and graceful disconnection.
+/**
+ * @brief Manages WebSocket connection lifecycle.
+ *
+ * Accepts and creates connections, handles the hello handshake, orchestrates server handoff
+ * decisions, and performs graceful disconnection with deferred cleanup.
+ *
+ * Typical usage:
+ *  1. Construct with a `SendspinClient*`.
+ *  2. Call `init_server()` once to create and configure the WebSocket server.
+ *  3. Call `loop()` periodically to drive connection state, process deferred events, and retry
+ *     hellos.
+ *  4. Call `connect_to()` to initiate an outgoing client connection when needed.
+ *  5. Call `disconnect()` to gracefully close the active connection.
+ *
+ * @code
+ * ConnectionManager manager(client);
+ * manager.init_server(client, use_psram, priority);
+ *
+ * while (running) {
+ *     manager.loop();
+ * }
+ *
+ * manager.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+ * @endcode
+ */
 class ConnectionManager {
 public:
-    explicit ConnectionManager(ConnectionManagerCallbacks callbacks);
+    explicit ConnectionManager(SendspinClient* client);
     ~ConnectionManager();
 
-    // --- Public API ---
+    // ========================================
+    // Public API
+    // ========================================
 
     /// @brief Initiates a client connection to a Sendspin server.
+    /// @param url WebSocket URL of the server to connect to.
     void connect_to(const std::string& url);
 
     /// @brief Disconnects from the current server.
+    /// @param reason The goodbye reason to send before closing.
     void disconnect(SendspinGoodbyeReason reason);
 
-    // --- Server lifecycle ---
+    // ========================================
+    // Server lifecycle
+    // ========================================
 
     /// @brief Creates the WebSocket server and configures callbacks. Call once from start_server().
-    /// @param client Client pointer passed through to ws_server (required by ws_server API).
-    void init_server(SendspinClient* client, bool psram_stack, unsigned priority);
+    /// Server configuration is read from client->config_.
+    /// @param client The SendspinClient that owns this manager.
+    void init_server(SendspinClient* client);
 
     /// @brief Drives connection state: starts server when network ready, processes lifecycle
     /// events, retries hello, calls loop() on active connections.
     void loop();
 
-    // --- Connection queries ---
-
-    /// @brief Returns the current active connection, or nullptr.
-    SendspinConnection* current() const;
-
-    /// @brief Returns the pending handoff connection, or nullptr.
-    SendspinConnection* pending() const;
+    // ========================================
+    // Connection queries
+    // ========================================
 
     /// @brief Returns true if there is an active connection with completed handshake.
+    /// @return True if connected and handshake is complete, false otherwise.
     bool is_connected() const;
 
-    // --- Event queuing (thread-safe) ---
+    /// @brief Returns the current active connection.
+    /// @return Pointer to the current connection, or nullptr if none.
+    // NOTE: not inlined due to incomplete SendspinConnection type
+    SendspinConnection* current() const {
+        return this->current_connection_.get();
+    }
 
-    /// @brief Enqueues a server hello event for deferred processing in loop().
-    void enqueue_hello(ServerHelloEvent event);
+    // ========================================
+    // Event queuing (thread-safe)
+    // ========================================
 
-    // --- Handoff support ---
+    /// @brief Schedules a server hello event for deferred processing in loop().
+    /// @param event The server hello event to schedule (moved).
+    void schedule_hello(ServerHelloEvent event);
+
+    // ========================================
+    // Handoff support
+    // ========================================
 
     /// @brief Sets the last-played server hash for handoff preference decisions.
+    /// @param hash FNV-1 hash of the last-played server ID.
     void set_last_played_server_hash(uint32_t hash);
 
     /// @brief FNV-1 hash function for strings.
     static uint32_t fnv1_hash(const char* str);
 
 private:
-    // --- Connection setup ---
-    void setup_connection_callbacks_(SendspinConnection* conn);
-    void on_new_connection_(std::unique_ptr<SendspinServerConnection> conn);
+    // ========================================
+    // Connection setup
+    // ========================================
+    /// @brief Attaches message and lifecycle callbacks to a connection.
+    /// @param conn The connection to configure.
+    void setup_connection_callbacks(SendspinConnection* conn);
+    /// @brief Accepts an incoming server connection as current or pending for handoff.
+    /// @param conn The newly accepted server connection.
+    void on_new_connection(std::unique_ptr<SendspinServerConnection> conn);
 
-    // --- Hello handshake ---
-    void initiate_hello_(SendspinConnection* conn);
-    bool send_hello_message_(uint8_t remaining_attempts, SendspinConnection* conn);
+    // ========================================
+    // Hello handshake
+    // ========================================
+    /// @brief Arms the hello retry state so loop() will send the hello after a 100ms initial delay.
+    /// @param conn The connection to send the hello to.
+    void initiate_hello(SendspinConnection* conn);
+    /// @brief Sends the hello message to a connection, returning true if no retry is needed.
+    /// @param remaining_attempts Number of send attempts remaining before giving up.
+    /// @param conn The connection to send the hello to.
+    /// @return True if done (sent or connection invalid), false if the send failed and should
+    /// retry.
+    bool send_hello_message(uint8_t remaining_attempts, SendspinConnection* conn);
 
-    // --- Connection lifecycle ---
-    void on_connection_lost_(SendspinConnection* conn);
-    bool should_switch_to_new_server_(SendspinConnection* current, SendspinConnection* new_conn);
-    void complete_handoff_(bool switch_to_new);
-    void disconnect_and_release_(std::unique_ptr<SendspinConnection> conn,
-                                 SendspinGoodbyeReason reason);
+    // ========================================
+    // Connection lifecycle
+    // ========================================
+    /// @brief Tears down a lost connection and promotes the pending connection if one exists.
+    /// @param conn The connection that was lost.
+    void on_connection_lost(SendspinConnection* conn);
+    /// @brief Decides whether to switch from the current connection to the new one.
+    /// @param current The existing active connection.
+    /// @param new_conn The newly connected candidate connection.
+    /// @return True if the new connection should become current, false to keep the existing one.
+    bool should_switch_to_new_server(SendspinConnection* current,
+                                     SendspinConnection* new_conn) const;
+    /// @brief Completes a server handoff by promoting or discarding the pending connection.
+    /// @param switch_to_new True to promote the pending connection, false to discard it.
+    void complete_handoff(bool switch_to_new);
+    /// @brief Sends a goodbye, then defers destruction of the connection until loop() runs.
+    /// @param conn The connection to disconnect and release.
+    /// @param reason The goodbye reason to send before closing.
+    void disconnect_and_release(std::unique_ptr<SendspinConnection> conn,
+                                SendspinGoodbyeReason reason);
 
-    // --- Callbacks ---
-    ConnectionManagerCallbacks callbacks_;
-
-    // --- Connections ---
-    std::unique_ptr<SendspinConnection> current_connection_;
-    std::unique_ptr<SendspinConnection> pending_connection_;
-    std::shared_ptr<SendspinConnection> dying_connection_;
-    std::unique_ptr<SendspinWsServer> ws_server_;
-
-    // --- Server start params (stored from init_server, used when network becomes ready) ---
-    SendspinClient* client_{nullptr};
-    bool psram_stack_{false};
-    unsigned task_priority_{17};
-
-    // --- Hello retry ---
+    // Struct fields
+    std::mutex conn_mutex_;  // Protects deferred lifecycle events
     HelloRetryState hello_retry_;
-
-    // --- Handoff state ---
-    uint32_t last_played_server_hash_{0};
-    bool has_last_played_server_{false};
-
-    // --- Deferred lifecycle events (protected by conn_mutex_) ---
-    std::mutex conn_mutex_;
     std::vector<int> pending_close_events_;
     std::vector<SendspinConnection*> pending_disconnect_events_;
     std::vector<ServerHelloEvent> pending_hello_events_;
+
+    // Pointer fields
+    SendspinClient* client_;
+    std::unique_ptr<SendspinConnection> current_connection_;
+    std::shared_ptr<SendspinConnection> dying_connection_;
+    std::unique_ptr<SendspinConnection> pending_connection_;
+    std::unique_ptr<SendspinWsServer> ws_server_;
+
+    // 32-bit fields
+    uint32_t last_played_server_hash_{0};
+
+    // 8-bit fields
     bool dying_connection_ready_to_release_{false};
+    bool has_last_played_server_{false};
 };
 
 }  // namespace sendspin

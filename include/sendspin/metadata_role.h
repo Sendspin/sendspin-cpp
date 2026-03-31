@@ -1,0 +1,178 @@
+// Copyright 2026 Sendspin Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/// @file metadata_role.h
+/// @brief Metadata role that receives track metadata and playback progress from the server
+
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+
+namespace sendspin {
+
+class SendspinClient;
+struct ClientHelloMessage;
+
+// ============================================================================
+// Metadata types
+// ============================================================================
+
+/// @brief Playback progress fields embedded in a metadata state update
+struct MetadataProgressObject {
+    uint32_t track_progress;
+    uint32_t track_duration;
+    uint32_t playback_speed;
+};
+
+/// @brief Repeat mode for playback
+enum class SendspinRepeatMode : uint8_t {
+    OFF,  // No repeat
+    ONE,  // Repeat current track
+    ALL,  // Repeat entire queue
+};
+
+/// @brief Returns a null-terminated string name for a repeat mode
+/// @param mode The mode to convert
+/// @return Null-terminated string, or "unknown" for unrecognized values
+inline const char* to_cstr(SendspinRepeatMode mode) {
+    switch (mode) {
+        case SendspinRepeatMode::OFF:
+            return "off";
+        case SendspinRepeatMode::ONE:
+            return "one";
+        case SendspinRepeatMode::ALL:
+            return "all";
+        default:
+            return "off";
+    }
+}
+
+/// @brief Parses a repeat mode from its string representation
+/// @param str The string to parse
+/// @return The matching mode, or std::nullopt if unrecognized
+inline std::optional<SendspinRepeatMode> repeat_mode_from_string(const std::string& str) {
+    if (str == "off") {
+        return SendspinRepeatMode::OFF;
+    }
+    if (str == "one") {
+        return SendspinRepeatMode::ONE;
+    }
+    if (str == "all") {
+        return SendspinRepeatMode::ALL;
+    }
+    return std::nullopt;
+}
+
+/// @brief Track metadata and playback state received from the server
+struct ServerMetadataStateObject {
+    int64_t timestamp{};
+    std::optional<std::string> title;
+    std::optional<std::string> artist;
+    std::optional<std::string> album_artist;
+    std::optional<std::string> album;
+    std::optional<std::string> artwork_url;
+    std::optional<uint16_t> year;
+    std::optional<uint16_t> track;
+    std::optional<MetadataProgressObject> progress;
+    std::optional<SendspinRepeatMode> repeat;
+    std::optional<bool> shuffle;
+};
+
+/// @brief Listener for metadata role events. All methods fire on the main loop thread.
+class MetadataRoleListener {
+public:
+    virtual ~MetadataRoleListener() = default;
+
+    /// @brief Called when metadata is updated by the server
+    virtual void on_metadata(const ServerMetadataStateObject& /*metadata*/) {}
+};
+
+/**
+ * @brief Metadata role that receives track metadata and playback progress from the server
+ *
+ * Maintains a local shadow of the server's metadata state, including track title, artist,
+ * album, artwork URL, repeat/shuffle mode, and playback progress. Incoming metadata deltas
+ * are merged into the shadow and delivered to the listener on the main loop thread. Progress
+ * is interpolated locally using the server timestamp so callers always get a current value.
+ *
+ * Usage:
+ * 1. Implement MetadataRoleListener to receive metadata updates
+ * 2. Add the role to the client via SendspinClient::add_metadata()
+ * 3. Call set_listener() with your listener implementation
+ * 4. Poll get_track_progress_ms() and get_track_duration_ms() as needed for UI updates
+ *
+ * @code
+ * struct MyMetadataListener : MetadataRoleListener {
+ *     void on_metadata(const ServerMetadataStateObject& m) override {
+ *         if (m.title) display_title(*m.title);
+ *         if (m.artist) display_artist(*m.artist);
+ *     }
+ * };
+ *
+ * MyMetadataListener listener;
+ * auto& metadata = client.add_metadata();
+ * metadata.set_listener(&listener);
+ * uint32_t progress = metadata.get_track_progress_ms();
+ * @endcode
+ */
+class MetadataRole {
+    friend class SendspinClient;
+
+public:
+    explicit MetadataRole(SendspinClient* client);
+    ~MetadataRole();
+
+    /// @brief Sets the listener for metadata events
+    /// @note The listener must outlive this role
+    /// @param listener Pointer to the listener implementation
+    void set_listener(MetadataRoleListener* listener) {
+        this->listener_ = listener;
+    }
+
+    /// @brief Returns the track duration in milliseconds
+    /// @return Track duration in milliseconds, or 0 if unknown or the stream is live
+    uint32_t get_track_duration_ms() const;
+
+    /// @brief Returns the interpolated track progress in milliseconds
+    /// @return Estimated playback position in milliseconds, interpolated from the last server
+    /// update
+    uint32_t get_track_progress_ms() const;
+
+private:
+    /// @brief Adds the metadata role to the supported roles list in the hello message
+    /// @param msg The hello message being assembled.
+    void build_hello_fields(ClientHelloMessage& msg);
+    /// @brief Merges an incoming server metadata delta into the pending shadow state
+    /// @param state The metadata delta received from the server.
+    void handle_server_state(ServerMetadataStateObject state);
+    /// @brief Applies any pending metadata delta and notifies the listener
+    void drain_events();
+    /// @brief Resets the metadata state and clears any pending events
+    void cleanup();
+
+    struct EventState;
+
+    // Struct fields
+    ServerMetadataStateObject metadata_{};
+
+    // Pointer fields
+    SendspinClient* client_;
+    std::unique_ptr<EventState> event_state_;
+    MetadataRoleListener* listener_{nullptr};
+};
+
+}  // namespace sendspin

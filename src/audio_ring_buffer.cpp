@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "audio_ring_buffer.h"
 
 #include "platform/logging.h"
@@ -22,17 +20,19 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.ring_buffer";
 
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
 std::unique_ptr<SendspinAudioRingBuffer> SendspinAudioRingBuffer::create(size_t buffer_size) {
     auto rb = std::unique_ptr<SendspinAudioRingBuffer>(new SendspinAudioRingBuffer());
 
-    rb->size_ = buffer_size;
-
-    if (!rb->storage_.allocate(rb->size_)) {
+    if (!rb->storage_.allocate(buffer_size)) {
         SS_LOGE(TAG, "Failed to allocate %zu bytes for ring buffer", buffer_size);
         return nullptr;
     }
 
-    if (!rb->ring_buffer_.create(rb->size_, rb->storage_.data())) {
+    if (!rb->ring_buffer_.create(buffer_size, rb->storage_.data())) {
         SS_LOGE(TAG, "Failed to create ring buffer");
         rb->storage_.reset();
         return nullptr;
@@ -42,6 +42,10 @@ std::unique_ptr<SendspinAudioRingBuffer> SendspinAudioRingBuffer::create(size_t 
 }
 
 SendspinAudioRingBuffer::~SendspinAudioRingBuffer() = default;
+
+// ============================================================================
+// Public API
+// ============================================================================
 
 bool SendspinAudioRingBuffer::write_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
                                           ChunkType chunk_type, uint32_t timeout_ms) {
@@ -93,5 +97,3 @@ void SendspinAudioRingBuffer::reset() {
 }
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

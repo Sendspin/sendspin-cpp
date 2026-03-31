@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file logging.h
+/// @brief Platform-abstracted logging macros mapping SS_LOG* to ESP-IDF or printf-based output
+
 #pragma once
 
 #ifdef ESP_PLATFORM
@@ -26,10 +29,12 @@
 
 namespace sendspin {
 
-/// No-op on ESP-IDF — log levels are controlled at compile time.
+/// @brief No-op on ESP-IDF; log levels are controlled at compile time
+/// @param level Ignored on ESP-IDF.
 inline void platform_set_log_level(int /*level*/) {}
 
-/// Returns INFO on ESP-IDF — runtime log level is not available.
+/// @brief Returns INFO on ESP-IDF; runtime log level is not available
+/// @return Always returns 3 (INFO) on ESP-IDF.
 inline int platform_get_log_level() {
     return 3;
 }
@@ -41,14 +46,13 @@ inline int platform_get_log_level() {
 #include <cinttypes>
 #include <cstdio>
 
-#define SS_LOG_NONE 0
 #define SS_LOG_ERROR 1
 #define SS_LOG_WARN 2
 #define SS_LOG_INFO 3
 #define SS_LOG_DEBUG 4
 #define SS_LOG_VERBOSE 5
 
-// Runtime log level — defaults to INFO, settable by the application (e.g., via command line)
+// Runtime log level - defaults to INFO, settable by the application (e.g., via command line)
 inline int ss_host_log_level = SS_LOG_INFO;
 
 // clang-format off
@@ -61,10 +65,14 @@ inline int ss_host_log_level = SS_LOG_INFO;
 
 namespace sendspin {
 
+/// @brief Sets the runtime log level
+/// @param level One of the SS_LOG_* constants.
 inline void platform_set_log_level(int level) {
     ss_host_log_level = level;
 }
 
+/// @brief Returns the current runtime log level
+/// @return One of the SS_LOG_* constants.
 inline int platform_get_log_level() {
     return ss_host_log_level;
 }

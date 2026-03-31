@@ -21,27 +21,29 @@
 
 namespace sendspin {
 
-/*
- * SendspinWsServer manages the HTTP server (httpd) that accepts incoming WebSocket connections.
- *
- * Key Design Points:
- * - The server listener ACCEPTS connections but doesn't OWN them long-term
- * - When a client connects, it creates a SendspinServerConnection and hands it to the
- * SendspinClient
- * - The SendspinClient decides whether to keep or reject the connection (for handoff logic)
- * - Supports max_connections=2 by default to enable handoff protocol:
- *   - One active connection is managed by the client
- *   - A second connection can be accepted temporarily during handoff
- *   - The client completes the handshake and decides which to keep
- *
- * Lifecycle:
- * 1. SendspinClient calls start() with callbacks and configuration
- * 2. Server listens on port 8928 at /sendspin
- * 3. open_callback() creates SendspinServerConnection instances
- * 4. SendspinClient receives connection via new_connection_callback
- * 5. SendspinClient manages connection ownership and handoff logic
- * 6. close_callback() handles socket cleanup
- */
+// ============================================================================
+// SendspinWsServer
+// ============================================================================
+//
+// Manages the HTTP server (httpd) that accepts incoming WebSocket connections.
+//
+// Key Design Points:
+// - The server listener ACCEPTS connections but doesn't OWN them long-term
+// - When a client connects, it creates a SendspinServerConnection and hands it to the
+//   SendspinClient
+// - The SendspinClient decides whether to keep or reject the connection (for handoff logic)
+// - Supports max_connections=2 by default to enable handoff protocol:
+//   - One active connection is managed by the client
+//   - A second connection can be accepted temporarily during handoff
+//   - The client completes the handshake and decides which to keep
+//
+// Lifecycle:
+// 1. SendspinClient calls start() with callbacks and configuration
+// 2. Server listens on port 8928 at /sendspin
+// 3. open_callback() creates SendspinServerConnection instances
+// 4. SendspinClient receives connection via new_connection_callback
+// 5. SendspinClient manages connection ownership and handoff logic
+// 6. close_callback() handles socket cleanup
 
 static const char* const TAG = "sendspin.ws_server";
 
@@ -70,7 +72,10 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
     config.close_fn = SendspinWsServer::close_callback;
     config.global_user_ctx = (void*)this;
     config.global_user_ctx_free_fn = nullptr;
-    config.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 1;  // Avoid conflict with web_server component
+    // Use the configured ctrl_port, or fall back to ESP_HTTPD_DEF_CTRL_PORT + 1 to avoid
+    // conflict with the web_server component
+    config.ctrl_port = (this->ctrl_port_ != 0) ? this->ctrl_port_
+                                               : static_cast<uint16_t>(ESP_HTTPD_DEF_CTRL_PORT + 1);
 
     // Start the HTTP server
     SS_LOGI(TAG, "Starting server on port: %d (max connections: %d)", config.server_port,
@@ -153,14 +158,14 @@ esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
 
     // Handle WebSocket handshake (HTTP_GET)
     if (req->method == HTTP_GET) {
-        // Find the connection and invoke its on_connected callback
+        // Find the connection and invoke its on_connected_cb callback
         int sockfd = httpd_req_to_sockfd(req);
         SendspinServerConnection* conn = nullptr;
         if (server->find_connection_callback_) {
             conn = server->find_connection_callback_(sockfd);
         }
-        if (conn != nullptr && conn->on_connected) {
-            conn->on_connected(conn);
+        if (conn != nullptr && conn->on_connected_cb) {
+            conn->on_connected_cb(conn);
         }
         return ESP_OK;
     }

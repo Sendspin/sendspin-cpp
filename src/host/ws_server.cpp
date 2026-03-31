@@ -18,9 +18,14 @@
 #include "platform/time.h"
 #include "server_connection.h"
 
+#include <limits>
+
 namespace sendspin {
 
 static const char* const TAG = "sendspin.ws_server";
+
+/// @brief Default WebSocket server port
+static constexpr uint16_t DEFAULT_SERVER_PORT = 8928U;
 
 SendspinWsServer::~SendspinWsServer() {
     this->stop();
@@ -35,66 +40,71 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
 
     this->client_ = client;
 
-    // Create IXWebSocket server on port 8928
-    this->server_ = std::make_unique<ix::WebSocketServer>(8928, "0.0.0.0");
+    // Create IXWebSocket server on the configured port
+    this->server_ = std::make_unique<ix::WebSocketServer>(DEFAULT_SERVER_PORT, "0.0.0.0");
 
-    this->server_->setOnConnectionCallback([this](std::weak_ptr<ix::WebSocket> weak_ws,
-                                                  std::shared_ptr<ix::ConnectionState> /*state*/) {
-        auto ws = weak_ws.lock();
-        if (!ws) {
-            return;
-        }
-
-        // Generate a synthetic sockfd from the pointer for connection lookup
-        int synthetic_sockfd = static_cast<int>(reinterpret_cast<intptr_t>(ws.get()) & 0x7FFFFFFF);
-
-        SS_LOGD(TAG, "New client connection (synthetic sockfd %d)", synthetic_sockfd);
-
-        // Create the server connection
-        auto connection = std::make_unique<SendspinServerConnection>(ws, synthetic_sockfd);
-
-        // Set up the message callback on the websocket to route data through the connection
-        ws->setOnMessageCallback([this, synthetic_sockfd](const ix::WebSocketMessagePtr& msg) {
-            int64_t receive_time = platform_time_us();
-
-            // Find the connection by sockfd
-            SendspinServerConnection* conn = nullptr;
-            if (this->find_connection_callback_) {
-                conn = this->find_connection_callback_(synthetic_sockfd);
+    this->server_->setOnConnectionCallback(
+        [this](const std::weak_ptr<ix::WebSocket>& weak_ws,
+               const std::shared_ptr<ix::ConnectionState>& /*state*/) {
+            auto ws = weak_ws.lock();
+            if (!ws) {
+                return;
             }
 
-            if (msg->type == ix::WebSocketMessageType::Message) {
-                if (conn == nullptr) {
-                    SS_LOGE(TAG, "No connection found for synthetic sockfd %d", synthetic_sockfd);
-                    return;
+            // Generate a synthetic sockfd from the pointer for connection lookup
+            int synthetic_sockfd = static_cast<int>(reinterpret_cast<intptr_t>(ws.get()) &
+                                                    std::numeric_limits<int>::max());
+
+            SS_LOGD(TAG, "New client connection (synthetic sockfd %d)", synthetic_sockfd);
+
+            // Create the server connection
+            auto connection = std::make_unique<SendspinServerConnection>(ws, synthetic_sockfd);
+
+            // Set up the message callback on the websocket to route data through the connection
+            ws->setOnMessageCallback([this, synthetic_sockfd](const ix::WebSocketMessagePtr& msg) {
+                int64_t receive_time = platform_time_us();
+
+                // Find the connection by sockfd
+                SendspinServerConnection* conn = nullptr;
+                if (this->find_connection_callback_) {
+                    conn = this->find_connection_callback_(synthetic_sockfd);
                 }
 
-                // Route through the connection's public handle_message method
-                conn->handle_message(msg->str, msg->binary, receive_time);
+                if (msg->type == ix::WebSocketMessageType::Message) {
+                    if (conn == nullptr) {
+                        SS_LOGE(TAG, "No connection found for synthetic sockfd %d",
+                                synthetic_sockfd);
+                        return;
+                    }
 
-            } else if (msg->type == ix::WebSocketMessageType::Open) {
-                if (conn != nullptr && conn->on_connected) {
-                    conn->on_connected(conn);
+                    // Route through the connection's public handle_message method
+                    conn->handle_message(msg->str, msg->binary, receive_time);
+
+                } else if (msg->type == ix::WebSocketMessageType::Open) {
+                    if (conn != nullptr && conn->on_connected_cb) {
+                        conn->on_connected_cb(conn);
+                    }
+                } else if (msg->type == ix::WebSocketMessageType::Close) {
+                    SS_LOGD(TAG, "Client closed connection (synthetic sockfd %d)",
+                            synthetic_sockfd);
+                    if (this->connection_closed_callback_) {
+                        this->connection_closed_callback_(synthetic_sockfd);
+                    }
+                } else if (msg->type == ix::WebSocketMessageType::Error) {
+                    SS_LOGE(TAG, "WebSocket error: %s", msg->errorInfo.reason.c_str());
                 }
-            } else if (msg->type == ix::WebSocketMessageType::Close) {
-                SS_LOGD(TAG, "Client closed connection (synthetic sockfd %d)", synthetic_sockfd);
-                if (this->connection_closed_callback_) {
-                    this->connection_closed_callback_(synthetic_sockfd);
-                }
-            } else if (msg->type == ix::WebSocketMessageType::Error) {
-                SS_LOGE(TAG, "WebSocket error: %s", msg->errorInfo.reason.c_str());
+            });
+
+            // Notify the client of the new connection
+            if (this->new_connection_callback_) {
+                this->new_connection_callback_(std::move(connection));
+            } else {
+                SS_LOGW(TAG, "No new connection callback set, connection will be dropped");
             }
         });
 
-        // Notify the client of the new connection
-        if (this->new_connection_callback_) {
-            this->new_connection_callback_(std::move(connection));
-        } else {
-            SS_LOGW(TAG, "No new connection callback set, connection will be dropped");
-        }
-    });
-
-    SS_LOGI(TAG, "Starting server on port: 8928 (max connections: %d)", this->max_connections_);
+    SS_LOGI(TAG, "Starting server on port: %d (max connections: %d)", DEFAULT_SERVER_PORT,
+            this->max_connections_);
 
     auto result = this->server_->listen();
     if (!result.first) {

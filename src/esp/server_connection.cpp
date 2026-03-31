@@ -25,10 +25,11 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.server_connection";
 
-/*
- * Structure holding connection context
- * and payload data for async send operations.
- */
+// ============================================================================
+// Static helpers
+// ============================================================================
+
+/// @brief Structure holding connection context and payload data for async send operations
 struct AsyncRespArg {
     void* context;
     uint8_t* payload;
@@ -36,6 +37,10 @@ struct AsyncRespArg {
     bool has_callback{false};
     SendCompleteCallback on_complete;
 };
+
+// ============================================================================
+// SendspinConnection interface implementation
+// ============================================================================
 
 SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int sockfd)
     : server_(server), sockfd_(sockfd) {
@@ -47,8 +52,7 @@ SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int so
 }
 
 void SendspinServerConnection::start() {
-    // Initialize any per-connection state
-    // Time filter is initialized by the hub when it sets up the connection
+    // Time filter is initialized by the hub when it sets up the connection.
 }
 
 void SendspinServerConnection::loop() {
@@ -71,8 +75,8 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
         // Trigger close regardless of send success
         this->trigger_close();
 
-        // Invoke user-provided completion callback if provided
-        // Note: This is already running in httpd worker thread context (async_send_text),
+        // Invoke user-provided completion callback if provided.
+        // Already running in httpd worker thread context (async_send_text),
         // so caller should use defer() if they need main loop context
         if (on_complete) {
             on_complete();
@@ -172,13 +176,13 @@ esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receiv
     if (ws_pkt.len == 0) {
         // No payload data, but still dispatch if final (for empty messages or buffered data)
         if (is_final) {
-            this->dispatch_completed_message_(this->is_text_frame_, receive_time);
+            this->dispatch_completed_message(this->is_text_frame_, receive_time);
         }
         return ESP_OK;
     }
 
     // Allocate/grow directly into the websocket payload buffer (zero-copy)
-    uint8_t* dest = this->prepare_receive_buffer_(ws_pkt.len);
+    uint8_t* dest = this->prepare_receive_buffer(ws_pkt.len);
     if (dest == nullptr) {
         return ESP_ERR_NO_MEM;
     }
@@ -190,14 +194,14 @@ esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receiv
     ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
     if (ret != ESP_OK) {
         SS_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
-        this->reset_websocket_payload_();
+        this->reset_websocket_payload();
         return ret;
     }
 
-    this->commit_receive_buffer_(ws_pkt.len);
+    this->commit_receive_buffer(ws_pkt.len);
 
     if (is_final) {
-        this->dispatch_completed_message_(this->is_text_frame_, receive_time);
+        this->dispatch_completed_message(this->is_text_frame_, receive_time);
     }
 
     return ESP_OK;

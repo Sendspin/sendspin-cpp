@@ -25,10 +25,6 @@ Dependencies (fetched automatically via CMake FetchContent): ArduinoJson, micro-
 
 Used as an IDF component. Add to your project's `idf_component.yml`.
 
-### PlatformIO
-
-Add via `library.json`.
-
 ## Examples
 
 - **`examples/basic_client/`** -- Standalone host example with PortAudio audio output

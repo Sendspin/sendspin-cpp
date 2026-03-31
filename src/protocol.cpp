@@ -12,15 +12,232 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "sendspin/protocol.h"
-
 #include "platform/logging.h"
 #include "platform/memory.h"
+#include "protocol_messages.h"
 #include <ArduinoJson.h>
 
 namespace sendspin {
 
 static const char* const TAG = "sendspin.protocol";
+
+// ============================================================================
+// Static helpers
+// ============================================================================
+
+static bool process_player_stream_object(const JsonObject player_object,
+                                         ServerPlayerStreamObject* player_obj,
+                                         bool require_all_fields) {
+    if (player_obj == nullptr) {
+        return false;
+    }
+
+    if (require_all_fields) {
+        if (!player_object["bit_depth"].is<JsonVariant>() ||
+            !player_object["channels"].is<JsonVariant>() ||
+            !player_object["sample_rate"].is<JsonVariant>() ||
+            !player_object["codec"].is<JsonVariant>()) {
+            SS_LOGE(TAG, "Invalid player object: missing required fields");
+            return false;
+        }
+    }
+
+    if (player_object["codec"].is<JsonVariant>()) {
+        std::string codec_type = player_object["codec"].as<std::string>();
+        auto codec = codec_format_from_string(codec_type);
+        player_obj->codec = codec.value_or(SendspinCodecFormat::UNSUPPORTED);
+    }
+
+    if (player_object["sample_rate"].is<JsonVariant>()) {
+        player_obj->sample_rate = player_object["sample_rate"].as<uint32_t>();
+    }
+
+    if (player_object["channels"].is<JsonVariant>()) {
+        player_obj->channels = player_object["channels"].as<uint8_t>();
+    }
+
+    if (player_object["bit_depth"].is<JsonVariant>()) {
+        player_obj->bit_depth = player_object["bit_depth"].as<uint8_t>();
+    }
+
+    if (player_object["codec_header"].is<JsonVariant>()) {
+        player_obj->codec_header = player_object["codec_header"].as<std::string>();
+    }
+
+    // For FLAC, codec_header is required
+    if (player_obj->codec.has_value() && player_obj->codec.value() == SendspinCodecFormat::FLAC &&
+        !player_obj->codec_header.has_value()) {
+        SS_LOGE(TAG, "Invalid player object: FLAC requires codec_header");
+        return false;
+    }
+
+    return true;
+}
+
+static bool process_artwork_channel_object(const JsonObject channel_object,
+                                           ServerArtworkChannelObject* channel,
+                                           bool require_all_fields) {
+    if (channel == nullptr) {
+        return false;
+    }
+
+    if (require_all_fields) {
+        if (!channel_object["source"].is<JsonVariant>() ||
+            !channel_object["format"].is<JsonVariant>() ||
+            !channel_object["width"].is<JsonVariant>() ||
+            !channel_object["height"].is<JsonVariant>()) {
+            SS_LOGE(TAG, "Invalid artwork channel: missing required fields");
+            return false;
+        }
+    }
+
+    if (channel_object["source"].is<const char*>()) {
+        std::string source_str = channel_object["source"].as<std::string>();
+        channel->source = image_source_from_string(source_str);
+    }
+
+    if (channel_object["format"].is<const char*>()) {
+        std::string format_str = channel_object["format"].as<std::string>();
+        channel->format = image_format_from_string(format_str);
+    }
+
+    if (channel_object["width"].is<JsonVariant>()) {
+        channel->width = channel_object["width"].as<uint16_t>();
+    }
+
+    if (channel_object["height"].is<JsonVariant>()) {
+        channel->height = channel_object["height"].as<uint16_t>();
+    }
+
+    return true;
+}
+
+static bool process_server_player_command_object(const JsonObject player_object,
+                                                 ServerPlayerCommandObject* player_cmd) {
+    if (player_cmd == nullptr || !player_object["command"].is<JsonVariant>()) {
+        return false;
+    }
+
+    std::string command_str = player_object["command"].as<std::string>();
+    auto command = player_command_from_string(command_str);
+
+    if (!command.has_value()) {
+        SS_LOGE(TAG, "Invalid server player command type: %s", command_str.c_str());
+        return false;
+    }
+    player_cmd->command = command.value();
+
+    // Parse optional fields
+    if (player_object["volume"].is<JsonVariant>()) {
+        player_cmd->volume = player_object["volume"].as<uint8_t>();
+    }
+
+    if (player_object["mute"].is<JsonVariant>()) {
+        player_cmd->mute = player_object["mute"].as<bool>();
+    }
+
+    if (player_object["static_delay_ms"].is<JsonVariant>()) {
+        player_cmd->static_delay_ms = player_object["static_delay_ms"].as<uint16_t>();
+    }
+
+    return true;
+}
+
+static bool process_server_metadata_state_object(const JsonObject metadata_object,
+                                                 ServerMetadataStateObject* metadata_state) {
+    if (metadata_state == nullptr) {
+        return false;
+    }
+
+    // timestamp is required (not optional)
+    if (!metadata_object["timestamp"].is<JsonVariant>()) {
+        SS_LOGE(TAG, "Invalid metadata state object: missing timestamp");
+        return false;
+    }
+    metadata_state->timestamp = metadata_object["timestamp"].as<int64_t>();
+
+    // All other fields are optional - handle both values and null (to clear)
+    // Null is treated as empty string so it gets applied via delta updates
+    // Use isUnbound() to distinguish "key exists with null" from "key doesn't exist"
+    JsonVariantConst title_var = metadata_object["title"];
+    if (title_var.is<const char*>()) {
+        metadata_state->title = title_var.as<std::string>();
+    } else if (!title_var.isUnbound() && title_var.isNull()) {
+        metadata_state->title = "";
+    }
+
+    JsonVariantConst artist_var = metadata_object["artist"];
+    if (artist_var.is<const char*>()) {
+        metadata_state->artist = artist_var.as<std::string>();
+    } else if (!artist_var.isUnbound() && artist_var.isNull()) {
+        metadata_state->artist = "";
+    }
+
+    JsonVariantConst album_artist_var = metadata_object["album_artist"];
+    if (album_artist_var.is<const char*>()) {
+        metadata_state->album_artist = album_artist_var.as<std::string>();
+    } else if (!album_artist_var.isUnbound() && album_artist_var.isNull()) {
+        metadata_state->album_artist = "";
+    }
+
+    JsonVariantConst album_var = metadata_object["album"];
+    if (album_var.is<const char*>()) {
+        metadata_state->album = album_var.as<std::string>();
+    } else if (!album_var.isUnbound() && album_var.isNull()) {
+        metadata_state->album = "";
+    }
+
+    JsonVariantConst artwork_url_var = metadata_object["artwork_url"];
+    if (artwork_url_var.is<const char*>()) {
+        metadata_state->artwork_url = artwork_url_var.as<std::string>();
+    } else if (!artwork_url_var.isUnbound() && artwork_url_var.isNull()) {
+        metadata_state->artwork_url = "";
+    }
+
+    if (metadata_object["year"].is<JsonVariant>() && !metadata_object["year"].isNull()) {
+        metadata_state->year = metadata_object["year"].as<uint16_t>();
+    }
+
+    if (metadata_object["track"].is<JsonVariant>() && !metadata_object["track"].isNull()) {
+        metadata_state->track = metadata_object["track"].as<uint16_t>();
+    }
+
+    // Parse progress object - if any progress field is present, create the object
+    if (metadata_object["progress"].is<JsonObject>()) {
+        JsonObject progress_object = metadata_object["progress"];
+        MetadataProgressObject progress{};
+        if (progress_object["track_progress"].is<JsonVariant>()) {
+            progress.track_progress = progress_object["track_progress"].as<uint32_t>();
+        }
+        if (progress_object["track_duration"].is<JsonVariant>()) {
+            progress.track_duration = progress_object["track_duration"].as<uint32_t>();
+        }
+        if (progress_object["playback_speed"].is<JsonVariant>()) {
+            progress.playback_speed = progress_object["playback_speed"].as<uint32_t>();
+        }
+        metadata_state->progress = progress;
+    } else if (!metadata_object["progress"].isUnbound() && metadata_object["progress"].isNull()) {
+        // Explicit null clears progress
+        metadata_state->progress = std::nullopt;
+    }
+
+    if (metadata_object["repeat"].is<const char*>()) {
+        std::string repeat_str = metadata_object["repeat"].as<std::string>();
+        metadata_state->repeat = repeat_mode_from_string(repeat_str);
+    }
+
+    if (metadata_object["shuffle"].is<JsonVariant>() && !metadata_object["shuffle"].isNull()) {
+        metadata_state->shuffle = metadata_object["shuffle"].as<bool>();
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Protocol functions
+// ============================================================================
+
+// Message type determination
 
 SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     if (!root["type"].is<const char*>()) {
@@ -30,24 +247,33 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     const std::string type_str = root["type"].as<std::string>();
     if (type_str == "server/hello") {
         return SendspinServerToClientMessageType::SERVER_HELLO;
-    } else if (type_str == "server/time") {
+    }
+    if (type_str == "server/time") {
         return SendspinServerToClientMessageType::SERVER_TIME;
-    } else if (type_str == "server/state") {
+    }
+    if (type_str == "server/state") {
         return SendspinServerToClientMessageType::SERVER_STATE;
-    } else if (type_str == "server/command") {
+    }
+    if (type_str == "server/command") {
         return SendspinServerToClientMessageType::SERVER_COMMAND;
-    } else if (type_str == "stream/start") {
+    }
+    if (type_str == "stream/start") {
         return SendspinServerToClientMessageType::STREAM_START;
-    } else if (type_str == "stream/end") {
+    }
+    if (type_str == "stream/end") {
         return SendspinServerToClientMessageType::STREAM_END;
-    } else if (type_str == "stream/clear") {
+    }
+    if (type_str == "stream/clear") {
         return SendspinServerToClientMessageType::STREAM_CLEAR;
-    } else if (type_str == "group/update") {
+    }
+    if (type_str == "group/update") {
         return SendspinServerToClientMessageType::GROUP_UPDATE;
     }
 
     return SendspinServerToClientMessageType::UNKNOWN;
 }
+
+// Message processing
 
 bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg) {
     if (!root["payload"]["server_id"].is<JsonVariant>() ||
@@ -158,6 +384,8 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
     return true;
 }
 
+// State delta application
+
 void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObject& updates) {
     if (current == nullptr) {
         return;
@@ -179,100 +407,68 @@ void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObje
     }
 }
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
-static bool process_player_stream_object(const JsonObject player_object,
-                                         ServerPlayerStreamObject* player_obj,
-                                         bool require_all_fields) {
-    if (player_obj == nullptr) {
+bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg) {
+    if (cmd_msg != nullptr && root["payload"]["player"].is<JsonObject>()) {
+        ServerPlayerCommandObject player_cmd{};
+        if (process_server_player_command_object(root["payload"]["player"], &player_cmd)) {
+            cmd_msg->player = player_cmd;
+            return true;
+        }
         return false;
     }
+    return true;
+}
 
-    if (require_all_fields) {
-        if (!player_object["bit_depth"].is<JsonVariant>() ||
-            !player_object["channels"].is<JsonVariant>() ||
-            !player_object["sample_rate"].is<JsonVariant>() ||
-            !player_object["codec"].is<JsonVariant>()) {
-            SS_LOGE(TAG, "Invalid player object: missing required fields");
-            return false;
+bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg) {
+    if (state_msg == nullptr) {
+        return true;
+    }
+
+    (void)root;
+
+    // Parse optional metadata object
+    if (root["payload"]["metadata"].is<JsonObject>()) {
+        ServerMetadataStateObject metadata_state{};
+        if (process_server_metadata_state_object(root["payload"]["metadata"], &metadata_state)) {
+            state_msg->metadata = metadata_state;
         }
     }
 
-    if (player_object["codec"].is<JsonVariant>()) {
-        std::string codec_type = player_object["codec"].as<std::string>();
-        auto codec = codec_format_from_string(codec_type);
-        player_obj->codec = codec.value_or(SendspinCodecFormat::UNSUPPORTED);
-    }
+    if (root["payload"]["controller"].is<JsonObject>()) {
+        ServerStateControllerObject controller_state{};
+        JsonObject controller_object = root["payload"]["controller"];
 
-    if (player_object["sample_rate"].is<JsonVariant>()) {
-        player_obj->sample_rate = player_object["sample_rate"].as<uint32_t>();
-    }
+        // Parse supported_commands array
+        if (controller_object["supported_commands"].is<JsonArray>()) {
+            std::vector<SendspinControllerCommand> commands;
+            JsonArray commands_array = controller_object["supported_commands"].as<JsonArray>();
+            for (JsonVariant command_var : commands_array) {
+                if (command_var.is<const char*>()) {
+                    std::string command_str = command_var.as<std::string>();
+                    auto command = controller_command_from_string(command_str);
+                    if (command.has_value()) {
+                        commands.push_back(command.value());
+                    }
+                }
+            }
+            controller_state.supported_commands = commands;
+        }
 
-    if (player_object["channels"].is<JsonVariant>()) {
-        player_obj->channels = player_object["channels"].as<uint8_t>();
-    }
+        // Parse volume
+        if (controller_object["volume"].is<JsonVariant>()) {
+            controller_state.volume = controller_object["volume"].as<uint8_t>();
+        }
 
-    if (player_object["bit_depth"].is<JsonVariant>()) {
-        player_obj->bit_depth = player_object["bit_depth"].as<uint8_t>();
-    }
+        // Parse muted
+        if (controller_object["muted"].is<JsonVariant>()) {
+            controller_state.muted = controller_object["muted"].as<bool>();
+        }
 
-    if (player_object["codec_header"].is<JsonVariant>()) {
-        player_obj->codec_header = player_object["codec_header"].as<std::string>();
-    }
-
-    // For FLAC, codec_header is required
-    if (player_obj->codec.has_value() && player_obj->codec.value() == SendspinCodecFormat::FLAC &&
-        !player_obj->codec_header.has_value()) {
-        SS_LOGE(TAG, "Invalid player object: FLAC requires codec_header");
-        return false;
+        state_msg->controller = controller_state;
     }
 
     return true;
 }
-
-#endif  // SENDSPIN_ENABLE_PLAYER
-
-#ifdef SENDSPIN_ENABLE_ARTWORK
-
-static bool process_artwork_channel_object(const JsonObject channel_object,
-                                           ServerArtworkChannelObject* channel,
-                                           bool require_all_fields) {
-    if (channel == nullptr) {
-        return false;
-    }
-
-    if (require_all_fields) {
-        if (!channel_object["source"].is<JsonVariant>() ||
-            !channel_object["format"].is<JsonVariant>() ||
-            !channel_object["width"].is<JsonVariant>() ||
-            !channel_object["height"].is<JsonVariant>()) {
-            SS_LOGE(TAG, "Invalid artwork channel: missing required fields");
-            return false;
-        }
-    }
-
-    if (channel_object["source"].is<const char*>()) {
-        std::string source_str = channel_object["source"].as<std::string>();
-        channel->source = image_source_from_string(source_str);
-    }
-
-    if (channel_object["format"].is<const char*>()) {
-        std::string format_str = channel_object["format"].as<std::string>();
-        channel->format = image_format_from_string(format_str);
-    }
-
-    if (channel_object["width"].is<JsonVariant>()) {
-        channel->width = channel_object["width"].as<uint16_t>();
-    }
-
-    if (channel_object["height"].is<JsonVariant>()) {
-        channel->height = channel_object["height"].as<uint16_t>();
-    }
-
-    return true;
-}
-
-#endif  // SENDSPIN_ENABLE_ARTWORK
 
 bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_msg) {
     if (stream_msg == nullptr) {
@@ -281,9 +477,8 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
 
     (void)root;
 
-#ifdef SENDSPIN_ENABLE_PLAYER
     if (root["payload"]["player"].is<JsonObject>()) {
-        ServerPlayerStreamObject player_obj;
+        ServerPlayerStreamObject player_obj{};
         if (process_player_stream_object(root["payload"]["player"], &player_obj, true)) {
             if (!player_obj.is_complete()) {
                 SS_LOGE(TAG, "Invalid stream/start message: incomplete player object");
@@ -294,16 +489,14 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             return false;
         }
     }
-#endif  // SENDSPIN_ENABLE_PLAYER
 
-#ifdef SENDSPIN_ENABLE_ARTWORK
     if (root["payload"]["artwork"]["channels"].is<JsonArray>()) {
-        ServerArtworkStreamObject artwork_obj;
+        ServerArtworkStreamObject artwork_obj{};
         std::vector<ServerArtworkChannelObject> channels;
 
         JsonArray channels_array = root["payload"]["artwork"]["channels"].as<JsonArray>();
         for (JsonObject channel_json : channels_array) {
-            ServerArtworkChannelObject channel;
+            ServerArtworkChannelObject channel{};
             if (process_artwork_channel_object(channel_json, &channel, true)) {
                 if (!channel.is_complete()) {
                     SS_LOGE(TAG, "Invalid stream/start message: incomplete artwork channel");
@@ -317,11 +510,9 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         artwork_obj.channels = channels;
         stream_msg->artwork = artwork_obj;
     }
-#endif  // SENDSPIN_ENABLE_ARTWORK
 
-#ifdef SENDSPIN_ENABLE_VISUALIZER
     if (root["payload"]["visualizer"].is<JsonObject>()) {
-        ServerVisualizerStreamObject vis_obj;
+        ServerVisualizerStreamObject vis_obj{};
         JsonObject vis_json = root["payload"]["visualizer"];
 
         // Parse types array
@@ -350,7 +541,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         // Parse spectrum config if present
         if (vis_json["spectrum"].is<JsonObject>()) {
             JsonObject spec_json = vis_json["spectrum"];
-            VisualizerSpectrumConfig spec_cfg;
+            VisualizerSpectrumConfig spec_cfg{};
             spec_cfg.n_disp_bins = spec_json["n_disp_bins"].as<uint8_t>();
             std::string scale_str = spec_json["scale"].as<std::string>();
             if (scale_str == "log") {
@@ -368,7 +559,6 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
 
         stream_msg->visualizer = vis_obj;
     }
-#endif  // SENDSPIN_ENABLE_VISUALIZER
 
     return true;
 }
@@ -408,145 +598,6 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
             }
         }
         clear_msg->roles = roles;
-    }
-
-    return true;
-}
-
-#ifdef SENDSPIN_ENABLE_PLAYER
-
-static bool process_server_player_command_object(const JsonObject player_object,
-                                                 ServerPlayerCommandObject* player_cmd) {
-    if (player_cmd == nullptr || !player_object["command"].is<JsonVariant>()) {
-        return false;
-    }
-
-    std::string command_str = player_object["command"].as<std::string>();
-    auto command = player_command_from_string(command_str);
-
-    if (!command.has_value()) {
-        SS_LOGE(TAG, "Invalid server player command type: %s", command_str.c_str());
-        return false;
-    }
-    player_cmd->command = command.value();
-
-    // Parse optional fields
-    if (player_object["volume"].is<JsonVariant>()) {
-        player_cmd->volume = player_object["volume"].as<uint8_t>();
-    }
-
-    if (player_object["mute"].is<JsonVariant>()) {
-        player_cmd->mute = player_object["mute"].as<bool>();
-    }
-
-    if (player_object["static_delay_ms"].is<JsonVariant>()) {
-        player_cmd->static_delay_ms = player_object["static_delay_ms"].as<uint16_t>();
-    }
-
-    return true;
-}
-
-bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg) {
-    if (cmd_msg != nullptr && root["payload"]["player"].is<JsonObject>()) {
-        ServerPlayerCommandObject player_cmd;
-        if (process_server_player_command_object(root["payload"]["player"], &player_cmd)) {
-            cmd_msg->player = player_cmd;
-            return true;
-        }
-        return false;
-    }
-    return true;
-}
-
-#endif  // SENDSPIN_ENABLE_PLAYER
-
-#ifdef SENDSPIN_ENABLE_METADATA
-
-static bool process_server_metadata_state_object(const JsonObject metadata_object,
-                                                 ServerMetadataStateObject* metadata_state) {
-    if (metadata_state == nullptr) {
-        return false;
-    }
-
-    // timestamp is required (not optional)
-    if (!metadata_object["timestamp"].is<JsonVariant>()) {
-        SS_LOGE(TAG, "Invalid metadata state object: missing timestamp");
-        return false;
-    }
-    metadata_state->timestamp = metadata_object["timestamp"].as<int64_t>();
-
-    // All other fields are optional - handle both values and null (to clear)
-    // Null is treated as empty string so it gets applied via delta updates
-    // Use isUnbound() to distinguish "key exists with null" from "key doesn't exist"
-    JsonVariantConst title_var = metadata_object["title"];
-    if (title_var.is<const char*>()) {
-        metadata_state->title = title_var.as<std::string>();
-    } else if (!title_var.isUnbound() && title_var.isNull()) {
-        metadata_state->title = "";
-    }
-
-    JsonVariantConst artist_var = metadata_object["artist"];
-    if (artist_var.is<const char*>()) {
-        metadata_state->artist = artist_var.as<std::string>();
-    } else if (!artist_var.isUnbound() && artist_var.isNull()) {
-        metadata_state->artist = "";
-    }
-
-    JsonVariantConst album_artist_var = metadata_object["album_artist"];
-    if (album_artist_var.is<const char*>()) {
-        metadata_state->album_artist = album_artist_var.as<std::string>();
-    } else if (!album_artist_var.isUnbound() && album_artist_var.isNull()) {
-        metadata_state->album_artist = "";
-    }
-
-    JsonVariantConst album_var = metadata_object["album"];
-    if (album_var.is<const char*>()) {
-        metadata_state->album = album_var.as<std::string>();
-    } else if (!album_var.isUnbound() && album_var.isNull()) {
-        metadata_state->album = "";
-    }
-
-    JsonVariantConst artwork_url_var = metadata_object["artwork_url"];
-    if (artwork_url_var.is<const char*>()) {
-        metadata_state->artwork_url = artwork_url_var.as<std::string>();
-    } else if (!artwork_url_var.isUnbound() && artwork_url_var.isNull()) {
-        metadata_state->artwork_url = "";
-    }
-
-    if (metadata_object["year"].is<JsonVariant>() && !metadata_object["year"].isNull()) {
-        metadata_state->year = metadata_object["year"].as<uint16_t>();
-    }
-
-    if (metadata_object["track"].is<JsonVariant>() && !metadata_object["track"].isNull()) {
-        metadata_state->track = metadata_object["track"].as<uint16_t>();
-    }
-
-    // Parse progress object - if any progress field is present, create the object
-    if (metadata_object["progress"].is<JsonObject>()) {
-        JsonObject progress_object = metadata_object["progress"];
-        MetadataProgressObject progress;
-        if (progress_object["track_progress"].is<JsonVariant>()) {
-            progress.track_progress = progress_object["track_progress"].as<uint32_t>();
-        }
-        if (progress_object["track_duration"].is<JsonVariant>()) {
-            progress.track_duration = progress_object["track_duration"].as<uint32_t>();
-        }
-        if (progress_object["playback_speed"].is<JsonVariant>()) {
-            progress.playback_speed = progress_object["playback_speed"].as<uint32_t>();
-        }
-        metadata_state->progress = progress;
-    } else if (!metadata_object["progress"].isUnbound() && metadata_object["progress"].isNull()) {
-        // Explicit null clears progress
-        metadata_state->progress = std::nullopt;
-    }
-
-    if (metadata_object["repeat"].is<const char*>()) {
-        std::string repeat_str = metadata_object["repeat"].as<std::string>();
-        metadata_state->repeat = repeat_mode_from_string(repeat_str);
-    }
-
-    if (metadata_object["shuffle"].is<JsonVariant>() && !metadata_object["shuffle"].isNull()) {
-        metadata_state->shuffle = metadata_object["shuffle"].as<bool>();
     }
 
     return true;
@@ -603,62 +654,7 @@ void apply_metadata_state_deltas(ServerMetadataStateObject* current,
     }
 }
 
-#endif  // SENDSPIN_ENABLE_METADATA
-
-bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg) {
-    if (state_msg == nullptr) {
-        return true;
-    }
-
-    (void)root;
-
-#ifdef SENDSPIN_ENABLE_METADATA
-    // Parse optional metadata object
-    if (root["payload"]["metadata"].is<JsonObject>()) {
-        ServerMetadataStateObject metadata_state;
-        if (process_server_metadata_state_object(root["payload"]["metadata"], &metadata_state)) {
-            state_msg->metadata = metadata_state;
-        }
-    }
-#endif  // SENDSPIN_ENABLE_METADATA
-
-#ifdef SENDSPIN_ENABLE_CONTROLLER
-    if (root["payload"]["controller"].is<JsonObject>()) {
-        ServerStateControllerObject controller_state;
-        JsonObject controller_object = root["payload"]["controller"];
-
-        // Parse supported_commands array
-        if (controller_object["supported_commands"].is<JsonArray>()) {
-            std::vector<SendspinControllerCommand> commands;
-            JsonArray commands_array = controller_object["supported_commands"].as<JsonArray>();
-            for (JsonVariant command_var : commands_array) {
-                if (command_var.is<const char*>()) {
-                    std::string command_str = command_var.as<std::string>();
-                    auto command = controller_command_from_string(command_str);
-                    if (command.has_value()) {
-                        commands.push_back(command.value());
-                    }
-                }
-            }
-            controller_state.supported_commands = commands;
-        }
-
-        // Parse volume
-        if (controller_object["volume"].is<JsonVariant>()) {
-            controller_state.volume = controller_object["volume"].as<uint8_t>();
-        }
-
-        // Parse muted
-        if (controller_object["muted"].is<JsonVariant>()) {
-            controller_state.muted = controller_object["muted"].as<bool>();
-        }
-
-        state_msg->controller = controller_state;
-    }
-#endif  // SENDSPIN_ENABLE_CONTROLLER
-
-    return true;
-}
+// Message formatting
 
 std::string format_client_hello_message(const ClientHelloMessage* msg) {
     JsonDocument doc = make_json_document();
@@ -685,7 +681,6 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         supported_roles_list.add(to_cstr(role));
     }
 
-#ifdef SENDSPIN_ENABLE_PLAYER
     if (msg->player_v1_support.has_value()) {
         JsonArray formats_list =
             root["payload"]["player@v1_support"]["supported_formats"].to<JsonArray>();
@@ -704,9 +699,7 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             commands_list.add(to_cstr(cmd));
         }
     }
-#endif  // SENDSPIN_ENABLE_PLAYER
 
-#ifdef SENDSPIN_ENABLE_ARTWORK
     if (msg->artwork_v1_support.has_value()) {
         JsonArray channels_list = root["payload"]["artwork@v1_support"]["channels"].to<JsonArray>();
         for (const auto& channel : msg->artwork_v1_support.value().channels) {
@@ -717,9 +710,7 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             channel_obj["media_height"] = channel.media_height;
         }
     }
-#endif  // SENDSPIN_ENABLE_ARTWORK
 
-#ifdef SENDSPIN_ENABLE_VISUALIZER
     if (msg->visualizer_support.has_value()) {
         const auto& vis = msg->visualizer_support.value();
         JsonArray types_list =
@@ -740,7 +731,6 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["rate_max"] = spec.rate_max;
         }
     }
-#endif  // SENDSPIN_ENABLE_VISUALIZER
 
     std::string output;
     serializeJson(doc, output);
@@ -754,7 +744,6 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
     root["type"] = "client/state";
     root["payload"]["state"] = to_cstr(msg->state);
 
-#ifdef SENDSPIN_ENABLE_PLAYER
     if (msg->player.has_value()) {
         const ClientPlayerStateObject& player_state = msg->player.value();
         root["payload"]["player"]["volume"] = player_state.volume;
@@ -768,7 +757,6 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
             }
         }
     }
-#endif  // SENDSPIN_ENABLE_PLAYER
 
     std::string output;
     serializeJson(doc, output);
@@ -783,7 +771,6 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
 
     root["type"] = "stream/request-format";
 
-#ifdef SENDSPIN_ENABLE_PLAYER
     if (msg->player.has_value()) {
         const auto& player = msg->player.value();
         if (player.codec.has_value()) {
@@ -799,9 +786,7 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
             root["payload"]["player"]["bit_depth"] = player.bit_depth.value();
         }
     }
-#endif  // SENDSPIN_ENABLE_PLAYER
 
-#ifdef SENDSPIN_ENABLE_ARTWORK
     if (msg->artwork.has_value()) {
         const auto& artwork = msg->artwork.value();
         root["payload"]["artwork"]["channel"] = artwork.channel;
@@ -818,14 +803,23 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
             root["payload"]["artwork"]["media_height"] = artwork.media_height.value();
         }
     }
-#endif  // SENDSPIN_ENABLE_ARTWORK
 
     std::string output;
     serializeJson(doc, output);
     return output;
 }
 
-#ifdef SENDSPIN_ENABLE_CONTROLLER
+std::string format_client_goodbye_message(SendspinGoodbyeReason reason) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/goodbye";
+    root["payload"]["reason"] = to_cstr(reason);
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
 
 std::string format_client_command_message(SendspinControllerCommand command,
                                           std::optional<uint8_t> volume, std::optional<bool> mute) {
@@ -840,20 +834,6 @@ std::string format_client_command_message(SendspinControllerCommand command,
     if (command == SendspinControllerCommand::MUTE && mute.has_value()) {
         root["payload"]["controller"]["mute"] = mute.value();
     }
-
-    std::string output;
-    serializeJson(doc, output);
-    return output;
-}
-
-#endif  // SENDSPIN_ENABLE_CONTROLLER
-
-std::string format_client_goodbye_message(SendspinGoodbyeReason reason) {
-    JsonDocument doc = make_json_document();
-    JsonObject root = doc.to<JsonObject>();
-
-    root["type"] = "client/goodbye";
-    root["payload"]["reason"] = to_cstr(reason);
 
     std::string output;
     serializeJson(doc, output);

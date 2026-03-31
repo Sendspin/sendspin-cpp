@@ -19,7 +19,7 @@ The binary is at `build/examples/basic_client/basic_client`.
 sudo apt install libavahi-compat-libdnssd-dev
 ```
 
-macOS has mDNS support built in — no extra dependencies needed.
+macOS has mDNS support built in; no extra dependencies needed.
 
 ## Run
 

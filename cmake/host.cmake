@@ -28,21 +28,6 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     )
 
     # =========================================================================
-    # Feature flags — host builds enable all features by default
-    # =========================================================================
-    option(SENDSPIN_ENABLE_PLAYER "Enable player feature" ON)
-    option(SENDSPIN_ENABLE_CONTROLLER "Enable controller feature" ON)
-    option(SENDSPIN_ENABLE_METADATA "Enable metadata feature" ON)
-    option(SENDSPIN_ENABLE_ARTWORK "Enable artwork feature" ON)
-    option(SENDSPIN_ENABLE_VISUALIZER "Enable visualizer feature" ON)
-
-    foreach(_flag PLAYER CONTROLLER METADATA ARTWORK VISUALIZER)
-        if(SENDSPIN_ENABLE_${_flag})
-            target_compile_definitions(${TARGET_LIB} PUBLIC SENDSPIN_ENABLE_${_flag})
-        endif()
-    endforeach()
-
-    # =========================================================================
     # Compiler settings
     # =========================================================================
     target_compile_features(${TARGET_LIB} PUBLIC cxx_std_20)
@@ -77,28 +62,26 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         ARDUINOJSON_USE_LONG_LONG=1
     )
 
-    # micro-flac and micro-opus (only needed for player feature)
-    if(SENDSPIN_ENABLE_PLAYER)
-        FetchContent_Declare(
-            micro_flac
-            GIT_REPOSITORY https://github.com/esphome-libs/micro-flac.git
-            GIT_TAG        main
-            GIT_SHALLOW    TRUE
-            GIT_SUBMODULES "lib/micro-ogg-demuxer"
-        )
-        FetchContent_MakeAvailable(micro_flac)
-        target_link_libraries(${TARGET_LIB} PUBLIC micro_flac)
+    # micro-flac and micro-opus (audio codec libraries, required by decoder)
+    FetchContent_Declare(
+        micro_flac
+        GIT_REPOSITORY https://github.com/esphome-libs/micro-flac.git
+        GIT_TAG        v0.1.0
+        GIT_SHALLOW    TRUE
+        GIT_SUBMODULES "lib/micro-ogg-demuxer"
+    )
+    FetchContent_MakeAvailable(micro_flac)
+    target_link_libraries(${TARGET_LIB} PUBLIC micro_flac)
 
-        FetchContent_Declare(
-            micro_opus
-            GIT_REPOSITORY https://github.com/esphome-libs/micro-opus.git
-            GIT_TAG        v0.3.5
-            GIT_SHALLOW    TRUE
-            GIT_SUBMODULES "lib/opus" "lib/micro-ogg-demuxer"
-        )
-        FetchContent_MakeAvailable(micro_opus)
-        target_link_libraries(${TARGET_LIB} PUBLIC micro_opus)
-    endif()
+    FetchContent_Declare(
+        micro_opus
+        GIT_REPOSITORY https://github.com/esphome-libs/micro-opus.git
+        GIT_TAG        v0.3.5
+        GIT_SHALLOW    TRUE
+        GIT_SUBMODULES "lib/opus" "lib/micro-ogg-demuxer"
+    )
+    FetchContent_MakeAvailable(micro_opus)
+    target_link_libraries(${TARGET_LIB} PUBLIC micro_opus)
 
     # IXWebSocket (WebSocket server/client for host networking)
     set(USE_TLS OFF CACHE BOOL "" FORCE)
@@ -115,5 +98,19 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     # Threading support (for shim implementations)
     find_package(Threads REQUIRED)
     target_link_libraries(${TARGET_LIB} PRIVATE Threads::Threads)
+
+    # =========================================================================
+    # clang-tidy integration (opt-in via -DENABLE_CLANG_TIDY=ON)
+    # Set only on this target so _deps are never analyzed.
+    # =========================================================================
+    option(ENABLE_CLANG_TIDY "Enable clang-tidy static analysis" OFF)
+    if(ENABLE_CLANG_TIDY)
+        find_program(CLANG_TIDY_EXE
+            NAMES clang-tidy clang-tidy-18 clang-tidy-17 clang-tidy-16
+            HINTS /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin
+            REQUIRED
+        )
+        set_target_properties(${TARGET_LIB} PROPERTIES CXX_CLANG_TIDY "${CLANG_TIDY_EXE}")
+    endif()
 
 endfunction()

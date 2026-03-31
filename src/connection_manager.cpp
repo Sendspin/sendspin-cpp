@@ -19,16 +19,24 @@
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "server_connection.h"
+#include "time_burst.h"
 #include "ws_server.h"
 
 namespace sendspin {
 
 static const char* const TAG = "sendspin.conn_mgr";
 
-// --- Constructor / Destructor ---
+static constexpr uint32_t FNV_OFFSET_BASIS = 2166136261UL;
+static constexpr uint32_t FNV_PRIME = 16777619UL;
+static constexpr int64_t US_PER_MS = 1000LL;
+static constexpr int64_t HELLO_INITIAL_DELAY_MS = 100LL;
+static constexpr int64_t HELLO_INITIAL_DELAY_US = HELLO_INITIAL_DELAY_MS * US_PER_MS;
 
-ConnectionManager::ConnectionManager(ConnectionManagerCallbacks callbacks)
-    : callbacks_(std::move(callbacks)) {}
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
+ConnectionManager::ConnectionManager(SendspinClient* client) : client_(client) {}
 
 ConnectionManager::~ConnectionManager() {
     this->current_connection_.reset();
@@ -36,17 +44,20 @@ ConnectionManager::~ConnectionManager() {
     this->dying_connection_.reset();
 }
 
-// --- Public API ---
+// ============================================================================
+// Public API
+// ============================================================================
 
 void ConnectionManager::connect_to(const std::string& url) {
     SS_LOGI(TAG, "Initiating client connection to: %s", url.c_str());
 
     auto client_conn = std::make_unique<SendspinClientConnection>(url);
     client_conn->set_auto_reconnect(false);
+    client_conn->set_task_config(this->client_->config_.websocket_priority);
 
-    this->setup_connection_callbacks_(client_conn.get());
-    client_conn->on_disconnected = [this](SendspinConnection* conn) {
-        // Defer to loop() — this callback runs on IXWebSocket's internal thread
+    this->setup_connection_callbacks(client_conn.get());
+    client_conn->on_disconnected_cb = [this](SendspinConnection* conn) {
+        // Defer to loop(); this callback runs on IXWebSocket's internal thread
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
         this->pending_disconnect_events_.push_back(conn);
     };
@@ -69,18 +80,20 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
     }
 }
 
-// --- Server lifecycle ---
+// ============================================================================
+// Server lifecycle
+// ============================================================================
 
-void ConnectionManager::init_server(SendspinClient* client, bool psram_stack, unsigned priority) {
+void ConnectionManager::init_server(SendspinClient* client) {
     this->client_ = client;
-    this->psram_stack_ = psram_stack;
-    this->task_priority_ = priority;
 
     this->ws_server_ = std::make_unique<SendspinWsServer>();
+    this->ws_server_->set_max_connections(this->client_->config_.server_max_connections);
+    this->ws_server_->set_ctrl_port(this->client_->config_.httpd_ctrl_port);
 
     this->ws_server_->set_new_connection_callback(
         [this](std::unique_ptr<SendspinServerConnection> conn) {
-            this->on_new_connection_(std::move(conn));
+            this->on_new_connection(std::move(conn));
         });
 
     this->ws_server_->set_connection_closed_callback([this](int sockfd) {
@@ -102,9 +115,9 @@ void ConnectionManager::init_server(SendspinClient* client, bool psram_stack, un
             this->pending_connection_->get_sockfd() == sockfd) {
             return static_cast<SendspinServerConnection*>(this->pending_connection_.get());
         }
-        if (this->dying_connection_ != nullptr && this->dying_connection_->get_sockfd() == sockfd) {
-            return static_cast<SendspinServerConnection*>(this->dying_connection_.get());
-        }
+        // Deliberately excludes dying_connection_; it has already been through cleanup and its
+        // message dispatch is disabled. Returning it here would let httpd route stale messages
+        // from the old connection into freshly-reset role queues.
         return nullptr;
     });
 }
@@ -112,8 +125,10 @@ void ConnectionManager::init_server(SendspinClient* client, bool psram_stack, un
 void ConnectionManager::loop() {
     // Start WS server when network becomes ready
     if (this->ws_server_ != nullptr && !this->ws_server_->is_started()) {
-        if (this->callbacks_.is_network_ready && this->callbacks_.is_network_ready()) {
-            this->ws_server_->start(this->client_, this->psram_stack_, this->task_priority_);
+        if (this->client_->network_provider_ &&
+            this->client_->network_provider_->is_network_ready()) {
+            this->ws_server_->start(this->client_, this->client_->config_.httpd_psram_stack,
+                                    this->client_->config_.httpd_priority);
         }
     }
 
@@ -133,37 +148,39 @@ void ConnectionManager::loop() {
         }
 
         // Server connection close events (ESP httpd)
+        // NOLINTBEGIN(clang-analyzer-cplusplus.Move)
         for (int sockfd : close_events) {
             if (this->current_connection_ != nullptr &&
                 this->current_connection_->get_sockfd() == sockfd) {
-                this->on_connection_lost_(this->current_connection_.get());
+                SendspinConnection* conn = this->current_connection_.get();
+                this->on_connection_lost(conn);
             } else if (this->pending_connection_ != nullptr &&
                        this->pending_connection_->get_sockfd() == sockfd) {
-                this->on_connection_lost_(this->pending_connection_.get());
+                SendspinConnection* conn = this->pending_connection_.get();
+                this->on_connection_lost(conn);
             }
         }
+        // NOLINTEND(clang-analyzer-cplusplus.Move)
 
         // Client connection disconnect events (host IXWebSocket)
         for (SendspinConnection* conn : disconnect_events) {
-            this->on_connection_lost_(conn);
+            this->on_connection_lost(conn);
         }
 
         if (release_dying) {
             this->dying_connection_.reset();
         }
 
-        // Server hello events — handshake completion and handoff
+        // Server hello events: handshake completion and handoff
         for (auto& event : hello_events) {
-            // Verify the connection is still one we manage
-            if (event.conn != this->current_connection_.get() &&
-                event.conn != this->pending_connection_.get()) {
+            // Verify the connection is still one we manage (and not null)
+            if (event.conn == nullptr || (event.conn != this->current_connection_.get() &&
+                                          event.conn != this->pending_connection_.get())) {
                 continue;
             }
 
-            // Notify client (stores server info, publishes state)
-            if (this->callbacks_.on_handshake_complete) {
-                this->callbacks_.on_handshake_complete(event.conn, std::move(event.server));
-            }
+            // Notify client and publish state
+            this->client_->on_handshake_complete(event.conn);
 
             SS_LOGI(TAG, "Connection handshake complete: server_id=%s, connection_reason=%s",
                     event.conn->get_server_id().c_str(),
@@ -173,21 +190,23 @@ void ConnectionManager::loop() {
             if (this->pending_connection_ != nullptr &&
                 this->pending_connection_.get() == event.conn) {
                 bool should_switch =
-                    this->should_switch_to_new_server_(this->current_connection_.get(), event.conn);
+                    this->should_switch_to_new_server(this->current_connection_.get(), event.conn);
                 SS_LOGI(TAG, "Handoff decision: %s",
                         should_switch ? "switch to new" : "keep current");
-                this->complete_handoff_(should_switch);
+                this->complete_handoff(should_switch);
             }
         }
     }
 
     // Call loop on active connections
+    // NOLINTBEGIN(clang-analyzer-cplusplus.Move)
     if (this->current_connection_ != nullptr) {
         this->current_connection_->loop();
     }
     if (this->pending_connection_ != nullptr) {
         this->pending_connection_->loop();
     }
+    // NOLINTEND(clang-analyzer-cplusplus.Move)
 
     // Check hello retry timer
     if (this->hello_retry_.retry_time_us > 0 &&
@@ -197,74 +216,83 @@ void ConnectionManager::loop() {
 
         // Verify connection is still valid
         if (conn == this->current_connection_.get() || conn == this->pending_connection_.get()) {
-            if (!this->send_hello_message_(this->hello_retry_.attempts - 1, conn)) {
+            if (!this->send_hello_message(this->hello_retry_.attempts - 1, conn)) {
                 // Transient failure - retry with exponential backoff
                 if (this->hello_retry_.attempts > 1) {
                     this->hello_retry_.delay_ms *= 2;
                     this->hello_retry_.attempts--;
                     this->hello_retry_.retry_time_us =
                         platform_time_us() +
-                        static_cast<int64_t>(this->hello_retry_.delay_ms) * 1000;
+                        static_cast<int64_t>(this->hello_retry_.delay_ms) * US_PER_MS;
                 }
             }
         }
     }
 }
 
-// --- Connection queries ---
-
-SendspinConnection* ConnectionManager::current() const {
-    return this->current_connection_.get();
-}
-
-SendspinConnection* ConnectionManager::pending() const {
-    return this->pending_connection_.get();
-}
+// ============================================================================
+// Connection queries
+// ============================================================================
 
 bool ConnectionManager::is_connected() const {
     return this->current_connection_ != nullptr && this->current_connection_->is_connected() &&
            this->current_connection_->is_handshake_complete();
 }
 
-// --- Event queuing ---
+// ============================================================================
+// Event queuing (thread-safe)
+// ============================================================================
 
-void ConnectionManager::enqueue_hello(ServerHelloEvent event) {
+void ConnectionManager::schedule_hello(ServerHelloEvent event) {
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->pending_hello_events_.push_back(std::move(event));
+    this->pending_hello_events_.push_back(event);
 }
 
-// --- Handoff support ---
+// ============================================================================
+// Handoff support
+// ============================================================================
 
 void ConnectionManager::set_last_played_server_hash(uint32_t hash) {
     this->last_played_server_hash_ = hash;
     this->has_last_played_server_ = true;
 }
 
-// --- Connection setup ---
+uint32_t ConnectionManager::fnv1_hash(const char* str) {
+    uint32_t hash = FNV_OFFSET_BASIS;
+    while (*str != '\0') {
+        hash *= FNV_PRIME;
+        hash ^= static_cast<uint8_t>(*str++);
+    }
+    return hash;
+}
 
-void ConnectionManager::setup_connection_callbacks_(SendspinConnection* conn) {
-    conn->on_connected = [this](SendspinConnection* c) { this->initiate_hello_(c); };
-    conn->on_json_message = [this](SendspinConnection* c, const std::string& message,
-                                   int64_t timestamp) {
-        this->callbacks_.on_json_message(c, message, timestamp);
+// ============================================================================
+// Connection setup
+// ============================================================================
+
+void ConnectionManager::setup_connection_callbacks(SendspinConnection* conn) {
+    conn->on_connected_cb = [this](SendspinConnection* c) { this->initiate_hello(c); };
+    conn->on_json_message_cb = [this](SendspinConnection* c, const std::string& message,
+                                      int64_t timestamp) {
+        this->client_->process_json_message(c, message, timestamp);
     };
-    conn->on_binary_message = [this](SendspinConnection* /*c*/, uint8_t* payload, size_t len) {
-        this->callbacks_.on_binary_message(payload, len);
+    conn->on_binary_message_cb = [this](SendspinConnection* /*c*/, uint8_t* payload, size_t len) {
+        this->client_->process_binary_message(payload, len);
     };
-    conn->on_handshake_complete = [](SendspinConnection* /*c*/) {
+    conn->on_handshake_complete_cb = [](SendspinConnection* /*c*/) {
         // Handshake completion is handled via deferred hello events in loop()
     };
 }
 
-void ConnectionManager::on_new_connection_(std::unique_ptr<SendspinServerConnection> conn) {
+void ConnectionManager::on_new_connection(std::unique_ptr<SendspinServerConnection> conn) {
     // Called from httpd open_callback thread. Connection pointer assignment must happen inline
     // because the httpd find_connection_callback needs to locate this connection immediately
     // for subsequent message routing on the same thread.
     conn->init_time_filter();
 
-    this->setup_connection_callbacks_(conn.get());
-    conn->on_disconnected = [](SendspinConnection* /*c*/) {
-        // Cleanup happens in on_connection_closed_ triggered by the server
+    this->setup_connection_callbacks(conn.get());
+    conn->on_disconnected_cb = [](SendspinConnection* /*c*/) {
+        // Cleanup happens in on_connection_lost triggered by the server
     };
 
     if (this->current_connection_ == nullptr) {
@@ -274,24 +302,26 @@ void ConnectionManager::on_new_connection_(std::unique_ptr<SendspinServerConnect
         SS_LOGD(TAG, "Existing connection present, setting as pending for handoff");
         if (this->pending_connection_ != nullptr) {
             SS_LOGW(TAG, "Already have pending connection, rejecting new connection");
-            this->disconnect_and_release_(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
+            this->disconnect_and_release(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
             return;
         }
         this->pending_connection_ = std::move(conn);
     }
 }
 
-// --- Hello handshake ---
+// ============================================================================
+// Hello handshake
+// ============================================================================
 
-void ConnectionManager::initiate_hello_(SendspinConnection* conn) {
-    // Set up retry state: 100ms initial delay, 3 attempts
+void ConnectionManager::initiate_hello(SendspinConnection* conn) {
+    // Set up retry state: initial delay, 3 attempts
     this->hello_retry_.conn = conn;
-    this->hello_retry_.delay_ms = 100;
+    this->hello_retry_.delay_ms = HelloRetryState::INITIAL_RETRY_DELAY_MS;
     this->hello_retry_.attempts = 3;
-    this->hello_retry_.retry_time_us = platform_time_us() + 100 * 1000;  // 100ms from now
+    this->hello_retry_.retry_time_us = platform_time_us() + HELLO_INITIAL_DELAY_US;
 }
 
-bool ConnectionManager::send_hello_message_(uint8_t remaining_attempts, SendspinConnection* conn) {
+bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinConnection* conn) {
     // Verify the connection is still one of our managed connections
     if (conn != this->current_connection_.get() && conn != this->pending_connection_.get()) {
         SS_LOGW(TAG, "Connection no longer valid for hello message");
@@ -303,7 +333,7 @@ bool ConnectionManager::send_hello_message_(uint8_t remaining_attempts, Sendspin
         return true;
     }
 
-    std::string hello_message = this->callbacks_.build_hello_message();
+    std::string hello_message = this->client_->build_hello_message();
 
     SsErr err =
         conn->send_text_message(hello_message, [conn](bool success, int64_t actual_send_time) {
@@ -329,21 +359,20 @@ bool ConnectionManager::send_hello_message_(uint8_t remaining_attempts, Sendspin
     return false;
 }
 
-// --- Connection lifecycle ---
+// ============================================================================
+// Connection lifecycle
+// ============================================================================
 
-void ConnectionManager::on_connection_lost_(SendspinConnection* conn) {
+void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
     if (conn == nullptr) {
         return;
     }
 
     if (this->current_connection_ != nullptr && this->current_connection_.get() == conn) {
         SS_LOGI(TAG, "Current connection lost");
-        if (this->callbacks_.reset_time_burst) {
-            this->callbacks_.reset_time_burst();
-        }
-        if (this->callbacks_.on_active_connection_lost) {
-            this->callbacks_.on_active_connection_lost();
-        }
+        conn->disable_message_dispatch();
+        this->client_->time_burst_->reset();
+        this->client_->cleanup_connection_state();
         this->current_connection_.reset();
 
         if (this->pending_connection_ != nullptr) {
@@ -356,8 +385,8 @@ void ConnectionManager::on_connection_lost_(SendspinConnection* conn) {
     }
 }
 
-bool ConnectionManager::should_switch_to_new_server_(SendspinConnection* current,
-                                                     SendspinConnection* new_conn) {
+bool ConnectionManager::should_switch_to_new_server(SendspinConnection* current,
+                                                    SendspinConnection* new_conn) const {
     if (current == nullptr || new_conn == nullptr) {
         return new_conn != nullptr;
     }
@@ -394,34 +423,31 @@ bool ConnectionManager::should_switch_to_new_server_(SendspinConnection* current
     return false;
 }
 
-void ConnectionManager::complete_handoff_(bool switch_to_new) {
+void ConnectionManager::complete_handoff(bool switch_to_new) {
     if (switch_to_new) {
         SS_LOGD(TAG, "Completing handoff: switching to new server");
         if (this->current_connection_ != nullptr) {
-            if (this->callbacks_.reset_time_burst) {
-                this->callbacks_.reset_time_burst();
-            }
-            if (this->callbacks_.on_active_connection_lost) {
-                this->callbacks_.on_active_connection_lost();
-            }
+            this->current_connection_->disable_message_dispatch();
+            this->client_->time_burst_->reset();
+            this->client_->cleanup_connection_state();
             auto old_current = std::move(this->current_connection_);
             this->current_connection_ = std::move(this->pending_connection_);
-            this->disconnect_and_release_(std::move(old_current),
-                                          SendspinGoodbyeReason::ANOTHER_SERVER);
+            this->disconnect_and_release(std::move(old_current),
+                                         SendspinGoodbyeReason::ANOTHER_SERVER);
         } else {
             this->current_connection_ = std::move(this->pending_connection_);
         }
     } else {
         SS_LOGD(TAG, "Completing handoff: keeping current server");
         if (this->pending_connection_ != nullptr) {
-            this->disconnect_and_release_(std::move(this->pending_connection_),
-                                          SendspinGoodbyeReason::ANOTHER_SERVER);
+            this->disconnect_and_release(std::move(this->pending_connection_),
+                                         SendspinGoodbyeReason::ANOTHER_SERVER);
         }
     }
 }
 
-void ConnectionManager::disconnect_and_release_(std::unique_ptr<SendspinConnection> conn,
-                                                SendspinGoodbyeReason reason) {
+void ConnectionManager::disconnect_and_release(std::unique_ptr<SendspinConnection> conn,
+                                               SendspinGoodbyeReason reason) {
     this->dying_connection_ = std::shared_ptr<SendspinConnection>(std::move(conn));
     this->dying_connection_->disconnect(reason, [this]() {
         // Defer the actual destruction to loop() to avoid use-after-free.
@@ -430,17 +456,6 @@ void ConnectionManager::disconnect_and_release_(std::unique_ptr<SendspinConnecti
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
         this->dying_connection_ready_to_release_ = true;
     });
-}
-
-// --- Helpers ---
-
-uint32_t ConnectionManager::fnv1_hash(const char* str) {
-    uint32_t hash = 2166136261UL;
-    while (*str) {
-        hash *= 16777619UL;
-        hash ^= static_cast<uint8_t>(*str++);
-    }
-    return hash;
 }
 
 }  // namespace sendspin

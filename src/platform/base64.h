@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file base64.h
+/// @brief Platform-abstracted base64 decoder wrapping mbedTLS on ESP and a built-in implementation
+/// on host
+
 #pragma once
 
 #include <cstddef>
@@ -23,7 +27,12 @@
 
 namespace sendspin {
 
-/// Decodes base64 data.
+/// @brief Decodes base64 data
+/// @param[out] dst Output buffer, or nullptr for a size query.
+/// @param dlen Capacity of the output buffer in bytes.
+/// @param[out] olen Set to the number of decoded bytes written.
+/// @param src Pointer to the base64-encoded input data.
+/// @param slen Length of the input data in bytes.
 /// @return 0 on success, non-zero on error.
 inline int platform_base64_decode(uint8_t* dst, size_t dlen, size_t* olen, const uint8_t* src,
                                   size_t slen) {
@@ -51,7 +60,12 @@ static constexpr unsigned char BASE64_DECODE_TABLE[128] = {
 };
 // clang-format on
 
-/// Decodes base64 data (host implementation).
+/// @brief Decodes base64 data (host implementation)
+/// @param[out] dst Output buffer, or nullptr for a size query.
+/// @param dlen Capacity of the output buffer in bytes.
+/// @param[out] olen Set to the number of decoded bytes written.
+/// @param src Pointer to the base64-encoded input data.
+/// @param slen Length of the input data in bytes.
 /// @return 0 on success, non-zero on error.
 inline int platform_base64_decode(uint8_t* dst, size_t dlen, size_t* olen, const uint8_t* src,
                                   size_t slen) {

@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file spsc_ring_buffer.h
+/// @brief Platform-abstracted single-producer/single-consumer ring buffer backed by a FreeRTOS
+/// NOSPLIT ring buffer on ESP and a mutex/condition-variable implementation on host
+
 #pragma once
 
 #include <cstddef>
@@ -25,6 +29,33 @@
 
 namespace sendspin {
 
+/**
+ * @brief Single-producer/single-consumer ring buffer with caller-provided storage
+ *
+ * Backed by a FreeRTOS NOSPLIT ring buffer on ESP and a mutex/condition-variable
+ * implementation on host. Items are written as contiguous blobs and read back in
+ * the same order. Supports both a one-phase send() and a two-phase acquire()/commit()
+ * path for zero-copy writes.
+ *
+ * Usage:
+ * 1. Allocate a storage buffer, then call create() with a pointer to it
+ * 2. Write data with send() or acquire()/commit() from the producer thread
+ * 3. Read data with receive() from the consumer thread
+ * 4. Call return_item() after processing each received item
+ *
+ * @code
+ * static uint8_t buf[4096];
+ * SpscRingBuffer rb;
+ * rb.create(sizeof(buf), buf);
+ *
+ * rb.send(data, data_len, 100);
+ *
+ * size_t sz;
+ * void* item = rb.receive(&sz, UINT32_MAX);
+ * // process item...
+ * rb.return_item(item);
+ * @endcode
+ */
 class SpscRingBuffer {
 public:
     SpscRingBuffer() = default;
@@ -38,7 +69,7 @@ public:
     SpscRingBuffer(const SpscRingBuffer&) = delete;
     SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
 
-    /// Creates the ring buffer with caller-provided storage.
+    /// @brief Creates the ring buffer with caller-provided storage
     /// @param size Total storage size in bytes.
     /// @param storage Pointer to pre-allocated storage (must outlive this object).
     /// @return true on success.
@@ -48,11 +79,15 @@ public:
         return this->handle_ != nullptr;
     }
 
+    /// @brief Returns true if the ring buffer has been successfully created
+    /// @return true if the ring buffer is ready for use.
     bool is_created() const {
         return this->handle_ != nullptr;
     }
 
-    /// Two-phase write: acquire contiguous space.
+    /// @brief Two-phase write: acquire contiguous space
+    /// @param size Number of bytes to acquire.
+    /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
     /// @return Pointer to acquired space, or nullptr on timeout.
     void* acquire(size_t size, uint32_t timeout_ms) {
         void* ptr = nullptr;
@@ -63,31 +98,42 @@ public:
         return ptr;
     }
 
-    /// Two-phase write: commit previously acquired space.
+    /// @brief Two-phase write: commit previously acquired space
+    /// @param ptr Pointer returned by a prior call to acquire().
+    /// @return true on success.
     bool commit(void* ptr) {
         return xRingbufferSendComplete(this->handle_, ptr) == pdTRUE;
     }
 
-    /// One-phase write: copy data into the ring buffer.
+    /// @brief One-phase write: copy data into the ring buffer
+    /// @param data Pointer to the data to copy.
+    /// @param size Number of bytes to copy.
+    /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
+    /// @return true if the data was written successfully.
     bool send(const void* data, size_t size, uint32_t timeout_ms) {
         return xRingbufferSend(this->handle_, data, size, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
     }
 
-    /// Receive the next item. Caller must call return_item() when done.
+    /// @brief Receive the next item; caller must call return_item() when done
     /// @param[out] item_size Set to the size of the received item.
+    /// @param timeout_ms Milliseconds to wait if no item is available (UINT32_MAX = wait forever).
     /// @return Pointer to item data, or nullptr on timeout.
     void* receive(size_t* item_size, uint32_t timeout_ms) {
         return xRingbufferReceive(this->handle_, item_size, pdMS_TO_TICKS(timeout_ms));
     }
 
-    /// Return a previously received item to the ring buffer.
+    /// @brief Return a previously received item to the ring buffer
+    /// @param ptr Pointer returned by a prior call to receive().
     void return_item(void* ptr) {
         vRingbufferReturnItem(this->handle_, ptr);
     }
 
 private:
-    RingbufHandle_t handle_{nullptr};
+    // Struct fields
     StaticRingbuffer_t structure_;
+
+    // Pointer fields
+    RingbufHandle_t handle_{nullptr};
 };
 
 }  // namespace sendspin
@@ -101,6 +147,32 @@ private:
 
 namespace sendspin {
 
+/**
+ * @brief Single-producer/single-consumer ring buffer with caller-provided storage
+ *
+ * Backed by a mutex/condition-variable implementation on host. Items are written as
+ * contiguous blobs and read back in the same order. Supports both a one-phase send()
+ * and a two-phase acquire()/commit() path for zero-copy writes.
+ *
+ * Usage:
+ * 1. Allocate a storage buffer, then call create() with a pointer to it
+ * 2. Write data with send() or acquire()/commit() from the producer thread
+ * 3. Read data with receive() from the consumer thread
+ * 4. Call return_item() after processing each received item
+ *
+ * @code
+ * static uint8_t buf[4096];
+ * SpscRingBuffer rb;
+ * rb.create(sizeof(buf), buf);
+ *
+ * rb.send(data, data_len, 100);
+ *
+ * size_t sz;
+ * void* item = rb.receive(&sz, UINT32_MAX);
+ * // process item...
+ * rb.return_item(item);
+ * @endcode
+ */
 class SpscRingBuffer {
 public:
     SpscRingBuffer() = default;
@@ -110,6 +182,10 @@ public:
     SpscRingBuffer(const SpscRingBuffer&) = delete;
     SpscRingBuffer& operator=(const SpscRingBuffer&) = delete;
 
+    /// @brief Creates the ring buffer with caller-provided storage
+    /// @param size Total storage size in bytes.
+    /// @param storage Pointer to pre-allocated storage (must outlive this object).
+    /// @return true on success.
     bool create(size_t size, uint8_t* storage) {
         this->storage_ = storage;
         this->storage_size_ = size;
@@ -120,28 +196,34 @@ public:
         return true;
     }
 
+    /// @brief Returns true if the ring buffer has been successfully created
+    /// @return true if the ring buffer is ready for use.
     bool is_created() const {
         return this->created_;
     }
 
+    /// @brief Two-phase write: acquire contiguous space
+    /// @param size Number of bytes to acquire.
+    /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
+    /// @return Pointer to acquired space, or nullptr on timeout.
     void* acquire(size_t size, uint32_t timeout_ms) {
-        size_t total = item_total_size_(size);
+        size_t total = item_total_size(size);
         std::unique_lock<std::mutex> lock(this->mtx_);
 
-        size_t offset = try_acquire_(total);
+        size_t offset = try_acquire(total);
         if (offset == SIZE_MAX) {
             if (timeout_ms == 0) {
                 return nullptr;
             }
             if (timeout_ms == UINT32_MAX) {
                 this->cv_write_.wait(lock, [&] {
-                    offset = try_acquire_(total);
+                    offset = try_acquire(total);
                     return offset != SIZE_MAX;
                 });
             } else {
                 bool ok =
                     this->cv_write_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-                        offset = try_acquire_(total);
+                        offset = try_acquire(total);
                         return offset != SIZE_MAX;
                     });
                 if (!ok) {
@@ -164,6 +246,9 @@ public:
         return ptr;
     }
 
+    /// @brief Two-phase write: commit previously acquired space
+    /// @param ptr Pointer returned by a prior call to acquire().
+    /// @return true on success.
     bool commit(void* ptr) {
         std::lock_guard<std::mutex> lock(this->mtx_);
         auto* header =
@@ -173,6 +258,11 @@ public:
         return true;
     }
 
+    /// @brief One-phase write: copy data into the ring buffer
+    /// @param data Pointer to the data to copy.
+    /// @param size Number of bytes to copy.
+    /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
+    /// @return true if the data was written successfully.
     bool send(const void* data, size_t size, uint32_t timeout_ms) {
         void* dest = acquire(size, timeout_ms);
         if (dest == nullptr) {
@@ -182,10 +272,14 @@ public:
         return commit(dest);
     }
 
+    /// @brief Receive the next item; caller must call return_item() when done
+    /// @param[out] item_size Set to the size of the received item.
+    /// @param timeout_ms Milliseconds to wait if no item is available (UINT32_MAX = wait forever).
+    /// @return Pointer to item data, or nullptr on timeout.
     void* receive(size_t* item_size, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);
 
-        void* result = try_read_(item_size);
+        void* result = try_read(item_size);
         if (result != nullptr) {
             return result;
         }
@@ -196,12 +290,12 @@ public:
 
         if (timeout_ms == UINT32_MAX) {
             this->cv_read_.wait(lock, [&] {
-                result = try_read_(item_size);
+                result = try_read(item_size);
                 return result != nullptr;
             });
         } else {
             this->cv_read_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-                result = try_read_(item_size);
+                result = try_read(item_size);
                 return result != nullptr;
             });
         }
@@ -209,11 +303,13 @@ public:
         return result;
     }
 
+    /// @brief Return a previously received item to the ring buffer
+    /// @param ptr Pointer returned by a prior call to receive().
     void return_item(void* ptr) {
         std::lock_guard<std::mutex> lock(this->mtx_);
         auto* header =
             reinterpret_cast<ItemHeader*>(static_cast<uint8_t*>(ptr) - sizeof(ItemHeader));
-        size_t total = item_total_size_(header->size);
+        size_t total = item_total_size(header->size);
 
         header->flags = FLAG_FREE;
         this->read_offset_ += total;
@@ -226,6 +322,7 @@ public:
     }
 
 private:
+    /// @brief Per-item metadata stored inline in the ring buffer ahead of each item's payload
     struct ItemHeader {
         uint32_t size;
         uint32_t flags;
@@ -240,15 +337,18 @@ private:
     static_assert(sizeof(ItemHeader) % ALIGNMENT == 0,
                   "ItemHeader size must be a multiple of ALIGNMENT");
 
-    static size_t align_(size_t n) {
+    /// @brief Rounds n up to the nearest multiple of ALIGNMENT
+    static size_t align(size_t n) {
         return (n + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
     }
 
-    static size_t item_total_size_(size_t data_size) {
-        return sizeof(ItemHeader) + align_(data_size);
+    /// @brief Returns the total storage occupied by one item including its header and alignment
+    static size_t item_total_size(size_t data_size) {
+        return sizeof(ItemHeader) + align(data_size);
     }
 
-    size_t try_acquire_(size_t total) {
+    /// @brief Attempts to reserve space for an item of total bytes; returns offset or SIZE_MAX
+    size_t try_acquire(size_t total) {
         if (this->free_bytes_ < total) {
             return SIZE_MAX;
         }
@@ -274,14 +374,15 @@ private:
         return SIZE_MAX;
     }
 
-    void* try_read_(size_t* item_size) {
+    /// @brief Attempts to read the next committed item; returns a pointer or nullptr if none ready
+    void* try_read(size_t* item_size) {
         while (this->read_offset_ != this->write_offset_ || this->free_bytes_ == 0) {
             if (this->read_offset_ >= this->storage_size_) {
                 this->read_offset_ = 0;
             }
             auto* header = reinterpret_cast<ItemHeader*>(this->storage_ + this->read_offset_);
             if (header->flags == FLAG_DUMMY) {
-                size_t skip = sizeof(ItemHeader) + align_(header->size);
+                size_t skip = sizeof(ItemHeader) + align(header->size);
                 this->read_offset_ += skip;
                 this->free_bytes_ += skip;
                 this->cv_write_.notify_all();
@@ -297,14 +398,21 @@ private:
         return nullptr;
     }
 
-    std::mutex mtx_;
-    std::condition_variable cv_write_;
+    // Struct fields
     std::condition_variable cv_read_;
+    std::condition_variable cv_write_;
+    std::mutex mtx_;
+
+    // Pointer fields
     uint8_t* storage_{nullptr};
+
+    // size_t fields
+    size_t free_bytes_{0};
+    size_t read_offset_{0};
     size_t storage_size_{0};
     size_t write_offset_{0};
-    size_t read_offset_{0};
-    size_t free_bytes_{0};
+
+    // 8-bit fields
     bool created_{false};
 };
 

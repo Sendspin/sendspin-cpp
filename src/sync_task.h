@@ -12,17 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#pragma once
+/// @file sync_task.h
+/// @brief Background sync task that decodes encoded audio, synchronizes to server timestamps, and
+/// writes PCM to the audio sink
 
-#ifdef SENDSPIN_ENABLE_PLAYER
+#pragma once
 
 #include "audio_ring_buffer.h"
 #include "audio_stream_info.h"
 #include "decoder.h"
 #include "platform/event_flags.h"
 #include "platform/thread_safe_queue.h"
-#include "sendspin/audio_sink.h"
-#include "sync_time_provider.h"
 #include "transfer_buffer.h"
 
 #include <atomic>
@@ -31,69 +31,74 @@
 
 namespace sendspin {
 
-// Stores the timing information of audio played received from the speaker
+class PlayerRole;
+class SendspinClient;
+
+/// @brief Timing feedback from the audio output: frames played and the finish timestamp
 struct PlaybackProgress {
     uint32_t frames_played;    // Number of audio frames played since last progress update
     int64_t finish_timestamp;  // The timestamp when the audio frames should finish playing
 };
 
+/// @brief States of the sync task's inner decode/playback loop
 enum class SyncTaskState : uint8_t {
-    INITIAL_SYNC,
-    LOAD_CHUNK,
-    SYNCHRONIZE_AUDIO,
-    TRANSFER_AUDIO,
+    INITIAL_SYNC,       // Priming the audio pipeline with silence before playback
+    LOAD_CHUNK,         // Loading and decoding the next encoded chunk
+    SYNCHRONIZE_AUDIO,  // Applying sync corrections (hard or soft) to align playback
+    TRANSFER_AUDIO,     // Sending buffered PCM frames to the audio sink
 };
 
+/// @brief Result of decoding a single encoded audio chunk
 enum class DecodeResult : uint8_t {
     SUCCESS,            // Audio decoded successfully (or header processed)
-    SKIPPED,            // Chunk skipped because it can't be played in time
+    SKIPPED,            // Chunk skipped because it cannot be played in time
     FAILED,             // Decoder failed to decode the chunk
-    ALLOCATION_FAILED,  // Buffer allocation failed, task should stop
+    ALLOCATION_FAILED,  // Buffer allocation failed; task should stop
 };
 
-// Stores all the variables needed by segments of the sync task
+/// @brief Working state shared across the sync task's inner decode/sync/transfer loop
 struct SyncContext {
-    // Smart pointers (4 bytes each on ESP32)
+    // Struct fields
+    AudioStreamInfo current_stream_info;  // Contains uint32_t and smaller members
+
+    // Pointer fields
     std::unique_ptr<TransferBuffer> decode_buffer;  // Reusable decode + output buffer
-    std::unique_ptr<TransferBuffer> interpolation_transfer_buffer;
     std::unique_ptr<SendspinDecoder> decoder;
-
-    // Raw pointers (4 bytes each on ESP32)
     AudioRingBufferEntry* encoded_entry{nullptr};
-    AudioSink* audio_sink{nullptr};  // Owned by task stack, outlives this context
+    std::unique_ptr<TransferBuffer> interpolation_transfer_buffer;
 
-    // 64-bit members
+    // 64-bit fields
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
     int64_t new_audio_client_playtime{0};
 
-    // 32-bit members
-    uint32_t buffered_frames{0};
+    // size_t fields
     size_t bytes_per_frame{0};
-    AudioStreamInfo current_stream_info;  // Contains uint32_t and smaller members
 
-    // 8-bit members
-    bool release_chunk{false};
-    bool initial_decode{false};
+    // 32-bit fields
+    uint32_t buffered_frames{0};
+
+    // 8-bit fields
     bool hard_syncing{true};  // Starts true so initial sync uses tight settle threshold
+    bool initial_decode{false};
+    bool release_chunk{false};
 };
 
-enum EventGroupBits : uint32_t {
-    COMMAND_STOP = (1 << 0),
-    COMMAND_STREAM_END = (1 << 1),
-    COMMAND_STREAM_CLEAR = (1 << 2),
-    COMMAND_START = (1 << 3),
-    TASK_STARTING = (1 << 7),
-    TASK_RUNNING = (1 << 8),
-    TASK_STOPPING = (1 << 9),
-    TASK_STOPPED = (1 << 10),
-    TASK_ERROR = (1 << 11),
-    TASK_IDLE = (1 << 12),
+/// @brief Event flag bits used for sync task lifecycle and command signaling
+enum EventGroupBits : uint16_t {
+    COMMAND_STOP = (1 << 0),          // Signal task to stop
+    COMMAND_STREAM_END = (1 << 1),    // Signal end of current stream
+    COMMAND_STREAM_CLEAR = (1 << 2),  // Signal immediate buffer clear
+    COMMAND_START = (1 << 3),         // Signal stream start acknowledged
+    TASK_RUNNING = (1 << 8),          // Task is actively processing a stream
+    TASK_STOPPED = (1 << 10),         // Task thread has exited
+    TASK_ERROR = (1 << 11),           // Task encountered a fatal error
+    TASK_IDLE = (1 << 12),            // Task is idle, waiting for a new stream
 };
 
-/// @brief Self-contained sync task for Sendspin synchronized audio playback.
+/// @brief Self-contained sync task for Sendspin synchronized audio playback
 ///
 /// Manages a persistent background thread that reads encoded audio from the ring buffer,
-/// decodes it, synchronizes it to server timestamps, and writes PCM data to an AudioSink.
+/// decodes it, synchronizes it to server timestamps, and writes PCM data via the player listener.
 /// The thread starts once during initialization and idles between streams to avoid
 /// thread create/destroy churn on embedded devices.
 ///
@@ -104,46 +109,50 @@ public:
     SyncTask() = default;
     ~SyncTask();
 
-    /// @brief Initializes queues and creates the encoded ring buffer.
-    /// @param time_provider Provides time sync, delay, and state callbacks.
-    /// @param audio_sink Pointer to the AudioSink to write decoded audio to.
+    /// @brief Initializes queues and creates the encoded ring buffer
+    /// @param player The owning PlayerRole, used for time sync, delay, and audio write access.
+    /// @param client The owning SendspinClient, used for shared services.
     /// @param buffer_size Size of the encoded audio ring buffer in bytes.
     /// @return true on success, false on allocation failure.
-    bool init(SyncTimeProvider time_provider, AudioSink* audio_sink, size_t buffer_size);
+    bool init(PlayerRole* player, SendspinClient* client, size_t buffer_size);
 
-    /// @brief Creates and starts the persistent sync background thread.
+    /// @brief Creates and starts the persistent sync background thread
     /// Call once after init(). The thread idles until a codec header arrives in the ring buffer.
     /// @param task_stack_in_psram Whether to allocate the task stack in PSRAM (ESP-IDF only).
     /// @return true if thread started successfully, false otherwise.
-    bool start(bool task_stack_in_psram = false);
+    bool start(bool task_stack_in_psram, unsigned priority);
 
-    /// @brief Returns true if init() has been called successfully.
+    /// @brief Returns true if init() has been called successfully
+    /// @return true if the sync task has been initialized, false otherwise.
     bool is_initialized() const {
         return this->event_flags_.is_created();
     }
 
-    /// @brief Returns true if the sync task is actively processing a stream.
+    /// @brief Returns true if the sync task is actively processing a stream
     /// Returns false when idle (waiting for a stream) or stopped.
-    bool is_running() const;
+    /// @return true if actively decoding and syncing a stream.
+    bool is_running() const {
+        return (this->event_flags_.get() & EventGroupBits::TASK_RUNNING) != 0U;
+    }
 
-    /// @brief Signals the sync task to end the current stream. Non-blocking.
+    /// @brief Signals the sync task to end the current stream. Non-blocking
     /// The task drains stale audio from the ring buffer and returns to idle.
     /// Thread-safe: may be called from any context.
     void signal_stream_end();
 
-    /// @brief Signals the sync task to clear all buffered audio. Non-blocking.
+    /// @brief Signals the sync task to clear all buffered audio. Non-blocking
     /// The task immediately drains the ring buffer and returns to idle.
     /// Thread-safe: may be called from any context.
     void signal_stream_clear();
 
-    /// @brief Signals the sync task that the client has processed the stream start.
+    /// @brief Signals the sync task that the client has processed the stream start
     /// The sync task waits for this after finding a codec header before transitioning
-    /// to the active state. This ensures the client's stream lifecycle callbacks
-    /// (end/clear → start) fire before the task begins decoding.
+    /// to the active state, so the client's stream lifecycle callbacks
+    /// (end/clear -> start) fire before the task begins decoding.
     /// Thread-safe: may be called from any context.
     void signal_stream_start();
 
-    /// @brief Writes an encoded audio chunk into the ring buffer.
+    /// @brief Writes an encoded audio chunk into the ring buffer
     /// Called from the client's audio chunk callback (may be any thread).
     /// @param data Pointer to the audio data.
     /// @param data_size Size of the audio data in bytes.
@@ -154,97 +163,80 @@ public:
     bool write_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
                            ChunkType chunk_type, uint32_t timeout_ms);
 
-    /// @brief Called by the audio output when it has played audio frames.
+    /// @brief Called by the audio output when it has played audio frames
     /// Thread-safe: may be called from any context.
     /// @param frames Number of audio frames played.
     /// @param timestamp Client timestamp when the audio finished playing.
     void notify_audio_played(uint32_t frames, int64_t timestamp);
 
-    /// @brief Gets the event flags for monitoring task lifecycle.
-    EventFlags& get_event_flags() {
-        return this->event_flags_;
-    }
-
-    /// @brief Checks if the last run ended with an error.
-    bool had_error() const {
-        return this->last_run_had_error_;
-    }
-
 protected:
-    static void sync_task(void* params);
+    /// @brief Entry point for the persistent sync background thread
+    /// @param params Pointer to the owning SyncTask instance.
+    static void thread_entry(void* params);
 
-    /// @brief Handles the INITIAL_SYNC state: feeds zeros to prime the audio pipeline.
-    SyncTaskState sync_handle_initial_sync_(SyncContext& sync_context);
+    /// @brief Handles the INITIAL_SYNC state: feeds zeros to prime the audio pipeline
+    SyncTaskState handle_initial_sync(SyncContext& sync_context);
 
-    /// @brief Handles the LOAD_CHUNK state: loads and decodes the next encoded chunk.
-    SyncTaskState sync_handle_load_chunk_(SyncContext& sync_context);
+    /// @brief Handles the LOAD_CHUNK state: loads and decodes the next encoded chunk
+    SyncTaskState handle_load_chunk(SyncContext& sync_context);
 
     /// @brief Handles the SYNCHRONIZE_AUDIO state: applies sync corrections based on predicted
     /// error.
-    SyncTaskState sync_handle_synchronize_audio_(SyncContext& sync_context);
+    SyncTaskState handle_synchronize_audio(SyncContext& sync_context);
 
-    /// @brief Handles the TRANSFER_AUDIO state: sends buffered audio to the sink.
-    SyncTaskState sync_handle_transfer_audio_(SyncContext& sync_context);
+    /// @brief Handles the TRANSFER_AUDIO state: sends buffered audio to the sink
+    SyncTaskState handle_transfer_audio(SyncContext& sync_context);
 
     /// @brief Updates buffered_frames and new_audio_client_playtime after sending audio to the
     /// speaker. These two must always be updated together to keep the playtime estimate consistent.
-    void sync_track_sent_audio_(SyncContext& sync_context, size_t bytes_sent);
+    void track_sent_audio(SyncContext& sync_context, size_t bytes_sent);
 
-    /// @brief Transfers audio from interpolation and decode buffers to the sink.
+    /// @brief Transfers audio from interpolation and decode buffers to the sink
     /// Returns true when all data has been sent, false if more transfers are needed.
-    bool sync_transfer_audio_(SyncContext& sync_context);
+    bool transfer_audio(SyncContext& sync_context);
 
-    /// @brief Loads the next encoded chunk from the ring buffer.
+    /// @brief Loads the next encoded chunk from the ring buffer
     /// Returns true if a chunk is available, false if none ready yet.
-    bool sync_load_next_chunk_(SyncContext& sync_context);
+    bool load_next_chunk(SyncContext& sync_context);
 
-    /// @brief Removes last decoded frame, blending into the second-to-last to minimize glitches.
+    /// @brief Removes last decoded frame, blending into the second-to-last to minimize glitches
     /// Returns -1 if a frame was removed, 0 if preconditions not met.
-    int32_t sync_soft_sync_remove_audio_(SyncContext& sync_context);
+    int32_t soft_sync_drop_frame(SyncContext& sync_context);
 
-    /// @brief Adds one interpolated frame between the first two decoded frames.
+    /// @brief Adds one interpolated frame between the first two decoded frames
     /// Returns 1 if a frame was added, 0 if preconditions not met.
-    int32_t sync_soft_sync_add_audio_(SyncContext& sync_context);
+    int32_t soft_sync_insert_frame(SyncContext& sync_context);
 
-    /// @brief Decodes the current encoded chunk.
-    DecodeResult sync_decode_audio_(SyncContext& sync_context);
+    /// @brief Decodes the current encoded chunk
+    DecodeResult decode_chunk(SyncContext& sync_context);
 
-    /// @brief Waits in IDLE for a codec header to arrive in the ring buffer.
+    /// @brief Waits in IDLE for a codec header to arrive in the ring buffer
     /// Discards stale audio chunks. Returns true if a codec header was found.
     /// Returns false if COMMAND_STOP was signaled.
-    bool sync_idle_wait_for_header_(SyncContext& sync_context);
+    bool wait_for_codec_header(SyncContext& sync_context);
 
-    /// @brief Non-blocking drain of audio data from the ring buffer, preserving codec headers.
-    void sync_drain_ring_buffer_(SyncContext& sync_context);
+    /// @brief Non-blocking drain of audio data from the ring buffer, preserving codec headers
+    void drain_ring_buffer(SyncContext& sync_context);
 
-    /// @brief Resets SyncContext between streams without deallocating buffers.
-    void sync_reset_context_(SyncContext& sync_context);
+    /// @brief Resets SyncContext between streams without deallocating buffers
+    void reset_context(SyncContext& sync_context);
 
     /// @brief Processes playback progress messages from the speaker to update buffered_frames and
     /// playtime.
-    void sync_process_playback_progress_(SyncContext& sync_context);
+    void process_playback_progress(SyncContext& sync_context);
 
-    /// @brief Signals the task to stop and waits for the thread to finish.
-    void stop_();
+    /// @brief Signals the task to stop and waits for the thread to finish
+    void stop();
 
-    // Smart pointers
-    std::unique_ptr<SendspinAudioRingBuffer> encoded_ring_buffer_;
-
-    // Platform-agnostic concurrency primitives
+    // Struct fields
     EventFlags event_flags_;
     ThreadSafeQueue<PlaybackProgress> playback_progress_queue_;
     std::thread sync_thread_;
 
-    // Provides time sync, delay, and state callbacks (set by init)
-    SyncTimeProvider time_provider_;
-
-    // Pointer to the audio sink for writing decoded audio
-    AudioSink* audio_sink_{nullptr};
-
-    // Tracks whether the last task run ended with an error
-    bool last_run_had_error_{false};
+    // Pointer fields
+    SendspinClient* client_{nullptr};
+    std::unique_ptr<SendspinAudioRingBuffer> encoded_ring_buffer_;
+    PlayerRole* player_{nullptr};
 };
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER

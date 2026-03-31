@@ -12,39 +12,64 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// @file time_filter.h
+/// @brief Two-dimensional Kalman filter for NTP-style clock offset and drift estimation between
+/// client and server
+
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <mutex>
 
 namespace sendspin {
 
+// ============================================================================
 // Time filter tuning constants
+// ============================================================================
 static constexpr double TIME_FILTER_PROCESS_STD_DEV = 0.0;
 static constexpr double TIME_FILTER_DRIFT_PROCESS_STD_DEV = 5e-11;
 static constexpr double TIME_FILTER_FORGET_FACTOR = 1.1;
 static constexpr double TIME_FILTER_ADAPTIVE_CUTOFF = 2.0;
-static constexpr uint8_t TIME_FILTER_MIN_SAMPLES = 100;
+static constexpr uint8_t TIME_FILTER_MIN_SAMPLES = 100U;
 static constexpr double TIME_FILTER_DRIFT_SIGNIFICANCE_THRESHOLD = 2.0;
 
-/// @brief Two-dimensional Kalman filter for NTP-style time synchronization between client and
-/// server.
-///
-/// This class implements a time synchronization filter that tracks both the timestamp offset and
-/// clock drift rate between a client and server. It processes measurements obtained with NTP-style
-/// time messages that contain round-trip timing information to optimally estimate the time
-/// relationship while accounting for network latency uncertainty.
-///
-/// The filter maintains a 2D state vector [offset, drift] with associated covariance matrix to
-/// track estimation uncertainty. An adaptive forgetting factor helps the filter recover quickly
-/// from network disruptions or server clock adjustments.
-///
-/// All computations use double precision arithmetic to maintain microsecond-level accuracy over
-/// extended periods. Thread-safe access to the current time transformation is provided via
-/// std::mutex.
+/**
+ * @brief Two-dimensional Kalman filter for NTP-style time synchronization between client and server
+ *
+ * Tracks both clock offset and drift rate between a client and server using a 2D state
+ * vector [offset, drift] with an associated covariance matrix. Measurements come from
+ * NTP-style round-trip exchanges. An adaptive forgetting factor allows the filter to
+ * recover from network disruptions or server clock adjustments. All arithmetic is double
+ * precision to maintain microsecond accuracy over extended periods. Time conversion
+ * methods are thread-safe via an internal mutex.
+ *
+ * Usage:
+ * 1. Construct with tuning parameters (or use the TIME_FILTER_* constants)
+ * 2. Call update() each time a time burst measurement arrives
+ * 3. Call compute_client_time() or compute_server_time() to convert timestamps
+ * 4. Call reset() when the connection drops and a new sync sequence starts
+ *
+ * @code
+ * SendspinTimeFilter filter(
+ *     TIME_FILTER_PROCESS_STD_DEV,
+ *     TIME_FILTER_DRIFT_PROCESS_STD_DEV,
+ *     TIME_FILTER_FORGET_FACTOR);
+ *
+ * // After receiving an NTP-style time exchange:
+ * filter.update(offset_us, max_error_us, client_timestamp_us);
+ *
+ * int64_t client_now = get_current_time_us();
+ * int64_t server_now = filter.compute_server_time(client_now);
+ * @endcode
+ */
 class SendspinTimeFilter {
 public:
-    /// @brief Constructs a Kalman filter for time synchronization.
+    // ========================================
+    // Lifecycle
+    // ========================================
+
+    /// @brief Constructs a Kalman filter for time synchronization
     ///
     /// @param process_std_dev Standard deviation of the offset process noise in microseconds,
     /// modeling clock jitter.
@@ -68,10 +93,14 @@ public:
     ///                                     drift_covariance, ensuring the drift estimate is
     ///                                     statistically significant before applying corrections.
     SendspinTimeFilter(double process_std_dev, double drift_process_std_dev, double forget_factor,
-                       double adaptive_cutoff = 0.75, uint8_t min_samples = 100,
+                       double adaptive_cutoff = 0.75, uint8_t min_samples = TIME_FILTER_MIN_SAMPLES,
                        double drift_significance_threshold = 2.0);
 
-    /// @brief Processes a new time synchronization measurement through the Kalman filter.
+    // ========================================
+    // Core API
+    // ========================================
+
+    /// @brief Processes a new time synchronization measurement through the Kalman filter
     ///
     /// Updates the filter's offset and drift estimates using a two-stage Kalman filter algorithm:
     /// predict based on the drift model then correct using the new measurement. The measurement
@@ -85,7 +114,7 @@ public:
     /// @param time_added Client timestamp when this measurement was taken in microseconds.
     void update(int64_t measurement, int64_t max_error, int64_t time_added);
 
-    /// @brief Converts a client timestamp to the equivalent server timestamp.
+    /// @brief Converts a client timestamp to the equivalent server timestamp
     ///
     /// Applies the current offset and drift compensation to transform from client time domain to
     /// server time domain. The transformation accounts for both static offset and dynamic drift
@@ -95,7 +124,7 @@ public:
     /// @return Equivalent server timestamp in microseconds.
     int64_t compute_server_time(int64_t client_time) const;
 
-    /// @brief Converts a server timestamp to the equivalent client timestamp.
+    /// @brief Converts a server timestamp to the equivalent client timestamp
     ///
     /// Inverts the time transformation to convert from server time domain to client time domain.
     /// Accounts for both offset and drift effects in the inverse transformation.
@@ -104,13 +133,25 @@ public:
     /// @return Equivalent client timestamp in microseconds.
     int64_t compute_client_time(int64_t server_time) const;
 
-    /// @brief Resets the filter to its initial uninitialized state.
+    /// @brief Resets the filter to its initial uninitialized state
     ///
     /// Clears all state estimates and resets covariances to initial values. The filter will require
     /// new measurements to re-establish synchronization.
     void reset();
 
-    /// @brief Returns the estimated standard deviation of the offset in microseconds.
+    // ========================================
+    // Accessors
+    // ========================================
+
+    /// @brief Returns the offset variance in microseconds squared
+    ///
+    /// Provides the raw variance value from the Kalman filter's covariance matrix. This represents
+    /// the statistical uncertainty in the offset estimate.
+    ///
+    /// @return Variance of the offset estimate in microseconds squared.
+    int64_t get_covariance() const;
+
+    /// @brief Returns the estimated standard deviation of the offset in microseconds
     ///
     /// Provides a measure of the current synchronization accuracy by computing the square root of
     /// the offset covariance. Smaller values indicate higher confidence in the time
@@ -119,39 +160,35 @@ public:
     /// @return Standard deviation of the offset estimate in microseconds.
     int64_t get_error() const;
 
-    /// @brief Returns true if the filter has received at least one measurement.
+    /// @brief Returns true if the filter has received at least one measurement
     /// @return True if the filter has been updated with at least one time measurement.
     bool has_update() const;
 
-    /// @brief Returns the offset variance in microseconds squared.
-    ///
-    /// Provides the raw variance value from the Kalman filter's covariance matrix. This represents
-    /// the statistical uncertainty in the offset estimate.
-    ///
-    /// @return Variance of the offset estimate in microseconds squared.
-    int64_t get_covariance() const;
-
 protected:
-    int64_t last_update_;
+    // ========================================
+    // Member variables
+    // ========================================
 
-    double offset_;
-    double drift_;
-
-    double offset_covariance_;
-    double offset_drift_covariance_;
-    double drift_covariance_;
-
-    const double process_variance_;
-    const double drift_process_variance_;
-    const double forget_variance_factor_;
-    const double adaptive_forgetting_cutoff_;
-    const double drift_significance_threshold_squared_;
-
+    // Struct fields
     mutable std::mutex state_mutex_;
 
-    bool use_drift_;
-    uint8_t count_;
-    const uint8_t min_samples_for_forgetting_;
+    // 64-bit fields
+    const double adaptive_forgetting_cutoff;
+    double drift_{0.0};
+    double drift_covariance_{0.0};
+    const double drift_process_variance;
+    const double drift_significance_threshold_squared;
+    const double forget_variance_factor;
+    int64_t last_update_{0};
+    double offset_{0.0};
+    double offset_covariance_{std::numeric_limits<double>::infinity()};
+    double offset_drift_covariance_{0.0};
+    const double process_variance;
+
+    // 8-bit fields
+    uint8_t count_{0};
+    const uint8_t min_samples_for_forgetting;
+    bool use_drift_{false};
 };
 
 }  // namespace sendspin

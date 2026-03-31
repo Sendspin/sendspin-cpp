@@ -12,24 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifdef SENDSPIN_ENABLE_PLAYER
-
 #include "transfer_buffer.h"
+
+#include "sendspin/player_role.h"
 
 #include <cstring>
 
 namespace sendspin {
 
-TransferBuffer::~TransferBuffer() = default;
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
+TransferBuffer::~TransferBuffer() {
+    this->deallocate_buffer();
+}
 
 std::unique_ptr<TransferBuffer> TransferBuffer::create(size_t buffer_size) {
     std::unique_ptr<TransferBuffer> buffer(new TransferBuffer());
 
-    if (!buffer->allocate_buffer_(buffer_size)) {
+    if (!buffer->allocate_buffer(buffer_size)) {
         return nullptr;
     }
 
     return buffer;
+}
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+size_t TransferBuffer::transfer_data_to_sink(uint32_t timeout_ms) {
+    size_t bytes_written = 0;
+    if (this->available() > 0 && this->listener_) {
+        bytes_written =
+            this->listener_->on_audio_write(this->data_start_, this->available(), timeout_ms);
+        this->decrease_buffer_length(bytes_written);
+    }
+
+    return bytes_written;
 }
 
 size_t TransferBuffer::free() const {
@@ -53,24 +74,9 @@ void TransferBuffer::increase_buffer_length(size_t bytes) {
     this->buffer_length_ += bytes;
 }
 
-size_t TransferBuffer::transfer_data_to_sink(uint32_t timeout_ms, bool post_shift) {
-    size_t bytes_written = 0;
-    if (this->available() > 0 && this->sink_ != nullptr) {
-        bytes_written = this->sink_->write(this->data_start_, this->available(), timeout_ms);
-        this->decrease_buffer_length(bytes_written);
-    }
-
-    if (post_shift && this->buffer_length_ > 0) {
-        std::memmove(this->buffer_.data(), this->data_start_, this->buffer_length_);
-        this->data_start_ = this->buffer_.data();
-    }
-
-    return bytes_written;
-}
-
 bool TransferBuffer::reallocate(size_t new_buffer_size) {
     if (!this->buffer_) {
-        return this->allocate_buffer_(new_buffer_size);
+        return this->allocate_buffer(new_buffer_size);
     }
 
     if (new_buffer_size < this->buffer_length_) {
@@ -91,7 +97,11 @@ bool TransferBuffer::reallocate(size_t new_buffer_size) {
     return true;
 }
 
-bool TransferBuffer::allocate_buffer_(size_t buffer_size) {
+// ============================================================================
+// Private helpers
+// ============================================================================
+
+bool TransferBuffer::allocate_buffer(size_t buffer_size) {
     if (!this->buffer_.allocate(buffer_size)) {
         return false;
     }
@@ -101,12 +111,10 @@ bool TransferBuffer::allocate_buffer_(size_t buffer_size) {
     return true;
 }
 
-void TransferBuffer::deallocate_buffer_() {
+void TransferBuffer::deallocate_buffer() {
     this->buffer_.reset();
     this->data_start_ = nullptr;
     this->buffer_length_ = 0;
 }
 
 }  // namespace sendspin
-
-#endif  // SENDSPIN_ENABLE_PLAYER
