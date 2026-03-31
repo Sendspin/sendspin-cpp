@@ -111,17 +111,23 @@ public:
     // Connection queries
     // ========================================
 
-    /// @brief Returns the current active connection.
-    /// @return Pointer to the current connection, or nullptr if none.
-    SendspinConnection* current() const;
-
     /// @brief Returns true if there is an active connection with completed handshake.
     /// @return True if connected and handshake is complete, false otherwise.
     bool is_connected() const;
 
+    /// @brief Returns the current active connection.
+    /// @return Pointer to the current connection, or nullptr if none.
+    // NOTE: not inlined due to incomplete SendspinConnection type
+    SendspinConnection* current() const {
+        return this->current_connection_.get();
+    }
+
     /// @brief Returns the pending handoff connection.
     /// @return Pointer to the pending connection, or nullptr if none.
-    SendspinConnection* pending() const;
+    // NOTE: not inlined due to incomplete SendspinConnection type
+    SendspinConnection* pending() const {
+        return this->pending_connection_.get();
+    }
 
     // ========================================
     // Event queuing (thread-safe)

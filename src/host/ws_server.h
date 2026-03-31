@@ -72,7 +72,7 @@ public:
     /// @param client Pointer to the SendspinClient (stored for context).
     /// @param task_stack_in_psram Ignored on host builds.
     /// @param task_priority Ignored on host builds.
-    /// @return true if server started successfully.
+    /// @return true if the server started successfully, false on error
     bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority);
 
     /// @brief Stops the WebSocket server and releases its resources
@@ -103,7 +103,7 @@ public:
     }
 
     /// @brief Returns true if the WebSocket server has been started
-    /// @return true if the server is currently running.
+    /// @return true if the server is currently running, false otherwise
     bool is_started() const {
         return this->server_ != nullptr;
     }

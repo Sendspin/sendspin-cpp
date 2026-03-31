@@ -234,8 +234,10 @@ static bool process_server_metadata_state_object(const JsonObject metadata_objec
 }
 
 // ============================================================================
-// Message type determination
+// Protocol functions
 // ============================================================================
+
+// Message type determination
 
 SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     if (!root["type"].is<const char*>()) {
@@ -264,9 +266,7 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     return SendspinServerToClientMessageType::UNKNOWN;
 }
 
-// ============================================================================
 // Message processing
-// ============================================================================
 
 bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg) {
     if (!root["payload"]["server_id"].is<JsonVariant>() ||
@@ -377,9 +377,7 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
     return true;
 }
 
-// ============================================================================
 // State delta application
-// ============================================================================
 
 void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObject& updates) {
     if (current == nullptr) {
@@ -649,9 +647,7 @@ void apply_metadata_state_deltas(ServerMetadataStateObject* current,
     }
 }
 
-// ============================================================================
 // Message formatting
-// ============================================================================
 
 std::string format_client_hello_message(const ClientHelloMessage* msg) {
     JsonDocument doc = make_json_document();

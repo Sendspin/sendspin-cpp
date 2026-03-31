@@ -31,31 +31,58 @@
 
 namespace sendspin {
 
-/// @brief Callback type for message send completion.
+/// @brief Callback type for message send completion
 /// @param success True if the message was sent successfully, false otherwise.
 /// @param timestamp The actual timestamp when the message was sent (in microseconds).
 using SendCompleteCallback = std::function<void(bool, int64_t)>;
 
-/// @brief Abstract base class for Sendspin connections (server-initiated or client-initiated).
-///
-/// This class represents a single connection to a Sendspin server. It manages connection state,
-/// time synchronization, message buffering, and the hello handshake. Derived classes implement
-/// the actual transport mechanism (e.g., incoming WebSocket server connection or outgoing client).
-///
-/// The hub owns connection instances and uses callbacks to receive notifications about messages,
-/// handshake completion, and disconnection events.
+/**
+ * @brief Abstract base class for Sendspin connections (server-initiated or client-initiated)
+ *
+ * This class represents a single connection to a Sendspin server. It manages connection state,
+ * time synchronization, message buffering, and the hello handshake. Derived classes implement
+ * the actual transport mechanism (e.g., incoming WebSocket server connection or outgoing client).
+ *
+ * The hub owns connection instances and uses callbacks to receive notifications about messages,
+ * handshake completion, and disconnection events.
+ *
+ * Key responsibilities:
+ * - Abstract base for platform-specific WebSocket transports (server and client variants)
+ * - Owns and drives the time filter (Kalman-based NTP-style synchronization)
+ * - Manages the reassembly payload buffer for fragmented WebSocket frames
+ * - Tracks hello handshake state (client_hello_sent / server_hello_received)
+ *
+ * Usage:
+ * 1. Construct a concrete subclass (SendspinServerConnection or SendspinClientConnection)
+ * 2. Set the on_connected, on_handshake_complete, on_disconnected, on_json_message, and
+ *    on_binary_message callbacks
+ * 3. Call start() to initialize the transport and begin connecting
+ * 4. Call loop() periodically to drive the state machine and process events
+ * 5. Call send_text_message() to send JSON messages to the peer
+ * 6. Call disconnect() to send a goodbye message and close the connection
+ *
+ * @code
+ * // Concrete subclass provided by the platform layer
+ * auto conn = std::make_unique<SendspinClientConnection>(url, config);
+ * conn->on_connected = [](SendspinConnection* c) { c->send_text_message(hello_json, {}); };
+ * conn->on_json_message = [](SendspinConnection* c, const std::string& msg, int64_t t) { ... };
+ * conn->on_disconnected = [](SendspinConnection* c) { handle_disconnect(); };
+ * conn->start();
+ * // Call conn->loop() from a periodic task
+ * @endcode
+ */
 class SendspinConnection {
 public:
     virtual ~SendspinConnection();
 
     /// @brief Starts the connection (e.g., initiates client connection or begins message
-    /// processing).
+    /// processing)
     virtual void start() = 0;
 
-    /// @brief Periodic loop processing (e.g., poll for events, handle state machine).
+    /// @brief Periodic loop processing (e.g., poll for events, handle state machine)
     virtual void loop() = 0;
 
-    /// @brief Disconnects from the server with a goodbye message.
+    /// @brief Disconnects from the server with a goodbye message
     /// @param reason The reason for disconnecting (e.g., shutdown, another server).
     /// @param on_complete Optional callback invoked after goodbye is sent (or send fails/times
     /// out).
@@ -64,44 +91,44 @@ public:
     ///                    thread.
     virtual void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) = 0;
 
-    /// @brief Checks if the transport connection is established.
+    /// @brief Checks if the transport connection is established
     /// @return true if connected, false otherwise.
     virtual bool is_connected() const = 0;
 
-    /// @brief Prevents any further message callbacks from firing on the network thread.
+    /// @brief Prevents any further message callbacks from firing on the network thread
     ///
-    /// Called on the main thread before connection cleanup to ensure no stale events from a dying
+    /// Called on the main thread before connection cleanup so that no stale events from a dying
     /// connection can sneak into role queues after they've been reset. Thread-safe: the flag is
     /// checked atomically in dispatch_completed_message_() which runs on the network thread.
     void disable_message_dispatch() {
         this->message_dispatch_enabled_.store(false, std::memory_order_release);
     }
 
-    /// @brief Checks if the hello handshake has completed successfully.
+    /// @brief Checks if the hello handshake has completed successfully
     /// @return true if handshake complete (hello exchange done), false otherwise.
     bool is_handshake_complete() const {
         return this->client_hello_sent_ && this->server_hello_received_;
     }
 
-    /// @brief Gets the socket file descriptor for this connection.
+    /// @brief Gets the socket file descriptor for this connection
     /// @return Socket fd for server connections, -1 for client connections.
     /// @note Used by the hub to identify which connection closed when notified by the server.
     virtual int get_sockfd() const {
         return -1;
     }
 
-    /// @brief Sends a text message to the server with a completion callback.
+    /// @brief Sends a text message to the server with a completion callback
     /// @param msg The message string to send.
     /// @param cb Callback invoked after send completes (success, actual_send_time).
     /// @return SsErr::OK if queued successfully, error code otherwise.
     virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb) = 0;
 
-    /// @brief Sends a time synchronization message with a completion callback.
+    /// @brief Sends a time synchronization message with a completion callback
     /// @param cb Callback invoked after send completes, providing actual send timestamp.
     /// @return true if message was queued successfully, false otherwise.
     bool send_time_message(SendCompleteCallback cb);
 
-    /// @brief Sends a goodbye message with completion callback.
+    /// @brief Sends a goodbye message with completion callback
     /// @param reason The reason for disconnecting.
     /// @param on_complete Callback invoked after the goodbye message is sent (or fails).
     /// @return SsErr::OK if sent successfully, error code otherwise.
@@ -111,13 +138,13 @@ public:
     // Server information accessors (populated after server/hello message is received)
     // ========================================
 
-    /// @brief Gets the connection reason from the server/hello message.
+    /// @brief Gets the connection reason from the server/hello message
     /// @return The connection reason (discovery or playback).
     SendspinConnectionReason get_connection_reason() const {
         return this->connection_reason_;
     }
 
-    /// @brief Gets the server ID from the server/hello message.
+    /// @brief Gets the server ID from the server/hello message
     /// @return The server ID string (empty until hello is received).
     const std::string& get_server_id() const {
         return this->server_id_;
@@ -127,35 +154,35 @@ public:
     // Callbacks set by the hub to receive notifications
     // ========================================
 
-    /// @brief Callback invoked when a JSON message is received.
+    /// @brief Callback invoked when a JSON message is received
     /// @param conn Pointer to this connection.
     /// @param message The JSON message string.
     /// @param timestamp The client timestamp when the message was received.
     std::function<void(SendspinConnection*, const std::string&, int64_t)> on_json_message;
 
-    /// @brief Callback invoked when a binary message is received.
+    /// @brief Callback invoked when a binary message is received
     /// @param conn Pointer to this connection.
     /// @param payload Pointer to the binary message data (owned by connection, valid until callback
     /// returns).
     /// @param len Length of the binary message data.
     std::function<void(SendspinConnection*, uint8_t*, size_t)> on_binary_message;
 
-    /// @brief Callback invoked when the transport connection is ready for messaging.
+    /// @brief Callback invoked when the transport connection is ready for messaging
     /// @param conn Pointer to this connection.
     /// @note For server connections, this is called when the WebSocket handshake completes.
     ///       For client connections, this is called when the connection to server succeeds.
     ///       The hub uses this to initiate the hello handshake.
     std::function<void(SendspinConnection*)> on_connected;
 
-    /// @brief Callback invoked when the hello handshake completes successfully.
+    /// @brief Callback invoked when the hello handshake completes successfully
     /// @param conn Pointer to this connection.
     std::function<void(SendspinConnection*)> on_handshake_complete;
 
-    /// @brief Callback invoked when the connection is closed or lost.
+    /// @brief Callback invoked when the connection is closed or lost
     /// @param conn Pointer to this connection.
     std::function<void(SendspinConnection*)> on_disconnected;
 
-    /// @brief Converts a server timestamp to the equivalent client timestamp.
+    /// @brief Converts a server timestamp to the equivalent client timestamp
     /// @param server_time Server timestamp in microseconds.
     /// @return Equivalent client timestamp in microseconds (0 if time filter not initialized).
     int64_t get_client_time(int64_t server_time) const {
@@ -165,7 +192,13 @@ public:
         return this->time_filter_->compute_client_time(server_time);
     }
 
-    /// @brief Returns true if the time filter has received at least one measurement.
+    /// @brief Gets the time filter for this connection
+    /// @return Pointer to the time filter, or nullptr if not initialized.
+    SendspinTimeFilter* get_time_filter() {
+        return this->time_filter_.get();
+    }
+
+    /// @brief Returns true if the time filter has received at least one measurement
     /// @return True if time synchronization has started, false otherwise.
     bool is_time_synced() const {
         if (this->time_filter_ == nullptr) {
@@ -174,95 +207,91 @@ public:
         return this->time_filter_->has_update();
     }
 
-    /// @brief Gets the time filter for this connection.
-    /// @return Pointer to the time filter, or nullptr if not initialized.
-    SendspinTimeFilter* get_time_filter() {
-        return this->time_filter_.get();
-    }
-
-    /// @brief Initializes the time filter with Kalman parameters.
+    /// @brief Initializes the time filter with Kalman parameters
     void init_time_filter();
 
     // ========================================
     // Configuration setters (called by hub after receiving server/hello message)
     // ========================================
 
-    /// @brief Sets the server ID (from server/hello message).
-    /// @param server_id The server ID string.
-    /// @note Called by hub after receiving server/hello message.
-    void set_server_id(const std::string& server_id) {
-        this->server_id_ = server_id;
-    }
-
-    /// @brief Sets the server name (from server/hello message).
-    /// @param server_name The server name string.
-    /// @note Called by hub after receiving server/hello message.
-    void set_server_name(const std::string& server_name) {
-        this->server_name_ = server_name;
-    }
-
-    /// @brief Sets the connection reason (from server/hello message).
-    /// @param reason The connection reason.
-    /// @note Called by hub after receiving server/hello message.
-    void set_connection_reason(SendspinConnectionReason reason) {
-        this->connection_reason_ = reason;
-    }
-
-    /// @brief Sets the client hello sent flag.
+    /// @brief Sets the client hello sent flag
     /// @param sent True if client hello message has been sent.
     /// @note Called by hub to track handshake state.
     void set_client_hello_sent(bool sent) {
         this->client_hello_sent_ = sent;
     }
 
-    /// @brief Sets the server hello received flag.
+    /// @brief Sets the connection reason (from server/hello message)
+    /// @param reason The connection reason.
+    /// @note Called by hub after receiving server/hello message.
+    void set_connection_reason(SendspinConnectionReason reason) {
+        this->connection_reason_ = reason;
+    }
+
+    /// @brief Sets the server hello received flag
     /// @param received True if server hello message has been received.
     /// @note Called by hub when SERVER_HELLO is processed.
     void set_server_hello_received(bool received) {
         this->server_hello_received_ = received;
     }
 
+    /// @brief Sets the server ID (from server/hello message)
+    /// @param server_id The server ID string.
+    /// @note Called by hub after receiving server/hello message.
+    void set_server_id(const std::string& server_id) {
+        this->server_id_ = server_id;
+    }
+
+    /// @brief Sets the server name (from server/hello message)
+    /// @param server_name The server name string.
+    /// @note Called by hub after receiving server/hello message.
+    void set_server_name(const std::string& server_name) {
+        this->server_name_ = server_name;
+    }
+
     // ========================================
     // Time message state accessors
     // ========================================
 
-    /// @brief Gets the timestamp of the last sent time message.
+    /// @brief Gets the timestamp of the last sent time message
     /// @return Timestamp in microseconds of the last sent time message (0 if none sent).
     int64_t get_last_sent_time_message() const {
         return this->last_sent_time_message_;
     }
 
-    /// @brief Sets the timestamp of the last sent time message.
+    /// @brief Sets the timestamp of the last sent time message
+    /// @param timestamp The timestamp of the last sent time message
     void set_last_sent_time_message(int64_t timestamp) {
         this->last_sent_time_message_ = timestamp;
     }
 
-    /// @brief Checks if a time message is pending (waiting for response).
+    /// @brief Checks if a time message is pending (waiting for response)
     /// @return True if a time message has been sent and a response is expected, false otherwise.
     bool is_pending_time_message() const {
         return this->pending_time_message_;
     }
 
-    /// @brief Sets the pending time message flag.
+    /// @brief Sets the pending time message flag
+    /// @param pending true if a time message is pending, false to clear the flag
     void set_pending_time_message(bool pending) {
         this->pending_time_message_ = pending;
     }
 
-    /// @brief Thread-safe peek at the last time replacement data.
+    /// @brief Thread-safe peek at the last time replacement data
     /// Uses a FreeRTOS queue (depth 1) so the send callback can write from any thread
     /// while the receive handler reads from any thread without data races.
     /// @return Copy of the last time replacement, or default-constructed if none available.
     TimeTransmittedReplacement peek_time_replacement() const;
 
 protected:
-    /// @brief Deallocates the websocket payload buffer if allocated.
+    /// @brief Deallocates the websocket payload buffer if allocated
     void deallocate_websocket_payload_();
 
-    /// @brief Resets the write offset without freeing the buffer (reuses it for the next message).
+    /// @brief Resets the write offset without freeing the buffer (reuses it for the next message)
     void reset_websocket_payload_();
 
     /// @brief Allocates or grows the websocket payload buffer and returns a pointer to the write
-    /// position.
+    /// position
     ///
     /// For the first fragment, allocates a new buffer of the given size.
     /// For continuation fragments, reallocates to grow the buffer if needed.
@@ -272,11 +301,11 @@ protected:
     /// nullptr on failure.
     uint8_t* prepare_receive_buffer_(size_t data_len);
 
-    /// @brief Advances the write offset after data has been written into the buffer.
+    /// @brief Advances the write offset after data has been written into the buffer
     /// @param data_len Number of bytes that were written.
     void commit_receive_buffer_(size_t data_len);
 
-    /// @brief Dispatches a fully assembled message to the appropriate callback.
+    /// @brief Dispatches a fully assembled message to the appropriate callback
     ///
     /// For text messages: creates a std::string from the buffer, invokes on_json_message,
     /// deallocates buffer. For binary messages: invokes on_binary_message callback. If the buffer
@@ -296,11 +325,11 @@ protected:
     /// Message buffering (for websocket frame assembly).
     PlatformBuffer websocket_payload_;
 
-    // Pointer fields
-
     /// Server identity (from server/hello message).
     std::string server_id_;
     std::string server_name_;
+
+    // Pointer fields
 
     /// Time synchronization filter (Kalman-based).
     std::unique_ptr<SendspinTimeFilter> time_filter_;
@@ -323,8 +352,8 @@ protected:
     /// Hello handshake state.
     bool client_hello_sent_{false};
 
-    /// @brief Tracks whether the current message being assembled is text (true) or binary (false).
-    /// @note Needed because WebSocket continuation frames don't carry the original frame type.
+    /// true if the current message being assembled is text, false if binary
+    /// Needed because WebSocket continuation frames do not carry the original frame type
     bool is_text_frame_{false};
 
     /// When false, dispatch_completed_message_() silently drops incoming messages.

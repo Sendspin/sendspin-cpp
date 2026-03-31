@@ -75,7 +75,7 @@ void SendspinClientConnection::start() {
 }
 
 // ============================================================================
-// Public API
+// SendspinConnection interface implementation
 // ============================================================================
 
 void SendspinClientConnection::loop() {

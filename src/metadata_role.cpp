@@ -23,25 +23,29 @@
 
 namespace sendspin {
 
+/// @brief Deferred event state for thread-safe metadata delivery to the main thread
 struct MetadataRole::EventState {
     ShadowSlot<ServerMetadataStateObject> shadow;
 };
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
 
 MetadataRole::MetadataRole(SendspinClient* client)
     : client_(client), event_state_(std::make_unique<EventState>()) {}
 
 MetadataRole::~MetadataRole() = default;
 
-void MetadataRole::contribute_hello(ClientHelloMessage& msg) {
-    msg.supported_roles.push_back(SendspinRole::METADATA);
-}
+// ============================================================================
+// Public API
+// ============================================================================
 
-void MetadataRole::handle_server_state(ServerMetadataStateObject state) {
-    this->event_state_->shadow.merge(
-        [](ServerMetadataStateObject& current, ServerMetadataStateObject&& delta) {
-            apply_metadata_state_deltas(&current, delta);
-        },
-        std::move(state));
+uint32_t MetadataRole::get_track_duration_ms() const {
+    if (!this->metadata_.progress.has_value()) {
+        return 0;
+    }
+    return this->metadata_.progress.value().track_duration;
 }
 
 uint32_t MetadataRole::get_track_progress_ms() const {
@@ -77,11 +81,20 @@ uint32_t MetadataRole::get_track_progress_ms() const {
     return static_cast<uint32_t>(calculated);
 }
 
-uint32_t MetadataRole::get_track_duration_ms() const {
-    if (!this->metadata_.progress.has_value()) {
-        return 0;
-    }
-    return this->metadata_.progress.value().track_duration;
+// ============================================================================
+// Internal Helpers
+// ============================================================================
+
+void MetadataRole::contribute_hello(ClientHelloMessage& msg) {
+    msg.supported_roles.push_back(SendspinRole::METADATA);
+}
+
+void MetadataRole::handle_server_state(ServerMetadataStateObject state) {
+    this->event_state_->shadow.merge(
+        [](ServerMetadataStateObject& current, ServerMetadataStateObject&& delta) {
+            apply_metadata_state_deltas(&current, delta);
+        },
+        std::move(state));
 }
 
 void MetadataRole::drain_events() {

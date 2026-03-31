@@ -61,6 +61,10 @@ struct TimeBurstResult {
  */
 class SendspinTimeBurst {
 public:
+    // ========================================
+    // Public API
+    // ========================================
+
     /// @brief Drive the burst state machine. Called from hub's loop()
     /// @param conn The active connection to send time messages on.
     /// @return Result indicating whether a message was sent and/or the burst completed.
@@ -75,6 +79,10 @@ public:
     bool on_time_response(SendspinConnection* conn, int64_t offset, int64_t max_error,
                           int64_t timestamp);
 
+    // ========================================
+    // Lifecycle
+    // ========================================
+
     /// @brief Reset state (call on connection loss/change)
     void reset();
 
@@ -84,7 +92,6 @@ protected:
     static const int64_t RESPONSE_TIMEOUT_MS = 10000;
 
     // 64-bit fields
-    // Best measurement in current burst
     int64_t best_max_error_{std::numeric_limits<int64_t>::max()};
     int64_t best_offset_{0};
     int64_t best_timestamp_{0};

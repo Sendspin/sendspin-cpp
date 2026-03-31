@@ -220,21 +220,13 @@ void ConnectionManager::loop() {
 // Connection queries
 // ============================================================================
 
-SendspinConnection* ConnectionManager::current() const {
-    return this->current_connection_.get();
-}
-
-SendspinConnection* ConnectionManager::pending() const {
-    return this->pending_connection_.get();
-}
-
 bool ConnectionManager::is_connected() const {
     return this->current_connection_ != nullptr && this->current_connection_->is_connected() &&
            this->current_connection_->is_handshake_complete();
 }
 
 // ============================================================================
-// Event queuing
+// Event queuing (thread-safe)
 // ============================================================================
 
 void ConnectionManager::enqueue_hello(ServerHelloEvent event) {

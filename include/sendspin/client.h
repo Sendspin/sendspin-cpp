@@ -99,7 +99,8 @@ public:
     }
 };
 
-/// @brief Log severity levels for host builds. Has no effect on ESP-IDF builds
+/// @brief Log severity levels for host builds
+/// Has no effect on ESP-IDF builds
 enum class LogLevel : int {
     NONE = 0,
     ERROR = 1,
@@ -323,6 +324,7 @@ public:
     // ========================================
 
     /// @brief Updates the client state (synchronized, error, external_source) and publishes
+    /// @param state The new client state to publish
     void update_state(SendspinClientState state);
 
     // ========================================
@@ -377,6 +379,7 @@ private:
     /// @param conn The connection that received the message
     /// @param message The raw JSON text
     /// @param timestamp Receive timestamp in microseconds
+    /// @return true if the message was handled, false on parse failure
     bool process_json_message_(SendspinConnection* conn, const std::string& message,
                                int64_t timestamp);
 
@@ -412,11 +415,12 @@ private:
     /// @param server Server information received during the handshake
     void on_handshake_complete_(SendspinConnection* conn, ServerInformationObject server);
 
+    struct EventState;
+
     // Struct fields
     SendspinClientConfig config_;
     GroupUpdateObject group_state_{};
     ServerInformationObject server_information_{};
-    struct EventState;
 
     // Pointer fields
     std::unique_ptr<ArtworkRole> artwork_;

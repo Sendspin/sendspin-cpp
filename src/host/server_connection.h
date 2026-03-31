@@ -52,6 +52,7 @@ public:
     /// @param sockfd Synthetic socket identifier for connection lookup.
     SendspinServerConnection(std::shared_ptr<ix::WebSocket> ws, int sockfd);
 
+    /// @brief Default destructor
     ~SendspinServerConnection() override = default;
 
     /// @brief No-op on server connections; the transport is already established when this is called
@@ -84,8 +85,11 @@ public:
         return this->sockfd_;
     }
 
-    /// @brief Handles an incoming complete message from IXWebSocket.
+    /// @brief Handles an incoming complete message from IXWebSocket
     /// Called from the ws_server's message callback.
+    /// @param data The complete message payload received from IXWebSocket
+    /// @param is_binary true if the message is binary, false if text
+    /// @param receive_time Server-relative timestamp at which the message was received
     void handle_message(const std::string& data, bool is_binary, int64_t receive_time);
 
 protected:

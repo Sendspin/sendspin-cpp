@@ -46,20 +46,25 @@ namespace sendspin {
  */
 class AudioStreamInfo {
 public:
+    /// @brief Default-constructs an empty AudioStreamInfo with zero-initialized fields
     AudioStreamInfo() : AudioStreamInfo(16, 1, 16000) {}
+    /// @brief Constructs an AudioStreamInfo with the given format parameters
+    /// @param bits_per_sample Number of bits per audio sample (e.g., 16).
+    /// @param channels Number of audio channels (e.g., 1 for mono, 2 for stereo).
+    /// @param sample_rate Audio sample rate in Hz (e.g., 44100).
     AudioStreamInfo(uint8_t bits_per_sample, uint8_t channels, uint32_t sample_rate);
 
-    /// @brief Returns the number of bits per audio sample.
+    /// @brief Returns the number of bits per audio sample
     /// @return Bits per sample (e.g., 16).
     uint8_t get_bits_per_sample() const {
         return this->bits_per_sample_;
     }
-    /// @brief Returns the number of audio channels.
+    /// @brief Returns the number of audio channels
     /// @return Channel count (e.g., 1 for mono, 2 for stereo).
     uint8_t get_channels() const {
         return this->channels_;
     }
-    /// @brief Returns the audio sample rate.
+    /// @brief Returns the audio sample rate
     /// @return Sample rate in Hz (e.g., 44100).
     uint32_t get_sample_rate() const {
         return this->sample_rate_;
@@ -119,7 +124,7 @@ public:
     /// @return Duration in microseconds.
     uint32_t frames_to_microseconds(uint32_t frames) const;
 
-    /// @brief Converts frames to milliseconds, updating frames with the remainder.
+    /// @brief Converts frames to milliseconds, updating frames with the remainder
     /// @param[out] frames Pointer to the frame count; updated in place with the leftover frames
     ///             that could not be converted to a whole millisecond.
     /// @return Whole milliseconds represented by the converted frames.

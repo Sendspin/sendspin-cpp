@@ -45,6 +45,9 @@ enum class SendspinRepeatMode {
     ALL,  // Repeat entire queue
 };
 
+/// @brief Returns a null-terminated string name for a repeat mode
+/// @param mode The mode to convert
+/// @return Null-terminated string, or "unknown" for unrecognized values
 inline const char* to_cstr(SendspinRepeatMode mode) {
     switch (mode) {
         case SendspinRepeatMode::OFF:
@@ -58,6 +61,9 @@ inline const char* to_cstr(SendspinRepeatMode mode) {
     }
 }
 
+/// @brief Parses a repeat mode from its string representation
+/// @param str The string to parse
+/// @return The matching mode, or std::nullopt if unrecognized
 inline std::optional<SendspinRepeatMode> repeat_mode_from_string(const std::string& str) {
     if (str == "off")
         return SendspinRepeatMode::OFF;
@@ -127,19 +133,21 @@ public:
     explicit MetadataRole(SendspinClient* client);
     ~MetadataRole();
 
-    /// @brief Sets the listener for metadata events. The listener must outlive this role.
+    /// @brief Sets the listener for metadata events
+    /// @note The listener must outlive this role
+    /// @param listener Pointer to the listener implementation
     void set_listener(MetadataRoleListener* listener) {
         this->listener_ = listener;
     }
+
+    /// @brief Returns the track duration in milliseconds
+    /// @return Track duration in milliseconds, or 0 if unknown or the stream is live
+    uint32_t get_track_duration_ms() const;
 
     /// @brief Returns the interpolated track progress in milliseconds
     /// @return Estimated playback position in milliseconds, interpolated from the last server
     /// update
     uint32_t get_track_progress_ms() const;
-
-    /// @brief Returns the track duration in milliseconds
-    /// @return Track duration in milliseconds, or 0 if unknown or the stream is live
-    uint32_t get_track_duration_ms() const;
 
 private:
     /// @brief Adds the metadata role to the supported roles list in the hello message
@@ -153,9 +161,10 @@ private:
     /// @brief Resets the metadata state and clears any pending events
     void cleanup();
 
+    struct EventState;
+
     // Struct fields
     ServerMetadataStateObject metadata_{};
-    struct EventState;
 
     // Pointer fields
     SendspinClient* client_;

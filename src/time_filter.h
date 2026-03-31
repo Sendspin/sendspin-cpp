@@ -23,7 +23,9 @@
 
 namespace sendspin {
 
+// ============================================================================
 // Time filter tuning constants
+// ============================================================================
 static constexpr double TIME_FILTER_PROCESS_STD_DEV = 0.0;
 static constexpr double TIME_FILTER_DRIFT_PROCESS_STD_DEV = 5e-11;
 static constexpr double TIME_FILTER_FORGET_FACTOR = 1.1;
@@ -62,6 +64,10 @@ static constexpr double TIME_FILTER_DRIFT_SIGNIFICANCE_THRESHOLD = 2.0;
  */
 class SendspinTimeFilter {
 public:
+    // ========================================
+    // Lifecycle
+    // ========================================
+
     /// @brief Constructs a Kalman filter for time synchronization
     ///
     /// @param process_std_dev Standard deviation of the offset process noise in microseconds,
@@ -88,6 +94,10 @@ public:
     SendspinTimeFilter(double process_std_dev, double drift_process_std_dev, double forget_factor,
                        double adaptive_cutoff = 0.75, uint8_t min_samples = 100,
                        double drift_significance_threshold = 2.0);
+
+    // ========================================
+    // Core API
+    // ========================================
 
     /// @brief Processes a new time synchronization measurement through the Kalman filter
     ///
@@ -128,6 +138,10 @@ public:
     /// new measurements to re-establish synchronization.
     void reset();
 
+    // ========================================
+    // Accessors
+    // ========================================
+
     /// @brief Returns the offset variance in microseconds squared
     ///
     /// Provides the raw variance value from the Kalman filter's covariance matrix. This represents
@@ -150,6 +164,10 @@ public:
     bool has_update() const;
 
 protected:
+    // ========================================
+    // Member variables
+    // ========================================
+
     // Struct fields
     mutable std::mutex state_mutex_;
 

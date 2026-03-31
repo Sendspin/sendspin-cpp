@@ -27,7 +27,7 @@ namespace sendspin {
 
 /// @brief Platform-agnostic error codes for Sendspin APIs
 enum class SsErr : int32_t {
-    // Success (>= 0)
+    // Success / informational (>= 0)
     OK = 0,  // Operation succeeded
 
     // Named error codes (> 0, mirrors esp_err_t values)
@@ -39,7 +39,7 @@ enum class SsErr : int32_t {
     NOT_SUPPORTED = 0x106,  // Operation not supported
     TIMEOUT = 0x107,        // Operation timed out
 
-    // Generic failure (< 0)
+    // Errors (< 0)
     FAIL = -1,  // Generic failure
 };
 

@@ -107,25 +107,8 @@ bool SyncTask::start(bool task_stack_in_psram) {
 }
 
 // ============================================================================
-// Lifecycle
-// ============================================================================
-
-void SyncTask::stop_() {
-    if (!this->sync_thread_.joinable()) {
-        return;
-    }
-
-    this->event_flags_.set(EventGroupBits::COMMAND_STOP);
-    this->sync_thread_.join();
-}
-
-// ============================================================================
 // Public API
 // ============================================================================
-
-bool SyncTask::is_running() const {
-    return this->event_flags_.get() & EventGroupBits::TASK_RUNNING;
-}
 
 void SyncTask::signal_stream_end() {
     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_END);
@@ -158,330 +141,6 @@ void SyncTask::notify_audio_played(uint32_t frames, int64_t timestamp) {
 // ============================================================================
 // Private sync helpers
 // ============================================================================
-
-void SyncTask::sync_track_sent_audio_(SyncContext& sync_context, size_t bytes_sent) {
-    uint32_t frames_sent = sync_context.current_stream_info.bytes_to_frames(bytes_sent);
-    sync_context.buffered_frames += frames_sent;
-    uint32_t remainder = frames_sent;
-    int64_t ms = sync_context.current_stream_info.frames_to_milliseconds_with_remainder(&remainder);
-    sync_context.new_audio_client_playtime +=
-        1000LL * ms +
-        static_cast<int64_t>(sync_context.current_stream_info.frames_to_microseconds(remainder));
-}
-
-bool SyncTask::sync_transfer_audio_(SyncContext& sync_context) {
-    size_t decode_available =
-        sync_context.release_chunk ? sync_context.decode_buffer->available() : 0;
-    const uint32_t duration_in_transfer_buffers = sync_context.current_stream_info.bytes_to_ms(
-        decode_available + sync_context.interpolation_transfer_buffer->available());
-
-    size_t bytes_written = sync_context.interpolation_transfer_buffer->transfer_data_to_sink(
-        duration_in_transfer_buffers / 2);
-    this->sync_track_sent_audio_(sync_context, bytes_written);
-
-    if ((bytes_written > 0) && sync_context.initial_decode) {
-        // Sent initial zeros, delay slightly to give it some time to work through the audio stack
-        std::this_thread::sleep_for(std::chrono::milliseconds(
-            sync_context.current_stream_info.bytes_to_ms(bytes_written) / 2));
-    }
-
-    if (sync_context.interpolation_transfer_buffer->available() == 0 &&
-        sync_context.release_chunk) {
-        // No interpolation bytes available, send main audio data
-        size_t decode_bytes_written =
-            sync_context.decode_buffer->transfer_data_to_sink(3 * duration_in_transfer_buffers / 2);
-        this->sync_track_sent_audio_(sync_context, decode_bytes_written);
-    }
-
-    // When decode buffer fully consumed and released, mark done
-    if (sync_context.decode_buffer->available() == 0 && sync_context.release_chunk) {
-        sync_context.release_chunk = false;
-    }
-
-    // Keep transferring if there's still data to send
-    if (sync_context.interpolation_transfer_buffer->available() > 0) {
-        return false;
-    }
-    if (sync_context.release_chunk && sync_context.decode_buffer->available() > 0) {
-        return false;
-    }
-
-    return true;
-}
-
-bool SyncTask::sync_load_next_chunk_(SyncContext& sync_context) {
-    if (sync_context.encoded_entry == nullptr) {
-        sync_context.encoded_entry = this->encoded_ring_buffer_->receive_chunk(15);
-        if (sync_context.encoded_entry == nullptr) {
-            // No chunk available to process
-            return false;
-        }
-    }
-
-    return true;
-}
-
-void SyncTask::sync_process_playback_progress_(SyncContext& sync_context) {
-    PlaybackProgress playback_progress;
-    bool received = false;
-    while (this->playback_progress_queue_.receive(playback_progress, 0)) {
-        received = true;
-        uint32_t frames_played = playback_progress.frames_played;
-
-        if (sync_context.initial_decode && frames_played) {
-            sync_context.initial_decode = false;
-        }
-
-        if (frames_played > sync_context.buffered_frames) {
-#ifdef SENDSPIN_SYNC_TASK_DEBUG
-            SS_LOGW(TAG,
-                    "Buffered frames underflow: played %" PRIu32 " but only %" PRIu32 " buffered",
-                    frames_played, sync_context.buffered_frames);
-#endif
-            sync_context.buffered_frames = 0;
-        } else {
-            sync_context.buffered_frames -= frames_played;
-        }
-    }
-    if (received) {
-        uint32_t unplayed_frames = sync_context.buffered_frames;
-        int64_t unplayed_ms =
-            sync_context.current_stream_info.frames_to_milliseconds_with_remainder(
-                &unplayed_frames);
-        int64_t unplayed_us =
-            1000LL * unplayed_ms +
-            static_cast<int64_t>(
-                sync_context.current_stream_info.frames_to_microseconds(unplayed_frames));
-        sync_context.new_audio_client_playtime = playback_progress.finish_timestamp + unplayed_us;
-    }
-}
-
-int32_t SyncTask::sync_soft_sync_remove_audio_(SyncContext& sync_context) {
-    // Small sync adjustment after getting slightly ahead.
-    // Removes the last frame in the chunk to get in sync. The second to last frame is replaced with
-    // the average of it and the removed frame to minimize audible glitches.
-
-    const uint32_t num_channels = sync_context.current_stream_info.get_channels();
-    const uint32_t bytes_per_sample = sync_context.bytes_per_frame / num_channels;
-
-    if (sync_context.decode_buffer->available() >= 2 * sync_context.bytes_per_frame) {
-        for (uint32_t chan = 0; chan < num_channels; ++chan) {
-            const int32_t first_sample = unpack_audio_sample_to_q31(
-                sync_context.decode_buffer->get_buffer_end() - 2 * sync_context.bytes_per_frame +
-                    chan * bytes_per_sample,
-                bytes_per_sample);
-            const int32_t second_sample = unpack_audio_sample_to_q31(
-                sync_context.decode_buffer->get_buffer_end() - sync_context.bytes_per_frame +
-                    chan * bytes_per_sample,
-                bytes_per_sample);
-            int32_t replacement_sample = first_sample / 2 + second_sample / 2;
-            pack_q31_as_audio_sample(replacement_sample,
-                                     sync_context.decode_buffer->get_buffer_end() -
-                                         2 * sync_context.bytes_per_frame + chan * bytes_per_sample,
-                                     bytes_per_sample);
-        }
-
-        sync_context.decode_buffer->decrease_buffer_length(sync_context.bytes_per_frame);
-        return -1;
-    }
-    return 0;
-}
-
-int32_t SyncTask::sync_soft_sync_add_audio_(SyncContext& sync_context) {
-    // Small sync adjustment after getting slightly behind.
-    // Adds one new frame to get in sync. The new frame is inserted between the first and second
-    // frames. The new frame is the average of the first two frames in the chunk to minimize audible
-    // glitches.
-
-    if ((sync_context.interpolation_transfer_buffer->free() >= sync_context.bytes_per_frame) &&
-        (sync_context.decode_buffer->available() >= 2 * sync_context.bytes_per_frame)) {
-        const uint32_t num_channels = sync_context.current_stream_info.get_channels();
-        const uint32_t bytes_per_sample = sync_context.bytes_per_frame / num_channels;
-
-        for (uint32_t chan = 0; chan < num_channels; ++chan) {
-            const int32_t first_sample = unpack_audio_sample_to_q31(
-                sync_context.decode_buffer->get_buffer_start() + chan * bytes_per_sample,
-                bytes_per_sample);
-            const int32_t second_sample = unpack_audio_sample_to_q31(
-                sync_context.decode_buffer->get_buffer_start() + chan * bytes_per_sample +
-                    sync_context.bytes_per_frame,
-                bytes_per_sample);
-            int32_t new_sample = first_sample / 2 + second_sample / 2;
-            pack_q31_as_audio_sample(
-                new_sample,
-                sync_context.decode_buffer->get_buffer_start() + chan * bytes_per_sample,
-                bytes_per_sample);
-            pack_q31_as_audio_sample(
-                first_sample,
-                sync_context.interpolation_transfer_buffer->get_buffer_start() +
-                    chan * bytes_per_sample,
-                bytes_per_sample);
-        }
-        sync_context.interpolation_transfer_buffer->increase_buffer_length(
-            sync_context.bytes_per_frame);
-        return 1;
-    }
-    return 0;
-}
-
-bool SyncTask::sync_idle_wait_for_header_(SyncContext& sync_context) {
-    // Wait for a codec header to arrive in the ring buffer, discarding stale audio chunks.
-    // Uses a long timeout (500ms) so the task yields CPU and barely wakes when idle.
-    static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 500;
-
-    while (
-        !(this->event_flags_.get() & (COMMAND_STOP | COMMAND_STREAM_END | COMMAND_STREAM_CLEAR))) {
-        auto* entry = this->encoded_ring_buffer_->receive_chunk(IDLE_RECEIVE_TIMEOUT_MS);
-        if (entry == nullptr) {
-            continue;  // Timed out; check flags and try again
-        }
-        if (entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO &&
-            entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO) {
-            // Found a codec header
-            sync_context.encoded_entry = entry;
-            return true;
-        }
-        // Stale audio data from a previous stream, discard it
-        this->encoded_ring_buffer_->return_chunk(entry);
-    }
-    return false;
-}
-
-void SyncTask::sync_drain_ring_buffer_(SyncContext& sync_context) {
-    // Non-blocking drain of audio data from the ring buffer, preserving codec headers.
-    // If a codec header is found, it is kept in sync_context.encoded_entry so the idle
-    // wait loop can process it immediately.
-    while (true) {
-        auto* entry = this->encoded_ring_buffer_->receive_chunk(0);
-        if (entry == nullptr) {
-            break;
-        }
-        if (entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO &&
-            entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO) {
-            // Codec header for the next stream; hold onto it
-            sync_context.encoded_entry = entry;
-            break;
-        }
-        this->encoded_ring_buffer_->return_chunk(entry);
-    }
-}
-
-void SyncTask::sync_reset_context_(SyncContext& sync_context) {
-    // Reset SyncContext between streams without deallocating buffers.
-    sync_context.encoded_entry = nullptr;
-    sync_context.decoded_timestamp = 0;
-    sync_context.new_audio_client_playtime = 0;
-    sync_context.buffered_frames = 0;
-    sync_context.current_stream_info = AudioStreamInfo{};
-    sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
-    sync_context.release_chunk = false;
-    sync_context.initial_decode = true;
-    sync_context.hard_syncing = true;
-
-    // Empty buffers without deallocating
-    if (sync_context.decode_buffer) {
-        sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
-    }
-    if (sync_context.interpolation_transfer_buffer) {
-        sync_context.interpolation_transfer_buffer->decrease_buffer_length(
-            sync_context.interpolation_transfer_buffer->available());
-    }
-    if (sync_context.decoder) {
-        sync_context.decoder->reset_decoders();
-    }
-}
-
-DecodeResult SyncTask::sync_decode_audio_(SyncContext& sync_context) {
-    if (sync_context.decode_buffer != nullptr && sync_context.decode_buffer->available() > 0) {
-        // Already have decoded audio
-        return DecodeResult::SUCCESS;
-    }
-
-    if ((sync_context.encoded_entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO) &&
-        (sync_context.encoded_entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO)) {
-        // New codec header
-        sync_context.decoder->reset_decoders();
-        AudioStreamInfo decoded_stream_info;
-        if (!sync_context.decoder->process_header(
-                sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
-                sync_context.encoded_entry->chunk_type, &decoded_stream_info)) {
-            SS_LOGE(TAG, "Failed to process audio codec header");
-        } else {
-            SS_LOGI(TAG, "Processed new codec header");
-            // Update stream info from the codec header (authoritative source of stream parameters)
-            if (decoded_stream_info != sync_context.current_stream_info) {
-                sync_context.current_stream_info = decoded_stream_info;
-                sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
-
-                // Resize interpolation buffer if needed for the actual stream parameters
-                size_t needed_interp_size =
-                    sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS);
-                if (sync_context.interpolation_transfer_buffer != nullptr &&
-                    needed_interp_size > sync_context.interpolation_transfer_buffer->capacity()) {
-                    if (!sync_context.interpolation_transfer_buffer->reallocate(
-                            needed_interp_size)) {
-                        SS_LOGW(TAG, "Failed to resize interpolation buffer for new stream info");
-                    }
-                }
-            }
-
-            // Create or resize the decode buffer now that we know the maximum decoded size
-            size_t needed = sync_context.decoder->get_maximum_decoded_size();
-            if (sync_context.decode_buffer == nullptr) {
-                sync_context.decode_buffer = TransferBuffer::create(needed);
-                if (sync_context.decode_buffer == nullptr) {
-                    SS_LOGE(TAG, "Failed to allocate decode buffer");
-                    this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
-                    sync_context.encoded_entry = nullptr;
-                    return DecodeResult::ALLOCATION_FAILED;
-                }
-                if (this->player_->listener_) {
-                    sync_context.decode_buffer->set_listener(this->player_->listener_);
-                }
-            } else if (needed > sync_context.decode_buffer->capacity()) {
-                if (!sync_context.decode_buffer->reallocate(needed)) {
-                    SS_LOGE(TAG, "Failed to reallocate decode buffer");
-                    this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
-                    sync_context.encoded_entry = nullptr;
-                    return DecodeResult::ALLOCATION_FAILED;
-                }
-            }
-        }
-    } else if ((sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) &&
-               (sync_context.encoded_entry->chunk_type == CHUNK_TYPE_ENCODED_AUDIO)) {
-        int64_t client_timestamp =
-            this->client_->get_client_time(sync_context.encoded_entry->timestamp) -
-            static_cast<int64_t>(this->player_->get_static_delay_ms()) * 1000 -
-            this->player_->get_fixed_delay_us();
-
-        if (client_timestamp < sync_context.new_audio_client_playtime - HARD_SYNC_THRESHOLD_US) {
-            // This chunk will arrive too late to be played, skip it!
-            this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
-            sync_context.encoded_entry = nullptr;
-            return DecodeResult::SKIPPED;
-        }
-
-        size_t decoded_size = 0;
-        if (!sync_context.decoder->decode_audio_chunk(
-                sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
-                sync_context.decode_buffer->get_buffer_end(), sync_context.decode_buffer->free(),
-                &decoded_size)) {
-            SS_LOGE(TAG, "Failed to decode audio chunk");
-            this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
-            sync_context.encoded_entry = nullptr;
-            return DecodeResult::FAILED;
-        } else {
-            sync_context.decode_buffer->increase_buffer_length(decoded_size);
-            sync_context.decoded_timestamp = client_timestamp;
-        }
-    }
-
-    // Return the encoded entry to the ring buffer
-    this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
-    sync_context.encoded_entry = nullptr;
-
-    return DecodeResult::SUCCESS;
-}
 
 SyncTaskState SyncTask::sync_handle_initial_sync_(SyncContext& sync_context) {
     if (!sync_context.initial_decode) {
@@ -618,6 +277,343 @@ SyncTaskState SyncTask::sync_handle_transfer_audio_(SyncContext& sync_context) {
         return SyncTaskState::SYNCHRONIZE_AUDIO;
     }
     return SyncTaskState::LOAD_CHUNK;
+}
+
+void SyncTask::sync_track_sent_audio_(SyncContext& sync_context, size_t bytes_sent) {
+    uint32_t frames_sent = sync_context.current_stream_info.bytes_to_frames(bytes_sent);
+    sync_context.buffered_frames += frames_sent;
+    uint32_t remainder = frames_sent;
+    int64_t ms = sync_context.current_stream_info.frames_to_milliseconds_with_remainder(&remainder);
+    sync_context.new_audio_client_playtime +=
+        1000LL * ms +
+        static_cast<int64_t>(sync_context.current_stream_info.frames_to_microseconds(remainder));
+}
+
+bool SyncTask::sync_transfer_audio_(SyncContext& sync_context) {
+    size_t decode_available =
+        sync_context.release_chunk ? sync_context.decode_buffer->available() : 0;
+    const uint32_t duration_in_transfer_buffers = sync_context.current_stream_info.bytes_to_ms(
+        decode_available + sync_context.interpolation_transfer_buffer->available());
+
+    size_t bytes_written = sync_context.interpolation_transfer_buffer->transfer_data_to_sink(
+        duration_in_transfer_buffers / 2);
+    this->sync_track_sent_audio_(sync_context, bytes_written);
+
+    if ((bytes_written > 0) && sync_context.initial_decode) {
+        // Sent initial zeros, delay slightly to give it some time to work through the audio stack
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            sync_context.current_stream_info.bytes_to_ms(bytes_written) / 2));
+    }
+
+    if (sync_context.interpolation_transfer_buffer->available() == 0 &&
+        sync_context.release_chunk) {
+        // No interpolation bytes available, send main audio data
+        size_t decode_bytes_written =
+            sync_context.decode_buffer->transfer_data_to_sink(3 * duration_in_transfer_buffers / 2);
+        this->sync_track_sent_audio_(sync_context, decode_bytes_written);
+    }
+
+    // When decode buffer fully consumed and released, mark done
+    if (sync_context.decode_buffer->available() == 0 && sync_context.release_chunk) {
+        sync_context.release_chunk = false;
+    }
+
+    // Keep transferring if there's still data to send
+    if (sync_context.interpolation_transfer_buffer->available() > 0) {
+        return false;
+    }
+    if (sync_context.release_chunk && sync_context.decode_buffer->available() > 0) {
+        return false;
+    }
+
+    return true;
+}
+
+bool SyncTask::sync_load_next_chunk_(SyncContext& sync_context) {
+    if (sync_context.encoded_entry == nullptr) {
+        sync_context.encoded_entry = this->encoded_ring_buffer_->receive_chunk(15);
+        if (sync_context.encoded_entry == nullptr) {
+            // No chunk available to process
+            return false;
+        }
+    }
+
+    return true;
+}
+
+int32_t SyncTask::sync_soft_sync_remove_audio_(SyncContext& sync_context) {
+    // Small sync adjustment after getting slightly ahead.
+    // Removes the last frame in the chunk to get in sync. The second to last frame is replaced with
+    // the average of it and the removed frame to minimize audible glitches.
+
+    const uint32_t num_channels = sync_context.current_stream_info.get_channels();
+    const uint32_t bytes_per_sample = sync_context.bytes_per_frame / num_channels;
+
+    if (sync_context.decode_buffer->available() >= 2 * sync_context.bytes_per_frame) {
+        for (uint32_t chan = 0; chan < num_channels; ++chan) {
+            const int32_t first_sample = unpack_audio_sample_to_q31(
+                sync_context.decode_buffer->get_buffer_end() - 2 * sync_context.bytes_per_frame +
+                    chan * bytes_per_sample,
+                bytes_per_sample);
+            const int32_t second_sample = unpack_audio_sample_to_q31(
+                sync_context.decode_buffer->get_buffer_end() - sync_context.bytes_per_frame +
+                    chan * bytes_per_sample,
+                bytes_per_sample);
+            int32_t replacement_sample = first_sample / 2 + second_sample / 2;
+            pack_q31_as_audio_sample(replacement_sample,
+                                     sync_context.decode_buffer->get_buffer_end() -
+                                         2 * sync_context.bytes_per_frame + chan * bytes_per_sample,
+                                     bytes_per_sample);
+        }
+
+        sync_context.decode_buffer->decrease_buffer_length(sync_context.bytes_per_frame);
+        return -1;
+    }
+    return 0;
+}
+
+int32_t SyncTask::sync_soft_sync_add_audio_(SyncContext& sync_context) {
+    // Small sync adjustment after getting slightly behind.
+    // Adds one new frame to get in sync. The new frame is inserted between the first and second
+    // frames. The new frame is the average of the first two frames in the chunk to minimize audible
+    // glitches.
+
+    if ((sync_context.interpolation_transfer_buffer->free() >= sync_context.bytes_per_frame) &&
+        (sync_context.decode_buffer->available() >= 2 * sync_context.bytes_per_frame)) {
+        const uint32_t num_channels = sync_context.current_stream_info.get_channels();
+        const uint32_t bytes_per_sample = sync_context.bytes_per_frame / num_channels;
+
+        for (uint32_t chan = 0; chan < num_channels; ++chan) {
+            const int32_t first_sample = unpack_audio_sample_to_q31(
+                sync_context.decode_buffer->get_buffer_start() + chan * bytes_per_sample,
+                bytes_per_sample);
+            const int32_t second_sample = unpack_audio_sample_to_q31(
+                sync_context.decode_buffer->get_buffer_start() + chan * bytes_per_sample +
+                    sync_context.bytes_per_frame,
+                bytes_per_sample);
+            int32_t new_sample = first_sample / 2 + second_sample / 2;
+            pack_q31_as_audio_sample(
+                new_sample,
+                sync_context.decode_buffer->get_buffer_start() + chan * bytes_per_sample,
+                bytes_per_sample);
+            pack_q31_as_audio_sample(
+                first_sample,
+                sync_context.interpolation_transfer_buffer->get_buffer_start() +
+                    chan * bytes_per_sample,
+                bytes_per_sample);
+        }
+        sync_context.interpolation_transfer_buffer->increase_buffer_length(
+            sync_context.bytes_per_frame);
+        return 1;
+    }
+    return 0;
+}
+
+DecodeResult SyncTask::sync_decode_audio_(SyncContext& sync_context) {
+    if (sync_context.decode_buffer != nullptr && sync_context.decode_buffer->available() > 0) {
+        // Already have decoded audio
+        return DecodeResult::SUCCESS;
+    }
+
+    if ((sync_context.encoded_entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO) &&
+        (sync_context.encoded_entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO)) {
+        // New codec header
+        sync_context.decoder->reset_decoders();
+        AudioStreamInfo decoded_stream_info;
+        if (!sync_context.decoder->process_header(
+                sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
+                sync_context.encoded_entry->chunk_type, &decoded_stream_info)) {
+            SS_LOGE(TAG, "Failed to process audio codec header");
+        } else {
+            SS_LOGI(TAG, "Processed new codec header");
+            // Update stream info from the codec header (authoritative source of stream parameters)
+            if (decoded_stream_info != sync_context.current_stream_info) {
+                sync_context.current_stream_info = decoded_stream_info;
+                sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
+
+                // Resize interpolation buffer if needed for the actual stream parameters
+                size_t needed_interp_size =
+                    sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS);
+                if (sync_context.interpolation_transfer_buffer != nullptr &&
+                    needed_interp_size > sync_context.interpolation_transfer_buffer->capacity()) {
+                    if (!sync_context.interpolation_transfer_buffer->reallocate(
+                            needed_interp_size)) {
+                        SS_LOGW(TAG, "Failed to resize interpolation buffer for new stream info");
+                    }
+                }
+            }
+
+            // Create or resize the decode buffer now that we know the maximum decoded size
+            size_t needed = sync_context.decoder->get_maximum_decoded_size();
+            if (sync_context.decode_buffer == nullptr) {
+                sync_context.decode_buffer = TransferBuffer::create(needed);
+                if (sync_context.decode_buffer == nullptr) {
+                    SS_LOGE(TAG, "Failed to allocate decode buffer");
+                    this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+                    sync_context.encoded_entry = nullptr;
+                    return DecodeResult::ALLOCATION_FAILED;
+                }
+                if (this->player_->listener_) {
+                    sync_context.decode_buffer->set_listener(this->player_->listener_);
+                }
+            } else if (needed > sync_context.decode_buffer->capacity()) {
+                if (!sync_context.decode_buffer->reallocate(needed)) {
+                    SS_LOGE(TAG, "Failed to reallocate decode buffer");
+                    this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+                    sync_context.encoded_entry = nullptr;
+                    return DecodeResult::ALLOCATION_FAILED;
+                }
+            }
+        }
+    } else if ((sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) &&
+               (sync_context.encoded_entry->chunk_type == CHUNK_TYPE_ENCODED_AUDIO)) {
+        int64_t client_timestamp =
+            this->client_->get_client_time(sync_context.encoded_entry->timestamp) -
+            static_cast<int64_t>(this->player_->get_static_delay_ms()) * 1000 -
+            this->player_->get_fixed_delay_us();
+
+        if (client_timestamp < sync_context.new_audio_client_playtime - HARD_SYNC_THRESHOLD_US) {
+            // This chunk will arrive too late to be played, skip it!
+            this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+            sync_context.encoded_entry = nullptr;
+            return DecodeResult::SKIPPED;
+        }
+
+        size_t decoded_size = 0;
+        if (!sync_context.decoder->decode_audio_chunk(
+                sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
+                sync_context.decode_buffer->get_buffer_end(), sync_context.decode_buffer->free(),
+                &decoded_size)) {
+            SS_LOGE(TAG, "Failed to decode audio chunk");
+            this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+            sync_context.encoded_entry = nullptr;
+            return DecodeResult::FAILED;
+        } else {
+            sync_context.decode_buffer->increase_buffer_length(decoded_size);
+            sync_context.decoded_timestamp = client_timestamp;
+        }
+    }
+
+    // Return the encoded entry to the ring buffer
+    this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+    sync_context.encoded_entry = nullptr;
+
+    return DecodeResult::SUCCESS;
+}
+
+bool SyncTask::sync_idle_wait_for_header_(SyncContext& sync_context) {
+    // Wait for a codec header to arrive in the ring buffer, discarding stale audio chunks.
+    // Uses a long timeout (500ms) so the task yields CPU and barely wakes when idle.
+    static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 500;
+
+    while (
+        !(this->event_flags_.get() & (COMMAND_STOP | COMMAND_STREAM_END | COMMAND_STREAM_CLEAR))) {
+        auto* entry = this->encoded_ring_buffer_->receive_chunk(IDLE_RECEIVE_TIMEOUT_MS);
+        if (entry == nullptr) {
+            continue;  // Timed out; check flags and try again
+        }
+        if (entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO &&
+            entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO) {
+            // Found a codec header
+            sync_context.encoded_entry = entry;
+            return true;
+        }
+        // Stale audio data from a previous stream, discard it
+        this->encoded_ring_buffer_->return_chunk(entry);
+    }
+    return false;
+}
+
+void SyncTask::sync_drain_ring_buffer_(SyncContext& sync_context) {
+    // Non-blocking drain of audio data from the ring buffer, preserving codec headers.
+    // If a codec header is found, it is kept in sync_context.encoded_entry so the idle
+    // wait loop can process it immediately.
+    while (true) {
+        auto* entry = this->encoded_ring_buffer_->receive_chunk(0);
+        if (entry == nullptr) {
+            break;
+        }
+        if (entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO &&
+            entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO) {
+            // Codec header for the next stream; hold onto it
+            sync_context.encoded_entry = entry;
+            break;
+        }
+        this->encoded_ring_buffer_->return_chunk(entry);
+    }
+}
+
+void SyncTask::sync_reset_context_(SyncContext& sync_context) {
+    // Reset SyncContext between streams without deallocating buffers.
+    sync_context.encoded_entry = nullptr;
+    sync_context.decoded_timestamp = 0;
+    sync_context.new_audio_client_playtime = 0;
+    sync_context.buffered_frames = 0;
+    sync_context.current_stream_info = AudioStreamInfo{};
+    sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
+    sync_context.release_chunk = false;
+    sync_context.initial_decode = true;
+    sync_context.hard_syncing = true;
+
+    // Empty buffers without deallocating
+    if (sync_context.decode_buffer) {
+        sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
+    }
+    if (sync_context.interpolation_transfer_buffer) {
+        sync_context.interpolation_transfer_buffer->decrease_buffer_length(
+            sync_context.interpolation_transfer_buffer->available());
+    }
+    if (sync_context.decoder) {
+        sync_context.decoder->reset_decoders();
+    }
+}
+
+void SyncTask::sync_process_playback_progress_(SyncContext& sync_context) {
+    PlaybackProgress playback_progress;
+    bool received = false;
+    while (this->playback_progress_queue_.receive(playback_progress, 0)) {
+        received = true;
+        uint32_t frames_played = playback_progress.frames_played;
+
+        if (sync_context.initial_decode && frames_played) {
+            sync_context.initial_decode = false;
+        }
+
+        if (frames_played > sync_context.buffered_frames) {
+#ifdef SENDSPIN_SYNC_TASK_DEBUG
+            SS_LOGW(TAG,
+                    "Buffered frames underflow: played %" PRIu32 " but only %" PRIu32 " buffered",
+                    frames_played, sync_context.buffered_frames);
+#endif
+            sync_context.buffered_frames = 0;
+        } else {
+            sync_context.buffered_frames -= frames_played;
+        }
+    }
+    if (received) {
+        uint32_t unplayed_frames = sync_context.buffered_frames;
+        int64_t unplayed_ms =
+            sync_context.current_stream_info.frames_to_milliseconds_with_remainder(
+                &unplayed_frames);
+        int64_t unplayed_us =
+            1000LL * unplayed_ms +
+            static_cast<int64_t>(
+                sync_context.current_stream_info.frames_to_microseconds(unplayed_frames));
+        sync_context.new_audio_client_playtime = playback_progress.finish_timestamp + unplayed_us;
+    }
+}
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
+void SyncTask::stop_() {
+    if (!this->sync_thread_.joinable()) {
+        return;
+    }
+
+    this->event_flags_.set(EventGroupBits::COMMAND_STOP);
+    this->sync_thread_.join();
 }
 
 // ============================================================================

@@ -76,6 +76,7 @@ namespace sendspin {
 // Drain task pimpl
 // ============================================================================
 
+/// @brief Persistent drain thread context and platform queue for visualizer data delivery
 struct VisualizerRole::DrainTask {
     SpscRingBuffer ring_buffer;
     PlatformBuffer ring_storage;
@@ -83,6 +84,7 @@ struct VisualizerRole::DrainTask {
     std::thread drain_thread;
 };
 
+/// @brief Deferred event state for thread-safe visualizer stream lifecycle delivery
 struct VisualizerRole::EventState {
     ThreadSafeQueue<VisualizerRole::EventType> queue;
     ShadowSlot<ServerVisualizerStreamObject> shadow_config;

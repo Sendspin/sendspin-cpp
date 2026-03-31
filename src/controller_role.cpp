@@ -20,20 +20,33 @@
 
 namespace sendspin {
 
+/// @brief Deferred event state for thread-safe controller state delivery
 struct ControllerRole::EventState {
     ShadowSlot<ServerStateControllerObject> shadow;
 };
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
 
 ControllerRole::ControllerRole(SendspinClient* client)
     : client_(client), event_state_(std::make_unique<EventState>()) {}
 
 ControllerRole::~ControllerRole() = default;
 
+// ============================================================================
+// Core API
+// ============================================================================
+
 void ControllerRole::send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume,
                                   std::optional<bool> mute) {
     std::string command_message = format_client_command_message(cmd, volume, mute);
     this->client_->send_text(command_message);
 }
+
+// ============================================================================
+// Internal Helpers
+// ============================================================================
 
 void ControllerRole::contribute_hello(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::CONTROLLER);

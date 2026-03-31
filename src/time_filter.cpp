@@ -21,6 +21,10 @@
 
 namespace sendspin {
 
+// ============================================================================
+// Lifecycle
+// ============================================================================
+
 SendspinTimeFilter::SendspinTimeFilter(double process_std_dev, double drift_process_std_dev,
                                        double forget_factor, double adaptive_cutoff,
                                        uint8_t min_samples, double drift_significance_threshold)
@@ -33,6 +37,10 @@ SendspinTimeFilter::SendspinTimeFilter(double process_std_dev, double drift_proc
       min_samples_for_forgetting_(min_samples) {
     this->reset();
 }
+
+// ============================================================================
+// Core API
+// ============================================================================
 
 void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t time_added) {
     std::lock_guard<std::mutex> lock(this->state_mutex_);
@@ -174,6 +182,10 @@ void SendspinTimeFilter::reset() {
     this->last_update_ = 0;
     this->use_drift_ = false;
 }
+
+// ============================================================================
+// Accessors
+// ============================================================================
 
 int64_t SendspinTimeFilter::get_covariance() const {
     std::lock_guard<std::mutex> lock(this->state_mutex_);

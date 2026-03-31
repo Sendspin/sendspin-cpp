@@ -28,23 +28,41 @@ namespace sendspin {
 class SendspinClient;
 class SendspinServerConnection;
 
-/// @brief WebSocket server listener for Sendspin
-///
-/// This class manages the HTTP server (httpd) that listens for incoming WebSocket
-/// connections from Sendspin servers. It does not own the connections long-term;
-/// instead, it creates SendspinServerConnection instances and hands them to the client,
-/// which decides whether to accept or reject them based on handoff logic.
-///
-/// The server supports accepting multiple connections temporarily (max 2) to enable
-/// the handoff protocol where a second server can connect while one is already active.
-///
-/// Lifecycle:
-/// 1. start() is called to begin listening for connections
-/// 2. When a client connects, open_callback creates a SendspinServerConnection
-/// 3. The new connection is passed to the client via callback
-/// 4. The client completes the handshake and decides whether to keep the connection
-/// 5. stop() is called to shut down the server
-class SendspinWsServer {
+/**
+ * @brief WebSocket server listener for Sendspin
+ *
+ * Manages the ESP-IDF HTTP server (httpd) that listens for incoming WebSocket
+ * connections from Sendspin servers. It does not own the connections long-term;
+ * instead, it creates SendspinServerConnection instances and hands them to the
+ * client, which decides whether to accept or reject them based on handoff logic.
+ *
+ * Capabilities:
+ * - Accepts incoming WebSocket connections on a dedicated port
+ * - Routes WebSocket messages to the appropriate connection object
+ * - Manages open/close callbacks to notify the client of connection lifecycle events
+ * - Supports up to max_connections simultaneous sockets (default: 2) to enable the
+ *   handoff protocol where a second server can connect while one is already active
+ *
+ * Usage:
+ * 1. Construct with a SendspinClient pointer (passed to start())
+ * 2. Register callbacks via set_new_connection_callback(), set_connection_closed_callback(),
+ *    and set_find_connection_callback()
+ * 3. Call start() to begin listening for incoming connections
+ * 4. Call stop() to shut down the server
+ *
+ * @code
+ * SendspinWsServer ws_server;
+ * ws_server.set_new_connection_callback([&](std::unique_ptr<SendspinServerConnection> conn) {
+ *     client.on_new_server_connection(std::move(conn));
+ * });
+ * ws_server.set_connection_closed_callback([&](int sockfd) {
+ *     client.on_server_connection_closed(sockfd);
+ * });
+ * ws_server.set_find_connection_callback([&](int sockfd) -> SendspinServerConnection* {
+ *     return client.find_server_connection(sockfd);
+ * });
+ * ws_server.start(&client, /*task_stack_in_psram=*/true, /*task_priority=*/5);
+*@endcode* / class SendspinWsServer {
 public:
     SendspinWsServer() = default;
     ~SendspinWsServer();
@@ -70,12 +88,6 @@ public:
     /// @brief Stops the HTTP server
     void stop();
 
-    /// @brief Checks if the server is currently running
-    /// @return true if the server is started, false otherwise.
-    bool is_started() const {
-        return this->server_ != nullptr;
-    }
-
     /// @brief Sets the callback to invoke when a socket closes
     /// @param callback The callback function.
     void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
@@ -99,6 +111,12 @@ public:
     /// @param callback The callback function.
     void set_new_connection_callback(NewConnectionCallback&& callback) {
         this->new_connection_callback_ = std::move(callback);
+    }
+
+    /// @brief Checks if the server is currently running
+    /// @return true if the server is started, false otherwise.
+    bool is_started() const {
+        return this->server_ != nullptr;
     }
 
     /// @brief Gets the httpd handle (for use by connections)

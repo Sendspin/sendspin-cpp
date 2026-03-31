@@ -32,6 +32,7 @@ static const char* const TAG = "sendspin.client";
 
 namespace sendspin {
 
+/// @brief Deferred event state for time responses and group updates on the main thread
 struct SendspinClient::EventState {
     ThreadSafeQueue<TimeResponseEvent> time_queue;
     ShadowSlot<GroupUpdateObject> shadow_group;
@@ -189,7 +190,7 @@ void SendspinClient::loop() {
 }
 
 // ============================================================================
-// Role registration
+// Role registration (call before start_server)
 // ============================================================================
 
 PlayerRole& SendspinClient::add_player(PlayerRole::Config config) {
@@ -265,7 +266,7 @@ void SendspinClient::update_state(SendspinClientState state) {
 }
 
 // ============================================================================
-// Role services
+// Role services (called by roles via SendspinClient pointer)
 // ============================================================================
 
 void SendspinClient::publish_state() {
@@ -633,7 +634,7 @@ void SendspinClient::persist_last_played_server_(const std::string& server_id) {
 }
 
 // ============================================================================
-// Connection event handlers
+// Connection event handlers (called by ConnectionManager via friend access)
 // ============================================================================
 
 void SendspinClient::on_handshake_complete_(SendspinConnection* conn,

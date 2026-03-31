@@ -28,10 +28,28 @@ namespace sendspin {
 
 class PlayerRoleListener;
 
-/// @brief Simple transfer buffer for moving decoded audio data to the audio output.
-///
-/// Manages a flat byte array with read/write cursors. Data is written at get_buffer_end() and
-/// read from get_buffer_start(). The player listener is invoked via transfer_data_to_sink().
+/**
+ * @brief Simple flat byte buffer with read/write cursors for transferring decoded audio to the
+ * audio output sink.
+ *
+ * Manages a flat byte array with read/write cursors for audio data transfer. Data is written at
+ * get_buffer_end() and read from get_buffer_start(). Supports dynamic reallocation and flushing
+ * accumulated data to a PlayerRoleListener sink.
+ *
+ * Usage:
+ *   1. Call create() to allocate the backing buffer.
+ *   2. Call set_listener() to register the audio sink.
+ *   3. Write decoded audio to the buffer via the internal methods.
+ *   4. Call transfer_data_to_sink() to flush buffered data to the listener.
+ *
+ * @code
+ * auto buf = TransferBuffer::create(4096);
+ * buf->set_listener(&my_player_listener);
+ * // ... write decoded audio into buf->get_buffer_end() ...
+ * buf->increase_buffer_length(bytes_written);
+ * buf->transfer_data_to_sink(100);
+ * @endcode
+ */
 class TransferBuffer {
 public:
     ~TransferBuffer();
@@ -40,12 +58,6 @@ public:
     /// @param buffer_size Size of the buffer in bytes.
     /// @return unique_ptr if successfully allocated, nullptr otherwise.
     static std::unique_ptr<TransferBuffer> create(size_t buffer_size);
-
-    /// @brief Sets the player listener for transfer_data_to_sink().
-    /// @param listener Pointer to the listener that receives audio data via on_audio_write().
-    void set_listener(PlayerRoleListener* listener) {
-        this->listener_ = listener;
-    }
 
     /// @brief Writes buffered data to the sink.
     /// @param timeout_ms Milliseconds to block while waiting for the sink (UINT32_MAX = wait
@@ -80,6 +92,12 @@ public:
     /// @brief Returns the number of free bytes available to write.
     /// @return Number of bytes that can be written before the buffer is full.
     size_t free() const;
+
+    /// @brief Sets the player listener for transfer_data_to_sink().
+    /// @param listener Pointer to the listener that receives audio data via on_audio_write().
+    void set_listener(PlayerRoleListener* listener) {
+        this->listener_ = listener;
+    }
 
     /// @brief Advances the read cursor after data has been consumed.
     /// @param bytes Number of bytes consumed from the start of the buffer.

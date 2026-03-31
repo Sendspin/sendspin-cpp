@@ -251,6 +251,7 @@ public:
 };
 
 /// @brief Creates a JsonDocument that uses PSRAM-preferring allocation
+/// @return A JsonDocument configured to use the platform's PSRAM-preferring allocator
 inline JsonDocument make_json_document() {
     return JsonDocument(PsramJsonAllocator::instance());
 }

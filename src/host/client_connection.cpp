@@ -37,6 +37,10 @@ SendspinClientConnection::~SendspinClientConnection() {
     }
 }
 
+// ============================================================================
+// Public API
+// ============================================================================
+
 void SendspinClientConnection::start() {
     if (this->ws_) {
         SS_LOGW(TAG, "Client already started, stopping first");
@@ -53,10 +57,6 @@ void SendspinClientConnection::start() {
     this->ws_->start();
     SS_LOGD(TAG, "Client connection starting to %s", this->url_.c_str());
 }
-
-// ============================================================================
-// Public API
-// ============================================================================
 
 void SendspinClientConnection::loop() {
     // Handle auto-reconnect
@@ -91,10 +91,6 @@ void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
             on_complete();
         }
     });
-}
-
-bool SendspinClientConnection::is_connected() const {
-    return this->connected_;
 }
 
 SsErr SendspinClientConnection::send_text_message(const std::string& message,

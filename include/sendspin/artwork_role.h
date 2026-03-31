@@ -112,6 +112,7 @@ struct ServerArtworkChannelObject {
     std::optional<uint16_t> width;
     std::optional<uint16_t> height;
 
+    /// @brief Returns true if all image slots in this channel have received data
     bool is_complete() const {
         return source.has_value() && format.has_value() && width.has_value() && height.has_value();
     }
@@ -150,7 +151,7 @@ class ArtworkRoleListener {
 public:
     virtual ~ArtworkRoleListener() = default;
 
-    /// @brief Called when an image is received or cleared.
+    /// @brief Called when an image is received or cleared
     /// @param slot The artwork slot index.
     /// @param data Image data, or nullptr for clears.
     /// @param length Length of image data in bytes.
@@ -196,36 +197,39 @@ public:
     explicit ArtworkRole(SendspinClient* client);
     ~ArtworkRole();
 
-    /// @brief Sets the listener for artwork events. The listener must outlive this role.
-    void set_listener(ArtworkRoleListener* listener) {
-        this->listener_ = listener;
-    }
-
-    /// @brief Adds a preferred image format for an artwork slot.
-    void add_image_preferred_format(const ImageSlotPreference& pref);
-
-    /// @brief Returns all configured image format preferences.
+    /// @brief Returns all configured image format preferences
     /// @return Vector of slot/format/resolution preferences registered via
     ///         add_image_preferred_format().
     const std::vector<ImageSlotPreference>& get_image_preferred_formats() const {
         return this->preferred_image_formats_;
     }
 
+    /// @brief Sets the listener for artwork events
+    /// @note The listener must outlive this role.
+    /// @param listener Pointer to the listener implementation; must outlive this role
+    void set_listener(ArtworkRoleListener* listener) {
+        this->listener_ = listener;
+    }
+
+    /// @brief Adds a preferred image format for an artwork slot
+    /// @param pref The slot/format/resolution preference to register
+    void add_image_preferred_format(const ImageSlotPreference& pref);
+
 private:
-    /// @brief Adds the artwork role and configured channels to the hello message.
+    /// @brief Adds the artwork role and configured channels to the hello message
     /// @param msg The hello message being assembled.
     void contribute_hello(ClientHelloMessage& msg);
-    /// @brief Decodes the timestamp and delivers an image chunk directly to the listener.
+    /// @brief Decodes the timestamp and delivers an image chunk directly to the listener
     /// @param slot Artwork slot index this image belongs to.
     /// @param data Pointer to the binary payload (8-byte big-endian timestamp followed by image
     /// data).
     /// @param len Length of the binary payload in bytes.
     void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
-    /// @brief Enqueues a stream-end event to be delivered on the main thread.
+    /// @brief Enqueues a stream-end event to be delivered on the main thread
     void handle_stream_end();
-    /// @brief Sends null images to the listener for each configured slot to signal stream end.
+    /// @brief Sends null images to the listener for each configured slot to signal stream end
     void drain_events();
-    /// @brief Resets pending events and enqueues a stream-end to clear all slots on next drain.
+    /// @brief Resets pending events and enqueues a stream-end to clear all slots on next drain
     void cleanup();
 
     struct EventState;

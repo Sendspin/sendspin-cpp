@@ -50,6 +50,9 @@ enum class SendspinControllerCommand {
     SWITCH,      // Switch playback source
 };
 
+/// @brief Returns a null-terminated string name for a controller command
+/// @param command The command to convert
+/// @return Null-terminated string, or "unknown" for unrecognized values
 inline const char* to_cstr(SendspinControllerCommand cmd) {
     switch (cmd) {
         case SendspinControllerCommand::PLAY:
@@ -83,6 +86,9 @@ inline const char* to_cstr(SendspinControllerCommand cmd) {
     }
 }
 
+/// @brief Parses a controller command from its string representation
+/// @param str The string to parse
+/// @return The matching command, or std::nullopt if unrecognized
 inline std::optional<SendspinControllerCommand> controller_command_from_string(
     const std::string& str) {
     if (str == "play")
@@ -171,7 +177,15 @@ public:
     explicit ControllerRole(SendspinClient* client);
     ~ControllerRole();
 
-    /// @brief Sets the listener for controller events. The listener must outlive this role.
+    /// @brief Returns the current controller state from the server
+    /// @return Const reference to the last received server controller state
+    const ServerStateControllerObject& get_controller_state() const {
+        return this->controller_state_;
+    }
+
+    /// @brief Sets the listener for controller events
+    /// @note The listener must outlive this role
+    /// @param listener Pointer to the listener implementation
     void set_listener(ControllerRoleListener* listener) {
         this->listener_ = listener;
     }
@@ -179,12 +193,6 @@ public:
     /// @brief Sends a controller command to the server
     void send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume = {},
                       std::optional<bool> mute = {});
-
-    /// @brief Returns the current controller state from the server
-    /// @return Const reference to the last received server controller state
-    const ServerStateControllerObject& get_controller_state() const {
-        return this->controller_state_;
-    }
 
 private:
     /// @brief Adds the controller role to the supported roles list in the hello message
@@ -199,9 +207,10 @@ private:
     /// @brief Resets the controller state and clears any pending events
     void cleanup();
 
+    struct EventState;
+
     // Struct fields
     ServerStateControllerObject controller_state_{};
-    struct EventState;
 
     // Pointer fields
     SendspinClient* client_;

@@ -21,10 +21,10 @@
 
 static const char* const TAG = "sendspin.artwork";
 
-/// @brief Size of the big-endian 64-bit timestamp at the start of artwork binary messages.
+/// @brief Size of the big-endian 64-bit timestamp at the start of artwork binary messages
 static const size_t BINARY_TIMESTAMP_SIZE = 8;
 
-/// @brief Swaps bytes of a big-endian 64-bit value to host byte order.
+/// @brief Swaps bytes of a big-endian 64-bit value to host byte order
 static int64_t be64_to_host(const uint8_t* bytes) {
     uint64_t val = 0;
     for (int i = 0; i < 8; ++i) {
@@ -35,6 +35,7 @@ static int64_t be64_to_host(const uint8_t* bytes) {
 
 namespace sendspin {
 
+/// @brief Deferred event state for thread-safe artwork stream lifecycle delivery
 struct ArtworkRole::EventState {
     ThreadSafeQueue<uint8_t> stream_end_queue;
 };

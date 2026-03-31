@@ -24,23 +24,31 @@
 
 namespace sendspin {
 
-/// @brief A server-side WebSocket connection for Sendspin
-///
-/// This class represents a single incoming WebSocket connection from a Sendspin server.
-/// It inherits from SendspinConnection and implements the connection interface for
-/// server-initiated connections (where the ESP device acts as a WebSocket server and
-/// the Sendspin server connects to it).
-///
-/// The class manages:
-/// - The socket file descriptor for the accepted connection
-/// - Sending text messages (hello, state, time, goodbye, commands)
-/// - The httpd handle reference (owned by SendspinWsServer)
-///
-/// Lifecycle:
-/// 1. Created by SendspinWsServer when a new connection is accepted
-/// 2. start() is called to begin message processing
-/// 3. loop() is called periodically to handle time synchronization
-/// 4. disconnect() is called to gracefully close with goodbye message
+/**
+ * @brief ESP-IDF HTTP server WebSocket connection representing a single Sendspin server session
+ *
+ * Implements the SendspinConnection interface for the server role, where the ESP device
+ * hosts an HTTP server and the Sendspin server connects to it as a WebSocket client.
+ *
+ * Manages:
+ * - The socket file descriptor for the accepted connection
+ * - Sending text messages (hello, state, time, goodbye, commands)
+ * - The httpd handle reference (owned by SendspinWsServer)
+ *
+ * Usage:
+ * 1. Created by SendspinWsServer when a new connection is accepted
+ * 2. start() is called to begin message processing
+ * 3. loop() is called periodically to handle time synchronization
+ * 4. disconnect() is called to gracefully close with goodbye message
+ *
+ * @code
+ * // Typical usage via SendspinWsServer (not constructed directly):
+ * SendspinWsServer ws_server;
+ * ws_server.start(port);
+ * // SendspinWsServer creates SendspinServerConnection instances internally
+ * // when incoming WebSocket connections are accepted.
+ * @endcode
+ */
 class SendspinServerConnection : public SendspinConnection {
 public:
     /// @brief Constructs a server connection with the given httpd handle and socket

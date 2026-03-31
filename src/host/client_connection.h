@@ -53,6 +53,7 @@ public:
     /// @brief Constructs a client connection to the given WebSocket URL
     /// @param url WebSocket URL of the Sendspin server to connect to.
     explicit SendspinClientConnection(std::string url);
+    /// @brief Stops the WebSocket connection and cleans up resources
     ~SendspinClientConnection() override;
 
     /// @brief Initiates the WebSocket connection to the server
@@ -80,17 +81,25 @@ public:
 
     /// @brief Returns true if the WebSocket connection is currently open
     /// @return true if connected, false otherwise.
-    bool is_connected() const override;
+    bool is_connected() const override {
+        return this->connected_;
+    }
 
 protected:
     /// @brief Registers the IXWebSocket message callback to handle open, close, data, and error
     /// events
     void setup_callbacks_();
 
-    // Pointer fields
+    // ========================================
+    // Member variables
+    // ========================================
+
+    // Struct fields
 
     /// @brief The WebSocket server URL
     std::string url_;
+
+    // Pointer fields
 
     /// @brief The IXWebSocket instance managing the connection
     std::unique_ptr<ix::WebSocket> ws_;

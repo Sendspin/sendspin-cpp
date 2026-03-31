@@ -40,6 +40,17 @@ std::unique_ptr<TransferBuffer> TransferBuffer::create(size_t buffer_size) {
 // Public API
 // ============================================================================
 
+size_t TransferBuffer::transfer_data_to_sink(uint32_t timeout_ms) {
+    size_t bytes_written = 0;
+    if (this->available() > 0 && this->listener_) {
+        bytes_written =
+            this->listener_->on_audio_write(this->data_start_, this->available(), timeout_ms);
+        this->decrease_buffer_length(bytes_written);
+    }
+
+    return bytes_written;
+}
+
 size_t TransferBuffer::free() const {
     if (this->buffer_.size() == 0) {
         return 0;
@@ -59,17 +70,6 @@ void TransferBuffer::decrease_buffer_length(size_t bytes) {
 
 void TransferBuffer::increase_buffer_length(size_t bytes) {
     this->buffer_length_ += bytes;
-}
-
-size_t TransferBuffer::transfer_data_to_sink(uint32_t timeout_ms) {
-    size_t bytes_written = 0;
-    if (this->available() > 0 && this->listener_) {
-        bytes_written =
-            this->listener_->on_audio_write(this->data_start_, this->available(), timeout_ms);
-        this->decrease_buffer_length(bytes_written);
-    }
-
-    return bytes_written;
 }
 
 bool TransferBuffer::reallocate(size_t new_buffer_size) {

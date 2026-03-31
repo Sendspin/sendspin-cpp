@@ -41,6 +41,9 @@ enum class VisualizerDataType : uint8_t {
     SPECTRUM,  // Full frequency spectrum bins
 };
 
+/// @brief Returns a null-terminated string name for a visualizer data type
+/// @param type The data type to convert
+/// @return Null-terminated string, or "unknown" for unrecognized values
 inline const char* to_cstr(VisualizerDataType type) {
     switch (type) {
         case VisualizerDataType::BEAT:
@@ -63,6 +66,9 @@ enum class VisualizerSpectrumScale : uint8_t {
     LIN,  // Linear scale
 };
 
+/// @brief Returns a null-terminated string name for a spectrum scale type
+/// @param scale The scale to convert
+/// @return Null-terminated string, or "unknown" for unrecognized values
 inline const char* to_cstr(VisualizerSpectrumScale scale) {
     switch (scale) {
         case VisualizerSpectrumScale::MEL:
@@ -117,20 +123,20 @@ class VisualizerRoleListener {
 public:
     virtual ~VisualizerRoleListener() = default;
 
-    /// @brief Called with a parsed visualizer frame at the correct playback timestamp.
+    /// @brief Called with a parsed visualizer frame at the correct playback timestamp
     /// Fires on the drain thread.
     virtual void on_visualizer_frame(const VisualizerFrame& /*frame*/) {}
 
-    /// @brief Called on beat events. Fires on the drain thread.
+    /// @brief Called on beat events. Fires on the drain thread
     virtual void on_beat(int64_t /*client_timestamp*/) {}
 
-    /// @brief Called when a visualizer stream starts. Fires on the main loop thread.
+    /// @brief Called when a visualizer stream starts. Fires on the main loop thread
     virtual void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) {}
 
-    /// @brief Called when a visualizer stream ends. Fires on the main loop thread.
+    /// @brief Called when a visualizer stream ends. Fires on the main loop thread
     virtual void on_visualizer_stream_end() {}
 
-    /// @brief Called when a visualizer stream is cleared. Fires on the main loop thread.
+    /// @brief Called when a visualizer stream is cleared. Fires on the main loop thread
     virtual void on_visualizer_stream_clear() {}
 };
 
@@ -171,7 +177,7 @@ class VisualizerRole {
     friend class SendspinClient;
 
 public:
-    /// @brief Configuration for the visualizer role.
+    /// @brief Configuration for the visualizer role
     struct Config {
         VisualizerSupportObject support;
     };
@@ -179,54 +185,55 @@ public:
     VisualizerRole(Config config, SendspinClient* client);
     ~VisualizerRole();
 
-    /// @brief Sets the listener for visualizer events. The listener must outlive this role.
+    /// @brief Sets the listener for visualizer events
+    /// @note The listener must outlive this role
     void set_listener(VisualizerRoleListener* listener) {
         this->listener_ = listener;
     }
 
-    /// @brief Returns the visualizer support configuration.
+    /// @brief Returns the visualizer support configuration
     /// @return The VisualizerSupportObject advertised to the server, or nullopt if not configured.
     const std::optional<VisualizerSupportObject>& get_visualizer_support() const {
         return this->visualizer_support_;
     }
 
 private:
-    /// @brief Deferred visualizer event types.
+    /// @brief Deferred visualizer event types
     enum class EventType : uint8_t {
         STREAM_START,
         STREAM_END,
         STREAM_CLEAR,
     };
 
-    /// @brief Starts the drain thread if the ring buffer is ready.
+    /// @brief Starts the drain thread if the ring buffer is ready
     /// @return True if the thread is running, false if the ring buffer is not initialized.
     bool start();
-    /// @brief Signals the drain thread to stop and waits for it to exit.
+    /// @brief Signals the drain thread to stop and waits for it to exit
     void stop_();
-    /// @brief Adds the visualizer role and support config to the hello message.
+    /// @brief Adds the visualizer role and support config to the hello message
     /// @param msg The hello message being assembled.
     void contribute_hello(ClientHelloMessage& msg);
-    /// @brief Parses incoming visualizer binary frames and writes them to the ring buffer.
+    /// @brief Parses incoming visualizer binary frames and writes them to the ring buffer
     /// @param binary_type Protocol binary type tag identifying the frame format.
     /// @param data Pointer to the raw frame data.
     /// @param len Length of the frame data in bytes.
     void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len);
-    /// @brief Caches stream config, signals the drain thread to flush, and enqueues a start event.
+    /// @brief Caches stream config, signals the drain thread to flush, and enqueues a start event
     /// @param stream Stream parameters received from the server.
     void handle_stream_start(const ServerVisualizerStreamObject& stream);
-    /// @brief Marks the stream inactive, flushes the ring buffer, and enqueues a stream-end event.
+    /// @brief Marks the stream inactive, flushes the ring buffer, and enqueues a stream-end event
     void handle_stream_end();
     /// @brief Marks the stream inactive, flushes the ring buffer, and enqueues a stream-clear
     /// event.
     void handle_stream_clear();
-    /// @brief Delivers pending stream lifecycle events (start, end, clear) to the listener.
+    /// @brief Delivers pending stream lifecycle events (start, end, clear) to the listener
     void drain_events();
-    /// @brief Resets pending events, flushes the ring buffer, and enqueues a stream-end event.
+    /// @brief Resets pending events, flushes the ring buffer, and enqueues a stream-end event
     void cleanup();
-    /// @brief Drains all pending items from the ring buffer without delivering them.
+    /// @brief Drains all pending items from the ring buffer without delivering them
     void flush_ring_buffer_();
 
-    /// @brief Entry point for the drain thread; reads ring buffer items and calls the listener.
+    /// @brief Entry point for the drain thread; reads ring buffer items and calls the listener
     /// @param self The VisualizerRole instance that owns this thread.
     static void drain_thread_func_(VisualizerRole* self);
 

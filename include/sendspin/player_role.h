@@ -176,9 +176,13 @@ class PlayerRoleListener {
 public:
     virtual ~PlayerRoleListener() = default;
 
-    /// @brief Writes decoded PCM audio to the platform's audio output.
+    /// @brief Writes decoded PCM audio to the platform's audio output
+    ///
     /// Called from the sync task's background thread. May block up to timeout_ms.
-    /// Must return the number of bytes actually written.
+    /// @param data Pointer to the decoded PCM audio data
+    /// @param length Number of bytes to write
+    /// @param timeout_ms Maximum time to wait for the write to complete
+    /// @return Number of bytes actually written
     virtual size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) = 0;
 
     /// @brief Called when a new audio stream starts.
@@ -234,7 +238,7 @@ class PlayerRole {
     friend class SyncTask;
 
 public:
-    /// @brief Configuration for the player role.
+    /// @brief Configuration for the player role
     struct Config {
         std::vector<AudioSupportedFormatObject> audio_formats;
         size_t audio_buffer_capacity{1000000};
@@ -245,7 +249,8 @@ public:
     PlayerRole(Config config, SendspinClient* client, SendspinPersistenceProvider* persistence);
     ~PlayerRole();
 
-    /// @brief Sets the listener for player events. The listener must outlive this role.
+    /// @brief Sets the listener for player events
+    /// @param listener Pointer to the listener implementation; must outlive this role
     void set_listener(PlayerRoleListener* listener) {
         this->listener_ = listener;
     }
@@ -255,9 +260,17 @@ public:
     // ========================================
 
     /// @brief Called by the audio output when it has played audio frames. Thread-safe.
+    /// @param frames Number of audio frames played
+    /// @param timestamp Server timestamp corresponding to the played position
     void notify_audio_played(uint32_t frames, int64_t timestamp);
 
     /// @brief Writes an audio chunk to the sync task's ring buffer.
+    /// @param data Pointer to encoded audio data
+    /// @param size Size of the encoded data in bytes
+    /// @param timestamp Server timestamp for this chunk
+    /// @param type Codec type for this chunk
+    /// @param timeout_ms Maximum time to wait for ring buffer space
+    /// @return true if the chunk was written, false on timeout or error
     bool write_audio_chunk(const uint8_t* data, size_t size, int64_t timestamp, ChunkType type,
                            uint32_t timeout_ms);
 
@@ -266,15 +279,19 @@ public:
     // ========================================
 
     /// @brief Updates the volume and publishes client state to the server.
+    /// @param volume New volume level
     void update_volume(uint8_t volume);
 
     /// @brief Updates the mute state and publishes client state to the server.
+    /// @param muted true to mute, false to unmute
     void update_muted(bool muted);
 
     /// @brief Updates the static delay and publishes client state to the server.
+    /// @param delay_ms Static delay in milliseconds
     void update_static_delay(uint16_t delay_ms);
 
     /// @brief Enables or disables the static delay adjustment command.
+    /// @param adjustable true if the delay can be adjusted at runtime
     void set_static_delay_adjustable(bool adjustable);
 
     // ========================================
@@ -287,31 +304,31 @@ public:
         return this->config_.audio_buffer_capacity;
     }
 
-    /// @brief Returns a reference to the current stream parameters.
+    /// @brief Returns a reference to the current stream parameters
     /// @return Const reference to the active stream parameters.
     const ServerPlayerStreamObject& get_current_stream_params() const {
         return this->current_stream_params_;
     }
 
-    /// @brief Returns the fixed delay in microseconds (from config).
+    /// @brief Returns the fixed delay in microseconds (from config)
     /// @return Fixed pipeline delay in microseconds.
     int32_t get_fixed_delay_us() const {
         return this->config_.fixed_delay_us;
     }
 
-    /// @brief Returns true if currently muted.
+    /// @brief Returns true if currently muted
     /// @return true if muted, false otherwise.
     bool get_muted() const {
         return this->muted_;
     }
 
-    /// @brief Returns the current static delay in milliseconds.
+    /// @brief Returns the current static delay in milliseconds
     /// @return Static playback delay in milliseconds.
     uint16_t get_static_delay_ms() const {
         return this->static_delay_ms_;
     }
 
-    /// @brief Returns the current volume level.
+    /// @brief Returns the current volume level
     /// @return Current volume level (0-255).
     uint8_t get_volume() const {
         return this->volume_;
@@ -333,34 +350,48 @@ private:
     // Private integration methods
     // ========================================
 
+    /// @brief Starts the player role and registers it with the client
     bool start(bool psram_stack);
+    /// @brief Adds player role information to the outgoing hello message
     void contribute_hello(ClientHelloMessage& msg);
+    /// @brief Publishes the current player state to the active connection
     void contribute_state(ClientStateMessage& msg);
+    /// @brief Handles an incoming binary audio chunk from the server
     void handle_binary(const uint8_t* data, size_t len);
+    /// @brief Handles a stream-start message from the server
     void handle_stream_start(const StreamStartMessage& stream_msg);
+    /// @brief Handles a stream-end message from the server
     void handle_stream_end();
+    /// @brief Handles a stream-clear message from the server
     void handle_stream_clear();
+    /// @brief Handles an incoming server command message
     void handle_server_command(const ServerCommandMessage& cmd);
+    /// @brief Delivers pending stream lifecycle events to the listener
     void drain_events();
+    /// @brief Cleans up player state when the connection is lost
     void cleanup();
 
     // ========================================
     // Helpers
     // ========================================
 
+    /// @brief Sends an audio chunk to the sync task ring buffer
     bool send_audio_chunk_(const uint8_t* data, size_t data_size, int64_t timestamp,
                            ChunkType chunk_type, uint32_t timeout_ms);
+    /// @brief Enqueues a state change for delivery on the main thread
     void enqueue_state_update_(SendspinClientState state);
+    /// @brief Loads the static delay preference from persistent storage
     void load_static_delay_();
+    /// @brief Persists the current static delay to storage
     void persist_static_delay_();
 
     // Struct fields
     Config config_;
     ServerPlayerStreamObject current_stream_params_{};
+    std::vector<StreamCallbackType> awaiting_sync_idle_events_;
     struct EventState;
 
     // Pointer fields
-    std::vector<StreamCallbackType> awaiting_sync_idle_events_;
     SendspinClient* client_;
     std::unique_ptr<EventState> event_state_;
     PlayerRoleListener* listener_{nullptr};

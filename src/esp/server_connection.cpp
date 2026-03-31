@@ -38,6 +38,10 @@ struct AsyncRespArg {
     SendCompleteCallback on_complete;
 };
 
+// ============================================================================
+// SendspinConnection interface implementation
+// ============================================================================
+
 SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int sockfd)
     : server_(server), sockfd_(sockfd) {
     // Disabling Nagle's algorithm significantly improves the time syncing accuracy

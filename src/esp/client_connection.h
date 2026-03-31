@@ -25,24 +25,33 @@
 
 namespace sendspin {
 
-/// @brief A client-side WebSocket connection for Sendspin
-///
-/// This class represents an outgoing WebSocket connection to a Sendspin server.
-/// It inherits from SendspinConnection and implements the connection interface for
-/// client-initiated connections (where the ESP device acts as a WebSocket client and
-/// connects to a Sendspin server).
-///
-/// The class manages:
-/// - The ESP-IDF websocket client handle
-/// - Connection and reconnection logic
-/// - Sending text messages (hello, state, time, goodbye, commands)
-/// - Receiving and buffering websocket messages
-///
-/// Lifecycle:
-/// 1. Created with server URL and Kalman filter parameters
-/// 2. start() is called to initiate the connection
-/// 3. loop() is called periodically to handle reconnection attempts
-/// 4. disconnect() is called to gracefully close with goodbye message
+/**
+ * @brief A client-side WebSocket connection for Sendspin.
+ *
+ * This class represents an outgoing WebSocket connection to a Sendspin server.
+ * It inherits from SendspinConnection and implements the SendspinConnection interface
+ * for client-initiated connections (where the ESP device acts as a WebSocket client
+ * and connects to a Sendspin server).
+ *
+ * Handles the full connection lifecycle, auto-reconnect on connection loss, and
+ * satisfies the SendspinConnection interface for message send/receive.
+ *
+ * Usage:
+ * 1. Construct with the server URL.
+ * 2. Call start() to initialize the ESP-IDF WebSocket client and connect.
+ * 3. Call loop() periodically to handle reconnection attempts.
+ * 4. Call disconnect() to close the connection with a goodbye message.
+ *
+ * @code
+ * SendspinClientConnection conn("ws://server.local:8927/sendspin");
+ * conn.set_auto_reconnect(true);
+ * conn.start();
+ * // In your main loop:
+ * conn.loop();
+ * // When shutting down:
+ * conn.disconnect(SendspinGoodbyeReason::SHUTDOWN, []() { /* done *\/ });
+ * @endcode
+ */
 class SendspinClientConnection : public SendspinConnection {
 public:
     /// @brief Constructs a client connection with the given server URL
@@ -111,13 +120,15 @@ protected:
     /// @brief Handles websocket error event
     void handle_error_();
 
+    // Struct fields
+
+    /// @brief The WebSocket server URL
+    std::string url_;
+
     // Pointer fields
 
     /// @brief The ESP-IDF websocket client handle
     esp_websocket_client_handle_t client_{nullptr};
-
-    /// @brief The WebSocket server URL
-    std::string url_;
 
     // 32-bit fields
 
