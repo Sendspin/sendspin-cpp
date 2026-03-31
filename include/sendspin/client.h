@@ -114,7 +114,6 @@ enum class LogLevel : int {
 class ConnectionManager;
 class SendspinConnection;
 class SendspinTimeBurst;
-struct ServerInformationObject;
 
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start_server()
@@ -324,6 +323,10 @@ public:
     /// @return true if connected with a completed handshake, false otherwise
     bool is_connected() const;
 
+    /// @brief Returns the server information from the active connection's hello handshake
+    /// @return ServerInformationObject if connected with a completed handshake, nullopt otherwise
+    std::optional<ServerInformationObject> get_server_information() const;
+
     /// @brief Returns true if the time filter has received at least one measurement
     /// @return true if time synchronization has been established, false otherwise
     bool is_time_synced() const;
@@ -332,16 +335,6 @@ public:
     /// @param server_time Server-side timestamp in microseconds
     /// @return Equivalent client-side timestamp in microseconds
     int64_t get_client_time(int64_t server_time) const;
-
-    /// @brief Returns the current active connection (or nullptr)
-    /// @return Pointer to the active connection, or nullptr if not connected
-    SendspinConnection* get_current_connection() const;
-
-    /// @brief Returns the current group ID (empty string if none)
-    /// @return Current group ID string, or empty string if not in a group
-    std::string get_group_id() const {
-        return this->group_state_.group_id.value_or("");
-    }
 
     /// @brief Returns the current group name (empty string if none)
     /// @return Current group name string, or empty string if not in a group
@@ -440,17 +433,15 @@ private:
     // Connection event handlers (called by ConnectionManager via friend access)
     // ========================================
 
-    /// @brief Stores server information and publishes the initial client state after handshake
+    /// @brief Publishes the initial client state after handshake completes
     /// @param conn The connection that completed the handshake
-    /// @param server Server information received during the handshake
-    void on_handshake_complete_(SendspinConnection* conn, ServerInformationObject server);
+    void on_handshake_complete_(SendspinConnection* conn);
 
     struct EventState;
 
     // Struct fields
     SendspinClientConfig config_;
     GroupUpdateObject group_state_{};
-    ServerInformationObject server_information_{};
 
     // Pointer fields
     std::unique_ptr<ArtworkRole> artwork_;

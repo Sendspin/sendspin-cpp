@@ -86,12 +86,10 @@ bool SyncTask::start(bool task_stack_in_psram, unsigned priority) {
         return false;
     }
 
-    this->event_flags_.clear(EventGroupBits::TASK_STARTING | EventGroupBits::TASK_RUNNING |
-                             EventGroupBits::TASK_STOPPING | EventGroupBits::TASK_STOPPED |
+    this->event_flags_.clear(EventGroupBits::TASK_RUNNING | EventGroupBits::TASK_STOPPED |
                              EventGroupBits::TASK_IDLE | EventGroupBits::COMMAND_STOP |
                              EventGroupBits::COMMAND_STREAM_END |
                              EventGroupBits::COMMAND_STREAM_CLEAR | EventGroupBits::COMMAND_START);
-    this->last_run_had_error_ = false;
 
     platform_configure_thread("Sendspin", SYNC_TASK_STACK_SIZE, static_cast<int>(priority),
                               task_stack_in_psram);
@@ -622,8 +620,6 @@ void SyncTask::stop_() {
 void SyncTask::thread_entry(void* params) {
     SyncTask* this_task = static_cast<SyncTask*>(params);
 
-    this_task->event_flags_.set(EventGroupBits::TASK_STARTING);
-
     // Allocate SyncContext once on the task stack, reused across streams.
     SyncContext sync_context;
     sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
@@ -644,10 +640,9 @@ void SyncTask::thread_entry(void* params) {
     // === OUTER LOOP: persists for the lifetime of the client ===
     while (!(this_task->event_flags_.get() & COMMAND_STOP)) {
         // --- IDLE STATE ---
-        this_task->event_flags_.clear(EventGroupBits::TASK_RUNNING | EventGroupBits::TASK_STOPPING |
-                                      EventGroupBits::COMMAND_STREAM_END |
-                                      EventGroupBits::COMMAND_STREAM_CLEAR |
-                                      EventGroupBits::COMMAND_START);
+        this_task->event_flags_.clear(
+            EventGroupBits::TASK_RUNNING | EventGroupBits::COMMAND_STREAM_END |
+            EventGroupBits::COMMAND_STREAM_CLEAR | EventGroupBits::COMMAND_START);
         this_task->event_flags_.set(EventGroupBits::TASK_IDLE);
 
         this_task->reset_context_(sync_context);
@@ -751,12 +746,6 @@ void SyncTask::thread_entry(void* params) {
         if (this_task->event_flags_.get() & COMMAND_STOP) {
             break;
         }
-
-        this_task->event_flags_.set(EventGroupBits::TASK_STOPPING);
-
-        // Check if the stream ended with an error
-        this_task->last_run_had_error_ =
-            (this_task->event_flags_.get() & EventGroupBits::TASK_ERROR) != 0;
 
         // Don't drain the ring buffer here; the idle wait loop already discards
         // stale audio and stops at codec headers. Draining here would throw away

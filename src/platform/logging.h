@@ -46,7 +46,6 @@ inline int platform_get_log_level() {
 #include <cinttypes>
 #include <cstdio>
 
-#define SS_LOG_NONE 0
 #define SS_LOG_ERROR 1
 #define SS_LOG_WARN 2
 #define SS_LOG_INFO 3

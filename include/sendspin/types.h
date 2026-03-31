@@ -76,21 +76,6 @@ inline const char* to_cstr(SendspinGoodbyeReason reason) {
     }
 }
 
-/// @brief Parses a protocol string into a SendspinGoodbyeReason
-/// @param str The string to parse.
-/// @return The matching enum value, or std::nullopt if the string is unrecognized.
-inline std::optional<SendspinGoodbyeReason> goodbye_reason_from_string(const std::string& str) {
-    if (str == "another_server")
-        return SendspinGoodbyeReason::ANOTHER_SERVER;
-    if (str == "shutdown")
-        return SendspinGoodbyeReason::SHUTDOWN;
-    if (str == "restart")
-        return SendspinGoodbyeReason::RESTART;
-    if (str == "user_request")
-        return SendspinGoodbyeReason::USER_REQUEST;
-    return std::nullopt;
-}
-
 /// @brief Optional hardware and software identity fields sent in client/hello messages
 struct DeviceInfoObject {
     std::optional<std::string> product_name;

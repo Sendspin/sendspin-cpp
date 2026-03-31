@@ -147,7 +147,13 @@ public:
     /// @brief Gets the server ID from the server/hello message
     /// @return The server ID string (empty until hello is received).
     const std::string& get_server_id() const {
-        return this->server_id_;
+        return this->server_information_.server_id;
+    }
+
+    /// @brief Gets the server information from the server/hello message
+    /// @return The ServerInformationObject (fields empty until hello is received).
+    const ServerInformationObject& get_server_information() const {
+        return this->server_information_;
     }
 
     // ========================================
@@ -235,29 +241,16 @@ public:
         this->server_hello_received_ = received;
     }
 
-    /// @brief Sets the server ID (from server/hello message)
-    /// @param server_id The server ID string.
+    /// @brief Sets the server information (from server/hello message)
+    /// @param info The ServerInformationObject received during the hello handshake.
     /// @note Called by hub after receiving server/hello message.
-    void set_server_id(const std::string& server_id) {
-        this->server_id_ = server_id;
-    }
-
-    /// @brief Sets the server name (from server/hello message)
-    /// @param server_name The server name string.
-    /// @note Called by hub after receiving server/hello message.
-    void set_server_name(const std::string& server_name) {
-        this->server_name_ = server_name;
+    void set_server_information(ServerInformationObject info) {
+        this->server_information_ = std::move(info);
     }
 
     // ========================================
     // Time message state accessors
     // ========================================
-
-    /// @brief Gets the timestamp of the last sent time message
-    /// @return Timestamp in microseconds of the last sent time message (0 if none sent).
-    int64_t get_last_sent_time_message() const {
-        return this->last_sent_time_message_;
-    }
 
     /// @brief Sets the timestamp of the last sent time message
     /// @param timestamp The timestamp of the last sent time message
@@ -326,8 +319,7 @@ protected:
     PlatformBuffer websocket_payload_;
 
     /// Server identity (from server/hello message).
-    std::string server_id_;
-    std::string server_name_;
+    ServerInformationObject server_information_{};
 
     // Pointer fields
 

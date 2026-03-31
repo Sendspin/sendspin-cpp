@@ -113,7 +113,7 @@ struct ServerArtworkChannelObject {
     std::optional<uint16_t> width;
     std::optional<uint16_t> height;
 
-    /// @brief Returns true if all image slots in this channel have received data
+    /// @brief Returns true if all fields in this channel have received data
     bool is_complete() const {
         return source.has_value() && format.has_value() && width.has_value() && height.has_value();
     }
@@ -227,13 +227,6 @@ class ArtworkRole {
 public:
     explicit ArtworkRole(SendspinClient* client);
     ~ArtworkRole();
-
-    /// @brief Returns all configured image format preferences
-    /// @return Vector of slot/format/resolution preferences registered via
-    ///         add_image_preferred_format().
-    const std::vector<ImageSlotPreference>& get_image_preferred_formats() const {
-        return this->preferred_image_formats_;
-    }
 
     /// @brief Sets the listener for artwork events
     /// @note The listener must outlive this role.

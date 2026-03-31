@@ -38,7 +38,6 @@ class SendspinWsServer;
 /// @brief Deferred server hello event, processed in ConnectionManager::loop()
 struct ServerHelloEvent {
     SendspinConnection* conn;  ///< Connection that received the hello (must still be valid)
-    ServerInformationObject server;
     SendspinConnectionReason connection_reason;
 };
 
@@ -119,13 +118,6 @@ public:
     // NOTE: not inlined due to incomplete SendspinConnection type
     SendspinConnection* current() const {
         return this->current_connection_.get();
-    }
-
-    /// @brief Returns the pending handoff connection.
-    /// @return Pointer to the pending connection, or nullptr if none.
-    // NOTE: not inlined due to incomplete SendspinConnection type
-    SendspinConnection* pending() const {
-        return this->pending_connection_.get();
     }
 
     // ========================================

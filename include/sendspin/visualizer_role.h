@@ -191,12 +191,6 @@ public:
         this->listener_ = listener;
     }
 
-    /// @brief Returns the visualizer support configuration
-    /// @return The VisualizerSupportObject advertised to the server, or nullopt if not configured.
-    const std::optional<VisualizerSupportObject>& get_visualizer_support() const {
-        return this->visualizer_support_;
-    }
-
 private:
     /// @brief Deferred visualizer event types
     enum class EventType : uint8_t {

@@ -264,16 +264,6 @@ public:
     /// @param timestamp Server timestamp corresponding to the played position
     void notify_audio_played(uint32_t frames, int64_t timestamp);
 
-    /// @brief Writes an audio chunk to the sync task's ring buffer.
-    /// @param data Pointer to encoded audio data
-    /// @param size Size of the encoded data in bytes
-    /// @param timestamp Server timestamp for this chunk
-    /// @param type Codec type for this chunk
-    /// @param timeout_ms Maximum time to wait for ring buffer space
-    /// @return true if the chunk was written, false on timeout or error
-    bool write_audio_chunk(const uint8_t* data, size_t size, int64_t timestamp, ChunkType type,
-                           uint32_t timeout_ms);
-
     // ========================================
     // State updates
     // ========================================
@@ -297,12 +287,6 @@ public:
     // ========================================
     // Queries
     // ========================================
-
-    /// @brief Returns the audio buffer capacity from config.
-    /// @return Audio ring buffer capacity in bytes.
-    size_t get_buffer_size() const {
-        return this->config_.audio_buffer_capacity;
-    }
 
     /// @brief Returns a reference to the current stream parameters
     /// @return Const reference to the active stream parameters.

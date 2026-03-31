@@ -265,8 +265,12 @@ int64_t SendspinClient::get_client_time(int64_t server_time) const {
     return conn != nullptr ? conn->get_client_time(server_time) : 0;
 }
 
-SendspinConnection* SendspinClient::get_current_connection() const {
-    return this->connection_manager_->current();
+std::optional<ServerInformationObject> SendspinClient::get_server_information() const {
+    auto* conn = this->connection_manager_->current();
+    if (conn == nullptr || !conn->is_handshake_complete()) {
+        return std::nullopt;
+    }
+    return conn->get_server_information();
 }
 
 // ============================================================================
@@ -494,13 +498,11 @@ bool SendspinClient::process_json_message_(SendspinConnection* conn, const std::
                         to_cstr(hello_msg.connection_reason));
 
                 if (conn != nullptr) {
-                    conn->set_server_id(hello_msg.server.server_id);
-                    conn->set_server_name(hello_msg.server.name);
+                    conn->set_server_information(std::move(hello_msg.server));
                     conn->set_connection_reason(hello_msg.connection_reason);
                     conn->set_server_hello_received(true);
 
-                    this->connection_manager_->schedule_hello(
-                        {conn, std::move(hello_msg.server), hello_msg.connection_reason});
+                    this->connection_manager_->schedule_hello({conn, hello_msg.connection_reason});
                 }
             }
             break;
@@ -661,9 +663,7 @@ void SendspinClient::persist_last_played_server_(const std::string& server_id) {
 // Connection event handlers (called by ConnectionManager via friend access)
 // ============================================================================
 
-void SendspinClient::on_handshake_complete_(SendspinConnection* conn,
-                                            ServerInformationObject server) {
-    this->server_information_ = std::move(server);
+void SendspinClient::on_handshake_complete_(SendspinConnection* conn) {
     this->publish_client_state_(conn);
 }
 

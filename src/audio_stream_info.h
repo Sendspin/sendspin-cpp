@@ -84,13 +84,6 @@ public:
         return bytes / (this->bytes_per_sample_ * this->channels_);
     }
 
-    /// @brief Converts a byte count to the number of audio samples
-    /// @param bytes Number of bytes of PCM data.
-    /// @return Number of samples (across all channels).
-    uint32_t bytes_to_samples(size_t bytes) const {
-        return bytes / this->bytes_per_sample_;
-    }
-
     /// @brief Converts a frame count to bytes
     /// @param frames Number of audio frames.
     /// @return Number of bytes.
@@ -103,13 +96,6 @@ public:
     /// @return Number of bytes.
     size_t samples_to_bytes(uint32_t samples) const {
         return samples * this->bytes_per_sample_;
-    }
-
-    /// @brief Converts milliseconds to the number of audio frames
-    /// @param ms Duration in milliseconds.
-    /// @return Number of frames.
-    uint32_t ms_to_frames(uint32_t ms) const {
-        return (ms * this->sample_rate_) / 1000;
     }
 
     /// @brief Converts milliseconds to bytes of PCM data

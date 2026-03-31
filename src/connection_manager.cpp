@@ -169,8 +169,8 @@ void ConnectionManager::loop() {
                 continue;
             }
 
-            // Notify client (stores server info, publishes state)
-            this->client_->on_handshake_complete_(event.conn, std::move(event.server));
+            // Notify client and publish state
+            this->client_->on_handshake_complete_(event.conn);
 
             SS_LOGI(TAG, "Connection handshake complete: server_id=%s, connection_reason=%s",
                     event.conn->get_server_id().c_str(),

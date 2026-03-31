@@ -81,16 +81,6 @@ enum class SendspinServerToClientMessageType {
     UNKNOWN,         // Unrecognized message type
 };
 
-/// @brief JSON message types sent from the client to the server
-enum class SendspinClientToServerMessageType {
-    CLIENT_HELLO,           // client/hello handshake
-    CLIENT_TIME,            // client/time clock sync request
-    CLIENT_STATE,           // client/state playback state report
-    CLIENT_COMMAND,         // client/command playback command
-    STREAM_REQUEST_FORMAT,  // stream/request_format codec negotiation
-    CLIENT_GOODBYE,         // client/goodbye disconnect notification
-};
-
 /// @brief Protocol role identifiers used in hello messages and role negotiation
 enum class SendspinRole {
     PLAYER,      // Audio playback role
@@ -187,11 +177,6 @@ struct ClientStateMessage {
 /// @brief Outgoing client/command message carrying a playback command to the server
 struct ClientCommandMessage {
     std::optional<ClientCommandControllerObject> controller;
-};
-
-/// @brief Outgoing client/goodbye message sent before a clean disconnect
-struct ClientGoodbyeMessage {
-    SendspinGoodbyeReason reason;
 };
 
 /// @brief Parsed server/state message containing per-role state updates

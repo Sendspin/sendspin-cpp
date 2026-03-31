@@ -89,9 +89,7 @@ enum EventGroupBits : uint32_t {
     COMMAND_STREAM_END = (1 << 1),    // Signal end of current stream
     COMMAND_STREAM_CLEAR = (1 << 2),  // Signal immediate buffer clear
     COMMAND_START = (1 << 3),         // Signal stream start acknowledged
-    TASK_STARTING = (1 << 7),         // Task thread is starting up
     TASK_RUNNING = (1 << 8),          // Task is actively processing a stream
-    TASK_STOPPING = (1 << 9),         // Task is in the process of stopping
     TASK_STOPPED = (1 << 10),         // Task thread has exited
     TASK_ERROR = (1 << 11),           // Task encountered a fatal error
     TASK_IDLE = (1 << 12),            // Task is idle, waiting for a new stream
@@ -123,18 +121,6 @@ public:
     /// @param task_stack_in_psram Whether to allocate the task stack in PSRAM (ESP-IDF only).
     /// @return true if thread started successfully, false otherwise.
     bool start(bool task_stack_in_psram, unsigned priority);
-
-    /// @brief Checks if the last run ended with an error
-    /// @return true if the most recent stream run encountered an error.
-    bool has_error() const {
-        return this->last_run_had_error_;
-    }
-
-    /// @brief Gets the event flags for monitoring task lifecycle
-    /// @return Reference to the internal event flags object.
-    EventFlags& get_event_flags() {
-        return this->event_flags_;
-    }
 
     /// @brief Returns true if init() has been called successfully
     /// @return true if the sync task has been initialized, false otherwise.
@@ -251,10 +237,6 @@ protected:
     SendspinClient* client_{nullptr};
     std::unique_ptr<SendspinAudioRingBuffer> encoded_ring_buffer_;
     PlayerRole* player_{nullptr};
-
-    // 8-bit fields
-    // Tracks whether the last task run ended with an error
-    bool last_run_had_error_{false};
 };
 
 }  // namespace sendspin

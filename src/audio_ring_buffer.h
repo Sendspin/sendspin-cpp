@@ -118,9 +118,6 @@ protected:
     // Struct fields
     SpscRingBuffer ring_buffer_;
     PlatformBuffer storage_;
-
-    // size_t fields
-    size_t size_{0};
 };
 
 }  // namespace sendspin

@@ -105,11 +105,6 @@ void PlayerRole::notify_audio_played(uint32_t frames, int64_t timestamp) {
     }
 }
 
-bool PlayerRole::write_audio_chunk(const uint8_t* data, size_t size, int64_t timestamp,
-                                   ChunkType type, uint32_t timeout_ms) {
-    return this->sync_task_->write_audio_chunk(data, size, timestamp, type, timeout_ms);
-}
-
 // ============================================================================
 // State updates
 // ============================================================================

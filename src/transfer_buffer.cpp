@@ -24,7 +24,9 @@ namespace sendspin {
 // Constructor / Destructor
 // ============================================================================
 
-TransferBuffer::~TransferBuffer() = default;
+TransferBuffer::~TransferBuffer() {
+    this->deallocate_buffer_();
+}
 
 std::unique_ptr<TransferBuffer> TransferBuffer::create(size_t buffer_size) {
     std::unique_ptr<TransferBuffer> buffer(new TransferBuffer());
