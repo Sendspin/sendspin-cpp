@@ -47,6 +47,7 @@ void ConnectionManager::connect_to(const std::string& url) {
 
     auto client_conn = std::make_unique<SendspinClientConnection>(url);
     client_conn->set_auto_reconnect(false);
+    client_conn->set_task_config(this->client_->config_.websocket_priority);
 
     this->setup_connection_callbacks_(client_conn.get());
     client_conn->on_disconnected_cb = [this](SendspinConnection* conn) {
@@ -77,12 +78,12 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
 // Server lifecycle
 // ============================================================================
 
-void ConnectionManager::init_server(SendspinClient* client, bool psram_stack, unsigned priority) {
+void ConnectionManager::init_server(SendspinClient* client) {
     this->client_ = client;
-    this->psram_stack_ = psram_stack;
-    this->task_priority_ = priority;
 
     this->ws_server_ = std::make_unique<SendspinWsServer>();
+    this->ws_server_->set_max_connections(this->client_->config_.server_max_connections);
+    this->ws_server_->set_ctrl_port(this->client_->config_.httpd_ctrl_port);
 
     this->ws_server_->set_new_connection_callback(
         [this](std::unique_ptr<SendspinServerConnection> conn) {
@@ -120,7 +121,8 @@ void ConnectionManager::loop() {
     if (this->ws_server_ != nullptr && !this->ws_server_->is_started()) {
         if (this->client_->network_provider_ &&
             this->client_->network_provider_->is_network_ready()) {
-            this->ws_server_->start(this->client_, this->psram_stack_, this->task_priority_);
+            this->ws_server_->start(this->client_, this->client_->config_.httpd_psram_stack,
+                                    this->client_->config_.httpd_priority);
         }
     }
 

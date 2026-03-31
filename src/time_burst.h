@@ -83,23 +83,29 @@ public:
     // Lifecycle
     // ========================================
 
+    /// @brief Configures burst parameters. Call before the first loop() invocation.
+    /// Defaults match the library's built-in values if configure() is never called.
+    /// @param burst_size Number of time messages per burst.
+    /// @param burst_interval_ms Milliseconds between bursts.
+    /// @param response_timeout_ms Milliseconds before an individual message times out.
+    void configure(uint8_t burst_size, int64_t burst_interval_ms, int64_t response_timeout_ms);
+
     /// @brief Reset state (call on connection loss/change)
     void reset();
 
 protected:
-    static const uint8_t BURST_SIZE = 8;
-    static const int64_t BURST_INTERVAL_MS = 10000;
-    static const int64_t RESPONSE_TIMEOUT_MS = 10000;
-
     // 64-bit fields
     int64_t best_max_error_{std::numeric_limits<int64_t>::max()};
     int64_t best_offset_{0};
     int64_t best_timestamp_{0};
     int64_t current_message_sent_time_{0};
     int64_t last_burst_complete_time_{0};
+    int64_t burst_interval_ms_{10000};
+    int64_t response_timeout_ms_{10000};
 
     // 8-bit fields
-    uint8_t burst_index_{BURST_SIZE};  // starts "complete" so first loop triggers a burst
+    uint8_t burst_size_{8};
+    uint8_t burst_index_{8};  // starts "complete" so first loop triggers a burst
     // Flag set by on_time_response() when burst completes, consumed by loop()
     bool pending_burst_completed_{false};
 };

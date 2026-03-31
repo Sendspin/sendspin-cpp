@@ -107,6 +107,13 @@ public:
         this->max_connections_ = max_connections;
     }
 
+    /// @brief Overrides the ESP-IDF httpd control port
+    /// Defaults to 0 (uses ESP_HTTPD_DEF_CTRL_PORT + 1 to avoid conflict with web_server).
+    /// @param ctrl_port Control port number; 0 = use default.
+    void set_ctrl_port(uint16_t ctrl_port) {
+        this->ctrl_port_ = ctrl_port;
+    }
+
     /// @brief Sets the callback to invoke when a new connection is accepted
     /// @param callback The callback function.
     void set_new_connection_callback(NewConnectionCallback&& callback) {
@@ -164,6 +171,9 @@ protected:
 
     /// @brief Maximum number of simultaneous connections (default: 2 for handoff)
     uint8_t max_connections_{2};
+
+    /// @brief httpd control port override (0 = use ESP_HTTPD_DEF_CTRL_PORT + 1)
+    uint16_t ctrl_port_{0};
 };
 
 }  // namespace sendspin

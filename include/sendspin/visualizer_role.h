@@ -206,8 +206,10 @@ private:
     };
 
     /// @brief Starts the drain thread if the ring buffer is ready
+    /// @param psram_stack Whether to allocate the drain thread stack in PSRAM (ESP-IDF only).
+    /// @param priority FreeRTOS task priority for the drain thread (ESP-IDF only).
     /// @return True if the thread is running, false if the ring buffer is not initialized.
-    bool start();
+    bool start(bool psram_stack, unsigned priority);
     /// @brief Signals the drain thread to stop and waits for it to exit
     void stop_();
     /// @brief Adds the visualizer role and support config to the hello message

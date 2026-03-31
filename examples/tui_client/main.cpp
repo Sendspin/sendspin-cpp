@@ -634,7 +634,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Start the server
-    if (!client.start_server(5)) {
+    if (!client.start_server()) {
         fprintf(stderr, "Failed to start server\n");
         return 1;
     }

@@ -98,10 +98,9 @@ public:
     // ========================================
 
     /// @brief Creates the WebSocket server and configures callbacks. Call once from start_server().
-    /// @param client Client pointer passed through to ws_server (required by ws_server API).
-    /// @param psram_stack True to allocate the server task stack from PSRAM.
-    /// @param priority FreeRTOS task priority for the server task.
-    void init_server(SendspinClient* client, bool psram_stack, unsigned priority);
+    /// Server configuration is read from client->config_.
+    /// @param client The SendspinClient that owns this manager.
+    void init_server(SendspinClient* client);
 
     /// @brief Drives connection state: starts server when network ready, processes lifecycle
     /// events, retries hello, calls loop() on active connections.
@@ -208,12 +207,10 @@ private:
 
     // 32-bit fields
     uint32_t last_played_server_hash_{0};
-    unsigned task_priority_{17};
 
     // 8-bit fields
     bool dying_connection_ready_to_release_{false};
     bool has_last_played_server_{false};
-    bool psram_stack_{false};
 };
 
 }  // namespace sendspin

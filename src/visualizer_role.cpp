@@ -117,7 +117,7 @@ VisualizerRole::~VisualizerRole() {
     this->stop_();
 }
 
-bool VisualizerRole::start() {
+bool VisualizerRole::start(bool psram_stack, unsigned priority) {
     if (!this->drain_task_ || !this->drain_task_->ring_buffer.is_created()) {
         return false;
     }
@@ -128,7 +128,7 @@ bool VisualizerRole::start() {
         return false;
     }
 
-    platform_configure_thread("SsVis", 4096, 2, false);
+    platform_configure_thread("SsVis", 4096, static_cast<int>(priority), psram_stack);
     this->drain_task_->drain_thread = std::thread(drain_thread_func_, this);
     return true;
 }

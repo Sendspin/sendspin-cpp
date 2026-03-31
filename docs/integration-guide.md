@@ -399,9 +399,8 @@ client.set_persistence_provider(&persistence_provider); // Optional
 
 ```cpp
 // Start the WebSocket server and sync task.
-// The priority argument sets the FreeRTOS task priority (ESP32) or is passed
-// to the background thread (host).
-if (!client.start_server(5)) {
+// Task priorities and PSRAM settings are taken from SendspinClientConfig.
+if (!client.start_server()) {
     // Handle failure
     return 1;
 }
@@ -564,7 +563,7 @@ int main() {
     player.set_listener(&player_listener);
     client.set_network_provider(&network);
 
-    client.start_server(5);
+    client.start_server();
 
     while (true) {
         client.loop();

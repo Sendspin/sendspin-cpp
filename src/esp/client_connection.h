@@ -97,6 +97,12 @@ public:
         this->auto_reconnect_ = enabled;
     }
 
+    /// @brief Configures the internal esp_websocket_client task
+    /// @param priority FreeRTOS task priority for the WebSocket client task.
+    void set_task_config(unsigned priority) {
+        this->task_priority_ = priority;
+    }
+
 protected:
     /// @brief Static event handler for ESP-IDF websocket client events
     /// @param handler_args User context (pointer to this SendspinClientConnection instance).
@@ -137,6 +143,11 @@ protected:
 
     /// @brief Delay in milliseconds between reconnection attempts
     uint32_t reconnect_interval_ms_{5000};
+
+    // 32-bit fields (unsigned)
+
+    /// @brief FreeRTOS task priority for the internal esp_websocket_client task
+    unsigned task_priority_{5};
 
     // 8-bit fields
 

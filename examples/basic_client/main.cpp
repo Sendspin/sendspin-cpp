@@ -298,7 +298,7 @@ int main(int argc, char* argv[]) {
     // Start the server
     fprintf(stderr, "Starting Sendspin basic client on port %u...\n", SENDSPIN_PORT);
 
-    if (!client.start_server(5)) {
+    if (!client.start_server()) {
         fprintf(stderr, "Failed to start server\n");
         return 1;
     }

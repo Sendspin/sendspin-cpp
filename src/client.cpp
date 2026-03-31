@@ -48,6 +48,9 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
       time_burst_(std::make_unique<SendspinTimeBurst>()),
       event_state_(std::make_unique<EventState>()) {
     this->event_state_->time_queue.create(16);
+    this->time_burst_->configure(this->config_.time_burst_size,
+                                 this->config_.time_burst_interval_ms,
+                                 this->config_.time_burst_response_timeout_ms);
 }
 
 SendspinClient::~SendspinClient() {
@@ -69,26 +72,28 @@ LogLevel SendspinClient::get_log_level() {
 // Lifecycle
 // ============================================================================
 
-bool SendspinClient::start_server(unsigned priority) {
+bool SendspinClient::start_server() {
     this->started_ = true;
 
     // Load persisted state
     this->load_last_played_server_();
 
     if (this->player_) {
-        if (!this->player_->start(this->config_.psram_stack)) {
+        if (!this->player_->start(this->config_.sync_task_psram_stack,
+                                  this->config_.sync_task_priority)) {
             return false;
         }
     }
 
     if (this->visualizer_) {
-        if (!this->visualizer_->start()) {
+        if (!this->visualizer_->start(this->config_.visualizer_psram_stack,
+                                      this->config_.visualizer_priority)) {
             return false;
         }
     }
 
     // Create and configure the WebSocket server (started later when network is ready)
-    this->connection_manager_->init_server(this, this->config_.psram_stack, priority);
+    this->connection_manager_->init_server(this);
 
     return true;
 }

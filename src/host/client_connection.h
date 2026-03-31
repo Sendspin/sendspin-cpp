@@ -80,6 +80,9 @@ public:
         this->auto_reconnect_ = enabled;
     }
 
+    /// @brief No-op on host builds; task configuration is an ESP-IDF concept
+    void set_task_config(unsigned /*priority*/) {}
+
     /// @brief Returns true if the WebSocket connection is currently open
     /// @return true if connected, false otherwise.
     bool is_connected() const override {

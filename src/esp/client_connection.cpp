@@ -50,6 +50,7 @@ void SendspinClientConnection::start() {
     esp_websocket_client_config_t config = {};
     config.uri = this->url_.c_str();
     config.disable_auto_reconnect = true;  // We handle reconnection ourselves
+    config.task_prio = static_cast<int>(this->task_priority_);
 
     // Create the client
     this->client_ = esp_websocket_client_init(&config);

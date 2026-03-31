@@ -96,6 +96,9 @@ public:
         this->max_connections_ = max_connections;
     }
 
+    /// @brief No-op on host builds; control port is an ESP-IDF httpd concept
+    void set_ctrl_port(uint16_t /*ctrl_port*/) {}
+
     /// @brief Sets the callback invoked when a new client connection is accepted
     /// @param callback Function called with ownership of the new SendspinServerConnection.
     void set_new_connection_callback(NewConnectionCallback&& callback) {

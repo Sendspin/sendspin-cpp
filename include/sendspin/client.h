@@ -124,7 +124,28 @@ struct SendspinClientConfig {
     std::string product_name;      ///< Device product name
     std::string manufacturer;      ///< Manufacturer name (e.g., "ESPHome")
     std::string software_version;  ///< Software version string
-    bool psram_stack{false};       ///< Whether to allocate task stacks in PSRAM
+
+    bool sync_task_psram_stack{false};   ///< Allocate sync task stack in PSRAM (ESP-IDF only)
+    bool httpd_psram_stack{false};       ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
+    bool visualizer_psram_stack{false};  ///< Allocate visualizer drain thread stack in PSRAM
+                                         ///< (ESP-IDF only)
+
+    unsigned sync_task_priority{2};   ///< FreeRTOS priority for the sync/decode task (ESP-IDF only)
+    unsigned httpd_priority{17};      ///< FreeRTOS priority for the HTTP server task (ESP-IDF only)
+    unsigned websocket_priority{5};   ///< FreeRTOS priority for the WebSocket client task
+                                      ///< (ESP-IDF only)
+    unsigned visualizer_priority{2};  ///< FreeRTOS priority for the visualizer drain thread
+                                      ///< (ESP-IDF only)
+
+    uint8_t server_max_connections{2};  ///< Maximum simultaneous connections (default: 2 for
+                                        ///< handoff protocol)
+    uint16_t httpd_ctrl_port{0};        ///< ESP-IDF httpd control port; 0 = ESP_HTTPD_DEF_CTRL_PORT
+                                        ///< + 1 (avoids conflict with web_server component)
+
+    uint8_t time_burst_size{8};             ///< Number of messages per time sync burst
+    int64_t time_burst_interval_ms{10000};  ///< Milliseconds between bursts
+    int64_t time_burst_response_timeout_ms{
+        10000};  ///< Milliseconds before a burst message times out
 };
 
 /// @brief Deferred event from a callback thread, processed in loop()
@@ -164,13 +185,18 @@ struct TimeResponseEvent {
  * MyPlayerListener player_listener;
  * MyNetworkProvider network_provider;
  *
- * SendspinClientConfig config{"device-id", "My Device", "Speaker", "Acme", "1.0.0"};
+ * SendspinClientConfig config;
+ * config.client_id = "device-id";
+ * config.name = "My Device";
+ * config.product_name = "Speaker";
+ * config.manufacturer = "Acme";
+ * config.software_version = "1.0.0";
  * SendspinClient client(config);
  * auto& player = client.add_player(PlayerRole::Config{});
  * player.set_listener(&player_listener);
  * client.add_controller();
  * client.set_network_provider(&network_provider);
- * client.start_server(5);
+ * client.start_server();
  *
  * while (true) {
  *     client.loop();
@@ -197,9 +223,9 @@ public:
     // ========================================
 
     /// @brief Starts the WebSocket server and initializes the sync task (if audio is configured)
-    /// @param priority FreeRTOS task priority for the WS server and sync task
+    /// Task priorities and PSRAM settings are taken from SendspinClientConfig
     /// @return true on success, false on failure
-    bool start_server(unsigned priority);
+    bool start_server();
 
     /// @brief Initiates a client connection to a Sendspin server at the given URL
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")

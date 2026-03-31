@@ -72,7 +72,10 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
     config.close_fn = SendspinWsServer::close_callback;
     config.global_user_ctx = (void*)this;
     config.global_user_ctx_free_fn = nullptr;
-    config.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 1;  // Avoid conflict with web_server component
+    // Use the configured ctrl_port, or fall back to ESP_HTTPD_DEF_CTRL_PORT + 1 to avoid
+    // conflict with the web_server component
+    config.ctrl_port = (this->ctrl_port_ != 0) ? this->ctrl_port_
+                                               : static_cast<uint16_t>(ESP_HTTPD_DEF_CTRL_PORT + 1);
 
     // Start the HTTP server
     SS_LOGI(TAG, "Starting server on port: %d (max connections: %d)", config.server_port,

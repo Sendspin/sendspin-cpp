@@ -53,7 +53,7 @@ auto& metadata = client.add_metadata();
 metadata.set_listener(&metadata_listener);
 client.set_network_provider(&network_provider);
 client.add_controller();
-client.start_server(5);
+client.start_server();
 ```
 
 ### Platform integration

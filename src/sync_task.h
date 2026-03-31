@@ -122,7 +122,7 @@ public:
     /// Call once after init(). The thread idles until a codec header arrives in the ring buffer.
     /// @param task_stack_in_psram Whether to allocate the task stack in PSRAM (ESP-IDF only).
     /// @return true if thread started successfully, false otherwise.
-    bool start(bool task_stack_in_psram = false);
+    bool start(bool task_stack_in_psram, unsigned priority);
 
     /// @brief Checks if the last run ended with an error
     /// @return true if the most recent stream run encountered an error.

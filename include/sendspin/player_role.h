@@ -351,7 +351,7 @@ private:
     // ========================================
 
     /// @brief Starts the player role and registers it with the client
-    bool start(bool psram_stack);
+    bool start(bool psram_stack, unsigned priority);
     /// @brief Adds player role information to the outgoing hello message
     void build_hello_fields(ClientHelloMessage& msg);
     /// @brief Adds the current player state fields to an outgoing state message
