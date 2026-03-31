@@ -26,6 +26,9 @@
 #include "tui.h"
 
 #include "sendspin/client.h"
+#include "sendspin/metadata_role.h"
+#include "sendspin/player_role.h"
+#include "sendspin/visualizer_role.h"
 #ifdef SENDSPIN_HAS_PORTAUDIO
 #include "portaudio_sink.h"
 #endif

@@ -18,8 +18,6 @@
 #pragma once
 
 #include "sendspin/artwork_role.h"
-#include "sendspin/controller_role.h"
-#include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
 #include "sendspin/types.h"
 #include "sendspin/visualizer_role.h"
@@ -32,6 +30,10 @@
 #include <vector>
 
 namespace sendspin {
+
+// Forward declarations for roles whose Config types are not used in this header's public API
+class ControllerRole;
+class MetadataRole;
 
 // Forward declarations for listener types
 struct GroupUpdateObject;

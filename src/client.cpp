@@ -22,6 +22,11 @@
 #include "platform/thread_safe_queue.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
+#include "sendspin/artwork_role.h"
+#include "sendspin/controller_role.h"
+#include "sendspin/metadata_role.h"
+#include "sendspin/player_role.h"
+#include "sendspin/visualizer_role.h"
 #include "time_burst.h"
 #include <ArduinoJson.h>
 
