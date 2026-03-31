@@ -104,7 +104,8 @@ struct VisualizerRole::EventState {
 // ============================================================================
 
 VisualizerRole::VisualizerRole(Config config, SendspinClient* client)
-    : visualizer_support_(std::move(config.support)),
+    : config_(std::move(config)),
+      visualizer_support_(std::move(this->config_.support)),
       client_(client),
       event_state_(std::make_unique<EventState>()) {
     this->event_state_->queue.create(8);
@@ -126,7 +127,7 @@ VisualizerRole::~VisualizerRole() {
     this->stop();
 }
 
-bool VisualizerRole::start(bool psram_stack, unsigned priority) {
+bool VisualizerRole::start() {
     if (!this->drain_task_ || !this->drain_task_->ring_buffer.is_created()) {
         return false;
     }
@@ -137,7 +138,8 @@ bool VisualizerRole::start(bool psram_stack, unsigned priority) {
         return false;
     }
 
-    platform_configure_thread("SsVis", 4096, static_cast<int>(priority), psram_stack);
+    platform_configure_thread("SsVis", 4096, static_cast<int>(this->config_.priority),
+                              this->config_.psram_stack);
     this->drain_task_->drain_thread = std::thread(drain_thread_func, this);
     return true;
 }

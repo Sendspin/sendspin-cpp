@@ -235,6 +235,8 @@ public:
     /// @brief Configuration for the artwork role
     struct Config {
         std::vector<ImageSlotPreference> preferred_formats{};
+        bool psram_stack{false};  ///< Allocate drain thread stack in PSRAM (ESP-IDF only)
+        unsigned priority{2};     ///< FreeRTOS priority for the drain thread (ESP-IDF only)
     };
 
     ArtworkRole(Config config, SendspinClient* client);
@@ -256,10 +258,8 @@ private:
     };
 
     /// @brief Starts the drain thread
-    /// @param psram_stack Whether to allocate the drain thread stack in PSRAM (ESP-IDF only).
-    /// @param priority FreeRTOS task priority for the drain thread (ESP-IDF only).
     /// @return True if the thread is running, false on failure.
-    bool start(bool psram_stack, unsigned priority);
+    bool start();
     /// @brief Signals the drain thread to stop and waits for it to exit
     void stop();
     /// @brief Adds the artwork role and configured channels to the hello message

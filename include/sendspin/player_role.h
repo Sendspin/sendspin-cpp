@@ -251,6 +251,8 @@ public:
         size_t audio_buffer_capacity{DEFAULT_AUDIO_BUFFER_CAPACITY};
         int32_t fixed_delay_us{0};
         uint16_t initial_static_delay_ms{0};
+        bool psram_stack{false};  ///< Allocate sync task stack in PSRAM (ESP-IDF only)
+        unsigned priority{2};     ///< FreeRTOS priority for the sync/decode task (ESP-IDF only)
     };
 
     PlayerRole(Config config, SendspinClient* client, SendspinPersistenceProvider* persistence);
@@ -342,7 +344,7 @@ private:
     // ========================================
 
     /// @brief Starts the player role and registers it with the client
-    bool start(bool psram_stack, unsigned priority);
+    bool start();
     /// @brief Adds player role information to the outgoing hello message
     void build_hello_fields(ClientHelloMessage& msg);
     /// @brief Adds the current player state fields to an outgoing state message

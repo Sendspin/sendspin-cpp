@@ -127,7 +127,7 @@ ArtworkRole::~ArtworkRole() {
     this->stop();
 }
 
-bool ArtworkRole::start(bool psram_stack, unsigned priority) {
+bool ArtworkRole::start() {
     if (!this->drain_task_) {
         return false;
     }
@@ -138,7 +138,8 @@ bool ArtworkRole::start(bool psram_stack, unsigned priority) {
         return false;
     }
 
-    platform_configure_thread("SsArt", 4096, static_cast<int>(priority), psram_stack);
+    platform_configure_thread("SsArt", 4096, static_cast<int>(this->config_.priority),
+                              this->config_.psram_stack);
     this->drain_task_->drain_thread = std::thread(drain_thread_func, this);
     return true;
 }

@@ -597,15 +597,9 @@ Main client configuration passed to the `SendspinClient` constructor.
 | `product_name` | `std::string` | — | Device product name |
 | `manufacturer` | `std::string` | — | Manufacturer name (e.g., `"ESPHome"`) |
 | `software_version` | `std::string` | — | Software version string |
-| `sync_task_psram_stack` | `bool` | `false` | Allocate sync/decode task stack in PSRAM (ESP-IDF only) |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
-| `visualizer_psram_stack` | `bool` | `false` | Allocate visualizer drain thread stack in PSRAM (ESP-IDF only) |
-| `artwork_psram_stack` | `bool` | `false` | Allocate artwork drain thread stack in PSRAM (ESP-IDF only) |
-| `sync_task_priority` | `unsigned` | `2` | FreeRTOS priority for the sync/decode task (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `17` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |
-| `visualizer_priority` | `unsigned` | `2` | FreeRTOS priority for the visualizer drain thread (ESP-IDF only) |
-| `artwork_priority` | `unsigned` | `2` | FreeRTOS priority for the artwork drain thread (ESP-IDF only) |
 | `server_max_connections` | `uint8_t` | `2` | Maximum simultaneous WebSocket connections (default supports the handoff protocol) |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |
 | `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |
@@ -624,6 +618,8 @@ Configuration passed to `client.add_player()`.
 | `audio_buffer_capacity` | `size_t` | `1000000` | Internal ring buffer size in bytes. Larger buffers absorb more jitter at the cost of memory. |
 | `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable static delay. |
 | `initial_static_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable static delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
+| `psram_stack` | `bool` | `false` | Allocate sync/decode task stack in PSRAM (ESP-IDF only) |
+| `priority` | `unsigned` | `2` | FreeRTOS priority for the sync/decode task (ESP-IDF only) |
 
 Each entry in `audio_formats` is an `AudioSupportedFormatObject`:
 
@@ -643,6 +639,8 @@ Configuration passed to `client.add_artwork()`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `preferred_formats` | `std::vector<ImageSlotPreference>` | `{}` | Image slot preferences advertised to the server during the hello handshake. Each entry declares a slot index, image source, format, and resolution. |
+| `psram_stack` | `bool` | `false` | Allocate drain thread stack in PSRAM (ESP-IDF only) |
+| `priority` | `unsigned` | `2` | FreeRTOS priority for the drain thread (ESP-IDF only) |
 
 Each entry in `preferred_formats` is an `ImageSlotPreference`:
 
@@ -660,9 +658,11 @@ Each entry in `preferred_formats` is an `ImageSlotPreference`:
 
 Configuration passed to `client.add_visualizer()`.
 
-| Field | Type | Description |
-|---|---|---|
-| `support` | `VisualizerSupportObject` | Visualizer capabilities advertised to the server during the hello handshake |
+| Field | Type | Default | Description |
+|---|---|--|---|
+| `support` | `VisualizerSupportObject` | - | Visualizer capabilities advertised to the server during the hello handshake |
+| `psram_stack` | `bool` | `false` | Allocate drain thread stack in PSRAM (ESP-IDF only) |
+| `priority` | `unsigned` | `2` | FreeRTOS priority for the drain thread (ESP-IDF only) |
 
 `VisualizerSupportObject` fields:
 

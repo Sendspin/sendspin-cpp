@@ -80,22 +80,19 @@ bool SendspinClient::start_server() {
     this->load_last_played_server();
 
     if (this->player_) {
-        if (!this->player_->start(this->config_.sync_task_psram_stack,
-                                  this->config_.sync_task_priority)) {
+        if (!this->player_->start()) {
             return false;
         }
     }
 
     if (this->visualizer_) {
-        if (!this->visualizer_->start(this->config_.visualizer_psram_stack,
-                                      this->config_.visualizer_priority)) {
+        if (!this->visualizer_->start()) {
             return false;
         }
     }
 
     if (this->artwork_) {
-        if (!this->artwork_->start(this->config_.artwork_psram_stack,
-                                   this->config_.artwork_priority)) {
+        if (!this->artwork_->start()) {
             return false;
         }
     }

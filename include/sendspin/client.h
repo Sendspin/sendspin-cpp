@@ -124,26 +124,15 @@ struct SendspinClientConfig {
     std::string manufacturer;      ///< Manufacturer name (e.g., "ESPHome")
     std::string software_version;  ///< Software version string
 
-    bool sync_task_psram_stack{false};   ///< Allocate sync task stack in PSRAM (ESP-IDF only)
-    bool httpd_psram_stack{false};       ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
-    bool visualizer_psram_stack{false};  ///< Allocate visualizer drain thread stack in PSRAM
-                                         ///< (ESP-IDF only)
-    bool artwork_psram_stack{false};     ///< Allocate artwork drain thread stack in PSRAM
-                                         ///< (ESP-IDF only)
+    bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
 
     /// @brief Default FreeRTOS priority for the HTTP server task (ESP-IDF only)
     static constexpr unsigned DEFAULT_HTTPD_PRIORITY = 17U;
 
-    unsigned sync_task_priority{2};  ///< FreeRTOS priority for the sync/decode task
-                                     ///< (ESP-IDF only)
     unsigned httpd_priority{DEFAULT_HTTPD_PRIORITY};  ///< FreeRTOS priority for the HTTP server
                                                       ///< task (ESP-IDF only)
-    unsigned websocket_priority{5};   ///< FreeRTOS priority for the WebSocket client task
-                                      ///< (ESP-IDF only)
-    unsigned visualizer_priority{2};  ///< FreeRTOS priority for the visualizer drain thread
-                                      ///< (ESP-IDF only)
-    unsigned artwork_priority{2};     ///< FreeRTOS priority for the artwork drain thread
-                                      ///< (ESP-IDF only)
+    unsigned websocket_priority{5};  ///< FreeRTOS priority for the WebSocket client task
+                                     ///< (ESP-IDF only)
 
     uint8_t server_max_connections{2};  ///< Maximum simultaneous connections (default: 2 for
                                         ///< handoff protocol)
@@ -234,7 +223,6 @@ public:
     // ========================================
 
     /// @brief Starts the WebSocket server and initializes the sync task (if audio is configured)
-    /// Task priorities and PSRAM settings are taken from SendspinClientConfig
     /// @return true on success, false on failure
     bool start_server();
 

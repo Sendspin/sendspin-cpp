@@ -140,7 +140,7 @@ void PlayerRole::set_static_delay_adjustable(bool adjustable) {
 // Private integration methods
 // ============================================================================
 
-bool PlayerRole::start(bool psram_stack, unsigned priority) {
+bool PlayerRole::start() {
     this->load_static_delay();
 
     if (!this->config_.audio_formats.empty() && this->listener_ &&
@@ -149,7 +149,7 @@ bool PlayerRole::start(bool psram_stack, unsigned priority) {
             SS_LOGE(TAG, "Failed to initialize sync task");
             return false;
         }
-        if (!this->sync_task_->start(psram_stack, priority)) {
+        if (!this->sync_task_->start(this->config_.psram_stack, this->config_.priority)) {
             SS_LOGE(TAG, "Failed to start sync task thread");
             return false;
         }
