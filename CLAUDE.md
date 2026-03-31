@@ -99,6 +99,7 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `spsc_ring_buffer.h`: single-producer/single-consumer ring buffer (ESP: FreeRTOS `xRingbuffer`, host: mutex/condition variable)
 - `thread_safe_queue.h`: thread-safe queue (ESP: FreeRTOS queue, host: mutex/condition variable)
 - `event_flags.h`: event flag group (ESP: FreeRTOS event group, host: mutex/condition variable)
+- `shadow_slot.h`: mutex-protected slot for publishing state from one thread and reading from another
 
 Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform differences are isolated to the platform layer and the `src/esp/`/`src/host/` directories.
 
