@@ -27,8 +27,6 @@
 
 namespace sendspin {
 
-#define SENDSPIN_SYNC_TASK_DEBUG
-
 // ============================================================================
 // Static helpers
 // ============================================================================
@@ -244,20 +242,15 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
         // Playtime estimate is advanced by transfer_audio() when the silence is actually sent
         sync_context.release_chunk = false;  // Keep decoded audio for after the silence
 
-#ifdef SENDSPIN_SYNC_TASK_DEBUG
-        uint32_t frames_added = sync_context.current_stream_info.bytes_to_frames(actual_bytes);
-        SS_LOGD(TAG,
+        SS_LOGV(TAG,
                 "Hard sync: adding %" PRIu32 " frames of silence for %" PRId64 "us future error",
-                frames_added, raw_error);
-#endif
+                sync_context.current_stream_info.bytes_to_frames(actual_bytes), raw_error);
     } else if (raw_error < -active_threshold) {
         // Chunk should have played already - we're behind, drop it
         // The skip logic in decode_chunk() will keep dropping until we catch up
         sync_context.hard_syncing = true;
         sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
-#ifdef SENDSPIN_SYNC_TASK_DEBUG
-        SS_LOGD(TAG, "Hard sync: dropping decoded chunk, %" PRId64 "us behind", -raw_error);
-#endif
+        SS_LOGV(TAG, "Hard sync: dropping decoded chunk, %" PRId64 "us behind", -raw_error);
         return SyncTaskState::LOAD_CHUNK;
     } else {
         // Within tolerance - exit hard sync mode and use sample insertion/deletion for fine
@@ -593,11 +586,9 @@ void SyncTask::process_playback_progress(SyncContext& sync_context) {
         }
 
         if (frames_played > sync_context.buffered_frames) {
-#ifdef SENDSPIN_SYNC_TASK_DEBUG
             SS_LOGW(TAG,
                     "Buffered frames underflow: played %" PRIu32 " but only %" PRIu32 " buffered",
                     frames_played, sync_context.buffered_frames);
-#endif
             sync_context.buffered_frames = 0;
         } else {
             sync_context.buffered_frames -= frames_played;
