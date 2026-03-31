@@ -196,8 +196,8 @@ public:
  *
  * Usage:
  * 1. Implement ArtworkRoleListener with on_image_decode() and on_image_display()
- * 2. Add the role to the client via SendspinClient::add_artwork()
- * 3. Call add_image_preferred_format() for each slot/format/resolution desired
+ * 2. Build an ArtworkRole::Config with the desired slot/format/resolution preferences
+ * 3. Add the role to the client via SendspinClient::add_artwork()
  * 4. Call set_listener() with your listener implementation
  *
  * @code
@@ -215,9 +215,10 @@ public:
  * };
  *
  * MyArtworkListener listener;
- * auto& artwork = client.add_artwork();
- * artwork.add_image_preferred_format({0, SendspinImageSource::ALBUM,
- *                                     SendspinImageFormat::JPEG, 240, 240});
+ * ArtworkRole::Config config;
+ * config.preferred_formats = {{0, SendspinImageSource::ALBUM,
+ *                               SendspinImageFormat::JPEG, 240, 240}};
+ * auto& artwork = client.add_artwork(config);
  * artwork.set_listener(&listener);
  * @endcode
  */
@@ -225,7 +226,12 @@ class ArtworkRole {
     friend class SendspinClient;
 
 public:
-    explicit ArtworkRole(SendspinClient* client);
+    /// @brief Configuration for the artwork role
+    struct Config {
+        std::vector<ImageSlotPreference> preferred_formats;
+    };
+
+    ArtworkRole(Config config, SendspinClient* client);
     ~ArtworkRole();
 
     /// @brief Sets the listener for artwork events
@@ -234,10 +240,6 @@ public:
     void set_listener(ArtworkRoleListener* listener) {
         this->listener_ = listener;
     }
-
-    /// @brief Adds a preferred image format for an artwork slot
-    /// @param pref The slot/format/resolution preference to register
-    void add_image_preferred_format(const ImageSlotPreference& pref);
 
 private:
     /// @brief Deferred artwork event types
@@ -284,8 +286,8 @@ private:
     struct EventState;
 
     // Struct fields
+    Config config_;
     std::vector<ArtworkChannelFormatObject> artwork_channels_;
-    std::vector<ImageSlotPreference> preferred_image_formats_;
 
     // Pointer fields
     SendspinClient* client_;

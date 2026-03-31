@@ -105,10 +105,14 @@ struct ArtworkRole::EventState {
 // Lifecycle
 // ============================================================================
 
-ArtworkRole::ArtworkRole(SendspinClient* client)
-    : client_(client),
+ArtworkRole::ArtworkRole(Config config, SendspinClient* client)
+    : config_(std::move(config)),
+      client_(client),
       drain_task_(std::make_unique<DrainTask>()),
       event_state_(std::make_unique<EventState>()) {
+    for (const auto& pref : this->config_.preferred_formats) {
+        this->artwork_channels_.push_back({pref.source, pref.format, pref.width, pref.height});
+    }
     this->event_state_->queue.create(8);
     this->drain_task_->notify_queue.create(8);
 }
@@ -139,11 +143,6 @@ void ArtworkRole::stop_() {
     }
     this->drain_task_->event_flags.set(COMMAND_STOP);
     this->drain_task_->drain_thread.join();
-}
-
-void ArtworkRole::add_image_preferred_format(const ImageSlotPreference& pref) {
-    this->preferred_image_formats_.push_back(pref);
-    this->artwork_channels_.push_back({pref.source, pref.format, pref.width, pref.height});
 }
 
 void ArtworkRole::build_hello_fields(ClientHelloMessage& msg) {
@@ -180,7 +179,7 @@ void ArtworkRole::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
 
     // Look up format for this slot
     SendspinImageFormat image_format = SendspinImageFormat::JPEG;
-    for (const auto& pref : this->preferred_image_formats_) {
+    for (const auto& pref : this->config_.preferred_formats) {
         if (pref.slot == slot) {
             image_format = pref.format;
             break;
@@ -271,7 +270,7 @@ void ArtworkRole::drain_events() {
             }
             case EventType::STREAM_END:
                 if (this->listener_) {
-                    for (const auto& pref : this->preferred_image_formats_) {
+                    for (const auto& pref : this->config_.preferred_formats) {
                         this->listener_->on_image_clear(pref.slot);
                     }
                     this->listener_->on_artwork_stream_end();
@@ -279,7 +278,7 @@ void ArtworkRole::drain_events() {
                 break;
             case EventType::STREAM_CLEAR:
                 if (this->listener_) {
-                    for (const auto& pref : this->preferred_image_formats_) {
+                    for (const auto& pref : this->config_.preferred_formats) {
                         this->listener_->on_image_clear(pref.slot);
                     }
                 }

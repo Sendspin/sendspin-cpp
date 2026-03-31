@@ -231,11 +231,11 @@ MetadataRole& SendspinClient::add_metadata() {
     return *this->metadata_;
 }
 
-ArtworkRole& SendspinClient::add_artwork() {
+ArtworkRole& SendspinClient::add_artwork(ArtworkRole::Config config) {
     if (this->started_) {
         SS_LOGW(TAG, "add_artwork() called after start_server()");
     }
-    this->artwork_ = std::make_unique<ArtworkRole>(this);
+    this->artwork_ = std::make_unique<ArtworkRole>(std::move(config), this);
     return *this->artwork_;
 }
 

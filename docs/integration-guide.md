@@ -97,17 +97,15 @@ auto& metadata = client.add_metadata();
 
 ### Artwork Role (Album Art)
 
-Receives album artwork images from the server. Requires declaring preferred image formats per slot.
+Receives album artwork images from the server. Requires a configuration struct declaring preferred image formats per slot.
 
 ```cpp
-auto& artwork = client.add_artwork();
-artwork.add_image_preferred_format({
-    .slot = 0,
-    .source = SendspinImageSource::ALBUM,
-    .format = SendspinImageFormat::JPEG,
-    .width = 300,
-    .height = 300,
-});
+ArtworkRole::Config artwork_config;
+artwork_config.preferred_formats = {
+    {0, SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 300, 300},
+};
+
+auto& artwork = client.add_artwork(std::move(artwork_config));
 ```
 
 ### Visualizer Role (Audio Visualization)
@@ -635,6 +633,26 @@ Each entry in `audio_formats` is an `AudioSupportedFormatObject`:
 | `channels` | `uint8_t` | Number of audio channels |
 | `sample_rate` | `uint32_t` | Sample rate in Hz |
 | `bit_depth` | `uint8_t` | Bits per sample |
+
+---
+
+### ArtworkRole::Config
+
+Configuration passed to `client.add_artwork()`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `preferred_formats` | `std::vector<ImageSlotPreference>` | `{}` | Image slot preferences advertised to the server during the hello handshake. Each entry declares a slot index, image source, format, and resolution. |
+
+Each entry in `preferred_formats` is an `ImageSlotPreference`:
+
+| Field | Type | Description |
+|---|---|---|
+| `slot` | `uint8_t` | Artwork slot index (0–3) |
+| `source` | `SendspinImageSource` | Image source (`ALBUM` or `ARTIST`) |
+| `format` | `SendspinImageFormat` | Image format (`JPEG`, `PNG`, or `BMP`) |
+| `width` | `uint16_t` | Desired image width in pixels |
+| `height` | `uint16_t` | Desired image height in pixels |
 
 ---
 

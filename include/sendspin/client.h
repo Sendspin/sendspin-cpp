@@ -255,7 +255,7 @@ public:
     MetadataRole& add_metadata();
 
     /// @brief Adds the artwork role. Returns a reference for setting callbacks
-    ArtworkRole& add_artwork();
+    ArtworkRole& add_artwork(ArtworkRole::Config config);
 
     /// @brief Adds the visualizer role. Returns a reference for setting callbacks
     VisualizerRole& add_visualizer(VisualizerRole::Config config);
