@@ -168,8 +168,9 @@ SyncTaskState SyncTask::handle_initial_sync(SyncContext& sync_context) {
         }
     } else {
         const size_t zeroed_bytes = sync_context.interpolation_transfer_buffer->free();
-        std::memset((void*)sync_context.interpolation_transfer_buffer->get_buffer_end(), 0,
-                    zeroed_bytes);
+        std::memset(
+            static_cast<void*>(sync_context.interpolation_transfer_buffer->get_buffer_end()), 0,
+            zeroed_bytes);
         sync_context.interpolation_transfer_buffer->increase_buffer_length(
             std::min(zeroed_bytes,
                      sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS)));
@@ -235,8 +236,9 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
         const size_t buffer_free = sync_context.interpolation_transfer_buffer->free();
         size_t actual_bytes = std::min(silence_bytes, buffer_free);
 
-        std::memset((void*)sync_context.interpolation_transfer_buffer->get_buffer_end(), 0,
-                    actual_bytes);
+        std::memset(
+            static_cast<void*>(sync_context.interpolation_transfer_buffer->get_buffer_end()), 0,
+            actual_bytes);
         sync_context.interpolation_transfer_buffer->increase_buffer_length(actual_bytes);
 
         // Playtime estimate is advanced by transfer_audio() when the silence is actually sent
