@@ -97,7 +97,7 @@ bool SyncTask::start(bool task_stack_in_psram) {
     platform_configure_thread("Sendspin", SYNC_TASK_STACK_SIZE, SYNC_TASK_PRIORITY,
                               task_stack_in_psram);
 
-    this->sync_thread_ = std::thread(sync_task, this);
+    this->sync_thread_ = std::thread(thread_entry, this);
 
     // Wait for the thread to reach IDLE before returning
     this->event_flags_.wait(EventGroupBits::TASK_IDLE | EventGroupBits::TASK_STOPPED, false, false,
@@ -142,7 +142,7 @@ void SyncTask::notify_audio_played(uint32_t frames, int64_t timestamp) {
 // Private sync helpers
 // ============================================================================
 
-SyncTaskState SyncTask::sync_handle_initial_sync_(SyncContext& sync_context) {
+SyncTaskState SyncTask::handle_initial_sync_(SyncContext& sync_context) {
     if (!sync_context.initial_decode) {
         return SyncTaskState::LOAD_CHUNK;
     }
@@ -152,7 +152,7 @@ SyncTaskState SyncTask::sync_handle_initial_sync_(SyncContext& sync_context) {
             sync_context.interpolation_transfer_buffer->available());
         size_t bytes_written = sync_context.interpolation_transfer_buffer->transfer_data_to_sink(
             duration_in_transfer_buffers / 2);
-        this->sync_track_sent_audio_(sync_context, bytes_written);
+        this->track_sent_audio_(sync_context, bytes_written);
         if ((bytes_written > 0) && sync_context.initial_decode) {
             // Sent initial zeros, delay slightly to give it some time to work through the audio
             // stack
@@ -171,7 +171,7 @@ SyncTaskState SyncTask::sync_handle_initial_sync_(SyncContext& sync_context) {
     return SyncTaskState::INITIAL_SYNC;
 }
 
-SyncTaskState SyncTask::sync_handle_load_chunk_(SyncContext& sync_context) {
+SyncTaskState SyncTask::handle_load_chunk_(SyncContext& sync_context) {
     if (!this->client_->is_time_synced()) {
         // Wait for the time filter to receive its first measurement before processing audio chunks.
         // Without a valid time offset, server timestamps can't be correctly converted to client
@@ -179,10 +179,10 @@ SyncTaskState SyncTask::sync_handle_load_chunk_(SyncContext& sync_context) {
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
         return SyncTaskState::LOAD_CHUNK;
     }
-    if (!this->sync_load_next_chunk_(sync_context)) {
+    if (!this->load_next_chunk_(sync_context)) {
         return SyncTaskState::LOAD_CHUNK;
     }
-    DecodeResult decode_result = this->sync_decode_audio_(sync_context);
+    DecodeResult decode_result = this->decode_chunk_(sync_context);
     if ((decode_result == DecodeResult::SKIPPED) || (decode_result == DecodeResult::FAILED)) {
         return SyncTaskState::LOAD_CHUNK;
     } else if (decode_result == DecodeResult::ALLOCATION_FAILED) {
@@ -196,7 +196,7 @@ SyncTaskState SyncTask::sync_handle_load_chunk_(SyncContext& sync_context) {
     return SyncTaskState::SYNCHRONIZE_AUDIO;
 }
 
-SyncTaskState SyncTask::sync_handle_synchronize_audio_(SyncContext& sync_context) {
+SyncTaskState SyncTask::handle_synchronize_audio_(SyncContext& sync_context) {
     // Predicted error: positive means chunk should play later than our current buffer endpoint
     int64_t raw_error = sync_context.decoded_timestamp - sync_context.new_audio_client_playtime;
 
@@ -229,7 +229,7 @@ SyncTaskState SyncTask::sync_handle_synchronize_audio_(SyncContext& sync_context
                     actual_bytes);
         sync_context.interpolation_transfer_buffer->increase_buffer_length(actual_bytes);
 
-        // Playtime estimate is advanced by sync_transfer_audio_() when the silence is actually sent
+        // Playtime estimate is advanced by transfer_audio_() when the silence is actually sent
         sync_context.release_chunk = false;  // Keep decoded audio for after the silence
 
 #ifdef SENDSPIN_SYNC_TASK_DEBUG
@@ -240,7 +240,7 @@ SyncTaskState SyncTask::sync_handle_synchronize_audio_(SyncContext& sync_context
 #endif
     } else if (raw_error < -active_threshold) {
         // Chunk should have played already - we're behind, drop it
-        // The skip logic in sync_decode_audio_ will keep dropping until we catch up
+        // The skip logic in decode_chunk_() will keep dropping until we catch up
         sync_context.hard_syncing = true;
         sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
 #ifdef SENDSPIN_SYNC_TASK_DEBUG
@@ -254,13 +254,13 @@ SyncTaskState SyncTask::sync_handle_synchronize_audio_(SyncContext& sync_context
 
         if (raw_error > SOFT_SYNC_THRESHOLD_US) {
             // Slightly behind - add one interpolated frame between the first two decoded frames
-            // Playtime estimate is advanced by sync_transfer_audio_() when the extra frame is sent
-            this->sync_soft_sync_add_audio_(sync_context);
+            // Playtime estimate is advanced by transfer_audio_() when the extra frame is sent
+            this->soft_sync_insert_frame_(sync_context);
         } else if (raw_error < -SOFT_SYNC_THRESHOLD_US) {
             // Slightly ahead - remove last frame, blend into second-to-last
-            // Playtime estimate naturally reflects the removed frame: sync_transfer_audio_() sends
+            // Playtime estimate naturally reflects the removed frame: transfer_audio_() sends
             // fewer bytes
-            this->sync_soft_sync_remove_audio_(sync_context);
+            this->soft_sync_drop_frame_(sync_context);
         }
         // else: Dead zone - pass decoded audio through directly
         sync_context.release_chunk = true;
@@ -268,8 +268,8 @@ SyncTaskState SyncTask::sync_handle_synchronize_audio_(SyncContext& sync_context
     return SyncTaskState::TRANSFER_AUDIO;
 }
 
-SyncTaskState SyncTask::sync_handle_transfer_audio_(SyncContext& sync_context) {
-    if (!this->sync_transfer_audio_(sync_context)) {
+SyncTaskState SyncTask::handle_transfer_audio_(SyncContext& sync_context) {
+    if (!this->transfer_audio_(sync_context)) {
         return SyncTaskState::TRANSFER_AUDIO;  // Not done transferring yet
     }
     if (sync_context.decode_buffer != nullptr && sync_context.decode_buffer->available() > 0) {
@@ -279,7 +279,7 @@ SyncTaskState SyncTask::sync_handle_transfer_audio_(SyncContext& sync_context) {
     return SyncTaskState::LOAD_CHUNK;
 }
 
-void SyncTask::sync_track_sent_audio_(SyncContext& sync_context, size_t bytes_sent) {
+void SyncTask::track_sent_audio_(SyncContext& sync_context, size_t bytes_sent) {
     uint32_t frames_sent = sync_context.current_stream_info.bytes_to_frames(bytes_sent);
     sync_context.buffered_frames += frames_sent;
     uint32_t remainder = frames_sent;
@@ -289,7 +289,7 @@ void SyncTask::sync_track_sent_audio_(SyncContext& sync_context, size_t bytes_se
         static_cast<int64_t>(sync_context.current_stream_info.frames_to_microseconds(remainder));
 }
 
-bool SyncTask::sync_transfer_audio_(SyncContext& sync_context) {
+bool SyncTask::transfer_audio_(SyncContext& sync_context) {
     size_t decode_available =
         sync_context.release_chunk ? sync_context.decode_buffer->available() : 0;
     const uint32_t duration_in_transfer_buffers = sync_context.current_stream_info.bytes_to_ms(
@@ -297,7 +297,7 @@ bool SyncTask::sync_transfer_audio_(SyncContext& sync_context) {
 
     size_t bytes_written = sync_context.interpolation_transfer_buffer->transfer_data_to_sink(
         duration_in_transfer_buffers / 2);
-    this->sync_track_sent_audio_(sync_context, bytes_written);
+    this->track_sent_audio_(sync_context, bytes_written);
 
     if ((bytes_written > 0) && sync_context.initial_decode) {
         // Sent initial zeros, delay slightly to give it some time to work through the audio stack
@@ -310,7 +310,7 @@ bool SyncTask::sync_transfer_audio_(SyncContext& sync_context) {
         // No interpolation bytes available, send main audio data
         size_t decode_bytes_written =
             sync_context.decode_buffer->transfer_data_to_sink(3 * duration_in_transfer_buffers / 2);
-        this->sync_track_sent_audio_(sync_context, decode_bytes_written);
+        this->track_sent_audio_(sync_context, decode_bytes_written);
     }
 
     // When decode buffer fully consumed and released, mark done
@@ -329,7 +329,7 @@ bool SyncTask::sync_transfer_audio_(SyncContext& sync_context) {
     return true;
 }
 
-bool SyncTask::sync_load_next_chunk_(SyncContext& sync_context) {
+bool SyncTask::load_next_chunk_(SyncContext& sync_context) {
     if (sync_context.encoded_entry == nullptr) {
         sync_context.encoded_entry = this->encoded_ring_buffer_->receive_chunk(15);
         if (sync_context.encoded_entry == nullptr) {
@@ -341,7 +341,7 @@ bool SyncTask::sync_load_next_chunk_(SyncContext& sync_context) {
     return true;
 }
 
-int32_t SyncTask::sync_soft_sync_remove_audio_(SyncContext& sync_context) {
+int32_t SyncTask::soft_sync_drop_frame_(SyncContext& sync_context) {
     // Small sync adjustment after getting slightly ahead.
     // Removes the last frame in the chunk to get in sync. The second to last frame is replaced with
     // the average of it and the removed frame to minimize audible glitches.
@@ -372,7 +372,7 @@ int32_t SyncTask::sync_soft_sync_remove_audio_(SyncContext& sync_context) {
     return 0;
 }
 
-int32_t SyncTask::sync_soft_sync_add_audio_(SyncContext& sync_context) {
+int32_t SyncTask::soft_sync_insert_frame_(SyncContext& sync_context) {
     // Small sync adjustment after getting slightly behind.
     // Adds one new frame to get in sync. The new frame is inserted between the first and second
     // frames. The new frame is the average of the first two frames in the chunk to minimize audible
@@ -409,7 +409,7 @@ int32_t SyncTask::sync_soft_sync_add_audio_(SyncContext& sync_context) {
     return 0;
 }
 
-DecodeResult SyncTask::sync_decode_audio_(SyncContext& sync_context) {
+DecodeResult SyncTask::decode_chunk_(SyncContext& sync_context) {
     if (sync_context.decode_buffer != nullptr && sync_context.decode_buffer->available() > 0) {
         // Already have decoded audio
         return DecodeResult::SUCCESS;
@@ -501,7 +501,7 @@ DecodeResult SyncTask::sync_decode_audio_(SyncContext& sync_context) {
     return DecodeResult::SUCCESS;
 }
 
-bool SyncTask::sync_idle_wait_for_header_(SyncContext& sync_context) {
+bool SyncTask::wait_for_codec_header_(SyncContext& sync_context) {
     // Wait for a codec header to arrive in the ring buffer, discarding stale audio chunks.
     // Uses a long timeout (500ms) so the task yields CPU and barely wakes when idle.
     static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 500;
@@ -524,7 +524,7 @@ bool SyncTask::sync_idle_wait_for_header_(SyncContext& sync_context) {
     return false;
 }
 
-void SyncTask::sync_drain_ring_buffer_(SyncContext& sync_context) {
+void SyncTask::drain_ring_buffer_(SyncContext& sync_context) {
     // Non-blocking drain of audio data from the ring buffer, preserving codec headers.
     // If a codec header is found, it is kept in sync_context.encoded_entry so the idle
     // wait loop can process it immediately.
@@ -543,7 +543,7 @@ void SyncTask::sync_drain_ring_buffer_(SyncContext& sync_context) {
     }
 }
 
-void SyncTask::sync_reset_context_(SyncContext& sync_context) {
+void SyncTask::reset_context_(SyncContext& sync_context) {
     // Reset SyncContext between streams without deallocating buffers.
     sync_context.encoded_entry = nullptr;
     sync_context.decoded_timestamp = 0;
@@ -568,7 +568,7 @@ void SyncTask::sync_reset_context_(SyncContext& sync_context) {
     }
 }
 
-void SyncTask::sync_process_playback_progress_(SyncContext& sync_context) {
+void SyncTask::process_playback_progress_(SyncContext& sync_context) {
     PlaybackProgress playback_progress;
     bool received = false;
     while (this->playback_progress_queue_.receive(playback_progress, 0)) {
@@ -620,7 +620,7 @@ void SyncTask::stop_() {
 // Sync task thread
 // ============================================================================
 
-void SyncTask::sync_task(void* params) {
+void SyncTask::thread_entry(void* params) {
     SyncTask* this_task = static_cast<SyncTask*>(params);
 
     this_task->event_flags_.set(EventGroupBits::TASK_STARTING);
@@ -651,11 +651,11 @@ void SyncTask::sync_task(void* params) {
                                       EventGroupBits::COMMAND_START);
         this_task->event_flags_.set(EventGroupBits::TASK_IDLE);
 
-        this_task->sync_reset_context_(sync_context);
+        this_task->reset_context_(sync_context);
         this_task->playback_progress_queue_.reset();
 
         // Wait for a codec header to arrive in the ring buffer (yields CPU with long timeout)
-        bool got_header = this_task->sync_idle_wait_for_header_(sync_context);
+        bool got_header = this_task->wait_for_codec_header_(sync_context);
 
         if (this_task->event_flags_.get() & COMMAND_STOP) {
             break;
@@ -665,7 +665,7 @@ void SyncTask::sync_task(void* params) {
             // Woke due to STREAM_END or STREAM_CLEAR during idle.
             // Only drain audio on STREAM_CLEAR; codec headers are preserved.
             if (this_task->event_flags_.get() & COMMAND_STREAM_CLEAR) {
-                this_task->sync_drain_ring_buffer_(sync_context);
+                this_task->drain_ring_buffer_(sync_context);
                 // If the drain found a codec header, treat it as if we got one
                 got_header = (sync_context.encoded_entry != nullptr);
             }
@@ -713,7 +713,7 @@ void SyncTask::sync_task(void* params) {
 
         // Decode the initial codec header
         if (sync_context.encoded_entry != nullptr) {
-            this_task->sync_decode_audio_(sync_context);
+            this_task->decode_chunk_(sync_context);
         }
 
         SyncTaskState sync_state = SyncTaskState::INITIAL_SYNC;
@@ -725,20 +725,20 @@ void SyncTask::sync_task(void* params) {
                 break;
             }
 
-            this_task->sync_process_playback_progress_(sync_context);
+            this_task->process_playback_progress_(sync_context);
 
             switch (sync_state) {
                 case SyncTaskState::INITIAL_SYNC:
-                    sync_state = this_task->sync_handle_initial_sync_(sync_context);
+                    sync_state = this_task->handle_initial_sync_(sync_context);
                     break;
                 case SyncTaskState::LOAD_CHUNK:
-                    sync_state = this_task->sync_handle_load_chunk_(sync_context);
+                    sync_state = this_task->handle_load_chunk_(sync_context);
                     break;
                 case SyncTaskState::SYNCHRONIZE_AUDIO:
-                    sync_state = this_task->sync_handle_synchronize_audio_(sync_context);
+                    sync_state = this_task->handle_synchronize_audio_(sync_context);
                     break;
                 case SyncTaskState::TRANSFER_AUDIO:
-                    sync_state = this_task->sync_handle_transfer_audio_(sync_context);
+                    sync_state = this_task->handle_transfer_audio_(sync_context);
                     break;
             }
         }

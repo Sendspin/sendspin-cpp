@@ -219,7 +219,7 @@ The `awaiting_sync_idle_events_` list is the key ordering mechanism. STREAM_END/
 
 ## Sync Task State Machine
 
-The sync task (`src/sync_task.cpp:603`) runs a two-level state machine on its dedicated thread.
+The sync task (`SyncTask::thread_entry`, `src/sync_task.cpp`) runs a two-level state machine on its dedicated thread.
 
 ### Outer Loop (per-stream lifecycle)
 
