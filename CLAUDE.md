@@ -117,7 +117,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
 - Memory: `platform_malloc`/`platform_realloc`/`platform_free` from `platform/memory.h` (not raw `heap_caps_malloc`)
 - Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer.
-- Role composition: Roles are added at runtime via `add_player()`, `add_metadata()`, etc. No compile-time feature flags in library code. The CMake option `SENDSPIN_ENABLE_PLAYER` only controls whether audio codec dependencies (micro-flac, micro-opus) are fetched and linked.
+- Role composition: Roles are added at runtime via `add_player()`, `add_metadata()`, etc. No compile-time feature flags in library code. Audio codec dependencies (micro-flac, micro-opus) are always linked.
 - Apache 2.0 license headers on all files
 
 ## Pre-commit hooks

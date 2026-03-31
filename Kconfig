@@ -5,13 +5,4 @@ menu "sendspin-cpp"
         default y
         select HTTPD_WS_SUPPORT
 
-    config SENDSPIN_CPP_ENABLE_PLAYER
-        bool "Link player audio codec libraries (micro-flac, micro-opus)"
-        default n
-        help
-            Link the micro-flac and micro-opus audio codec libraries required
-            for the player role. Disable to reduce binary size when audio
-            playback is not needed. Roles are selected at runtime via the
-            add_player() / add_metadata() / etc. API.
-
 endmenu
