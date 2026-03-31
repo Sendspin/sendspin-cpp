@@ -54,8 +54,8 @@ using SendCompleteCallback = std::function<void(bool, int64_t)>;
  *
  * Usage:
  * 1. Construct a concrete subclass (SendspinServerConnection or SendspinClientConnection)
- * 2. Set the on_connected, on_handshake_complete, on_disconnected, on_json_message, and
- *    on_binary_message callbacks
+ * 2. Set the on_connected_cb, on_handshake_complete_cb, on_disconnected_cb, on_json_message_cb,
+ *    and on_binary_message_cb callbacks
  * 3. Call start() to initialize the transport and begin connecting
  * 4. Call loop() periodically to drive the state machine and process events
  * 5. Call send_text_message() to send JSON messages to the peer
@@ -64,9 +64,9 @@ using SendCompleteCallback = std::function<void(bool, int64_t)>;
  * @code
  * // Concrete subclass provided by the platform layer
  * auto conn = std::make_unique<SendspinClientConnection>(url, config);
- * conn->on_connected = [](SendspinConnection* c) { c->send_text_message(hello_json, {}); };
- * conn->on_json_message = [](SendspinConnection* c, const std::string& msg, int64_t t) { ... };
- * conn->on_disconnected = [](SendspinConnection* c) { handle_disconnect(); };
+ * conn->on_connected_cb = [](SendspinConnection* c) { c->send_text_message(hello_json, {}); };
+ * conn->on_json_message_cb = [](SendspinConnection* c, const std::string& msg, int64_t t) { ... };
+ * conn->on_disconnected_cb = [](SendspinConnection* c) { handle_disconnect(); };
  * conn->start();
  * // Call conn->loop() from a periodic task
  * @endcode
@@ -158,29 +158,29 @@ public:
     /// @param conn Pointer to this connection.
     /// @param message The JSON message string.
     /// @param timestamp The client timestamp when the message was received.
-    std::function<void(SendspinConnection*, const std::string&, int64_t)> on_json_message;
+    std::function<void(SendspinConnection*, const std::string&, int64_t)> on_json_message_cb;
 
     /// @brief Callback invoked when a binary message is received
     /// @param conn Pointer to this connection.
     /// @param payload Pointer to the binary message data (owned by connection, valid until callback
     /// returns).
     /// @param len Length of the binary message data.
-    std::function<void(SendspinConnection*, uint8_t*, size_t)> on_binary_message;
+    std::function<void(SendspinConnection*, uint8_t*, size_t)> on_binary_message_cb;
 
     /// @brief Callback invoked when the transport connection is ready for messaging
     /// @param conn Pointer to this connection.
     /// @note For server connections, this is called when the WebSocket handshake completes.
     ///       For client connections, this is called when the connection to server succeeds.
     ///       The hub uses this to initiate the hello handshake.
-    std::function<void(SendspinConnection*)> on_connected;
+    std::function<void(SendspinConnection*)> on_connected_cb;
 
     /// @brief Callback invoked when the hello handshake completes successfully
     /// @param conn Pointer to this connection.
-    std::function<void(SendspinConnection*)> on_handshake_complete;
+    std::function<void(SendspinConnection*)> on_handshake_complete_cb;
 
     /// @brief Callback invoked when the connection is closed or lost
     /// @param conn Pointer to this connection.
-    std::function<void(SendspinConnection*)> on_disconnected;
+    std::function<void(SendspinConnection*)> on_disconnected_cb;
 
     /// @brief Converts a server timestamp to the equivalent client timestamp
     /// @param server_time Server timestamp in microseconds.
@@ -307,9 +307,9 @@ protected:
 
     /// @brief Dispatches a fully assembled message to the appropriate callback
     ///
-    /// For text messages: creates a std::string from the buffer, invokes on_json_message,
-    /// deallocates buffer. For binary messages: invokes on_binary_message callback. If the buffer
-    /// is null, does nothing.
+    /// For text messages: creates a std::string from the buffer, invokes on_json_message_cb,
+    /// deallocates buffer. For binary messages: invokes on_binary_message_cb callback. If the
+    /// buffer is null, does nothing.
     ///
     /// @param is_text True if this is a text message, false for binary.
     /// @param receive_time Timestamp when the data was received (microseconds).

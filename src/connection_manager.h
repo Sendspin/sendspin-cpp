@@ -133,9 +133,9 @@ public:
     // Event queuing (thread-safe)
     // ========================================
 
-    /// @brief Enqueues a server hello event for deferred processing in loop().
-    /// @param event The server hello event to enqueue (moved).
-    void enqueue_hello(ServerHelloEvent event);
+    /// @brief Schedules a server hello event for deferred processing in loop().
+    /// @param event The server hello event to schedule (moved).
+    void schedule_hello(ServerHelloEvent event);
 
     // ========================================
     // Handoff support

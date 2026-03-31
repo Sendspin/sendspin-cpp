@@ -218,7 +218,7 @@ public:
 private:
     /// @brief Adds the artwork role and configured channels to the hello message
     /// @param msg The hello message being assembled.
-    void contribute_hello(ClientHelloMessage& msg);
+    void build_hello_fields(ClientHelloMessage& msg);
     /// @brief Decodes the timestamp and delivers an image chunk directly to the listener
     /// @param slot Artwork slot index this image belongs to.
     /// @param data Pointer to the binary payload (8-byte big-endian timestamp followed by image

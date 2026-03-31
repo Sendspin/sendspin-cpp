@@ -130,8 +130,8 @@ void SendspinClientConnection::setup_callbacks_() {
             case ix::WebSocketMessageType::Open:
                 SS_LOGD(TAG, "WebSocket connected to %s", this->url_.c_str());
                 this->connected_ = true;
-                if (this->on_connected) {
-                    this->on_connected(this);
+                if (this->on_connected_cb) {
+                    this->on_connected_cb(this);
                 }
                 break;
 
@@ -142,8 +142,8 @@ void SendspinClientConnection::setup_callbacks_() {
                 this->server_hello_received_ = false;
                 this->pending_time_message_ = false;
                 this->reset_websocket_payload_();
-                if (this->on_disconnected) {
-                    this->on_disconnected(this);
+                if (this->on_disconnected_cb) {
+                    this->on_disconnected_cb(this);
                 }
                 break;
 
@@ -157,8 +157,8 @@ void SendspinClientConnection::setup_callbacks_() {
                     if (dest == nullptr) {
                         SS_LOGE(TAG, "Allocation failed, dropping connection");
                         this->connected_ = false;
-                        if (this->on_disconnected) {
-                            this->on_disconnected(this);
+                        if (this->on_disconnected_cb) {
+                            this->on_disconnected_cb(this);
                         }
                         return;
                     }

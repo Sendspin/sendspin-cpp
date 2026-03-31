@@ -126,7 +126,7 @@ public:
 
     /// @brief Checks if the last run ended with an error
     /// @return true if the most recent stream run encountered an error.
-    bool had_error() const {
+    bool has_error() const {
         return this->last_run_had_error_;
     }
 

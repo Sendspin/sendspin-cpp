@@ -212,7 +212,7 @@ private:
     void stop_();
     /// @brief Adds the visualizer role and support config to the hello message
     /// @param msg The hello message being assembled.
-    void contribute_hello(ClientHelloMessage& msg);
+    void build_hello_fields(ClientHelloMessage& msg);
     /// @brief Parses incoming visualizer binary frames and writes them to the ring buffer
     /// @param binary_type Protocol binary type tag identifying the frame format.
     /// @param data Pointer to the raw frame data.

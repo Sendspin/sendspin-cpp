@@ -184,9 +184,9 @@ void SendspinClientConnection::handle_connected_() {
     SS_LOGD(TAG, "WebSocket connected to %s", this->url_.c_str());
     this->connected_ = true;
 
-    // Invoke the on_connected callback if set (hub uses this to initiate hello handshake)
-    if (this->on_connected) {
-        this->on_connected(this);
+    // Invoke the on_connected_cb callback if set (hub uses this to initiate hello handshake)
+    if (this->on_connected_cb) {
+        this->on_connected_cb(this);
     }
 }
 
@@ -199,8 +199,8 @@ void SendspinClientConnection::handle_disconnected_() {
     this->reset_websocket_payload_();
 
     // Invoke the disconnected callback if set
-    if (this->on_disconnected) {
-        this->on_disconnected(this);
+    if (this->on_disconnected_cb) {
+        this->on_disconnected_cb(this);
     }
 }
 

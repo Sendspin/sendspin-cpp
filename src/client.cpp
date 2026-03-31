@@ -342,21 +342,21 @@ std::string SendspinClient::build_hello_message_() {
 
     msg.version = 1;
 
-    // Let each role contribute to the hello message
+    // Let each role add its fields to the hello message
     if (this->player_) {
-        this->player_->contribute_hello(msg);
+        this->player_->build_hello_fields(msg);
     }
     if (this->controller_) {
-        this->controller_->contribute_hello(msg);
+        this->controller_->build_hello_fields(msg);
     }
     if (this->metadata_) {
-        this->metadata_->contribute_hello(msg);
+        this->metadata_->build_hello_fields(msg);
     }
     if (this->artwork_) {
-        this->artwork_->contribute_hello(msg);
+        this->artwork_->build_hello_fields(msg);
     }
     if (this->visualizer_) {
-        this->visualizer_->contribute_hello(msg);
+        this->visualizer_->build_hello_fields(msg);
     }
 
     return format_client_hello_message(&msg);
@@ -475,7 +475,7 @@ bool SendspinClient::process_json_message_(SendspinConnection* conn, const std::
                     conn->set_connection_reason(hello_msg.connection_reason);
                     conn->set_server_hello_received(true);
 
-                    this->connection_manager_->enqueue_hello(
+                    this->connection_manager_->schedule_hello(
                         {conn, std::move(hello_msg.server), hello_msg.connection_reason});
                 }
             }
@@ -592,7 +592,7 @@ void SendspinClient::publish_client_state_(SendspinConnection* conn) {
     state_msg.state = this->state_;
 
     if (this->player_) {
-        this->player_->contribute_state(state_msg);
+        this->player_->build_state_fields(state_msg);
     }
 
     std::string state_message = format_client_state_message(&state_msg);

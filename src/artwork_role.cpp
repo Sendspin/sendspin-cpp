@@ -52,7 +52,7 @@ void ArtworkRole::add_image_preferred_format(const ImageSlotPreference& pref) {
     this->artwork_channels_.push_back({pref.source, pref.format, pref.width, pref.height});
 }
 
-void ArtworkRole::contribute_hello(ClientHelloMessage& msg) {
+void ArtworkRole::build_hello_fields(ClientHelloMessage& msg) {
     if (this->artwork_channels_.empty()) {
         return;
     }

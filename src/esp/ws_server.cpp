@@ -155,14 +155,14 @@ esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
 
     // Handle WebSocket handshake (HTTP_GET)
     if (req->method == HTTP_GET) {
-        // Find the connection and invoke its on_connected callback
+        // Find the connection and invoke its on_connected_cb callback
         int sockfd = httpd_req_to_sockfd(req);
         SendspinServerConnection* conn = nullptr;
         if (server->find_connection_callback_) {
             conn = server->find_connection_callback_(sockfd);
         }
-        if (conn != nullptr && conn->on_connected) {
-            conn->on_connected(conn);
+        if (conn != nullptr && conn->on_connected_cb) {
+            conn->on_connected_cb(conn);
         }
         return ESP_OK;
     }

@@ -197,7 +197,7 @@ public:
 private:
     /// @brief Adds the controller role to the supported roles list in the hello message
     /// @param msg The hello message being assembled.
-    void contribute_hello(ClientHelloMessage& msg);
+    void build_hello_fields(ClientHelloMessage& msg);
     /// @brief Stores an incoming server controller state update for delivery on the main thread
     /// Only the most recent update is retained; earlier pending updates are overwritten.
     /// @param state The controller state received from the server.

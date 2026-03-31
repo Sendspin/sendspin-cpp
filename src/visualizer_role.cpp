@@ -141,7 +141,7 @@ void VisualizerRole::stop_() {
     this->drain_task_->drain_thread.join();
 }
 
-void VisualizerRole::contribute_hello(ClientHelloMessage& msg) {
+void VisualizerRole::build_hello_fields(ClientHelloMessage& msg) {
     if (this->visualizer_support_.has_value()) {
         msg.supported_roles.push_back(SendspinRole::VISUALIZER);
         msg.visualizer_support = this->visualizer_support_.value();

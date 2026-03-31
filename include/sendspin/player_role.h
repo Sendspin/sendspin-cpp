@@ -353,9 +353,9 @@ private:
     /// @brief Starts the player role and registers it with the client
     bool start(bool psram_stack);
     /// @brief Adds player role information to the outgoing hello message
-    void contribute_hello(ClientHelloMessage& msg);
-    /// @brief Publishes the current player state to the active connection
-    void contribute_state(ClientStateMessage& msg);
+    void build_hello_fields(ClientHelloMessage& msg);
+    /// @brief Adds the current player state fields to an outgoing state message
+    void build_state_fields(ClientStateMessage& msg);
     /// @brief Handles an incoming binary audio chunk from the server
     void handle_binary(const uint8_t* data, size_t len);
     /// @brief Handles a stream-start message from the server

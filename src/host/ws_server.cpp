@@ -73,8 +73,8 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
                 conn->handle_message(msg->str, msg->binary, receive_time);
 
             } else if (msg->type == ix::WebSocketMessageType::Open) {
-                if (conn != nullptr && conn->on_connected) {
-                    conn->on_connected(conn);
+                if (conn != nullptr && conn->on_connected_cb) {
+                    conn->on_connected_cb(conn);
                 }
             } else if (msg->type == ix::WebSocketMessageType::Close) {
                 SS_LOGD(TAG, "Client closed connection (synthetic sockfd %d)", synthetic_sockfd);

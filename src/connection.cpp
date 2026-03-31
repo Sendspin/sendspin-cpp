@@ -141,14 +141,14 @@ void SendspinConnection::dispatch_completed_message_(bool is_text, int64_t recei
                                   this->websocket_payload_.data() + this->websocket_write_offset_);
 
         // Invoke JSON message callback
-        if (this->on_json_message) {
-            this->on_json_message(this, message, receive_time);
+        if (this->on_json_message_cb) {
+            this->on_json_message_cb(this, message, receive_time);
         }
     } else {
         // Binary message - connection retains buffer ownership, callback reads in-place
-        if (this->on_binary_message) {
-            this->on_binary_message(this, this->websocket_payload_.data(),
-                                    this->websocket_write_offset_);
+        if (this->on_binary_message_cb) {
+            this->on_binary_message_cb(this, this->websocket_payload_.data(),
+                                       this->websocket_write_offset_);
         }
     }
 

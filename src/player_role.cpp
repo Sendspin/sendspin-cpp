@@ -159,7 +159,7 @@ bool PlayerRole::start(bool psram_stack) {
     return true;
 }
 
-void PlayerRole::contribute_hello(ClientHelloMessage& msg) {
+void PlayerRole::build_hello_fields(ClientHelloMessage& msg) {
     if (this->config_.audio_formats.empty()) {
         return;
     }
@@ -176,7 +176,7 @@ void PlayerRole::contribute_hello(ClientHelloMessage& msg) {
     msg.player_v1_support = player_support;
 }
 
-void PlayerRole::contribute_state(ClientStateMessage& msg) {
+void PlayerRole::build_state_fields(ClientStateMessage& msg) {
     if (this->config_.audio_formats.empty()) {
         return;
     }

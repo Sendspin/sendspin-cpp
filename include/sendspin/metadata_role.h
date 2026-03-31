@@ -152,7 +152,7 @@ public:
 private:
     /// @brief Adds the metadata role to the supported roles list in the hello message
     /// @param msg The hello message being assembled.
-    void contribute_hello(ClientHelloMessage& msg);
+    void build_hello_fields(ClientHelloMessage& msg);
     /// @brief Merges an incoming server metadata delta into the pending shadow state
     /// @param state The metadata delta received from the server.
     void handle_server_state(ServerMetadataStateObject state);

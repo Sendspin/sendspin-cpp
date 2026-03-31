@@ -85,7 +85,7 @@ uint32_t MetadataRole::get_track_progress_ms() const {
 // Internal Helpers
 // ============================================================================
 
-void MetadataRole::contribute_hello(ClientHelloMessage& msg) {
+void MetadataRole::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::METADATA);
 }
 

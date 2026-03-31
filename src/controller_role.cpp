@@ -48,7 +48,7 @@ void ControllerRole::send_command(SendspinControllerCommand cmd, std::optional<u
 // Internal Helpers
 // ============================================================================
 
-void ControllerRole::contribute_hello(ClientHelloMessage& msg) {
+void ControllerRole::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::CONTROLLER);
 }
 

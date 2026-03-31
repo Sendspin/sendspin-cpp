@@ -49,7 +49,7 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->set_auto_reconnect(false);
 
     this->setup_connection_callbacks_(client_conn.get());
-    client_conn->on_disconnected = [this](SendspinConnection* conn) {
+    client_conn->on_disconnected_cb = [this](SendspinConnection* conn) {
         // Defer to loop(); this callback runs on IXWebSocket's internal thread
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
         this->pending_disconnect_events_.push_back(conn);
@@ -229,7 +229,7 @@ bool ConnectionManager::is_connected() const {
 // Event queuing (thread-safe)
 // ============================================================================
 
-void ConnectionManager::enqueue_hello(ServerHelloEvent event) {
+void ConnectionManager::schedule_hello(ServerHelloEvent event) {
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->pending_hello_events_.push_back(std::move(event));
 }
@@ -257,15 +257,15 @@ uint32_t ConnectionManager::fnv1_hash(const char* str) {
 // ============================================================================
 
 void ConnectionManager::setup_connection_callbacks_(SendspinConnection* conn) {
-    conn->on_connected = [this](SendspinConnection* c) { this->initiate_hello_(c); };
-    conn->on_json_message = [this](SendspinConnection* c, const std::string& message,
-                                   int64_t timestamp) {
+    conn->on_connected_cb = [this](SendspinConnection* c) { this->initiate_hello_(c); };
+    conn->on_json_message_cb = [this](SendspinConnection* c, const std::string& message,
+                                      int64_t timestamp) {
         this->client_->process_json_message_(c, message, timestamp);
     };
-    conn->on_binary_message = [this](SendspinConnection* /*c*/, uint8_t* payload, size_t len) {
+    conn->on_binary_message_cb = [this](SendspinConnection* /*c*/, uint8_t* payload, size_t len) {
         this->client_->process_binary_message_(payload, len);
     };
-    conn->on_handshake_complete = [](SendspinConnection* /*c*/) {
+    conn->on_handshake_complete_cb = [](SendspinConnection* /*c*/) {
         // Handshake completion is handled via deferred hello events in loop()
     };
 }
@@ -277,7 +277,7 @@ void ConnectionManager::on_new_connection_(std::unique_ptr<SendspinServerConnect
     conn->init_time_filter();
 
     this->setup_connection_callbacks_(conn.get());
-    conn->on_disconnected = [](SendspinConnection* /*c*/) {
+    conn->on_disconnected_cb = [](SendspinConnection* /*c*/) {
         // Cleanup happens in on_connection_lost_ triggered by the server
     };
 
