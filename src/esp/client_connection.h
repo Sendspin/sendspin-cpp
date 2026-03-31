@@ -49,7 +49,8 @@ namespace sendspin {
  * // In your main loop:
  * conn.loop();
  * // When shutting down:
- * conn.disconnect(SendspinGoodbyeReason::SHUTDOWN, []() { /* done *\/ });
+ * conn.disconnect(SendspinGoodbyeReason::SHUTDOWN, []() { // done
+ * });
  * @endcode
  */
 class SendspinClientConnection : public SendspinConnection {

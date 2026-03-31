@@ -61,8 +61,10 @@ class SendspinServerConnection;
  * ws_server.set_find_connection_callback([&](int sockfd) -> SendspinServerConnection* {
  *     return client.find_server_connection(sockfd);
  * });
- * ws_server.start(&client, /*task_stack_in_psram=*/true, /*task_priority=*/5);
-*@endcode* / class SendspinWsServer {
+ * ws_server.start(&client, true, 5);
+ * @endcode
+ */
+class SendspinWsServer {
 public:
     SendspinWsServer() = default;
     ~SendspinWsServer();
