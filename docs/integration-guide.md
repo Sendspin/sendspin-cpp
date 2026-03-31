@@ -37,7 +37,6 @@ config.name = "Living Room Speaker";            // Friendly display name
 config.product_name = "My Speaker";             // Device product name
 config.manufacturer = "My Company";             // Manufacturer name
 config.software_version = "1.0.0";              // Software version string
-config.psram_stack = false;                     // Set true on ESP32 with PSRAM
 
 SendspinClient client(std::move(config));
 ```
@@ -571,6 +570,85 @@ int main() {
     }
 }
 ```
+
+## Configuration Reference
+
+### SendspinClientConfig
+
+Main client configuration passed to the `SendspinClient` constructor.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `client_id` | `std::string` | — | Unique client identifier (e.g., MAC address) |
+| `name` | `std::string` | — | Friendly display name shown in the Sendspin UI |
+| `product_name` | `std::string` | — | Device product name |
+| `manufacturer` | `std::string` | — | Manufacturer name (e.g., `"ESPHome"`) |
+| `software_version` | `std::string` | — | Software version string |
+| `sync_task_psram_stack` | `bool` | `false` | Allocate sync/decode task stack in PSRAM (ESP-IDF only) |
+| `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
+| `visualizer_psram_stack` | `bool` | `false` | Allocate visualizer drain thread stack in PSRAM (ESP-IDF only) |
+| `sync_task_priority` | `unsigned` | `2` | FreeRTOS priority for the sync/decode task (ESP-IDF only) |
+| `httpd_priority` | `unsigned` | `17` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
+| `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |
+| `visualizer_priority` | `unsigned` | `2` | FreeRTOS priority for the visualizer drain thread (ESP-IDF only) |
+| `server_max_connections` | `uint8_t` | `2` | Maximum simultaneous WebSocket connections (default supports the handoff protocol) |
+| `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |
+| `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |
+| `time_burst_interval_ms` | `int64_t` | `10000` | Milliseconds between time sync bursts |
+| `time_burst_response_timeout_ms` | `int64_t` | `10000` | Milliseconds before a burst message times out |
+
+---
+
+### PlayerRole::Config
+
+Configuration passed to `client.add_player()`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports; advertised to the server during the hello handshake. The server selects one when establishing a stream. |
+| `audio_buffer_capacity` | `size_t` | `1000000` | Internal ring buffer size in bytes. Larger buffers absorb more jitter at the cost of memory. |
+| `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable static delay. |
+| `initial_static_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable static delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
+
+Each entry in `audio_formats` is an `AudioSupportedFormatObject`:
+
+| Field | Type | Description |
+|---|---|---|
+| `codec` | `SendspinCodecFormat` | Audio codec (`FLAC`, `OPUS`, or `PCM`) |
+| `channels` | `uint8_t` | Number of audio channels |
+| `sample_rate` | `uint32_t` | Sample rate in Hz |
+| `bit_depth` | `uint8_t` | Bits per sample |
+
+---
+
+### VisualizerRole::Config
+
+Configuration passed to `client.add_visualizer()`.
+
+| Field | Type | Description |
+|---|---|---|
+| `support` | `VisualizerSupportObject` | Visualizer capabilities advertised to the server during the hello handshake |
+
+`VisualizerSupportObject` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`) |
+| `buffer_capacity` | `size_t` | Internal buffer size for incoming visualizer frames |
+| `batch_max` | `uint8_t` | Maximum number of frames to process per drain cycle |
+| `spectrum` | `std::optional<VisualizerSpectrumConfig>` | Spectrum analysis parameters; required when `SPECTRUM` is in `types` |
+
+`VisualizerSpectrumConfig` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `n_disp_bins` | `uint8_t` | Number of frequency bins to receive |
+| `scale` | `VisualizerSpectrumScale` | Frequency scale (`MEL`, `LOG`, or `LIN`) |
+| `f_min` | `uint16_t` | Minimum frequency in Hz |
+| `f_max` | `uint16_t` | Maximum frequency in Hz |
+| `rate_max` | `uint16_t` | Maximum spectrum update rate in Hz |
+
+---
 
 ## Enums Reference
 
