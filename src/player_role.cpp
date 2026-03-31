@@ -28,7 +28,8 @@ static const char* const TAG = "sendspin.player";
 static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
 static constexpr uint16_t MAX_STATIC_DELAY_MS = 5000U;
 static constexpr uint32_t HEADER_SEND_TIMEOUT_MS = 100U;
-static constexpr size_t AUDIO_BUFFER_ADVERTISE_FRACTION = 5;  // Advertise 4/5 of capacity
+// Denominator for the advertised buffer capacity fraction: advertises (N-1)/N of capacity
+static constexpr size_t AUDIO_BUFFER_ADVERTISE_DENOMINATOR = 5;
 
 /// @brief Swaps bytes of a big-endian 64-bit value to host byte order.
 static int64_t be64_to_host(const uint8_t* bytes) {
@@ -169,7 +170,8 @@ void PlayerRole::build_hello_fields(ClientHelloMessage& msg) {
     PlayerSupportObject player_support = {
         .supported_formats = this->config_.audio_formats,
         .buffer_capacity = this->config_.audio_buffer_capacity *
-                           (AUDIO_BUFFER_ADVERTISE_FRACTION - 1) / AUDIO_BUFFER_ADVERTISE_FRACTION,
+                           (AUDIO_BUFFER_ADVERTISE_DENOMINATOR - 1) /
+                           AUDIO_BUFFER_ADVERTISE_DENOMINATOR,
         .supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE},
     };
     msg.player_v1_support = player_support;
