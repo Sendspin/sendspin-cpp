@@ -176,37 +176,39 @@ struct ServerCommandMessage {
 
 /// @brief Listener for player role events
 ///
-/// on_audio_write() is called from the sync task's background thread and must be thread-safe.
-/// All other methods fire on the main loop thread.
+/// THREAD SAFETY: on_audio_write() fires on the sync task's background thread.
+/// Implementations must be thread-safe for this method. on_stream_start(), on_stream_end(),
+/// on_stream_clear(), on_volume_changed(), on_mute_changed(), and on_static_delay_changed()
+/// fire on the main loop thread via drain_events(). The listener must outlive the role.
 class PlayerRoleListener {
 public:
     virtual ~PlayerRoleListener() = default;
 
     /// @brief Writes decoded PCM audio to the platform's audio output
     ///
-    /// Called from the sync task's background thread. May block up to timeout_ms.
+    /// Fires on the sync task's background thread. May block up to timeout_ms.
     /// @param data Pointer to the decoded PCM audio data
     /// @param length Number of bytes to write
     /// @param timeout_ms Maximum time to wait for the write to complete
     /// @return Number of bytes actually written
     virtual size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) = 0;
 
-    /// @brief Called when a new audio stream starts.
+    /// @brief Called when a new audio stream starts. Fires on the main loop thread
     virtual void on_stream_start() {}
 
-    /// @brief Called when the audio stream ends.
+    /// @brief Called when the audio stream ends. Fires on the main loop thread
     virtual void on_stream_end() {}
 
-    /// @brief Called when the audio stream is cleared.
+    /// @brief Called when the audio stream is cleared. Fires on the main loop thread
     virtual void on_stream_clear() {}
 
-    /// @brief Called when the volume is changed by the server.
+    /// @brief Called when the volume is changed by the server. Fires on the main loop thread
     virtual void on_volume_changed(uint8_t /*volume*/) {}
 
-    /// @brief Called when the mute state is changed by the server.
+    /// @brief Called when the mute state is changed by the server. Fires on the main loop thread
     virtual void on_mute_changed(bool /*muted*/) {}
 
-    /// @brief Called when the static delay is changed by the server.
+    /// @brief Called when the static delay is changed by the server. Fires on the main loop thread
     virtual void on_static_delay_changed(uint16_t /*delay_ms*/) {}
 };
 
