@@ -13,6 +13,7 @@ The library uses a small number of long-lived threads. All state mutations and u
 | **Main loop** | (caller's) | User code | - | - | Drives `SendspinClient::loop()`. All role event processing and listener callbacks run here. |
 | **Sync task** | `Sendspin` | `PlayerRole::start()` → `SyncTask::start()` | 6192 B | 2 | Decodes audio, synchronizes to server timestamps, writes PCM to the audio sink via `on_audio_write`. |
 | **Visualizer drain** | `SsVis` | `VisualizerRole::start()` | 4096 B | 2 | Reads visualization frames from a ring buffer and delivers them to the listener at the correct playback time. |
+| **Artwork drain** | `SsArt` | `ArtworkRole::start()` | 4096 B | 2 | Receives image notifications, calls decode callback, then waits for the correct timestamp to call the display callback. |
 | **Network** | (library-internal) | IXWebSocket (host) or esp_http_server (ESP) | - | - | WebSocket I/O. Callbacks fire on these threads and must defer work to the main loop. |
 
 On host builds, `platform_configure_thread()` is a no-op; threads use OS defaults. On ESP-IDF it calls `esp_pthread_set_cfg()` to set stack size, priority, name, and optional PSRAM allocation before the `std::thread` is constructed.
@@ -31,6 +32,13 @@ On host builds, `platform_configure_thread()` is a no-op; threads use OS default
 1. `VisualizerRole::start()` spawns the drain thread.
 2. The thread blocks on ring buffer receives with a 50 ms timeout.
 3. `VisualizerRole::stop_()` sets `COMMAND_STOP` and joins.
+
+**Artwork drain** (`src/artwork_role.cpp`):
+
+1. `ArtworkRole::start()` spawns the drain thread.
+2. The thread blocks on notification queue receives with a 100 ms timeout.
+3. On notification: calls `on_image_decode()` immediately, then sleeps until the server timestamp to call `on_image_display()`. Sleep is interruptible via `EventFlags`.
+4. `ArtworkRole::stop_()` sets `COMMAND_STOP` and joins.
 
 **Destruction order** matters because external audio callbacks may still reference the sync task. `PlayerRole`'s destructor resets the sync task first (`sync_task_.reset()`) before tearing down anything else, so the thread is fully joined before any shared state is destroyed.
 
@@ -55,7 +63,7 @@ TASK_ERROR           (1 << 11)  Allocation or decode failure
 TASK_IDLE            (1 << 12)  Waiting for work
 ```
 
-The sync task and visualizer drain thread both use event flags for command signaling from the main loop and status reporting back.
+The sync task, visualizer drain thread, and artwork drain thread all use event flags for command signaling from the main loop and status reporting back. The artwork and visualizer drain threads use a simpler subset: `COMMAND_STOP` and `COMMAND_FLUSH`.
 
 ### ThreadSafeQueue (`src/platform/thread_safe_queue.h`)
 
@@ -67,7 +75,8 @@ Fixed-depth FIFO queue with timed send/receive. Used to defer events from networ
 | `PlayerRole::state_queue` | 4 | `SendspinClientState` | Sync task thread | Main loop (`drain_events`) |
 | `SyncTask::playback_progress_queue_` | 50 | `PlaybackProgress` | Audio output callback | Sync task thread |
 | `Client::time_queue` | 16 | `TimeResponseEvent` | Network thread | Main loop (`loop`) |
-| `ArtworkRole::stream_end_queue` | - | `uint8_t` (dummy) | Network thread | Main loop (`drain_events`) |
+| `ArtworkRole::notify_queue` | 8 | `ArtworkNotification` | Network thread | Artwork drain thread |
+| `ArtworkRole::queue` | 8 | `EventType` | Network thread | Main loop (`drain_events`) |
 | `VisualizerRole::queue` | - | `EventType` | Network thread | Main loop (`drain_events`) |
 
 ### ShadowSlot (`src/platform/shadow_slot.h`)
@@ -81,6 +90,7 @@ Single-slot state container with "latest wins" or custom merge semantics. The ne
 | `PlayerRole::shadow_command` | `ServerCommandMessage` | Field-by-field merge (volume, mute, delay independent) |
 | `ControllerRole::shadow` | `ServerStateControllerObject` | Latest wins |
 | `MetadataRole::shadow` | `ServerMetadataStateObject` | Field-by-field delta merge |
+| `ArtworkRole::shadow_config` | `ServerArtworkStreamObject` | Latest wins |
 | `VisualizerRole::shadow_config` | `ServerVisualizerStreamObject` | Latest wins |
 
 The merge strategy for `shadow_command` is important: if a volume change and a mute change arrive between two drain ticks, both are preserved because the merge function only overwrites fields that have values in the delta.
@@ -100,6 +110,9 @@ Used for:
 - **`std::mutex`** on `SendspinTimeFilter::state_mutex_`: protects Kalman filter state (offset, drift, covariance).
 - **`std::atomic<bool>`** on `SendspinConnection::message_dispatch_enabled_`: allows the main loop to instantly suppress message delivery from the network thread.
 - **`std::atomic<bool/uint8_t/size_t>`** on `VisualizerRole`: network thread writes stream config atomically; drain thread reads it.
+- **`std::atomic<bool>`** on `ArtworkRole::stream_active_`: guards `handle_binary()` from writing when no stream is active.
+- **`std::atomic<uint8_t>`** on `ArtworkRole::SlotBuffer::write_idx`: tracks which of two double-buffers the network thread writes to next.
+- **`std::atomic<bool>`** on `ArtworkRole::SlotBuffer::drain_active`: set by the drain thread while decoding, checked by the network thread to avoid overwriting an in-use buffer.
 - **`std::atomic<uint8_t>`** on `SendspinClient::high_performance_ref_count_`: ref-counted high-performance networking requests from time sync and playback.
 
 ## Message Flow
@@ -131,9 +144,9 @@ Network thread (IXWebSocket / esp_http_server)
 | `SERVER_STATE` | Writes to `ControllerRole::shadow` and `MetadataRole::shadow` |
 | `SERVER_COMMAND` | Merges into `PlayerRole::shadow_command` |
 | `GROUP_UPDATE` | Merges into `Client::shadow_group` |
-| `STREAM_START` | Writes to `PlayerRole::shadow_stream_params`, enqueues `STREAM_START` into `stream_queue`. Writes to `VisualizerRole::shadow_config`, enqueues start event. |
+| `STREAM_START` | Writes to `PlayerRole::shadow_stream_params`, enqueues `STREAM_START` into `stream_queue`. Writes to `ArtworkRole::shadow_config` and `VisualizerRole::shadow_config`, enqueues start events. |
 | `STREAM_END` | Enqueues `STREAM_END` into player/artwork/visualizer queues, signals sync task `COMMAND_STREAM_END` |
-| `STREAM_CLEAR` | Enqueues `STREAM_CLEAR` into player/visualizer queues, signals sync task `COMMAND_STREAM_CLEAR` |
+| `STREAM_CLEAR` | Enqueues `STREAM_CLEAR` into player/artwork/visualizer queues, signals sync task `COMMAND_STREAM_CLEAR` |
 
 ### Binary Message Dispatch (network thread)
 
@@ -142,7 +155,7 @@ Network thread (IXWebSocket / esp_http_server)
 | Binary Type | Handler |
 |-------------|---------|
 | Player audio | `PlayerRole::handle_binary()`: writes to encoded audio ring buffer |
-| Artwork image | `ArtworkRole::handle_binary()`: delivers image data to listener directly on network thread |
+| Artwork image | `ArtworkRole::handle_binary()`: copies image data to a per-slot double buffer and enqueues a notification for the artwork drain thread |
 | Visualizer frame/beat | `VisualizerRole::handle_binary()`: writes to visualizer ring buffer |
 
 ### Main Loop Processing
@@ -214,7 +227,7 @@ The `awaiting_sync_idle_events_` list is the key ordering mechanism. STREAM_END/
 
 - **ControllerRole**: Takes from shadow, fires `on_controller_state()`.
 - **MetadataRole**: Takes from shadow, applies deltas, fires `on_metadata()`.
-- **ArtworkRole**: Drains `stream_end_queue`, fires `on_image(nullptr)` for each slot to signal clear.
+- **ArtworkRole**: Drains event queue, processes stream start/end/clear with shadow config. On `STREAM_END` and `STREAM_CLEAR`, fires `on_image_clear()` for each configured slot. Image data delivery (`on_image_decode` and `on_image_display`) happens on the dedicated artwork drain thread, not here.
 - **VisualizerRole**: Drains event queue, processes stream start/end/clear with shadow config.
 
 ## Sync Task State Machine

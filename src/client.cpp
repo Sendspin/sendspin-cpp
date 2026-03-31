@@ -57,6 +57,7 @@ SendspinClient::~SendspinClient() {
     // Stop background threads before tearing down connections.
     this->player_.reset();
     this->visualizer_.reset();
+    this->artwork_.reset();
     this->connection_manager_.reset();
 }
 
@@ -88,6 +89,13 @@ bool SendspinClient::start_server() {
     if (this->visualizer_) {
         if (!this->visualizer_->start(this->config_.visualizer_psram_stack,
                                       this->config_.visualizer_priority)) {
+            return false;
+        }
+    }
+
+    if (this->artwork_) {
+        if (!this->artwork_->start(this->config_.artwork_psram_stack,
+                                   this->config_.artwork_priority)) {
             return false;
         }
     }
@@ -397,6 +405,10 @@ bool SendspinClient::process_json_message_(SendspinConnection* conn, const std::
                 this->player_->handle_stream_start(stream_msg);
             }
 
+            if (this->artwork_ && stream_msg.artwork.has_value()) {
+                this->artwork_->handle_stream_start(stream_msg.artwork.value());
+            }
+
             if (this->visualizer_ && stream_msg.visualizer.has_value()) {
                 this->visualizer_->handle_stream_start(stream_msg.visualizer.value());
             }
@@ -442,23 +454,30 @@ bool SendspinClient::process_json_message_(SendspinConnection* conn, const std::
             StreamClearMessage clear_msg;
             if (process_stream_clear_message(root, &clear_msg)) {
                 bool clear_player = !clear_msg.roles.has_value();
+                bool clear_artwork = !clear_msg.roles.has_value();
                 bool clear_visualizer = !clear_msg.roles.has_value();
 
                 if (clear_msg.roles.has_value()) {
                     for (const auto& role : clear_msg.roles.value()) {
                         if (role == "player") {
                             clear_player = true;
+                        } else if (role == "artwork") {
+                            clear_artwork = true;
                         } else if (role == "visualizer") {
                             clear_visualizer = true;
                         }
                     }
                 }
 
-                SS_LOGD(TAG, "Stream clear - player:%d visualizer:%d", clear_player,
-                        clear_visualizer);
+                SS_LOGD(TAG, "Stream clear - player:%d artwork:%d visualizer:%d", clear_player,
+                        clear_artwork, clear_visualizer);
 
                 if (this->player_ && clear_player) {
                     this->player_->handle_stream_clear();
+                }
+
+                if (this->artwork_ && clear_artwork) {
+                    this->artwork_->handle_stream_clear();
                 }
 
                 if (this->visualizer_ && clear_visualizer) {

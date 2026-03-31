@@ -254,18 +254,32 @@ struct MyControllerListener : ControllerRoleListener {
 
 ### ArtworkRoleListener
 
+The artwork role uses a dedicated drain thread with two-phase delivery: `on_image_decode()` fires immediately when encoded image data arrives (for decoding), then `on_image_display()` fires at the correct server timestamp (for synchronized display). Lifecycle callbacks fire on the main loop thread.
+
 ```cpp
 struct MyArtworkListener : ArtworkRoleListener {
-    // THREAD SAFETY: Called from the network thread (data != nullptr) and the
-    // main loop thread (data == nullptr for clears). Must be thread-safe.
-    void on_image(uint8_t slot, const uint8_t* data, size_t length,
-                  SendspinImageFormat format, int64_t timestamp) override {
-        if (data == nullptr) {
-            clear_artwork(slot);
-        } else {
-            display_artwork(slot, data, length, format);
-        }
+    // THREAD SAFETY: Called from a dedicated drain thread.
+    // Decode the encoded image synchronously (e.g., JPEG to bitmap).
+    // The data pointer is valid for the duration of this call.
+    void on_image_decode(uint8_t slot, const uint8_t* data, size_t length,
+                         SendspinImageFormat format) override {
+        decoded_images[slot] = decode_image(data, length, format);
     }
+
+    // Called from the drain thread at the correct playback timestamp.
+    // Swap the decoded image onto the display.
+    void on_image_display(uint8_t slot, int64_t client_timestamp) override {
+        display.show_image(slot, decoded_images[slot]);
+    }
+
+    // Called from the main loop thread when artwork should be cleared.
+    void on_image_clear(uint8_t slot) override {
+        display.clear_slot(slot);
+    }
+
+    // Called from the main loop thread on stream lifecycle events.
+    void on_artwork_stream_start(const ServerArtworkStreamObject& stream) override { }
+    void on_artwork_stream_end() override { }
 };
 ```
 
@@ -520,9 +534,10 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 | Callback | Thread |
 |---|---|
 | `PlayerRoleListener::on_audio_write()` | Sync task background thread |
-| `ArtworkRoleListener::on_image()` | Network thread (data received) or main loop thread (clears) |
-| `VisualizerRoleListener::on_visualizer_frame()` | Dedicated drain thread |
-| `VisualizerRoleListener::on_beat()` | Dedicated drain thread |
+| `ArtworkRoleListener::on_image_decode()` | Dedicated artwork drain thread |
+| `ArtworkRoleListener::on_image_display()` | Dedicated artwork drain thread |
+| `VisualizerRoleListener::on_visualizer_frame()` | Dedicated visualizer drain thread |
+| `VisualizerRoleListener::on_beat()` | Dedicated visualizer drain thread |
 | All other listener methods | Main loop thread |
 
 `PlayerRole::notify_audio_played()` is thread-safe and is designed to be called from an audio output callback thread.
@@ -587,10 +602,12 @@ Main client configuration passed to the `SendspinClient` constructor.
 | `sync_task_psram_stack` | `bool` | `false` | Allocate sync/decode task stack in PSRAM (ESP-IDF only) |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `visualizer_psram_stack` | `bool` | `false` | Allocate visualizer drain thread stack in PSRAM (ESP-IDF only) |
+| `artwork_psram_stack` | `bool` | `false` | Allocate artwork drain thread stack in PSRAM (ESP-IDF only) |
 | `sync_task_priority` | `unsigned` | `2` | FreeRTOS priority for the sync/decode task (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `17` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |
 | `visualizer_priority` | `unsigned` | `2` | FreeRTOS priority for the visualizer drain thread (ESP-IDF only) |
+| `artwork_priority` | `unsigned` | `2` | FreeRTOS priority for the artwork drain thread (ESP-IDF only) |
 | `server_max_connections` | `uint8_t` | `2` | Maximum simultaneous WebSocket connections (default supports the handoff protocol) |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |
 | `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |

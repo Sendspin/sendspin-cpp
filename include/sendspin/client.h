@@ -129,12 +129,16 @@ struct SendspinClientConfig {
     bool httpd_psram_stack{false};       ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
     bool visualizer_psram_stack{false};  ///< Allocate visualizer drain thread stack in PSRAM
                                          ///< (ESP-IDF only)
+    bool artwork_psram_stack{false};     ///< Allocate artwork drain thread stack in PSRAM
+                                         ///< (ESP-IDF only)
 
     unsigned sync_task_priority{2};   ///< FreeRTOS priority for the sync/decode task (ESP-IDF only)
     unsigned httpd_priority{17};      ///< FreeRTOS priority for the HTTP server task (ESP-IDF only)
     unsigned websocket_priority{5};   ///< FreeRTOS priority for the WebSocket client task
                                       ///< (ESP-IDF only)
     unsigned visualizer_priority{2};  ///< FreeRTOS priority for the visualizer drain thread
+                                      ///< (ESP-IDF only)
+    unsigned artwork_priority{2};     ///< FreeRTOS priority for the artwork drain thread
                                       ///< (ESP-IDF only)
 
     uint8_t server_max_connections{2};  ///< Maximum simultaneous connections (default: 2 for

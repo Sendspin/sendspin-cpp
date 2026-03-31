@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -143,43 +144,73 @@ struct ImageSlotPreference {
 
 /// @brief Listener for artwork role events
 ///
-/// THREAD SAFETY: on_image() is called from two different contexts:
-/// - From the network thread when image data is received (data != nullptr)
-/// - From the main loop thread when images are cleared (data == nullptr)
-/// Implementations must be thread-safe.
+/// THREAD SAFETY: on_image_decode() and on_image_display() fire on a dedicated drain thread.
+/// Implementations must be thread-safe for these two methods. on_image_clear(),
+/// on_artwork_stream_start(), and on_artwork_stream_end() fire on the main loop thread.
 class ArtworkRoleListener {
 public:
     virtual ~ArtworkRoleListener() = default;
 
-    /// @brief Called when an image is received or cleared
+    /// @brief Called on the drain thread when encoded image data arrives
+    ///
+    /// The implementation should decode the image (e.g., JPEG to bitmap) synchronously.
+    /// The data pointer is valid for the duration of this call.
     /// @param slot The artwork slot index.
-    /// @param data Image data, or nullptr for clears.
-    /// @param length Length of image data in bytes.
-    /// @param format Image format.
-    /// @param timestamp Server timestamp (0 for clears).
-    virtual void on_image(uint8_t /*slot*/, const uint8_t* /*data*/, size_t /*length*/,
-                          SendspinImageFormat /*format*/, int64_t /*timestamp*/) {}
+    /// @param data Pointer to the encoded image data.
+    /// @param length Length of the encoded image data in bytes.
+    /// @param format Image format (JPEG, PNG, BMP).
+    virtual void on_image_decode(uint8_t /*slot*/, const uint8_t* /*data*/, size_t /*length*/,
+                                 SendspinImageFormat /*format*/) {}
+
+    /// @brief Called on the drain thread at the correct timestamp when the decoded image should be
+    /// displayed
+    ///
+    /// Fires after on_image_decode() once the server timestamp is reached.
+    /// @param slot The artwork slot index.
+    /// @param client_timestamp Client-domain timestamp in microseconds.
+    virtual void on_image_display(uint8_t /*slot*/, int64_t /*client_timestamp*/) {}
+
+    /// @brief Called on the main loop thread when artwork should be cleared for a slot
+    ///
+    /// Fires on stream end or stream clear for each configured slot.
+    /// @param slot The artwork slot index to clear.
+    virtual void on_image_clear(uint8_t /*slot*/) {}
+
+    /// @brief Called on the main loop thread when a new artwork stream starts
+    /// @param stream Artwork stream parameters from the server.
+    virtual void on_artwork_stream_start(const ServerArtworkStreamObject& /*stream*/) {}
+
+    /// @brief Called on the main loop thread when the artwork stream ends
+    virtual void on_artwork_stream_end() {}
 };
 
 /**
  * @brief Artwork role that receives album art and artist images from the server
  *
  * Receives binary image payloads from the server and delivers them to the platform
- * through the ArtworkRoleListener::on_image() callback, timestamped for synchronized
- * display. Supports multiple image slots with configurable format and resolution preferences.
+ * through ArtworkRoleListener callbacks. A dedicated drain thread handles two-phase
+ * delivery: on_image_decode() fires immediately when data arrives for decoding, then
+ * on_image_display() fires at the correct timestamp for synchronized display. Lifecycle
+ * callbacks fire on the main loop thread. Supports multiple image slots with configurable
+ * format and resolution preferences.
  *
  * Usage:
- * 1. Implement ArtworkRoleListener with at minimum on_image()
+ * 1. Implement ArtworkRoleListener with on_image_decode() and on_image_display()
  * 2. Add the role to the client via SendspinClient::add_artwork()
  * 3. Call add_image_preferred_format() for each slot/format/resolution desired
  * 4. Call set_listener() with your listener implementation
  *
  * @code
  * struct MyArtworkListener : ArtworkRoleListener {
- *     void on_image(uint8_t slot, const uint8_t* data, size_t length,
- *                   SendspinImageFormat format, int64_t timestamp) override {
- *         if (data) display.show_image(slot, data, length, format);
- *         else display.clear_slot(slot);
+ *     void on_image_decode(uint8_t slot, const uint8_t* data, size_t length,
+ *                          SendspinImageFormat format) override {
+ *         decoded_images[slot] = decode(data, length, format);
+ *     }
+ *     void on_image_display(uint8_t slot, int64_t client_timestamp) override {
+ *         display.show_image(slot, decoded_images[slot]);
+ *     }
+ *     void on_image_clear(uint8_t slot) override {
+ *         display.clear_slot(slot);
  *     }
  * };
  *
@@ -216,22 +247,47 @@ public:
     void add_image_preferred_format(const ImageSlotPreference& pref);
 
 private:
+    /// @brief Deferred artwork event types
+    enum class EventType : uint8_t {
+        STREAM_START,
+        STREAM_END,
+        STREAM_CLEAR,
+    };
+
+    /// @brief Starts the drain thread
+    /// @param psram_stack Whether to allocate the drain thread stack in PSRAM (ESP-IDF only).
+    /// @param priority FreeRTOS task priority for the drain thread (ESP-IDF only).
+    /// @return True if the thread is running, false on failure.
+    bool start(bool psram_stack, unsigned priority);
+    /// @brief Signals the drain thread to stop and waits for it to exit
+    void stop_();
     /// @brief Adds the artwork role and configured channels to the hello message
     /// @param msg The hello message being assembled.
     void build_hello_fields(ClientHelloMessage& msg);
-    /// @brief Decodes the timestamp and delivers an image chunk directly to the listener
+    /// @brief Copies image data to a per-slot buffer and signals the drain thread
     /// @param slot Artwork slot index this image belongs to.
     /// @param data Pointer to the binary payload (8-byte big-endian timestamp followed by image
     /// data).
     /// @param len Length of the binary payload in bytes.
     void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
-    /// @brief Enqueues a stream-end event to be delivered on the main thread
+    /// @brief Caches stream config, signals the drain thread to flush, and enqueues a start event
+    /// @param stream Stream parameters received from the server.
+    void handle_stream_start(const ServerArtworkStreamObject& stream);
+    /// @brief Marks the stream inactive, flushes the drain thread, and enqueues a stream-end event
     void handle_stream_end();
-    /// @brief Sends null images to the listener for each configured slot to signal stream end
+    /// @brief Marks the stream inactive, flushes the drain thread, and enqueues a stream-clear
+    /// event
+    void handle_stream_clear();
+    /// @brief Delivers pending stream lifecycle events (start, end, clear) to the listener
     void drain_events();
-    /// @brief Resets pending events and enqueues a stream-end to clear all slots on next drain
+    /// @brief Resets pending events, flushes the drain thread, and enqueues a stream-end event
     void cleanup();
 
+    /// @brief Entry point for the drain thread; processes image decode and display callbacks
+    /// @param self The ArtworkRole instance that owns this thread.
+    static void drain_thread_func_(ArtworkRole* self);
+
+    struct DrainTask;
     struct EventState;
 
     // Struct fields
@@ -240,8 +296,12 @@ private:
 
     // Pointer fields
     SendspinClient* client_;
+    std::unique_ptr<DrainTask> drain_task_;
     std::unique_ptr<EventState> event_state_;
     ArtworkRoleListener* listener_{nullptr};
+
+    // 8-bit fields
+    std::atomic<bool> stream_active_{false};
 };
 
 }  // namespace sendspin
