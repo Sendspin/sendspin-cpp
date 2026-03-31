@@ -105,7 +105,6 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 ## Build
 
 - **ESP-IDF**: Used as an IDF component via `idf_component.yml`. Sources defined in `cmake/sources.cmake`.
-- **PlatformIO**: Via `library.json`
 - **Host (CMake)**: `cmake -B build && cmake --build build`. Fetches dependencies (ArduinoJson, micro-flac, micro-opus, IXWebSocket) via FetchContent.
 - **ESP dependencies**: ArduinoJson, esp_websocket_client, micro-flac, micro-opus, esp_http_server, mbedtls, pthread, esp_ringbuf
 - **Host dependencies**: ArduinoJson, micro-flac, micro-opus, IXWebSocket, pthreads
