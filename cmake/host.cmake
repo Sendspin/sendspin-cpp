@@ -99,4 +99,18 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     find_package(Threads REQUIRED)
     target_link_libraries(${TARGET_LIB} PRIVATE Threads::Threads)
 
+    # =========================================================================
+    # clang-tidy integration (opt-in via -DENABLE_CLANG_TIDY=ON)
+    # Set only on this target so _deps are never analyzed.
+    # =========================================================================
+    option(ENABLE_CLANG_TIDY "Enable clang-tidy static analysis" OFF)
+    if(ENABLE_CLANG_TIDY)
+        find_program(CLANG_TIDY_EXE
+            NAMES clang-tidy clang-tidy-18 clang-tidy-17 clang-tidy-16
+            HINTS /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin
+            REQUIRED
+        )
+        set_target_properties(${TARGET_LIB} PROPERTIES CXX_CLANG_TIDY "${CLANG_TIDY_EXE}")
+    endif()
+
 endfunction()

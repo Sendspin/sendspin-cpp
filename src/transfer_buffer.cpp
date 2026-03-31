@@ -25,13 +25,13 @@ namespace sendspin {
 // ============================================================================
 
 TransferBuffer::~TransferBuffer() {
-    this->deallocate_buffer_();
+    this->deallocate_buffer();
 }
 
 std::unique_ptr<TransferBuffer> TransferBuffer::create(size_t buffer_size) {
     std::unique_ptr<TransferBuffer> buffer(new TransferBuffer());
 
-    if (!buffer->allocate_buffer_(buffer_size)) {
+    if (!buffer->allocate_buffer(buffer_size)) {
         return nullptr;
     }
 
@@ -76,7 +76,7 @@ void TransferBuffer::increase_buffer_length(size_t bytes) {
 
 bool TransferBuffer::reallocate(size_t new_buffer_size) {
     if (!this->buffer_) {
-        return this->allocate_buffer_(new_buffer_size);
+        return this->allocate_buffer(new_buffer_size);
     }
 
     if (new_buffer_size < this->buffer_length_) {
@@ -101,7 +101,7 @@ bool TransferBuffer::reallocate(size_t new_buffer_size) {
 // Private helpers
 // ============================================================================
 
-bool TransferBuffer::allocate_buffer_(size_t buffer_size) {
+bool TransferBuffer::allocate_buffer(size_t buffer_size) {
     if (!this->buffer_.allocate(buffer_size)) {
         return false;
     }
@@ -111,7 +111,7 @@ bool TransferBuffer::allocate_buffer_(size_t buffer_size) {
     return true;
 }
 
-void TransferBuffer::deallocate_buffer_() {
+void TransferBuffer::deallocate_buffer() {
     this->buffer_.reset();
     this->data_start_ = nullptr;
     this->buffer_length_ = 0;

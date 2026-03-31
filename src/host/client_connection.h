@@ -92,7 +92,7 @@ public:
 protected:
     /// @brief Registers the IXWebSocket message callback to handle open, close, data, and error
     /// events
-    void setup_callbacks_();
+    void setup_callbacks();
 
     // ========================================
     // Member variables
@@ -113,8 +113,10 @@ protected:
     /// @brief Monotonic timestamp (ms) of the last reconnection attempt
     uint32_t last_reconnect_attempt_{0};
 
+    static constexpr uint32_t DEFAULT_RECONNECT_INTERVAL_MS = 5000U;
+
     /// @brief Delay in milliseconds between reconnection attempts
-    uint32_t reconnect_interval_ms_{5000};
+    uint32_t reconnect_interval_ms_{DEFAULT_RECONNECT_INTERVAL_MS};
 
     // 8-bit fields
 

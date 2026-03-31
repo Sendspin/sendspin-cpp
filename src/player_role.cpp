@@ -25,7 +25,10 @@
 static const char* const TAG = "sendspin.player";
 
 /// @brief Size of the big-endian 64-bit timestamp at the start of player binary messages.
-static const size_t BINARY_TIMESTAMP_SIZE = 8;
+static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
+static constexpr uint16_t MAX_STATIC_DELAY_MS = 5000U;
+static constexpr uint32_t HEADER_SEND_TIMEOUT_MS = 100U;
+static constexpr size_t AUDIO_BUFFER_ADVERTISE_FRACTION = 5;  // Advertise 4/5 of capacity
 
 /// @brief Swaps bytes of a big-endian 64-bit value to host byte order.
 static int64_t be64_to_host(const uint8_t* bytes) {
@@ -120,11 +123,11 @@ void PlayerRole::update_muted(bool muted) {
 }
 
 void PlayerRole::update_static_delay(uint16_t delay_ms) {
-    if (delay_ms > 5000) {
-        delay_ms = 5000;
+    if (delay_ms > MAX_STATIC_DELAY_MS) {
+        delay_ms = MAX_STATIC_DELAY_MS;
     }
     this->static_delay_ms_ = delay_ms;
-    this->persist_static_delay_();
+    this->persist_static_delay();
     this->client_->publish_state();
 }
 
@@ -138,7 +141,7 @@ void PlayerRole::set_static_delay_adjustable(bool adjustable) {
 // ============================================================================
 
 bool PlayerRole::start(bool psram_stack, unsigned priority) {
-    this->load_static_delay_();
+    this->load_static_delay();
 
     if (!this->config_.audio_formats.empty() && this->listener_ &&
         !this->sync_task_->is_initialized()) {
@@ -165,18 +168,19 @@ void PlayerRole::build_hello_fields(ClientHelloMessage& msg) {
     // and rapid stop/start scenarios
     PlayerSupportObject player_support = {
         .supported_formats = this->config_.audio_formats,
-        .buffer_capacity = this->config_.audio_buffer_capacity * 4 / 5,
+        .buffer_capacity = this->config_.audio_buffer_capacity *
+                           (AUDIO_BUFFER_ADVERTISE_FRACTION - 1) / AUDIO_BUFFER_ADVERTISE_FRACTION,
         .supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE},
     };
     msg.player_v1_support = player_support;
 }
 
-void PlayerRole::build_state_fields(ClientStateMessage& msg) {
+void PlayerRole::build_state_fields(ClientStateMessage& msg) const {
     if (this->config_.audio_formats.empty()) {
         return;
     }
 
-    ClientPlayerStateObject player_state;
+    ClientPlayerStateObject player_state{};
     player_state.volume = this->volume_;
     player_state.muted = this->muted_;
     player_state.static_delay_ms = this->static_delay_ms_;
@@ -195,8 +199,8 @@ void PlayerRole::handle_binary(const uint8_t* data, size_t len) {
         return;
     }
     int64_t timestamp = be64_to_host(data);
-    if (!this->send_audio_chunk_(data + BINARY_TIMESTAMP_SIZE, len - BINARY_TIMESTAMP_SIZE,
-                                 timestamp, CHUNK_TYPE_ENCODED_AUDIO, 0)) {
+    if (!this->send_audio_chunk(data + BINARY_TIMESTAMP_SIZE, len - BINARY_TIMESTAMP_SIZE,
+                                timestamp, CHUNK_TYPE_ENCODED_AUDIO, 0)) {
         SS_LOGW(TAG, "Failed to send audio chunk");
     }
 }
@@ -227,7 +231,7 @@ void PlayerRole::handle_stream_start(const StreamStartMessage& stream_msg) {
         bool header_sent = false;
 
         if ((codec == SendspinCodecFormat::PCM) || (codec == SendspinCodecFormat::OPUS)) {
-            DummyHeader header;
+            DummyHeader header{};
             header.sample_rate = player_obj.sample_rate.value();
             header.bits_per_sample = player_obj.bit_depth.value();
             header.channels = player_obj.channels.value();
@@ -236,16 +240,17 @@ void PlayerRole::handle_stream_start(const StreamStartMessage& stream_msg) {
                                        ? CHUNK_TYPE_PCM_DUMMY_HEADER
                                        : CHUNK_TYPE_OPUS_DUMMY_HEADER;
 
-            header_sent = this->send_audio_chunk_(reinterpret_cast<const uint8_t*>(&header),
-                                                  sizeof(DummyHeader), 0, chunk_type, 100);
+            header_sent =
+                this->send_audio_chunk(reinterpret_cast<const uint8_t*>(&header),
+                                       sizeof(DummyHeader), 0, chunk_type, HEADER_SEND_TIMEOUT_MS);
         } else if (codec == SendspinCodecFormat::FLAC) {
             if (!player_obj.codec_header.has_value()) {
                 SS_LOGE(TAG, "FLAC codec header missing");
                 return;
             }
             std::vector<uint8_t> flac_header = base64_decode(player_obj.codec_header.value());
-            header_sent = this->send_audio_chunk_(flac_header.data(), flac_header.size(), 0,
-                                                  CHUNK_TYPE_FLAC_HEADER, 100);
+            header_sent = this->send_audio_chunk(flac_header.data(), flac_header.size(), 0,
+                                                 CHUNK_TYPE_FLAC_HEADER, HEADER_SEND_TIMEOUT_MS);
         }
 
         if (!header_sent) {
@@ -285,7 +290,7 @@ void PlayerRole::handle_server_command(const ServerCommandMessage& cmd) {
                 return;
             }
             if (!current.player.has_value()) {
-                current.player = std::move(delta.player);
+                current.player = delta.player;
                 return;
             }
             // Overlay individual optional fields so different command types
@@ -307,7 +312,7 @@ void PlayerRole::handle_server_command(const ServerCommandMessage& cmd) {
 
 void PlayerRole::drain_events() {
     // --- Client state events (from sync task) ---
-    SendspinClientState state;
+    SendspinClientState state{};
     SendspinClientState last_state{};
     bool has_state = false;
     while (this->event_state_->state_queue.receive(state, 0)) {
@@ -321,7 +326,7 @@ void PlayerRole::drain_events() {
     // --- Server command events (volume, mute, static delay) ---
     // Check each field independently since multiple command types may have been
     // merged into one shadow slot between drain ticks.
-    ServerCommandMessage cmd_msg;
+    ServerCommandMessage cmd_msg{};
     if (this->event_state_->shadow_command.take(cmd_msg)) {
         if (cmd_msg.player.has_value()) {
             const ServerPlayerCommandObject& player_cmd = cmd_msg.player.value();
@@ -350,7 +355,7 @@ void PlayerRole::drain_events() {
     }
 
     // --- Stream lifecycle callback events ---
-    StreamCallbackType stream_event;
+    StreamCallbackType stream_event{};
     while (this->event_state_->stream_queue.receive(stream_event, 0)) {
         this->awaiting_sync_idle_events_.push_back(stream_event);
     }
@@ -431,21 +436,21 @@ void PlayerRole::cleanup() {
 // Helpers
 // ============================================================================
 
-bool PlayerRole::send_audio_chunk_(const uint8_t* data, size_t data_size, int64_t timestamp,
-                                   ChunkType chunk_type, uint32_t timeout_ms) {
+bool PlayerRole::send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
+                                  ChunkType chunk_type, uint32_t timeout_ms) {
     if (data == nullptr || data_size == 0) {
-        SS_LOGE(TAG, "Invalid data passed to send_audio_chunk_");
+        SS_LOGE(TAG, "Invalid data passed to send_audio_chunk");
         return false;
     }
 
     return this->sync_task_->write_audio_chunk(data, data_size, timestamp, chunk_type, timeout_ms);
 }
 
-void PlayerRole::enqueue_state_update_(SendspinClientState state) {
+void PlayerRole::enqueue_state_update(SendspinClientState state) {
     this->event_state_->state_queue.send(state, 0);
 }
 
-void PlayerRole::load_static_delay_() {
+void PlayerRole::load_static_delay() {
     if (!this->persistence_) {
         // No persistence provider - use initial value from config
         if (this->config_.initial_static_delay_ms > 0) {
@@ -457,7 +462,7 @@ void PlayerRole::load_static_delay_() {
 
     auto delay = this->persistence_->load_static_delay();
     if (delay.has_value()) {
-        if (delay.value() <= 5000) {
+        if (delay.value() <= MAX_STATIC_DELAY_MS) {
             this->static_delay_ms_ = delay.value();
             SS_LOGI(TAG, "Loaded static delay: %u ms", this->static_delay_ms_);
         } else {
@@ -469,7 +474,7 @@ void PlayerRole::load_static_delay_() {
     }
 }
 
-void PlayerRole::persist_static_delay_() {
+void PlayerRole::persist_static_delay() {
     if (this->persistence_) {
         if (this->persistence_->save_static_delay(this->static_delay_ms_)) {
             SS_LOGD(TAG, "Persisted static delay: %u ms", this->static_delay_ms_);

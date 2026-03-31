@@ -35,7 +35,7 @@ struct ClientHelloMessage;
 // ============================================================================
 
 /// @brief Image format for artwork
-enum class SendspinImageFormat {
+enum class SendspinImageFormat : uint8_t {
     JPEG,  // JPEG compressed image
     PNG,   // PNG image
     BMP,   // BMP image
@@ -55,17 +55,20 @@ inline const char* to_cstr(SendspinImageFormat format) {
 }
 
 inline std::optional<SendspinImageFormat> image_format_from_string(const std::string& str) {
-    if (str == "jpeg")
+    if (str == "jpeg") {
         return SendspinImageFormat::JPEG;
-    if (str == "png")
+    }
+    if (str == "png") {
         return SendspinImageFormat::PNG;
-    if (str == "bmp")
+    }
+    if (str == "bmp") {
         return SendspinImageFormat::BMP;
+    }
     return std::nullopt;
 }
 
 /// @brief Source type for an artwork image
-enum class SendspinImageSource {
+enum class SendspinImageSource : uint8_t {
     ALBUM,   // Album cover art
     ARTIST,  // Artist photo
     NONE,    // No image
@@ -84,21 +87,24 @@ inline const char* to_cstr(SendspinImageSource source) {
 }
 
 inline std::optional<SendspinImageSource> image_source_from_string(const std::string& str) {
-    if (str == "album")
+    if (str == "album") {
         return SendspinImageSource::ALBUM;
-    if (str == "artist")
+    }
+    if (str == "artist") {
         return SendspinImageSource::ARTIST;
-    if (str == "none")
+    }
+    if (str == "none") {
         return SendspinImageSource::NONE;
+    }
     return std::nullopt;
 }
 
 /// @brief Format and resolution for a single supported artwork channel
 struct ArtworkChannelFormatObject {
-    SendspinImageSource source;
-    SendspinImageFormat format;
-    uint16_t media_width;
-    uint16_t media_height;
+    SendspinImageSource source{};
+    SendspinImageFormat format{};
+    uint16_t media_width{};
+    uint16_t media_height{};
 };
 
 /// @brief Artwork capabilities advertised to the server during the hello handshake
@@ -126,7 +132,7 @@ struct ServerArtworkStreamObject {
 
 /// @brief Client request for a specific artwork channel format, sent in stream/request_format
 struct ClientArtworkRequestObject {
-    uint8_t channel;
+    uint8_t channel{};
     std::optional<SendspinImageSource> source;
     std::optional<SendspinImageFormat> format;
     std::optional<uint16_t> media_width;
@@ -135,11 +141,11 @@ struct ClientArtworkRequestObject {
 
 /// @brief Preference for an image slot's format and resolution
 struct ImageSlotPreference {
-    uint8_t slot;
-    SendspinImageSource source;
-    SendspinImageFormat format;
-    uint16_t width;
-    uint16_t height;
+    uint8_t slot{};
+    SendspinImageSource source{};
+    SendspinImageFormat format{};
+    uint16_t width{};
+    uint16_t height{};
 };
 
 /// @brief Listener for artwork role events
@@ -228,7 +234,7 @@ class ArtworkRole {
 public:
     /// @brief Configuration for the artwork role
     struct Config {
-        std::vector<ImageSlotPreference> preferred_formats;
+        std::vector<ImageSlotPreference> preferred_formats{};
     };
 
     ArtworkRole(Config config, SendspinClient* client);
@@ -255,7 +261,7 @@ private:
     /// @return True if the thread is running, false on failure.
     bool start(bool psram_stack, unsigned priority);
     /// @brief Signals the drain thread to stop and waits for it to exit
-    void stop_();
+    void stop();
     /// @brief Adds the artwork role and configured channels to the hello message
     /// @param msg The hello message being assembled.
     void build_hello_fields(ClientHelloMessage& msg);
@@ -280,7 +286,7 @@ private:
 
     /// @brief Entry point for the drain thread; processes image decode and display callbacks
     /// @param self The ArtworkRole instance that owns this thread.
-    static void drain_thread_func_(ArtworkRole* self);
+    static void drain_thread_func(ArtworkRole* self);
 
     struct DrainTask;
     struct EventState;

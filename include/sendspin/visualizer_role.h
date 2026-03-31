@@ -93,25 +93,25 @@ struct VisualizerSpectrumConfig {
 
 /// @brief Visualizer capabilities advertised to the server during the hello handshake
 struct VisualizerSupportObject {
-    std::vector<VisualizerDataType> types;
-    size_t buffer_capacity;
-    uint8_t batch_max;
+    std::vector<VisualizerDataType> types{};
+    size_t buffer_capacity{};
+    uint8_t batch_max{};
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 
 /// @brief Visualizer stream parameters sent by the server in stream/start messages
 struct ServerVisualizerStreamObject {
-    std::vector<VisualizerDataType> types;
-    uint8_t batch_max;
+    std::vector<VisualizerDataType> types{};
+    uint8_t batch_max{};
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 
 /// @brief A parsed visualizer frame with client-domain timestamp
 struct VisualizerFrame {
-    int64_t timestamp;  ///< Client timestamp in microseconds
+    int64_t timestamp{};  ///< Client timestamp in microseconds
     std::optional<uint16_t> loudness;
     std::optional<uint16_t> peak_freq;
-    std::vector<uint16_t> spectrum;
+    std::vector<uint16_t> spectrum{};
 };
 
 /// @brief Listener for visualizer role events
@@ -205,7 +205,7 @@ private:
     /// @return True if the thread is running, false if the ring buffer is not initialized.
     bool start(bool psram_stack, unsigned priority);
     /// @brief Signals the drain thread to stop and waits for it to exit
-    void stop_();
+    void stop();
     /// @brief Adds the visualizer role and support config to the hello message
     /// @param msg The hello message being assembled.
     void build_hello_fields(ClientHelloMessage& msg);
@@ -227,11 +227,11 @@ private:
     /// @brief Resets pending events, flushes the ring buffer, and enqueues a stream-end event
     void cleanup();
     /// @brief Drains all pending items from the ring buffer without delivering them
-    void flush_ring_buffer_();
+    void flush_ring_buffer();
 
     /// @brief Entry point for the drain thread; reads ring buffer items and calls the listener
     /// @param self The VisualizerRole instance that owns this thread.
-    static void drain_thread_func_(VisualizerRole* self);
+    static void drain_thread_func(VisualizerRole* self);
 
     struct DrainTask;
     struct EventState;

@@ -39,6 +39,12 @@ static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
 /// @brief Maximum number of artwork slots (2-bit slot field in protocol binary type byte)
 static constexpr size_t MAX_SLOTS = 4;
 
+/// @brief Timeout for blocking queue receive in drain thread (allows periodic command checks)
+static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 100U;
+
+/// @brief Microseconds per millisecond (unit conversion constant)
+static constexpr int64_t US_PER_MS = 1000LL;
+
 // Event flag bits for drain thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
 static constexpr uint32_t COMMAND_FLUSH = (1 << 1);
@@ -118,7 +124,7 @@ ArtworkRole::ArtworkRole(Config config, SendspinClient* client)
 }
 
 ArtworkRole::~ArtworkRole() {
-    this->stop_();
+    this->stop();
 }
 
 bool ArtworkRole::start(bool psram_stack, unsigned priority) {
@@ -133,11 +139,11 @@ bool ArtworkRole::start(bool psram_stack, unsigned priority) {
     }
 
     platform_configure_thread("SsArt", 4096, static_cast<int>(priority), psram_stack);
-    this->drain_task_->drain_thread = std::thread(drain_thread_func_, this);
+    this->drain_task_->drain_thread = std::thread(drain_thread_func, this);
     return true;
 }
 
-void ArtworkRole::stop_() {
+void ArtworkRole::stop() {
     if (!this->drain_task_ || !this->drain_task_->drain_thread.joinable()) {
         return;
     }
@@ -151,9 +157,8 @@ void ArtworkRole::build_hello_fields(ClientHelloMessage& msg) {
     }
     msg.supported_roles.push_back(SendspinRole::ARTWORK);
 
-    ArtworkSupportObject artwork_support = {
-        .channels = this->artwork_channels_,
-    };
+    ArtworkSupportObject artwork_support{};
+    artwork_support.channels = this->artwork_channels_;
     msg.artwork_v1_support = artwork_support;
 }
 
@@ -258,11 +263,11 @@ void ArtworkRole::handle_stream_clear() {
 // ============================================================================
 
 void ArtworkRole::drain_events() {
-    EventType event_type;
+    EventType event_type{};
     while (this->event_state_->queue.receive(event_type, 0)) {
         switch (event_type) {
             case EventType::STREAM_START: {
-                ServerArtworkStreamObject config;
+                ServerArtworkStreamObject config{};
                 if (this->event_state_->shadow_config.take(config) && this->listener_) {
                     this->listener_->on_artwork_stream_start(config);
                 }
@@ -307,7 +312,7 @@ void ArtworkRole::cleanup() {
 // Drain thread
 // ============================================================================
 
-void ArtworkRole::drain_thread_func_(ArtworkRole* self) {
+void ArtworkRole::drain_thread_func(ArtworkRole* self) {
     SS_LOGD(TAG, "Drain thread started");
 
     auto& queue = self->drain_task_->notify_queue;
@@ -316,30 +321,34 @@ void ArtworkRole::drain_thread_func_(ArtworkRole* self) {
     while (true) {
         // Non-blocking check for commands
         uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, 0);
-        if (cmd & COMMAND_STOP)
+        if (cmd & COMMAND_STOP) {
             break;
+        }
         if (cmd & COMMAND_FLUSH) {
             // Drain all pending notifications without processing
-            ArtworkNotification dummy;
+            ArtworkNotification dummy{};
             while (queue.receive(dummy, 0)) {}
             continue;
         }
 
         // Blocking receive with 100ms timeout (allows periodic command checks)
-        ArtworkNotification notif;
-        if (!queue.receive(notif, 100))
+        ArtworkNotification notif{};
+        if (!queue.receive(notif, DRAIN_RECEIVE_TIMEOUT_MS)) {
             continue;
+        }
 
         uint8_t slot = notif.slot;
         uint8_t buf_idx = notif.buffer_idx;
-        if (slot >= MAX_SLOTS)
+        if (slot >= MAX_SLOTS) {
             continue;
+        }
 
         auto& sb = self->drain_task_->slot_buffers[slot];
         auto& buf = sb.buffers[buf_idx];
 
-        if (notif.data_length == 0 || buf.data() == nullptr)
+        if (notif.data_length == 0 || buf.data() == nullptr) {
             continue;
+        }
 
         // Mark this buffer as in-use so the network thread avoids it
         sb.drain_buf_idx = buf_idx;
@@ -354,24 +363,27 @@ void ArtworkRole::drain_thread_func_(ArtworkRole* self) {
         sb.drain_active.store(false, std::memory_order_release);
 
         // Wait for time sync before scheduling display
-        if (!self->client_->is_time_synced())
+        if (!self->client_->is_time_synced()) {
             continue;
+        }
 
         // Phase 2: Wait until display timestamp
         int64_t client_ts = self->client_->get_client_time(notif.timestamp);
 
-        if (client_ts == 0)
+        if (client_ts == 0) {
             continue;
+        }
 
         int64_t now = platform_time_us();
         if (client_ts > now) {
-            uint32_t wait_ms = static_cast<uint32_t>((client_ts - now) / 1000);
+            uint32_t wait_ms = static_cast<uint32_t>((client_ts - now) / US_PER_MS);
             if (wait_ms > 0) {
                 cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, wait_ms);
-                if (cmd & COMMAND_STOP)
+                if (cmd & COMMAND_STOP) {
                     break;
+                }
                 if (cmd & COMMAND_FLUSH) {
-                    ArtworkNotification dummy;
+                    ArtworkNotification dummy{};
                     while (queue.receive(dummy, 0)) {}
                     continue;
                 }

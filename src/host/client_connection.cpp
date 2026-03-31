@@ -17,6 +17,7 @@
 #include "platform/logging.h"
 #include "platform/time.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -52,7 +53,7 @@ void SendspinClientConnection::start() {
     this->ws_->setUrl(this->url_);
     this->ws_->disableAutomaticReconnection();
 
-    this->setup_callbacks_();
+    this->setup_callbacks();
 
     this->ws_->start();
     SS_LOGD(TAG, "Client connection starting to %s", this->url_.c_str());
@@ -122,7 +123,7 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
 // Private helpers / callbacks
 // ============================================================================
 
-void SendspinClientConnection::setup_callbacks_() {
+void SendspinClientConnection::setup_callbacks() {
     this->ws_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
         int64_t receive_time = platform_time_us();
 
@@ -141,7 +142,7 @@ void SendspinClientConnection::setup_callbacks_() {
                 this->client_hello_sent_ = false;
                 this->server_hello_received_ = false;
                 this->pending_time_message_ = false;
-                this->reset_websocket_payload_();
+                this->reset_websocket_payload();
                 if (this->on_disconnected_cb) {
                     this->on_disconnected_cb(this);
                 }
@@ -153,7 +154,7 @@ void SendspinClientConnection::setup_callbacks_() {
                 bool is_binary = msg->binary;
 
                 if (!data.empty()) {
-                    uint8_t* dest = this->prepare_receive_buffer_(data.size());
+                    uint8_t* dest = this->prepare_receive_buffer(data.size());
                     if (dest == nullptr) {
                         SS_LOGE(TAG, "Allocation failed, dropping connection");
                         this->connected_ = false;
@@ -162,10 +163,10 @@ void SendspinClientConnection::setup_callbacks_() {
                         }
                         return;
                     }
-                    std::memcpy(dest, data.data(), data.size());
-                    this->commit_receive_buffer_(data.size());
+                    std::copy(data.begin(), data.end(), dest);
+                    this->commit_receive_buffer(data.size());
                 }
-                this->dispatch_completed_message_(!is_binary, receive_time);
+                this->dispatch_completed_message(!is_binary, receive_time);
                 break;
             }
 

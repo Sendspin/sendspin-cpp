@@ -205,7 +205,7 @@ static bool process_server_metadata_state_object(const JsonObject metadata_objec
     // Parse progress object - if any progress field is present, create the object
     if (metadata_object["progress"].is<JsonObject>()) {
         JsonObject progress_object = metadata_object["progress"];
-        MetadataProgressObject progress;
+        MetadataProgressObject progress{};
         if (progress_object["track_progress"].is<JsonVariant>()) {
             progress.track_progress = progress_object["track_progress"].as<uint32_t>();
         }
@@ -247,19 +247,26 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     const std::string type_str = root["type"].as<std::string>();
     if (type_str == "server/hello") {
         return SendspinServerToClientMessageType::SERVER_HELLO;
-    } else if (type_str == "server/time") {
+    }
+    if (type_str == "server/time") {
         return SendspinServerToClientMessageType::SERVER_TIME;
-    } else if (type_str == "server/state") {
+    }
+    if (type_str == "server/state") {
         return SendspinServerToClientMessageType::SERVER_STATE;
-    } else if (type_str == "server/command") {
+    }
+    if (type_str == "server/command") {
         return SendspinServerToClientMessageType::SERVER_COMMAND;
-    } else if (type_str == "stream/start") {
+    }
+    if (type_str == "stream/start") {
         return SendspinServerToClientMessageType::STREAM_START;
-    } else if (type_str == "stream/end") {
+    }
+    if (type_str == "stream/end") {
         return SendspinServerToClientMessageType::STREAM_END;
-    } else if (type_str == "stream/clear") {
+    }
+    if (type_str == "stream/clear") {
         return SendspinServerToClientMessageType::STREAM_CLEAR;
-    } else if (type_str == "group/update") {
+    }
+    if (type_str == "group/update") {
         return SendspinServerToClientMessageType::GROUP_UPDATE;
     }
 
@@ -402,7 +409,7 @@ void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObje
 
 bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg) {
     if (cmd_msg != nullptr && root["payload"]["player"].is<JsonObject>()) {
-        ServerPlayerCommandObject player_cmd;
+        ServerPlayerCommandObject player_cmd{};
         if (process_server_player_command_object(root["payload"]["player"], &player_cmd)) {
             cmd_msg->player = player_cmd;
             return true;
@@ -421,14 +428,14 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
 
     // Parse optional metadata object
     if (root["payload"]["metadata"].is<JsonObject>()) {
-        ServerMetadataStateObject metadata_state;
+        ServerMetadataStateObject metadata_state{};
         if (process_server_metadata_state_object(root["payload"]["metadata"], &metadata_state)) {
             state_msg->metadata = metadata_state;
         }
     }
 
     if (root["payload"]["controller"].is<JsonObject>()) {
-        ServerStateControllerObject controller_state;
+        ServerStateControllerObject controller_state{};
         JsonObject controller_object = root["payload"]["controller"];
 
         // Parse supported_commands array
@@ -471,7 +478,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
     (void)root;
 
     if (root["payload"]["player"].is<JsonObject>()) {
-        ServerPlayerStreamObject player_obj;
+        ServerPlayerStreamObject player_obj{};
         if (process_player_stream_object(root["payload"]["player"], &player_obj, true)) {
             if (!player_obj.is_complete()) {
                 SS_LOGE(TAG, "Invalid stream/start message: incomplete player object");
@@ -484,12 +491,12 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
     }
 
     if (root["payload"]["artwork"]["channels"].is<JsonArray>()) {
-        ServerArtworkStreamObject artwork_obj;
+        ServerArtworkStreamObject artwork_obj{};
         std::vector<ServerArtworkChannelObject> channels;
 
         JsonArray channels_array = root["payload"]["artwork"]["channels"].as<JsonArray>();
         for (JsonObject channel_json : channels_array) {
-            ServerArtworkChannelObject channel;
+            ServerArtworkChannelObject channel{};
             if (process_artwork_channel_object(channel_json, &channel, true)) {
                 if (!channel.is_complete()) {
                     SS_LOGE(TAG, "Invalid stream/start message: incomplete artwork channel");
@@ -505,7 +512,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
     }
 
     if (root["payload"]["visualizer"].is<JsonObject>()) {
-        ServerVisualizerStreamObject vis_obj;
+        ServerVisualizerStreamObject vis_obj{};
         JsonObject vis_json = root["payload"]["visualizer"];
 
         // Parse types array
@@ -534,7 +541,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         // Parse spectrum config if present
         if (vis_json["spectrum"].is<JsonObject>()) {
             JsonObject spec_json = vis_json["spectrum"];
-            VisualizerSpectrumConfig spec_cfg;
+            VisualizerSpectrumConfig spec_cfg{};
             spec_cfg.n_disp_bins = spec_json["n_disp_bins"].as<uint8_t>();
             std::string scale_str = spec_json["scale"].as<std::string>();
             if (scale_str == "log") {

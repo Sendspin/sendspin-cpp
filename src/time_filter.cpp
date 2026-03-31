@@ -28,15 +28,13 @@ namespace sendspin {
 SendspinTimeFilter::SendspinTimeFilter(double process_std_dev, double drift_process_std_dev,
                                        double forget_factor, double adaptive_cutoff,
                                        uint8_t min_samples, double drift_significance_threshold)
-    : adaptive_forgetting_cutoff_(adaptive_cutoff),
-      drift_process_variance_(drift_process_std_dev * drift_process_std_dev),
-      drift_significance_threshold_squared_(drift_significance_threshold *
-                                            drift_significance_threshold),
-      forget_variance_factor_(forget_factor * forget_factor),
-      process_variance_(process_std_dev * process_std_dev),
-      min_samples_for_forgetting_(min_samples) {
-    this->reset();
-}
+    : adaptive_forgetting_cutoff(adaptive_cutoff),
+      drift_process_variance(drift_process_std_dev * drift_process_std_dev),
+      drift_significance_threshold_squared(drift_significance_threshold *
+                                           drift_significance_threshold),
+      forget_variance_factor(forget_factor * forget_factor),
+      process_variance(process_std_dev * process_std_dev),
+      min_samples_for_forgetting(min_samples) {}
 
 // ============================================================================
 // Core API
@@ -92,30 +90,30 @@ void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t 
 
     // Process noise for both offset and drift (full random walk model)
     // We assume clock jitter (offset noise) and wander (drift noise) are independent processes
-    const double drift_process_variance = dt * this->drift_process_variance_;
+    const double drift_process_variance = dt * this->drift_process_variance;
     double new_drift_covariance = this->drift_covariance_ + drift_process_variance;
 
     double new_offset_drift_covariance =
         this->offset_drift_covariance_ + this->drift_covariance_ * dt;
 
-    const double offset_process_variance = dt * this->process_variance_;
+    const double offset_process_variance = dt * this->process_variance;
     double new_offset_covariance = this->offset_covariance_ +
                                    2 * this->offset_drift_covariance_ * dt +
                                    this->drift_covariance_ * dt_squared + offset_process_variance;
 
     /*** Innovation and Adaptive Forgetting ***/
     const double residual = measurement - offset;  // Innovation: y_k = z_k - H * x_k|k-1
-    const double max_residual_cutoff = max_error * this->adaptive_forgetting_cutoff_;
+    const double max_residual_cutoff = max_error * this->adaptive_forgetting_cutoff;
 
-    if (this->count_ < this->min_samples_for_forgetting_) {
+    if (this->count_ < this->min_samples_for_forgetting) {
         // Build sufficient history before enabling adaptive forgetting
         ++this->count_;
     } else if (std::abs(residual) > max_residual_cutoff) {
         // Large prediction error detected - likely network disruption or clock adjustment
         // Apply forgetting factor to increase Kalman gain and accelerate convergence
-        new_drift_covariance *= this->forget_variance_factor_;
-        new_offset_drift_covariance *= this->forget_variance_factor_;
-        new_offset_covariance *= this->forget_variance_factor_;
+        new_drift_covariance *= this->forget_variance_factor;
+        new_offset_drift_covariance *= this->forget_variance_factor;
+        new_offset_covariance *= this->forget_variance_factor;
     }
 
     /*** Kalman Update Step ***/
@@ -141,7 +139,7 @@ void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t 
     // Only apply drift compensation if statistically significant (SNR check)
     const double drift_squared = this->drift_ * this->drift_;
     this->use_drift_ =
-        drift_squared > this->drift_significance_threshold_squared_ * this->drift_covariance_;
+        drift_squared > this->drift_significance_threshold_squared * this->drift_covariance_;
 }
 
 int64_t SendspinTimeFilter::compute_server_time(int64_t client_time) const {

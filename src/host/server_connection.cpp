@@ -17,6 +17,8 @@
 #include "platform/logging.h"
 #include "platform/time.h"
 
+#include <algorithm>
+
 namespace sendspin {
 
 SendspinServerConnection::SendspinServerConnection(std::shared_ptr<ix::WebSocket> ws, int sockfd)
@@ -85,13 +87,13 @@ void SendspinServerConnection::trigger_close() {
 void SendspinServerConnection::handle_message(const std::string& data, bool is_binary,
                                               int64_t receive_time) {
     if (!data.empty()) {
-        uint8_t* dest = this->prepare_receive_buffer_(data.size());
+        uint8_t* dest = this->prepare_receive_buffer(data.size());
         if (dest != nullptr) {
-            std::memcpy(dest, data.data(), data.size());
-            this->commit_receive_buffer_(data.size());
+            std::copy(data.begin(), data.end(), dest);
+            this->commit_receive_buffer(data.size());
         }
     }
-    this->dispatch_completed_message_(!is_binary, receive_time);
+    this->dispatch_completed_message(!is_binary, receive_time);
 }
 
 }  // namespace sendspin

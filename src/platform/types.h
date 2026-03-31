@@ -26,7 +26,7 @@
 namespace sendspin {
 
 /// @brief Platform-agnostic error codes for Sendspin APIs
-enum class SsErr : int32_t {
+enum class SsErr : int16_t {
     // Success / informational (>= 0)
     OK = 0,  // Operation succeeded
 

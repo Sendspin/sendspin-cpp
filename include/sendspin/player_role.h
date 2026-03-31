@@ -58,7 +58,7 @@ struct DummyHeader {
 };
 
 /// @brief Audio codec format for a player stream
-enum class SendspinCodecFormat {
+enum class SendspinCodecFormat : uint8_t {
     FLAC,         // FLAC lossless audio
     OPUS,         // Opus compressed audio
     PCM,          // Raw PCM audio
@@ -79,12 +79,15 @@ inline const char* to_cstr(SendspinCodecFormat format) {
 }
 
 inline std::optional<SendspinCodecFormat> codec_format_from_string(const std::string& str) {
-    if (str == "flac")
+    if (str == "flac") {
         return SendspinCodecFormat::FLAC;
-    if (str == "opus")
+    }
+    if (str == "opus") {
         return SendspinCodecFormat::OPUS;
-    if (str == "pcm")
+    }
+    if (str == "pcm") {
         return SendspinCodecFormat::PCM;
+    }
     return std::nullopt;
 }
 
@@ -97,7 +100,7 @@ struct AudioSupportedFormatObject {
 };
 
 /// @brief Command types the server can send to the player role
-enum class SendspinPlayerCommand {
+enum class SendspinPlayerCommand : uint8_t {
     VOLUME,            // Set playback volume
     MUTE,              // Set mute state
     SET_STATIC_DELAY,  // Set static playback delay
@@ -117,33 +120,36 @@ inline const char* to_cstr(SendspinPlayerCommand cmd) {
 }
 
 inline std::optional<SendspinPlayerCommand> player_command_from_string(const std::string& str) {
-    if (str == "volume")
+    if (str == "volume") {
         return SendspinPlayerCommand::VOLUME;
-    if (str == "mute")
+    }
+    if (str == "mute") {
         return SendspinPlayerCommand::MUTE;
-    if (str == "set_static_delay")
+    }
+    if (str == "set_static_delay") {
         return SendspinPlayerCommand::SET_STATIC_DELAY;
+    }
     return std::nullopt;
 }
 
 /// @brief Player capabilities advertised to the server during the hello handshake
 struct PlayerSupportObject {
-    std::vector<AudioSupportedFormatObject> supported_formats;
-    size_t buffer_capacity;
-    std::vector<SendspinPlayerCommand> supported_commands;
+    std::vector<AudioSupportedFormatObject> supported_formats{};
+    size_t buffer_capacity{};
+    std::vector<SendspinPlayerCommand> supported_commands{};
 };
 
 /// @brief Player state reported by the client to the server in client/state messages
 struct ClientPlayerStateObject {
-    uint8_t volume;
-    bool muted;
-    uint16_t static_delay_ms;
-    std::vector<SendspinPlayerCommand> supported_commands;
+    uint8_t volume{};
+    bool muted{};
+    uint16_t static_delay_ms{};
+    std::vector<SendspinPlayerCommand> supported_commands{};
 };
 
 /// @brief Stream parameters sent by the server in stream/start messages
 struct ServerPlayerStreamObject {
-    std::optional<SendspinCodecFormat> codec;
+    std::optional<SendspinCodecFormat> codec{};
     std::optional<uint32_t> sample_rate;
     std::optional<uint8_t> channels;
     std::optional<uint8_t> bit_depth;
@@ -157,7 +163,7 @@ struct ServerPlayerStreamObject {
 
 /// @brief A single player command sent by the server, with optional parameter fields
 struct ServerPlayerCommandObject {
-    SendspinPlayerCommand command;
+    SendspinPlayerCommand command{};
     std::optional<uint8_t> volume;
     std::optional<bool> mute;
     std::optional<uint16_t> static_delay_ms;
@@ -240,8 +246,9 @@ class PlayerRole {
 public:
     /// @brief Configuration for the player role
     struct Config {
-        std::vector<AudioSupportedFormatObject> audio_formats;
-        size_t audio_buffer_capacity{1000000};
+        static constexpr size_t DEFAULT_AUDIO_BUFFER_CAPACITY = 1000000U;  ///< ~1MB default buffer
+        std::vector<AudioSupportedFormatObject> audio_formats{};
+        size_t audio_buffer_capacity{DEFAULT_AUDIO_BUFFER_CAPACITY};
         int32_t fixed_delay_us{0};
         uint16_t initial_static_delay_ms{0};
     };
@@ -339,7 +346,7 @@ private:
     /// @brief Adds player role information to the outgoing hello message
     void build_hello_fields(ClientHelloMessage& msg);
     /// @brief Adds the current player state fields to an outgoing state message
-    void build_state_fields(ClientStateMessage& msg);
+    void build_state_fields(ClientStateMessage& msg) const;
     /// @brief Handles an incoming binary audio chunk from the server
     void handle_binary(const uint8_t* data, size_t len);
     /// @brief Handles a stream-start message from the server
@@ -360,14 +367,14 @@ private:
     // ========================================
 
     /// @brief Sends an audio chunk to the sync task ring buffer
-    bool send_audio_chunk_(const uint8_t* data, size_t data_size, int64_t timestamp,
-                           ChunkType chunk_type, uint32_t timeout_ms);
+    bool send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
+                          ChunkType chunk_type, uint32_t timeout_ms);
     /// @brief Enqueues a state change for delivery on the main thread
-    void enqueue_state_update_(SendspinClientState state);
+    void enqueue_state_update(SendspinClientState state);
     /// @brief Loads the static delay preference from persistent storage
-    void load_static_delay_();
+    void load_static_delay();
     /// @brief Persists the current static delay to storage
-    void persist_static_delay_();
+    void persist_static_delay();
 
     // Struct fields
     Config config_;

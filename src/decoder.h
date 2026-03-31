@@ -104,7 +104,7 @@ protected:
     /// @param data_size Size of the header data in bytes.
     /// @param[out] stream_info Populated with stream parameters on success.
     /// @return True if the header was valid and stream_info was populated, false otherwise.
-    bool decode_dummy_header_(const uint8_t* data, size_t data_size, AudioStreamInfo* stream_info);
+    bool decode_dummy_header(const uint8_t* data, size_t data_size, AudioStreamInfo* stream_info);
 
     // Struct fields
     AudioStreamInfo current_stream_info_;

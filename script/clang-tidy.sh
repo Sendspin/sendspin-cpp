@@ -39,9 +39,10 @@ if [ ! -f "${BUILD_DIR}/compile_commands.json" ]; then
     cmake -B "$BUILD_DIR" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "$ROOT_DIR"
 fi
 
-# Find all source files, excluding build/ directories
+# Find all source files, excluding build/ and src/esp/ directories
 SOURCES=$(find "$ROOT_DIR/src" \
     -path '*/build' -prune -o \
+    -path '*/src/esp' -prune -o \
     \( -name '*.cpp' -o -name '*.c' \) -print 2>/dev/null || true)
 
 if [ -z "$SOURCES" ]; then

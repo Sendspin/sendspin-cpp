@@ -101,7 +101,7 @@ public:
 
 /// @brief Log severity levels for host builds
 /// Has no effect on ESP-IDF builds
-enum class LogLevel : int {
+enum class LogLevel : uint8_t {
     NONE = 0,
     ERROR = 1,
     WARN = 2,
@@ -131,8 +131,13 @@ struct SendspinClientConfig {
     bool artwork_psram_stack{false};     ///< Allocate artwork drain thread stack in PSRAM
                                          ///< (ESP-IDF only)
 
-    unsigned sync_task_priority{2};   ///< FreeRTOS priority for the sync/decode task (ESP-IDF only)
-    unsigned httpd_priority{17};      ///< FreeRTOS priority for the HTTP server task (ESP-IDF only)
+    /// @brief Default FreeRTOS priority for the HTTP server task (ESP-IDF only)
+    static constexpr unsigned DEFAULT_HTTPD_PRIORITY = 17U;
+
+    unsigned sync_task_priority{2};  ///< FreeRTOS priority for the sync/decode task
+                                     ///< (ESP-IDF only)
+    unsigned httpd_priority{DEFAULT_HTTPD_PRIORITY};  ///< FreeRTOS priority for the HTTP server
+                                                      ///< task (ESP-IDF only)
     unsigned websocket_priority{5};   ///< FreeRTOS priority for the WebSocket client task
                                       ///< (ESP-IDF only)
     unsigned visualizer_priority{2};  ///< FreeRTOS priority for the visualizer drain thread
@@ -145,10 +150,13 @@ struct SendspinClientConfig {
     uint16_t httpd_ctrl_port{0};        ///< ESP-IDF httpd control port; 0 = ESP_HTTPD_DEF_CTRL_PORT
                                         ///< + 1 (avoids conflict with web_server component)
 
-    uint8_t time_burst_size{8};             ///< Number of messages per time sync burst
-    int64_t time_burst_interval_ms{10000};  ///< Milliseconds between bursts
+    static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
+    static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
+
+    uint8_t time_burst_size{8};  ///< Number of messages per time sync burst
+    int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};  ///< Milliseconds between bursts
     int64_t time_burst_response_timeout_ms{
-        10000};  ///< Milliseconds before a burst message times out
+        DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
 };
 
 /// @brief Deferred event from a callback thread, processed in loop()
@@ -389,10 +397,10 @@ public:
 
 private:
     /// @brief Cleans up playback state when the active streaming connection is removed
-    void cleanup_connection_state_();
+    void cleanup_connection_state();
 
     /// @brief Builds the formatted client hello message from config
-    std::string build_hello_message_();
+    std::string build_hello_message();
 
     // ========================================
     // Message processing
@@ -403,13 +411,13 @@ private:
     /// @param message The raw JSON text
     /// @param timestamp Receive timestamp in microseconds
     /// @return true if the message was handled, false on parse failure
-    bool process_json_message_(SendspinConnection* conn, const std::string& message,
-                               int64_t timestamp);
+    bool process_json_message(SendspinConnection* conn, const std::string& message,
+                              int64_t timestamp);
 
     /// @brief Processes a binary message from a connection
     /// @param payload Pointer to the raw binary data
     /// @param len Length of the binary data in bytes
-    void process_binary_message_(uint8_t* payload, size_t len);
+    void process_binary_message(const uint8_t* payload, size_t len);
 
     // ========================================
     // State publishing
@@ -417,17 +425,17 @@ private:
 
     /// @brief Publishes the current client state to the specified connection
     /// @param conn The connection to publish to
-    void publish_client_state_(SendspinConnection* conn);
+    void publish_client_state(SendspinConnection* conn);
 
     // ========================================
     // Persistence
     // ========================================
 
     /// @brief Loads the last played server hash from persistence
-    void load_last_played_server_();
+    void load_last_played_server();
 
     /// @brief Persists the server ID as the last played server (hashed)
-    void persist_last_played_server_(const std::string& server_id);
+    void persist_last_played_server(const std::string& server_id);
 
     // ========================================
     // Connection event handlers (called by ConnectionManager via friend access)
@@ -435,7 +443,7 @@ private:
 
     /// @brief Publishes the initial client state after handshake completes
     /// @param conn The connection that completed the handshake
-    void on_handshake_complete_(SendspinConnection* conn);
+    void on_handshake_complete(SendspinConnection* conn);
 
     struct EventState;
 

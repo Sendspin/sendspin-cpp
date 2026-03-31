@@ -34,7 +34,7 @@ struct ClientHelloMessage;
 // ============================================================================
 
 /// @brief Playback commands the controller role can send to the server
-enum class SendspinControllerCommand {
+enum class SendspinControllerCommand : uint8_t {
     PLAY,        // Resume or start playback
     PAUSE,       // Pause playback
     STOP,        // Stop playback
@@ -91,47 +91,60 @@ inline const char* to_cstr(SendspinControllerCommand cmd) {
 /// @return The matching command, or std::nullopt if unrecognized
 inline std::optional<SendspinControllerCommand> controller_command_from_string(
     const std::string& str) {
-    if (str == "play")
+    if (str == "play") {
         return SendspinControllerCommand::PLAY;
-    if (str == "pause")
+    }
+    if (str == "pause") {
         return SendspinControllerCommand::PAUSE;
-    if (str == "stop")
+    }
+    if (str == "stop") {
         return SendspinControllerCommand::STOP;
-    if (str == "next")
+    }
+    if (str == "next") {
         return SendspinControllerCommand::NEXT;
-    if (str == "previous")
+    }
+    if (str == "previous") {
         return SendspinControllerCommand::PREVIOUS;
-    if (str == "volume")
+    }
+    if (str == "volume") {
         return SendspinControllerCommand::VOLUME;
-    if (str == "mute")
+    }
+    if (str == "mute") {
         return SendspinControllerCommand::MUTE;
-    if (str == "repeat_off")
+    }
+    if (str == "repeat_off") {
         return SendspinControllerCommand::REPEAT_OFF;
-    if (str == "repeat_one")
+    }
+    if (str == "repeat_one") {
         return SendspinControllerCommand::REPEAT_ONE;
-    if (str == "repeat_all")
+    }
+    if (str == "repeat_all") {
         return SendspinControllerCommand::REPEAT_ALL;
-    if (str == "shuffle")
+    }
+    if (str == "shuffle") {
         return SendspinControllerCommand::SHUFFLE;
-    if (str == "unshuffle")
+    }
+    if (str == "unshuffle") {
         return SendspinControllerCommand::UNSHUFFLE;
-    if (str == "switch")
+    }
+    if (str == "switch") {
         return SendspinControllerCommand::SWITCH;
+    }
     return std::nullopt;
 }
 
 /// @brief A playback command sent from the client to the server via client/command messages
 struct ClientCommandControllerObject {
-    SendspinControllerCommand command;
+    SendspinControllerCommand command{};
     std::optional<uint8_t> volume;
     std::optional<bool> mute;
 };
 
 /// @brief Controller state received from the server in server/state messages
 struct ServerStateControllerObject {
-    std::vector<SendspinControllerCommand> supported_commands;
-    uint8_t volume;
-    bool muted;
+    std::vector<SendspinControllerCommand> supported_commands{};
+    uint8_t volume{};
+    bool muted{};
 };
 
 /// @brief Listener for controller role events. All methods fire on the main loop thread.

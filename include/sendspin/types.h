@@ -28,7 +28,7 @@ namespace sendspin {
 // ============================================================================
 
 /// @brief Client playback state reported to the server
-enum class SendspinClientState {
+enum class SendspinClientState : uint8_t {
     SYNCHRONIZED,     // Client is synchronized and playing from the server
     ERROR,            // Client encountered a playback error
     EXTERNAL_SOURCE,  // Client is playing from a non-Sendspin source
@@ -51,7 +51,7 @@ inline const char* to_cstr(SendspinClientState state) {
 }
 
 /// @brief Reason sent in a client/goodbye message when disconnecting
-enum class SendspinGoodbyeReason {
+enum class SendspinGoodbyeReason : uint8_t {
     ANOTHER_SERVER,  // Client is switching to another server
     SHUTDOWN,        // Client is shutting down
     RESTART,         // Client is restarting
@@ -78,19 +78,19 @@ inline const char* to_cstr(SendspinGoodbyeReason reason) {
 
 /// @brief Optional hardware and software identity fields sent in client/hello messages
 struct DeviceInfoObject {
-    std::optional<std::string> product_name;
-    std::optional<std::string> manufacturer;
-    std::optional<std::string> software_version;
+    std::optional<std::string> product_name{};
+    std::optional<std::string> manufacturer{};
+    std::optional<std::string> software_version{};
 };
 
 /// @brief Server identity fields received in server/hello messages
 struct ServerInformationObject {
-    std::string server_id;
-    std::string name;
+    std::string server_id{};
+    std::string name{};
 };
 
 /// @brief Overall group playback state
-enum class SendspinPlaybackState {
+enum class SendspinPlaybackState : uint8_t {
     PLAYING,  // Group is actively playing
     STOPPED,  // Group playback is stopped
 };
@@ -112,18 +112,20 @@ inline const char* to_cstr(SendspinPlaybackState state) {
 /// @param str The string to parse.
 /// @return The matching enum value, or std::nullopt if the string is unrecognized.
 inline std::optional<SendspinPlaybackState> playback_state_from_string(const std::string& str) {
-    if (str == "playing")
+    if (str == "playing") {
         return SendspinPlaybackState::PLAYING;
-    if (str == "stopped")
+    }
+    if (str == "stopped") {
         return SendspinPlaybackState::STOPPED;
+    }
     return std::nullopt;
 }
 
 /// @brief Group membership and playback state delta received in group/update messages
 struct GroupUpdateObject {
-    std::optional<SendspinPlaybackState> playback_state;
-    std::optional<std::string> group_id;
-    std::optional<std::string> group_name;
+    std::optional<SendspinPlaybackState> playback_state{};
+    std::optional<std::string> group_id{};
+    std::optional<std::string> group_name{};
 };
 
 }  // namespace sendspin

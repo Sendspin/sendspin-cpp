@@ -113,18 +113,18 @@ protected:
                                         void* event_data);
 
     /// @brief Handles websocket connected event
-    void handle_connected_();
+    void handle_connected();
 
     /// @brief Handles websocket disconnected event
-    void handle_disconnected_();
+    void handle_disconnected();
 
     /// @brief Handles websocket data event
     /// @param data Pointer to websocket event data.
     /// @param receive_time Timestamp when the event was received (for time synchronization).
-    void handle_data_(const esp_websocket_event_data_t* data, int64_t receive_time);
+    void handle_data(const esp_websocket_event_data_t* data, int64_t receive_time);
 
     /// @brief Handles websocket error event
-    void handle_error_();
+    void handle_error();
 
     // Struct fields
 
@@ -141,8 +141,10 @@ protected:
     /// @brief Monotonic timestamp (ms) of the last reconnection attempt
     uint32_t last_reconnect_attempt_{0};
 
+    static constexpr uint32_t DEFAULT_RECONNECT_INTERVAL_MS = 5000U;
+
     /// @brief Delay in milliseconds between reconnection attempts
-    uint32_t reconnect_interval_ms_{5000};
+    uint32_t reconnect_interval_ms_{DEFAULT_RECONNECT_INTERVAL_MS};
 
     // 32-bit fields (unsigned)
 

@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <mutex>
 
 namespace sendspin {
@@ -30,7 +31,7 @@ static constexpr double TIME_FILTER_PROCESS_STD_DEV = 0.0;
 static constexpr double TIME_FILTER_DRIFT_PROCESS_STD_DEV = 5e-11;
 static constexpr double TIME_FILTER_FORGET_FACTOR = 1.1;
 static constexpr double TIME_FILTER_ADAPTIVE_CUTOFF = 2.0;
-static constexpr uint8_t TIME_FILTER_MIN_SAMPLES = 100;
+static constexpr uint8_t TIME_FILTER_MIN_SAMPLES = 100U;
 static constexpr double TIME_FILTER_DRIFT_SIGNIFICANCE_THRESHOLD = 2.0;
 
 /**
@@ -92,7 +93,7 @@ public:
     ///                                     drift_covariance, ensuring the drift estimate is
     ///                                     statistically significant before applying corrections.
     SendspinTimeFilter(double process_std_dev, double drift_process_std_dev, double forget_factor,
-                       double adaptive_cutoff = 0.75, uint8_t min_samples = 100,
+                       double adaptive_cutoff = 0.75, uint8_t min_samples = TIME_FILTER_MIN_SAMPLES,
                        double drift_significance_threshold = 2.0);
 
     // ========================================
@@ -172,22 +173,22 @@ protected:
     mutable std::mutex state_mutex_;
 
     // 64-bit fields
-    const double adaptive_forgetting_cutoff_;
-    double drift_;
-    double drift_covariance_;
-    const double drift_process_variance_;
-    const double drift_significance_threshold_squared_;
-    const double forget_variance_factor_;
-    int64_t last_update_;
-    double offset_;
-    double offset_covariance_;
-    double offset_drift_covariance_;
-    const double process_variance_;
+    const double adaptive_forgetting_cutoff;
+    double drift_{0.0};
+    double drift_covariance_{0.0};
+    const double drift_process_variance;
+    const double drift_significance_threshold_squared;
+    const double forget_variance_factor;
+    int64_t last_update_{0};
+    double offset_{0.0};
+    double offset_covariance_{std::numeric_limits<double>::infinity()};
+    double offset_drift_covariance_{0.0};
+    const double process_variance;
 
     // 8-bit fields
-    uint8_t count_;
-    const uint8_t min_samples_for_forgetting_;
-    bool use_drift_;
+    uint8_t count_{0};
+    const uint8_t min_samples_for_forgetting;
+    bool use_drift_{false};
 };
 
 }  // namespace sendspin

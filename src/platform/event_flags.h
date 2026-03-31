@@ -209,9 +209,8 @@ public:
         auto pred = [&]() -> bool {
             if (wait_all) {
                 return (this->bits_ & bits_to_wait) == bits_to_wait;
-            } else {
-                return (this->bits_ & bits_to_wait) != 0;
             }
+            return (this->bits_ & bits_to_wait) != 0;
         };
 
         if (!pred()) {

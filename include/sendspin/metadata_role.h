@@ -39,7 +39,7 @@ struct MetadataProgressObject {
 };
 
 /// @brief Repeat mode for playback
-enum class SendspinRepeatMode {
+enum class SendspinRepeatMode : uint8_t {
     OFF,  // No repeat
     ONE,  // Repeat current track
     ALL,  // Repeat entire queue
@@ -65,18 +65,21 @@ inline const char* to_cstr(SendspinRepeatMode mode) {
 /// @param str The string to parse
 /// @return The matching mode, or std::nullopt if unrecognized
 inline std::optional<SendspinRepeatMode> repeat_mode_from_string(const std::string& str) {
-    if (str == "off")
+    if (str == "off") {
         return SendspinRepeatMode::OFF;
-    if (str == "one")
+    }
+    if (str == "one") {
         return SendspinRepeatMode::ONE;
-    if (str == "all")
+    }
+    if (str == "all") {
         return SendspinRepeatMode::ALL;
+    }
     return std::nullopt;
 }
 
 /// @brief Track metadata and playback state received from the server
 struct ServerMetadataStateObject {
-    int64_t timestamp;
+    int64_t timestamp{};
     std::optional<std::string> title;
     std::optional<std::string> artist;
     std::optional<std::string> album_artist;

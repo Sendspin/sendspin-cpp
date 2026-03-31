@@ -23,6 +23,9 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.time_burst";
 
+/// @brief Microseconds per millisecond (unit conversion constant)
+static constexpr int64_t US_PER_MS = 1000LL;
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -37,7 +40,7 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
     }
 
     const int64_t now_us = platform_time_us();
-    const int64_t now_ms = now_us / 1000LL;
+    const int64_t now_ms = now_us / US_PER_MS;
 
     // State 1: Burst complete / inter-burst wait
     if (this->burst_index_ >= this->burst_size_) {
@@ -109,7 +112,7 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, int64_t offse
             time_filter->update(this->best_offset_, this->best_max_error_, this->best_timestamp_);
             SS_LOGV(TAG, "Burst complete, best max_error: %" PRId64 " us", this->best_max_error_);
         }
-        this->last_burst_complete_time_ = platform_time_us() / 1000LL;
+        this->last_burst_complete_time_ = platform_time_us() / US_PER_MS;
         this->pending_burst_completed_ = true;
         return true;
     }

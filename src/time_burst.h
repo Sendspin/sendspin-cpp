@@ -94,14 +94,17 @@ public:
     void reset();
 
 protected:
+    static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;
+    static constexpr int64_t DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
+
     // 64-bit fields
     int64_t best_max_error_{std::numeric_limits<int64_t>::max()};
     int64_t best_offset_{0};
     int64_t best_timestamp_{0};
     int64_t current_message_sent_time_{0};
     int64_t last_burst_complete_time_{0};
-    int64_t burst_interval_ms_{10000};
-    int64_t response_timeout_ms_{10000};
+    int64_t burst_interval_ms_{DEFAULT_BURST_INTERVAL_MS};
+    int64_t response_timeout_ms_{DEFAULT_RESPONSE_TIMEOUT_MS};
 
     // 8-bit fields
     uint8_t burst_size_{8};

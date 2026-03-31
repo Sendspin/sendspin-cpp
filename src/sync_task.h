@@ -84,7 +84,7 @@ struct SyncContext {
 };
 
 /// @brief Event flag bits used for sync task lifecycle and command signaling
-enum EventGroupBits : uint32_t {
+enum EventGroupBits : uint16_t {
     COMMAND_STOP = (1 << 0),          // Signal task to stop
     COMMAND_STREAM_END = (1 << 1),    // Signal end of current stream
     COMMAND_STREAM_CLEAR = (1 << 2),  // Signal immediate buffer clear
@@ -132,7 +132,7 @@ public:
     /// Returns false when idle (waiting for a stream) or stopped.
     /// @return true if actively decoding and syncing a stream.
     bool is_running() const {
-        return this->event_flags_.get() & EventGroupBits::TASK_RUNNING;
+        return (this->event_flags_.get() & EventGroupBits::TASK_RUNNING) != 0U;
     }
 
     /// @brief Signals the sync task to end the current stream. Non-blocking
@@ -175,58 +175,58 @@ protected:
     static void thread_entry(void* params);
 
     /// @brief Handles the INITIAL_SYNC state: feeds zeros to prime the audio pipeline
-    SyncTaskState handle_initial_sync_(SyncContext& sync_context);
+    SyncTaskState handle_initial_sync(SyncContext& sync_context);
 
     /// @brief Handles the LOAD_CHUNK state: loads and decodes the next encoded chunk
-    SyncTaskState handle_load_chunk_(SyncContext& sync_context);
+    SyncTaskState handle_load_chunk(SyncContext& sync_context);
 
     /// @brief Handles the SYNCHRONIZE_AUDIO state: applies sync corrections based on predicted
     /// error.
-    SyncTaskState handle_synchronize_audio_(SyncContext& sync_context);
+    SyncTaskState handle_synchronize_audio(SyncContext& sync_context);
 
     /// @brief Handles the TRANSFER_AUDIO state: sends buffered audio to the sink
-    SyncTaskState handle_transfer_audio_(SyncContext& sync_context);
+    SyncTaskState handle_transfer_audio(SyncContext& sync_context);
 
     /// @brief Updates buffered_frames and new_audio_client_playtime after sending audio to the
     /// speaker. These two must always be updated together to keep the playtime estimate consistent.
-    void track_sent_audio_(SyncContext& sync_context, size_t bytes_sent);
+    void track_sent_audio(SyncContext& sync_context, size_t bytes_sent);
 
     /// @brief Transfers audio from interpolation and decode buffers to the sink
     /// Returns true when all data has been sent, false if more transfers are needed.
-    bool transfer_audio_(SyncContext& sync_context);
+    bool transfer_audio(SyncContext& sync_context);
 
     /// @brief Loads the next encoded chunk from the ring buffer
     /// Returns true if a chunk is available, false if none ready yet.
-    bool load_next_chunk_(SyncContext& sync_context);
+    bool load_next_chunk(SyncContext& sync_context);
 
     /// @brief Removes last decoded frame, blending into the second-to-last to minimize glitches
     /// Returns -1 if a frame was removed, 0 if preconditions not met.
-    int32_t soft_sync_drop_frame_(SyncContext& sync_context);
+    int32_t soft_sync_drop_frame(SyncContext& sync_context);
 
     /// @brief Adds one interpolated frame between the first two decoded frames
     /// Returns 1 if a frame was added, 0 if preconditions not met.
-    int32_t soft_sync_insert_frame_(SyncContext& sync_context);
+    int32_t soft_sync_insert_frame(SyncContext& sync_context);
 
     /// @brief Decodes the current encoded chunk
-    DecodeResult decode_chunk_(SyncContext& sync_context);
+    DecodeResult decode_chunk(SyncContext& sync_context);
 
     /// @brief Waits in IDLE for a codec header to arrive in the ring buffer
     /// Discards stale audio chunks. Returns true if a codec header was found.
     /// Returns false if COMMAND_STOP was signaled.
-    bool wait_for_codec_header_(SyncContext& sync_context);
+    bool wait_for_codec_header(SyncContext& sync_context);
 
     /// @brief Non-blocking drain of audio data from the ring buffer, preserving codec headers
-    void drain_ring_buffer_(SyncContext& sync_context);
+    void drain_ring_buffer(SyncContext& sync_context);
 
     /// @brief Resets SyncContext between streams without deallocating buffers
-    void reset_context_(SyncContext& sync_context);
+    void reset_context(SyncContext& sync_context);
 
     /// @brief Processes playback progress messages from the speaker to update buffered_frames and
     /// playtime.
-    void process_playback_progress_(SyncContext& sync_context);
+    void process_playback_progress(SyncContext& sync_context);
 
     /// @brief Signals the task to stop and waits for the thread to finish
-    void stop_();
+    void stop();
 
     // Struct fields
     EventFlags event_flags_;

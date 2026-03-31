@@ -176,13 +176,13 @@ esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receiv
     if (ws_pkt.len == 0) {
         // No payload data, but still dispatch if final (for empty messages or buffered data)
         if (is_final) {
-            this->dispatch_completed_message_(this->is_text_frame_, receive_time);
+            this->dispatch_completed_message(this->is_text_frame_, receive_time);
         }
         return ESP_OK;
     }
 
     // Allocate/grow directly into the websocket payload buffer (zero-copy)
-    uint8_t* dest = this->prepare_receive_buffer_(ws_pkt.len);
+    uint8_t* dest = this->prepare_receive_buffer(ws_pkt.len);
     if (dest == nullptr) {
         return ESP_ERR_NO_MEM;
     }
@@ -194,14 +194,14 @@ esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receiv
     ret = httpd_ws_recv_frame(req, &ws_pkt, ws_pkt.len);
     if (ret != ESP_OK) {
         SS_LOGE(TAG, "httpd_ws_recv_frame failed with %d", ret);
-        this->reset_websocket_payload_();
+        this->reset_websocket_payload();
         return ret;
     }
 
-    this->commit_receive_buffer_(ws_pkt.len);
+    this->commit_receive_buffer(ws_pkt.len);
 
     if (is_final) {
-        this->dispatch_completed_message_(this->is_text_frame_, receive_time);
+        this->dispatch_completed_message(this->is_text_frame_, receive_time);
     }
 
     return ESP_OK;

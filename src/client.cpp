@@ -77,7 +77,7 @@ bool SendspinClient::start_server() {
     this->started_ = true;
 
     // Load persisted state
-    this->load_last_played_server_();
+    this->load_last_played_server();
 
     if (this->player_) {
         if (!this->player_->start(this->config_.sync_task_psram_stack,
@@ -143,7 +143,7 @@ void SendspinClient::loop() {
 
     // --- Time sync events ---
     {
-        TimeResponseEvent time_event;
+        TimeResponseEvent time_event{};
         while (this->event_state_->time_queue.receive(time_event, 0)) {
             auto* current = this->connection_manager_->current();
             if (current != nullptr) {
@@ -187,7 +187,7 @@ void SendspinClient::loop() {
                 if (current != nullptr) {
                     const std::string& server_id = current->get_server_id();
                     if (!server_id.empty()) {
-                        this->persist_last_played_server_(server_id);
+                        this->persist_last_played_server(server_id);
                     }
                 }
             }
@@ -279,7 +279,7 @@ std::optional<ServerInformationObject> SendspinClient::get_server_information() 
 
 void SendspinClient::update_state(SendspinClientState state) {
     this->state_ = state;
-    this->publish_client_state_(this->connection_manager_->current());
+    this->publish_client_state(this->connection_manager_->current());
 }
 
 // ============================================================================
@@ -287,7 +287,7 @@ void SendspinClient::update_state(SendspinClientState state) {
 // ============================================================================
 
 void SendspinClient::publish_state() {
-    this->publish_client_state_(this->connection_manager_->current());
+    this->publish_client_state(this->connection_manager_->current());
 }
 
 void SendspinClient::send_text(const std::string& text) {
@@ -316,7 +316,7 @@ void SendspinClient::release_high_performance() {
 // Private helpers
 // ============================================================================
 
-void SendspinClient::cleanup_connection_state_() {
+void SendspinClient::cleanup_connection_state() {
     SS_LOGV(TAG, "Cleaning up connection state");
 
     // Reset client event state
@@ -346,12 +346,12 @@ void SendspinClient::cleanup_connection_state_() {
     }
 }
 
-std::string SendspinClient::build_hello_message_() {
+std::string SendspinClient::build_hello_message() {
     ClientHelloMessage msg;
     msg.client_id = this->config_.client_id;
     msg.name = this->config_.name;
 
-    DeviceInfoObject device_info;
+    DeviceInfoObject device_info{};
     device_info.product_name = this->config_.product_name;
     device_info.manufacturer = this->config_.manufacturer;
     device_info.software_version = this->config_.software_version;
@@ -383,8 +383,8 @@ std::string SendspinClient::build_hello_message_() {
 // Message processing
 // ============================================================================
 
-bool SendspinClient::process_json_message_(SendspinConnection* conn, const std::string& message,
-                                           int64_t timestamp) {
+bool SendspinClient::process_json_message(SendspinConnection* conn, const std::string& message,
+                                          int64_t timestamp) {
     JsonDocument doc = make_json_document();
     DeserializationError error = deserializeJson(doc, message.c_str(), message.size());
     if (error || doc.isNull()) {
@@ -513,8 +513,8 @@ bool SendspinClient::process_json_message_(SendspinConnection* conn, const std::
                 break;
             }
 
-            int64_t offset;
-            int64_t max_error;
+            int64_t offset{0};
+            int64_t max_error{0};
             if (process_server_time_message(root, timestamp, conn->peek_time_replacement(), &offset,
                                             &max_error)) {
                 this->event_state_->time_queue.send({offset, max_error, timestamp}, 0);
@@ -562,7 +562,7 @@ bool SendspinClient::process_json_message_(SendspinConnection* conn, const std::
     return true;
 }
 
-void SendspinClient::process_binary_message_(uint8_t* payload, size_t len) {
+void SendspinClient::process_binary_message(const uint8_t* payload, size_t len) {
     if (len < 2) {
         return;
     }
@@ -609,7 +609,7 @@ void SendspinClient::process_binary_message_(uint8_t* payload, size_t len) {
 // State publishing
 // ============================================================================
 
-void SendspinClient::publish_client_state_(SendspinConnection* conn) {
+void SendspinClient::publish_client_state(SendspinConnection* conn) {
     if (conn == nullptr || !conn->is_connected() || !conn->is_handshake_complete()) {
         return;
     }
@@ -629,7 +629,7 @@ void SendspinClient::publish_client_state_(SendspinConnection* conn) {
 // Persistence
 // ============================================================================
 
-void SendspinClient::load_last_played_server_() {
+void SendspinClient::load_last_played_server() {
     if (!this->persistence_provider_) {
         return;
     }
@@ -641,7 +641,7 @@ void SendspinClient::load_last_played_server_() {
     }
 }
 
-void SendspinClient::persist_last_played_server_(const std::string& server_id) {
+void SendspinClient::persist_last_played_server(const std::string& server_id) {
     if (server_id.empty()) {
         return;
     }
@@ -663,8 +663,8 @@ void SendspinClient::persist_last_played_server_(const std::string& server_id) {
 // Connection event handlers (called by ConnectionManager via friend access)
 // ============================================================================
 
-void SendspinClient::on_handshake_complete_(SendspinConnection* conn) {
-    this->publish_client_state_(conn);
+void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
+    this->publish_client_state(conn);
 }
 
 }  // namespace sendspin

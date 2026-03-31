@@ -207,23 +207,23 @@ public:
     /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
     /// @return Pointer to acquired space, or nullptr on timeout.
     void* acquire(size_t size, uint32_t timeout_ms) {
-        size_t total = item_total_size_(size);
+        size_t total = item_total_size(size);
         std::unique_lock<std::mutex> lock(this->mtx_);
 
-        size_t offset = try_acquire_(total);
+        size_t offset = try_acquire(total);
         if (offset == SIZE_MAX) {
             if (timeout_ms == 0) {
                 return nullptr;
             }
             if (timeout_ms == UINT32_MAX) {
                 this->cv_write_.wait(lock, [&] {
-                    offset = try_acquire_(total);
+                    offset = try_acquire(total);
                     return offset != SIZE_MAX;
                 });
             } else {
                 bool ok =
                     this->cv_write_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-                        offset = try_acquire_(total);
+                        offset = try_acquire(total);
                         return offset != SIZE_MAX;
                     });
                 if (!ok) {
@@ -279,7 +279,7 @@ public:
     void* receive(size_t* item_size, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);
 
-        void* result = try_read_(item_size);
+        void* result = try_read(item_size);
         if (result != nullptr) {
             return result;
         }
@@ -290,12 +290,12 @@ public:
 
         if (timeout_ms == UINT32_MAX) {
             this->cv_read_.wait(lock, [&] {
-                result = try_read_(item_size);
+                result = try_read(item_size);
                 return result != nullptr;
             });
         } else {
             this->cv_read_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-                result = try_read_(item_size);
+                result = try_read(item_size);
                 return result != nullptr;
             });
         }
@@ -309,7 +309,7 @@ public:
         std::lock_guard<std::mutex> lock(this->mtx_);
         auto* header =
             reinterpret_cast<ItemHeader*>(static_cast<uint8_t*>(ptr) - sizeof(ItemHeader));
-        size_t total = item_total_size_(header->size);
+        size_t total = item_total_size(header->size);
 
         header->flags = FLAG_FREE;
         this->read_offset_ += total;
@@ -338,17 +338,17 @@ private:
                   "ItemHeader size must be a multiple of ALIGNMENT");
 
     /// @brief Rounds n up to the nearest multiple of ALIGNMENT
-    static size_t align_(size_t n) {
+    static size_t align(size_t n) {
         return (n + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
     }
 
     /// @brief Returns the total storage occupied by one item including its header and alignment
-    static size_t item_total_size_(size_t data_size) {
-        return sizeof(ItemHeader) + align_(data_size);
+    static size_t item_total_size(size_t data_size) {
+        return sizeof(ItemHeader) + align(data_size);
     }
 
     /// @brief Attempts to reserve space for an item of total bytes; returns offset or SIZE_MAX
-    size_t try_acquire_(size_t total) {
+    size_t try_acquire(size_t total) {
         if (this->free_bytes_ < total) {
             return SIZE_MAX;
         }
@@ -375,14 +375,14 @@ private:
     }
 
     /// @brief Attempts to read the next committed item; returns a pointer or nullptr if none ready
-    void* try_read_(size_t* item_size) {
+    void* try_read(size_t* item_size) {
         while (this->read_offset_ != this->write_offset_ || this->free_bytes_ == 0) {
             if (this->read_offset_ >= this->storage_size_) {
                 this->read_offset_ = 0;
             }
             auto* header = reinterpret_cast<ItemHeader*>(this->storage_ + this->read_offset_);
             if (header->flags == FLAG_DUMMY) {
-                size_t skip = sizeof(ItemHeader) + align_(header->size);
+                size_t skip = sizeof(ItemHeader) + align(header->size);
                 this->read_offset_ += skip;
                 this->free_bytes_ += skip;
                 this->cv_write_.notify_all();

@@ -43,6 +43,9 @@ static constexpr uint8_t FLAG_HAS_LOUDNESS = (1 << 0);
 static constexpr uint8_t FLAG_HAS_F_PEAK = (1 << 1);
 static constexpr uint8_t FLAG_HAS_SPECTRUM = (1 << 2);
 
+/// @brief Mask to extract the flags portion (bits 0-6) from a frame type byte
+static constexpr uint8_t FRAME_FLAGS_MASK = 0x7FU;
+
 // Entry header sizes (before the 8-byte server timestamp)
 static constexpr size_t FRAME_HEADER_SIZE = 2;  // type+flags byte, bin_count byte
 static constexpr size_t BEAT_HEADER_SIZE = 1;   // type byte only
@@ -51,6 +54,12 @@ static constexpr size_t TIMESTAMP_SIZE = 8;
 // Event flag bits for drain thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
 static constexpr uint32_t COMMAND_FLUSH = (1 << 1);
+
+/// @brief Timeout for blocking ring buffer receive in drain thread (allows periodic command checks)
+static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 50U;
+
+/// @brief Microseconds per millisecond (unit conversion constant)
+static constexpr int64_t US_PER_MS = 1000LL;
 
 static constexpr int64_t TOO_OLD_THRESHOLD_US = 20000;  // 20ms
 
@@ -114,7 +123,7 @@ VisualizerRole::VisualizerRole(Config config, SendspinClient* client)
 }
 
 VisualizerRole::~VisualizerRole() {
-    this->stop_();
+    this->stop();
 }
 
 bool VisualizerRole::start(bool psram_stack, unsigned priority) {
@@ -129,11 +138,11 @@ bool VisualizerRole::start(bool psram_stack, unsigned priority) {
     }
 
     platform_configure_thread("SsVis", 4096, static_cast<int>(priority), psram_stack);
-    this->drain_task_->drain_thread = std::thread(drain_thread_func_, this);
+    this->drain_task_->drain_thread = std::thread(drain_thread_func, this);
     return true;
 }
 
-void VisualizerRole::stop_() {
+void VisualizerRole::stop() {
     if (!this->drain_task_ || !this->drain_task_->drain_thread.joinable()) {
         return;
     }
@@ -160,23 +169,28 @@ void VisualizerRole::handle_binary(uint8_t binary_type, const uint8_t* data, siz
 
     // Build the frame flags byte from cached config
     uint8_t flags = ENTRY_FRAME;
-    if (this->has_loudness_)
+    if (this->has_loudness_) {
         flags |= FLAG_HAS_LOUDNESS;
-    if (this->has_f_peak_)
+    }
+    if (this->has_f_peak_) {
         flags |= FLAG_HAS_F_PEAK;
-    if (this->has_spectrum_)
+    }
+    if (this->has_spectrum_) {
         flags |= FLAG_HAS_SPECTRUM;
+    }
 
     if (binary_type == SENDSPIN_BINARY_VISUALIZER_BEAT) {
         // Beat format: [num_beats(1)][per-beat: server_timestamp(8)]
-        if (len < 1)
+        if (len < 1) {
             return;
+        }
         uint8_t num_beats = data[0];
         size_t offset = 1;
 
         for (uint8_t i = 0; i < num_beats; ++i) {
-            if (offset + TIMESTAMP_SIZE > len)
+            if (offset + TIMESTAMP_SIZE > len) {
                 break;
+            }
 
             // Build beat entry: [ENTRY_BEAT][8-byte server_ts]
             uint8_t entry[BEAT_HEADER_SIZE + TIMESTAMP_SIZE];
@@ -188,22 +202,25 @@ void VisualizerRole::handle_binary(uint8_t binary_type, const uint8_t* data, siz
         }
     } else {
         // Visualizer data format: [num_frames(1)][per-frame: timestamp(8) + fields...]
-        if (len < 1)
+        if (len < 1) {
             return;
+        }
         uint8_t num_frames = data[0];
         size_t offset = 1;
         size_t wire_frame_size = TIMESTAMP_SIZE + this->raw_frame_size_;
         size_t entry_size = FRAME_HEADER_SIZE + TIMESTAMP_SIZE + this->raw_frame_size_;
 
         for (uint8_t i = 0; i < num_frames; ++i) {
-            if (offset + wire_frame_size > len)
+            if (offset + wire_frame_size > len) {
                 break;
+            }
 
             // Build frame entry: [flags][bin_count][8-byte server_ts][raw field bytes]
             // Use acquire+commit to avoid double-copy
             void* dest = this->drain_task_->ring_buffer.acquire(entry_size, 0);
-            if (dest == nullptr)
+            if (dest == nullptr) {
                 break;  // Buffer full, drop remaining frames
+            }
 
             auto* entry = static_cast<uint8_t*>(dest);
             entry[0] = flags;
@@ -228,12 +245,15 @@ void VisualizerRole::handle_stream_start(const ServerVisualizerStreamObject& str
     this->spectrum_bin_count_ = 0;
 
     for (auto type : stream.types) {
-        if (type == VisualizerDataType::LOUDNESS)
+        if (type == VisualizerDataType::LOUDNESS) {
             this->has_loudness_ = true;
-        if (type == VisualizerDataType::F_PEAK)
+        }
+        if (type == VisualizerDataType::F_PEAK) {
             this->has_f_peak_ = true;
-        if (type == VisualizerDataType::SPECTRUM)
+        }
+        if (type == VisualizerDataType::SPECTRUM) {
             this->has_spectrum_ = true;
+        }
     }
     if (this->has_spectrum_ && stream.spectrum.has_value()) {
         this->spectrum_bin_count_ = stream.spectrum->n_disp_bins;
@@ -278,11 +298,11 @@ void VisualizerRole::handle_stream_clear() {
 // ============================================================================
 
 void VisualizerRole::drain_events() {
-    EventType event_type;
+    EventType event_type{};
     while (this->event_state_->queue.receive(event_type, 0)) {
         switch (event_type) {
             case EventType::STREAM_START: {
-                ServerVisualizerStreamObject config;
+                ServerVisualizerStreamObject config{};
                 if (this->event_state_->shadow_config.take(config) && this->listener_) {
                     this->listener_->on_visualizer_stream_start(config);
                 }
@@ -322,9 +342,10 @@ void VisualizerRole::cleanup() {
 // Drain thread
 // ============================================================================
 
-void VisualizerRole::flush_ring_buffer_() {
-    if (!this->drain_task_)
+void VisualizerRole::flush_ring_buffer() {
+    if (!this->drain_task_) {
         return;
+    }
     size_t item_size = 0;
     void* item = nullptr;
     while ((item = this->drain_task_->ring_buffer.receive(&item_size, 0)) != nullptr) {
@@ -332,7 +353,7 @@ void VisualizerRole::flush_ring_buffer_() {
     }
 }
 
-void VisualizerRole::drain_thread_func_(VisualizerRole* self) {
+void VisualizerRole::drain_thread_func(VisualizerRole* self) {
     SS_LOGD(TAG, "Drain thread started");
 
     auto& rb = self->drain_task_->ring_buffer;
@@ -341,18 +362,20 @@ void VisualizerRole::drain_thread_func_(VisualizerRole* self) {
     while (true) {
         // Non-blocking check for commands
         uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, 0);
-        if (cmd & COMMAND_STOP)
+        if (cmd & COMMAND_STOP) {
             break;
+        }
         if (cmd & COMMAND_FLUSH) {
-            self->flush_ring_buffer_();
+            self->flush_ring_buffer();
             continue;
         }
 
         // Blocking receive with 50ms timeout (allows periodic command checks)
         size_t item_size = 0;
-        void* item = rb.receive(&item_size, 50);
-        if (item == nullptr)
+        void* item = rb.receive(&item_size, DRAIN_RECEIVE_TIMEOUT_MS);
+        if (item == nullptr) {
             continue;
+        }
 
         // Wait for time sync
         if (!self->client_->is_time_synced()) {
@@ -381,7 +404,7 @@ void VisualizerRole::drain_thread_func_(VisualizerRole* self) {
         // Sleep until display time (interruptible via event flags)
         int64_t now = platform_time_us();
         if (client_ts > now) {
-            uint32_t wait_ms = static_cast<uint32_t>((client_ts - now) / 1000);
+            uint32_t wait_ms = static_cast<uint32_t>((client_ts - now) / US_PER_MS);
             if (wait_ms > 0) {
                 cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, wait_ms);
                 if (cmd & COMMAND_STOP) {
@@ -390,7 +413,7 @@ void VisualizerRole::drain_thread_func_(VisualizerRole* self) {
                 }
                 if (cmd & COMMAND_FLUSH) {
                     rb.return_item(item);
-                    self->flush_ring_buffer_();
+                    self->flush_ring_buffer();
                     continue;
                 }
             }
@@ -405,13 +428,13 @@ void VisualizerRole::drain_thread_func_(VisualizerRole* self) {
 
         // Parse and deliver
         if (is_frame && self->listener_) {
-            uint8_t frame_flags = type_byte & 0x7F;
+            uint8_t frame_flags = type_byte & FRAME_FLAGS_MASK;
             uint8_t bin_count = raw[1];
             const uint8_t* fields = raw + FRAME_HEADER_SIZE + TIMESTAMP_SIZE;
             size_t data_len = item_size - FRAME_HEADER_SIZE - TIMESTAMP_SIZE;
             size_t offset = 0;
 
-            VisualizerFrame frame;
+            VisualizerFrame frame{};
             frame.timestamp = client_ts;
 
             if ((frame_flags & FLAG_HAS_LOUDNESS) && offset + 2 <= data_len) {

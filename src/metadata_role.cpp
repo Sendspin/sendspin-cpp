@@ -14,6 +14,7 @@
 
 #include "sendspin/metadata_role.h"
 
+#include "audio_stream_info.h"
 #include "platform/shadow_slot.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
@@ -69,7 +70,8 @@ uint32_t MetadataRole::get_track_progress_ms() const {
     // 1_000_000
     int64_t elapsed_us = platform_time_us() - client_target;
     int64_t calculated = static_cast<int64_t>(progress.track_progress) +
-                         elapsed_us * static_cast<int64_t>(progress.playback_speed) / 1000000;
+                         elapsed_us * static_cast<int64_t>(progress.playback_speed) /
+                             static_cast<int64_t>(US_PER_SECOND);
 
     if (progress.track_duration != 0) {
         calculated = std::max(std::min(calculated, static_cast<int64_t>(progress.track_duration)),
@@ -98,7 +100,7 @@ void MetadataRole::handle_server_state(ServerMetadataStateObject state) {
 }
 
 void MetadataRole::drain_events() {
-    ServerMetadataStateObject delta;
+    ServerMetadataStateObject delta{};
     if (this->event_state_->shadow.take(delta)) {
         apply_metadata_state_deltas(&this->metadata_, delta);
         if (this->listener_) {

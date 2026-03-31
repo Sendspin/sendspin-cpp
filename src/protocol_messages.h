@@ -69,7 +69,7 @@ enum SendspinBinaryType : uint8_t {
 };
 
 /// @brief JSON message types sent from the server to the client
-enum class SendspinServerToClientMessageType {
+enum class SendspinServerToClientMessageType : uint8_t {
     SERVER_HELLO,    // server/hello handshake
     SERVER_TIME,     // server/time clock sync reply
     SERVER_STATE,    // server/state playback state update
@@ -82,7 +82,7 @@ enum class SendspinServerToClientMessageType {
 };
 
 /// @brief Protocol role identifiers used in hello messages and role negotiation
-enum class SendspinRole {
+enum class SendspinRole : uint8_t {
     PLAYER,      // Audio playback role
     CONTROLLER,  // Playback command/state role
     METADATA,    // Track metadata role
@@ -111,7 +111,7 @@ inline const char* to_cstr(SendspinRole role) {
 }
 
 /// @brief Connection reason reported in server/hello messages
-enum class SendspinConnectionReason {
+enum class SendspinConnectionReason : uint8_t {
     DISCOVERY,  // Server connected for device discovery only
     PLAYBACK,   // Server connected for active audio playback
 };
@@ -135,10 +135,12 @@ inline const char* to_cstr(SendspinConnectionReason reason) {
 /// @return The matching enum value, or std::nullopt if the string is unrecognized.
 inline std::optional<SendspinConnectionReason> connection_reason_from_string(
     const std::string& str) {
-    if (str == "discovery")
+    if (str == "discovery") {
         return SendspinConnectionReason::DISCOVERY;
-    if (str == "playback")
+    }
+    if (str == "playback") {
         return SendspinConnectionReason::PLAYBACK;
+    }
     return std::nullopt;
 }
 
@@ -158,20 +160,20 @@ struct TimeTransmittedReplacement {
 
 /// @brief Outgoing client/hello handshake message sent at connection startup
 struct ClientHelloMessage {
-    std::string client_id;
-    std::string name;
-    std::optional<DeviceInfoObject> device_info;
-    uint8_t version;
-    std::vector<SendspinRole> supported_roles;
-    std::optional<PlayerSupportObject> player_v1_support;
-    std::optional<ArtworkSupportObject> artwork_v1_support;
-    std::optional<VisualizerSupportObject> visualizer_support;
+    std::string client_id{};
+    std::string name{};
+    std::optional<DeviceInfoObject> device_info{};
+    uint8_t version{};
+    std::vector<SendspinRole> supported_roles{};
+    std::optional<PlayerSupportObject> player_v1_support{};
+    std::optional<ArtworkSupportObject> artwork_v1_support{};
+    std::optional<VisualizerSupportObject> visualizer_support{};
 };
 
 /// @brief Outgoing client/state message reporting client playback state to the server
 struct ClientStateMessage {
-    SendspinClientState state;
-    std::optional<ClientPlayerStateObject> player;
+    SendspinClientState state{};
+    std::optional<ClientPlayerStateObject> player{};
 };
 
 /// @brief Outgoing client/command message carrying a playback command to the server
@@ -187,10 +189,10 @@ struct ServerStateMessage {
 
 /// @brief Parsed server/hello handshake message received at connection startup
 struct ServerHelloMessage {
-    ServerInformationObject server;
-    uint16_t version;
-    std::vector<std::string> active_roles;
-    SendspinConnectionReason connection_reason;
+    ServerInformationObject server{};
+    uint16_t version{};
+    std::vector<std::string> active_roles{};
+    SendspinConnectionReason connection_reason{};
 };
 
 /// @brief Parsed group/update message containing the group state delta
@@ -213,12 +215,12 @@ struct StreamRequestFormatMessage {
 
 /// @brief Parsed stream/end message listing which roles the stream end applies to
 struct StreamEndMessage {
-    std::optional<std::vector<std::string>> roles;
+    std::optional<std::vector<std::string>> roles{};
 };
 
 /// @brief Parsed stream/clear message listing which roles the buffer flush applies to
 struct StreamClearMessage {
-    std::optional<std::vector<std::string>> roles;
+    std::optional<std::vector<std::string>> roles{};
 };
 
 // ============================================================================

@@ -23,6 +23,15 @@
 
 namespace sendspin {
 
+/// @brief Milliseconds per second (unit conversion constant)
+static constexpr uint32_t MS_PER_SECOND = 1000U;
+
+/// @brief Microseconds per second (unit conversion constant)
+static constexpr uint32_t US_PER_SECOND = 1000000U;
+
+/// @brief Default audio sample rate in Hz used when no format is specified
+static constexpr uint32_t DEFAULT_SAMPLE_RATE_HZ = 16000U;
+
 /**
  * @brief Audio stream format descriptor with unit conversion helpers for bytes, frames,
  * samples, and durations
@@ -47,7 +56,7 @@ namespace sendspin {
 class AudioStreamInfo {
 public:
     /// @brief Default-constructs an empty AudioStreamInfo with zero-initialized fields
-    AudioStreamInfo() : AudioStreamInfo(16, 1, 16000) {}
+    AudioStreamInfo() : AudioStreamInfo(16, 1, DEFAULT_SAMPLE_RATE_HZ) {}
     /// @brief Constructs an AudioStreamInfo with the given format parameters
     /// @param bits_per_sample Number of bits per audio sample (e.g., 16).
     /// @param channels Number of audio channels (e.g., 1 for mono, 2 for stereo).
@@ -74,7 +83,8 @@ public:
     /// @param bytes Number of bytes of PCM data.
     /// @return Duration in milliseconds.
     uint32_t bytes_to_ms(size_t bytes) const {
-        return bytes * 1000 / (this->sample_rate_ * this->bytes_per_sample_ * this->channels_);
+        return bytes * MS_PER_SECOND /
+               (this->sample_rate_ * this->bytes_per_sample_ * this->channels_);
     }
 
     /// @brief Converts a byte count to the number of audio frames
@@ -102,7 +112,8 @@ public:
     /// @param ms Duration in milliseconds.
     /// @return Number of bytes.
     size_t ms_to_bytes(uint32_t ms) const {
-        return (ms * this->bytes_per_sample_ * this->channels_ * this->sample_rate_) / 1000;
+        return (ms * this->bytes_per_sample_ * this->channels_ * this->sample_rate_) /
+               MS_PER_SECOND;
     }
 
     /// @brief Converts a frame count to microseconds

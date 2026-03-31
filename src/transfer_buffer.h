@@ -117,9 +117,9 @@ protected:
 
     /// @brief Allocates the backing buffer and resets tracking state.
     /// @return True if allocation succeeded, false otherwise.
-    bool allocate_buffer_(size_t buffer_size);
+    bool allocate_buffer(size_t buffer_size);
     /// @brief Releases the backing buffer and resets all tracking state.
-    void deallocate_buffer_();
+    void deallocate_buffer();
 
     // Struct fields
     PlatformBuffer buffer_;

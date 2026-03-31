@@ -99,7 +99,7 @@ public:
     ///
     /// Called on the main thread before connection cleanup so that no stale events from a dying
     /// connection can sneak into role queues after they've been reset. Thread-safe: the flag is
-    /// checked atomically in dispatch_completed_message_() which runs on the network thread.
+    /// checked atomically in dispatch_completed_message() which runs on the network thread.
     void disable_message_dispatch() {
         this->message_dispatch_enabled_.store(false, std::memory_order_release);
     }
@@ -278,10 +278,10 @@ public:
 
 protected:
     /// @brief Deallocates the websocket payload buffer if allocated
-    void deallocate_websocket_payload_();
+    void deallocate_websocket_payload();
 
     /// @brief Resets the write offset without freeing the buffer (reuses it for the next message)
-    void reset_websocket_payload_();
+    void reset_websocket_payload();
 
     /// @brief Allocates or grows the websocket payload buffer and returns a pointer to the write
     /// position
@@ -292,11 +292,11 @@ protected:
     /// @param data_len Number of bytes that will be written.
     /// @return Pointer to the write position (websocket_payload_ + websocket_write_offset_), or
     /// nullptr on failure.
-    uint8_t* prepare_receive_buffer_(size_t data_len);
+    uint8_t* prepare_receive_buffer(size_t data_len);
 
     /// @brief Advances the write offset after data has been written into the buffer
     /// @param data_len Number of bytes that were written.
-    void commit_receive_buffer_(size_t data_len);
+    void commit_receive_buffer(size_t data_len);
 
     /// @brief Dispatches a fully assembled message to the appropriate callback
     ///
@@ -306,7 +306,7 @@ protected:
     ///
     /// @param is_text True if this is a text message, false for binary.
     /// @param receive_time Timestamp when the data was received (microseconds).
-    void dispatch_completed_message_(bool is_text, int64_t receive_time);
+    void dispatch_completed_message(bool is_text, int64_t receive_time);
 
     // Struct fields
 
@@ -348,7 +348,7 @@ protected:
     /// Needed because WebSocket continuation frames do not carry the original frame type
     bool is_text_frame_{false};
 
-    /// When false, dispatch_completed_message_() silently drops incoming messages.
+    /// When false, dispatch_completed_message() silently drops incoming messages.
     /// Set to false on the main thread before cleanup; checked on the network thread.
     std::atomic<bool> message_dispatch_enabled_{true};
 

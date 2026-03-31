@@ -91,16 +91,16 @@ SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
 // WebSocket payload buffer management
 // ============================================================================
 
-void SendspinConnection::deallocate_websocket_payload_() {
+void SendspinConnection::deallocate_websocket_payload() {
     this->websocket_payload_.reset();
     this->websocket_write_offset_ = 0;
 }
 
-void SendspinConnection::reset_websocket_payload_() {
+void SendspinConnection::reset_websocket_payload() {
     this->websocket_write_offset_ = 0;
 }
 
-uint8_t* SendspinConnection::prepare_receive_buffer_(size_t data_len) {
+uint8_t* SendspinConnection::prepare_receive_buffer(size_t data_len) {
     if (!this->websocket_payload_) {
         // First fragment - allocate new buffer
         if (!this->websocket_payload_.allocate(data_len)) {
@@ -113,7 +113,7 @@ uint8_t* SendspinConnection::prepare_receive_buffer_(size_t data_len) {
         size_t new_len = this->websocket_write_offset_ + data_len;
         if (!this->websocket_payload_.realloc(new_len)) {
             SS_LOGE(TAG, "Failed to expand websocket payload to %zu bytes", new_len);
-            this->deallocate_websocket_payload_();
+            this->deallocate_websocket_payload();
             return nullptr;
         }
     }
@@ -121,17 +121,17 @@ uint8_t* SendspinConnection::prepare_receive_buffer_(size_t data_len) {
     return this->websocket_payload_.data() + this->websocket_write_offset_;
 }
 
-void SendspinConnection::commit_receive_buffer_(size_t data_len) {
+void SendspinConnection::commit_receive_buffer(size_t data_len) {
     this->websocket_write_offset_ += data_len;
 }
 
-void SendspinConnection::dispatch_completed_message_(bool is_text, int64_t receive_time) {
+void SendspinConnection::dispatch_completed_message(bool is_text, int64_t receive_time) {
     if (!this->websocket_payload_) {
         return;
     }
 
     if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
-        this->reset_websocket_payload_();
+        this->reset_websocket_payload();
         return;
     }
 
@@ -153,7 +153,7 @@ void SendspinConnection::dispatch_completed_message_(bool is_text, int64_t recei
     }
 
     // Reset write offset for next message; keep buffer allocated for reuse
-    this->reset_websocket_payload_();
+    this->reset_websocket_payload();
 }
 
 }  // namespace sendspin
