@@ -4,8 +4,8 @@ dependencies:
   idf: ">=5.1"
   espressif/esp_websocket_client: ">=1.0.0"
   bblanchon/arduinojson: ">=7.4.0"
-  micro-flac:
-    git: https://github.com/esphome-libs/micro-flac.git
+  esphome/micro-flac:
+    version: ">=0.1.0"
   esphome/micro-opus:
     version: ">=0.3.5"
 description: "Sendspin synchronized audio streaming client for ESP32"

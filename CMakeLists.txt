@@ -41,7 +41,7 @@ if(ESP_IDF_BUILD)
     # Collect sources
     sendspin_get_sources(${SENDSPIN_COMPONENT_DIR})
 
-    set(SENDSPIN_REQUIRES esp_http_server esp_timer esp_ringbuf pthread mbedtls bblanchon__arduinojson micro-flac esphome__micro-opus)
+    set(SENDSPIN_REQUIRES esp_http_server esp_timer esp_ringbuf pthread mbedtls bblanchon__arduinojson esphome__micro-flac esphome__micro-opus)
 
     # Register the component — uses both common and ESP-specific sources
     idf_component_register(
