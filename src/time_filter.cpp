@@ -28,12 +28,12 @@ namespace sendspin {
 SendspinTimeFilter::SendspinTimeFilter(double process_std_dev, double drift_process_std_dev,
                                        double forget_factor, double adaptive_cutoff,
                                        uint8_t min_samples, double drift_significance_threshold)
-    : process_variance_(process_std_dev * process_std_dev),
+    : adaptive_forgetting_cutoff_(adaptive_cutoff),
       drift_process_variance_(drift_process_std_dev * drift_process_std_dev),
-      forget_variance_factor_(forget_factor * forget_factor),
-      adaptive_forgetting_cutoff_(adaptive_cutoff),
       drift_significance_threshold_squared_(drift_significance_threshold *
                                             drift_significance_threshold),
+      forget_variance_factor_(forget_factor * forget_factor),
+      process_variance_(process_std_dev * process_std_dev),
       min_samples_for_forgetting_(min_samples) {
     this->reset();
 }

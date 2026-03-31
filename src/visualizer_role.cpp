@@ -95,8 +95,8 @@ struct VisualizerRole::EventState {
 // ============================================================================
 
 VisualizerRole::VisualizerRole(Config config, SendspinClient* client)
-    : client_(client),
-      visualizer_support_(std::move(config.support)),
+    : visualizer_support_(std::move(config.support)),
+      client_(client),
       event_state_(std::make_unique<EventState>()) {
     this->event_state_->queue.create(8);
 

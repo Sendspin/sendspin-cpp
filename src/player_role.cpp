@@ -80,10 +80,10 @@ struct PlayerRole::EventState {
 PlayerRole::PlayerRole(Config config, SendspinClient* client,
                        SendspinPersistenceProvider* persistence)
     : config_(std::move(config)),
-      persistence_(persistence),
       client_(client),
-      sync_task_(std::make_unique<SyncTask>()),
-      event_state_(std::make_unique<EventState>()) {
+      event_state_(std::make_unique<EventState>()),
+      persistence_(persistence),
+      sync_task_(std::make_unique<SyncTask>()) {
     this->event_state_->stream_queue.create(8);
     this->event_state_->state_queue.create(4);
 }

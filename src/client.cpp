@@ -45,8 +45,8 @@ struct SendspinClient::EventState {
 SendspinClient::SendspinClient(SendspinClientConfig config)
     : config_(std::move(config)),
       connection_manager_(std::make_unique<ConnectionManager>(this)),
-      time_burst_(std::make_unique<SendspinTimeBurst>()),
-      event_state_(std::make_unique<EventState>()) {
+      event_state_(std::make_unique<EventState>()),
+      time_burst_(std::make_unique<SendspinTimeBurst>()) {
     this->event_state_->time_queue.create(16);
     this->time_burst_->configure(this->config_.time_burst_size,
                                  this->config_.time_burst_interval_ms,

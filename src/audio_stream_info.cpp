@@ -34,7 +34,7 @@ static uint32_t gcd(uint32_t a, uint32_t b) {
 // ============================================================================
 
 AudioStreamInfo::AudioStreamInfo(uint8_t bits_per_sample, uint8_t channels, uint32_t sample_rate)
-    : bits_per_sample_(bits_per_sample), channels_(channels), sample_rate_(sample_rate) {
+    : sample_rate_(sample_rate), bits_per_sample_(bits_per_sample), channels_(channels) {
     this->ms_sample_rate_gcd_ = gcd(1000, this->sample_rate_);
     this->bytes_per_sample_ = (this->bits_per_sample_ + 7) / 8;
 }
