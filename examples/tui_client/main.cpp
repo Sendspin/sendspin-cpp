@@ -21,6 +21,7 @@
 ///   name:  Optional friendly name (default: "TUI Client")
 ///
 /// Options:
+///   -f FORMAT Audio format as codec:rate:bits:channels (repeatable)
 ///   -h        Show usage
 
 #include "tui.h"
@@ -46,6 +47,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -343,11 +345,63 @@ private:
     std::vector<DNSServiceRef> pending_resolves_;
 };
 
+/// Parse an audio format string like "flac:48000:24:2" into an AudioSupportedFormatObject.
+/// Returns true on success.
+static bool parse_audio_format(const std::string& str, sendspin::AudioSupportedFormatObject& fmt) {
+    std::istringstream ss(str);
+    std::string codec_str, rate_str, bits_str, channels_str;
+
+    if (!std::getline(ss, codec_str, ':') || !std::getline(ss, rate_str, ':') ||
+        !std::getline(ss, bits_str, ':') || !std::getline(ss, channels_str, ':')) {
+        return false;
+    }
+
+    // Parse codec
+    std::transform(codec_str.begin(), codec_str.end(), codec_str.begin(), ::tolower);
+    if (codec_str == "flac") {
+        fmt.codec = sendspin::SendspinCodecFormat::FLAC;
+    } else if (codec_str == "opus") {
+        fmt.codec = sendspin::SendspinCodecFormat::OPUS;
+    } else if (codec_str == "pcm") {
+        fmt.codec = sendspin::SendspinCodecFormat::PCM;
+    } else {
+        fprintf(stderr, "Unknown codec: %s (expected flac, opus, or pcm)\n", codec_str.c_str());
+        return false;
+    }
+
+    // Parse numeric fields
+    char* end = nullptr;
+    unsigned long rate = strtoul(rate_str.c_str(), &end, 10);
+    if (*end != '\0' || rate == 0) {
+        fprintf(stderr, "Invalid sample rate: %s\n", rate_str.c_str());
+        return false;
+    }
+    fmt.sample_rate = static_cast<uint32_t>(rate);
+
+    unsigned long bits = strtoul(bits_str.c_str(), &end, 10);
+    if (*end != '\0' || bits == 0 || bits > 32) {
+        fprintf(stderr, "Invalid bit depth: %s\n", bits_str.c_str());
+        return false;
+    }
+    fmt.bit_depth = static_cast<uint8_t>(bits);
+
+    unsigned long channels = strtoul(channels_str.c_str(), &end, 10);
+    if (*end != '\0' || channels == 0 || channels > 8) {
+        fprintf(stderr, "Invalid channel count: %s\n", channels_str.c_str());
+        return false;
+    }
+    fmt.channels = static_cast<uint8_t>(channels);
+
+    return true;
+}
+
 static void print_usage(const char* prog) {
     fprintf(stderr, "Usage: %s [options] [name]\n", prog);
     fprintf(stderr, "  name          Friendly name (default: \"TUI Client\")\n\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -u URL        Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)\n");
+    fprintf(stderr, "  -f FORMAT     Audio format as codec:rate:bits:channels (e.g. flac:48000:24:2)\n");
+    fprintf(stderr, "                Can be specified multiple times. Codecs: flac, opus, pcm\n");
     fprintf(stderr, "  -V            Disable visualizer\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
@@ -356,12 +410,21 @@ int main(int argc, char* argv[]) {
     // Parse command line options
     bool enable_visualizer = true;
     std::string connect_url;
+    std::vector<sendspin::AudioSupportedFormatObject> audio_formats;
     int opt;
-    while ((opt = getopt(argc, argv, "u:Vh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:f:Vh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
                 break;
+            case 'f': {
+                sendspin::AudioSupportedFormatObject fmt;
+                if (!parse_audio_format(optarg, fmt)) {
+                    return 1;
+                }
+                audio_formats.push_back(fmt);
+                break;
+            }
             case 'V':
                 enable_visualizer = false;
                 break;
@@ -390,17 +453,67 @@ int main(int argc, char* argv[]) {
     // Create audio output
 #ifdef SENDSPIN_HAS_PORTAUDIO
     PortAudioSink audio_sink;
+
+    // Validate explicitly requested formats against PortAudio device capabilities
+    if (!audio_formats.empty()) {
+        for (const auto& fmt : audio_formats) {
+            if (!PortAudioSink::is_format_supported(fmt.sample_rate, fmt.channels, fmt.bit_depth)) {
+                fprintf(stderr,
+                        "Audio format not supported by output device: %uHz %uch %ubit\n",
+                        fmt.sample_rate, fmt.channels, fmt.bit_depth);
+                return 1;
+            }
+        }
+    } else {
+        // Build default format list based on device capabilities
+        uint8_t max_ch = PortAudioSink::max_output_channels();
+        if (max_ch == 0) {
+            fprintf(stderr, "No audio output device available\n");
+            return 1;
+        }
+        uint8_t channels = std::min(max_ch, static_cast<uint8_t>(2));
+
+        static constexpr uint32_t SAMPLE_RATES[] = {44100, 48000, 88200, 96000};
+        static constexpr uint8_t BIT_DEPTHS[] = {16, 24, 32};
+        static constexpr SendspinCodecFormat CODECS[] = {
+            SendspinCodecFormat::FLAC, SendspinCodecFormat::OPUS, SendspinCodecFormat::PCM,
+        };
+
+        for (uint32_t rate : SAMPLE_RATES) {
+            for (uint8_t bits : BIT_DEPTHS) {
+                if (!PortAudioSink::is_format_supported(rate, channels, bits)) {
+                    continue;
+                }
+                for (SendspinCodecFormat codec : CODECS) {
+                    // Opus always decodes to 48kHz 16-bit
+                    if (codec == SendspinCodecFormat::OPUS && (rate != 48000 || bits != 16)) {
+                        continue;
+                    }
+                    audio_formats.push_back({codec, channels, rate, bits});
+                }
+            }
+        }
+
+        if (audio_formats.empty()) {
+            fprintf(stderr, "No supported audio formats found for default output device\n");
+            return 1;
+        }
+    }
+#else
+    if (audio_formats.empty()) {
+        audio_formats = {
+            {SendspinCodecFormat::FLAC, 2, 44100, 16}, {SendspinCodecFormat::FLAC, 2, 48000, 16},
+            {SendspinCodecFormat::OPUS, 2, 48000, 16}, {SendspinCodecFormat::PCM, 2, 44100, 16},
+            {SendspinCodecFormat::PCM, 2, 48000, 16},
+        };
+    }
 #endif
 
     SendspinClient client(std::move(config));
 
     // Add roles
     PlayerRole::Config player_config;
-    player_config.audio_formats = {
-        {SendspinCodecFormat::FLAC, 2, 44100, 16}, {SendspinCodecFormat::FLAC, 2, 48000, 16},
-        {SendspinCodecFormat::OPUS, 2, 48000, 16}, {SendspinCodecFormat::PCM, 2, 44100, 16},
-        {SendspinCodecFormat::PCM, 2, 48000, 16},
-    };
+    player_config.audio_formats = std::move(audio_formats);
     auto& player = client.add_player(std::move(player_config));
     auto& controller = client.add_controller();
     auto& metadata = client.add_metadata();
@@ -652,6 +765,27 @@ int main(int argc, char* argv[]) {
 
     // Auto-connect if a URL was provided via -u
     if (!connect_url.empty()) {
+        // Parse host and port from ws://host:port/path for display
+        {
+            std::string url_tmp = connect_url;
+            auto scheme_end = url_tmp.find("://");
+            if (scheme_end != std::string::npos) {
+                url_tmp = url_tmp.substr(scheme_end + 3);
+            }
+            auto path_start = url_tmp.find('/');
+            std::string host_port = (path_start != std::string::npos)
+                                        ? url_tmp.substr(0, path_start)
+                                        : url_tmp;
+            auto colon = host_port.rfind(':');
+            if (colon != std::string::npos) {
+                state.connected_host = host_port.substr(0, colon);
+                state.connected_port =
+                    static_cast<uint16_t>(std::stoul(host_port.substr(colon + 1)));
+            } else {
+                state.connected_host = host_port;
+                state.connected_port = SENDSPIN_PORT;
+            }
+        }
         client.connect_to(connect_url);
     }
 
@@ -667,8 +801,14 @@ int main(int argc, char* argv[]) {
         while (running.load()) {
             client.loop();
 
-            // Smooth visualizer display values every tick (10ms)
+            bool vis_showing;
             {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                vis_showing = state.show_visualizer;
+            }
+
+            // Smooth visualizer display values every tick (10ms) — only when visible
+            if (vis_showing) {
                 int64_t current_us = now_us();
                 std::lock_guard<std::mutex> lock(state.mutex);
 
@@ -714,11 +854,6 @@ int main(int argc, char* argv[]) {
             }
 
             // Post UI refresh at ~30fps (every 3 ticks) when visualizer is showing
-            bool vis_showing;
-            {
-                std::lock_guard<std::mutex> lock(state.mutex);
-                vis_showing = state.show_visualizer;
-            }
             if (vis_showing) {
                 if (++vis_refresh_counter % 3 == 0) {
                     screen.PostEvent(ftxui::Event::Custom);
@@ -726,6 +861,24 @@ int main(int argc, char* argv[]) {
             }
 
             if (++tick % 25 == 0) {  // every 250ms
+                // Snapshot previous state to detect changes
+                uint32_t prev_progress, prev_duration;
+                bool prev_connected;
+                uint8_t prev_group_vol, prev_player_vol;
+                bool prev_group_muted, prev_player_muted;
+                std::string prev_group_name;
+                {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    prev_progress = state.track_progress_ms;
+                    prev_duration = state.track_duration_ms;
+                    prev_connected = state.connected;
+                    prev_group_vol = state.group_volume;
+                    prev_player_vol = state.player_volume;
+                    prev_group_muted = state.group_muted;
+                    prev_player_muted = state.player_muted;
+                    prev_group_name = state.group_name;
+                }
+
                 update_polled_state(state, client);
 #ifdef SENDSPIN_HAS_PORTAUDIO
                 // Sync audio sink volume with client state every poll cycle.
@@ -745,8 +898,24 @@ int main(int argc, char* argv[]) {
                         state.server_selector_index = std::max(0, max_index);
                     }
                 }
+
+                // Only post a redraw if something actually changed
                 if (!vis_showing) {
-                    screen.PostEvent(ftxui::Event::Custom);
+                    bool changed;
+                    {
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        changed = (state.track_progress_ms != prev_progress ||
+                                   state.track_duration_ms != prev_duration ||
+                                   state.connected != prev_connected ||
+                                   state.group_volume != prev_group_vol ||
+                                   state.player_volume != prev_player_vol ||
+                                   state.group_muted != prev_group_muted ||
+                                   state.player_muted != prev_player_muted ||
+                                   state.group_name != prev_group_name);
+                    }
+                    if (changed) {
+                        screen.PostEvent(ftxui::Event::Custom);
+                    }
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));

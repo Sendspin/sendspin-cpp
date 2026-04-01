@@ -38,6 +38,7 @@ struct TuiSnapshot {
     bool player_muted{false};
     uint32_t track_progress_ms{0};
     uint32_t track_duration_ms{0};
+    std::chrono::steady_clock::time_point progress_updated_at;
     SendspinRepeatMode repeat_mode{SendspinRepeatMode::OFF};
     bool shuffle{false};
     SendspinPlaybackState playback_state{SendspinPlaybackState::STOPPED};
@@ -50,6 +51,8 @@ struct TuiSnapshot {
     bool time_synced{false};
     std::string group_name;
     bool streaming{false};
+    std::string connected_host;
+    uint16_t connected_port{0};
 
     // Server selector
     bool server_selector_active{false};
@@ -81,6 +84,7 @@ static TuiSnapshot take_snapshot(TuiState& state) {
     snap.player_muted = state.player_muted;
     snap.track_progress_ms = state.track_progress_ms;
     snap.track_duration_ms = state.track_duration_ms;
+    snap.progress_updated_at = state.progress_updated_at;
     snap.repeat_mode = state.repeat_mode;
     snap.shuffle = state.shuffle;
     snap.playback_state = state.playback_state;
@@ -93,6 +97,8 @@ static TuiSnapshot take_snapshot(TuiState& state) {
     snap.time_synced = state.time_synced;
     snap.group_name = state.group_name;
     snap.streaming = state.streaming;
+    snap.connected_host = state.connected_host;
+    snap.connected_port = state.connected_port;
     snap.server_selector_active = state.server_selector_active;
     snap.server_selector_index = state.server_selector_index;
     snap.discovered_servers = state.discovered_servers;
@@ -165,116 +171,238 @@ static bool is_highlighted(const TuiSnapshot& snap, const std::string& label) {
     return snap.highlight_active && snap.highlighted_label == label;
 }
 
-// Render a shortcut key label, e.g., "[Space]", with highlight if active.
+// Render a shortcut key label with highlight if active.
 static Element shortcut_label(const TuiSnapshot& snap, const std::string& label,
                               const std::string& display) {
     if (is_highlighted(snap, label)) {
-        return text(display) | bold | inverted;
+        return text(display) | bold | color(Color::Yellow) | inverted;
     }
-    return text(display) | bold;
+    return text(display) | bold | color(Color::Cyan);
 }
 
 static Element render_now_playing(const TuiSnapshot& snap) {
+    auto make_shortcuts = [&] {
+        return vbox({
+            separator(),
+            hbox({
+                text("  "),
+                shortcut_label(snap, "<", "\u2190"),
+                text(" prev  ") | color(Color::White) | dim,
+                shortcut_label(snap, "Space", "<space>"),
+                text(" play/pause  ") | color(Color::White) | dim,
+                shortcut_label(snap, ">", "\u2192"),
+                text(" next") | color(Color::White) | dim,
+            }),
+        });
+    };
+
     // Not connected: show connection guidance
     if (!snap.connected) {
         return window(text(" Now Playing ") | bold, vbox({
-            text("  Waiting for server connection...") | dim,
-            text("  Press [s] to browse for servers") | dim,
+            text("  Waiting for server connection...") | color(Color::White) | dim,
+            text("  Press s to browse for servers") | color(Color::White) | dim,
             text(""),
-            text(""),
-        }));
+            make_shortcuts(),
+        })) | color(Color::Blue);
     }
 
     // Connected but stopped with no metadata: show playback guidance
     if (snap.playback_state == SendspinPlaybackState::STOPPED && snap.title.empty()) {
         return window(text(" Now Playing ") | bold, vbox({
-            text("  Ready to play") | dim,
-            text("  Press [Space] to start playback") | dim,
-            text("  Press [g] to join a group") | dim,
-            text(""),
-        }));
+            text("  Ready to play") | color(Color::White) | dim,
+            text("  Press <space> to start playback") | color(Color::White) | dim,
+            text("  Press g to join a group") | color(Color::White) | dim,
+            make_shortcuts(),
+        })) | color(Color::Blue);
     }
 
     // Normal display with metadata
-    auto title_text = snap.title.empty() ? "---" : snap.title;
-    auto artist_text = snap.artist.empty() ? "---" : snap.artist;
-    auto album_text = snap.album.empty() ? "---" : snap.album;
-
-    auto playing_indicator =
-        snap.playback_state == SendspinPlaybackState::PLAYING ? text(" Playing") | color(Color::Green)
-                                                              : text(" Stopped") | dim;
+    auto title_text = snap.title.empty() ? "\u2014" : snap.title;
+    auto artist_text = snap.artist.empty() ? "Unknown artist" : snap.artist;
+    auto album_text = snap.album.empty() ? "Unknown album" : snap.album;
 
     return window(text(" Now Playing ") | bold, vbox({
-        hbox({text("  Title:  ") | bold, text(title_text) | flex}),
-        hbox({text("  Artist: ") | bold, text(artist_text) | flex}),
-        hbox({text("  Album:  ") | bold, text(album_text) | flex}),
-        hbox({text("  Status: ") | bold, playing_indicator}),
-    }));
+        hbox({text("  Title:  ") | color(Color::White) | dim, text(title_text) | bold | color(Color::White) | flex}),
+        hbox({text("  Artist: ") | color(Color::White) | dim, text(artist_text) | color(Color::Cyan) | flex}),
+        hbox({text("  Album:  ") | color(Color::White) | dim, text(album_text) | color(Color::White) | dim | flex}),
+        make_shortcuts(),
+    })) | color(Color::Blue);
 }
 
 static Element render_volume(const TuiSnapshot& snap) {
     auto vol_row = [](const std::string& label, uint8_t vol, bool muted) {
         float level = muted ? 0.0f : vol / 100.0f;
-        std::string pct_str = muted ? "MUTE" : std::to_string(vol) + "%";
-        auto pct_elem = muted ? text(" " + pct_str + " ") | color(Color::Red)
-                              : text(" " + pct_str + " ");
         auto bar_color = muted ? Color::GrayDark : Color::Cyan;
-        return hbox({
-            text("  " + label) | bold,
+        Elements row_elems = {
+            text("  " + label) | color(Color::White) | dim,
             gauge(level) | flex | color(bar_color),
-            pct_elem,
-        });
+        };
+        if (muted) {
+            row_elems.push_back(text(" [MUTED]") | color(Color::Red));
+        } else {
+            row_elems.push_back(text(" " + std::to_string(vol) + "%") | color(Color::Cyan));
+        }
+        return hbox(std::move(row_elems));
     };
 
     return window(text(" Volume ") | bold, vbox({
         vol_row("Group:  ", snap.group_volume, snap.group_muted),
         vol_row("Player: ", snap.player_volume, snap.player_muted),
-    }));
+        separator(),
+        hbox({
+            text("  "),
+            shortcut_label(snap, "Up/Dn", "\u2191/\u2193"),
+            text(" player  ") | color(Color::White) | dim,
+            shortcut_label(snap, "m", "m"),
+            text(" mute") | color(Color::White) | dim,
+        }),
+        hbox({
+            text("  "),
+            shortcut_label(snap, "[ / ]", "[/]"),
+            text(" group  ") | color(Color::White) | dim,
+            shortcut_label(snap, "M", "M"),
+            text(" mute") | color(Color::White) | dim,
+        }),
+    })) | color(Color::Magenta);
+}
+
+static Element render_progress_bar(float progress, int width) {
+    // ASCII progress bar: [====>--------]
+    int bar_width = std::max(0, width - 2);  // subtract [ and ]
+    int filled = static_cast<int>(progress * bar_width);
+    filled = std::clamp(filled, 0, bar_width);
+    int empty = bar_width - filled;
+
+    // Build: [=====>-------]
+    Elements elems;
+    elems.push_back(text("[") | dim);
+    if (filled > 0) {
+        elems.push_back(text(std::string(filled - 1, '=') + ">") | bold | color(Color::Green));
+    } else {
+        elems.push_back(text(">") | bold | color(Color::Green));
+        empty = std::max(0, empty - 1);
+    }
+    if (empty > 0) {
+        elems.push_back(text(std::string(empty, '-')) | dim);
+    }
+    elems.push_back(text("]") | dim);
+    return hbox(std::move(elems));
 }
 
 static Element render_progress(const TuiSnapshot& snap) {
+    // Interpolate progress during playback for smooth movement
+    uint32_t display_progress_ms = snap.track_progress_ms;
+    if (snap.playback_state == SendspinPlaybackState::PLAYING &&
+        snap.progress_updated_at.time_since_epoch().count() > 0 &&
+        snap.track_duration_ms > 0) {
+        auto elapsed = std::chrono::steady_clock::now() - snap.progress_updated_at;
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+        display_progress_ms += static_cast<uint32_t>(elapsed_ms);
+        display_progress_ms = std::min(display_progress_ms, snap.track_duration_ms);
+    }
+
     float progress = snap.track_duration_ms > 0
-                         ? static_cast<float>(snap.track_progress_ms) / snap.track_duration_ms
+                         ? static_cast<float>(display_progress_ms) / snap.track_duration_ms
                          : 0.0f;
     progress = std::clamp(progress, 0.0f, 1.0f);
 
-    return hbox({
-        text("  " + format_time(snap.track_progress_ms) + " "),
-        gauge(progress) | flex | color(Color::Blue),
-        text(" " + format_time(snap.track_duration_ms) + "  "),
-    });
+    // Get terminal width to size the bar. Subtract padding for time + borders.
+    int term_width = Terminal::Size().dimx;
+    int time_width = 14;   // "  MM:SS " + " MM:SS  " ≈ 14 chars + border
+    int bar_width = std::max(10, term_width - time_width - 4);
+
+    return window(text(" Progress ") | bold, hbox({
+        text("  " + format_time(display_progress_ms) + " ") | color(Color::Cyan),
+        render_progress_bar(progress, bar_width) | flex,
+        text(" " + format_time(snap.track_duration_ms) + "  ") | color(Color::Cyan),
+    })) | color(Color::Green);
 }
 
 static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
-    auto playback_panel = window(text(" Playback ") | bold, vbox({
-        hbox({text("  Repeat:  ") | bold, text(repeat_mode_str(snap.repeat_mode))}),
-        hbox({text("  Shuffle: ") | bold,
-              snap.shuffle ? text("On") | color(Color::Green)
-                           : text("Off") | dim}),
-    }));
+    // Helper for dim label + cyan value rows
+    auto info_row = [](const std::string& label, const std::string& value, bool has_value = true) {
+        if (has_value) {
+            return hbox({text("  " + label) | color(Color::White) | dim, text(value) | color(Color::Cyan)});
+        }
+        return hbox({text("  " + label) | color(Color::White) | dim, text("\u2014") | color(Color::White) | dim});
+    };
 
-    std::string codec_display = snap.codec ? codec_str(*snap.codec) : "---";
-    std::string rate_display = snap.sample_rate ? format_sample_rate(*snap.sample_rate) : "---";
-    std::string depth_display = snap.bit_depth ? std::to_string(*snap.bit_depth) + "-bit" : "---";
-    std::string channels_display = snap.channels ? std::to_string(*snap.channels) + "ch" : "---";
+    auto repeat_val = repeat_mode_str(snap.repeat_mode);
+    bool repeat_active = snap.repeat_mode != SendspinRepeatMode::OFF;
+    auto shuffle_val = snap.shuffle ? "On" : "Off";
+
+    auto playback_panel = window(text(" Playback ") | bold, vbox({
+        hbox({text("  Repeat:  ") | color(Color::White) | dim,
+              repeat_active ? text(repeat_val) | color(Color::Cyan) : text(repeat_val) | color(Color::White) | dim}),
+        hbox({text("  Shuffle: ") | color(Color::White) | dim,
+              snap.shuffle ? text(shuffle_val) | color(Color::Cyan) : text(shuffle_val) | color(Color::White) | dim}),
+        text(""),
+        text(""),
+        text(""),
+        separator(),
+        hbox({
+            text("  "),
+            shortcut_label(snap, "r", "r"),
+            text(" repeat  ") | color(Color::White) | dim,
+            shortcut_label(snap, "x", "x"),
+            text(" shuffle") | color(Color::White) | dim,
+        }),
+    })) | color(Color::Yellow);
+
+    std::string codec_display = snap.codec ? codec_str(*snap.codec) : "";
+    std::string rate_display = snap.sample_rate ? format_sample_rate(*snap.sample_rate) : "";
+    std::string depth_display = snap.bit_depth ? std::to_string(*snap.bit_depth) + "bit" : "";
+    std::string channels_display;
+    if (snap.channels) {
+        channels_display = (*snap.channels == 2) ? "Stereo" : std::to_string(*snap.channels) + "ch";
+    }
+    bool has_stream = snap.codec.has_value();
 
     auto stream_panel = window(text(" Stream ") | bold, vbox({
-        hbox({text("  Format: ") | bold, text(codec_display + " " + rate_display)}),
-        hbox({text("  Audio:  ") | bold, text(depth_display + " " + channels_display)}),
-        hbox({text("  Delay:  ") | bold, text(std::to_string(snap.static_delay_ms) + " ms")}),
-    }));
+        info_row("Codec:    ", codec_display, has_stream),
+        info_row("Rate:     ", rate_display, has_stream),
+        info_row("Depth:    ", depth_display, has_stream),
+        info_row("Channels: ", channels_display, has_stream),
+        info_row("Delay:    ", "+" + std::to_string(snap.static_delay_ms) + "ms", true),
+        separator(),
+        hbox({
+            text("  "),
+            shortcut_label(snap, ", / .", ",/."),
+            text(" adjust delay") | color(Color::White) | dim,
+        }),
+    })) | color(Color::Yellow);
 
     auto connection_color = snap.connected ? Color::Green : Color::Red;
-    auto connection_text = snap.connected ? "Connected" : "Disconnected";
+    auto connection_str = snap.connected ? "Connected" : "Disconnected";
+    auto host_display = snap.connected_host.empty() ? "\u2014" : snap.connected_host;
+    auto port_display = snap.connected_port > 0 ? std::to_string(snap.connected_port) : "\u2014";
+
+    // Build server info rows — group only shown when set (matches reference)
+    Elements server_rows;
+    server_rows.push_back(hbox({text("  Status: ") | color(Color::White) | dim, text(connection_str) | bold | color(connection_color)}));
+    server_rows.push_back(info_row("Host:    ", host_display, !snap.connected_host.empty()));
+    if (snap.connected_port > 0) {
+        server_rows.push_back(info_row("Port:    ", port_display, true));
+    }
+    if (!snap.group_name.empty()) {
+        server_rows.push_back(info_row("Group:   ", snap.group_name, true));
+    }
+    // Pad to match stream panel height (5 data rows + separator + shortcut = 7)
+    while (server_rows.size() < 5) {
+        server_rows.push_back(text(""));
+    }
+    server_rows.push_back(separator());
 
     auto server_panel = window(text(" Server ") | bold, vbox({
-        hbox({text("  Status: ") | bold, text(connection_text) | color(connection_color)}),
-        hbox({text("  Sync:   ") | bold,
-              snap.time_synced ? text("Yes") | color(Color::Green)
-                               : text("No") | dim}),
-        hbox({text("  Group:  ") | bold,
-              text(snap.group_name.empty() ? "---" : snap.group_name)}),
-    }));
+        vbox(std::move(server_rows)),
+        hbox({
+            text("  "),
+            shortcut_label(snap, "g", "g"),
+            text(" group  ") | color(Color::White) | dim,
+            shortcut_label(snap, "s", "s"),
+            text(" server") | color(Color::White) | dim,
+        }),
+    })) | color(Color::Yellow);
 
     // Responsive: stack vertically if terminal is narrow
     if (terminal_width < 80) {
@@ -311,9 +439,9 @@ static Element render_visualizer(const TuiSnapshot& snap) {
     if (!snap.visualizer_active && snap.vis_display_spectrum.empty()) {
         auto shortcuts = hbox({
             text("  "),
-            text("[Tab]") | bold, text(" Player  "),
-            text("[q]") | bold, text(" Quit"),
-        }) | dim;
+            text("v") | bold | color(Color::Cyan), text(" player  ") | dim,
+            text("q") | bold | color(Color::Cyan), text(" quit") | dim,
+        });
 
         return vbox({
             window(text(" Visualizer ") | bold, vbox({
@@ -403,12 +531,11 @@ static Element render_visualizer(const TuiSnapshot& snap) {
 
     auto shortcuts = hbox({
         text("  "),
-        text("[Tab]") | bold, text(" Player  "),
-        text("[Space]") | bold, text(" Play/Pause  "),
-        text("[") | bold, text("<") | bold, text("/") | bold, text(">") | bold,
-        text("]") | bold, text(" Prev/Next  "),
-        text("[q]") | bold, text(" Quit"),
-    }) | dim;
+        text("v") | bold | color(Color::Cyan), text(" player  ") | dim,
+        text("<space>") | bold | color(Color::Cyan), text(" play/pause  ") | dim,
+        text("\u2190/\u2192") | bold | color(Color::Cyan), text(" prev/next  ") | dim,
+        text("q") | bold | color(Color::Cyan), text(" quit") | dim,
+    });
 
     return vbox({
         spectrum_box,
@@ -421,60 +548,67 @@ static Element render_visualizer(const TuiSnapshot& snap) {
 static Element render_server_selector(const TuiSnapshot& snap) {
     Elements rows;
     if (snap.discovered_servers.empty()) {
-        rows.push_back(text("  Searching for servers...") | dim);
+        rows.push_back(text("  Searching for servers...") | color(Color::White) | dim);
     } else {
         for (int i = 0; i < static_cast<int>(snap.discovered_servers.size()); ++i) {
             const auto& server = snap.discovered_servers[i];
-            std::string entry = server.name + "  " + server.host + ":" + std::to_string(server.port);
-            auto row = text("  " + entry);
-            if (i == snap.server_selector_index) {
-                row = text("> " + entry) | bold | inverted;
+            bool selected = (i == snap.server_selector_index);
+            bool is_current = (!snap.connected_host.empty() && server.host == snap.connected_host &&
+                               server.port == snap.connected_port);
+
+            // Line 1: indicator + name + (current)
+            Elements name_elems;
+            if (selected) {
+                name_elems.push_back(text(" > ") | bold | color(Color::Cyan));
+                name_elems.push_back(text(server.name) | bold | color(Color::White));
+            } else {
+                name_elems.push_back(text("   ") | color(Color::White));
+                name_elems.push_back(text(server.name) | color(Color::White));
             }
-            rows.push_back(row);
+            if (is_current) {
+                name_elems.push_back(text(" (current)") | color(Color::Green) | dim);
+            }
+            rows.push_back(hbox(std::move(name_elems)));
+
+            // Line 2: host:port
+            std::string addr = server.host + ":" + std::to_string(server.port);
+            if (selected) {
+                rows.push_back(text("      " + addr) | color(Color::Cyan));
+            } else {
+                rows.push_back(text("      " + addr) | color(Color::White) | dim);
+            }
         }
     }
 
     auto shortcuts = hbox({
         text("  "),
-        text("[Up/Down]") | bold, text(" Navigate  "),
-        text("[Enter]") | bold, text(" Connect  "),
-        text("[r]") | bold, text(" Refresh  "),
-        text("[Esc]") | bold, text(" Back"),
-    }) | dim;
+        shortcut_label(snap, "selector-up", "\u2191"),
+        text("/"),
+        shortcut_label(snap, "selector-down", "\u2193"),
+        text(" navigate  ") | color(Color::White) | dim,
+        shortcut_label(snap, "selector-enter", "enter"),
+        text(" connect  ") | color(Color::White) | dim,
+        shortcut_label(snap, "selector-refresh", "r"),
+        text(" refresh  ") | color(Color::White) | dim,
+        text("q") | bold | color(Color::Cyan),
+        text(" back") | color(Color::White) | dim,
+    });
 
     return vbox({
-        window(text(" Server Selector ") | bold, vbox(rows) | flex) | flex,
+        window(text(" Select Server ") | bold, vbox(rows) | flex) | flex | color(Color::Cyan),
         filler(),
         shortcuts,
     });
 }
 
-static Element render_shortcuts(const TuiSnapshot& snap) {
+static Element render_footer(const TuiSnapshot& snap) {
     return hbox({
-        text("  "),
-        shortcut_label(snap, "Space", "[Space]"), text(" Play/Pause  "),
-        text("[") | bold, shortcut_label(snap, "<", "<"),
-        text("/") | bold, shortcut_label(snap, ">", ">"),
-        text("]") | bold, text(" Prev/Next  "),
-        text("[") | bold, shortcut_label(snap, "Up/Dn", "Up/Dn"),
-        text("]") | bold, text(" Vol  "),
-        shortcut_label(snap, "r", "[r]"), text(" Repeat  "),
-        shortcut_label(snap, "x", "[x]"), text(" Shuffle  "),
-        shortcut_label(snap, "m", "[m]"), text(" Mute  "),
-        shortcut_label(snap, "g", "[g]"), text(" Join  "),
-        shortcut_label(snap, "s", "[s]"), text(" Servers  "),
-        text("[Tab]") | bold, text(" Visualizer  "),
-        text("[q]") | bold, text(" Quit"),
-    }) | dim;
-}
-
-static Element render_shortcuts_line2(const TuiSnapshot& snap) {
-    return hbox({
-        text("  "),
-        shortcut_label(snap, "[ / ]", "[ / ]"), text(" Group Vol  "),
-        shortcut_label(snap, ", / .", "[, / .]"), text(" Delay +/-  "),
-        shortcut_label(snap, "M", "[M]"), text(" Group Mute"),
-    }) | dim;
+        filler(),
+        shortcut_label(snap, "v", "v"),
+        text(" visualizer  ") | dim,
+        text("q") | bold | color(Color::Cyan),
+        text(" quit  ") | dim,
+    });
 }
 
 static Element render_tui(TuiState& state) {
@@ -490,16 +624,25 @@ static Element render_tui(TuiState& state) {
 
     int width = Terminal::Size().dimx;
 
+    Element top_section;
+    if (width < 80) {
+        top_section = vbox({
+            render_now_playing(snap),
+            render_volume(snap),
+        });
+    } else {
+        top_section = hbox({
+            render_now_playing(snap) | flex,
+            render_volume(snap),
+        });
+    }
+
     return vbox({
-        render_now_playing(snap),
-        render_volume(snap),
-        text(""),
+        top_section,
         render_progress(snap),
-        text(""),
         render_info_panels(snap, width),
         filler(),
-        render_shortcuts(snap),
-        render_shortcuts_line2(snap),
+        render_footer(snap),
     });
 }
 
@@ -538,6 +681,8 @@ static bool handle_selector_key(const Event& event, SendspinClient& client, TuiS
             const auto& server = state.discovered_servers[idx];
             std::string path = server.path.empty() ? "/sendspin" : server.path;
             url = "ws://" + server.host + ":" + std::to_string(server.port) + path;
+            state.connected_host = server.host;
+            state.connected_port = server.port;
             state.server_selector_active = false;
         }
         client.connect_to(url);
@@ -574,9 +719,10 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
     }
 
     // Toggle visualizer view
-    if (event == Event::Tab) {
+    if (event == Event::Character('v') || event == Event::Tab) {
         std::lock_guard<std::mutex> lock(state.mutex);
         state.show_visualizer = !state.show_visualizer;
+        set_highlight(state, "v");
         return true;
     }
 
@@ -781,7 +927,11 @@ Component create_tui_component(SendspinClient& client, TuiState& state,
 
 void update_polled_state(TuiState& state, SendspinClient& client) {
     std::lock_guard<std::mutex> lock(state.mutex);
-    state.track_progress_ms = client.metadata() ? client.metadata()->get_track_progress_ms() : 0;
+    uint32_t new_progress = client.metadata() ? client.metadata()->get_track_progress_ms() : 0;
+    if (new_progress != state.track_progress_ms) {
+        state.track_progress_ms = new_progress;
+        state.progress_updated_at = std::chrono::steady_clock::now();
+    }
     state.track_duration_ms = client.metadata() ? client.metadata()->get_track_duration_ms() : 0;
     state.connected = client.is_connected();
     state.time_synced = client.is_time_synced();

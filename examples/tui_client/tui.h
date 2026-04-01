@@ -57,6 +57,7 @@ struct TuiState {
     // Progress
     uint32_t track_progress_ms{0};
     uint32_t track_duration_ms{0};
+    std::chrono::steady_clock::time_point progress_updated_at;
 
     // Playback
     SendspinRepeatMode repeat_mode{SendspinRepeatMode::OFF};
@@ -75,6 +76,8 @@ struct TuiState {
     bool time_synced{false};
     std::string group_name;
     bool streaming{false};
+    std::string connected_host;
+    uint16_t connected_port{0};
 
     // Server selector
     bool server_selector_active{false};

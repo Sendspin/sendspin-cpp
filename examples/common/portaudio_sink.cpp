@@ -207,6 +207,50 @@ bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bi
     return true;
 }
 
+bool PortAudioSink::is_format_supported(uint32_t sample_rate, uint8_t channels,
+                                        uint8_t bits_per_sample) {
+    PaDeviceIndex device = Pa_GetDefaultOutputDevice();
+    if (device == paNoDevice) {
+        return false;
+    }
+
+    PaSampleFormat sample_format;
+    switch (bits_per_sample) {
+        case 16:
+            sample_format = paInt16;
+            break;
+        case 24:
+            sample_format = paInt24;
+            break;
+        case 32:
+            sample_format = paInt32;
+            break;
+        default:
+            return false;
+    }
+
+    PaStreamParameters params = {};
+    params.device = device;
+    params.channelCount = channels;
+    params.sampleFormat = sample_format;
+    params.suggestedLatency = Pa_GetDeviceInfo(device)->defaultLowOutputLatency;
+
+    return Pa_IsFormatSupported(nullptr, &params, static_cast<double>(sample_rate)) ==
+           paFormatIsSupported;
+}
+
+uint8_t PortAudioSink::max_output_channels() {
+    PaDeviceIndex device = Pa_GetDefaultOutputDevice();
+    if (device == paNoDevice) {
+        return 0;
+    }
+    const PaDeviceInfo* info = Pa_GetDeviceInfo(device);
+    if (info == nullptr) {
+        return 0;
+    }
+    return static_cast<uint8_t>(std::min(info->maxOutputChannels, 255));
+}
+
 void PortAudioSink::stop() {
     // Signal any blocked writer to abort, then wake it.
     abort_write_.store(true, std::memory_order_release);

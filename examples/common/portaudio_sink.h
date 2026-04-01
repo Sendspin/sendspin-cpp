@@ -95,6 +95,14 @@ public:
     /// @brief Set the mute state. When muted, output is silenced regardless of volume.
     void set_muted(bool muted);
 
+    /// @brief Check if the default output device supports a given format.
+    /// PortAudio must be initialized before calling (i.e., a PortAudioSink must exist).
+    static bool is_format_supported(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);
+
+    /// @brief Return the maximum output channel count of the default output device.
+    /// Returns 0 if no output device is available.
+    static uint8_t max_output_channels();
+
     /// @brief Callback for timing feedback. Wire to client.notify_audio_played().
     std::function<void(uint32_t frames, int64_t timestamp)> on_frames_played;
 
