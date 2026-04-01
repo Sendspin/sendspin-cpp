@@ -46,4 +46,13 @@ function(sendspin_get_sources BASE_DIR)
 
         PARENT_SCOPE
     )
+
+    # Host only sources — IXWebSocket-based networking
+    set(SENDSPIN_HOST_SOURCES
+        ${BASE_DIR}/src/host/ws_server.cpp
+        ${BASE_DIR}/src/host/server_connection.cpp
+        ${BASE_DIR}/src/host/client_connection.cpp
+
+        PARENT_SCOPE
+    )
 endfunction()

@@ -21,11 +21,7 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     # =========================================================================
     # Host networking sources (IXWebSocket-based implementations)
     # =========================================================================
-    target_sources(${TARGET_LIB} PRIVATE
-        ${SOURCE_DIR}/src/host/ws_server.cpp
-        ${SOURCE_DIR}/src/host/server_connection.cpp
-        ${SOURCE_DIR}/src/host/client_connection.cpp
-    )
+    target_sources(${TARGET_LIB} PRIVATE ${SENDSPIN_HOST_SOURCES})
 
     # =========================================================================
     # Compiler settings
