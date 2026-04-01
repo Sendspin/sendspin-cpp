@@ -353,8 +353,9 @@ private:
     // ========================================
 
     /// @brief Sends an audio chunk to the sync task ring buffer
+    /// @param chunk_type A ChunkType value cast to uint8_t (avoids exposing internal enum)
     bool send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
-                          ChunkType chunk_type, uint32_t timeout_ms);
+                          uint8_t chunk_type, uint32_t timeout_ms);
     /// @brief Enqueues a state change for delivery on the main thread
     void enqueue_state_update(SendspinClientState state);
     /// @brief Loads the static delay preference from persistent storage

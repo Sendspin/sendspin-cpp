@@ -14,6 +14,7 @@
 
 #include "sendspin/player_role.h"
 
+#include "audio_types.h"
 #include "platform/base64.h"
 #include "platform/logging.h"
 #include "platform/shadow_slot.h"
@@ -439,13 +440,14 @@ void PlayerRole::cleanup() {
 // ============================================================================
 
 bool PlayerRole::send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
-                                  ChunkType chunk_type, uint32_t timeout_ms) {
+                                  uint8_t chunk_type, uint32_t timeout_ms) {
     if (data == nullptr || data_size == 0) {
         SS_LOGE(TAG, "Invalid data passed to send_audio_chunk");
         return false;
     }
 
-    return this->sync_task_->write_audio_chunk(data, data_size, timestamp, chunk_type, timeout_ms);
+    return this->sync_task_->write_audio_chunk(data, data_size, timestamp,
+                                               static_cast<ChunkType>(chunk_type), timeout_ms);
 }
 
 void PlayerRole::enqueue_state_update(SendspinClientState state) {
