@@ -15,6 +15,7 @@
 #include "time_burst.h"
 
 #include "connection.h"
+#include "constants.h"
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "time_filter.h"
@@ -22,9 +23,6 @@
 namespace sendspin {
 
 static const char* const TAG = "sendspin.time_burst";
-
-/// @brief Microseconds per millisecond (unit conversion constant)
-static constexpr int64_t US_PER_MS = 1000LL;
 
 // ============================================================================
 // Public API

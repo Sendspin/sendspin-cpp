@@ -14,6 +14,7 @@
 
 #include "sendspin/artwork_role.h"
 
+#include "constants.h"
 #include "platform/event_flags.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
@@ -41,9 +42,6 @@ static constexpr size_t MAX_SLOTS = 4;
 
 /// @brief Timeout for blocking queue receive in drain thread (allows periodic command checks)
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 100U;
-
-/// @brief Microseconds per millisecond (unit conversion constant)
-static constexpr int64_t US_PER_MS = 1000LL;
 
 // Event flag bits for drain thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);

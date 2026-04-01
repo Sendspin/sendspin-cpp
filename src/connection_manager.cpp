@@ -16,6 +16,7 @@
 
 #include "client_connection.h"
 #include "connection.h"
+#include "constants.h"
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "server_connection.h"
@@ -28,7 +29,6 @@ static const char* const TAG = "sendspin.conn_mgr";
 
 static constexpr uint32_t FNV_OFFSET_BASIS = 2166136261UL;
 static constexpr uint32_t FNV_PRIME = 16777619UL;
-static constexpr int64_t US_PER_MS = 1000LL;
 static constexpr int64_t HELLO_INITIAL_DELAY_MS = 100LL;
 static constexpr int64_t HELLO_INITIAL_DELAY_US = HELLO_INITIAL_DELAY_MS * US_PER_MS;
 

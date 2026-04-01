@@ -18,9 +18,9 @@
 
 #pragma once
 
+#include "audio_types.h"
 #include "platform/memory.h"
 #include "platform/spsc_ring_buffer.h"
-#include "sendspin/player_role.h"
 
 #include <cstddef>
 #include <cstdint>

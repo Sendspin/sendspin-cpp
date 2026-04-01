@@ -15,6 +15,7 @@
 #include "sync_task.h"
 
 #include "audio_utils.h"
+#include "constants.h"
 #include "platform/logging.h"
 #include "platform/thread.h"
 #include "sendspin/client.h"
@@ -48,9 +49,6 @@ static constexpr uint32_t WAIT_FOR_TIME_SYNC_MS = 15U;
 
 /// @brief Timeout (ms) for receiving the next encoded audio chunk from the ring buffer
 static constexpr uint32_t ENCODED_CHUNK_RECEIVE_TIMEOUT_MS = 15U;
-
-/// @brief Microseconds per millisecond (unit conversion constant)
-static constexpr int64_t US_PER_MS = 1000LL;
 
 static const char* const TAG = "sendspin_sync_task";
 
@@ -225,11 +223,10 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
             sync_context.interpolation_transfer_buffer->available());
 
         // Compute silence directly in frames from microseconds (avoids ms truncation)
-        static constexpr uint64_t MICROSECONDS_PER_SECOND = 1000000ULL;
         uint32_t silence_frames = static_cast<uint32_t>(
             (static_cast<uint64_t>(raw_error) *
              static_cast<uint64_t>(sync_context.current_stream_info.get_sample_rate())) /
-            MICROSECONDS_PER_SECOND);
+            static_cast<uint64_t>(US_PER_SECOND));
         size_t silence_bytes = sync_context.current_stream_info.frames_to_bytes(silence_frames);
 
         // Cap at buffer capacity

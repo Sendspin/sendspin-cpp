@@ -39,24 +39,6 @@ struct StreamStartMessage;
 // Player types
 // ============================================================================
 
-/// @brief Audio chunk type tag used internally between components
-///
-/// Not part of the protocol specification.
-enum ChunkType : uint8_t {
-    CHUNK_TYPE_ENCODED_AUDIO = 0,  // Raw encoded audio data
-    CHUNK_TYPE_DECODED_AUDIO,      // Already-decoded PCM frames
-    CHUNK_TYPE_PCM_DUMMY_HEADER,   // Synthetic header for PCM streams
-    CHUNK_TYPE_OPUS_DUMMY_HEADER,  // Synthetic header for Opus streams
-    CHUNK_TYPE_FLAC_HEADER,        // FLAC stream header block
-};
-
-/// @brief Synthetic codec header for PCM and Opus streams that lack a real header block
-struct DummyHeader {
-    uint32_t sample_rate;
-    uint8_t bits_per_sample;
-    uint8_t channels;
-};
-
 /// @brief Audio codec format for a player stream
 enum class SendspinCodecFormat : uint8_t {
     FLAC,         // FLAC lossless audio

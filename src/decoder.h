@@ -18,8 +18,9 @@
 #pragma once
 
 #include "audio_stream_info.h"
+#include "audio_types.h"
 #include "platform/memory.h"
-#include "sendspin/player_role.h"  // For ChunkType, DummyHeader, SendspinCodecFormat
+#include "sendspin/player_role.h"  // For SendspinCodecFormat
 #include <micro_flac/flac_decoder.h>
 #include <opus.h>
 

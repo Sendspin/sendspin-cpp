@@ -14,6 +14,7 @@
 
 #include "sendspin/visualizer_role.h"
 
+#include "constants.h"
 #include "platform/event_flags.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
@@ -57,9 +58,6 @@ static constexpr uint32_t COMMAND_FLUSH = (1 << 1);
 
 /// @brief Timeout for blocking ring buffer receive in drain thread (allows periodic command checks)
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 50U;
-
-/// @brief Microseconds per millisecond (unit conversion constant)
-static constexpr int64_t US_PER_MS = 1000LL;
 
 static constexpr int64_t TOO_OLD_THRESHOLD_US = 20000;  // 20ms
 
