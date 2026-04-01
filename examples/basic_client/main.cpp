@@ -39,6 +39,8 @@
 #include <dns_sd.h>
 #include <getopt.h>
 
+#include <arpa/inet.h>
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
