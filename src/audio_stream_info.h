@@ -18,16 +18,12 @@
 
 #pragma once
 
+#include "constants.h"
+
 #include <cstddef>
 #include <cstdint>
 
 namespace sendspin {
-
-/// @brief Milliseconds per second (unit conversion constant)
-static constexpr uint32_t MS_PER_SECOND = 1000U;
-
-/// @brief Microseconds per second (unit conversion constant)
-static constexpr uint32_t US_PER_SECOND = 1000000U;
 
 /// @brief Default audio sample rate in Hz used when no format is specified
 static constexpr uint32_t DEFAULT_SAMPLE_RATE_HZ = 16000U;

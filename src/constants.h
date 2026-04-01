@@ -22,6 +22,7 @@
 namespace sendspin {
 
 static constexpr int64_t US_PER_MS = 1000LL;
-static constexpr int64_t US_PER_SECOND = 1000000LL;
+static constexpr uint32_t MS_PER_SECOND = 1000U;
+static constexpr uint32_t US_PER_SECOND = 1000000U;
 
 }  // namespace sendspin
