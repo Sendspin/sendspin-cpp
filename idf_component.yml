@@ -5,9 +5,9 @@ dependencies:
   espressif/esp_websocket_client: ">=1.0.0"
   bblanchon/arduinojson: "==7.4.1"
   esphome/micro-flac:
-    version: "0.1.0"
+    version: "0.1.1"
   esphome/micro-opus:
-    version: "0.1.0"
+    version: "0.3.5"
 description: "Sendspin synchronized audio streaming client for ESP32"
 license: "Apache-2.0"
 maintainers:
