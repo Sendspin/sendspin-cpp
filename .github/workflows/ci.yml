@@ -57,3 +57,16 @@ jobs:
 
       - name: Build
         run: cmake --build build
+
+  ci:
+    name: CI
+    needs: [pre-commit, lint, build]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Verify all jobs passed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more jobs failed or were cancelled"
+            exit 1
+          fi
