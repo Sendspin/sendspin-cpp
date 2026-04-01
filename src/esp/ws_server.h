@@ -26,6 +26,7 @@ namespace sendspin {
 
 // Forward declarations
 class SendspinClient;
+class SendspinConnection;
 class SendspinServerConnection;
 
 /**
@@ -77,8 +78,9 @@ public:
     /// The client needs to identify which connection owns this sockfd and clean it up.
     using ConnectionClosedCallback = std::function<void(int sockfd)>;
 
-    /// @brief Callback type for looking up a connection by sockfd
-    using FindConnectionCallback = std::function<SendspinServerConnection*(int sockfd)>;
+    /// @brief Callback type for looking up a connection by sockfd.
+    /// Returns a shared_ptr to keep the connection alive during message dispatch.
+    using FindConnectionCallback = std::function<std::shared_ptr<SendspinConnection>(int sockfd)>;
 
     /// @brief Starts the HTTP server and begins listening for WebSocket connections
     /// @param client Pointer to the SendspinClient (used for context in callbacks).

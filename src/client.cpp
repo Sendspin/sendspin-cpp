@@ -504,7 +504,8 @@ bool SendspinClient::process_json_message(SendspinConnection* conn, const std::s
                     conn->set_connection_reason(hello_msg.connection_reason);
                     conn->set_server_hello_received(true);
 
-                    this->connection_manager_->schedule_hello({conn, hello_msg.connection_reason});
+                    this->connection_manager_->schedule_hello(
+                        {conn->shared_from_this(), hello_msg.connection_reason});
                 }
             }
             break;

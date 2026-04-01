@@ -37,14 +37,13 @@ class SendspinWsServer;
 
 /// @brief Deferred server hello event, processed in ConnectionManager::loop()
 struct ServerHelloEvent {
-    SendspinConnection* conn;  ///< Connection that received the hello (must still be valid)
+    std::shared_ptr<SendspinConnection> conn;  ///< Connection that received the hello
     SendspinConnectionReason connection_reason;
 };
 
 /// @brief Hello retry state for exponential backoff
 struct HelloRetryState {
-    SendspinConnection* conn{
-        nullptr};              ///< Connection awaiting hello (must match current_ or pending_)
+    std::shared_ptr<SendspinConnection> conn;  ///< Connection awaiting hello
     int64_t retry_time_us{0};  ///< Next retry time in microseconds (0 = no pending retry)
     static constexpr uint32_t INITIAL_RETRY_DELAY_MS = 100U;  ///< Initial backoff delay in ms
     uint32_t delay_ms{INITIAL_RETRY_DELAY_MS};                ///< Current backoff delay
@@ -114,10 +113,10 @@ public:
     /// @return True if connected and handshake is complete, false otherwise.
     bool is_connected() const;
 
-    /// @brief Returns the current active connection.
+    /// @brief Returns the current active connection. Main-thread only.
     /// @return Pointer to the current connection, or nullptr if none.
-    // NOTE: not inlined due to incomplete SendspinConnection type
     SendspinConnection* current() const {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         return this->current_connection_.get();
     }
 
@@ -182,21 +181,23 @@ private:
     /// @brief Sends a goodbye, then defers destruction of the connection until loop() runs.
     /// @param conn The connection to disconnect and release.
     /// @param reason The goodbye reason to send before closing.
-    void disconnect_and_release(std::unique_ptr<SendspinConnection> conn,
+    void disconnect_and_release(std::shared_ptr<SendspinConnection> conn,
                                 SendspinGoodbyeReason reason);
 
     // Struct fields
-    std::mutex conn_mutex_;  // Protects deferred lifecycle events
+    std::mutex conn_mutex_;              // Protects deferred lifecycle event queues
+    mutable std::mutex conn_ptr_mutex_;  // Protects current_connection_ and pending_connection_
     HelloRetryState hello_retry_;
     std::vector<int> pending_close_events_;
-    std::vector<SendspinConnection*> pending_disconnect_events_;
+    std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
+    std::vector<std::shared_ptr<SendspinConnection>> pending_disconnect_events_;
     std::vector<ServerHelloEvent> pending_hello_events_;
 
     // Pointer fields
     SendspinClient* client_;
-    std::unique_ptr<SendspinConnection> current_connection_;
+    std::shared_ptr<SendspinConnection> current_connection_;
     std::shared_ptr<SendspinConnection> dying_connection_;
-    std::unique_ptr<SendspinConnection> pending_connection_;
+    std::shared_ptr<SendspinConnection> pending_connection_;
     std::unique_ptr<SendspinWsServer> ws_server_;
 
     // 32-bit fields

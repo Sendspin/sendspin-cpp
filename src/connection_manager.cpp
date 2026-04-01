@@ -39,8 +39,12 @@ static constexpr int64_t HELLO_INITIAL_DELAY_US = HELLO_INITIAL_DELAY_MS * US_PE
 ConnectionManager::ConnectionManager(SendspinClient* client) : client_(client) {}
 
 ConnectionManager::~ConnectionManager() {
-    this->current_connection_.reset();
-    this->pending_connection_.reset();
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        this->current_connection_.reset();
+        this->pending_connection_.reset();
+    }
+    this->hello_retry_.conn.reset();
     this->dying_connection_.reset();
 }
 
@@ -59,22 +63,26 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->on_disconnected_cb = [this](SendspinConnection* conn) {
         // Defer to loop(); this callback runs on IXWebSocket's internal thread
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->pending_disconnect_events_.push_back(conn);
+        this->pending_disconnect_events_.push_back(conn->shared_from_this());
     };
 
     client_conn->init_time_filter();
 
-    if (this->current_connection_ != nullptr && this->current_connection_->is_connected()) {
-        SS_LOGD(TAG, "Existing connection active, new connection will go through handoff");
-        this->pending_connection_ = std::move(client_conn);
-        this->pending_connection_->start();
-    } else {
-        this->current_connection_ = std::move(client_conn);
-        this->current_connection_->start();
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        if (this->current_connection_ != nullptr && this->current_connection_->is_connected()) {
+            SS_LOGD(TAG, "Existing connection active, new connection will go through handoff");
+            this->pending_connection_ = std::move(client_conn);
+            this->pending_connection_->start();
+        } else {
+            this->current_connection_ = std::move(client_conn);
+            this->current_connection_->start();
+        }
     }
 }
 
 void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
+    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
     if (this->current_connection_ != nullptr && this->current_connection_->is_connected()) {
         this->current_connection_->disconnect(reason, nullptr);
     }
@@ -106,20 +114,22 @@ void ConnectionManager::init_server(SendspinClient* client) {
         this->pending_close_events_.push_back(sockfd);
     });
 
-    this->ws_server_->set_find_connection_callback([this](int sockfd) -> SendspinServerConnection* {
-        if (this->current_connection_ != nullptr &&
-            this->current_connection_->get_sockfd() == sockfd) {
-            return static_cast<SendspinServerConnection*>(this->current_connection_.get());
-        }
-        if (this->pending_connection_ != nullptr &&
-            this->pending_connection_->get_sockfd() == sockfd) {
-            return static_cast<SendspinServerConnection*>(this->pending_connection_.get());
-        }
-        // Deliberately excludes dying_connection_; it has already been through cleanup and its
-        // message dispatch is disabled. Returning it here would let httpd route stale messages
-        // from the old connection into freshly-reset role queues.
-        return nullptr;
-    });
+    this->ws_server_->set_find_connection_callback(
+        [this](int sockfd) -> std::shared_ptr<SendspinConnection> {
+            std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+            if (this->current_connection_ != nullptr &&
+                this->current_connection_->get_sockfd() == sockfd) {
+                return this->current_connection_;
+            }
+            if (this->pending_connection_ != nullptr &&
+                this->pending_connection_->get_sockfd() == sockfd) {
+                return this->pending_connection_;
+            }
+            // Deliberately excludes dying_connection_; it has already been through cleanup and its
+            // message dispatch is disabled. Returning it here would let httpd route stale messages
+            // from the old connection into freshly-reset role queues.
+            return nullptr;
+        });
 }
 
 void ConnectionManager::loop() {
@@ -135,88 +145,106 @@ void ConnectionManager::loop() {
     // Process deferred connection lifecycle events
     {
         std::vector<int> close_events;
-        std::vector<SendspinConnection*> disconnect_events;
+        std::vector<std::shared_ptr<SendspinConnection>> connected_events;
+        std::vector<std::shared_ptr<SendspinConnection>> disconnect_events;
         std::vector<ServerHelloEvent> hello_events;
         bool release_dying = false;
         {
             std::lock_guard<std::mutex> lock(this->conn_mutex_);
             close_events.swap(this->pending_close_events_);
+            connected_events.swap(this->pending_connected_events_);
             disconnect_events.swap(this->pending_disconnect_events_);
             hello_events.swap(this->pending_hello_events_);
             release_dying = this->dying_connection_ready_to_release_;
             this->dying_connection_ready_to_release_ = false;
         }
 
-        // Server connection close events (ESP httpd)
-        // NOLINTBEGIN(clang-analyzer-cplusplus.Move)
-        for (int sockfd : close_events) {
-            if (this->current_connection_ != nullptr &&
-                this->current_connection_->get_sockfd() == sockfd) {
-                SendspinConnection* conn = this->current_connection_.get();
-                this->on_connection_lost(conn);
-            } else if (this->pending_connection_ != nullptr &&
-                       this->pending_connection_->get_sockfd() == sockfd) {
-                SendspinConnection* conn = this->pending_connection_.get();
-                this->on_connection_lost(conn);
-            }
-        }
-        // NOLINTEND(clang-analyzer-cplusplus.Move)
+        {
+            std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
 
-        // Client connection disconnect events (host IXWebSocket)
-        for (SendspinConnection* conn : disconnect_events) {
-            this->on_connection_lost(conn);
+            // Server connection close events (ESP httpd)
+            for (int sockfd : close_events) {
+                if (this->current_connection_ != nullptr &&
+                    this->current_connection_->get_sockfd() == sockfd) {
+                    SendspinConnection* conn = this->current_connection_.get();
+                    this->on_connection_lost(conn);
+                } else if (this->pending_connection_ != nullptr &&
+                           this->pending_connection_->get_sockfd() == sockfd) {
+                    SendspinConnection* conn = this->pending_connection_.get();
+                    this->on_connection_lost(conn);
+                }
+            }
+
+            // Client connection disconnect events (host IXWebSocket)
+            for (auto& conn : disconnect_events) {
+                this->on_connection_lost(conn.get());
+            }
+
+            // Process deferred connected events (initiate hello on main thread)
+            for (auto& conn : connected_events) {
+                if (conn == this->current_connection_ || conn == this->pending_connection_) {
+                    this->initiate_hello(conn.get());
+                }
+            }
+
+            // Server hello events: handshake completion and handoff
+            for (auto& event : hello_events) {
+                // Verify the connection is still one we manage (and not null)
+                if (!event.conn || (event.conn != this->current_connection_ &&
+                                    event.conn != this->pending_connection_)) {
+                    continue;
+                }
+
+                // Notify client and publish state
+                this->client_->on_handshake_complete(event.conn.get());
+
+                SS_LOGI(TAG, "Connection handshake complete: server_id=%s, connection_reason=%s",
+                        event.conn->get_server_id().c_str(),
+                        to_cstr(event.conn->get_connection_reason()));
+
+                // Handle handoff if pending connection completed its handshake
+                if (this->pending_connection_ != nullptr &&
+                    this->pending_connection_ == event.conn) {
+                    bool should_switch = this->should_switch_to_new_server(
+                        this->current_connection_.get(), event.conn.get());
+                    SS_LOGI(TAG, "Handoff decision: %s",
+                            should_switch ? "switch to new" : "keep current");
+                    this->complete_handoff(should_switch);
+                }
+            }
         }
 
         if (release_dying) {
             this->dying_connection_.reset();
         }
-
-        // Server hello events: handshake completion and handoff
-        for (auto& event : hello_events) {
-            // Verify the connection is still one we manage (and not null)
-            if (event.conn == nullptr || (event.conn != this->current_connection_.get() &&
-                                          event.conn != this->pending_connection_.get())) {
-                continue;
-            }
-
-            // Notify client and publish state
-            this->client_->on_handshake_complete(event.conn);
-
-            SS_LOGI(TAG, "Connection handshake complete: server_id=%s, connection_reason=%s",
-                    event.conn->get_server_id().c_str(),
-                    to_cstr(event.conn->get_connection_reason()));
-
-            // Handle handoff if pending connection completed its handshake
-            if (this->pending_connection_ != nullptr &&
-                this->pending_connection_.get() == event.conn) {
-                bool should_switch =
-                    this->should_switch_to_new_server(this->current_connection_.get(), event.conn);
-                SS_LOGI(TAG, "Handoff decision: %s",
-                        should_switch ? "switch to new" : "keep current");
-                this->complete_handoff(should_switch);
-            }
-        }
     }
 
-    // Call loop on active connections
-    // NOLINTBEGIN(clang-analyzer-cplusplus.Move)
-    if (this->current_connection_ != nullptr) {
-        this->current_connection_->loop();
+    // Call loop on active connections using shared_ptr copies to avoid holding the lock
+    std::shared_ptr<SendspinConnection> current_copy;
+    std::shared_ptr<SendspinConnection> pending_copy;
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        current_copy = this->current_connection_;
+        pending_copy = this->pending_connection_;
     }
-    if (this->pending_connection_ != nullptr) {
-        this->pending_connection_->loop();
+    if (current_copy) {
+        current_copy->loop();
     }
-    // NOLINTEND(clang-analyzer-cplusplus.Move)
+    if (pending_copy) {
+        pending_copy->loop();
+    }
 
     // Check hello retry timer
     if (this->hello_retry_.retry_time_us > 0 &&
         platform_time_us() >= this->hello_retry_.retry_time_us) {
         this->hello_retry_.retry_time_us = 0;
-        SendspinConnection* conn = this->hello_retry_.conn;
 
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         // Verify connection is still valid
-        if (conn == this->current_connection_.get() || conn == this->pending_connection_.get()) {
-            if (!this->send_hello_message(this->hello_retry_.attempts - 1, conn)) {
+        if (this->hello_retry_.conn == this->current_connection_ ||
+            this->hello_retry_.conn == this->pending_connection_) {
+            if (!this->send_hello_message(this->hello_retry_.attempts - 1,
+                                          this->hello_retry_.conn.get())) {
                 // Transient failure - retry with exponential backoff
                 if (this->hello_retry_.attempts > 1) {
                     this->hello_retry_.delay_ms *= 2;
@@ -226,6 +254,8 @@ void ConnectionManager::loop() {
                         static_cast<int64_t>(this->hello_retry_.delay_ms) * US_PER_MS;
                 }
             }
+        } else {
+            this->hello_retry_.conn.reset();
         }
     }
 }
@@ -235,6 +265,7 @@ void ConnectionManager::loop() {
 // ============================================================================
 
 bool ConnectionManager::is_connected() const {
+    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
     return this->current_connection_ != nullptr && this->current_connection_->is_connected() &&
            this->current_connection_->is_handshake_complete();
 }
@@ -245,7 +276,7 @@ bool ConnectionManager::is_connected() const {
 
 void ConnectionManager::schedule_hello(ServerHelloEvent event) {
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->pending_hello_events_.push_back(event);
+    this->pending_hello_events_.push_back(std::move(event));
 }
 
 // ============================================================================
@@ -271,7 +302,11 @@ uint32_t ConnectionManager::fnv1_hash(const char* str) {
 // ============================================================================
 
 void ConnectionManager::setup_connection_callbacks(SendspinConnection* conn) {
-    conn->on_connected_cb = [this](SendspinConnection* c) { this->initiate_hello(c); };
+    conn->on_connected_cb = [this](SendspinConnection* c) {
+        // Defer to loop(); this callback runs on the network thread
+        std::lock_guard<std::mutex> lock(this->conn_mutex_);
+        this->pending_connected_events_.push_back(c->shared_from_this());
+    };
     conn->on_json_message_cb = [this](SendspinConnection* c, const std::string& message,
                                       int64_t timestamp) {
         this->client_->process_json_message(c, message, timestamp);
@@ -295,6 +330,7 @@ void ConnectionManager::on_new_connection(std::unique_ptr<SendspinServerConnecti
         // Cleanup happens in on_connection_lost triggered by the server
     };
 
+    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
     if (this->current_connection_ == nullptr) {
         SS_LOGD(TAG, "No existing connection, accepting as current");
         this->current_connection_ = std::move(conn);
@@ -302,7 +338,8 @@ void ConnectionManager::on_new_connection(std::unique_ptr<SendspinServerConnecti
         SS_LOGD(TAG, "Existing connection present, setting as pending for handoff");
         if (this->pending_connection_ != nullptr) {
             SS_LOGW(TAG, "Already have pending connection, rejecting new connection");
-            this->disconnect_and_release(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
+            this->disconnect_and_release(std::shared_ptr<SendspinConnection>(std::move(conn)),
+                                         SendspinGoodbyeReason::ANOTHER_SERVER);
             return;
         }
         this->pending_connection_ = std::move(conn);
@@ -314,8 +351,9 @@ void ConnectionManager::on_new_connection(std::unique_ptr<SendspinServerConnecti
 // ============================================================================
 
 void ConnectionManager::initiate_hello(SendspinConnection* conn) {
+    // Note: caller must hold conn_ptr_mutex_
     // Set up retry state: initial delay, 3 attempts
-    this->hello_retry_.conn = conn;
+    this->hello_retry_.conn = conn->shared_from_this();
     this->hello_retry_.delay_ms = HelloRetryState::INITIAL_RETRY_DELAY_MS;
     this->hello_retry_.attempts = 3;
     this->hello_retry_.retry_time_us = platform_time_us() + HELLO_INITIAL_DELAY_US;
@@ -373,6 +411,10 @@ void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
         conn->disable_message_dispatch();
         this->client_->time_burst_->reset();
         this->client_->cleanup_connection_state();
+        if (this->hello_retry_.conn.get() == conn) {
+            this->hello_retry_.conn.reset();
+            this->hello_retry_.retry_time_us = 0;
+        }
         this->current_connection_.reset();
 
         if (this->pending_connection_ != nullptr) {
@@ -381,6 +423,10 @@ void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
         }
     } else if (this->pending_connection_ != nullptr && this->pending_connection_.get() == conn) {
         SS_LOGD(TAG, "Pending connection lost");
+        if (this->hello_retry_.conn.get() == conn) {
+            this->hello_retry_.conn.reset();
+            this->hello_retry_.retry_time_us = 0;
+        }
         this->pending_connection_.reset();
     }
 }
@@ -424,6 +470,7 @@ bool ConnectionManager::should_switch_to_new_server(SendspinConnection* current,
 }
 
 void ConnectionManager::complete_handoff(bool switch_to_new) {
+    // Note: caller must hold conn_ptr_mutex_
     if (switch_to_new) {
         SS_LOGD(TAG, "Completing handoff: switching to new server");
         if (this->current_connection_ != nullptr) {
@@ -446,9 +493,9 @@ void ConnectionManager::complete_handoff(bool switch_to_new) {
     }
 }
 
-void ConnectionManager::disconnect_and_release(std::unique_ptr<SendspinConnection> conn,
+void ConnectionManager::disconnect_and_release(std::shared_ptr<SendspinConnection> conn,
                                                SendspinGoodbyeReason reason) {
-    this->dying_connection_ = std::shared_ptr<SendspinConnection>(std::move(conn));
+    this->dying_connection_ = std::move(conn);
     this->dying_connection_->disconnect(reason, [this]() {
         // Defer the actual destruction to loop() to avoid use-after-free.
         // This callback runs in the httpd worker thread (async_send_text), but the connection

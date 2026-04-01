@@ -14,6 +14,7 @@
 
 #include "ws_server.h"
 
+#include "connection.h"
 #include "lwip/sockets.h"  // for close()
 #include "platform/logging.h"
 #include "server_connection.h"
@@ -160,9 +161,11 @@ esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
     if (req->method == HTTP_GET) {
         // Find the connection and invoke its on_connected_cb callback
         int sockfd = httpd_req_to_sockfd(req);
+        std::shared_ptr<SendspinConnection> conn_holder;
         SendspinServerConnection* conn = nullptr;
         if (server->find_connection_callback_) {
-            conn = server->find_connection_callback_(sockfd);
+            conn_holder = server->find_connection_callback_(sockfd);
+            conn = static_cast<SendspinServerConnection*>(conn_holder.get());
         }
         if (conn != nullptr && conn->on_connected_cb) {
             conn->on_connected_cb(conn);
@@ -170,11 +173,13 @@ esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
         return ESP_OK;
     }
 
-    // Find connection by sockfd
+    // Find connection by sockfd; hold shared_ptr to keep it alive during dispatch
     int sockfd = httpd_req_to_sockfd(req);
+    std::shared_ptr<SendspinConnection> conn_holder;
     SendspinServerConnection* conn = nullptr;
     if (server->find_connection_callback_) {
-        conn = server->find_connection_callback_(sockfd);
+        conn_holder = server->find_connection_callback_(sockfd);
+        conn = static_cast<SendspinServerConnection*>(conn_holder.get());
     }
 
     if (conn == nullptr) {

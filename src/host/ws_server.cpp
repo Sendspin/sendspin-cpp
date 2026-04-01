@@ -14,6 +14,7 @@
 
 #include "ws_server.h"
 
+#include "connection.h"
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "server_connection.h"
@@ -64,10 +65,12 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
             ws->setOnMessageCallback([this, synthetic_sockfd](const ix::WebSocketMessagePtr& msg) {
                 int64_t receive_time = platform_time_us();
 
-                // Find the connection by sockfd
+                // Find the connection by sockfd; hold shared_ptr to keep it alive during dispatch
+                std::shared_ptr<SendspinConnection> conn_holder;
                 SendspinServerConnection* conn = nullptr;
                 if (this->find_connection_callback_) {
-                    conn = this->find_connection_callback_(synthetic_sockfd);
+                    conn_holder = this->find_connection_callback_(synthetic_sockfd);
+                    conn = static_cast<SendspinServerConnection*>(conn_holder.get());
                 }
 
                 if (msg->type == ix::WebSocketMessageType::Message) {

@@ -71,7 +71,7 @@ using SendCompleteCallback = std::function<void(bool, int64_t)>;
  * // Call conn->loop() from a periodic task
  * @endcode
  */
-class SendspinConnection {
+class SendspinConnection : public std::enable_shared_from_this<SendspinConnection> {
 public:
     virtual ~SendspinConnection();
 
