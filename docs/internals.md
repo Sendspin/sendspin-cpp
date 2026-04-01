@@ -390,7 +390,7 @@ When a connection is lost (`on_connection_lost_`):
 
 ### Graceful Disconnect
 
-`disconnect_and_release_()` moves the connection into `dying_connection_` (as a `shared_ptr`) and sends a goodbye message with a completion callback. The callback sets a flag under the connection mutex, and the main loop's next tick destroys the connection. This two-phase approach prevents use-after-free when platform worker threads (e.g., ESP httpd) have pending work items referencing the connection.
+`disconnect_and_release()` moves the connection into `dying_connection_` (as a `shared_ptr`) and sends a goodbye message with a completion callback. The callback sets a flag under the connection mutex, and the main loop's next tick destroys the connection. This two-phase approach prevents use-after-free when platform worker threads (e.g., ESP httpd) have pending work items referencing the connection.
 
 ## Ordering Guarantees Summary
 
