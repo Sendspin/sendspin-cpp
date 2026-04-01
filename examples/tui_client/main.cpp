@@ -36,6 +36,7 @@
 
 #include <arpa/inet.h>
 #include <dns_sd.h>
+#include <netdb.h>
 #include <getopt.h>
 #include <sys/select.h>
 
@@ -255,7 +256,7 @@ private:
     }
 
     static void DNSSD_API resolve_callback(DNSServiceRef ref, DNSServiceFlags /*flags*/,
-                                            uint32_t interface_index, DNSServiceErrorType error,
+                                            uint32_t /*interface_index*/, DNSServiceErrorType error,
                                             const char* /*fullname*/, const char* hosttarget,
                                             uint16_t port, uint16_t txt_len,
                                             const unsigned char* txt_record, void* context) {
@@ -282,56 +283,35 @@ private:
         ctx->browser->remove_resolve_ref(ref);
         DNSServiceRefDeallocate(ref);
 
-        // Now resolve the hostname to an IP address
-        DNSServiceRef addr_ref = nullptr;
-        DNSServiceErrorType err = DNSServiceGetAddrInfo(
-            &addr_ref, 0, interface_index, kDNSServiceProtocol_IPv4, hosttarget,
-            addr_info_callback, ctx);
-        if (err == kDNSServiceErr_NoError) {
-            ctx->browser->add_resolve_ref(addr_ref);
-        } else {
+        // Resolve the hostname to an IP address using POSIX getaddrinfo.
+        // DNSServiceGetAddrInfo is a Bonjour extension not available in Avahi on Linux.
+        std::thread([ctx, host = std::string(hosttarget)]() {
+            struct addrinfo hints {};
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+
+            struct addrinfo* res = nullptr;
+            if (getaddrinfo(host.c_str(), nullptr, &hints, &res) == 0 && res != nullptr) {
+                char addr_str[INET_ADDRSTRLEN] = {};
+                const auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(res->ai_addr);
+                inet_ntop(AF_INET, &addr_in->sin_addr, addr_str, sizeof(addr_str));
+                freeaddrinfo(res);
+
+                if (addr_str[0] != '\0') {
+                    DiscoveredServer server;
+                    server.name = ctx->name;
+                    server.host = addr_str;
+                    server.port = ctx->port;
+                    server.path = ctx->path;
+
+                    std::lock_guard<std::mutex> lock(ctx->browser->servers_mutex_);
+                    ctx->browser->servers_[ctx->key] = std::move(server);
+                }
+            } else if (res != nullptr) {
+                freeaddrinfo(res);
+            }
             delete ctx;
-        }
-    }
-
-    static void DNSSD_API addr_info_callback(DNSServiceRef ref, DNSServiceFlags /*flags*/,
-                                              uint32_t /*interface_index*/,
-                                              DNSServiceErrorType error, const char* /*hostname*/,
-                                              const struct sockaddr* address, uint32_t /*ttl*/,
-                                              void* context) {
-        auto* ctx = static_cast<ResolveContext*>(context);
-
-        if (error != kDNSServiceErr_NoError || address == nullptr) {
-            ctx->browser->remove_resolve_ref(ref);
-            DNSServiceRefDeallocate(ref);
-            delete ctx;
-            return;
-        }
-
-        // Extract IP address string
-        char addr_str[INET6_ADDRSTRLEN] = {};
-        if (address->sa_family == AF_INET) {
-            const auto* addr_in = reinterpret_cast<const struct sockaddr_in*>(address);
-            inet_ntop(AF_INET, &addr_in->sin_addr, addr_str, sizeof(addr_str));
-        } else if (address->sa_family == AF_INET6) {
-            const auto* addr_in6 = reinterpret_cast<const struct sockaddr_in6*>(address);
-            inet_ntop(AF_INET6, &addr_in6->sin6_addr, addr_str, sizeof(addr_str));
-        }
-
-        if (addr_str[0] != '\0') {
-            DiscoveredServer server;
-            server.name = ctx->name;
-            server.host = addr_str;
-            server.port = ctx->port;
-            server.path = ctx->path;
-
-            std::lock_guard<std::mutex> lock(ctx->browser->servers_mutex_);
-            ctx->browser->servers_[ctx->key] = std::move(server);
-        }
-
-        ctx->browser->remove_resolve_ref(ref);
-        DNSServiceRefDeallocate(ref);
-        delete ctx;
+        }).detach();
     }
 
     DNSServiceRef browse_ref_{nullptr};
