@@ -400,8 +400,7 @@ private:
     /// @param conn The connection that received the message
     /// @param message The raw JSON text
     /// @param timestamp Receive timestamp in microseconds
-    /// @return true if the message was handled, false on parse failure
-    bool process_json_message(SendspinConnection* conn, const std::string& message,
+    void process_json_message(SendspinConnection* conn, const std::string& message,
                               int64_t timestamp);
 
     /// @brief Processes a binary message from a connection

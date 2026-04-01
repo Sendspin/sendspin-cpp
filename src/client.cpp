@@ -385,13 +385,13 @@ std::string SendspinClient::build_hello_message() {
 // Message processing
 // ============================================================================
 
-bool SendspinClient::process_json_message(SendspinConnection* conn, const std::string& message,
+void SendspinClient::process_json_message(SendspinConnection* conn, const std::string& message,
                                           int64_t timestamp) {
     JsonDocument doc = make_json_document();
     DeserializationError error = deserializeJson(doc, message.c_str(), message.size());
     if (error || doc.isNull()) {
         SS_LOGW(TAG, "Failed to parse JSON message");
-        return false;
+        return;
     }
     JsonObject root = doc.as<JsonObject>();
 
@@ -561,8 +561,6 @@ bool SendspinClient::process_json_message(SendspinConnection* conn, const std::s
             SS_LOGW(TAG, "Unhandled server message type: %s",
                     root["type"].is<const char*>() ? root["type"].as<const char*>() : "unknown");
     }
-
-    return true;
 }
 
 void SendspinClient::process_binary_message(const uint8_t* payload, size_t len) {
