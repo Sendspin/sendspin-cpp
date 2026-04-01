@@ -10,6 +10,11 @@ Standalone C++ library implementing the Sendspin synchronized audio streaming pr
 - FLAC, Opus, and PCM audio decoding
 - Cross-platform: ESP-IDF (ESP32) and host (macOS/Linux)
 
+## Documentation
+
+- **[Integration Guide](docs/integration-guide.md)** -- How to integrate sendspin-cpp into your application, including required callbacks, role composition, and platform setup
+- **[Internals](docs/internals.md)** -- Internal architecture, threading model, and inter-class communication
+
 ## Build
 
 ### Host (macOS/Linux)
