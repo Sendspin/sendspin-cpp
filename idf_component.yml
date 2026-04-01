@@ -13,8 +13,8 @@ license: "Apache-2.0"
 maintainers:
   - Kevin Ahrendt <kevin.ahrendt@openhomefoundation.org>
 version: "0.1.0"
-url: https://github.com/esphome-libs/sendspin-cpp
-repository: https://github.com/esphome-libs/sendspin-cpp.git
+url: https://github.com/sendspin/sendspin-cpp
+repository: https://github.com/sendspin/sendspin-cpp.git
 files:
   exclude:
     - ".claude/**"
