@@ -63,7 +63,6 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         micro_flac
         GIT_REPOSITORY https://github.com/esphome-libs/micro-flac.git
         GIT_TAG        v0.1.1
-        GIT_SHALLOW    TRUE
         GIT_SUBMODULES "lib/micro-ogg-demuxer"
     )
     FetchContent_MakeAvailable(micro_flac)
@@ -73,7 +72,6 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         micro_opus
         GIT_REPOSITORY https://github.com/esphome-libs/micro-opus.git
         GIT_TAG        v0.3.5
-        GIT_SHALLOW    TRUE
         GIT_SUBMODULES "lib/opus" "lib/micro-ogg-demuxer"
     )
     FetchContent_MakeAvailable(micro_opus)
