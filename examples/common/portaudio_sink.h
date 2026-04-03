@@ -23,6 +23,7 @@
 #include <functional>
 #include <mutex>
 #include <vector>
+#include <string>
 
 namespace sendspin {
 
@@ -81,7 +82,8 @@ public:
     size_t write(uint8_t* data, size_t length, uint32_t timeout_ms);
 
     /// @brief Configure audio format and (re)open the PortAudio stream.
-    bool configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);
+    /// @param device_index Optional device index, uses default if -1
+    bool configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample, int device_index = -1);
 
     /// @brief Stop playback and clear the ring buffer.
     void stop();
@@ -95,6 +97,9 @@ public:
     /// @brief Set the mute state. When muted, output is silenced regardless of volume.
     void set_muted(bool muted);
 
+    /// @brief Set the ALSA mixer name for hardware volume control.
+    void set_alsa_mixer_name(const std::string& mixer_name);
+
     /// @brief Check if the default output device supports a given format.
     /// PortAudio must be initialized before calling (i.e., a PortAudioSink must exist).
     static bool is_format_supported(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);
@@ -102,6 +107,24 @@ public:
     /// @brief Return the maximum output channel count of the default output device.
     /// Returns 0 if no output device is available.
     static uint8_t max_output_channels();
+
+    /// @brief List all available audio devices.
+    static void list_devices();
+
+    /// @brief List ALSA mixer controls for a specific device (Linux only).
+    /// @return true if ALSA is available and listing was successful, false otherwise.
+    static bool list_alsa_mixers(int device_index);
+
+    /// @brief Set hardware volume using ALSA mixer (Linux only).
+    /// @return true if successful, false otherwise.
+    static bool set_alsa_volume(const std::string& mixer_name, int device_index, uint8_t volume);
+
+    /// @brief Get hardware volume using ALSA mixer (Linux only).
+    /// @return volume in 0-100 range, or -1 if failed.
+    static int get_alsa_volume(const std::string& mixer_name, int device_index);
+
+    /// @brief Check if a specific device supports a given format.
+    static bool is_format_supported(int device_index, uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);
 
     /// @brief Callback for timing feedback. Wire to client.notify_audio_played().
     std::function<void(uint32_t frames, int64_t timestamp)> on_frames_played;
@@ -131,6 +154,8 @@ private:
     std::atomic<uint64_t> volume_multiplier_{UINT64_C(1) << 32};
     uint8_t volume_{100};
     bool muted_{false};
+    int device_index_{-1};
+    std::string alsa_mixer_name_;
     void update_volume_multiplier_();
     static void apply_volume_(uint8_t* data, size_t len, uint8_t bytes_per_sample, uint64_t scale);
 };

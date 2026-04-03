@@ -20,6 +20,12 @@
 #include <cstring>
 #include <thread>
 
+// ALSA includes for mixer control (Linux only)
+#ifdef __linux__
+#include <alsa/asoundlib.h>
+#include <alsa/mixer.h>
+#endif
+
 namespace sendspin {
 
 // Ring buffer capacity. With condition-variable-based blocking in write(),
@@ -162,7 +168,7 @@ size_t PortAudioSink::write(uint8_t* data, size_t length, uint32_t timeout_ms) {
     return total_written;
 }
 
-bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample) {
+bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample, int device_index) {
     stop();
     abort_write_.store(false, std::memory_order_release);
 
@@ -170,6 +176,7 @@ bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bi
     channels_ = channels;
     bits_per_sample_ = bits_per_sample;
     bytes_per_frame_ = channels * (bits_per_sample / 8);
+    device_index_ = device_index;
 
     PaSampleFormat sample_format;
     switch (bits_per_sample) {
@@ -187,8 +194,62 @@ bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bi
             return false;
     }
 
-    PaError err = Pa_OpenDefaultStream(&stream_, 0, channels, sample_format, sample_rate,
-                                       paFramesPerBufferUnspecified, pa_callback, this);
+    PaError err;
+    uint32_t actual_sample_rate = sample_rate;
+    
+    if (device_index >= 0) {
+        // Use specific device
+        PaDeviceIndex device = static_cast<PaDeviceIndex>(device_index);
+        const PaDeviceInfo* device_info = Pa_GetDeviceInfo(device);
+        if (device_info == nullptr) {
+            fprintf(stderr, "PortAudio: invalid device index %d\n", device_index);
+            return false;
+        }
+        
+        // Check if the device supports the requested format
+        PaStreamParameters test_params = {};
+        test_params.device = device;
+        test_params.channelCount = channels;
+        test_params.sampleFormat = sample_format;
+        test_params.suggestedLatency = device_info->defaultLowOutputLatency;
+        
+        if (Pa_IsFormatSupported(nullptr, &test_params, static_cast<double>(sample_rate)) != paFormatIsSupported) {
+            // Try using the device's default sample rate instead
+            fprintf(stderr, "PortAudio: device %d does not support %uHz, trying default rate %.0fHz\n", 
+                    device_index, sample_rate, device_info->defaultSampleRate);
+            actual_sample_rate = static_cast<uint32_t>(device_info->defaultSampleRate);
+            
+            if (Pa_IsFormatSupported(nullptr, &test_params, static_cast<double>(actual_sample_rate)) != paFormatIsSupported) {
+                fprintf(stderr, "PortAudio: device %d does not support %uch %ubit format at any sample rate\n", 
+                        device_index, channels, bits_per_sample);
+                return false;
+            }
+        }
+        
+        PaStreamParameters output_parameters = {};
+        output_parameters.device = device;
+        output_parameters.channelCount = channels;
+        output_parameters.sampleFormat = sample_format;
+        output_parameters.suggestedLatency = device_info->defaultLowOutputLatency;
+        output_parameters.hostApiSpecificStreamInfo = nullptr;
+        
+        err = Pa_OpenStream(&stream_, nullptr, &output_parameters, actual_sample_rate,
+                           paFramesPerBufferUnspecified, paFramesPerBufferUnspecified,
+                           pa_callback, this);
+    } else {
+        // Use default device
+        err = Pa_OpenDefaultStream(&stream_, 0, channels, sample_format, sample_rate,
+                                   paFramesPerBufferUnspecified, pa_callback, this);
+    }
+    
+    if (err != paNoError) {
+        fprintf(stderr, "PortAudio: failed to open stream: %s\n", Pa_GetErrorText(err));
+        stream_ = nullptr;
+        return false;
+    }
+    
+    // Update the actual sample rate used (might be different from requested)
+    sample_rate_ = actual_sample_rate;
     if (err != paNoError) {
         fprintf(stderr, "PortAudio: failed to open stream: %s\n", Pa_GetErrorText(err));
         stream_ = nullptr;
@@ -203,7 +264,7 @@ bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bi
         return false;
     }
 
-    fprintf(stderr, "PortAudio: playing %uHz %uch %ubit\n", sample_rate, channels, bits_per_sample);
+    fprintf(stderr, "PortAudio: playing %uHz %uch %ubit\n", sample_rate_, channels_, bits_per_sample_);
     return true;
 }
 
@@ -239,6 +300,29 @@ bool PortAudioSink::is_format_supported(uint32_t sample_rate, uint8_t channels,
            paFormatIsSupported;
 }
 
+void PortAudioSink::list_devices() {
+    int device_count = Pa_GetDeviceCount();
+    if (device_count < 0) {
+        fprintf(stderr, "Error getting device count: %s\n", Pa_GetErrorText(device_count));
+        return;
+    }
+
+    fprintf(stderr, "Available audio devices [%d]:\n", device_count);
+    for (int i = 0; i < device_count; i++) {
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+        if (info == nullptr) continue;
+
+        fprintf(stderr, "  %d: %s\n", i, info->name);
+        fprintf(stderr, "     Input channels: %d, Output channels: %d\n", 
+                info->maxInputChannels, info->maxOutputChannels);
+        fprintf(stderr, "     Default sample rate: %.1f Hz\n", info->defaultSampleRate);
+        
+        if (i == Pa_GetDefaultOutputDevice()) {
+            fprintf(stderr, "     [DEFAULT OUTPUT]\n");
+        }
+    }
+}
+
 uint8_t PortAudioSink::max_output_channels() {
     PaDeviceIndex device = Pa_GetDefaultOutputDevice();
     if (device == paNoDevice) {
@@ -249,6 +333,37 @@ uint8_t PortAudioSink::max_output_channels() {
         return 0;
     }
     return static_cast<uint8_t>(std::min(info->maxOutputChannels, 255));
+}
+
+bool PortAudioSink::is_format_supported(int device_index, uint32_t sample_rate, uint8_t channels,
+                                        uint8_t bits_per_sample) {
+    if (device_index < 0 || device_index >= Pa_GetDeviceCount()) {
+        return false;
+    }
+
+    PaSampleFormat sample_format;
+    switch (bits_per_sample) {
+        case 16:
+            sample_format = paInt16;
+            break;
+        case 24:
+            sample_format = paInt24;
+            break;
+        case 32:
+            sample_format = paInt32;
+            break;
+        default:
+            return false;
+    }
+
+    PaStreamParameters params = {};
+    params.device = device_index;
+    params.channelCount = channels;
+    params.sampleFormat = sample_format;
+    params.suggestedLatency = Pa_GetDeviceInfo(device_index)->defaultLowOutputLatency;
+
+    return Pa_IsFormatSupported(nullptr, &params, static_cast<double>(sample_rate)) ==
+           paFormatIsSupported;
 }
 
 void PortAudioSink::stop() {
@@ -316,12 +431,27 @@ int PortAudioSink::pa_callback(const void* /*input*/, void* output, unsigned lon
 
 void PortAudioSink::set_volume(uint8_t volume) {
     volume_ = volume > 100 ? 100 : volume;
+    
+    // Try hardware volume control first if ALSA mixer is specified
+    if (!alsa_mixer_name_.empty() && device_index_ >= 0) {
+        if (set_alsa_volume(alsa_mixer_name_, device_index_, volume_)) {
+            // Hardware volume control succeeded, use full software volume
+            update_volume_multiplier_();
+            return;
+        }
+    }
+    
+    // Fall back to software volume control
     update_volume_multiplier_();
 }
 
 void PortAudioSink::set_muted(bool muted) {
     muted_ = muted;
     update_volume_multiplier_();
+}
+
+void PortAudioSink::set_alsa_mixer_name(const std::string& mixer_name) {
+    alsa_mixer_name_ = mixer_name;
 }
 
 void PortAudioSink::update_volume_multiplier_() {
@@ -394,5 +524,122 @@ void PortAudioSink::apply_volume_(uint8_t* data, size_t len, uint8_t bytes_per_s
             break;
     }
 }
+
+// ALSA hardware volume control implementations
+#ifdef __linux__
+bool PortAudioSink::set_alsa_volume(const std::string& mixer_name, int device_index, uint8_t volume) {
+    snd_mixer_t* handle;
+    snd_mixer_selem_id_t* sid;
+    
+    // Open mixer
+    if (snd_mixer_open(&handle, 0) < 0) {
+        return false;
+    }
+    
+    // Attach to default card
+    if (snd_mixer_attach(handle, "default") < 0) {
+        snd_mixer_close(handle);
+        return false;
+    }
+    
+    // Register mixer
+    if (snd_mixer_selem_register(handle, nullptr, nullptr) < 0) {
+        snd_mixer_close(handle);
+        return false;
+    }
+    
+    // Load mixer elements
+    if (snd_mixer_load(handle) < 0) {
+        snd_mixer_close(handle);
+        return false;
+    }
+    
+    // Allocate memory for mixer element ID
+    snd_mixer_selem_id_alloca(&sid);
+    snd_mixer_selem_id_set_index(sid, 0);
+    snd_mixer_selem_id_set_name(sid, mixer_name.c_str());
+    
+    // Find the mixer element
+    snd_mixer_elem_t* elem = snd_mixer_find_selem(handle, sid);
+    if (!elem) {
+        snd_mixer_close(handle);
+        return false;
+    }
+    
+    // Set volume (convert 0-100 to ALSA range)
+    long alsa_min, alsa_max;
+    snd_mixer_selem_get_playback_volume_range(elem, &alsa_min, &alsa_max);
+    long alsa_volume = alsa_min + (alsa_max - alsa_min) * volume / 100;
+    
+    if (snd_mixer_selem_set_playback_volume_all(elem, alsa_volume) < 0) {
+        snd_mixer_close(handle);
+        return false;
+    }
+    
+    snd_mixer_close(handle);
+    return true;
+}
+
+int PortAudioSink::get_alsa_volume(const std::string& mixer_name, int device_index) {
+    snd_mixer_t* handle;
+    snd_mixer_selem_id_t* sid;
+    
+    // Open mixer
+    if (snd_mixer_open(&handle, 0) < 0) {
+        return -1;
+    }
+    
+    // Attach to default card
+    if (snd_mixer_attach(handle, "default") < 0) {
+        snd_mixer_close(handle);
+        return -1;
+    }
+    
+    // Register mixer
+    if (snd_mixer_selem_register(handle, nullptr, nullptr) < 0) {
+        snd_mixer_close(handle);
+        return -1;
+    }
+    
+    // Load mixer elements
+    if (snd_mixer_load(handle) < 0) {
+        snd_mixer_close(handle);
+        return -1;
+    }
+    
+    // Allocate memory for mixer element ID
+    snd_mixer_selem_id_alloca(&sid);
+    snd_mixer_selem_id_set_index(sid, 0);
+    snd_mixer_selem_id_set_name(sid, mixer_name.c_str());
+    
+    // Find the mixer element
+    snd_mixer_elem_t* elem = snd_mixer_find_selem(handle, sid);
+    if (!elem) {
+        snd_mixer_close(handle);
+        return -1;
+    }
+    
+    // Get volume
+    long alsa_min, alsa_max, alsa_volume;
+    snd_mixer_selem_get_playback_volume_range(elem, &alsa_min, &alsa_max);
+    snd_mixer_selem_get_playback_volume(elem, SND_MIXER_SCHN_FRONT_LEFT, &alsa_volume);
+    
+    // Convert ALSA volume to 0-100 range
+    int volume = static_cast<int>((alsa_volume - alsa_min) * 100 / (alsa_max - alsa_min));
+    
+    snd_mixer_close(handle);
+    return volume;
+}
+#else
+bool PortAudioSink::set_alsa_volume(const std::string& mixer_name, int device_index, uint8_t volume) {
+    (void)mixer_name; (void)device_index; (void)volume;
+    return false;
+}
+
+int PortAudioSink::get_alsa_volume(const std::string& mixer_name, int device_index) {
+    (void)mixer_name; (void)device_index;
+    return -1;
+}
+#endif
 
 }  // namespace sendspin

@@ -26,6 +26,9 @@
 ///   -l LEVEL  Set log level: none, error, warn, info (default), debug, verbose
 ///   -v        Verbose logging (same as -l verbose)
 ///   -q        Quiet logging (same as -l error)
+///   -L        List available audio devices and exit
+///   -d DEVICE Select audio device by index (use -L to list devices)
+///   -m MIXER  Use ALSA hardware mixer for volume control (e.g., "PCM")
 ///   -h        Show usage
 
 #include "sendspin/client.h"
@@ -124,6 +127,9 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  -l LEVEL      Log level: none, error, warn, info (default), debug, verbose\n");
     fprintf(stderr, "  -v            Verbose logging (same as -l verbose)\n");
     fprintf(stderr, "  -q            Quiet logging (same as -l error)\n");
+    fprintf(stderr, "  -L            List available audio devices and exit\n");
+    fprintf(stderr, "  -d DEVICE     Select audio device by index (use -L to list devices)\n");
+    fprintf(stderr, "  -m MIXER      Use ALSA hardware mixer for volume control (e.g., \"PCM\")\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
 
@@ -145,8 +151,11 @@ int main(int argc, char* argv[]) {
     // Parse command line options
     LogLevel log_level = LogLevel::INFO;
     std::string connect_url;
+    int audio_device_index = -1;
+    bool list_devices = false;
+    std::string alsa_mixer_name;
     int opt;
-    while ((opt = getopt(argc, argv, "u:l:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:l:vqhd:m:L")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
@@ -164,6 +173,15 @@ int main(int argc, char* argv[]) {
             case 'q':
                 log_level = LogLevel::ERROR;
                 break;
+            case 'd':
+                audio_device_index = std::atoi(optarg);
+                break;
+            case 'm':
+                alsa_mixer_name = optarg;
+                break;
+            case 'L':
+                list_devices = true;
+                break;
             case 'h':
                 print_usage(argv[0]);
                 return 0;
@@ -174,6 +192,21 @@ int main(int argc, char* argv[]) {
     }
 
     SendspinClient::set_log_level(log_level);
+
+    // Handle device listing request
+#ifdef SENDSPIN_HAS_PORTAUDIO
+    if (list_devices) {
+        // Initialize PortAudio just to list devices
+        PaError err = Pa_Initialize();
+        if (err == paNoError) {
+            PortAudioSink::list_devices();
+            Pa_Terminate();
+        } else {
+            fprintf(stderr, "PortAudio init failed: %s\n", Pa_GetErrorText(err));
+        }
+        return 0;
+    }
+#endif
 
     // Optional name from remaining arguments
     std::string friendly_name = (optind < argc) ? argv[optind] : "Basic Client";
@@ -189,19 +222,64 @@ int main(int argc, char* argv[]) {
     // Create audio output and client
 #ifdef SENDSPIN_HAS_PORTAUDIO
     PortAudioSink audio_sink;
+    if (!alsa_mixer_name.empty()) {
+        audio_sink.set_alsa_mixer_name(alsa_mixer_name);
+    }
 #endif
 
     SendspinClient client(std::move(config));
 
     // Add roles
     PlayerRole::Config player_config;
-    player_config.audio_formats = {
-        {SendspinCodecFormat::FLAC, 2, 44100, 16},
-        {SendspinCodecFormat::FLAC, 2, 48000, 16},
-        {SendspinCodecFormat::OPUS, 2, 48000, 16},
-        {SendspinCodecFormat::PCM, 2, 44100, 16},
-        {SendspinCodecFormat::PCM, 2, 48000, 16},
-    };
+    
+    // Dynamically determine supported audio formats based on device capabilities
+    if (audio_device_index >= 0) {
+        fprintf(stderr, "Checking supported formats for device %d...\n", audio_device_index);
+        
+        // Test common sample rates
+        std::vector<uint32_t> sample_rates = {44100, 48000, 96000, 192000};
+        std::vector<uint8_t> bit_depths = {16, 24, 32};
+        
+        for (uint32_t sample_rate : sample_rates) {
+            for (uint8_t bit_depth : bit_depths) {
+                if (PortAudioSink::is_format_supported(audio_device_index, sample_rate, 2, bit_depth)) {
+                    fprintf(stderr, "  Device supports: %uHz 2ch %ubit\n", sample_rate, bit_depth);
+                    
+                    // Add FLAC format if supported
+                    player_config.audio_formats.push_back({SendspinCodecFormat::FLAC, 2, sample_rate, bit_depth});
+                    
+                    // Add PCM format if supported
+                    player_config.audio_formats.push_back({SendspinCodecFormat::PCM, 2, sample_rate, bit_depth});
+                    
+                    // Add OPUS format for common sample rates (OPUS typically uses 48kHz)
+                    if (sample_rate == 48000) {
+                        player_config.audio_formats.push_back({SendspinCodecFormat::OPUS, 2, sample_rate, 16});
+                    }
+                }
+            }
+        }
+        
+        if (player_config.audio_formats.empty()) {
+            fprintf(stderr, "Warning: No supported formats found for device %d, using defaults\n", audio_device_index);
+            player_config.audio_formats = {
+                {SendspinCodecFormat::FLAC, 2, 44100, 16},
+                {SendspinCodecFormat::FLAC, 2, 48000, 16},
+                {SendspinCodecFormat::OPUS, 2, 48000, 16},
+                {SendspinCodecFormat::PCM, 2, 44100, 16},
+                {SendspinCodecFormat::PCM, 2, 48000, 16},
+            };
+        }
+    } else {
+        // Use default formats when no specific device is selected
+        fprintf(stderr, "Using default audio formats (no specific device selected)\n");
+        player_config.audio_formats = {
+            {SendspinCodecFormat::FLAC, 2, 44100, 16},
+            {SendspinCodecFormat::FLAC, 2, 48000, 16},
+            {SendspinCodecFormat::OPUS, 2, 48000, 16},
+            {SendspinCodecFormat::PCM, 2, 44100, 16},
+            {SendspinCodecFormat::PCM, 2, 48000, 16},
+        };
+    }
     auto& player = client.add_player(std::move(player_config));
     auto& controller = client.add_controller();
     auto& metadata = client.add_metadata();
@@ -215,7 +293,8 @@ int main(int argc, char* argv[]) {
 #ifdef SENDSPIN_HAS_PORTAUDIO
         PortAudioSink& sink;
         PlayerRole& player;
-        BasicPlayerListener(PortAudioSink& s, PlayerRole& p) : sink(s), player(p) {}
+        int audio_device_index;
+        BasicPlayerListener(PortAudioSink& s, PlayerRole& p, int device_index) : sink(s), player(p), audio_device_index(device_index) {}
 #endif
 
         size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
@@ -235,7 +314,7 @@ int main(int argc, char* argv[]) {
             auto& params = player.get_current_stream_params();
             if (params.sample_rate.has_value() && params.channels.has_value() &&
                 params.bit_depth.has_value()) {
-                sink.configure(*params.sample_rate, *params.channels, *params.bit_depth);
+                sink.configure(*params.sample_rate, *params.channels, *params.bit_depth, audio_device_index);
             } else {
                 fprintf(stderr, ">>> Stream params not yet available for PortAudio\n");
             }
@@ -284,7 +363,7 @@ int main(int argc, char* argv[]) {
     };
 
 #ifdef SENDSPIN_HAS_PORTAUDIO
-    BasicPlayerListener player_listener(audio_sink, player);
+    BasicPlayerListener player_listener(audio_sink, player, audio_device_index);
     audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
         player.notify_audio_played(frames, timestamp);
     };
