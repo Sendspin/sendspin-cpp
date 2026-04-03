@@ -28,7 +28,7 @@
 ///   -q        Quiet logging (same as -l error)
 ///   -L        List available audio devices and exit
 ///   -d DEVICE Select audio device by index (use -L to list devices)
-///   -m MIXER  Use ALSA hardware mixer for volume control (e.g., "PCM")
+///   -m MIXER  Use ALSA hardware mixer for volume control (format: card:control, e.g., "1:Digital")
 ///   -h        Show usage
 
 #include "sendspin/client.h"
@@ -130,7 +130,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  -q            Quiet logging (same as -l error)\n");
     fprintf(stderr, "  -L            List available audio devices and exit\n");
     fprintf(stderr, "  -d DEVICE     Select audio device by index (use -L to list devices)\n");
-    fprintf(stderr, "  -m MIXER      Use ALSA hardware mixer for volume control (e.g., \"PCM\")\n");
+    fprintf(stderr, "  -m MIXER      Use ALSA hardware mixer for volume control (format: card:control, e.g., \"1:Digital\")\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
 
@@ -154,7 +154,7 @@ int main(int argc, char* argv[]) {
     std::string connect_url;
     int audio_device_index = -1;
     bool list_devices = false;
-    std::string alsa_mixer_name;
+    std::string alsa_mixer_spec;
     int opt;
     while ((opt = getopt(argc, argv, "u:l:vqhd:m:L")) != -1) {
         switch (opt) {
@@ -178,7 +178,7 @@ int main(int argc, char* argv[]) {
                 audio_device_index = std::atoi(optarg);
                 break;
             case 'm':
-                alsa_mixer_name = optarg;
+                alsa_mixer_spec = optarg;
                 break;
             case 'L':
                 list_devices = true;
@@ -223,8 +223,16 @@ int main(int argc, char* argv[]) {
     // Create audio output and client
 #ifdef SENDSPIN_HAS_PORTAUDIO
     PortAudioSink audio_sink;
-    if (!alsa_mixer_name.empty()) {
-        audio_sink.set_alsa_mixer_name(alsa_mixer_name);
+    if (!alsa_mixer_spec.empty()) {
+        audio_sink.set_alsa_mixer_spec(alsa_mixer_spec);
+        
+        // Try to read and display current hardware volume
+        int current_volume = PortAudioSink::get_alsa_volume(alsa_mixer_spec);
+        if (current_volume >= 0) {
+            fprintf(stderr, "ALSA mixer '%s' current volume: %d%%\n", alsa_mixer_spec.c_str(), current_volume);
+        } else {
+            fprintf(stderr, "Warning: Could not read current volume from ALSA mixer '%s'\n", alsa_mixer_spec.c_str());
+        }
     }
 #endif
 
@@ -272,6 +280,16 @@ int main(int argc, char* argv[]) {
         };
     }
     auto& player = client.add_player(std::move(player_config));
+    
+    // Set initial volume to match hardware mixer if using ALSA volume control
+    if (!alsa_mixer_spec.empty()) {
+        int current_volume = PortAudioSink::get_alsa_volume(alsa_mixer_spec);
+        if (current_volume >= 0) {
+            player.update_volume(static_cast<uint8_t>(current_volume));
+            player.update_muted(false);
+        }
+    }
+    
     auto& controller = client.add_controller();
     auto& metadata = client.add_metadata();
 
@@ -396,13 +414,25 @@ int main(int argc, char* argv[]) {
 
     // Main loop
     int tick = 0;
+    uint8_t last_volume = player.get_volume();
+    bool last_muted = player.get_muted();
     while (running.load()) {
         client.loop();
 #ifdef SENDSPIN_HAS_PORTAUDIO
         // Sync audio sink volume periodically (catches all volume change sources)
         if (++tick % 25 == 0) {
-            audio_sink.set_volume(player.get_volume());
-            audio_sink.set_muted(player.get_muted());
+            uint8_t current_volume = player.get_volume();
+            bool current_muted = player.get_muted();
+            
+            // Only update if values have changed
+            if (current_volume != last_volume) {
+                audio_sink.set_volume(current_volume);
+                last_volume = current_volume;
+            }
+            if (current_muted != last_muted) {
+                audio_sink.set_muted(current_muted);
+                last_muted = current_muted;
+            }
         }
 #else
         ++tick;

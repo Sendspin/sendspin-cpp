@@ -97,8 +97,9 @@ public:
     /// @brief Set the mute state. When muted, output is silenced regardless of volume.
     void set_muted(bool muted);
 
-    /// @brief Set the ALSA mixer name for hardware volume control.
-    void set_alsa_mixer_name(const std::string& mixer_name);
+    /// @brief Set the ALSA mixer specification for hardware volume control.
+    /// @param mixer_spec Mixer specification in format "card:control" (e.g., "1:Digital")
+    void set_alsa_mixer_spec(const std::string& mixer_spec);
 
     /// @brief Check if the default output device supports a given format.
     /// PortAudio must be initialized before calling (i.e., a PortAudioSink must exist).
@@ -116,12 +117,14 @@ public:
     static bool list_alsa_mixers(int device_index);
 
     /// @brief Set hardware volume using ALSA mixer (Linux only).
+    /// @param mixer_spec Mixer specification in format "card:control" (e.g., "1:Digital")
     /// @return true if successful, false otherwise.
-    static bool set_alsa_volume(const std::string& mixer_name, int device_index, uint8_t volume);
+    static bool set_alsa_volume(const std::string& mixer_spec, uint8_t volume);
 
     /// @brief Get hardware volume using ALSA mixer (Linux only).
+    /// @param mixer_spec Mixer specification in format "card:control" (e.g., "1:Digital")
     /// @return volume in 0-100 range, or -1 if failed.
-    static int get_alsa_volume(const std::string& mixer_name, int device_index);
+    static int get_alsa_volume(const std::string& mixer_spec);
 
     /// @brief Check if a specific device supports a given format.
     static bool is_format_supported(int device_index, uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);
@@ -155,7 +158,7 @@ private:
     uint8_t volume_{100};
     bool muted_{false};
     int device_index_{-1};
-    std::string alsa_mixer_name_;
+    std::string alsa_mixer_spec_;
     void update_volume_multiplier_();
     static void apply_volume_(uint8_t* data, size_t len, uint8_t bytes_per_sample, uint64_t scale);
 };

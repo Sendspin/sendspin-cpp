@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#include <cmath>
 
 // ALSA includes for mixer control (Linux only)
 #ifdef __linux__
@@ -433,10 +434,10 @@ void PortAudioSink::set_volume(uint8_t volume) {
     volume_ = volume > 100 ? 100 : volume;
     
     // Try hardware volume control first if ALSA mixer is specified
-    if (!alsa_mixer_name_.empty() && device_index_ >= 0) {
-        if (set_alsa_volume(alsa_mixer_name_, device_index_, volume_)) {
-            // Hardware volume control succeeded, use full software volume
-            update_volume_multiplier_();
+    if (!alsa_mixer_spec_.empty()) {
+        if (set_alsa_volume(alsa_mixer_spec_, volume_)) {
+            // Hardware volume control succeeded, set software volume to full (no scaling)
+            volume_multiplier_.store(UINT64_C(1) << 32, std::memory_order_relaxed);
             return;
         }
     }
@@ -450,8 +451,8 @@ void PortAudioSink::set_muted(bool muted) {
     update_volume_multiplier_();
 }
 
-void PortAudioSink::set_alsa_mixer_name(const std::string& mixer_name) {
-    alsa_mixer_name_ = mixer_name;
+void PortAudioSink::set_alsa_mixer_spec(const std::string& mixer_spec) {
+    alsa_mixer_spec_ = mixer_spec;
 }
 
 void PortAudioSink::update_volume_multiplier_() {
@@ -527,7 +528,18 @@ void PortAudioSink::apply_volume_(uint8_t* data, size_t len, uint8_t bytes_per_s
 
 // ALSA hardware volume control implementations
 #ifdef __linux__
-bool PortAudioSink::set_alsa_volume(const std::string& mixer_name, int device_index, uint8_t volume) {
+bool PortAudioSink::set_alsa_volume(const std::string& mixer_spec, uint8_t volume) {
+    fprintf(stderr, "[ALSA DEBUG] Setting volume to %d%% for mixer: %s\n", volume, mixer_spec.c_str());
+    
+    // Parse mixer specification in format "card:control"
+    size_t colon_pos = mixer_spec.find(':');
+    if (colon_pos == std::string::npos) {
+        fprintf(stderr, "[ALSA DEBUG] Invalid mixer specification format. Expected 'card:control'\n");
+        return false;
+    }
+    
+    std::string card_str = mixer_spec.substr(0, colon_pos);
+    std::string control_name = mixer_spec.substr(colon_pos + 1);
     snd_mixer_t* handle;
     snd_mixer_selem_id_t* sid;
     
@@ -536,8 +548,9 @@ bool PortAudioSink::set_alsa_volume(const std::string& mixer_name, int device_in
         return false;
     }
     
-    // Attach to default card
-    if (snd_mixer_attach(handle, "default") < 0) {
+    // Attach to the specified card
+    std::string card_name = "hw:" + card_str;
+    if (snd_mixer_attach(handle, card_name.c_str()) < 0) {
         snd_mixer_close(handle);
         return false;
     }
@@ -557,7 +570,7 @@ bool PortAudioSink::set_alsa_volume(const std::string& mixer_name, int device_in
     // Allocate memory for mixer element ID
     snd_mixer_selem_id_alloca(&sid);
     snd_mixer_selem_id_set_index(sid, 0);
-    snd_mixer_selem_id_set_name(sid, mixer_name.c_str());
+    snd_mixer_selem_id_set_name(sid, control_name.c_str());
     
     // Find the mixer element
     snd_mixer_elem_t* elem = snd_mixer_find_selem(handle, sid);
@@ -568,19 +581,34 @@ bool PortAudioSink::set_alsa_volume(const std::string& mixer_name, int device_in
     
     // Set volume (convert 0-100 to ALSA range)
     long alsa_min, alsa_max;
-    snd_mixer_selem_get_playback_volume_range(elem, &alsa_min, &alsa_max);
-    long alsa_volume = alsa_min + (alsa_max - alsa_min) * volume / 100;
+    snd_mixer_selem_get_playback_dB_range(elem, &alsa_min, &alsa_max);
     
-    if (snd_mixer_selem_set_playback_volume_all(elem, alsa_volume) < 0) {
+    // ALSA uses a logarithmic scale for perceived volume
+    double min_norm = exp10((alsa_min - alsa_max) / 6000.0);
+    double vol = (volume / 100 ) * (1 - min_norm) + min_norm;
+    double alsa_volume = 6000.0 * log10(vol) + alsa_max;
+    if (snd_mixer_selem_set_playback_dB_all(elem, alsa_volume, 0) < 0) {
         snd_mixer_close(handle);
         return false;
     }
     
+    fprintf(stderr, "[ALSA DEBUG] Successfully set volume to %d%%\n", volume);
     snd_mixer_close(handle);
     return true;
 }
 
-int PortAudioSink::get_alsa_volume(const std::string& mixer_name, int device_index) {
+int PortAudioSink::get_alsa_volume(const std::string& mixer_spec) {
+    fprintf(stderr, "[ALSA DEBUG] Getting volume for mixer: %s\n", mixer_spec.c_str());
+    
+    // Parse mixer specification in format "card:control"
+    size_t colon_pos = mixer_spec.find(':');
+    if (colon_pos == std::string::npos) {
+        fprintf(stderr, "[ALSA DEBUG] Invalid mixer specification format. Expected 'card:control'\n");
+        return -1;
+    }
+    
+    std::string card_str = mixer_spec.substr(0, colon_pos);
+    std::string control_name = mixer_spec.substr(colon_pos + 1);
     snd_mixer_t* handle;
     snd_mixer_selem_id_t* sid;
     
@@ -589,8 +617,9 @@ int PortAudioSink::get_alsa_volume(const std::string& mixer_name, int device_ind
         return -1;
     }
     
-    // Attach to default card
-    if (snd_mixer_attach(handle, "default") < 0) {
+    // Attach to the specified card
+    std::string card_name = "hw:" + card_str;
+    if (snd_mixer_attach(handle, card_name.c_str()) < 0) {
         snd_mixer_close(handle);
         return -1;
     }
@@ -610,7 +639,7 @@ int PortAudioSink::get_alsa_volume(const std::string& mixer_name, int device_ind
     // Allocate memory for mixer element ID
     snd_mixer_selem_id_alloca(&sid);
     snd_mixer_selem_id_set_index(sid, 0);
-    snd_mixer_selem_id_set_name(sid, mixer_name.c_str());
+    snd_mixer_selem_id_set_name(sid, control_name.c_str());
     
     // Find the mixer element
     snd_mixer_elem_t* elem = snd_mixer_find_selem(handle, sid);
@@ -621,11 +650,18 @@ int PortAudioSink::get_alsa_volume(const std::string& mixer_name, int device_ind
     
     // Get volume
     long alsa_min, alsa_max, alsa_volume;
-    snd_mixer_selem_get_playback_volume_range(elem, &alsa_min, &alsa_max);
-    snd_mixer_selem_get_playback_volume(elem, SND_MIXER_SCHN_FRONT_LEFT, &alsa_volume);
+    snd_mixer_selem_get_playback_dB_range(elem, &alsa_min, &alsa_max);
+    snd_mixer_selem_get_playback_dB(elem, SND_MIXER_SCHN_MONO, &alsa_volume);
     
-    // Convert ALSA volume to 0-100 range
-    int volume = static_cast<int>((alsa_volume - alsa_min) * 100 / (alsa_max - alsa_min));
+    double _vol = pow(10, (alsa_volume - alsa_max) / 6000.0);
+    if (alsa_min != SND_CTL_TLV_DB_GAIN_MUTE)
+    {
+        double min_norm = pow(10, (alsa_min - alsa_max) / 6000.0);
+        _vol = (_vol - min_norm) / (1 - min_norm);
+    }
+    int volume = static_cast<int>(_vol * 100);
+    
+    fprintf(stderr, "[ALSA DEBUG] ALSA volume: %.3f -> volume: %d%%\n", _vol, volume);
     
     snd_mixer_close(handle);
     return volume;
