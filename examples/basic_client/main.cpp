@@ -37,6 +37,7 @@
 #include "sendspin/player_role.h"
 #ifdef SENDSPIN_HAS_PORTAUDIO
 #include "portaudio_sink.h"
+#include <portaudio.h>
 #endif
 
 #include <dns_sd.h>
@@ -233,45 +234,35 @@ int main(int argc, char* argv[]) {
     PlayerRole::Config player_config;
     
     // Dynamically determine supported audio formats based on device capabilities
-    if (audio_device_index >= 0) {
-        fprintf(stderr, "Checking supported formats for device %d...\n", audio_device_index);
-        
-        // Test common sample rates
-        std::vector<uint32_t> sample_rates = {44100, 48000, 96000, 192000};
-        std::vector<uint8_t> bit_depths = {16, 24, 32};
-        
-        for (uint32_t sample_rate : sample_rates) {
-            for (uint8_t bit_depth : bit_depths) {
-                if (PortAudioSink::is_format_supported(audio_device_index, sample_rate, 2, bit_depth)) {
-                    fprintf(stderr, "  Device supports: %uHz 2ch %ubit\n", sample_rate, bit_depth);
-                    
-                    // Add FLAC format if supported
-                    player_config.audio_formats.push_back({SendspinCodecFormat::FLAC, 2, sample_rate, bit_depth});
-                    
-                    // Add PCM format if supported
-                    player_config.audio_formats.push_back({SendspinCodecFormat::PCM, 2, sample_rate, bit_depth});
-                    
-                    // Add OPUS format for common sample rates (OPUS typically uses 48kHz)
-                    if (sample_rate == 48000) {
-                        player_config.audio_formats.push_back({SendspinCodecFormat::OPUS, 2, sample_rate, 16});
-                    }
+    int device_to_check = audio_device_index >= 0 ? audio_device_index : Pa_GetDefaultOutputDevice();
+    
+    fprintf(stderr, "Checking supported formats for device %d...\n", device_to_check);
+    
+    // Test common sample rates
+    std::vector<uint32_t> sample_rates = {44100, 48000, 96000, 192000};
+    std::vector<uint8_t> bit_depths = {16, 24, 32};
+    
+    for (uint32_t sample_rate : sample_rates) {
+        for (uint8_t bit_depth : bit_depths) {
+            if (PortAudioSink::is_format_supported(device_to_check, sample_rate, 2, bit_depth)) {
+                fprintf(stderr, "  Device supports: %uHz 2ch %ubit\n", sample_rate, bit_depth);
+                
+                // Add FLAC format if supported
+                player_config.audio_formats.push_back({SendspinCodecFormat::FLAC, 2, sample_rate, bit_depth});
+                
+                // Add PCM format if supported
+                player_config.audio_formats.push_back({SendspinCodecFormat::PCM, 2, sample_rate, bit_depth});
+                
+                // Add OPUS format for common sample rates (OPUS typically uses 48kHz)
+                if (sample_rate == 48000) {
+                    player_config.audio_formats.push_back({SendspinCodecFormat::OPUS, 2, sample_rate, 16});
                 }
             }
         }
-        
-        if (player_config.audio_formats.empty()) {
-            fprintf(stderr, "Warning: No supported formats found for device %d, using defaults\n", audio_device_index);
-            player_config.audio_formats = {
-                {SendspinCodecFormat::FLAC, 2, 44100, 16},
-                {SendspinCodecFormat::FLAC, 2, 48000, 16},
-                {SendspinCodecFormat::OPUS, 2, 48000, 16},
-                {SendspinCodecFormat::PCM, 2, 44100, 16},
-                {SendspinCodecFormat::PCM, 2, 48000, 16},
-            };
-        }
-    } else {
-        // Use default formats when no specific device is selected
-        fprintf(stderr, "Using default audio formats (no specific device selected)\n");
+    }
+    
+    if (player_config.audio_formats.empty()) {
+        fprintf(stderr, "Warning: No supported formats found for device %d, using defaults\n", device_to_check);
         player_config.audio_formats = {
             {SendspinCodecFormat::FLAC, 2, 44100, 16},
             {SendspinCodecFormat::FLAC, 2, 48000, 16},
