@@ -281,13 +281,15 @@ int main(int argc, char* argv[]) {
     }
     auto& player = client.add_player(std::move(player_config));
     
-    // Set initial volume to match hardware mixer if using ALSA volume control
+    // Set initial volume and mute to match hardware mixer if using ALSA control
     if (!alsa_mixer_spec.empty()) {
         int current_volume = PortAudioSink::get_alsa_volume(alsa_mixer_spec);
         if (current_volume >= 0) {
             player.update_volume(static_cast<uint8_t>(current_volume));
-            player.update_muted(false);
         }
+        
+        bool current_mute = PortAudioSink::get_alsa_mute(alsa_mixer_spec);
+        player.update_muted(current_mute);
     }
     
     auto& controller = client.add_controller();

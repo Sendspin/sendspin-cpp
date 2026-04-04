@@ -25,6 +25,12 @@
 #include <vector>
 #include <string>
 
+// ALSA includes for mixer control (Linux only)
+#ifdef __linux__
+#include <alsa/asoundlib.h>
+#include <alsa/mixer.h>
+#endif
+
 namespace sendspin {
 
 /// @brief Lock-free single-producer single-consumer ring buffer for bridging
@@ -126,6 +132,16 @@ public:
     /// @return volume in 0-100 range, or -1 if failed.
     static int get_alsa_volume(const std::string& mixer_spec);
 
+    /// @brief Set hardware mute state using ALSA mixer (Linux only).
+    /// @param mixer_spec Mixer specification in format "card:control" (e.g., "1:Digital")
+    /// @return true if successful, false otherwise.
+    static bool set_alsa_mute(const std::string& mixer_spec, bool muted);
+
+    /// @brief Get hardware mute state using ALSA mixer (Linux only).
+    /// @param mixer_spec Mixer specification in format "card:control" (e.g., "1:Digital")
+    /// @return true if muted, false if unmuted, error will return false (assume unmuted)
+    static bool get_alsa_mute(const std::string& mixer_spec);
+
     /// @brief Check if a specific device supports a given format.
     static bool is_format_supported(int device_index, uint32_t sample_rate, uint8_t channels, uint8_t bits_per_sample);
 
@@ -133,6 +149,12 @@ public:
     std::function<void(uint32_t frames, int64_t timestamp)> on_frames_played;
 
 private:
+#ifdef __linux__
+    /// @brief Helper function to get ALSA mixer element
+    /// @return snd_mixer_elem_t* on success, nullptr on failure
+    static snd_mixer_elem_t* get_alsa_mixer_elem(const std::string& mixer_spec, snd_mixer_t** handle);
+#endif
+
     static int pa_callback(const void* input, void* output, unsigned long frame_count,
                            const PaStreamCallbackTimeInfo* time_info,
                            PaStreamCallbackFlags status_flags, void* user_data);
