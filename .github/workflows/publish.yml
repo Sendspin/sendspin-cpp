@@ -24,4 +24,4 @@ jobs:
           version: ${{ steps.version.outputs.version }}
           components: |
             sendspin-cpp: .
-          namespace: esphome
+          namespace: sendspin
