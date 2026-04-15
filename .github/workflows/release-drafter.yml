@@ -16,27 +16,8 @@ permissions:
 jobs:
   release-drafter:
     name: Release Drafter
-    environment: release-drafter
     runs-on: ubuntu-latest
     steps:
       - uses: release-drafter/release-drafter@5de93583980a40bd78603b6dfdcda5b4df377b32 # v7.2.0
-        id: drafter
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ssh-key: ${{ secrets.DEPLOY_KEY }}
-
-      - name: Update version files
-        run: |
-          sed -i "s/version: .*/version: \"${{ steps.drafter.outputs.resolved_version }}\"/g" idf_component.yml
-
-      - name: Commit changes
-        run: |
-          if ! git diff --quiet; then
-            git config --global user.name "esphomebot"
-            git config --global user.email "68923041+esphomebot@users.noreply.github.com"
-            git commit -am "Bump version to ${{ steps.drafter.outputs.resolved_version }}"
-            git push
-          fi
