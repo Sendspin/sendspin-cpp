@@ -75,8 +75,8 @@ Fixed-depth FIFO queue with timed send/receive. Used to defer events from networ
 | `PlayerRole::state_queue` | 4 | `SendspinClientState` | Sync task thread | Main loop (`drain_events`) |
 | `Client::time_queue` | 16 | `TimeResponseEvent` | Network thread | Main loop (`loop`) |
 | `ArtworkRole::notify_queue` | 8 | `ArtworkNotification` | Network thread | Artwork drain thread |
-| `ArtworkRole::queue` | 8 | `EventType` | Network thread | Main loop (`drain_events`) |
-| `VisualizerRole::queue` | - | `EventType` | Network thread | Main loop (`drain_events`) |
+| `ArtworkRole::queue` | 8 | `ArtworkEventType` | Network thread | Main loop (`drain_events`) |
+| `VisualizerRole::queue` | - | `VisualizerEventType` | Network thread | Main loop (`drain_events`) |
 
 ### ShadowSlot (`src/platform/shadow_slot.h`)
 

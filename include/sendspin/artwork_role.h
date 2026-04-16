@@ -41,32 +41,6 @@ enum class SendspinImageFormat : uint8_t {
     BMP,   // BMP image
 };
 
-inline const char* to_cstr(SendspinImageFormat format) {
-    switch (format) {
-        case SendspinImageFormat::JPEG:
-            return "jpeg";
-        case SendspinImageFormat::PNG:
-            return "png";
-        case SendspinImageFormat::BMP:
-            return "bmp";
-        default:
-            return "jpeg";
-    }
-}
-
-inline std::optional<SendspinImageFormat> image_format_from_string(const std::string& str) {
-    if (str == "jpeg") {
-        return SendspinImageFormat::JPEG;
-    }
-    if (str == "png") {
-        return SendspinImageFormat::PNG;
-    }
-    if (str == "bmp") {
-        return SendspinImageFormat::BMP;
-    }
-    return std::nullopt;
-}
-
 /// @brief Source type for an artwork image
 enum class SendspinImageSource : uint8_t {
     ALBUM,   // Album cover art
@@ -74,42 +48,12 @@ enum class SendspinImageSource : uint8_t {
     NONE,    // No image
 };
 
-inline const char* to_cstr(SendspinImageSource source) {
-    switch (source) {
-        case SendspinImageSource::ALBUM:
-            return "album";
-        case SendspinImageSource::ARTIST:
-            return "artist";
-        case SendspinImageSource::NONE:
-        default:
-            return "none";
-    }
-}
-
-inline std::optional<SendspinImageSource> image_source_from_string(const std::string& str) {
-    if (str == "album") {
-        return SendspinImageSource::ALBUM;
-    }
-    if (str == "artist") {
-        return SendspinImageSource::ARTIST;
-    }
-    if (str == "none") {
-        return SendspinImageSource::NONE;
-    }
-    return std::nullopt;
-}
-
 /// @brief Format and resolution for a single supported artwork channel
 struct ArtworkChannelFormatObject {
     SendspinImageSource source{};
     SendspinImageFormat format{};
     uint16_t media_width{};
     uint16_t media_height{};
-};
-
-/// @brief Artwork capabilities advertised to the server during the hello handshake
-struct ArtworkSupportObject {
-    std::vector<ArtworkChannelFormatObject> channels;
 };
 
 /// @brief Server-side description of one artwork channel's format and dimensions
@@ -128,15 +72,6 @@ struct ServerArtworkChannelObject {
 /// @brief Artwork stream parameters sent by the server in stream/start messages
 struct ServerArtworkStreamObject {
     std::optional<std::vector<ServerArtworkChannelObject>> channels;
-};
-
-/// @brief Client request for a specific artwork channel format, sent in stream/request_format
-struct ClientArtworkRequestObject {
-    uint8_t channel{};
-    std::optional<SendspinImageSource> source;
-    std::optional<SendspinImageFormat> format;
-    std::optional<uint16_t> media_width;
-    std::optional<uint16_t> media_height;
 };
 
 /// @brief Preference for an image slot's format and resolution
@@ -250,13 +185,6 @@ public:
     }
 
 private:
-    /// @brief Deferred artwork event types
-    enum class EventType : uint8_t {
-        STREAM_START,
-        STREAM_END,
-        STREAM_CLEAR,
-    };
-
     /// @brief Starts the drain thread
     /// @return True if the thread is running, false on failure.
     bool start();

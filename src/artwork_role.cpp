@@ -30,6 +30,17 @@
 
 static const char* const TAG = "sendspin.artwork";
 
+namespace {
+
+/// @brief Deferred artwork event types
+enum class ArtworkEventType : uint8_t {
+    STREAM_START,
+    STREAM_END,
+    STREAM_CLEAR,
+};
+
+}  // namespace
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -101,7 +112,7 @@ struct ArtworkRole::DrainTask {
 
 /// @brief Deferred event state for thread-safe artwork stream lifecycle delivery
 struct ArtworkRole::EventState {
-    ThreadSafeQueue<ArtworkRole::EventType> queue;
+    ThreadSafeQueue<ArtworkEventType> queue;
     ShadowSlot<ServerArtworkStreamObject> shadow_config;
 };
 
@@ -234,7 +245,7 @@ void ArtworkRole::handle_stream_start(const ServerArtworkStreamObject& stream) {
 
     // Shadow the config for main-thread callback
     this->event_state_->shadow_config.write(stream);
-    this->event_state_->queue.send(EventType::STREAM_START, 0);
+    this->event_state_->queue.send(ArtworkEventType::STREAM_START, 0);
 }
 
 void ArtworkRole::handle_stream_end() {
@@ -244,7 +255,7 @@ void ArtworkRole::handle_stream_end() {
         this->drain_task_->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state_->queue.send(EventType::STREAM_END, 0);
+    this->event_state_->queue.send(ArtworkEventType::STREAM_END, 0);
 }
 
 void ArtworkRole::handle_stream_clear() {
@@ -254,7 +265,7 @@ void ArtworkRole::handle_stream_clear() {
         this->drain_task_->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state_->queue.send(EventType::STREAM_CLEAR, 0);
+    this->event_state_->queue.send(ArtworkEventType::STREAM_CLEAR, 0);
 }
 
 // ============================================================================
@@ -262,17 +273,17 @@ void ArtworkRole::handle_stream_clear() {
 // ============================================================================
 
 void ArtworkRole::drain_events() {
-    EventType event_type{};
+    ArtworkEventType event_type{};
     while (this->event_state_->queue.receive(event_type, 0)) {
         switch (event_type) {
-            case EventType::STREAM_START: {
+            case ArtworkEventType::STREAM_START: {
                 ServerArtworkStreamObject config{};
                 if (this->event_state_->shadow_config.take(config) && this->listener_) {
                     this->listener_->on_artwork_stream_start(config);
                 }
                 break;
             }
-            case EventType::STREAM_END:
+            case ArtworkEventType::STREAM_END:
                 if (this->listener_) {
                     for (const auto& pref : this->config_.preferred_formats) {
                         this->listener_->on_image_clear(pref.slot);
@@ -280,7 +291,7 @@ void ArtworkRole::drain_events() {
                     this->listener_->on_artwork_stream_end();
                 }
                 break;
-            case EventType::STREAM_CLEAR:
+            case ArtworkEventType::STREAM_CLEAR:
                 if (this->listener_) {
                     for (const auto& pref : this->config_.preferred_formats) {
                         this->listener_->on_image_clear(pref.slot);
@@ -304,7 +315,7 @@ void ArtworkRole::cleanup() {
 
     this->event_state_->queue.reset();
     this->event_state_->shadow_config.reset();
-    this->event_state_->queue.send(EventType::STREAM_END, 0);
+    this->event_state_->queue.send(ArtworkEventType::STREAM_END, 0);
 }
 
 // ============================================================================

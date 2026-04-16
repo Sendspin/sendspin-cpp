@@ -37,6 +37,13 @@ static const char* const TAG = "sendspin.client";
 
 namespace sendspin {
 
+/// @brief Deferred event from the network thread, processed in loop()
+struct TimeResponseEvent {
+    int64_t offset;
+    int64_t max_error;
+    int64_t timestamp;
+};
+
 /// @brief Deferred event state for time responses and group updates on the main thread
 struct SendspinClient::EventState {
     ThreadSafeQueue<TimeResponseEvent> time_queue;
