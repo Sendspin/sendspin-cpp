@@ -32,7 +32,8 @@ static constexpr size_t RING_BUFFER_CAPACITY = 16384;
 // PortAudioRingBuffer
 // ============================================================================
 
-PortAudioRingBuffer::PortAudioRingBuffer(size_t capacity) : buffer_(capacity), capacity_(capacity) {}
+PortAudioRingBuffer::PortAudioRingBuffer(size_t capacity)
+    : buffer_(capacity), capacity_(capacity) {}
 
 size_t PortAudioRingBuffer::write(const uint8_t* data, size_t len) {
     size_t write_pos = write_pos_.load(std::memory_order_relaxed);
@@ -143,15 +144,30 @@ size_t PortAudioSink::write(uint8_t* data, size_t length, uint32_t timeout_ms) {
             if (abort_write_.load(std::memory_order_acquire)) {
                 break;
             }
-            size_t written = ring_buffer_.write(data + total_written, length - total_written);
-            total_written += written;
+            // When free space limits the write, round down to a frame boundary
+            // so partial-frame bytes never accumulate in the ring buffer.  The
+            // sync task counts sent frames via integer division (bytes_to_frames),
+            // so untracked remainder bytes would cause the PA callback to report
+            // more frames_played than buffered_frames, triggering underflow
+            // warnings.  When there is enough space for all remaining data we
+            // write it all — the caller always provides frame-aligned buffers.
+            size_t remaining = length - total_written;
+            size_t free = ring_buffer_.free_space();
+            size_t to_write = std::min(remaining, free);
+            if (to_write < remaining && bytes_per_frame_ > 0) {
+                to_write -= to_write % bytes_per_frame_;
+            }
+            if (to_write > 0) {
+                total_written += ring_buffer_.write(data + total_written, to_write);
+            }
         }
 
         if (total_written < length) {
-            // Block until the PA callback frees space, abort is requested, or timeout.
+            // Block until the PA callback frees at least one frame, abort is requested, or timeout.
             std::unique_lock<std::mutex> lock(write_mutex_);
-            if (!write_cv_.wait_until(lock, deadline, [this]() {
-                    return ring_buffer_.free_space() > 0 ||
+            size_t min_space = bytes_per_frame_ > 0 ? bytes_per_frame_ : 1;
+            if (!write_cv_.wait_until(lock, deadline, [this, min_space]() {
+                    return ring_buffer_.free_space() >= min_space ||
                            abort_write_.load(std::memory_order_acquire);
                 })) {
                 break;  // Timed out
@@ -187,12 +203,36 @@ bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bi
             return false;
     }
 
-    PaError err = Pa_OpenDefaultStream(&stream_, 0, channels, sample_format, sample_rate,
-                                       paFramesPerBufferUnspecified, pa_callback, this);
+    PaDeviceIndex device = Pa_GetDefaultOutputDevice();
+    if (device == paNoDevice) {
+        fprintf(stderr, "PortAudio: no default output device\n");
+        return false;
+    }
+    const PaDeviceInfo* device_info = Pa_GetDeviceInfo(device);
+
+    PaStreamParameters output_params = {};
+    output_params.device = device;
+    output_params.channelCount = channels;
+    output_params.sampleFormat = sample_format;
+    output_params.suggestedLatency = device_info->defaultHighOutputLatency;
+    output_params.hostApiSpecificStreamInfo = nullptr;
+
+    PaError err = Pa_OpenStream(&stream_, nullptr, &output_params, sample_rate,
+                                paFramesPerBufferUnspecified, paNoFlag, pa_callback, this);
     if (err != paNoError) {
         fprintf(stderr, "PortAudio: failed to open stream: %s\n", Pa_GetErrorText(err));
         stream_ = nullptr;
         return false;
+    }
+
+    // Use the nominal actual sample rate reported by PA for frame<->second
+    // conversions in the callback. Falls back to the requested rate if
+    // unavailable.
+    const PaStreamInfo* stream_info = Pa_GetStreamInfo(stream_);
+    if (stream_info != nullptr && stream_info->sampleRate > 0.0) {
+        actual_sample_rate_ = stream_info->sampleRate;
+    } else {
+        actual_sample_rate_ = static_cast<double>(sample_rate);
     }
 
     err = Pa_StartStream(stream_);
@@ -203,7 +243,6 @@ bool PortAudioSink::configure(uint32_t sample_rate, uint8_t channels, uint8_t bi
         return false;
     }
 
-    fprintf(stderr, "PortAudio: playing %uHz %uch %ubit\n", sample_rate, channels, bits_per_sample);
     return true;
 }
 
@@ -233,7 +272,7 @@ bool PortAudioSink::is_format_supported(uint32_t sample_rate, uint8_t channels,
     params.device = device;
     params.channelCount = channels;
     params.sampleFormat = sample_format;
-    params.suggestedLatency = Pa_GetDeviceInfo(device)->defaultLowOutputLatency;
+    params.suggestedLatency = Pa_GetDeviceInfo(device)->defaultHighOutputLatency;
 
     return Pa_IsFormatSupported(nullptr, &params, static_cast<double>(sample_rate)) ==
            paFormatIsSupported;
@@ -274,6 +313,10 @@ void PortAudioSink::clear() {
 int PortAudioSink::pa_callback(const void* /*input*/, void* output, unsigned long frame_count,
                                const PaStreamCallbackTimeInfo* time_info,
                                PaStreamCallbackFlags /*status_flags*/, void* user_data) {
+    int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+
     auto* self = static_cast<PortAudioSink*>(user_data);
     size_t bytes_requested = frame_count * self->bytes_per_frame_;
     auto* out = static_cast<uint8_t*>(output);
@@ -301,12 +344,9 @@ int PortAudioSink::pa_callback(const void* /*input*/, void* output, unsigned lon
 
         // How far in the future (in seconds) the DAC will output the last frame
         double dac_offset_s = (time_info->outputBufferDacTime - time_info->currentTime) +
-                              (static_cast<double>(frames_played) / self->sample_rate_);
-        int64_t dac_offset_us = static_cast<int64_t>(dac_offset_s * 1e6);
+                              (static_cast<double>(frames_played) / self->actual_sample_rate_);
+        int64_t dac_offset_us = static_cast<int64_t>(std::round(dac_offset_s * 1e6));
 
-        int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                             std::chrono::steady_clock::now().time_since_epoch())
-                             .count();
         int64_t finish_timestamp = now_us + dac_offset_us;
         self->on_frames_played(frames_played, finish_timestamp);
     }
@@ -372,9 +412,8 @@ void PortAudioSink::apply_volume_(uint8_t* data, size_t len, uint8_t bytes_per_s
                 if (sample & 0x800000) {
                     sample |= static_cast<int32_t>(0xFF000000);
                 }
-                int32_t out =
-                    static_cast<int32_t>((static_cast<int64_t>(sample) * s_scale + ROUND_TERM) >>
-                                         FRAC_BITS);
+                int32_t out = static_cast<int32_t>(
+                    (static_cast<int64_t>(sample) * s_scale + ROUND_TERM) >> FRAC_BITS);
                 p[0] = static_cast<uint8_t>(out & 0xFF);
                 p[1] = static_cast<uint8_t>((out >> 8) & 0xFF);
                 p[2] = static_cast<uint8_t>((out >> 16) & 0xFF);
