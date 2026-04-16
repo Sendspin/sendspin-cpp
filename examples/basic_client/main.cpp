@@ -203,6 +203,7 @@ int main(int argc, char* argv[]) {
         {SendspinCodecFormat::PCM, 2, 48000, 16},
     };
     auto& player = client.add_player(std::move(player_config));
+    player.set_static_delay_adjustable(true);
     auto& controller = client.add_controller();
     auto& metadata = client.add_metadata();
 
