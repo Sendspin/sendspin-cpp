@@ -98,7 +98,7 @@ void MetadataRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::METADATA);
 }
 
-void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject state) {
+void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject state) const {
     this->event_state->shadow.merge(
         [](ServerMetadataStateObject& current, ServerMetadataStateObject&& delta) {
             apply_metadata_state_deltas(&current, delta);

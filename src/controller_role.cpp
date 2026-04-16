@@ -51,7 +51,8 @@ void ControllerRole::send_command(SendspinControllerCommand cmd, std::optional<u
 // ============================================================================
 
 void ControllerRole::Impl::send_command(SendspinControllerCommand cmd,
-                                        std::optional<uint8_t> volume, std::optional<bool> mute) {
+                                        std::optional<uint8_t> volume,
+                                        std::optional<bool> mute) const {
     std::string command_message = format_client_command_message(cmd, volume, mute);
     this->client->send_text(command_message);
 }
@@ -60,7 +61,7 @@ void ControllerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::CONTROLLER);
 }
 
-void ControllerRole::Impl::handle_server_state(ServerStateControllerObject state) {
+void ControllerRole::Impl::handle_server_state(ServerStateControllerObject state) const {
     this->event_state->shadow.write(std::move(state));
 }
 

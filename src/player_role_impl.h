@@ -65,9 +65,9 @@ struct PlayerRole::Impl {
     void build_state_fields(ClientStateMessage& msg) const;
     void handle_binary(const uint8_t* data, size_t len);
     void handle_stream_start(const StreamStartMessage& stream_msg);
-    void handle_stream_end();
-    void handle_stream_clear();
-    void handle_server_command(const ServerCommandMessage& cmd);
+    void handle_stream_end() const;
+    void handle_stream_clear() const;
+    void handle_server_command(const ServerCommandMessage& cmd) const;
     void drain_events();
     void cleanup();
 
@@ -84,10 +84,10 @@ struct PlayerRole::Impl {
     // ========================================
 
     bool send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
-                          uint8_t chunk_type, uint32_t timeout_ms);
-    void enqueue_state_update(SendspinClientState state);
+                          uint8_t chunk_type, uint32_t timeout_ms) const;
+    void enqueue_state_update(SendspinClientState state) const;
     void load_static_delay();
-    void persist_static_delay();
+    void persist_static_delay() const;
 
     // ========================================
     // Fields

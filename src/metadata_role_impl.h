@@ -45,7 +45,7 @@ struct MetadataRole::Impl {
     // ========================================
 
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerMetadataStateObject state);
+    void handle_server_state(ServerMetadataStateObject state) const;
     void drain_events();
     void cleanup();
 

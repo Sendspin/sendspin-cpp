@@ -45,7 +45,7 @@ struct ControllerRole::Impl {
     // ========================================
 
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerStateControllerObject state);
+    void handle_server_state(ServerStateControllerObject state) const;
     void drain_events();
     void cleanup();
 
@@ -54,7 +54,7 @@ struct ControllerRole::Impl {
     // ========================================
 
     void send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume,
-                      std::optional<bool> mute);
+                      std::optional<bool> mute) const;
 
     // ========================================
     // Fields

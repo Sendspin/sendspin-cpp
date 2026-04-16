@@ -92,7 +92,7 @@ bool ArtworkRole::Impl::start() {
     return true;
 }
 
-void ArtworkRole::Impl::stop() {
+void ArtworkRole::Impl::stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
         return;
     }
@@ -100,7 +100,7 @@ void ArtworkRole::Impl::stop() {
     this->drain_task->drain_thread.join();
 }
 
-void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
+void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
     if (this->artwork_channels.empty()) {
         return;
     }

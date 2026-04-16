@@ -297,17 +297,17 @@ void PlayerRole::Impl::handle_stream_start(const StreamStartMessage& stream_msg)
     }
 }
 
-void PlayerRole::Impl::handle_stream_end() {
+void PlayerRole::Impl::handle_stream_end() const {
     this->sync_task->signal_stream_end();
     this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_END, 0);
 }
 
-void PlayerRole::Impl::handle_stream_clear() {
+void PlayerRole::Impl::handle_stream_clear() const {
     this->sync_task->signal_stream_clear();
     this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_CLEAR, 0);
 }
 
-void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) {
+void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) const {
     if (!cmd.player.has_value()) {
         SS_LOGV(TAG, "Server command has no player commands");
         return;
@@ -465,7 +465,7 @@ void PlayerRole::Impl::cleanup() {
 // ============================================================================
 
 bool PlayerRole::Impl::send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
-                                        uint8_t chunk_type, uint32_t timeout_ms) {
+                                        uint8_t chunk_type, uint32_t timeout_ms) const {
     if (data == nullptr || data_size == 0) {
         SS_LOGE(TAG, "Invalid data passed to send_audio_chunk");
         return false;
@@ -475,7 +475,7 @@ bool PlayerRole::Impl::send_audio_chunk(const uint8_t* data, size_t data_size, i
                                               static_cast<ChunkType>(chunk_type), timeout_ms);
 }
 
-void PlayerRole::Impl::enqueue_state_update(SendspinClientState state) {
+void PlayerRole::Impl::enqueue_state_update(SendspinClientState state) const {
     this->event_state->state_queue.send(state, 0);
 }
 
@@ -503,7 +503,7 @@ void PlayerRole::Impl::load_static_delay() {
     }
 }
 
-void PlayerRole::Impl::persist_static_delay() {
+void PlayerRole::Impl::persist_static_delay() const {
     if (this->persistence) {
         if (this->persistence->save_static_delay(this->static_delay_ms)) {
             SS_LOGD(TAG, "Persisted static delay: %u ms", this->static_delay_ms);

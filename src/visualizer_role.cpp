@@ -136,7 +136,7 @@ bool VisualizerRole::Impl::start() {
     return true;
 }
 
-void VisualizerRole::Impl::stop() {
+void VisualizerRole::Impl::stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
         return;
     }
@@ -290,7 +290,7 @@ void VisualizerRole::Impl::handle_stream_clear() {
 // Event draining (main thread) - lifecycle events only
 // ============================================================================
 
-void VisualizerRole::Impl::drain_events() {
+void VisualizerRole::Impl::drain_events() const {
     VisualizerEventType event_type{};
     while (this->event_state->queue.receive(event_type, 0)) {
         switch (event_type) {
@@ -335,7 +335,7 @@ void VisualizerRole::Impl::cleanup() {
 // Drain thread helpers
 // ============================================================================
 
-void VisualizerRole::Impl::flush_ring_buffer() {
+void VisualizerRole::Impl::flush_ring_buffer() const {
     if (!this->drain_task) {
         return;
     }

@@ -74,15 +74,15 @@ struct VisualizerRole::Impl {
     void handle_stream_start(const ServerVisualizerStreamObject& stream);
     void handle_stream_end();
     void handle_stream_clear();
-    void drain_events();
+    void drain_events() const;
     void cleanup();
 
     // ========================================
     // Internal helpers
     // ========================================
 
-    void stop();
-    void flush_ring_buffer();
+    void stop() const;
+    void flush_ring_buffer() const;
 
     static void drain_thread_func(VisualizerRole::Impl* self);
 
