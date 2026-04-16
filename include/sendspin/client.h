@@ -150,13 +150,6 @@ struct SendspinClientConfig {
         DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
 };
 
-/// @brief Deferred event from a callback thread, processed in loop()
-struct TimeResponseEvent {
-    int64_t offset;
-    int64_t max_error;
-    int64_t timestamp;
-};
-
 /**
  * @brief Main orchestration class for the sendspin-cpp library
  *
