@@ -230,22 +230,25 @@ void SendspinServerConnection::async_send_time_text(void* arg) {
         return;
     }
 
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
     // Capture client_transmitted as close as possible to the actual send. The serialization
     // happens between this capture and the wire send; track its duration so the bias is
     // visible in the time_burst log. Stack buffer keeps the path heap-free.
     char buf[96];
     const int64_t client_transmitted = esp_timer_get_time();
     const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
-    this_conn->update_serialize_ema(esp_timer_get_time() - client_transmitted);
+
     if (len == 0) {
         return;
     }
 
-    httpd_ws_frame_t ws_pkt;
-    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
     ws_pkt.payload = reinterpret_cast<uint8_t*>(buf);
     ws_pkt.len = len;
-    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+    this_conn->update_serialize_ema(esp_timer_get_time() - client_transmitted);
 
     httpd_ws_send_frame_async(this_conn->server_, this_conn->sockfd_, &ws_pkt);
 }
