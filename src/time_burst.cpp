@@ -76,10 +76,10 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
         return {.sent = false, .burst_completed = burst_completed_by_response};
     }
 
-    // State 3: Ready to send next message in burst
-    // The time replacement (transmitted_time + actual_transmit_time) is pushed to the
-    // connection's thread-safe queue internally by send_time_message's send callback.
-    bool queued = conn->send_time_message(nullptr);
+    // State 3: Ready to send next message in burst.
+    // The transport stamps client_transmitted at the actual send point (e.g., inside the
+    // httpd worker on ESP server), so no post-send replacement is needed.
+    bool queued = conn->send_time_message();
 
     if (queued) {
         conn->set_pending_time_message(true);

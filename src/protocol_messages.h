@@ -144,16 +144,6 @@ inline std::optional<SendspinConnectionReason> connection_reason_from_string(
     return std::nullopt;
 }
 
-/// @brief Holds the planned and actual transmit timestamps for a client/time message
-///
-/// When a client/time message is queued, the intended transmit time is stored. After the
-/// WebSocket layer sends it, the actual send time replaces the placeholder so the server
-/// can compute round-trip latency more accurately.
-struct TimeTransmittedReplacement {
-    int64_t transmitted_time = 0;
-    int64_t actual_transmit_time = 0;
-};
-
 // ============================================================================
 // Message envelope structs
 // ============================================================================
@@ -241,12 +231,10 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
 /// @brief Parses a server/time JSON message and computes time offset and max error
 /// @param root Parsed JSON object from the message.
 /// @param timestamp Client timestamp when the message was received (microseconds).
-/// @param time_replacement Actual send time replacement from the outgoing time message.
 /// @param offset [out] Computed time offset between server and client clocks (microseconds).
 /// @param max_error [out] Upper bound on clock error from the round-trip (microseconds).
 /// @return true if parsing and computation succeeded, false otherwise.
-bool process_server_time_message(JsonObject root, int64_t timestamp,
-                                 TimeTransmittedReplacement time_replacement, int64_t* offset,
+bool process_server_time_message(JsonObject root, int64_t timestamp, int64_t* offset,
                                  int64_t* max_error);
 
 /// @brief Parses a group/update JSON message into the provided struct
@@ -315,6 +303,21 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
 /// @param reason The reason for disconnecting.
 /// @return Goodbye message serialized into JSON format.
 std::string format_client_goodbye_message(SendspinGoodbyeReason reason);
+
+/// Buffer size for format_client_time_message(). Fits the longest possible message:
+/// prefix (52) + '-' (1) + 19 digits + suffix (2) + padding = 75 bytes, rounded up.
+static constexpr size_t TIME_MESSAGE_BUF_SIZE = 96;
+
+/// @brief Formats a client/time JSON message into a caller-supplied buffer
+///
+/// Hot path on the time-sync send side: avoids any heap allocation by writing the fixed-shape
+/// message directly into the caller's stack buffer. A 96-byte buffer is always large enough.
+/// @param buf Destination buffer.
+/// @param cap Capacity of `buf` in bytes (recommend >= 96).
+/// @param client_transmitted The client transmit timestamp (microseconds). Should be captured
+///                           as close as possible to the actual wire send.
+/// @return Number of bytes written (excluding any null terminator), or 0 on error.
+size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted);
 
 /// @brief Formats a client/command message as a JSON string for sending to the server
 /// @param command The playback command to send.

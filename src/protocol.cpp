@@ -17,6 +17,10 @@
 #include "protocol_messages.h"
 #include <ArduinoJson.h>
 
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+
 namespace sendspin {
 
 static const char* const TAG = "sendspin.protocol";
@@ -312,8 +316,7 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
     return true;
 }
 
-bool process_server_time_message(JsonObject root, int64_t timestamp,
-                                 TimeTransmittedReplacement time_replacement, int64_t* offset,
+bool process_server_time_message(JsonObject root, int64_t timestamp, int64_t* offset,
                                  int64_t* max_error) {
     if (!root["payload"]["client_transmitted"].is<JsonVariant>() ||
         !root["payload"]["server_received"].is<JsonVariant>() ||
@@ -322,14 +325,7 @@ bool process_server_time_message(JsonObject root, int64_t timestamp,
         return false;
     }
 
-    int64_t client_transmitted = root["payload"]["client_transmitted"];
-
-    if (client_transmitted != time_replacement.transmitted_time) {
-        SS_LOGW(TAG, "Mismatched time message history, discarding measurement");
-        return false;
-    }
-    client_transmitted = time_replacement.actual_transmit_time;
-
+    const int64_t client_transmitted = root["payload"]["client_transmitted"];
     const int64_t server_received = root["payload"]["server_received"];
     const int64_t server_transmitted = root["payload"]["server_transmitted"];
     const int64_t client_received = timestamp;
@@ -819,6 +815,122 @@ std::string format_client_goodbye_message(SendspinGoodbyeReason reason) {
     std::string output;
     serializeJson(doc, output);
     return output;
+}
+
+namespace {
+
+/// Maximum decimal digits in a uint64_t value.
+constexpr int MAX_UINT64_DIGITS = 19;
+
+/// Radix used for two-digit-at-a-time integer formatting.
+constexpr uint64_t RADIX_100 = 100U;
+
+/// Threshold for single vs. two-digit final write.
+constexpr uint64_t RADIX_10 = 10U;
+
+// Two-digit ASCII lookup. Index 2*N..2*N+1 holds the decimal digits of N for N in [0, 99].
+// Lets us emit two characters per 64-bit division instead of one, halving the libgcc
+// __udivdi3 calls, which are the expensive part on a 32-bit MCU.
+constexpr char TWO_DIGIT_TABLE[201] = "00010203040506070809"
+                                      "10111213141516171819"
+                                      "20212223242526272829"
+                                      "30313233343536373839"
+                                      "40414243444546474849"
+                                      "50515253545556575859"
+                                      "60616263646566676869"
+                                      "70717273747576777879"
+                                      "80818283848586878889"
+                                      "90919293949596979899";
+
+// log10(v) + 1, computed without any division. Uses clz to get an approximate base-10 length
+// from the base-2 length, then a single table comparison to round to the exact value.
+inline int decimal_digits(uint64_t v) {
+    if (v == 0U) {
+        return 1;
+    }
+    // floor(log2(v)) for v != 0
+    const int log2 = 63 - __builtin_clzll(v);
+    // floor(log10(v)) ≈ floor(log2(v) * log10(2)). 1233 / 4096 ≈ 0.30108, accurate to within 1.
+    const int approx = (log2 * 1233) >> 12;
+    static constexpr uint64_t POW10[20] = {1ULL,
+                                           10ULL,
+                                           100ULL,
+                                           1000ULL,
+                                           10000ULL,
+                                           100000ULL,
+                                           1000000ULL,
+                                           10000000ULL,
+                                           100000000ULL,
+                                           1000000000ULL,
+                                           10000000000ULL,
+                                           100000000000ULL,
+                                           1000000000000ULL,
+                                           10000000000000ULL,
+                                           100000000000000ULL,
+                                           1000000000000000ULL,
+                                           10000000000000000ULL,
+                                           100000000000000000ULL,
+                                           1000000000000000000ULL,
+                                           10000000000000000000ULL};
+    return approx + 1 + static_cast<int>(v >= POW10[approx + 1]);
+}
+
+}  // namespace
+
+size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted) {
+    // Hot path on the time-sync send side. ESP-IDF newlib's snprintf("%lld", ...) costs ~50us
+    // for a single int64 because it instantiates a full printf state machine and does 64-bit
+    // division through generic code. We bypass it entirely: memcpy the two constant chunks
+    // around a hand-rolled int64-to-decimal conversion that uses clz for digit count and a
+    // two-digit-at-a-time write to halve the 64-bit division count.
+    static constexpr char PREFIX[] = R"({"type":"client/time","payload":{"client_transmitted":)";
+    static constexpr size_t PREFIX_LEN = sizeof(PREFIX) - 1;
+    static constexpr char SUFFIX[] = "}}";
+    static constexpr size_t SUFFIX_LEN = sizeof(SUFFIX) - 1;
+
+    // Worst case: prefix + '-' + MAX_UINT64_DIGITS digits + suffix.
+    if (cap < PREFIX_LEN + 1 + MAX_UINT64_DIGITS + SUFFIX_LEN) {
+        return 0;
+    }
+
+    char* p = buf;
+    std::memcpy(p, PREFIX, PREFIX_LEN);
+    p += PREFIX_LEN;
+
+    uint64_t v = 0;
+    if (client_transmitted < 0) {
+        *p++ = '-';
+        // Cast through uint64_t to handle INT64_MIN without UB
+        v = static_cast<uint64_t>(-(client_transmitted + 1)) + 1U;
+    } else {
+        v = static_cast<uint64_t>(client_transmitted);
+    }
+
+    // Place the digit cursor at the end of the integer field and write backwards, two digits
+    // per loop iteration. The clz-based digit count means we know exactly where to start.
+    const int n = decimal_digits(v);
+    char* end = p + n;
+    char* w = end;
+    while (v >= RADIX_100) {
+        const uint64_t q = v / RADIX_100;
+        const auto r = static_cast<size_t>(v - q * RADIX_100);
+        w -= 2;
+        std::memcpy(w, &TWO_DIGIT_TABLE[r * 2U], 2);
+        v = q;
+    }
+    if (v >= RADIX_10) {
+        w -= 2;
+        std::memcpy(w, &TWO_DIGIT_TABLE[static_cast<size_t>(v) * 2U], 2);
+    } else {
+        w -= 1;
+        *w = static_cast<char>('0' + v);
+    }
+    p = end;
+
+    std::memcpy(p, SUFFIX, SUFFIX_LEN);
+    p += SUFFIX_LEN;
+
+    return static_cast<size_t>(p - buf);
 }
 
 std::string format_client_command_message(SendspinControllerCommand command,

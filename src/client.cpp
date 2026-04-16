@@ -518,8 +518,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const std::s
 
             int64_t offset{0};
             int64_t max_error{0};
-            if (process_server_time_message(root, timestamp, conn->peek_time_replacement(), &offset,
-                                            &max_error)) {
+            if (process_server_time_message(root, timestamp, &offset, &max_error)) {
                 this->event_state_->time_queue.send({offset, max_error, timestamp}, 0);
             }
             break;

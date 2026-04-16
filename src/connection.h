@@ -19,7 +19,6 @@
 #pragma once
 
 #include "platform/memory.h"
-#include "platform/thread_safe_queue.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "time_filter.h"
@@ -33,8 +32,7 @@ namespace sendspin {
 
 /// @brief Callback type for message send completion
 /// @param success True if the message was sent successfully, false otherwise.
-/// @param timestamp The actual timestamp when the message was sent (in microseconds).
-using SendCompleteCallback = std::function<void(bool, int64_t)>;
+using SendCompleteCallback = std::function<void(bool)>;
 
 /**
  * @brief Abstract base class for Sendspin connections (server-initiated or client-initiated)
@@ -119,14 +117,19 @@ public:
 
     /// @brief Sends a text message to the server with a completion callback
     /// @param msg The message string to send.
-    /// @param cb Callback invoked after send completes (success, actual_send_time).
+    /// @param cb Callback invoked after send completes.
     /// @return SsErr::OK if queued successfully, error code otherwise.
     virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb) = 0;
 
-    /// @brief Sends a time synchronization message with a completion callback
-    /// @param cb Callback invoked after send completes, providing actual send timestamp.
-    /// @return true if message was queued successfully, false otherwise.
-    bool send_time_message(SendCompleteCallback cb);
+    /// @brief Sends a client/time synchronization message
+    ///
+    /// The transport implementation captures `client_transmitted` as close to the actual wire
+    /// send as possible (e.g., inside the httpd worker on ESP server, just before
+    /// `httpd_ws_send_frame_async`) and serializes the JSON inline. This eliminates the queue
+    /// latency variance that a hub-thread timestamp would introduce.
+    ///
+    /// @return true if the message was queued/sent successfully, false otherwise.
+    virtual bool send_time_message() = 0;
 
     /// @brief Sends a goodbye message with completion callback
     /// @param reason The reason for disconnecting.
@@ -216,6 +219,25 @@ public:
     /// @brief Initializes the time filter with Kalman parameters
     void init_time_filter();
 
+    /// @brief Returns the EMA (microseconds) of how long format_client_time_message() takes
+    ///
+    /// Updated by `send_time_message()` on each call. The serialization happens between when
+    /// `client_transmitted` is captured and when the bytes hit the wire, so this EMA estimates
+    /// the constant bias subtracted from the embedded timestamp. Reported alongside per-burst
+    /// stats for diagnostics. Atomic so the httpd worker (ESP server) can update it while the
+    /// hub thread reads it.
+    int64_t get_serialize_ema_us() const {
+        return this->serialize_ema_us_.load(std::memory_order_relaxed);
+    }
+
+    /// @brief Folds a new serialization-duration sample into the EMA (1/16 weight)
+    /// @param sample_us Measured duration in microseconds.
+    void update_serialize_ema(int64_t sample_us) {
+        int64_t prev = this->serialize_ema_us_.load(std::memory_order_relaxed);
+        const int64_t next = (prev == 0) ? sample_us : ((prev * 15 + sample_us) / 16);
+        this->serialize_ema_us_.store(next, std::memory_order_relaxed);
+    }
+
     // ========================================
     // Configuration setters (called by hub after receiving server/hello message)
     // ========================================
@@ -252,12 +274,6 @@ public:
     // Time message state accessors
     // ========================================
 
-    /// @brief Sets the timestamp of the last sent time message
-    /// @param timestamp The timestamp of the last sent time message
-    void set_last_sent_time_message(int64_t timestamp) {
-        this->last_sent_time_message_ = timestamp;
-    }
-
     /// @brief Checks if a time message is pending (waiting for response)
     /// @return True if a time message has been sent and a response is expected, false otherwise.
     bool is_pending_time_message() const {
@@ -269,12 +285,6 @@ public:
     void set_pending_time_message(bool pending) {
         this->pending_time_message_ = pending;
     }
-
-    /// @brief Thread-safe peek at the last time replacement data
-    /// Uses a FreeRTOS queue (depth 1) so the send callback can write from any thread
-    /// while the receive handler reads from any thread without data races.
-    /// @return Copy of the last time replacement, or default-constructed if none available.
-    TimeTransmittedReplacement peek_time_replacement() const;
 
 protected:
     /// @brief Deallocates the websocket payload buffer if allocated
@@ -310,11 +320,6 @@ protected:
 
     // Struct fields
 
-    /// Thread-safe single-slot buffer for time replacement data.
-    /// Written by the send callback (which may run on httpd/websocket thread),
-    /// read by the receive handler (which may run on a different thread).
-    ThreadSafeQueue<TimeTransmittedReplacement> time_replacement_queue_;
-
     /// Message buffering (for websocket frame assembly).
     PlatformBuffer websocket_payload_;
 
@@ -328,8 +333,9 @@ protected:
 
     // 64-bit fields
 
-    /// Time message state.
-    int64_t last_sent_time_message_{0};
+    /// EMA (microseconds) of format_client_time_message() duration. Atomic because the ESP
+    /// server worker thread updates it while the hub thread reads it for logging.
+    std::atomic<int64_t> serialize_ema_us_{0};
 
     // size_t fields
     size_t websocket_write_offset_{0};

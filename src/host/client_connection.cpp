@@ -16,6 +16,7 @@
 
 #include "platform/logging.h"
 #include "platform/time.h"
+#include "protocol_messages.h"
 
 #include <algorithm>
 #include <chrono>
@@ -84,7 +85,7 @@ void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
     }
 
     // Send goodbye message then stop
-    this->send_goodbye_reason(reason, [this, on_complete](bool /*success*/, int64_t) {
+    this->send_goodbye_reason(reason, [this, on_complete](bool /*success*/) {
         if (this->ws_) {
             this->ws_->stop();
         }
@@ -98,17 +99,16 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback cb) {
     if (!this->is_connected()) {
         if (cb) {
-            cb(false, 0);
+            cb(false);
         }
         return SsErr::INVALID_STATE;
     }
 
     auto info = this->ws_->send(message);
-    int64_t after_send_time = platform_time_us();
     bool success = info.success;
 
     if (cb) {
-        cb(success, after_send_time);
+        cb(success);
     }
 
     if (!success) {
@@ -117,6 +117,21 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     }
 
     return SsErr::OK;
+}
+
+bool SendspinClientConnection::send_time_message() {
+    if (!this->is_connected()) {
+        return false;
+    }
+
+    char buf[TIME_MESSAGE_BUF_SIZE];
+    const int64_t client_transmitted = platform_time_us();
+    const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
+    if (len == 0) {
+        return false;
+    }
+    this->update_serialize_ema(platform_time_us() - client_transmitted);
+    return this->ws_->send(std::string(buf, len)).success;
 }
 
 // ============================================================================

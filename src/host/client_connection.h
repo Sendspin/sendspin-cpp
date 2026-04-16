@@ -70,9 +70,13 @@ public:
 
     /// @brief Sends a text message to the server
     /// @param message The message string to send.
-    /// @param cb Callback invoked after send completes (success, actual_send_time).
+    /// @param cb Callback invoked after send completes.
     /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb) override;
+
+    /// @brief Sends a client/time message, capturing the timestamp synchronously before send
+    /// @return true if the message was sent successfully, false otherwise.
+    bool send_time_message() override;
 
     /// @brief Enables or disables automatic reconnection after connection loss
     /// @param enabled True to reconnect automatically, false to stay disconnected.

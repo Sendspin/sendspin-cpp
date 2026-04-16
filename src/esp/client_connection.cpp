@@ -15,6 +15,7 @@
 #include "client_connection.h"
 
 #include "platform/logging.h"
+#include "protocol_messages.h"
 #include <esp_timer.h>
 
 #include <cstring>
@@ -111,7 +112,7 @@ void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
 
     // Send goodbye message and then stop client
     // For client connections, send_text_message is synchronous, so callback fires immediately
-    this->send_goodbye_reason(reason, [this, on_complete](bool success, int64_t) {
+    this->send_goodbye_reason(reason, [this, on_complete](bool success) {
         // Stop the client regardless of send success
         if (this->client_ != nullptr) {
             esp_websocket_client_stop(this->client_);
@@ -131,9 +132,8 @@ bool SendspinClientConnection::is_connected() const {
 SsErr SendspinClientConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback cb) {
     if (!this->is_connected()) {
-        // No connection - invoke callback with failure if provided
         if (cb) {
-            cb(false, 0);
+            cb(false);
         }
         return SsErr::INVALID_STATE;
     }
@@ -142,14 +142,10 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     int sent = esp_websocket_client_send_text(this->client_, message.c_str(), message.length(),
                                               pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
 
-    // Capture timestamp after send
-    int64_t after_send_time = esp_timer_get_time();
-
     bool success = (sent >= 0);
 
-    // Invoke callback if provided
     if (cb) {
-        cb(success, after_send_time);
+        cb(success);
     }
 
     if (!success) {
@@ -158,6 +154,31 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     }
 
     return SsErr::OK;
+}
+
+bool SendspinClientConnection::send_time_message() {
+    if (!this->is_connected()) {
+        return false;
+    }
+
+    // Capture client_transmitted as close to the actual send call as possible. Track the
+    // serialization duration as the bias subtracted from the embedded timestamp. Stack buffer
+    // keeps the path heap-free.
+    char buf[TIME_MESSAGE_BUF_SIZE];
+    const int64_t client_transmitted = esp_timer_get_time();
+    const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
+    if (len == 0) {
+        return false;
+    }
+    this->update_serialize_ema(esp_timer_get_time() - client_transmitted);
+
+    int sent = esp_websocket_client_send_text(this->client_, buf, len,
+                                              pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
+    if (sent < 0) {
+        SS_LOGE(TAG, "Failed to send time message: %d", sent);
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================

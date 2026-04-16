@@ -15,9 +15,7 @@
 #include "connection.h"
 
 #include "platform/logging.h"
-#include "platform/time.h"
 #include "time_filter.h"
-#include <ArduinoJson.h>
 
 #include <memory>
 
@@ -40,47 +38,11 @@ void SendspinConnection::init_time_filter() {
         TIME_FILTER_PROCESS_STD_DEV, TIME_FILTER_DRIFT_PROCESS_STD_DEV, TIME_FILTER_FORGET_FACTOR,
         TIME_FILTER_ADAPTIVE_CUTOFF, TIME_FILTER_MIN_SAMPLES,
         TIME_FILTER_DRIFT_SIGNIFICANCE_THRESHOLD);
-    if (!this->time_replacement_queue_.is_created()) {
-        this->time_replacement_queue_.create(1);
-    }
-}
-
-TimeTransmittedReplacement SendspinConnection::peek_time_replacement() const {
-    TimeTransmittedReplacement replacement{};
-    this->time_replacement_queue_.peek(replacement);
-    return replacement;
 }
 
 // ============================================================================
 // Message sending
 // ============================================================================
-
-bool SendspinConnection::send_time_message(SendCompleteCallback cb) {
-    int64_t now = platform_time_us();
-
-    // Build the time message using ArduinoJson directly
-    JsonDocument doc = make_json_document();
-    doc["type"] = "client/time";
-    doc["payload"]["client_transmitted"] = now;
-    std::string serialized_text;
-    serializeJson(doc, serialized_text);
-
-    // Wrap the caller's callback to push the time replacement into the queue
-    // after the message is actually sent. This is thread-safe: the queue handles
-    // synchronization between the send thread and the receive thread.
-    auto* queue = &this->time_replacement_queue_;
-    auto wrapped_cb = [now, queue, cb = std::move(cb)](bool success, int64_t actual_send_time) {
-        if (success && queue->is_created()) {
-            TimeTransmittedReplacement replacement{now, actual_send_time};
-            queue->overwrite(replacement);
-        }
-        if (cb) {
-            cb(success, actual_send_time);
-        }
-    };
-
-    return this->send_text_message(serialized_text, std::move(wrapped_cb)) == SsErr::OK;
-}
 
 SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
                                               SendCompleteCallback on_complete) {
