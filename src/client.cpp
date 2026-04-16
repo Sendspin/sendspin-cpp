@@ -622,7 +622,8 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const std::s
 
 #ifdef SENDSPIN_ENABLE_METADATA
                 if (this->metadata_ && state_msg.metadata.has_value()) {
-                    this->metadata_->impl_->handle_server_state(state_msg.metadata.value());
+                    this->metadata_->impl_->handle_server_state(
+                        std::move(state_msg.metadata.value()));
                 }
 #endif
             }

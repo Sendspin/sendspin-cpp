@@ -89,9 +89,7 @@ PlayerRole::Impl::~Impl() {
 
 PlayerRole::PlayerRole(Config config, SendspinClient* client,
                        SendspinPersistenceProvider* persistence)
-    : impl_(std::make_unique<Impl>(std::move(config), client, persistence)) {
-    impl_->owner = this;
-}
+    : impl_(std::make_unique<Impl>(std::move(config), client, persistence)) {}
 
 PlayerRole::~PlayerRole() = default;
 
@@ -174,7 +172,7 @@ bool PlayerRole::Impl::start() {
 
     if (!this->config.audio_formats.empty() && this->listener &&
         !this->sync_task->is_initialized()) {
-        if (!this->sync_task->init(this->owner, this->client, this->config.audio_buffer_capacity)) {
+        if (!this->sync_task->init(this, this->client, this->config.audio_buffer_capacity)) {
             SS_LOGE(TAG, "Failed to initialize sync task");
             return false;
         }
@@ -378,7 +376,7 @@ void PlayerRole::Impl::drain_events() {
             if (player_cmd.static_delay_ms.has_value()) {
                 this->update_static_delay(player_cmd.static_delay_ms.value());
                 if (this->listener) {
-                    this->listener->on_static_delay_changed(player_cmd.static_delay_ms.value());
+                    this->listener->on_static_delay_changed(this->static_delay_ms);
                 }
             }
         }

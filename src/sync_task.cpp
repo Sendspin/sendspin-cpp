@@ -57,8 +57,8 @@ SyncTask::~SyncTask() {
     this->stop();
 }
 
-bool SyncTask::init(PlayerRole* player, SendspinClient* client, size_t buffer_size) {
-    this->player_ = player;
+bool SyncTask::init(PlayerRole::Impl* player_impl, SendspinClient* client, size_t buffer_size) {
+    this->player_impl_ = player_impl;
     this->client_ = client;
 
     if (!this->event_flags_.create()) {
@@ -456,8 +456,8 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                     sync_context.encoded_entry = nullptr;
                     return DecodeResult::ALLOCATION_FAILED;
                 }
-                if (this->player_->impl_->listener) {
-                    sync_context.decode_buffer->set_listener(this->player_->impl_->listener);
+                if (this->player_impl_->listener) {
+                    sync_context.decode_buffer->set_listener(this->player_impl_->listener);
                 }
             } else if (needed > sync_context.decode_buffer->capacity()) {
                 if (!sync_context.decode_buffer->reallocate(needed)) {
@@ -472,8 +472,8 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                (sync_context.encoded_entry->chunk_type == CHUNK_TYPE_ENCODED_AUDIO)) {
         int64_t client_timestamp =
             this->client_->get_client_time(sync_context.encoded_entry->timestamp) -
-            static_cast<int64_t>(this->player_->get_static_delay_ms()) * US_PER_MS -
-            this->player_->get_fixed_delay_us();
+            static_cast<int64_t>(this->player_impl_->static_delay_ms) * US_PER_MS -
+            this->player_impl_->config.fixed_delay_us;
 
         if (client_timestamp < sync_context.new_audio_client_playtime - HARD_SYNC_THRESHOLD_US) {
             // This chunk will arrive too late to be played, skip it!
@@ -632,9 +632,8 @@ void SyncTask::thread_entry(void* params) {
         return;
     }
 
-    if (this_task->player_->impl_->listener) {
-        sync_context.interpolation_transfer_buffer->set_listener(
-            this_task->player_->impl_->listener);
+    if (this_task->player_impl_->listener) {
+        sync_context.interpolation_transfer_buffer->set_listener(this_task->player_impl_->listener);
     }
     sync_context.decoder = std::make_unique<SendspinDecoder>();
 
@@ -704,7 +703,7 @@ void SyncTask::thread_entry(void* params) {
 
         this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
 
-        this_task->player_->impl_->enqueue_state_update(SendspinClientState::SYNCHRONIZED);
+        this_task->player_impl_->enqueue_state_update(SendspinClientState::SYNCHRONIZED);
 
         // Decode the initial codec header
         if (sync_context.encoded_entry != nullptr) {

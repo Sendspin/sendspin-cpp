@@ -75,12 +75,14 @@ ArtworkRole::Impl::~Impl() {
 
 bool ArtworkRole::Impl::start() {
     if (!this->drain_task) {
+        SS_LOGE(TAG, "Failed to start artwork: drain task not initialized");
         return false;
     }
     if (this->drain_task->drain_thread.joinable()) {
         return true;  // Already running
     }
     if (!this->drain_task->event_flags.is_created() && !this->drain_task->event_flags.create()) {
+        SS_LOGE(TAG, "Failed to create artwork event flags");
         return false;
     }
 

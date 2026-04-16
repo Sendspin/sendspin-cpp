@@ -102,7 +102,6 @@ struct PlayerRole::Impl {
     SendspinClient* client;
     std::unique_ptr<EventState> event_state;
     PlayerRoleListener* listener{nullptr};
-    PlayerRole* owner{nullptr};  // Back-pointer to owning PlayerRole (set after construction)
     SendspinPersistenceProvider* persistence;
     std::unique_ptr<SyncTask> sync_task;
 

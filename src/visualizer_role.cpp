@@ -119,12 +119,14 @@ void VisualizerRole::set_listener(VisualizerRoleListener* listener) {
 
 bool VisualizerRole::Impl::start() {
     if (!this->drain_task || !this->drain_task->ring_buffer.is_created()) {
+        SS_LOGE(TAG, "Failed to start visualizer: drain task not initialized");
         return false;
     }
     if (this->drain_task->drain_thread.joinable()) {
         return true;  // Already running
     }
     if (!this->drain_task->event_flags.is_created() && !this->drain_task->event_flags.create()) {
+        SS_LOGE(TAG, "Failed to create visualizer event flags");
         return false;
     }
 
