@@ -310,7 +310,7 @@ std::string format_client_goodbye_message(SendspinGoodbyeReason reason);
 /// message directly into the caller's stack buffer. A 96-byte buffer is always large enough.
 /// @param buf Destination buffer.
 /// @param cap Capacity of `buf` in bytes (recommend >= 96).
-/// @param client_transmitted The client transmit timestamp (microseconds) — should be captured
+/// @param client_transmitted The client transmit timestamp (microseconds). Should be captured
 ///                           as close as possible to the actual wire send.
 /// @return Number of bytes written (excluding any null terminator), or 0 on error.
 size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted);

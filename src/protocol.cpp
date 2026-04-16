@@ -821,7 +821,7 @@ namespace {
 
 // Two-digit ASCII lookup. Index 2*N..2*N+1 holds the decimal digits of N for N in [0, 99].
 // Lets us emit two characters per 64-bit division instead of one, halving the libgcc
-// __udivdi3 calls — those are the expensive part on a 32-bit MCU.
+// __udivdi3 calls, which are the expensive part on a 32-bit MCU.
 constexpr char TWO_DIGIT_TABLE[201] = "00010203040506070809"
                                       "10111213141516171819"
                                       "20212223242526272829"
