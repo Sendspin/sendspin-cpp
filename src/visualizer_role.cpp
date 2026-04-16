@@ -104,7 +104,7 @@ VisualizerRole::Impl::~Impl() {
 // VisualizerRole forwarding (public API → Impl)
 // ============================================================================
 
-VisualizerRole::VisualizerRole(Config config, SendspinClient* client)
+VisualizerRole::VisualizerRole(VisualizerRoleConfig config, SendspinClient* client)
     : impl_(std::make_unique<Impl>(std::move(config), client)) {}
 
 VisualizerRole::~VisualizerRole() = default;

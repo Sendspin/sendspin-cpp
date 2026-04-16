@@ -110,11 +110,9 @@ class VisualizerRole {
     friend class SendspinClient;
 
 public:
-    using Config = VisualizerRoleConfig;
-
     struct Impl;
 
-    VisualizerRole(Config config, SendspinClient* client);
+    VisualizerRole(VisualizerRoleConfig config, SendspinClient* client);
     ~VisualizerRole();
 
     /// @brief Sets the listener for visualizer events

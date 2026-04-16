@@ -352,7 +352,7 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
 // ArtworkRole public API (thin forwarding)
 // ============================================================================
 
-ArtworkRole::ArtworkRole(Config config, SendspinClient* client)
+ArtworkRole::ArtworkRole(ArtworkRoleConfig config, SendspinClient* client)
     : impl_(std::make_unique<Impl>(std::move(config), client)) {}
 
 ArtworkRole::~ArtworkRole() = default;

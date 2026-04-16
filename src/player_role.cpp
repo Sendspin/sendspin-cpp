@@ -87,7 +87,7 @@ PlayerRole::Impl::~Impl() {
 // PlayerRole forwarding (public API → Impl)
 // ============================================================================
 
-PlayerRole::PlayerRole(Config config, SendspinClient* client,
+PlayerRole::PlayerRole(PlayerRoleConfig config, SendspinClient* client,
                        SendspinPersistenceProvider* persistence)
     : impl_(std::make_unique<Impl>(std::move(config), client, persistence)) {}
 

@@ -140,10 +140,10 @@ class PlayerRole {
     friend class SendspinClient;
 
 public:
-    using Config = PlayerRoleConfig;
     struct Impl;
 
-    PlayerRole(Config config, SendspinClient* client, SendspinPersistenceProvider* persistence);
+    PlayerRole(PlayerRoleConfig config, SendspinClient* client,
+               SendspinPersistenceProvider* persistence);
     ~PlayerRole();
 
     /// @brief Sets the listener for player events

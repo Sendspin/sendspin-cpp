@@ -144,11 +144,9 @@ class ArtworkRole {
     friend class SendspinClient;
 
 public:
-    using Config = ArtworkRoleConfig;
-
     struct Impl;
 
-    ArtworkRole(Config config, SendspinClient* client);
+    ArtworkRole(ArtworkRoleConfig config, SendspinClient* client);
     ~ArtworkRole();
 
     /// @brief Sets the listener for artwork events
