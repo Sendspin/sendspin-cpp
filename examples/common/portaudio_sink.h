@@ -114,6 +114,7 @@ private:
     PortAudioRingBuffer ring_buffer_;
     PaStream* stream_{nullptr};
     uint32_t sample_rate_{0};
+    double actual_sample_rate_{0.0};
     uint8_t channels_{0};
     uint8_t bits_per_sample_{0};
     size_t bytes_per_frame_{0};
