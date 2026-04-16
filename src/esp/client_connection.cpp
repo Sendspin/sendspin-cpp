@@ -164,7 +164,7 @@ bool SendspinClientConnection::send_time_message() {
     // Capture client_transmitted as close to the actual send call as possible. Track the
     // serialization duration as the bias subtracted from the embedded timestamp. Stack buffer
     // keeps the path heap-free.
-    char buf[96];
+    char buf[TIME_MESSAGE_BUF_SIZE];
     const int64_t client_transmitted = esp_timer_get_time();
     const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
     if (len == 0) {

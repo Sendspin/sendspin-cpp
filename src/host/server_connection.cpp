@@ -83,7 +83,7 @@ bool SendspinServerConnection::send_time_message() {
         return false;
     }
 
-    char buf[96];
+    char buf[TIME_MESSAGE_BUF_SIZE];
     const int64_t client_transmitted = platform_time_us();
     const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
     if (len == 0) {

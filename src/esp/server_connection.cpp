@@ -237,7 +237,7 @@ void SendspinServerConnection::async_send_time_text(void* arg) {
     // Capture client_transmitted as close as possible to the actual send. The serialization
     // happens between this capture and the wire send; track its duration so the bias is
     // visible in the time_burst log. Stack buffer keeps the path heap-free.
-    char buf[96];
+    char buf[TIME_MESSAGE_BUF_SIZE];
     const int64_t client_transmitted = esp_timer_get_time();
     const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
 

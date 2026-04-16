@@ -819,6 +819,15 @@ std::string format_client_goodbye_message(SendspinGoodbyeReason reason) {
 
 namespace {
 
+/// Maximum decimal digits in a uint64_t value.
+static constexpr int MAX_UINT64_DIGITS = 19;
+
+/// Radix used for two-digit-at-a-time integer formatting.
+static constexpr uint64_t RADIX_100 = 100U;
+
+/// Threshold for single vs. two-digit final write.
+static constexpr uint64_t RADIX_10 = 10U;
+
 // Two-digit ASCII lookup. Index 2*N..2*N+1 holds the decimal digits of N for N in [0, 99].
 // Lets us emit two characters per 64-bit division instead of one, halving the libgcc
 // __udivdi3 calls, which are the expensive part on a 32-bit MCU.
@@ -863,7 +872,7 @@ inline int decimal_digits(uint64_t v) {
                                            100000000000000000ULL,
                                            1000000000000000000ULL,
                                            10000000000000000000ULL};
-    return approx + 1 + (v >= POW10[approx + 1]);
+    return approx + 1 + static_cast<int>(v >= POW10[approx + 1]);
 }
 
 }  // namespace
@@ -879,8 +888,8 @@ size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmit
     static constexpr char SUFFIX[] = "}}";
     static constexpr size_t SUFFIX_LEN = sizeof(SUFFIX) - 1;
 
-    // Worst case: prefix + '-' + 19 digits + suffix.
-    if (cap < PREFIX_LEN + 1 + 19 + SUFFIX_LEN) {
+    // Worst case: prefix + '-' + MAX_UINT64_DIGITS digits + suffix.
+    if (cap < PREFIX_LEN + 1 + MAX_UINT64_DIGITS + SUFFIX_LEN) {
         return 0;
     }
 
@@ -888,7 +897,7 @@ size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmit
     std::memcpy(p, PREFIX, PREFIX_LEN);
     p += PREFIX_LEN;
 
-    uint64_t v;
+    uint64_t v = 0;
     if (client_transmitted < 0) {
         *p++ = '-';
         // Cast through uint64_t to handle INT64_MIN without UB
@@ -902,16 +911,16 @@ size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmit
     const int n = decimal_digits(v);
     char* end = p + n;
     char* w = end;
-    while (v >= 100U) {
-        const uint64_t q = v / 100U;
-        const uint32_t r = static_cast<uint32_t>(v - q * 100U);
+    while (v >= RADIX_100) {
+        const uint64_t q = v / RADIX_100;
+        const auto r = static_cast<size_t>(v - q * RADIX_100);
         w -= 2;
         std::memcpy(w, &TWO_DIGIT_TABLE[r * 2U], 2);
         v = q;
     }
-    if (v >= 10U) {
+    if (v >= RADIX_10) {
         w -= 2;
-        std::memcpy(w, &TWO_DIGIT_TABLE[v * 2U], 2);
+        std::memcpy(w, &TWO_DIGIT_TABLE[static_cast<size_t>(v) * 2U], 2);
     } else {
         w -= 1;
         *w = static_cast<char>('0' + v);

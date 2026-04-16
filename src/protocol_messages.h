@@ -304,6 +304,10 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
 /// @return Goodbye message serialized into JSON format.
 std::string format_client_goodbye_message(SendspinGoodbyeReason reason);
 
+/// Buffer size for format_client_time_message(). Fits the longest possible message:
+/// prefix (52) + '-' (1) + 19 digits + suffix (2) + padding = 75 bytes, rounded up.
+static constexpr size_t TIME_MESSAGE_BUF_SIZE = 96;
+
 /// @brief Formats a client/time JSON message into a caller-supplied buffer
 ///
 /// Hot path on the time-sync send side: avoids any heap allocation by writing the fixed-shape
