@@ -72,7 +72,7 @@ public:
 
     /// @brief Sends a text message to the connected client
     /// @param message The message string to send.
-    /// @param on_complete Callback invoked after send completes (success, actual_send_time).
+    /// @param on_complete Callback invoked after send completes.
     /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete) override;
 
