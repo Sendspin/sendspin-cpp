@@ -1,16 +1,17 @@
 # sendspin-cpp
 
-Standalone C++ library implementing the Sendspin synchronized audio streaming protocol. Builds on both ESP-IDF (ESP32) and host platforms (macOS/Linux). Designed to be consumed by ESPHome but has no ESPHome dependencies.
-
 [![CI](https://github.com/Sendspin/sendspin-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/Sendspin/sendspin-cpp/actions/workflows/ci.yml)
 [![Component Registry](https://components.espressif.com/components/sendspin/sendspin-cpp/badge.svg)](https://components.espressif.com/components/sendspin/sendspin-cpp)
+
+Standalone C++ library implementing the [Sendspin synchronized audio streaming protocol](https://www.sendspin-audio.com/). Builds on both ESP-IDF (ESP32) and host platforms (macOS/Linux). Designed to be consumed by ESPHome but has no ESPHome dependencies.
 
 [![A project from the Open Home Foundation](https://www.openhomefoundation.org/badges/ohf-project.png)](https://www.openhomefoundation.org/)
 
 ## Features
 
-- WebSocket-based audio streaming with server time synchronization
-- FLAC, Opus, and PCM audio decoding
+- Modular Sendspin role composition: artwork, controller, metadata, player, and visualizer
+- WebSocket client and server support
+- Decodes FLAC, Opus, and PCM
 - Cross-platform: ESP-IDF (ESP32) and host (macOS/Linux)
 
 ## Documentation
@@ -31,7 +32,14 @@ Dependencies (fetched automatically via CMake FetchContent): ArduinoJson, micro-
 
 ### ESP-IDF
 
-Used as an IDF component. Add to your project's `idf_component.yml`.
+Available on the [ESP-IDF Component Registry](https://components.espressif.com/components/sendspin/sendspin-cpp). Add to your project's `idf_component.yml`:
+
+```yaml
+dependencies:
+  sendspin/sendspin-cpp: ">=0.1.2"
+```
+
+Requires ESP-IDF v5.1 or later.
 
 ## Examples
 
