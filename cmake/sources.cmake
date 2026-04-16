@@ -1,8 +1,8 @@
 # Source file definitions for sendspin-cpp
 
 function(sendspin_get_sources BASE_DIR)
-    # Common sources — build on both ESP-IDF and host
-    set(SENDSPIN_COMMON_SOURCES
+    # Core sources — always compiled on both ESP-IDF and host
+    set(SENDSPIN_CORE_SOURCES
         # Audio utilities
         ${BASE_DIR}/src/audio_stream_info.cpp
         ${BASE_DIR}/src/transfer_buffer.cpp
@@ -17,23 +17,45 @@ function(sendspin_get_sources BASE_DIR)
         # Connection base class
         ${BASE_DIR}/src/connection.cpp
 
-        # Audio pipeline
+        # Connection management
+        ${BASE_DIR}/src/connection_manager.cpp
+
+        # Client orchestration
+        ${BASE_DIR}/src/client.cpp
+
+        PARENT_SCOPE
+    )
+
+    # Per-role source sets — conditionally compiled based on SENDSPIN_ENABLE_* options
+    set(SENDSPIN_PLAYER_SOURCES
+        ${BASE_DIR}/src/player_role.cpp
         ${BASE_DIR}/src/audio_ring_buffer.cpp
         ${BASE_DIR}/src/decoder.cpp
         ${BASE_DIR}/src/sync_task.cpp
 
-        # Connection management
-        ${BASE_DIR}/src/connection_manager.cpp
+        PARENT_SCOPE
+    )
 
-        # Role classes
-        ${BASE_DIR}/src/player_role.cpp
+    set(SENDSPIN_CONTROLLER_SOURCES
         ${BASE_DIR}/src/controller_role.cpp
-        ${BASE_DIR}/src/metadata_role.cpp
-        ${BASE_DIR}/src/artwork_role.cpp
-        ${BASE_DIR}/src/visualizer_role.cpp
 
-        # Client orchestration
-        ${BASE_DIR}/src/client.cpp
+        PARENT_SCOPE
+    )
+
+    set(SENDSPIN_METADATA_SOURCES
+        ${BASE_DIR}/src/metadata_role.cpp
+
+        PARENT_SCOPE
+    )
+
+    set(SENDSPIN_ARTWORK_SOURCES
+        ${BASE_DIR}/src/artwork_role.cpp
+
+        PARENT_SCOPE
+    )
+
+    set(SENDSPIN_VISUALIZER_SOURCES
+        ${BASE_DIR}/src/visualizer_role.cpp
 
         PARENT_SCOPE
     )

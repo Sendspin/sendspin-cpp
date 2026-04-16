@@ -23,7 +23,9 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 
 ### Role composition
 
-Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role receives a `SendspinClient*` at construction time and uses it to access shared services (time sync, state publishing, message sending). The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers; no preprocessor guards.
+Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role receives a `SendspinClient*` at construction time and uses it to access shared services (time sync, state publishing, message sending). The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers.
+
+Roles can be disabled at compile time via `SENDSPIN_ENABLE_*` cmake options (host build) or Kconfig entries (ESP-IDF build). When a role is disabled, its source files are not compiled and its `add_*()` declaration, accessor, and `unique_ptr` member are removed from `client.h`. `#ifdef` guards live in exactly two places: `cmake/sources.cmake` (source lists) and `include/sendspin/client.h` / `src/client.cpp` (dispatch points).
 
 ```cpp
 // Implement listener interfaces
@@ -69,7 +71,7 @@ The platform (e.g., ESPHome) provides:
 ## Project layout
 
 ```text
-include/sendspin/     - Public API headers (client.h, types.h, *_role.h)
+include/sendspin/     - Public API headers (client.h, config.h, types.h, *_role.h)
 src/                        - Cross-platform source files (.cpp) and private headers (.h)
 src/platform/               - Platform abstraction headers and host-only source files
 src/esp/                    - ESP-IDF networking implementations and headers
@@ -82,7 +84,7 @@ examples/tui_client/        - Terminal UI host example with PortAudio audio outp
 
 ### Header visibility
 
-- **Public** (`include/sendspin/`): `client.h`, `types.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`). These are the consumer-facing API. Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles.
+- **Public** (`include/sendspin/`): `client.h`, `config.h`, `types.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`). These are the consumer-facing API. `config.h` contains all configuration structs (`SendspinClientConfig` and role configs). Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles.
 - **Private** (`src/`): All internal headers (decoder, sync_task, time_filter, ring buffers, protocol_messages, etc.). Not exposed to consumers. `protocol_messages.h` contains message envelope structs, internal protocol enums, and protocol function declarations.
 - **Platform-specific** (`src/esp/`, `src/host/`): Networking headers with the same names (`client_connection.h`, `server_connection.h`, `ws_server.h`) but different implementations per platform.
 
@@ -117,7 +119,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
 - Memory: `platform_malloc`/`platform_realloc`/`platform_free` from `platform/memory.h` (not raw `heap_caps_malloc`)
 - Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer.
-- Role composition: Roles are added at runtime via `add_player()`, `add_metadata()`, etc. No compile-time feature flags in library code. Audio codec dependencies (micro-flac, micro-opus) are always linked.
+- Role composition: Roles are added at runtime via `add_player()`, `add_metadata()`, etc. Roles can be disabled at compile time via `SENDSPIN_ENABLE_*` cmake options / Kconfig entries. Audio codec dependencies (micro-flac, micro-opus) are only linked when the player role is enabled.
 - Apache 2.0 license headers on all files
 
 ## Pre-commit hooks

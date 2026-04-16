@@ -21,13 +21,11 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <string>
 #include <vector>
 
 namespace sendspin {
 
 class SendspinClient;
-struct ClientHelloMessage;
 
 // ============================================================================
 // Controller types
@@ -97,48 +95,26 @@ class ControllerRole {
     friend class SendspinClient;
 
 public:
+    struct Impl;
+
     explicit ControllerRole(SendspinClient* client);
     ~ControllerRole();
 
     /// @brief Returns the current controller state from the server
     /// @return Const reference to the last received server controller state
-    const ServerStateControllerObject& get_controller_state() const {
-        return this->controller_state_;
-    }
+    const ServerStateControllerObject& get_controller_state() const;
 
     /// @brief Sets the listener for controller events
     /// @note The listener must outlive this role
     /// @param listener Pointer to the listener implementation
-    void set_listener(ControllerRoleListener* listener) {
-        this->listener_ = listener;
-    }
+    void set_listener(ControllerRoleListener* listener);
 
     /// @brief Sends a controller command to the server
     void send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume = {},
                       std::optional<bool> mute = {});
 
 private:
-    /// @brief Adds the controller role to the supported roles list in the hello message
-    /// @param msg The hello message being assembled.
-    void build_hello_fields(ClientHelloMessage& msg);
-    /// @brief Stores an incoming server controller state update for delivery on the main thread
-    /// Only the most recent update is retained; earlier pending updates are overwritten.
-    /// @param state The controller state received from the server.
-    void handle_server_state(ServerStateControllerObject state);
-    /// @brief Delivers any pending controller state update to the listener
-    void drain_events();
-    /// @brief Resets the controller state and clears any pending events
-    void cleanup();
-
-    struct EventState;
-
-    // Struct fields
-    ServerStateControllerObject controller_state_{};
-
-    // Pointer fields
-    SendspinClient* client_;
-    std::unique_ptr<EventState> event_state_;
-    ControllerRoleListener* listener_{nullptr};
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace sendspin

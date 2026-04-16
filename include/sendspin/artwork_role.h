@@ -17,7 +17,8 @@
 
 #pragma once
 
-#include <atomic>
+#include "sendspin/config.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -28,25 +29,10 @@
 namespace sendspin {
 
 class SendspinClient;
-struct ClientHelloMessage;
 
 // ============================================================================
 // Artwork types
 // ============================================================================
-
-/// @brief Image format for artwork
-enum class SendspinImageFormat : uint8_t {
-    JPEG,  // JPEG compressed image
-    PNG,   // PNG image
-    BMP,   // BMP image
-};
-
-/// @brief Source type for an artwork image
-enum class SendspinImageSource : uint8_t {
-    ALBUM,   // Album cover art
-    ARTIST,  // Artist photo
-    NONE,    // No image
-};
 
 /// @brief Format and resolution for a single supported artwork channel
 struct ArtworkChannelFormatObject {
@@ -72,15 +58,6 @@ struct ServerArtworkChannelObject {
 /// @brief Artwork stream parameters sent by the server in stream/start messages
 struct ServerArtworkStreamObject {
     std::optional<std::vector<ServerArtworkChannelObject>> channels;
-};
-
-/// @brief Preference for an image slot's format and resolution
-struct ImageSlotPreference {
-    uint8_t slot{};
-    SendspinImageSource source{};
-    SendspinImageFormat format{};
-    uint16_t width{};
-    uint16_t height{};
 };
 
 /// @brief Listener for artwork role events
@@ -137,7 +114,7 @@ public:
  *
  * Usage:
  * 1. Implement ArtworkRoleListener with on_image_decode() and on_image_display()
- * 2. Build an ArtworkRole::Config with the desired slot/format/resolution preferences
+ * 2. Build an ArtworkRoleConfig with the desired slot/format/resolution preferences
  * 3. Add the role to the client via SendspinClient::add_artwork()
  * 4. Call set_listener() with your listener implementation
  *
@@ -156,7 +133,7 @@ public:
  * };
  *
  * MyArtworkListener listener;
- * ArtworkRole::Config config;
+ * ArtworkRoleConfig config;
  * config.preferred_formats = {{0, SendspinImageSource::ALBUM,
  *                               SendspinImageFormat::JPEG, 240, 240}};
  * auto& artwork = client.add_artwork(config);
@@ -167,70 +144,18 @@ class ArtworkRole {
     friend class SendspinClient;
 
 public:
-    /// @brief Configuration for the artwork role
-    struct Config {
-        std::vector<ImageSlotPreference> preferred_formats{};
-        bool psram_stack{false};  ///< Allocate drain thread stack in PSRAM (ESP-IDF only)
-        unsigned priority{2};     ///< FreeRTOS priority for the drain thread (ESP-IDF only)
-    };
+    struct Impl;
 
-    ArtworkRole(Config config, SendspinClient* client);
+    ArtworkRole(ArtworkRoleConfig config, SendspinClient* client);
     ~ArtworkRole();
 
     /// @brief Sets the listener for artwork events
     /// @note The listener must outlive this role.
     /// @param listener Pointer to the listener implementation; must outlive this role
-    void set_listener(ArtworkRoleListener* listener) {
-        this->listener_ = listener;
-    }
+    void set_listener(ArtworkRoleListener* listener);
 
 private:
-    /// @brief Starts the drain thread
-    /// @return True if the thread is running, false on failure.
-    bool start();
-    /// @brief Signals the drain thread to stop and waits for it to exit
-    void stop();
-    /// @brief Adds the artwork role and configured channels to the hello message
-    /// @param msg The hello message being assembled.
-    void build_hello_fields(ClientHelloMessage& msg);
-    /// @brief Copies image data to a per-slot buffer and signals the drain thread
-    /// @param slot Artwork slot index this image belongs to.
-    /// @param data Pointer to the binary payload (8-byte big-endian timestamp followed by image
-    /// data).
-    /// @param len Length of the binary payload in bytes.
-    void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
-    /// @brief Caches stream config, signals the drain thread to flush, and enqueues a start event
-    /// @param stream Stream parameters received from the server.
-    void handle_stream_start(const ServerArtworkStreamObject& stream);
-    /// @brief Marks the stream inactive, flushes the drain thread, and enqueues a stream-end event
-    void handle_stream_end();
-    /// @brief Marks the stream inactive, flushes the drain thread, and enqueues a stream-clear
-    /// event
-    void handle_stream_clear();
-    /// @brief Delivers pending stream lifecycle events (start, end, clear) to the listener
-    void drain_events();
-    /// @brief Resets pending events, flushes the drain thread, and enqueues a stream-end event
-    void cleanup();
-
-    /// @brief Entry point for the drain thread; processes image decode and display callbacks
-    /// @param self The ArtworkRole instance that owns this thread.
-    static void drain_thread_func(ArtworkRole* self);
-
-    struct DrainTask;
-    struct EventState;
-
-    // Struct fields
-    Config config_;
-    std::vector<ArtworkChannelFormatObject> artwork_channels_;
-
-    // Pointer fields
-    SendspinClient* client_;
-    std::unique_ptr<DrainTask> drain_task_;
-    std::unique_ptr<EventState> event_state_;
-    ArtworkRoleListener* listener_{nullptr};
-
-    // 8-bit fields
-    std::atomic<bool> stream_active_{false};
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace sendspin

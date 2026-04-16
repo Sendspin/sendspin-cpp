@@ -5,4 +5,24 @@ menu "sendspin-cpp"
         default y
         select HTTPD_WS_SUPPORT
 
+    config SENDSPIN_ENABLE_PLAYER
+        bool "Enable player role (audio decode/playback)"
+        default y
+
+    config SENDSPIN_ENABLE_CONTROLLER
+        bool "Enable controller role"
+        default y
+
+    config SENDSPIN_ENABLE_METADATA
+        bool "Enable metadata role"
+        default y
+
+    config SENDSPIN_ENABLE_ARTWORK
+        bool "Enable artwork role"
+        default y
+
+    config SENDSPIN_ENABLE_VISUALIZER
+        bool "Enable visualizer role"
+        default y
+
 endmenu

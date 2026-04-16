@@ -21,12 +21,22 @@
 #include "platform/shadow_slot.h"
 #include "platform/thread_safe_queue.h"
 #include "platform/time.h"
+#ifdef SENDSPIN_ENABLE_ARTWORK
+#include "artwork_role_impl.h"
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+#include "controller_role_impl.h"
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+#include "metadata_role_impl.h"
+#endif
+#ifdef SENDSPIN_ENABLE_PLAYER
+#include "player_role_impl.h"
+#endif
 #include "protocol_messages.h"
-#include "sendspin/artwork_role.h"
-#include "sendspin/controller_role.h"
-#include "sendspin/metadata_role.h"
-#include "sendspin/player_role.h"
-#include "sendspin/visualizer_role.h"
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+#include "visualizer_role_impl.h"
+#endif
 #include "time_burst.h"
 #include <ArduinoJson.h>
 
@@ -67,9 +77,15 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
 
 SendspinClient::~SendspinClient() {
     // Stop background threads before tearing down connections.
+#ifdef SENDSPIN_ENABLE_PLAYER
     this->player_.reset();
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     this->visualizer_.reset();
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
     this->artwork_.reset();
+#endif
     this->connection_manager_.reset();
 }
 
@@ -91,23 +107,29 @@ bool SendspinClient::start_server() {
     // Load persisted state
     this->load_last_played_server();
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
-        if (!this->player_->start()) {
+        if (!this->player_->impl_->start()) {
             return false;
         }
     }
+#endif
 
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     if (this->visualizer_) {
-        if (!this->visualizer_->start()) {
+        if (!this->visualizer_->impl_->start()) {
             return false;
         }
     }
+#endif
 
+#ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
-        if (!this->artwork_->start()) {
+        if (!this->artwork_->impl_->start()) {
             return false;
         }
     }
+#endif
 
     // Create and configure the WebSocket server (started later when network is ready)
     this->connection_manager_->init_server(this);
@@ -163,21 +185,31 @@ void SendspinClient::loop() {
     }
 
     // --- Role events (each role handles its own synchronization) ---
+#ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
-        this->player_->drain_events();
+        this->player_->impl_->drain_events();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     if (this->controller_) {
-        this->controller_->drain_events();
+        this->controller_->impl_->drain_events();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     if (this->metadata_) {
-        this->metadata_->drain_events();
+        this->metadata_->impl_->drain_events();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
-        this->artwork_->drain_events();
+        this->artwork_->impl_->drain_events();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     if (this->visualizer_) {
-        this->visualizer_->drain_events();
+        this->visualizer_->impl_->drain_events();
     }
+#endif
 
     // --- Group update events ---
     {
@@ -215,7 +247,8 @@ void SendspinClient::loop() {
 // Role registration (call before start_server)
 // ============================================================================
 
-PlayerRole& SendspinClient::add_player(PlayerRole::Config config) {
+#ifdef SENDSPIN_ENABLE_PLAYER
+PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
     if (this->started_) {
         SS_LOGW(TAG, "add_player() called after start_server(); role may not initialize correctly");
     }
@@ -223,7 +256,9 @@ PlayerRole& SendspinClient::add_player(PlayerRole::Config config) {
         std::make_unique<PlayerRole>(std::move(config), this, this->persistence_provider_);
     return *this->player_;
 }
+#endif
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
 ControllerRole& SendspinClient::add_controller() {
     if (this->started_) {
         SS_LOGW(TAG, "add_controller() called after start_server()");
@@ -231,7 +266,9 @@ ControllerRole& SendspinClient::add_controller() {
     this->controller_ = std::make_unique<ControllerRole>(this);
     return *this->controller_;
 }
+#endif
 
+#ifdef SENDSPIN_ENABLE_METADATA
 MetadataRole& SendspinClient::add_metadata() {
     if (this->started_) {
         SS_LOGW(TAG, "add_metadata() called after start_server()");
@@ -239,22 +276,27 @@ MetadataRole& SendspinClient::add_metadata() {
     this->metadata_ = std::make_unique<MetadataRole>(this);
     return *this->metadata_;
 }
+#endif
 
-ArtworkRole& SendspinClient::add_artwork(ArtworkRole::Config config) {
+#ifdef SENDSPIN_ENABLE_ARTWORK
+ArtworkRole& SendspinClient::add_artwork(ArtworkRoleConfig config) {
     if (this->started_) {
         SS_LOGW(TAG, "add_artwork() called after start_server()");
     }
     this->artwork_ = std::make_unique<ArtworkRole>(std::move(config), this);
     return *this->artwork_;
 }
+#endif
 
-VisualizerRole& SendspinClient::add_visualizer(VisualizerRole::Config config) {
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+VisualizerRole& SendspinClient::add_visualizer(VisualizerRoleConfig config) {
     if (this->started_) {
         SS_LOGW(TAG, "add_visualizer() called after start_server()");
     }
     this->visualizer_ = std::make_unique<VisualizerRole>(std::move(config), this);
     return *this->visualizer_;
 }
+#endif
 
 // ============================================================================
 // Queries
@@ -332,21 +374,31 @@ void SendspinClient::cleanup_connection_state() {
     this->event_state_->time_queue.reset();
     this->event_state_->shadow_group.reset();
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
-        this->player_->cleanup();
+        this->player_->impl_->cleanup();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     if (this->controller_) {
-        this->controller_->cleanup();
+        this->controller_->impl_->cleanup();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     if (this->metadata_) {
-        this->metadata_->cleanup();
+        this->metadata_->impl_->cleanup();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
-        this->artwork_->cleanup();
+        this->artwork_->impl_->cleanup();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     if (this->visualizer_) {
-        this->visualizer_->cleanup();
+        this->visualizer_->impl_->cleanup();
     }
+#endif
 
     // Release high-performance networking for time sync
     if (this->high_performance_held_for_time_) {
@@ -369,21 +421,31 @@ std::string SendspinClient::build_hello_message() {
     msg.version = 1;
 
     // Let each role add its fields to the hello message
+#ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
-        this->player_->build_hello_fields(msg);
+        this->player_->impl_->build_hello_fields(msg);
     }
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     if (this->controller_) {
-        this->controller_->build_hello_fields(msg);
+        this->controller_->impl_->build_hello_fields(msg);
     }
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     if (this->metadata_) {
-        this->metadata_->build_hello_fields(msg);
+        this->metadata_->impl_->build_hello_fields(msg);
     }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
-        this->artwork_->build_hello_fields(msg);
+        this->artwork_->impl_->build_hello_fields(msg);
     }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     if (this->visualizer_) {
-        this->visualizer_->build_hello_fields(msg);
+        this->visualizer_->impl_->build_hello_fields(msg);
     }
+#endif
 
     return format_client_hello_message(&msg);
 }
@@ -414,17 +476,23 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const std::s
                 break;
             }
 
+#ifdef SENDSPIN_ENABLE_PLAYER
             if (this->player_) {
-                this->player_->handle_stream_start(stream_msg);
+                this->player_->impl_->handle_stream_start(stream_msg);
             }
+#endif
 
+#ifdef SENDSPIN_ENABLE_ARTWORK
             if (this->artwork_ && stream_msg.artwork.has_value()) {
-                this->artwork_->handle_stream_start(stream_msg.artwork.value());
+                this->artwork_->impl_->handle_stream_start(stream_msg.artwork.value());
             }
+#endif
 
+#ifdef SENDSPIN_ENABLE_VISUALIZER
             if (this->visualizer_ && stream_msg.visualizer.has_value()) {
-                this->visualizer_->handle_stream_start(stream_msg.visualizer.value());
+                this->visualizer_->impl_->handle_stream_start(stream_msg.visualizer.value());
             }
+#endif
             break;
         }
         case SendspinServerToClientMessageType::STREAM_END: {
@@ -449,17 +517,23 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const std::s
                 SS_LOGD(TAG, "Stream ended - player:%d artwork:%d visualizer:%d", end_player,
                         end_artwork, end_visualizer);
 
+#ifdef SENDSPIN_ENABLE_PLAYER
                 if (this->player_ && end_player) {
-                    this->player_->handle_stream_end();
+                    this->player_->impl_->handle_stream_end();
                 }
+#endif
 
+#ifdef SENDSPIN_ENABLE_ARTWORK
                 if (this->artwork_ && end_artwork) {
-                    this->artwork_->handle_stream_end();
+                    this->artwork_->impl_->handle_stream_end();
                 }
+#endif
 
+#ifdef SENDSPIN_ENABLE_VISUALIZER
                 if (this->visualizer_ && end_visualizer) {
-                    this->visualizer_->handle_stream_end();
+                    this->visualizer_->impl_->handle_stream_end();
                 }
+#endif
             }
             break;
         }
@@ -485,17 +559,23 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const std::s
                 SS_LOGD(TAG, "Stream clear - player:%d artwork:%d visualizer:%d", clear_player,
                         clear_artwork, clear_visualizer);
 
+#ifdef SENDSPIN_ENABLE_PLAYER
                 if (this->player_ && clear_player) {
-                    this->player_->handle_stream_clear();
+                    this->player_->impl_->handle_stream_clear();
                 }
+#endif
 
+#ifdef SENDSPIN_ENABLE_ARTWORK
                 if (this->artwork_ && clear_artwork) {
-                    this->artwork_->handle_stream_clear();
+                    this->artwork_->impl_->handle_stream_clear();
                 }
+#endif
 
+#ifdef SENDSPIN_ENABLE_VISUALIZER
                 if (this->visualizer_ && clear_visualizer) {
-                    this->visualizer_->handle_stream_clear();
+                    this->visualizer_->impl_->handle_stream_clear();
                 }
+#endif
             }
             break;
         }
@@ -533,23 +613,31 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const std::s
         case SendspinServerToClientMessageType::SERVER_STATE: {
             ServerStateMessage state_msg;
             if (process_server_state_message(root, &state_msg)) {
+#ifdef SENDSPIN_ENABLE_CONTROLLER
                 if (this->controller_ && state_msg.controller.has_value()) {
-                    this->controller_->handle_server_state(std::move(state_msg.controller.value()));
+                    this->controller_->impl_->handle_server_state(
+                        std::move(state_msg.controller.value()));
                 }
+#endif
 
+#ifdef SENDSPIN_ENABLE_METADATA
                 if (this->metadata_ && state_msg.metadata.has_value()) {
-                    this->metadata_->handle_server_state(state_msg.metadata.value());
+                    this->metadata_->impl_->handle_server_state(
+                        std::move(state_msg.metadata.value()));
                 }
+#endif
             }
             break;
         }
         case SendspinServerToClientMessageType::SERVER_COMMAND: {
+#ifdef SENDSPIN_ENABLE_PLAYER
             if (this->player_) {
                 ServerCommandMessage cmd_msg;
                 if (process_server_command_message(root, &cmd_msg)) {
-                    this->player_->handle_server_command(cmd_msg);
+                    this->player_->impl_->handle_server_command(cmd_msg);
                 }
             }
+#endif
             break;
         }
         case SendspinServerToClientMessageType::GROUP_UPDATE: {
@@ -584,25 +672,31 @@ void SendspinClient::process_binary_message(const uint8_t* payload, size_t len) 
 
     switch (role) {
         case SENDSPIN_ROLE_PLAYER: {
+#ifdef SENDSPIN_ENABLE_PLAYER
             if (this->player_) {
                 if (slot == 0) {
-                    this->player_->handle_binary(data, data_len);
+                    this->player_->impl_->handle_binary(data, data_len);
                 } else {
                     SS_LOGW(TAG, "Unknown player binary slot %d", slot);
                 }
             }
+#endif
             break;
         }
         case SENDSPIN_ROLE_ARTWORK: {
+#ifdef SENDSPIN_ENABLE_ARTWORK
             if (this->artwork_) {
-                this->artwork_->handle_binary(slot, data, data_len);
+                this->artwork_->impl_->handle_binary(slot, data, data_len);
             }
+#endif
             break;
         }
         case SENDSPIN_ROLE_VISUALIZER: {
+#ifdef SENDSPIN_ENABLE_VISUALIZER
             if (this->visualizer_) {
-                this->visualizer_->handle_binary(binary_type, data, data_len);
+                this->visualizer_->impl_->handle_binary(binary_type, data, data_len);
             }
+#endif
             break;
         }
         default: {
@@ -624,9 +718,11 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     ClientStateMessage state_msg;
     state_msg.state = this->state_;
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
-        this->player_->build_state_fields(state_msg);
+        this->player_->impl_->build_state_fields(state_msg);
     }
+#endif
 
     std::string state_message = format_client_state_message(&state_msg);
     conn->send_text_message(state_message, nullptr);

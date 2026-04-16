@@ -23,6 +23,7 @@
 #include "decoder.h"
 #include "platform/event_flags.h"
 #include "platform/shadow_slot.h"
+#include "sendspin/player_role.h"
 #include "transfer_buffer.h"
 
 #include <atomic>
@@ -31,7 +32,6 @@
 
 namespace sendspin {
 
-class PlayerRole;
 class SendspinClient;
 
 /// @brief Timing feedback from the audio output: frames played and the finish timestamp
@@ -110,11 +110,11 @@ public:
     ~SyncTask();
 
     /// @brief Initializes queues and creates the encoded ring buffer
-    /// @param player The owning PlayerRole, used for time sync, delay, and audio write access.
+    /// @param player_impl The owning PlayerRole::Impl, used for delay, listener, and state updates.
     /// @param client The owning SendspinClient, used for shared services.
     /// @param buffer_size Size of the encoded audio ring buffer in bytes.
     /// @return true on success, false on allocation failure.
-    bool init(PlayerRole* player, SendspinClient* client, size_t buffer_size);
+    bool init(PlayerRole::Impl* player_impl, SendspinClient* client, size_t buffer_size);
 
     /// @brief Creates and starts the persistent sync background thread
     /// Call once after init(). The thread idles until a codec header arrives in the ring buffer.
@@ -238,7 +238,7 @@ protected:
     // Pointer fields
     SendspinClient* client_{nullptr};
     std::unique_ptr<SendspinAudioRingBuffer> encoded_ring_buffer_;
-    PlayerRole* player_{nullptr};
+    PlayerRole::Impl* player_impl_{nullptr};
 };
 
 }  // namespace sendspin

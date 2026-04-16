@@ -25,7 +25,6 @@
 namespace sendspin {
 
 class SendspinClient;
-struct ClientHelloMessage;
 
 // ============================================================================
 // Metadata types
@@ -101,15 +100,15 @@ class MetadataRole {
     friend class SendspinClient;
 
 public:
+    struct Impl;
+
     explicit MetadataRole(SendspinClient* client);
     ~MetadataRole();
 
     /// @brief Sets the listener for metadata events
     /// @note The listener must outlive this role
     /// @param listener Pointer to the listener implementation
-    void set_listener(MetadataRoleListener* listener) {
-        this->listener_ = listener;
-    }
+    void set_listener(MetadataRoleListener* listener);
 
     /// @brief Returns the track duration in milliseconds
     /// @return Track duration in milliseconds, or 0 if unknown or the stream is live
@@ -121,26 +120,7 @@ public:
     uint32_t get_track_progress_ms() const;
 
 private:
-    /// @brief Adds the metadata role to the supported roles list in the hello message
-    /// @param msg The hello message being assembled.
-    void build_hello_fields(ClientHelloMessage& msg);
-    /// @brief Merges an incoming server metadata delta into the pending shadow state
-    /// @param state The metadata delta received from the server.
-    void handle_server_state(ServerMetadataStateObject state);
-    /// @brief Applies any pending metadata delta and notifies the listener
-    void drain_events();
-    /// @brief Resets the metadata state and clears any pending events
-    void cleanup();
-
-    struct EventState;
-
-    // Struct fields
-    ServerMetadataStateObject metadata_{};
-
-    // Pointer fields
-    SendspinClient* client_;
-    std::unique_ptr<EventState> event_state_;
-    MetadataRoleListener* listener_{nullptr};
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace sendspin

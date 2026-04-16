@@ -17,11 +17,18 @@ The only role with a required callback is the player role (`on_audio_write`). Al
 
 ## Headers
 
-Include `sendspin/client.h` to get the full public API. It pulls in all role headers and `types.h` transitively.
+Include `sendspin/client.h` for the client class, config types, and shared types. Role headers must be included explicitly for any roles you use:
 
 ```cpp
-#include "sendspin/client.h"
+#include "sendspin/client.h"          // SendspinClient, providers, listeners
+#include "sendspin/player_role.h"     // PlayerRole, PlayerRoleListener
+#include "sendspin/controller_role.h" // ControllerRole, ControllerRoleListener
+#include "sendspin/metadata_role.h"   // MetadataRole, MetadataRoleListener
+#include "sendspin/artwork_role.h"    // ArtworkRole, ArtworkRoleListener
+#include "sendspin/visualizer_role.h" // VisualizerRole, VisualizerRoleListener
 ```
+
+Only include the role headers you need. `client.h` includes `sendspin/config.h` (all configuration structs, including `SendspinClientConfig`) and `sendspin/types.h` transitively.
 
 ## Step 1: Configure and Create the Client
 
@@ -50,7 +57,7 @@ Add only the roles your application needs. All roles must be added before callin
 The player role handles audio decoding and synchronized playback. It requires a configuration struct that declares which audio formats your hardware supports.
 
 ```cpp
-PlayerRole::Config player_config;
+PlayerRoleConfig player_config;
 player_config.audio_formats = {
     {SendspinCodecFormat::FLAC, 2, 44100, 16},
     {SendspinCodecFormat::FLAC, 2, 48000, 16},
@@ -100,7 +107,7 @@ auto& metadata = client.add_metadata();
 Receives album artwork images from the server. Requires a configuration struct declaring preferred image formats per slot.
 
 ```cpp
-ArtworkRole::Config artwork_config;
+ArtworkRoleConfig artwork_config;
 artwork_config.preferred_formats = {
     {0, SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 300, 300},
 };
@@ -165,7 +172,7 @@ struct MyPlayerListener : PlayerRoleListener {
         my_audio_output.clear();
     }
 
-    // Optional: Called when the server changes the volume (0-100).
+    // Optional: Called when the server changes the volume.
     void on_volume_changed(uint8_t volume) override {
         my_audio_output.set_volume(volume);
     }
@@ -190,7 +197,7 @@ player.notify_audio_played(frames_played, current_timestamp_us);
 ```
 
 - `frames_played`: Number of audio frames (not bytes) just played
-- `current_timestamp_us`: Current monotonic timestamp in microseconds (e.g., from `std::chrono::steady_clock`)
+- `timestamp`: Client timestamp in microseconds when the audio will finish playing (e.g., from `std::chrono::steady_clock`)
 
 This method is thread-safe and is expected to be called from an audio callback thread.
 
@@ -472,6 +479,8 @@ if (auto* v = client.visualizer()) { /* ... */ }
 
 Use these accessors when the role reference from `add_*()` is out of scope.
 
+> **Note:** Role registration methods (`add_player()`, etc.), accessor methods (`player()`, etc.), and their backing members are conditionally compiled based on `SENDSPIN_ENABLE_*` flags. When a role is disabled at build time, calling `add_player()` or `client.player()` is a compile error, not a runtime nullptr. See [Compile-Time Role Selection](#compile-time-role-selection) below.
+
 ## Updating Player State
 
 Report local state changes back to the server:
@@ -504,14 +513,12 @@ The client and roles expose query methods for polling state in your main loop or
 bool connected = client.is_connected();       // Active connection with completed handshake
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
 std::string group = client.get_group_name();   // Current group name (empty if none)
-std::string gid = client.get_group_id();       // Current group ID (empty if none)
 
 // Player state
 uint8_t vol = player.get_volume();
 bool muted = player.get_muted();
 uint16_t delay = player.get_static_delay_ms();
 int32_t fixed = player.get_fixed_delay_us();
-size_t buf_size = player.get_buffer_size();
 auto& stream = player.get_current_stream_params();
 
 // Controller state
@@ -546,6 +553,7 @@ A minimal integration that receives and discards audio:
 
 ```cpp
 #include "sendspin/client.h"
+#include "sendspin/player_role.h"
 
 using namespace sendspin;
 
@@ -566,7 +574,7 @@ int main() {
 
     SendspinClient client(std::move(config));
 
-    PlayerRole::Config player_config;
+    PlayerRoleConfig player_config;
     player_config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
     auto& player = client.add_player(std::move(player_config));
 
@@ -583,6 +591,55 @@ int main() {
     }
 }
 ```
+
+## Compile-Time Role Selection
+
+By default all roles are enabled. You can disable roles at build time to exclude their code (and dependencies like audio decoders) from the binary. This is useful on constrained targets where flash space matters.
+
+### CMake (Host Builds)
+
+Pass `-D` options to cmake:
+
+```bash
+# Disable the player role (excludes decoder, sync task, audio ring buffer)
+cmake -B build -DSENDSPIN_ENABLE_PLAYER=OFF
+
+# Disable all optional roles, keep only the player
+cmake -B build -DSENDSPIN_ENABLE_CONTROLLER=OFF \
+               -DSENDSPIN_ENABLE_METADATA=OFF \
+               -DSENDSPIN_ENABLE_ARTWORK=OFF \
+               -DSENDSPIN_ENABLE_VISUALIZER=OFF
+```
+
+Available options (all `ON` by default):
+
+| Option | Controls |
+|---|---|
+| `SENDSPIN_ENABLE_PLAYER` | Player role, audio decoders (micro-flac, micro-opus), sync task |
+| `SENDSPIN_ENABLE_CONTROLLER` | Controller role |
+| `SENDSPIN_ENABLE_METADATA` | Metadata role |
+| `SENDSPIN_ENABLE_ARTWORK` | Artwork role |
+| `SENDSPIN_ENABLE_VISUALIZER` | Visualizer role |
+
+When `SENDSPIN_ENABLE_PLAYER` is `OFF`, the micro-flac and micro-opus dependencies are not fetched.
+
+### ESP-IDF (Kconfig)
+
+Role flags are exposed via Kconfig under `Component config → sendspin-cpp`:
+
+```kconfig
+CONFIG_SENDSPIN_ENABLE_PLAYER=y
+CONFIG_SENDSPIN_ENABLE_CONTROLLER=y
+CONFIG_SENDSPIN_ENABLE_METADATA=y
+CONFIG_SENDSPIN_ENABLE_ARTWORK=y
+CONFIG_SENDSPIN_ENABLE_VISUALIZER=y
+```
+
+### Effect on the API
+
+When a role is disabled, its `add_*()` method, accessor method, and backing member are removed from `client.h` via `#ifdef` guards. Attempting to call `client.add_player()` when `SENDSPIN_ENABLE_PLAYER` is `OFF` produces a compile error. The corresponding role header can still be included (it defines protocol types and the listener interface), but the role class cannot be instantiated.
+
+---
 
 ## Configuration Reference
 
@@ -608,7 +665,7 @@ Main client configuration passed to the `SendspinClient` constructor.
 
 ---
 
-### PlayerRole::Config
+### PlayerRoleConfig
 
 Configuration passed to `client.add_player()`.
 
@@ -632,7 +689,7 @@ Each entry in `audio_formats` is an `AudioSupportedFormatObject`:
 
 ---
 
-### ArtworkRole::Config
+### ArtworkRoleConfig
 
 Configuration passed to `client.add_artwork()`.
 
@@ -654,7 +711,7 @@ Each entry in `preferred_formats` is an `ImageSlotPreference`:
 
 ---
 
-### VisualizerRole::Config
+### VisualizerRoleConfig
 
 Configuration passed to `client.add_visualizer()`.
 
