@@ -20,7 +20,7 @@ The only role with a required callback is the player role (`on_audio_write`). Al
 Include `sendspin/client.h` for the client class, config types, and shared types. Role headers must be included explicitly for any roles you use:
 
 ```cpp
-#include "sendspin/client.h"          // SendspinClient, config types, types.h
+#include "sendspin/client.h"          // SendspinClient, providers, listeners
 #include "sendspin/player_role.h"     // PlayerRole, PlayerRoleListener
 #include "sendspin/controller_role.h" // ControllerRole, ControllerRoleListener
 #include "sendspin/metadata_role.h"   // MetadataRole, MetadataRoleListener
@@ -28,7 +28,7 @@ Include `sendspin/client.h` for the client class, config types, and shared types
 #include "sendspin/visualizer_role.h" // VisualizerRole, VisualizerRoleListener
 ```
 
-Only include the role headers you need. `client.h` includes `sendspin/config.h` and `sendspin/types.h` transitively.
+Only include the role headers you need. `client.h` includes `sendspin/config.h` (all configuration structs, including `SendspinClientConfig`) and `sendspin/types.h` transitively.
 
 ## Step 1: Configure and Create the Client
 

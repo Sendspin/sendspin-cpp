@@ -128,39 +128,6 @@ class ConnectionManager;
 class SendspinConnection;
 class SendspinTimeBurst;
 
-/// @brief Configuration for a SendspinClient instance
-/// Filled in by the platform (e.g., ESPHome) before calling start_server()
-struct SendspinClientConfig {
-    std::string client_id;         ///< Unique client identifier (e.g., MAC address)
-    std::string name;              ///< Friendly display name
-    std::string product_name;      ///< Device product name
-    std::string manufacturer;      ///< Manufacturer name (e.g., "ESPHome")
-    std::string software_version;  ///< Software version string
-
-    bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
-
-    /// @brief Default FreeRTOS priority for the HTTP server task (ESP-IDF only)
-    static constexpr unsigned DEFAULT_HTTPD_PRIORITY = 17U;
-
-    unsigned httpd_priority{DEFAULT_HTTPD_PRIORITY};  ///< FreeRTOS priority for the HTTP server
-                                                      ///< task (ESP-IDF only)
-    unsigned websocket_priority{5};  ///< FreeRTOS priority for the WebSocket client task
-                                     ///< (ESP-IDF only)
-
-    uint8_t server_max_connections{2};  ///< Maximum simultaneous connections (default: 2 for
-                                        ///< handoff protocol)
-    uint16_t httpd_ctrl_port{0};        ///< ESP-IDF httpd control port; 0 = ESP_HTTPD_DEF_CTRL_PORT
-                                        ///< + 1 (avoids conflict with web_server component)
-
-    static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
-    static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
-
-    uint8_t time_burst_size{8};  ///< Number of messages per time sync burst
-    int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};  ///< Milliseconds between bursts
-    int64_t time_burst_response_timeout_ms{
-        DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
-};
-
 /**
  * @brief Main orchestration class for the sendspin-cpp library
  *
