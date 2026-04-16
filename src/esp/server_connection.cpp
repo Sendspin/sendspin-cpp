@@ -72,7 +72,7 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
 
     // Send goodbye message, then trigger close, then invoke user callback
     // Capture on_complete by value to keep it alive until async callback fires
-    this->send_goodbye_reason(reason, [this, on_complete](bool success, int64_t) {
+    this->send_goodbye_reason(reason, [this, on_complete](bool success) {
         // Trigger close regardless of send success
         this->trigger_close();
 
@@ -94,7 +94,7 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
     if (!this->is_connected()) {
         // No client connected - invoke callback with failure if provided
         if (on_complete) {
-            on_complete(false, 0);
+            on_complete(false);
         }
         return SsErr::INVALID_STATE;
     }
@@ -104,7 +104,7 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
     if (resp_arg == nullptr) {
         SS_LOGE(TAG, "Failed to allocate AsyncRespArg for message send");
         if (on_complete) {
-            on_complete(false, 0);
+            on_complete(false);
         }
         return SsErr::NO_MEM;
     }
@@ -119,7 +119,7 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
         resp_arg->~AsyncRespArg();
         platform_free(resp_arg);
         if (on_complete) {
-            on_complete(false, 0);
+            on_complete(false);
         }
         return SsErr::NO_MEM;
     }
@@ -138,7 +138,7 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
         platform_free(resp_arg->payload);
         // Need to invoke callback with failure before destroying it
         if (resp_arg->has_callback) {
-            resp_arg->on_complete(false, 0);
+            resp_arg->on_complete(false);
         }
         resp_arg->~AsyncRespArg();
         platform_free(resp_arg);
@@ -262,8 +262,6 @@ void SendspinServerConnection::async_send_text(void* arg) {
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
 
     bool send_success = false;
-    const int64_t after_send_time = esp_timer_get_time();
-
     if (this_conn->is_connected()) {
         esp_err_t err = httpd_ws_send_frame_async(this_conn->server_, this_conn->sockfd_, &ws_pkt);
         send_success = (err == ESP_OK);
@@ -271,7 +269,7 @@ void SendspinServerConnection::async_send_text(void* arg) {
 
     // Call the completion callback if provided
     if (resp_arg->has_callback) {
-        resp_arg->on_complete(send_success, after_send_time);
+        resp_arg->on_complete(send_success);
     }
 
     platform_free(ws_pkt.payload);

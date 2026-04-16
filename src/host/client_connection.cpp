@@ -85,7 +85,7 @@ void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
     }
 
     // Send goodbye message then stop
-    this->send_goodbye_reason(reason, [this, on_complete](bool /*success*/, int64_t) {
+    this->send_goodbye_reason(reason, [this, on_complete](bool /*success*/) {
         if (this->ws_) {
             this->ws_->stop();
         }
@@ -99,17 +99,16 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback cb) {
     if (!this->is_connected()) {
         if (cb) {
-            cb(false, 0);
+            cb(false);
         }
         return SsErr::INVALID_STATE;
     }
 
-    int64_t send_time = platform_time_us();
     auto info = this->ws_->send(message);
     bool success = info.success;
 
     if (cb) {
-        cb(success, send_time);
+        cb(success);
     }
 
     if (!success) {

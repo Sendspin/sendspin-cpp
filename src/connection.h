@@ -32,8 +32,7 @@ namespace sendspin {
 
 /// @brief Callback type for message send completion
 /// @param success True if the message was sent successfully, false otherwise.
-/// @param timestamp The actual timestamp when the message was sent (in microseconds).
-using SendCompleteCallback = std::function<void(bool, int64_t)>;
+using SendCompleteCallback = std::function<void(bool)>;
 
 /**
  * @brief Abstract base class for Sendspin connections (server-initiated or client-initiated)
@@ -275,12 +274,6 @@ public:
     // Time message state accessors
     // ========================================
 
-    /// @brief Sets the timestamp of the last sent time message
-    /// @param timestamp The timestamp of the last sent time message
-    void set_last_sent_time_message(int64_t timestamp) {
-        this->last_sent_time_message_ = timestamp;
-    }
-
     /// @brief Checks if a time message is pending (waiting for response)
     /// @return True if a time message has been sent and a response is expected, false otherwise.
     bool is_pending_time_message() const {
@@ -343,9 +336,6 @@ protected:
     /// EMA (microseconds) of format_client_time_message() duration. Atomic because the ESP
     /// server worker thread updates it while the hub thread reads it for logging.
     std::atomic<int64_t> serialize_ema_us_{0};
-
-    /// Time message state.
-    int64_t last_sent_time_message_{0};
 
     // size_t fields
     size_t websocket_write_offset_{0};

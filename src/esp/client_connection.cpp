@@ -112,7 +112,7 @@ void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
 
     // Send goodbye message and then stop client
     // For client connections, send_text_message is synchronous, so callback fires immediately
-    this->send_goodbye_reason(reason, [this, on_complete](bool success, int64_t) {
+    this->send_goodbye_reason(reason, [this, on_complete](bool success) {
         // Stop the client regardless of send success
         if (this->client_ != nullptr) {
             esp_websocket_client_stop(this->client_);
@@ -132,9 +132,8 @@ bool SendspinClientConnection::is_connected() const {
 SsErr SendspinClientConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback cb) {
     if (!this->is_connected()) {
-        // No connection - invoke callback with failure if provided
         if (cb) {
-            cb(false, 0);
+            cb(false);
         }
         return SsErr::INVALID_STATE;
     }
@@ -143,14 +142,10 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     int sent = esp_websocket_client_send_text(this->client_, message.c_str(), message.length(),
                                               pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
 
-    // Capture timestamp after send
-    int64_t after_send_time = esp_timer_get_time();
-
     bool success = (sent >= 0);
 
-    // Invoke callback if provided
     if (cb) {
-        cb(success, after_send_time);
+        cb(success);
     }
 
     if (!success) {
