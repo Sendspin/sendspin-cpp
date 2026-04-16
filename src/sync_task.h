@@ -22,7 +22,7 @@
 #include "audio_stream_info.h"
 #include "decoder.h"
 #include "platform/event_flags.h"
-#include "platform/thread_safe_queue.h"
+#include "platform/shadow_slot.h"
 #include "transfer_buffer.h"
 
 #include <atomic>
@@ -230,7 +230,9 @@ protected:
 
     // Struct fields
     EventFlags event_flags_;
-    ThreadSafeQueue<PlaybackProgress> playback_progress_queue_;
+    // Latest-wins slot that merges (sum frames, keep latest finish_timestamp)
+    // updates from the audio callback and is drained by the sync thread.
+    ShadowSlot<PlaybackProgress> playback_progress_slot_;
     std::thread sync_thread_;
 
     // Pointer fields
