@@ -63,7 +63,7 @@ struct PlayerRole::Impl {
     bool start();
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
-    void handle_binary(const uint8_t* data, size_t len);
+    void handle_binary(const uint8_t* data, size_t len) const;
     void handle_stream_start(const StreamStartMessage& stream_msg);
     void handle_stream_end() const;
     void handle_stream_clear() const;

@@ -218,7 +218,7 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     msg.player = player_state;
 }
 
-void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) {
+void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) const {
     if (this->config.audio_formats.empty()) {
         return;
     }
