@@ -41,9 +41,6 @@ static constexpr uint32_t INITIAL_SYNC_ZEROS_DURATION_MS = 25;
 
 static constexpr size_t SYNC_TASK_STACK_SIZE = 6192;  // Opus uses more stack than FLAC
 
-/// @brief Capacity of the playback progress queue (number of progress events)
-static constexpr size_t PLAYBACK_PROGRESS_QUEUE_SIZE = 50U;
-
 /// @brief Wait time (ms) between retries when time sync is not yet available
 static constexpr uint32_t WAIT_FOR_TIME_SYNC_MS = 15U;
 
@@ -66,11 +63,6 @@ bool SyncTask::init(PlayerRole* player, SendspinClient* client, size_t buffer_si
 
     if (!this->event_flags_.create()) {
         SS_LOGE(TAG, "Couldn't create event flags.");
-        return false;
-    }
-
-    if (!this->playback_progress_queue_.create(PLAYBACK_PROGRESS_QUEUE_SIZE)) {
-        SS_LOGE(TAG, "Couldn't create playback progress queue.");
         return false;
     }
 
@@ -137,10 +129,15 @@ bool SyncTask::write_audio_chunk(const uint8_t* data, size_t data_size, int64_t 
 }
 
 void SyncTask::notify_audio_played(uint32_t frames, int64_t timestamp) {
-    PlaybackProgress playback_progress{frames, timestamp};
-    if (!this->playback_progress_queue_.send(playback_progress, 0)) {
-        SS_LOGE(TAG, "Playback info queue was full");
-    }
+    // Merge into the shadow slot: sum frames across unread updates and keep
+    // the most recent finish_timestamp. The sync thread drains on each inner
+    // loop iteration.
+    this->playback_progress_slot_.merge(
+        [](PlaybackProgress& current, PlaybackProgress&& delta) {
+            current.frames_played += delta.frames_played;
+            current.finish_timestamp = delta.finish_timestamp;
+        },
+        PlaybackProgress{frames, timestamp});
 }
 
 // ============================================================================
@@ -575,9 +572,7 @@ void SyncTask::reset_context(SyncContext& sync_context) {
 
 void SyncTask::process_playback_progress(SyncContext& sync_context) {
     PlaybackProgress playback_progress{};
-    bool received = false;
-    while (this->playback_progress_queue_.receive(playback_progress, 0)) {
-        received = true;
+    if (this->playback_progress_slot_.take(playback_progress)) {
         uint32_t frames_played = playback_progress.frames_played;
 
         if (sync_context.initial_decode && frames_played) {
@@ -592,8 +587,7 @@ void SyncTask::process_playback_progress(SyncContext& sync_context) {
         } else {
             sync_context.buffered_frames -= frames_played;
         }
-    }
-    if (received) {
+
         uint32_t unplayed_frames = sync_context.buffered_frames;
         int64_t unplayed_ms =
             sync_context.current_stream_info.frames_to_milliseconds_with_remainder(
@@ -652,7 +646,7 @@ void SyncTask::thread_entry(void* params) {
         this_task->event_flags_.set(EventGroupBits::TASK_IDLE);
 
         this_task->reset_context(sync_context);
-        this_task->playback_progress_queue_.reset();
+        this_task->playback_progress_slot_.reset();
 
         // Wait for a codec header to arrive in the ring buffer (yields CPU with long timeout)
         bool got_header = this_task->wait_for_codec_header(sync_context);
@@ -705,7 +699,7 @@ void SyncTask::thread_entry(void* params) {
         // before setting TASK_RUNNING. The I2S hardware may still be draining its DMA
         // buffer from the old stream, and those callbacks would corrupt the new stream's
         // buffered_frames tracking.
-        this_task->playback_progress_queue_.reset();
+        this_task->playback_progress_slot_.reset();
 
         this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
 
