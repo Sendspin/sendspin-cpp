@@ -45,38 +45,6 @@ enum class SendspinRepeatMode : uint8_t {
     ALL,  // Repeat entire queue
 };
 
-/// @brief Returns a null-terminated string name for a repeat mode
-/// @param mode The mode to convert
-/// @return Null-terminated string, or "unknown" for unrecognized values
-inline const char* to_cstr(SendspinRepeatMode mode) {
-    switch (mode) {
-        case SendspinRepeatMode::OFF:
-            return "off";
-        case SendspinRepeatMode::ONE:
-            return "one";
-        case SendspinRepeatMode::ALL:
-            return "all";
-        default:
-            return "off";
-    }
-}
-
-/// @brief Parses a repeat mode from its string representation
-/// @param str The string to parse
-/// @return The matching mode, or std::nullopt if unrecognized
-inline std::optional<SendspinRepeatMode> repeat_mode_from_string(const std::string& str) {
-    if (str == "off") {
-        return SendspinRepeatMode::OFF;
-    }
-    if (str == "one") {
-        return SendspinRepeatMode::ONE;
-    }
-    if (str == "all") {
-        return SendspinRepeatMode::ALL;
-    }
-    return std::nullopt;
-}
-
 /// @brief Track metadata and playback state received from the server
 struct ServerMetadataStateObject {
     int64_t timestamp{};

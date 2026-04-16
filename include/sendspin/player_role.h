@@ -47,32 +47,6 @@ enum class SendspinCodecFormat : uint8_t {
     UNSUPPORTED,  // Codec not recognized
 };
 
-inline const char* to_cstr(SendspinCodecFormat format) {
-    switch (format) {
-        case SendspinCodecFormat::FLAC:
-            return "flac";
-        case SendspinCodecFormat::OPUS:
-            return "opus";
-        case SendspinCodecFormat::PCM:
-            return "pcm";
-        default:
-            return "unsupported";
-    }
-}
-
-inline std::optional<SendspinCodecFormat> codec_format_from_string(const std::string& str) {
-    if (str == "flac") {
-        return SendspinCodecFormat::FLAC;
-    }
-    if (str == "opus") {
-        return SendspinCodecFormat::OPUS;
-    }
-    if (str == "pcm") {
-        return SendspinCodecFormat::PCM;
-    }
-    return std::nullopt;
-}
-
 /// @brief One supported audio format entry advertised by the player in the hello message
 struct AudioSupportedFormatObject {
     SendspinCodecFormat codec;
@@ -86,47 +60,6 @@ enum class SendspinPlayerCommand : uint8_t {
     VOLUME,            // Set playback volume
     MUTE,              // Set mute state
     SET_STATIC_DELAY,  // Set static playback delay
-};
-
-inline const char* to_cstr(SendspinPlayerCommand cmd) {
-    switch (cmd) {
-        case SendspinPlayerCommand::VOLUME:
-            return "volume";
-        case SendspinPlayerCommand::MUTE:
-            return "mute";
-        case SendspinPlayerCommand::SET_STATIC_DELAY:
-            return "set_static_delay";
-        default:
-            return "unknown";
-    }
-}
-
-inline std::optional<SendspinPlayerCommand> player_command_from_string(const std::string& str) {
-    if (str == "volume") {
-        return SendspinPlayerCommand::VOLUME;
-    }
-    if (str == "mute") {
-        return SendspinPlayerCommand::MUTE;
-    }
-    if (str == "set_static_delay") {
-        return SendspinPlayerCommand::SET_STATIC_DELAY;
-    }
-    return std::nullopt;
-}
-
-/// @brief Player capabilities advertised to the server during the hello handshake
-struct PlayerSupportObject {
-    std::vector<AudioSupportedFormatObject> supported_formats{};
-    size_t buffer_capacity{};
-    std::vector<SendspinPlayerCommand> supported_commands{};
-};
-
-/// @brief Player state reported by the client to the server in client/state messages
-struct ClientPlayerStateObject {
-    uint8_t volume{};
-    bool muted{};
-    uint16_t static_delay_ms{};
-    std::vector<SendspinPlayerCommand> supported_commands{};
 };
 
 /// @brief Stream parameters sent by the server in stream/start messages

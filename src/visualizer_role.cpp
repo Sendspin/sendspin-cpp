@@ -31,6 +31,17 @@
 
 static const char* const TAG = "sendspin.visualizer";
 
+namespace {
+
+/// @brief Deferred visualizer event types
+enum class VisualizerEventType : uint8_t {
+    STREAM_START,
+    STREAM_END,
+    STREAM_CLEAR,
+};
+
+}  // namespace
+
 // ============================================================================
 // Entry format constants
 // ============================================================================
@@ -93,7 +104,7 @@ struct VisualizerRole::DrainTask {
 
 /// @brief Deferred event state for thread-safe visualizer stream lifecycle delivery
 struct VisualizerRole::EventState {
-    ThreadSafeQueue<VisualizerRole::EventType> queue;
+    ThreadSafeQueue<VisualizerEventType> queue;
     ShadowSlot<ServerVisualizerStreamObject> shadow_config;
 };
 
@@ -270,7 +281,7 @@ void VisualizerRole::handle_stream_start(const ServerVisualizerStreamObject& str
 
     // Shadow the config for main-thread callback, then signal
     this->event_state_->shadow_config.write(stream);
-    this->event_state_->queue.send(EventType::STREAM_START, 0);
+    this->event_state_->queue.send(VisualizerEventType::STREAM_START, 0);
 }
 
 void VisualizerRole::handle_stream_end() {
@@ -280,7 +291,7 @@ void VisualizerRole::handle_stream_end() {
         this->drain_task_->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state_->queue.send(EventType::STREAM_END, 0);
+    this->event_state_->queue.send(VisualizerEventType::STREAM_END, 0);
 }
 
 void VisualizerRole::handle_stream_clear() {
@@ -290,7 +301,7 @@ void VisualizerRole::handle_stream_clear() {
         this->drain_task_->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state_->queue.send(EventType::STREAM_CLEAR, 0);
+    this->event_state_->queue.send(VisualizerEventType::STREAM_CLEAR, 0);
 }
 
 // ============================================================================
@@ -298,22 +309,22 @@ void VisualizerRole::handle_stream_clear() {
 // ============================================================================
 
 void VisualizerRole::drain_events() {
-    EventType event_type{};
+    VisualizerEventType event_type{};
     while (this->event_state_->queue.receive(event_type, 0)) {
         switch (event_type) {
-            case EventType::STREAM_START: {
+            case VisualizerEventType::STREAM_START: {
                 ServerVisualizerStreamObject config{};
                 if (this->event_state_->shadow_config.take(config) && this->listener_) {
                     this->listener_->on_visualizer_stream_start(config);
                 }
                 break;
             }
-            case EventType::STREAM_END:
+            case VisualizerEventType::STREAM_END:
                 if (this->listener_) {
                     this->listener_->on_visualizer_stream_end();
                 }
                 break;
-            case EventType::STREAM_CLEAR:
+            case VisualizerEventType::STREAM_CLEAR:
                 if (this->listener_) {
                     this->listener_->on_visualizer_stream_clear();
                 }
@@ -335,7 +346,7 @@ void VisualizerRole::cleanup() {
 
     this->event_state_->queue.reset();
     this->event_state_->shadow_config.reset();
-    this->event_state_->queue.send(EventType::STREAM_END, 0);
+    this->event_state_->queue.send(VisualizerEventType::STREAM_END, 0);
 }
 
 // ============================================================================

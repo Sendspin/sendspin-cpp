@@ -145,6 +145,347 @@ inline std::optional<SendspinConnectionReason> connection_reason_from_string(
 }
 
 // ============================================================================
+// Conversion helpers (moved from public headers — internal use only)
+// ============================================================================
+
+// --- types.h ---
+
+inline const char* to_cstr(SendspinClientState state) {
+    switch (state) {
+        case SendspinClientState::SYNCHRONIZED:
+            return "synchronized";
+        case SendspinClientState::EXTERNAL_SOURCE:
+            return "external_source";
+        case SendspinClientState::ERROR:
+            // Intentional fallthrough
+        default:
+            return "error";
+    }
+}
+
+inline const char* to_cstr(SendspinGoodbyeReason reason) {
+    switch (reason) {
+        case SendspinGoodbyeReason::ANOTHER_SERVER:
+            return "another_server";
+        case SendspinGoodbyeReason::SHUTDOWN:
+            return "shutdown";
+        case SendspinGoodbyeReason::RESTART:
+            return "restart";
+        case SendspinGoodbyeReason::USER_REQUEST:
+            return "user_request";
+        default:
+            return "shutdown";
+    }
+}
+
+inline const char* to_cstr(SendspinPlaybackState state) {
+    switch (state) {
+        case SendspinPlaybackState::PLAYING:
+            return "playing";
+        case SendspinPlaybackState::STOPPED:
+        default:
+            return "stopped";
+    }
+}
+
+inline std::optional<SendspinPlaybackState> playback_state_from_string(const std::string& str) {
+    if (str == "playing") {
+        return SendspinPlaybackState::PLAYING;
+    }
+    if (str == "stopped") {
+        return SendspinPlaybackState::STOPPED;
+    }
+    return std::nullopt;
+}
+
+/// @brief Optional hardware and software identity fields sent in client/hello messages
+struct DeviceInfoObject {
+    std::optional<std::string> product_name{};
+    std::optional<std::string> manufacturer{};
+    std::optional<std::string> software_version{};
+};
+
+// --- player_role.h ---
+
+inline const char* to_cstr(SendspinCodecFormat format) {
+    switch (format) {
+        case SendspinCodecFormat::FLAC:
+            return "flac";
+        case SendspinCodecFormat::OPUS:
+            return "opus";
+        case SendspinCodecFormat::PCM:
+            return "pcm";
+        default:
+            return "unsupported";
+    }
+}
+
+inline std::optional<SendspinCodecFormat> codec_format_from_string(const std::string& str) {
+    if (str == "flac") {
+        return SendspinCodecFormat::FLAC;
+    }
+    if (str == "opus") {
+        return SendspinCodecFormat::OPUS;
+    }
+    if (str == "pcm") {
+        return SendspinCodecFormat::PCM;
+    }
+    return std::nullopt;
+}
+
+inline const char* to_cstr(SendspinPlayerCommand cmd) {
+    switch (cmd) {
+        case SendspinPlayerCommand::VOLUME:
+            return "volume";
+        case SendspinPlayerCommand::MUTE:
+            return "mute";
+        case SendspinPlayerCommand::SET_STATIC_DELAY:
+            return "set_static_delay";
+        default:
+            return "unknown";
+    }
+}
+
+inline std::optional<SendspinPlayerCommand> player_command_from_string(const std::string& str) {
+    if (str == "volume") {
+        return SendspinPlayerCommand::VOLUME;
+    }
+    if (str == "mute") {
+        return SendspinPlayerCommand::MUTE;
+    }
+    if (str == "set_static_delay") {
+        return SendspinPlayerCommand::SET_STATIC_DELAY;
+    }
+    return std::nullopt;
+}
+
+/// @brief Player capabilities advertised to the server during the hello handshake
+struct PlayerSupportObject {
+    std::vector<AudioSupportedFormatObject> supported_formats{};
+    size_t buffer_capacity{};
+    std::vector<SendspinPlayerCommand> supported_commands{};
+};
+
+/// @brief Player state reported by the client to the server in client/state messages
+struct ClientPlayerStateObject {
+    uint8_t volume{};
+    bool muted{};
+    uint16_t static_delay_ms{};
+    std::vector<SendspinPlayerCommand> supported_commands{};
+};
+
+// --- controller_role.h ---
+
+inline const char* to_cstr(SendspinControllerCommand cmd) {
+    switch (cmd) {
+        case SendspinControllerCommand::PLAY:
+            return "play";
+        case SendspinControllerCommand::PAUSE:
+            return "pause";
+        case SendspinControllerCommand::STOP:
+            return "stop";
+        case SendspinControllerCommand::NEXT:
+            return "next";
+        case SendspinControllerCommand::PREVIOUS:
+            return "previous";
+        case SendspinControllerCommand::VOLUME:
+            return "volume";
+        case SendspinControllerCommand::MUTE:
+            return "mute";
+        case SendspinControllerCommand::REPEAT_OFF:
+            return "repeat_off";
+        case SendspinControllerCommand::REPEAT_ONE:
+            return "repeat_one";
+        case SendspinControllerCommand::REPEAT_ALL:
+            return "repeat_all";
+        case SendspinControllerCommand::SHUFFLE:
+            return "shuffle";
+        case SendspinControllerCommand::UNSHUFFLE:
+            return "unshuffle";
+        case SendspinControllerCommand::SWITCH:
+            return "switch";
+        default:
+            return "unknown";
+    }
+}
+
+inline std::optional<SendspinControllerCommand> controller_command_from_string(
+    const std::string& str) {
+    if (str == "play") {
+        return SendspinControllerCommand::PLAY;
+    }
+    if (str == "pause") {
+        return SendspinControllerCommand::PAUSE;
+    }
+    if (str == "stop") {
+        return SendspinControllerCommand::STOP;
+    }
+    if (str == "next") {
+        return SendspinControllerCommand::NEXT;
+    }
+    if (str == "previous") {
+        return SendspinControllerCommand::PREVIOUS;
+    }
+    if (str == "volume") {
+        return SendspinControllerCommand::VOLUME;
+    }
+    if (str == "mute") {
+        return SendspinControllerCommand::MUTE;
+    }
+    if (str == "repeat_off") {
+        return SendspinControllerCommand::REPEAT_OFF;
+    }
+    if (str == "repeat_one") {
+        return SendspinControllerCommand::REPEAT_ONE;
+    }
+    if (str == "repeat_all") {
+        return SendspinControllerCommand::REPEAT_ALL;
+    }
+    if (str == "shuffle") {
+        return SendspinControllerCommand::SHUFFLE;
+    }
+    if (str == "unshuffle") {
+        return SendspinControllerCommand::UNSHUFFLE;
+    }
+    if (str == "switch") {
+        return SendspinControllerCommand::SWITCH;
+    }
+    return std::nullopt;
+}
+
+/// @brief A playback command sent from the client to the server via client/command messages
+struct ClientCommandControllerObject {
+    SendspinControllerCommand command{};
+    std::optional<uint8_t> volume;
+    std::optional<bool> mute;
+};
+
+// --- metadata_role.h ---
+
+inline const char* to_cstr(SendspinRepeatMode mode) {
+    switch (mode) {
+        case SendspinRepeatMode::OFF:
+            return "off";
+        case SendspinRepeatMode::ONE:
+            return "one";
+        case SendspinRepeatMode::ALL:
+            return "all";
+        default:
+            return "off";
+    }
+}
+
+inline std::optional<SendspinRepeatMode> repeat_mode_from_string(const std::string& str) {
+    if (str == "off") {
+        return SendspinRepeatMode::OFF;
+    }
+    if (str == "one") {
+        return SendspinRepeatMode::ONE;
+    }
+    if (str == "all") {
+        return SendspinRepeatMode::ALL;
+    }
+    return std::nullopt;
+}
+
+// --- artwork_role.h ---
+
+inline const char* to_cstr(SendspinImageFormat format) {
+    switch (format) {
+        case SendspinImageFormat::JPEG:
+            return "jpeg";
+        case SendspinImageFormat::PNG:
+            return "png";
+        case SendspinImageFormat::BMP:
+            return "bmp";
+        default:
+            return "jpeg";
+    }
+}
+
+inline std::optional<SendspinImageFormat> image_format_from_string(const std::string& str) {
+    if (str == "jpeg") {
+        return SendspinImageFormat::JPEG;
+    }
+    if (str == "png") {
+        return SendspinImageFormat::PNG;
+    }
+    if (str == "bmp") {
+        return SendspinImageFormat::BMP;
+    }
+    return std::nullopt;
+}
+
+inline const char* to_cstr(SendspinImageSource source) {
+    switch (source) {
+        case SendspinImageSource::ALBUM:
+            return "album";
+        case SendspinImageSource::ARTIST:
+            return "artist";
+        case SendspinImageSource::NONE:
+        default:
+            return "none";
+    }
+}
+
+inline std::optional<SendspinImageSource> image_source_from_string(const std::string& str) {
+    if (str == "album") {
+        return SendspinImageSource::ALBUM;
+    }
+    if (str == "artist") {
+        return SendspinImageSource::ARTIST;
+    }
+    if (str == "none") {
+        return SendspinImageSource::NONE;
+    }
+    return std::nullopt;
+}
+
+/// @brief Artwork capabilities advertised to the server during the hello handshake
+struct ArtworkSupportObject {
+    std::vector<ArtworkChannelFormatObject> channels;
+};
+
+/// @brief Client request for a specific artwork channel format, sent in stream/request_format
+struct ClientArtworkRequestObject {
+    uint8_t channel{};
+    std::optional<SendspinImageSource> source;
+    std::optional<SendspinImageFormat> format;
+    std::optional<uint16_t> media_width;
+    std::optional<uint16_t> media_height;
+};
+
+// --- visualizer_role.h ---
+
+inline const char* to_cstr(VisualizerDataType type) {
+    switch (type) {
+        case VisualizerDataType::BEAT:
+            return "beat";
+        case VisualizerDataType::LOUDNESS:
+            return "loudness";
+        case VisualizerDataType::F_PEAK:
+            return "f_peak";
+        case VisualizerDataType::SPECTRUM:
+            return "spectrum";
+        default:
+            return "unknown";
+    }
+}
+
+inline const char* to_cstr(VisualizerSpectrumScale scale) {
+    switch (scale) {
+        case VisualizerSpectrumScale::MEL:
+            return "mel";
+        case VisualizerSpectrumScale::LOG:
+            return "log";
+        case VisualizerSpectrumScale::LIN:
+            return "lin";
+        default:
+            return "mel";
+    }
+}
+
+// ============================================================================
 // Message envelope structs
 // ============================================================================
 

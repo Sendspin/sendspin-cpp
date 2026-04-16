@@ -41,46 +41,12 @@ enum class VisualizerDataType : uint8_t {
     SPECTRUM,  // Full frequency spectrum bins
 };
 
-/// @brief Returns a null-terminated string name for a visualizer data type
-/// @param type The data type to convert
-/// @return Null-terminated string, or "unknown" for unrecognized values
-inline const char* to_cstr(VisualizerDataType type) {
-    switch (type) {
-        case VisualizerDataType::BEAT:
-            return "beat";
-        case VisualizerDataType::LOUDNESS:
-            return "loudness";
-        case VisualizerDataType::F_PEAK:
-            return "f_peak";
-        case VisualizerDataType::SPECTRUM:
-            return "spectrum";
-        default:
-            return "unknown";
-    }
-}
-
 /// @brief Frequency scale used for spectrum visualization bins
 enum class VisualizerSpectrumScale : uint8_t {
     MEL,  // Mel perceptual scale
     LOG,  // Logarithmic scale
     LIN,  // Linear scale
 };
-
-/// @brief Returns a null-terminated string name for a spectrum scale type
-/// @param scale The scale to convert
-/// @return Null-terminated string, or "unknown" for unrecognized values
-inline const char* to_cstr(VisualizerSpectrumScale scale) {
-    switch (scale) {
-        case VisualizerSpectrumScale::MEL:
-            return "mel";
-        case VisualizerSpectrumScale::LOG:
-            return "log";
-        case VisualizerSpectrumScale::LIN:
-            return "lin";
-        default:
-            return "mel";
-    }
-}
 
 /// @brief Spectrum visualization parameters: bin count, frequency range, scale, and rate cap
 struct VisualizerSpectrumConfig {
@@ -194,13 +160,6 @@ public:
     }
 
 private:
-    /// @brief Deferred visualizer event types
-    enum class EventType : uint8_t {
-        STREAM_START,
-        STREAM_END,
-        STREAM_CLEAR,
-    };
-
     /// @brief Starts the drain thread if the ring buffer is ready
     /// @return True if the thread is running, false if the ring buffer is not initialized.
     bool start();
