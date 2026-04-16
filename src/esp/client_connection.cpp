@@ -167,10 +167,10 @@ bool SendspinClientConnection::send_time_message() {
     char buf[96];
     const int64_t client_transmitted = esp_timer_get_time();
     const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
-    this->update_serialize_ema(esp_timer_get_time() - client_transmitted);
     if (len == 0) {
         return false;
     }
+    this->update_serialize_ema(esp_timer_get_time() - client_transmitted);
 
     int sent = esp_websocket_client_send_text(this->client_, buf, len,
                                               pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));

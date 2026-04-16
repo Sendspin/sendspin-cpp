@@ -86,10 +86,10 @@ bool SendspinServerConnection::send_time_message() {
     char buf[96];
     const int64_t client_transmitted = platform_time_us();
     const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
-    this->update_serialize_ema(platform_time_us() - client_transmitted);
     if (len == 0) {
         return false;
     }
+    this->update_serialize_ema(platform_time_us() - client_transmitted);
     return this->ws_->send(std::string(buf, len)).success;
 }
 
