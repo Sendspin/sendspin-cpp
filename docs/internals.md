@@ -73,7 +73,6 @@ Fixed-depth FIFO queue with timed send/receive. Used to defer events from networ
 |-------|-------|------|----------|----------|
 | `PlayerRole::stream_queue` | 8 | `StreamCallbackType` | Network thread | Main loop (`drain_events`) |
 | `PlayerRole::state_queue` | 4 | `SendspinClientState` | Sync task thread | Main loop (`drain_events`) |
-| `SyncTask::playback_progress_queue_` | 50 | `PlaybackProgress` | Audio output callback | Sync task thread |
 | `Client::time_queue` | 16 | `TimeResponseEvent` | Network thread | Main loop (`loop`) |
 | `ArtworkRole::notify_queue` | 8 | `ArtworkNotification` | Network thread | Artwork drain thread |
 | `ArtworkRole::queue` | 8 | `EventType` | Network thread | Main loop (`drain_events`) |
@@ -92,6 +91,7 @@ Single-slot state container with "latest wins" or custom merge semantics. The ne
 | `MetadataRole::shadow` | `ServerMetadataStateObject` | Field-by-field delta merge |
 | `ArtworkRole::shadow_config` | `ServerArtworkStreamObject` | Latest wins |
 | `VisualizerRole::shadow_config` | `ServerVisualizerStreamObject` | Latest wins |
+| `SyncTask::playback_progress_slot_` | `PlaybackProgress` | Sum `frames_played`, keep latest `finish_timestamp` |
 
 The merge strategy for `shadow_command` is important: if a volume change and a mute change arrive between two drain ticks, both are preserved because the merge function only overwrites fields that have values in the delta.
 
@@ -316,7 +316,7 @@ Hard sync sets a flag that switches to a tighter 500 us settle threshold until t
 
 ### Playback Progress Tracking
 
-The audio output hardware reports consumed frames via `notify_audio_played()` → `playback_progress_queue_`. The sync task drains this queue on every inner loop iteration to maintain an accurate `new_audio_client_playtime` estimate:
+The audio output hardware reports consumed frames via `notify_audio_played()` → `playback_progress_slot_` (a `ShadowSlot` whose merge strategy sums `frames_played` across unread updates and keeps the latest `finish_timestamp`). The sync task takes the accumulated value on every inner loop iteration to maintain an accurate `new_audio_client_playtime` estimate:
 
 ```cpp
 new_audio_client_playtime = last_finish_timestamp + remaining_buffered_frames_as_microseconds
@@ -416,7 +416,7 @@ This prevents the sync task from starting a new stream before the main loop has 
 
 ### Playback Progress
 
-Audio output callbacks run on a platform audio thread. They report consumed frames via `notify_audio_played()` → `playback_progress_queue_`. The sync task drains this queue non-blockingly on each iteration of its inner loop, keeping the playtime estimate accurate without blocking the audio thread.
+Audio output callbacks run on a platform audio thread. They report consumed frames via `notify_audio_played()` → `playback_progress_slot_` (merging sums frames and keeps the latest timestamp). The sync task takes the accumulated value non-blockingly on each iteration of its inner loop, keeping the playtime estimate accurate without blocking the audio thread.
 
 ### Cleanup Atomicity
 
