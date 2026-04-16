@@ -197,7 +197,7 @@ player.notify_audio_played(frames_played, current_timestamp_us);
 ```
 
 - `frames_played`: Number of audio frames (not bytes) just played
-- `timestamp`: Server timestamp corresponding to the played position
+- `timestamp`: Client timestamp in microseconds when the audio will finish playing (e.g., from `std::chrono::steady_clock`)
 
 This method is thread-safe and is expected to be called from an audio callback thread.
 

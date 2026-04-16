@@ -156,7 +156,7 @@ public:
 
     /// @brief Called by the audio output when it has played audio frames. Thread-safe.
     /// @param frames Number of audio frames played
-    /// @param timestamp Server timestamp corresponding to the played position
+    /// @param timestamp Client timestamp in microseconds when the audio will finish playing
     void notify_audio_played(uint32_t frames, int64_t timestamp);
 
     // ========================================

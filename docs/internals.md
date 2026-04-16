@@ -116,7 +116,7 @@ Used for:
 - **`std::mutex`** on `SendspinTimeFilter::state_mutex_`: protects Kalman filter state (offset, drift, covariance).
 - **`std::atomic<bool>`** on `SendspinConnection::message_dispatch_enabled_`: allows the main loop to instantly suppress message delivery from the network thread.
 - **`std::atomic<bool/uint8_t/size_t>`** on `VisualizerRole::Impl`: network thread writes stream config atomically; drain thread reads it.
-- **`std::atomic<bool>`** on `ArtworkRole::Impl::stream_active_`: guards `handle_binary()` from writing when no stream is active.
+- **`std::atomic<bool>`** on `ArtworkRole::Impl::stream_active`: guards `handle_binary()` from writing when no stream is active.
 - **`std::atomic<uint8_t>`** on `ArtworkRole::Impl::SlotBuffer::write_idx`: tracks which of two double-buffers the network thread writes to next.
 - **`std::atomic<bool>`** on `ArtworkRole::Impl::SlotBuffer::drain_active`: set by the drain thread while decoding, checked by the network thread to avoid overwriting an in-use buffer.
 - **`std::atomic<uint8_t>`** on `SendspinClient::high_performance_ref_count_`: ref-counted high-performance networking requests from time sync and playback.
