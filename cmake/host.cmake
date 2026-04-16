@@ -58,24 +58,27 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         ARDUINOJSON_USE_LONG_LONG=1
     )
 
-    # micro-flac and micro-opus (audio codec libraries, required by decoder)
-    FetchContent_Declare(
-        micro_flac
-        GIT_REPOSITORY https://github.com/esphome-libs/micro-flac.git
-        GIT_TAG        v0.1.1
-        GIT_SUBMODULES "lib/micro-ogg-demuxer"
-    )
-    FetchContent_MakeAvailable(micro_flac)
-    target_link_libraries(${TARGET_LIB} PUBLIC micro_flac)
+    # micro-flac and micro-opus (audio codec libraries, required by player/decoder)
+    # Only fetched and linked when the player role is enabled.
+    if(SENDSPIN_ENABLE_PLAYER)
+        FetchContent_Declare(
+            micro_flac
+            GIT_REPOSITORY https://github.com/esphome-libs/micro-flac.git
+            GIT_TAG        v0.1.1
+            GIT_SUBMODULES "lib/micro-ogg-demuxer"
+        )
+        FetchContent_MakeAvailable(micro_flac)
+        target_link_libraries(${TARGET_LIB} PUBLIC micro_flac)
 
-    FetchContent_Declare(
-        micro_opus
-        GIT_REPOSITORY https://github.com/esphome-libs/micro-opus.git
-        GIT_TAG        v0.3.5
-        GIT_SUBMODULES "lib/opus" "lib/micro-ogg-demuxer"
-    )
-    FetchContent_MakeAvailable(micro_opus)
-    target_link_libraries(${TARGET_LIB} PUBLIC micro_opus)
+        FetchContent_Declare(
+            micro_opus
+            GIT_REPOSITORY https://github.com/esphome-libs/micro-opus.git
+            GIT_TAG        v0.3.5
+            GIT_SUBMODULES "lib/opus" "lib/micro-ogg-demuxer"
+        )
+        FetchContent_MakeAvailable(micro_opus)
+        target_link_libraries(${TARGET_LIB} PUBLIC micro_opus)
+    endif()
 
     # IXWebSocket (WebSocket server/client for host networking)
     set(USE_TLS OFF CACHE BOOL "" FORCE)

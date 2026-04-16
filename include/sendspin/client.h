@@ -17,10 +17,8 @@
 
 #pragma once
 
-#include "sendspin/artwork_role.h"
-#include "sendspin/player_role.h"
+#include "sendspin/config.h"
 #include "sendspin/types.h"
-#include "sendspin/visualizer_role.h"
 
 #include <atomic>
 #include <cstdint>
@@ -31,9 +29,22 @@
 
 namespace sendspin {
 
-// Forward declarations for roles whose Config types are not used in this header's public API
+// Forward declarations for enabled roles
+#ifdef SENDSPIN_ENABLE_ARTWORK
+class ArtworkRole;
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
 class ControllerRole;
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
 class MetadataRole;
+#endif
+#ifdef SENDSPIN_ENABLE_PLAYER
+class PlayerRole;
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+class VisualizerRole;
+#endif
 
 // Forward declarations for listener types
 struct GroupUpdateObject;
@@ -187,7 +198,7 @@ struct SendspinClientConfig {
  * config.manufacturer = "Acme";
  * config.software_version = "1.0.0";
  * SendspinClient client(config);
- * auto& player = client.add_player(PlayerRole::Config{});
+ * auto& player = client.add_player(PlayerRoleConfig{});
  * player.set_listener(&player_listener);
  * client.add_controller();
  * client.set_network_provider(&network_provider);
@@ -236,25 +247,36 @@ public:
     // Role registration (call before start_server)
     // ========================================
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     /// @brief Adds the player role. Returns a reference for setting callbacks
-    PlayerRole& add_player(PlayerRole::Config config);
+    PlayerRole& add_player(PlayerRoleConfig config);
+#endif
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     /// @brief Adds the controller role. Returns a reference for setting callbacks
     ControllerRole& add_controller();
+#endif
 
+#ifdef SENDSPIN_ENABLE_METADATA
     /// @brief Adds the metadata role. Returns a reference for setting callbacks
     MetadataRole& add_metadata();
+#endif
 
+#ifdef SENDSPIN_ENABLE_ARTWORK
     /// @brief Adds the artwork role. Returns a reference for setting callbacks
-    ArtworkRole& add_artwork(ArtworkRole::Config config);
+    ArtworkRole& add_artwork(ArtworkRoleConfig config);
+#endif
 
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     /// @brief Adds the visualizer role. Returns a reference for setting callbacks
-    VisualizerRole& add_visualizer(VisualizerRole::Config config);
+    VisualizerRole& add_visualizer(VisualizerRoleConfig config);
+#endif
 
     // ========================================
     // Role access (nullptr if not added)
     // ========================================
 
+#ifdef SENDSPIN_ENABLE_ARTWORK
     /// @brief Returns the artwork role, or nullptr if not added
     /// @return Pointer to the artwork role, or nullptr
     ArtworkRole* artwork() {
@@ -265,6 +287,8 @@ public:
     const ArtworkRole* artwork() const {
         return this->artwork_.get();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     /// @brief Returns the controller role, or nullptr if not added
     /// @return Pointer to the controller role, or nullptr
     ControllerRole* controller() {
@@ -275,6 +299,8 @@ public:
     const ControllerRole* controller() const {
         return this->controller_.get();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     /// @brief Returns the metadata role, or nullptr if not added
     /// @return Pointer to the metadata role, or nullptr
     MetadataRole* metadata() {
@@ -285,6 +311,8 @@ public:
     const MetadataRole* metadata() const {
         return this->metadata_.get();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_PLAYER
     /// @brief Returns the player role, or nullptr if not added
     /// @return Pointer to the player role, or nullptr
     PlayerRole* player() {
@@ -295,6 +323,8 @@ public:
     const PlayerRole* player() const {
         return this->player_.get();
     }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     /// @brief Returns the visualizer role, or nullptr if not added
     /// @return Pointer to the visualizer role, or nullptr
     VisualizerRole* visualizer() {
@@ -305,6 +335,7 @@ public:
     const VisualizerRole* visualizer() const {
         return this->visualizer_.get();
     }
+#endif
 
     // ========================================
     // Queries
@@ -434,17 +465,27 @@ private:
     GroupUpdateObject group_state_{};
 
     // Pointer fields
+#ifdef SENDSPIN_ENABLE_ARTWORK
     std::unique_ptr<ArtworkRole> artwork_;
+#endif
     std::unique_ptr<ConnectionManager> connection_manager_;
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     std::unique_ptr<ControllerRole> controller_;
+#endif
     std::unique_ptr<EventState> event_state_;
     SendspinClientListener* listener_{nullptr};
+#ifdef SENDSPIN_ENABLE_METADATA
     std::unique_ptr<MetadataRole> metadata_;
+#endif
     SendspinNetworkProvider* network_provider_{nullptr};
     SendspinPersistenceProvider* persistence_provider_{nullptr};
+#ifdef SENDSPIN_ENABLE_PLAYER
     std::unique_ptr<PlayerRole> player_;
+#endif
     std::unique_ptr<SendspinTimeBurst> time_burst_;
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     std::unique_ptr<VisualizerRole> visualizer_;
+#endif
 
     // 32-bit fields
     SendspinClientState state_{SendspinClientState::SYNCHRONIZED};

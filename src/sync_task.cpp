@@ -18,8 +18,8 @@
 #include "constants.h"
 #include "platform/logging.h"
 #include "platform/thread.h"
+#include "player_role_impl.h"
 #include "sendspin/client.h"
-#include "sendspin/player_role.h"
 
 #include <algorithm>
 #include <chrono>
@@ -456,8 +456,8 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                     sync_context.encoded_entry = nullptr;
                     return DecodeResult::ALLOCATION_FAILED;
                 }
-                if (this->player_->listener_) {
-                    sync_context.decode_buffer->set_listener(this->player_->listener_);
+                if (this->player_->impl_->listener) {
+                    sync_context.decode_buffer->set_listener(this->player_->impl_->listener);
                 }
             } else if (needed > sync_context.decode_buffer->capacity()) {
                 if (!sync_context.decode_buffer->reallocate(needed)) {
@@ -632,8 +632,9 @@ void SyncTask::thread_entry(void* params) {
         return;
     }
 
-    if (this_task->player_->listener_) {
-        sync_context.interpolation_transfer_buffer->set_listener(this_task->player_->listener_);
+    if (this_task->player_->impl_->listener) {
+        sync_context.interpolation_transfer_buffer->set_listener(
+            this_task->player_->impl_->listener);
     }
     sync_context.decoder = std::make_unique<SendspinDecoder>();
 
@@ -703,7 +704,7 @@ void SyncTask::thread_entry(void* params) {
 
         this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
 
-        this_task->player_->enqueue_state_update(SendspinClientState::SYNCHRONIZED);
+        this_task->player_->impl_->enqueue_state_update(SendspinClientState::SYNCHRONIZED);
 
         // Decode the initial codec header
         if (sync_context.encoded_entry != nullptr) {

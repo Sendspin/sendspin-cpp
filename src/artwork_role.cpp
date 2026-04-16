@@ -12,34 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "sendspin/artwork_role.h"
-
+#include "artwork_role_impl.h"
 #include "constants.h"
-#include "platform/event_flags.h"
 #include "platform/logging.h"
-#include "platform/memory.h"
-#include "platform/shadow_slot.h"
 #include "platform/thread.h"
-#include "platform/thread_safe_queue.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 
 #include <cstring>
-#include <thread>
 
 static const char* const TAG = "sendspin.artwork";
-
-namespace {
-
-/// @brief Deferred artwork event types
-enum class ArtworkEventType : uint8_t {
-    STREAM_START,
-    STREAM_END,
-    STREAM_CLEAR,
-};
-
-}  // namespace
 
 // ============================================================================
 // Constants
@@ -47,9 +30,6 @@ enum class ArtworkEventType : uint8_t {
 
 /// @brief Size of the big-endian 64-bit timestamp at the start of artwork binary messages
 static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
-
-/// @brief Maximum number of artwork slots (2-bit slot field in protocol binary type byte)
-static constexpr size_t MAX_SLOTS = 4;
 
 /// @brief Timeout for blocking queue receive in drain thread (allows periodic command checks)
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 100U;
@@ -74,101 +54,58 @@ static int64_t be64_to_host(const uint8_t* bytes) {
 namespace sendspin {
 
 // ============================================================================
-// Internal types
+// ArtworkRole::Impl lifecycle
 // ============================================================================
 
-/// @brief Double-buffered image storage for a single artwork slot
-struct SlotBuffer {
-    PlatformBuffer buffers[2];
-    std::atomic<uint8_t> write_idx{0};      ///< Which buffer the network thread writes to next
-    std::atomic<bool> drain_active{false};  ///< True while the drain thread is using a buffer
-    uint8_t drain_buf_idx{0};               ///< Which buffer the drain thread is currently using
-};
-
-/// @brief Notification sent from the network thread to the drain thread when new image data arrives
-///
-/// All metadata is carried in the notification itself (not in SlotBuffer) so that the
-/// ThreadSafeQueue's internal mutex provides the happens-before guarantee between the
-/// network thread's writes and the drain thread's reads.
-struct ArtworkNotification {
-    uint8_t slot;
-    uint8_t buffer_idx;
-    size_t data_length;
-    int64_t timestamp;
-    SendspinImageFormat format;
-};
-
-// ============================================================================
-// Pimpl definitions
-// ============================================================================
-
-/// @brief Persistent drain thread context for artwork image decode and display delivery
-struct ArtworkRole::DrainTask {
-    ThreadSafeQueue<ArtworkNotification> notify_queue;
-    EventFlags event_flags;
-    std::thread drain_thread;
-    SlotBuffer slot_buffers[MAX_SLOTS];
-};
-
-/// @brief Deferred event state for thread-safe artwork stream lifecycle delivery
-struct ArtworkRole::EventState {
-    ThreadSafeQueue<ArtworkEventType> queue;
-    ShadowSlot<ServerArtworkStreamObject> shadow_config;
-};
-
-// ============================================================================
-// Lifecycle
-// ============================================================================
-
-ArtworkRole::ArtworkRole(Config config, SendspinClient* client)
-    : config_(std::move(config)),
-      client_(client),
-      drain_task_(std::make_unique<DrainTask>()),
-      event_state_(std::make_unique<EventState>()) {
-    for (const auto& pref : this->config_.preferred_formats) {
-        this->artwork_channels_.push_back({pref.source, pref.format, pref.width, pref.height});
+ArtworkRole::Impl::Impl(ArtworkRoleConfig config, SendspinClient* client)
+    : config(std::move(config)),
+      client(client),
+      drain_task(std::make_unique<DrainTask>()),
+      event_state(std::make_unique<EventState>()) {
+    for (const auto& pref : this->config.preferred_formats) {
+        this->artwork_channels.push_back({pref.source, pref.format, pref.width, pref.height});
     }
-    this->event_state_->queue.create(8);
-    this->drain_task_->notify_queue.create(8);
+    this->event_state->queue.create(8);
+    this->drain_task->notify_queue.create(8);
 }
 
-ArtworkRole::~ArtworkRole() {
+ArtworkRole::Impl::~Impl() {
     this->stop();
 }
 
-bool ArtworkRole::start() {
-    if (!this->drain_task_) {
+bool ArtworkRole::Impl::start() {
+    if (!this->drain_task) {
         return false;
     }
-    if (this->drain_task_->drain_thread.joinable()) {
+    if (this->drain_task->drain_thread.joinable()) {
         return true;  // Already running
     }
-    if (!this->drain_task_->event_flags.is_created() && !this->drain_task_->event_flags.create()) {
+    if (!this->drain_task->event_flags.is_created() && !this->drain_task->event_flags.create()) {
         return false;
     }
 
-    platform_configure_thread("SsArt", 4096, static_cast<int>(this->config_.priority),
-                              this->config_.psram_stack);
-    this->drain_task_->drain_thread = std::thread(drain_thread_func, this);
+    platform_configure_thread("SsArt", 4096, static_cast<int>(this->config.priority),
+                              this->config.psram_stack);
+    this->drain_task->drain_thread = std::thread(drain_thread_func, this);
     return true;
 }
 
-void ArtworkRole::stop() {
-    if (!this->drain_task_ || !this->drain_task_->drain_thread.joinable()) {
+void ArtworkRole::Impl::stop() {
+    if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
         return;
     }
-    this->drain_task_->event_flags.set(COMMAND_STOP);
-    this->drain_task_->drain_thread.join();
+    this->drain_task->event_flags.set(COMMAND_STOP);
+    this->drain_task->drain_thread.join();
 }
 
-void ArtworkRole::build_hello_fields(ClientHelloMessage& msg) {
-    if (this->artwork_channels_.empty()) {
+void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
+    if (this->artwork_channels.empty()) {
         return;
     }
     msg.supported_roles.push_back(SendspinRole::ARTWORK);
 
     ArtworkSupportObject artwork_support{};
-    artwork_support.channels = this->artwork_channels_;
+    artwork_support.channels = this->artwork_channels;
     msg.artwork_v1_support = artwork_support;
 }
 
@@ -176,11 +113,11 @@ void ArtworkRole::build_hello_fields(ClientHelloMessage& msg) {
 // Binary handling (network thread)
 // ============================================================================
 
-void ArtworkRole::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
-    if (!this->stream_active_ || !this->drain_task_ || !this->listener_) {
+void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
+    if (!this->stream_active || !this->drain_task || !this->listener) {
         return;
     }
-    if (slot >= MAX_SLOTS) {
+    if (slot >= ARTWORK_MAX_SLOTS) {
         return;
     }
     if (len < BINARY_TIMESTAMP_SIZE) {
@@ -194,7 +131,7 @@ void ArtworkRole::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
 
     // Look up format for this slot
     SendspinImageFormat image_format = SendspinImageFormat::JPEG;
-    for (const auto& pref : this->config_.preferred_formats) {
+    for (const auto& pref : this->config.preferred_formats) {
         if (pref.slot == slot) {
             image_format = pref.format;
             break;
@@ -202,7 +139,7 @@ void ArtworkRole::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
     }
 
     // Copy into the back buffer for this slot (grow-only)
-    auto& sb = this->drain_task_->slot_buffers[slot];
+    auto& sb = this->drain_task->slot_buffers[slot];
     uint8_t write_idx = sb.write_idx.load(std::memory_order_acquire);
 
     // If the drain thread is actively using this buffer, skip to the other one.
@@ -228,73 +165,73 @@ void ArtworkRole::handle_binary(uint8_t slot, const uint8_t* data, size_t len) {
 
     // Signal drain thread with all metadata in the notification
     ArtworkNotification notif{slot, write_idx, image_len, timestamp, image_format};
-    this->drain_task_->notify_queue.send(notif, 0);
+    this->drain_task->notify_queue.send(notif, 0);
 }
 
 // ============================================================================
 // Stream lifecycle (network thread)
 // ============================================================================
 
-void ArtworkRole::handle_stream_start(const ServerArtworkStreamObject& stream) {
-    this->stream_active_ = true;
+void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream) {
+    this->stream_active = true;
 
     // Signal drain thread to flush any stale notifications
-    if (this->drain_task_) {
-        this->drain_task_->event_flags.set(COMMAND_FLUSH);
+    if (this->drain_task) {
+        this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
     // Shadow the config for main-thread callback
-    this->event_state_->shadow_config.write(stream);
-    this->event_state_->queue.send(ArtworkEventType::STREAM_START, 0);
+    this->event_state->shadow_config.write(stream);
+    this->event_state->queue.send(ArtworkEventType::STREAM_START, 0);
 }
 
-void ArtworkRole::handle_stream_end() {
-    this->stream_active_ = false;
+void ArtworkRole::Impl::handle_stream_end() {
+    this->stream_active = false;
 
-    if (this->drain_task_) {
-        this->drain_task_->event_flags.set(COMMAND_FLUSH);
+    if (this->drain_task) {
+        this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state_->queue.send(ArtworkEventType::STREAM_END, 0);
+    this->event_state->queue.send(ArtworkEventType::STREAM_END, 0);
 }
 
-void ArtworkRole::handle_stream_clear() {
-    this->stream_active_ = false;
+void ArtworkRole::Impl::handle_stream_clear() {
+    this->stream_active = false;
 
-    if (this->drain_task_) {
-        this->drain_task_->event_flags.set(COMMAND_FLUSH);
+    if (this->drain_task) {
+        this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state_->queue.send(ArtworkEventType::STREAM_CLEAR, 0);
+    this->event_state->queue.send(ArtworkEventType::STREAM_CLEAR, 0);
 }
 
 // ============================================================================
 // Event draining (main thread) - lifecycle events only
 // ============================================================================
 
-void ArtworkRole::drain_events() {
+void ArtworkRole::Impl::drain_events() {
     ArtworkEventType event_type{};
-    while (this->event_state_->queue.receive(event_type, 0)) {
+    while (this->event_state->queue.receive(event_type, 0)) {
         switch (event_type) {
             case ArtworkEventType::STREAM_START: {
                 ServerArtworkStreamObject config{};
-                if (this->event_state_->shadow_config.take(config) && this->listener_) {
-                    this->listener_->on_artwork_stream_start(config);
+                if (this->event_state->shadow_config.take(config) && this->listener) {
+                    this->listener->on_artwork_stream_start(config);
                 }
                 break;
             }
             case ArtworkEventType::STREAM_END:
-                if (this->listener_) {
-                    for (const auto& pref : this->config_.preferred_formats) {
-                        this->listener_->on_image_clear(pref.slot);
+                if (this->listener) {
+                    for (const auto& pref : this->config.preferred_formats) {
+                        this->listener->on_image_clear(pref.slot);
                     }
-                    this->listener_->on_artwork_stream_end();
+                    this->listener->on_artwork_stream_end();
                 }
                 break;
             case ArtworkEventType::STREAM_CLEAR:
-                if (this->listener_) {
-                    for (const auto& pref : this->config_.preferred_formats) {
-                        this->listener_->on_image_clear(pref.slot);
+                if (this->listener) {
+                    for (const auto& pref : this->config.preferred_formats) {
+                        this->listener->on_image_clear(pref.slot);
                     }
                 }
                 break;
@@ -306,27 +243,27 @@ void ArtworkRole::drain_events() {
 // Cleanup (main thread)
 // ============================================================================
 
-void ArtworkRole::cleanup() {
-    this->stream_active_ = false;
+void ArtworkRole::Impl::cleanup() {
+    this->stream_active = false;
 
-    if (this->drain_task_) {
-        this->drain_task_->event_flags.set(COMMAND_FLUSH);
+    if (this->drain_task) {
+        this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state_->queue.reset();
-    this->event_state_->shadow_config.reset();
-    this->event_state_->queue.send(ArtworkEventType::STREAM_END, 0);
+    this->event_state->queue.reset();
+    this->event_state->shadow_config.reset();
+    this->event_state->queue.send(ArtworkEventType::STREAM_END, 0);
 }
 
 // ============================================================================
 // Drain thread
 // ============================================================================
 
-void ArtworkRole::drain_thread_func(ArtworkRole* self) {
+void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
     SS_LOGD(TAG, "Drain thread started");
 
-    auto& queue = self->drain_task_->notify_queue;
-    auto& flags = self->drain_task_->event_flags;
+    auto& queue = self->drain_task->notify_queue;
+    auto& flags = self->drain_task->event_flags;
 
     while (true) {
         // Non-blocking check for commands
@@ -349,11 +286,11 @@ void ArtworkRole::drain_thread_func(ArtworkRole* self) {
 
         uint8_t slot = notif.slot;
         uint8_t buf_idx = notif.buffer_idx;
-        if (slot >= MAX_SLOTS) {
+        if (slot >= ARTWORK_MAX_SLOTS) {
             continue;
         }
 
-        auto& sb = self->drain_task_->slot_buffers[slot];
+        auto& sb = self->drain_task->slot_buffers[slot];
         auto& buf = sb.buffers[buf_idx];
 
         if (notif.data_length == 0 || buf.data() == nullptr) {
@@ -365,20 +302,20 @@ void ArtworkRole::drain_thread_func(ArtworkRole* self) {
         sb.drain_active.store(true, std::memory_order_release);
 
         // Phase 1: Decode callback (immediate)
-        if (self->listener_) {
-            self->listener_->on_image_decode(slot, buf.data(), notif.data_length, notif.format);
+        if (self->listener) {
+            self->listener->on_image_decode(slot, buf.data(), notif.data_length, notif.format);
         }
 
         // Buffer is no longer needed after decode completes
         sb.drain_active.store(false, std::memory_order_release);
 
         // Wait for time sync before scheduling display
-        if (!self->client_->is_time_synced()) {
+        if (!self->client->is_time_synced()) {
             continue;
         }
 
         // Phase 2: Wait until display timestamp
-        int64_t client_ts = self->client_->get_client_time(notif.timestamp);
+        int64_t client_ts = self->client->get_client_time(notif.timestamp);
 
         if (client_ts == 0) {
             continue;
@@ -393,20 +330,33 @@ void ArtworkRole::drain_thread_func(ArtworkRole* self) {
                     break;
                 }
                 if (cmd & COMMAND_FLUSH) {
-                    ArtworkNotification dummy{};
-                    while (queue.receive(dummy, 0)) {}
+                    ArtworkNotification dummy2{};
+                    while (queue.receive(dummy2, 0)) {}
                     continue;
                 }
             }
         }
 
         // Display/swap callback
-        if (self->listener_) {
-            self->listener_->on_image_display(slot, client_ts);
+        if (self->listener) {
+            self->listener->on_image_display(slot, client_ts);
         }
     }
 
     SS_LOGD(TAG, "Drain thread stopped");
+}
+
+// ============================================================================
+// ArtworkRole public API (thin forwarding)
+// ============================================================================
+
+ArtworkRole::ArtworkRole(Config config, SendspinClient* client)
+    : impl_(std::make_unique<Impl>(std::move(config), client)) {}
+
+ArtworkRole::~ArtworkRole() = default;
+
+void ArtworkRole::set_listener(ArtworkRoleListener* listener) {
+    this->impl_->listener = listener;
 }
 
 }  // namespace sendspin

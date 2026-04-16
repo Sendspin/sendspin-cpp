@@ -17,8 +17,8 @@
 
 #pragma once
 
-#include <atomic>
-#include <cstddef>
+#include "sendspin/config.h"
+
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -27,43 +27,10 @@
 namespace sendspin {
 
 class SendspinClient;
-struct ClientHelloMessage;
 
 // ============================================================================
 // Visualizer types
 // ============================================================================
-
-/// @brief Visualizer data stream types
-enum class VisualizerDataType : uint8_t {
-    BEAT,      // Beat detection events
-    LOUDNESS,  // Overall loudness level
-    F_PEAK,    // Peak frequency
-    SPECTRUM,  // Full frequency spectrum bins
-};
-
-/// @brief Frequency scale used for spectrum visualization bins
-enum class VisualizerSpectrumScale : uint8_t {
-    MEL,  // Mel perceptual scale
-    LOG,  // Logarithmic scale
-    LIN,  // Linear scale
-};
-
-/// @brief Spectrum visualization parameters: bin count, frequency range, scale, and rate cap
-struct VisualizerSpectrumConfig {
-    uint8_t n_disp_bins;
-    VisualizerSpectrumScale scale;
-    uint16_t f_min;
-    uint16_t f_max;
-    uint16_t rate_max;
-};
-
-/// @brief Visualizer capabilities advertised to the server during the hello handshake
-struct VisualizerSupportObject {
-    std::vector<VisualizerDataType> types{};
-    size_t buffer_capacity{};
-    uint8_t batch_max{};
-    std::optional<VisualizerSpectrumConfig> spectrum;
-};
 
 /// @brief Visualizer stream parameters sent by the server in stream/start messages
 struct ServerVisualizerStreamObject {
@@ -131,7 +98,7 @@ public:
  * };
  *
  * MyVisualizerListener listener;
- * VisualizerRole::Config config;
+ * VisualizerRoleConfig config;
  * config.support.types = {VisualizerDataType::SPECTRUM, VisualizerDataType::BEAT};
  * config.support.buffer_capacity = 4096;
  * config.support.batch_max = 4;
@@ -143,81 +110,19 @@ class VisualizerRole {
     friend class SendspinClient;
 
 public:
-    /// @brief Configuration for the visualizer role
-    struct Config {
-        VisualizerSupportObject support;
-        bool psram_stack{false};  ///< Allocate drain thread stack in PSRAM (ESP-IDF only)
-        unsigned priority{2};     ///< FreeRTOS priority for the drain thread (ESP-IDF only)
-    };
+    using Config = VisualizerRoleConfig;
+
+    struct Impl;
 
     VisualizerRole(Config config, SendspinClient* client);
     ~VisualizerRole();
 
     /// @brief Sets the listener for visualizer events
     /// @note The listener must outlive this role
-    void set_listener(VisualizerRoleListener* listener) {
-        this->listener_ = listener;
-    }
+    void set_listener(VisualizerRoleListener* listener);
 
 private:
-    /// @brief Starts the drain thread if the ring buffer is ready
-    /// @return True if the thread is running, false if the ring buffer is not initialized.
-    bool start();
-    /// @brief Signals the drain thread to stop and waits for it to exit
-    void stop();
-    /// @brief Adds the visualizer role and support config to the hello message
-    /// @param msg The hello message being assembled.
-    void build_hello_fields(ClientHelloMessage& msg);
-    /// @brief Parses incoming visualizer binary frames and writes them to the ring buffer
-    /// @param binary_type Protocol binary type tag identifying the frame format.
-    /// @param data Pointer to the raw frame data.
-    /// @param len Length of the frame data in bytes.
-    void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len);
-    /// @brief Caches stream config, signals the drain thread to flush, and enqueues a start event
-    /// @param stream Stream parameters received from the server.
-    void handle_stream_start(const ServerVisualizerStreamObject& stream);
-    /// @brief Marks the stream inactive, flushes the ring buffer, and enqueues a stream-end event
-    void handle_stream_end();
-    /// @brief Marks the stream inactive, flushes the ring buffer, and enqueues a stream-clear
-    /// event.
-    void handle_stream_clear();
-    /// @brief Delivers pending stream lifecycle events (start, end, clear) to the listener
-    void drain_events();
-    /// @brief Resets pending events, flushes the ring buffer, and enqueues a stream-end event
-    void cleanup();
-    /// @brief Drains all pending items from the ring buffer without delivering them
-    void flush_ring_buffer();
-
-    /// @brief Entry point for the drain thread; reads ring buffer items and calls the listener
-    /// @param self The VisualizerRole instance that owns this thread.
-    static void drain_thread_func(VisualizerRole* self);
-
-    struct DrainTask;
-    struct EventState;
-
-    // Struct fields
-    Config config_;
-    std::optional<VisualizerSupportObject> visualizer_support_;
-
-    // Pointer fields
-    SendspinClient* client_;
-    // Drain task (pimpl to avoid exposing platform headers)
-    std::unique_ptr<DrainTask> drain_task_;
-    std::unique_ptr<EventState> event_state_;
-    VisualizerRoleListener* listener_{nullptr};
-
-    // size_t fields
-    // Cached stream config, written by the network thread in handle_stream_start(),
-    // read by the network thread in handle_binary(). stream_active_ is also cleared
-    // by cleanup() on the main thread.
-    std::atomic<size_t> raw_frame_size_{0};
-
-    // 8-bit fields
-    std::atomic<bool> has_f_peak_{false};
-    std::atomic<bool> has_loudness_{false};
-    std::atomic<bool> has_spectrum_{false};
-    std::atomic<uint8_t> spectrum_bin_count_{0};
-    std::atomic<bool> stream_active_{false};
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace sendspin

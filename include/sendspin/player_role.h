@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "sendspin/config.h"
 #include "sendspin/types.h"
 
 #include <cstddef>
@@ -24,36 +25,15 @@
 #include <memory>
 #include <optional>
 #include <string>
-#include <vector>
 
 namespace sendspin {
 
 class SendspinClient;
 class SendspinPersistenceProvider;
-class SyncTask;
-struct ClientHelloMessage;
-struct ClientStateMessage;
-struct StreamStartMessage;
 
 // ============================================================================
 // Player types
 // ============================================================================
-
-/// @brief Audio codec format for a player stream
-enum class SendspinCodecFormat : uint8_t {
-    FLAC,         // FLAC lossless audio
-    OPUS,         // Opus compressed audio
-    PCM,          // Raw PCM audio
-    UNSUPPORTED,  // Codec not recognized
-};
-
-/// @brief One supported audio format entry advertised by the player in the hello message
-struct AudioSupportedFormatObject {
-    SendspinCodecFormat codec;
-    uint8_t channels;
-    uint32_t sample_rate;
-    uint8_t bit_depth;
-};
 
 /// @brief Command types the server can send to the player role
 enum class SendspinPlayerCommand : uint8_t {
@@ -150,7 +130,7 @@ public:
  * };
  *
  * MyPlayerListener listener;
- * PlayerRole::Config config;
+ * PlayerRoleConfig config;
  * config.audio_formats = {{SendspinCodecFormat::FLAC, 2, 44100, 16}};
  * auto& player = client.add_player(config);
  * player.set_listener(&listener);
@@ -161,25 +141,15 @@ class PlayerRole {
     friend class SyncTask;
 
 public:
-    /// @brief Configuration for the player role
-    struct Config {
-        static constexpr size_t DEFAULT_AUDIO_BUFFER_CAPACITY = 1000000U;  ///< ~1MB default buffer
-        std::vector<AudioSupportedFormatObject> audio_formats{};
-        size_t audio_buffer_capacity{DEFAULT_AUDIO_BUFFER_CAPACITY};
-        int32_t fixed_delay_us{0};
-        uint16_t initial_static_delay_ms{0};
-        bool psram_stack{false};  ///< Allocate sync task stack in PSRAM (ESP-IDF only)
-        unsigned priority{2};     ///< FreeRTOS priority for the sync/decode task (ESP-IDF only)
-    };
+    using Config = PlayerRoleConfig;
+    struct Impl;
 
     PlayerRole(Config config, SendspinClient* client, SendspinPersistenceProvider* persistence);
     ~PlayerRole();
 
     /// @brief Sets the listener for player events
     /// @param listener Pointer to the listener implementation; must outlive this role
-    void set_listener(PlayerRoleListener* listener) {
-        this->listener_ = listener;
-    }
+    void set_listener(PlayerRoleListener* listener);
 
     // ========================================
     // Audio
@@ -216,107 +186,26 @@ public:
 
     /// @brief Returns a reference to the current stream parameters
     /// @return Const reference to the active stream parameters.
-    const ServerPlayerStreamObject& get_current_stream_params() const {
-        return this->current_stream_params_;
-    }
+    const ServerPlayerStreamObject& get_current_stream_params() const;
 
     /// @brief Returns the fixed delay in microseconds (from config)
     /// @return Fixed pipeline delay in microseconds.
-    int32_t get_fixed_delay_us() const {
-        return this->config_.fixed_delay_us;
-    }
+    int32_t get_fixed_delay_us() const;
 
     /// @brief Returns true if currently muted
     /// @return true if muted, false otherwise.
-    bool get_muted() const {
-        return this->muted_;
-    }
+    bool get_muted() const;
 
     /// @brief Returns the current static delay in milliseconds
     /// @return Static playback delay in milliseconds.
-    uint16_t get_static_delay_ms() const {
-        return this->static_delay_ms_;
-    }
+    uint16_t get_static_delay_ms() const;
 
     /// @brief Returns the current volume level
     /// @return Current volume level (0-255).
-    uint8_t get_volume() const {
-        return this->volume_;
-    }
+    uint8_t get_volume() const;
 
 private:
-    // ========================================
-    // Deferred event types
-    // ========================================
-
-    /// @brief Deferred stream lifecycle callback types queued from the network thread
-    enum class StreamCallbackType : uint8_t {
-        STREAM_START,  // New stream is starting
-        STREAM_END,    // Stream ended normally
-        STREAM_CLEAR,  // Stream cleared immediately
-    };
-
-    // ========================================
-    // Private integration methods
-    // ========================================
-
-    /// @brief Starts the player role and registers it with the client
-    bool start();
-    /// @brief Adds player role information to the outgoing hello message
-    void build_hello_fields(ClientHelloMessage& msg);
-    /// @brief Adds the current player state fields to an outgoing state message
-    void build_state_fields(ClientStateMessage& msg) const;
-    /// @brief Handles an incoming binary audio chunk from the server
-    void handle_binary(const uint8_t* data, size_t len);
-    /// @brief Handles a stream-start message from the server
-    void handle_stream_start(const StreamStartMessage& stream_msg);
-    /// @brief Handles a stream-end message from the server
-    void handle_stream_end();
-    /// @brief Handles a stream-clear message from the server
-    void handle_stream_clear();
-    /// @brief Handles an incoming server command message
-    void handle_server_command(const ServerCommandMessage& cmd);
-    /// @brief Delivers pending stream lifecycle events to the listener
-    void drain_events();
-    /// @brief Cleans up player state when the connection is lost
-    void cleanup();
-
-    // ========================================
-    // Helpers
-    // ========================================
-
-    /// @brief Sends an audio chunk to the sync task ring buffer
-    /// @param chunk_type A ChunkType value cast to uint8_t (avoids exposing internal enum)
-    bool send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
-                          uint8_t chunk_type, uint32_t timeout_ms);
-    /// @brief Enqueues a state change for delivery on the main thread
-    void enqueue_state_update(SendspinClientState state);
-    /// @brief Loads the static delay preference from persistent storage
-    void load_static_delay();
-    /// @brief Persists the current static delay to storage
-    void persist_static_delay();
-
-    // Struct fields
-    Config config_;
-    ServerPlayerStreamObject current_stream_params_{};
-    std::vector<StreamCallbackType> awaiting_sync_idle_events_;
-    struct EventState;
-
-    // Pointer fields
-    SendspinClient* client_;
-    std::unique_ptr<EventState> event_state_;
-    PlayerRoleListener* listener_{nullptr};
-    SendspinPersistenceProvider* persistence_;
-    std::unique_ptr<SyncTask> sync_task_;
-
-    // 16-bit fields
-    uint16_t static_delay_ms_{0};
-
-    // 8-bit fields
-    bool high_performance_requested_for_playback_{false};
-    bool muted_{false};
-    bool static_delay_adjustable_{false};
-    uint8_t volume_{0};
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace sendspin

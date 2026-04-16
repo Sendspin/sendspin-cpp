@@ -492,7 +492,7 @@ int main(int argc, char* argv[]) {
     SendspinClient client(std::move(config));
 
     // Add roles
-    PlayerRole::Config player_config;
+    PlayerRoleConfig player_config;
     player_config.audio_formats = std::move(audio_formats);
     auto& player = client.add_player(std::move(player_config));
     player.set_static_delay_adjustable(true);
@@ -517,7 +517,7 @@ int main(int argc, char* argv[]) {
             .f_max = 16000,
             .rate_max = 30,
         };
-        vis_role = &client.add_visualizer(VisualizerRole::Config{.support = vis});
+        vis_role = &client.add_visualizer(VisualizerRoleConfig{.support = vis});
     }
 
     // --- Listener implementations ---

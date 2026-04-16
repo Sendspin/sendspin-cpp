@@ -194,7 +194,7 @@ int main(int argc, char* argv[]) {
     SendspinClient client(std::move(config));
 
     // Add roles
-    PlayerRole::Config player_config;
+    PlayerRoleConfig player_config;
     player_config.audio_formats = {
         {SendspinCodecFormat::FLAC, 2, 44100, 16},
         {SendspinCodecFormat::FLAC, 2, 48000, 16},

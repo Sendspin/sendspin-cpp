@@ -50,7 +50,7 @@ Add only the roles your application needs. All roles must be added before callin
 The player role handles audio decoding and synchronized playback. It requires a configuration struct that declares which audio formats your hardware supports.
 
 ```cpp
-PlayerRole::Config player_config;
+PlayerRoleConfig player_config;
 player_config.audio_formats = {
     {SendspinCodecFormat::FLAC, 2, 44100, 16},
     {SendspinCodecFormat::FLAC, 2, 48000, 16},
@@ -100,7 +100,7 @@ auto& metadata = client.add_metadata();
 Receives album artwork images from the server. Requires a configuration struct declaring preferred image formats per slot.
 
 ```cpp
-ArtworkRole::Config artwork_config;
+ArtworkRoleConfig artwork_config;
 artwork_config.preferred_formats = {
     {0, SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 300, 300},
 };
@@ -566,7 +566,7 @@ int main() {
 
     SendspinClient client(std::move(config));
 
-    PlayerRole::Config player_config;
+    PlayerRoleConfig player_config;
     player_config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
     auto& player = client.add_player(std::move(player_config));
 
@@ -608,7 +608,7 @@ Main client configuration passed to the `SendspinClient` constructor.
 
 ---
 
-### PlayerRole::Config
+### PlayerRoleConfig
 
 Configuration passed to `client.add_player()`.
 
@@ -632,7 +632,7 @@ Each entry in `audio_formats` is an `AudioSupportedFormatObject`:
 
 ---
 
-### ArtworkRole::Config
+### ArtworkRoleConfig
 
 Configuration passed to `client.add_artwork()`.
 
@@ -654,7 +654,7 @@ Each entry in `preferred_formats` is an `ImageSlotPreference`:
 
 ---
 
-### VisualizerRole::Config
+### VisualizerRoleConfig
 
 Configuration passed to `client.add_visualizer()`.
 
