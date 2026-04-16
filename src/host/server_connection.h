@@ -76,6 +76,10 @@ public:
     /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete) override;
 
+    /// @brief Sends a client/time message, capturing the timestamp synchronously before send
+    /// @return true if the message was sent successfully, false otherwise.
+    bool send_time_message() override;
+
     /// @brief Requests the WebSocket connection to close
     void trigger_close();
 

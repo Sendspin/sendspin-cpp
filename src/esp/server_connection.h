@@ -91,6 +91,14 @@ public:
     /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete) override;
 
+    /// @brief Sends a client/time message, stamping the timestamp inside the httpd worker
+    ///
+    /// Schedules a worker job that captures `client_transmitted` and serializes the JSON
+    /// just before calling `httpd_ws_send_frame_async`, eliminating hub→worker queue latency
+    /// from the measured client timestamp.
+    /// @return true if the worker job was queued successfully, false otherwise.
+    bool send_time_message() override;
+
     /// @brief Triggers the underlying socket to close
     ///
     /// This is a low-level method that directly triggers the httpd session to close.
@@ -121,6 +129,13 @@ protected:
     /// @brief httpd_queue_work callback that sends a queued text frame over the WebSocket
     /// @param arg Pointer to the AsyncRespArg context allocated by send_text_message().
     static void async_send_text(void* arg);
+
+    /// @brief httpd_queue_work callback that builds and sends a client/time frame
+    ///
+    /// Captures the client_transmitted timestamp inside the worker (just before
+    /// `httpd_ws_send_frame_async`), serializes the JSON, then sends.
+    /// @param arg The owning `SendspinServerConnection*` (passed directly, not heap-allocated).
+    static void async_send_time_text(void* arg);
 
     // Pointer fields
 

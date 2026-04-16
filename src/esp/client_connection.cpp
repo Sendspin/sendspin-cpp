@@ -15,6 +15,7 @@
 #include "client_connection.h"
 
 #include "platform/logging.h"
+#include "protocol_messages.h"
 #include <esp_timer.h>
 
 #include <cstring>
@@ -158,6 +159,31 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     }
 
     return SsErr::OK;
+}
+
+bool SendspinClientConnection::send_time_message() {
+    if (!this->is_connected()) {
+        return false;
+    }
+
+    // Capture client_transmitted as close to the actual send call as possible. Track the
+    // serialization duration as the bias subtracted from the embedded timestamp. Stack buffer
+    // keeps the path heap-free.
+    char buf[96];
+    const int64_t client_transmitted = esp_timer_get_time();
+    const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
+    this->update_serialize_ema(esp_timer_get_time() - client_transmitted);
+    if (len == 0) {
+        return false;
+    }
+
+    int sent = esp_websocket_client_send_text(this->client_, buf, len,
+                                              pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
+    if (sent < 0) {
+        SS_LOGE(TAG, "Failed to send time message: %d", sent);
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================

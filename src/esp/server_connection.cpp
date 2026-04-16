@@ -17,6 +17,7 @@
 #include "lwip/sockets.h"  // for setsockopt, IPPROTO_TCP, NODELAY
 #include "platform/logging.h"
 #include "platform/memory.h"
+#include "protocol_messages.h"
 #include <esp_timer.h>
 
 #include <cstring>
@@ -207,6 +208,48 @@ esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receiv
     return ESP_OK;
 }
 
+bool SendspinServerConnection::send_time_message() {
+    if (!this->is_connected()) {
+        return false;
+    }
+
+    // The worker job only needs the connection pointer (no buffer to free), so pass `this`
+    // directly. The JSON is built inside the worker so client_transmitted is captured as
+    // close to the wire send as possible.
+    if (httpd_queue_work(this->server_, async_send_time_text, this) != ESP_OK) {
+        SS_LOGE(TAG, "httpd_queue_work failed for time message");
+        return false;
+    }
+    return true;
+}
+
+void SendspinServerConnection::async_send_time_text(void* arg) {
+    auto* this_conn = static_cast<SendspinServerConnection*>(arg);
+
+    if (!this_conn->is_connected()) {
+        return;
+    }
+
+    // Capture client_transmitted as close as possible to the actual send. The serialization
+    // happens between this capture and the wire send; track its duration so the bias is
+    // visible in the time_burst log. Stack buffer keeps the path heap-free.
+    char buf[96];
+    const int64_t client_transmitted = esp_timer_get_time();
+    const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
+    this_conn->update_serialize_ema(esp_timer_get_time() - client_transmitted);
+    if (len == 0) {
+        return;
+    }
+
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+    ws_pkt.payload = reinterpret_cast<uint8_t*>(buf);
+    ws_pkt.len = len;
+    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+
+    httpd_ws_send_frame_async(this_conn->server_, this_conn->sockfd_, &ws_pkt);
+}
+
 void SendspinServerConnection::async_send_text(void* arg) {
     struct AsyncRespArg* resp_arg = (AsyncRespArg*)arg;
     httpd_ws_frame_t ws_pkt;
@@ -219,12 +262,12 @@ void SendspinServerConnection::async_send_text(void* arg) {
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
 
     bool send_success = false;
+    const int64_t after_send_time = esp_timer_get_time();
+
     if (this_conn->is_connected()) {
         esp_err_t err = httpd_ws_send_frame_async(this_conn->server_, this_conn->sockfd_, &ws_pkt);
         send_success = (err == ESP_OK);
     }
-
-    const int64_t after_send_time = esp_timer_get_time();
 
     // Call the completion callback if provided
     if (resp_arg->has_callback) {

@@ -74,6 +74,10 @@ public:
     /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb) override;
 
+    /// @brief Sends a client/time message, capturing the timestamp synchronously before send
+    /// @return true if the message was sent successfully, false otherwise.
+    bool send_time_message() override;
+
     /// @brief Enables or disables automatic reconnection after connection loss
     /// @param enabled True to reconnect automatically, false to stay disconnected.
     void set_auto_reconnect(bool enabled) {

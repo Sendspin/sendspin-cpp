@@ -16,6 +16,7 @@
 
 #include "platform/logging.h"
 #include "platform/time.h"
+#include "protocol_messages.h"
 
 #include <algorithm>
 
@@ -67,15 +68,30 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
         return SsErr::INVALID_STATE;
     }
 
+    int64_t send_time = platform_time_us();
     auto info = this->ws_->send(message);
-    int64_t after_send_time = platform_time_us();
     bool success = info.success;
 
     if (on_complete) {
-        on_complete(success, after_send_time);
+        on_complete(success, send_time);
     }
 
     return success ? SsErr::OK : SsErr::FAIL;
+}
+
+bool SendspinServerConnection::send_time_message() {
+    if (!this->is_connected()) {
+        return false;
+    }
+
+    char buf[96];
+    const int64_t client_transmitted = platform_time_us();
+    const size_t len = format_client_time_message(buf, sizeof(buf), client_transmitted);
+    this->update_serialize_ema(platform_time_us() - client_transmitted);
+    if (len == 0) {
+        return false;
+    }
+    return this->ws_->send(std::string(buf, len)).success;
 }
 
 void SendspinServerConnection::trigger_close() {
