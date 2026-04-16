@@ -820,13 +820,13 @@ std::string format_client_goodbye_message(SendspinGoodbyeReason reason) {
 namespace {
 
 /// Maximum decimal digits in a uint64_t value.
-static constexpr int MAX_UINT64_DIGITS = 19;
+constexpr int MAX_UINT64_DIGITS = 19;
 
 /// Radix used for two-digit-at-a-time integer formatting.
-static constexpr uint64_t RADIX_100 = 100U;
+constexpr uint64_t RADIX_100 = 100U;
 
 /// Threshold for single vs. two-digit final write.
-static constexpr uint64_t RADIX_10 = 10U;
+constexpr uint64_t RADIX_10 = 10U;
 
 // Two-digit ASCII lookup. Index 2*N..2*N+1 holds the decimal digits of N for N in [0, 99].
 // Lets us emit two characters per 64-bit division instead of one, halving the libgcc
