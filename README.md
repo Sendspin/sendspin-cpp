@@ -32,7 +32,14 @@ Dependencies (fetched automatically via CMake FetchContent): ArduinoJson, micro-
 
 ### ESP-IDF
 
-Used as an IDF component. Add to your project's `idf_component.yml`.
+Available on the [ESP-IDF Component Registry](https://components.espressif.com/components/sendspin/sendspin-cpp). Add to your project's `idf_component.yml`:
+
+```yaml
+dependencies:
+  sendspin/sendspin-cpp: ">=0.1.2"
+```
+
+Requires ESP-IDF v5.1 or later.
 
 ## Examples
 
