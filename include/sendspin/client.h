@@ -325,10 +325,10 @@ public:
     /// @return Equivalent client-side timestamp in microseconds
     int64_t get_client_time(int64_t server_time) const;
 
-    /// @brief Returns the current group name (empty string if none)
-    /// @return Current group name string, or empty string if not in a group
-    std::string get_group_name() const {
-        return this->group_state_.group_name.value_or("");
+    /// @brief Returns the current group state
+    /// @return The current GroupUpdateObject (fields are optional and may be unset)
+    const GroupUpdateObject& get_group_state() const {
+        return this->group_state_;
     }
 
     // ========================================

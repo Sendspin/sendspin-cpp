@@ -938,7 +938,7 @@ void update_polled_state(TuiState& state, SendspinClient& client) {
     state.static_delay_ms = client.player() ? client.player()->get_static_delay_ms() : 0;
     state.player_volume = client.player() ? client.player()->get_volume() : 0;
     state.player_muted = client.player() ? client.player()->get_muted() : false;
-    state.group_name = client.get_group_name();
+    state.group_name = client.get_group_state().group_name.value_or("");
 
     if (client.controller()) {
         auto& cs = client.controller()->get_controller_state();
