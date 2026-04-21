@@ -68,6 +68,24 @@ public:
         return true;
     }
 
+    /// @brief Move the accumulated value out if dirty and the predicate accepts it
+    /// @param[out] out Receives the stored value if taken.
+    /// @param pred Callable invoked as `bool(const T&)` under the lock; the value is taken
+    /// only if it returns true. The value is left in place unchanged if the predicate returns
+    /// false, so a later call can re-check.
+    /// @return true if a value was taken, false if the slot was clean or the predicate rejected.
+    template <typename Predicate>
+    bool take_if(T& out, Predicate&& pred) {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        if (!this->dirty_ || !pred(static_cast<const T&>(this->slot_))) {
+            return false;
+        }
+        out = std::move(this->slot_);
+        this->slot_ = T{};
+        this->dirty_ = false;
+        return true;
+    }
+
     /// @brief Discard any pending value
     void reset() {
         std::lock_guard<std::mutex> lock(this->mutex_);

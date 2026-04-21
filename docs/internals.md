@@ -232,7 +232,7 @@ The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering
 ### Other Roles
 
 - **ControllerRole**: Takes from shadow, fires `on_controller_state()`.
-- **MetadataRole**: Takes from shadow, applies deltas, fires `on_metadata()`.
+- **MetadataRole**: Takes from shadow when the pending update's `timestamp` has been reached on the synced client clock (or immediately if time sync is not yet ready), applies deltas, fires `on_metadata()`.
 - **ArtworkRole**: Drains event queue, processes stream start/end/clear with shadow config. On `STREAM_END` and `STREAM_CLEAR`, fires `on_image_clear()` for each configured slot. Image data delivery (`on_image_decode` and `on_image_display`) happens on the dedicated artwork drain thread, not here.
 - **VisualizerRole**: Drains event queue, processes stream start/end/clear with shadow config.
 
