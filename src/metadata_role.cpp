@@ -108,11 +108,25 @@ void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject state) co
 
 void MetadataRole::Impl::drain_events() {
     ServerMetadataStateObject delta{};
-    if (this->event_state->shadow.take(delta)) {
-        apply_metadata_state_deltas(&this->metadata, delta);
-        if (this->listener) {
-            this->listener->on_metadata(this->metadata);
-        }
+    // Caveat: merged deltas carry only the newest timestamp, so a past-valid field merged
+    // under a later future-valid update gets held back until the later deadline. Accepted
+    // since overlapping fields are last-writer-wins anyway.
+    const bool taken =
+        this->event_state->shadow.take_if(delta, [this](const ServerMetadataStateObject& pending) {
+            // Fire immediately if time sync isn't ready: without sync we can't honor the
+            // deadline anyway, and holding forever would starve the listener.
+            int64_t client_ts = this->client->get_client_time(pending.timestamp);
+            if (client_ts == 0) {
+                return true;
+            }
+            return client_ts <= platform_time_us();
+        });
+    if (!taken) {
+        return;
+    }
+    apply_metadata_state_deltas(&this->metadata, delta);
+    if (this->listener) {
+        this->listener->on_metadata(this->metadata);
     }
 }
 
