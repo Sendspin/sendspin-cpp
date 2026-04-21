@@ -222,7 +222,7 @@ The `ServerMetadataStateObject` contains these fields (all optional except `time
 
 | Field | Type | Description |
 |---|---|---|
-| `timestamp` | `int64_t` | Server timestamp |
+| `timestamp` | `int64_t` | Server clock µs at which this metadata becomes valid; delivery is held until the synced client clock reaches it |
 | `title` | `std::optional<std::string>` | Track title |
 | `artist` | `std::optional<std::string>` | Track artist |
 | `album_artist` | `std::optional<std::string>` | Album artist |
