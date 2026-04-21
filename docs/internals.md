@@ -95,7 +95,6 @@ Single-slot state container with "latest wins" or custom merge semantics. The ne
 | `PlayerRole::Impl::shadow_command` | `ServerCommandMessage` | Field-by-field merge (volume, mute, delay independent) |
 | `ControllerRole::Impl::shadow` | `ServerStateControllerObject` | Latest wins |
 | `MetadataRole::Impl::shadow` | `ServerMetadataStateObject` | Field-by-field delta merge |
-| `ArtworkRole::Impl::shadow_config` | `ServerArtworkStreamObject` | Latest wins |
 | `VisualizerRole::Impl::shadow_config` | `ServerVisualizerStreamObject` | Latest wins |
 | `SyncTask::playback_progress_slot_` | `PlaybackProgress` | Sum `frames_played`, keep latest `finish_timestamp` |
 
@@ -150,7 +149,7 @@ Network thread (IXWebSocket / esp_http_server)
 | `SERVER_STATE` | Writes to `ControllerRole::Impl::shadow` and `MetadataRole::Impl::shadow` |
 | `SERVER_COMMAND` | Merges into `PlayerRole::Impl::shadow_command` |
 | `GROUP_UPDATE` | Merges into `Client::shadow_group` |
-| `STREAM_START` | Writes to `PlayerRole::Impl::shadow_stream_params`, enqueues `STREAM_START` into `stream_queue`. Writes to `ArtworkRole::Impl::shadow_config` and `VisualizerRole::Impl::shadow_config`, enqueues start events. |
+| `STREAM_START` | Writes to `PlayerRole::Impl::shadow_stream_params`, enqueues `STREAM_START` into `stream_queue`. Marks the artwork stream active and flushes the drain thread. Writes to `VisualizerRole::Impl::shadow_config`, enqueues a start event. |
 | `STREAM_END` | Enqueues `STREAM_END` into player/artwork/visualizer queues, signals sync task `COMMAND_STREAM_END` |
 | `STREAM_CLEAR` | Enqueues `STREAM_CLEAR` into player/artwork/visualizer queues, signals sync task `COMMAND_STREAM_CLEAR` |
 
@@ -233,7 +232,7 @@ The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering
 
 - **ControllerRole**: Takes from shadow, fires `on_controller_state()`.
 - **MetadataRole**: Takes from shadow when the pending update's `timestamp` has been reached on the synced client clock (or immediately if time sync is not yet ready), applies deltas, fires `on_metadata()`.
-- **ArtworkRole**: Drains event queue, processes stream start/end/clear with shadow config. On `STREAM_END` and `STREAM_CLEAR`, fires `on_image_clear()` for each configured slot. Image data delivery (`on_image_decode` and `on_image_display`) happens on the dedicated artwork drain thread, not here.
+- **ArtworkRole**: Drains event queue for stream end/clear lifecycle events. On `STREAM_END` and `STREAM_CLEAR`, fires `on_image_clear()` for each configured slot. Image data delivery (`on_image_decode` and `on_image_display`) happens on the dedicated artwork drain thread, not here.
 - **VisualizerRole**: Drains event queue, processes stream start/end/clear with shadow config.
 
 ## Sync Task State Machine

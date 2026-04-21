@@ -281,10 +281,6 @@ struct MyArtworkListener : ArtworkRoleListener {
     void on_image_clear(uint8_t slot) override {
         display.clear_slot(slot);
     }
-
-    // Called from the main loop thread on stream lifecycle events.
-    void on_artwork_stream_start(const ServerArtworkStreamObject& stream) override { }
-    void on_artwork_stream_end() override { }
 };
 ```
 

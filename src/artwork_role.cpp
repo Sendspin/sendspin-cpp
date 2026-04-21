@@ -174,17 +174,13 @@ void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
 // Stream lifecycle (network thread)
 // ============================================================================
 
-void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream) {
+void ArtworkRole::Impl::handle_stream_start() {
     this->stream_active = true;
 
     // Signal drain thread to flush any stale notifications
     if (this->drain_task) {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
-
-    // Shadow the config for main-thread callback
-    this->event_state->shadow_config.write(stream);
-    this->event_state->queue.send(ArtworkEventType::STREAM_START, 0);
 }
 
 void ArtworkRole::Impl::handle_stream_end() {
@@ -215,21 +211,7 @@ void ArtworkRole::Impl::drain_events() {
     ArtworkEventType event_type{};
     while (this->event_state->queue.receive(event_type, 0)) {
         switch (event_type) {
-            case ArtworkEventType::STREAM_START: {
-                ServerArtworkStreamObject config{};
-                if (this->event_state->shadow_config.take(config) && this->listener) {
-                    this->listener->on_artwork_stream_start(config);
-                }
-                break;
-            }
             case ArtworkEventType::STREAM_END:
-                if (this->listener) {
-                    for (const auto& pref : this->config.preferred_formats) {
-                        this->listener->on_image_clear(pref.slot);
-                    }
-                    this->listener->on_artwork_stream_end();
-                }
-                break;
             case ArtworkEventType::STREAM_CLEAR:
                 if (this->listener) {
                     for (const auto& pref : this->config.preferred_formats) {
@@ -253,7 +235,6 @@ void ArtworkRole::Impl::cleanup() {
     }
 
     this->event_state->queue.reset();
-    this->event_state->shadow_config.reset();
     this->event_state->queue.send(ArtworkEventType::STREAM_END, 0);
 }
 
