@@ -22,49 +22,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <optional>
-#include <string>
-#include <vector>
 
 namespace sendspin {
 
 class SendspinClient;
 
-// ============================================================================
-// Artwork types
-// ============================================================================
-
-/// @brief Format and resolution for a single supported artwork channel
-struct ArtworkChannelFormatObject {
-    SendspinImageSource source{};
-    SendspinImageFormat format{};
-    uint16_t media_width{};
-    uint16_t media_height{};
-};
-
-/// @brief Server-side description of one artwork channel's format and dimensions
-struct ServerArtworkChannelObject {
-    std::optional<SendspinImageSource> source;
-    std::optional<SendspinImageFormat> format;
-    std::optional<uint16_t> width;
-    std::optional<uint16_t> height;
-
-    /// @brief Returns true if all fields in this channel have received data
-    bool is_complete() const {
-        return source.has_value() && format.has_value() && width.has_value() && height.has_value();
-    }
-};
-
-/// @brief Artwork stream parameters sent by the server in stream/start messages
-struct ServerArtworkStreamObject {
-    std::optional<std::vector<ServerArtworkChannelObject>> channels;
-};
-
 /// @brief Listener for artwork role events
 ///
 /// THREAD SAFETY: on_image_decode() and on_image_display() fire on a dedicated drain thread.
-/// Implementations must be thread-safe for these two methods. on_image_clear(),
-/// on_artwork_stream_start(), and on_artwork_stream_end() fire on the main loop thread.
+/// Implementations must be thread-safe for these two methods. on_image_clear() fires on the
+/// main loop thread.
 class ArtworkRoleListener {
 public:
     virtual ~ArtworkRoleListener() = default;
@@ -85,21 +52,13 @@ public:
     ///
     /// Fires after on_image_decode() once the server timestamp is reached.
     /// @param slot The artwork slot index.
-    /// @param client_timestamp Client-domain timestamp in microseconds.
-    virtual void on_image_display(uint8_t /*slot*/, int64_t /*client_timestamp*/) {}
+    virtual void on_image_display(uint8_t /*slot*/) {}
 
     /// @brief Called on the main loop thread when artwork should be cleared for a slot
     ///
     /// Fires on stream end or stream clear for each configured slot.
     /// @param slot The artwork slot index to clear.
     virtual void on_image_clear(uint8_t /*slot*/) {}
-
-    /// @brief Called on the main loop thread when a new artwork stream starts
-    /// @param stream Artwork stream parameters from the server.
-    virtual void on_artwork_stream_start(const ServerArtworkStreamObject& /*stream*/) {}
-
-    /// @brief Called on the main loop thread when the artwork stream ends
-    virtual void on_artwork_stream_end() {}
 };
 
 /**
@@ -124,7 +83,7 @@ public:
  *                          SendspinImageFormat format) override {
  *         decoded_images[slot] = decode(data, length, format);
  *     }
- *     void on_image_display(uint8_t slot, int64_t client_timestamp) override {
+ *     void on_image_display(uint8_t slot) override {
  *         display.show_image(slot, decoded_images[slot]);
  *     }
  *     void on_image_clear(uint8_t slot) override {

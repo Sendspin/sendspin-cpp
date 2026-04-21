@@ -273,7 +273,7 @@ struct MyArtworkListener : ArtworkRoleListener {
 
     // Called from the drain thread at the correct playback timestamp.
     // Swap the decoded image onto the display.
-    void on_image_display(uint8_t slot, int64_t client_timestamp) override {
+    void on_image_display(uint8_t slot) override {
         display.show_image(slot, decoded_images[slot]);
     }
 
@@ -281,10 +281,6 @@ struct MyArtworkListener : ArtworkRoleListener {
     void on_image_clear(uint8_t slot) override {
         display.clear_slot(slot);
     }
-
-    // Called from the main loop thread on stream lifecycle events.
-    void on_artwork_stream_start(const ServerArtworkStreamObject& stream) override { }
-    void on_artwork_stream_end() override { }
 };
 ```
 

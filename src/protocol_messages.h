@@ -441,6 +441,32 @@ inline std::optional<SendspinImageSource> image_source_from_string(const std::st
     return std::nullopt;
 }
 
+/// @brief Format and resolution for a single supported artwork channel
+struct ArtworkChannelFormatObject {
+    SendspinImageSource source{};
+    SendspinImageFormat format{};
+    uint16_t media_width{};
+    uint16_t media_height{};
+};
+
+/// @brief Server-side description of one artwork channel's format and dimensions
+struct ServerArtworkChannelObject {
+    std::optional<SendspinImageSource> source;
+    std::optional<SendspinImageFormat> format;
+    std::optional<uint16_t> width;
+    std::optional<uint16_t> height;
+
+    /// @brief Returns true if all fields in this channel have received data
+    bool is_complete() const {
+        return source.has_value() && format.has_value() && width.has_value() && height.has_value();
+    }
+};
+
+/// @brief Artwork stream parameters sent by the server in stream/start messages
+struct ServerArtworkStreamObject {
+    std::optional<std::vector<ServerArtworkChannelObject>> channels;
+};
+
 /// @brief Artwork capabilities advertised to the server during the hello handshake
 struct ArtworkSupportObject {
     std::vector<ArtworkChannelFormatObject> channels;

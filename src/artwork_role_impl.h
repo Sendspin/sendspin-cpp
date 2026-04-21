@@ -19,8 +19,8 @@
 
 #include "platform/event_flags.h"
 #include "platform/memory.h"
-#include "platform/shadow_slot.h"
 #include "platform/thread_safe_queue.h"
+#include "protocol_messages.h"
 #include "sendspin/artwork_role.h"
 
 #include <atomic>
@@ -37,7 +37,6 @@ struct ClientHelloMessage;
 
 /// @brief Deferred artwork event types
 enum class ArtworkEventType : uint8_t {
-    STREAM_START,
     STREAM_END,
     STREAM_CLEAR,
 };
@@ -86,7 +85,6 @@ struct ArtworkRole::Impl {
     /// @brief Deferred event state for thread-safe artwork stream lifecycle delivery
     struct EventState {
         ThreadSafeQueue<ArtworkEventType> queue;
-        ShadowSlot<ServerArtworkStreamObject> shadow_config;
     };
 
     // ========================================
@@ -96,7 +94,7 @@ struct ArtworkRole::Impl {
     bool start();
     void build_hello_fields(ClientHelloMessage& msg) const;
     void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
-    void handle_stream_start(const ServerArtworkStreamObject& stream);
+    void handle_stream_start();
     void handle_stream_end();
     void handle_stream_clear();
     void drain_events();
