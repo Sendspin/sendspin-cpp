@@ -85,8 +85,7 @@ public:
     ///
     /// Fires after on_image_decode() once the server timestamp is reached.
     /// @param slot The artwork slot index.
-    /// @param client_timestamp Client-domain timestamp in microseconds.
-    virtual void on_image_display(uint8_t /*slot*/, int64_t /*client_timestamp*/) {}
+    virtual void on_image_display(uint8_t /*slot*/) {}
 
     /// @brief Called on the main loop thread when artwork should be cleared for a slot
     ///
@@ -124,7 +123,7 @@ public:
  *                          SendspinImageFormat format) override {
  *         decoded_images[slot] = decode(data, length, format);
  *     }
- *     void on_image_display(uint8_t slot, int64_t client_timestamp) override {
+ *     void on_image_display(uint8_t slot) override {
  *         display.show_image(slot, decoded_images[slot]);
  *     }
  *     void on_image_clear(uint8_t slot) override {

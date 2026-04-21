@@ -273,7 +273,7 @@ struct MyArtworkListener : ArtworkRoleListener {
 
     // Called from the drain thread at the correct playback timestamp.
     // Swap the decoded image onto the display.
-    void on_image_display(uint8_t slot, int64_t client_timestamp) override {
+    void on_image_display(uint8_t slot) override {
         display.show_image(slot, decoded_images[slot]);
     }
 

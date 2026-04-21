@@ -341,7 +341,7 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
 
         // Display/swap callback
         if (self->listener) {
-            self->listener->on_image_display(slot, client_ts);
+            self->listener->on_image_display(slot);
         }
     }
 
