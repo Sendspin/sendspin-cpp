@@ -478,7 +478,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const std::s
 
 #ifdef SENDSPIN_ENABLE_PLAYER
             if (this->player_ && stream_msg.player.has_value()) {
-                this->player_->impl_->handle_stream_start(stream_msg);
+                this->player_->impl_->handle_stream_start(stream_msg.player.value());
             }
 #endif
 

@@ -233,7 +233,7 @@ void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) const {
     }
 }
 
-void PlayerRole::Impl::handle_stream_start(const StreamStartMessage& stream_msg) {
+void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) {
     if (this->config.audio_formats.empty()) {
         // No audio formats, just defer stream start callback
         this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_START, 0);
@@ -246,55 +246,47 @@ void PlayerRole::Impl::handle_stream_start(const StreamStartMessage& stream_msg)
         this->high_performance_requested_for_playback = true;
     }
 
-    if (stream_msg.player.has_value()) {
-        const ServerPlayerStreamObject& player_obj = stream_msg.player.value();
-
-        if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
-            !player_obj.sample_rate.has_value() || !player_obj.codec.has_value()) {
-            SS_LOGE(TAG, "Stream start message missing required audio parameters");
-            return;
-        }
-
-        auto codec = player_obj.codec.value();
-        bool header_sent = false;
-
-        if ((codec == SendspinCodecFormat::PCM) || (codec == SendspinCodecFormat::OPUS)) {
-            DummyHeader header{};
-            header.sample_rate = player_obj.sample_rate.value();
-            header.bits_per_sample = player_obj.bit_depth.value();
-            header.channels = player_obj.channels.value();
-
-            ChunkType chunk_type = (codec == SendspinCodecFormat::PCM)
-                                       ? CHUNK_TYPE_PCM_DUMMY_HEADER
-                                       : CHUNK_TYPE_OPUS_DUMMY_HEADER;
-
-            header_sent =
-                this->send_audio_chunk(reinterpret_cast<const uint8_t*>(&header),
-                                       sizeof(DummyHeader), 0, chunk_type, HEADER_SEND_TIMEOUT_MS);
-        } else if (codec == SendspinCodecFormat::FLAC) {
-            if (!player_obj.codec_header.has_value()) {
-                SS_LOGE(TAG, "FLAC codec header missing");
-                return;
-            }
-            std::vector<uint8_t> flac_header = base64_decode(player_obj.codec_header.value());
-            header_sent = this->send_audio_chunk(flac_header.data(), flac_header.size(), 0,
-                                                 CHUNK_TYPE_FLAC_HEADER, HEADER_SEND_TIMEOUT_MS);
-        }
-
-        if (!header_sent) {
-            SS_LOGE(TAG, "Failed to send codec header");
-            this->sync_task->signal_stream_end();
-            this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_END, 0);
-            return;
-        }
-
-        // Shadow stream params for main thread, then signal
-        this->event_state->shadow_stream_params.write(player_obj);
-        this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_START, 0);
-    } else {
-        // No player in stream start -- sync task is already running (idle)
-        this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_START, 0);
+    if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
+        !player_obj.sample_rate.has_value() || !player_obj.codec.has_value()) {
+        SS_LOGE(TAG, "Stream start message missing required audio parameters");
+        return;
     }
+
+    auto codec = player_obj.codec.value();
+    bool header_sent = false;
+
+    if ((codec == SendspinCodecFormat::PCM) || (codec == SendspinCodecFormat::OPUS)) {
+        DummyHeader header{};
+        header.sample_rate = player_obj.sample_rate.value();
+        header.bits_per_sample = player_obj.bit_depth.value();
+        header.channels = player_obj.channels.value();
+
+        ChunkType chunk_type = (codec == SendspinCodecFormat::PCM) ? CHUNK_TYPE_PCM_DUMMY_HEADER
+                                                                   : CHUNK_TYPE_OPUS_DUMMY_HEADER;
+
+        header_sent =
+            this->send_audio_chunk(reinterpret_cast<const uint8_t*>(&header), sizeof(DummyHeader),
+                                   0, chunk_type, HEADER_SEND_TIMEOUT_MS);
+    } else if (codec == SendspinCodecFormat::FLAC) {
+        if (!player_obj.codec_header.has_value()) {
+            SS_LOGE(TAG, "FLAC codec header missing");
+            return;
+        }
+        std::vector<uint8_t> flac_header = base64_decode(player_obj.codec_header.value());
+        header_sent = this->send_audio_chunk(flac_header.data(), flac_header.size(), 0,
+                                             CHUNK_TYPE_FLAC_HEADER, HEADER_SEND_TIMEOUT_MS);
+    }
+
+    if (!header_sent) {
+        SS_LOGE(TAG, "Failed to send codec header");
+        this->sync_task->signal_stream_end();
+        this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_END, 0);
+        return;
+    }
+
+    // Shadow stream params for main thread, then signal
+    this->event_state->shadow_stream_params.write(player_obj);
+    this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_START, 0);
 }
 
 void PlayerRole::Impl::handle_stream_end() const {
