@@ -194,12 +194,15 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
                 SS_LOGW(TAG, "Artwork channel %zu format mismatch", i);
             }
             if (srv.width.has_value() && srv.width.value() != req.media_width) {
-                SS_LOGW(TAG, "Artwork channel %zu width mismatch: server %u, expected %u", i,
-                        srv.width.value(), req.media_width);
+                SS_LOGW(TAG,
+                        "Artwork channel %zu width mismatch: server %" PRIu16 ", expected %" PRIu16,
+                        i, srv.width.value(), req.media_width);
             }
             if (srv.height.has_value() && srv.height.value() != req.media_height) {
-                SS_LOGW(TAG, "Artwork channel %zu height mismatch: server %u, expected %u", i,
-                        srv.height.value(), req.media_height);
+                SS_LOGW(TAG,
+                        "Artwork channel %zu height mismatch: server %" PRIu16
+                        ", expected %" PRIu16,
+                        i, srv.height.value(), req.media_height);
             }
         }
     }
