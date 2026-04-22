@@ -31,7 +31,6 @@ class SendspinClient;
 class SendspinPersistenceProvider;
 struct ClientHelloMessage;
 struct ClientStateMessage;
-struct StreamStartMessage;
 
 /// @brief Deferred stream lifecycle callback types queued from the network thread
 enum class PlayerStreamCallbackType : uint8_t {
@@ -64,7 +63,7 @@ struct PlayerRole::Impl {
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
     void handle_binary(const uint8_t* data, size_t len) const;
-    void handle_stream_start(const StreamStartMessage& stream_msg);
+    void handle_stream_start(const ServerPlayerStreamObject& player_obj);
     void handle_stream_end() const;
     void handle_stream_clear() const;
     void handle_server_command(const ServerCommandMessage& cmd) const;

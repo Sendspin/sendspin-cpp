@@ -20,6 +20,7 @@
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 
+#include <algorithm>
 #include <cstring>
 
 static const char* const TAG = "sendspin.artwork";
@@ -175,7 +176,37 @@ void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
 // Stream lifecycle (network thread)
 // ============================================================================
 
-void ArtworkRole::Impl::handle_stream_start() {
+void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream) {
+    if (stream.channels.has_value()) {
+        const auto& server_channels = stream.channels.value();
+        if (server_channels.size() != this->artwork_channels.size()) {
+            SS_LOGW(TAG, "Artwork channel count mismatch: server sent %zu, expected %zu",
+                    server_channels.size(), this->artwork_channels.size());
+        }
+        size_t n = std::min(server_channels.size(), this->artwork_channels.size());
+        for (size_t i = 0; i < n; ++i) {
+            const auto& srv = server_channels[i];
+            const auto& req = this->artwork_channels[i];
+            if (srv.source.has_value() && srv.source.value() != req.source) {
+                SS_LOGW(TAG, "Artwork channel %zu source mismatch", i);
+            }
+            if (srv.format.has_value() && srv.format.value() != req.format) {
+                SS_LOGW(TAG, "Artwork channel %zu format mismatch", i);
+            }
+            if (srv.width.has_value() && srv.width.value() != req.media_width) {
+                SS_LOGW(TAG,
+                        "Artwork channel %zu width mismatch: server %" PRIu16 ", expected %" PRIu16,
+                        i, srv.width.value(), req.media_width);
+            }
+            if (srv.height.has_value() && srv.height.value() != req.media_height) {
+                SS_LOGW(TAG,
+                        "Artwork channel %zu height mismatch: server %" PRIu16
+                        ", expected %" PRIu16,
+                        i, srv.height.value(), req.media_height);
+            }
+        }
+    }
+
     this->stream_active = true;
 
     // Signal decode thread to flush any stale notifications

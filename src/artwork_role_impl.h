@@ -106,7 +106,7 @@ struct ArtworkRole::Impl {
     bool start();
     void build_hello_fields(ClientHelloMessage& msg) const;
     void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
-    void handle_stream_start();
+    void handle_stream_start(const ServerArtworkStreamObject& stream);
     void handle_stream_end();
     void handle_stream_clear();
     void drain_events();
