@@ -10,6 +10,21 @@ Each role class uses the pimpl (pointer to implementation) pattern. The public h
 
 Throughout this document, internal field and method references use the `Impl` qualification (e.g., `PlayerRole::Impl::drain_events()`) to reflect the actual code location.
 
+## Conditional Compilation
+
+Roles can be disabled at build time via `SENDSPIN_ENABLE_*` (CMake options on host, Kconfig entries on ESP-IDF). Two mechanisms cooperate, with a strict boundary between them:
+
+1. **CMake source-list exclusion** (`cmake/sources.cmake`). Each role has its own `SENDSPIN_<ROLE>_SOURCES` list. When a role is disabled, its translation units are not added to the build, so the code never compiles and its transitive dependencies are not required; e.g., micro-flac and micro-opus for the player. The ESP-IDF component manifest (`idf_component.yml`) similarly gates the audio codec dependencies on `SENDSPIN_ENABLE_PLAYER` so they are not even fetched.
+2. **`#ifdef SENDSPIN_ENABLE_<ROLE>` guards** in `include/sendspin/client.h` and `src/client.cpp`. These are the only core files that must reference role types directly (the `std::unique_ptr<RoleClass>` members, `add_*()` / accessor declarations, and dispatch branches in message handlers). Nowhere else in the core should use these guards.
+
+The split exists because the two problems are different. CMake handles "don't compile this file and don't require its dependencies," while `#ifdef` handles "core code needs to conditionally mention a type." Using `#ifdef` to gate entire files would still force the codec headers onto the include path; using CMake to gate individual member declarations is not possible.
+
+As a consequence, role-only headers;e.g., `src/decoder.h`, which pulls in `<micro_flac/flac_decoder.h>` and `<opus.h>`, must only be reachable through role-only sources or through `#ifdef`-guarded includes in `client.cpp`. Public role headers in `include/sendspin/` must remain free of codec dependencies so that core files like `src/transfer_buffer.cpp` and `src/protocol_messages.h` can include them unconditionally.
+
+When adding a new role, the checklist is: add a `SENDSPIN_<ROLE>_SOURCES` list in `cmake/sources.cmake`, add the member/accessor/dispatch guards in `client.h` and `client.cpp`, and keep any heavy dependencies behind the role's private headers.
+
+A separate `#ifdef` axis lives in `src/platform/`: headers there use `#ifdef ESP_PLATFORM` to select between ESP-IDF (FreeRTOS, `heap_caps_malloc`, `esp_log`, etc.) and host (std primitives, `malloc`, `printf`) implementations behind a common API. This is orthogonal to role selection; the split is between build targets, not features. Core sources outside `src/platform/`, `src/esp/`, and `src/host/` should never use `#ifdef ESP_PLATFORM` directly, so platform differences stay isolated to the abstraction layer.
+
 ## Thread Model
 
 The library uses a small number of long-lived threads. All state mutations and user-facing callbacks happen on the caller's main loop thread unless explicitly noted otherwise.
