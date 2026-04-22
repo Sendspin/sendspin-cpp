@@ -19,6 +19,7 @@
 
 #include "platform/event_flags.h"
 #include "platform/memory.h"
+#include "platform/shadow_slot.h"
 #include "platform/thread_safe_queue.h"
 #include "protocol_messages.h"
 #include "sendspin/artwork_role.h"
@@ -48,15 +49,16 @@ static constexpr size_t ARTWORK_MAX_SLOTS = 4;
 struct SlotBuffer {
     PlatformBuffer buffers[2];
     std::atomic<uint8_t> write_idx{0};      ///< Which buffer the network thread writes to next
-    std::atomic<bool> drain_active{false};  ///< True while the drain thread is using a buffer
-    uint8_t drain_buf_idx{0};               ///< Which buffer the drain thread is currently using
+    std::atomic<bool> drain_active{false};  ///< True while the decode thread is using a buffer
+    uint8_t drain_buf_idx{0};               ///< Which buffer the decode thread is currently using
 };
 
-/// @brief Notification sent from the network thread to the drain thread when new image data arrives
+/// @brief Notification sent from the network thread to the decode thread when new image data
+/// arrives
 ///
 /// All metadata is carried in the notification itself (not in SlotBuffer) so that the
 /// ThreadSafeQueue's internal mutex provides the happens-before guarantee between the
-/// network thread's writes and the drain thread's reads.
+/// network thread's writes and the decode thread's reads.
 struct ArtworkNotification {
     uint8_t slot;
     uint8_t buffer_idx;
@@ -74,7 +76,7 @@ struct ArtworkRole::Impl {
     // Nested types
     // ========================================
 
-    /// @brief Persistent drain thread context for artwork image decode and display delivery
+    /// @brief Persistent decode thread context for artwork image decode
     struct DrainTask {
         ThreadSafeQueue<ArtworkNotification> notify_queue;
         EventFlags event_flags;
@@ -85,6 +87,16 @@ struct ArtworkRole::Impl {
     /// @brief Deferred event state for thread-safe artwork stream lifecycle delivery
     struct EventState {
         ThreadSafeQueue<ArtworkEventType> queue;
+    };
+
+    /// @brief Pending display timestamps, one slot per artwork slot
+    ///
+    /// The decode thread writes the server timestamp after on_image_decode() completes; the
+    /// main loop reads the timestamp and fires on_image_display() once it is reached. Latest-
+    /// wins per slot: if a newer frame finishes decoding before the pending display fires,
+    /// the older timestamp is overwritten and only the newer display is delivered.
+    struct DisplayScheduler {
+        ShadowSlot<int64_t> pending[ARTWORK_MAX_SLOTS];
     };
 
     // ========================================
@@ -119,6 +131,7 @@ struct ArtworkRole::Impl {
     SendspinClient* client;
     std::unique_ptr<DrainTask> drain_task;
     std::unique_ptr<EventState> event_state;
+    std::unique_ptr<DisplayScheduler> display_scheduler;
     ArtworkRoleListener* listener{nullptr};
 
     // 8-bit fields

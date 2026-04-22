@@ -29,14 +29,14 @@ class SendspinClient;
 
 /// @brief Listener for artwork role events
 ///
-/// THREAD SAFETY: on_image_decode() and on_image_display() fire on a dedicated drain thread.
-/// Implementations must be thread-safe for these two methods. on_image_clear() fires on the
-/// main loop thread.
+/// THREAD SAFETY: on_image_decode() fires on a dedicated decode thread and must be
+/// thread-safe with respect to the other callbacks. on_image_display() and on_image_clear()
+/// fire on the main loop thread.
 class ArtworkRoleListener {
 public:
     virtual ~ArtworkRoleListener() = default;
 
-    /// @brief Called on the drain thread when encoded image data arrives
+    /// @brief Called on the decode thread when encoded image data arrives
     ///
     /// The implementation should decode the image (e.g., JPEG to bitmap) synchronously.
     /// The data pointer is valid for the duration of this call.
@@ -47,10 +47,12 @@ public:
     virtual void on_image_decode(uint8_t /*slot*/, const uint8_t* /*data*/, size_t /*length*/,
                                  SendspinImageFormat /*format*/) {}
 
-    /// @brief Called on the drain thread at the correct timestamp when the decoded image should be
-    /// displayed
+    /// @brief Called on the main loop thread at the correct timestamp when the decoded image
+    /// should be displayed
     ///
-    /// Fires after on_image_decode() once the server timestamp is reached.
+    /// Fires after on_image_decode() once the server timestamp is reached. If a newer frame for
+    /// the same slot finishes decoding before the pending display fires, the older pending
+    /// display is superseded and only the newer one is delivered.
     /// @param slot The artwork slot index.
     virtual void on_image_display(uint8_t /*slot*/) {}
 
@@ -65,11 +67,10 @@ public:
  * @brief Artwork role that receives album art and artist images from the server
  *
  * Receives binary image payloads from the server and delivers them to the platform
- * through ArtworkRoleListener callbacks. A dedicated drain thread handles two-phase
- * delivery: on_image_decode() fires immediately when data arrives for decoding, then
- * on_image_display() fires at the correct timestamp for synchronized display. Lifecycle
- * callbacks fire on the main loop thread. Supports multiple image slots with configurable
- * format and resolution preferences.
+ * through ArtworkRoleListener callbacks. A dedicated decode thread fires on_image_decode()
+ * immediately when data arrives; on_image_display() and on_image_clear() fire on the main
+ * loop thread, with on_image_display() scheduled to the server timestamp. Supports multiple
+ * image slots with configurable format and resolution preferences.
  *
  * Usage:
  * 1. Implement ArtworkRoleListener with on_image_decode() and on_image_display()
