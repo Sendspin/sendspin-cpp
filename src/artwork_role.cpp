@@ -31,10 +31,10 @@ static const char* const TAG = "sendspin.artwork";
 /// @brief Size of the big-endian 64-bit timestamp at the start of artwork binary messages
 static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
 
-/// @brief Timeout for blocking queue receive in drain thread (allows periodic command checks)
+/// @brief Timeout for blocking queue receive in decode thread (allows periodic command checks)
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 100U;
 
-// Event flag bits for drain thread signaling
+// Event flag bits for decode thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
 static constexpr uint32_t COMMAND_FLUSH = (1 << 1);
 
@@ -61,7 +61,8 @@ ArtworkRole::Impl::Impl(ArtworkRoleConfig config, SendspinClient* client)
     : config(std::move(config)),
       client(client),
       drain_task(std::make_unique<DrainTask>()),
-      event_state(std::make_unique<EventState>()) {
+      event_state(std::make_unique<EventState>()),
+      display_scheduler(std::make_unique<DisplayScheduler>()) {
     for (const auto& pref : this->config.preferred_formats) {
         this->artwork_channels.push_back({pref.source, pref.format, pref.width, pref.height});
     }
@@ -75,7 +76,7 @@ ArtworkRole::Impl::~Impl() {
 
 bool ArtworkRole::Impl::start() {
     if (!this->drain_task) {
-        SS_LOGE(TAG, "Failed to start artwork: drain task not initialized");
+        SS_LOGE(TAG, "Failed to start artwork: decode task not initialized");
         return false;
     }
     if (this->drain_task->drain_thread.joinable()) {
@@ -144,8 +145,8 @@ void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
     auto& sb = this->drain_task->slot_buffers[slot];
     uint8_t write_idx = sb.write_idx.load(std::memory_order_acquire);
 
-    // If the drain thread is actively using this buffer, skip to the other one.
-    // If the drain thread is using the other one, this write_idx is already safe.
+    // If the decode thread is actively using this buffer, skip to the other one.
+    // If the decode thread is using the other one, this write_idx is already safe.
     if (sb.drain_active.load(std::memory_order_acquire) && sb.drain_buf_idx == write_idx) {
         write_idx ^= 1;
     }
@@ -165,7 +166,7 @@ void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
     // Flip write index so the next network write goes to the other buffer
     sb.write_idx.store(write_idx ^ 1, std::memory_order_release);
 
-    // Signal drain thread with all metadata in the notification
+    // Signal decode thread with all metadata in the notification
     ArtworkNotification notif{slot, write_idx, image_len, timestamp, image_format};
     this->drain_task->notify_queue.send(notif, 0);
 }
@@ -177,9 +178,15 @@ void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
 void ArtworkRole::Impl::handle_stream_start() {
     this->stream_active = true;
 
-    // Signal drain thread to flush any stale notifications
+    // Signal decode thread to flush any stale notifications
     if (this->drain_task) {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
+    }
+    // Discard any pending displays from a prior stream
+    if (this->display_scheduler) {
+        for (auto& slot : this->display_scheduler->pending) {
+            slot.reset();
+        }
     }
 }
 
@@ -204,21 +211,50 @@ void ArtworkRole::Impl::handle_stream_clear() {
 }
 
 // ============================================================================
-// Event draining (main thread) - lifecycle events only
+// Event draining (main thread) - lifecycle events and scheduled displays
 // ============================================================================
 
 void ArtworkRole::Impl::drain_events() {
+    // Process stream lifecycle events first so we don't fire a display that was
+    // cancelled by an end/clear in the same tick.
     ArtworkEventType event_type{};
     while (this->event_state->queue.receive(event_type, 0)) {
         switch (event_type) {
             case ArtworkEventType::STREAM_END:
             case ArtworkEventType::STREAM_CLEAR:
+                if (this->display_scheduler) {
+                    for (auto& pending : this->display_scheduler->pending) {
+                        pending.reset();
+                    }
+                }
                 if (this->listener) {
                     for (const auto& pref : this->config.preferred_formats) {
                         this->listener->on_image_clear(pref.slot);
                     }
                 }
                 break;
+        }
+    }
+
+    if (!this->display_scheduler || !this->listener) {
+        return;
+    }
+
+    const int64_t now = platform_time_us();
+    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+        int64_t server_ts = 0;
+        const bool taken = this->display_scheduler->pending[slot].take_if(
+            server_ts, [this, now](const int64_t& pending_ts) {
+                // Fire immediately if time sync isn't ready: holding forever would starve
+                // the listener. Matches the metadata role's behavior.
+                int64_t client_ts = this->client->get_client_time(pending_ts);
+                if (client_ts == 0) {
+                    return true;
+                }
+                return client_ts <= now;
+            });
+        if (taken) {
+            this->listener->on_image_display(slot);
         }
     }
 }
@@ -234,16 +270,22 @@ void ArtworkRole::Impl::cleanup() {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
+    if (this->display_scheduler) {
+        for (auto& pending : this->display_scheduler->pending) {
+            pending.reset();
+        }
+    }
+
     this->event_state->queue.reset();
     this->event_state->queue.send(ArtworkEventType::STREAM_END, 0);
 }
 
 // ============================================================================
-// Drain thread
+// Decode thread
 // ============================================================================
 
 void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
-    SS_LOGD(TAG, "Drain thread started");
+    SS_LOGD(TAG, "Decode thread started");
 
     auto& queue = self->drain_task->notify_queue;
     auto& flags = self->drain_task->event_flags;
@@ -284,49 +326,20 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
         sb.drain_buf_idx = buf_idx;
         sb.drain_active.store(true, std::memory_order_release);
 
-        // Phase 1: Decode callback (immediate)
         if (self->listener) {
             self->listener->on_image_decode(slot, buf.data(), notif.data_length, notif.format);
         }
 
-        // Buffer is no longer needed after decode completes
         sb.drain_active.store(false, std::memory_order_release);
 
-        // Wait for time sync before scheduling display
-        if (!self->client->is_time_synced()) {
-            continue;
-        }
-
-        // Phase 2: Wait until display timestamp
-        int64_t client_ts = self->client->get_client_time(notif.timestamp);
-
-        if (client_ts == 0) {
-            continue;
-        }
-
-        int64_t now = platform_time_us();
-        if (client_ts > now) {
-            uint32_t wait_ms = static_cast<uint32_t>((client_ts - now) / US_PER_MS);
-            if (wait_ms > 0) {
-                cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, wait_ms);
-                if (cmd & COMMAND_STOP) {
-                    break;
-                }
-                if (cmd & COMMAND_FLUSH) {
-                    ArtworkNotification dummy2{};
-                    while (queue.receive(dummy2, 0)) {}
-                    continue;
-                }
-            }
-        }
-
-        // Display/swap callback
-        if (self->listener) {
-            self->listener->on_image_display(slot);
+        // Hand off the timestamp to the main loop. Skip if the stream ended while we were
+        // decoding so the main loop doesn't fire a display after on_image_clear.
+        if (self->stream_active.load(std::memory_order_acquire) && self->display_scheduler) {
+            self->display_scheduler->pending[slot].write(notif.timestamp);
         }
     }
 
-    SS_LOGD(TAG, "Drain thread stopped");
+    SS_LOGD(TAG, "Decode thread stopped");
 }
 
 // ============================================================================

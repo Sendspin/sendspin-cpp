@@ -259,11 +259,11 @@ struct MyControllerListener : ControllerRoleListener {
 
 ### ArtworkRoleListener
 
-The artwork role uses a dedicated drain thread with two-phase delivery: `on_image_decode()` fires immediately when encoded image data arrives (for decoding), then `on_image_display()` fires at the correct server timestamp (for synchronized display). Lifecycle callbacks fire on the main loop thread.
+The artwork role uses a dedicated decode thread for the CPU-bound decode step and the main loop for scheduled display. `on_image_decode()` fires on the decode thread immediately when encoded image data arrives; once decode returns, the server display timestamp is handed off to the main loop, which fires `on_image_display()` once the timestamp is reached. If a newer frame for the same slot finishes decoding before its predecessor's display fires, only the newer one is delivered. Lifecycle callbacks also fire on the main loop thread.
 
 ```cpp
 struct MyArtworkListener : ArtworkRoleListener {
-    // THREAD SAFETY: Called from a dedicated drain thread.
+    // THREAD SAFETY: Called from the dedicated decode thread.
     // Decode the encoded image synchronously (e.g., JPEG to bitmap).
     // The data pointer is valid for the duration of this call.
     void on_image_decode(uint8_t slot, const uint8_t* data, size_t length,
@@ -271,7 +271,7 @@ struct MyArtworkListener : ArtworkRoleListener {
         decoded_images[slot] = decode_image(data, length, format);
     }
 
-    // Called from the drain thread at the correct playback timestamp.
+    // Called from the main loop thread once the server display timestamp is reached.
     // Swap the decoded image onto the display.
     void on_image_display(uint8_t slot) override {
         display.show_image(slot, decoded_images[slot]);
@@ -535,8 +535,8 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 | Callback | Thread |
 |---|---|
 | `PlayerRoleListener::on_audio_write()` | Sync task background thread |
-| `ArtworkRoleListener::on_image_decode()` | Dedicated artwork drain thread |
-| `ArtworkRoleListener::on_image_display()` | Dedicated artwork drain thread |
+| `ArtworkRoleListener::on_image_decode()` | Dedicated artwork decode thread |
+| `ArtworkRoleListener::on_image_display()` | Main loop thread |
 | `VisualizerRoleListener::on_visualizer_frame()` | Dedicated visualizer drain thread |
 | `VisualizerRoleListener::on_beat()` | Dedicated visualizer drain thread |
 | All other listener methods | Main loop thread |
@@ -692,8 +692,8 @@ Configuration passed to `client.add_artwork()`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `preferred_formats` | `std::vector<ImageSlotPreference>` | `{}` | Image slot preferences advertised to the server during the hello handshake. Each entry declares a slot index, image source, format, and resolution. |
-| `psram_stack` | `bool` | `false` | Allocate drain thread stack in PSRAM (ESP-IDF only) |
-| `priority` | `unsigned` | `2` | FreeRTOS priority for the drain thread (ESP-IDF only) |
+| `psram_stack` | `bool` | `false` | Allocate decode thread stack in PSRAM (ESP-IDF only) |
+| `priority` | `unsigned` | `2` | FreeRTOS priority for the decode thread (ESP-IDF only) |
 
 Each entry in `preferred_formats` is an `ImageSlotPreference`:
 

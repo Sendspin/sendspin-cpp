@@ -123,8 +123,8 @@ struct ImageSlotPreference {
 /// @brief Configuration for the artwork role
 struct ArtworkRoleConfig {
     std::vector<ImageSlotPreference> preferred_formats{};
-    bool psram_stack{false};  ///< Allocate drain thread stack in PSRAM (ESP-IDF only)
-    unsigned priority{2};     ///< FreeRTOS priority for the drain thread (ESP-IDF only)
+    bool psram_stack{false};  ///< Allocate decode thread stack in PSRAM (ESP-IDF only)
+    unsigned priority{2};     ///< FreeRTOS priority for the decode thread (ESP-IDF only)
 };
 
 // ============================================================================
