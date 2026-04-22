@@ -240,12 +240,6 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
         return;
     }
 
-    // Request high-performance networking for playback
-    if (!this->high_performance_requested_for_playback) {
-        this->client->acquire_high_performance();
-        this->high_performance_requested_for_playback = true;
-    }
-
     if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
         !player_obj.sample_rate.has_value() || !player_obj.codec.has_value()) {
         SS_LOGE(TAG, "Stream start message missing required audio parameters");
@@ -282,6 +276,12 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
         this->sync_task->signal_stream_end();
         this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_END, 0);
         return;
+    }
+
+    // Request high-performance networking for playback
+    if (!this->high_performance_requested_for_playback) {
+        this->client->acquire_high_performance();
+        this->high_performance_requested_for_playback = true;
     }
 
     // Shadow stream params for main thread, then signal
