@@ -107,7 +107,7 @@ struct PlayerRole::Impl {
     std::unique_ptr<SyncTask> sync_task;
 
     // 16-bit fields
-    uint16_t static_delay_ms{0};
+    std::atomic<uint16_t> static_delay_ms{0};
 
     // 8-bit fields
     bool high_performance_requested_for_playback{false};

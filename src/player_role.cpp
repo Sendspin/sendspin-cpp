@@ -377,7 +377,7 @@ void PlayerRole::Impl::drain_events() {
             if (player_cmd.static_delay_ms.has_value()) {
                 this->update_static_delay(player_cmd.static_delay_ms.value());
                 if (this->listener) {
-                    this->listener->on_static_delay_changed(this->static_delay_ms);
+                    this->listener->on_static_delay_changed(this->static_delay_ms.load());
                 }
             }
         }
@@ -485,7 +485,8 @@ void PlayerRole::Impl::load_static_delay() {
         // No persistence provider - use initial value from config
         if (this->config.initial_static_delay_ms > 0) {
             this->static_delay_ms = this->config.initial_static_delay_ms;
-            SS_LOGI(TAG, "Using initial static delay from config: %u ms", this->static_delay_ms);
+            SS_LOGI(TAG, "Using initial static delay from config: %u ms",
+                    this->static_delay_ms.load());
         }
         return;
     }
@@ -494,24 +495,25 @@ void PlayerRole::Impl::load_static_delay() {
     if (delay.has_value()) {
         if (delay.value() <= MAX_STATIC_DELAY_MS) {
             this->static_delay_ms = delay.value();
-            SS_LOGI(TAG, "Loaded static delay: %u ms", this->static_delay_ms);
+            SS_LOGI(TAG, "Loaded static delay: %u ms", this->static_delay_ms.load());
         } else {
             SS_LOGW(TAG, "Persisted static delay out of range (%u), ignoring", delay.value());
         }
     } else if (this->config.initial_static_delay_ms > 0) {
         this->static_delay_ms = this->config.initial_static_delay_ms;
-        SS_LOGI(TAG, "Using initial static delay from config: %u ms", this->static_delay_ms);
+        SS_LOGI(TAG, "Using initial static delay from config: %u ms", this->static_delay_ms.load());
     }
 }
 
 uint16_t PlayerRole::Impl::get_effective_static_delay_ms() const {
-    return this->static_delay_adjustable ? this->static_delay_ms : 0;
+    return this->static_delay_adjustable ? this->static_delay_ms.load() : 0;
 }
 
 void PlayerRole::Impl::persist_static_delay() const {
     if (this->persistence) {
-        if (this->persistence->save_static_delay(this->static_delay_ms)) {
-            SS_LOGD(TAG, "Persisted static delay: %u ms", this->static_delay_ms);
+        uint16_t delay = this->static_delay_ms.load();
+        if (this->persistence->save_static_delay(delay)) {
+            SS_LOGD(TAG, "Persisted static delay: %u ms", delay);
         } else {
             SS_LOGW(TAG, "Failed to persist static delay");
         }
