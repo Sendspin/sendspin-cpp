@@ -211,8 +211,9 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     ClientPlayerStateObject player_state{};
     player_state.volume = this->volume;
     player_state.muted = this->muted;
-    player_state.static_delay_ms = this->get_effective_static_delay_ms();
-    if (this->static_delay_adjustable) {
+    bool adjustable = this->static_delay_adjustable.load();
+    player_state.static_delay_ms = adjustable ? this->static_delay_ms.load() : 0;
+    if (adjustable) {
         player_state.supported_commands = {SendspinPlayerCommand::SET_STATIC_DELAY};
     }
     msg.player = player_state;
