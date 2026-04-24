@@ -133,7 +133,7 @@ bool PlayerRole::get_muted() const {
 }
 
 uint16_t PlayerRole::get_static_delay_ms() const {
-    return this->impl_->static_delay_ms;
+    return this->impl_->get_effective_static_delay_ms();
 }
 
 uint8_t PlayerRole::get_volume() const {
@@ -211,7 +211,7 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     ClientPlayerStateObject player_state{};
     player_state.volume = this->volume;
     player_state.muted = this->muted;
-    player_state.static_delay_ms = this->static_delay_ms;
+    player_state.static_delay_ms = this->get_effective_static_delay_ms();
     if (this->static_delay_adjustable) {
         player_state.supported_commands = {SendspinPlayerCommand::SET_STATIC_DELAY};
     }
@@ -502,6 +502,10 @@ void PlayerRole::Impl::load_static_delay() {
         this->static_delay_ms = this->config.initial_static_delay_ms;
         SS_LOGI(TAG, "Using initial static delay from config: %u ms", this->static_delay_ms);
     }
+}
+
+uint16_t PlayerRole::Impl::get_effective_static_delay_ms() const {
+    return this->static_delay_adjustable ? this->static_delay_ms : 0;
 }
 
 void PlayerRole::Impl::persist_static_delay() const {

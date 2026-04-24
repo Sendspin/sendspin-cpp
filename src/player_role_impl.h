@@ -22,6 +22,7 @@
 #include "sendspin/player_role.h"
 #include "sync_task.h"
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
@@ -87,6 +88,7 @@ struct PlayerRole::Impl {
     void enqueue_state_update(SendspinClientState state) const;
     void load_static_delay();
     void persist_static_delay() const;
+    uint16_t get_effective_static_delay_ms() const;
 
     // ========================================
     // Fields
@@ -110,7 +112,7 @@ struct PlayerRole::Impl {
     // 8-bit fields
     bool high_performance_requested_for_playback{false};
     bool muted{false};
-    bool static_delay_adjustable{false};
+    std::atomic<bool> static_delay_adjustable{false};
     uint8_t volume{0};
 };
 

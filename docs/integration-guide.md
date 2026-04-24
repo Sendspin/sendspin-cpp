@@ -486,7 +486,8 @@ player.update_volume(75);
 player.update_muted(false);
 player.update_static_delay(50);  // User-adjustable delay in ms
 
-// Enable/disable static delay adjustment by the server
+// Enable/disable static delay adjustment by the server. When disabled, the stored delay
+// is not applied to sync timing and is reported as 0 in client state.
 player.set_static_delay_adjustable(true);
 ```
 
