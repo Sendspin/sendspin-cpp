@@ -116,7 +116,7 @@ void PlayerRole::update_static_delay(uint16_t delay_ms) {
 }
 
 void PlayerRole::set_static_delay_adjustable(bool adjustable) {
-    this->impl_->static_delay_adjustable = adjustable;
+    this->impl_->static_delay_adjustable.store(adjustable, std::memory_order_relaxed);
     this->impl_->client->publish_state();
 }
 
@@ -133,7 +133,7 @@ bool PlayerRole::get_muted() const {
 }
 
 uint16_t PlayerRole::get_static_delay_ms() const {
-    return this->impl_->static_delay_ms;
+    return this->impl_->get_effective_static_delay_ms();
 }
 
 uint8_t PlayerRole::get_volume() const {
@@ -158,7 +158,7 @@ void PlayerRole::Impl::update_static_delay(uint16_t delay_ms) {
     if (delay_ms > MAX_STATIC_DELAY_MS) {
         delay_ms = MAX_STATIC_DELAY_MS;
     }
-    this->static_delay_ms = delay_ms;
+    this->static_delay_ms.store(delay_ms, std::memory_order_relaxed);
     this->persist_static_delay();
     this->client->publish_state();
 }
@@ -211,8 +211,10 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     ClientPlayerStateObject player_state{};
     player_state.volume = this->volume;
     player_state.muted = this->muted;
-    player_state.static_delay_ms = this->static_delay_ms;
-    if (this->static_delay_adjustable) {
+    bool adjustable = this->static_delay_adjustable.load(std::memory_order_relaxed);
+    player_state.static_delay_ms =
+        adjustable ? this->static_delay_ms.load(std::memory_order_relaxed) : 0;
+    if (adjustable) {
         player_state.supported_commands = {SendspinPlayerCommand::SET_STATIC_DELAY};
     }
     msg.player = player_state;
@@ -377,7 +379,8 @@ void PlayerRole::Impl::drain_events() {
             if (player_cmd.static_delay_ms.has_value()) {
                 this->update_static_delay(player_cmd.static_delay_ms.value());
                 if (this->listener) {
-                    this->listener->on_static_delay_changed(this->static_delay_ms);
+                    this->listener->on_static_delay_changed(
+                        this->static_delay_ms.load(std::memory_order_relaxed));
                 }
             }
         }
@@ -484,8 +487,10 @@ void PlayerRole::Impl::load_static_delay() {
     if (!this->persistence) {
         // No persistence provider - use initial value from config
         if (this->config.initial_static_delay_ms > 0) {
-            this->static_delay_ms = this->config.initial_static_delay_ms;
-            SS_LOGI(TAG, "Using initial static delay from config: %u ms", this->static_delay_ms);
+            this->static_delay_ms.store(this->config.initial_static_delay_ms,
+                                        std::memory_order_relaxed);
+            SS_LOGI(TAG, "Using initial static delay from config: %u ms",
+                    this->config.initial_static_delay_ms);
         }
         return;
     }
@@ -493,21 +498,30 @@ void PlayerRole::Impl::load_static_delay() {
     auto delay = this->persistence->load_static_delay();
     if (delay.has_value()) {
         if (delay.value() <= MAX_STATIC_DELAY_MS) {
-            this->static_delay_ms = delay.value();
-            SS_LOGI(TAG, "Loaded static delay: %u ms", this->static_delay_ms);
+            this->static_delay_ms.store(delay.value(), std::memory_order_relaxed);
+            SS_LOGI(TAG, "Loaded static delay: %u ms", delay.value());
         } else {
             SS_LOGW(TAG, "Persisted static delay out of range (%u), ignoring", delay.value());
         }
     } else if (this->config.initial_static_delay_ms > 0) {
-        this->static_delay_ms = this->config.initial_static_delay_ms;
-        SS_LOGI(TAG, "Using initial static delay from config: %u ms", this->static_delay_ms);
+        this->static_delay_ms.store(this->config.initial_static_delay_ms,
+                                    std::memory_order_relaxed);
+        SS_LOGI(TAG, "Using initial static delay from config: %u ms",
+                this->config.initial_static_delay_ms);
     }
+}
+
+uint16_t PlayerRole::Impl::get_effective_static_delay_ms() const {
+    return this->static_delay_adjustable.load(std::memory_order_relaxed)
+               ? this->static_delay_ms.load(std::memory_order_relaxed)
+               : 0;
 }
 
 void PlayerRole::Impl::persist_static_delay() const {
     if (this->persistence) {
-        if (this->persistence->save_static_delay(this->static_delay_ms)) {
-            SS_LOGD(TAG, "Persisted static delay: %u ms", this->static_delay_ms);
+        uint16_t delay = this->static_delay_ms.load(std::memory_order_relaxed);
+        if (this->persistence->save_static_delay(delay)) {
+            SS_LOGD(TAG, "Persisted static delay: %u ms", delay);
         } else {
             SS_LOGW(TAG, "Failed to persist static delay");
         }
