@@ -147,7 +147,11 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
         server->connection_closed_callback_(sockfd);
     }
 
-    // Close the socket
+    // Shut down the receive side before close() to stop lwIP from delivering more packets
+    // during teardown. Without this, lwIP can race with netconn_prepare_delete and trigger
+    // pbuf_free / recv_tcp assertions or cache faults inside the close path.
+    // SHUT_RD (not SHUT_RDWR) lets the FIN still go out cleanly.
+    shutdown(sockfd, SHUT_RD);
     close(sockfd);
 }
 
