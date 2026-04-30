@@ -35,7 +35,7 @@ namespace sendspin {
 /// @return Pointer to the allocated memory, or nullptr on failure.
 inline void* platform_malloc(size_t size) {
     return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-                                   MALLOC_CAP_INTERNAL);
+                                   MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
 /// @brief Reallocates memory, preferring SPIRAM on ESP-IDF. Falls back to internal RAM
@@ -44,7 +44,7 @@ inline void* platform_malloc(size_t size) {
 /// @return Pointer to the reallocated memory, or nullptr on failure.
 inline void* platform_realloc(void* ptr, size_t size) {
     return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-                                    MALLOC_CAP_INTERNAL);
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
 /// @brief Allocates memory, preferring internal RAM on ESP-IDF. Falls back to SPIRAM
@@ -52,7 +52,7 @@ inline void* platform_realloc(void* ptr, size_t size) {
 /// @return Pointer to the allocated memory, or nullptr on failure.
 inline void* platform_malloc_internal(size_t size) {
     return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
-                                   MALLOC_CAP_SPIRAM);
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
 /// @brief Reallocates memory, preferring internal RAM on ESP-IDF. Falls back to SPIRAM
@@ -61,7 +61,7 @@ inline void* platform_malloc_internal(size_t size) {
 /// @return Pointer to the reallocated memory, or nullptr on failure.
 inline void* platform_realloc_internal(void* ptr, size_t size) {
     return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
-                                    MALLOC_CAP_SPIRAM);
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
 /// @brief Frees memory allocated by any platform_malloc[_internal] or platform_realloc[_internal]
