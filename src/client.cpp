@@ -16,6 +16,7 @@
 
 #include "connection.h"
 #include "connection_manager.h"
+#include "platform/compiler.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/shadow_slot.h"
@@ -657,7 +658,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const std::s
     }
 }
 
-void SendspinClient::process_binary_message(const uint8_t* payload, size_t len) {
+SS_HOT void SendspinClient::process_binary_message(const uint8_t* payload, size_t len) {
     if (len < 2) {
         return;
     }

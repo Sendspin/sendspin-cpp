@@ -16,6 +16,7 @@
 
 #include "connection.h"
 #include "lwip/sockets.h"  // for close()
+#include "platform/compiler.h"
 #include "platform/logging.h"
 #include "server_connection.h"
 #include <esp_timer.h>
@@ -155,7 +156,7 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
     close(sockfd);
 }
 
-esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
+SS_HOT esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
     // Capture timestamp immediately for accurate time synchronization
     int64_t receive_time = esp_timer_get_time();
 

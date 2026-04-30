@@ -14,6 +14,7 @@
 
 #include "audio_ring_buffer.h"
 
+#include "platform/compiler.h"
 #include "platform/logging.h"
 
 namespace sendspin {
@@ -47,8 +48,9 @@ SendspinAudioRingBuffer::~SendspinAudioRingBuffer() = default;
 // Public API
 // ============================================================================
 
-bool SendspinAudioRingBuffer::write_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
-                                          ChunkType chunk_type, uint32_t timeout_ms) {
+SS_HOT bool SendspinAudioRingBuffer::write_chunk(const uint8_t* data, size_t data_size,
+                                                 int64_t timestamp, ChunkType chunk_type,
+                                                 uint32_t timeout_ms) {
     size_t total_size = sizeof(AudioRingBufferEntry) + data_size;
 
     void* acquired_memory = this->ring_buffer_.acquire(total_size, timeout_ms);

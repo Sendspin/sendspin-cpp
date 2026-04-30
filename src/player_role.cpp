@@ -14,6 +14,7 @@
 
 #include "audio_types.h"
 #include "platform/base64.h"
+#include "platform/compiler.h"
 #include "platform/logging.h"
 #include "player_role_impl.h"
 #include "protocol_messages.h"
@@ -220,7 +221,7 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     msg.player = player_state;
 }
 
-void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) const {
+SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) const {
     if (this->config.audio_formats.empty()) {
         return;
     }

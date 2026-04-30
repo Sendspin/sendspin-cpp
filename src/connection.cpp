@@ -14,6 +14,7 @@
 
 #include "connection.h"
 
+#include "platform/compiler.h"
 #include "platform/logging.h"
 #include "time_filter.h"
 
@@ -87,7 +88,7 @@ void SendspinConnection::commit_receive_buffer(size_t data_len) {
     this->websocket_write_offset_ += data_len;
 }
 
-void SendspinConnection::dispatch_completed_message(bool is_text, int64_t receive_time) {
+SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t receive_time) {
     if (!this->websocket_payload_) {
         return;
     }

@@ -15,6 +15,7 @@
 #include "server_connection.h"
 
 #include "lwip/sockets.h"  // for setsockopt, IPPROTO_TCP, NODELAY
+#include "platform/compiler.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "protocol_messages.h"
@@ -153,7 +154,7 @@ void SendspinServerConnection::trigger_close() {
     }
 }
 
-esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receive_time) {
+SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receive_time) {
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
 
