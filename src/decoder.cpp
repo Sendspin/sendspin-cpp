@@ -23,6 +23,18 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.decoder";
 
+// The OpusDecoder state is what micro-opus's CONFIG_OPUS_STATE_MEMORY_PREFERENCE Kconfig governs
+// when opus_decoder_create() does the allocation. We use opus_decoder_init() and own the backing
+// buffer ourselves, so we mirror the same Kconfig here so consumers get one consistent placement
+// rule for the OpusDecoder state regardless of who allocated it. The strict *_ONLY modes are
+// honored as a soft preference (falling back to the other region if the preferred is exhausted);
+// the buffer is only ~30-50KB so a fallback rarely matters in practice.
+#if defined(CONFIG_OPUS_STATE_PREFER_INTERNAL) || defined(CONFIG_OPUS_STATE_INTERNAL_ONLY)
+constexpr MemoryLocation OPUS_STATE_LOCATION = MemoryLocation::PREFER_INTERNAL;
+#else
+constexpr MemoryLocation OPUS_STATE_LOCATION = MemoryLocation::PREFER_EXTERNAL;
+#endif
+
 void SendspinDecoder::reset_decoders() {
     if (this->flac_decoder_ != nullptr) {
         this->flac_decoder_->reset();
@@ -80,7 +92,7 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
             }
 
             size_t opus_size = opus_decoder_get_size(stream_info->get_channels());
-            if (!this->opus_decoder_buf_.allocate(opus_size)) {
+            if (!this->opus_decoder_buf_.allocate(opus_size, OPUS_STATE_LOCATION)) {
                 SS_LOGE(TAG, "Failed to allocate %zu bytes for OPUS decoder", opus_size);
                 return false;
             }
