@@ -449,7 +449,8 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             // Create or resize the decode buffer now that we know the maximum decoded size
             size_t needed = sync_context.decoder->get_maximum_decoded_size();
             if (sync_context.decode_buffer == nullptr) {
-                sync_context.decode_buffer = TransferBuffer::create(needed);
+                sync_context.decode_buffer = TransferBuffer::create(
+                    needed, this->player_impl_->config.decode_buffer_location);
                 if (sync_context.decode_buffer == nullptr) {
                     SS_LOGE(TAG, "Failed to allocate decode buffer");
                     this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
@@ -625,7 +626,8 @@ void SyncTask::thread_entry(void* params) {
     sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
 
     sync_context.interpolation_transfer_buffer = TransferBuffer::create(
-        sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS));
+        sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS),
+        this_task->player_impl_->config.interpolation_buffer_location);
     if (sync_context.interpolation_transfer_buffer == nullptr) {
         SS_LOGE(TAG, "Failed to allocate interpolation transfer buffer");
         this_task->event_flags_.set(EventGroupBits::TASK_ERROR | EventGroupBits::TASK_STOPPED);

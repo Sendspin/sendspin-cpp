@@ -19,6 +19,7 @@
 #pragma once
 
 #include "platform/memory.h"
+#include "sendspin/types.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -56,8 +57,11 @@ public:
 
     /// @brief Creates a new transfer buffer.
     /// @param buffer_size Size of the buffer in bytes.
+    /// @param location Memory placement preference for the backing allocation. Subsequent
+    /// reallocate() calls reuse this preference.
     /// @return unique_ptr if successfully allocated, nullptr otherwise.
-    static std::unique_ptr<TransferBuffer> create(size_t buffer_size);
+    static std::unique_ptr<TransferBuffer> create(
+        size_t buffer_size, MemoryLocation location = MemoryLocation::PREFER_EXTERNAL);
 
     /// @brief Writes buffered data to the sink.
     /// @param timeout_ms Milliseconds to block while waiting for the sink (UINT32_MAX = wait
@@ -117,7 +121,8 @@ protected:
 
     /// @brief Allocates the backing buffer and resets tracking state.
     /// @return True if allocation succeeded, false otherwise.
-    bool allocate_buffer(size_t buffer_size);
+    bool allocate_buffer(size_t buffer_size,
+                         MemoryLocation location = MemoryLocation::PREFER_EXTERNAL);
     /// @brief Releases the backing buffer and resets all tracking state.
     void deallocate_buffer();
 

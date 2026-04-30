@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "sendspin/types.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -91,6 +93,14 @@ struct PlayerRoleConfig {
     uint16_t initial_static_delay_ms{0};
     bool psram_stack{false};  ///< Allocate sync task stack in PSRAM (ESP-IDF only)
     unsigned priority{2};     ///< FreeRTOS priority for the sync/decode task (ESP-IDF only)
+
+    /// @brief Memory placement for the interpolation transfer buffer (ESP-IDF only; ignored on
+    /// host). Defaults to PREFER_EXTERNAL (SPIRAM).
+    MemoryLocation interpolation_buffer_location{MemoryLocation::PREFER_EXTERNAL};
+
+    /// @brief Memory placement for the decode transfer buffer (ESP-IDF only; ignored on host).
+    /// Defaults to PREFER_EXTERNAL (SPIRAM).
+    MemoryLocation decode_buffer_location{MemoryLocation::PREFER_EXTERNAL};
 };
 
 // ============================================================================

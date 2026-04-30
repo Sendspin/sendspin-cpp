@@ -93,7 +93,7 @@ examples/tui_client/        - Terminal UI host example with PortAudio audio outp
 Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs across platforms:
 
 - `logging.h`: `SS_LOGE`/`SS_LOGW`/`SS_LOGI`/`SS_LOGD`/`SS_LOGV` macros (ESP: `esp_log.h`, host: `printf`-based)
-- `memory.h`: `platform_malloc`/`platform_realloc`/`platform_free` (ESP: SPIRAM-preferring `heap_caps_malloc`, host: standard `malloc`)
+- `memory.h`: `platform_malloc`/`platform_realloc`/`platform_malloc_internal`/`platform_realloc_internal`/`platform_free` (ESP: SPIRAM-preferring or internal-RAM-preferring `heap_caps_malloc_prefer`, host: standard `malloc`). `PlatformBuffer` accepts a `MemoryLocation` (defined in `include/sendspin/types.h`) to select the preference.
 - `thread.h`: threading utilities
 - `time.h`: time utilities
 - `base64.h`: base64 encoding/decoding
@@ -117,7 +117,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 - C++20 (`gnu++20` on ESP, `cxx_std_20` on host)
 - Namespace: `sendspin`
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
-- Memory: `platform_malloc`/`platform_realloc`/`platform_free` from `platform/memory.h` (not raw `heap_caps_malloc`)
+- Memory: `platform_malloc`/`platform_realloc`/`platform_malloc_internal`/`platform_realloc_internal`/`platform_free` from `platform/memory.h` (not raw `heap_caps_malloc`). The `_internal` variants prefer internal RAM with SPIRAM fallback; the unsuffixed variants do the reverse. `PlatformBuffer` and `TransferBuffer` accept a `MemoryLocation` argument to select the preference.
 - Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer.
 - Role composition: Roles are added at runtime via `add_player()`, `add_metadata()`, etc. Roles can be disabled at compile time via `SENDSPIN_ENABLE_*` cmake options / Kconfig entries. Audio codec dependencies (micro-flac, micro-opus) are only linked when the player role is enabled.
 - Apache 2.0 license headers on all files

@@ -61,4 +61,12 @@ struct GroupUpdateObject {
     std::optional<std::string> group_name{};
 };
 
+/// @brief Memory placement preference for platform allocations
+/// On ESP-IDF, controls whether SPIRAM or internal RAM is tried first; the other is the
+/// fallback. Ignored on host platforms (no internal/external distinction).
+enum class MemoryLocation : uint8_t {
+    PREFER_EXTERNAL,  // Prefer SPIRAM, fall back to internal RAM
+    PREFER_INTERNAL,  // Prefer internal RAM, fall back to SPIRAM
+};
+
 }  // namespace sendspin

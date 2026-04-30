@@ -28,10 +28,11 @@ TransferBuffer::~TransferBuffer() {
     this->deallocate_buffer();
 }
 
-std::unique_ptr<TransferBuffer> TransferBuffer::create(size_t buffer_size) {
+std::unique_ptr<TransferBuffer> TransferBuffer::create(size_t buffer_size,
+                                                       MemoryLocation location) {
     std::unique_ptr<TransferBuffer> buffer(new TransferBuffer());
 
-    if (!buffer->allocate_buffer(buffer_size)) {
+    if (!buffer->allocate_buffer(buffer_size, location)) {
         return nullptr;
     }
 
@@ -75,10 +76,6 @@ void TransferBuffer::increase_buffer_length(size_t bytes) {
 }
 
 bool TransferBuffer::reallocate(size_t new_buffer_size) {
-    if (!this->buffer_) {
-        return this->allocate_buffer(new_buffer_size);
-    }
-
     if (new_buffer_size < this->buffer_length_) {
         return false;
     }
@@ -101,8 +98,8 @@ bool TransferBuffer::reallocate(size_t new_buffer_size) {
 // Private helpers
 // ============================================================================
 
-bool TransferBuffer::allocate_buffer(size_t buffer_size) {
-    if (!this->buffer_.allocate(buffer_size)) {
+bool TransferBuffer::allocate_buffer(size_t buffer_size, MemoryLocation location) {
+    if (!this->buffer_.allocate(buffer_size, location)) {
         return false;
     }
 
