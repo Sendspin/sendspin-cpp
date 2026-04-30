@@ -92,7 +92,16 @@ struct PlayerRoleConfig {
     int32_t fixed_delay_us{0};
     uint16_t initial_static_delay_ms{0};
     bool psram_stack{false};  ///< Allocate sync task stack in PSRAM (ESP-IDF only)
-    unsigned priority{2};     ///< FreeRTOS priority for the sync/decode task (ESP-IDF only)
+
+    /// @brief Default FreeRTOS priority for the sync/decode task (ESP-IDF only).
+    /// One above SendspinClientConfig::DEFAULT_HTTPD_PRIORITY so the httpd server task
+    /// cannot starve the decoder during the initial burst of incoming encoded audio that
+    /// fills the audio buffer at stream start.
+    static constexpr unsigned DEFAULT_SYNC_TASK_PRIORITY =
+        SendspinClientConfig::DEFAULT_HTTPD_PRIORITY + 1U;
+
+    unsigned priority{DEFAULT_SYNC_TASK_PRIORITY};  ///< FreeRTOS priority for the sync/decode
+                                                    ///< task (ESP-IDF only)
 
     /// @brief Memory placement for the interpolation transfer buffer (ESP-IDF only; ignored on
     /// host). Defaults to PREFER_EXTERNAL (SPIRAM).
