@@ -673,7 +673,7 @@ Configuration passed to `client.add_player()`.
 | `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable static delay. |
 | `initial_static_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable static delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
 | `psram_stack` | `bool` | `false` | Allocate sync/decode task stack in PSRAM (ESP-IDF only) |
-| `priority` | `unsigned` | `18` | FreeRTOS priority for the sync/decode task (ESP-IDF only). One above `httpd_priority` so the HTTP server task cannot starve the decoder during the initial burst of encoded audio that fills the buffer at stream start. |
+| `priority` | `unsigned` | `18` | FreeRTOS priority for the sync/decode task (ESP-IDF only). The default value, `18`, is one above the default `httpd_priority` (`17`). If you customize priorities, keep this above `httpd_priority` so the HTTP server task cannot starve the decoder during the initial burst of encoded audio that fills the buffer at stream start. |
 | `interpolation_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement preference for the interpolation transfer buffer. `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. ESP-IDF only; ignored on host. |
 | `decode_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement preference for the decode transfer buffer. Same semantics as `interpolation_buffer_location`. ESP-IDF only; ignored on host. |
 
