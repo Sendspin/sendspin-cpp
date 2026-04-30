@@ -242,12 +242,33 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
                 "Hard sync: adding %" PRIu32 " frames of silence for %" PRId64 "us future error",
                 sync_context.current_stream_info.bytes_to_frames(actual_bytes), raw_error);
     } else if (raw_error < -active_threshold) {
-        // Chunk should have played already - we're behind, drop it
-        // The skip logic in decode_chunk() will keep dropping until we catch up
+        // Chunk should have started playing already - drop only the late prefix from the front of
+        // the buffer and play the remainder. By the time we get here, silence has already been
+        // inserted to fill the gap (one audible discontinuity); a partial drop keeps the
+        // follow-up disturbance smaller than discarding the whole chunk would. Any sub-threshold
+        // residual is left for the next chunk's soft sync to absorb.
         sync_context.hard_syncing = true;
-        sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
-        SS_LOGV(TAG, "Hard sync: dropping decoded chunk, %" PRId64 "us behind", -raw_error);
-        return SyncTaskState::LOAD_CHUNK;
+
+        uint32_t late_frames = static_cast<uint32_t>(
+            (static_cast<uint64_t>(-raw_error) *
+             static_cast<uint64_t>(sync_context.current_stream_info.get_sample_rate())) /
+            static_cast<uint64_t>(US_PER_SECOND));
+        size_t late_bytes = sync_context.current_stream_info.frames_to_bytes(late_frames);
+        size_t actual_drop = std::min(late_bytes, sync_context.decode_buffer->available());
+        sync_context.decode_buffer->decrease_buffer_length(actual_drop);
+        uint32_t dropped_frames = sync_context.current_stream_info.bytes_to_frames(actual_drop);
+        sync_context.decoded_timestamp +=
+            sync_context.current_stream_info.frames_to_microseconds(dropped_frames);
+
+        SS_LOGV(TAG,
+                "Hard sync: dropping %" PRIu32 " frames from start of chunk, %" PRId64 "us behind",
+                dropped_frames, -raw_error);
+
+        if (sync_context.decode_buffer->available() == 0) {
+            // Entire chunk was late
+            return SyncTaskState::LOAD_CHUNK;
+        }
+        sync_context.release_chunk = true;
     } else {
         // Within tolerance - exit hard sync mode and use sample insertion/deletion for fine
         // corrections
