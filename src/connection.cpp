@@ -66,7 +66,7 @@ void SendspinConnection::reset_websocket_payload() {
 uint8_t* SendspinConnection::prepare_receive_buffer(size_t data_len) {
     if (!this->websocket_payload_) {
         // First fragment - allocate new buffer
-        if (!this->websocket_payload_.allocate(data_len)) {
+        if (!this->websocket_payload_.allocate(data_len, this->websocket_payload_location_)) {
             SS_LOGE(TAG, "Failed to allocate %zu bytes for websocket payload", data_len);
             return nullptr;
         }

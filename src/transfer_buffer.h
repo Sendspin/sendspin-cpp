@@ -44,7 +44,7 @@ class PlayerRoleListener;
  *   4. Call transfer_data_to_sink() to flush buffered data to the listener.
  *
  * @code
- * auto buf = TransferBuffer::create(4096);
+ * auto buf = TransferBuffer::create(4096, MemoryLocation::PREFER_EXTERNAL);
  * buf->set_listener(&my_player_listener);
  * // ... write decoded audio into buf->get_buffer_end() ...
  * buf->increase_buffer_length(bytes_written);
@@ -60,8 +60,7 @@ public:
     /// @param location Memory placement preference for the backing allocation. Subsequent
     /// reallocate() calls reuse this preference.
     /// @return unique_ptr if successfully allocated, nullptr otherwise.
-    static std::unique_ptr<TransferBuffer> create(
-        size_t buffer_size, MemoryLocation location = MemoryLocation::PREFER_EXTERNAL);
+    static std::unique_ptr<TransferBuffer> create(size_t buffer_size, MemoryLocation location);
 
     /// @brief Writes buffered data to the sink.
     /// @param timeout_ms Milliseconds to block while waiting for the sink (UINT32_MAX = wait
@@ -121,8 +120,7 @@ protected:
 
     /// @brief Allocates the backing buffer and resets tracking state.
     /// @return True if allocation succeeded, false otherwise.
-    bool allocate_buffer(size_t buffer_size,
-                         MemoryLocation location = MemoryLocation::PREFER_EXTERNAL);
+    bool allocate_buffer(size_t buffer_size, MemoryLocation location);
     /// @brief Releases the backing buffer and resets all tracking state.
     void deallocate_buffer();
 

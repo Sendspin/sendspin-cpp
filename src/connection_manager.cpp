@@ -58,6 +58,7 @@ void ConnectionManager::connect_to(const std::string& url) {
     auto client_conn = std::make_unique<SendspinClientConnection>(url);
     client_conn->set_auto_reconnect(false);
     client_conn->set_task_config(this->client_->config_.websocket_priority);
+    client_conn->set_websocket_payload_location(this->client_->config_.websocket_payload_location);
 
     this->setup_connection_callbacks(client_conn.get());
     client_conn->on_disconnected_cb = [this](SendspinConnection* conn) {
@@ -324,6 +325,7 @@ void ConnectionManager::on_new_connection(std::unique_ptr<SendspinServerConnecti
     // because the httpd find_connection_callback needs to locate this connection immediately
     // for subsequent message routing on the same thread.
     conn->init_time_filter();
+    conn->set_websocket_payload_location(this->client_->config_.websocket_payload_location);
 
     this->setup_connection_callbacks(conn.get());
     conn->on_disconnected_cb = [](SendspinConnection* /*c*/) {
