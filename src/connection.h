@@ -286,6 +286,17 @@ public:
         this->pending_time_message_ = pending;
     }
 
+    // ========================================
+    // Initialization setters (called by hub before start)
+    // ========================================
+
+    /// @brief Sets the memory location preference for the websocket payload reassembly buffer
+    /// @param location PREFER_EXTERNAL (SPIRAM-first) or PREFER_INTERNAL (internal-RAM-first).
+    /// @note Must be called before the first received frame; takes effect on the next allocation.
+    void set_websocket_payload_location(MemoryLocation location) {
+        this->websocket_payload_location_ = location;
+    }
+
 protected:
     /// @brief Deallocates the websocket payload buffer if allocated
     void deallocate_websocket_payload();
@@ -361,6 +372,9 @@ protected:
     /// Time message state.
     bool pending_time_message_{false};
     bool server_hello_received_{false};
+
+    /// Memory placement preference for `websocket_payload_` allocations (ESP-IDF only).
+    MemoryLocation websocket_payload_location_{MemoryLocation::PREFER_EXTERNAL};
 };
 
 }  // namespace sendspin

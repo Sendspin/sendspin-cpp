@@ -659,6 +659,7 @@ Main client configuration passed to the `SendspinClient` constructor.
 | `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |
 | `time_burst_interval_ms` | `int64_t` | `10000` | Milliseconds between time sync bursts |
 | `time_burst_response_timeout_ms` | `int64_t` | `10000` | Milliseconds before a burst message times out |
+| `websocket_payload_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the per-connection WebSocket payload reassembly buffer (sized to the largest incoming frame, holds raw audio chunks delivered by httpd). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
 
 ---
 
@@ -865,4 +866,4 @@ Set with `SendspinClient::set_log_level()`. Only affects host builds; ESP-IDF bu
 | `PREFER_EXTERNAL` | Prefer SPIRAM, fall back to internal RAM (ESP-IDF only) |
 | `PREFER_INTERNAL` | Prefer internal RAM, fall back to SPIRAM (ESP-IDF only) |
 
-Used by `PlayerRoleConfig::interpolation_buffer_location` and `decode_buffer_location` to control where the player's transfer buffers are allocated. Ignored on host platforms (no internal/external distinction).
+Used by `SendspinClientConfig::websocket_payload_location` to control where the per-connection WebSocket payload reassembly buffer is allocated, and by `PlayerRoleConfig::interpolation_buffer_location` and `decode_buffer_location` to control where the player's transfer buffers are allocated. Ignored on host platforms (no internal/external distinction).

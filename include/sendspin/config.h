@@ -62,6 +62,10 @@ struct SendspinClientConfig {
     int64_t time_burst_interval_ms{DEFAULT_BURST_INTERVAL_MS};  ///< Milliseconds between bursts
     int64_t time_burst_response_timeout_ms{
         DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
+
+    /// @brief Memory placement for the per-connection WebSocket payload reassembly buffer
+    /// (ESP-IDF only; ignored on host). Defaults to PREFER_EXTERNAL (SPIRAM).
+    MemoryLocation websocket_payload_location{MemoryLocation::PREFER_EXTERNAL};
 };
 
 // ============================================================================
