@@ -47,6 +47,14 @@ static constexpr uint32_t WAIT_FOR_TIME_SYNC_MS = 15U;
 /// @brief Timeout (ms) for receiving the next encoded audio chunk from the ring buffer
 static constexpr uint32_t ENCODED_CHUNK_RECEIVE_TIMEOUT_MS = 15U;
 
+/// @brief Timeout (ms) for on_audio_write pushes; bounds how long the sync task blocks on the
+/// sink before returning to its inner loop to re-check flags and drift.
+static constexpr uint32_t AUDIO_WRITE_TIMEOUT_MS = 20U;
+
+/// @brief Minimum sleep (ms) after an initial-sync push, to let the audio stack begin draining
+/// before the next push.
+static constexpr uint32_t INITIAL_SYNC_SETTLE_MIN_MS = 5U;
+
 static const char* const TAG = "sendspin_sync_task";
 
 // ============================================================================
@@ -150,16 +158,15 @@ SyncTaskState SyncTask::handle_initial_sync(SyncContext& sync_context) {
     }
 
     if (sync_context.interpolation_transfer_buffer->available() > 0) {
-        const uint32_t duration_in_transfer_buffers = sync_context.current_stream_info.bytes_to_ms(
-            sync_context.interpolation_transfer_buffer->available());
         size_t bytes_written = sync_context.interpolation_transfer_buffer->transfer_data_to_sink(
-            duration_in_transfer_buffers / 2);
+            AUDIO_WRITE_TIMEOUT_MS);
         this->track_sent_audio(sync_context, bytes_written);
         if ((bytes_written > 0) && sync_context.initial_decode) {
             // Sent initial zeros, delay slightly to give it some time to work through the audio
             // stack
-            std::this_thread::sleep_for(std::chrono::milliseconds(
-                sync_context.current_stream_info.bytes_to_ms(bytes_written) / 2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::max<uint32_t>(
+                INITIAL_SYNC_SETTLE_MIN_MS,
+                sync_context.current_stream_info.bytes_to_ms(bytes_written) / 2)));
         }
     } else {
         const size_t zeroed_bytes = sync_context.interpolation_transfer_buffer->free();
@@ -312,26 +319,22 @@ void SyncTask::track_sent_audio(SyncContext& sync_context, size_t bytes_sent) {
 }
 
 bool SyncTask::transfer_audio(SyncContext& sync_context) {
-    size_t decode_available =
-        sync_context.release_chunk ? sync_context.decode_buffer->available() : 0;
-    const uint32_t duration_in_transfer_buffers = sync_context.current_stream_info.bytes_to_ms(
-        decode_available + sync_context.interpolation_transfer_buffer->available());
-
-    size_t bytes_written = sync_context.interpolation_transfer_buffer->transfer_data_to_sink(
-        duration_in_transfer_buffers / 2);
+    size_t bytes_written =
+        sync_context.interpolation_transfer_buffer->transfer_data_to_sink(AUDIO_WRITE_TIMEOUT_MS);
     this->track_sent_audio(sync_context, bytes_written);
 
     if ((bytes_written > 0) && sync_context.initial_decode) {
         // Sent initial zeros, delay slightly to give it some time to work through the audio stack
         std::this_thread::sleep_for(std::chrono::milliseconds(
-            sync_context.current_stream_info.bytes_to_ms(bytes_written) / 2));
+            std::max<uint32_t>(INITIAL_SYNC_SETTLE_MIN_MS,
+                               sync_context.current_stream_info.bytes_to_ms(bytes_written) / 2)));
     }
 
     if (sync_context.interpolation_transfer_buffer->available() == 0 &&
         sync_context.release_chunk) {
         // No interpolation bytes available, send main audio data
         size_t decode_bytes_written =
-            sync_context.decode_buffer->transfer_data_to_sink(3 * duration_in_transfer_buffers / 2);
+            sync_context.decode_buffer->transfer_data_to_sink(AUDIO_WRITE_TIMEOUT_MS);
         this->track_sent_audio(sync_context, decode_bytes_written);
     }
 
