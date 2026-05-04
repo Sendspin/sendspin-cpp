@@ -15,9 +15,19 @@ The binary is at `build/examples/tui_client/tui_client`.
 
 ### Linux prerequisites
 
+PortAudio enables audio playback:
+
 ```sh
-sudo apt install libavahi-compat-libdnssd-dev portaudio19-dev
+sudo apt install portaudio19-dev
 ```
+
+mDNS server discovery is optional. Install Avahi's Bonjour-compatible headers to enable it:
+
+```sh
+sudo apt install libavahi-compat-libdnssd-dev
+```
+
+Without it the in-TUI server picker stays empty and you must use `-u ws://server-host:port/path` to connect.
 
 macOS has mDNS support built in. Install PortAudio via Homebrew:
 

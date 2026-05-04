@@ -34,11 +34,14 @@
 #include "portaudio_sink.h"
 #endif
 
+#include <getopt.h>
+
+#ifdef SENDSPIN_HAS_MDNS
 #include <arpa/inet.h>
 #include <dns_sd.h>
 #include <netdb.h>
-#include <getopt.h>
 #include <sys/select.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -70,6 +73,7 @@ static size_t null_audio_write(uint8_t*, size_t length, uint32_t) {
     return length;
 }
 
+#ifdef SENDSPIN_HAS_MDNS
 // Manages mDNS service advertisement via dns_sd.h
 class MdnsAdvertiser {
 public:
@@ -324,6 +328,7 @@ private:
     std::mutex resolve_mutex_;
     std::vector<DNSServiceRef> pending_resolves_;
 };
+#endif  // SENDSPIN_HAS_MDNS
 
 /// Parse an audio format string like "flac:48000:24:2" into an AudioSupportedFormatObject.
 /// Returns true on success.
@@ -736,13 +741,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Advertise via mDNS
+    // Advertise via mDNS and browse for other servers (when compiled in)
+#ifdef SENDSPIN_HAS_MDNS
     MdnsAdvertiser mdns;
     mdns.start(friendly_name, SENDSPIN_PORT, SENDSPIN_PATH);
 
-    // Start mDNS browsing for servers
     MdnsBrowser mdns_browser;
     mdns_browser.start();
+#endif
 
     // Auto-connect if a URL was provided via -u
     if (!connect_url.empty()) {
@@ -869,6 +875,7 @@ int main(int argc, char* argv[]) {
                 audio_sink.set_muted(player.get_muted());
 #endif
                 // Update discovered servers list
+#ifdef SENDSPIN_HAS_MDNS
                 {
                     auto servers = mdns_browser.get_servers();
                     std::lock_guard<std::mutex> lock(state.mutex);
@@ -879,6 +886,7 @@ int main(int argc, char* argv[]) {
                         state.server_selector_index = std::max(0, max_index);
                     }
                 }
+#endif
 
                 // Only post a redraw if something actually changed
                 if (!vis_showing) {
@@ -909,8 +917,10 @@ int main(int argc, char* argv[]) {
     // Cleanup
     running.store(false);
     client_thread.join();
+#ifdef SENDSPIN_HAS_MDNS
     mdns_browser.stop();
     mdns.stop();
+#endif
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
 
     return 0;

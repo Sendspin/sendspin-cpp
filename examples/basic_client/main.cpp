@@ -15,8 +15,10 @@
 /// @file Host example application for sendspin-cpp.
 ///
 /// Runs a SendspinClient on the host computer, listening for incoming
-/// connections from a Sendspin server on port 8928. Advertises via mDNS
-/// so Sendspin servers can discover and connect automatically.
+/// connections from a Sendspin server on port 8928. When built with mDNS
+/// support (dns_sd.h available), advertises via mDNS so Sendspin servers
+/// can discover and connect automatically; otherwise the user must connect
+/// manually with `-u ws://<server-host>:<port>/<path>`.
 ///
 /// Usage: ./basic_client [options] [name]
 ///   name:  Optional friendly name (default: "Basic Client")
@@ -36,10 +38,12 @@
 #include "portaudio_sink.h"
 #endif
 
-#include <dns_sd.h>
 #include <getopt.h>
 
+#ifdef SENDSPIN_HAS_MDNS
 #include <arpa/inet.h>
+#include <dns_sd.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -57,6 +61,7 @@ static const char* SENDSPIN_PATH = "/sendspin";
 // Tracks total audio bytes received (used when PortAudio is unavailable)
 static size_t null_audio_total_bytes = 0;
 
+#ifdef SENDSPIN_HAS_MDNS
 // Manages mDNS service advertisement via dns_sd.h
 class MdnsAdvertiser {
 public:
@@ -109,6 +114,7 @@ public:
 private:
     DNSServiceRef service_ref_{nullptr};
 };
+#endif  // SENDSPIN_HAS_MDNS
 
 static std::atomic<bool> running{true};
 
@@ -309,13 +315,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Advertise via mDNS
+#ifdef SENDSPIN_HAS_MDNS
     MdnsAdvertiser mdns;
     if (!mdns.start(friendly_name, SENDSPIN_PORT, SENDSPIN_PATH)) {
         fprintf(stderr, "Warning: mDNS advertisement failed, server still running\n");
         fprintf(stderr, "Connect manually to ws://<this-host>:%u%s\n", SENDSPIN_PORT,
                 SENDSPIN_PATH);
     }
+#else
+    fprintf(stderr,
+            "mDNS advertisement not compiled in. Either restart with "
+            "-u ws://<server-host>:<port>/<path> to dial a server, or tell a server "
+            "to connect to ws://<this-host>:%u%s.\n",
+            SENDSPIN_PORT, SENDSPIN_PATH);
+#endif
 
     // Auto-connect if a URL was provided via -u
     if (!connect_url.empty()) {
@@ -342,7 +355,9 @@ int main(int argc, char* argv[]) {
     }
 
     fprintf(stderr, "\nShutting down...\n");
+#ifdef SENDSPIN_HAS_MDNS
     mdns.stop();
+#endif
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
 
 #ifndef SENDSPIN_HAS_PORTAUDIO
