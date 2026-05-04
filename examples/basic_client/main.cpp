@@ -18,7 +18,7 @@
 /// connections from a Sendspin server on port 8928. When built with mDNS
 /// support (dns_sd.h available), advertises via mDNS so Sendspin servers
 /// can discover and connect automatically; otherwise the user must connect
-/// manually with `-u ws://host:8928/sendspin`.
+/// manually with `-u ws://<server-host>:<port>/<path>`.
 ///
 /// Usage: ./basic_client [options] [name]
 ///   name:  Optional friendly name (default: "Basic Client")

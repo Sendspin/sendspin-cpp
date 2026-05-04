@@ -1,6 +1,6 @@
 # Basic Client Example
 
-Runs the sendspin-cpp client on a host computer (macOS/Linux). When built with mDNS support, advertises via mDNS so Sendspin servers discover and connect automatically; otherwise connect to a server manually with `-u ws://host:8928/sendspin`.
+Runs the sendspin-cpp client on a host computer (macOS/Linux). When built with mDNS support, advertises via mDNS so Sendspin servers discover and connect automatically; otherwise connect to a server manually with `-u ws://<server-host>:<port>/<path>`.
 
 ## Build
 
