@@ -20,11 +20,25 @@ target_link_libraries(tui_client PRIVATE
 )
 target_compile_features(tui_client PRIVATE cxx_std_20)
 
-# mDNS service advertisement via dns_sd.h
+# mDNS service advertisement and browsing via dns_sd.h (optional)
 # macOS: built-in (no extra link flags needed — dns_sd is in libSystem)
-# Linux: requires libavahi-compat-libdnssd-dev (link with -ldns_sd)
-if(NOT APPLE)
-    target_link_libraries(tui_client PRIVATE dns_sd)
+# Linux: requires libavahi-compat-libdnssd-dev (provides dns_sd.h + libdns_sd)
+if(APPLE)
+    target_compile_definitions(tui_client PRIVATE SENDSPIN_HAS_MDNS=1)
+    message(STATUS "mDNS advertisement/browsing enabled for TUI (Bonjour built-in)")
+else()
+    find_path(TUI_CLIENT_DNS_SD_INCLUDE_DIR dns_sd.h)
+    find_library(TUI_CLIENT_DNS_SD_LIBRARY dns_sd)
+    if(TUI_CLIENT_DNS_SD_INCLUDE_DIR AND TUI_CLIENT_DNS_SD_LIBRARY)
+        target_include_directories(tui_client PRIVATE ${TUI_CLIENT_DNS_SD_INCLUDE_DIR})
+        target_link_libraries(tui_client PRIVATE ${TUI_CLIENT_DNS_SD_LIBRARY})
+        target_compile_definitions(tui_client PRIVATE SENDSPIN_HAS_MDNS=1)
+        message(STATUS "mDNS advertisement/browsing enabled for TUI (${TUI_CLIENT_DNS_SD_LIBRARY})")
+    else()
+        message(STATUS "mDNS advertisement/browsing disabled for TUI. Install "
+                       "libavahi-compat-libdnssd-dev (Debian/Ubuntu) to enable; -u "
+                       "ws://... still works")
+    endif()
 endif()
 
 # PortAudio (optional — enables audio playback via PortAudioSink)
