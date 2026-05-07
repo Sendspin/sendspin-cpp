@@ -25,16 +25,17 @@ namespace sendspin {
 // Lifecycle
 // ============================================================================
 
-SendspinTimeFilter::SendspinTimeFilter(double process_std_dev, double drift_process_std_dev,
-                                       double forget_factor, double adaptive_cutoff,
-                                       uint8_t min_samples, double drift_significance_threshold)
-    : adaptive_forgetting_cutoff(adaptive_cutoff),
-      drift_process_variance(drift_process_std_dev * drift_process_std_dev),
-      drift_significance_threshold_squared(drift_significance_threshold *
-                                           drift_significance_threshold),
-      forget_variance_factor(forget_factor * forget_factor),
-      process_variance(process_std_dev * process_std_dev),
-      min_samples_for_forgetting(min_samples) {}
+SendspinTimeFilter::SendspinTimeFilter() : SendspinTimeFilter(Config{}) {}
+
+SendspinTimeFilter::SendspinTimeFilter(const Config& config)
+    : adaptive_forgetting_cutoff(config.adaptive_cutoff),
+      drift_process_variance(config.drift_process_std_dev * config.drift_process_std_dev),
+      drift_significance_threshold_squared(config.drift_significance_threshold *
+                                           config.drift_significance_threshold),
+      forget_variance_factor(config.forget_factor * config.forget_factor),
+      max_error_scale(config.max_error_scale),
+      process_variance(config.process_std_dev * config.process_std_dev),
+      min_samples_for_forgetting(config.min_samples) {}
 
 // ============================================================================
 // Core API
@@ -53,7 +54,7 @@ void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t 
     const double dt_squared = dt * dt;
     this->last_update_ = time_added;
 
-    const double update_std_dev = max_error;
+    const double update_std_dev = max_error * this->max_error_scale;
     const double measurement_variance = update_std_dev * update_std_dev;
 
     // Filter initialization: First measurement establishes offset baseline
@@ -90,8 +91,8 @@ void SendspinTimeFilter::update(int64_t measurement, int64_t max_error, int64_t 
 
     // Process noise for both offset and drift (full random walk model)
     // We assume clock jitter (offset noise) and wander (drift noise) are independent processes
-    const double drift_process_variance = dt * this->drift_process_variance;
-    double new_drift_covariance = this->drift_covariance_ + drift_process_variance;
+    const double drift_process_variance_dt = dt * this->drift_process_variance;
+    double new_drift_covariance = this->drift_covariance_ + drift_process_variance_dt;
 
     double new_offset_drift_covariance =
         this->offset_drift_covariance_ + this->drift_covariance_ * dt;

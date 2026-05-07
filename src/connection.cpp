@@ -35,10 +35,7 @@ SendspinConnection::~SendspinConnection() = default;
 // ============================================================================
 
 void SendspinConnection::init_time_filter() {
-    this->time_filter_ = std::make_unique<SendspinTimeFilter>(
-        TIME_FILTER_PROCESS_STD_DEV, TIME_FILTER_DRIFT_PROCESS_STD_DEV, TIME_FILTER_FORGET_FACTOR,
-        TIME_FILTER_ADAPTIVE_CUTOFF, TIME_FILTER_MIN_SAMPLES,
-        TIME_FILTER_DRIFT_SIGNIFICANCE_THRESHOLD);
+    this->time_filter_ = std::make_unique<SendspinTimeFilter>(SendspinTimeFilter::Config{});
 }
 
 // ============================================================================
