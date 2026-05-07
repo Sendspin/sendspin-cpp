@@ -249,9 +249,9 @@ The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering
 ### Other Roles
 
 - **ControllerRole**: Takes from shadow, fires `on_controller_state()`.
-- **MetadataRole**: Takes from shadow when the pending update's `timestamp` has been reached on the synced client clock (or immediately if time sync is not yet ready), applies deltas, fires `on_metadata()`.
+- **MetadataRole**: Takes from shadow when the pending update's `timestamp` has been reached on the synced client clock (or immediately if there is no active connection), applies deltas, fires `on_metadata()`.
 - **ColorRole**: Fires `on_color_clear()` first if a `pending_clear` flag is set (deferred from `cleanup()` to avoid invoking the listener while `ConnectionManager` holds `conn_ptr_mutex_`). Then takes from shadow when the pending update's `timestamp` has been reached on the synced client clock (or immediately if there is no active connection), applies deltas, fires `on_color()`.
-- **ArtworkRole**: Drains event queue for stream end/clear lifecycle events first (resetting all per-slot pending display timestamps and firing `on_image_clear()` for each configured slot). Then iterates the per-slot `DisplayScheduler::pending` shadow slots and fires `on_image_display(slot)` for any slot whose pending timestamp is due on the synced client clock (or immediately if time sync is not yet ready). `on_image_decode` still happens on the dedicated artwork decode thread.
+- **ArtworkRole**: Drains event queue for stream end/clear lifecycle events first (resetting all per-slot pending display timestamps and firing `on_image_clear()` for each configured slot). Then iterates the per-slot `DisplayScheduler::pending` shadow slots and fires `on_image_display(slot)` for any slot whose pending timestamp is due on the synced client clock (or immediately if there is no active connection). `on_image_decode` still happens on the dedicated artwork decode thread.
 - **VisualizerRole**: Drains event queue, processes stream start/end/clear with shadow config.
 
 ## Sync Task State Machine

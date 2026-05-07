@@ -71,8 +71,8 @@ public:
  * Maintains a local shadow of the server's metadata state, including track title, artist,
  * album, artwork URL, and playback progress. Incoming metadata deltas
  * are merged into the shadow and delivered to the listener on the main loop thread once the
- * synchronized client clock reaches the update's `timestamp` (or immediately if time sync is
- * not yet ready). Progress is interpolated locally using the server timestamp so callers
+ * synchronized client clock reaches the update's `timestamp` (or immediately if there is no
+ * active connection). Progress is interpolated locally using the server timestamp so callers
  * always get a current value.
  *
  * Usage:

@@ -276,8 +276,9 @@ void ArtworkRole::Impl::drain_events() {
         int64_t server_ts = 0;
         const bool taken = this->display_scheduler->pending[slot].take_if(
             server_ts, [this, now](const int64_t& pending_ts) {
-                // Fire immediately if time sync isn't ready: holding forever would starve
-                // the listener. Matches the metadata role's behavior.
+                // get_client_time returns 0 when there is no current connection. Without a
+                // connection we cannot honor the server-clock deadline, so fire immediately rather
+                // than starving the listener.
                 int64_t client_ts = this->client->get_client_time(pending_ts);
                 if (client_ts == 0) {
                     return true;
