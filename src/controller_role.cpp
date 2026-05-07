@@ -66,6 +66,15 @@ void ControllerRole::Impl::handle_server_state(ServerStateControllerObject state
 }
 
 void ControllerRole::Impl::drain_events() {
+    // Deferred from cleanup() to avoid invoking the listener while ConnectionManager holds
+    // conn_ptr_mutex_; a listener that calls back into the client would otherwise deadlock.
+    if (this->event_state->pending_clear) {
+        this->event_state->pending_clear = false;
+        if (this->listener) {
+            this->listener->on_controller_state_clear();
+        }
+    }
+
     ServerStateControllerObject state;
     if (this->event_state->shadow.take(state)) {
         this->controller_state = std::move(state);
@@ -78,6 +87,7 @@ void ControllerRole::Impl::drain_events() {
 void ControllerRole::Impl::cleanup() {
     this->event_state->shadow.reset();
     this->controller_state = {};
+    this->event_state->pending_clear = true;
 }
 
 }  // namespace sendspin

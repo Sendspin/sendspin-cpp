@@ -38,6 +38,7 @@ struct ControllerRole::Impl {
 
     struct EventState {
         ShadowSlot<ServerStateControllerObject> shadow;
+        bool pending_clear{false};
     };
 
     // ========================================

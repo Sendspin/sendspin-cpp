@@ -107,6 +107,15 @@ void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject state) co
 }
 
 void MetadataRole::Impl::drain_events() {
+    // Deferred from cleanup() to avoid invoking the listener while ConnectionManager holds
+    // conn_ptr_mutex_; a listener that calls back into the client would otherwise deadlock.
+    if (this->event_state->pending_clear) {
+        this->event_state->pending_clear = false;
+        if (this->listener) {
+            this->listener->on_metadata_clear();
+        }
+    }
+
     ServerMetadataStateObject delta{};
     // Caveat: merged deltas carry only the newest timestamp, so a past-valid field merged
     // under a later future-valid update gets held back until the later deadline. Accepted
@@ -133,6 +142,7 @@ void MetadataRole::Impl::drain_events() {
 void MetadataRole::Impl::cleanup() {
     this->event_state->shadow.reset();
     this->metadata = {};
+    this->event_state->pending_clear = true;
 }
 
 }  // namespace sendspin
