@@ -48,6 +48,12 @@ function(sendspin_get_sources BASE_DIR)
         PARENT_SCOPE
     )
 
+    set(SENDSPIN_COLOR_SOURCES
+        ${BASE_DIR}/src/color_role.cpp
+
+        PARENT_SCOPE
+    )
+
     set(SENDSPIN_ARTWORK_SOURCES
         ${BASE_DIR}/src/artwork_role.cpp
 

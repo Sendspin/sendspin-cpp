@@ -228,6 +228,66 @@ static bool process_server_metadata_state_object(const JsonObject metadata_objec
     return true;
 }
 
+// Parses a single `[R, G, B]` color field into a tri-state delta entry. A field that is absent on
+// the wire leaves `out` untouched (outer nullopt). An explicit `null` writes outer-engaged +
+// inner-nullopt (clear). A 3-element array of ints in 0-255 writes outer-engaged + inner-engaged.
+// Malformed values are logged and skipped (treated as absent).
+static void parse_color_field(JsonVariantConst var, std::optional<std::optional<RgbColor>>* out) {
+    if (var.isUnbound()) {
+        return;
+    }
+    if (var.isNull()) {
+        *out = std::optional<RgbColor>{};
+        return;
+    }
+    if (!var.is<JsonArrayConst>()) {
+        SS_LOGW(TAG, "Color field is not an array; ignoring");
+        return;
+    }
+    JsonArrayConst arr = var.as<JsonArrayConst>();
+    if (arr.size() != 3) {
+        SS_LOGW(TAG, "Color field array length %zu != 3; ignoring", arr.size());
+        return;
+    }
+    RgbColor color{};
+    for (size_t i = 0; i < 3; i++) {
+        JsonVariantConst component = arr[i];
+        if (!component.is<int>()) {
+            SS_LOGW(TAG, "Color field component is not an integer; ignoring");
+            return;
+        }
+        int value = component.as<int>();
+        if (value < 0 || value > 255) {
+            SS_LOGW(TAG, "Color field component %d out of range 0-255; ignoring", value);
+            return;
+        }
+        color[i] = static_cast<uint8_t>(value);
+    }
+    *out = color;
+}
+
+static bool process_server_color_state_object(const JsonObject color_object,
+                                              ServerColorStateDelta* color_delta) {
+    if (color_delta == nullptr) {
+        return false;
+    }
+
+    if (!color_object["timestamp"].is<JsonVariant>()) {
+        SS_LOGE(TAG, "Invalid color state object: missing timestamp");
+        return false;
+    }
+    color_delta->timestamp = color_object["timestamp"].as<int64_t>();
+
+    parse_color_field(color_object["background_dark"], &color_delta->background_dark);
+    parse_color_field(color_object["background_light"], &color_delta->background_light);
+    parse_color_field(color_object["primary"], &color_delta->primary);
+    parse_color_field(color_object["accent"], &color_delta->accent);
+    parse_color_field(color_object["on_dark"], &color_delta->on_dark);
+    parse_color_field(color_object["on_light"], &color_delta->on_light);
+
+    return true;
+}
+
 // ============================================================================
 // Protocol functions
 // ============================================================================
@@ -418,6 +478,13 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
         ServerMetadataStateObject metadata_state{};
         if (process_server_metadata_state_object(root["payload"]["metadata"], &metadata_state)) {
             state_msg->metadata = metadata_state;
+        }
+    }
+
+    if (root["payload"]["color"].is<JsonObject>()) {
+        ServerColorStateDelta color_delta{};
+        if (process_server_color_state_object(root["payload"]["color"], &color_delta)) {
+            state_msg->color = std::move(color_delta);
         }
     }
 
@@ -644,6 +711,36 @@ void apply_metadata_state_deltas(ServerMetadataStateObject* current,
 
     if (updates.progress.has_value()) {
         current->progress = updates.progress;
+    }
+}
+
+void apply_color_state_deltas(ServerColorStateObject* current, const ServerColorStateDelta& delta) {
+    if (current == nullptr) {
+        return;
+    }
+
+    current->timestamp = delta.timestamp;
+
+    // For each field, an outer-engaged delta entry overwrites the merged optional with the inner
+    // optional verbatim, so an inner-`nullopt` (explicit `null` on the wire) clears the merged
+    // field.
+    if (delta.background_dark.has_value()) {
+        current->background_dark = *delta.background_dark;
+    }
+    if (delta.background_light.has_value()) {
+        current->background_light = *delta.background_light;
+    }
+    if (delta.primary.has_value()) {
+        current->primary = *delta.primary;
+    }
+    if (delta.accent.has_value()) {
+        current->accent = *delta.accent;
+    }
+    if (delta.on_dark.has_value()) {
+        current->on_dark = *delta.on_dark;
+    }
+    if (delta.on_light.has_value()) {
+        current->on_light = *delta.on_light;
     }
 }
 

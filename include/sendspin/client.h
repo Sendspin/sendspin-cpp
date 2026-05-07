@@ -33,6 +33,9 @@ namespace sendspin {
 #ifdef SENDSPIN_ENABLE_ARTWORK
 class ArtworkRole;
 #endif
+#ifdef SENDSPIN_ENABLE_COLOR
+class ColorRole;
+#endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
 class ControllerRole;
 #endif
@@ -219,6 +222,11 @@ public:
     PlayerRole& add_player(PlayerRoleConfig config);
 #endif
 
+#ifdef SENDSPIN_ENABLE_COLOR
+    /// @brief Adds the color role. Returns a reference for setting callbacks
+    ColorRole& add_color();
+#endif
+
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     /// @brief Adds the controller role. Returns a reference for setting callbacks
     ControllerRole& add_controller();
@@ -253,6 +261,18 @@ public:
     /// @return Const pointer to the artwork role, or nullptr
     const ArtworkRole* artwork() const {
         return this->artwork_.get();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    /// @brief Returns the color role, or nullptr if not added
+    /// @return Pointer to the color role, or nullptr
+    ColorRole* color() {
+        return this->color_.get();
+    }
+    /// @brief Returns the color role (const), or nullptr if not added
+    /// @return Const pointer to the color role, or nullptr
+    const ColorRole* color() const {
+        return this->color_.get();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
@@ -434,6 +454,9 @@ private:
     // Pointer fields
 #ifdef SENDSPIN_ENABLE_ARTWORK
     std::unique_ptr<ArtworkRole> artwork_;
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    std::unique_ptr<ColorRole> color_;
 #endif
     std::unique_ptr<ConnectionManager> connection_manager_;
 #ifdef SENDSPIN_ENABLE_CONTROLLER
