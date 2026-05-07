@@ -39,9 +39,6 @@ namespace sendspin {
 /// All computations use double precision arithmetic to maintain microsecond-level accuracy over
 /// extended periods. Thread-safe access to the current time transformation is provided via
 /// std::mutex.
-/// @brief Default minimum samples before adaptive forgetting is enabled in the time filter.
-static constexpr uint8_t TIME_FILTER_DEFAULT_MIN_SAMPLES = 100U;
-
 class SendspinTimeFilter {
 public:
     /// @brief Configuration parameters for the time synchronization filter.
@@ -62,7 +59,7 @@ public:
         double adaptive_cutoff = 3.0;
         /// Minimum number of samples before adaptive forgetting is enabled.
         /// Building sufficient history before enabling forgetting improves stability.
-        uint8_t min_samples = TIME_FILTER_DEFAULT_MIN_SAMPLES;
+        uint8_t min_samples = 100U;  // NOLINT(readability-magic-numbers)
         /// SNR threshold for applying drift compensation in time conversions.
         /// Drift is only used when drift² > threshold² * drift_covariance, ensuring
         /// the drift estimate is statistically significant before applying corrections.
