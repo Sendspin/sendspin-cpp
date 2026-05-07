@@ -658,7 +658,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const std::s
 
 #ifdef SENDSPIN_ENABLE_COLOR
                 if (this->color_ && state_msg.color.has_value()) {
-                    this->color_->impl_->handle_server_state(std::move(state_msg.color.value()));
+                    this->color_->impl_->handle_server_state(state_msg.color.value());
                 }
 #endif
             }

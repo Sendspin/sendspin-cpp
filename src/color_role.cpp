@@ -53,29 +53,31 @@ void ColorRole::Impl::handle_server_state(ServerColorStateDelta delta) const {
     // outer-engaged incoming entry overwrites the accumulated entry verbatim; absent
     // (outer-nullopt) incoming fields leave the accumulated entry untouched, so pending clears
     // (inner-nullopt) from earlier deltas survive until drain_events applies them.
+    // ServerColorStateDelta is trivially copyable (RgbColor is std::array<uint8_t, 3>), so the
+    // merge assigns fields directly without std::move.
     this->event_state->shadow.merge(
         [](ServerColorStateDelta& current, ServerColorStateDelta&& incoming) {
             current.timestamp = incoming.timestamp;
             if (incoming.background_dark.has_value()) {
-                current.background_dark = std::move(incoming.background_dark);
+                current.background_dark = incoming.background_dark;
             }
             if (incoming.background_light.has_value()) {
-                current.background_light = std::move(incoming.background_light);
+                current.background_light = incoming.background_light;
             }
             if (incoming.primary.has_value()) {
-                current.primary = std::move(incoming.primary);
+                current.primary = incoming.primary;
             }
             if (incoming.accent.has_value()) {
-                current.accent = std::move(incoming.accent);
+                current.accent = incoming.accent;
             }
             if (incoming.on_dark.has_value()) {
-                current.on_dark = std::move(incoming.on_dark);
+                current.on_dark = incoming.on_dark;
             }
             if (incoming.on_light.has_value()) {
-                current.on_light = std::move(incoming.on_light);
+                current.on_light = incoming.on_light;
             }
         },
-        std::move(delta));
+        delta);
 }
 
 void ColorRole::Impl::drain_events() {

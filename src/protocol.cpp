@@ -484,7 +484,7 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
     if (root["payload"]["color"].is<JsonObject>()) {
         ServerColorStateDelta color_delta{};
         if (process_server_color_state_object(root["payload"]["color"], &color_delta)) {
-            state_msg->color = std::move(color_delta);
+            state_msg->color = color_delta;
         }
     }
 
