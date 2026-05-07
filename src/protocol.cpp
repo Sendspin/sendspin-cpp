@@ -225,15 +225,6 @@ static bool process_server_metadata_state_object(const JsonObject metadata_objec
         metadata_state->progress = std::nullopt;
     }
 
-    if (metadata_object["repeat"].is<const char*>()) {
-        std::string repeat_str = metadata_object["repeat"].as<std::string>();
-        metadata_state->repeat = repeat_mode_from_string(repeat_str);
-    }
-
-    if (metadata_object["shuffle"].is<JsonVariant>() && !metadata_object["shuffle"].isNull()) {
-        metadata_state->shuffle = metadata_object["shuffle"].as<bool>();
-    }
-
     return true;
 }
 
@@ -460,6 +451,20 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
             controller_state.muted = controller_object["muted"].as<bool>();
         }
 
+        // Parse repeat
+        if (controller_object["repeat"].is<const char*>()) {
+            std::string repeat_str = controller_object["repeat"].as<std::string>();
+            auto repeat = repeat_mode_from_string(repeat_str);
+            if (repeat.has_value()) {
+                controller_state.repeat = repeat.value();
+            }
+        }
+
+        // Parse shuffle
+        if (controller_object["shuffle"].is<JsonVariant>()) {
+            controller_state.shuffle = controller_object["shuffle"].as<bool>();
+        }
+
         state_msg->controller = controller_state;
     }
 
@@ -639,14 +644,6 @@ void apply_metadata_state_deltas(ServerMetadataStateObject* current,
 
     if (updates.progress.has_value()) {
         current->progress = updates.progress;
-    }
-
-    if (updates.repeat.has_value()) {
-        current->repeat = updates.repeat;
-    }
-
-    if (updates.shuffle.has_value()) {
-        current->shuffle = updates.shuffle;
     }
 }
 

@@ -37,13 +37,6 @@ struct MetadataProgressObject {
     uint32_t playback_speed;
 };
 
-/// @brief Repeat mode for playback
-enum class SendspinRepeatMode : uint8_t {
-    OFF,  // No repeat
-    ONE,  // Repeat current track
-    ALL,  // Repeat entire queue
-};
-
 /// @brief Track metadata and playback state received from the server
 struct ServerMetadataStateObject {
     int64_t timestamp{};
@@ -55,8 +48,6 @@ struct ServerMetadataStateObject {
     std::optional<uint16_t> year;
     std::optional<uint16_t> track;
     std::optional<MetadataProgressObject> progress;
-    std::optional<SendspinRepeatMode> repeat;
-    std::optional<bool> shuffle;
 };
 
 /// @brief Listener for metadata role events. All methods fire on the main loop thread.
@@ -78,7 +69,7 @@ public:
  * @brief Metadata role that receives track metadata and playback progress from the server
  *
  * Maintains a local shadow of the server's metadata state, including track title, artist,
- * album, artwork URL, repeat/shuffle mode, and playback progress. Incoming metadata deltas
+ * album, artwork URL, and playback progress. Incoming metadata deltas
  * are merged into the shadow and delivered to the listener on the main loop thread once the
  * synchronized client clock reaches the update's `timestamp` (or immediately if time sync is
  * not yet ready). Progress is interpolated locally using the server timestamp so callers

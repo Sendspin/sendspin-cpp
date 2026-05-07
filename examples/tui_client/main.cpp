@@ -626,12 +626,6 @@ int main(int argc, char* argv[]) {
             if (md.album.has_value()) {
                 state.album = *md.album;
             }
-            if (md.repeat.has_value()) {
-                state.repeat_mode = *md.repeat;
-            }
-            if (md.shuffle.has_value()) {
-                state.shuffle = *md.shuffle;
-            }
         }
     };
 

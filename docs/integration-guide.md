@@ -88,7 +88,7 @@ Call `is_complete()` on the object to check if all fields have values.
 
 ### Controller Role (Playback Commands)
 
-Lets your application send transport commands (play, pause, next, etc.) and receive the server's controller state (volume, mute, supported commands).
+Lets your application send transport commands (play, pause, next, etc.) and receive the server's controller state (volume, mute, repeat, shuffle, supported commands).
 
 ```cpp
 auto& controller = client.add_controller();
@@ -212,8 +212,6 @@ struct MyMetadataListener : MetadataRoleListener {
         if (md.progress) {
             update_progress_bar(md.progress->track_progress, md.progress->track_duration);
         }
-        if (md.repeat) update_repeat_icon(*md.repeat);
-        if (md.shuffle) update_shuffle_icon(*md.shuffle);
     }
 };
 ```
@@ -231,8 +229,6 @@ The `ServerMetadataStateObject` contains these fields (all optional except `time
 | `year` | `std::optional<uint16_t>` | Release year |
 | `track` | `std::optional<uint16_t>` | Track number |
 | `progress` | `std::optional<MetadataProgressObject>` | Playback progress (see below) |
-| `repeat` | `std::optional<SendspinRepeatMode>` | Repeat mode |
-| `shuffle` | `std::optional<bool>` | Shuffle state |
 
 `MetadataProgressObject` contains `track_progress` (ms), `track_duration` (ms), and `playback_speed`.
 
@@ -248,9 +244,11 @@ uint32_t duration_ms = metadata.get_track_duration_ms();   // 0 = unknown/live
 ```cpp
 struct MyControllerListener : ControllerRoleListener {
     void on_controller_state(const ServerStateControllerObject& state) override {
-        // Update UI with server-side volume and mute state
+        // Update UI with server-side volume, mute, repeat, and shuffle state
         update_volume_slider(state.volume);
         update_mute_button(state.muted);
+        update_repeat_icon(state.repeat);
+        update_shuffle_icon(state.shuffle);
         // Enable/disable buttons based on supported commands
         enable_buttons(state.supported_commands);
     }
@@ -519,7 +517,7 @@ int32_t fixed = player.get_fixed_delay_us();
 auto& stream = player.get_current_stream_params();
 
 // Controller state
-auto& ctrl = controller.get_controller_state();  // volume, muted, supported_commands
+auto& ctrl = controller.get_controller_state();  // volume, muted, repeat, shuffle, supported_commands
 
 // Metadata
 uint32_t progress = metadata.get_track_progress_ms();  // Interpolated

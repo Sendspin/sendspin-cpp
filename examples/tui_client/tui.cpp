@@ -944,6 +944,8 @@ void update_polled_state(TuiState& state, SendspinClient& client) {
         auto& cs = client.controller()->get_controller_state();
         state.group_volume = cs.volume;
         state.group_muted = cs.muted;
+        state.repeat_mode = cs.repeat;
+        state.shuffle = cs.shuffle;
     }
 }
 

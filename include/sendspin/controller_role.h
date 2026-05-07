@@ -48,11 +48,20 @@ enum class SendspinControllerCommand : uint8_t {
     SWITCH,      // Switch playback source
 };
 
+/// @brief Repeat mode for playback
+enum class SendspinRepeatMode : uint8_t {
+    OFF,  // No repeat
+    ONE,  // Repeat current track
+    ALL,  // Repeat entire queue
+};
+
 /// @brief Controller state received from the server in server/state messages
 struct ServerStateControllerObject {
     std::vector<SendspinControllerCommand> supported_commands{};
     uint8_t volume{};
     bool muted{};
+    SendspinRepeatMode repeat{SendspinRepeatMode::OFF};
+    bool shuffle{};
 };
 
 /// @brief Listener for controller role events. All methods fire on the main loop thread.
@@ -66,17 +75,18 @@ public:
     /// @brief Called when the connection to the server is lost and cached controller state is
     /// dropped
     ///
-    /// Implementations should clear any displayed controller state (volume, mute, supported
-    /// commands) since the previous server's state is no longer valid.
+    /// Implementations should clear any displayed controller state (volume, mute, repeat,
+    /// shuffle, supported commands) since the previous server's state is no longer valid.
     virtual void on_controller_state_clear() {}
 };
 
 /**
  * @brief Playback controller role that sends commands to and receives state from the server
  *
- * Maintains a local copy of the server's controller state (volume, mute, supported commands)
- * and provides a send_command() method for dispatching playback control messages. State
- * updates from the server are queued and delivered to the listener on the main loop thread.
+ * Maintains a local copy of the server's controller state (volume, mute, repeat, shuffle,
+ * supported commands) and provides a send_command() method for dispatching playback control
+ * messages. State updates from the server are queued and delivered to the listener on the
+ * main loop thread.
  *
  * Usage:
  * 1. Implement ControllerRoleListener to receive server state updates
@@ -88,6 +98,8 @@ public:
  * struct MyControllerListener : ControllerRoleListener {
  *     void on_controller_state(const ServerStateControllerObject& state) override {
  *         update_volume_ui(state.volume, state.muted);
+ *         update_repeat_ui(state.repeat);
+ *         update_shuffle_ui(state.shuffle);
  *     }
  * };
  *

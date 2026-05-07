@@ -353,15 +353,6 @@ inline std::optional<SendspinControllerCommand> controller_command_from_string(
     return std::nullopt;
 }
 
-/// @brief A playback command sent from the client to the server via client/command messages
-struct ClientCommandControllerObject {
-    SendspinControllerCommand command{};
-    std::optional<uint8_t> volume;
-    std::optional<bool> mute;
-};
-
-// --- metadata_role.h ---
-
 inline const char* to_cstr(SendspinRepeatMode mode) {
     switch (mode) {
         case SendspinRepeatMode::OFF:
@@ -387,6 +378,13 @@ inline std::optional<SendspinRepeatMode> repeat_mode_from_string(const std::stri
     }
     return std::nullopt;
 }
+
+/// @brief A playback command sent from the client to the server via client/command messages
+struct ClientCommandControllerObject {
+    SendspinControllerCommand command{};
+    std::optional<uint8_t> volume;
+    std::optional<bool> mute;
+};
 
 // --- artwork_role.h ---
 
