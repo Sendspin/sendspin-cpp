@@ -38,6 +38,7 @@ struct MetadataRole::Impl {
 
     struct EventState {
         ShadowSlot<ServerMetadataStateObject> shadow;
+        bool pending_clear{false};
     };
 
     // ========================================
