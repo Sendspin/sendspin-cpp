@@ -7,7 +7,7 @@ This guide describes what you need to implement in order to integrate sendspin-c
 Integration follows this pattern:
 
 1. Create a `SendspinClient` with a configuration struct
-2. Add roles (player, controller, metadata, artwork, visualizer) depending on what your application needs
+2. Add roles (player, controller, metadata, artwork, visualizer, color) depending on what your application needs
 3. Implement listener interfaces for the roles you added
 4. Implement a network provider (required) and optionally a persistence provider
 5. Wire listeners and providers to the client and roles
@@ -26,6 +26,7 @@ Include `sendspin/client.h` for the client class, config types, and shared types
 #include "sendspin/metadata_role.h"   // MetadataRole, MetadataRoleListener
 #include "sendspin/artwork_role.h"    // ArtworkRole, ArtworkRoleListener
 #include "sendspin/visualizer_role.h" // VisualizerRole, VisualizerRoleListener
+#include "sendspin/color_role.h"      // ColorRole, ColorRoleListener
 ```
 
 Only include the role headers you need. `client.h` includes `sendspin/config.h` (all configuration structs, including `SendspinClientConfig`) and `sendspin/types.h` transitively.
@@ -138,6 +139,14 @@ vis_support.spectrum = VisualizerSpectrumConfig{
 };
 
 auto& visualizer = client.add_visualizer({.support = vis_support});
+```
+
+### Color Role (Audio-Derived Color Palette)
+
+Receives an RGB color palette derived by the server from the currently playing audio (e.g., extracted from album artwork). Useful for LED matrices, status lights, or themed displays. Server-to-client only; no configuration.
+
+```cpp
+auto& color = client.add_color();
 ```
 
 ## Step 3: Implement Listener Interfaces
@@ -306,6 +315,39 @@ struct MyVisualizerListener : VisualizerRoleListener {
 };
 ```
 
+### ColorRoleListener
+
+```cpp
+struct MyColorListener : ColorRoleListener {
+    void on_color(const ServerColorStateObject& c) override {
+        if (c.background_dark) set_dark_bg(*c.background_dark);
+        if (c.background_light) set_light_bg(*c.background_light);
+        if (c.primary) set_primary((*c.primary)[0], (*c.primary)[1], (*c.primary)[2]);
+        // accent, on_dark, on_light...
+    }
+
+    // Called when the connection is lost and cached colors are dropped.
+    // Reset any displayed colors to a neutral or default state.
+    void on_color_clear() override {
+        reset_to_defaults();
+    }
+};
+```
+
+The `ServerColorStateObject` contains a `timestamp` and six optional `RgbColor` fields (`std::array<uint8_t, 3>`, ordered `[R, G, B]`):
+
+| Field | Description |
+|---|---|
+| `timestamp` | Server clock µs at which this color update becomes valid; delivery is held until the synced client clock reaches it, or fires immediately if there is no active connection |
+| `background_dark` | Background suitable for dark mode; safe contrast with white text and `on_dark` |
+| `background_light` | Background suitable for light mode; safe contrast with black text and `on_light` |
+| `primary` | Dominant color, not adjusted for contrast |
+| `accent` | Secondary or complementary color, not adjusted for contrast |
+| `on_dark` | Light foreground for use on dark backgrounds |
+| `on_light` | Dark foreground for use on light backgrounds |
+
+A field is `nullopt` when the server has not provided it or has explicitly cleared it; listeners do not need to distinguish those cases.
+
 ## Step 4: Implement Providers
 
 ### SendspinNetworkProvider (Required)
@@ -469,6 +511,7 @@ if (auto* m = client.metadata()) {
 }
 if (auto* a = client.artwork()) { /* ... */ }
 if (auto* v = client.visualizer()) { /* ... */ }
+if (auto* col = client.color()) { /* ... */ }
 ```
 
 Use these accessors when the role reference from `add_*()` is out of scope.
@@ -603,7 +646,8 @@ cmake -B build -DSENDSPIN_ENABLE_PLAYER=OFF
 cmake -B build -DSENDSPIN_ENABLE_CONTROLLER=OFF \
                -DSENDSPIN_ENABLE_METADATA=OFF \
                -DSENDSPIN_ENABLE_ARTWORK=OFF \
-               -DSENDSPIN_ENABLE_VISUALIZER=OFF
+               -DSENDSPIN_ENABLE_VISUALIZER=OFF \
+               -DSENDSPIN_ENABLE_COLOR=OFF
 ```
 
 Available options (all `ON` by default):
@@ -615,6 +659,7 @@ Available options (all `ON` by default):
 | `SENDSPIN_ENABLE_METADATA` | Metadata role |
 | `SENDSPIN_ENABLE_ARTWORK` | Artwork role |
 | `SENDSPIN_ENABLE_VISUALIZER` | Visualizer role |
+| `SENDSPIN_ENABLE_COLOR` | Color role |
 
 When `SENDSPIN_ENABLE_PLAYER` is `OFF`, the micro-flac and micro-opus dependencies are not fetched.
 
@@ -628,6 +673,7 @@ CONFIG_SENDSPIN_ENABLE_CONTROLLER=y
 CONFIG_SENDSPIN_ENABLE_METADATA=y
 CONFIG_SENDSPIN_ENABLE_ARTWORK=y
 CONFIG_SENDSPIN_ENABLE_VISUALIZER=y
+CONFIG_SENDSPIN_ENABLE_COLOR=y
 ```
 
 ### Effect on the API

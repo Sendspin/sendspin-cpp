@@ -9,7 +9,7 @@ Standalone C++ library implementing the [Sendspin synchronized audio streaming p
 
 ## Features
 
-- Modular Sendspin role composition: artwork, controller, metadata, player, and visualizer
+- Modular Sendspin role composition: artwork, color, controller, metadata, player, and visualizer
 - WebSocket client and server support
 - Decodes FLAC, Opus, and PCM
 - Cross-platform: ESP-IDF (ESP32) and host (macOS/Linux)

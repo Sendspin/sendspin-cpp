@@ -110,6 +110,7 @@ Single-slot state container with "latest wins" or custom merge semantics. The ne
 | `PlayerRole::Impl::shadow_command` | `ServerCommandMessage` | Field-by-field merge (volume, mute, delay independent) |
 | `ControllerRole::Impl::shadow` | `ServerStateControllerObject` | Latest wins |
 | `MetadataRole::Impl::shadow` | `ServerMetadataStateObject` | Field-by-field delta merge |
+| `ColorRole::Impl::shadow` | `ServerColorStateDelta` | Field-by-field delta merge (preserves pending clears across rapid updates) |
 | `ArtworkRole::Impl::display_scheduler->pending[slot]` (×4) | `int64_t` (server display timestamp) | Latest wins |
 | `VisualizerRole::Impl::shadow_config` | `ServerVisualizerStreamObject` | Latest wins |
 | `SyncTask::playback_progress_slot_` | `PlaybackProgress` | Sum `frames_played`, keep latest `finish_timestamp` |
@@ -162,7 +163,7 @@ Network thread (IXWebSocket / esp_http_server)
 |---------|------------------------|
 | `SERVER_HELLO` | Enqueues `ServerHelloEvent` into `ConnectionManager`'s mutex-protected vector |
 | `SERVER_TIME` | Enqueues `TimeResponseEvent` into `time_queue` |
-| `SERVER_STATE` | Writes to `ControllerRole::Impl::shadow` and `MetadataRole::Impl::shadow` |
+| `SERVER_STATE` | Writes to `ControllerRole::Impl::shadow`, `MetadataRole::Impl::shadow`, and `ColorRole::Impl::shadow` |
 | `SERVER_COMMAND` | Merges into `PlayerRole::Impl::shadow_command` |
 | `GROUP_UPDATE` | Merges into `Client::shadow_group` |
 | `STREAM_START` | Writes to `PlayerRole::Impl::shadow_stream_params`, enqueues `STREAM_START` into `stream_queue`. Marks the artwork stream active, flushes the decode thread's notification queue, and resets any pending per-slot display timestamps. Writes to `VisualizerRole::Impl::shadow_config`, enqueues a start event. |
@@ -204,6 +205,7 @@ Network thread (IXWebSocket / esp_http_server)
    ├─ player_->impl_->drain_events()
    ├─ controller_->impl_->drain_events()
    ├─ metadata_->impl_->drain_events()
+   ├─ color_->impl_->drain_events()
    ├─ artwork_->impl_->drain_events()
    └─ visualizer_->impl_->drain_events()
 
@@ -247,8 +249,9 @@ The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering
 ### Other Roles
 
 - **ControllerRole**: Takes from shadow, fires `on_controller_state()`.
-- **MetadataRole**: Takes from shadow when the pending update's `timestamp` has been reached on the synced client clock (or immediately if time sync is not yet ready), applies deltas, fires `on_metadata()`.
-- **ArtworkRole**: Drains event queue for stream end/clear lifecycle events first (resetting all per-slot pending display timestamps and firing `on_image_clear()` for each configured slot). Then iterates the per-slot `DisplayScheduler::pending` shadow slots and fires `on_image_display(slot)` for any slot whose pending timestamp is due on the synced client clock (or immediately if time sync is not yet ready). `on_image_decode` still happens on the dedicated artwork decode thread.
+- **MetadataRole**: Takes from shadow when the pending update's `timestamp` has been reached on the synced client clock (or immediately if there is no active connection), applies deltas, fires `on_metadata()`.
+- **ColorRole**: Fires `on_color_clear()` first if a `pending_clear` flag is set (deferred from `cleanup()` to avoid invoking the listener while `ConnectionManager` holds `conn_ptr_mutex_`). Then takes from shadow when the pending update's `timestamp` has been reached on the synced client clock (or immediately if there is no active connection), applies deltas, fires `on_color()`.
+- **ArtworkRole**: Drains event queue for stream end/clear lifecycle events first (resetting all per-slot pending display timestamps and firing `on_image_clear()` for each configured slot). Then iterates the per-slot `DisplayScheduler::pending` shadow slots and fires `on_image_display(slot)` for any slot whose pending timestamp is due on the synced client clock (or immediately if there is no active connection). `on_image_decode` still happens on the dedicated artwork decode thread.
 - **VisualizerRole**: Drains event queue, processes stream start/end/clear with shadow config.
 
 ## Sync Task State Machine

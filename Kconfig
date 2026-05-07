@@ -17,6 +17,10 @@ menu "sendspin-cpp"
         bool "Enable metadata role"
         default y
 
+    config SENDSPIN_ENABLE_COLOR
+        bool "Enable color role"
+        default y
+
     config SENDSPIN_ENABLE_ARTWORK
         bool "Enable artwork role"
         default y

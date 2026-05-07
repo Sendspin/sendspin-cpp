@@ -19,6 +19,7 @@
 #pragma once
 
 #include "sendspin/artwork_role.h"
+#include "sendspin/color_role.h"
 #include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
@@ -88,6 +89,7 @@ enum class SendspinRole : uint8_t {
     METADATA,    // Track metadata role
     ARTWORK,     // Album artwork role
     VISUALIZER,  // Audio visualization role
+    COLOR,       // Audio-derived color palette role
 };
 
 /// @brief Converts a SendspinRole value to its protocol wire string representation
@@ -105,6 +107,8 @@ inline const char* to_cstr(SendspinRole role) {
             return "artwork@v1";
         case SendspinRole::VISUALIZER:
             return "visualizer@_draft_r1";
+        case SendspinRole::COLOR:
+            return "color@v1";
         default:
             return "unknown";
     }
@@ -509,6 +513,24 @@ inline const char* to_cstr(VisualizerSpectrumScale scale) {
     }
 }
 
+// --- color_role.h ---
+
+/// @brief Wire-level delta for the color role's server/state object
+///
+/// Each field is a tri-state: outer `nullopt` means the field was absent in the delta and the
+/// merged state should be left alone; outer engaged with inner `nullopt` means the server sent an
+/// explicit `null` and the merged state should clear that color; outer and inner both engaged is a
+/// regular value update.
+struct ServerColorStateDelta {
+    int64_t timestamp{};
+    std::optional<std::optional<RgbColor>> background_dark;
+    std::optional<std::optional<RgbColor>> background_light;
+    std::optional<std::optional<RgbColor>> primary;
+    std::optional<std::optional<RgbColor>> accent;
+    std::optional<std::optional<RgbColor>> on_dark;
+    std::optional<std::optional<RgbColor>> on_light;
+};
+
 // ============================================================================
 // Message envelope structs
 // ============================================================================
@@ -540,6 +562,7 @@ struct ClientCommandMessage {
 struct ServerStateMessage {
     std::optional<ServerStateControllerObject> controller;
     std::optional<ServerMetadataStateObject> metadata;
+    std::optional<ServerColorStateDelta> color;
 };
 
 /// @brief Parsed server/hello handshake message received at connection startup
@@ -648,6 +671,13 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
 /// @param updates Delta object containing only the fields that changed.
 void apply_metadata_state_deltas(ServerMetadataStateObject* current,
                                  const ServerMetadataStateObject& updates);
+
+/// @brief Merges a ServerColorStateDelta into the current color state
+/// @param current [out] Current color state to update in place.
+/// @param delta Wire-level delta containing only the fields that changed; fields with an explicit
+///              `null` on the wire arrive as outer-engaged + inner-`nullopt` and clear the
+///              corresponding merged field.
+void apply_color_state_deltas(ServerColorStateObject* current, const ServerColorStateDelta& delta);
 
 /// @brief Formats a client hello message as a JSON string for sending to the server
 /// @param msg Message to serialize.

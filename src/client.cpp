@@ -25,6 +25,9 @@
 #ifdef SENDSPIN_ENABLE_ARTWORK
 #include "artwork_role_impl.h"
 #endif
+#ifdef SENDSPIN_ENABLE_COLOR
+#include "color_role_impl.h"
+#endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
 #include "controller_role_impl.h"
 #endif
@@ -201,6 +204,11 @@ void SendspinClient::loop() {
         this->metadata_->impl_->drain_events();
     }
 #endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    if (this->color_) {
+        this->color_->impl_->drain_events();
+    }
+#endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
         this->artwork_->impl_->drain_events();
@@ -276,6 +284,16 @@ MetadataRole& SendspinClient::add_metadata() {
     }
     this->metadata_ = std::make_unique<MetadataRole>(this);
     return *this->metadata_;
+}
+#endif
+
+#ifdef SENDSPIN_ENABLE_COLOR
+ColorRole& SendspinClient::add_color() {
+    if (this->started_) {
+        SS_LOGW(TAG, "add_color() called after start_server()");
+    }
+    this->color_ = std::make_unique<ColorRole>(this);
+    return *this->color_;
 }
 #endif
 
@@ -390,6 +408,11 @@ void SendspinClient::cleanup_connection_state() {
         this->metadata_->impl_->cleanup();
     }
 #endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    if (this->color_) {
+        this->color_->impl_->cleanup();
+    }
+#endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
         this->artwork_->impl_->cleanup();
@@ -435,6 +458,11 @@ std::string SendspinClient::build_hello_message() {
 #ifdef SENDSPIN_ENABLE_METADATA
     if (this->metadata_) {
         this->metadata_->impl_->build_hello_fields(msg);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    if (this->color_) {
+        this->color_->impl_->build_hello_fields(msg);
     }
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
@@ -625,6 +653,12 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const std::s
                 if (this->metadata_ && state_msg.metadata.has_value()) {
                     this->metadata_->impl_->handle_server_state(
                         std::move(state_msg.metadata.value()));
+                }
+#endif
+
+#ifdef SENDSPIN_ENABLE_COLOR
+                if (this->color_ && state_msg.color.has_value()) {
+                    this->color_->impl_->handle_server_state(state_msg.color.value());
                 }
 #endif
             }
