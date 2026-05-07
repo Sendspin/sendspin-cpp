@@ -78,6 +78,9 @@ void ControllerRole::Impl::drain_events() {
 void ControllerRole::Impl::cleanup() {
     this->event_state->shadow.reset();
     this->controller_state = {};
+    if (this->listener) {
+        this->listener->on_controller_state_clear();
+    }
 }
 
 }  // namespace sendspin

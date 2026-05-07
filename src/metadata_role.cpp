@@ -133,6 +133,9 @@ void MetadataRole::Impl::drain_events() {
 void MetadataRole::Impl::cleanup() {
     this->event_state->shadow.reset();
     this->metadata = {};
+    if (this->listener) {
+        this->listener->on_metadata_clear();
+    }
 }
 
 }  // namespace sendspin

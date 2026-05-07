@@ -66,6 +66,12 @@ public:
 
     /// @brief Called when metadata is updated by the server
     virtual void on_metadata(const ServerMetadataStateObject& /*metadata*/) {}
+
+    /// @brief Called when the connection to the server is lost and cached metadata is dropped
+    ///
+    /// Implementations should clear any displayed track metadata (title, artist, artwork URL,
+    /// progress, etc.) since the previous server's state is no longer valid.
+    virtual void on_metadata_clear() {}
 };
 
 /**

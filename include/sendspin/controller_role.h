@@ -62,6 +62,13 @@ public:
 
     /// @brief Called when the server sends updated controller state
     virtual void on_controller_state(const ServerStateControllerObject& /*state*/) {}
+
+    /// @brief Called when the connection to the server is lost and cached controller state is
+    /// dropped
+    ///
+    /// Implementations should clear any displayed controller state (volume, mute, supported
+    /// commands) since the previous server's state is no longer valid.
+    virtual void on_controller_state_clear() {}
 };
 
 /**
