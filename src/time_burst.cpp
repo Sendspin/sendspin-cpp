@@ -93,11 +93,18 @@ TimeBurstResult SendspinTimeBurst::loop(SendspinConnection* conn) {
 
 bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, int64_t offset,
                                          int64_t max_error, int64_t timestamp) {
-    // Track the best (lowest RTT) measurement in this burst
-    if (max_error < this->best_max_error_) {
+    // Track the best (lowest RTT) measurement in this burst.
+    // max_error is half the round-trip delay and must be strictly positive; zero or negative
+    // values arise from clock skew or timestamp quantization in the time message and would
+    // yield zero/negative measurement variance in the Kalman filter (risking divide-by-zero
+    // in the update step), so we skip updating the best_* tracking for those samples.
+    if (max_error > 0 && max_error < this->best_max_error_) {
         this->best_max_error_ = max_error;
         this->best_offset_ = offset;
         this->best_timestamp_ = timestamp;
+    } else if (max_error <= 0) {
+        SS_LOGW(TAG, "Dropping time response with non-positive max_error: %" PRId64 " us",
+                max_error);
     }
 
     conn->set_pending_time_message(false);
@@ -106,7 +113,7 @@ bool SendspinTimeBurst::on_time_response(SendspinConnection* conn, int64_t offse
     // Check if burst is complete
     if (this->burst_index_ >= this->burst_size_) {
         auto* time_filter = conn->get_time_filter();
-        if (time_filter != nullptr) {
+        if (time_filter != nullptr && this->best_max_error_ < std::numeric_limits<int64_t>::max()) {
             time_filter->update(this->best_offset_, this->best_max_error_, this->best_timestamp_);
             SS_LOGV(TAG, "Burst complete, best max_error: %" PRId64 " us", this->best_max_error_);
         }
