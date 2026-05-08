@@ -215,11 +215,14 @@ This method is thread-safe and is expected to be called from an audio callback t
 ```cpp
 struct MyMetadataListener : MetadataRoleListener {
     void on_metadata(const ServerMetadataStateObject& md) override {
-        if (md.title) display_title(*md.title);
-        if (md.artist) display_artist(*md.artist);
-        if (md.album) display_album(*md.album);
+        // Overwrite display state on every call so server clears (nullopt) propagate.
+        display_title(md.title.value_or(""));
+        display_artist(md.artist.value_or(""));
+        display_album(md.album.value_or(""));
         if (md.progress) {
             update_progress_bar(md.progress->track_progress, md.progress->track_duration);
+        } else {
+            clear_progress_bar();
         }
     }
 };
@@ -240,6 +243,8 @@ The `ServerMetadataStateObject` contains these fields (all optional except `time
 | `progress` | `std::optional<MetadataProgressObject>` | Playback progress (see below) |
 
 `MetadataProgressObject` contains `track_progress` (ms), `track_duration` (ms), and `playback_speed`.
+
+A field is `nullopt` when the server has not provided it or has explicitly cleared it. Listeners that mirror metadata into display state should overwrite the displayed value on every `on_metadata()` call (using e.g. `value_or("")`) so that server clears propagate.
 
 You can also poll track progress at any time:
 

@@ -513,6 +513,26 @@ inline const char* to_cstr(VisualizerSpectrumScale scale) {
     }
 }
 
+// --- metadata_role.h ---
+
+/// @brief Wire-level delta for the metadata role's server/state object
+///
+/// Each field is a tri-state: outer `nullopt` means the field was absent in the delta and the
+/// merged state should be left alone; outer engaged with inner `nullopt` means the server sent an
+/// explicit `null` and the merged state should clear that field; outer and inner both engaged is a
+/// regular value update.
+struct ServerMetadataStateDelta {
+    int64_t timestamp{};
+    std::optional<std::optional<std::string>> title;
+    std::optional<std::optional<std::string>> artist;
+    std::optional<std::optional<std::string>> album_artist;
+    std::optional<std::optional<std::string>> album;
+    std::optional<std::optional<std::string>> artwork_url;
+    std::optional<std::optional<uint16_t>> year;
+    std::optional<std::optional<uint16_t>> track;
+    std::optional<std::optional<MetadataProgressObject>> progress;
+};
+
 // --- color_role.h ---
 
 /// @brief Wire-level delta for the color role's server/state object
@@ -561,7 +581,7 @@ struct ClientCommandMessage {
 /// @brief Parsed server/state message containing per-role state updates
 struct ServerStateMessage {
     std::optional<ServerStateControllerObject> controller;
-    std::optional<ServerMetadataStateObject> metadata;
+    std::optional<ServerMetadataStateDelta> metadata;
     std::optional<ServerColorStateDelta> color;
 };
 
@@ -666,11 +686,13 @@ bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg);
 /// @return true if parsing succeeded, false on missing required fields.
 bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg);
 
-/// @brief Merges a ServerMetadataStateObject delta into the current metadata state
+/// @brief Merges a ServerMetadataStateDelta into the current metadata state
 /// @param current [out] Current metadata state to update in place.
-/// @param updates Delta object containing only the fields that changed.
+/// @param delta Wire-level delta containing only the fields that changed; fields with an explicit
+///              `null` on the wire arrive as outer-engaged + inner-`nullopt` and clear the
+///              corresponding merged field.
 void apply_metadata_state_deltas(ServerMetadataStateObject* current,
-                                 const ServerMetadataStateObject& updates);
+                                 const ServerMetadataStateDelta& delta);
 
 /// @brief Merges a ServerColorStateDelta into the current color state
 /// @param current [out] Current color state to update in place.

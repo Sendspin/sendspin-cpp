@@ -617,15 +617,9 @@ int main(int argc, char* argv[]) {
 
         void on_metadata(const ServerMetadataStateObject& md) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            if (md.title.has_value()) {
-                state.title = *md.title;
-            }
-            if (md.artist.has_value()) {
-                state.artist = *md.artist;
-            }
-            if (md.album.has_value()) {
-                state.album = *md.album;
-            }
+            state.title = md.title.value_or("");
+            state.artist = md.artist.value_or("");
+            state.album = md.album.value_or("");
         }
     };
 

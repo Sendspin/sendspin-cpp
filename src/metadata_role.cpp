@@ -98,12 +98,40 @@ void MetadataRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::METADATA);
 }
 
-void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject state) const {
+void MetadataRole::Impl::handle_server_state(ServerMetadataStateDelta delta) const {
+    // Merge incoming wire delta into the accumulated delta in the shadow slot. For each field, an
+    // outer-engaged incoming entry overwrites the accumulated entry verbatim; absent
+    // (outer-nullopt) incoming fields leave the accumulated entry untouched, so pending clears
+    // (inner-nullopt) from earlier deltas survive until drain_events applies them.
     this->event_state->shadow.merge(
-        [](ServerMetadataStateObject& current, ServerMetadataStateObject&& delta) {
-            apply_metadata_state_deltas(&current, delta);
+        [](ServerMetadataStateDelta& current, ServerMetadataStateDelta&& incoming) {
+            current.timestamp = incoming.timestamp;
+            if (incoming.title.has_value()) {
+                current.title = std::move(incoming.title);
+            }
+            if (incoming.artist.has_value()) {
+                current.artist = std::move(incoming.artist);
+            }
+            if (incoming.album_artist.has_value()) {
+                current.album_artist = std::move(incoming.album_artist);
+            }
+            if (incoming.album.has_value()) {
+                current.album = std::move(incoming.album);
+            }
+            if (incoming.artwork_url.has_value()) {
+                current.artwork_url = std::move(incoming.artwork_url);
+            }
+            if (incoming.year.has_value()) {
+                current.year = incoming.year;
+            }
+            if (incoming.track.has_value()) {
+                current.track = incoming.track;
+            }
+            if (incoming.progress.has_value()) {
+                current.progress = incoming.progress;
+            }
         },
-        std::move(state));
+        std::move(delta));
 }
 
 void MetadataRole::Impl::drain_events() {
@@ -116,12 +144,12 @@ void MetadataRole::Impl::drain_events() {
         }
     }
 
-    ServerMetadataStateObject delta{};
+    ServerMetadataStateDelta delta{};
     // Caveat: merged deltas carry only the newest timestamp, so a past-valid field merged
     // under a later future-valid update gets held back until the later deadline. Accepted
     // since overlapping fields are last-writer-wins anyway.
     const bool taken =
-        this->event_state->shadow.take_if(delta, [this](const ServerMetadataStateObject& pending) {
+        this->event_state->shadow.take_if(delta, [this](const ServerMetadataStateDelta& pending) {
             // get_client_time returns 0 when there is no current connection. Without a connection
             // we cannot honor the server-clock deadline, so fire immediately rather than starving
             // the listener.
