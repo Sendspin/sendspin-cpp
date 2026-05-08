@@ -18,6 +18,7 @@
 #pragma once
 
 #include "platform/shadow_slot.h"
+#include "protocol_messages.h"
 #include "sendspin/metadata_role.h"
 
 #include <memory>
@@ -37,7 +38,7 @@ struct MetadataRole::Impl {
     // ========================================
 
     struct EventState {
-        ShadowSlot<ServerMetadataStateObject> shadow;
+        ShadowSlot<ServerMetadataStateDelta> shadow;
         bool pending_clear{false};
     };
 
@@ -46,7 +47,7 @@ struct MetadataRole::Impl {
     // ========================================
 
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerMetadataStateObject state) const;
+    void handle_server_state(ServerMetadataStateDelta delta) const;
     void drain_events();
     void cleanup();
 

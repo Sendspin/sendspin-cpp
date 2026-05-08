@@ -147,9 +147,31 @@ static bool process_server_player_command_object(const JsonObject player_object,
     return true;
 }
 
+// Parses a single string field into a tri-state delta entry. Absent on the wire leaves `out`
+// untouched; explicit `null` writes outer-engaged + inner-`nullopt` (clear); a string writes
+// outer-engaged + inner-engaged.
+static void parse_metadata_string_field(JsonVariantConst var,
+                                        std::optional<std::optional<std::string>>* out) {
+    if (var.is<const char*>()) {
+        *out = var.as<std::string>();
+    } else if (!var.isUnbound() && var.isNull()) {
+        *out = std::optional<std::string>{};
+    }
+}
+
+// Parses a single uint16 field into a tri-state delta entry. Same semantics as above.
+static void parse_metadata_uint16_field(JsonVariantConst var,
+                                        std::optional<std::optional<uint16_t>>* out) {
+    if (var.is<uint16_t>()) {
+        *out = var.as<uint16_t>();
+    } else if (!var.isUnbound() && var.isNull()) {
+        *out = std::optional<uint16_t>{};
+    }
+}
+
 static bool process_server_metadata_state_object(const JsonObject metadata_object,
-                                                 ServerMetadataStateObject* metadata_state) {
-    if (metadata_state == nullptr) {
+                                                 ServerMetadataStateDelta* metadata_delta) {
+    if (metadata_delta == nullptr) {
         return false;
     }
 
@@ -158,55 +180,18 @@ static bool process_server_metadata_state_object(const JsonObject metadata_objec
         SS_LOGE(TAG, "Invalid metadata state object: missing timestamp");
         return false;
     }
-    metadata_state->timestamp = metadata_object["timestamp"].as<int64_t>();
+    metadata_delta->timestamp = metadata_object["timestamp"].as<int64_t>();
 
-    // All other fields are optional - handle both values and null (to clear)
-    // Null is treated as empty string so it gets applied via delta updates
-    // Use isUnbound() to distinguish "key exists with null" from "key doesn't exist"
-    JsonVariantConst title_var = metadata_object["title"];
-    if (title_var.is<const char*>()) {
-        metadata_state->title = title_var.as<std::string>();
-    } else if (!title_var.isUnbound() && title_var.isNull()) {
-        metadata_state->title = "";
-    }
+    parse_metadata_string_field(metadata_object["title"], &metadata_delta->title);
+    parse_metadata_string_field(metadata_object["artist"], &metadata_delta->artist);
+    parse_metadata_string_field(metadata_object["album_artist"], &metadata_delta->album_artist);
+    parse_metadata_string_field(metadata_object["album"], &metadata_delta->album);
+    parse_metadata_string_field(metadata_object["artwork_url"], &metadata_delta->artwork_url);
+    parse_metadata_uint16_field(metadata_object["year"], &metadata_delta->year);
+    parse_metadata_uint16_field(metadata_object["track"], &metadata_delta->track);
 
-    JsonVariantConst artist_var = metadata_object["artist"];
-    if (artist_var.is<const char*>()) {
-        metadata_state->artist = artist_var.as<std::string>();
-    } else if (!artist_var.isUnbound() && artist_var.isNull()) {
-        metadata_state->artist = "";
-    }
-
-    JsonVariantConst album_artist_var = metadata_object["album_artist"];
-    if (album_artist_var.is<const char*>()) {
-        metadata_state->album_artist = album_artist_var.as<std::string>();
-    } else if (!album_artist_var.isUnbound() && album_artist_var.isNull()) {
-        metadata_state->album_artist = "";
-    }
-
-    JsonVariantConst album_var = metadata_object["album"];
-    if (album_var.is<const char*>()) {
-        metadata_state->album = album_var.as<std::string>();
-    } else if (!album_var.isUnbound() && album_var.isNull()) {
-        metadata_state->album = "";
-    }
-
-    JsonVariantConst artwork_url_var = metadata_object["artwork_url"];
-    if (artwork_url_var.is<const char*>()) {
-        metadata_state->artwork_url = artwork_url_var.as<std::string>();
-    } else if (!artwork_url_var.isUnbound() && artwork_url_var.isNull()) {
-        metadata_state->artwork_url = "";
-    }
-
-    if (metadata_object["year"].is<JsonVariant>() && !metadata_object["year"].isNull()) {
-        metadata_state->year = metadata_object["year"].as<uint16_t>();
-    }
-
-    if (metadata_object["track"].is<JsonVariant>() && !metadata_object["track"].isNull()) {
-        metadata_state->track = metadata_object["track"].as<uint16_t>();
-    }
-
-    // Parse progress object - if any progress field is present, create the object
+    // Parse progress object - present object engages inner; explicit null clears; absent leaves
+    // outer nullopt.
     if (metadata_object["progress"].is<JsonObject>()) {
         JsonObject progress_object = metadata_object["progress"];
         MetadataProgressObject progress{};
@@ -219,10 +204,9 @@ static bool process_server_metadata_state_object(const JsonObject metadata_objec
         if (progress_object["playback_speed"].is<JsonVariant>()) {
             progress.playback_speed = progress_object["playback_speed"].as<uint32_t>();
         }
-        metadata_state->progress = progress;
+        metadata_delta->progress = progress;
     } else if (!metadata_object["progress"].isUnbound() && metadata_object["progress"].isNull()) {
-        // Explicit null clears progress
-        metadata_state->progress = std::nullopt;
+        metadata_delta->progress = std::optional<MetadataProgressObject>{};
     }
 
     return true;
@@ -475,9 +459,9 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
 
     // Parse optional metadata object
     if (root["payload"]["metadata"].is<JsonObject>()) {
-        ServerMetadataStateObject metadata_state{};
-        if (process_server_metadata_state_object(root["payload"]["metadata"], &metadata_state)) {
-            state_msg->metadata = metadata_state;
+        ServerMetadataStateDelta metadata_delta{};
+        if (process_server_metadata_state_object(root["payload"]["metadata"], &metadata_delta)) {
+            state_msg->metadata = metadata_delta;
         }
     }
 
@@ -672,45 +656,39 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
 }
 
 void apply_metadata_state_deltas(ServerMetadataStateObject* current,
-                                 const ServerMetadataStateObject& updates) {
+                                 const ServerMetadataStateDelta& delta) {
     if (current == nullptr) {
         return;
     }
 
-    // timestamp is always updated (not optional)
-    current->timestamp = updates.timestamp;
+    current->timestamp = delta.timestamp;
 
-    // Update optional fields only if they have values
-    if (updates.title.has_value()) {
-        current->title = updates.title;
+    // For each field, an outer-engaged delta entry overwrites the merged optional with the inner
+    // optional verbatim, so an inner-`nullopt` (explicit `null` on the wire) clears the merged
+    // field.
+    if (delta.title.has_value()) {
+        current->title = *delta.title;
     }
-
-    if (updates.artist.has_value()) {
-        current->artist = updates.artist;
+    if (delta.artist.has_value()) {
+        current->artist = *delta.artist;
     }
-
-    if (updates.album_artist.has_value()) {
-        current->album_artist = updates.album_artist;
+    if (delta.album_artist.has_value()) {
+        current->album_artist = *delta.album_artist;
     }
-
-    if (updates.album.has_value()) {
-        current->album = updates.album;
+    if (delta.album.has_value()) {
+        current->album = *delta.album;
     }
-
-    if (updates.artwork_url.has_value()) {
-        current->artwork_url = updates.artwork_url;
+    if (delta.artwork_url.has_value()) {
+        current->artwork_url = *delta.artwork_url;
     }
-
-    if (updates.year.has_value()) {
-        current->year = updates.year;
+    if (delta.year.has_value()) {
+        current->year = *delta.year;
     }
-
-    if (updates.track.has_value()) {
-        current->track = updates.track;
+    if (delta.track.has_value()) {
+        current->track = *delta.track;
     }
-
-    if (updates.progress.has_value()) {
-        current->progress = updates.progress;
+    if (delta.progress.has_value()) {
+        current->progress = *delta.progress;
     }
 }
 

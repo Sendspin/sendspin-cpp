@@ -241,6 +241,8 @@ The `ServerMetadataStateObject` contains these fields (all optional except `time
 
 `MetadataProgressObject` contains `track_progress` (ms), `track_duration` (ms), and `playback_speed`.
 
+A field is `nullopt` when the server has not provided it or has explicitly cleared it. Listeners that mirror metadata into display state should overwrite the displayed value on every `on_metadata()` call (using e.g. `value_or("")`) so that server clears propagate.
+
 You can also poll track progress at any time:
 
 ```cpp
