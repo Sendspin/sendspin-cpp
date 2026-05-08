@@ -215,11 +215,14 @@ This method is thread-safe and is expected to be called from an audio callback t
 ```cpp
 struct MyMetadataListener : MetadataRoleListener {
     void on_metadata(const ServerMetadataStateObject& md) override {
-        if (md.title) display_title(*md.title);
-        if (md.artist) display_artist(*md.artist);
-        if (md.album) display_album(*md.album);
+        // Overwrite display state on every call so server clears (nullopt) propagate.
+        display_title(md.title.value_or(""));
+        display_artist(md.artist.value_or(""));
+        display_album(md.album.value_or(""));
         if (md.progress) {
             update_progress_bar(md.progress->track_progress, md.progress->track_duration);
+        } else {
+            clear_progress_bar();
         }
     }
 };
