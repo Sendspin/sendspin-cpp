@@ -19,6 +19,7 @@
 #include "platform/logging.h"
 #include "platform/thread.h"
 #include "player_role_impl.h"
+#include "protocol_messages.h"
 #include "sendspin/client.h"
 
 #include <algorithm>
@@ -55,7 +56,7 @@ static constexpr uint32_t AUDIO_WRITE_TIMEOUT_MS = 20U;
 /// before the next push.
 static constexpr uint32_t INITIAL_SYNC_SETTLE_MIN_MS = 5U;
 
-static const char* const TAG = "sendspin_sync_task";
+static const char* const TAG = "sendspin.sync_task";
 
 // ============================================================================
 // Constructor / Destructor
@@ -452,7 +453,10 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                 sync_context.encoded_entry->chunk_type, &decoded_stream_info)) {
             SS_LOGE(TAG, "Failed to process audio codec header");
         } else {
-            SS_LOGI(TAG, "Processed new codec header");
+            SS_LOGI(TAG, "Processed new codec header: %s, %u Hz, %u ch, %u-bit",
+                    to_cstr(sync_context.decoder->get_current_codec()),
+                    decoded_stream_info.get_sample_rate(), decoded_stream_info.get_channels(),
+                    decoded_stream_info.get_bits_per_sample());
             // Update stream info from the codec header (authoritative source of stream parameters)
             if (decoded_stream_info != sync_context.current_stream_info) {
                 sync_context.current_stream_info = decoded_stream_info;
