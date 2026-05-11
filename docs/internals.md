@@ -157,7 +157,7 @@ Network thread (IXWebSocket / esp_http_server)
 
 ### JSON Message Dispatch (network thread)
 
-`process_json_message()` (`src/client.cpp:457`) parses the message type and routes:
+`process_json_message()` (`src/client.cpp`) parses the message type and routes:
 
 | Message | Action on Network Thread |
 |---------|------------------------|
@@ -169,6 +169,12 @@ Network thread (IXWebSocket / esp_http_server)
 | `STREAM_START` | Writes to `PlayerRole::Impl::shadow_stream_params`, enqueues `STREAM_START` into `stream_queue`. Marks the artwork stream active, flushes the decode thread's notification queue, and resets any pending per-slot display timestamps. Writes to `VisualizerRole::Impl::shadow_config`, enqueues a start event. |
 | `STREAM_END` | Enqueues `STREAM_END` into player/artwork/visualizer queues, signals sync task `COMMAND_STREAM_END` |
 | `STREAM_CLEAR` | Enqueues `STREAM_CLEAR` into player/artwork/visualizer queues, signals sync task `COMMAND_STREAM_CLEAR` |
+
+#### JSON parse arena (`src/platform/json_arena.h`)
+
+The `JsonDocument` used to parse each incoming message comes from `make_json_document()`. By default that allocates the document's variant pool and copied strings out of PSRAM (`PsramJsonAllocator`), which puts PSRAM traffic on the CPU-hot network thread for every message. When `SendspinClientConfig::json_arena_size > 0` (the default is `2048`), `SendspinClient` instead owns a `SendspinArenaAllocator` (a fixed internal-RAM bump arena) and `process_json_message()` calls `reset()` on it and parses into a document backed by it. An allocation that does not fit the remaining budget falls back to `platform_malloc` (PSRAM-preferring), so an unexpectedly large message (e.g. track metadata) still parses, just slowly.
+
+The bump arena suits ArduinoJson's allocation pattern: during a parse the variant pool is allocated once up front and the deserializer's string scratch buffer is always the most-recently-allocated block while it grows and shrinks, so those reallocations happen in place; document teardown frees strings newest-first and the pool last (LIFO), draining the arena back to empty on its own. `reset()` between messages is a safety net for any arena block left behind by a non-LIFO free; it cannot free PSRAM fallbacks (those are released by `deallocate()` on document teardown like any other allocation). The allocator is not thread-safe; the single instance is owned by `SendspinClient` and touched only on the network thread (`process_json_message()` runs serialized on the httpd worker task, and the previous call's `JsonDocument` is destroyed before the next call). Outgoing-message serialization in `src/protocol.cpp` still uses the PSRAM allocator.
 
 ### Binary Message Dispatch (network thread)
 
@@ -182,7 +188,7 @@ Network thread (IXWebSocket / esp_http_server)
 
 ### Main Loop Processing
 
-`SendspinClient::loop()` (`src/client.cpp:148`) runs the following steps **in order** on each tick:
+`SendspinClient::loop()` (`src/client.cpp`) runs the following steps **in order** on each tick:
 
 ```api
 1. connection_manager_->loop()
