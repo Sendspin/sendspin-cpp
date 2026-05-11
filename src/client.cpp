@@ -483,10 +483,16 @@ std::string SendspinClient::build_hello_message() {
 // Message processing
 // ============================================================================
 
-void SendspinClient::process_json_message(SendspinConnection* conn, const std::string& message,
+void SendspinClient::process_json_message(SendspinConnection* conn, char* data, size_t len,
                                           int64_t timestamp) {
     JsonDocument doc = make_json_document();
-    DeserializationError error = deserializeJson(doc, message.c_str(), message.size());
+    // Parse straight out of the connection's reassembly buffer; the old path first copied it into
+    // a std::string. ArduinoJson 7 has no zero-copy mode, so string *values* are still copied into
+    // the document's (PSRAM-backed) pool and the buffer itself is left untouched -- but the
+    // whole-message copy is gone. Safe: the document and everything derived from it stay within
+    // this synchronous call; process_*_message copies any values it keeps into owning types
+    // before returning.
+    DeserializationError error = deserializeJson(doc, data, len);
     if (error || doc.isNull()) {
         SS_LOGW(TAG, "Failed to parse JSON message");
         return;

@@ -308,9 +308,9 @@ void ConnectionManager::setup_connection_callbacks(SendspinConnection* conn) {
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
         this->pending_connected_events_.push_back(c->shared_from_this());
     };
-    conn->on_json_message_cb = [this](SendspinConnection* c, const std::string& message,
+    conn->on_json_message_cb = [this](SendspinConnection* c, char* data, size_t len,
                                       int64_t timestamp) {
-        this->client_->process_json_message(c, message, timestamp);
+        this->client_->process_json_message(c, data, len, timestamp);
     };
     conn->on_binary_message_cb = [this](SendspinConnection* /*c*/, uint8_t* payload, size_t len) {
         this->client_->process_binary_message(payload, len);
