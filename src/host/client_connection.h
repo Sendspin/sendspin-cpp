@@ -42,7 +42,7 @@ namespace sendspin {
  *
  * @code
  * auto conn = std::make_unique<SendspinClientConnection>("ws://192.168.1.10:8928");
- * conn->on_json_message_cb = [](SendspinConnection*, char* data, size_t len, int64_t) {
+ * conn->on_json_message_cb = [](SendspinConnection*, const char* data, size_t len, int64_t) {
  * handle(data, len);
  * }; conn->start();
  * // periodically:

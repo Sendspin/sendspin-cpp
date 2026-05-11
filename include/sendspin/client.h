@@ -410,10 +410,12 @@ private:
 
     /// @brief Processes a JSON message from a connection
     /// @param conn The connection that received the message
-    /// @param data Mutable pointer to the raw JSON text (parsed in place, not null-terminated)
+    /// @param data Pointer to the raw JSON text (not null-terminated; valid for the duration of the
+    /// call only)
     /// @param len Length of the JSON text in bytes
     /// @param timestamp Receive timestamp in microseconds
-    void process_json_message(SendspinConnection* conn, char* data, size_t len, int64_t timestamp);
+    void process_json_message(SendspinConnection* conn, const char* data, size_t len,
+                              int64_t timestamp);
 
     /// @brief Processes a binary message from a connection
     /// @param payload Pointer to the raw binary data

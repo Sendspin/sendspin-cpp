@@ -63,7 +63,7 @@ using SendCompleteCallback = std::function<void(bool)>;
  * // Concrete subclass provided by the platform layer
  * auto conn = std::make_unique<SendspinClientConnection>(url, config);
  * conn->on_connected_cb = [](SendspinConnection* c) { c->send_text_message(hello_json, {}); };
- * conn->on_json_message_cb = [](SendspinConnection* c, char* data, size_t len, int64_t t) { ... };
+ * conn->on_json_message_cb = [](SendspinConnection* c, const char* d, size_t n, int64_t t) {...};
  * conn->on_disconnected_cb = [](SendspinConnection* c) { handle_disconnect(); };
  * conn->start();
  * // Call conn->loop() from a periodic task
@@ -167,11 +167,10 @@ public:
     /// @param conn Pointer to this connection.
     /// @param data Pointer to the message bytes, owned by the connection. Valid only until the
     /// callback returns -- it is reused for the next message immediately afterwards, so the
-    /// callback must not retain it. Mutable, so the callback may parse in place. Not
-    /// null-terminated; use @p len.
+    /// callback must not retain it. Not null-terminated; use @p len.
     /// @param len Length of the message in bytes.
     /// @param timestamp The client timestamp when the message was received.
-    std::function<void(SendspinConnection*, char*, size_t, int64_t)> on_json_message_cb;
+    std::function<void(SendspinConnection*, const char*, size_t, int64_t)> on_json_message_cb;
 
     /// @brief Callback invoked when a binary message is received
     /// @param conn Pointer to this connection.
