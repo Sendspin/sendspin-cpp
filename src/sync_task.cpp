@@ -471,7 +471,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             }
 
             // Create or resize the decode buffer now that we know the maximum decoded size
-            size_t needed = sync_context.decoder->get_maximum_decoded_size();
+            size_t needed = sync_context.decoder->get_decode_buffer_size();
             if (sync_context.decode_buffer == nullptr) {
                 sync_context.decode_buffer = TransferBuffer::create(
                     needed, this->player_impl_->config.decode_buffer_location);
@@ -508,10 +508,24 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
         }
 
         size_t decoded_size = 0;
-        if (!sync_context.decoder->decode_audio_chunk(
-                sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
-                sync_context.decode_buffer->get_buffer_end(), sync_context.decode_buffer->free(),
-                &decoded_size)) {
+        bool decoded = sync_context.decoder->decode_audio_chunk(
+            sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
+            sync_context.decode_buffer->get_buffer_end(), sync_context.decode_buffer->free(),
+            &decoded_size);
+        if (!decoded) {
+            // The decoder raises its decoded-size estimate when it meets an unusually large chunk
+            // (e.g. a multi-frame Opus packet bigger than the typical 20ms buffer). Grow the
+            // buffer to the new estimate and retry once.
+            size_t needed = sync_context.decoder->get_decode_buffer_size();
+            if (needed > sync_context.decode_buffer->capacity() &&
+                sync_context.decode_buffer->reallocate(needed)) {
+                decoded = sync_context.decoder->decode_audio_chunk(
+                    sync_context.encoded_entry->data(), sync_context.encoded_entry->data_size,
+                    sync_context.decode_buffer->get_buffer_end(),
+                    sync_context.decode_buffer->free(), &decoded_size);
+            }
+        }
+        if (!decoded) {
             SS_LOGE(TAG, "Failed to decode audio chunk");
             this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
             sync_context.encoded_entry = nullptr;

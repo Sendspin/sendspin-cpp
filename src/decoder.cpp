@@ -81,9 +81,9 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
                 AudioStreamInfo(static_cast<uint8_t>(info.bits_per_sample()),
                                 static_cast<uint8_t>(info.num_channels()), info.sample_rate());
             *stream_info = this->current_stream_info_;
-            this->maximum_decoded_size_ = static_cast<size_t>(info.max_block_size()) *
-                                          static_cast<size_t>(info.num_channels()) *
-                                          static_cast<size_t>(info.bytes_per_sample());
+            this->decode_buffer_size_ = static_cast<size_t>(info.max_block_size()) *
+                                        static_cast<size_t>(info.num_channels()) *
+                                        static_cast<size_t>(info.bytes_per_sample());
             break;
         }
         case CHUNK_TYPE_OPUS_DUMMY_HEADER: {
@@ -107,9 +107,11 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
                 return false;
             }
 
-            static constexpr uint32_t OPUS_MAX_FRAME_MS = 120U;
-            this->maximum_decoded_size_ =
-                stream_info->ms_to_bytes(OPUS_MAX_FRAME_MS);  // Opus max frame size is 120ms
+            // Opus packets are almost always a single 20ms frame, so size the decode buffer for
+            // that. decode_audio_chunk() raises this estimate (up to the 120ms spec maximum) the
+            // first time it sees a larger packet, signalling the caller to grow its buffer.
+            static constexpr uint32_t OPUS_TYPICAL_FRAME_MS = 20U;
+            this->decode_buffer_size_ = stream_info->ms_to_bytes(OPUS_TYPICAL_FRAME_MS);
             this->current_stream_info_ = *stream_info;
             this->current_codec_ = SendspinCodecFormat::OPUS;
             break;
@@ -121,7 +123,7 @@ bool SendspinDecoder::process_header(const uint8_t* data, size_t data_size, Chun
             this->current_stream_info_ = *stream_info;
             this->current_codec_ = SendspinCodecFormat::PCM;
             static constexpr uint32_t PCM_MAX_CHUNK_MS = 120U;
-            this->maximum_decoded_size_ =
+            this->decode_buffer_size_ =
                 stream_info->ms_to_bytes(PCM_MAX_CHUNK_MS);  // PCM max chunk size
             break;
         }
@@ -172,6 +174,16 @@ bool SendspinDecoder::decode_audio_chunk(const uint8_t* data, size_t data_size,
         int output_frames = opus_decode(
             this->opus_decoder_buf_.as<OpusDecoder>(), data, data_size, (int16_t*)output_buffer,
             this->current_stream_info_.bytes_to_frames(output_buffer_size), 0);
+        if (output_frames == OPUS_BUFFER_TOO_SMALL) {
+            // The output buffer was sized for a typical 20ms frame but this packet decodes to
+            // more. Raise the estimate to the Opus spec maximum (120ms) so the caller can grow
+            // the buffer via get_decode_buffer_size() and call again.
+            static constexpr uint32_t OPUS_MAX_FRAME_MS = 120U;
+            this->decode_buffer_size_ = this->current_stream_info_.ms_to_bytes(OPUS_MAX_FRAME_MS);
+            SS_LOGD(TAG, "Opus packet exceeds decode buffer; raising estimate to %zu bytes",
+                    this->decode_buffer_size_);
+            return false;
+        }
         if (output_frames < 0) {
             SS_LOGE(TAG, "Error decoding opus chunk: %d", output_frames);
             return false;
