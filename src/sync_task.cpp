@@ -453,7 +453,8 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                 sync_context.encoded_entry->chunk_type, &decoded_stream_info)) {
             SS_LOGE(TAG, "Failed to process audio codec header");
         } else {
-            SS_LOGI(TAG, "Processed new codec header: %s, %u Hz, %u ch, %u-bit",
+            SS_LOGI(TAG,
+                    "Processed new codec header: %s, %" PRIu32 " Hz, %" PRIu8 " ch, %" PRIu8 "-bit",
                     to_cstr(sync_context.decoder->get_current_codec()),
                     decoded_stream_info.get_sample_rate(), decoded_stream_info.get_channels(),
                     decoded_stream_info.get_bits_per_sample());
