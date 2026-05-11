@@ -470,7 +470,8 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                 }
             }
 
-            // Create or resize the decode buffer now that we know the maximum decoded size
+            // Create or resize the decode buffer using the decoder's current required size
+            // estimate; some codecs (for example, Opus) may require this to grow later.
             size_t needed = sync_context.decoder->get_decode_buffer_size();
             if (sync_context.decode_buffer == nullptr) {
                 sync_context.decode_buffer = TransferBuffer::create(
