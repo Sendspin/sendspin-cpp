@@ -129,6 +129,7 @@ enum class LogLevel : uint8_t {
 
 // Forward declarations
 class ConnectionManager;
+class SendspinArenaAllocator;
 class SendspinConnection;
 class SendspinTimeBurst;
 
@@ -466,6 +467,9 @@ private:
     std::unique_ptr<ControllerRole> controller_;
 #endif
     std::unique_ptr<EventState> event_state_;
+    /// Internal-RAM scratch arena for parsing incoming JSON; null unless config_.json_arena_size >
+    /// 0
+    std::unique_ptr<SendspinArenaAllocator> json_arena_;
     SendspinClientListener* listener_{nullptr};
 #ifdef SENDSPIN_ENABLE_METADATA
     std::unique_ptr<MetadataRole> metadata_;

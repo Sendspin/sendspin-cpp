@@ -17,6 +17,7 @@
 #include "connection.h"
 #include "connection_manager.h"
 #include "platform/compiler.h"
+#include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/shadow_slot.h"
@@ -73,6 +74,9 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
       connection_manager_(std::make_unique<ConnectionManager>(this)),
       event_state_(std::make_unique<EventState>()),
       time_burst_(std::make_unique<SendspinTimeBurst>()) {
+    if (this->config_.json_arena_size > 0) {
+        this->json_arena_ = std::make_unique<SendspinArenaAllocator>(this->config_.json_arena_size);
+    }
     this->event_state_->time_queue.create(16);
     this->time_burst_->configure(this->config_.time_burst_size,
                                  this->config_.time_burst_interval_ms,
@@ -485,7 +489,14 @@ std::string SendspinClient::build_hello_message() {
 
 void SendspinClient::process_json_message(SendspinConnection* conn, const char* data, size_t len,
                                           int64_t timestamp) {
-    JsonDocument doc = make_json_document();
+    // Reuse the internal-RAM scratch arena if configured. Safe to reset here: this runs only on
+    // the network task, and the JsonDocument from the previous call was already destroyed when
+    // that call returned.
+    if (this->json_arena_) {
+        this->json_arena_->reset();
+    }
+    JsonDocument doc =
+        this->json_arena_ ? make_json_document(*this->json_arena_) : make_json_document();
     DeserializationError error = deserializeJson(doc, data, len);
     if (error || doc.isNull()) {
         SS_LOGW(TAG, "Failed to parse JSON message");
