@@ -48,7 +48,8 @@ namespace sendspin {
  * block while it is grown and shrunk - those reallocations happen in place. Document teardown frees
  * strings newest-first and the variant pool last, i.e. in the arena's LIFO order, so a finished
  * document drains the arena back to empty on its own. reset() is still called between messages as a
- * safety net (and is a no-op for anything that escaped to PSRAM).
+ * safety net for any block left behind by a non-LIFO free; it does not touch (or free) blocks that
+ * escaped to PSRAM - those are released by deallocate() on document teardown like any other block.
  *
  * ArduinoJson::Allocator has no "document destroyed" hook, only per-block deallocate(), so reset()
  * is driven by the code that owns the JsonDocument. NOT thread-safe - use one instance per thread
@@ -224,7 +225,14 @@ private:
     }
     /// @brief Returns true if @p p points inside the backing buffer (i.e. was bump-allocated)
     bool in_arena(const void* p) const {
-        return this->cap_ != 0 && p >= this->base_ && p < this->base_ + this->cap_;
+        if (this->cap_ == 0) {
+            return false;
+        }
+        // p may come from platform_malloc, an unrelated allocation; relational comparison of
+        // pointers into different objects is UB, so compare the integer addresses instead.
+        const auto addr = reinterpret_cast<uintptr_t>(p);
+        const auto begin = reinterpret_cast<uintptr_t>(this->base_);
+        return addr >= begin && addr < begin + this->cap_;
     }
     /// @brief Updates the high-water mark if the current usage exceeds it
     void note_high_water() {

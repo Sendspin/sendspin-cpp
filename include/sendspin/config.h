@@ -70,12 +70,13 @@ struct SendspinClientConfig {
     /// @brief Size in bytes of an internal-RAM scratch arena for parsing incoming JSON messages.
     /// When non-zero, the JSON document used to parse each incoming protocol message is allocated
     /// from a fixed internal-RAM buffer of this size instead of PSRAM, cutting PSRAM traffic on the
-    /// network task; messages too large for the budget transparently fall back to PSRAM. Costs this
-    /// many bytes of internal RAM permanently. The default (2048) covers the steady-state protocol
-    /// traffic, including the FLAC stream-start header; large track-metadata messages may exceed it
-    /// and fall back to PSRAM, but those arrive only once per song. Set to 0 to disable the arena
-    /// and keep the PSRAM-only behaviour. Has no effect on host (no PSRAM). Smaller values just
-    /// fall back more often.
+    /// network task; messages too large for the budget fall back to PSRAM. Costs this many bytes of
+    /// internal RAM permanently. The default (2048) covers the steady-state protocol traffic,
+    /// including the FLAC stream-start header; large track-metadata messages may exceed it and fall
+    /// back to PSRAM, but those arrive only once per song. Set to 0 to disable the arena and keep
+    /// the PSRAM-only behaviour. Smaller values just fall back more often. On host there is no
+    /// PSRAM distinction, so the arena is a fixed scratch buffer for the parse (still allocated and
+    /// used; harmless).
     size_t json_arena_size{2048};
 };
 
