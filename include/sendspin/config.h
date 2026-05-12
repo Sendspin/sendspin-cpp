@@ -119,10 +119,6 @@ struct PlayerRoleConfig {
     unsigned priority{DEFAULT_SYNC_TASK_PRIORITY};  ///< FreeRTOS priority for the sync/decode
                                                     ///< task (ESP-IDF only)
 
-    /// @brief Memory placement for the interpolation transfer buffer (ESP-IDF only; ignored on
-    /// host). Defaults to PREFER_EXTERNAL (SPIRAM).
-    MemoryLocation interpolation_buffer_location{MemoryLocation::PREFER_EXTERNAL};
-
     /// @brief Memory placement for the decode transfer buffer (ESP-IDF only; ignored on host).
     /// Defaults to PREFER_EXTERNAL (SPIRAM).
     MemoryLocation decode_buffer_location{MemoryLocation::PREFER_EXTERNAL};
