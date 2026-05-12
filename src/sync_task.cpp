@@ -174,8 +174,11 @@ SyncTaskState SyncTask::handle_initial_sync(SyncContext& sync_context) {
     }
 
     if (sync_context.silence_remaining == 0) {
-        sync_context.silence_remaining =
-            sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS);
+        // Keep the silence run frame-aligned so per-write chunks (and the playtime accounting in
+        // track_sent_audio) land on whole frames.
+        sync_context.silence_remaining = sync_context.current_stream_info.frames_to_bytes(
+            sync_context.current_stream_info.bytes_to_frames(
+                sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS)));
     }
     this->send_pending_silence(sync_context);
 
@@ -313,6 +316,16 @@ void SyncTask::send_pending_silence(SyncContext& sync_context) {
     }
 
     size_t chunk = std::min<size_t>(sync_context.silence_remaining, sizeof(silence_scratch));
+    // Push whole frames only: the scratch size is not necessarily a multiple of bytes_per_frame
+    // (e.g. 24-bit stereo), and unaligned writes would mis-account playtime in track_sent_audio()
+    // and can violate frame-alignment expectations of some sinks. silence_remaining is itself
+    // frame-aligned, so the final chunk stays whole.
+    if (sync_context.bytes_per_frame > 0) {
+        chunk -= chunk % sync_context.bytes_per_frame;
+        if (chunk == 0) {
+            chunk = std::min<size_t>(sync_context.silence_remaining, sync_context.bytes_per_frame);
+        }
+    }
     size_t bytes_written = 0;
     if (this->player_impl_->listener != nullptr) {
         bytes_written = this->player_impl_->listener->on_audio_write(silence_scratch, chunk,
