@@ -54,7 +54,7 @@ static constexpr uint32_t AUDIO_WRITE_TIMEOUT_MS = 20U;
 
 /// @brief Minimum sleep (ms) after an initial-sync push, to let the audio stack begin draining
 /// before the next push.
-static constexpr uint32_t INITIAL_SYNC_SETTLE_MIN_MS = 5U;
+static constexpr uint32_t INITIAL_SYNC_SETTLE_MIN_MS = 2U;
 
 /// @brief Size of the shared silence scratch buffer. Bounds the bytes pushed to the sink per call;
 /// silence longer than this is sent over multiple iterations.
