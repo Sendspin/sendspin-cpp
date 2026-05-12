@@ -451,6 +451,16 @@ int32_t SyncTask::soft_sync_insert_frame(SyncContext& sync_context) {
 }
 
 DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
+    if (sync_context.encoded_entry != nullptr &&
+        sync_context.encoded_entry->chunk_type == CHUNK_TYPE_STREAM_CLEAR_MARKER) {
+        // Reached the stream/clear marker before the inner loop noticed COMMAND_STREAM_CLEAR
+        // (the marker was at the front of an otherwise-empty ring buffer). Apply the clear here.
+        this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+        sync_context.encoded_entry = nullptr;
+        this->apply_stream_clear(sync_context);
+        return DecodeResult::SKIPPED;
+    }
+
     if (sync_context.decode_buffer != nullptr && sync_context.decode_buffer->available() > 0) {
         // Already have decoded audio
         return DecodeResult::SUCCESS;
@@ -565,12 +575,13 @@ bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
             continue;  // Timed out; check flags and try again
         }
         if (entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO &&
-            entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO) {
+            entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO &&
+            entry->chunk_type != CHUNK_TYPE_STREAM_CLEAR_MARKER) {
             // Found a codec header
             sync_context.encoded_entry = entry;
             return true;
         }
-        // Stale audio data from a previous stream, discard it
+        // Stale audio data (or a leftover stream/clear marker) from a previous stream, discard it
         this->encoded_ring_buffer_->return_chunk(entry);
     }
     return false;
@@ -586,13 +597,55 @@ void SyncTask::drain_ring_buffer(SyncContext& sync_context) {
             break;
         }
         if (entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO &&
-            entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO) {
+            entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO &&
+            entry->chunk_type != CHUNK_TYPE_STREAM_CLEAR_MARKER) {
             // Codec header for the next stream; hold onto it
             sync_context.encoded_entry = entry;
             break;
         }
         this->encoded_ring_buffer_->return_chunk(entry);
     }
+}
+
+void SyncTask::apply_stream_clear(SyncContext& sync_context) {
+    // Drop in-flight decoded audio (it carries the pre-seek timestamp; appending post-seek audio to
+    // it would mis-stamp the buffer) and any pending priming/gap-fill silence. Codec/decoder state,
+    // buffered_frames and new_audio_client_playtime are deliberately left intact: the audio already
+    // handed to the sink keeps draining, and the next chunk's server timestamp lets the existing
+    // sync logic re-align (hard sync) on its own.
+    sync_context.silence_remaining = 0;
+    sync_context.release_chunk = false;
+    if (sync_context.decode_buffer != nullptr) {
+        sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
+    }
+    this->event_flags_.clear(EventGroupBits::COMMAND_STREAM_CLEAR);
+}
+
+void SyncTask::discard_to_clear_marker(SyncContext& sync_context) {
+    // A stream/clear arrived: discard buffered audio up to the marker the client enqueued right
+    // after signaling.
+    if (sync_context.encoded_entry != nullptr) {
+        bool is_marker = sync_context.encoded_entry->chunk_type == CHUNK_TYPE_STREAM_CLEAR_MARKER;
+        this->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+        sync_context.encoded_entry = nullptr;
+        if (is_marker) {
+            this->apply_stream_clear(sync_context);
+            return;
+        }
+    }
+
+    while (!(this->event_flags_.get() & COMMAND_STOP)) {
+        auto* entry = this->encoded_ring_buffer_->receive_chunk(0);
+        if (entry == nullptr) {
+            break;
+        }
+        ChunkType type = entry->chunk_type;
+        this->encoded_ring_buffer_->return_chunk(entry);
+        if (type == CHUNK_TYPE_STREAM_CLEAR_MARKER) {
+            break;
+        }
+    }
+    this->apply_stream_clear(sync_context);
 }
 
 void SyncTask::reset_context(SyncContext& sync_context) {
@@ -751,8 +804,15 @@ void SyncTask::thread_entry(void* params) {
         // === INNER LOOP: state machine for active stream ===
         while (true) {
             uint32_t flags = this_task->event_flags_.get();
-            if (flags & (COMMAND_STOP | COMMAND_STREAM_END | COMMAND_STREAM_CLEAR)) {
+            if (flags & (COMMAND_STOP | COMMAND_STREAM_END)) {
                 break;
+            }
+            if (flags & COMMAND_STREAM_CLEAR) {
+                // Seek within the current stream: discard buffered audio up to the marker, keep the
+                // codec/decoder and playtime accounting, and continue decoding the new audio.
+                this_task->discard_to_clear_marker(sync_context);
+                sync_state = SyncTaskState::LOAD_CHUNK;
+                continue;
             }
 
             this_task->process_playback_progress(sync_context);

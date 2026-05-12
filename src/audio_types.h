@@ -25,11 +25,12 @@ namespace sendspin {
 ///
 /// Not part of the protocol specification.
 enum ChunkType : uint8_t {
-    CHUNK_TYPE_ENCODED_AUDIO = 0,  // Raw encoded audio data
-    CHUNK_TYPE_DECODED_AUDIO,      // Already-decoded PCM frames
-    CHUNK_TYPE_PCM_DUMMY_HEADER,   // Synthetic header for PCM streams
-    CHUNK_TYPE_OPUS_DUMMY_HEADER,  // Synthetic header for Opus streams
-    CHUNK_TYPE_FLAC_HEADER,        // FLAC stream header block
+    CHUNK_TYPE_ENCODED_AUDIO = 0,    // Raw encoded audio data
+    CHUNK_TYPE_DECODED_AUDIO,        // Already-decoded PCM frames
+    CHUNK_TYPE_PCM_DUMMY_HEADER,     // Synthetic header for PCM streams
+    CHUNK_TYPE_OPUS_DUMMY_HEADER,    // Synthetic header for Opus streams
+    CHUNK_TYPE_FLAC_HEADER,          // FLAC stream header block
+    CHUNK_TYPE_STREAM_CLEAR_MARKER,  // Boundary marker: discard everything before it (stream/clear)
 };
 
 /// @brief Synthetic codec header for PCM and Opus streams that lack a real header block

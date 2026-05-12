@@ -90,7 +90,7 @@ struct SyncContext {
 enum EventGroupBits : uint16_t {
     COMMAND_STOP = (1 << 0),          // Signal task to stop
     COMMAND_STREAM_END = (1 << 1),    // Signal end of current stream
-    COMMAND_STREAM_CLEAR = (1 << 2),  // Signal immediate buffer clear
+    COMMAND_STREAM_CLEAR = (1 << 2),  // Seek: discard buffered audio up to the clear marker
     COMMAND_START = (1 << 3),         // Signal stream start acknowledged
     TASK_RUNNING = (1 << 8),          // Task is actively processing a stream
     TASK_STOPPED = (1 << 10),         // Task thread has exited
@@ -143,8 +143,10 @@ public:
     /// Thread-safe: may be called from any context.
     void signal_stream_end();
 
-    /// @brief Signals the sync task to clear all buffered audio. Non-blocking
-    /// The task immediately drains the ring buffer and returns to idle.
+    /// @brief Signals the sync task that a stream/clear (seek) occurred. Non-blocking
+    /// The task discards buffered audio up to the CHUNK_TYPE_STREAM_CLEAR_MARKER that the caller
+    /// must enqueue immediately after this call, then keeps processing the same stream with its
+    /// existing codec, decoder, and playtime accounting intact. It does not return to idle.
     /// Thread-safe: may be called from any context.
     void signal_stream_clear();
 
@@ -225,6 +227,15 @@ protected:
 
     /// @brief Non-blocking drain of audio data from the ring buffer, preserving codec headers
     void drain_ring_buffer(SyncContext& sync_context);
+
+    /// @brief Handles a stream/clear (seek) while a stream is active: discards ring-buffer chunks
+    /// up to (and including) the CHUNK_TYPE_STREAM_CLEAR_MARKER, then applies apply_stream_clear()
+    void discard_to_clear_marker(SyncContext& sync_context);
+
+    /// @brief Drops in-flight decoded audio and pending silence (they carry the pre-seek timeline)
+    /// and clears COMMAND_STREAM_CLEAR. Codec/decoder state and playtime accounting are left
+    /// intact; the next chunk's server timestamp lets the existing sync logic re-align on its own.
+    void apply_stream_clear(SyncContext& sync_context);
 
     /// @brief Resets SyncContext between streams without deallocating buffers
     void reset_context(SyncContext& sync_context);
