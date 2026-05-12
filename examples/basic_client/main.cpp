@@ -256,13 +256,6 @@ int main(int argc, char* argv[]) {
 #endif
         }
 
-        void on_stream_clear() override {
-            fprintf(stderr, ">>> Stream clear\n");
-#ifdef SENDSPIN_HAS_PORTAUDIO
-            sink.clear();
-#endif
-        }
-
 #ifdef SENDSPIN_HAS_PORTAUDIO
         void on_volume_changed(uint8_t vol) override { sink.set_volume(vol); }
         void on_mute_changed(bool muted) override { sink.set_muted(muted); }

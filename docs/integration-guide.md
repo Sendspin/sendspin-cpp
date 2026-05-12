@@ -176,11 +176,6 @@ struct MyPlayerListener : PlayerRoleListener {
         my_audio_output.clear();
     }
 
-    // Optional: Called when the audio stream is cleared (e.g., track skip).
-    void on_stream_clear() override {
-        my_audio_output.clear();
-    }
-
     // Optional: Called when the server changes the volume.
     void on_volume_changed(uint8_t volume) override {
         my_audio_output.set_volume(volume);

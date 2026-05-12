@@ -579,12 +579,6 @@ int main(int argc, char* argv[]) {
 #endif
         }
 
-        void on_stream_clear() override {
-#ifdef SENDSPIN_HAS_PORTAUDIO
-            sink.clear();
-#endif
-        }
-
         void on_volume_changed(uint8_t vol) override {
             {
                 std::lock_guard<std::mutex> lock(state.mutex);

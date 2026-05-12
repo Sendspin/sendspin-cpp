@@ -73,7 +73,7 @@ struct ServerCommandMessage {
 ///
 /// THREAD SAFETY: on_audio_write() fires on the sync task's background thread.
 /// Implementations must be thread-safe for this method. on_stream_start(), on_stream_end(),
-/// on_stream_clear(), on_volume_changed(), on_mute_changed(), and on_static_delay_changed()
+/// on_volume_changed(), on_mute_changed(), and on_static_delay_changed()
 /// fire on the main loop thread via drain_events(). The listener must outlive the role.
 class PlayerRoleListener {
 public:
@@ -93,9 +93,6 @@ public:
 
     /// @brief Called when the audio stream ends. Fires on the main loop thread
     virtual void on_stream_end() {}
-
-    /// @brief Called when the audio stream is cleared. Fires on the main loop thread
-    virtual void on_stream_clear() {}
 
     /// @brief Called when the volume is changed by the server. Fires on the main loop thread
     virtual void on_volume_changed(uint8_t /*volume*/) {}

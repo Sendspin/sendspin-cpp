@@ -37,7 +37,6 @@ struct ClientStateMessage;
 enum class PlayerStreamCallbackType : uint8_t {
     STREAM_START,  // New stream is starting
     STREAM_END,    // Stream ended normally
-    STREAM_CLEAR,  // Stream cleared immediately
 };
 
 /// @brief Private implementation of the player role

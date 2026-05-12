@@ -411,9 +411,7 @@ void PlayerRole::Impl::drain_events() {
         size_t processed = 0;
 
         for (auto& event : this->awaiting_sync_idle_events) {
-            if ((event == PlayerStreamCallbackType::STREAM_END ||
-                 event == PlayerStreamCallbackType::STREAM_CLEAR) &&
-                !sync_idle) {
+            if (event == PlayerStreamCallbackType::STREAM_END && !sync_idle) {
                 break;  // Wait for sync task to go idle before firing this and anything after it
             }
 
@@ -425,11 +423,6 @@ void PlayerRole::Impl::drain_events() {
                     if (this->high_performance_requested_for_playback) {
                         this->client->release_high_performance();
                         this->high_performance_requested_for_playback = false;
-                    }
-                    break;
-                case PlayerStreamCallbackType::STREAM_CLEAR:
-                    if (this->listener) {
-                        this->listener->on_stream_clear();
                     }
                     break;
                 case PlayerStreamCallbackType::STREAM_START: {

@@ -76,7 +76,7 @@ Atomic bit flags with blocking wait. Used for thread lifecycle control:
 ```api
 COMMAND_STOP         (1 << 0)   Stop the thread
 COMMAND_STREAM_END   (1 << 1)   End current stream
-COMMAND_STREAM_CLEAR (1 << 2)   Clear all buffered audio
+COMMAND_STREAM_CLEAR (1 << 2)   Seek: discard buffered audio up to the stream/clear marker
 COMMAND_START        (1 << 3)   Main loop acknowledged stream start
 TASK_RUNNING         (1 << 8)   Actively decoding
 TASK_STOPPED         (1 << 10)  Thread has exited
@@ -168,7 +168,7 @@ Network thread (IXWebSocket / esp_http_server)
 | `GROUP_UPDATE` | Merges into `Client::shadow_group` |
 | `STREAM_START` | Writes to `PlayerRole::Impl::shadow_stream_params`, enqueues `STREAM_START` into `stream_queue`. Marks the artwork stream active, flushes the decode thread's notification queue, and resets any pending per-slot display timestamps. Writes to `VisualizerRole::Impl::shadow_config`, enqueues a start event. |
 | `STREAM_END` | Enqueues `STREAM_END` into player/artwork/visualizer queues, signals sync task `COMMAND_STREAM_END` |
-| `STREAM_CLEAR` | Enqueues `STREAM_CLEAR` into player/artwork/visualizer queues, signals sync task `COMMAND_STREAM_CLEAR` |
+| `STREAM_CLEAR` | Enqueues `STREAM_CLEAR` into artwork/visualizer queues; for the player, signals sync task `COMMAND_STREAM_CLEAR` and enqueues a `CHUNK_TYPE_STREAM_CLEAR_MARKER` chunk into the encoded ring buffer (no player listener callback — a seek is not a stream lifecycle event) |
 
 #### JSON parse arena (`src/platform/json_arena.h`)
 
@@ -240,9 +240,9 @@ stream_queue → awaiting_sync_idle_events_ list
                        │
                        ▼
          For each event in order:
-           ├─ STREAM_END or STREAM_CLEAR:
-           │    If sync task is still running → STOP, wait for next tick
-           │    If sync task is idle → fire callback, continue
+           ├─ STREAM_END:
+           │    If sync task is still running → wait for next tick
+           │    If sync task is idle → fire on_stream_end(), continue
            │
            └─ STREAM_START:
                 Take shadow_stream_params
@@ -250,7 +250,7 @@ stream_queue → awaiting_sync_idle_events_ list
                 Signal sync task COMMAND_START
 ```
 
-The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering mechanism. STREAM_END/CLEAR callbacks are held until the sync task has reached its IDLE state, preventing the main loop from processing a new STREAM_START before the sync task has finished with the old stream. Events ahead of the blocked event also wait, preserving FIFO order.
+The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering mechanism. STREAM_END callbacks are held until the sync task has reached its IDLE state, preventing the main loop from processing a new STREAM_START before the sync task has finished with the old stream. Events ahead of the blocked event also wait, preserving FIFO order. (`stream/clear` is not queued here — it is handled synchronously in `handle_stream_clear()` by signaling the sync task and enqueuing a marker chunk.)
 
 ### Other Roles
 
