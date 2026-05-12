@@ -56,6 +56,18 @@ static constexpr uint32_t AUDIO_WRITE_TIMEOUT_MS = 20U;
 /// before the next push.
 static constexpr uint32_t INITIAL_SYNC_SETTLE_MIN_MS = 5U;
 
+/// @brief Size of the shared silence scratch buffer. Bounds the bytes pushed to the sink per call;
+/// silence longer than this is sent over multiple iterations.
+static constexpr size_t SILENCE_SCRATCH_BYTES = 1024;
+
+/// @brief Chunk of zeros streamed to the sink for initial-sync priming and hard-sync gap fills.
+/// Never written after zero-initialization (the sink only ever reads its input). Deliberately
+/// non-const so it lands in .bss (internal SRAM on ESP-IDF) rather than .rodata (flash): the
+/// initial-sync push happens exactly when the server is flooding the ring buffer in PSRAM, and on
+/// the ESP32 flash shares the SPI bus with PSRAM, so a flash read here would contend with that
+/// flood. .bss costs no heap and no flash; it is reserved and zeroed once at startup.
+static uint8_t silence_scratch[SILENCE_SCRATCH_BYTES] = {};
+
 static const char* const TAG = "sendspin.sync_task";
 
 // ============================================================================
@@ -155,29 +167,17 @@ void SyncTask::notify_audio_played(uint32_t frames, int64_t timestamp) {
 
 SyncTaskState SyncTask::handle_initial_sync(SyncContext& sync_context) {
     if (!sync_context.initial_decode) {
+        // Priming done (the audio stack has started consuming) - drop any leftover priming silence
+        // so it is not injected before the first real chunk.
+        sync_context.silence_remaining = 0;
         return SyncTaskState::LOAD_CHUNK;
     }
 
-    if (sync_context.interpolation_transfer_buffer->available() > 0) {
-        size_t bytes_written = sync_context.interpolation_transfer_buffer->transfer_data_to_sink(
-            AUDIO_WRITE_TIMEOUT_MS);
-        this->track_sent_audio(sync_context, bytes_written);
-        if ((bytes_written > 0) && sync_context.initial_decode) {
-            // Sent initial zeros, delay slightly to give it some time to work through the audio
-            // stack
-            std::this_thread::sleep_for(std::chrono::milliseconds(std::max<uint32_t>(
-                INITIAL_SYNC_SETTLE_MIN_MS,
-                sync_context.current_stream_info.bytes_to_ms(bytes_written) / 2)));
-        }
-    } else {
-        const size_t zeroed_bytes = sync_context.interpolation_transfer_buffer->free();
-        std::memset(
-            static_cast<void*>(sync_context.interpolation_transfer_buffer->get_buffer_end()), 0,
-            zeroed_bytes);
-        sync_context.interpolation_transfer_buffer->increase_buffer_length(
-            std::min(zeroed_bytes,
-                     sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS)));
+    if (sync_context.silence_remaining == 0) {
+        sync_context.silence_remaining =
+            sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS);
     }
+    this->send_pending_silence(sync_context);
 
     return SyncTaskState::INITIAL_SYNC;
 }
@@ -223,32 +223,20 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
         // gap
         sync_context.hard_syncing = true;
 
-        // Clear any stale interpolation data
-        sync_context.interpolation_transfer_buffer->decrease_buffer_length(
-            sync_context.interpolation_transfer_buffer->available());
-
         // Compute silence directly in frames from microseconds (avoids ms truncation)
         uint32_t silence_frames = static_cast<uint32_t>(
             (static_cast<uint64_t>(raw_error) *
              static_cast<uint64_t>(sync_context.current_stream_info.get_sample_rate())) /
             static_cast<uint64_t>(US_PER_SECOND));
-        size_t silence_bytes = sync_context.current_stream_info.frames_to_bytes(silence_frames);
-
-        // Cap at buffer capacity
-        const size_t buffer_free = sync_context.interpolation_transfer_buffer->free();
-        size_t actual_bytes = std::min(silence_bytes, buffer_free);
-
-        std::memset(
-            static_cast<void*>(sync_context.interpolation_transfer_buffer->get_buffer_end()), 0,
-            actual_bytes);
-        sync_context.interpolation_transfer_buffer->increase_buffer_length(actual_bytes);
+        sync_context.silence_remaining =
+            sync_context.current_stream_info.frames_to_bytes(silence_frames);
 
         // Playtime estimate is advanced by transfer_audio() when the silence is actually sent
         sync_context.release_chunk = false;  // Keep decoded audio for after the silence
 
         SS_LOGV(TAG,
                 "Hard sync: adding %" PRIu32 " frames of silence for %" PRId64 "us future error",
-                sync_context.current_stream_info.bytes_to_frames(actual_bytes), raw_error);
+                silence_frames, raw_error);
     } else if (raw_error < -active_threshold) {
         // Chunk should have started playing already - drop only the late prefix from the front of
         // the buffer and play the remainder. By the time we get here, silence has already been
@@ -283,7 +271,7 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
         sync_context.hard_syncing = false;
 
         if (raw_error > SOFT_SYNC_THRESHOLD_US) {
-            // Slightly behind - add one interpolated frame between the first two decoded frames
+            // Slightly behind - add one interpolated frame between the last two decoded frames
             // Playtime estimate is advanced by transfer_audio() when the extra frame is sent
             this->soft_sync_insert_frame(sync_context);
         } else if (raw_error < -SOFT_SYNC_THRESHOLD_US) {
@@ -319,21 +307,33 @@ void SyncTask::track_sent_audio(SyncContext& sync_context, size_t bytes_sent) {
         static_cast<int64_t>(sync_context.current_stream_info.frames_to_microseconds(remainder));
 }
 
-bool SyncTask::transfer_audio(SyncContext& sync_context) {
-    size_t bytes_written =
-        sync_context.interpolation_transfer_buffer->transfer_data_to_sink(AUDIO_WRITE_TIMEOUT_MS);
+void SyncTask::send_pending_silence(SyncContext& sync_context) {
+    if (sync_context.silence_remaining == 0) {
+        return;
+    }
+
+    size_t chunk = std::min<size_t>(sync_context.silence_remaining, sizeof(silence_scratch));
+    size_t bytes_written = 0;
+    if (this->player_impl_->listener != nullptr) {
+        bytes_written = this->player_impl_->listener->on_audio_write(silence_scratch, chunk,
+                                                                     AUDIO_WRITE_TIMEOUT_MS);
+    }
     this->track_sent_audio(sync_context, bytes_written);
+    sync_context.silence_remaining -= bytes_written;
 
     if ((bytes_written > 0) && sync_context.initial_decode) {
-        // Sent initial zeros, delay slightly to give it some time to work through the audio stack
+        // Sent priming zeros - delay slightly to give the audio stack time to start consuming
         std::this_thread::sleep_for(std::chrono::milliseconds(
             std::max<uint32_t>(INITIAL_SYNC_SETTLE_MIN_MS,
                                sync_context.current_stream_info.bytes_to_ms(bytes_written) / 2)));
     }
+}
 
-    if (sync_context.interpolation_transfer_buffer->available() == 0 &&
-        sync_context.release_chunk) {
-        // No interpolation bytes available, send main audio data
+bool SyncTask::transfer_audio(SyncContext& sync_context) {
+    // Pending silence (priming or hard-sync gap fill) goes out before the decoded chunk
+    this->send_pending_silence(sync_context);
+
+    if (sync_context.silence_remaining == 0 && sync_context.release_chunk) {
         size_t decode_bytes_written =
             sync_context.decode_buffer->transfer_data_to_sink(AUDIO_WRITE_TIMEOUT_MS);
         this->track_sent_audio(sync_context, decode_bytes_written);
@@ -345,7 +345,7 @@ bool SyncTask::transfer_audio(SyncContext& sync_context) {
     }
 
     // Keep transferring if there's still data to send
-    if (sync_context.interpolation_transfer_buffer->available() > 0) {
+    if (sync_context.silence_remaining > 0) {
         return false;
     }
     if (sync_context.release_chunk && sync_context.decode_buffer->available() > 0) {
@@ -403,38 +403,38 @@ int32_t SyncTask::soft_sync_drop_frame(SyncContext& sync_context) {
 
 int32_t SyncTask::soft_sync_insert_frame(SyncContext& sync_context) {
     // Small sync adjustment after getting slightly behind.
-    // Adds one new frame to get in sync. The new frame is inserted between the first and second
-    // frames. The new frame is the average of the first two frames in the chunk to minimize audible
-    // glitches.
+    // Adds one new frame to get in sync. The new frame is inserted between the last two frames of
+    // the chunk and set to the average of those two frames to minimize audible glitches. The
+    // original last frame is moved into the spare frame the decode buffer reserves past the decoded
+    // data, so no second buffer is needed.
 
-    if ((sync_context.interpolation_transfer_buffer->free() >= sync_context.bytes_per_frame) &&
-        (sync_context.decode_buffer->available() >= 2 * sync_context.bytes_per_frame)) {
-        const uint32_t num_channels = sync_context.current_stream_info.get_channels();
-        const uint32_t bytes_per_sample = sync_context.bytes_per_frame / num_channels;
-
-        for (uint32_t chan = 0; chan < num_channels; ++chan) {
-            const size_t chan_offset =
-                static_cast<size_t>(chan) * static_cast<size_t>(bytes_per_sample);
-            const int32_t first_sample = unpack_audio_sample_to_q31(
-                sync_context.decode_buffer->get_buffer_start() + chan_offset, bytes_per_sample);
-            const int32_t second_sample =
-                unpack_audio_sample_to_q31(sync_context.decode_buffer->get_buffer_start() +
-                                               chan_offset + sync_context.bytes_per_frame,
-                                           bytes_per_sample);
-            int32_t new_sample = first_sample / 2 + second_sample / 2;
-            pack_q31_as_audio_sample(new_sample,
-                                     sync_context.decode_buffer->get_buffer_start() + chan_offset,
-                                     bytes_per_sample);
-            pack_q31_as_audio_sample(
-                first_sample,
-                sync_context.interpolation_transfer_buffer->get_buffer_start() + chan_offset,
-                bytes_per_sample);
-        }
-        sync_context.interpolation_transfer_buffer->increase_buffer_length(
-            sync_context.bytes_per_frame);
-        return 1;
+    if ((sync_context.decode_buffer->available() < 2 * sync_context.bytes_per_frame) ||
+        (sync_context.decode_buffer->free() < sync_context.bytes_per_frame)) {
+        return 0;
     }
-    return 0;
+
+    const uint32_t num_channels = sync_context.current_stream_info.get_channels();
+    const uint32_t bytes_per_sample = sync_context.bytes_per_frame / num_channels;
+
+    uint8_t* last_frame =
+        sync_context.decode_buffer->get_buffer_end() - sync_context.bytes_per_frame;
+    uint8_t* second_last_frame = last_frame - sync_context.bytes_per_frame;
+    uint8_t* spare_frame = sync_context.decode_buffer->get_buffer_end();
+
+    // Move the original last frame into the spare slot, then blend the new frame into its old slot.
+    std::memcpy(spare_frame, last_frame, sync_context.bytes_per_frame);
+    for (uint32_t chan = 0; chan < num_channels; ++chan) {
+        const size_t chan_offset =
+            static_cast<size_t>(chan) * static_cast<size_t>(bytes_per_sample);
+        const int32_t second_last_sample =
+            unpack_audio_sample_to_q31(second_last_frame + chan_offset, bytes_per_sample);
+        const int32_t last_sample =
+            unpack_audio_sample_to_q31(last_frame + chan_offset, bytes_per_sample);
+        const int32_t blended_sample = second_last_sample / 2 + last_sample / 2;
+        pack_q31_as_audio_sample(blended_sample, last_frame + chan_offset, bytes_per_sample);
+    }
+    sync_context.decode_buffer->increase_buffer_length(sync_context.bytes_per_frame);
+    return 1;
 }
 
 DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
@@ -462,22 +462,13 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             if (decoded_stream_info != sync_context.current_stream_info) {
                 sync_context.current_stream_info = decoded_stream_info;
                 sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
-
-                // Resize interpolation buffer if needed for the actual stream parameters
-                size_t needed_interp_size =
-                    sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS);
-                if (sync_context.interpolation_transfer_buffer != nullptr &&
-                    needed_interp_size > sync_context.interpolation_transfer_buffer->capacity()) {
-                    if (!sync_context.interpolation_transfer_buffer->reallocate(
-                            needed_interp_size)) {
-                        SS_LOGW(TAG, "Failed to resize interpolation buffer for new stream info");
-                    }
-                }
             }
 
             // Create or resize the decode buffer using the decoder's current required size
-            // estimate; some codecs (for example, Opus) may require this to grow later.
-            size_t needed = sync_context.decoder->get_decode_buffer_size();
+            // estimate; some codecs (for example, Opus) may require this to grow later. One extra
+            // frame is reserved past the decoded data for soft-sync frame insertion.
+            size_t needed =
+                sync_context.decoder->get_decode_buffer_size() + sync_context.bytes_per_frame;
             if (sync_context.decode_buffer == nullptr) {
                 sync_context.decode_buffer = TransferBuffer::create(
                     needed, this->player_impl_->config.decode_buffer_location);
@@ -521,8 +512,9 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
         if (!decoded) {
             // The decoder raises its decoded-size estimate when it meets an unusually large chunk
             // (e.g. a multi-frame Opus packet bigger than the typical 20ms buffer). Grow the
-            // buffer to the new estimate and retry once.
-            size_t needed = sync_context.decoder->get_decode_buffer_size();
+            // buffer to the new estimate (plus the reserved spare frame) and retry once.
+            size_t needed =
+                sync_context.decoder->get_decode_buffer_size() + sync_context.bytes_per_frame;
             if (needed > sync_context.decode_buffer->capacity() &&
                 sync_context.decode_buffer->reallocate(needed)) {
                 decoded = sync_context.decoder->decode_audio_chunk(
@@ -601,14 +593,11 @@ void SyncTask::reset_context(SyncContext& sync_context) {
     sync_context.release_chunk = false;
     sync_context.initial_decode = true;
     sync_context.hard_syncing = true;
+    sync_context.silence_remaining = 0;
 
-    // Empty buffers without deallocating
+    // Empty the decode buffer without deallocating
     if (sync_context.decode_buffer) {
         sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
-    }
-    if (sync_context.interpolation_transfer_buffer) {
-        sync_context.interpolation_transfer_buffer->decrease_buffer_length(
-            sync_context.interpolation_transfer_buffer->available());
     }
     if (sync_context.decoder) {
         sync_context.decoder->reset_decoders();
@@ -665,22 +654,10 @@ void SyncTask::stop() {
 void SyncTask::thread_entry(void* params) {
     SyncTask* this_task = static_cast<SyncTask*>(params);
 
-    // Allocate SyncContext once on the task stack, reused across streams.
+    // Allocate SyncContext once on the task stack, reused across streams. The decode buffer is
+    // created lazily once the first codec header arrives.
     SyncContext sync_context;
     sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
-
-    sync_context.interpolation_transfer_buffer = TransferBuffer::create(
-        sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS),
-        this_task->player_impl_->config.interpolation_buffer_location);
-    if (sync_context.interpolation_transfer_buffer == nullptr) {
-        SS_LOGE(TAG, "Failed to allocate interpolation transfer buffer");
-        this_task->event_flags_.set(EventGroupBits::TASK_ERROR | EventGroupBits::TASK_STOPPED);
-        return;
-    }
-
-    if (this_task->player_impl_->listener) {
-        sync_context.interpolation_transfer_buffer->set_listener(this_task->player_impl_->listener);
-    }
     sync_context.decoder = std::make_unique<SendspinDecoder>();
 
     // === OUTER LOOP: persists for the lifetime of the client ===

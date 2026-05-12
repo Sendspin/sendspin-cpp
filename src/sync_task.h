@@ -62,10 +62,11 @@ struct SyncContext {
     AudioStreamInfo current_stream_info;  // Contains uint32_t and smaller members
 
     // Pointer fields
-    std::unique_ptr<TransferBuffer> decode_buffer;  // Reusable decode + output buffer
+    std::unique_ptr<TransferBuffer> decode_buffer;  // Reusable decode + output buffer; reserves one
+                                                    // spare frame past the decoded data for
+                                                    // soft-sync frame insertion
     std::unique_ptr<SendspinDecoder> decoder;
     AudioRingBufferEntry* encoded_entry{nullptr};
-    std::unique_ptr<TransferBuffer> interpolation_transfer_buffer;
 
     // 64-bit fields
     int64_t decoded_timestamp{0};  // Timestamp for decoded audio
@@ -73,6 +74,8 @@ struct SyncContext {
 
     // size_t fields
     size_t bytes_per_frame{0};
+    size_t silence_remaining{0};  // Bytes of silence still to emit before the next/held chunk
+                                  // (initial-sync priming or hard-sync gap fill)
 
     // 32-bit fields
     uint32_t buffered_frames{0};
@@ -191,7 +194,11 @@ protected:
     /// speaker. These two must always be updated together to keep the playtime estimate consistent.
     void track_sent_audio(SyncContext& sync_context, size_t bytes_sent);
 
-    /// @brief Transfers audio from interpolation and decode buffers to the sink
+    /// @brief Sends one chunk of pending silence (initial-sync priming or hard-sync gap fill) to
+    /// the sink and updates the playtime estimate. No-op when no silence is pending.
+    void send_pending_silence(SyncContext& sync_context);
+
+    /// @brief Transfers pending silence (if any) then the decoded chunk to the sink
     /// Returns true when all data has been sent, false if more transfers are needed.
     bool transfer_audio(SyncContext& sync_context);
 
@@ -203,7 +210,8 @@ protected:
     /// Returns -1 if a frame was removed, 0 if preconditions not met.
     int32_t soft_sync_drop_frame(SyncContext& sync_context);
 
-    /// @brief Adds one interpolated frame between the first two decoded frames
+    /// @brief Adds one interpolated frame between the last two decoded frames (average of the two),
+    /// moving the original last frame into the decode buffer's reserved spare frame
     /// Returns 1 if a frame was added, 0 if preconditions not met.
     int32_t soft_sync_insert_frame(SyncContext& sync_context);
 

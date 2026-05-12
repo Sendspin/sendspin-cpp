@@ -335,7 +335,7 @@ Where `decoded_timestamp` is the server timestamp converted to client time (via 
 |-------------|--------|
 | > +5000 us (or +500 us settling) | **Hard sync ahead**: insert silence frames to fill the gap |
 | < -5000 us (or -500 us settling) | **Hard sync behind**: drop the decoded chunk |
-| +100 to +5000 us | **Soft sync**: insert one interpolated frame (average of first two) |
+| +100 to +5000 us | **Soft sync**: insert one interpolated frame near the end (average of last two) |
 | -100 to -5000 us | **Soft sync**: remove last frame (blend into second-to-last) |
 | -100 to +100 us | **Dead zone**: pass audio through unmodified |
 
