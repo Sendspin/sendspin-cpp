@@ -314,8 +314,13 @@ void PlayerRole::Impl::handle_stream_clear() const {
     // so the sync task starts draining (freeing ring-buffer space) before we write the marker.
     // No listener callback: a seek is not a stream lifecycle event for the consumer.
     this->sync_task->signal_stream_clear();
-    this->sync_task->write_audio_chunk(nullptr, 0, 0, CHUNK_TYPE_STREAM_CLEAR_MARKER,
-                                       HEADER_SEND_TIMEOUT_MS);
+    if (!this->sync_task->write_audio_chunk(nullptr, 0, 0, CHUNK_TYPE_STREAM_CLEAR_MARKER,
+                                            HEADER_SEND_TIMEOUT_MS)) {
+        // The marker couldn't be enqueued (ring buffer full). The sync task will still drain to
+        // empty and apply the clear, but the pre-seek/post-seek boundary is lost, so new audio
+        // may be discarded along with the old.
+        SS_LOGW(TAG, "Failed to enqueue stream/clear marker; seek boundary may be imprecise");
+    }
 }
 
 void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) const {
