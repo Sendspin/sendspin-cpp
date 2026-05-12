@@ -232,9 +232,11 @@ protected:
     /// up to (and including) the CHUNK_TYPE_STREAM_CLEAR_MARKER, then applies apply_stream_clear()
     void discard_to_clear_marker(SyncContext& sync_context);
 
-    /// @brief Drops in-flight decoded audio and pending silence (they carry the pre-seek timeline)
-    /// and clears COMMAND_STREAM_CLEAR. Codec/decoder state and playtime accounting are left
-    /// intact; the next chunk's server timestamp lets the existing sync logic re-align on its own.
+    /// @brief Drops in-flight decoded audio and pending silence (they carry the pre-seek timeline),
+    /// forces hard_syncing on, and clears COMMAND_STREAM_CLEAR. Codec/decoder state, playtime
+    /// accounting, and initial_decode are left intact; the next chunk's server timestamp lets the
+    /// sync logic re-align on its own. The caller re-enters the loop at INITIAL_SYNC so unfinished
+    /// priming resumes.
     void apply_stream_clear(SyncContext& sync_context);
 
     /// @brief Resets SyncContext between streams without deallocating buffers

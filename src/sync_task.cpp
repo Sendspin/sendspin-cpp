@@ -609,12 +609,16 @@ void SyncTask::drain_ring_buffer(SyncContext& sync_context) {
 
 void SyncTask::apply_stream_clear(SyncContext& sync_context) {
     // Drop in-flight decoded audio (it carries the pre-seek timestamp; appending post-seek audio to
-    // it would mis-stamp the buffer) and any pending priming/gap-fill silence. Codec/decoder state,
-    // buffered_frames and new_audio_client_playtime are deliberately left intact: the audio already
-    // handed to the sink keeps draining, and the next chunk's server timestamp lets the existing
-    // sync logic re-align (hard sync) on its own.
+    // it would mis-stamp the buffer) and any pending hard-sync gap-fill silence. Codec/decoder
+    // state, buffered_frames and new_audio_client_playtime are deliberately left intact: the audio
+    // already handed to the sink keeps draining, and the next chunk's server timestamp lets the
+    // sync logic re-align on its own. Force hard_syncing on so that re-alignment uses the tight
+    // settle threshold (the post-seek timestamp jump would trigger it anyway, but this is
+    // explicit). initial_decode is left as-is: if priming has not finished the caller resumes it
+    // via the INITIAL_SYNC state; if it has, we must not re-prime an already-running sink.
     sync_context.silence_remaining = 0;
     sync_context.release_chunk = false;
+    sync_context.hard_syncing = true;
     if (sync_context.decode_buffer != nullptr) {
         sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
     }
@@ -810,8 +814,10 @@ void SyncTask::thread_entry(void* params) {
             if (flags & COMMAND_STREAM_CLEAR) {
                 // Seek within the current stream: discard buffered audio up to the marker, keep the
                 // codec/decoder and playtime accounting, and continue decoding the new audio.
+                // Re-enter at INITIAL_SYNC: if priming had not finished it resumes there; otherwise
+                // handle_initial_sync() falls straight through to LOAD_CHUNK on the next tick.
                 this_task->discard_to_clear_marker(sync_context);
-                sync_state = SyncTaskState::LOAD_CHUNK;
+                sync_state = SyncTaskState::INITIAL_SYNC;
                 continue;
             }
 
