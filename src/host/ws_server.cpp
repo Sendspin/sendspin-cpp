@@ -59,7 +59,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
             SS_LOGD(TAG, "New client connection (synthetic sockfd %d)", synthetic_sockfd);
 
             // Create the server connection
-            auto connection = std::make_unique<SendspinServerConnection>(ws, synthetic_sockfd);
+            auto connection = std::make_shared<SendspinServerConnection>(ws, synthetic_sockfd);
 
             // Set up the message callback on the websocket to route data through the connection
             ws->setOnMessageCallback([this, synthetic_sockfd](const ix::WebSocketMessagePtr& msg) {

@@ -125,12 +125,20 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
         return ESP_FAIL;
     }
 
-    // Create a new connection instance
-    auto connection = std::make_unique<SendspinServerConnection>(handle, sockfd);
+    // Pin the connection to the httpd session: a heap-allocated shared_ptr is set as the session
+    // context, with a free_fn that drops the refcount when the session is torn down. httpd invokes
+    // the close_fn before the free_fn, so observers (ConnectionManager) get notified first and any
+    // queued workers that have already started look up the same shared_ptr via httpd_sess_get_ctx
+    // and run safely until the session is freed.
+    auto conn = std::make_shared<SendspinServerConnection>(handle, sockfd);
+    auto* slot = new std::shared_ptr<SendspinServerConnection>(conn);
+    httpd_sess_set_ctx(handle, sockfd, slot, [](void* p) {
+        delete static_cast<std::shared_ptr<SendspinServerConnection>*>(p);
+    });
 
     // Notify the client of the new connection (client decides whether to keep it)
     if (server->new_connection_callback_) {
-        server->new_connection_callback_(std::move(connection));
+        server->new_connection_callback_(std::move(conn));
     } else {
         SS_LOGW(TAG, "No new connection callback set, connection will be dropped");
     }
@@ -143,7 +151,10 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
 
     SendspinWsServer* server = (SendspinWsServer*)httpd_get_global_user_ctx(handle);
 
-    // Notify the client so it can identify and clean up the connection
+    // Notify ConnectionManager so it can drop its observer shared_ptr. The session slot (set in
+    // open_callback) keeps the connection alive until httpd invokes the slot's free_fn next, which
+    // ensures any in-flight workers that are still looking it up via httpd_sess_get_ctx see a
+    // valid object.
     if (server != nullptr && server->connection_closed_callback_) {
         server->connection_closed_callback_(sockfd);
     }
@@ -160,39 +171,33 @@ SS_HOT esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
     // Capture timestamp immediately for accurate time synchronization
     int64_t receive_time = esp_timer_get_time();
 
-    SendspinWsServer* server = (SendspinWsServer*)req->user_ctx;
+    // Look up the connection via httpd's per-session ctx. The slot was pinned in open_callback and
+    // is freed only after this handler unwinds for a given session, so the shared_ptr copy below
+    // is always valid. Copying the shared_ptr keeps the conn alive for the duration of dispatch
+    // even if a teardown is racing on another thread. This replaces the previous cross-thread
+    // find_connection_callback + mutex.
+    int sockfd = httpd_req_to_sockfd(req);
+    auto* slot = static_cast<std::shared_ptr<SendspinServerConnection>*>(
+        httpd_sess_get_ctx(req->handle, sockfd));
+    if (slot == nullptr || !*slot) {
+        SS_LOGE(TAG, "No connection found for sockfd %d", sockfd);
+        return ESP_FAIL;
+    }
+    std::shared_ptr<SendspinServerConnection> conn_holder = *slot;
+    SendspinServerConnection* conn = conn_holder.get();
 
     // Handle WebSocket handshake (HTTP_GET)
     if (req->method == HTTP_GET) {
-        // Find the connection and invoke its on_connected_cb callback
-        int sockfd = httpd_req_to_sockfd(req);
-        std::shared_ptr<SendspinConnection> conn_holder;
-        SendspinServerConnection* conn = nullptr;
-        if (server->find_connection_callback_) {
-            conn_holder = server->find_connection_callback_(sockfd);
-            conn = static_cast<SendspinServerConnection*>(conn_holder.get());
-        }
-        if (conn != nullptr && conn->on_connected_cb) {
+        if (conn->on_connected_cb) {
             conn->on_connected_cb(conn);
         }
         return ESP_OK;
     }
 
-    // Find connection by sockfd; hold shared_ptr to keep it alive during dispatch
-    int sockfd = httpd_req_to_sockfd(req);
-    std::shared_ptr<SendspinConnection> conn_holder;
-    SendspinServerConnection* conn = nullptr;
-    if (server->find_connection_callback_) {
-        conn_holder = server->find_connection_callback_(sockfd);
-        conn = static_cast<SendspinServerConnection*>(conn_holder.get());
-    }
-
-    if (conn == nullptr) {
-        SS_LOGE(TAG, "No connection found for sockfd %d", sockfd);
-        return ESP_FAIL;
-    }
-
-    // Delegate to connection's handle_data
+    // Delegate to connection's handle_data. Stale messages (i.e., after the connection has been
+    // dropped from ConnectionManager's observer slots) are short-circuited inside the connection
+    // via disable_message_dispatch(), so a still-alive session-pinned conn does not leak messages
+    // into freshly-reset role queues.
     return conn->handle_data(req, receive_time);
 }
 

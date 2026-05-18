@@ -31,14 +31,37 @@ static const char* const TAG = "sendspin.server_connection";
 // Static helpers
 // ============================================================================
 
-/// @brief Structure holding connection context and payload data for async send operations
+/// @brief Structure holding the session identity and payload data for async send operations
+///
+/// Workers look the connection up at run time via `httpd_sess_get_ctx(server, sockfd)`. The
+/// session-pinned shared_ptr keeps the conn alive until httpd has drained queued work for the
+/// session and called the slot's free_fn, so the worker can either find a valid conn or cleanly
+/// no-op if the session is already gone.
 struct AsyncRespArg {
-    void* context;
-    uint8_t* payload;
-    size_t len;
+    httpd_handle_t server{nullptr};
+    int sockfd{-1};
+    uint8_t* payload{nullptr};
+    size_t len{0};
     bool has_callback{false};
     SendCompleteCallback on_complete;
 };
+
+/// @brief Small heap struct used by the time-message worker to identify its session
+struct SessionLookup {
+    httpd_handle_t server;
+    int sockfd;
+};
+
+/// @brief Looks up the session-pinned connection shared_ptr, returning a copy or empty if gone
+static std::shared_ptr<SendspinServerConnection> lookup_session_conn(httpd_handle_t server,
+                                                                     int sockfd) {
+    auto* slot =
+        static_cast<std::shared_ptr<SendspinServerConnection>*>(httpd_sess_get_ctx(server, sockfd));
+    if (slot == nullptr) {
+        return nullptr;
+    }
+    return *slot;
+}
 
 // ============================================================================
 // SendspinConnection interface implementation
@@ -71,11 +94,19 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
         return;
     }
 
-    // Send goodbye message, then trigger close, then invoke user callback
-    // Capture on_complete by value to keep it alive until async callback fires
-    this->send_goodbye_reason(reason, [this, on_complete](bool success) {
-        // Trigger close regardless of send success
-        this->trigger_close();
+    // Send goodbye, then trigger close, then invoke the user callback. Capture a weak_ptr to
+    // self instead of raw `this`: the worker normally finds the conn via the session slot
+    // (keeping it alive through the completion), but a weak_ptr makes that invariant explicit
+    // and avoids any UAF if the worker ever runs after the slot has been freed (e.g., across
+    // ESP-IDF versions whose httpd drain-before-free_fn ordering differs from the version we
+    // designed against). Skipping trigger_close() when the conn is already gone is harmless --
+    // the session is gone too.
+    std::weak_ptr<SendspinServerConnection> weak_self =
+        std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
+    this->send_goodbye_reason(reason, [weak_self, on_complete](bool /*success*/) {
+        if (auto self = weak_self.lock()) {
+            self->trigger_close();
+        }
 
         // Invoke user-provided completion callback if provided.
         // Already running in httpd worker thread context (async_send_text),
@@ -113,7 +144,8 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
     // Use placement new to properly construct the struct with the callback
     new (resp_arg) AsyncRespArg();
 
-    resp_arg->context = (void*)this;
+    resp_arg->server = this->server_;
+    resp_arg->sockfd = this->sockfd_;
     resp_arg->payload = static_cast<uint8_t*>(platform_malloc(message.size()));
     if (resp_arg->payload == nullptr) {
         SS_LOGE(TAG, "Failed to allocate %zu bytes for message payload", message.size());
@@ -214,20 +246,34 @@ bool SendspinServerConnection::send_time_message() {
         return false;
     }
 
-    // The worker job only needs the connection pointer (no buffer to free), so pass `this`
-    // directly. The JSON is built inside the worker so client_transmitted is captured as
-    // close to the wire send as possible.
-    if (httpd_queue_work(this->server_, async_send_time_text, this) != ESP_OK) {
+    // The worker looks up the conn by sockfd at run time via `httpd_sess_get_ctx`. The session
+    // slot keeps the conn alive past any ConnectionManager teardown that races the httpd ctrl
+    // queue. The JSON is built inside the worker so client_transmitted is captured as close to
+    // the wire send as possible. SessionLookup is POD so a raw malloc/free pair (matching the
+    // AsyncRespArg allocator convention) is sufficient; no constructor/destructor to invoke.
+    auto* lookup = static_cast<SessionLookup*>(platform_malloc_internal(sizeof(SessionLookup)));
+    if (lookup == nullptr) {
+        SS_LOGE(TAG, "Failed to allocate SessionLookup for time message");
+        return false;
+    }
+    lookup->server = this->server_;
+    lookup->sockfd = this->sockfd_;
+    if (httpd_queue_work(this->server_, async_send_time_text, lookup) != ESP_OK) {
         SS_LOGE(TAG, "httpd_queue_work failed for time message");
+        platform_free(lookup);
         return false;
     }
     return true;
 }
 
 void SendspinServerConnection::async_send_time_text(void* arg) {
-    auto* this_conn = static_cast<SendspinServerConnection*>(arg);
+    auto* lookup = static_cast<SessionLookup*>(arg);
+    const httpd_handle_t server = lookup->server;
+    const int sockfd = lookup->sockfd;
+    platform_free(lookup);
 
-    if (!this_conn->is_connected()) {
+    auto conn = lookup_session_conn(server, sockfd);
+    if (!conn || !conn->is_connected()) {
         return;
     }
 
@@ -249,9 +295,9 @@ void SendspinServerConnection::async_send_time_text(void* arg) {
     ws_pkt.payload = reinterpret_cast<uint8_t*>(buf);
     ws_pkt.len = len;
 
-    this_conn->update_serialize_ema(esp_timer_get_time() - client_transmitted);
+    conn->update_serialize_ema(esp_timer_get_time() - client_transmitted);
 
-    httpd_ws_send_frame_async(this_conn->server_, this_conn->sockfd_, &ws_pkt);
+    httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt);
 }
 
 void SendspinServerConnection::async_send_text(void* arg) {
@@ -259,19 +305,21 @@ void SendspinServerConnection::async_send_text(void* arg) {
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
 
-    SendspinServerConnection* this_conn = (SendspinServerConnection*)resp_arg->context;
-
     ws_pkt.payload = resp_arg->payload;
     ws_pkt.len = resp_arg->len;
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
 
+    // Look up the conn via the session slot. If the session has already been torn down (e.g.,
+    // trigger_close was processed first) the slot is gone and we treat this as a failed send.
+    auto conn = lookup_session_conn(resp_arg->server, resp_arg->sockfd);
     bool send_success = false;
-    if (this_conn->is_connected()) {
-        esp_err_t err = httpd_ws_send_frame_async(this_conn->server_, this_conn->sockfd_, &ws_pkt);
+    if (conn && conn->is_connected()) {
+        esp_err_t err = httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt);
         send_success = (err == ESP_OK);
     }
 
-    // Call the completion callback if provided
+    // Call the completion callback if provided. Always invoke (rather than dropping silently) so
+    // chained logic such as disconnect()'s trigger_close still runs for the no-session case.
     if (resp_arg->has_callback) {
         resp_arg->on_complete(send_success);
     }

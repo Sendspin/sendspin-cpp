@@ -33,34 +33,35 @@ class SendspinServerConnection;
  * @brief WebSocket server listener for Sendspin
  *
  * Manages the ESP-IDF HTTP server (httpd) that listens for incoming WebSocket
- * connections from Sendspin servers. It does not own the connections long-term;
- * instead, it creates SendspinServerConnection instances and hands them to the
- * client, which decides whether to accept or reject them based on handoff logic.
+ * connections from Sendspin servers. The authoritative owner of each accepted
+ * SendspinServerConnection is the httpd session itself: open_callback() pins a
+ * shared_ptr onto the session via httpd_sess_set_ctx with a free_fn deleter, and
+ * the websocket_handler / queued workers look the connection up at run time via
+ * httpd_sess_get_ctx. ConnectionManager receives the same shared_ptr as a secondary
+ * observer for routing and handoff decisions.
  *
  * Capabilities:
  * - Accepts incoming WebSocket connections on a dedicated port
- * - Routes WebSocket messages to the appropriate connection object
+ * - Routes WebSocket messages directly via the session-pinned shared_ptr (no cross-thread
+ *   find-by-sockfd lookup is needed)
  * - Manages open/close callbacks to notify the client of connection lifecycle events
  * - Supports up to max_connections simultaneous sockets (default: 2) to enable the
  *   handoff protocol where a second server can connect while one is already active
  *
  * Usage:
  * 1. Construct with a SendspinClient pointer (passed to start())
- * 2. Register callbacks via set_new_connection_callback(), set_connection_closed_callback(),
- *    and set_find_connection_callback()
+ * 2. Register callbacks via set_new_connection_callback() and set_connection_closed_callback()
+ *    (set_find_connection_callback() is a no-op stub on ESP, kept for symmetry with the host build)
  * 3. Call start() to begin listening for incoming connections
  * 4. Call stop() to shut down the server
  *
  * @code
  * SendspinWsServer ws_server;
- * ws_server.set_new_connection_callback([&](std::unique_ptr<SendspinServerConnection> conn) {
+ * ws_server.set_new_connection_callback([&](std::shared_ptr<SendspinServerConnection> conn) {
  *     client.on_new_server_connection(std::move(conn));
  * });
  * ws_server.set_connection_closed_callback([&](int sockfd) {
  *     client.on_server_connection_closed(sockfd);
- * });
- * ws_server.set_find_connection_callback([&](int sockfd) -> SendspinServerConnection* {
- *     return client.find_server_connection(sockfd);
  * });
  * ws_server.start(&client, true, 5);
  * @endcode
@@ -71,8 +72,9 @@ public:
     ~SendspinWsServer();
 
     /// @brief Callback type for notifying the client of new connections
-    /// The client receives ownership of the connection and must decide whether to keep it.
-    using NewConnectionCallback = std::function<void(std::unique_ptr<SendspinServerConnection>)>;
+    /// The client receives a shared_ptr; the connection is also pinned to the httpd session via
+    /// httpd_sess_set_ctx, which acts as the authoritative owner for the connection's lifetime.
+    using NewConnectionCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
 
     /// @brief Callback type for notifying the client when a socket closes
     /// The client needs to identify which connection owns this sockfd and clean it up.
@@ -99,10 +101,12 @@ public:
     }
 
     /// @brief Sets callback to find a connection by socket fd
-    /// @param callback The callback function.
-    void set_find_connection_callback(FindConnectionCallback&& callback) {
-        this->find_connection_callback_ = std::move(callback);
-    }
+    ///
+    /// On ESP this is a no-op: `websocket_handler` runs on the httpd task and looks the connection
+    /// up directly via `httpd_sess_get_ctx`, which is also where the connection's authoritative
+    /// owner lives. The setter is kept for API symmetry with the host build.
+    /// @param callback Ignored.
+    void set_find_connection_callback(FindConnectionCallback&& /*callback*/) {}
 
     /// @brief Configures the maximum number of simultaneous connections
     /// Default is 2 to support the handoff protocol (one active + one pending).
@@ -156,9 +160,6 @@ protected:
 
     /// @brief Callback to notify the client when a socket closes
     ConnectionClosedCallback connection_closed_callback_;
-
-    /// @brief Callback to find a connection by socket fd
-    FindConnectionCallback find_connection_callback_;
 
     /// @brief Callback to notify the client of new connections
     NewConnectionCallback new_connection_callback_;

@@ -382,13 +382,14 @@ The filter is protected by `state_mutex_` so that `compute_client_time()` can be
 
 ### Connection Management (`src/connection_manager.cpp`)
 
-The `ConnectionManager` maintains up to three connection slots:
+The `ConnectionManager` maintains two observer slots for the connections it routes messages through:
 
 | Slot | Purpose |
 |------|---------|
 | `current_connection_` | Active connection receiving messages |
 | `pending_connection_` | Handoff candidate completing its handshake |
-| `dying_connection_` | Gracefully disconnecting (kept alive as shared_ptr until goodbye is sent) |
+
+Both are `std::shared_ptr<SendspinConnection>`, and on the ESP server path they are observers rather than authoritative owners — the authoritative owner of a `SendspinServerConnection` is the httpd session itself (see [Server connection ownership (ESP)](#server-connection-ownership-esp)). On the host (IXWebSocket) client path the `shared_ptr` in these slots is the only owner.
 
 ### Handshake and Handoff
 
@@ -419,7 +420,23 @@ When a connection is lost (`on_connection_lost`):
 
 ### Graceful Disconnect
 
-`disconnect_and_release()` moves the connection into `dying_connection_` (as a `shared_ptr`) and sends a goodbye message with a completion callback. The callback sets a flag under the connection mutex, and the main loop's next tick destroys the connection. This two-phase approach prevents use-after-free when platform worker threads (e.g., ESP httpd) have pending work items referencing the connection.
+`disconnect_and_release()` calls `conn->disconnect(reason, nullptr)` and lets the local `shared_ptr` go out of scope.
+
+- **ESP server**: the goodbye text is queued as an httpd worker job; the worker looks the connection up via `httpd_sess_get_ctx`, sends the frame, then runs the completion lambda that calls `trigger_close()`. The session slot installed in `open_callback` keeps the connection alive across that whole sequence even after `ConnectionManager`'s observer `shared_ptr` is dropped. The session is finally freed when httpd invokes the slot's `free_fn` (see [Server connection ownership (ESP)](#server-connection-ownership-esp)). The completion lambda captures a `weak_ptr` to make this lifetime explicit — `trigger_close()` is skipped if the conn has already been freed.
+- **Host client**: the IXWebSocket send is synchronous, so the goodbye and close have both completed by the time `disconnect()` returns and the `shared_ptr` drops the last reference.
+
+### Server connection ownership (ESP)
+
+On the ESP build, `SendspinServerConnection` lifetime is pinned to the httpd session rather than to `ConnectionManager`:
+
+1. `SendspinWsServer::open_callback` (the httpd `open_fn`) creates the `shared_ptr<SendspinServerConnection>`, heap-allocates a `shared_ptr*` slot, and calls `httpd_sess_set_ctx(handle, sockfd, slot, free_fn)` with a deleter that `delete`s the slot. That slot is the authoritative reference.
+2. The same shared_ptr is forwarded into `ConnectionManager::on_new_connection`, which stores it in `current_connection_` or `pending_connection_` as a *secondary observer*.
+3. The httpd WebSocket handler (`websocket_handler`) and queued workers (`async_send_text`, `async_send_time_text`) look the connection up by `httpd_sess_get_ctx(handle, sockfd)` at run time, copying the slot's `shared_ptr` for the duration of their work. They never assume the manager's observer slot is alive.
+4. When the socket closes, httpd calls the `close_fn` first (which fires `connection_closed_callback_` so `ConnectionManager` can drop its observer in the next `loop()`), then later calls the slot's `free_fn` to release the authoritative reference once no workers are queued for that session.
+
+Queued workers carry only a `{httpd_handle_t, int sockfd}` pair (`AsyncRespArg` for text sends, `SessionLookup` for time sends) rather than capturing the connection directly. If the session has already been torn down by the time a worker runs, the lookup returns null and the worker no-ops cleanly. Both arg structs are allocated through `platform_malloc` / `platform_malloc_internal` and freed in the worker.
+
+The host build does not need this scheme: `SendspinWsServer` (host) routes IXWebSocket messages by calling `find_connection_callback_` to resolve a synthetic sockfd back to the connection that `ConnectionManager` is holding. The ESP build keeps the `set_find_connection_callback()` setter as a no-op stub for symmetry; see the comment at the call site in `ConnectionManager::init_server`.
 
 ## Ordering Guarantees Summary
 

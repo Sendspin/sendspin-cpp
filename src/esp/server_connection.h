@@ -134,7 +134,9 @@ protected:
     ///
     /// Captures the client_transmitted timestamp inside the worker (just before
     /// `httpd_ws_send_frame_async`), serializes the JSON, then sends.
-    /// @param arg The owning `SendspinServerConnection*` (passed directly, not heap-allocated).
+    /// @param arg A heap-allocated `SessionLookup` carrying the server handle and sockfd. The
+    ///            worker looks the connection up via `httpd_sess_get_ctx`, sends the frame if the
+    ///            session is still alive, and frees the arg on return.
     static void async_send_time_text(void* arg);
 
     // Pointer fields

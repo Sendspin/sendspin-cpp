@@ -45,7 +45,6 @@ ConnectionManager::~ConnectionManager() {
         this->pending_connection_.reset();
     }
     this->hello_retry_.conn.reset();
-    this->dying_connection_.reset();
 }
 
 // ============================================================================
@@ -101,20 +100,21 @@ void ConnectionManager::init_server(SendspinClient* client) {
     this->ws_server_->set_ctrl_port(this->client_->config_.httpd_ctrl_port);
 
     this->ws_server_->set_new_connection_callback(
-        [this](std::unique_ptr<SendspinServerConnection> conn) {
+        [this](std::shared_ptr<SendspinServerConnection> conn) {
             this->on_new_connection(std::move(conn));
         });
 
     this->ws_server_->set_connection_closed_callback([this](int sockfd) {
         SS_LOGD(TAG, "Connection closed callback for socket %d", sockfd);
-        // Defer the actual cleanup to loop() to avoid use-after-free.
-        // This callback runs in the httpd thread, but there may be pending httpd_queue_work items
-        // (e.g., async_send_text) with raw pointers to the connection object. If we destroy the
-        // connection here, those pending work items would dereference freed memory when processed.
+        // Defer the actual cleanup to loop() so on_connection_lost runs on the main thread
+        // alongside the rest of the connection state mutations.
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
         this->pending_close_events_.push_back(sockfd);
     });
 
+    // Connection lookup-by-sockfd. Used by the host build's ws_server to route IXWebSocket
+    // messages; the ESP build ignores this and looks the connection up directly via
+    // httpd_sess_get_ctx (set in open_callback), so its setter is a no-op stub.
     this->ws_server_->set_find_connection_callback(
         [this](int sockfd) -> std::shared_ptr<SendspinConnection> {
             std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
@@ -126,9 +126,6 @@ void ConnectionManager::init_server(SendspinClient* client) {
                 this->pending_connection_->get_sockfd() == sockfd) {
                 return this->pending_connection_;
             }
-            // Deliberately excludes dying_connection_; it has already been through cleanup and its
-            // message dispatch is disabled. Returning it here would let httpd route stale messages
-            // from the old connection into freshly-reset role queues.
             return nullptr;
         });
 }
@@ -149,15 +146,12 @@ void ConnectionManager::loop() {
         std::vector<std::shared_ptr<SendspinConnection>> connected_events;
         std::vector<std::shared_ptr<SendspinConnection>> disconnect_events;
         std::vector<ServerHelloEvent> hello_events;
-        bool release_dying = false;
         {
             std::lock_guard<std::mutex> lock(this->conn_mutex_);
             close_events.swap(this->pending_close_events_);
             connected_events.swap(this->pending_connected_events_);
             disconnect_events.swap(this->pending_disconnect_events_);
             hello_events.swap(this->pending_hello_events_);
-            release_dying = this->dying_connection_ready_to_release_;
-            this->dying_connection_ready_to_release_ = false;
         }
 
         {
@@ -213,10 +207,6 @@ void ConnectionManager::loop() {
                     this->complete_handoff(should_switch);
                 }
             }
-        }
-
-        if (release_dying) {
-            this->dying_connection_.reset();
         }
     }
 
@@ -320,10 +310,10 @@ void ConnectionManager::setup_connection_callbacks(SendspinConnection* conn) {
     };
 }
 
-void ConnectionManager::on_new_connection(std::unique_ptr<SendspinServerConnection> conn) {
-    // Called from httpd open_callback thread. Connection pointer assignment must happen inline
-    // because the httpd find_connection_callback needs to locate this connection immediately
-    // for subsequent message routing on the same thread.
+void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnection> conn) {
+    // Called from the platform's new-connection callback (ESP: httpd open_callback). The
+    // authoritative owner is the platform's session/transport context; this observer shared_ptr
+    // can be reset at any time without freeing the conn out from under in-flight workers.
     conn->init_time_filter();
     conn->set_websocket_payload_location(this->client_->config_.websocket_payload_location);
 
@@ -340,8 +330,7 @@ void ConnectionManager::on_new_connection(std::unique_ptr<SendspinServerConnecti
         SS_LOGD(TAG, "Existing connection present, setting as pending for handoff");
         if (this->pending_connection_ != nullptr) {
             SS_LOGW(TAG, "Already have pending connection, rejecting new connection");
-            this->disconnect_and_release(std::shared_ptr<SendspinConnection>(std::move(conn)),
-                                         SendspinGoodbyeReason::ANOTHER_SERVER);
+            this->disconnect_and_release(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
             return;
         }
         this->pending_connection_ = std::move(conn);
@@ -495,14 +484,11 @@ void ConnectionManager::complete_handoff(bool switch_to_new) {
 
 void ConnectionManager::disconnect_and_release(std::shared_ptr<SendspinConnection> conn,
                                                SendspinGoodbyeReason reason) {
-    this->dying_connection_ = std::move(conn);
-    this->dying_connection_->disconnect(reason, [this]() {
-        // Defer the actual destruction to loop() to avoid use-after-free.
-        // This callback runs in the httpd worker thread (async_send_text), but the connection
-        // must stay alive until all pending httpd_queue_work items have been processed.
-        std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->dying_connection_ready_to_release_ = true;
-    });
+    // Send the goodbye and let the conn shared_ptr go out of scope. On ESP the httpd session slot
+    // keeps the conn alive until the goodbye worker runs, calls trigger_close, the session tears
+    // down, and the slot's free_fn fires. On host the IXWebSocket send is synchronous, so the
+    // goodbye + close have both completed by the time disconnect() returns.
+    conn->disconnect(reason, nullptr);
 }
 
 }  // namespace sendspin

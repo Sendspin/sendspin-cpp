@@ -61,7 +61,7 @@ public:
     ~SendspinWsServer();
 
     /// @brief Callback type for notifying the client of new connections
-    using NewConnectionCallback = std::function<void(std::unique_ptr<SendspinServerConnection>)>;
+    using NewConnectionCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
 
     /// @brief Callback type for notifying the client when a socket closes
     using ConnectionClosedCallback = std::function<void(int sockfd)>;
