@@ -125,6 +125,14 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
         return ESP_FAIL;
     }
 
+    // Reject the session before allocating anything if there is nobody to deliver the connection
+    // to; otherwise the session would sit pinned with no one driving its handshake until the peer
+    // gives up.
+    if (!server->new_connection_callback_) {
+        SS_LOGW(TAG, "No new connection callback set, rejecting session");
+        return ESP_FAIL;
+    }
+
     // Pin the connection to the httpd session: a heap-allocated shared_ptr is set as the session
     // context, with a free_fn that drops the refcount when the session is torn down. httpd invokes
     // the close_fn before the free_fn, so observers (ConnectionManager) get notified first and any
@@ -136,13 +144,7 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
         delete static_cast<std::shared_ptr<SendspinServerConnection>*>(p);
     });
 
-    // Notify the client of the new connection (client decides whether to keep it)
-    if (server->new_connection_callback_) {
-        server->new_connection_callback_(std::move(conn));
-    } else {
-        SS_LOGW(TAG, "No new connection callback set, connection will be dropped");
-    }
-
+    server->new_connection_callback_(std::move(conn));
     return ESP_OK;
 }
 

@@ -309,19 +309,19 @@ void SendspinServerConnection::async_send_text(void* arg) {
     ws_pkt.len = resp_arg->len;
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
 
-    // Look up the conn via the session slot. If the session has already been torn down (e.g.,
-    // trigger_close was processed first) the slot is gone and we treat this as a failed send.
+    // Look up the conn via the session slot and invoke on_complete only when the conn is still
+    // alive. If the session has already been torn down the slot is gone and we drop the completion
+    // callback silently: callers frequently capture the connection by raw pointer (e.g.,
+    // ConnectionManager::send_hello_message), and dereferencing it after teardown would be a UAF.
+    // Lifetime-safe completion logic (e.g., disconnect()'s weak_ptr-guarded trigger_close) already
+    // tolerates not firing in this case. The AsyncRespArg destructor below releases any captured
+    // state held by the std::function.
     auto conn = lookup_session_conn(resp_arg->server, resp_arg->sockfd);
-    bool send_success = false;
     if (conn && conn->is_connected()) {
         esp_err_t err = httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt);
-        send_success = (err == ESP_OK);
-    }
-
-    // Call the completion callback if provided. Always invoke (rather than dropping silently) so
-    // chained logic such as disconnect()'s trigger_close still runs for the no-session case.
-    if (resp_arg->has_callback) {
-        resp_arg->on_complete(send_success);
+        if (resp_arg->has_callback) {
+            resp_arg->on_complete(err == ESP_OK);
+        }
     }
 
     platform_free(ws_pkt.payload);
