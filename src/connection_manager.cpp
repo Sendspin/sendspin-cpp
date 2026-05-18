@@ -482,13 +482,15 @@ void ConnectionManager::complete_handoff(bool switch_to_new) {
     }
 }
 
-void ConnectionManager::disconnect_and_release(std::shared_ptr<SendspinConnection> conn,
+void ConnectionManager::disconnect_and_release(std::shared_ptr<SendspinConnection>&& conn,
                                                SendspinGoodbyeReason reason) {
-    // Send the goodbye and let the conn shared_ptr go out of scope. On ESP the httpd session slot
-    // keeps the conn alive until the goodbye worker runs, calls trigger_close, the session tears
-    // down, and the slot's free_fn fires. On host the IXWebSocket send is synchronous, so the
-    // goodbye + close have both completed by the time disconnect() returns.
-    conn->disconnect(reason, nullptr);
+    // Take ownership of the caller's shared_ptr into a local, send the goodbye, then let the
+    // local go out of scope. On ESP the httpd session slot keeps the conn alive until the
+    // goodbye worker runs, calls trigger_close, the session tears down, and the slot's free_fn
+    // fires. On host the IXWebSocket send is synchronous, so the goodbye + close have both
+    // completed by the time disconnect() returns.
+    auto local = std::move(conn);
+    local->disconnect(reason, nullptr);
 }
 
 }  // namespace sendspin
