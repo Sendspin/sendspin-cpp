@@ -167,8 +167,12 @@ else()
     # Apply host configuration
     sendspin_configure_host(sendspin ${CMAKE_CURRENT_SOURCE_DIR})
 
-    # Examples
-    add_subdirectory(examples/basic_client)
-    add_subdirectory(examples/tui_client)
+    # Examples (only build if explicitly requested)
+    if(NOT DEFINED BUILD_EXAMPLES OR BUILD_EXAMPLES)
+        add_subdirectory(examples/basic_client)
+        add_subdirectory(examples/tui_client)
+    else()
+        message(STATUS "Skipping sendspin-cpp examples (BUILD_EXAMPLES=OFF)")
+    endif()
 
 endif()
