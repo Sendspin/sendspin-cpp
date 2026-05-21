@@ -164,12 +164,25 @@ else()
     option(ENABLE_WERROR "Treat warnings as errors" OFF)
     option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
+    # Examples build by default for standalone development, but not when sendspin is pulled into
+    # a larger project via add_subdirectory (where the consumer doesn't want the example deps,
+    # e.g. FTXUI). Override either way with -DBUILD_EXAMPLES=ON/OFF.
+    set(_sendspin_is_top_level OFF)
+    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+        set(_sendspin_is_top_level ON)
+    endif()
+    option(BUILD_EXAMPLES "Build host examples" ${_sendspin_is_top_level})
+
     # Apply host configuration
     sendspin_configure_host(sendspin ${CMAKE_CURRENT_SOURCE_DIR})
 
     # Examples
-    add_subdirectory(examples/basic_client)
-    add_subdirectory(examples/tui_client)
+    if(BUILD_EXAMPLES)
+        add_subdirectory(examples/basic_client)
+        add_subdirectory(examples/tui_client)
+    else()
+        message(STATUS "Skipping sendspin-cpp examples (BUILD_EXAMPLES=OFF)")
+    endif()
 
     # Unit tests (host only, opt-in via -DSENDSPIN_BUILD_TESTS=ON)
     option(SENDSPIN_BUILD_TESTS "Build host unit tests" OFF)
