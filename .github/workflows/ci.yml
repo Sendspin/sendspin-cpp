@@ -58,9 +58,29 @@ jobs:
       - name: Build
         run: cmake --build build
 
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libavahi-compat-libdnssd-dev
+
+      - name: Configure CMake
+        run: cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON .
+
+      - name: Build tests
+        run: cmake --build build-tests --target sendspin_tests
+
+      - name: Run tests
+        run: ctest --test-dir build-tests --output-on-failure
+
   ci:
     name: CI
-    needs: [pre-commit, lint, build]
+    needs: [pre-commit, lint, build, test]
     runs-on: ubuntu-latest
     if: always()
     steps:

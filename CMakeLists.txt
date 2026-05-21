@@ -171,4 +171,11 @@ else()
     add_subdirectory(examples/basic_client)
     add_subdirectory(examples/tui_client)
 
+    # Unit tests (host only, opt-in via -DSENDSPIN_BUILD_TESTS=ON)
+    option(SENDSPIN_BUILD_TESTS "Build host unit tests" OFF)
+    if(SENDSPIN_BUILD_TESTS)
+        enable_testing()
+        add_subdirectory(tests)
+    endif()
+
 endif()
