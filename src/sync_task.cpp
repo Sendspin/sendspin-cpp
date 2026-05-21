@@ -303,11 +303,8 @@ SyncTaskState SyncTask::handle_transfer_audio(SyncContext& sync_context) {
 void SyncTask::track_sent_audio(SyncContext& sync_context, size_t bytes_sent) {
     uint32_t frames_sent = sync_context.current_stream_info.bytes_to_frames(bytes_sent);
     sync_context.buffered_frames += frames_sent;
-    uint32_t remainder = frames_sent;
-    int64_t ms = sync_context.current_stream_info.frames_to_milliseconds_with_remainder(&remainder);
     sync_context.new_audio_client_playtime +=
-        US_PER_MS * ms +
-        static_cast<int64_t>(sync_context.current_stream_info.frames_to_microseconds(remainder));
+        sync_context.current_stream_info.frames_to_microseconds(frames_sent);
 }
 
 void SyncTask::send_pending_silence(SyncContext& sync_context) {
@@ -692,14 +689,8 @@ void SyncTask::process_playback_progress(SyncContext& sync_context) {
             sync_context.buffered_frames -= frames_played;
         }
 
-        uint32_t unplayed_frames = sync_context.buffered_frames;
-        int64_t unplayed_ms =
-            sync_context.current_stream_info.frames_to_milliseconds_with_remainder(
-                &unplayed_frames);
         int64_t unplayed_us =
-            US_PER_MS * unplayed_ms +
-            static_cast<int64_t>(
-                sync_context.current_stream_info.frames_to_microseconds(unplayed_frames));
+            sync_context.current_stream_info.frames_to_microseconds(sync_context.buffered_frames);
         sync_context.new_audio_client_playtime = playback_progress.finish_timestamp + unplayed_us;
     }
 }

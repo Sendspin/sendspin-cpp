@@ -46,7 +46,7 @@ static constexpr uint32_t DEFAULT_SAMPLE_RATE_HZ = 16000U;
  *
  * size_t bytes_for_100ms = info.ms_to_bytes(100);
  * uint32_t frames        = info.bytes_to_frames(bytes_for_100ms);
- * uint32_t duration_us   = info.frames_to_microseconds(frames);
+ * int64_t duration_us    = info.frames_to_microseconds(frames);
  * @endcode
  */
 class AudioStreamInfo {
@@ -115,13 +115,10 @@ public:
     /// @brief Converts a frame count to microseconds
     /// @param frames Number of audio frames.
     /// @return Duration in microseconds.
-    uint32_t frames_to_microseconds(uint32_t frames) const;
-
-    /// @brief Converts frames to milliseconds, updating frames with the remainder
-    /// @param[out] frames Pointer to the frame count; updated in place with the leftover frames
-    ///             that could not be converted to a whole millisecond.
-    /// @return Whole milliseconds represented by the converted frames.
-    uint32_t frames_to_milliseconds_with_remainder(uint32_t* frames) const;
+    /// @note The intermediate frames * US_PER_SECOND product is computed in 64-bit, so this is
+    ///       exact for any frame count (no 32-bit overflow). The result is returned as int64_t to
+    ///       match the playtime accumulators that consume it.
+    int64_t frames_to_microseconds(uint32_t frames) const;
 
     /// @brief Returns true if both AudioStreamInfo objects describe the same format
     /// @param rhs The other AudioStreamInfo to compare against.
@@ -140,7 +137,6 @@ protected:
     size_t bytes_per_sample_;
 
     // 32-bit fields
-    uint32_t ms_sample_rate_gcd_;
     uint32_t sample_rate_;
 
     // 8-bit fields

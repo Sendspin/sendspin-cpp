@@ -17,25 +17,11 @@
 namespace sendspin {
 
 // ============================================================================
-// Static helpers
-// ============================================================================
-
-static uint32_t gcd(uint32_t a, uint32_t b) {
-    while (b != 0) {
-        uint32_t t = b;
-        b = a % b;
-        a = t;
-    }
-    return a;
-}
-
-// ============================================================================
 // Constructor / Destructor
 // ============================================================================
 
 AudioStreamInfo::AudioStreamInfo(uint8_t bits_per_sample, uint8_t channels, uint32_t sample_rate)
     : sample_rate_(sample_rate), bits_per_sample_(bits_per_sample), channels_(channels) {
-    this->ms_sample_rate_gcd_ = gcd(MS_PER_SECOND, this->sample_rate_);
     this->bytes_per_sample_ = (this->bits_per_sample_ + 7) / 8;
 }
 
@@ -43,18 +29,13 @@ AudioStreamInfo::AudioStreamInfo(uint8_t bits_per_sample, uint8_t channels, uint
 // Public API
 // ============================================================================
 
-uint32_t AudioStreamInfo::frames_to_microseconds(uint32_t frames) const {
-    return (frames * US_PER_SECOND + (this->sample_rate_ >> 1)) / this->sample_rate_;
-}
-
-uint32_t AudioStreamInfo::frames_to_milliseconds_with_remainder(uint32_t* total_frames) const {
-    uint32_t unprocessable_frames =
-        *total_frames % (this->sample_rate_ / this->ms_sample_rate_gcd_);
-    uint32_t frames_for_ms_calculation = *total_frames - unprocessable_frames;
-
-    uint32_t playback_ms = (frames_for_ms_calculation * MS_PER_SECOND) / this->sample_rate_;
-    *total_frames = unprocessable_frames;
-    return playback_ms;
+int64_t AudioStreamInfo::frames_to_microseconds(uint32_t frames) const {
+    // The product is widened to 64-bit before the multiply so it cannot overflow for any frame
+    // count (a 32-bit product overflows above ~4295 frames, i.e. ~97 ms at 44.1 kHz). The
+    // single rounded divide is exact for the whole input, which removes the need to peel off
+    // whole milliseconds separately before converting the sub-millisecond remainder.
+    return (static_cast<uint64_t>(frames) * US_PER_SECOND + (this->sample_rate_ >> 1)) /
+           this->sample_rate_;
 }
 
 bool AudioStreamInfo::operator==(const AudioStreamInfo& rhs) const {
