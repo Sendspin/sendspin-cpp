@@ -70,7 +70,9 @@ jobs:
           sudo apt-get install -y libavahi-compat-libdnssd-dev
 
       - name: Configure CMake
-        run: cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON .
+        # BUILD_EXAMPLES=OFF so the test job configures only sendspin + tests and skips the
+        # example-only FetchContent deps (e.g. FTXUI).
+        run: cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .
 
       - name: Build tests
         run: cmake --build build-tests --target sendspin_tests
