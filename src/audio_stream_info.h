@@ -116,8 +116,8 @@ public:
     /// @param frames Number of audio frames.
     /// @return Duration in microseconds.
     /// @note The intermediate frames * US_PER_SECOND product is computed in 64-bit, so this is
-    ///       exact for any frame count (no 32-bit overflow). The result is returned as int64_t to
-    ///       match the playtime accumulators that consume it.
+    ///       avoids overflow for any reasonable frame count. The result is returned as int64_t
+    ///       to match the playtime accumulators that consume it.
     int64_t frames_to_microseconds(uint32_t frames) const;
 
     /// @brief Returns true if both AudioStreamInfo objects describe the same format
