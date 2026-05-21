@@ -31,9 +31,7 @@ AudioStreamInfo::AudioStreamInfo(uint8_t bits_per_sample, uint8_t channels, uint
 
 int64_t AudioStreamInfo::frames_to_microseconds(uint32_t frames) const {
     // The product is widened to 64-bit before the multiply so it cannot overflow for any frame
-    // count (a 32-bit product overflows above ~4295 frames, i.e. ~97 ms at 44.1 kHz). The
-    // single rounded divide is exact for the whole input, which removes the need to peel off
-    // whole milliseconds separately before converting the sub-millisecond remainder.
+    // count (a 32-bit product overflows above ~4295 frames, i.e. ~97 ms at 44.1 kHz).
     return (static_cast<uint64_t>(frames) * US_PER_SECOND + (this->sample_rate_ >> 1)) /
            this->sample_rate_;
 }
