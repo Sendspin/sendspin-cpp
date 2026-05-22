@@ -371,8 +371,10 @@ protected:
 
     // 8-bit fields
 
-    /// Hello handshake state.
-    bool client_hello_sent_{false};
+    /// Hello handshake state. Atomic because it is set from the send-completion callback (the httpd
+    /// worker thread on ESP) and the disconnect handlers (network thread), while
+    /// is_handshake_complete() and the pre-hello send gate read it from other threads.
+    std::atomic<bool> client_hello_sent_{false};
 
     /// true if the current message being assembled is text, false if binary
     /// Needed because WebSocket continuation frames do not carry the original frame type
@@ -384,7 +386,10 @@ protected:
 
     /// Time message state.
     bool pending_time_message_{false};
-    bool server_hello_received_{false};
+
+    /// Atomic for the same reason as client_hello_sent_: written on network threads, read from the
+    /// main loop via is_handshake_complete().
+    std::atomic<bool> server_hello_received_{false};
 
     /// Memory placement preference for `websocket_payload_` allocations (ESP-IDF only).
     MemoryLocation websocket_payload_location_{MemoryLocation::PREFER_EXTERNAL};
