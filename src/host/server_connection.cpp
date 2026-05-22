@@ -60,7 +60,8 @@ bool SendspinServerConnection::is_connected() const {
 }
 
 SsErr SendspinServerConnection::send_text_message(const std::string& message,
-                                                  SendCompleteCallback on_complete) {
+                                                  SendCompleteCallback on_complete,
+                                                  bool /*allow_before_hello*/) {
     if (!this->is_connected()) {
         if (on_complete) {
             on_complete(false);

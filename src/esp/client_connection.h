@@ -86,7 +86,8 @@ public:
     /// @param msg The message string to send.
     /// @param cb Callback invoked after send completes.
     /// @return SsErr::OK if sent successfully, error code otherwise.
-    SsErr send_text_message(const std::string& message, SendCompleteCallback cb) override;
+    SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
+                            bool allow_before_hello) override;
 
     /// @brief Sends a client/time message, capturing the timestamp just before send
     /// @return true if the message was sent successfully, false otherwise.

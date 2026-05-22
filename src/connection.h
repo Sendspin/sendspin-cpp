@@ -116,10 +116,16 @@ public:
     }
 
     /// @brief Sends a text message to the server with a completion callback
-    /// @param msg The message string to send.
+    /// @param message The message string to send.
     /// @param cb Callback invoked after send completes.
+    /// @param allow_before_hello If true, the message may be sent before the client/hello has been
+    ///        sent on this connection (used for the hello itself and for goodbye). If false (the
+    ///        default), platform transports that send asynchronously drop the message when no
+    ///        client/hello has been sent yet, preserving the "hello is always first" protocol
+    ///        invariant. Synchronous transports ignore this flag.
     /// @return SsErr::OK if queued successfully, error code otherwise.
-    virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb) = 0;
+    virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
+                                    bool allow_before_hello = false) = 0;
 
     /// @brief Sends a client/time synchronization message
     ///

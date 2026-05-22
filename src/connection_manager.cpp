@@ -364,13 +364,16 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
 
     std::string hello_message = this->client_->build_hello_message();
 
-    SsErr err = conn->send_text_message(hello_message, [conn](bool success) {
-        if (success) {
-            conn->set_client_hello_sent(true);
-        } else {
-            SS_LOGW(TAG, "Hello message send failed");
-        }
-    });
+    SsErr err = conn->send_text_message(
+        hello_message,
+        [conn](bool success) {
+            if (success) {
+                conn->set_client_hello_sent(true);
+            } else {
+                SS_LOGW(TAG, "Hello message send failed");
+            }
+        },
+        /*allow_before_hello=*/true);
 
     if (err == SsErr::OK) {
         return true;  // Successfully queued
