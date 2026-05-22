@@ -39,11 +39,11 @@ static constexpr int64_t HELLO_INITIAL_DELAY_US = HELLO_INITIAL_DELAY_MS * US_PE
 ConnectionManager::ConnectionManager(SendspinClient* client) : client_(client) {}
 
 ConnectionManager::~ConnectionManager() {
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        this->current_connection_.reset();
-        this->pending_connection_.reset();
-    }
+    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+    this->current_connection_.reset();
+    this->pending_connection_.reset();
+    // Clear under the same lock that guards every other access to hello_retries_, keeping the
+    // locking discipline uniform.
     this->hello_retries_.clear();
 }
 
