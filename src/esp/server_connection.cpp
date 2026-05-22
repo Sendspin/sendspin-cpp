@@ -31,37 +31,29 @@ static const char* const TAG = "sendspin.server_connection";
 // Static helpers
 // ============================================================================
 
-/// @brief Structure holding the session identity and payload data for async send operations
+/// @brief Holds the originating connection and payload data for an async text send
 ///
-/// Workers look the connection up at run time via `httpd_sess_get_ctx(server, sockfd)`. The
-/// session-pinned shared_ptr keeps the conn alive until httpd has drained queued work for the
-/// session and called the slot's free_fn, so the worker can either find a valid conn or cleanly
-/// no-op if the session is already gone.
+/// `conn` is a weak_ptr to the connection that queued the work, not a raw `(server, sockfd)` pair.
+/// The worker resolves it with `conn.lock()`: a recycled sockfd can therefore never redirect the
+/// frame onto a different connection, and a destroyed connection yields a null lock (a clean
+/// no-op) rather than a use-after-free.
 struct AsyncRespArg {
-    httpd_handle_t server{nullptr};
-    int sockfd{-1};
+    std::weak_ptr<SendspinServerConnection> conn;
     uint8_t* payload{nullptr};
     size_t len{0};
     bool has_callback{false};
+    /// When true the frame may be sent before client/hello (the hello itself and goodbye); when
+    /// false the worker drops it unless the hello has already been sent on this connection.
+    bool allow_before_hello{false};
     SendCompleteCallback on_complete;
 };
 
-/// @brief Small heap struct used by the time-message worker to identify its session
+/// @brief Heap struct used by the time-message worker to identify its originating connection
+///
+/// Holds a weak_ptr for the same identity-and-lifetime safety as AsyncRespArg.
 struct SessionLookup {
-    httpd_handle_t server;
-    int sockfd;
+    std::weak_ptr<SendspinServerConnection> conn;
 };
-
-/// @brief Looks up the session-pinned connection shared_ptr, returning a copy or empty if gone
-static std::shared_ptr<SendspinServerConnection> lookup_session_conn(httpd_handle_t server,
-                                                                     int sockfd) {
-    auto* slot =
-        static_cast<std::shared_ptr<SendspinServerConnection>*>(httpd_sess_get_ctx(server, sockfd));
-    if (slot == nullptr) {
-        return nullptr;
-    }
-    return *slot;
-}
 
 // ============================================================================
 // SendspinConnection interface implementation
@@ -122,7 +114,8 @@ bool SendspinServerConnection::is_connected() const {
 }
 
 SsErr SendspinServerConnection::send_text_message(const std::string& message,
-                                                  SendCompleteCallback on_complete) {
+                                                  SendCompleteCallback on_complete,
+                                                  bool allow_before_hello) {
     if (!this->is_connected()) {
         // No client connected - invoke callback with failure if provided
         if (on_complete) {
@@ -144,8 +137,8 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
     // Use placement new to properly construct the struct with the callback
     new (resp_arg) AsyncRespArg();
 
-    resp_arg->server = this->server_;
-    resp_arg->sockfd = this->sockfd_;
+    resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
+    resp_arg->allow_before_hello = allow_before_hello;
     resp_arg->payload = static_cast<uint8_t*>(platform_malloc(message.size()));
     if (resp_arg->payload == nullptr) {
         SS_LOGE(TAG, "Failed to allocate %zu bytes for message payload", message.size());
@@ -246,20 +239,21 @@ bool SendspinServerConnection::send_time_message() {
         return false;
     }
 
-    // The worker looks up the conn by sockfd at run time via `httpd_sess_get_ctx`. The session
-    // slot keeps the conn alive past any ConnectionManager teardown that races the httpd ctrl
-    // queue. The JSON is built inside the worker so client_transmitted is captured as close to
-    // the wire send as possible. SessionLookup is POD so a raw malloc/free pair (matching the
-    // AsyncRespArg allocator convention) is sufficient; no constructor/destructor to invoke.
+    // The worker resolves the originating connection via the weak_ptr below, so a recycled sockfd
+    // cannot redirect the frame and a destroyed connection yields a clean no-op. The JSON is built
+    // inside the worker so client_transmitted is captured as close to the wire send as possible.
+    // SessionLookup now holds a weak_ptr, so it is constructed with placement new and explicitly
+    // destroyed before free (matching the AsyncRespArg convention).
     auto* lookup = static_cast<SessionLookup*>(platform_malloc_internal(sizeof(SessionLookup)));
     if (lookup == nullptr) {
         SS_LOGE(TAG, "Failed to allocate SessionLookup for time message");
         return false;
     }
-    lookup->server = this->server_;
-    lookup->sockfd = this->sockfd_;
+    new (lookup) SessionLookup();
+    lookup->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
     if (httpd_queue_work(this->server_, async_send_time_text, lookup) != ESP_OK) {
         SS_LOGE(TAG, "httpd_queue_work failed for time message");
+        lookup->~SessionLookup();
         platform_free(lookup);
         return false;
     }
@@ -268,12 +262,14 @@ bool SendspinServerConnection::send_time_message() {
 
 void SendspinServerConnection::async_send_time_text(void* arg) {
     auto* lookup = static_cast<SessionLookup*>(arg);
-    const httpd_handle_t server = lookup->server;
-    const int sockfd = lookup->sockfd;
+    auto conn = lookup->conn.lock();
+    lookup->~SessionLookup();
     platform_free(lookup);
 
-    auto conn = lookup_session_conn(server, sockfd);
-    if (!conn || !conn->is_connected()) {
+    // Drop the time frame unless client/hello has already been sent on this exact connection. The
+    // weak_ptr lock guarantees identity (never a recycled-sockfd peer); the hello gate guarantees
+    // a stale time frame can never jump ahead of a fresh connection's hello.
+    if (!conn || !conn->is_connected() || !conn->client_hello_sent_) {
         return;
     }
 
@@ -309,15 +305,19 @@ void SendspinServerConnection::async_send_text(void* arg) {
     ws_pkt.len = resp_arg->len;
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
 
-    // Look up the conn via the session slot and invoke on_complete only when the conn is still
-    // alive. If the session has already been torn down the slot is gone and we drop the completion
-    // callback silently: callers frequently capture the connection by raw pointer (e.g.,
-    // ConnectionManager::send_hello_message), and dereferencing it after teardown would be a UAF.
-    // Lifetime-safe completion logic (e.g., disconnect()'s weak_ptr-guarded trigger_close) already
-    // tolerates not firing in this case. The AsyncRespArg destructor below releases any captured
-    // state held by the std::function.
-    auto conn = lookup_session_conn(resp_arg->server, resp_arg->sockfd);
-    if (conn && conn->is_connected()) {
+    // Resolve the originating connection. weak_ptr.lock() yields the exact conn that queued this
+    // work (or null if it has since been destroyed), so a recycled sockfd can never redirect the
+    // frame onto a different connection -- the lifetime-safe replacement for the old raw `this`
+    // pointer that caused the use-after-free crash. Non-handshake frames are additionally gated on
+    // client_hello_sent_ so nothing can precede the client/hello; allow_before_hello opts the hello
+    // and goodbye out of that gate. The completion callback fires only when the frame is actually
+    // sent: it is skipped both when the gate blocks the frame AND when the connection is already
+    // gone (lock() is null) -- allow_before_hello bypasses the gate but not the conn-alive
+    // requirement, so callers must not rely on the callback as an unconditional "send finished"
+    // signal.
+    auto conn = resp_arg->conn.lock();
+    if (conn && conn->is_connected() &&
+        (resp_arg->allow_before_hello || conn->client_hello_sent_)) {
         esp_err_t err = httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt);
         if (resp_arg->has_callback) {
             resp_arg->on_complete(err == ESP_OK);

@@ -116,10 +116,19 @@ public:
     }
 
     /// @brief Sends a text message to the server with a completion callback
-    /// @param msg The message string to send.
-    /// @param cb Callback invoked after send completes.
+    /// @param message The message string to send.
+    /// @param cb Callback invoked with the send result. On asynchronous transports it is not
+    ///        guaranteed to fire: if the connection is torn down before the queued send runs, or
+    ///        the message is dropped by the pre-hello gate, the callback is skipped. Treat it as a
+    ///        best-effort completion notification, not an unconditional "send finished" signal.
+    /// @param allow_before_hello If true, the message may be sent before the client/hello has been
+    ///        sent on this connection (used for the hello itself and for goodbye). If false (the
+    ///        default), platform transports that send asynchronously drop the message when no
+    ///        client/hello has been sent yet, preserving the "hello is always first" protocol
+    ///        invariant. Synchronous transports ignore this flag.
     /// @return SsErr::OK if queued successfully, error code otherwise.
-    virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb) = 0;
+    virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
+                                    bool allow_before_hello = false) = 0;
 
     /// @brief Sends a client/time synchronization message
     ///
@@ -362,8 +371,10 @@ protected:
 
     // 8-bit fields
 
-    /// Hello handshake state.
-    bool client_hello_sent_{false};
+    /// Hello handshake state. Atomic because it is set from the send-completion callback (the httpd
+    /// worker thread on ESP) and the disconnect handlers (network thread), while
+    /// is_handshake_complete() and the pre-hello send gate read it from other threads.
+    std::atomic<bool> client_hello_sent_{false};
 
     /// true if the current message being assembled is text, false if binary
     /// Needed because WebSocket continuation frames do not carry the original frame type
@@ -375,7 +386,10 @@ protected:
 
     /// Time message state.
     bool pending_time_message_{false};
-    bool server_hello_received_{false};
+
+    /// Atomic for the same reason as client_hello_sent_: written on network threads, read from the
+    /// main loop via is_handshake_complete().
+    std::atomic<bool> server_hello_received_{false};
 
     /// Memory placement preference for `websocket_payload_` allocations (ESP-IDF only).
     MemoryLocation websocket_payload_location_{MemoryLocation::PREFER_EXTERNAL};

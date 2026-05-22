@@ -89,7 +89,8 @@ public:
     /// @param message The message string to send.
     /// @param on_complete Callback invoked after send completes.
     /// @return SsErr::OK if queued successfully, error code otherwise.
-    SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete) override;
+    SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete,
+                            bool allow_before_hello) override;
 
     /// @brief Sends a client/time message, stamping the timestamp inside the httpd worker
     ///
@@ -134,9 +135,10 @@ protected:
     ///
     /// Captures the client_transmitted timestamp inside the worker (just before
     /// `httpd_ws_send_frame_async`), serializes the JSON, then sends.
-    /// @param arg A heap-allocated `SessionLookup` carrying the server handle and sockfd. The
-    ///            worker looks the connection up via `httpd_sess_get_ctx`, sends the frame if the
-    ///            session is still alive, and frees the arg on return.
+    /// @param arg A heap-allocated `SessionLookup` holding a `weak_ptr` to the originating
+    ///            connection. The worker `lock()`s it: if the connection is still alive (and has
+    ///            sent its client/hello) it sends the frame, otherwise it no-ops. The arg is
+    ///            destroyed and freed before the worker returns.
     static void async_send_time_text(void* arg);
 
     // Pointer fields

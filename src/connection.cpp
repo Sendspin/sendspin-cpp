@@ -44,7 +44,10 @@ void SendspinConnection::init_time_filter() {
 
 SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
                                               SendCompleteCallback on_complete) {
-    return this->send_text_message(format_client_goodbye_message(reason), std::move(on_complete));
+    // Goodbye is a control message that may legitimately be sent before the client/hello (e.g.,
+    // when rejecting an excess connection), so it bypasses the pre-hello send gate.
+    return this->send_text_message(format_client_goodbye_message(reason), std::move(on_complete),
+                                   /*allow_before_hello=*/true);
 }
 
 // ============================================================================

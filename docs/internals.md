@@ -197,7 +197,7 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    ├─ Process close/disconnect events (on_connection_lost)
    ├─ Process hello events (handshake completion, handoff decisions)
    ├─ Call loop() on current and pending connections
-   └─ Check hello retry timer
+   └─ Check per-connection hello retry timers
 
 2. time_burst_->loop(conn)  (skipped when no current connection)
    ├─ Send next time message if ready
@@ -394,7 +394,7 @@ Both are `std::shared_ptr<SendspinConnection>`, and on the ESP server path they 
 ### Handshake and Handoff
 
 1. A new connection (outbound or inbound) is started. If a current connection exists, the new one becomes `pending_connection_`.
-2. The connection sends a CLIENT_HELLO. Retry with exponential backoff (100 ms base, 3 attempts).
+2. The connection sends a CLIENT_HELLO. Retry with exponential backoff (100 ms base, 3 attempts). Each managed connection has its own retry entry in `ConnectionManager::hello_retries_`, so a handoff candidate arriving mid-handshake cannot clobber the current connection's pending hello (and vice versa).
 3. SERVER_HELLO arrives on the network thread → enqueued into mutex-protected vector.
 4. Main loop processes the hello event:
    - Stores server info on the connection.
@@ -422,7 +422,7 @@ When a connection is lost (`on_connection_lost`):
 
 `disconnect_and_release()` calls `conn->disconnect(reason, nullptr)` and lets the local `shared_ptr` go out of scope.
 
-- **ESP server**: the goodbye text is queued as an httpd worker job; the worker looks the connection up via `httpd_sess_get_ctx`, sends the frame, then runs the completion lambda that calls `trigger_close()`. The session slot installed in `open_callback` keeps the connection alive across that whole sequence even after `ConnectionManager`'s observer `shared_ptr` is dropped. The session is finally freed when httpd invokes the slot's `free_fn` (see [Server connection ownership (ESP)](#server-connection-ownership-esp)). The completion lambda captures a `weak_ptr` to make this lifetime explicit — `trigger_close()` is skipped if the conn has already been freed.
+- **ESP server**: the goodbye text is queued as an httpd worker job. The worker resolves the connection by `lock()`ing the `weak_ptr` captured in the queued arg when the goodbye was enqueued; if it resolves it sends the frame, then runs the completion lambda that calls `trigger_close()`. The session slot installed in `open_callback` keeps the connection alive across that whole sequence even after `ConnectionManager`'s observer `shared_ptr` is dropped. The session is finally freed when httpd invokes the slot's `free_fn` (see [Server connection ownership (ESP)](#server-connection-ownership-esp)). The completion lambda also captures a `weak_ptr` to make this lifetime explicit — `trigger_close()` is skipped if the conn has already been freed. Goodbye is one of the two messages that pass `allow_before_hello=true`, so it is not blocked by the pre-hello send gate (a rejected connection is told to leave before it ever sends a hello).
 - **Host client**: the IXWebSocket send is synchronous, so the goodbye and close have both completed by the time `disconnect()` returns and the `shared_ptr` drops the last reference.
 
 ### Server connection ownership (ESP)
@@ -431,10 +431,12 @@ On the ESP build, `SendspinServerConnection` lifetime is pinned to the httpd ses
 
 1. `SendspinWsServer::open_callback` (the httpd `open_fn`) creates the `shared_ptr<SendspinServerConnection>`, heap-allocates a `shared_ptr*` slot, and calls `httpd_sess_set_ctx(handle, sockfd, slot, free_fn)` with a deleter that `delete`s the slot. That slot is the authoritative reference.
 2. The same shared_ptr is forwarded into `ConnectionManager::on_new_connection`, which stores it in `current_connection_` or `pending_connection_` as a *secondary observer*.
-3. The httpd WebSocket handler (`websocket_handler`) and queued workers (`async_send_text`, `async_send_time_text`) look the connection up by `httpd_sess_get_ctx(handle, sockfd)` at run time, copying the slot's `shared_ptr` for the duration of their work. They never assume the manager's observer slot is alive.
+3. The httpd WebSocket handler (`websocket_handler`) looks the connection up by `httpd_sess_get_ctx(handle, sockfd)` at run time, copying the slot's `shared_ptr` for the duration of its work; it never assumes the manager's observer slot is alive. The queued send workers (`async_send_text`, `async_send_time_text`) instead capture a `weak_ptr<SendspinServerConnection>` to the originating connection and `lock()` it when they run.
 4. When the socket closes, httpd calls the `close_fn` first (which fires `connection_closed_callback_` so `ConnectionManager` can drop its observer in the next `loop()`), then later calls the slot's `free_fn` to release the authoritative reference once no workers are queued for that session.
 
-Queued workers carry only a `{httpd_handle_t, int sockfd}` pair (`AsyncRespArg` for text sends, `SessionLookup` for time sends) rather than capturing the connection directly. If the session has already been torn down by the time a worker runs, the lookup returns null and the worker no-ops cleanly. Both arg structs are allocated through `platform_malloc` / `platform_malloc_internal` and freed in the worker.
+Queued send workers capture a `weak_ptr<SendspinServerConnection>` to the originating connection — `AsyncRespArg` for text sends, `SessionLookup` for time sends — and `lock()` it when the worker runs. This is deliberately **not** a `{httpd_handle_t, int sockfd}` pair: identifying the target by sockfd risked binding to a *different* connection that had recycled the same fd after the original closed, sending a frame to the wrong peer. The `weak_ptr` resolves to the exact connection that queued the work, or to null if it has since been destroyed, in which case the worker no-ops cleanly. Because these structs now hold non-trivial members (the `weak_ptr`, and `AsyncRespArg`'s completion `std::function`), they are constructed with placement-new and explicitly destroyed before `platform_free` rather than treated as POD. Both are allocated through `platform_malloc` / `platform_malloc_internal`.
+
+The send workers also enforce the protocol's "hello is always first" rule: a frame is dropped unless `client_hello_sent_` is set on the resolved connection, *unless* the caller passed `allow_before_hello=true`. Exactly two callers do — the `client/hello` itself (which would otherwise gate its own send and deadlock) and `goodbye` — so a stale or out-of-order frame can never precede the handshake. The `weak_ptr` guards identity; the gate guards ordering; the two are independent.
 
 The host build does not need this scheme: `SendspinWsServer` (host) routes IXWebSocket messages by calling `find_connection_callback_` to resolve a synthetic sockfd back to the connection that `ConnectionManager` is holding. The ESP build keeps the `set_find_connection_callback()` setter as a no-op stub for symmetry; see the comment at the call site in `ConnectionManager::init_server`.
 

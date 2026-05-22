@@ -39,12 +39,12 @@ static constexpr int64_t HELLO_INITIAL_DELAY_US = HELLO_INITIAL_DELAY_MS * US_PE
 ConnectionManager::ConnectionManager(SendspinClient* client) : client_(client) {}
 
 ConnectionManager::~ConnectionManager() {
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        this->current_connection_.reset();
-        this->pending_connection_.reset();
-    }
-    this->hello_retry_.conn.reset();
+    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+    this->current_connection_.reset();
+    this->pending_connection_.reset();
+    // Clear under the same lock that guards every other access to hello_retries_, keeping the
+    // locking discipline uniform.
+    this->hello_retries_.clear();
 }
 
 // ============================================================================
@@ -225,28 +225,41 @@ void ConnectionManager::loop() {
         pending_copy->loop();
     }
 
-    // Check hello retry timer
-    if (this->hello_retry_.retry_time_us > 0 &&
-        platform_time_us() >= this->hello_retry_.retry_time_us) {
-        this->hello_retry_.retry_time_us = 0;
-
+    // Check hello retry timers (one entry per managed connection, so a second connection arriving
+    // mid-handshake cannot clobber the first connection's pending hello).
+    {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        // Verify connection is still valid
-        if (this->hello_retry_.conn == this->current_connection_ ||
-            this->hello_retry_.conn == this->pending_connection_) {
-            if (!this->send_hello_message(this->hello_retry_.attempts - 1,
-                                          this->hello_retry_.conn.get())) {
-                // Transient failure - retry with exponential backoff
-                if (this->hello_retry_.attempts > 1) {
-                    this->hello_retry_.delay_ms *= 2;
-                    this->hello_retry_.attempts--;
-                    this->hello_retry_.retry_time_us =
-                        platform_time_us() +
-                        static_cast<int64_t>(this->hello_retry_.delay_ms) * US_PER_MS;
-                }
+        const int64_t now_us = platform_time_us();
+        for (auto it = this->hello_retries_.begin(); it != this->hello_retries_.end();) {
+            HelloRetryState& retry = *it;
+
+            // Drop retries whose connection is no longer managed.
+            if (retry.conn != this->current_connection_ &&
+                retry.conn != this->pending_connection_) {
+                it = this->hello_retries_.erase(it);
+                continue;
             }
-        } else {
-            this->hello_retry_.conn.reset();
+
+            if (retry.retry_time_us == 0 || now_us < retry.retry_time_us) {
+                ++it;
+                continue;
+            }
+
+            if (this->send_hello_message(retry.attempts - 1, retry.conn.get())) {
+                // Sent successfully (or connection no longer valid) - retry is complete.
+                it = this->hello_retries_.erase(it);
+                continue;
+            }
+
+            // Transient failure - retry with exponential backoff until attempts are exhausted.
+            if (retry.attempts > 1) {
+                retry.delay_ms *= 2;
+                retry.attempts--;
+                retry.retry_time_us = now_us + static_cast<int64_t>(retry.delay_ms) * US_PER_MS;
+                ++it;
+            } else {
+                it = this->hello_retries_.erase(it);
+            }
         }
     }
 }
@@ -343,11 +356,40 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
 
 void ConnectionManager::initiate_hello(SendspinConnection* conn) {
     // Note: caller must hold conn_ptr_mutex_
-    // Set up retry state: initial delay, 3 attempts
-    this->hello_retry_.conn = conn->shared_from_this();
-    this->hello_retry_.delay_ms = HelloRetryState::INITIAL_RETRY_DELAY_MS;
-    this->hello_retry_.attempts = 3;
-    this->hello_retry_.retry_time_us = platform_time_us() + HELLO_INITIAL_DELAY_US;
+    // Arm a per-connection hello retry: initial delay, 3 attempts. If an entry for this connection
+    // already exists (a duplicate connected event for the same connection would land here twice),
+    // re-arm it in place instead of pushing a second one, so a connection never gets two timers.
+    auto conn_sp = conn->shared_from_this();
+    const int64_t retry_time_us = platform_time_us() + HELLO_INITIAL_DELAY_US;
+
+    for (auto& retry : this->hello_retries_) {
+        if (retry.conn == conn_sp) {
+            retry.delay_ms = HelloRetryState::INITIAL_RETRY_DELAY_MS;
+            retry.attempts = 3;
+            retry.retry_time_us = retry_time_us;
+            return;
+        }
+    }
+
+    HelloRetryState retry;
+    retry.conn = std::move(conn_sp);
+    retry.delay_ms = HelloRetryState::INITIAL_RETRY_DELAY_MS;
+    retry.attempts = 3;
+    retry.retry_time_us = retry_time_us;
+    this->hello_retries_.push_back(std::move(retry));
+}
+
+void ConnectionManager::remove_hello_retry(SendspinConnection* conn) {
+    // Note: caller must hold conn_ptr_mutex_
+    // Safe to call unconditionally: a no-op if conn never had a retry entry (e.g. a connection
+    // rejected before initiate_hello, or one whose hello already sent and cleared its entry).
+    for (auto it = this->hello_retries_.begin(); it != this->hello_retries_.end();) {
+        if (it->conn.get() == conn) {
+            it = this->hello_retries_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinConnection* conn) {
@@ -364,13 +406,16 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
 
     std::string hello_message = this->client_->build_hello_message();
 
-    SsErr err = conn->send_text_message(hello_message, [conn](bool success) {
-        if (success) {
-            conn->set_client_hello_sent(true);
-        } else {
-            SS_LOGW(TAG, "Hello message send failed");
-        }
-    });
+    SsErr err = conn->send_text_message(
+        hello_message,
+        [conn](bool success) {
+            if (success) {
+                conn->set_client_hello_sent(true);
+            } else {
+                SS_LOGW(TAG, "Hello message send failed");
+            }
+        },
+        /*allow_before_hello=*/true);
 
     if (err == SsErr::OK) {
         return true;  // Successfully queued
@@ -400,10 +445,7 @@ void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
         conn->disable_message_dispatch();
         this->client_->time_burst_->reset();
         this->client_->cleanup_connection_state();
-        if (this->hello_retry_.conn.get() == conn) {
-            this->hello_retry_.conn.reset();
-            this->hello_retry_.retry_time_us = 0;
-        }
+        this->remove_hello_retry(conn);
         this->current_connection_.reset();
 
         if (this->pending_connection_ != nullptr) {
@@ -412,10 +454,7 @@ void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
         }
     } else if (this->pending_connection_ != nullptr && this->pending_connection_.get() == conn) {
         SS_LOGD(TAG, "Pending connection lost");
-        if (this->hello_retry_.conn.get() == conn) {
-            this->hello_retry_.conn.reset();
-            this->hello_retry_.retry_time_us = 0;
-        }
+        this->remove_hello_retry(conn);
         this->pending_connection_.reset();
     }
 }
@@ -468,6 +507,10 @@ void ConnectionManager::complete_handoff(bool switch_to_new) {
             this->client_->cleanup_connection_state();
             auto old_current = std::move(this->current_connection_);
             this->current_connection_ = std::move(this->pending_connection_);
+            // Drop any retry entry now that this connection is leaving the managed set, mirroring
+            // on_connection_lost. (loop() also prunes orphaned entries, but removing it here closes
+            // the window where a retry could fire against an already-handed-off connection.)
+            this->remove_hello_retry(old_current.get());
             this->disconnect_and_release(std::move(old_current),
                                          SendspinGoodbyeReason::ANOTHER_SERVER);
         } else {
@@ -476,6 +519,7 @@ void ConnectionManager::complete_handoff(bool switch_to_new) {
     } else {
         SS_LOGD(TAG, "Completing handoff: keeping current server");
         if (this->pending_connection_ != nullptr) {
+            this->remove_hello_retry(this->pending_connection_.get());
             this->disconnect_and_release(std::move(this->pending_connection_),
                                          SendspinGoodbyeReason::ANOTHER_SERVER);
         }
