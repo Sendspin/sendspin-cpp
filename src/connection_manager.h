@@ -164,6 +164,9 @@ private:
     /// @return True if done (sent or connection invalid), false if the send failed and should
     /// retry.
     bool send_hello_message(uint8_t remaining_attempts, SendspinConnection* conn);
+    /// @brief Removes any pending hello-retry entry associated with the given connection.
+    /// @param conn The connection whose retry state should be dropped.
+    void remove_hello_retry(SendspinConnection* conn);
 
     // ========================================
     // Connection lifecycle
@@ -190,7 +193,7 @@ private:
     // Struct fields
     std::mutex conn_mutex_;              // Protects deferred lifecycle event queues
     mutable std::mutex conn_ptr_mutex_;  // Protects current_connection_ and pending_connection_
-    HelloRetryState hello_retry_;
+    std::vector<HelloRetryState> hello_retries_;  // One entry per connection awaiting its hello
     std::vector<int> pending_close_events_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_disconnect_events_;
