@@ -309,10 +309,12 @@ void SendspinServerConnection::async_send_text(void* arg) {
     // work (or null if it has since been destroyed), so a recycled sockfd can never redirect the
     // frame onto a different connection -- the lifetime-safe replacement for the old raw `this`
     // pointer that caused the use-after-free crash. Non-handshake frames are additionally gated on
-    // client_hello_sent_ so nothing can precede the client/hello. When the conn is gone or the
-    // frame is gated the completion callback is intentionally not fired; callers that key off
-    // completion (e.g., the hello in ConnectionManager::send_hello_message) always pass
-    // allow_before_hello, so their callback still runs.
+    // client_hello_sent_ so nothing can precede the client/hello; allow_before_hello opts the hello
+    // and goodbye out of that gate. The completion callback fires only when the frame is actually
+    // sent: it is skipped both when the gate blocks the frame AND when the connection is already
+    // gone (lock() is null) -- allow_before_hello bypasses the gate but not the conn-alive
+    // requirement, so callers must not rely on the callback as an unconditional "send finished"
+    // signal.
     auto conn = resp_arg->conn.lock();
     if (conn && conn->is_connected() &&
         (resp_arg->allow_before_hello || conn->client_hello_sent_)) {

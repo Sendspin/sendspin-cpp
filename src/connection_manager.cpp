@@ -356,8 +356,9 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
 
 void ConnectionManager::initiate_hello(SendspinConnection* conn) {
     // Note: caller must hold conn_ptr_mutex_
-    // Arm a per-connection hello retry: initial delay, 3 attempts. Reuse an existing entry for this
-    // connection if one is somehow already present so a connection never gets two retry timers.
+    // Arm a per-connection hello retry: initial delay, 3 attempts. If an entry for this connection
+    // already exists (a duplicate connected event for the same connection would land here twice),
+    // re-arm it in place instead of pushing a second one, so a connection never gets two timers.
     auto conn_sp = conn->shared_from_this();
     const int64_t retry_time_us = platform_time_us() + HELLO_INITIAL_DELAY_US;
 
@@ -380,6 +381,8 @@ void ConnectionManager::initiate_hello(SendspinConnection* conn) {
 
 void ConnectionManager::remove_hello_retry(SendspinConnection* conn) {
     // Note: caller must hold conn_ptr_mutex_
+    // Safe to call unconditionally: a no-op if conn never had a retry entry (e.g. a connection
+    // rejected before initiate_hello, or one whose hello already sent and cleared its entry).
     for (auto it = this->hello_retries_.begin(); it != this->hello_retries_.end();) {
         if (it->conn.get() == conn) {
             it = this->hello_retries_.erase(it);
@@ -504,6 +507,10 @@ void ConnectionManager::complete_handoff(bool switch_to_new) {
             this->client_->cleanup_connection_state();
             auto old_current = std::move(this->current_connection_);
             this->current_connection_ = std::move(this->pending_connection_);
+            // Drop any retry entry now that this connection is leaving the managed set, mirroring
+            // on_connection_lost. (loop() also prunes orphaned entries, but removing it here closes
+            // the window where a retry could fire against an already-handed-off connection.)
+            this->remove_hello_retry(old_current.get());
             this->disconnect_and_release(std::move(old_current),
                                          SendspinGoodbyeReason::ANOTHER_SERVER);
         } else {
@@ -512,6 +519,7 @@ void ConnectionManager::complete_handoff(bool switch_to_new) {
     } else {
         SS_LOGD(TAG, "Completing handoff: keeping current server");
         if (this->pending_connection_ != nullptr) {
+            this->remove_hello_retry(this->pending_connection_.get());
             this->disconnect_and_release(std::move(this->pending_connection_),
                                          SendspinGoodbyeReason::ANOTHER_SERVER);
         }

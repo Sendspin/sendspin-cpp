@@ -117,7 +117,10 @@ public:
 
     /// @brief Sends a text message to the server with a completion callback
     /// @param message The message string to send.
-    /// @param cb Callback invoked after send completes.
+    /// @param cb Callback invoked with the send result. On asynchronous transports it is not
+    ///        guaranteed to fire: if the connection is torn down before the queued send runs, or
+    ///        the message is dropped by the pre-hello gate, the callback is skipped. Treat it as a
+    ///        best-effort completion notification, not an unconditional "send finished" signal.
     /// @param allow_before_hello If true, the message may be sent before the client/hello has been
     ///        sent on this connection (used for the hello itself and for goodbye). If false (the
     ///        default), platform transports that send asynchronously drop the message when no
