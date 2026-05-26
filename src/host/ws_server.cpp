@@ -103,8 +103,8 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
             }
         });
 
-    SS_LOGI(TAG, "Starting server on port: %d (max connections: %d)", this->server_port_,
-            this->max_connections_);
+    SS_LOGI(TAG, "Starting server on port: %u (max connections: %d)",
+            static_cast<unsigned int>(this->server_port_), this->max_connections_);
 
     auto result = this->server_->listen();
     if (!result.first) {
