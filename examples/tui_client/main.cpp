@@ -21,6 +21,7 @@
 ///   name:  Optional friendly name (default: "TUI Client")
 ///
 /// Options:
+///   -p PORT   Listen on PORT (default: 8928)
 ///   -f FORMAT Audio format as codec:rate:bits:channels (repeatable)
 ///   -h        Show usage
 
@@ -47,6 +48,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -58,7 +60,7 @@
 
 using namespace sendspin;
 
-static const uint16_t SENDSPIN_PORT = 8928;
+static constexpr uint16_t DEFAULT_SENDSPIN_PORT = SendspinClientConfig::DEFAULT_SERVER_PORT;
 static const char* SENDSPIN_PATH = "/sendspin";
 
 // Big-endian helpers for binary visualizer data parsing
@@ -380,11 +382,22 @@ static bool parse_audio_format(const std::string& str, sendspin::AudioSupportedF
     return true;
 }
 
+static bool parse_port(const char* str, uint16_t& port) {
+    char* end = nullptr;
+    unsigned long value = strtoul(str, &end, 10);
+    if (*str == '\0' || *end != '\0' || value == 0 || value > 65535UL) {
+        return false;
+    }
+    port = static_cast<uint16_t>(value);
+    return true;
+}
+
 static void print_usage(const char* prog) {
     fprintf(stderr, "Usage: %s [options] [name]\n", prog);
     fprintf(stderr, "  name          Friendly name (default: \"TUI Client\")\n\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -u URL        Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)\n");
+    fprintf(stderr, "  -p PORT       Listen on PORT (default: %u)\n", DEFAULT_SENDSPIN_PORT);
     fprintf(stderr, "  -f FORMAT     Audio format as codec:rate:bits:channels (e.g. flac:48000:24:2)\n");
     fprintf(stderr, "                Can be specified multiple times. Codecs: flac, opus, pcm\n");
     fprintf(stderr, "  -V            Disable visualizer\n");
@@ -395,12 +408,20 @@ int main(int argc, char* argv[]) {
     // Parse command line options
     bool enable_visualizer = true;
     std::string connect_url;
+    uint16_t server_port = DEFAULT_SENDSPIN_PORT;
     std::vector<sendspin::AudioSupportedFormatObject> audio_formats;
     int opt;
-    while ((opt = getopt(argc, argv, "u:f:Vh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:p:f:Vh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
+                break;
+            case 'p':
+                if (!parse_port(optarg, server_port)) {
+                    fprintf(stderr, "Invalid port: %s\n", optarg);
+                    print_usage(argv[0]);
+                    return 1;
+                }
                 break;
             case 'f': {
                 sendspin::AudioSupportedFormatObject fmt;
@@ -434,6 +455,7 @@ int main(int argc, char* argv[]) {
     config.product_name = "sendspin-cpp host TUI";
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
+    config.server_port = server_port;
 
     // Create audio output
 #ifdef SENDSPIN_HAS_PORTAUDIO
@@ -726,7 +748,7 @@ int main(int argc, char* argv[]) {
     // Advertise via mDNS and browse for other servers (when compiled in)
 #ifdef SENDSPIN_HAS_MDNS
     MdnsAdvertiser mdns;
-    mdns.start(friendly_name, SENDSPIN_PORT, SENDSPIN_PATH);
+    mdns.start(friendly_name, server_port, SENDSPIN_PATH);
 
     MdnsBrowser mdns_browser;
     mdns_browser.start();
@@ -752,7 +774,7 @@ int main(int argc, char* argv[]) {
                     static_cast<uint16_t>(std::stoul(host_port.substr(colon + 1)));
             } else {
                 state.connected_host = host_port;
-                state.connected_port = SENDSPIN_PORT;
+                state.connected_port = DEFAULT_SENDSPIN_PORT;
             }
         }
         client.connect_to(connect_url);

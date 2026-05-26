@@ -41,7 +41,7 @@ namespace sendspin {
 //
 // Lifecycle:
 // 1. SendspinClient calls start() with callbacks and configuration
-// 2. Server listens on port 8928 at /sendspin
+// 2. Server listens on the configured port at /sendspin
 // 3. open_callback() creates SendspinServerConnection instances
 // 4. SendspinClient receives connection via new_connection_callback
 // 5. SendspinClient manages connection ownership and handoff logic
@@ -68,7 +68,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
         config.task_caps = MALLOC_CAP_SPIRAM;
     }
     config.task_priority = task_priority;
-    config.server_port = 8928;
+    config.server_port = this->server_port_;
     config.max_open_sockets = this->max_connections_;
     config.open_fn = SendspinWsServer::open_callback;
     config.close_fn = SendspinWsServer::close_callback;

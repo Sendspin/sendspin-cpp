@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include "sendspin/config.h"
+
 #include <ixwebsocket/IXWebSocketServer.h>
 
 #include <cstdint>
@@ -34,9 +36,9 @@ class SendspinServerConnection;
 /**
  * @brief WebSocket server that listens for incoming Sendspin client connections (host build)
  *
- * Wraps an IXWebSocket server listening on port 8928. When a client connects, a
- * SendspinServerConnection is created and delivered via the NewConnectionCallback.
- * Connection close events are reported via ConnectionClosedCallback.
+ * Wraps an IXWebSocket server listening on the configured port. When a client connects, a
+ * SendspinServerConnection is created and delivered via the NewConnectionCallback. Connection
+ * close events are reported via ConnectionClosedCallback.
  *
  * Usage:
  * 1. Set the new_connection, connection_closed, and find_connection callbacks
@@ -70,7 +72,7 @@ public:
     /// Returns a shared_ptr to keep the connection alive during message dispatch.
     using FindConnectionCallback = std::function<std::shared_ptr<SendspinConnection>(int sockfd)>;
 
-    /// @brief Starts the WebSocket server on port 8928
+    /// @brief Starts the WebSocket server on the configured port
     /// @param client Pointer to the SendspinClient (stored for context).
     /// @param task_stack_in_psram Ignored on host builds.
     /// @param task_priority Ignored on host builds.
@@ -96,6 +98,12 @@ public:
     /// @param max_connections Maximum connection count.
     void set_max_connections(uint8_t max_connections) {
         this->max_connections_ = max_connections;
+    }
+
+    /// @brief Sets the TCP port the WebSocket server listens on
+    /// @param port Port number.
+    void set_port(uint16_t port) {
+        this->server_port_ = port;
     }
 
     /// @brief No-op on host builds; control port is an ESP-IDF httpd concept
@@ -133,10 +141,13 @@ protected:
     /// @brief The IXWebSocket server instance
     std::unique_ptr<ix::WebSocketServer> server_;
 
-    // 8-bit fields
+    // Numeric fields
 
     /// @brief Maximum number of simultaneous connections (default: 2 for handoff)
     uint8_t max_connections_{2};
+
+    /// @brief TCP port the WebSocket server listens on
+    uint16_t server_port_{SendspinClientConfig::DEFAULT_SERVER_PORT};
 };
 
 }  // namespace sendspin

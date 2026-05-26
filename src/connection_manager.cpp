@@ -96,6 +96,7 @@ void ConnectionManager::init_server(SendspinClient* client) {
     this->client_ = client;
 
     this->ws_server_ = std::make_unique<SendspinWsServer>();
+    this->ws_server_->set_port(this->client_->config_.server_port);
     this->ws_server_->set_max_connections(this->client_->config_.server_max_connections);
     this->ws_server_->set_ctrl_port(this->client_->config_.httpd_ctrl_port);
 
