@@ -19,7 +19,6 @@
 #pragma once
 
 #include "sendspin/config.h"
-
 #include <ixwebsocket/IXWebSocketServer.h>
 
 #include <cstdint>

@@ -57,7 +57,7 @@ struct SendspinClientConfig {
     uint16_t server_port{DEFAULT_SERVER_PORT};  ///< WebSocket server port
     uint8_t server_max_connections{2};          ///< Maximum simultaneous connections (default: 2
                                                 ///< for handoff protocol)
-                                                
+
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
     static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
 

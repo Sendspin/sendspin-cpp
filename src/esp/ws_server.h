@@ -18,7 +18,6 @@
 #pragma once
 
 #include "sendspin/config.h"
-
 #include <esp_http_server.h>
 
 #include <functional>
