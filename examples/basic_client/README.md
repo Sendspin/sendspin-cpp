@@ -28,9 +28,10 @@ macOS has mDNS support built in; no extra dependencies needed.
 ```sh
 ./build/examples/basic_client/basic_client            # default name "Basic Client"
 ./build/examples/basic_client/basic_client "My Player" # custom name
+./build/examples/basic_client/basic_client -p 8930     # listen on a custom port
 ```
 
-The client listens on port 8928. When mDNS is enabled it advertises `_sendspin._tcp` so Sendspin servers on the local network discover and connect automatically; otherwise tell the server to connect with `ws://<this-host>:8928/sendspin`.
+The client listens on port 8928 by default. When mDNS is enabled it advertises `_sendspin._tcp` with the configured port so Sendspin servers on the local network discover and connect automatically; otherwise tell the server to connect with `ws://<this-host>:8928/sendspin`, replacing `8928` if you passed `-p`.
 
 If PortAudio is available, audio is played through the default output device. Otherwise, audio is discarded (NullAudioSink).
 

@@ -25,9 +25,6 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.ws_server";
 
-/// @brief Default WebSocket server port
-static constexpr uint16_t DEFAULT_SERVER_PORT = 8928U;
-
 SendspinWsServer::~SendspinWsServer() {
     this->stop();
 }
@@ -42,7 +39,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
     this->client_ = client;
 
     // Create IXWebSocket server on the configured port
-    this->server_ = std::make_unique<ix::WebSocketServer>(DEFAULT_SERVER_PORT, "0.0.0.0");
+    this->server_ = std::make_unique<ix::WebSocketServer>(this->server_port_, "0.0.0.0");
 
     this->server_->setOnConnectionCallback(
         [this](const std::weak_ptr<ix::WebSocket>& weak_ws,
@@ -106,8 +103,8 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
             }
         });
 
-    SS_LOGI(TAG, "Starting server on port: %d (max connections: %d)", DEFAULT_SERVER_PORT,
-            this->max_connections_);
+    SS_LOGI(TAG, "Starting server on port: %u (max connections: %d)",
+            static_cast<unsigned int>(this->server_port_), this->max_connections_);
 
     auto result = this->server_->listen();
     if (!result.first) {

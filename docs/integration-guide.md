@@ -698,6 +698,7 @@ Main client configuration passed to the `SendspinClient` constructor.
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `17` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |
+| `server_port` | `uint16_t` | `8928` | WebSocket server port |
 | `server_max_connections` | `uint8_t` | `2` | Maximum simultaneous WebSocket connections (default supports the handoff protocol) |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |
 | `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |

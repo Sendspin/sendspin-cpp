@@ -15,7 +15,7 @@
 /// @file Host example application for sendspin-cpp.
 ///
 /// Runs a SendspinClient on the host computer, listening for incoming
-/// connections from a Sendspin server on port 8928. When built with mDNS
+/// connections from a Sendspin server on the configured port. When built with mDNS
 /// support (dns_sd.h available), advertises via mDNS so Sendspin servers
 /// can discover and connect automatically; otherwise the user must connect
 /// manually with `-u ws://<server-host>:<port>/<path>`.
@@ -25,6 +25,7 @@
 ///
 /// Options:
 ///   -u URL    Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)
+///   -p PORT   Listen on PORT (default: 8928)
 ///   -l LEVEL  Set log level: none, error, warn, info (default), debug, verbose
 ///   -v        Verbose logging (same as -l verbose)
 ///   -q        Quiet logging (same as -l error)
@@ -49,13 +50,14 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
 
 using namespace sendspin;
 
-static const uint16_t SENDSPIN_PORT = 8928;
+static constexpr uint16_t DEFAULT_SENDSPIN_PORT = SendspinClientConfig::DEFAULT_SERVER_PORT;
 static const char* SENDSPIN_PATH = "/sendspin";
 
 // Tracks total audio bytes received (used when PortAudio is unavailable)
@@ -127,6 +129,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  name          Friendly name (default: \"Basic Client\")\n\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -u URL        Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)\n");
+    fprintf(stderr, "  -p PORT       Listen on PORT (default: %u)\n", DEFAULT_SENDSPIN_PORT);
     fprintf(stderr, "  -l LEVEL      Log level: none, error, warn, info (default), debug, verbose\n");
     fprintf(stderr, "  -v            Verbose logging (same as -l verbose)\n");
     fprintf(stderr, "  -q            Quiet logging (same as -l error)\n");
@@ -143,6 +146,16 @@ static bool parse_log_level(const char* str, LogLevel& level) {
     return false;
 }
 
+static bool parse_port(const char* str, uint16_t& port) {
+    char* end = nullptr;
+    unsigned long value = strtoul(str, &end, 10);
+    if (*str == '\0' || *end != '\0' || value == 0 || value > 65535UL) {
+        return false;
+    }
+    port = static_cast<uint16_t>(value);
+    return true;
+}
+
 int main(int argc, char* argv[]) {
     // Set up signal handler for clean shutdown
     std::signal(SIGINT, signal_handler);
@@ -151,11 +164,19 @@ int main(int argc, char* argv[]) {
     // Parse command line options
     LogLevel log_level = LogLevel::INFO;
     std::string connect_url;
+    uint16_t server_port = DEFAULT_SENDSPIN_PORT;
     int opt;
-    while ((opt = getopt(argc, argv, "u:l:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:p:l:vqh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
+                break;
+            case 'p':
+                if (!parse_port(optarg, server_port)) {
+                    fprintf(stderr, "Invalid port: %s\n", optarg);
+                    print_usage(argv[0]);
+                    return 1;
+                }
                 break;
             case 'l':
                 if (!parse_log_level(optarg, log_level)) {
@@ -191,6 +212,7 @@ int main(int argc, char* argv[]) {
     config.product_name = "sendspin-cpp host example";
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
+    config.server_port = server_port;
 
     // Create audio output and client
 #ifdef SENDSPIN_HAS_PORTAUDIO
@@ -301,7 +323,7 @@ int main(int argc, char* argv[]) {
     client.set_network_provider(&network_provider);
 
     // Start the server
-    fprintf(stderr, "Starting Sendspin basic client on port %u...\n", SENDSPIN_PORT);
+    fprintf(stderr, "Starting Sendspin basic client on port %u...\n", server_port);
 
     if (!client.start_server()) {
         fprintf(stderr, "Failed to start server\n");
@@ -310,9 +332,9 @@ int main(int argc, char* argv[]) {
 
 #ifdef SENDSPIN_HAS_MDNS
     MdnsAdvertiser mdns;
-    if (!mdns.start(friendly_name, SENDSPIN_PORT, SENDSPIN_PATH)) {
+    if (!mdns.start(friendly_name, server_port, SENDSPIN_PATH)) {
         fprintf(stderr, "Warning: mDNS advertisement failed, server still running\n");
-        fprintf(stderr, "Connect manually to ws://<this-host>:%u%s\n", SENDSPIN_PORT,
+        fprintf(stderr, "Connect manually to ws://<this-host>:%u%s\n", server_port,
                 SENDSPIN_PATH);
     }
 #else
@@ -320,7 +342,7 @@ int main(int argc, char* argv[]) {
             "mDNS advertisement not compiled in. Either restart with "
             "-u ws://<server-host>:<port>/<path> to dial a server, or tell a server "
             "to connect to ws://<this-host>:%u%s.\n",
-            SENDSPIN_PORT, SENDSPIN_PATH);
+            server_port, SENDSPIN_PATH);
 #endif
 
     // Auto-connect if a URL was provided via -u

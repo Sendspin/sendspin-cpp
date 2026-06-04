@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "sendspin/config.h"
 #include <esp_http_server.h>
 
 #include <functional>
@@ -41,7 +42,7 @@ class SendspinServerConnection;
  * observer for routing and handoff decisions.
  *
  * Capabilities:
- * - Accepts incoming WebSocket connections on a dedicated port
+ * - Accepts incoming WebSocket connections on a configurable dedicated port
  * - Routes WebSocket messages directly via the session-pinned shared_ptr (no cross-thread
  *   find-by-sockfd lookup is needed)
  * - Manages open/close callbacks to notify the client of connection lifecycle events
@@ -115,6 +116,12 @@ public:
         this->max_connections_ = max_connections;
     }
 
+    /// @brief Sets the TCP port the WebSocket server listens on
+    /// @param port Port number.
+    void set_port(uint16_t port) {
+        this->server_port_ = port;
+    }
+
     /// @brief Overrides the ESP-IDF httpd control port
     /// Defaults to 0 (uses ESP_HTTPD_DEF_CTRL_PORT + 1 to avoid conflict with web_server).
     /// @param ctrl_port Control port number; 0 = use default.
@@ -172,10 +179,13 @@ protected:
     /// @brief The HTTP server handle
     httpd_handle_t server_{nullptr};
 
-    // 8-bit fields
+    // Numeric fields
 
     /// @brief Maximum number of simultaneous connections (default: 2 for handoff)
     uint8_t max_connections_{2};
+
+    /// @brief TCP port the WebSocket server listens on
+    uint16_t server_port_{SendspinClientConfig::DEFAULT_SERVER_PORT};
 
     /// @brief httpd control port override (0 = use ESP_HTTPD_DEF_CTRL_PORT + 1)
     uint16_t ctrl_port_{0};

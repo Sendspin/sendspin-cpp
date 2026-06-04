@@ -50,10 +50,13 @@ struct SendspinClientConfig {
     unsigned websocket_priority{5};  ///< FreeRTOS priority for the WebSocket client task
                                      ///< (ESP-IDF only)
 
-    uint8_t server_max_connections{2};  ///< Maximum simultaneous connections (default: 2 for
-                                        ///< handoff protocol)
-    uint16_t httpd_ctrl_port{0};        ///< ESP-IDF httpd control port; 0 = ESP_HTTPD_DEF_CTRL_PORT
-                                        ///< + 1 (avoids conflict with web_server component)
+    static constexpr uint16_t DEFAULT_SERVER_PORT = 8928U;  ///< Default WebSocket server port
+
+    uint16_t httpd_ctrl_port{0};  ///< ESP-IDF httpd control port; 0 = ESP_HTTPD_DEF_CTRL_PORT
+                                  ///< + 1 (avoids conflict with web_server component)
+    uint16_t server_port{DEFAULT_SERVER_PORT};  ///< WebSocket server port
+    uint8_t server_max_connections{2};          ///< Maximum simultaneous connections (default: 2
+                                                ///< for handoff protocol)
 
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
     static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms
