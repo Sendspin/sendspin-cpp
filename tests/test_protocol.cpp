@@ -308,3 +308,43 @@ TEST(Protocol, FormatClientCommandNoArgs) {
     EXPECT_FALSE(doc["payload"]["controller"]["volume"].is<int>());
     EXPECT_FALSE(doc["payload"]["controller"]["mute"].is<bool>());
 }
+
+// Every device_info identity field (product_name, manufacturer, software_version, mac_address)
+// is optional and serialized only when present.
+TEST(Protocol, FormatClientHelloDeviceInfoFieldsPresent) {
+    ClientHelloMessage msg;
+    msg.client_id = "abc";
+    msg.name = "Speaker";
+    msg.version = 1;
+    DeviceInfoObject info{};
+    info.product_name = "Speaker Pro";
+    info.manufacturer = "ESPHome";
+    info.software_version = "1.2.3";
+    info.mac_address = "aa:bb:cc:dd:ee:ff";
+    msg.device_info = info;
+
+    const std::string out = format_client_hello_message(&msg);
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, out));
+    EXPECT_STREQ(doc["payload"]["device_info"]["product_name"], "Speaker Pro");
+    EXPECT_STREQ(doc["payload"]["device_info"]["manufacturer"], "ESPHome");
+    EXPECT_STREQ(doc["payload"]["device_info"]["software_version"], "1.2.3");
+    EXPECT_STREQ(doc["payload"]["device_info"]["mac_address"], "aa:bb:cc:dd:ee:ff");
+}
+
+// Unset optional identity fields must not emit their keys.
+TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
+    ClientHelloMessage msg;
+    msg.client_id = "abc";
+    msg.name = "Speaker";
+    msg.version = 1;
+    msg.device_info = DeviceInfoObject{};
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    EXPECT_FALSE(doc["payload"]["device_info"]["product_name"].is<const char*>());
+    EXPECT_FALSE(doc["payload"]["device_info"]["manufacturer"].is<const char*>());
+    EXPECT_FALSE(doc["payload"]["device_info"]["software_version"].is<const char*>());
+    EXPECT_FALSE(doc["payload"]["device_info"]["mac_address"].is<const char*>());
+}

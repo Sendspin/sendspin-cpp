@@ -207,6 +207,7 @@ struct DeviceInfoObject {
     std::optional<std::string> product_name{};
     std::optional<std::string> manufacturer{};
     std::optional<std::string> software_version{};
+    std::optional<std::string> mac_address{};
 };
 
 // --- player_role.h ---

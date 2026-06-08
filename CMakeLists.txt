@@ -44,7 +44,7 @@ if(ESP_IDF_BUILD)
     # Assemble source list from core + enabled roles (driven by Kconfig)
     set(SENDSPIN_ALL_SOURCES ${SENDSPIN_CORE_SOURCES} ${SENDSPIN_ESP_SOURCES})
 
-    set(SENDSPIN_REQUIRES esp_http_server esp_timer esp_ringbuf pthread mbedtls bblanchon__arduinojson)
+    set(SENDSPIN_REQUIRES esp_http_server esp_netif esp_timer esp_ringbuf pthread mbedtls bblanchon__arduinojson)
     set(SENDSPIN_COMPILE_DEFS "")
 
     if(CONFIG_SENDSPIN_ENABLE_PLAYER)
