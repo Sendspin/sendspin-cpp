@@ -30,6 +30,9 @@ static const char* const TAG = "sendspin.network_info";
 
 namespace {
 
+/// @brief Size of a formatted MAC string buffer: "aa:bb:cc:dd:ee:ff" plus null terminator.
+constexpr size_t MAC_STR_BUF_SIZE = 18;
+
 /// @brief Formats six MAC octets as lowercase colon-separated text, or nullopt if all zero.
 std::optional<std::string> format_mac(const uint8_t* mac) {
     bool all_zero = true;
@@ -43,7 +46,7 @@ std::optional<std::string> format_mac(const uint8_t* mac) {
         return std::nullopt;  // emulators/unprovisioned efuse can report a zeroed MAC
     }
 
-    char buf[18];
+    char buf[MAC_STR_BUF_SIZE];
     std::snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3],
                   mac[4], mac[5]);
     return std::string(buf);

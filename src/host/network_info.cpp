@@ -41,6 +41,13 @@ static const char* const TAG = "sendspin.network_info";
 
 namespace {
 
+/// @brief Size of a formatted MAC string buffer: "aa:bb:cc:dd:ee:ff" plus null terminator.
+constexpr size_t MAC_STR_BUF_SIZE = 18;
+/// @brief First octet of the IPv4 loopback range 127.0.0.0/8.
+constexpr uint8_t IPV4_LOOPBACK_FIRST_OCTET = 127;
+/// @brief High 16 bits of the IPv4 link-local range 169.254.0.0/16.
+constexpr uint16_t IPV4_LINK_LOCAL_PREFIX = 0xA9FE;
+
 /// @brief Formats six MAC octets as lowercase colon-separated text, or nullopt if all zero.
 std::optional<std::string> format_mac(const uint8_t* mac) {
     bool all_zero = true;
@@ -54,7 +61,7 @@ std::optional<std::string> format_mac(const uint8_t* mac) {
         return std::nullopt;
     }
 
-    char buf[18];
+    char buf[MAC_STR_BUF_SIZE];
     std::snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3],
                   mac[4], mac[5]);
     return std::string(buf);
@@ -70,20 +77,17 @@ bool is_routable_ip(const struct sockaddr* sa) {
         const uint32_t addr = ntohl(in->sin_addr.s_addr);
         const uint8_t first = static_cast<uint8_t>(addr >> 24);
         const uint16_t first_two = static_cast<uint16_t>(addr >> 16);
-        if (first == 127) {
+        if (first == IPV4_LOOPBACK_FIRST_OCTET) {
             return false;  // loopback 127.0.0.0/8
         }
-        if (first_two == 0xA9FE) {
+        if (first_two == IPV4_LINK_LOCAL_PREFIX) {
             return false;  // link-local 169.254.0.0/16
         }
         return true;
     }
     if (sa->sa_family == AF_INET6) {
         const auto* in6 = reinterpret_cast<const struct sockaddr_in6*>(sa);
-        if (IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) || IN6_IS_ADDR_LINKLOCAL(&in6->sin6_addr)) {
-            return false;
-        }
-        return true;
+        return !IN6_IS_ADDR_LOOPBACK(&in6->sin6_addr) && !IN6_IS_ADDR_LINKLOCAL(&in6->sin6_addr);
     }
     return false;
 }
