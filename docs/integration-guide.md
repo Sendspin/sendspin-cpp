@@ -696,7 +696,7 @@ Main client configuration passed to the `SendspinClient` constructor.
 | `manufacturer` | `std::string` | — | Manufacturer name (e.g., `"ESPHome"`) |
 | `software_version` | `std::string` | — | Software version string |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
-| `httpd_priority` | `unsigned` | `17` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
+| `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |
 | `server_port` | `uint16_t` | `8928` | WebSocket server port |
 | `server_max_connections` | `uint8_t` | `2` | Maximum simultaneous WebSocket connections (default supports the handoff protocol) |
@@ -720,7 +720,7 @@ Configuration passed to `client.add_player()`.
 | `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable static delay. |
 | `initial_static_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable static delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
 | `psram_stack` | `bool` | `false` | Allocate sync/decode task stack in PSRAM (ESP-IDF only) |
-| `priority` | `unsigned` | `18` | FreeRTOS priority for the sync/decode task (ESP-IDF only). The default value, `18`, is one above the default `httpd_priority` (`17`). If you customize priorities, keep this above `httpd_priority` so the HTTP server task cannot starve the decoder during the initial burst of encoded audio that fills the buffer at stream start. |
+| `priority` | `unsigned` | `6` | FreeRTOS priority for the sync/decode task (ESP-IDF only). The default value, `6`, is one above the default `httpd_priority` (`5`). If you customize priorities, keep this above `httpd_priority` so the HTTP server task cannot starve the decoder during the initial burst of encoded audio that fills the buffer at stream start. |
 | `decode_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement preference for the decode transfer buffer. `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. ESP-IDF only; ignored on host. |
 
 Each entry in `audio_formats` is an `AudioSupportedFormatObject`:

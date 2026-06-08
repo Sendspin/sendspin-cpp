@@ -43,7 +43,7 @@ struct SendspinClientConfig {
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
 
     /// @brief Default FreeRTOS priority for the HTTP server task (ESP-IDF only)
-    static constexpr unsigned DEFAULT_HTTPD_PRIORITY = 17U;
+    static constexpr unsigned DEFAULT_HTTPD_PRIORITY = 5U;
 
     unsigned httpd_priority{DEFAULT_HTTPD_PRIORITY};  ///< FreeRTOS priority for the HTTP server
                                                       ///< task (ESP-IDF only)
