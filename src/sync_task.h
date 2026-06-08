@@ -84,6 +84,11 @@ struct SyncContext {
     bool hard_syncing{true};  // Starts true so initial sync uses tight settle threshold
     bool initial_decode{false};
     bool release_chunk{false};
+    bool aligning{true};  // True during initial-sync alignment (both priming phases) and post-seek
+                          // re-alignment; cleared on first in-tolerance sync. Hard syncs while
+                          // aligning are expected and do not report the ERROR client state.
+    bool reported_error{false};  // True between reporting ERROR and recovering to SYNCHRONIZED;
+                                 // edge-triggers the client/state transitions.
 };
 
 /// @brief Event flag bits used for sync task lifecycle and command signaling

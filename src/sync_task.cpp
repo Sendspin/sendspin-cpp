@@ -221,6 +221,18 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
     const int64_t active_threshold =
         sync_context.hard_syncing ? HARD_SYNC_SETTLE_THRESHOLD_US : HARD_SYNC_THRESHOLD_US;
 
+    if ((raw_error > active_threshold) || (raw_error < -active_threshold)) {
+        // A hard sync is needed. While aligning (initial-sync priming/alignment or post-seek
+        // re-alignment) hard syncs are expected, so they do not report an error. Otherwise this is
+        // an unexpected loss of sync (e.g. buffer underrun): report ERROR once and keep filling
+        // with silence until we re-align, at which point SYNCHRONIZED is reported.
+        if (!sync_context.aligning && !sync_context.reported_error) {
+            sync_context.reported_error = true;
+            this->player_impl_->enqueue_state_update(SendspinClientState::ERROR);
+            SS_LOGW(TAG, "Lost sync (%" PRId64 "us off), reporting error", raw_error);
+        }
+    }
+
     if (raw_error > active_threshold) {
         // Buffer will run out before this chunk is supposed to play - insert silence to fill the
         // gap
@@ -272,6 +284,15 @@ SyncTaskState SyncTask::handle_synchronize_audio(SyncContext& sync_context) {
         // Within tolerance - exit hard sync mode and use sample insertion/deletion for fine
         // corrections
         sync_context.hard_syncing = false;
+
+        // First in-tolerance alignment completes initial-sync/post-seek alignment. If we had
+        // reported a sync error, we have now recovered: report SYNCHRONIZED.
+        sync_context.aligning = false;
+        if (sync_context.reported_error) {
+            sync_context.reported_error = false;
+            this->player_impl_->enqueue_state_update(SendspinClientState::SYNCHRONIZED);
+            SS_LOGI(TAG, "Regained sync, reporting synchronized");
+        }
 
         if (raw_error > SOFT_SYNC_THRESHOLD_US) {
             // Slightly behind - add one interpolated frame between the last two decoded frames
@@ -616,6 +637,9 @@ void SyncTask::apply_stream_clear(SyncContext& sync_context) {
     sync_context.silence_remaining = 0;
     sync_context.release_chunk = false;
     sync_context.hard_syncing = true;
+    // Post-seek re-alignment hard syncs are expected, not a loss of sync. Leave reported_error
+    // as-is so a pre-seek error still recovers to SYNCHRONIZED once we re-align.
+    sync_context.aligning = true;
     if (sync_context.decode_buffer != nullptr) {
         sync_context.decode_buffer->decrease_buffer_length(sync_context.decode_buffer->available());
     }
@@ -660,6 +684,8 @@ void SyncTask::reset_context(SyncContext& sync_context) {
     sync_context.release_chunk = false;
     sync_context.initial_decode = true;
     sync_context.hard_syncing = true;
+    sync_context.aligning = true;
+    sync_context.reported_error = false;
     sync_context.silence_remaining = 0;
 
     // Empty the decode buffer without deallocating
