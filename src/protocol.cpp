@@ -742,6 +742,9 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         if (info.software_version.has_value()) {
             root["payload"]["device_info"]["software_version"] = info.software_version.value();
         }
+        if (info.mac_address.has_value()) {
+            root["payload"]["device_info"]["mac_address"] = info.mac_address.value();
+        }
     }
     root["payload"]["version"] = msg->version;
     JsonArray supported_roles_list = root["payload"]["supported_roles"].to<JsonArray>();

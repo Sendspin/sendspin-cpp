@@ -34,11 +34,21 @@ namespace sendspin {
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start_server()
 struct SendspinClientConfig {
-    std::string client_id;         ///< Unique client identifier (e.g., MAC address)
-    std::string name;              ///< Friendly display name
-    std::string product_name;      ///< Device product name
-    std::string manufacturer;      ///< Manufacturer name (e.g., "ESPHome")
-    std::string software_version;  ///< Software version string
+    std::string client_id;  ///< Unique client identifier (e.g., MAC address)
+    std::string name;       ///< Friendly display name
+
+    std::optional<std::string> product_name{};  ///< Device product name (optional)
+    std::optional<std::string> manufacturer{};  ///< Manufacturer name, e.g., "ESPHome" (optional)
+    std::optional<std::string> software_version{};  ///< Software version string (optional)
+
+    /// @brief MAC address of the network interface the connection is opened on.
+    /// Sent in the client/hello device_info object. Must be lowercase colon-separated
+    /// form (e.g., "aa:bb:cc:dd:ee:ff"). When left unset, the library auto-detects it:
+    /// from the default network interface (Wi-Fi or Ethernet) on ESP-IDF, and best-effort
+    /// from the active routable interface on host. Set this explicitly to override the
+    /// detected value (recommended on multi-homed hosts where detection may pick the wrong
+    /// interface).
+    std::optional<std::string> mac_address{};
 
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
 

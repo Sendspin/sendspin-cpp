@@ -42,9 +42,9 @@ SendspinClient::set_log_level(LogLevel::INFO);
 SendspinClientConfig config;
 config.client_id = "my-device-mac-addr";       // Unique identifier (e.g., MAC address)
 config.name = "Living Room Speaker";            // Friendly display name
-config.product_name = "My Speaker";             // Device product name
-config.manufacturer = "My Company";             // Manufacturer name
-config.software_version = "1.0.0";              // Software version string
+config.product_name = "My Speaker";             // Device product name (optional)
+config.manufacturer = "My Company";             // Manufacturer name (optional)
+config.software_version = "1.0.0";              // Software version string (optional)
 
 SendspinClient client(std::move(config));
 ```
@@ -692,9 +692,10 @@ Main client configuration passed to the `SendspinClient` constructor.
 |---|---|---|---|
 | `client_id` | `std::string` | — | Unique client identifier (e.g., MAC address) |
 | `name` | `std::string` | — | Friendly display name shown in the Sendspin UI |
-| `product_name` | `std::string` | — | Device product name |
-| `manufacturer` | `std::string` | — | Manufacturer name (e.g., `"ESPHome"`) |
-| `software_version` | `std::string` | — | Software version string |
+| `product_name` | `std::optional<std::string>` | unset | Device product name; sent in `client/hello` only when set |
+| `manufacturer` | `std::optional<std::string>` | unset | Manufacturer name (e.g., `"ESPHome"`); sent in `client/hello` only when set |
+| `software_version` | `std::optional<std::string>` | unset | Software version string; sent in `client/hello` only when set |
+| `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `17` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |

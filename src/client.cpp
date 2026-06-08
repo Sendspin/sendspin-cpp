@@ -20,6 +20,7 @@
 #include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
+#include "platform/network_info.h"
 #include "platform/shadow_slot.h"
 #include "platform/thread_safe_queue.h"
 #include "platform/time.h"
@@ -444,6 +445,10 @@ std::string SendspinClient::build_hello_message() {
     device_info.product_name = this->config_.product_name;
     device_info.manufacturer = this->config_.manufacturer;
     device_info.software_version = this->config_.software_version;
+    // Use the explicitly configured MAC when provided; otherwise fall back to platform detection
+    // (reliable on ESP, best-effort on host). Leaves the field absent if neither is available.
+    device_info.mac_address =
+        this->config_.mac_address ? this->config_.mac_address : platform_get_interface_mac();
     msg.device_info = device_info;
 
     msg.version = 1;

@@ -23,6 +23,7 @@ add_executable(sendspin_tests
     test_audio_stream_info.cpp
     test_time_filter.cpp
     test_protocol.cpp
+    test_network_info.cpp
 )
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...).
