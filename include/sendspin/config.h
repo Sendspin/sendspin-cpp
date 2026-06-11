@@ -120,6 +120,16 @@ struct PlayerRoleConfig {
     size_t audio_buffer_capacity{DEFAULT_AUDIO_BUFFER_CAPACITY};
     int32_t fixed_delay_us{0};
     uint16_t initial_static_delay_ms{0};
+
+    /// @brief Default extra silence (ms) inserted at stream start for decode-pipeline headroom
+    static constexpr uint16_t DEFAULT_EXTRA_STARTUP_SILENCE_MS = 50U;
+
+    /// @brief Extra silence (ms) inserted at stream start, after the first playback notification
+    /// and before the first decoded chunk, on top of the initial-sync priming silence. Gives the
+    /// decode pipeline slack to stay ahead of the sink, preventing the initial-playback stutter.
+    /// Larger values trade longer startup latency for more underflow protection; 0 disables.
+    uint16_t extra_startup_silence_ms{DEFAULT_EXTRA_STARTUP_SILENCE_MS};
+
     bool psram_stack{false};  ///< Allocate sync task stack in PSRAM (ESP-IDF only)
 
     /// @brief Default FreeRTOS priority for the sync/decode task (ESP-IDF only).

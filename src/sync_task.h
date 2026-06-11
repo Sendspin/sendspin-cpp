@@ -205,6 +205,12 @@ protected:
     /// the sink and updates the playtime estimate. No-op when no silence is pending.
     void send_pending_silence(SyncContext& sync_context);
 
+    /// @brief Bridges an encoded-chunk underflow while aligning (startup/post-seek) by feeding the
+    /// sink silence (up to UNDERFLOW_SILENCE_KEEPALIVE_MS) instead of letting the DAC run dry,
+    /// bailing the instant a chunk lands or a lifecycle command fires. Only called while aligning;
+    /// see handle_load_chunk().
+    void fill_underflow_silence(SyncContext& sync_context);
+
     /// @brief Transfers pending silence (if any) then the decoded chunk to the sink
     /// Returns true when all data has been sent, false if more transfers are needed.
     bool transfer_audio(SyncContext& sync_context);

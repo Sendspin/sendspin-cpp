@@ -48,6 +48,10 @@ static constexpr uint32_t WAIT_FOR_TIME_SYNC_MS = 15U;
 /// @brief Timeout (ms) for receiving the next encoded audio chunk from the ring buffer
 static constexpr uint32_t ENCODED_CHUNK_RECEIVE_TIMEOUT_MS = 15U;
 
+/// @brief Silence (ms) fed to the sink per retry on a ring-buffer underflow, to keep the DAC fed
+/// instead of running dry. Larger than the load-wait timeout so each retry outpaces the drain.
+static constexpr uint32_t UNDERFLOW_SILENCE_KEEPALIVE_MS = 20U;
+
 /// @brief Timeout (ms) for on_audio_write pushes; bounds how long the sync task blocks on the
 /// sink before returning to its inner loop to re-check flags and drift.
 static constexpr uint32_t AUDIO_WRITE_TIMEOUT_MS = 20U;
@@ -67,6 +71,15 @@ static constexpr size_t SILENCE_SCRATCH_BYTES = 1024;
 /// the ESP32 flash shares the SPI bus with PSRAM, so a flash read here would contend with that
 /// flood. .bss costs no heap and no flash; it is reserved and zeroed once at startup.
 static uint8_t silence_scratch[SILENCE_SCRATCH_BYTES] = {};
+
+/// @brief Byte count for `duration_ms` of silence, rounded down to whole frames so per-write chunks
+/// and track_sent_audio() accounting stay on frame boundaries (the ms->bytes result need not
+/// align).
+static size_t frame_aligned_silence_bytes(const AudioStreamInfo& stream_info,
+                                          uint32_t duration_ms) {
+    return stream_info.frames_to_bytes(
+        stream_info.bytes_to_frames(stream_info.ms_to_bytes(duration_ms)));
+}
 
 static const char* const TAG = "sendspin.sync_task";
 
@@ -167,18 +180,19 @@ void SyncTask::notify_audio_played(uint32_t frames, int64_t timestamp) {
 
 SyncTaskState SyncTask::handle_initial_sync(SyncContext& sync_context) {
     if (!sync_context.initial_decode) {
-        // Priming done (the audio stack has started consuming) - drop any leftover priming silence
-        // so it is not injected before the first real chunk.
-        sync_context.silence_remaining = 0;
+        // Priming done. process_playback_progress() queued the extra startup silence on the first
+        // playback notification; drain it before the first real chunk so the decode pipeline has
+        // slack to stay ahead of the sink.
+        this->send_pending_silence(sync_context);
+        if (sync_context.silence_remaining > 0) {
+            return SyncTaskState::INITIAL_SYNC;
+        }
         return SyncTaskState::LOAD_CHUNK;
     }
 
     if (sync_context.silence_remaining == 0) {
-        // Keep the silence run frame-aligned so per-write chunks (and the playtime accounting in
-        // track_sent_audio) land on whole frames.
-        sync_context.silence_remaining = sync_context.current_stream_info.frames_to_bytes(
-            sync_context.current_stream_info.bytes_to_frames(
-                sync_context.current_stream_info.ms_to_bytes(INITIAL_SYNC_ZEROS_DURATION_MS)));
+        sync_context.silence_remaining = frame_aligned_silence_bytes(
+            sync_context.current_stream_info, INITIAL_SYNC_ZEROS_DURATION_MS);
     }
     this->send_pending_silence(sync_context);
 
@@ -194,6 +208,13 @@ SyncTaskState SyncTask::handle_load_chunk(SyncContext& sync_context) {
         return SyncTaskState::LOAD_CHUNK;
     }
     if (!this->load_next_chunk(sync_context)) {
+        // Bridge underflows with silence only while aligning (startup/post-seek). In steady state
+        // an empty buffer means the stream is winding down; stuffing silence would pile up in the
+        // sink and delay a rapid restart (and a real underrun is better surfaced as an error than
+        // masked).
+        if (sync_context.aligning) {
+            this->fill_underflow_silence(sync_context);
+        }
         return SyncTaskState::LOAD_CHUNK;
     }
     DecodeResult decode_result = this->decode_chunk(sync_context);
@@ -357,6 +378,28 @@ void SyncTask::send_pending_silence(SyncContext& sync_context) {
         std::this_thread::sleep_for(std::chrono::milliseconds(
             std::max<uint32_t>(INITIAL_SYNC_SETTLE_MIN_MS,
                                sync_context.current_stream_info.bytes_to_ms(bytes_written) / 2)));
+    }
+}
+
+void SyncTask::fill_underflow_silence(SyncContext& sync_context) {
+    // Bridge a startup/post-seek underflow: keep the sink fed with silence until the next chunk
+    // arrives instead of spinning and draining the DAC. Feeding silence advances
+    // new_audio_client_playtime, so handle_synchronize_audio() re-aligns the next chunk against it
+    // once one arrives.
+    if (this->player_impl_->listener == nullptr) {
+        return;
+    }
+    if (sync_context.silence_remaining == 0) {
+        sync_context.silence_remaining = frame_aligned_silence_bytes(
+            sync_context.current_stream_info, UNDERFLOW_SILENCE_KEEPALIVE_MS);
+    }
+    // Drain the window block by block; send_pending_silence() blocks on sink backpressure, and we
+    // bail the instant a chunk lands or a lifecycle command fires.
+    while (
+        (sync_context.silence_remaining > 0) &&
+        (this->encoded_ring_buffer_->chunks_waiting() == 0) &&
+        !(this->event_flags_.get() & (COMMAND_STOP | COMMAND_STREAM_END | COMMAND_STREAM_CLEAR))) {
+        this->send_pending_silence(sync_context);
     }
 }
 
@@ -703,7 +746,13 @@ void SyncTask::process_playback_progress(SyncContext& sync_context) {
         uint32_t frames_played = playback_progress.frames_played;
 
         if (sync_context.initial_decode && frames_played) {
+            // First audio reached the sink. Queue the extra startup silence (replacing any unsent
+            // priming silence) for decode-pipeline slack before the sink drains;
+            // handle_initial_sync() drains it before the first real chunk.
             sync_context.initial_decode = false;
+            sync_context.silence_remaining =
+                frame_aligned_silence_bytes(sync_context.current_stream_info,
+                                            this->player_impl_->config.extra_startup_silence_ms);
         }
 
         if (frames_played > sync_context.buffered_frames) {

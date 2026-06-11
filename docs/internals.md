@@ -319,9 +319,9 @@ INITIAL_SYNC ──→ LOAD_CHUNK ──→ SYNCHRONIZE_AUDIO ──→ TRANSFER
      └──→ LOAD_CHUNK (once first playback progress callback confirms frames were consumed)
 ```
 
-**INITIAL_SYNC**: Fills the audio pipeline with silence to prime DMA buffers. Sleeps briefly after sending to let the audio stack start consuming.
+**INITIAL_SYNC**: Fills the audio pipeline with silence to prime DMA buffers. Sleeps briefly after sending to let the audio stack start consuming. Once the first playback-progress callback confirms frames were consumed, it queues `extra_startup_silence_ms` of additional silence (see `PlayerRoleConfig`) and drains it before advancing to LOAD_CHUNK. This extra lead gives the decode pipeline slack to stay ahead of the sink at stream start, preventing the initial-playback stutter caused by the decoder briefly falling behind.
 
-**LOAD_CHUNK**: Reads the next encoded chunk from the ring buffer. Waits for time sync if not yet available. Decodes audio via FLAC/Opus/PCM decoder.
+**LOAD_CHUNK**: Reads the next encoded chunk from the ring buffer. Waits for time sync if not yet available. Decodes audio via FLAC/Opus/PCM decoder. On a ring-buffer underflow (no chunk ready) **while still aligning** (startup or post-seek), it feeds silence toward the sink to keep the DAC fed while the decode pipeline catches up, instead of letting it run dry; SYNCHRONIZE_AUDIO then re-aligns the next chunk against wherever the silence carried us. In steady state it does **not** fill — an empty buffer there means the stream is winding down, and stuffing silence would pile up in the sink and delay a rapid restart (a genuine underrun instead surfaces as an error in SYNCHRONIZE_AUDIO).
 
 **SYNCHRONIZE_AUDIO**: Computes the sync error:
 
