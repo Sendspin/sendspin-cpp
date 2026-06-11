@@ -88,6 +88,9 @@ public:
     /// @brief Returns the number of committed items waiting to be received
     /// @return Count of items written and committed but not yet received by the consumer.
     size_t items_waiting() const {
+        if (this->handle_ == nullptr) {
+            return 0;
+        }
         UBaseType_t items = 0;
         vRingbufferGetInfo(this->handle_, nullptr, nullptr, nullptr, nullptr, &items);
         return static_cast<size_t>(items);
