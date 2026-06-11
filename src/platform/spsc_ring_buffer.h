@@ -85,6 +85,20 @@ public:
         return this->handle_ != nullptr;
     }
 
+    /// @brief Returns the number of committed items waiting to be received
+    /// @return Count of items written and committed but not yet received by the consumer.
+    size_t items_waiting() const {
+        UBaseType_t items = 0;
+        vRingbufferGetInfo(this->handle_, nullptr, nullptr, nullptr, nullptr, &items);
+        return static_cast<size_t>(items);
+    }
+
+    /// @brief Returns true if no committed items are waiting to be received
+    /// @return true if the ring buffer has no items pending for the consumer.
+    bool is_empty() const {
+        return this->items_waiting() == 0;
+    }
+
     /// @brief Two-phase write: acquire contiguous space
     /// @param size Number of bytes to acquire.
     /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
@@ -192,6 +206,7 @@ public:
         this->write_offset_ = 0;
         this->read_offset_ = 0;
         this->free_bytes_ = size;
+        this->items_waiting_ = 0;
         this->created_ = true;
         return true;
     }
@@ -200,6 +215,20 @@ public:
     /// @return true if the ring buffer is ready for use.
     bool is_created() const {
         return this->created_;
+    }
+
+    /// @brief Returns the number of committed items waiting to be received
+    /// @return Count of items written and committed but not yet received by the consumer.
+    size_t items_waiting() const {
+        std::lock_guard<std::mutex> lock(this->mtx_);
+        return this->items_waiting_;
+    }
+
+    /// @brief Returns true if no committed items are waiting to be received
+    /// @return true if the ring buffer has no items pending for the consumer.
+    bool is_empty() const {
+        std::lock_guard<std::mutex> lock(this->mtx_);
+        return this->items_waiting_ == 0;
     }
 
     /// @brief Two-phase write: acquire contiguous space
@@ -254,6 +283,7 @@ public:
         auto* header =
             reinterpret_cast<ItemHeader*>(static_cast<uint8_t*>(ptr) - sizeof(ItemHeader));
         header->flags = FLAG_WRITTEN;
+        ++this->items_waiting_;
         this->cv_read_.notify_all();
         return true;
     }
@@ -390,6 +420,7 @@ private:
             }
             if (header->flags == FLAG_WRITTEN) {
                 *item_size = header->size;
+                --this->items_waiting_;
                 return this->storage_ + this->read_offset_ + sizeof(ItemHeader);
             }
             // ACQUIRED but not yet committed -- wait
@@ -401,13 +432,14 @@ private:
     // Struct fields
     std::condition_variable cv_read_;
     std::condition_variable cv_write_;
-    std::mutex mtx_;
+    mutable std::mutex mtx_;
 
     // Pointer fields
     uint8_t* storage_{nullptr};
 
     // size_t fields
     size_t free_bytes_{0};
+    size_t items_waiting_{0};
     size_t read_offset_{0};
     size_t storage_size_{0};
     size_t write_offset_{0};

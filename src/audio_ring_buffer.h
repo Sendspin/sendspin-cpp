@@ -108,6 +108,18 @@ public:
     /// @param entry Pointer previously returned by receive_chunk(). May be nullptr (no-op).
     void return_chunk(AudioRingBufferEntry* entry);
 
+    /// @brief Returns the number of audio chunks waiting to be received.
+    /// @return Count of chunks written but not yet received by the consumer.
+    size_t chunks_waiting() const {
+        return this->ring_buffer_.items_waiting();
+    }
+
+    /// @brief Returns true if no audio chunks are waiting to be received.
+    /// @return true if the consumer has received every chunk written so far.
+    bool is_empty() const {
+        return this->ring_buffer_.is_empty();
+    }
+
     /// @brief Drains all items from the ring buffer.
     /// @note Only safe to call when the consumer task is stopped.
     void reset();
