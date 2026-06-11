@@ -48,8 +48,9 @@ static constexpr uint32_t WAIT_FOR_TIME_SYNC_MS = 15U;
 /// @brief Timeout (ms) for receiving the next encoded audio chunk from the ring buffer
 static constexpr uint32_t ENCODED_CHUNK_RECEIVE_TIMEOUT_MS = 15U;
 
-/// @brief Silence (ms) fed to the sink per retry on a ring-buffer underflow, to keep the DAC fed
-/// instead of running dry. Larger than the load-wait timeout so each retry outpaces the drain.
+/// @brief Silence (ms) queued per encoded-chunk underflow to keep the DAC fed between chunks. A bit
+/// above ENCODED_CHUNK_RECEIVE_TIMEOUT_MS so it spans one more load wait, though not a strict
+/// bound: the fill bails as soon as a chunk lands and is paced by sink backpressure.
 static constexpr uint32_t UNDERFLOW_SILENCE_KEEPALIVE_MS = 20U;
 
 /// @brief Timeout (ms) for on_audio_write pushes; bounds how long the sync task blocks on the
@@ -393,8 +394,9 @@ void SyncTask::fill_underflow_silence(SyncContext& sync_context) {
         sync_context.silence_remaining = frame_aligned_silence_bytes(
             sync_context.current_stream_info, UNDERFLOW_SILENCE_KEEPALIVE_MS);
     }
-    // Drain the window block by block; send_pending_silence() blocks on sink backpressure, and we
-    // bail the instant a chunk lands or a lifecycle command fires.
+    // Drain the window block by block; send_pending_silence() blocks on sink backpressure. The loop
+    // re-checks between blocks, so it stops after the current write once a chunk lands or a
+    // lifecycle command fires.
     while (
         (sync_context.silence_remaining > 0) &&
         (this->encoded_ring_buffer_->chunks_waiting() == 0) &&

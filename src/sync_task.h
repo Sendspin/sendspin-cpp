@@ -207,8 +207,8 @@ protected:
 
     /// @brief Bridges an encoded-chunk underflow while aligning (startup/post-seek) by feeding the
     /// sink silence (up to UNDERFLOW_SILENCE_KEEPALIVE_MS) instead of letting the DAC run dry,
-    /// bailing the instant a chunk lands or a lifecycle command fires. Only called while aligning;
-    /// see handle_load_chunk().
+    /// stopping after the current silence write once a chunk lands or a lifecycle command fires.
+    /// Only called while aligning; see handle_load_chunk().
     void fill_underflow_silence(SyncContext& sync_context);
 
     /// @brief Transfers pending silence (if any) then the decoded chunk to the sink
