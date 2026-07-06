@@ -167,6 +167,9 @@ enum class SendspinImageSource : uint8_t {
 
 /// @brief Preference for an image slot's format and resolution
 struct ImageSlotPreference {
+    /// @brief Deprecated and ignored. The channel/slot number is determined by this entry's
+    /// position (index) in ArtworkRoleConfig::preferred_formats, not by this field. Kept only
+    /// for API compatibility.
     uint8_t slot{};
     SendspinImageSource source{};
     SendspinImageFormat format{};
@@ -176,6 +179,10 @@ struct ImageSlotPreference {
 
 /// @brief Configuration for the artwork role
 struct ArtworkRoleConfig {
+    /// @brief Slot/channel preferences in order. The array index is the authoritative channel
+    /// slot number (matched against the binary message slot byte and advertised to the server
+    /// in that order); ImageSlotPreference::slot is ignored. Limited to ARTWORK_MAX_SLOTS (4)
+    /// entries; extra entries are truncated with a warning.
     std::vector<ImageSlotPreference> preferred_formats{};
     bool psram_stack{false};  ///< Allocate decode thread stack in PSRAM (ESP-IDF only)
     unsigned priority{2};     ///< FreeRTOS priority for the decode thread (ESP-IDF only)
@@ -211,6 +218,10 @@ struct VisualizerSpectrumConfig {
 
 /// @brief Visualizer capabilities advertised to the server during the hello handshake
 struct VisualizerSupportObject {
+    /// @brief Data types the client wants to receive.
+    /// The order here does not need to match the wire order: VisualizerRole normalizes this
+    /// list internally to LOUDNESS, F_PEAK, SPECTRUM, then BEAT (duplicates removed) before it
+    /// is sent, so the server always packs per-frame fields in the order the client parses them.
     std::vector<VisualizerDataType> types{};
     size_t buffer_capacity{};
     uint8_t batch_max{};
