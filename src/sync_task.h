@@ -140,6 +140,11 @@ public:
     /// Returns false when idle (waiting for a stream) or stopped.
     /// @return true if actively decoding and syncing a stream.
     bool is_running() const {
+        // Guarded so callers may query before init(); reading uncreated event flags is a
+        // null-handle crash on ESP
+        if (!this->is_initialized()) {
+            return false;
+        }
         return (this->event_flags_.get() & EventGroupBits::TASK_RUNNING) != 0U;
     }
 
