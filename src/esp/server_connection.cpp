@@ -110,7 +110,7 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
 }
 
 bool SendspinServerConnection::is_connected() const {
-    return this->sockfd_ >= 0;
+    return this->sockfd_ >= 0 && !this->closed_.load(std::memory_order_acquire);
 }
 
 SsErr SendspinServerConnection::send_text_message(const std::string& message,
