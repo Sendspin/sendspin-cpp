@@ -239,7 +239,7 @@ SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) con
 void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) {
     if (this->config.audio_formats.empty()) {
         // No audio formats, just defer stream start callback
-        this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_START, 0);
+        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START);
         return;
     }
 
@@ -286,24 +286,20 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
 
     if (!header_sent) {
         this->sync_task->signal_stream_end();
-        this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_END, 0);
+        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END);
         return;
     }
 
-    // Request high-performance networking for playback
-    if (!this->high_performance_requested_for_playback) {
-        this->client->acquire_high_performance();
-        this->high_performance_requested_for_playback = true;
-    }
-
-    // Shadow stream params for main thread, then signal
+    // Shadow stream params for main thread, then signal. The high-performance acquire for
+    // playback happens when the main loop drains the STREAM_START event, keeping
+    // high_performance_requested_for_playback main-thread-only.
     this->event_state->shadow_stream_params.write(player_obj);
-    this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_START, 0);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START);
 }
 
 void PlayerRole::Impl::handle_stream_end() const {
     this->sync_task->signal_stream_end();
-    this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_END, 0);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END);
 }
 
 void PlayerRole::Impl::handle_stream_clear() const {
@@ -417,15 +413,28 @@ void PlayerRole::Impl::drain_events() {
 
             switch (event) {
                 case PlayerStreamCallbackType::STREAM_END:
-                    if (this->listener) {
+                    // Only fire the callback when a stream is actually open: cleanup() enqueues
+                    // an unconditional STREAM_END (and a failed stream start enqueues one with no
+                    // preceding START), so gating here keeps on_stream_end() paired 1:1 with
+                    // on_stream_start()
+                    if (this->listener && this->stream_active) {
                         this->listener->on_stream_end();
                     }
+                    this->stream_active = false;
                     if (this->high_performance_requested_for_playback) {
                         this->client->release_high_performance();
                         this->high_performance_requested_for_playback = false;
                     }
                     break;
                 case PlayerStreamCallbackType::STREAM_START: {
+                    // Request high-performance networking for playback (deferred from the
+                    // network thread's handle_stream_start so the listener callback and the
+                    // pairing flag stay on the main thread)
+                    if (!this->config.audio_formats.empty() &&
+                        !this->high_performance_requested_for_playback) {
+                        this->client->acquire_high_performance();
+                        this->high_performance_requested_for_playback = true;
+                    }
                     ServerPlayerStreamObject stream_params;
                     if (this->event_state->shadow_stream_params.take(stream_params)) {
                         this->current_stream_params = std::move(stream_params);
@@ -433,7 +442,12 @@ void PlayerRole::Impl::drain_events() {
                     if (this->listener) {
                         this->listener->on_stream_start();
                     }
+                    this->stream_active = true;
                     this->sync_task->signal_stream_start();
+                    // The sync task sets TASK_RUNNING asynchronously after this signal, so the
+                    // pre-loop snapshot is stale now: a STREAM_END later in this same batch must
+                    // wait for the just-started task to drain
+                    sync_idle = false;
                     break;
                 }
             }
@@ -459,7 +473,8 @@ void PlayerRole::Impl::cleanup() {
     this->event_state->shadow_stream_params.reset();
     this->event_state->shadow_command.reset();
 
-    // Enqueue a clean STREAM_END - drain_events() will fire the callback
+    // Enqueue a clean STREAM_END - drain_events() will fire the callback (the queue was just
+    // reset, so this send cannot fail)
     this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_END, 0);
 
     // Clear awaiting events too (main-thread only, no mutex needed)
@@ -487,7 +502,20 @@ bool PlayerRole::Impl::send_audio_chunk(const uint8_t* data, size_t data_size, i
 }
 
 void PlayerRole::Impl::enqueue_state_update(SendspinClientState state) const {
-    this->event_state->state_queue.send(state, 0);
+    if (!this->event_state->state_queue.send(state, 0)) {
+        // The drain takes only the newest state, so a dropped older one is recoverable -- but
+        // a full queue means the main loop has stalled for several ticks
+        SS_LOGW(TAG, "Client state queue full; dropping state update");
+    }
+}
+
+void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event) const {
+    if (!this->event_state->stream_queue.send(event, 0)) {
+        // A lost STREAM_START would leave the sync task waiting for its start signal forever;
+        // a lost STREAM_END would leave the consumer believing the stream is still active
+        SS_LOGE(TAG, "Stream event queue full; dropping %s event",
+                event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END");
+    }
 }
 
 void PlayerRole::Impl::load_static_delay() {

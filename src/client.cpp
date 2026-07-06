@@ -379,11 +379,16 @@ void SendspinClient::acquire_high_performance() {
 }
 
 void SendspinClient::release_high_performance() {
-    if (this->high_performance_ref_count_.load() == 0) {
-        return;
-    }
-    if (this->high_performance_ref_count_.fetch_sub(1) == 1 && this->listener_) {
-        this->listener_->on_release_high_performance();
+    // Compare-exchange loop so two concurrent releases at count 1 can't both pass a
+    // plain zero-check and underflow the counter
+    uint8_t count = this->high_performance_ref_count_.load();
+    while (count != 0) {
+        if (this->high_performance_ref_count_.compare_exchange_weak(count, count - 1)) {
+            if (count == 1 && this->listener_) {
+                this->listener_->on_release_high_performance();
+            }
+            return;
+        }
     }
 }
 
@@ -651,7 +656,9 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             int64_t offset{0};
             int64_t max_error{0};
             if (process_server_time_message(root, timestamp, &offset, &max_error)) {
-                this->event_state_->time_queue.send({offset, max_error, timestamp}, 0);
+                if (!this->event_state_->time_queue.send({offset, max_error, timestamp}, 0)) {
+                    SS_LOGW(TAG, "Time response queue full; dropping measurement");
+                }
             }
             break;
         }
