@@ -169,7 +169,9 @@ void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
 
     // Signal decode thread with all metadata in the notification
     ArtworkNotification notif{slot, write_idx, image_len, timestamp, image_format};
-    this->drain_task->notify_queue.send(notif, 0);
+    if (!this->drain_task->notify_queue.send(notif, 0)) {
+        SS_LOGW(TAG, "Artwork notify queue full; dropping image for slot %u", slot);
+    }
 }
 
 // ============================================================================
@@ -228,7 +230,9 @@ void ArtworkRole::Impl::handle_stream_end() {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state->queue.send(ArtworkEventType::STREAM_END, 0);
+    if (!this->event_state->queue.send(ArtworkEventType::STREAM_END, 0)) {
+        SS_LOGW(TAG, "Artwork event queue full; dropping STREAM_END");
+    }
 }
 
 void ArtworkRole::Impl::handle_stream_clear() {
@@ -238,7 +242,9 @@ void ArtworkRole::Impl::handle_stream_clear() {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state->queue.send(ArtworkEventType::STREAM_CLEAR, 0);
+    if (!this->event_state->queue.send(ArtworkEventType::STREAM_CLEAR, 0)) {
+        SS_LOGW(TAG, "Artwork event queue full; dropping STREAM_CLEAR");
+    }
 }
 
 // ============================================================================

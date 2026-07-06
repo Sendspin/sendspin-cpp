@@ -263,7 +263,9 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
 
     // Shadow the config for main-thread callback, then signal
     this->event_state->shadow_config.write(stream);
-    this->event_state->queue.send(VisualizerEventType::STREAM_START, 0);
+    if (!this->event_state->queue.send(VisualizerEventType::STREAM_START, 0)) {
+        SS_LOGW(TAG, "Visualizer event queue full; dropping STREAM_START");
+    }
 }
 
 void VisualizerRole::Impl::handle_stream_end() {
@@ -273,7 +275,9 @@ void VisualizerRole::Impl::handle_stream_end() {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state->queue.send(VisualizerEventType::STREAM_END, 0);
+    if (!this->event_state->queue.send(VisualizerEventType::STREAM_END, 0)) {
+        SS_LOGW(TAG, "Visualizer event queue full; dropping STREAM_END");
+    }
 }
 
 void VisualizerRole::Impl::handle_stream_clear() {
@@ -283,7 +287,9 @@ void VisualizerRole::Impl::handle_stream_clear() {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state->queue.send(VisualizerEventType::STREAM_CLEAR, 0);
+    if (!this->event_state->queue.send(VisualizerEventType::STREAM_CLEAR, 0)) {
+        SS_LOGW(TAG, "Visualizer event queue full; dropping STREAM_CLEAR");
+    }
 }
 
 // ============================================================================
