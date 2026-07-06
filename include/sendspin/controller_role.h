@@ -109,7 +109,7 @@ public:
  * auto& controller = client.add_controller();
  * controller.set_listener(&listener);
  * controller.send_command(SendspinControllerCommand::PLAY);
- * controller.send_command(SendspinControllerCommand::VOLUME, 128);
+ * controller.send_command(SendspinControllerCommand::VOLUME, 75);  // volume range is 0-100
  * @endcode
  */
 class ControllerRole {
