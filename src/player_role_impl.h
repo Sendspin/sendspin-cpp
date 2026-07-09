@@ -63,7 +63,7 @@ struct PlayerRole::Impl {
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
     void handle_binary(const uint8_t* data, size_t len) const;
-    void handle_stream_start(const ServerPlayerStreamObject& player_obj);
+    void handle_stream_start(const ServerPlayerStreamObject& player_obj) const;
     void handle_stream_end() const;
     void handle_stream_clear() const;
     void handle_server_command(const ServerCommandMessage& cmd) const;
@@ -85,6 +85,7 @@ struct PlayerRole::Impl {
     bool send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
                           uint8_t chunk_type, uint32_t timeout_ms) const;
     void enqueue_state_update(SendspinClientState state) const;
+    void enqueue_stream_event(PlayerStreamCallbackType event) const;
     void load_static_delay();
     void persist_static_delay() const;
     uint16_t get_effective_static_delay_ms() const;
@@ -111,6 +112,9 @@ struct PlayerRole::Impl {
     // 8-bit fields
     bool high_performance_requested_for_playback{false};
     bool muted{false};
+    // True between the drained STREAM_START and STREAM_END callbacks (main-thread only); keeps
+    // on_stream_end() from firing without a matching on_stream_start()
+    bool stream_active{false};
     std::atomic<bool> static_delay_adjustable{false};
     uint8_t volume{0};
 };

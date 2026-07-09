@@ -83,9 +83,12 @@ public:
     ///
     /// Fires on the sync task's background thread. May block up to timeout_ms.
     /// @param data Pointer to the decoded PCM audio data
-    /// @param length Number of bytes to write
+    /// @param length Number of bytes to write; always a whole number of PCM frames
     /// @param timeout_ms Maximum time to wait for the write to complete
-    /// @return Number of bytes actually written
+    /// @return Number of bytes actually written. Partial writes are allowed but MUST be a
+    /// whole number of PCM frames (a multiple of channels * bytes-per-sample): the sync task
+    /// counts played frames from this value, so a mid-frame count drifts the playtime estimate
+    /// and starts the next write mid-frame.
     virtual size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) = 0;
 
     /// @brief Called when a new audio stream starts. Fires on the main loop thread
@@ -206,7 +209,7 @@ public:
     uint16_t get_static_delay_ms() const;
 
     /// @brief Returns the current volume level
-    /// @return Current volume level (0-255).
+    /// @return Current volume level (0-100).
     uint8_t get_volume() const;
 
 private:
