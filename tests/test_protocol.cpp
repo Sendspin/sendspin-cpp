@@ -65,7 +65,8 @@ TEST(Protocol, ControllerCommandRoundTrip) {
         SendspinControllerCommand::MUTE,       SendspinControllerCommand::REPEAT_OFF,
         SendspinControllerCommand::REPEAT_ONE, SendspinControllerCommand::REPEAT_ALL,
         SendspinControllerCommand::SHUFFLE,    SendspinControllerCommand::UNSHUFFLE,
-        SendspinControllerCommand::SWITCH,
+        SendspinControllerCommand::SWITCH,     SendspinControllerCommand::SEEK,
+        SendspinControllerCommand::SEEK_RELATIVE,
     };
     for (const auto cmd : commands) {
         const auto parsed = controller_command_from_string(to_cstr(cmd));
