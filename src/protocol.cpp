@@ -404,9 +404,12 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
     if (hello_msg != nullptr) {
         hello_msg->server.server_id = root["payload"]["server_id"].as<std::string>();
         hello_msg->server.name = root["payload"]["name"].as<std::string>();
-        if (auto v = read_uint_field<uint16_t>(root["payload"]["version"], "version")) {
-            hello_msg->version = *v;
+        auto version = read_uint_field<uint16_t>(root["payload"]["version"], "version");
+        if (!version.has_value()) {
+            SS_LOGE(TAG, "Invalid version in server/hello message");
+            return false;
         }
+        hello_msg->version = *version;
 
         // Parse active_roles array
         hello_msg->active_roles.clear();
@@ -669,7 +672,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         if (vis_json["spectrum"].is<JsonObject>()) {
             JsonObject spec_json = vis_json["spectrum"];
             VisualizerSpectrumConfig spec_cfg{};
-            if (auto v = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins")) {
+            if (auto v = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins", 1)) {
                 spec_cfg.n_disp_bins = *v;
             }
             std::string scale_str = spec_json["scale"].as<std::string>();
@@ -690,6 +693,23 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
                 spec_cfg.rate_max = *v;
             }
             vis_obj.spectrum = spec_cfg;
+        }
+
+        // If SPECTRUM is advertised, a valid spectrum config with a non-zero bin count must be
+        // present; otherwise raw_frame_size is indeterminate and subsequent binary visualizer
+        // frames would misparse.
+        bool advertises_spectrum = false;
+        for (auto type : vis_obj.types) {
+            if (type == VisualizerDataType::SPECTRUM) {
+                advertises_spectrum = true;
+                break;
+            }
+        }
+        if (advertises_spectrum &&
+            (!vis_obj.spectrum.has_value() || vis_obj.spectrum->n_disp_bins == 0)) {
+            SS_LOGE(TAG, "Invalid stream/start message: SPECTRUM advertised without valid spectrum "
+                         "config");
+            return false;
         }
 
         stream_msg->visualizer = std::move(vis_obj);

@@ -349,6 +349,82 @@ TEST(Protocol, GroupUpdatePlaybackStateValidation) {
     }
 }
 
+// server/hello declares `version` a required field, so a present-but-malformed value (wrong type or
+// out of uint16 range) rejects the whole message rather than silently defaulting to 0, which would
+// break protocol version gating downstream.
+TEST(Protocol, ServerHelloRejectsInvalidVersion) {
+    const char* kBadVersions[] = {"\"1\"", "1.5", "70000", "null"};
+    for (const char* version : kBadVersions) {
+        JsonDocument doc;
+        JsonObject root;
+        std::string json = std::string(R"({"type":"server/hello","payload":{"server_id":"s1",)"
+                                        R"("name":"srv","version":)") +
+                           version + R"(,"active_roles":[],"connection_reason":"playback"}})";
+        ASSERT_TRUE(parse(json, doc, root)) << json;
+        ServerHelloMessage msg;
+        EXPECT_FALSE(process_server_hello_message(root, &msg)) << json;
+    }
+
+    // Control: a valid integer version is accepted and stored.
+    JsonDocument doc_ok;
+    JsonObject root_ok;
+    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"server_id":"s1","name":"srv",)"
+                      R"("version":7,"active_roles":[],"connection_reason":"playback"}})",
+                      doc_ok, root_ok));
+    ServerHelloMessage ok;
+    ASSERT_TRUE(process_server_hello_message(root_ok, &ok));
+    EXPECT_EQ(ok.version, 7);
+}
+
+// If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a non-zero
+// bin count must be present. Otherwise raw_frame_size would be indeterminate and subsequent binary
+// visualizer frames would misparse, so the whole stream/start is rejected.
+TEST(Protocol, StreamStartRejectsSpectrumWithoutValidConfig) {
+    // (a) SPECTRUM advertised but no spectrum object at all.
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(
+            R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"]}}})", doc,
+            root));
+        StreamStartMessage msg;
+        EXPECT_FALSE(process_stream_start_message(root, &msg));
+    }
+    // (b) spectrum object present but n_disp_bins is zero.
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
+                          R"("spectrum":{"n_disp_bins":0}}}})",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_FALSE(process_stream_start_message(root, &msg));
+    }
+    // (c) n_disp_bins present but not an integer.
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
+                          R"("spectrum":{"n_disp_bins":"32"}}}})",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_FALSE(process_stream_start_message(root, &msg));
+    }
+
+    // Control: SPECTRUM advertised with a valid config is accepted.
+    JsonDocument doc_ok;
+    JsonObject root_ok;
+    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
+                      R"("spectrum":{"n_disp_bins":32,"scale":"log","f_min":20,"f_max":20000,)"
+                      R"("rate_max":30}}}})",
+                      doc_ok, root_ok));
+    StreamStartMessage ok;
+    ASSERT_TRUE(process_stream_start_message(root_ok, &ok));
+    ASSERT_TRUE(ok.visualizer.has_value());
+    ASSERT_TRUE(ok.visualizer->spectrum.has_value());
+    EXPECT_EQ(ok.visualizer->spectrum->n_disp_bins, 32);
+}
+
 // The refactored color parser reads each component as a uint8, so a non-integer (or out-of-range)
 // component fails the type check and the whole color is treated as absent.
 TEST(Protocol, ColorRejectsNonIntegerComponent) {
