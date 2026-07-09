@@ -324,6 +324,23 @@ TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
     EXPECT_EQ(ok.player->channels.value(), 2);
 }
 
+// The refactored color parser reads each component as a uint8, so a non-integer (or out-of-range)
+// component fails the type check and the whole color is treated as absent.
+TEST(Protocol, ColorRejectsNonIntegerComponent) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"color":)"
+                      R"({"timestamp":1,"primary":[10,"x",30]}}})",
+                      doc, root));
+    ServerStateMessage msg;
+    ASSERT_TRUE(process_server_state_message(root, &msg));
+    ASSERT_TRUE(msg.color.has_value());
+
+    ServerColorStateObject current;
+    apply_color_state_deltas(&current, msg.color.value());
+    EXPECT_FALSE(current.primary.has_value());  // malformed component -> whole color dropped
+}
+
 // ============================================================================
 // format_client_time_message: hand-rolled int64 formatter checked against snprintf
 // ============================================================================

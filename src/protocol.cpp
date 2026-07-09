@@ -269,11 +269,13 @@ static bool process_server_metadata_state_object(const JsonObject metadata_objec
     return true;
 }
 
-// Parses a single `[R, G, B]` color field into a tri-state delta entry. A field that is absent on
-// the wire leaves `out` untouched (outer nullopt). An explicit `null` writes outer-engaged +
-// inner-nullopt (clear). A 3-element array of ints in 0-255 writes outer-engaged + inner-engaged.
-// Malformed values are logged and skipped (treated as absent).
-static void parse_color_field(JsonVariantConst var, std::optional<std::optional<RgbColor>>* out) {
+// Parses a single `[R, G, B]` color field into a tri-state delta entry. Absent leaves `out`
+// untouched (outer nullopt); explicit `null` writes outer-engaged + inner-nullopt (clear); a
+// 3-element array of 0-255 integers writes the color. Any malformed value is logged and skipped
+// (treated as absent). Each component is read as a uint8, so its type check is also its range
+// check.
+static void parse_color_field(JsonVariantConst var, const char* name,
+                              std::optional<std::optional<RgbColor>>* out) {
     if (var.isUnbound()) {
         return;
     }
@@ -282,27 +284,21 @@ static void parse_color_field(JsonVariantConst var, std::optional<std::optional<
         return;
     }
     if (!var.is<JsonArrayConst>()) {
-        SS_LOGW(TAG, "Color field is not an array; ignoring");
+        SS_LOGW(TAG, "Ignoring field '%s': expected [R, G, B] array", name);
         return;
     }
     JsonArrayConst arr = var.as<JsonArrayConst>();
     if (arr.size() != 3) {
-        SS_LOGW(TAG, "Color field array length %zu != 3; ignoring", arr.size());
+        SS_LOGW(TAG, "Ignoring field '%s': expected 3 components, got %zu", name, arr.size());
         return;
     }
     RgbColor color{};
     for (size_t i = 0; i < 3; i++) {
-        JsonVariantConst component = arr[i];
-        if (!component.is<int>()) {
-            SS_LOGW(TAG, "Color field component is not an integer; ignoring");
-            return;
+        auto component = read_uint_field<uint8_t>(arr[i], name);
+        if (!component) {
+            return;  // out of [0, 255] or wrong type; already logged
         }
-        int value = component.as<int>();
-        if (value < 0 || value > 255) {
-            SS_LOGW(TAG, "Color field component %d out of range 0-255; ignoring", value);
-            return;
-        }
-        color[i] = static_cast<uint8_t>(value);
+        color[i] = *component;
     }
     *out = color;
 }
@@ -319,12 +315,14 @@ static bool process_server_color_state_object(const JsonObject color_object,
     }
     color_delta->timestamp = color_object["timestamp"].as<int64_t>();
 
-    parse_color_field(color_object["background_dark"], &color_delta->background_dark);
-    parse_color_field(color_object["background_light"], &color_delta->background_light);
-    parse_color_field(color_object["primary"], &color_delta->primary);
-    parse_color_field(color_object["accent"], &color_delta->accent);
-    parse_color_field(color_object["on_dark"], &color_delta->on_dark);
-    parse_color_field(color_object["on_light"], &color_delta->on_light);
+    parse_color_field(color_object["background_dark"], "background_dark",
+                      &color_delta->background_dark);
+    parse_color_field(color_object["background_light"], "background_light",
+                      &color_delta->background_light);
+    parse_color_field(color_object["primary"], "primary", &color_delta->primary);
+    parse_color_field(color_object["accent"], "accent", &color_delta->accent);
+    parse_color_field(color_object["on_dark"], "on_dark", &color_delta->on_dark);
+    parse_color_field(color_object["on_light"], "on_light", &color_delta->on_light);
 
     return true;
 }
