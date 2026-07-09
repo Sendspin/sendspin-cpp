@@ -124,6 +124,19 @@ public:
         return this->instance_id;
     }
 
+    /// @brief Records the accept/provisional timestamp (microseconds from platform_time_us()).
+    /// Called when the connection is admitted into a manager slot (on_new_connection /
+    /// connect_to), which may happen on a network thread. The provisional-connection timeout in
+    /// ConnectionManager::loop() reads it on the main loop, hence atomic.
+    void set_provisional_time_us(int64_t t) {
+        this->provisional_time_us_.store(t, std::memory_order_relaxed);
+    }
+
+    /// @brief Returns the accept/provisional timestamp, or 0 if not yet set.
+    int64_t get_provisional_time_us() const {
+        return this->provisional_time_us_.load(std::memory_order_relaxed);
+    }
+
     /// @brief Sends a text message to the server with a completion callback
     /// @param message The message string to send.
     /// @param cb Callback invoked with the send result. On asynchronous transports it is not
@@ -372,6 +385,11 @@ protected:
     std::unique_ptr<SendspinTimeFilter> time_filter_;
 
     // 64-bit fields
+
+    /// Monotonic timestamp (platform_time_us()) when this connection was admitted into a manager
+    /// slot. Atomic because it is written at admission (possibly on a network thread) and read on
+    /// the main loop (provisional-connection timeout check). 0 = not yet set.
+    std::atomic<int64_t> provisional_time_us_{0};
 
     /// EMA (microseconds) of format_client_time_message() duration. Atomic because the ESP
     /// server worker thread updates it while the hub thread reads it for logging.

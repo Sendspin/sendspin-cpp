@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,19 @@ struct ServerHelloEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection that received the hello
     SendspinConnectionReason connection_reason;
 };
+
+/// @brief Timeout for provisional (pre-handshake) connections in seconds.
+/// A connection that has not completed the hello handshake within this window is closed. This
+/// reaps connections whose transport never delivers a close for sockets that die before the
+/// WebSocket session is established (host IXWebSocket, issue #75) as well as peers that connect
+/// and stall without completing the hello (both platforms). Mirrors the encryption branch's
+/// provisional-connection timeout, whose reap is gated on is_awaiting_activate();
+/// !is_handshake_complete() is the plaintext analogue.
+static constexpr double PROVISIONAL_CONNECTION_TIMEOUT_S = 30.0;
+
+/// @brief Timeout in microseconds (derived from PROVISIONAL_CONNECTION_TIMEOUT_S).
+static constexpr int64_t PROVISIONAL_CONNECTION_TIMEOUT_US =
+    static_cast<int64_t>(PROVISIONAL_CONNECTION_TIMEOUT_S * 1'000'000LL);
 
 /// @brief Hello retry state for exponential backoff
 struct HelloRetryState {
@@ -182,6 +196,7 @@ private:
     // Connection lifecycle
     // ========================================
     /// @brief Tears down a lost connection and promotes the pending connection if one exists.
+    /// Caller must hold conn_ptr_mutex_.
     /// @param conn The connection that was lost.
     void on_connection_lost(SendspinConnection* conn);
     /// @brief Decides whether to switch from the current connection to the new one.
@@ -199,6 +214,17 @@ private:
     /// @param reason The goodbye reason to send before closing.
     void disconnect_and_release(std::shared_ptr<SendspinConnection>&& conn,
                                 SendspinGoodbyeReason reason);
+    /// @brief Single teardown path: releases a managed connection's slot, cleans up client state
+    /// (current slot only), promotes the pending connection, and optionally sends a goodbye.
+    ///
+    /// No-op if conn is null. If conn is not a managed connection (already released by an
+    /// earlier event in the same loop() pass), only its stale hello-retry entry, if any, is
+    /// pruned. Caller must hold conn_ptr_mutex_.
+    ///
+    /// @param conn The connection to drop; must be current_connection_ or pending_connection_.
+    /// @param goodbye Goodbye reason to send before closing, or nullopt when the transport is
+    ///        already gone (connection-lost path) so no goodbye should be attempted.
+    void drop_connection(SendspinConnection* conn, std::optional<SendspinGoodbyeReason> goodbye);
 
     // Struct fields
     std::mutex conn_mutex_;              // Protects deferred lifecycle event queues
