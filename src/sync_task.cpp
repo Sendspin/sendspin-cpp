@@ -143,14 +143,26 @@ bool SyncTask::start(bool task_stack_in_psram, unsigned priority) {
 // ============================================================================
 
 void SyncTask::signal_stream_end() {
+    // The player role signals lifecycle events unconditionally, but init() only runs when the
+    // role has audio formats and a listener; on ESP, setting bits on uncreated event flags is a
+    // null-handle crash, so all signal/query paths guard on is_initialized().
+    if (!this->is_initialized()) {
+        return;
+    }
     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_END);
 }
 
 void SyncTask::signal_stream_clear() {
+    if (!this->is_initialized()) {
+        return;
+    }
     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_CLEAR);
 }
 
 void SyncTask::signal_stream_start() {
+    if (!this->is_initialized()) {
+        return;
+    }
     this->event_flags_.set(EventGroupBits::COMMAND_START);
 }
 
@@ -529,9 +541,8 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
         return DecodeResult::SUCCESS;
     }
 
-    if ((sync_context.encoded_entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO) &&
-        (sync_context.encoded_entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO)) {
-        // New codec header
+    if (sync_context.encoded_entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO) {
+        // New codec header (the stream/clear marker was already handled above)
         sync_context.decoder->reset_decoders();
         AudioStreamInfo decoded_stream_info;
         if (!sync_context.decoder->process_header(
@@ -576,8 +587,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
                 }
             }
         }
-    } else if ((sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) &&
-               (sync_context.encoded_entry->chunk_type == CHUNK_TYPE_ENCODED_AUDIO)) {
+    } else if (sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) {
         int64_t client_timestamp =
             this->client_->get_client_time(sync_context.encoded_entry->timestamp) -
             static_cast<int64_t>(this->player_impl_->get_effective_static_delay_ms()) * US_PER_MS -
@@ -638,7 +648,6 @@ bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
             continue;  // Timed out; check flags and try again
         }
         if (entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO &&
-            entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO &&
             entry->chunk_type != CHUNK_TYPE_STREAM_CLEAR_MARKER) {
             // Found a codec header
             sync_context.encoded_entry = entry;
@@ -660,7 +669,6 @@ void SyncTask::drain_ring_buffer(SyncContext& sync_context) {
             break;
         }
         if (entry->chunk_type != CHUNK_TYPE_ENCODED_AUDIO &&
-            entry->chunk_type != CHUNK_TYPE_DECODED_AUDIO &&
             entry->chunk_type != CHUNK_TYPE_STREAM_CLEAR_MARKER) {
             // Codec header for the next stream; hold onto it
             sync_context.encoded_entry = entry;

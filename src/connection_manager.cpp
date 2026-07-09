@@ -31,6 +31,8 @@ static constexpr uint32_t FNV_OFFSET_BASIS = 2166136261UL;
 static constexpr uint32_t FNV_PRIME = 16777619UL;
 static constexpr int64_t HELLO_INITIAL_DELAY_MS = 100LL;
 static constexpr int64_t HELLO_INITIAL_DELAY_US = HELLO_INITIAL_DELAY_MS * US_PER_MS;
+static constexpr int64_t WS_SERVER_START_RETRY_MS = 5000LL;
+static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * US_PER_MS;
 
 // ============================================================================
 // Constructor / Destructor
@@ -72,9 +74,27 @@ void ConnectionManager::connect_to(const std::string& url) {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         if (this->current_connection_ != nullptr && this->current_connection_->is_connected()) {
             SS_LOGD(TAG, "Existing connection active, new connection will go through handoff");
+            // Release any existing pending connection (e.g. an inbound handoff candidate) before
+            // overwriting the slot, mirroring on_new_connection and complete_handoff; otherwise it
+            // is dropped with no goodbye and, on ESP, leaves its httpd session pinned.
+            if (this->pending_connection_ != nullptr) {
+                this->remove_hello_retry(this->pending_connection_.get());
+                this->disconnect_and_release(std::move(this->pending_connection_),
+                                             SendspinGoodbyeReason::ANOTHER_SERVER);
+            }
             this->pending_connection_ = std::move(client_conn);
             this->pending_connection_->start();
         } else {
+            // A present-but-disconnected current connection (its close event not yet processed) is
+            // being replaced. Tear its state down as on_connection_lost would, instead of
+            // overwriting the slot and orphaning dispatch/time-filter/client state and its retry.
+            if (this->current_connection_ != nullptr) {
+                this->current_connection_->disable_message_dispatch();
+                this->client_->time_burst_->reset();
+                this->client_->cleanup_connection_state();
+                this->remove_hello_retry(this->current_connection_.get());
+                this->current_connection_.reset();
+            }
             this->current_connection_ = std::move(client_conn);
             this->current_connection_->start();
         }
@@ -132,12 +152,16 @@ void ConnectionManager::init_server(SendspinClient* client) {
 }
 
 void ConnectionManager::loop() {
-    // Start WS server when network becomes ready
+    // Start WS server when network becomes ready. A persistent failure (e.g. the server port is
+    // already in use) is retried with backoff instead of on every tick, which would spam the log.
     if (this->ws_server_ != nullptr && !this->ws_server_->is_started()) {
-        if (this->client_->network_provider_ &&
+        const int64_t now_us = platform_time_us();
+        if (now_us >= this->ws_server_start_retry_time_us_ && this->client_->network_provider_ &&
             this->client_->network_provider_->is_network_ready()) {
-            this->ws_server_->start(this->client_, this->client_->config_.httpd_psram_stack,
-                                    this->client_->config_.httpd_priority);
+            if (!this->ws_server_->start(this->client_, this->client_->config_.httpd_psram_stack,
+                                         this->client_->config_.httpd_priority)) {
+                this->ws_server_start_retry_time_us_ = now_us + WS_SERVER_START_RETRY_US;
+            }
         }
     }
 

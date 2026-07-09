@@ -20,6 +20,7 @@
 #include "connection.h"
 #include <esp_http_server.h>
 
+#include <atomic>
 #include <functional>
 
 namespace sendspin {
@@ -84,6 +85,16 @@ public:
     /// @brief Checks if the socket connection is valid
     /// @return true if connected, false otherwise.
     bool is_connected() const override;
+
+    /// @brief Marks the connection closed after the httpd session ends
+    ///
+    /// Called from the ws server's close notification (httpd thread). Without this,
+    /// is_connected() stayed true until the manager dropped the connection on the main loop,
+    /// and a queued async send in that window could resolve the stale sockfd against a
+    /// recycled httpd session and write the frame to the wrong peer.
+    void mark_closed() {
+        this->closed_.store(true, std::memory_order_release);
+    }
 
     /// @brief Sends a text message to the server with a completion callback
     /// @param message The message string to send.
@@ -150,6 +161,11 @@ protected:
 
     /// @brief The socket file descriptor for this connection
     int sockfd_{-1};
+
+    // 8-bit fields
+
+    /// @brief Set once the httpd session has closed (see mark_closed())
+    std::atomic<bool> closed_{false};
 };
 
 }  // namespace sendspin

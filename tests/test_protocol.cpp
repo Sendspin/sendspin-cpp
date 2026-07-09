@@ -65,7 +65,8 @@ TEST(Protocol, ControllerCommandRoundTrip) {
         SendspinControllerCommand::MUTE,       SendspinControllerCommand::REPEAT_OFF,
         SendspinControllerCommand::REPEAT_ONE, SendspinControllerCommand::REPEAT_ALL,
         SendspinControllerCommand::SHUFFLE,    SendspinControllerCommand::UNSHUFFLE,
-        SendspinControllerCommand::SWITCH,
+        SendspinControllerCommand::SWITCH,     SendspinControllerCommand::SEEK,
+        SendspinControllerCommand::SEEK_RELATIVE,
     };
     for (const auto cmd : commands) {
         const auto parsed = controller_command_from_string(to_cstr(cmd));
@@ -223,6 +224,241 @@ TEST(Protocol, ColorRangeValidationAndMerge) {
 
     // on_dark was explicit null -> cleared.
     EXPECT_FALSE(current.on_dark.has_value());
+}
+
+// ============================================================================
+// Scalar field validation: strict types, range bounds, warn-and-drop
+// ============================================================================
+
+namespace {
+
+// Wraps a player command object in a server/command envelope, parses it, and returns the parsed
+// player command (nullopt if the envelope or command failed to parse). The command object's fields
+// are std::optional, so has_value() cleanly distinguishes an applied field from a dropped one.
+std::optional<ServerPlayerCommandObject> parse_player_command(const std::string& player_json) {
+    const std::string json =
+        R"({"type":"server/command","payload":{"player":)" + player_json + "}}";
+    JsonDocument doc;
+    JsonObject root;
+    if (!parse(json, doc, root)) {
+        return std::nullopt;
+    }
+    ServerCommandMessage msg;
+    if (!process_server_command_message(root, &msg)) {
+        return std::nullopt;
+    }
+    return msg.player;
+}
+
+}  // namespace
+
+// Volume is validated against the protocol range [0, 100]. A valid value is applied; a value that is
+// in-type but out-of-range, or out-of-type entirely, is dropped (warn-and-drop) rather than silently
+// wrapped into the narrow field.
+TEST(Protocol, PlayerCommandVolumeRangeValidation) {
+    auto valid = parse_player_command(R"({"command":"volume","volume":50})");
+    ASSERT_TRUE(valid.has_value());
+    ASSERT_TRUE(valid->volume.has_value());
+    EXPECT_EQ(valid->volume.value(), 50);
+
+    // 150 fits uint8 but exceeds the protocol maximum of 100 -> dropped.
+    auto over_max = parse_player_command(R"({"command":"volume","volume":150})");
+    ASSERT_TRUE(over_max.has_value());
+    EXPECT_FALSE(over_max->volume.has_value());
+
+    // 300 does not fit uint8 at all -> dropped (a truncating cast would have wrapped it to 44).
+    auto over_type = parse_player_command(R"({"command":"volume","volume":300})");
+    ASSERT_TRUE(over_type.has_value());
+    EXPECT_FALSE(over_type->volume.has_value());
+}
+
+// Booleans are strict: only genuine JSON true/false is accepted; a 0/1 integer is dropped.
+TEST(Protocol, PlayerCommandBooleanStrictness) {
+    auto real_bool = parse_player_command(R"({"command":"mute","mute":true})");
+    ASSERT_TRUE(real_bool.has_value());
+    ASSERT_TRUE(real_bool->mute.has_value());
+    EXPECT_TRUE(real_bool->mute.value());
+
+    auto int_bool = parse_player_command(R"({"command":"mute","mute":1})");
+    ASSERT_TRUE(int_bool.has_value());
+    EXPECT_FALSE(int_bool->mute.has_value());  // integer 1 is not a JSON boolean -> dropped
+}
+
+// Integer fields reject a float representation, even one with an integral value.
+TEST(Protocol, PlayerCommandRejectsFloatForInteger) {
+    auto valid = parse_player_command(R"({"command":"set_static_delay","static_delay_ms":250})");
+    ASSERT_TRUE(valid.has_value());
+    ASSERT_TRUE(valid->static_delay_ms.has_value());
+    EXPECT_EQ(valid->static_delay_ms.value(), 250);
+
+    auto fractional = parse_player_command(R"({"command":"set_static_delay","static_delay_ms":12.5})");
+    ASSERT_TRUE(fractional.has_value());
+    EXPECT_FALSE(fractional->static_delay_ms.has_value());
+
+    auto integral_float =
+        parse_player_command(R"({"command":"set_static_delay","static_delay_ms":12.0})");
+    ASSERT_TRUE(integral_float.has_value());
+    EXPECT_FALSE(integral_float->static_delay_ms.has_value());
+}
+
+// A malformed required scalar in stream/start (channels out of range) is dropped, leaving the player
+// object incomplete, so the whole message is rejected instead of being accepted with a bogus value.
+TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"player":{"codec":"pcm",)"
+                      R"("sample_rate":44100,"channels":300,"bit_depth":16}}}})",
+                      doc, root));
+    StreamStartMessage msg;
+    EXPECT_FALSE(process_stream_start_message(root, &msg));
+
+    // Control: the same message with an in-range channel count is accepted.
+    JsonDocument doc_ok;
+    JsonObject root_ok;
+    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"player":{"codec":"pcm",)"
+                      R"("sample_rate":44100,"channels":2,"bit_depth":16}}}})",
+                      doc_ok, root_ok));
+    StreamStartMessage ok;
+    EXPECT_TRUE(process_stream_start_message(root_ok, &ok));
+    ASSERT_TRUE(ok.player.has_value());
+    ASSERT_TRUE(ok.player->channels.has_value());
+    EXPECT_EQ(ok.player->channels.value(), 2);
+}
+
+// Enum fields are validated against the known wire strings: a recognized value is applied, an
+// unrecognized one is dropped (leaving the field untouched) rather than clearing or storing garbage.
+TEST(Protocol, GroupUpdatePlaybackStateValidation) {
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(
+            parse(R"({"type":"group/update","payload":{"playback_state":"playing"}})", doc, root));
+        GroupUpdateMessage msg;
+        ASSERT_TRUE(process_group_update_message(root, &msg));
+        ASSERT_TRUE(msg.group.playback_state.has_value());
+        EXPECT_EQ(msg.group.playback_state.value(), SendspinPlaybackState::PLAYING);
+    }
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(
+            parse(R"({"type":"group/update","payload":{"playback_state":"bogus"}})", doc, root));
+        GroupUpdateMessage msg;
+        ASSERT_TRUE(process_group_update_message(root, &msg));
+        EXPECT_FALSE(msg.group.playback_state.has_value());  // unknown state dropped
+    }
+}
+
+// server/hello declares `version` a required field, so a present-but-malformed value (wrong type or
+// out of uint16 range) rejects the whole message rather than silently defaulting to 0, which would
+// break protocol version gating downstream.
+TEST(Protocol, ServerHelloRejectsInvalidVersion) {
+    const char* kBadVersions[] = {"\"1\"", "1.5", "70000", "null"};
+    for (const char* version : kBadVersions) {
+        JsonDocument doc;
+        JsonObject root;
+        std::string json = std::string(R"({"type":"server/hello","payload":{"server_id":"s1",)"
+                                        R"("name":"srv","version":)") +
+                           version + R"(,"active_roles":[],"connection_reason":"playback"}})";
+        ASSERT_TRUE(parse(json, doc, root)) << json;
+        ServerHelloMessage msg;
+        EXPECT_FALSE(process_server_hello_message(root, &msg)) << json;
+    }
+
+    // Control: a valid integer version is accepted and stored.
+    JsonDocument doc_ok;
+    JsonObject root_ok;
+    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"server_id":"s1","name":"srv",)"
+                      R"("version":7,"active_roles":[],"connection_reason":"playback"}})",
+                      doc_ok, root_ok));
+    ServerHelloMessage ok;
+    ASSERT_TRUE(process_server_hello_message(root_ok, &ok));
+    EXPECT_EQ(ok.version, 7);
+}
+
+// If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a non-zero
+// bin count must be present. Otherwise raw_frame_size would be indeterminate and subsequent binary
+// visualizer frames would misparse, so the whole stream/start is rejected.
+TEST(Protocol, StreamStartRejectsSpectrumWithoutValidConfig) {
+    // (a) SPECTRUM advertised but no spectrum object at all.
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(
+            R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"]}}})", doc,
+            root));
+        StreamStartMessage msg;
+        EXPECT_FALSE(process_stream_start_message(root, &msg));
+    }
+    // (b) spectrum object present but n_disp_bins is zero.
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
+                          R"("spectrum":{"n_disp_bins":0}}}})",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_FALSE(process_stream_start_message(root, &msg));
+    }
+    // (c) n_disp_bins present but not an integer.
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
+                          R"("spectrum":{"n_disp_bins":"32"}}}})",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_FALSE(process_stream_start_message(root, &msg));
+    }
+
+    // Control: SPECTRUM advertised with a valid config is accepted.
+    JsonDocument doc_ok;
+    JsonObject root_ok;
+    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
+                      R"("spectrum":{"n_disp_bins":32,"scale":"log","f_min":20,"f_max":20000,)"
+                      R"("rate_max":30}}}})",
+                      doc_ok, root_ok));
+    StreamStartMessage ok;
+    ASSERT_TRUE(process_stream_start_message(root_ok, &ok));
+    ASSERT_TRUE(ok.visualizer.has_value());
+    ASSERT_TRUE(ok.visualizer->spectrum.has_value());
+    EXPECT_EQ(ok.visualizer->spectrum->n_disp_bins, 32);
+}
+
+// The refactored color parser reads each component as a uint8, so a non-integer (or out-of-range)
+// component fails the type check and the whole color is treated as absent.
+TEST(Protocol, ColorRejectsNonIntegerComponent) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"color":)"
+                      R"({"timestamp":1,"primary":[10,"x",30]}}})",
+                      doc, root));
+    ServerStateMessage msg;
+    ASSERT_TRUE(process_server_state_message(root, &msg));
+    ASSERT_TRUE(msg.color.has_value());
+
+    ServerColorStateObject current;
+    apply_color_state_deltas(&current, msg.color.value());
+    EXPECT_FALSE(current.primary.has_value());  // malformed component -> whole color dropped
+}
+
+// supported_commands is validated element-by-element. The controller role is frozen at v1, so an
+// unrecognized command is a non-compliant value that is dropped (and logged), while the valid
+// commands around it are kept in order.
+TEST(Protocol, ControllerSupportedCommandsValidation) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
+                      R"({"supported_commands":["play","bogus","mute"]}}})",
+                      doc, root));
+    ServerStateMessage msg;
+    ASSERT_TRUE(process_server_state_message(root, &msg));
+    ASSERT_TRUE(msg.controller.has_value());
+
+    const auto& commands = msg.controller->supported_commands;
+    ASSERT_EQ(commands.size(), 2u);  // "bogus" dropped
+    EXPECT_EQ(commands[0], SendspinControllerCommand::PLAY);
+    EXPECT_EQ(commands[1], SendspinControllerCommand::MUTE);
 }
 
 // ============================================================================

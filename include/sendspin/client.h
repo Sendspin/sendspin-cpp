@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -205,6 +206,10 @@ public:
     bool start_server();
 
     /// @brief Initiates a client connection to a Sendspin server at the given URL
+    ///
+    /// Must be called from the main loop thread: it tears down and replaces connection state
+    /// (time filter, dispatch, client state) directly rather than deferring to loop(), so calling
+    /// it concurrently with loop() would race those mutations.
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
@@ -470,6 +475,9 @@ private:
     /// Internal-RAM scratch arena for parsing incoming JSON; null unless config_.json_arena_size >
     /// 0
     std::unique_ptr<SendspinArenaAllocator> json_arena_;
+    /// Serializes process_json_message() (and its use of json_arena_) across the network threads
+    /// of concurrently live connections (current + pending during a handoff).
+    std::mutex json_processing_mutex_;
     SendspinClientListener* listener_{nullptr};
 #ifdef SENDSPIN_ENABLE_METADATA
     std::unique_ptr<MetadataRole> metadata_;

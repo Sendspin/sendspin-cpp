@@ -204,6 +204,13 @@ public:
     /// @param storage Pointer to pre-allocated storage (must outlive this object).
     /// @return true on success.
     bool create(size_t size, uint8_t* storage) {
+        // Item offsets always advance in ALIGNMENT multiples, so an unaligned tail would
+        // desynchronize the writer/reader dummy-filler accounting (and a tail smaller than
+        // ItemHeader can never hold the wrap marker). Ignore any trailing remainder.
+        size &= ~(ALIGNMENT - 1);
+        if (size < sizeof(ItemHeader) + ALIGNMENT) {
+            return false;
+        }
         this->storage_ = storage;
         this->storage_size_ = size;
         this->write_offset_ = 0;

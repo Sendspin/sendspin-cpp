@@ -20,6 +20,7 @@
 #include "connection.h"
 #include <esp_websocket_client.h>
 
+#include <atomic>
 #include <functional>
 #include <string>
 
@@ -162,8 +163,9 @@ protected:
     /// @brief Whether to automatically reconnect after connection loss
     bool auto_reconnect_{true};
 
-    /// @brief Whether the websocket is currently connected
-    bool connected_{false};
+    /// @brief Whether the websocket is currently connected. Written by the transport task,
+    /// read cross-thread via is_connected(), hence atomic.
+    std::atomic<bool> connected_{false};
 };
 
 }  // namespace sendspin

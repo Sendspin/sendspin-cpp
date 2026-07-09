@@ -110,7 +110,7 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
 }
 
 bool SendspinServerConnection::is_connected() const {
-    return this->sockfd_ >= 0;
+    return this->sockfd_ >= 0 && !this->closed_.load(std::memory_order_acquire);
 }
 
 SsErr SendspinServerConnection::send_text_message(const std::string& message,
@@ -211,6 +211,10 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
     // Allocate/grow directly into the websocket payload buffer (zero-copy)
     uint8_t* dest = this->prepare_receive_buffer(ws_pkt.len);
     if (dest == nullptr) {
+        // Returning an error makes httpd close the session, which tears the slot down via
+        // the close notification on the main loop
+        SS_LOGE(TAG, "Allocation failed, dropping connection");
+        this->disable_message_dispatch();
         return ESP_ERR_NO_MEM;
     }
 
