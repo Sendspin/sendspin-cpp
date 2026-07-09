@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <optional>
 
 namespace sendspin {
 
@@ -28,6 +30,50 @@ static const char* const TAG = "sendspin.protocol";
 // ============================================================================
 // Static helpers
 // ============================================================================
+
+/// @brief Protocol maximum for volume fields (volume is 0-100 on the wire).
+static constexpr uint8_t VOLUME_MAX = 100;
+
+/// @brief Reads an optional unsigned-integer field with strict type and optional range validation.
+/// Absent or null returns nullopt silently (a legal state for an optional field). A present value
+/// that is the wrong JSON type, outside the target type's range, or outside [min, max] is logged
+/// and dropped. Strict about representation: a float or numeric string is rejected, matching a
+/// spec-compliant server that sends genuine JSON integers.
+template <typename T>
+static std::optional<T> read_uint_field(JsonVariantConst var, const char* name,
+                                        T min = std::numeric_limits<T>::min(),
+                                        T max = std::numeric_limits<T>::max()) {
+    if (var.isUnbound() || var.isNull()) {
+        return std::nullopt;
+    }
+    if (!var.is<T>()) {
+        SS_LOGW(TAG, "Ignoring field '%s': expected integer in [%llu, %llu]", name,
+                static_cast<unsigned long long>(min), static_cast<unsigned long long>(max));
+        return std::nullopt;
+    }
+    T value = var.as<T>();
+    if (value < min || value > max) {
+        SS_LOGW(TAG, "Ignoring field '%s': %llu outside [%llu, %llu]", name,
+                static_cast<unsigned long long>(value), static_cast<unsigned long long>(min),
+                static_cast<unsigned long long>(max));
+        return std::nullopt;
+    }
+    return value;
+}
+
+/// @brief Reads an optional boolean field. Absent or null returns nullopt silently; a present
+/// non-boolean value (including 0/1 integers) is logged and dropped. Strict: only genuine JSON
+/// true/false is accepted, matching a spec-compliant server.
+static std::optional<bool> read_bool_field(JsonVariantConst var, const char* name) {
+    if (var.isUnbound() || var.isNull()) {
+        return std::nullopt;
+    }
+    if (!var.is<bool>()) {
+        SS_LOGW(TAG, "Ignoring field '%s': expected boolean", name);
+        return std::nullopt;
+    }
+    return var.as<bool>();
+}
 
 static bool process_player_stream_object(const JsonObject player_object,
                                          ServerPlayerStreamObject* player_obj,
@@ -52,16 +98,16 @@ static bool process_player_stream_object(const JsonObject player_object,
         player_obj->codec = codec.value_or(SendspinCodecFormat::UNSUPPORTED);
     }
 
-    if (player_object["sample_rate"].is<JsonVariant>()) {
-        player_obj->sample_rate = player_object["sample_rate"].as<uint32_t>();
+    if (auto v = read_uint_field<uint32_t>(player_object["sample_rate"], "sample_rate")) {
+        player_obj->sample_rate = *v;
     }
 
-    if (player_object["channels"].is<JsonVariant>()) {
-        player_obj->channels = player_object["channels"].as<uint8_t>();
+    if (auto v = read_uint_field<uint8_t>(player_object["channels"], "channels")) {
+        player_obj->channels = *v;
     }
 
-    if (player_object["bit_depth"].is<JsonVariant>()) {
-        player_obj->bit_depth = player_object["bit_depth"].as<uint8_t>();
+    if (auto v = read_uint_field<uint8_t>(player_object["bit_depth"], "bit_depth")) {
+        player_obj->bit_depth = *v;
     }
 
     if (player_object["codec_header"].is<JsonVariant>()) {
@@ -105,12 +151,12 @@ static bool process_artwork_channel_object(const JsonObject channel_object,
         channel->format = image_format_from_string(format_str);
     }
 
-    if (channel_object["width"].is<JsonVariant>()) {
-        channel->width = channel_object["width"].as<uint16_t>();
+    if (auto v = read_uint_field<uint16_t>(channel_object["width"], "width")) {
+        channel->width = *v;
     }
 
-    if (channel_object["height"].is<JsonVariant>()) {
-        channel->height = channel_object["height"].as<uint16_t>();
+    if (auto v = read_uint_field<uint16_t>(channel_object["height"], "height")) {
+        channel->height = *v;
     }
 
     return true;
@@ -132,16 +178,16 @@ static bool process_server_player_command_object(const JsonObject player_object,
     player_cmd->command = command.value();
 
     // Parse optional fields
-    if (player_object["volume"].is<JsonVariant>()) {
-        player_cmd->volume = player_object["volume"].as<uint8_t>();
+    if (auto v = read_uint_field<uint8_t>(player_object["volume"], "volume", 0, VOLUME_MAX)) {
+        player_cmd->volume = *v;
     }
 
-    if (player_object["mute"].is<JsonVariant>()) {
-        player_cmd->mute = player_object["mute"].as<bool>();
+    if (auto v = read_bool_field(player_object["mute"], "mute")) {
+        player_cmd->mute = *v;
     }
 
-    if (player_object["static_delay_ms"].is<JsonVariant>()) {
-        player_cmd->static_delay_ms = player_object["static_delay_ms"].as<uint16_t>();
+    if (auto v = read_uint_field<uint16_t>(player_object["static_delay_ms"], "static_delay_ms")) {
+        player_cmd->static_delay_ms = *v;
     }
 
     return true;
@@ -149,23 +195,29 @@ static bool process_server_player_command_object(const JsonObject player_object,
 
 // Parses a single string field into a tri-state delta entry. Absent on the wire leaves `out`
 // untouched; explicit `null` writes outer-engaged + inner-`nullopt` (clear); a string writes
-// outer-engaged + inner-engaged.
-static void parse_metadata_string_field(JsonVariantConst var,
+// outer-engaged + inner-engaged. A present value that is neither a string nor null is logged and
+// skipped (treated as absent).
+static void parse_metadata_string_field(JsonVariantConst var, const char* name,
                                         std::optional<std::optional<std::string>>* out) {
     if (var.is<const char*>()) {
         *out = var.as<std::string>();
-    } else if (!var.isUnbound() && var.isNull()) {
+    } else if (var.isNull() && !var.isUnbound()) {
         *out = std::optional<std::string>{};
+    } else if (!var.isUnbound()) {
+        SS_LOGW(TAG, "Ignoring field '%s': expected string or null", name);
     }
 }
 
-// Parses a single uint16 field into a tri-state delta entry. Same semantics as above.
-static void parse_metadata_uint16_field(JsonVariantConst var,
+// Parses a single uint16 field into a tri-state delta entry. Same semantics as above; a present
+// value that is neither a uint16 (0-65535) nor null is logged and skipped.
+static void parse_metadata_uint16_field(JsonVariantConst var, const char* name,
                                         std::optional<std::optional<uint16_t>>* out) {
     if (var.is<uint16_t>()) {
         *out = var.as<uint16_t>();
-    } else if (!var.isUnbound() && var.isNull()) {
+    } else if (var.isNull() && !var.isUnbound()) {
         *out = std::optional<uint16_t>{};
+    } else if (!var.isUnbound()) {
+        SS_LOGW(TAG, "Ignoring field '%s': expected integer in [0, 65535] or null", name);
     }
 }
 
@@ -182,27 +234,32 @@ static bool process_server_metadata_state_object(const JsonObject metadata_objec
     }
     metadata_delta->timestamp = metadata_object["timestamp"].as<int64_t>();
 
-    parse_metadata_string_field(metadata_object["title"], &metadata_delta->title);
-    parse_metadata_string_field(metadata_object["artist"], &metadata_delta->artist);
-    parse_metadata_string_field(metadata_object["album_artist"], &metadata_delta->album_artist);
-    parse_metadata_string_field(metadata_object["album"], &metadata_delta->album);
-    parse_metadata_string_field(metadata_object["artwork_url"], &metadata_delta->artwork_url);
-    parse_metadata_uint16_field(metadata_object["year"], &metadata_delta->year);
-    parse_metadata_uint16_field(metadata_object["track"], &metadata_delta->track);
+    parse_metadata_string_field(metadata_object["title"], "title", &metadata_delta->title);
+    parse_metadata_string_field(metadata_object["artist"], "artist", &metadata_delta->artist);
+    parse_metadata_string_field(metadata_object["album_artist"], "album_artist",
+                                &metadata_delta->album_artist);
+    parse_metadata_string_field(metadata_object["album"], "album", &metadata_delta->album);
+    parse_metadata_string_field(metadata_object["artwork_url"], "artwork_url",
+                                &metadata_delta->artwork_url);
+    parse_metadata_uint16_field(metadata_object["year"], "year", &metadata_delta->year);
+    parse_metadata_uint16_field(metadata_object["track"], "track", &metadata_delta->track);
 
     // Parse progress object - present object engages inner; explicit null clears; absent leaves
     // outer nullopt.
     if (metadata_object["progress"].is<JsonObject>()) {
         JsonObject progress_object = metadata_object["progress"];
         MetadataProgressObject progress{};
-        if (progress_object["track_progress"].is<JsonVariant>()) {
-            progress.track_progress = progress_object["track_progress"].as<uint32_t>();
+        if (auto v =
+                read_uint_field<uint32_t>(progress_object["track_progress"], "track_progress")) {
+            progress.track_progress = *v;
         }
-        if (progress_object["track_duration"].is<JsonVariant>()) {
-            progress.track_duration = progress_object["track_duration"].as<uint32_t>();
+        if (auto v =
+                read_uint_field<uint32_t>(progress_object["track_duration"], "track_duration")) {
+            progress.track_duration = *v;
         }
-        if (progress_object["playback_speed"].is<JsonVariant>()) {
-            progress.playback_speed = progress_object["playback_speed"].as<uint32_t>();
+        if (auto v =
+                read_uint_field<uint32_t>(progress_object["playback_speed"], "playback_speed")) {
+            progress.playback_speed = *v;
         }
         metadata_delta->progress = progress;
     } else if (!metadata_object["progress"].isUnbound() && metadata_object["progress"].isNull()) {
@@ -327,7 +384,9 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
     if (hello_msg != nullptr) {
         hello_msg->server.server_id = root["payload"]["server_id"].as<std::string>();
         hello_msg->server.name = root["payload"]["name"].as<std::string>();
-        hello_msg->version = root["payload"]["version"].as<uint16_t>();
+        if (auto v = read_uint_field<uint16_t>(root["payload"]["version"], "version")) {
+            hello_msg->version = *v;
+        }
 
         // Parse active_roles array
         hello_msg->active_roles.clear();
@@ -493,13 +552,14 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
         }
 
         // Parse volume
-        if (controller_object["volume"].is<JsonVariant>()) {
-            controller_state.volume = controller_object["volume"].as<uint8_t>();
+        if (auto v =
+                read_uint_field<uint8_t>(controller_object["volume"], "volume", 0, VOLUME_MAX)) {
+            controller_state.volume = *v;
         }
 
         // Parse muted
-        if (controller_object["muted"].is<JsonVariant>()) {
-            controller_state.muted = controller_object["muted"].as<bool>();
+        if (auto v = read_bool_field(controller_object["muted"], "muted")) {
+            controller_state.muted = *v;
         }
 
         // Parse repeat
@@ -512,8 +572,8 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
         }
 
         // Parse shuffle
-        if (controller_object["shuffle"].is<JsonVariant>()) {
-            controller_state.shuffle = controller_object["shuffle"].as<bool>();
+        if (auto v = read_bool_field(controller_object["shuffle"], "shuffle")) {
+            controller_state.shuffle = *v;
         }
 
         state_msg->controller = std::move(controller_state);
@@ -586,15 +646,17 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             }
         }
 
-        if (vis_json["batch_max"].is<JsonVariant>()) {
-            vis_obj.batch_max = vis_json["batch_max"].as<uint8_t>();
+        if (auto v = read_uint_field<uint8_t>(vis_json["batch_max"], "batch_max")) {
+            vis_obj.batch_max = *v;
         }
 
         // Parse spectrum config if present
         if (vis_json["spectrum"].is<JsonObject>()) {
             JsonObject spec_json = vis_json["spectrum"];
             VisualizerSpectrumConfig spec_cfg{};
-            spec_cfg.n_disp_bins = spec_json["n_disp_bins"].as<uint8_t>();
+            if (auto v = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins")) {
+                spec_cfg.n_disp_bins = *v;
+            }
             std::string scale_str = spec_json["scale"].as<std::string>();
             if (scale_str == "log") {
                 spec_cfg.scale = VisualizerSpectrumScale::LOG;
@@ -603,9 +665,15 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             } else {
                 spec_cfg.scale = VisualizerSpectrumScale::MEL;
             }
-            spec_cfg.f_min = spec_json["f_min"].as<uint16_t>();
-            spec_cfg.f_max = spec_json["f_max"].as<uint16_t>();
-            spec_cfg.rate_max = spec_json["rate_max"].as<uint16_t>();
+            if (auto v = read_uint_field<uint16_t>(spec_json["f_min"], "f_min")) {
+                spec_cfg.f_min = *v;
+            }
+            if (auto v = read_uint_field<uint16_t>(spec_json["f_max"], "f_max")) {
+                spec_cfg.f_max = *v;
+            }
+            if (auto v = read_uint_field<uint16_t>(spec_json["rate_max"], "rate_max")) {
+                spec_cfg.rate_max = *v;
+            }
             vis_obj.spectrum = spec_cfg;
         }
 
