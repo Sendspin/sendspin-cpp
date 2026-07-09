@@ -116,7 +116,6 @@ TEST(SpscRingBuffer, UnalignedStorageSizeJustUnderAligned) {
 TEST(SpscRingBuffer, CreateRejectsTooSmallStorage) {
     std::vector<uint8_t> storage(16);
     SpscRingBuffer rb;
-
     // After rounding down, less than one header plus one aligned byte of payload fits.
     EXPECT_FALSE(rb.create(15, storage.data()));
     EXPECT_FALSE(rb.create(8, storage.data()));
