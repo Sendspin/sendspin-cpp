@@ -63,23 +63,15 @@ ArtworkRole::Impl::Impl(ArtworkRoleConfig config, SendspinClient* client)
       drain_task(std::make_unique<DrainTask>()),
       event_state(std::make_unique<EventState>()),
       display_scheduler(std::make_unique<DisplayScheduler>()) {
-    // The array index (not the `slot` field) is authoritative for channel/slot mapping: the
-    // hello advertises channels in this->artwork_channels order, and handle_binary looks up
-    // this->config.preferred_formats by index to match. The `slot` field is kept for API
-    // compatibility but is otherwise ignored, so warn once if a caller's config disagrees.
+    // The array index is authoritative for channel/slot mapping: the hello advertises channels
+    // in this->artwork_channels order, and handle_binary looks up this->config.preferred_formats
+    // by index to match.
     if (this->config.preferred_formats.size() > ARTWORK_MAX_SLOTS) {
         SS_LOGW(TAG, "Artwork configured with %zu channels, truncating to %zu",
                 this->config.preferred_formats.size(), ARTWORK_MAX_SLOTS);
         this->config.preferred_formats.resize(ARTWORK_MAX_SLOTS);
     }
-    for (size_t i = 0; i < this->config.preferred_formats.size(); ++i) {
-        const auto& pref = this->config.preferred_formats[i];
-        if (pref.slot != i) {
-            SS_LOGW(TAG,
-                    "Artwork channel at index %zu has slot field %u; the slot field is ignored, "
-                    "array index order is authoritative",
-                    i, pref.slot);
-        }
+    for (const auto& pref : this->config.preferred_formats) {
         this->artwork_channels.push_back({pref.source, pref.format, pref.width, pref.height});
     }
     this->event_state->queue.create(8);
@@ -148,8 +140,8 @@ void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
     const uint8_t* image_data = data + BINARY_TIMESTAMP_SIZE;
     size_t image_len = len - BINARY_TIMESTAMP_SIZE;
 
-    // Look up format by array index (authoritative), not by matching the deprecated `slot`
-    // field. See the Impl constructor comment for why the index is authoritative.
+    // Look up format by array index. See the Impl constructor comment for why the index is
+    // authoritative for slot mapping.
     SendspinImageFormat image_format = SendspinImageFormat::JPEG;
     if (slot < this->config.preferred_formats.size()) {
         image_format = this->config.preferred_formats[slot].format;

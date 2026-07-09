@@ -167,10 +167,6 @@ enum class SendspinImageSource : uint8_t {
 
 /// @brief Preference for an image slot's format and resolution
 struct ImageSlotPreference {
-    /// @brief Deprecated and ignored. The channel/slot number is determined by this entry's
-    /// position (index) in ArtworkRoleConfig::preferred_formats, not by this field. Kept only
-    /// for API compatibility.
-    uint8_t slot{};
     SendspinImageSource source{};
     SendspinImageFormat format{};
     uint16_t width{};
@@ -179,10 +175,10 @@ struct ImageSlotPreference {
 
 /// @brief Configuration for the artwork role
 struct ArtworkRoleConfig {
-    /// @brief Slot/channel preferences in order. The array index is the authoritative channel
-    /// slot number (matched against the binary message slot byte and advertised to the server
-    /// in that order); ImageSlotPreference::slot is ignored. Limited to ARTWORK_MAX_SLOTS (4)
-    /// entries; extra entries are truncated with a warning.
+    /// @brief Slot/channel preferences in order. The array index is the channel slot number
+    /// (matched against the binary message slot byte and advertised to the server in that
+    /// order). Limited to ARTWORK_MAX_SLOTS (4) entries; extra entries are truncated with a
+    /// warning.
     std::vector<ImageSlotPreference> preferred_formats{};
     bool psram_stack{false};  ///< Allocate decode thread stack in PSRAM (ESP-IDF only)
     unsigned priority{2};     ///< FreeRTOS priority for the decode thread (ESP-IDF only)
