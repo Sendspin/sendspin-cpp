@@ -120,6 +120,16 @@ public:
         return this->current_connection_.get();
     }
 
+    /// @brief Returns a shared_ptr to the current connection. Thread-safe.
+    /// Role threads (sync task, artwork/visualizer drains) must use this instead of current():
+    /// the shared_ptr keeps the connection alive for the duration of the caller's use even if the
+    /// main loop concurrently drops or replaces the current connection.
+    /// @return Shared pointer to the current connection, or nullptr if none.
+    std::shared_ptr<SendspinConnection> current_shared() const {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        return this->current_connection_;
+    }
+
     // ========================================
     // Event queuing (thread-safe)
     // ========================================
@@ -207,6 +217,10 @@ private:
 
     // 32-bit fields
     uint32_t last_played_server_hash_{0};
+
+    // 64-bit fields
+    /// Earliest time (us) to attempt another WS server start after a failure. Main-loop only.
+    int64_t ws_server_start_retry_time_us_{0};
 
     // 8-bit fields
     bool has_last_played_server_{false};

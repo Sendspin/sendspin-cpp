@@ -115,6 +115,15 @@ public:
         return -1;
     }
 
+    /// @brief Returns this connection's process-unique instance id
+    /// @return A monotonic id assigned at construction, never reused for the lifetime of the
+    ///         process. Used to identify a connection across a thread-safe queue without a raw
+    ///         pointer, which could ABA-collide with a later connection allocated at the same
+    ///         address. Ids start at 1, so 0 is a safe "no connection" sentinel.
+    uint64_t get_instance_id() const {
+        return this->instance_id;
+    }
+
     /// @brief Sends a text message to the server with a completion callback
     /// @param message The message string to send.
     /// @param cb Callback invoked with the send result. On asynchronous transports it is not
@@ -342,6 +351,13 @@ protected:
     /// @param receive_time Timestamp when the data was received (microseconds).
     void dispatch_completed_message(bool is_text, int64_t receive_time);
 
+    /// @brief Returns the next process-unique connection id (starts at 1, monotonic).
+    /// @note The function-local atomic gives thread-safe, ordering-independent uniqueness.
+    static uint64_t next_instance_id() {
+        static std::atomic<uint64_t> counter{1};
+        return counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // Struct fields
 
     /// Message buffering (for websocket frame assembly).
@@ -360,6 +376,9 @@ protected:
     /// EMA (microseconds) of format_client_time_message() duration. Atomic because the ESP
     /// server worker thread updates it while the hub thread reads it for logging.
     std::atomic<int64_t> serialize_ema_us_{0};
+
+    /// Process-unique connection identity (see get_instance_id()). Assigned once at construction.
+    const uint64_t instance_id{next_instance_id()};
 
     // size_t fields
     size_t websocket_write_offset_{0};
@@ -384,8 +403,9 @@ protected:
     /// Set to false on the main thread before cleanup; checked on the network thread.
     std::atomic<bool> message_dispatch_enabled_{true};
 
-    /// Time message state.
-    bool pending_time_message_{false};
+    /// Time message state. Written by the main-loop time burst and cleared by the transport
+    /// thread's disconnect handler, hence atomic.
+    std::atomic<bool> pending_time_message_{false};
 
     /// Atomic for the same reason as client_hello_sent_: written on network threads, read from the
     /// main loop via is_handshake_complete().

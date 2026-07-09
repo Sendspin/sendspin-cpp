@@ -258,6 +258,11 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
         uint8_t* dest = this->prepare_receive_buffer(prepare_len);
         if (dest == nullptr) {
             SS_LOGE(TAG, "Allocation failed, dropping connection");
+            // Stop processing frames that keep arriving on the still-open transport; the
+            // manager reacts to the disconnect callback by dropping the connection, whose
+            // destructor stops the transport (esp_websocket_client_stop cannot be called
+            // from the websocket task's own event handler).
+            this->disable_message_dispatch();
             this->handle_disconnected();
             return;
         }

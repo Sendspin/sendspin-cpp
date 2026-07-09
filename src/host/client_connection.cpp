@@ -173,10 +173,17 @@ void SendspinClientConnection::setup_callbacks() {
                     uint8_t* dest = this->prepare_receive_buffer(data.size());
                     if (dest == nullptr) {
                         SS_LOGE(TAG, "Allocation failed, dropping connection");
+                        // Stop processing further frames and initiate a real transport close
+                        // (stop() would join IX's thread and deadlock here; close() is async
+                        // and safe). The later Close event repeats the disconnect callback,
+                        // which the manager tolerates (drop of an unmanaged connection is a
+                        // no-op).
+                        this->disable_message_dispatch();
                         this->connected_ = false;
                         if (this->on_disconnected_cb) {
                             this->on_disconnected_cb(this);
                         }
+                        this->ws_->close();
                         return;
                     }
                     std::copy(data.begin(), data.end(), dest);

@@ -58,6 +58,12 @@ struct TimeResponseEvent {
     int64_t offset;
     int64_t max_error;
     int64_t timestamp;
+    /// Instance id of the connection the response arrived on, compared against the current
+    /// connection at drain time so a measurement from a displaced or pending server cannot
+    /// contaminate the current connection's time filter. An id (not a pointer) so a since-freed
+    /// connection cannot ABA-match a later connection reusing its address; 0 never matches a live
+    /// connection (ids start at 1).
+    uint64_t source_id;
 };
 
 /// @brief Deferred event state for time responses and group updates on the main thread
@@ -186,7 +192,10 @@ void SendspinClient::loop() {
         TimeResponseEvent time_event{};
         while (this->event_state_->time_queue.receive(time_event, 0)) {
             auto* current = this->connection_manager_->current();
-            if (current != nullptr) {
+            // Apply only measurements from the connection that is still current; a response queued
+            // by a since-displaced (or pending) server carries that server's clock and would
+            // contaminate this connection's Kalman filter.
+            if (current != nullptr && current->get_instance_id() == time_event.source_id) {
                 this->time_burst_->on_time_response(current, time_event.offset,
                                                     time_event.max_error, time_event.timestamp);
             }
@@ -331,17 +340,21 @@ bool SendspinClient::is_connected() const {
 }
 
 bool SendspinClient::is_time_synced() const {
-    auto* conn = this->connection_manager_->current();
+    // current_shared(): called from role threads (sync task, drain threads), so the shared_ptr
+    // must keep the connection alive while it is dereferenced.
+    auto conn = this->connection_manager_->current_shared();
     return conn != nullptr && conn->is_time_synced();
 }
 
 int64_t SendspinClient::get_client_time(int64_t server_time) const {
-    auto* conn = this->connection_manager_->current();
+    // current_shared(): called from role threads; see is_time_synced().
+    auto conn = this->connection_manager_->current_shared();
     return conn != nullptr ? conn->get_client_time(server_time) : 0;
 }
 
 std::optional<ServerInformationObject> SendspinClient::get_server_information() const {
-    auto* conn = this->connection_manager_->current();
+    // current_shared(): public accessor, callable from any thread.
+    auto conn = this->connection_manager_->current_shared();
     if (conn == nullptr || !conn->is_handshake_complete()) {
         return std::nullopt;
     }
@@ -499,9 +512,14 @@ std::string SendspinClient::build_hello_message() {
 
 void SendspinClient::process_json_message(SendspinConnection* conn, const char* data, size_t len,
                                           int64_t timestamp) {
-    // Reuse the internal-RAM scratch arena if configured. Safe to reset here: this runs only on
-    // the network task, and the JsonDocument from the previous call was already destroyed when
-    // that call returned.
+    // Two connections can deliver JSON concurrently on their own network threads (current +
+    // pending during a handoff, or an outbound connect_to() transport alongside the inbound
+    // server). Serialize the shared arena and the parse itself; JSON control messages are
+    // infrequent, so contention is negligible.
+    std::lock_guard<std::mutex> lock(this->json_processing_mutex_);
+
+    // Reuse the internal-RAM scratch arena if configured. Safe to reset here: the JsonDocument
+    // from the previous call was already destroyed when that call returned.
     if (this->json_arena_) {
         this->json_arena_->reset();
     }
@@ -656,7 +674,8 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             int64_t offset{0};
             int64_t max_error{0};
             if (process_server_time_message(root, timestamp, &offset, &max_error)) {
-                if (!this->event_state_->time_queue.send({offset, max_error, timestamp}, 0)) {
+                if (!this->event_state_->time_queue.send(
+                        {offset, max_error, timestamp, conn->get_instance_id()}, 0)) {
                     SS_LOGW(TAG, "Time response queue full; dropping measurement");
                 }
             }

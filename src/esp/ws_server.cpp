@@ -151,6 +151,14 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
 void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
     SS_LOGD(TAG, "Client closed connection on socket %d", sockfd);
 
+    // Flip the connection to disconnected immediately: queued async sends check is_connected()
+    // and must not resolve this sockfd once httpd may recycle it for a new session.
+    auto* slot =
+        static_cast<std::shared_ptr<SendspinServerConnection>*>(httpd_sess_get_ctx(handle, sockfd));
+    if (slot != nullptr && *slot != nullptr) {
+        (*slot)->mark_closed();
+    }
+
     SendspinWsServer* server = (SendspinWsServer*)httpd_get_global_user_ctx(handle);
 
     // Notify ConnectionManager so it can drop its observer shared_ptr. The session slot (set in
