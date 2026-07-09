@@ -461,7 +461,7 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
     if (root["payload"]["metadata"].is<JsonObject>()) {
         ServerMetadataStateDelta metadata_delta{};
         if (process_server_metadata_state_object(root["payload"]["metadata"], &metadata_delta)) {
-            state_msg->metadata = metadata_delta;
+            state_msg->metadata = std::move(metadata_delta);
         }
     }
 
@@ -489,7 +489,7 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
                     }
                 }
             }
-            controller_state.supported_commands = commands;
+            controller_state.supported_commands = std::move(commands);
         }
 
         // Parse volume
@@ -516,7 +516,7 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
             controller_state.shuffle = controller_object["shuffle"].as<bool>();
         }
 
-        state_msg->controller = controller_state;
+        state_msg->controller = std::move(controller_state);
     }
 
     return true;
@@ -536,7 +536,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
                 SS_LOGE(TAG, "Invalid stream/start message: incomplete player object");
                 return false;
             }
-            stream_msg->player = player_obj;
+            stream_msg->player = std::move(player_obj);
         } else {
             return false;
         }
@@ -559,8 +559,8 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
                 return false;
             }
         }
-        artwork_obj.channels = channels;
-        stream_msg->artwork = artwork_obj;
+        artwork_obj.channels = std::move(channels);
+        stream_msg->artwork = std::move(artwork_obj);
     }
 
     if (root["payload"]["visualizer"].is<JsonObject>()) {
@@ -609,7 +609,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             vis_obj.spectrum = spec_cfg;
         }
 
-        stream_msg->visualizer = vis_obj;
+        stream_msg->visualizer = std::move(vis_obj);
     }
 
     return true;
@@ -629,7 +629,7 @@ bool process_stream_end_message(JsonObject root, StreamEndMessage* end_msg) {
                 roles.push_back(role_var.as<std::string>());
             }
         }
-        end_msg->roles = roles;
+        end_msg->roles = std::move(roles);
     }
 
     return true;
@@ -649,7 +649,7 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
                 roles.push_back(role_var.as<std::string>());
             }
         }
-        clear_msg->roles = roles;
+        clear_msg->roles = std::move(roles);
     }
 
     return true;
