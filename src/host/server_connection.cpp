@@ -22,9 +22,15 @@
 
 namespace sendspin {
 
+static const char* const TAG = "sendspin.server_conn";
+
 SendspinServerConnection::SendspinServerConnection(std::shared_ptr<ix::WebSocket> ws, int sockfd)
     : ws_(std::move(ws)), sockfd_(sockfd) {
-    // IXWebSocket handles TCP_NODELAY internally
+    // Note: IXWebSocket only sets TCP_NODELAY on outbound connects, not on accepted sockets,
+    // and its public API does not expose the accepted socket's fd, so Nagle stays enabled
+    // here. Time messages on this host-server path can therefore see up to ~40 ms of
+    // coalescing delay. The ESP server path sets TCP_NODELAY explicitly; revisit if
+    // IXWebSocket ever exposes the accepted socket.
 }
 
 void SendspinServerConnection::start() {
@@ -104,10 +110,17 @@ void SendspinServerConnection::handle_message(const std::string& data, bool is_b
                                               int64_t receive_time) {
     if (!data.empty()) {
         uint8_t* dest = this->prepare_receive_buffer(data.size());
-        if (dest != nullptr) {
-            std::copy(data.begin(), data.end(), dest);
-            this->commit_receive_buffer(data.size());
+        if (dest == nullptr) {
+            // Dispatching would hand a stale/partial buffer to the protocol layer. Drop the
+            // connection instead: the close event tears the slot down on the main loop.
+            SS_LOGE(TAG, "Allocation failed, dropping connection");
+            this->disable_message_dispatch();
+            this->reset_websocket_payload();
+            this->trigger_close();
+            return;
         }
+        std::copy(data.begin(), data.end(), dest);
+        this->commit_receive_buffer(data.size());
     }
     this->dispatch_completed_message(!is_binary, receive_time);
 }

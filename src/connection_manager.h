@@ -208,6 +208,10 @@ private:
     // 32-bit fields
     uint32_t last_played_server_hash_{0};
 
+    // 64-bit fields
+    /// Earliest time (us) to attempt another WS server start after a failure. Main-loop only.
+    int64_t ws_server_start_retry_time_us_{0};
+
     // 8-bit fields
     bool has_last_played_server_{false};
 };

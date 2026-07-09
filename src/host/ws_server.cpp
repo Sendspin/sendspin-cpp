@@ -19,7 +19,7 @@
 #include "platform/time.h"
 #include "server_connection.h"
 
-#include <limits>
+#include <atomic>
 
 namespace sendspin {
 
@@ -49,9 +49,16 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
                 return;
             }
 
-            // Generate a synthetic sockfd from the pointer for connection lookup
-            int synthetic_sockfd = static_cast<int>(reinterpret_cast<intptr_t>(ws.get()) &
-                                                    std::numeric_limits<int>::max());
+            // Generate a synthetic sockfd from a monotonic counter for connection lookup.
+            // (A pointer-derived id could repeat when a freed ix::WebSocket's address is
+            // reused, briefly mis-routing close events to a live connection.)
+            static std::atomic<int> next_synthetic_sockfd{1};
+            int synthetic_sockfd = next_synthetic_sockfd.fetch_add(1);
+            if (synthetic_sockfd <= 0) {
+                // Wrapped after ~2 billion connections; restart the sequence
+                next_synthetic_sockfd.store(1);
+                synthetic_sockfd = next_synthetic_sockfd.fetch_add(1);
+            }
 
             SS_LOGD(TAG, "New client connection (synthetic sockfd %d)", synthetic_sockfd);
 

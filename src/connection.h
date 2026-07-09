@@ -384,8 +384,9 @@ protected:
     /// Set to false on the main thread before cleanup; checked on the network thread.
     std::atomic<bool> message_dispatch_enabled_{true};
 
-    /// Time message state.
-    bool pending_time_message_{false};
+    /// Time message state. Written by the main-loop time burst and cleared by the transport
+    /// thread's disconnect handler, hence atomic.
+    std::atomic<bool> pending_time_message_{false};
 
     /// Atomic for the same reason as client_hello_sent_: written on network threads, read from the
     /// main loop via is_handshake_complete().
