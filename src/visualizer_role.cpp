@@ -81,8 +81,9 @@ namespace {
 // fields in an order the parser cannot decode correctly. Reorder (and de-duplicate) the
 // advertised types here so the wire order always matches the parser, regardless of what
 // order the caller populated VisualizerRoleConfig::support.types in. BEAT is not a per-frame
-// field (it arrives as a separate binary message type), so it is kept but sorted last along
-// with any other/unknown type.
+// field (it arrives as a separate binary message type), so it is kept but sorted last. Any
+// type the parser does not recognize is dropped, since the fixed-order parser cannot decode a
+// field it does not understand.
 std::vector<VisualizerDataType> normalize_type_order(const std::vector<VisualizerDataType>& types) {
     bool has_loudness = false;
     bool has_f_peak = false;
@@ -503,9 +504,11 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
                 offset += 2;
             }
             if ((frame_flags & FLAG_HAS_SPECTRUM) && bin_count > 0) {
-                // resize() only reallocates when growing past the current capacity; once the
-                // largest bin_count has been seen, subsequent frames reuse the same allocation.
-                frame.spectrum.resize(bin_count);
+                // assign() zero-initializes all bin_count elements and reuses the existing
+                // allocation when capacity suffices (no per-frame heap churn). Zeroing up front
+                // means a short or corrupt entry that exits the fill loop early cannot leak
+                // stale bins from a previous frame through the reused vector.
+                frame.spectrum.assign(bin_count, 0);
                 for (uint8_t b = 0; b < bin_count && offset + 2 <= data_len; ++b) {
                     frame.spectrum[b] = read_be16(fields + offset);
                     offset += 2;
