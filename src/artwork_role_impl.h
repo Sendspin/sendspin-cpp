@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -46,11 +47,21 @@ enum class ArtworkEventType : uint8_t {
 static constexpr size_t ARTWORK_MAX_SLOTS = 4;
 
 /// @brief Double-buffered image storage for a single artwork slot
+///
+/// All fields here are guarded by DrainTask::slot_mutex (shared across all slots; artwork is
+/// not a hot path so contention is negligible). The network thread and decode thread both read
+/// and write these fields, so they must never be touched outside that lock:
+///  - write_idx: which buffer the network thread writes to next.
+///  - drain_active / drain_buf_idx: which buffer the decode thread is currently decoding.
+///  - write_generation[i]: bumped every time buffers[i] is overwritten by the network thread.
+///    The decode thread compares this against the generation stamped on the notification it
+///    dequeued to detect whether the buffer was overwritten again before it could be claimed.
 struct SlotBuffer {
     PlatformBuffer buffers[2];
-    std::atomic<uint8_t> write_idx{0};      ///< Which buffer the network thread writes to next
-    std::atomic<bool> drain_active{false};  ///< True while the decode thread is using a buffer
-    uint8_t drain_buf_idx{0};               ///< Which buffer the decode thread is currently using
+    uint8_t write_idx{0};
+    bool drain_active{false};
+    uint8_t drain_buf_idx{0};
+    uint32_t write_generation[2]{0, 0};
 };
 
 /// @brief Notification sent from the network thread to the decode thread when new image data
@@ -59,12 +70,19 @@ struct SlotBuffer {
 /// All metadata is carried in the notification itself (not in SlotBuffer) so that the
 /// ThreadSafeQueue's internal mutex provides the happens-before guarantee between the
 /// network thread's writes and the decode thread's reads.
+///
+/// `generation` and `stream_epoch` let the decode thread detect a stale notification: if the
+/// buffer it names has since been overwritten (generation mismatch) or the stream has moved on
+/// (stream_epoch mismatch), the notification is skipped rather than decoding torn or
+/// superseded data. See ArtworkRole::Impl::drain_thread_func.
 struct ArtworkNotification {
     uint8_t slot;
     uint8_t buffer_idx;
     size_t data_length;
     int64_t timestamp;
     SendspinImageFormat format;
+    uint32_t generation;
+    uint32_t stream_epoch;
 };
 
 /// @brief Private implementation of the artwork role
@@ -82,6 +100,9 @@ struct ArtworkRole::Impl {
         EventFlags event_flags;
         std::thread drain_thread;
         SlotBuffer slot_buffers[ARTWORK_MAX_SLOTS];
+        /// @brief Guards every field of every entry in slot_buffers. One mutex for all slots
+        /// is intentional: artwork is not a hot path, so cross-slot contention is negligible.
+        std::mutex slot_mutex;
     };
 
     /// @brief Deferred event state for thread-safe artwork stream lifecycle delivery
@@ -136,6 +157,12 @@ struct ArtworkRole::Impl {
 
     // 8-bit fields
     std::atomic<bool> stream_active{false};
+
+    /// @brief Bumped on stream start/end/clear/cleanup so in-flight notifications from a
+    /// previous stream are recognized as stale and skipped by the decode thread, instead of
+    /// relying on draining the notify queue (which could discard a new stream's first image
+    /// if it was queued before the flush was serviced).
+    std::atomic<uint32_t> stream_epoch{0};
 };
 
 }  // namespace sendspin

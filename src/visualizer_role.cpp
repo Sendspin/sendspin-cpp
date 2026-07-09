@@ -72,6 +72,55 @@ static uint16_t read_be16(const uint8_t* p) {
 
 namespace sendspin {
 
+namespace {
+
+// The server packs per-frame fields in the order of the `types` list advertised in the
+// client's hello (see ClientHelloMessage::visualizer_support), but the drain thread parser
+// always reads fields in a fixed order: LOUDNESS, then F_PEAK, then SPECTRUM (see
+// drain_thread_func below). If the advertised order did not match, the server would pack
+// fields in an order the parser cannot decode correctly. Reorder (and de-duplicate) the
+// advertised types here so the wire order always matches the parser, regardless of what
+// order the caller populated VisualizerRoleConfig::support.types in. BEAT is not a per-frame
+// field (it arrives as a separate binary message type), so it is kept but sorted last. Any
+// type the parser does not recognize is dropped, since the fixed-order parser cannot decode a
+// field it does not understand.
+std::vector<VisualizerDataType> normalize_type_order(const std::vector<VisualizerDataType>& types) {
+    bool has_loudness = false;
+    bool has_f_peak = false;
+    bool has_spectrum = false;
+    bool has_beat = false;
+
+    for (auto type : types) {
+        if (type == VisualizerDataType::LOUDNESS) {
+            has_loudness = true;
+        } else if (type == VisualizerDataType::F_PEAK) {
+            has_f_peak = true;
+        } else if (type == VisualizerDataType::SPECTRUM) {
+            has_spectrum = true;
+        } else if (type == VisualizerDataType::BEAT) {
+            has_beat = true;
+        }
+    }
+
+    std::vector<VisualizerDataType> ordered;
+    ordered.reserve(types.size());
+    if (has_loudness) {
+        ordered.push_back(VisualizerDataType::LOUDNESS);
+    }
+    if (has_f_peak) {
+        ordered.push_back(VisualizerDataType::F_PEAK);
+    }
+    if (has_spectrum) {
+        ordered.push_back(VisualizerDataType::SPECTRUM);
+    }
+    if (has_beat) {
+        ordered.push_back(VisualizerDataType::BEAT);
+    }
+    return ordered;
+}
+
+}  // namespace
+
 // ============================================================================
 // Impl constructor / destructor
 // ============================================================================
@@ -84,6 +133,10 @@ VisualizerRole::Impl::Impl(VisualizerRoleConfig config, SendspinClient* client)
     this->event_state->queue.create(8);
 
     if (this->visualizer_support.has_value()) {
+        // Normalize the advertised type order so the server packs fields in the order the
+        // drain thread parser expects. See normalize_type_order() above for the constraint.
+        this->visualizer_support->types = normalize_type_order(this->visualizer_support->types);
+
         this->drain_task = std::make_unique<DrainTask>();
 
         // The ring buffer needs more space than the raw data capacity because each entry
@@ -263,7 +316,9 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
 
     // Shadow the config for main-thread callback, then signal
     this->event_state->shadow_config.write(stream);
-    this->event_state->queue.send(VisualizerEventType::STREAM_START, 0);
+    if (!this->event_state->queue.send(VisualizerEventType::STREAM_START, 0)) {
+        SS_LOGW(TAG, "Visualizer event queue full; dropping STREAM_START");
+    }
 }
 
 void VisualizerRole::Impl::handle_stream_end() {
@@ -273,7 +328,9 @@ void VisualizerRole::Impl::handle_stream_end() {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state->queue.send(VisualizerEventType::STREAM_END, 0);
+    if (!this->event_state->queue.send(VisualizerEventType::STREAM_END, 0)) {
+        SS_LOGW(TAG, "Visualizer event queue full; dropping STREAM_END");
+    }
 }
 
 void VisualizerRole::Impl::handle_stream_clear() {
@@ -283,7 +340,9 @@ void VisualizerRole::Impl::handle_stream_clear() {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state->queue.send(VisualizerEventType::STREAM_CLEAR, 0);
+    if (!this->event_state->queue.send(VisualizerEventType::STREAM_CLEAR, 0)) {
+        SS_LOGW(TAG, "Visualizer event queue full; dropping STREAM_CLEAR");
+    }
 }
 
 // ============================================================================
@@ -351,6 +410,10 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
 
     auto& rb = self->drain_task->ring_buffer;
     auto& flags = self->drain_task->event_flags;
+
+    // Reused across iterations to avoid a heap alloc/free per frame. The spectrum vector's
+    // capacity grows to the largest bin_count seen and is resized (not reallocated) after that.
+    VisualizerFrame frame{};
 
     while (true) {
         // Non-blocking check for commands
@@ -427,8 +490,10 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             size_t data_len = item_size - FRAME_HEADER_SIZE - TIMESTAMP_SIZE;
             size_t offset = 0;
 
-            VisualizerFrame frame{};
+            // Reset all fields so no stale data from a previous frame leaks through.
             frame.timestamp = client_ts;
+            frame.loudness.reset();
+            frame.peak_freq.reset();
 
             if ((frame_flags & FLAG_HAS_LOUDNESS) && offset + 2 <= data_len) {
                 frame.loudness = read_be16(fields + offset);
@@ -439,11 +504,17 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
                 offset += 2;
             }
             if ((frame_flags & FLAG_HAS_SPECTRUM) && bin_count > 0) {
-                frame.spectrum.resize(bin_count);
+                // assign() zero-initializes all bin_count elements and reuses the existing
+                // allocation when capacity suffices (no per-frame heap churn). Zeroing up front
+                // means a short or corrupt entry that exits the fill loop early cannot leak
+                // stale bins from a previous frame through the reused vector.
+                frame.spectrum.assign(bin_count, 0);
                 for (uint8_t b = 0; b < bin_count && offset + 2 <= data_len; ++b) {
                     frame.spectrum[b] = read_be16(fields + offset);
                     offset += 2;
                 }
+            } else {
+                frame.spectrum.clear();
             }
 
             rb.return_item(item);

@@ -37,7 +37,6 @@ static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 100U;
 
 // Event flag bits for decode thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
-static constexpr uint32_t COMMAND_FLUSH = (1 << 1);
 
 // ============================================================================
 // Big-endian helpers
@@ -64,6 +63,14 @@ ArtworkRole::Impl::Impl(ArtworkRoleConfig config, SendspinClient* client)
       drain_task(std::make_unique<DrainTask>()),
       event_state(std::make_unique<EventState>()),
       display_scheduler(std::make_unique<DisplayScheduler>()) {
+    // The array index is authoritative for channel/slot mapping: the hello advertises channels
+    // in this->artwork_channels order, and handle_binary looks up this->config.preferred_formats
+    // by index to match.
+    if (this->config.preferred_formats.size() > ARTWORK_MAX_SLOTS) {
+        SS_LOGW(TAG, "Artwork configured with %zu channels, truncating to %zu",
+                this->config.preferred_formats.size(), ARTWORK_MAX_SLOTS);
+        this->config.preferred_formats.resize(ARTWORK_MAX_SLOTS);
+    }
     for (const auto& pref : this->config.preferred_formats) {
         this->artwork_channels.push_back({pref.source, pref.format, pref.width, pref.height});
     }
@@ -133,43 +140,57 @@ void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
     const uint8_t* image_data = data + BINARY_TIMESTAMP_SIZE;
     size_t image_len = len - BINARY_TIMESTAMP_SIZE;
 
-    // Look up format for this slot
+    // Look up format by array index. See the Impl constructor comment for why the index is
+    // authoritative for slot mapping.
     SendspinImageFormat image_format = SendspinImageFormat::JPEG;
-    for (const auto& pref : this->config.preferred_formats) {
-        if (pref.slot == slot) {
-            image_format = pref.format;
-            break;
+    if (slot < this->config.preferred_formats.size()) {
+        image_format = this->config.preferred_formats[slot].format;
+    }
+
+    uint32_t generation = 0;
+    uint8_t write_idx = 0;
+    {
+        // Hold the slot mutex across the read-modify-write of write_idx/drain_active/
+        // write_generation and the memcpy itself, so the decode thread can never observe a
+        // buffer mid-write (torn image) and can never have a buffer stolen out from under it
+        // while it still owns the notification for that generation.
+        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+        auto& sb = this->drain_task->slot_buffers[slot];
+        write_idx = sb.write_idx;
+
+        // If the decode thread is actively using this buffer, skip to the other one.
+        // If the decode thread is using the other one, this write_idx is already safe.
+        if (sb.drain_active && sb.drain_buf_idx == write_idx) {
+            write_idx ^= 1;
         }
-    }
 
-    // Copy into the back buffer for this slot (grow-only)
-    auto& sb = this->drain_task->slot_buffers[slot];
-    uint8_t write_idx = sb.write_idx.load(std::memory_order_acquire);
+        auto& buf = sb.buffers[write_idx];
 
-    // If the decode thread is actively using this buffer, skip to the other one.
-    // If the decode thread is using the other one, this write_idx is already safe.
-    if (sb.drain_active.load(std::memory_order_acquire) && sb.drain_buf_idx == write_idx) {
-        write_idx ^= 1;
-    }
-
-    auto& buf = sb.buffers[write_idx];
-
-    if (buf.size() < image_len) {
-        if (!buf.realloc(image_len)) {
-            SS_LOGE(TAG, "Failed to allocate artwork buffer for slot %d (%zu bytes)", slot,
-                    image_len);
-            return;
+        if (buf.size() < image_len) {
+            if (!buf.realloc(image_len)) {
+                SS_LOGE(TAG, "Failed to allocate artwork buffer for slot %d (%zu bytes)", slot,
+                        image_len);
+                return;
+            }
         }
+
+        std::memcpy(buf.data(), image_data, image_len);
+
+        // Bump this buffer's generation so the decode thread can detect if it gets
+        // overwritten again before being claimed, then flip write_idx so the next network
+        // write goes to the other buffer.
+        sb.write_generation[write_idx]++;
+        generation = sb.write_generation[write_idx];
+        sb.write_idx = write_idx ^ 1;
     }
-
-    std::memcpy(buf.data(), image_data, image_len);
-
-    // Flip write index so the next network write goes to the other buffer
-    sb.write_idx.store(write_idx ^ 1, std::memory_order_release);
 
     // Signal decode thread with all metadata in the notification
-    ArtworkNotification notif{slot, write_idx, image_len, timestamp, image_format};
-    this->drain_task->notify_queue.send(notif, 0);
+    uint32_t epoch = this->stream_epoch.load(std::memory_order_relaxed);
+    ArtworkNotification notif{slot,         write_idx,  image_len, timestamp,
+                              image_format, generation, epoch};
+    if (!this->drain_task->notify_queue.send(notif, 0)) {
+        SS_LOGW(TAG, "Artwork notify queue full; dropping image for slot %u", slot);
+    }
 }
 
 // ============================================================================
@@ -209,10 +230,12 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
 
     this->stream_active = true;
 
-    // Signal decode thread to flush any stale notifications
-    if (this->drain_task) {
-        this->drain_task->event_flags.set(COMMAND_FLUSH);
-    }
+    // Bump the stream epoch so any notification still in the queue from a prior stream is
+    // recognized as stale by the decode thread and skipped, rather than draining the whole
+    // notify queue here (which could wrongly discard this new stream's first image if it was
+    // already queued before this handler ran).
+    this->stream_epoch.fetch_add(1, std::memory_order_relaxed);
+
     // Discard any pending displays from a prior stream
     if (this->display_scheduler) {
         for (auto& slot : this->display_scheduler->pending) {
@@ -223,22 +246,20 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
 
 void ArtworkRole::Impl::handle_stream_end() {
     this->stream_active = false;
+    this->stream_epoch.fetch_add(1, std::memory_order_relaxed);
 
-    if (this->drain_task) {
-        this->drain_task->event_flags.set(COMMAND_FLUSH);
+    if (!this->event_state->queue.send(ArtworkEventType::STREAM_END, 0)) {
+        SS_LOGW(TAG, "Artwork event queue full; dropping STREAM_END");
     }
-
-    this->event_state->queue.send(ArtworkEventType::STREAM_END, 0);
 }
 
 void ArtworkRole::Impl::handle_stream_clear() {
     this->stream_active = false;
+    this->stream_epoch.fetch_add(1, std::memory_order_relaxed);
 
-    if (this->drain_task) {
-        this->drain_task->event_flags.set(COMMAND_FLUSH);
+    if (!this->event_state->queue.send(ArtworkEventType::STREAM_CLEAR, 0)) {
+        SS_LOGW(TAG, "Artwork event queue full; dropping STREAM_CLEAR");
     }
-
-    this->event_state->queue.send(ArtworkEventType::STREAM_CLEAR, 0);
 }
 
 // ============================================================================
@@ -259,8 +280,9 @@ void ArtworkRole::Impl::drain_events() {
                     }
                 }
                 if (this->listener) {
-                    for (const auto& pref : this->config.preferred_formats) {
-                        this->listener->on_image_clear(pref.slot);
+                    // Array index is the authoritative slot number; see the Impl constructor.
+                    for (size_t i = 0; i < this->config.preferred_formats.size(); ++i) {
+                        this->listener->on_image_clear(static_cast<uint8_t>(i));
                     }
                 }
                 break;
@@ -297,10 +319,7 @@ void ArtworkRole::Impl::drain_events() {
 
 void ArtworkRole::Impl::cleanup() {
     this->stream_active = false;
-
-    if (this->drain_task) {
-        this->drain_task->event_flags.set(COMMAND_FLUSH);
-    }
+    this->stream_epoch.fetch_add(1, std::memory_order_relaxed);
 
     if (this->display_scheduler) {
         for (auto& pending : this->display_scheduler->pending) {
@@ -324,15 +343,9 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
 
     while (true) {
         // Non-blocking check for commands
-        uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, 0);
+        uint32_t cmd = flags.wait(COMMAND_STOP, false, true, 0);
         if (cmd & COMMAND_STOP) {
             break;
-        }
-        if (cmd & COMMAND_FLUSH) {
-            // Drain all pending notifications without processing
-            ArtworkNotification dummy{};
-            while (queue.receive(dummy, 0)) {}
-            continue;
         }
 
         // Blocking receive with 100ms timeout (allows periodic command checks)
@@ -347,22 +360,45 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
             continue;
         }
 
-        auto& sb = self->drain_task->slot_buffers[slot];
-        auto& buf = sb.buffers[buf_idx];
+        uint8_t* decode_data = nullptr;
+        size_t decode_length = 0;
+        {
+            // Validate the notification is still current before touching the buffer: a newer
+            // stream (stream_epoch changed) or a newer write to the same buffer (write_generation
+            // changed) means this notification is stale and the bytes it names may have already
+            // been overwritten by the network thread, or are about to be. Skip it instead of
+            // risking a torn read; a fresher notification for the same slot is already queued or
+            // on its way.
+            std::lock_guard<std::mutex> lock(self->drain_task->slot_mutex);
+            auto& sb = self->drain_task->slot_buffers[slot];
 
-        if (notif.data_length == 0 || buf.data() == nullptr) {
-            continue;
+            if (notif.stream_epoch != self->stream_epoch.load(std::memory_order_relaxed)) {
+                continue;
+            }
+            if (notif.generation != sb.write_generation[buf_idx]) {
+                continue;
+            }
+
+            auto& buf = sb.buffers[buf_idx];
+            if (notif.data_length == 0 || buf.data() == nullptr) {
+                continue;
+            }
+
+            // Mark this buffer as in-use so the network thread avoids it while we decode.
+            sb.drain_buf_idx = buf_idx;
+            sb.drain_active = true;
+            decode_data = buf.data();
+            decode_length = notif.data_length;
         }
-
-        // Mark this buffer as in-use so the network thread avoids it
-        sb.drain_buf_idx = buf_idx;
-        sb.drain_active.store(true, std::memory_order_release);
 
         if (self->listener) {
-            self->listener->on_image_decode(slot, buf.data(), notif.data_length, notif.format);
+            self->listener->on_image_decode(slot, decode_data, decode_length, notif.format);
         }
 
-        sb.drain_active.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(self->drain_task->slot_mutex);
+            self->drain_task->slot_buffers[slot].drain_active = false;
+        }
 
         // Hand off the timestamp to the main loop. Skip if the stream ended while we were
         // decoding so the main loop doesn't fire a display after on_image_clear.
