@@ -121,15 +121,15 @@ static bool process_player_stream_object(const JsonObject player_object,
     }
 
     if (auto v = read_uint_field<uint32_t>(player_object["sample_rate"], "sample_rate")) {
-        player_obj->sample_rate = *v;
+        player_obj->sample_rate = std::move(v);
     }
 
     if (auto v = read_uint_field<uint8_t>(player_object["channels"], "channels")) {
-        player_obj->channels = *v;
+        player_obj->channels = std::move(v);
     }
 
     if (auto v = read_uint_field<uint8_t>(player_object["bit_depth"], "bit_depth")) {
-        player_obj->bit_depth = *v;
+        player_obj->bit_depth = std::move(v);
     }
 
     if (player_object["codec_header"].is<JsonVariant>()) {
@@ -165,20 +165,20 @@ static bool process_artwork_channel_object(const JsonObject channel_object,
 
     if (auto source =
             read_enum_field(channel_object["source"], "source", image_source_from_string)) {
-        channel->source = *source;
+        channel->source = std::move(source);
     }
 
     if (auto format =
             read_enum_field(channel_object["format"], "format", image_format_from_string)) {
-        channel->format = *format;
+        channel->format = std::move(format);
     }
 
     if (auto v = read_uint_field<uint16_t>(channel_object["width"], "width")) {
-        channel->width = *v;
+        channel->width = std::move(v);
     }
 
     if (auto v = read_uint_field<uint16_t>(channel_object["height"], "height")) {
-        channel->height = *v;
+        channel->height = std::move(v);
     }
 
     return true;
@@ -201,15 +201,15 @@ static bool process_server_player_command_object(const JsonObject player_object,
 
     // Parse optional fields
     if (auto v = read_uint_field<uint8_t>(player_object["volume"], "volume", 0, VOLUME_MAX)) {
-        player_cmd->volume = *v;
+        player_cmd->volume = std::move(v);
     }
 
     if (auto v = read_bool_field(player_object["mute"], "mute")) {
-        player_cmd->mute = *v;
+        player_cmd->mute = std::move(v);
     }
 
     if (auto v = read_uint_field<uint16_t>(player_object["static_delay_ms"], "static_delay_ms")) {
-        player_cmd->static_delay_ms = *v;
+        player_cmd->static_delay_ms = std::move(v);
     }
 
     return true;
@@ -470,7 +470,7 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
         group_msg->group.playback_state = std::nullopt;
     } else if (auto state = read_enum_field(playback_state_var, "playback_state",
                                             playback_state_from_string)) {
-        group_msg->group.playback_state = *state;
+        group_msg->group.playback_state = std::move(state);
     }
 
     // Parse optional group_id - use empty string to signal clearing
