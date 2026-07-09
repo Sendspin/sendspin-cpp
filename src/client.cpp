@@ -58,11 +58,12 @@ struct TimeResponseEvent {
     int64_t offset;
     int64_t max_error;
     int64_t timestamp;
-    /// Identity of the connection the response arrived on, compared (never dereferenced) against
-    /// the current connection at drain time so a measurement from a displaced or pending server
-    /// cannot contaminate the current connection's time filter. A raw pointer because the ESP
-    /// ThreadSafeQueue memcpys its items.
-    SendspinConnection* source_conn;
+    /// Instance id of the connection the response arrived on, compared against the current
+    /// connection at drain time so a measurement from a displaced or pending server cannot
+    /// contaminate the current connection's time filter. An id (not a pointer) so a since-freed
+    /// connection cannot ABA-match a later connection reusing its address; 0 never matches a live
+    /// connection (ids start at 1).
+    uint64_t source_id;
 };
 
 /// @brief Deferred event state for time responses and group updates on the main thread
@@ -194,7 +195,7 @@ void SendspinClient::loop() {
             // Apply only measurements from the connection that is still current; a response queued
             // by a since-displaced (or pending) server carries that server's clock and would
             // contaminate this connection's Kalman filter.
-            if (current != nullptr && current == time_event.source_conn) {
+            if (current != nullptr && current->get_instance_id() == time_event.source_id) {
                 this->time_burst_->on_time_response(current, time_event.offset,
                                                     time_event.max_error, time_event.timestamp);
             }
@@ -673,7 +674,8 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             int64_t offset{0};
             int64_t max_error{0};
             if (process_server_time_message(root, timestamp, &offset, &max_error)) {
-                if (!this->event_state_->time_queue.send({offset, max_error, timestamp, conn}, 0)) {
+                if (!this->event_state_->time_queue.send(
+                        {offset, max_error, timestamp, conn->get_instance_id()}, 0)) {
                     SS_LOGW(TAG, "Time response queue full; dropping measurement");
                 }
             }
