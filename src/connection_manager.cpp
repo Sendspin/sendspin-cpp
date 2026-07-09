@@ -361,9 +361,11 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
     };
 
     std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+    SendspinConnection* accepted_conn = nullptr;
     if (this->current_connection_ == nullptr) {
         SS_LOGD(TAG, "No existing connection, accepting as current");
         this->current_connection_ = std::move(conn);
+        accepted_conn = this->current_connection_.get();
     } else {
         SS_LOGD(TAG, "Existing connection present, setting as pending for handoff");
         if (this->pending_connection_ != nullptr) {
@@ -372,6 +374,15 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             return;
         }
         this->pending_connection_ = std::move(conn);
+        accepted_conn = this->pending_connection_.get();
+    }
+
+    // Some ESP-IDF/httpd versions complete the WebSocket upgrade without dispatching the initial
+    // HTTP_GET request to websocket_handler(). Arm the hello retry from the accept path as well so
+    // server-initiated connections always receive client/hello. If the GET callback arrives later,
+    // initiate_hello() only re-arms the existing per-connection retry entry.
+    if (accepted_conn != nullptr) {
+        this->initiate_hello(accepted_conn);
     }
 }
 

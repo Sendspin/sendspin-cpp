@@ -456,17 +456,26 @@ void SendspinClient::cleanup_connection_state() {
 
 std::string SendspinClient::build_hello_message() {
     ClientHelloMessage msg;
-    msg.client_id = this->config_.client_id;
     msg.name = this->config_.name;
+
+    // Use the explicitly configured MAC when provided; otherwise fall back to platform detection
+    // (reliable on ESP, best-effort on host). Leaves the field absent if neither is available.
+    const std::optional<std::string> interface_mac =
+        this->config_.mac_address ? this->config_.mac_address : platform_get_interface_mac();
+
+    // Some integrations use the network MAC as the Sendspin client_id. If they leave it empty,
+    // default to the same active-interface MAC advertised in device_info instead of forcing them
+    // to duplicate platform-specific MAC detection.
+    msg.client_id = this->config_.client_id;
+    if (msg.client_id.empty() && interface_mac.has_value()) {
+        msg.client_id = interface_mac.value();
+    }
 
     DeviceInfoObject device_info{};
     device_info.product_name = this->config_.product_name;
     device_info.manufacturer = this->config_.manufacturer;
     device_info.software_version = this->config_.software_version;
-    // Use the explicitly configured MAC when provided; otherwise fall back to platform detection
-    // (reliable on ESP, best-effort on host). Leaves the field absent if neither is available.
-    device_info.mac_address =
-        this->config_.mac_address ? this->config_.mac_address : platform_get_interface_mac();
+    device_info.mac_address = interface_mac;
     msg.device_info = device_info;
 
     msg.version = 1;

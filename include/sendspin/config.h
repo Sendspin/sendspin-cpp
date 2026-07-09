@@ -34,8 +34,10 @@ namespace sendspin {
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start_server()
 struct SendspinClientConfig {
-    std::string client_id;  ///< Unique client identifier (e.g., MAC address)
-    std::string name;       ///< Friendly display name
+    /// Unique client identifier. When left empty, the library falls back to the detected local
+    /// network interface MAC address (the same value used for device_info.mac_address).
+    std::string client_id;
+    std::string name;  ///< Friendly display name
 
     std::optional<std::string> product_name{};  ///< Device product name (optional)
     std::optional<std::string> manufacturer{};  ///< Manufacturer name, e.g., "ESPHome" (optional)
