@@ -309,6 +309,10 @@ inline const char* to_cstr(SendspinControllerCommand cmd) {
             return "unshuffle";
         case SendspinControllerCommand::SWITCH:
             return "switch";
+        case SendspinControllerCommand::SEEK:
+            return "seek";
+        case SendspinControllerCommand::SEEK_RELATIVE:
+            return "seek_relative";
         default:
             return "unknown";
     }
@@ -354,6 +358,12 @@ inline std::optional<SendspinControllerCommand> controller_command_from_string(
     }
     if (str == "switch") {
         return SendspinControllerCommand::SWITCH;
+    }
+    if (str == "seek") {
+        return SendspinControllerCommand::SEEK;
+    }
+    if (str == "seek_relative") {
+        return SendspinControllerCommand::SEEK_RELATIVE;
     }
     return std::nullopt;
 }

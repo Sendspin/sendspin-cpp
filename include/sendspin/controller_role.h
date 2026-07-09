@@ -33,19 +33,21 @@ class SendspinClient;
 
 /// @brief Playback commands the controller role can send to the server
 enum class SendspinControllerCommand : uint8_t {
-    PLAY,        // Resume or start playback
-    PAUSE,       // Pause playback
-    STOP,        // Stop playback
-    NEXT,        // Skip to next track
-    PREVIOUS,    // Skip to previous track
-    VOLUME,      // Set volume level
-    MUTE,        // Set mute state
-    REPEAT_OFF,  // Disable repeat
-    REPEAT_ONE,  // Repeat current track
-    REPEAT_ALL,  // Repeat entire queue
-    SHUFFLE,     // Enable shuffle
-    UNSHUFFLE,   // Disable shuffle
-    SWITCH,      // Switch playback source
+    PLAY,           // Resume or start playback
+    PAUSE,          // Pause playback
+    STOP,           // Stop playback
+    NEXT,           // Skip to next track
+    PREVIOUS,       // Skip to previous track
+    VOLUME,         // Set volume level
+    MUTE,           // Set mute state
+    REPEAT_OFF,     // Disable repeat
+    REPEAT_ONE,     // Repeat current track
+    REPEAT_ALL,     // Repeat entire queue
+    SHUFFLE,        // Enable shuffle
+    UNSHUFFLE,      // Disable shuffle
+    SWITCH,         // Switch playback source
+    SEEK,           // Seek to an absolute position
+    SEEK_RELATIVE,  // Seek by a relative offset
 };
 
 /// @brief Repeat mode for playback
