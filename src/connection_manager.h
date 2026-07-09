@@ -196,6 +196,7 @@ private:
     // Connection lifecycle
     // ========================================
     /// @brief Tears down a lost connection and promotes the pending connection if one exists.
+    /// Caller must hold conn_ptr_mutex_.
     /// @param conn The connection that was lost.
     void on_connection_lost(SendspinConnection* conn);
     /// @brief Decides whether to switch from the current connection to the new one.
@@ -216,7 +217,9 @@ private:
     /// @brief Single teardown path: releases a managed connection's slot, cleans up client state
     /// (current slot only), promotes the pending connection, and optionally sends a goodbye.
     ///
-    /// No-op if conn is null or not a managed connection. Caller must hold conn_ptr_mutex_.
+    /// No-op if conn is null. If conn is not a managed connection (already released by an
+    /// earlier event in the same loop() pass), only its stale hello-retry entry, if any, is
+    /// pruned. Caller must hold conn_ptr_mutex_.
     ///
     /// @param conn The connection to drop; must be current_connection_ or pending_connection_.
     /// @param goodbye Goodbye reason to send before closing, or nullopt when the transport is

@@ -23,6 +23,8 @@
 #include "time_burst.h"
 #include "ws_server.h"
 
+#include <utility>
+
 namespace sendspin {
 
 static const char* const TAG = "sendspin.conn_mgr";
@@ -511,6 +513,7 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
 // ============================================================================
 
 void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
+    // Note: caller must hold conn_ptr_mutex_ (reads the slots and calls drop_connection)
     if (conn == nullptr) {
         return;
     }
@@ -540,10 +543,12 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         conn->disable_message_dispatch();
         this->client_->time_burst_->reset();
         this->client_->cleanup_connection_state();
-        auto conn_to_drop = std::move(this->current_connection_);
+        // std::exchange (not std::move) so the slots are never left in a moved-from state the
+        // static analyzer flags when a later event in the same loop() pass reads them.
+        auto conn_to_drop = std::exchange(this->current_connection_, nullptr);
         if (this->pending_connection_ != nullptr) {
             SS_LOGD(TAG, "Promoting pending connection to current");
-            this->current_connection_ = std::move(this->pending_connection_);
+            this->current_connection_ = std::exchange(this->pending_connection_, nullptr);
         }
         if (goodbye.has_value()) {
             this->disconnect_and_release(std::move(conn_to_drop), goodbye.value());
@@ -551,7 +556,7 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         // Without a goodbye (connection already lost), conn_to_drop releases here.
     } else if (conn == this->pending_connection_.get()) {
         // Dropping a pending connection: no client-state cleanup (it was never promoted).
-        auto conn_to_drop = std::move(this->pending_connection_);
+        auto conn_to_drop = std::exchange(this->pending_connection_, nullptr);
         if (goodbye.has_value()) {
             this->disconnect_and_release(std::move(conn_to_drop), goodbye.value());
         }
@@ -607,7 +612,7 @@ void ConnectionManager::complete_handoff(bool switch_to_new) {
             this->drop_connection(this->current_connection_.get(),
                                   SendspinGoodbyeReason::ANOTHER_SERVER);
         } else {
-            this->current_connection_ = std::move(this->pending_connection_);
+            this->current_connection_ = std::exchange(this->pending_connection_, nullptr);
         }
     } else {
         SS_LOGD(TAG, "Completing handoff: keeping current server");
