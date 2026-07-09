@@ -121,7 +121,7 @@ public:
     ///         pointer, which could ABA-collide with a later connection allocated at the same
     ///         address. Ids start at 1, so 0 is a safe "no connection" sentinel.
     uint64_t get_instance_id() const {
-        return this->instance_id_;
+        return this->instance_id;
     }
 
     /// @brief Sends a text message to the server with a completion callback
@@ -378,7 +378,7 @@ protected:
     std::atomic<int64_t> serialize_ema_us_{0};
 
     /// Process-unique connection identity (see get_instance_id()). Assigned once at construction.
-    const uint64_t instance_id_{next_instance_id()};
+    const uint64_t instance_id{next_instance_id()};
 
     // size_t fields
     size_t websocket_write_offset_{0};
