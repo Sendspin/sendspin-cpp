@@ -75,6 +75,28 @@ static std::optional<bool> read_bool_field(JsonVariantConst var, const char* nam
     return var.as<bool>();
 }
 
+/// @brief Reads an optional enum field parsed from a wire string via `from_string`. Absent or null
+/// returns nullopt silently; a present non-string, or a string that `from_string` does not
+/// recognize, is logged and dropped. For enum fields whose policy is "apply if valid, otherwise
+/// leave the current value untouched" (not for fields that map unknown values to a sentinel or that
+/// reject the whole message).
+template <typename E>
+static std::optional<E> read_enum_field(JsonVariantConst var, const char* name,
+                                        std::optional<E> (*from_string)(const std::string&)) {
+    if (var.isUnbound() || var.isNull()) {
+        return std::nullopt;
+    }
+    if (!var.is<const char*>()) {
+        SS_LOGW(TAG, "Ignoring field '%s': expected string", name);
+        return std::nullopt;
+    }
+    std::optional<E> value = from_string(var.as<std::string>());
+    if (!value) {
+        SS_LOGW(TAG, "Ignoring field '%s': unknown value '%s'", name, var.as<const char*>());
+    }
+    return value;
+}
+
 static bool process_player_stream_object(const JsonObject player_object,
                                          ServerPlayerStreamObject* player_obj,
                                          bool require_all_fields) {
@@ -141,14 +163,14 @@ static bool process_artwork_channel_object(const JsonObject channel_object,
         }
     }
 
-    if (channel_object["source"].is<const char*>()) {
-        std::string source_str = channel_object["source"].as<std::string>();
-        channel->source = image_source_from_string(source_str);
+    if (auto source =
+            read_enum_field(channel_object["source"], "source", image_source_from_string)) {
+        channel->source = *source;
     }
 
-    if (channel_object["format"].is<const char*>()) {
-        std::string format_str = channel_object["format"].as<std::string>();
-        channel->format = image_format_from_string(format_str);
+    if (auto format =
+            read_enum_field(channel_object["format"], "format", image_format_from_string)) {
+        channel->format = *format;
     }
 
     if (auto v = read_uint_field<uint16_t>(channel_object["width"], "width")) {
@@ -443,12 +465,12 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
 
     // Parse optional playback_state
     JsonVariantConst playback_state_var = root["payload"]["playback_state"];
-    if (playback_state_var.is<const char*>()) {
-        std::string state_str = playback_state_var.as<std::string>();
-        group_msg->group.playback_state = playback_state_from_string(state_str);
-    } else if (!playback_state_var.isUnbound() && playback_state_var.isNull()) {
+    if (!playback_state_var.isUnbound() && playback_state_var.isNull()) {
         // Field set to null - clear from state
         group_msg->group.playback_state = std::nullopt;
+    } else if (auto state = read_enum_field(playback_state_var, "playback_state",
+                                            playback_state_from_string)) {
+        group_msg->group.playback_state = *state;
     }
 
     // Parse optional group_id - use empty string to signal clearing
@@ -533,17 +555,15 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
         ServerStateControllerObject controller_state{};
         JsonObject controller_object = root["payload"]["controller"];
 
-        // Parse supported_commands array
+        // Parse supported_commands array. The controller role is frozen at v1, so an unrecognized
+        // command is a non-compliant value rather than a forward-compatible one: drop and log it.
         if (controller_object["supported_commands"].is<JsonArray>()) {
             std::vector<SendspinControllerCommand> commands;
-            JsonArray commands_array = controller_object["supported_commands"].as<JsonArray>();
-            for (JsonVariant command_var : commands_array) {
-                if (command_var.is<const char*>()) {
-                    std::string command_str = command_var.as<std::string>();
-                    auto command = controller_command_from_string(command_str);
-                    if (command.has_value()) {
-                        commands.push_back(command.value());
-                    }
+            for (JsonVariantConst command_var :
+                 controller_object["supported_commands"].as<JsonArrayConst>()) {
+                if (auto command = read_enum_field(command_var, "supported_commands",
+                                                   controller_command_from_string)) {
+                    commands.push_back(*command);
                 }
             }
             controller_state.supported_commands = std::move(commands);
@@ -561,12 +581,9 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
         }
 
         // Parse repeat
-        if (controller_object["repeat"].is<const char*>()) {
-            std::string repeat_str = controller_object["repeat"].as<std::string>();
-            auto repeat = repeat_mode_from_string(repeat_str);
-            if (repeat.has_value()) {
-                controller_state.repeat = repeat.value();
-            }
+        if (auto repeat =
+                read_enum_field(controller_object["repeat"], "repeat", repeat_mode_from_string)) {
+            controller_state.repeat = *repeat;
         }
 
         // Parse shuffle

@@ -324,6 +324,30 @@ TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
     EXPECT_EQ(ok.player->channels.value(), 2);
 }
 
+// Enum fields are validated against the known wire strings: a recognized value is applied, an
+// unrecognized one is dropped (leaving the field untouched) rather than clearing or storing garbage.
+TEST(Protocol, GroupUpdatePlaybackStateValidation) {
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(
+            parse(R"({"type":"group/update","payload":{"playback_state":"playing"}})", doc, root));
+        GroupUpdateMessage msg;
+        ASSERT_TRUE(process_group_update_message(root, &msg));
+        ASSERT_TRUE(msg.group.playback_state.has_value());
+        EXPECT_EQ(msg.group.playback_state.value(), SendspinPlaybackState::PLAYING);
+    }
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(
+            parse(R"({"type":"group/update","payload":{"playback_state":"bogus"}})", doc, root));
+        GroupUpdateMessage msg;
+        ASSERT_TRUE(process_group_update_message(root, &msg));
+        EXPECT_FALSE(msg.group.playback_state.has_value());  // unknown state dropped
+    }
+}
+
 // The refactored color parser reads each component as a uint8, so a non-integer (or out-of-range)
 // component fails the type check and the whole color is treated as absent.
 TEST(Protocol, ColorRejectsNonIntegerComponent) {
@@ -339,6 +363,25 @@ TEST(Protocol, ColorRejectsNonIntegerComponent) {
     ServerColorStateObject current;
     apply_color_state_deltas(&current, msg.color.value());
     EXPECT_FALSE(current.primary.has_value());  // malformed component -> whole color dropped
+}
+
+// supported_commands is validated element-by-element. The controller role is frozen at v1, so an
+// unrecognized command is a non-compliant value that is dropped (and logged), while the valid
+// commands around it are kept in order.
+TEST(Protocol, ControllerSupportedCommandsValidation) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
+                      R"({"supported_commands":["play","bogus","mute"]}}})",
+                      doc, root));
+    ServerStateMessage msg;
+    ASSERT_TRUE(process_server_state_message(root, &msg));
+    ASSERT_TRUE(msg.controller.has_value());
+
+    const auto& commands = msg.controller->supported_commands;
+    ASSERT_EQ(commands.size(), 2u);  // "bogus" dropped
+    EXPECT_EQ(commands[0], SendspinControllerCommand::PLAY);
+    EXPECT_EQ(commands[1], SendspinControllerCommand::MUTE);
 }
 
 // ============================================================================
