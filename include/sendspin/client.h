@@ -206,6 +206,10 @@ public:
     bool start_server();
 
     /// @brief Initiates a client connection to a Sendspin server at the given URL
+    ///
+    /// Must be called from the main loop thread: it tears down and replaces connection state
+    /// (time filter, dispatch, client state) directly rather than deferring to loop(), so calling
+    /// it concurrently with loop() would race those mutations.
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
