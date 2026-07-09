@@ -70,6 +70,10 @@ void ConnectionManager::connect_to(const std::string& url) {
 
     client_conn->init_time_filter();
 
+    // Start the provisional-timeout window: loop() reaps the connection if the hello handshake
+    // has not completed within PROVISIONAL_CONNECTION_TIMEOUT_US.
+    client_conn->set_provisional_time_us(platform_time_us());
+
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         if (this->current_connection_ != nullptr && this->current_connection_->is_connected()) {
@@ -287,6 +291,35 @@ void ConnectionManager::loop() {
             }
         }
     }
+
+    // Provisional-connection timeout: drop any managed connection that has not completed the
+    // hello handshake within PROVISIONAL_CONNECTION_TIMEOUT_US. This is the only release path
+    // for connections whose socket died before the WebSocket session was established (the host
+    // transport never delivers a close for those, issue #75) and for peers that connect and then
+    // stall without completing the hello (both platforms).
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        const int64_t now_us = platform_time_us();
+        auto handshake_expired = [now_us](const std::shared_ptr<SendspinConnection>& conn) {
+            if (conn == nullptr || conn->is_handshake_complete()) {
+                return false;
+            }
+            const int64_t prov_time = conn->get_provisional_time_us();
+            return prov_time != 0 && (now_us - prov_time) >= PROVISIONAL_CONNECTION_TIMEOUT_US;
+        };
+        if (handshake_expired(this->pending_connection_)) {
+            SS_LOGW(TAG, "Pending connection timed out (>%d s without completing hello), dropping",
+                    static_cast<int>(PROVISIONAL_CONNECTION_TIMEOUT_S));
+            this->drop_connection(this->pending_connection_.get(),
+                                  SendspinGoodbyeReason::ANOTHER_SERVER);
+        }
+        if (handshake_expired(this->current_connection_)) {
+            SS_LOGW(TAG, "Current connection timed out (>%d s without completing hello), dropping",
+                    static_cast<int>(PROVISIONAL_CONNECTION_TIMEOUT_S));
+            this->drop_connection(this->current_connection_.get(),
+                                  SendspinGoodbyeReason::ANOTHER_SERVER);
+        }
+    }
 }
 
 // ============================================================================
@@ -359,6 +392,12 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
     conn->on_disconnected_cb = [](SendspinConnection* /*c*/) {
         // Cleanup happens in on_connection_lost triggered by the server
     };
+
+    // Start the provisional-timeout window: loop() reaps the connection if the hello handshake
+    // has not completed within PROVISIONAL_CONNECTION_TIMEOUT_US. This is the release path for
+    // sockets that die before the WebSocket session is established: the host transport delivers
+    // no close for those, so without the timeout they would hold a slot forever (issue #75).
+    conn->set_provisional_time_us(platform_time_us());
 
     std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
     SendspinConnection* accepted_conn = nullptr;
@@ -476,23 +515,48 @@ void ConnectionManager::on_connection_lost(SendspinConnection* conn) {
         return;
     }
 
-    if (this->current_connection_ != nullptr && this->current_connection_.get() == conn) {
+    if (conn == this->current_connection_.get()) {
         SS_LOGI(TAG, "Current connection lost");
+    } else if (conn == this->pending_connection_.get()) {
+        SS_LOGD(TAG, "Pending connection lost");
+    }
+
+    // The transport is already gone, so no goodbye is attempted (nullopt).
+    this->drop_connection(conn, std::nullopt);
+}
+
+void ConnectionManager::drop_connection(SendspinConnection* conn,
+                                        std::optional<SendspinGoodbyeReason> goodbye) {
+    // Note: caller must hold conn_ptr_mutex_
+    if (conn == nullptr) {
+        return;
+    }
+
+    this->remove_hello_retry(conn);
+
+    if (conn == this->current_connection_.get()) {
+        // Dropping the admitted connection: block stale network-thread events, quiesce the
+        // client's per-connection state, and promote the pending connection if one exists.
         conn->disable_message_dispatch();
         this->client_->time_burst_->reset();
         this->client_->cleanup_connection_state();
-        this->remove_hello_retry(conn);
-        this->current_connection_.reset();
-
+        auto conn_to_drop = std::move(this->current_connection_);
         if (this->pending_connection_ != nullptr) {
             SS_LOGD(TAG, "Promoting pending connection to current");
             this->current_connection_ = std::move(this->pending_connection_);
         }
-    } else if (this->pending_connection_ != nullptr && this->pending_connection_.get() == conn) {
-        SS_LOGD(TAG, "Pending connection lost");
-        this->remove_hello_retry(conn);
-        this->pending_connection_.reset();
+        if (goodbye.has_value()) {
+            this->disconnect_and_release(std::move(conn_to_drop), goodbye.value());
+        }
+        // Without a goodbye (connection already lost), conn_to_drop releases here.
+    } else if (conn == this->pending_connection_.get()) {
+        // Dropping a pending connection: no client-state cleanup (it was never promoted).
+        auto conn_to_drop = std::move(this->pending_connection_);
+        if (goodbye.has_value()) {
+            this->disconnect_and_release(std::move(conn_to_drop), goodbye.value());
+        }
     }
+    // Not a managed connection: nothing to do (already released by an earlier event this tick).
 }
 
 bool ConnectionManager::should_switch_to_new_server(SendspinConnection* current,
@@ -538,26 +602,18 @@ void ConnectionManager::complete_handoff(bool switch_to_new) {
     if (switch_to_new) {
         SS_LOGD(TAG, "Completing handoff: switching to new server");
         if (this->current_connection_ != nullptr) {
-            this->current_connection_->disable_message_dispatch();
-            this->client_->time_burst_->reset();
-            this->client_->cleanup_connection_state();
-            auto old_current = std::move(this->current_connection_);
-            this->current_connection_ = std::move(this->pending_connection_);
-            // Drop any retry entry now that this connection is leaving the managed set, mirroring
-            // on_connection_lost. (loop() also prunes orphaned entries, but removing it here closes
-            // the window where a retry could fire against an already-handed-off connection.)
-            this->remove_hello_retry(old_current.get());
-            this->disconnect_and_release(std::move(old_current),
-                                         SendspinGoodbyeReason::ANOTHER_SERVER);
+            // drop_connection tears down the displaced current connection (with goodbye) and
+            // promotes the pending connection into the current slot.
+            this->drop_connection(this->current_connection_.get(),
+                                  SendspinGoodbyeReason::ANOTHER_SERVER);
         } else {
             this->current_connection_ = std::move(this->pending_connection_);
         }
     } else {
         SS_LOGD(TAG, "Completing handoff: keeping current server");
         if (this->pending_connection_ != nullptr) {
-            this->remove_hello_retry(this->pending_connection_.get());
-            this->disconnect_and_release(std::move(this->pending_connection_),
-                                         SendspinGoodbyeReason::ANOTHER_SERVER);
+            this->drop_connection(this->pending_connection_.get(),
+                                  SendspinGoodbyeReason::ANOTHER_SERVER);
         }
     }
 }
