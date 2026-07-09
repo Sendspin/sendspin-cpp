@@ -236,7 +236,7 @@ SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) con
     }
 }
 
-void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) {
+void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) const {
     if (this->config.audio_formats.empty()) {
         // No audio formats, just defer stream start callback
         this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START);
