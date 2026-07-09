@@ -120,6 +120,16 @@ public:
         return this->current_connection_.get();
     }
 
+    /// @brief Returns a shared_ptr to the current connection. Thread-safe.
+    /// Role threads (sync task, artwork/visualizer drains) must use this instead of current():
+    /// the shared_ptr keeps the connection alive for the duration of the caller's use even if the
+    /// main loop concurrently drops or replaces the current connection.
+    /// @return Shared pointer to the current connection, or nullptr if none.
+    std::shared_ptr<SendspinConnection> current_shared() const {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        return this->current_connection_;
+    }
+
     // ========================================
     // Event queuing (thread-safe)
     // ========================================

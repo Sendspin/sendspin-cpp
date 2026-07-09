@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -470,6 +471,9 @@ private:
     /// Internal-RAM scratch arena for parsing incoming JSON; null unless config_.json_arena_size >
     /// 0
     std::unique_ptr<SendspinArenaAllocator> json_arena_;
+    /// Serializes process_json_message() (and its use of json_arena_) across the network threads
+    /// of concurrently live connections (current + pending during a handoff).
+    std::mutex json_processing_mutex_;
     SendspinClientListener* listener_{nullptr};
 #ifdef SENDSPIN_ENABLE_METADATA
     std::unique_ptr<MetadataRole> metadata_;
