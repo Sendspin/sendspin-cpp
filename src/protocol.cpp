@@ -664,30 +664,24 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             vis_obj.tracks_downbeats = vis_json["tracks_downbeats"].as<bool>();
         }
 
-        // Parse spectrum config if present
+        // Parse spectrum config if present. Every field is required by the spec; if any is
+        // absent or malformed, leave the config unset so the SPECTRUM validation below rejects
+        // the stream rather than acting on a fabricated default.
         if (vis_json["spectrum"].is<JsonObject>()) {
             JsonObject spec_json = vis_json["spectrum"];
-            VisualizerSpectrumConfig spec_cfg{};
-            if (auto v = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins", 1)) {
-                spec_cfg.n_disp_bins = *v;
+            auto n_disp_bins = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins", 1);
+            auto scale =
+                read_enum_field(spec_json["scale"], "scale", visualizer_spectrum_scale_from_string);
+            auto f_min = read_uint_field<uint16_t>(spec_json["f_min"], "f_min");
+            auto f_max = read_uint_field<uint16_t>(spec_json["f_max"], "f_max");
+            if (n_disp_bins && scale && f_min && f_max) {
+                vis_obj.spectrum = VisualizerSpectrumConfig{*n_disp_bins, *scale, *f_min, *f_max};
             }
-            // Absent or unknown scale falls back to MEL (read_enum_field warns on an unknown
-            // value; an absent field is silent).
-            spec_cfg.scale =
-                read_enum_field(spec_json["scale"], "scale", visualizer_spectrum_scale_from_string)
-                    .value_or(VisualizerSpectrumScale::MEL);
-            if (auto v = read_uint_field<uint16_t>(spec_json["f_min"], "f_min")) {
-                spec_cfg.f_min = *v;
-            }
-            if (auto v = read_uint_field<uint16_t>(spec_json["f_max"], "f_max")) {
-                spec_cfg.f_max = *v;
-            }
-            vis_obj.spectrum = spec_cfg;
         }
 
-        // If SPECTRUM is advertised, a valid spectrum config with a non-zero bin count must be
-        // present; otherwise the expected size of binary spectrum messages is indeterminate
-        // and they could not be validated.
+        // If SPECTRUM is advertised, a fully valid spectrum config must be present; otherwise the
+        // expected size of binary spectrum messages is indeterminate and they could not be
+        // validated.
         bool advertises_spectrum = false;
         for (auto type : vis_obj.types) {
             if (type == VisualizerDataType::SPECTRUM) {
@@ -695,8 +689,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
                 break;
             }
         }
-        if (advertises_spectrum &&
-            (!vis_obj.spectrum.has_value() || vis_obj.spectrum->n_disp_bins == 0)) {
+        if (advertises_spectrum && !vis_obj.spectrum.has_value()) {
             SS_LOGE(TAG, "Invalid stream/start message: SPECTRUM advertised without valid spectrum "
                          "config");
             return false;
