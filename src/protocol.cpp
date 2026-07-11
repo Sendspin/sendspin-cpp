@@ -649,19 +649,9 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         if (vis_json["types"].is<JsonArray>()) {
             JsonArray types_array = vis_json["types"].as<JsonArray>();
             for (JsonVariant type_var : types_array) {
-                if (type_var.is<const char*>()) {
-                    std::string type_str = type_var.as<std::string>();
-                    if (type_str == "loudness") {
-                        vis_obj.types.push_back(VisualizerDataType::LOUDNESS);
-                    } else if (type_str == "f_peak") {
-                        vis_obj.types.push_back(VisualizerDataType::F_PEAK);
-                    } else if (type_str == "spectrum") {
-                        vis_obj.types.push_back(VisualizerDataType::SPECTRUM);
-                    } else if (type_str == "beat") {
-                        vis_obj.types.push_back(VisualizerDataType::BEAT);
-                    } else if (type_str == "peak") {
-                        vis_obj.types.push_back(VisualizerDataType::PEAK);
-                    }
+                if (auto type =
+                        read_enum_field(type_var, "types", visualizer_data_type_from_string)) {
+                    vis_obj.types.push_back(*type);
                 }
             }
         }
@@ -681,14 +671,11 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             if (auto v = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins", 1)) {
                 spec_cfg.n_disp_bins = *v;
             }
-            std::string scale_str = spec_json["scale"].as<std::string>();
-            if (scale_str == "log") {
-                spec_cfg.scale = VisualizerSpectrumScale::LOG;
-            } else if (scale_str == "lin") {
-                spec_cfg.scale = VisualizerSpectrumScale::LIN;
-            } else {
-                spec_cfg.scale = VisualizerSpectrumScale::MEL;
-            }
+            // Absent or unknown scale falls back to MEL (read_enum_field warns on an unknown
+            // value; an absent field is silent).
+            spec_cfg.scale =
+                read_enum_field(spec_json["scale"], "scale", visualizer_spectrum_scale_from_string)
+                    .value_or(VisualizerSpectrumScale::MEL);
             if (auto v = read_uint_field<uint16_t>(spec_json["f_min"], "f_min")) {
                 spec_cfg.f_min = *v;
             }

@@ -521,6 +521,25 @@ inline const char* to_cstr(VisualizerDataType type) {
     }
 }
 
+inline std::optional<VisualizerDataType> visualizer_data_type_from_string(const std::string& str) {
+    if (str == "beat") {
+        return VisualizerDataType::BEAT;
+    }
+    if (str == "loudness") {
+        return VisualizerDataType::LOUDNESS;
+    }
+    if (str == "f_peak") {
+        return VisualizerDataType::F_PEAK;
+    }
+    if (str == "spectrum") {
+        return VisualizerDataType::SPECTRUM;
+    }
+    if (str == "peak") {
+        return VisualizerDataType::PEAK;
+    }
+    return std::nullopt;
+}
+
 inline const char* to_cstr(VisualizerSpectrumScale scale) {
     switch (scale) {
         case VisualizerSpectrumScale::MEL:
@@ -532,6 +551,20 @@ inline const char* to_cstr(VisualizerSpectrumScale scale) {
         default:
             return "mel";
     }
+}
+
+inline std::optional<VisualizerSpectrumScale> visualizer_spectrum_scale_from_string(
+    const std::string& str) {
+    if (str == "mel") {
+        return VisualizerSpectrumScale::MEL;
+    }
+    if (str == "log") {
+        return VisualizerSpectrumScale::LOG;
+    }
+    if (str == "lin") {
+        return VisualizerSpectrumScale::LIN;
+    }
+    return std::nullopt;
 }
 
 // --- metadata_role.h ---
