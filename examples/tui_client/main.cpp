@@ -530,6 +530,7 @@ int main(int argc, char* argv[]) {
     (void)controller;
 
     // Visualizer support (disabled with -V flag)
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     VisualizerRole* vis_role = nullptr;
     if (enable_visualizer) {
         VisualizerSupportObject vis;
@@ -546,6 +547,9 @@ int main(int argc, char* argv[]) {
         };
         vis_role = &client.add_visualizer(VisualizerRoleConfig{.support = vis});
     }
+#else
+    (void)enable_visualizer;
+#endif
 
     // --- Listener implementations ---
 
@@ -654,6 +658,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     struct TuiVisualizerListener : VisualizerRoleListener {
         TuiState& state;
         explicit TuiVisualizerListener(TuiState& s) : state(s) {}
@@ -720,6 +725,7 @@ int main(int argc, char* argv[]) {
             state.vis_beat_expire_us = current_us + 100000;  // 100ms flash
         }
     };
+#endif
 
     struct HostNetworkProvider : SendspinNetworkProvider {
         bool is_network_ready() override { return true; }
@@ -739,16 +745,20 @@ int main(int argc, char* argv[]) {
 #endif
     TuiMetadataListener metadata_listener(state);
     TuiClientListener client_listener(state);
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     TuiVisualizerListener visualizer_listener(state);
+#endif
     HostNetworkProvider network_provider;
 
     player.set_listener(&player_listener);
     metadata.set_listener(&metadata_listener);
     client.set_listener(&client_listener);
     client.set_network_provider(&network_provider);
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     if (vis_role) {
         vis_role->set_listener(&visualizer_listener);
     }
+#endif
 
     // Start the server
     if (!client.start_server()) {
