@@ -660,8 +660,8 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             vis_obj.rate_max = *v;
         }
 
-        if (vis_json["tracks_downbeats"].is<bool>()) {
-            vis_obj.tracks_downbeats = vis_json["tracks_downbeats"].as<bool>();
+        if (auto v = read_bool_field(vis_json["tracks_downbeats"], "tracks_downbeats")) {
+            vis_obj.tracks_downbeats = *v;
         }
 
         // Parse spectrum config if present. Every field is required by the spec; if any is

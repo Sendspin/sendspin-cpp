@@ -52,12 +52,19 @@ enum SendspinBinaryRole : uint8_t {
 /// @brief Extracts the role field from a standard 4-slot binary message type byte
 /// @param type Binary message type byte.
 /// @return Role portion of the type (bits 7-2).
+/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK, IDs 4-11). The visualizer
+///          range (IDs 16-23) is dispatched by range in SendspinClient::process_binary_message
+///          and must not be routed through this helper: get_binary_role(16) yields 4, which
+///          matches no SendspinBinaryRole enumerator.
 inline uint8_t get_binary_role(uint8_t type) {
     return type >> 2;
 }
 /// @brief Extracts the slot field from a standard 4-slot binary message type byte
 /// @param type Binary message type byte.
 /// @return Slot portion of the type (bits 1-0).
+/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK, IDs 4-11). It masks bits
+///          1-0, so it cannot address the visualizer's 8-slot range (e.g. IDs 16 and 20 both
+///          alias to slot 0); those messages are dispatched by range, not by slot.
 inline uint8_t get_binary_slot(uint8_t type) {
     return type & 0x03;
 }

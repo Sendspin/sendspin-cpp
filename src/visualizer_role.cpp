@@ -171,44 +171,14 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
         return;
     }
 
-    // Every visualizer message is one frame: [server_ts(8)][payload]
+    // Forward the raw message verbatim: [wire_type][server_ts(8)][payload]. Like the player and
+    // artwork roles, the network thread stays dumb -- it records the message and hands it to the
+    // drain thread, which owns all structural validation and per-type truncation. The only check
+    // here is that a timestamp is present, since the drain thread needs it to schedule the entry.
+    // No size cap is applied: the ring buffer records each entry's length, so an oversized message
+    // is self-limiting (it either fits or is dropped when acquire() fails).
     if (len < TIMESTAMP_SIZE) {
         return;
-    }
-    size_t payload_len = len - TIMESTAMP_SIZE;
-
-    switch (binary_type) {
-        case SENDSPIN_BINARY_VISUALIZER_LOUDNESS:
-            if (payload_len < LOUDNESS_PAYLOAD_SIZE) {
-                return;
-            }
-            break;
-        case SENDSPIN_BINARY_VISUALIZER_BEAT:
-            if (payload_len < BEAT_PAYLOAD_SIZE) {
-                return;
-            }
-            break;
-        case SENDSPIN_BINARY_VISUALIZER_F_PEAK:
-            if (payload_len < F_PEAK_PAYLOAD_SIZE) {
-                return;
-            }
-            break;
-        case SENDSPIN_BINARY_VISUALIZER_SPECTRUM: {
-            uint8_t bin_count = this->spectrum_bin_count;
-            if (bin_count == 0 || payload_len < 2U * bin_count) {
-                return;
-            }
-            // Truncate any trailing bytes so the drain thread delivers exactly n_disp_bins
-            len = TIMESTAMP_SIZE + 2U * bin_count;
-            break;
-        }
-        case SENDSPIN_BINARY_VISUALIZER_PEAK:
-            if (payload_len < PEAK_PAYLOAD_SIZE) {
-                return;
-            }
-            break;
-        default:
-            return;  // Reserved types 21-23
     }
 
     // Build entry: [wire_type][server_ts(8)][payload]. Use acquire+commit to avoid double-copy.
@@ -363,6 +333,25 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     // grows to the largest bin count seen and is resized (not reallocated) after that.
     std::vector<uint16_t> spectrum_bins;
 
+    // RAII guard so the ring-buffer slot is returned exactly once on every exit path. Each branch
+    // calls release() to hand the slot back *before* invoking the listener callback, so a slow
+    // callback never blocks the network producer; if a branch exits without releasing (a short-
+    // payload drop, or a future wire type that forgets), the destructor returns it. Stack-only.
+    struct SlotGuard {
+        SpscRingBuffer& rb;
+        void* item;
+        bool released = false;
+        void release() {
+            if (!this->released) {
+                this->rb.return_item(this->item);
+                this->released = true;
+            }
+        }
+        ~SlotGuard() {
+            this->release();
+        }
+    };
+
     while (true) {
         // Non-blocking check for commands
         uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, 0);
@@ -432,50 +421,69 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Parse and deliver. Payload lengths were validated in handle_binary before queueing.
+        // Parse and deliver. The network thread forwards messages verbatim, so every branch
+        // validates its own payload length here before reading.
         const uint8_t* payload = raw + ENTRY_TYPE_SIZE + TIMESTAMP_SIZE;
         size_t payload_len = item_size - ENTRY_TYPE_SIZE - TIMESTAMP_SIZE;
 
+        SlotGuard guard{rb, item};
+
         switch (wire_type) {
             case SENDSPIN_BINARY_VISUALIZER_LOUDNESS: {
+                if (payload_len < LOUDNESS_PAYLOAD_SIZE) {
+                    break;
+                }
                 uint16_t loudness = read_be16(payload);
-                rb.return_item(item);
+                guard.release();
                 self->listener->on_loudness(client_ts, loudness);
                 break;
             }
             case SENDSPIN_BINARY_VISUALIZER_BEAT: {
+                if (payload_len < BEAT_PAYLOAD_SIZE) {
+                    break;
+                }
                 // Bit 0 is only meaningful when the stream tracks downbeats
                 bool downbeat = self->tracks_downbeats && (payload[0] & BEAT_FLAG_DOWNBEAT) != 0;
-                rb.return_item(item);
+                guard.release();
                 self->listener->on_beat(client_ts, downbeat);
                 break;
             }
             case SENDSPIN_BINARY_VISUALIZER_F_PEAK: {
+                if (payload_len < F_PEAK_PAYLOAD_SIZE) {
+                    break;
+                }
                 uint16_t freq = read_be16(payload);
                 uint16_t amp = read_be16(payload + 2);
-                rb.return_item(item);
+                guard.release();
                 self->listener->on_f_peak(client_ts, freq, amp);
                 break;
             }
             case SENDSPIN_BINARY_VISUALIZER_SPECTRUM: {
-                size_t bin_count = payload_len / 2;
-                spectrum_bins.resize(bin_count);
-                for (size_t b = 0; b < bin_count; ++b) {
+                // Deliver exactly the negotiated n_disp_bins. Drop the frame if SPECTRUM was not
+                // negotiated (bin count 0) or the payload is short; ignore any trailing bytes.
+                uint8_t configured = self->spectrum_bin_count;
+                if (configured == 0 || payload_len < 2U * configured) {
+                    break;
+                }
+                spectrum_bins.resize(configured);
+                for (uint8_t b = 0; b < configured; ++b) {
                     spectrum_bins[b] = read_be16(payload + 2 * b);
                 }
-                rb.return_item(item);
+                guard.release();
                 self->listener->on_spectrum(client_ts, spectrum_bins);
                 break;
             }
             case SENDSPIN_BINARY_VISUALIZER_PEAK: {
+                if (payload_len < PEAK_PAYLOAD_SIZE) {
+                    break;
+                }
                 uint8_t strength = payload[0];
-                rb.return_item(item);
+                guard.release();
                 self->listener->on_peak(client_ts, strength);
                 break;
             }
             default:
-                rb.return_item(item);
-                break;
+                break;  // Reserved types 21-23; guard returns the slot
         }
     }
 

@@ -132,7 +132,7 @@ vis_support.types = {
     VisualizerDataType::SPECTRUM,
     VisualizerDataType::PEAK,
 };
-vis_support.buffer_capacity = 8192;
+vis_support.buffer_capacity = 32768;  // Total ring buffer bytes; ~1/3 holds wire data
 vis_support.rate_max = 30;  // Set to the display refresh rate
 vis_support.spectrum = VisualizerSpectrumConfig{
     .n_disp_bins = 32,
