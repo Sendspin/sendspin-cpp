@@ -42,10 +42,11 @@ namespace sendspin {
 ///
 /// Bits 7-2 encode the role (upper 6 bits of the type byte); bits 1-0 encode
 /// the slot. Each role therefore has 4 slots (IDs = role << 2 through role << 2 + 3).
+/// The visualizer role has an expanded 8-slot allocation (IDs 16-23, bits 2-0 as slot)
+/// and is dispatched by ID range rather than through this enum.
 enum SendspinBinaryRole : uint8_t {
-    SENDSPIN_ROLE_PLAYER = 1,      // 000001xx (IDs 4-7)
-    SENDSPIN_ROLE_ARTWORK = 2,     // 000010xx (IDs 8-11)
-    SENDSPIN_ROLE_VISUALIZER = 4,  // 000100xx (IDs 16-19)
+    SENDSPIN_ROLE_PLAYER = 1,   // 000001xx (IDs 4-7)
+    SENDSPIN_ROLE_ARTWORK = 2,  // 000010xx (IDs 8-11)
 };
 
 /// @brief Extracts the role field from a standard 4-slot binary message type byte
@@ -63,10 +64,17 @@ inline uint8_t get_binary_slot(uint8_t type) {
 
 /// @brief Binary message type byte values for known message kinds
 enum SendspinBinaryType : uint8_t {
-    SENDSPIN_BINARY_PLAYER_AUDIO = 4,      // Player slot 0: encoded audio chunk
-    SENDSPIN_BINARY_ARTWORK_IMAGE = 8,     // Artwork slot 0: image data
-    SENDSPIN_BINARY_VISUALIZER = 16,       // Visualizer slot 0: loudness, f_peak, spectrum
-    SENDSPIN_BINARY_VISUALIZER_BEAT = 17,  // Visualizer slot 1: beat events
+    SENDSPIN_BINARY_PLAYER_AUDIO = 4,   // Player slot 0: encoded audio chunk
+    SENDSPIN_BINARY_ARTWORK_IMAGE = 8,  // Artwork slot 0: image data
+    // Visualizer expanded allocation (IDs 16-23); each data type is its own message
+    // carrying exactly one frame of [timestamp:8][data]
+    SENDSPIN_BINARY_VISUALIZER_LOUDNESS = 16,  // uint16 A-weighted loudness
+    SENDSPIN_BINARY_VISUALIZER_BEAT = 17,      // uint8 flags (bit 0 = downbeat)
+    SENDSPIN_BINARY_VISUALIZER_F_PEAK = 18,    // uint16 freq Hz + uint16 amplitude
+    SENDSPIN_BINARY_VISUALIZER_SPECTRUM = 19,  // uint16[n_disp_bins] magnitudes
+    SENDSPIN_BINARY_VISUALIZER_PEAK = 20,      // uint8 onset strength
+    SENDSPIN_BINARY_VISUALIZER_FIRST = 16,     // Start of visualizer ID range
+    SENDSPIN_BINARY_VISUALIZER_LAST = 23,      // End of visualizer ID range (21-23 reserved)
 };
 
 /// @brief JSON message types sent from the server to the client
@@ -106,7 +114,7 @@ inline const char* to_cstr(SendspinRole role) {
         case SendspinRole::ARTWORK:
             return "artwork@v1";
         case SendspinRole::VISUALIZER:
-            return "visualizer@_draft_r1";
+            return "visualizer@v1";
         case SendspinRole::COLOR:
             return "color@v1";
         default:
@@ -506,6 +514,8 @@ inline const char* to_cstr(VisualizerDataType type) {
             return "f_peak";
         case VisualizerDataType::SPECTRUM:
             return "spectrum";
+        case VisualizerDataType::PEAK:
+            return "peak";
         default:
             return "unknown";
     }
@@ -616,10 +626,12 @@ struct StreamStartMessage {
     std::optional<ServerVisualizerStreamObject> visualizer;
 };
 
-/// @brief Outgoing stream/request_format message used for codec and artwork format negotiation
+/// @brief Outgoing stream/request_format message used for codec, artwork, and visualizer
+/// format negotiation
 struct StreamRequestFormatMessage {
     std::optional<ServerPlayerStreamObject> player;
     std::optional<ClientArtworkRequestObject> artwork;
+    std::optional<VisualizerFormatRequest> visualizer;
 };
 
 /// @brief Parsed stream/end message listing which roles the stream end applies to

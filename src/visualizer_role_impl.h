@@ -76,6 +76,7 @@ struct VisualizerRole::Impl {
     void handle_stream_clear();
     void handle_stream_ring_event(VisualizerEventType event) const;
     void cleanup();
+    void request_format(const VisualizerFormatRequest& request) const;
 
     // ========================================
     // Internal helpers
@@ -103,11 +104,8 @@ struct VisualizerRole::Impl {
     VisualizerRoleListener* listener{nullptr};
 
     // Atomic fields (written by network thread, read by drain thread / cleanup)
-    std::atomic<size_t> raw_frame_size{0};
-    std::atomic<bool> has_f_peak{false};
-    std::atomic<bool> has_loudness{false};
-    std::atomic<bool> has_spectrum{false};
     std::atomic<uint8_t> spectrum_bin_count{0};
+    std::atomic<bool> tracks_downbeats{false};
     std::atomic<bool> stream_active{false};
 };
 

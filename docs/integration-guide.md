@@ -121,7 +121,7 @@ The slot/channel number for each entry is its position (index) in `preferred_for
 
 ### Visualizer Role (Audio Visualization)
 
-Receives real-time beat, loudness, peak frequency, and spectrum data synchronized to playback.
+Receives real-time beat, loudness, peak frequency, onset, and spectrum data synchronized to playback.
 
 ```cpp
 VisualizerSupportObject vis_support;
@@ -130,15 +130,15 @@ vis_support.types = {
     VisualizerDataType::LOUDNESS,
     VisualizerDataType::F_PEAK,
     VisualizerDataType::SPECTRUM,
+    VisualizerDataType::PEAK,
 };
 vis_support.buffer_capacity = 8192;
-vis_support.batch_max = 4;
+vis_support.rate_max = 30;  // Set to the display refresh rate
 vis_support.spectrum = VisualizerSpectrumConfig{
     .n_disp_bins = 32,
     .scale = VisualizerSpectrumScale::MEL,
     .f_min = 40,
     .f_max = 16000,
-    .rate_max = 30,
 };
 
 auto& visualizer = client.add_visualizer({.support = vis_support});
@@ -298,17 +298,28 @@ struct MyArtworkListener : ArtworkRoleListener {
 
 ```cpp
 struct MyVisualizerListener : VisualizerRoleListener {
-    // THREAD SAFETY: Called from a dedicated drain thread. Copy data quickly
-    // and defer heavy processing.
-    void on_visualizer_frame(const VisualizerFrame& frame) override {
-        if (frame.loudness) update_vu_meter(*frame.loudness);
-        if (frame.peak_freq) update_peak_display(*frame.peak_freq);
-        if (!frame.spectrum.empty()) update_spectrum_bars(frame.spectrum);
+    // THREAD SAFETY: Data callbacks fire on a dedicated drain thread at each
+    // frame's display timestamp. Copy data quickly and defer heavy processing.
+    void on_loudness(int64_t client_timestamp, uint16_t loudness) override {
+        update_vu_meter(loudness);
     }
 
-    // Called from the drain thread on beat events.
-    void on_beat(int64_t client_timestamp) override {
-        trigger_beat_animation();
+    void on_f_peak(int64_t client_timestamp, uint16_t frequency_hz, uint16_t amplitude) override {
+        update_peak_display(frequency_hz, amplitude);
+    }
+
+    void on_spectrum(int64_t client_timestamp, const std::vector<uint16_t>& bins) override {
+        update_spectrum_bars(bins);
+    }
+
+    // Musical beat events; downbeat marks a bar start when the server tracks downbeats.
+    void on_beat(int64_t client_timestamp, bool downbeat) override {
+        trigger_beat_animation(downbeat);
+    }
+
+    // Energy onset (transient) events, independent of musical timing.
+    void on_peak(int64_t client_timestamp, uint8_t strength) override {
+        trigger_flash(strength);
     }
 
     // Called from the main loop thread.
@@ -582,8 +593,7 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 | `PlayerRoleListener::on_audio_write()` | Sync task background thread |
 | `ArtworkRoleListener::on_image_decode()` | Dedicated artwork decode thread |
 | `ArtworkRoleListener::on_image_display()` | Main loop thread |
-| `VisualizerRoleListener::on_visualizer_frame()` | Dedicated visualizer drain thread |
-| `VisualizerRoleListener::on_beat()` | Dedicated visualizer drain thread |
+| `VisualizerRoleListener` data callbacks (`on_loudness()`, `on_beat()`, `on_f_peak()`, `on_spectrum()`, `on_peak()`) | Dedicated visualizer drain thread |
 | All other listener methods | Main loop thread |
 
 `PlayerRole::notify_audio_played()` is thread-safe and is designed to be called from an audio output callback thread.
@@ -774,9 +784,9 @@ Configuration passed to `client.add_visualizer()`.
 
 | Field | Type | Description |
 |---|---|---|
-| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`) |
-| `buffer_capacity` | `size_t` | Internal buffer size for incoming visualizer frames |
-| `batch_max` | `uint8_t` | Maximum number of frames to process per drain cycle |
+| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`) |
+| `buffer_capacity` | `size_t` | Max total size in bytes of buffered visualizer messages, counting each message's full wire size |
+| `rate_max` | `uint16_t` | Maximum periodic frames per second; set to the display refresh rate |
 | `spectrum` | `std::optional<VisualizerSpectrumConfig>` | Spectrum analysis parameters; required when `SPECTRUM` is in `types` |
 
 `VisualizerSpectrumConfig` fields:
@@ -787,7 +797,6 @@ Configuration passed to `client.add_visualizer()`.
 | `scale` | `VisualizerSpectrumScale` | Frequency scale (`MEL`, `LOG`, or `LIN`) |
 | `f_min` | `uint16_t` | Minimum frequency in Hz |
 | `f_max` | `uint16_t` | Maximum frequency in Hz |
-| `rate_max` | `uint16_t` | Maximum spectrum update rate in Hz |
 
 ---
 

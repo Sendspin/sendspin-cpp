@@ -659,13 +659,19 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
                         vis_obj.types.push_back(VisualizerDataType::SPECTRUM);
                     } else if (type_str == "beat") {
                         vis_obj.types.push_back(VisualizerDataType::BEAT);
+                    } else if (type_str == "peak") {
+                        vis_obj.types.push_back(VisualizerDataType::PEAK);
                     }
                 }
             }
         }
 
-        if (auto v = read_uint_field<uint8_t>(vis_json["batch_max"], "batch_max")) {
-            vis_obj.batch_max = *v;
+        if (auto v = read_uint_field<uint16_t>(vis_json["rate_max"], "rate_max")) {
+            vis_obj.rate_max = *v;
+        }
+
+        if (vis_json["tracks_downbeats"].is<bool>()) {
+            vis_obj.tracks_downbeats = vis_json["tracks_downbeats"].as<bool>();
         }
 
         // Parse spectrum config if present
@@ -689,15 +695,12 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             if (auto v = read_uint_field<uint16_t>(spec_json["f_max"], "f_max")) {
                 spec_cfg.f_max = *v;
             }
-            if (auto v = read_uint_field<uint16_t>(spec_json["rate_max"], "rate_max")) {
-                spec_cfg.rate_max = *v;
-            }
             vis_obj.spectrum = spec_cfg;
         }
 
         // If SPECTRUM is advertised, a valid spectrum config with a non-zero bin count must be
-        // present; otherwise raw_frame_size is indeterminate and subsequent binary visualizer
-        // frames would misparse.
+        // present; otherwise the expected size of binary spectrum messages is indeterminate
+        // and they could not be validated.
         bool advertises_spectrum = false;
         for (auto type : vis_obj.types) {
             if (type == VisualizerDataType::SPECTRUM) {
@@ -887,22 +890,19 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
 
     if (msg->visualizer_support.has_value()) {
         const auto& vis = msg->visualizer_support.value();
-        JsonArray types_list =
-            root["payload"]["visualizer@_draft_r1_support"]["types"].to<JsonArray>();
+        JsonObject vis_json = root["payload"]["visualizer@v1_support"].to<JsonObject>();
+        JsonArray types_list = vis_json["types"].to<JsonArray>();
         for (const auto& type : vis.types) {
             types_list.add(to_cstr(type));
         }
-        root["payload"]["visualizer@_draft_r1_support"]["buffer_capacity"] = vis.buffer_capacity;
-        root["payload"]["visualizer@_draft_r1_support"]["batch_max"] = vis.batch_max;
+        vis_json["buffer_capacity"] = vis.buffer_capacity;
+        vis_json["rate_max"] = vis.rate_max;
         if (vis.spectrum.has_value()) {
             const auto& spec = vis.spectrum.value();
-            root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["n_disp_bins"] =
-                spec.n_disp_bins;
-            root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["scale"] =
-                to_cstr(spec.scale);
-            root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["f_min"] = spec.f_min;
-            root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["f_max"] = spec.f_max;
-            root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["rate_max"] = spec.rate_max;
+            vis_json["spectrum"]["n_disp_bins"] = spec.n_disp_bins;
+            vis_json["spectrum"]["scale"] = to_cstr(spec.scale);
+            vis_json["spectrum"]["f_min"] = spec.f_min;
+            vis_json["spectrum"]["f_max"] = spec.f_max;
         }
     }
 
@@ -975,6 +975,27 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
         }
         if (artwork.media_height.has_value()) {
             root["payload"]["artwork"]["media_height"] = artwork.media_height.value();
+        }
+    }
+
+    if (msg->visualizer.has_value()) {
+        const auto& vis = msg->visualizer.value();
+        JsonObject vis_json = root["payload"]["visualizer"].to<JsonObject>();
+        if (vis.types.has_value()) {
+            JsonArray types_list = vis_json["types"].to<JsonArray>();
+            for (const auto& type : vis.types.value()) {
+                types_list.add(to_cstr(type));
+            }
+        }
+        if (vis.rate_max.has_value()) {
+            vis_json["rate_max"] = vis.rate_max.value();
+        }
+        if (vis.spectrum.has_value()) {
+            const auto& spec = vis.spectrum.value();
+            vis_json["spectrum"]["n_disp_bins"] = spec.n_disp_bins;
+            vis_json["spectrum"]["scale"] = to_cstr(spec.scale);
+            vis_json["spectrum"]["f_min"] = spec.f_min;
+            vis_json["spectrum"]["f_max"] = spec.f_max;
         }
     }
 

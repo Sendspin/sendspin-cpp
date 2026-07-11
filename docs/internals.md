@@ -50,7 +50,7 @@ On host builds, `platform_configure_thread()` is a no-op; threads use OS default
 3. The thread runs a persistent outer loop for the lifetime of the client.
 4. `SyncTask::stop()` sets `COMMAND_STOP` and joins the thread. Called from `SyncTask`'s destructor, which is triggered by `sync_task_.reset()` in `PlayerRole::Impl`'s destructor.
 
-**Visualizer drain** (`src/visualizer_role.cpp:120`):
+**Visualizer drain** (`src/visualizer_role.cpp`):
 
 1. `VisualizerRole::Impl::start()` spawns the drain thread.
 2. The thread blocks on ring buffer receives with a 50 ms timeout.
@@ -137,14 +137,14 @@ Single-producer/single-consumer ring buffer for variable-size binary data. Two-p
 Used for:
 
 - **Encoded audio**: Via the `SendspinAudioRingBuffer` wrapper (which adds chunk headers and exposes `write_chunk` / `receive_chunk` / `return_chunk`). Network thread writes chunks; sync task reads and decodes them.
-- **Visualizer frames**: Used directly. Network thread writes frame/beat entries; drain thread reads them at the correct playback time.
+- **Visualizer frames**: Used directly. Network thread writes one entry per visualizer binary message; drain thread reads them at the correct playback time.
 
 ### Other Primitives
 
 - **`std::mutex`** on `ConnectionManager::conn_mutex_`: protects deferred connection event vectors.
 - **`std::mutex`** on `SendspinTimeFilter::state_mutex_`: protects Kalman filter state (offset, drift, covariance).
 - **`std::atomic<bool>`** on `SendspinConnection::message_dispatch_enabled_`: allows the main loop to instantly suppress message delivery from the network thread.
-- **`std::atomic<bool/uint8_t/size_t>`** on `VisualizerRole::Impl`: network thread writes stream config atomically; drain thread reads it.
+- **`std::atomic<bool/uint8_t>`** on `VisualizerRole::Impl`: network thread writes stream config atomically; drain thread reads it.
 - **`std::atomic<bool>`** on `ArtworkRole::Impl::stream_active`: guards `handle_binary()` from writing when no stream is active.
 - **`std::atomic<uint8_t>`** on `ArtworkRole::Impl::SlotBuffer::write_idx`: tracks which of two double-buffers the network thread writes to next.
 - **`std::atomic<bool>`** on `ArtworkRole::Impl::SlotBuffer::drain_active`: set by the decode thread while decoding, checked by the network thread to avoid overwriting an in-use buffer.
@@ -197,7 +197,7 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
 |-------------|---------|
 | Player audio | `PlayerRole::Impl::handle_binary()`: writes to encoded audio ring buffer |
 | Artwork image | `ArtworkRole::Impl::handle_binary()`: copies image data to a per-slot double buffer and enqueues a notification for the artwork decode thread |
-| Visualizer frame/beat | `VisualizerRole::Impl::handle_binary()`: writes to visualizer ring buffer |
+| Visualizer data (binary types 16-20) | `VisualizerRole::Impl::handle_binary()`: writes to visualizer ring buffer |
 
 ### Main Loop Processing
 

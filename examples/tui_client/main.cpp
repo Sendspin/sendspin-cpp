@@ -534,15 +534,15 @@ int main(int argc, char* argv[]) {
     if (enable_visualizer) {
         VisualizerSupportObject vis;
         vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
-                     VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM};
+                     VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
+                     VisualizerDataType::PEAK};
         vis.buffer_capacity = 8192;
-        vis.batch_max = 4;
+        vis.rate_max = 30;
         vis.spectrum = VisualizerSpectrumConfig{
             .n_disp_bins = 32,
             .scale = VisualizerSpectrumScale::MEL,
             .f_min = 40,
             .f_max = 16000,
-            .rate_max = 30,
         };
         vis_role = &client.add_visualizer(VisualizerRoleConfig{.support = vis});
     }
@@ -689,20 +689,31 @@ int main(int argc, char* argv[]) {
             state.vis_beat = false;
         }
 
-        void on_visualizer_frame(const VisualizerFrame& frame) override {
+        void on_loudness(int64_t /*client_timestamp*/, uint16_t loudness) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            if (frame.loudness.has_value()) {
-                state.vis_loudness = *frame.loudness;
-            }
-            if (frame.peak_freq.has_value()) {
-                state.vis_peak_freq = *frame.peak_freq;
-            }
-            if (!frame.spectrum.empty()) {
-                state.vis_spectrum = frame.spectrum;
-            }
+            state.vis_loudness = loudness;
         }
 
-        void on_beat(int64_t /*client_timestamp*/) override {
+        void on_f_peak(int64_t /*client_timestamp*/, uint16_t frequency_hz,
+                       uint16_t /*amplitude*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.vis_peak_freq = frequency_hz;
+        }
+
+        void on_spectrum(int64_t /*client_timestamp*/,
+                         const std::vector<uint16_t>& bins) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.vis_spectrum = bins;
+        }
+
+        void on_beat(int64_t /*client_timestamp*/, bool /*downbeat*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            int64_t current_us = now_us();
+            state.vis_beat = true;
+            state.vis_beat_expire_us = current_us + 100000;  // 100ms flash
+        }
+
+        void on_peak(int64_t /*client_timestamp*/, uint8_t /*strength*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             int64_t current_us = now_us();
             state.vis_beat = true;
