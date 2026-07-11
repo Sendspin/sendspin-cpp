@@ -24,9 +24,11 @@
 #include "sendspin/visualizer_role.h"
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <thread>
+#include <vector>
 
 namespace sendspin {
 
@@ -39,6 +41,33 @@ enum class VisualizerEventType : uint8_t {
     STREAM_END,
     STREAM_CLEAR,
 };
+
+/// @brief Result of decoding one visualizer wire message, ready to hand to the listener.
+/// A kind of None means the entry was malformed, short, or non-deliverable and should be dropped.
+/// For Spectrum, the decoded bins are written into the caller-supplied scratch vector.
+struct VisualizerDelivery {
+    enum class Kind : uint8_t { NONE, LOUDNESS, BEAT, F_PEAK, SPECTRUM, PEAK };
+    Kind kind{Kind::NONE};
+    uint16_t loudness{0};
+    bool downbeat{false};
+    uint16_t frequency_hz{0};
+    uint16_t amplitude{0};
+    uint8_t strength{0};
+};
+
+/// @brief Validates and decodes one visualizer entry payload. Pure drain-thread logic with no I/O,
+/// factored out so it can be unit tested independently of the client and drain thread.
+/// @param wire_type        SENDSPIN_BINARY_VISUALIZER_* type byte.
+/// @param payload          Bytes following the entry's wire-type byte and 8-byte timestamp.
+/// @param payload_len      Number of payload bytes available.
+/// @param configured_bins  Negotiated spectrum n_disp_bins (0 if SPECTRUM was not negotiated).
+/// @param tracks_downbeats Whether the active stream reports downbeats.
+/// @param spectrum_out     Scratch vector reused for SPECTRUM bins; resized to configured_bins.
+/// @return What to deliver; Kind::None if the entry is malformed, short, or non-deliverable.
+VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* payload,
+                                             size_t payload_len, uint8_t configured_bins,
+                                             bool tracks_downbeats,
+                                             std::vector<uint16_t>& spectrum_out);
 
 /// @brief Private implementation of the visualizer role
 struct VisualizerRole::Impl {

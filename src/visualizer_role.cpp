@@ -312,6 +312,60 @@ void VisualizerRole::Impl::cleanup() {
 // Drain thread helpers
 // ============================================================================
 
+VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* payload,
+                                             size_t payload_len, uint8_t configured_bins,
+                                             bool tracks_downbeats,
+                                             std::vector<uint16_t>& spectrum_out) {
+    VisualizerDelivery out;
+    switch (wire_type) {
+        case SENDSPIN_BINARY_VISUALIZER_LOUDNESS:
+            if (payload_len < LOUDNESS_PAYLOAD_SIZE) {
+                break;
+            }
+            out.kind = VisualizerDelivery::Kind::LOUDNESS;
+            out.loudness = read_be16(payload);
+            break;
+        case SENDSPIN_BINARY_VISUALIZER_BEAT:
+            if (payload_len < BEAT_PAYLOAD_SIZE) {
+                break;
+            }
+            out.kind = VisualizerDelivery::Kind::BEAT;
+            // Bit 0 is only meaningful when the stream tracks downbeats
+            out.downbeat = tracks_downbeats && (payload[0] & BEAT_FLAG_DOWNBEAT) != 0;
+            break;
+        case SENDSPIN_BINARY_VISUALIZER_F_PEAK:
+            if (payload_len < F_PEAK_PAYLOAD_SIZE) {
+                break;
+            }
+            out.kind = VisualizerDelivery::Kind::F_PEAK;
+            out.frequency_hz = read_be16(payload);
+            out.amplitude = read_be16(payload + 2);
+            break;
+        case SENDSPIN_BINARY_VISUALIZER_SPECTRUM:
+            // Deliver exactly the negotiated n_disp_bins. Drop the frame if SPECTRUM was not
+            // negotiated (bin count 0) or the payload is short; ignore any trailing bytes.
+            if (configured_bins == 0 || payload_len < 2U * configured_bins) {
+                break;
+            }
+            spectrum_out.resize(configured_bins);
+            for (uint8_t b = 0; b < configured_bins; ++b) {
+                spectrum_out[b] = read_be16(payload + 2 * b);
+            }
+            out.kind = VisualizerDelivery::Kind::SPECTRUM;
+            break;
+        case SENDSPIN_BINARY_VISUALIZER_PEAK:
+            if (payload_len < PEAK_PAYLOAD_SIZE) {
+                break;
+            }
+            out.kind = VisualizerDelivery::Kind::PEAK;
+            out.strength = payload[0];
+            break;
+        default:
+            break;  // Reserved types 21-23
+    }
+    return out;
+}
+
 void VisualizerRole::Impl::flush_ring_buffer() const {
     if (!this->drain_task) {
         return;
@@ -421,69 +475,36 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Parse and deliver. The network thread forwards messages verbatim, so every branch
-        // validates its own payload length here before reading.
+        // Decode and deliver. The network thread forwards messages verbatim, so decode validates
+        // each payload's length before reading. Copy out of the slot, release it via the guard,
+        // then deliver -- so a slow listener callback never blocks the network producer.
         const uint8_t* payload = raw + ENTRY_TYPE_SIZE + TIMESTAMP_SIZE;
         size_t payload_len = item_size - ENTRY_TYPE_SIZE - TIMESTAMP_SIZE;
 
         SlotGuard guard{rb, item};
+        VisualizerDelivery out =
+            decode_visualizer_message(wire_type, payload, payload_len, self->spectrum_bin_count,
+                                      self->tracks_downbeats, spectrum_bins);
+        guard.release();
 
-        switch (wire_type) {
-            case SENDSPIN_BINARY_VISUALIZER_LOUDNESS: {
-                if (payload_len < LOUDNESS_PAYLOAD_SIZE) {
-                    break;
-                }
-                uint16_t loudness = read_be16(payload);
-                guard.release();
-                self->listener->on_loudness(client_ts, loudness);
+        switch (out.kind) {
+            case VisualizerDelivery::Kind::LOUDNESS:
+                self->listener->on_loudness(client_ts, out.loudness);
                 break;
-            }
-            case SENDSPIN_BINARY_VISUALIZER_BEAT: {
-                if (payload_len < BEAT_PAYLOAD_SIZE) {
-                    break;
-                }
-                // Bit 0 is only meaningful when the stream tracks downbeats
-                bool downbeat = self->tracks_downbeats && (payload[0] & BEAT_FLAG_DOWNBEAT) != 0;
-                guard.release();
-                self->listener->on_beat(client_ts, downbeat);
+            case VisualizerDelivery::Kind::BEAT:
+                self->listener->on_beat(client_ts, out.downbeat);
                 break;
-            }
-            case SENDSPIN_BINARY_VISUALIZER_F_PEAK: {
-                if (payload_len < F_PEAK_PAYLOAD_SIZE) {
-                    break;
-                }
-                uint16_t freq = read_be16(payload);
-                uint16_t amp = read_be16(payload + 2);
-                guard.release();
-                self->listener->on_f_peak(client_ts, freq, amp);
+            case VisualizerDelivery::Kind::F_PEAK:
+                self->listener->on_f_peak(client_ts, out.frequency_hz, out.amplitude);
                 break;
-            }
-            case SENDSPIN_BINARY_VISUALIZER_SPECTRUM: {
-                // Deliver exactly the negotiated n_disp_bins. Drop the frame if SPECTRUM was not
-                // negotiated (bin count 0) or the payload is short; ignore any trailing bytes.
-                uint8_t configured = self->spectrum_bin_count;
-                if (configured == 0 || payload_len < 2U * configured) {
-                    break;
-                }
-                spectrum_bins.resize(configured);
-                for (uint8_t b = 0; b < configured; ++b) {
-                    spectrum_bins[b] = read_be16(payload + 2 * b);
-                }
-                guard.release();
+            case VisualizerDelivery::Kind::SPECTRUM:
                 self->listener->on_spectrum(client_ts, spectrum_bins);
                 break;
-            }
-            case SENDSPIN_BINARY_VISUALIZER_PEAK: {
-                if (payload_len < PEAK_PAYLOAD_SIZE) {
-                    break;
-                }
-                uint8_t strength = payload[0];
-                guard.release();
-                self->listener->on_peak(client_ts, strength);
+            case VisualizerDelivery::Kind::PEAK:
+                self->listener->on_peak(client_ts, out.strength);
                 break;
-            }
-            default:
-                break;  // Reserved types 21-23; guard returns the slot
+            case VisualizerDelivery::Kind::NONE:
+                break;
         }
     }
 
