@@ -537,7 +537,7 @@ int main(int argc, char* argv[]) {
         vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
                      VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
                      VisualizerDataType::PEAK};
-        vis.buffer_capacity = 8192;
+        vis.buffer_capacity = 32768;
         vis.rate_max = 30;
         vis.spectrum = VisualizerSpectrumConfig{
             .n_disp_bins = 32,
