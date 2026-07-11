@@ -216,6 +216,8 @@ enum class VisualizerSpectrumScale : uint8_t {
 
 /// @brief Spectrum visualization parameters: bin count, frequency range, and scale
 struct VisualizerSpectrumConfig {
+    /// @brief Number of display bins (bars on a graphical equalizer). Capped at 255 by the
+    /// uint8_t width; typical equalizer bin counts are well below this
     uint8_t n_disp_bins;
     VisualizerSpectrumScale scale;
     uint16_t f_min;
@@ -227,7 +229,9 @@ struct VisualizerSupportObject {
     /// @brief Data types the client wants to receive
     std::vector<VisualizerDataType> types{};
     /// @brief Max total size in bytes of buffered visualizer binary messages, counting each
-    /// message's full wire size (message-type byte + timestamp + data)
+    /// message's full wire size (message-type byte + timestamp + data). This is also the total
+    /// RAM budget for the internal ring buffer; because each entry carries per-entry overhead,
+    /// roughly a third of it holds actual wire data
     size_t buffer_capacity{};
     /// @brief Maximum periodic visualization frames per second (applies to LOUDNESS, F_PEAK,
     /// SPECTRUM). Event types (BEAT, PEAK) are not throttled. Set to the display refresh rate

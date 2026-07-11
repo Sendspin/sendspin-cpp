@@ -682,6 +682,7 @@ int main(int argc, char* argv[]) {
             std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
             state.vis_display_loudness = 0.0f;
             state.vis_beat = false;
+            state.vis_peak = false;
         }
 
         void on_visualizer_stream_clear() override {
@@ -692,6 +693,7 @@ int main(int argc, char* argv[]) {
             std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
             state.vis_display_loudness = 0.0f;
             state.vis_beat = false;
+            state.vis_peak = false;
         }
 
         void on_loudness(int64_t /*client_timestamp*/, uint16_t loudness) override {
@@ -721,8 +723,8 @@ int main(int argc, char* argv[]) {
         void on_peak(int64_t /*client_timestamp*/, uint8_t /*strength*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             int64_t current_us = now_us();
-            state.vis_beat = true;
-            state.vis_beat_expire_us = current_us + 100000;  // 100ms flash
+            state.vis_peak = true;
+            state.vis_peak_expire_us = current_us + 100000;  // 100ms flash
         }
     };
 #endif
@@ -859,9 +861,12 @@ int main(int argc, char* argv[]) {
                     state.vis_display_loudness = current + alpha * (target - current);
                 }
 
-                // Expire beat flash
+                // Expire beat and peak flashes
                 if (state.vis_beat && current_us >= state.vis_beat_expire_us) {
                     state.vis_beat = false;
+                }
+                if (state.vis_peak && current_us >= state.vis_peak_expire_us) {
+                    state.vis_peak = false;
                 }
             }
 

@@ -82,10 +82,10 @@ VisualizerRole::Impl::Impl(VisualizerRoleConfig config, SendspinClient* client)
     if (this->visualizer_support.has_value()) {
         this->drain_task = std::make_unique<DrainTask>();
 
-        // The ring buffer needs more space than the raw data capacity because each entry
-        // has internal overhead: an 8-byte ItemHeader aligned to 8 bytes. Allocate 3x the
-        // advertised capacity to account for this, since visualizer entries are small.
-        size_t capacity = this->visualizer_support->buffer_capacity * 3;
+        // buffer_capacity is the total RAM budget for the ring buffer. Each entry carries an
+        // 8-byte ItemHeader aligned to 8 bytes, so with the small visualizer entries roughly a
+        // third of this storage holds actual wire data and the rest is per-entry overhead.
+        size_t capacity = this->visualizer_support->buffer_capacity;
         if (this->drain_task->ring_storage.allocate(capacity)) {
             this->drain_task->ring_buffer.create(capacity, this->drain_task->ring_storage.data());
         }

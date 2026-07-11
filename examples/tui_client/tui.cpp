@@ -70,6 +70,7 @@ struct TuiSnapshot {
     std::vector<float> vis_display_spectrum;
     float vis_display_loudness{0.0f};
     bool vis_beat{false};
+    bool vis_peak{false};
 };
 
 static TuiSnapshot take_snapshot(TuiState& state) {
@@ -113,6 +114,7 @@ static TuiSnapshot take_snapshot(TuiState& state) {
     snap.vis_display_spectrum = state.vis_display_spectrum;
     snap.vis_display_loudness = state.vis_display_loudness;
     snap.vis_beat = state.vis_beat;
+    snap.vis_peak = state.vis_peak;
     return snap;
 }
 
@@ -503,25 +505,25 @@ static Element render_visualizer(const TuiSnapshot& snap) {
         text(" " + std::to_string(static_cast<int>(loudness_pct * 100)) + "% "),
     });
 
-    // Peak frequency
+    // Dominant frequency (f_peak). Labeled "Freq" to avoid confusion with the onset
+    // "Peak" blinker below, which is the separate `peak` energy-onset visualizer type.
     auto peak_row = hbox({
-        text("  Peak:     ") | bold,
+        text("  Freq:     ") | bold,
         text(std::to_string(snap.vis_peak_freq) + " Hz"),
     });
 
-    // Beat indicator
-    Element beat_elem;
-    if (snap.vis_beat) {
-        beat_elem = hbox({
-            text("  "),
-            text("\xe2\x97\x8f Beat") | bold | color(Color::Yellow),
-        });
-    } else {
-        beat_elem = hbox({
-            text("  "),
-            text("\xe2\x97\x8b Beat") | dim,
-        });
-    }
+    // Beat (musical pulse) on the far left, energy-onset peak blinker on the far right.
+    Element beat_label = snap.vis_beat ? text("\xe2\x97\x8f Beat") | bold | color(Color::Yellow)
+                                       : text("\xe2\x97\x8b Beat") | dim;
+    Element peak_label = snap.vis_peak ? text("Peak \xe2\x97\x8f") | bold | color(Color::Red)
+                                       : text("Peak \xe2\x97\x8b") | dim;
+    auto beat_elem = hbox({
+        text("  "),
+        beat_label,
+        filler(),
+        peak_label,
+        text("  "),
+    });
 
     auto info_panel = window(text(" Analysis ") | bold, vbox({
         loudness_row,
