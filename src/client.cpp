@@ -183,9 +183,9 @@ void SendspinClient::loop() {
         }
     }
 
-    // Process deferred events -- all state mutations and user callbacks happen here,
-    // on the main loop thread, to avoid cross-thread data races.
-    // Each role drains its own queues/shadows internally.
+    // Process deferred events: all state mutations and user callbacks happen here, on the main
+    // loop thread, to avoid cross-thread data races. Each role drains its own queues/shadows
+    // internally.
 
     // --- Time sync events ---
     {
@@ -411,6 +411,10 @@ void SendspinClient::release_high_performance() {
 
 void SendspinClient::cleanup_connection_state() {
     SS_LOGV(TAG, "Cleaning up connection state");
+
+    // The time burst is per-connection state too; resetting it here keeps it impossible to tear
+    // down a connection without also stopping its burst.
+    this->time_burst_->reset();
 
     // Reset client event state
     this->event_state_->time_queue.reset();
@@ -666,10 +670,10 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                 if (conn != nullptr) {
                     conn->set_server_information(std::move(hello_msg.server));
                     conn->set_connection_reason(hello_msg.connection_reason);
+                    // Set last: this atomic store publishes the fields above to the manager's
+                    // promotion scan on the main loop, which observes is_handshake_complete()
+                    // and establishes the connection; nothing needs to be scheduled here.
                     conn->set_server_hello_received(true);
-
-                    this->connection_manager_->schedule_hello(
-                        {conn->shared_from_this(), hello_msg.connection_reason});
                 }
             }
             break;

@@ -214,6 +214,10 @@ public:
     void connect_to(const std::string& url);
 
     /// @brief Disconnects from the current server with the given reason
+    ///
+    /// Must be called from the main loop thread: the blocking transport close runs outside the
+    /// manager lock, so a call from another thread could race loop()'s own release of the same
+    /// connection (two concurrent transport stops).
     /// @param reason The goodbye reason to send
     void disconnect(SendspinGoodbyeReason reason);
 

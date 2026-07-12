@@ -52,8 +52,8 @@ using SendCompleteCallback = std::function<void(bool)>;
  *
  * Usage:
  * 1. Construct a concrete subclass (SendspinServerConnection or SendspinClientConnection)
- * 2. Set the on_connected_cb, on_handshake_complete_cb, on_disconnected_cb, on_json_message_cb,
- *    and on_binary_message_cb callbacks
+ * 2. Set the on_connected_cb, on_disconnected_cb, on_json_message_cb, and on_binary_message_cb
+ *    callbacks
  * 3. Call start() to initialize the transport and begin connecting
  * 4. Call loop() periodically to drive the state machine and process events
  * 5. Call send_text_message() to send JSON messages to the peer
@@ -95,8 +95,8 @@ public:
 
     /// @brief Prevents any further message callbacks from firing on the network thread
     ///
-    /// Called on the main thread before connection cleanup so that no stale events from a dying
-    /// connection can sneak into role queues after they've been reset. Thread-safe: the flag is
+    /// Called on the main thread before connection cleanup so that no stale events from a closing
+    /// connection can reach role queues after they have been reset. Thread-safe: the flag is
     /// checked atomically in dispatch_completed_message() which runs on the network thread.
     void disable_message_dispatch() {
         this->message_dispatch_enabled_.store(false, std::memory_order_release);
@@ -197,8 +197,8 @@ public:
     /// @brief Callback invoked when a JSON message is received
     /// @param conn Pointer to this connection.
     /// @param data Pointer to the message bytes, owned by the connection. Valid only until the
-    /// callback returns -- it is reused for the next message immediately afterwards, so the
-    /// callback must not retain it. Not null-terminated; use @p len.
+    /// callback returns; it is reused for the next message immediately afterwards, so the callback
+    /// must not retain it. Not null-terminated; use @p len.
     /// @param len Length of the message in bytes.
     /// @param timestamp The client timestamp when the message was received.
     std::function<void(SendspinConnection*, const char*, size_t, int64_t)> on_json_message_cb;
@@ -212,14 +212,11 @@ public:
 
     /// @brief Callback invoked when the transport connection is ready for messaging
     /// @param conn Pointer to this connection.
-    /// @note For server connections, this is called when the WebSocket handshake completes.
-    ///       For client connections, this is called when the connection to server succeeds.
-    ///       The hub uses this to initiate the hello handshake.
+    /// @note Fired by outbound (client) transports only, once the connect and WebSocket upgrade
+    ///       complete; the manager uses it to arm the hello. Inbound server connections are
+    ///       delivered to the manager already upgraded (their hello is armed at nursery
+    ///       admission) and never fire this.
     std::function<void(SendspinConnection*)> on_connected_cb;
-
-    /// @brief Callback invoked when the hello handshake completes successfully
-    /// @param conn Pointer to this connection.
-    std::function<void(SendspinConnection*)> on_handshake_complete_cb;
 
     /// @brief Callback invoked when the connection is closed or lost
     /// @param conn Pointer to this connection.
@@ -281,6 +278,28 @@ public:
     /// @note Called by hub to track handshake state.
     void set_client_hello_sent(bool sent) {
         this->client_hello_sent_ = sent;
+    }
+
+    /// @brief Returns whether this connection has successfully sent its client/hello.
+    /// @return true once a client/hello send has completed on this connection.
+    bool has_client_hello_sent() const {
+        return this->client_hello_sent_;
+    }
+
+    /// @brief Marks that the WebSocket upgrade completed
+    /// @note Distinct from is_connected(): on ESP the socket is accepted (and is_connected() true)
+    ///       before any WebSocket handshake, so this flag signals that the peer spoke the WebSocket
+    ///       protocol. Set by the platform ws_server just before it delivers an inbound connection
+    ///       to the manager, or by the outbound transport's connected callback, either way on a
+    ///       network thread. Read on the main loop (reap diagnostics), hence atomic with
+    ///       release/acquire ordering.
+    void mark_ws_upgraded() {
+        this->ws_upgraded_.store(true, std::memory_order_release);
+    }
+
+    /// @brief Returns whether the WebSocket upgrade completed.
+    bool is_ws_upgraded() const {
+        return this->ws_upgraded_.load(std::memory_order_acquire);
     }
 
     /// @brief Sets the connection reason (from server/hello message)
@@ -412,6 +431,12 @@ protected:
     /// worker thread on ESP) and the disconnect handlers (network thread), while
     /// is_handshake_complete() and the pre-hello send gate read it from other threads.
     std::atomic<bool> client_hello_sent_{false};
+
+    /// true once the transport delivered the connected event (WebSocket upgrade completed).
+    /// Written from the transport connected callback (network thread), read by the manager's
+    /// setup-stage derivation on the main loop and on other network threads, hence atomic.
+    /// See mark_ws_upgraded().
+    std::atomic<bool> ws_upgraded_{false};
 
     /// true if the current message being assembled is text, false if binary
     /// Needed because WebSocket continuation frames do not carry the original frame type

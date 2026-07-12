@@ -161,7 +161,7 @@ Network thread (IXWebSocket / esp_http_server)
 
 | Message | Action on Network Thread |
 |---------|------------------------|
-| `SERVER_HELLO` | Enqueues `ServerHelloEvent` into `ConnectionManager`'s mutex-protected vector |
+| `SERVER_HELLO` | Stores server info and connection reason on the connection, then sets `server_hello_received_` (an atomic store that publishes the fields to the main loop; the manager's promotion scan observes `is_handshake_complete()` on its next tick) |
 | `SERVER_TIME` | Enqueues `TimeResponseEvent` into `time_queue` |
 | `SERVER_STATE` | Writes to `ControllerRole::Impl::shadow`, `MetadataRole::Impl::shadow`, and `ColorRole::Impl::shadow` |
 | `SERVER_COMMAND` | Merges into `PlayerRole::Impl::shadow_command` |
@@ -195,9 +195,11 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    ├─ Start WS server if network ready
    ├─ Swap deferred connection events under mutex
    ├─ Process close/disconnect events (on_connection_lost)
-   ├─ Process hello events (handshake completion, handoff decisions)
-   ├─ Call loop() on current and pending connections
-   └─ Check per-connection hello retry timers
+   ├─ Promotion scan: establish nursery connections whose hello handshake completed
+   │  (handoff decisions against the incumbent)
+   ├─ Call loop() on the current and nursery connections
+   ├─ Check per-connection hello retry timers
+   └─ Reap nursery connections past the establish deadline; tick the platform ws_server
 
 2. time_burst_->loop(conn)  (skipped when no current connection)
    ├─ Send next time message if ready
@@ -382,27 +384,25 @@ The filter is protected by `state_mutex_` so that `compute_client_time()` can be
 
 ### Connection Management (`src/connection_manager.cpp`)
 
-The `ConnectionManager` maintains two observer slots for the connections it routes messages through:
+The `ConnectionManager` maintains one established slot plus a bounded nursery of unproven connections:
 
 | Slot | Purpose |
 |------|---------|
-| `current_connection_` | Active connection receiving messages |
-| `pending_connection_` | Handoff candidate completing its handshake |
+| `current_connection_` | Active connection receiving messages; holds only connections that completed the hello handshake |
+| `nursery_` | Unproven connections (inbound or outbound) awaiting establishment, bounded by `NURSERY_CAPACITY` inbound + 1 outbound |
 
-Both are `std::shared_ptr<SendspinConnection>`, and on the ESP server path they are observers rather than authoritative owners — the authoritative owner of a `SendspinServerConnection` is the httpd session itself (see [Server connection ownership (ESP)](#server-connection-ownership-esp)). On the host (IXWebSocket) client path the `shared_ptr` in these slots is the only owner.
+All are `std::shared_ptr<SendspinConnection>`, and on the ESP server path they are observers rather than authoritative owners; the authoritative owner of a `SendspinServerConnection` is the httpd session itself (see [Server connection ownership (ESP)](#server-connection-ownership-esp)). On the host (IXWebSocket) client path the `shared_ptr` in these slots is the only owner.
 
 ### Handshake and Handoff
 
-1. A new connection (outbound or inbound) is started. If a current connection exists, the new one becomes `pending_connection_`.
-2. The connection sends a CLIENT_HELLO. Retry with exponential backoff (100 ms base, 3 attempts). Each managed connection has its own retry entry in `ConnectionManager::hello_retries_`, so a handoff candidate arriving mid-handshake cannot clobber the current connection's pending hello (and vice versa).
-3. SERVER_HELLO arrives on the network thread → enqueued into mutex-protected vector.
-4. Main loop processes the hello event:
-   - Stores server info on the connection.
-   - If this was the pending connection, runs handoff decision logic:
-     - Prefer PLAYBACK reason over DISCOVERY.
-     - Among two DISCOVERY connections, prefer the last-played server.
-     - Default: keep current.
-5. Handoff executes: disable old message dispatch → cleanup state → move connections → send goodbye to the rejected connection.
+1. A new connection (outbound or inbound) enters the nursery. Inbound connections are delivered by the platform ws_server only after their WebSocket upgrade is observed.
+2. The connection sends a CLIENT_HELLO. Retry with exponential backoff (100 ms base, 3 attempts). Each managed connection has its own retry entry in `ConnectionManager::hello_retries_`, so a handoff candidate arriving mid-handshake cannot clobber another connection's pending hello.
+3. The handshake state lives on the connection as two atomic flags: `client_hello_sent_` (set by the hello send-completion callback) and `server_hello_received_` (set when SERVER_HELLO is processed on the network thread, after the server info fields it publishes).
+4. Establishment is level-triggered: each `loop()` tick, the promotion scan promotes any nursery connection whose `is_handshake_complete()` is true, so the order in which the two flags were set is irrelevant. If an incumbent exists, the handoff decision runs:
+   - Prefer PLAYBACK reason over DISCOVERY.
+   - Among two DISCOVERY connections, prefer the last-played server.
+   - Default: keep current.
+5. Handoff executes: disable the loser's message dispatch → cleanup client state (winner only gets `on_handshake_complete`) → send goodbye to the rejected connection via the deferred-release queue.
 
 ### Disconnection and Cleanup
 
@@ -410,10 +410,10 @@ When a connection is lost (`on_connection_lost`):
 
 ```api
 1. conn->disable_message_dispatch()      ← atomic, immediate on network thread
-2. time_burst_->reset()                  ← stop time sync
-3. client_->cleanup_connection_state()  ← drain all role queues/shadows, signal stream end
-4. current_connection_.reset()           ← destroy connection
-5. Promote pending to current if exists
+2. client_->cleanup_connection_state()  ← stop time sync, drain all role queues/shadows,
+                                           signal stream end
+3. Queue the connection on deferred_releases_ (released outside the manager lock)
+4. The current slot stays empty; the next promotion scan fills it from the nursery
 ```
 
 `disable_message_dispatch()` is the first step because it's an atomic flag that the network thread checks before invoking any callback. This prevents stale messages from a dead connection from racing into freshly-reset role queues.
@@ -430,7 +430,7 @@ When a connection is lost (`on_connection_lost`):
 On the ESP build, `SendspinServerConnection` lifetime is pinned to the httpd session rather than to `ConnectionManager`:
 
 1. `SendspinWsServer::open_callback` (the httpd `open_fn`) creates the `shared_ptr<SendspinServerConnection>`, heap-allocates a `shared_ptr*` slot, and calls `httpd_sess_set_ctx(handle, sockfd, slot, free_fn)` with a deleter that `delete`s the slot. That slot is the authoritative reference.
-2. The same shared_ptr is forwarded into `ConnectionManager::on_new_connection`, which stores it in `current_connection_` or `pending_connection_` as a *secondary observer*.
+2. The same shared_ptr is forwarded into `ConnectionManager::on_new_connection`, which admits it into the nursery as a *secondary observer* (it moves to `current_connection_` only once its hello handshake completes).
 3. The httpd WebSocket handler (`websocket_handler`) looks the connection up by `httpd_sess_get_ctx(handle, sockfd)` at run time, copying the slot's `shared_ptr` for the duration of its work; it never assumes the manager's observer slot is alive. The queued send workers (`async_send_text`, `async_send_time_text`) instead capture a `weak_ptr<SendspinServerConnection>` to the originating connection and `lock()` it when they run.
 4. When the socket closes, httpd calls the `close_fn` first (which fires `connection_closed_callback_` so `ConnectionManager` can drop its observer in the next `loop()`), then later calls the slot's `free_fn` to release the authoritative reference once no workers are queued for that session.
 

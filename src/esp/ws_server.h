@@ -20,8 +20,11 @@
 #include "sendspin/config.h"
 #include <esp_http_server.h>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 namespace sendspin {
 
@@ -29,6 +32,16 @@ namespace sendspin {
 class SendspinClient;
 class SendspinConnection;
 class SendspinServerConnection;
+
+/// @brief An accepted httpd session whose WebSocket upgrade has not yet been observed.
+///
+/// The session slot (httpd_sess_set_ctx) remains the authoritative owner of the connection;
+/// this entry's shared_ptr is dropped when the session is delivered, closed, or reaped.
+struct PendingUpgrade {
+    std::shared_ptr<SendspinServerConnection> conn;  ///< Parallel refcount to the session slot
+    int64_t accept_time_us;                          ///< Accept stamp for the upgrade deadline
+    int sockfd;                                      ///< httpd socket fd, the lookup key
+};
 
 /**
  * @brief WebSocket server listener for Sendspin
@@ -41,28 +54,43 @@ class SendspinServerConnection;
  * httpd_sess_get_ctx. ConnectionManager receives the same shared_ptr as a secondary
  * observer for routing and handoff decisions.
  *
+ * Delivery contract: a connection is delivered to the NewConnectionCallback only once its
+ * WebSocket upgrade has been observed, so the rest of the library never sees sockets that might
+ * not speak WebSocket. Accepted-but-not-yet-upgraded sessions wait in a pending table until the
+ * upgrade signal fires: the HTTP_GET branch of websocket_handler. IDF <= 5.5.4 / 6.0.0 dispatches
+ * the upgrade GET to the handler natively; IDF >= 5.5.5 / 6.0.1 reaches the same branch through
+ * ws_post_handshake_cb, which is registered as websocket_handler itself and invoked with the same
+ * GET request at the same lifecycle position. The component's Kconfig selects
+ * CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT wherever it exists. tick() reaps sessions still
+ * undelivered after WS_UPGRADE_TIMEOUT_US; httpd has no handshake timeout of its own and
+ * max_open_sockets is small, so a held-open raw TCP probe would otherwise pin a socket slot
+ * indefinitely (the ESP variant of issue #75).
+ *
  * Capabilities:
  * - Accepts incoming WebSocket connections on a configurable dedicated port
  * - Routes WebSocket messages directly via the session-pinned shared_ptr (no cross-thread
  *   find-by-sockfd lookup is needed)
  * - Manages open/close callbacks to notify the client of connection lifecycle events
- * - Supports up to max_connections simultaneous sockets (default: 2) to enable the
- *   handoff protocol where a second server can connect while one is already active
+ * - Supports up to max_connections simultaneous sockets (default:
+ *   SendspinClientConfig::DEFAULT_SERVER_MAX_CONNECTIONS) so a second server can connect while
+ *   one is already active (handoff) and a surplus peer can still be greeted with a goodbye
  *
  * Usage:
  * 1. Construct with a SendspinClient pointer (passed to start())
  * 2. Register callbacks via set_new_connection_callback() and set_connection_closed_callback()
  *    (set_find_connection_callback() is a no-op stub on ESP, kept for symmetry with the host build)
  * 3. Call start() to begin listening for incoming connections
- * 4. Call stop() to shut down the server
+ * 4. Call tick() periodically (the ConnectionManager loop does this) to reap sessions whose
+ *    upgrade never completed
+ * 5. Call stop() to shut down the server
  *
  * @code
  * SendspinWsServer ws_server;
  * ws_server.set_new_connection_callback([&](std::shared_ptr<SendspinServerConnection> conn) {
  *     client.on_new_server_connection(std::move(conn));
  * });
- * ws_server.set_connection_closed_callback([&](int sockfd) {
- *     client.on_server_connection_closed(sockfd);
+ * ws_server.set_connection_closed_callback([&](std::shared_ptr<SendspinServerConnection> conn) {
+ *     client.on_server_connection_closed(std::move(conn));
  * });
  * ws_server.start(&client, true, 5);
  * @endcode
@@ -77,9 +105,11 @@ public:
     /// httpd_sess_set_ctx, which acts as the authoritative owner for the connection's lifetime.
     using NewConnectionCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
 
-    /// @brief Callback type for notifying the client when a socket closes
-    /// The client needs to identify which connection owns this sockfd and clean it up.
-    using ConnectionClosedCallback = std::function<void(int sockfd)>;
+    /// @brief Callback type for notifying the client when a session closes
+    /// Passes the closed connection itself rather than its sockfd: the OS recycles fds after
+    /// close(), so an fd-keyed event drained later (on the manager loop) could be mis-routed to
+    /// a new connection that was accepted onto the recycled fd in the meantime.
+    using ConnectionClosedCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
 
     /// @brief Callback type for looking up a connection by sockfd.
     /// Returns a shared_ptr to keep the connection alive during message dispatch.
@@ -94,6 +124,11 @@ public:
 
     /// @brief Stops the HTTP server
     void stop();
+
+    /// @brief Closes sessions still undelivered after WS_UPGRADE_TIMEOUT_US (raw TCP probes that
+    /// never speak WebSocket; httpd has no handshake timeout of its own). Called from the
+    /// ConnectionManager loop.
+    void tick();
 
     /// @brief Sets the callback to invoke when a socket closes
     /// @param callback The callback function.
@@ -110,7 +145,9 @@ public:
     void set_find_connection_callback(FindConnectionCallback&& /*callback*/) {}
 
     /// @brief Configures the maximum number of simultaneous connections
-    /// Default is 2 to support the handoff protocol (one active + one pending).
+    /// The default supports handoff plus graceful rejection: one established connection, the
+    /// manager's nursery, and one spare socket so a surplus peer can receive a goodbye (see
+    /// ConnectionManager::NURSERY_CAPACITY's socket-budget invariant).
     /// @param max_connections Maximum number of open sockets (1-7).
     void set_max_connections(uint8_t max_connections) {
         this->max_connections_ = max_connections;
@@ -160,10 +197,31 @@ protected:
     /// @param sockfd The socket file descriptor being closed.
     static void close_callback(httpd_handle_t handle, int sockfd);
 
-    /// @brief WebSocket message handler registered with httpd
+    /// @brief WebSocket message handler registered with httpd. Doubles as the
+    /// ws_post_handshake_cb on IDF versions that provide it: httpd then invokes it with the
+    /// upgrade GET request, restoring the pre-6.0.1 dispatch so the HTTP_GET branch is the
+    /// single handshake-time upgrade signal on every version.
     static esp_err_t websocket_handler(httpd_req_t* req);
 
+    /// @brief Pops the pending entry for @p sockfd and delivers its connection, marked
+    /// WS-upgraded, to the new-connection callback. No-op if the session was already closed or
+    /// reaped; the pending-table pop resolves a delivery racing the tick() reap exactly-once.
+    /// @param sockfd The socket file descriptor whose upgrade was observed.
+    void deliver_upgraded(int sockfd);
+
+    /// @brief Removes the pending entry for @p sockfd and returns its connection.
+    /// @param sockfd The socket file descriptor to look up.
+    /// @return The pending connection, or nullptr if the session was not pending.
+    std::shared_ptr<SendspinServerConnection> pop_pending(int sockfd);
+
     // Struct fields
+
+    /// @brief Guards pending_. Held only for table mutation/scan; delivery and closing happen
+    /// outside it (the new-connection callback takes the manager's locks).
+    std::mutex pending_mutex_;
+
+    /// @brief Accepted sessions whose WebSocket upgrade has not yet been observed
+    std::vector<PendingUpgrade> pending_;
 
     /// @brief Callback to notify the client when a socket closes
     ConnectionClosedCallback connection_closed_callback_;
@@ -181,8 +239,8 @@ protected:
 
     // Numeric fields
 
-    /// @brief Maximum number of simultaneous connections (default: 2 for handoff)
-    uint8_t max_connections_{2};
+    /// @brief Maximum number of simultaneous connections (see set_max_connections)
+    uint8_t max_connections_{SendspinClientConfig::DEFAULT_SERVER_MAX_CONNECTIONS};
 
     /// @brief TCP port the WebSocket server listens on
     uint16_t server_port_{SendspinClientConfig::DEFAULT_SERVER_PORT};
