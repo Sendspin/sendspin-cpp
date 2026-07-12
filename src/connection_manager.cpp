@@ -172,14 +172,19 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
         if (this->current_connection_ != nullptr && this->current_connection_->is_connected()) {
             to_disconnect.push_back(this->current_connection_);
         }
-        // Drain the nursery too: on shutdown an unproven connection would otherwise keep holding
-        // its transport until a nursery deadline reaps it.
-        for (auto& entry : this->nursery_) {
-            if (entry.conn->is_connected()) {
-                to_disconnect.push_back(entry.conn);
+        // Drain the nursery too. A connected entry gets a goodbye and leaves on its close event; an
+        // unconnected (pre-upgrade) entry has no transport to goodbye and yields no close, so
+        // release it here rather than leave it for the nursery deadline to reap.
+        for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
+            if (it->conn->is_connected()) {
+                to_disconnect.push_back(it->conn);
+                ++it;
+            } else {
+                it = this->release_nursery_entry(it, std::nullopt);
             }
         }
     }
+    this->flush_deferred_releases();
     for (auto& conn : to_disconnect) {
         conn->disconnect(reason, nullptr);
     }
