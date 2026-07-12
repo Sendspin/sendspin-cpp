@@ -67,8 +67,16 @@ struct SendspinClientConfig {
     uint16_t httpd_ctrl_port{0};  ///< ESP-IDF httpd control port; 0 = ESP_HTTPD_DEF_CTRL_PORT
                                   ///< + 1 (avoids conflict with web_server component)
     uint16_t server_port{DEFAULT_SERVER_PORT};  ///< WebSocket server port
-    uint8_t server_max_connections{2};          ///< Maximum simultaneous connections (default: 2
-                                                ///< for handoff protocol)
+
+    /// @brief Default maximum simultaneous inbound connections: one established connection, two
+    /// unproven connections awaiting the hello handshake (the manager's nursery capacity), and
+    /// one spare so a surplus peer can still be accepted long enough to receive a graceful
+    /// client/goodbye. Values below this trade that goodbye for a transport-level refusal at
+    /// accept (on ESP the surplus peer waits unanswered in the TCP backlog instead).
+    static constexpr uint8_t DEFAULT_SERVER_MAX_CONNECTIONS = 4U;
+
+    uint8_t server_max_connections{
+        DEFAULT_SERVER_MAX_CONNECTIONS};  ///< Maximum simultaneous connections
 
     static constexpr int64_t DEFAULT_BURST_INTERVAL_MS = 10000;  ///< Default ms between bursts
     static constexpr int64_t DEFAULT_BURST_TIMEOUT_MS = 10000;   ///< Default burst timeout ms

@@ -25,6 +25,15 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.ws_server";
 
+/// @brief Deadline (seconds) for an accepted socket to complete its WebSocket handshake.
+///
+/// This is the host counterpart of the ESP build's WS_UPGRADE_TIMEOUT_US: sockets that never
+/// speak WebSocket are closed inside the transport layer and stay invisible to the manager.
+/// IXWebSocket's own server default happens to be the same 3 s, but the delivery contract in
+/// ws_server.h depends on the bound existing, so it is pinned here explicitly rather than
+/// inherited from a dependency default an IXWebSocket upgrade could silently rescope.
+static constexpr int WS_HANDSHAKE_TIMEOUT_SECS = 3;
+
 SendspinWsServer::~SendspinWsServer() {
     this->stop();
 }
@@ -38,8 +47,12 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
 
     this->client_ = client;
 
-    // Create IXWebSocket server on the configured port
-    this->server_ = std::make_unique<ix::WebSocketServer>(this->server_port_, "0.0.0.0");
+    // Create IXWebSocket server on the configured port. max_connections_ is enforced here (IX
+    // closes surplus sockets at accept), so the configured budget is real on host, matching the
+    // ESP build's httpd max_open_sockets.
+    this->server_ = std::make_unique<ix::WebSocketServer>(
+        this->server_port_, "0.0.0.0", ix::SocketServer::kDefaultTcpBacklog, this->max_connections_,
+        WS_HANDSHAKE_TIMEOUT_SECS);
 
     this->server_->setOnConnectionCallback(
         [this](const std::weak_ptr<ix::WebSocket>& weak_ws,
@@ -60,27 +73,36 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
                 synthetic_sockfd = next_synthetic_sockfd.fetch_add(1);
             }
 
-            SS_LOGD(TAG, "New client connection (synthetic sockfd %d)", synthetic_sockfd);
+            SS_LOGD(TAG, "Accepted connection (synthetic sockfd %d), awaiting WS upgrade",
+                    synthetic_sockfd);
 
-            // Create the server connection
-            auto connection = std::make_shared<SendspinServerConnection>(ws, synthetic_sockfd);
-
-            // Set up the message callback on the websocket to route data through the connection
-            ws->setOnMessageCallback([this, synthetic_sockfd](const ix::WebSocketMessagePtr& msg) {
+            // This callback fires at TCP accept, before the WebSocket handshake. Nothing is
+            // created or delivered here: a socket that never completes the handshake (port scan,
+            // health check, plain HTTP) is IXWebSocket's problem; its server-side handshake timeout
+            // (3 s) closes such sockets without ever surfacing an event. The manager only ever
+            // learns about connections that reach Open.
+            //
+            // Filled at Open so the Close event can report the connection by identity. A
+            // never-delivered socket leaves it empty, and its Close is not reported (the manager
+            // never knew the connection existed).
+            auto delivered = std::make_shared<std::weak_ptr<SendspinServerConnection>>();
+            ws->setOnMessageCallback([this, synthetic_sockfd, weak_ws,
+                                      delivered](const ix::WebSocketMessagePtr& msg) {
                 int64_t receive_time = platform_time_us();
 
-                // Find the connection by sockfd; hold shared_ptr to keep it alive during dispatch
-                std::shared_ptr<SendspinConnection> conn_holder;
-                SendspinServerConnection* conn = nullptr;
-                if (this->find_connection_callback_) {
-                    conn_holder = this->find_connection_callback_(synthetic_sockfd);
-                    conn = static_cast<SendspinServerConnection*>(conn_holder.get());
-                }
-
                 if (msg->type == ix::WebSocketMessageType::Message) {
+                    // Find the connection by sockfd; hold shared_ptr to keep it alive
+                    // during dispatch
+                    std::shared_ptr<SendspinConnection> conn_holder;
+                    if (this->find_connection_callback_) {
+                        conn_holder = this->find_connection_callback_(synthetic_sockfd);
+                    }
+                    auto* conn = static_cast<SendspinServerConnection*>(conn_holder.get());
                     if (conn == nullptr) {
-                        SS_LOGE(TAG, "No connection found for synthetic sockfd %d",
-                                synthetic_sockfd);
+                        // Not managed: the manager rejected it at delivery (goodbye + close
+                        // already sent) or has since released it. Frames racing that close
+                        // are dropped here.
+                        SS_LOGD(TAG, "Dropping message for unmanaged sockfd %d", synthetic_sockfd);
                         return;
                     }
 
@@ -88,26 +110,39 @@ bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*
                     conn->handle_message(msg->str, msg->binary, receive_time);
 
                 } else if (msg->type == ix::WebSocketMessageType::Open) {
-                    if (conn != nullptr && conn->on_connected_cb) {
-                        conn->on_connected_cb(conn);
+                    // The WebSocket upgrade completed: this is where the connection comes
+                    // into existence for the rest of the library. Delivering here (rather
+                    // than at accept) means the manager never has to reason about sockets
+                    // that might not speak WebSocket, and a rejection's goodbye reaches the
+                    // peer because the session is already Open.
+                    auto self_ws = weak_ws.lock();
+                    if (!self_ws) {
+                        return;
                     }
+                    if (!this->new_connection_callback_) {
+                        SS_LOGW(TAG, "No new connection callback set, closing connection");
+                        self_ws->close();
+                        return;
+                    }
+                    auto connection = std::make_shared<SendspinServerConnection>(std::move(self_ws),
+                                                                                 synthetic_sockfd);
+                    connection->mark_ws_upgraded();
+                    *delivered = connection;
+                    this->new_connection_callback_(std::move(connection));
                 } else if (msg->type == ix::WebSocketMessageType::Close) {
                     SS_LOGD(TAG, "Client closed connection (synthetic sockfd %d)",
                             synthetic_sockfd);
-                    if (this->connection_closed_callback_) {
-                        this->connection_closed_callback_(synthetic_sockfd);
+                    // lock() fails once the manager (the sole long-term owner) has already
+                    // released the connection; there is nothing left to notify it about.
+                    if (auto conn = delivered->lock()) {
+                        if (this->connection_closed_callback_) {
+                            this->connection_closed_callback_(std::move(conn));
+                        }
                     }
                 } else if (msg->type == ix::WebSocketMessageType::Error) {
                     SS_LOGE(TAG, "WebSocket error: %s", msg->errorInfo.reason.c_str());
                 }
             });
-
-            // Notify the client of the new connection
-            if (this->new_connection_callback_) {
-                this->new_connection_callback_(std::move(connection));
-            } else {
-                SS_LOGW(TAG, "No new connection callback set, connection will be dropped");
-            }
         });
 
     SS_LOGI(TAG, "Starting server on port: %u (max connections: %d)",

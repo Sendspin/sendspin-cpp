@@ -4,6 +4,12 @@ menu "sendspin-cpp"
         bool
         default y
         select HTTPD_WS_SUPPORT
+        # Event-driven WebSocket upgrade detection (src/esp/ws_server.cpp). The symbol only
+        # exists on IDF >= 5.5.5 / 6.0.1 (Kconfig default n there, with a `depends on
+        # HTTPD_WS_SUPPORT` satisfied by the select above). On older IDF the symbol is undefined
+        # and this select is silently ignored, which is fine: those versions dispatch the upgrade
+        # GET to the URI handler natively, so there is nothing to enable.
+        select HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
 
     config SENDSPIN_ENABLE_PLAYER
         bool "Enable player role (audio decode/playback)"

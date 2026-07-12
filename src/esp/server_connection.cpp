@@ -86,13 +86,12 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
         return;
     }
 
-    // Send goodbye, then trigger close, then invoke the user callback. Capture a weak_ptr to
-    // self instead of raw `this`: the worker normally finds the conn via the session slot
-    // (keeping it alive through the completion), but a weak_ptr makes that invariant explicit
-    // and avoids any UAF if the worker ever runs after the slot has been freed (e.g., across
-    // ESP-IDF versions whose httpd drain-before-free_fn ordering differs from the version we
-    // designed against). Skipping trigger_close() when the conn is already gone is harmless --
-    // the session is gone too.
+    // Send goodbye, then trigger close, then invoke the user callback. Capture a weak_ptr to self
+    // instead of raw `this`: the worker normally finds the conn via the session slot (keeping it
+    // alive through the completion), but a weak_ptr makes that invariant explicit and avoids a UAF
+    // if the worker ever runs after the slot has been freed (e.g. across ESP-IDF versions whose
+    // httpd drain-before-free_fn ordering differs). Skipping trigger_close() when the conn is
+    // already gone is harmless; the session is gone too.
     std::weak_ptr<SendspinServerConnection> weak_self =
         std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
     this->send_goodbye_reason(reason, [weak_self, on_complete](bool /*success*/) {
@@ -174,12 +173,21 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
 }
 
 void SendspinServerConnection::trigger_close() {
-    if (this->sockfd_ >= 0) {
-        httpd_sess_trigger_close(this->server_, this->sockfd_);
+    // Gate on is_connected(): once close_callback has marked this connection closed, httpd may
+    // recycle the fd onto a freshly-accepted session, and closing by the stale fd would kill the
+    // wrong peer. A residual instruction-scale TOCTOU remains (the session could close between
+    // this check and the call below); eliminating it entirely would need an identity check on
+    // the httpd task itself, which is not worth the extra queue hop for a close-time race.
+    if (!this->is_connected()) {
+        return;
     }
+    httpd_sess_trigger_close(this->server_, this->sockfd_);
 }
 
 SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t receive_time) {
+    // The connection was delivered (and marked WS-upgraded) from the upgrade GET before any
+    // frame can arrive; frames on a never-delivered connection are dropped by the null guards
+    // in dispatch_completed_message.
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
 
@@ -246,7 +254,7 @@ bool SendspinServerConnection::send_time_message() {
     // The worker resolves the originating connection via the weak_ptr below, so a recycled sockfd
     // cannot redirect the frame and a destroyed connection yields a clean no-op. The JSON is built
     // inside the worker so client_transmitted is captured as close to the wire send as possible.
-    // SessionLookup now holds a weak_ptr, so it is constructed with placement new and explicitly
+    // SessionLookup holds a weak_ptr, so it is constructed with placement new and explicitly
     // destroyed before free (matching the AsyncRespArg convention).
     auto* lookup = static_cast<SessionLookup*>(platform_malloc_internal(sizeof(SessionLookup)));
     if (lookup == nullptr) {
@@ -310,15 +318,13 @@ void SendspinServerConnection::async_send_text(void* arg) {
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
 
     // Resolve the originating connection. weak_ptr.lock() yields the exact conn that queued this
-    // work (or null if it has since been destroyed), so a recycled sockfd can never redirect the
-    // frame onto a different connection -- the lifetime-safe replacement for the old raw `this`
-    // pointer that caused the use-after-free crash. Non-handshake frames are additionally gated on
-    // client_hello_sent_ so nothing can precede the client/hello; allow_before_hello opts the hello
-    // and goodbye out of that gate. The completion callback fires only when the frame is actually
-    // sent: it is skipped both when the gate blocks the frame AND when the connection is already
-    // gone (lock() is null) -- allow_before_hello bypasses the gate but not the conn-alive
-    // requirement, so callers must not rely on the callback as an unconditional "send finished"
-    // signal.
+    // work (or null if it has been destroyed), so a recycled sockfd can never redirect the frame
+    // onto a different connection. Non-handshake frames are gated on client_hello_sent_ so nothing
+    // can precede the client/hello; allow_before_hello opts the hello and goodbye out of that gate.
+    // The completion callback fires only when the frame is sent: it is skipped both when the gate
+    // blocks the frame and when the connection is already gone (lock() is null).
+    // allow_before_hello bypasses the gate but not the conn-alive requirement, so callers must not
+    // rely on the callback as an unconditional "send finished" signal.
     auto conn = resp_arg->conn.lock();
     if (conn && conn->is_connected() &&
         (resp_arg->allow_before_hello || conn->client_hello_sent_)) {

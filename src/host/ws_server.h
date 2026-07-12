@@ -35,9 +35,12 @@ class SendspinServerConnection;
 /**
  * @brief WebSocket server that listens for incoming Sendspin client connections (host build)
  *
- * Wraps an IXWebSocket server listening on the configured port. When a client connects, a
- * SendspinServerConnection is created and delivered via the NewConnectionCallback. Connection
- * close events are reported via ConnectionClosedCallback.
+ * Wraps an IXWebSocket server listening on the configured port. A SendspinServerConnection is
+ * created and delivered via the NewConnectionCallback only once the peer completes the WebSocket
+ * upgrade (the Open event); sockets that never complete the handshake are closed by IXWebSocket's
+ * server-side handshake timeout, which start() pins explicitly (WS_HANDSHAKE_TIMEOUT_SECS, 3 s)
+ * so the bound cannot be silently rescoped by an IXWebSocket upgrade. Such sockets are invisible
+ * to the rest of the library. Connection close events are reported via ConnectionClosedCallback.
  *
  * Usage:
  * 1. Set the new_connection, connection_closed, and find_connection callbacks
@@ -50,8 +53,8 @@ class SendspinServerConnection;
  * server.set_new_connection_callback([&](auto conn) {
  *     store_connection(std::move(conn));
  * });
- * server.set_connection_closed_callback([&](int fd) {
- *     remove_connection(fd);
+ * server.set_connection_closed_callback([&](std::shared_ptr<SendspinServerConnection> conn) {
+ *     remove_connection(std::move(conn));
  * });
  * server.start(&client, false, 5);
  * @endcode
@@ -64,8 +67,10 @@ public:
     /// @brief Callback type for notifying the client of new connections
     using NewConnectionCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
 
-    /// @brief Callback type for notifying the client when a socket closes
-    using ConnectionClosedCallback = std::function<void(int sockfd)>;
+    /// @brief Callback type for notifying the client when a connection closes
+    /// Passes the closed connection itself rather than its sockfd, matching the ESP build (where
+    /// fd recycling makes fd-keyed close events ambiguous by the time the manager drains them).
+    using ConnectionClosedCallback = std::function<void(std::shared_ptr<SendspinServerConnection>)>;
 
     /// @brief Callback type for looking up a connection by sockfd.
     /// Returns a shared_ptr to keep the connection alive during message dispatch.
@@ -81,8 +86,13 @@ public:
     /// @brief Stops the WebSocket server and releases its resources
     void stop();
 
+    /// @brief No-op on host builds. On ESP the manager loop drives the pending-upgrade reap
+    /// through this; here IXWebSocket delivers Open events and times out stalled handshakes on
+    /// its own threads (bounded by WS_HANDSHAKE_TIMEOUT_SECS, pinned in start()).
+    void tick() {}
+
     /// @brief Sets the callback invoked when a client connection closes
-    /// @param callback Function called with the socket fd of the closed connection.
+    /// @param callback Function called with the closed connection.
     void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
         this->connection_closed_callback_ = std::move(callback);
     }
@@ -94,6 +104,10 @@ public:
     }
 
     /// @brief Sets the maximum number of simultaneous client connections
+    /// The default supports handoff plus graceful rejection: one established connection, the
+    /// manager's nursery, and one spare socket so a surplus peer can receive a goodbye (see
+    /// ConnectionManager::NURSERY_CAPACITY's socket-budget invariant). Enforced by IXWebSocket
+    /// at accept.
     /// @param max_connections Maximum connection count.
     void set_max_connections(uint8_t max_connections) {
         this->max_connections_ = max_connections;
@@ -142,8 +156,8 @@ protected:
 
     // Numeric fields
 
-    /// @brief Maximum number of simultaneous connections (default: 2 for handoff)
-    uint8_t max_connections_{2};
+    /// @brief Maximum number of simultaneous connections (see set_max_connections)
+    uint8_t max_connections_{SendspinClientConfig::DEFAULT_SERVER_MAX_CONNECTIONS};
 
     /// @brief TCP port the WebSocket server listens on
     uint16_t server_port_{SendspinClientConfig::DEFAULT_SERVER_PORT};

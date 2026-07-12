@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "constants.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 
@@ -36,24 +37,45 @@ class SendspinConnection;
 class SendspinServerConnection;
 class SendspinWsServer;
 
-/// @brief Deferred server hello event, processed in ConnectionManager::loop()
-struct ServerHelloEvent {
-    std::shared_ptr<SendspinConnection> conn;  ///< Connection that received the hello
-    SendspinConnectionReason connection_reason;
+/// @brief Converts a duration in seconds to microseconds at compile time.
+constexpr int64_t seconds_to_us(double s) {
+    return static_cast<int64_t>(s * US_PER_SECOND);
+}
+
+/// @brief Deadline (seconds) for a nursery connection to complete the hello handshake, measured
+/// from delivery (inbound, already WS-upgraded) or initiation (outbound, before DNS/TCP resolve)
+///
+/// Reaps peers that connect and then stall before completing the hello, and outbound sockets whose
+/// transport never delivers a close (host IXWebSocket, issue #75). Sockets that never upgrade are
+/// closed in the platform layer before the manager sees them (ESP ws_server tick() at
+/// WS_UPGRADE_TIMEOUT_US; host IXWebSocket's 3 s handshake timeout).
+static constexpr double NURSERY_ESTABLISH_TIMEOUT_S = 30.0;
+
+/// @brief Timeout in microseconds (derived from NURSERY_ESTABLISH_TIMEOUT_S).
+static constexpr int64_t NURSERY_ESTABLISH_TIMEOUT_US = seconds_to_us(NURSERY_ESTABLISH_TIMEOUT_S);
+
+/// @brief A connection that has not completed the hello handshake
+///
+/// Unproven connections never occupy the current-connection slot; they wait in the bounded nursery
+/// until they establish, then are promoted (or released after losing the handoff comparison to an
+/// established incumbent). Inbound entries arrive WS-upgraded, so their hello is armed at
+/// admission; outbound entries arm theirs when the transport's connected event arrives.
+struct NurseryEntry {
+    std::shared_ptr<SendspinConnection> conn;  ///< Observer; the session slot / transport owns
+    bool inbound;  ///< true if accepted by the WS server, false for connect_to()
 };
 
-/// @brief Timeout for provisional (pre-handshake) connections in seconds.
-/// A connection that has not completed the hello handshake within this window is closed. This
-/// reaps connections whose transport never delivers a close for sockets that die before the
-/// WebSocket session is established (host IXWebSocket, issue #75) as well as peers that connect
-/// and stall without completing the hello (both platforms). Mirrors the encryption branch's
-/// provisional-connection timeout, whose reap is gated on is_awaiting_activate();
-/// !is_handshake_complete() is the plaintext analogue.
-static constexpr double PROVISIONAL_CONNECTION_TIMEOUT_S = 30.0;
-
-/// @brief Timeout in microseconds (derived from PROVISIONAL_CONNECTION_TIMEOUT_S).
-static constexpr int64_t PROVISIONAL_CONNECTION_TIMEOUT_US =
-    static_cast<int64_t>(PROVISIONAL_CONNECTION_TIMEOUT_S * 1'000'000LL);
+/// @brief A connection release deferred until conn_ptr_mutex_ has been dropped
+///
+/// Sending a goodbye can block on the transport, and even shared_ptr destruction can join the
+/// transport thread (the host outbound destructor stops its IXWebSocket). Neither may happen under
+/// the manager lock: the join can deadlock against a transport callback waiting on that same lock,
+/// and any block stalls every other manager entry point. Locked sections only queue releases;
+/// flush_deferred_releases() performs them lock-free.
+struct DeferredRelease {
+    std::shared_ptr<SendspinConnection> conn;      ///< Sole remaining manager reference
+    std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: transport gone, just release
+};
 
 /// @brief Hello retry state for exponential backoff
 struct HelloRetryState {
@@ -69,6 +91,14 @@ struct HelloRetryState {
  *
  * Accepts and creates connections, handles the hello handshake, orchestrates server handoff
  * decisions, and performs graceful disconnection with deferred cleanup.
+ *
+ * Connections prove themselves before they are trusted: every new connection enters a bounded
+ * nursery and leaves it only by completing the hello handshake (promotion, or a fair comparison
+ * against the incumbent) or by missing the establish deadline (reaped). The platform ws_server
+ * delivers inbound connections only after observing their WebSocket upgrade, so the manager never
+ * reasons about raw sockets that might not speak WebSocket; those are closed inside the platform
+ * layer. Invariant: `current_connection_ != nullptr` implies
+ * `current_connection_->is_handshake_complete()`.
  *
  * Typical usage:
  *  1. Construct with a `SendspinClient*`.
@@ -103,6 +133,11 @@ public:
     void connect_to(const std::string& url);
 
     /// @brief Disconnects from the current server.
+    ///
+    /// Must be called from the main loop thread: conn->disconnect() runs outside conn_ptr_mutex_
+    /// (it can block on the transport, and on host outbound it joins the transport thread), so
+    /// only the main loop's serialization keeps it from racing loop()'s reap/handoff release of
+    /// the same connection into two concurrent transport stops.
     /// @param reason The goodbye reason to send before closing.
     void disconnect(SendspinGoodbyeReason reason);
 
@@ -145,14 +180,6 @@ public:
     }
 
     // ========================================
-    // Event queuing (thread-safe)
-    // ========================================
-
-    /// @brief Schedules a server hello event for deferred processing in loop().
-    /// @param event The server hello event to schedule (moved).
-    void schedule_hello(ServerHelloEvent event);
-
-    // ========================================
     // Handoff support
     // ========================================
 
@@ -170,11 +197,37 @@ private:
     /// @brief Attaches message and lifecycle callbacks to a connection.
     /// @param conn The connection to configure.
     void setup_connection_callbacks(SendspinConnection* conn);
-    /// @brief Accepts an incoming server connection as current or pending for handoff.
-    /// @param conn The newly accepted server connection. The session slot keeps a parallel
+    /// @brief Admits an incoming server connection into the nursery and arms its hello
+    ///
+    /// Never enters the current slot directly (the hello handshake is not complete yet). If the
+    /// inbound slots are full (outbound entries do not count) the newcomer is rejected with a
+    /// goodbye, which reaches the peer because its session is already upgraded.
+    /// @param conn The newly delivered server connection. The session slot keeps a parallel
     ///             refcount, so this observer can be reset at any time without freeing the conn
     ///             out from under in-flight httpd workers.
     void on_new_connection(std::shared_ptr<SendspinServerConnection> conn);
+
+    /// @brief Finds the nursery entry holding the given connection. Caller must hold
+    /// conn_ptr_mutex_.
+    /// @param conn The connection to look up.
+    /// @return Iterator into nursery_, or nursery_.end() if the connection is not in the nursery.
+    std::vector<NurseryEntry>::iterator find_in_nursery(const SendspinConnection* conn);
+
+    /// @brief Releases a nursery entry: erases it, prunes its hello retry, and queues the
+    /// goodbye+release on deferred_releases_. Caller must hold conn_ptr_mutex_ and call
+    /// flush_deferred_releases() after dropping it.
+    /// @param it Valid iterator into nursery_.
+    /// @param reason The goodbye reason to send before closing, or nullopt when the transport is
+    ///        already gone so no goodbye should be attempted.
+    /// @return Iterator to the entry after the erased one.
+    std::vector<NurseryEntry>::iterator release_nursery_entry(
+        std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason);
+
+    /// @brief Performs the queued goodbye sends and connection releases from deferred_releases_.
+    /// Caller must NOT hold conn_ptr_mutex_ (see DeferredRelease). Safe to call from any thread;
+    /// a queued release is performed exactly once. Called after every locked section that can
+    /// queue a release; loop() also calls it as a backstop.
+    void flush_deferred_releases();
 
     // ========================================
     // Hello handshake
@@ -195,50 +248,64 @@ private:
     // ========================================
     // Connection lifecycle
     // ========================================
-    /// @brief Tears down a lost connection and promotes the pending connection if one exists.
-    /// Caller must hold conn_ptr_mutex_.
+    /// @brief Tears down a lost connection (current or nursery). Caller must hold conn_ptr_mutex_.
     /// @param conn The connection that was lost.
     void on_connection_lost(SendspinConnection* conn);
     /// @brief Decides whether to switch from the current connection to the new one.
-    /// @param current The existing active connection.
-    /// @param new_conn The newly connected candidate connection.
+    /// @param current The existing active connection. Must not be null.
+    /// @param new_conn The newly connected candidate connection. Must not be null.
     /// @return True if the new connection should become current, false to keep the existing one.
     bool should_switch_to_new_server(SendspinConnection* current,
                                      SendspinConnection* new_conn) const;
-    /// @brief Completes a server handoff by promoting or discarding the pending connection.
-    /// @param switch_to_new True to promote the pending connection, false to discard it.
-    void complete_handoff(bool switch_to_new);
     /// @brief Sends a goodbye and takes ownership of the caller's shared_ptr so it drops at
     /// function exit.
     /// @param conn The connection to disconnect and release. Caller's shared_ptr is left empty.
     /// @param reason The goodbye reason to send before closing.
     void disconnect_and_release(std::shared_ptr<SendspinConnection>&& conn,
                                 SendspinGoodbyeReason reason);
-    /// @brief Single teardown path: releases a managed connection's slot, cleans up client state
-    /// (current slot only), promotes the pending connection, and optionally sends a goodbye.
+    /// @brief Single teardown path: removes a managed connection (the current slot or a nursery
+    /// entry), cleans up client state (current slot only), and queues the goodbye+release on
+    /// deferred_releases_. The current slot stays empty after a drop; the next nursery
+    /// establishment promotes into it.
     ///
     /// No-op if conn is null. If conn is not a managed connection (already released by an
     /// earlier event in the same loop() pass), only its stale hello-retry entry, if any, is
-    /// pruned. Caller must hold conn_ptr_mutex_.
+    /// pruned. Caller must hold conn_ptr_mutex_ and call flush_deferred_releases() after
+    /// dropping it.
     ///
-    /// @param conn The connection to drop; must be current_connection_ or pending_connection_.
+    /// @param conn The connection to drop; must be current_connection_ or a nursery entry.
     /// @param goodbye Goodbye reason to send before closing, or nullopt when the transport is
     ///        already gone (connection-lost path) so no goodbye should be attempted.
     void drop_connection(SendspinConnection* conn, std::optional<SendspinGoodbyeReason> goodbye);
 
+    /// @brief Maximum number of unproven inbound connections held at once
+    ///
+    /// The platform ws_server delivers only WS-upgraded sessions, so nursery slots are only ever
+    /// occupied by peers that speak WebSocket; raw-TCP junk never reaches the nursery. Outbound
+    /// entries do not count against the capacity in either direction: a user-initiated connect_to()
+    /// is admitted even against full inbound slots, and an in-flight connect_to() never causes an
+    /// inbound peer to be rejected. An outbound entry always replaces any previous one, so the
+    /// bound on the whole nursery is NURSERY_CAPACITY + 1.
+    ///
+    /// Socket-budget invariant: gracefully rejecting a surplus inbound peer requires the transport
+    /// to accept NURSERY_CAPACITY + 2 sockets (1 established + the nursery + the surplus peer,
+    /// which must be connected to receive its goodbye). The default server_max_connections
+    /// satisfies this; init_server warns when a configured value does not.
+    static constexpr size_t NURSERY_CAPACITY = 2;
+
     // Struct fields
-    std::mutex conn_mutex_;              // Protects deferred lifecycle event queues
-    mutable std::mutex conn_ptr_mutex_;  // Protects current_connection_ and pending_connection_
-    std::vector<HelloRetryState> hello_retries_;  // One entry per connection awaiting its hello
-    std::vector<int> pending_close_events_;
+    std::mutex conn_mutex_;                           // Protects deferred lifecycle event queues
+    mutable std::mutex conn_ptr_mutex_;               // Protects current_connection_, nursery_, and
+                                                      // deferred_releases_
+    std::vector<DeferredRelease> deferred_releases_;  // Queued releases; see DeferredRelease
+    std::vector<NurseryEntry> nursery_;               // Unproven connections awaiting establishment
+    std::vector<HelloRetryState> hello_retries_;      // One entry per connection awaiting its hello
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_disconnect_events_;
-    std::vector<ServerHelloEvent> pending_hello_events_;
 
     // Pointer fields
     SendspinClient* client_;
     std::shared_ptr<SendspinConnection> current_connection_;
-    std::shared_ptr<SendspinConnection> pending_connection_;
     std::unique_ptr<SendspinWsServer> ws_server_;
 
     // 32-bit fields
