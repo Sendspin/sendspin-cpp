@@ -17,11 +17,12 @@
 
 #pragma once
 
-#include "platform/shadow_slot.h"
+#include "inbox.h"
 #include "protocol_messages.h"
 #include "sendspin/metadata_role.h"
 
 #include <memory>
+#include <optional>
 
 namespace sendspin {
 
@@ -38,17 +39,18 @@ struct MetadataRole::Impl {
     // ========================================
 
     struct EventState {
-        ShadowSlot<ServerMetadataStateDelta> shadow;
-        bool pending_clear{false};
+        InboxSlot<ServerMetadataStateDelta> slot;
     };
 
     // ========================================
     // Internal integration methods (called by SendspinClient)
     // ========================================
 
+    void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
     void handle_server_state(ServerMetadataStateDelta delta) const;
     void drain_events();
+    void handle_cleared_event() const;
     void cleanup();
 
     // ========================================
@@ -64,10 +66,14 @@ struct MetadataRole::Impl {
 
     // Struct fields
     ServerMetadataStateObject metadata{};
+    // Delta accumulated from the inbox slot, awaiting its server-clock deadline. Main-thread
+    // only: written and read exclusively from drain_events()/cleanup() on the loop thread.
+    std::optional<ServerMetadataStateDelta> held_delta;
 
     // Pointer fields
     SendspinClient* client;
     std::unique_ptr<EventState> event_state;
+    Inbox* inbox{nullptr};
     MetadataRoleListener* listener{nullptr};
 };
 

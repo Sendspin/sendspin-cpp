@@ -76,7 +76,10 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
 }
 
 SendspinClient::~SendspinClient() {
-    // Stop background threads before tearing down connections.
+    // Stop background threads before tearing down connections. Every role is reset explicitly
+    // (not just the threaded ones): role InboxSlots release their topic-bit claims against
+    // event_state_'s Inbox on destruction, so all roles must be gone before the alphabetized
+    // member order destroys event_state_.
 #ifdef SENDSPIN_ENABLE_PLAYER
     this->player_.reset();
 #endif
@@ -85,6 +88,15 @@ SendspinClient::~SendspinClient() {
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
     this->artwork_.reset();
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    this->controller_.reset();
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+    this->metadata_.reset();
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    this->color_.reset();
 #endif
     this->connection_manager_.reset();
 }
@@ -201,6 +213,41 @@ void SendspinClient::loop() {
                         }
                         break;
                     }
+                    // CONTROLLER_CLEARED / METADATA_CLEARED / COLOR_CLEARED: pushed by each
+                    // role's cleanup() in place of the old boolean coalescing flag. At most one
+                    // CLEARED per role is ever pending when this drain runs: cleanup() is called
+                    // only from cleanup_connection_state(), which first calls inbox.reset_events()
+                    // (wiping the whole ring) before any role re-pushes its CLEARED, and that path
+                    // runs only under conn_ptr_mutex_ (ConnectionManager::drop_connection), so it
+                    // cannot interleave with itself. So even a back-to-back disconnect/reconnect
+                    // coalesces to a single CLEARED -- the reset_events() ordering is what
+                    // guarantees it, not clear-callback idempotency. (Callbacks are idempotent by
+                    // contract anyway; see on_controller_state_clear() / on_metadata_clear() /
+                    // on_color_clear().)
+                    case InboxEventType::CONTROLLER_CLEARED: {
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+                        if (this->controller_) {
+                            this->controller_->impl_->handle_cleared_event();
+                        }
+#endif
+                        break;
+                    }
+                    case InboxEventType::METADATA_CLEARED: {
+#ifdef SENDSPIN_ENABLE_METADATA
+                        if (this->metadata_) {
+                            this->metadata_->impl_->handle_cleared_event();
+                        }
+#endif
+                        break;
+                    }
+                    case InboxEventType::COLOR_CLEARED: {
+#ifdef SENDSPIN_ENABLE_COLOR
+                        if (this->color_) {
+                            this->color_->impl_->handle_cleared_event();
+                        }
+#endif
+                        break;
+                    }
                     default: {
                         // No role event types are produced yet; unhandled types are logged and
                         // dropped.
@@ -214,6 +261,12 @@ void SendspinClient::loop() {
     }
 
     // --- Role events (each role handles its own synchronization) ---
+    // These drains must stay unconditional (gated only on the role existing), NOT wrapped in an
+    // `inbox_bits & INBOX_TOPIC_*` test like the group slot below. metadata/color drain_events()
+    // take() clears the topic bit even when it defers a future-dated delta into held_delta; that
+    // deferred delta is re-evaluated against its deadline on later ticks only because this call
+    // runs every tick. Bit-gating it would strand the delta until an unrelated new delta happened
+    // to re-set the bit, silently starving deadline-based delivery.
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         this->player_->impl_->drain_events();
@@ -298,6 +351,7 @@ ControllerRole& SendspinClient::add_controller() {
         SS_LOGW(TAG, "add_controller() called after start_server()");
     }
     this->controller_ = std::make_unique<ControllerRole>(this);
+    this->controller_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->controller_;
 }
 #endif
@@ -308,6 +362,7 @@ MetadataRole& SendspinClient::add_metadata() {
         SS_LOGW(TAG, "add_metadata() called after start_server()");
     }
     this->metadata_ = std::make_unique<MetadataRole>(this);
+    this->metadata_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->metadata_;
 }
 #endif
@@ -318,6 +373,7 @@ ColorRole& SendspinClient::add_color() {
         SS_LOGW(TAG, "add_color() called after start_server()");
     }
     this->color_ = std::make_unique<ColorRole>(this);
+    this->color_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->color_;
 }
 #endif

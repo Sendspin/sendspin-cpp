@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "platform/shadow_slot.h"
+#include "inbox.h"
 #include "sendspin/controller_role.h"
 
 #include <memory>
@@ -37,17 +37,18 @@ struct ControllerRole::Impl {
     // ========================================
 
     struct EventState {
-        ShadowSlot<ServerStateControllerObject> shadow;
-        bool pending_clear{false};
+        InboxSlot<ServerStateControllerObject> slot;
     };
 
     // ========================================
     // Internal integration methods (called by SendspinClient)
     // ========================================
 
+    void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
     void handle_server_state(ServerStateControllerObject state) const;
     void drain_events();
+    void handle_cleared_event() const;
     void cleanup();
 
     // ========================================
@@ -67,6 +68,7 @@ struct ControllerRole::Impl {
     // Pointer fields
     SendspinClient* client;
     std::unique_ptr<EventState> event_state;
+    Inbox* inbox{nullptr};
     ControllerRoleListener* listener{nullptr};
 };
 

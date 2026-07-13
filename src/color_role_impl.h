@@ -17,11 +17,12 @@
 
 #pragma once
 
-#include "platform/shadow_slot.h"
+#include "inbox.h"
 #include "protocol_messages.h"
 #include "sendspin/color_role.h"
 
 #include <memory>
+#include <optional>
 
 namespace sendspin {
 
@@ -40,17 +41,18 @@ struct ColorRole::Impl {
     struct EventState {
         // Stores the wire-level delta type so accumulated clears (inner-nullopt) survive
         // cross-thread merging until drain_events applies them to the merged state.
-        ShadowSlot<ServerColorStateDelta> shadow;
-        bool pending_clear{false};
+        InboxSlot<ServerColorStateDelta> slot;
     };
 
     // ========================================
     // Internal integration methods (called by SendspinClient)
     // ========================================
 
+    void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
     void handle_server_state(ServerColorStateDelta delta) const;
     void drain_events();
+    void handle_cleared_event() const;
     void cleanup();
 
     // ========================================
@@ -59,10 +61,14 @@ struct ColorRole::Impl {
 
     // Struct fields
     ServerColorStateObject color{};
+    // Delta accumulated from the inbox slot, awaiting its server-clock deadline. Main-thread
+    // only: written and read exclusively from drain_events()/cleanup() on the loop thread.
+    std::optional<ServerColorStateDelta> held_delta;
 
     // Pointer fields
     SendspinClient* client;
     std::unique_ptr<EventState> event_state;
+    Inbox* inbox{nullptr};
     ColorRoleListener* listener{nullptr};
 };
 
