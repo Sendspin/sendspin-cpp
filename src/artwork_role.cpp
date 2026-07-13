@@ -53,6 +53,27 @@ static int64_t be64_to_host(const uint8_t* bytes) {
 
 namespace sendspin {
 
+namespace {
+
+/// @brief Merges a single-slot display delta into the accumulated cross-thread update
+///
+/// Called under the Inbox mutex via InboxSlot::merge() (see Impl::drain_thread_func), so it must
+/// stay a pure data operation with no callbacks into application code. `delta` carries exactly
+/// one slot's bit (set by the decode thread after a single image finishes decoding); OR-ing
+/// valid_mask and overwriting only the masked timestamps entries preserves latest-wins per slot
+/// while leaving any other slot's already-accumulated (not yet drained) timestamp untouched.
+void merge_artwork_display_update(ArtworkDisplayUpdate& current, ArtworkDisplayUpdate&& delta) {
+    current.valid_mask |= delta.valid_mask;
+    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+        if (delta.valid_mask & (1U << slot)) {
+            current.timestamps[slot] = delta.timestamps[slot];
+            current.epochs[slot] = delta.epochs[slot];
+        }
+    }
+}
+
+}  // namespace
+
 // ============================================================================
 // ArtworkRole::Impl lifecycle
 // ============================================================================
@@ -61,8 +82,7 @@ ArtworkRole::Impl::Impl(ArtworkRoleConfig config, SendspinClient* client)
     : config(std::move(config)),
       client(client),
       drain_task(std::make_unique<DrainTask>()),
-      event_state(std::make_unique<EventState>()),
-      display_scheduler(std::make_unique<DisplayScheduler>()) {
+      event_state(std::make_unique<EventState>()) {
     // The array index is authoritative for channel/slot mapping: the hello advertises channels
     // in this->artwork_channels order, and handle_binary looks up this->config.preferred_formats
     // by index to match.
@@ -74,12 +94,16 @@ ArtworkRole::Impl::Impl(ArtworkRoleConfig config, SendspinClient* client)
     for (const auto& pref : this->config.preferred_formats) {
         this->artwork_channels.push_back({pref.source, pref.format, pref.width, pref.height});
     }
-    this->event_state->queue.create(8);
     this->drain_task->notify_queue.create(8);
 }
 
 ArtworkRole::Impl::~Impl() {
     this->stop();
+}
+
+void ArtworkRole::Impl::attach_inbox(Inbox& inbox) {
+    this->inbox = &inbox;
+    this->event_state->display_slot.bind(inbox, INBOX_TOPIC_ARTWORK_DISPLAY);
 }
 
 bool ArtworkRole::Impl::start() {
@@ -236,78 +260,106 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
     // already queued before this handler ran).
     this->stream_epoch.fetch_add(1, std::memory_order_relaxed);
 
-    // Discard any pending displays from a prior stream
-    if (this->display_scheduler) {
-        for (auto& slot : this->display_scheduler->pending) {
-            slot.reset();
-        }
-    }
+    // Discard any pending display from a prior stream that has not yet been folded into the
+    // main thread's held_display_mask (see drain_events()). A display already folded into the
+    // holds is not reachable from here, but it carries the epoch it was decoded under
+    // (held_display_epoch), so the epoch bump above makes the main-loop deadline check drop it.
+    this->event_state->display_slot.reset();
 }
 
 void ArtworkRole::Impl::handle_stream_end() {
     this->stream_active = false;
     this->stream_epoch.fetch_add(1, std::memory_order_relaxed);
 
-    if (!this->event_state->queue.send(ArtworkEventType::STREAM_END, 0)) {
-        SS_LOGW(TAG, "Artwork event queue full; dropping STREAM_END");
-    }
+    this->enqueue_stream_event(ArtworkEventType::STREAM_END);
 }
 
 void ArtworkRole::Impl::handle_stream_clear() {
     this->stream_active = false;
     this->stream_epoch.fetch_add(1, std::memory_order_relaxed);
 
-    if (!this->event_state->queue.send(ArtworkEventType::STREAM_CLEAR, 0)) {
-        SS_LOGW(TAG, "Artwork event queue full; dropping STREAM_CLEAR");
-    }
+    this->enqueue_stream_event(ArtworkEventType::STREAM_CLEAR);
+}
+
+void ArtworkRole::Impl::enqueue_stream_event(ArtworkEventType event) const {
+    push_event_or_log(this->inbox, InboxEventType::ARTWORK_STREAM, static_cast<uint8_t>(event), TAG,
+                      event == ArtworkEventType::STREAM_END ? "STREAM_END" : "STREAM_CLEAR");
 }
 
 // ============================================================================
-// Event draining (main thread) - lifecycle events and scheduled displays
+// Event dispatch (main thread) - lifecycle via the ring, scheduled displays via polling
 // ============================================================================
 
+void ArtworkRole::Impl::handle_stream_ring_event(ArtworkEventType event) {
+    // Called from the ring drain in SendspinClient::loop() before this role's drain_events()
+    // runs each tick (see drain_events()), so clearing the holds and display_slot here cancels
+    // any display that would otherwise fire later this same tick -- the same "lifecycle first"
+    // ordering the old queue-drain loop at the top of drain_events() used to guarantee by running
+    // before the display-deadline loop below it.
+    switch (event) {
+        case ArtworkEventType::STREAM_END:
+        case ArtworkEventType::STREAM_CLEAR:
+            this->held_display_mask = 0;
+            this->event_state->display_slot.reset();
+            if (this->listener) {
+                // Array index is the authoritative slot number; see the Impl constructor.
+                for (size_t i = 0; i < this->config.preferred_formats.size(); ++i) {
+                    this->listener->on_image_clear(static_cast<uint8_t>(i));
+                }
+            }
+            break;
+    }
+}
+
 void ArtworkRole::Impl::drain_events() {
-    // Process stream lifecycle events first so we don't fire a display that was
-    // cancelled by an end/clear in the same tick.
-    ArtworkEventType event_type{};
-    while (this->event_state->queue.receive(event_type, 0)) {
-        switch (event_type) {
-            case ArtworkEventType::STREAM_END:
-            case ArtworkEventType::STREAM_CLEAR:
-                if (this->display_scheduler) {
-                    for (auto& pending : this->display_scheduler->pending) {
-                        pending.reset();
-                    }
-                }
-                if (this->listener) {
-                    // Array index is the authoritative slot number; see the Impl constructor.
-                    for (size_t i = 0; i < this->config.preferred_formats.size(); ++i) {
-                        this->listener->on_image_clear(static_cast<uint8_t>(i));
-                    }
-                }
-                break;
+    // Fold any newly published display update into the main-thread holds. Latest-wins per
+    // artwork slot, same as the old per-slot ShadowSlot overwrite: a bit set in valid_mask means
+    // timestamps[i] is a fresher pending display than whatever (if anything) slot i already
+    // held. Any STREAM_END/STREAM_CLEAR for this tick has already run via
+    // handle_stream_ring_event() before this call (see the comment there), so a lifecycle event
+    // arriving this tick has already cleared held_display_mask before we get here.
+    ArtworkDisplayUpdate update{};
+    if (this->event_state->display_slot.take(update)) {
+        for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+            if (update.valid_mask & (1U << slot)) {
+                this->held_display_ts[slot] = update.timestamps[slot];
+                this->held_display_epoch[slot] = update.epochs[slot];
+                this->held_display_mask |= static_cast<uint8_t>(1U << slot);
+            }
         }
     }
 
-    if (!this->display_scheduler || !this->listener) {
+    // No listener guard here: the epoch/deadline sweep below must still consume held bits so a
+    // listener-less role does not report needs_drain() forever; only the callback itself is
+    // gated on the listener.
+    if (this->held_display_mask == 0) {
         return;
     }
 
+    // Single now snapshot per tick, like today. No lock is held here (the slot value was
+    // already taken above), unlike the old take_if predicate which ran under the shadow slot's
+    // mutex.
     const int64_t now = platform_time_us();
+    const uint32_t current_epoch = this->stream_epoch.load(std::memory_order_relaxed);
     for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
-        int64_t server_ts = 0;
-        const bool taken = this->display_scheduler->pending[slot].take_if(
-            server_ts, [this, now](const int64_t& pending_ts) {
-                // get_client_time returns 0 when there is no current connection. Without a
-                // connection we cannot honor the server-clock deadline, so fire immediately rather
-                // than starving the listener.
-                int64_t client_ts = this->client->get_client_time(pending_ts);
-                if (client_ts == 0) {
-                    return true;
-                }
-                return client_ts <= now;
-            });
-        if (taken) {
+        if (!(this->held_display_mask & (1U << slot))) {
+            continue;
+        }
+        // Drop a display decoded under a since-replaced stream (restart with no intervening
+        // end/clear bumps the epoch but cannot reach these main-thread holds to cancel it).
+        if (this->held_display_epoch[slot] != current_epoch) {
+            this->held_display_mask &= static_cast<uint8_t>(~(1U << slot));
+            continue;
+        }
+        // get_client_time returns 0 when there is no current connection. Without a connection we
+        // cannot honor the server-clock deadline, so fire immediately rather than starving the
+        // listener.
+        int64_t client_ts = this->client->get_client_time(this->held_display_ts[slot]);
+        if (client_ts != 0 && client_ts > now) {
+            continue;
+        }
+        this->held_display_mask &= static_cast<uint8_t>(~(1U << slot));
+        if (this->listener) {
             this->listener->on_image_display(slot);
         }
     }
@@ -321,14 +373,17 @@ void ArtworkRole::Impl::cleanup() {
     this->stream_active = false;
     this->stream_epoch.fetch_add(1, std::memory_order_relaxed);
 
-    if (this->display_scheduler) {
-        for (auto& pending : this->display_scheduler->pending) {
-            pending.reset();
-        }
-    }
+    // Stale ring-borne events (an in-flight STREAM_END/STREAM_CLEAR queued before this cleanup)
+    // are already discarded by SendspinClient::cleanup_connection_state()'s inbox.reset_events()
+    // call, which runs before any role's cleanup() -- so there is no per-event ring reset to do
+    // here.
+    this->held_display_mask = 0;
+    this->event_state->display_slot.reset();
 
-    this->event_state->queue.reset();
-    this->event_state->queue.send(ArtworkEventType::STREAM_END, 0);
+    // Enqueue a clean STREAM_END - handle_stream_ring_event() will fire the on_image_clear()
+    // callbacks (the ring was just reset above us, so this push should not fail;
+    // enqueue_stream_event() logs if it somehow does).
+    this->enqueue_stream_event(ArtworkEventType::STREAM_END);
 }
 
 // ============================================================================
@@ -401,9 +456,17 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
         }
 
         // Hand off the timestamp to the main loop. Skip if the stream ended while we were
-        // decoding so the main loop doesn't fire a display after on_image_clear.
-        if (self->stream_active.load(std::memory_order_acquire) && self->display_scheduler) {
-            self->display_scheduler->pending[slot].write(notif.timestamp);
+        // decoding so the main loop doesn't fire a display after on_image_clear. The delta
+        // carries just this slot's bit; merge_artwork_display_update ORs it into whatever the
+        // main loop hasn't drained out of display_slot yet.
+        if (self->stream_active.load(std::memory_order_acquire)) {
+            ArtworkDisplayUpdate delta{};
+            delta.timestamps[slot] = notif.timestamp;
+            // The epoch this decode was validated under: lets the main-loop deadline check drop
+            // the display if the stream is replaced after this hand-off (see held_display_epoch).
+            delta.epochs[slot] = notif.stream_epoch;
+            delta.valid_mask = static_cast<uint8_t>(1U << slot);
+            self->event_state->display_slot.merge(merge_artwork_display_update, delta);
         }
     }
 

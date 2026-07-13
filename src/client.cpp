@@ -282,9 +282,31 @@ void SendspinClient::loop() {
 #endif
                         break;
                     }
+                    // ARTWORK_STREAM / VISUALIZER_STREAM: stream lifecycle sub-events (code =
+                    // the role-local ArtworkEventType/VisualizerEventType) from the artwork and
+                    // visualizer roles, dispatched the same way as PLAYER_STREAM above -- straight
+                    // to a main-thread-only Impl method keyed on the role-local enum.
+                    case InboxEventType::ARTWORK_STREAM: {
+#ifdef SENDSPIN_ENABLE_ARTWORK
+                        if (this->artwork_) {
+                            this->artwork_->impl_->handle_stream_ring_event(
+                                static_cast<ArtworkEventType>(event.code));
+                        }
+#endif
+                        break;
+                    }
+                    case InboxEventType::VISUALIZER_STREAM: {
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+                        if (this->visualizer_) {
+                            this->visualizer_->impl_->handle_stream_ring_event(
+                                static_cast<VisualizerEventType>(event.code));
+                        }
+#endif
+                        break;
+                    }
                     default: {
-                        // No role event types are produced yet; unhandled types are logged and
-                        // dropped.
+                        // Every InboxEventType is dispatched above; this guards only against a
+                        // corrupted enum value.
                         SS_LOGD(TAG, "Unhandled inbox event type: %d",
                                 static_cast<int>(event.type));
                         break;
@@ -332,11 +354,6 @@ void SendspinClient::loop() {
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
         this->artwork_->impl_->drain_events();
-    }
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_) {
-        this->visualizer_->impl_->drain_events();
     }
 #endif
 
@@ -427,6 +444,7 @@ ArtworkRole& SendspinClient::add_artwork(ArtworkRoleConfig config) {
         SS_LOGW(TAG, "add_artwork() called after start_server()");
     }
     this->artwork_ = std::make_unique<ArtworkRole>(std::move(config), this);
+    this->artwork_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->artwork_;
 }
 #endif
@@ -437,6 +455,7 @@ VisualizerRole& SendspinClient::add_visualizer(VisualizerRoleConfig config) {
         SS_LOGW(TAG, "add_visualizer() called after start_server()");
     }
     this->visualizer_ = std::make_unique<VisualizerRole>(std::move(config), this);
+    this->visualizer_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->visualizer_;
 }
 #endif

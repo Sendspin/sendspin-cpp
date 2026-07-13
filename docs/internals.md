@@ -60,7 +60,7 @@ On host builds, `platform_configure_thread()` is a no-op; threads use OS default
 
 1. `ArtworkRole::Impl::start()` spawns the decode thread.
 2. The thread blocks on notification queue receives with a 100 ms timeout.
-3. On notification: calls `on_image_decode()`, then writes the server display timestamp into a per-slot `ShadowSlot<int64_t>` (`DisplayScheduler::pending[slot]`). The main loop's `ArtworkRole::Impl::drain_events()` fires `on_image_display()` once the timestamp is reached. Latest-wins per slot: if a newer frame's timestamp overwrites the pending one before the main loop takes it, only the newer display fires.
+3. On notification: calls `on_image_decode()`, then merges an `ArtworkDisplayUpdate` (the slot's server display timestamp plus the `stream_epoch` it was decoded under) into the `ArtworkRole::Impl::EventState::display_slot` `InboxSlot` via `merge_artwork_display_update`. The main loop's `ArtworkRole::Impl::drain_events()` folds the taken update into its main-thread-only `held_display_*` state and fires `on_image_display()` once the timestamp is reached. Latest-wins per slot: if a newer frame's timestamp overwrites the pending one before the main loop takes it, only the newer display fires; the per-slot epoch lets the deadline sweep drop a display whose stream was replaced after the hand-off.
 4. `ArtworkRole::Impl` destructor sets `COMMAND_STOP` and joins.
 
 **Destruction order** matters because external audio callbacks may still reference the sync task. `PlayerRole::Impl`'s destructor resets the sync task first (`sync_task_.reset()`) before tearing down anything else, so the thread is fully joined before any shared state is destroyed.
@@ -93,8 +93,6 @@ Fixed-depth FIFO queue with timed send/receive. Used to defer events from networ
 | Queue | Depth | Data | Producer | Consumer |
 |-------|-------|------|----------|----------|
 | `ArtworkRole::Impl::notify_queue` | 8 | `ArtworkNotification` | Network thread | Artwork decode thread |
-| `ArtworkRole::Impl::queue` | 8 | `ArtworkEventType` | Network thread | Main loop (`drain_events`) |
-| `VisualizerRole::Impl::queue` | 8 | `VisualizerEventType` | Network thread | Main loop (`drain_events`) |
 
 ### ShadowSlot (`src/platform/shadow_slot.h`)
 
@@ -102,8 +100,6 @@ Single-slot state container with "latest wins" or custom merge semantics. The ne
 
 | Shadow Slot | Data | Merge Strategy |
 |-------------|------|----------------|
-| `ArtworkRole::Impl::display_scheduler->pending[slot]` (×4) | `int64_t` (server display timestamp) | Latest wins |
-| `VisualizerRole::Impl::shadow_config` | `ServerVisualizerStreamObject` | Latest wins |
 | `SyncTask::playback_progress_slot_` | `PlaybackProgress` | Sum `frames_played`, keep latest `finish_timestamp` |
 
 The field-by-field merge pattern - preserving, say, a volume change and a mute change that arrive between two drain ticks because the merge only overwrites fields present in the delta - now lives on the Inbox merge slots (the player's `command_slot`, and the metadata/color/group delta slots below) rather than on a `ShadowSlot`.
@@ -121,7 +117,7 @@ State currently on the Inbox:
 
 | Endpoint | Topic bit | Data | Producer |
 |----------|-----------|------|----------|
-| Event ring | `INBOX_TOPIC_EVENTS` | Lifecycle events (`TimeResponsePayload` and `PLAYER_STREAM` STREAM_START/STREAM_END, plus `CONTROLLER_CLEARED` / `METADATA_CLEARED` / `COLOR_CLEARED`) via `InboxEvent` | Network thread (`TimeResponsePayload`, `PLAYER_STREAM`) / main-loop thread (`*_CLEARED` via role `cleanup()`) |
+| Event ring | `INBOX_TOPIC_EVENTS` | Lifecycle events (`TimeResponsePayload`, `PLAYER_STREAM` STREAM_START/STREAM_END, `ARTWORK_STREAM` STREAM_END/STREAM_CLEAR, `VISUALIZER_STREAM` STREAM_START/STREAM_END/STREAM_CLEAR, plus `CONTROLLER_CLEARED` / `METADATA_CLEARED` / `COLOR_CLEARED`) via `InboxEvent` | Network thread (`TimeResponsePayload`, `PLAYER_STREAM`, `ARTWORK_STREAM`, `VISUALIZER_STREAM`) / main-loop thread (`*_CLEARED` and the synthetic `cleanup()` stream events) |
 | `Client::group_slot` | `INBOX_TOPIC_GROUP` | `GroupUpdateObject` (field-by-field delta merge) | Network thread |
 | `ControllerRole::Impl::slot` | `INBOX_TOPIC_CONTROLLER` | `ServerStateControllerObject` (latest wins) | Network thread |
 | `MetadataRole::Impl::slot` | `INBOX_TOPIC_METADATA` | `ServerMetadataStateDelta` (field-by-field delta merge) | Network thread |
@@ -129,8 +125,10 @@ State currently on the Inbox:
 | `PlayerRole::Impl::EventState::stream_params_slot` | `INBOX_TOPIC_PLAYER_STREAM_PARAMS` | `ServerPlayerStreamObject` (latest wins) | Network thread |
 | `PlayerRole::Impl::EventState::command_slot` | `INBOX_TOPIC_PLAYER_COMMAND` | `ServerCommandMessage` (field-by-field merge) | Network thread |
 | `PlayerRole::Impl::EventState::state_slot` | `INBOX_TOPIC_PLAYER_STATE` | `SendspinClientState` (latest wins) | Sync task thread |
+| `VisualizerRole::Impl::EventState::config_slot` | `INBOX_TOPIC_VISUALIZER_CONFIG` | `ServerVisualizerStreamObject` (latest wins) | Network thread |
+| `ArtworkRole::Impl::EventState::display_slot` | `INBOX_TOPIC_ARTWORK_DISPLAY` | `ArtworkDisplayUpdate` (per-slot display timestamp + epoch, merged) | Artwork decode thread |
 
-The controller, metadata, color, and player roles have been migrated onto the Inbox. The controller/metadata/color roles write or merge server state into their `InboxSlot` from `handle_server_state()`, and their disconnect clear arrives as a `*_CLEARED` lifecycle event on the shared ring rather than a per-role flag. The player role owns three `InboxSlot`s (stream params, command, and client state, on its `EventState`) plus `PLAYER_STREAM` lifecycle events on the shared ring; its disconnect clear is the synthetic STREAM_END that `cleanup()` pushes onto the ring. The remaining role-level state (artwork, visualizer) still uses the per-role `ThreadSafeQueue`/`ShadowSlot` endpoints above; migrating those onto the Inbox is a later phase.
+All roles have been migrated onto the Inbox. The controller/metadata/color roles write or merge server state into their `InboxSlot` from `handle_server_state()`, and their disconnect clear arrives as a `*_CLEARED` lifecycle event on the shared ring rather than a per-role flag. The player role owns three `InboxSlot`s (stream params, command, and client state, on its `EventState`) plus `PLAYER_STREAM` lifecycle events on the shared ring; its disconnect clear is the synthetic STREAM_END that `cleanup()` pushes onto the ring. The visualizer role writes its stream config to `config_slot` and delivers STREAM_START/END/CLEAR as `VISUALIZER_STREAM` ring events (no per-tick `drain_events()`; the config is taken when the START event is dispatched). The artwork role merges per-slot display timestamps (tagged with the decode `stream_epoch`) into `display_slot`, delivers STREAM_END/CLEAR as `ARTWORK_STREAM` ring events, and keeps a per-tick `drain_events()` for its server-clock display-deadline sweep. Both roles' disconnect clears are synthetic stream events that `cleanup()` pushes onto the ring.
 
 ### SpscRingBuffer (`src/platform/spsc_ring_buffer.h`)
 
@@ -181,9 +179,9 @@ Network thread (IXWebSocket / esp_http_server)
 | `SERVER_STATE` | Writes/merges into the controller, metadata, and color `InboxSlot`s via each role's `handle_server_state()` |
 | `SERVER_COMMAND` | Merges into the player's `command_slot` (`InboxSlot<ServerCommandMessage>`) |
 | `GROUP_UPDATE` | Merges into `Client::group_slot` (`InboxSlot<GroupUpdateObject>`) |
-| `STREAM_START` | Writes to the player's `stream_params_slot`, pushes a `PLAYER_STREAM` (STREAM_START) event onto the inbox ring. Marks the artwork stream active, flushes the decode thread's notification queue, and resets any pending per-slot display timestamps. Writes to `VisualizerRole::Impl::shadow_config`, enqueues a start event. |
-| `STREAM_END` | Pushes a `PLAYER_STREAM` (STREAM_END) event onto the inbox ring and signals sync task `COMMAND_STREAM_END`; enqueues `STREAM_END` into the artwork/visualizer queues |
-| `STREAM_CLEAR` | Enqueues `STREAM_CLEAR` into artwork/visualizer queues; for the player, signals sync task `COMMAND_STREAM_CLEAR` and enqueues a `CHUNK_TYPE_STREAM_CLEAR_MARKER` chunk into the encoded ring buffer (no player listener callback — a seek is not a stream lifecycle event) |
+| `STREAM_START` | Writes to the player's `stream_params_slot`, pushes a `PLAYER_STREAM` (STREAM_START) event onto the inbox ring. Marks the artwork stream active, flushes the decode thread's notification queue, bumps the artwork `stream_epoch`, and resets the artwork `display_slot`. Writes the config to the visualizer's `config_slot` and pushes a `VISUALIZER_STREAM` (STREAM_START) event onto the inbox ring. |
+| `STREAM_END` | Pushes a `PLAYER_STREAM` (STREAM_END) event onto the inbox ring and signals sync task `COMMAND_STREAM_END`; pushes `ARTWORK_STREAM` (STREAM_END) and `VISUALIZER_STREAM` (STREAM_END) events onto the inbox ring |
+| `STREAM_CLEAR` | Pushes `ARTWORK_STREAM` (STREAM_CLEAR) and `VISUALIZER_STREAM` (STREAM_CLEAR) events onto the inbox ring; for the player, signals sync task `COMMAND_STREAM_CLEAR` and enqueues a `CHUNK_TYPE_STREAM_CLEAR_MARKER` chunk into the encoded ring buffer (no player listener callback - a seek is not a stream lifecycle event) |
 
 #### JSON parse arena (`src/platform/json_arena.h`)
 
@@ -223,15 +221,17 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
 
 3. Drain inbox event ring (when INBOX_TOPIC_EVENTS is set)
    ├─ Feed TIME_RESPONSE events into time_burst_->on_time_response()
-   └─ Fire CONTROLLER/METADATA/COLOR_CLEARED via each role's handle_cleared_event()
+   ├─ Fire CONTROLLER/METADATA/COLOR_CLEARED via each role's handle_cleared_event()
+   ├─ Dispatch PLAYER_STREAM via player_->impl_->on_stream_ring_event()
+   ├─ Dispatch ARTWORK_STREAM via artwork_->impl_->handle_stream_ring_event()
+   └─ Dispatch VISUALIZER_STREAM via visualizer_->impl_->handle_stream_ring_event()
 
 4. Role event draining (each role's impl_->drain_events())
    ├─ player_->impl_->drain_events()
    ├─ controller_->impl_->drain_events()
    ├─ metadata_->impl_->drain_events()
    ├─ color_->impl_->drain_events()
-   ├─ artwork_->impl_->drain_events()
-   └─ visualizer_->impl_->drain_events()
+   └─ artwork_->impl_->drain_events()   (display-deadline sweep; visualizer has no drain_events())
 
 5. Drain group_slot (when INBOX_TOPIC_GROUP is set)
    └─ Apply group deltas, fire on_group_update, persist last played server
@@ -241,7 +241,7 @@ This ordering matters: connection lifecycle events are processed before role eve
 
 ## Role Event Draining
 
-Each role implements `drain_events()` to process its deferred events on the main loop thread. This is the mechanism that converts thread-safe queue/shadow writes into sequential, single-threaded callback delivery.
+Most roles implement `drain_events()` to process their deferred state on the main loop thread; stream lifecycle events instead ride the shared inbox ring and are dispatched from the ring drain (step 3 above) via each role's `handle_stream_ring_event()` / `on_stream_ring_event()` / `handle_cleared_event()`. Together these convert cross-thread inbox writes into sequential, single-threaded callback delivery. (The visualizer role has no `drain_events()` - all its delivery is ring-driven.)
 
 ### PlayerRole::Impl::drain_events() (`src/player_role.cpp:363`)
 
@@ -275,8 +275,8 @@ The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering
 - **ControllerRole**: Takes the latest `ServerStateControllerObject` from its `InboxSlot`, fires `on_controller_state()`. The disconnect clear is not handled here; it arrives as a `CONTROLLER_CLEARED` event on the shared ring, whose `handle_cleared_event()` fires `on_controller_state_clear()` (deferred from `cleanup()` to avoid invoking the listener while `ConnectionManager` holds `conn_ptr_mutex_`).
 - **MetadataRole**: `InboxSlot` has no `take_if`, so the deadline gate that used to run under the shadow slot's mutex is split in two: `take()` unconditionally moves any pending delta into a main-thread-only `held_delta` (folding it into an already-held delta), then the server-clock deadline is evaluated with no lock held, applying deltas and firing `on_metadata()` once the `timestamp` is reached (or immediately if there is no active connection). A future-dated `held_delta` persists across ticks with no topic bit set, which is why this `drain_events()` must be called unconditionally every tick (see the warning in `SendspinClient::loop()`). The clear arrives separately as a `METADATA_CLEARED` ring event (`handle_cleared_event()` fires `on_metadata_clear()`), deferred from `cleanup()` for the same `conn_ptr_mutex_` reason.
 - **ColorRole**: Same structure as MetadataRole: `take()` into `held_delta`, a lock-free server-clock deadline gate firing `on_color()`, and a `COLOR_CLEARED` ring event driving `on_color_clear()`.
-- **ArtworkRole**: Drains event queue for stream end/clear lifecycle events first (resetting all per-slot pending display timestamps and firing `on_image_clear()` for each configured slot). Then iterates the per-slot `DisplayScheduler::pending` shadow slots and fires `on_image_display(slot)` for any slot whose pending timestamp is due on the synced client clock (or immediately if there is no active connection). `on_image_decode` still happens on the dedicated artwork decode thread.
-- **VisualizerRole**: Drains event queue, processes stream start/end/clear with shadow config.
+- **ArtworkRole**: Stream end/clear lifecycle is handled earlier in the tick by `handle_stream_ring_event()` (dispatched from the ring drain, before this call), which clears `held_display_mask`/`display_slot` and fires `on_image_clear()` for each configured slot - preserving the "lifecycle before display" ordering the old single-function drain guaranteed. `drain_events()` itself folds any taken `display_slot` update into the main-thread-only `held_display_*` state (latest-wins per slot), then sweeps the held slots and fires `on_image_display(slot)` for any whose timestamp is due on the synced client clock (or immediately if there is no active connection). Per-slot epochs drop a held display whose stream was replaced after the decode hand-off. The sweep runs unconditionally every tick (not bit-gated) so held displays are re-evaluated against their deadlines; `on_image_decode` still happens on the dedicated artwork decode thread.
+- **VisualizerRole**: Has no `drain_events()`. STREAM_START/END/CLEAR are dispatched entirely from `handle_stream_ring_event()` (from the ring drain): STREAM_START `take()`s the config from `config_slot` and fires `on_visualizer_stream_start()`; STREAM_END/CLEAR fire `on_visualizer_stream_end()`/`on_visualizer_stream_clear()`.
 
 ## Sync Task State Machine
 
@@ -460,7 +460,7 @@ The host build does not need this scheme: `SendspinWsServer` (host) routes IXWeb
 
 ### Network Thread → Main Loop
 
-All network thread actions are deferred to the main loop via queues, shadow slots, or mutex-protected vectors. The main loop processes them in a fixed order each tick (connections → time → roles → group). This guarantees that:
+All network thread actions are deferred to the main loop, primarily through the shared `Inbox` (its event ring and `InboxSlot`s), with a few remaining per-thread queues, shadow slots, and mutex-protected vectors. The main loop processes them in a fixed order each tick (connections → time → roles → group). This guarantees that:
 
 - Connection state is settled before roles process events.
 - Time sync is updated before audio sync decisions.
