@@ -72,18 +72,18 @@ enum class InboxEventType : uint8_t {
 /// Mirrors the fields of the current TimeResponseEvent in client.cpp; that struct migrates here
 /// in a later phase.
 struct TimeResponsePayload {
-    int64_t offset;
-    int64_t max_error;
-    int64_t timestamp;
-    uint64_t source_id;
+    int64_t offset{0};
+    int64_t max_error{0};
+    int64_t timestamp{0};
+    uint64_t source_id{0};
 };
 
 /// @brief One entry in the shared event ring
 ///
 /// POD; copied in and out of the ring by value.
 struct InboxEvent {
-    InboxEventType type;
-    uint8_t code;              // Role-local enum value; 0 when unused
+    InboxEventType type{};
+    uint8_t code{0};           // Role-local enum value; 0 when unused
     TimeResponsePayload time;  // Valid only when type == InboxEventType::TIME_RESPONSE
 };
 
