@@ -96,7 +96,7 @@ Fixed-depth FIFO queue with timed send/receive. Used to defer events from networ
 
 ### ShadowSlot (`src/platform/shadow_slot.h`)
 
-Single-slot state container with "latest wins" or custom merge semantics. The network thread writes or merges; the main loop takes the accumulated value:
+Single-slot state container with "latest wins" or custom merge semantics for a producer/consumer thread pair where **neither thread is the main loop**. The writer thread writes or merges; the reader thread takes the accumulated value. Main-loop-bound cross-thread state goes through the Inbox / `InboxSlot` instead (see below), which consolidates many producers onto one shared mutex and a single lock-free `poll()` read per tick. Its one remaining user is the sync task's playback-progress slot (audio-callback thread → sync-task thread):
 
 | Shadow Slot | Data | Merge Strategy |
 |-------------|------|----------------|
@@ -204,15 +204,16 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
 `SendspinClient::loop()` (`src/client.cpp`) runs the following steps **in order** on each tick:
 
 ```api
-1. connection_manager_->loop()
+1. connection_manager_->loop()   (sections gated on lock-free atomic hints - see below)
    ├─ Start WS server if network ready
-   ├─ Swap deferred connection events under mutex
+   ├─ Swap deferred connection events under mutex   (only when has_pending_events_)
    ├─ Process close/disconnect events (on_connection_lost)
    ├─ Promotion scan: establish nursery connections whose hello handshake completed
    │  (handoff decisions against the incumbent)
-   ├─ Call loop() on the current and nursery connections
-   ├─ Check per-connection hello retry timers
-   └─ Reap nursery connections past the establish deadline; tick the platform ws_server
+   ├─ Call loop() on the current and nursery connections   (only when has_current_ or nursery_size_)
+   ├─ Check per-connection hello retry timers   (only when nursery_size_)
+   ├─ Reap nursery connections past the establish deadline; tick the platform ws_server
+   └─ flush_deferred_releases()   (early-returns without locking when deferred_size_ is 0)
 
 2. time_burst_->loop(conn)  (skipped when no current connection)
    ├─ Send next time message if ready
@@ -226,18 +227,29 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    ├─ Dispatch ARTWORK_STREAM via artwork_->impl_->handle_stream_ring_event()
    └─ Dispatch VISUALIZER_STREAM via visualizer_->impl_->handle_stream_ring_event()
 
-4. Role event draining (each role's impl_->drain_events())
+4. Role event draining (each role's impl_->drain_events(), gated on impl_->needs_drain(slot_bits))
    ├─ player_->impl_->drain_events()
    ├─ controller_->impl_->drain_events()
    ├─ metadata_->impl_->drain_events()
    ├─ color_->impl_->drain_events()
    └─ artwork_->impl_->drain_events()   (display-deadline sweep; visualizer has no drain_events())
 
-5. Drain group_slot (when INBOX_TOPIC_GROUP is set)
+5. Drain group_slot (when INBOX_TOPIC_GROUP is set in slot_bits)
    └─ Apply group deltas, fire on_group_update, persist last played server
 ```
 
 This ordering matters: connection lifecycle events are processed before role events, and time sync before audio processing, so that roles always see a consistent connection and time state.
+
+Each `loop()` section that would otherwise take a mutex first consults a lock-free atomic hint, so an idle tick pays only for the atomic loads it needs to decide there is nothing to do. `ConnectionManager` keeps four such hints, each refreshed under the owning mutex right after the container/pointer it mirrors changes (always re-derived from `.size()` or the assigned value, never incremented in place, so the hint cannot drift from ground truth):
+
+- `has_pending_events_` (under `conn_mutex_`): set at every push into either deferred connection-event queue, cleared once `loop()` has swapped both out. Lets `loop()` skip the `conn_mutex_` acquisition when neither queue has anything pending.
+- `nursery_size_` (under `conn_ptr_mutex_`): mirrors `nursery_.size()`. Lets `loop()` skip the current/nursery copy-and-`loop()` block, the hello-retry scan, and the nursery reap scan when the nursery is empty, while keeping the lifecycle block running while any nursery connection exists (its promotion scan is level-triggered on connection flags, not on events).
+- `has_current_` (under `conn_ptr_mutex_`): true whenever `current_connection_` is non-null. Lets `loop()` skip the copy-and-`loop()` block when there is no current connection and the nursery is empty.
+- `deferred_size_` (under `conn_ptr_mutex_`): mirrors `deferred_releases_.size()`. Lets `flush_deferred_releases()` early-return without locking when nothing is queued.
+
+Steady state is therefore cheap: connected-and-idle costs one `conn_ptr_mutex_` acquisition (the current/nursery copy ahead of the `conn->loop()` calls) plus a handful of atomic loads; disconnected-and-idle costs zero mutex acquisitions. The mutex-protected containers and pointers remain the ground truth in every case; the hints only decide whether it is worth locking to look.
+
+The Inbox drain steps gate the same way, off two lock-free `poll()` snapshots of the topic bitmask. `inbox_bits` is taken first and gates only the event-ring drain (step 3). `slot_bits` is taken *after* that drain completes and gates the role drains (step 4) and the group drain (step 5); the second snapshot catches topic bits a producer set while the ring drain was running (including a ring event's own side effects re-entering the inbox). A bit either snapshot races and misses is not lost - it stays set and the next tick's `poll()` observes it (bounded staleness, per `Inbox::poll()`). Each role's `needs_drain(slot_bits)` decides whether its drain runs: mostly a simple `slot_bits & INBOX_TOPIC_*` test, but the player, metadata, and artwork roles OR in a main-thread-only carry-over term (the player's `awaiting_sync_idle_events`, the metadata role's future-dated `held_delta`, the artwork role's nonzero `held_display_mask`) so that work waiting out a deadline no inbox bit tracks still gets a drain every tick until it fires.
 
 ## Role Event Draining
 
@@ -273,9 +285,9 @@ The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering
 ### Other Roles
 
 - **ControllerRole**: Takes the latest `ServerStateControllerObject` from its `InboxSlot`, fires `on_controller_state()`. The disconnect clear is not handled here; it arrives as a `CONTROLLER_CLEARED` event on the shared ring, whose `handle_cleared_event()` fires `on_controller_state_clear()` (deferred from `cleanup()` to avoid invoking the listener while `ConnectionManager` holds `conn_ptr_mutex_`).
-- **MetadataRole**: `InboxSlot` has no `take_if`, so the deadline gate that used to run under the shadow slot's mutex is split in two: `take()` unconditionally moves any pending delta into a main-thread-only `held_delta` (folding it into an already-held delta), then the server-clock deadline is evaluated with no lock held, applying deltas and firing `on_metadata()` once the `timestamp` is reached (or immediately if there is no active connection). A future-dated `held_delta` persists across ticks with no topic bit set, which is why this `drain_events()` must be called unconditionally every tick (see the warning in `SendspinClient::loop()`). The clear arrives separately as a `METADATA_CLEARED` ring event (`handle_cleared_event()` fires `on_metadata_clear()`), deferred from `cleanup()` for the same `conn_ptr_mutex_` reason.
+- **MetadataRole**: `InboxSlot` has no `take_if`, so the deadline gate that used to run under the shadow slot's mutex is split in two: `take()` unconditionally moves any pending delta into a main-thread-only `held_delta` (folding it into an already-held delta), then the server-clock deadline is evaluated with no lock held, applying deltas and firing `on_metadata()` once the `timestamp` is reached (or immediately if there is no active connection). A future-dated `held_delta` persists across ticks with no topic bit set, which is why `needs_drain()` ORs in `held_delta.has_value()` alongside the `INBOX_TOPIC_METADATA` bit test: the deadline sets no inbox bit, so without that term a bit-gated tick would strand the delta until an unrelated new delta happened to re-set the bit, silently starving deadline-based delivery. The clear arrives separately as a `METADATA_CLEARED` ring event (`handle_cleared_event()` fires `on_metadata_clear()`), deferred from `cleanup()` for the same `conn_ptr_mutex_` reason.
 - **ColorRole**: Same structure as MetadataRole: `take()` into `held_delta`, a lock-free server-clock deadline gate firing `on_color()`, and a `COLOR_CLEARED` ring event driving `on_color_clear()`.
-- **ArtworkRole**: Stream end/clear lifecycle is handled earlier in the tick by `handle_stream_ring_event()` (dispatched from the ring drain, before this call), which clears `held_display_mask`/`display_slot` and fires `on_image_clear()` for each configured slot - preserving the "lifecycle before display" ordering the old single-function drain guaranteed. `drain_events()` itself folds any taken `display_slot` update into the main-thread-only `held_display_*` state (latest-wins per slot), then sweeps the held slots and fires `on_image_display(slot)` for any whose timestamp is due on the synced client clock (or immediately if there is no active connection). Per-slot epochs drop a held display whose stream was replaced after the decode hand-off. The sweep runs unconditionally every tick (not bit-gated) so held displays are re-evaluated against their deadlines; `on_image_decode` still happens on the dedicated artwork decode thread.
+- **ArtworkRole**: Stream end/clear lifecycle is handled earlier in the tick by `handle_stream_ring_event()` (dispatched from the ring drain, before this call), which clears `held_display_mask`/`display_slot` and fires `on_image_clear()` for each configured slot - preserving the "lifecycle before display" ordering the old single-function drain guaranteed. `drain_events()` itself folds any taken `display_slot` update into the main-thread-only `held_display_*` state (latest-wins per slot), then sweeps the held slots and fires `on_image_display(slot)` for any whose timestamp is due on the synced client clock (or immediately if there is no active connection). Per-slot epochs drop a held display whose stream was replaced after the decode hand-off. `needs_drain()` ORs a nonzero `held_display_mask` into the `INBOX_TOPIC_ARTWORK_DISPLAY` bit test (the same carry-over pattern the metadata role uses for `held_delta`) so held displays keep getting a drain every tick until their deadline fires, even though the deadline sets no inbox bit; `on_image_decode` still happens on the dedicated artwork decode thread.
 - **VisualizerRole**: Has no `drain_events()`. STREAM_START/END/CLEAR are dispatched entirely from `handle_stream_ring_event()` (from the ring drain): STREAM_START `take()`s the config from `config_slot` and fires `on_visualizer_stream_start()`; STREAM_END/CLEAR fire `on_visualizer_stream_end()`/`on_visualizer_stream_clear()`.
 
 ## Sync Task State Machine
@@ -460,7 +472,7 @@ The host build does not need this scheme: `SendspinWsServer` (host) routes IXWeb
 
 ### Network Thread → Main Loop
 
-All network thread actions are deferred to the main loop, primarily through the shared `Inbox` (its event ring and `InboxSlot`s), with a few remaining per-thread queues, shadow slots, and mutex-protected vectors. The main loop processes them in a fixed order each tick (connections → time → roles → group). This guarantees that:
+All network thread actions are deferred to the main loop, primarily through the shared `Inbox` (its event ring and `InboxSlot`s), with a few remaining per-thread queues and mutex-protected vectors. The main loop processes them in a fixed order each tick (connections → time → roles → group). This guarantees that:
 
 - Connection state is settled before roles process events.
 - Time sync is updated before audio sync decisions.
