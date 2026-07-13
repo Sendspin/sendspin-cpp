@@ -169,6 +169,7 @@ void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
     this->inbox = &inbox;
     this->event_state->stream_params_slot.bind(inbox, INBOX_TOPIC_PLAYER_STREAM_PARAMS);
     this->event_state->command_slot.bind(inbox, INBOX_TOPIC_PLAYER_COMMAND);
+    this->event_state->state_slot.bind(inbox, INBOX_TOPIC_PLAYER_STATE);
 }
 
 bool PlayerRole::Impl::start() {
@@ -359,20 +360,11 @@ void PlayerRole::Impl::on_stream_ring_event(PlayerStreamCallbackType event) {
     this->awaiting_sync_idle_events.push_back(event);
 }
 
-void PlayerRole::Impl::on_state_ring_event(SendspinClientState state) {
-    this->pending_state = state;
-    this->has_pending_state = true;
-}
-
 void PlayerRole::Impl::drain_events() {
-    // --- Client state events (from sync task, delivered via on_state_ring_event) ---
-    // Latest-wins: the ring is fully drained (and on_state_ring_event() called for each
-    // PLAYER_STATE entry) before drain_events() runs each tick, so has_pending_state/pending_state
-    // already hold the last state pushed this tick -- equivalent to the collapse loop this
-    // replaces.
-    if (this->has_pending_state) {
-        this->client->update_state(this->pending_state);
-        this->has_pending_state = false;
+    // --- Client state events (from the sync task, via the latest-wins state slot) ---
+    SendspinClientState state{};
+    if (this->event_state->state_slot.take(state)) {
+        this->client->update_state(state);
     }
 
     // --- Server command events (volume, mute, static delay) ---
@@ -506,11 +498,12 @@ void PlayerRole::Impl::cleanup() {
     this->sync_task->signal_stream_end();
 
     // Discard stale slot content from the dead connection. Stale ring-borne events (an
-    // in-flight STREAM_START/STREAM_END/state update queued before this cleanup) are already
-    // discarded by SendspinClient::cleanup_connection_state()'s inbox.reset_events() call, which
-    // runs before any role's cleanup() -- so there is no per-queue ring reset to do here.
+    // in-flight STREAM_START/STREAM_END queued before this cleanup) are already discarded by
+    // SendspinClient::cleanup_connection_state()'s inbox.reset_events() call, which runs before
+    // any role's cleanup() -- so there is no per-queue ring reset to do here.
     this->event_state->stream_params_slot.reset();
     this->event_state->command_slot.reset();
+    this->event_state->state_slot.reset();
 
     // Enqueue a clean STREAM_END - drain_events() will fire the callback (the ring was just
     // reset above us, so this push should not fail; enqueue_stream_event() logs if it somehow does)
@@ -541,14 +534,11 @@ bool PlayerRole::Impl::send_audio_chunk(const uint8_t* data, size_t data_size, i
 }
 
 void PlayerRole::Impl::enqueue_state_update(SendspinClientState state) const {
-    InboxEvent event{};
-    event.type = InboxEventType::PLAYER_STATE;
-    event.code = static_cast<uint8_t>(state);
-    if (this->inbox == nullptr || !this->inbox->push_event(event)) {
-        // The drain takes only the newest state, so a dropped older one is recoverable -- but
-        // a full ring means the main loop has stalled for several ticks
-        SS_LOGW(TAG, "Inbox event ring full; dropping state update");
-    }
+    // Latest-wins slot, never the shared event ring: consecutive transitions between drains
+    // collapse to the newest (matching the drain's semantics), and a sync task that keeps
+    // transitioning while the main loop stalls cannot fill the ring and starve the
+    // non-idempotent lifecycle events that live there.
+    this->event_state->state_slot.write(state);
 }
 
 void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event) const {

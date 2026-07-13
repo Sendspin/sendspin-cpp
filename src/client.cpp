@@ -232,26 +232,17 @@ void SendspinClient::loop() {
                         }
                         break;
                     }
-                    // Stream lifecycle / client state events from the player role. Dispatched to
-                    // main-thread-only Impl methods that mirror the arrival exactly as the old
-                    // per-role queues delivered it: PLAYER_STREAM appends to
-                    // awaiting_sync_idle_events (the sync-idle gate itself is untouched);
-                    // PLAYER_STATE overwrites a latest-wins pending slot consumed once by
-                    // drain_events() below.
+                    // Stream lifecycle events from the player role. Dispatched to a
+                    // main-thread-only Impl method that mirrors the arrival exactly as the old
+                    // per-role queue delivered it: PLAYER_STREAM appends to
+                    // awaiting_sync_idle_events (the sync-idle gate itself is untouched).
+                    // Client-state updates from the sync task travel via the player's
+                    // latest-wins state slot, not this ring; see PlayerRole::Impl::EventState.
                     case InboxEventType::PLAYER_STREAM: {
 #ifdef SENDSPIN_ENABLE_PLAYER
                         if (this->player_) {
                             this->player_->impl_->on_stream_ring_event(
                                 static_cast<PlayerStreamCallbackType>(event.code));
-                        }
-#endif
-                        break;
-                    }
-                    case InboxEventType::PLAYER_STATE: {
-#ifdef SENDSPIN_ENABLE_PLAYER
-                        if (this->player_) {
-                            this->player_->impl_->on_state_ring_event(
-                                static_cast<SendspinClientState>(event.code));
                         }
 #endif
                         break;

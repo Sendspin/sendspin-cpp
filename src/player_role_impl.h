@@ -50,6 +50,12 @@ struct PlayerRole::Impl {
     struct EventState {
         InboxSlot<ServerPlayerStreamObject> stream_params_slot;
         InboxSlot<ServerCommandMessage> command_slot;
+        // Client state from the sync task. Latest-wins by design (the old ring events were
+        // collapsed to the newest at drain time anyway), and deliberately NOT on the event
+        // ring: the sync task is the one producer that can keep emitting while the main loop
+        // stalls, and un-coalesced state transitions must not be able to fill the shared ring
+        // and starve non-idempotent lifecycle events out of it.
+        InboxSlot<SendspinClientState> state_slot;
     };
 
     // ========================================
@@ -66,7 +72,6 @@ struct PlayerRole::Impl {
     void handle_stream_clear() const;
     void handle_server_command(const ServerCommandMessage& cmd) const;
     void on_stream_ring_event(PlayerStreamCallbackType event);
-    void on_state_ring_event(SendspinClientState state);
     void drain_events();
     void cleanup();
 
@@ -124,12 +129,6 @@ struct PlayerRole::Impl {
     bool stream_active{false};
     std::atomic<bool> static_delay_adjustable{false};
     uint8_t volume{0};
-    // Main-thread only: latest state delivered by on_state_ring_event() from the ring drain,
-    // awaiting drain_events()'s single update_state() call; pending_state is valid only when
-    // has_pending_state is true. Reproduces the prior collapse-to-last (latest-wins) semantics
-    // exactly, since the ring is fully drained before drain_events() runs each tick.
-    SendspinClientState pending_state{SendspinClientState::SYNCHRONIZED};
-    bool has_pending_state{false};
 };
 
 }  // namespace sendspin
