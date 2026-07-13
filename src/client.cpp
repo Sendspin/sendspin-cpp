@@ -178,11 +178,13 @@ void SendspinClient::loop() {
         // Drain in small batches to bound the stack cost on the shared main-loop task (the ring
         // holds up to EVENT_CAPACITY entries of ~40 bytes each). A batch that comes back partial
         // means the ring is empty, ending the loop; events pushed mid-drain are still delivered
-        // this tick as long as full batches keep arriving.
-        InboxEvent events[8];
+        // this tick as long as full batches keep arriving. Sized as a fraction of the ring so the
+        // batch/ring ratio (and the stack cost above) tracks EVENT_CAPACITY automatically.
+        constexpr size_t EVENT_DRAIN_BATCH_SIZE = Inbox::EVENT_CAPACITY / 4;
+        InboxEvent events[EVENT_DRAIN_BATCH_SIZE];
         size_t event_count = 0;
         do {
-            event_count = this->event_state_->inbox.take_events(events, 8);
+            event_count = this->event_state_->inbox.take_events(events, EVENT_DRAIN_BATCH_SIZE);
             for (size_t i = 0; i < event_count; ++i) {
                 const InboxEvent& event = events[i];
                 switch (event.type) {
@@ -200,14 +202,15 @@ void SendspinClient::loop() {
                         break;
                     }
                     default: {
-                        // Role event types are not produced yet; later phases add drains here.
+                        // No role event types are produced yet; unhandled types are logged and
+                        // dropped.
                         SS_LOGD(TAG, "Unhandled inbox event type: %d",
                                 static_cast<int>(event.type));
                         break;
                     }
                 }
             }
-        } while (event_count == 8);
+        } while (event_count == EVENT_DRAIN_BATCH_SIZE);
     }
 
     // --- Role events (each role handles its own synchronization) ---
