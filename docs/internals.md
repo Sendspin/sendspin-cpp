@@ -106,9 +106,6 @@ Single-slot state container with "latest wins" or custom merge semantics. The ne
 |-------------|------|----------------|
 | `PlayerRole::Impl::shadow_stream_params` | `ServerPlayerStreamObject` | Latest wins |
 | `PlayerRole::Impl::shadow_command` | `ServerCommandMessage` | Field-by-field merge (volume, mute, delay independent) |
-| `ControllerRole::Impl::shadow` | `ServerStateControllerObject` | Latest wins |
-| `MetadataRole::Impl::shadow` | `ServerMetadataStateDelta` | Field-by-field delta merge (preserves pending clears across rapid updates) |
-| `ColorRole::Impl::shadow` | `ServerColorStateDelta` | Field-by-field delta merge (preserves pending clears across rapid updates) |
 | `ArtworkRole::Impl::display_scheduler->pending[slot]` (×4) | `int64_t` (server display timestamp) | Latest wins |
 | `VisualizerRole::Impl::shadow_config` | `ServerVisualizerStreamObject` | Latest wins |
 | `SyncTask::playback_progress_slot_` | `PlaybackProgress` | Sum `frames_played`, keep latest `finish_timestamp` |
@@ -124,14 +121,17 @@ Shared main-loop mailbox that consolidates client-level cross-thread traffic beh
 
 The main loop calls `poll()` once per tick to read the bitmask lock-free and only locks the mutex to drain topics whose bit is set. A bit set by a producer just after the snapshot is never lost: it stays set until a consumer drains it, so the next tick observes it. The Inbox is a leaf in the lock order, and merge functors must be pure data operations (no callbacks into application code while the mutex is held).
 
-Client-level state currently on the Inbox:
+State currently on the Inbox:
 
 | Endpoint | Topic bit | Data | Producer |
 |----------|-----------|------|----------|
-| Event ring | `INBOX_TOPIC_EVENTS` | `TimeResponsePayload` (via `InboxEvent`) | Network thread |
+| Event ring | `INBOX_TOPIC_EVENTS` | Lifecycle events (`TimeResponsePayload`, plus `CONTROLLER_CLEARED` / `METADATA_CLEARED` / `COLOR_CLEARED`) via `InboxEvent` | Network thread / role `cleanup()` |
 | `Client::group_slot` | `INBOX_TOPIC_GROUP` | `GroupUpdateObject` (field-by-field delta merge) | Network thread |
+| `ControllerRole::Impl::slot` | `INBOX_TOPIC_CONTROLLER` | `ServerStateControllerObject` (latest wins) | Network thread |
+| `MetadataRole::Impl::slot` | `INBOX_TOPIC_METADATA` | `ServerMetadataStateDelta` (field-by-field delta merge) | Network thread |
+| `ColorRole::Impl::slot` | `INBOX_TOPIC_COLOR` | `ServerColorStateDelta` (field-by-field delta merge) | Network thread |
 
-Role-level state (player, controller, metadata, color, artwork, visualizer) still uses the per-role `ThreadSafeQueue`/`ShadowSlot` endpoints above; migrating those onto the Inbox is a later phase.
+The controller, metadata, and color roles have been migrated onto the Inbox: each `handle_server_state()` writes or merges into its `InboxSlot`, and the disconnect clear is delivered as a `*_CLEARED` lifecycle event on the shared ring rather than a per-role flag. The remaining role-level state (player, artwork, visualizer) still uses the per-role `ThreadSafeQueue`/`ShadowSlot` endpoints above; migrating those onto the Inbox is a later phase.
 
 ### SpscRingBuffer (`src/platform/spsc_ring_buffer.h`)
 
@@ -179,7 +179,7 @@ Network thread (IXWebSocket / esp_http_server)
 |---------|------------------------|
 | `SERVER_HELLO` | Stores server info and connection reason on the connection, then sets `server_hello_received_` (an atomic store that publishes the fields to the main loop; the manager's promotion scan observes `is_handshake_complete()` on its next tick) |
 | `SERVER_TIME` | Pushes a `TIME_RESPONSE` `InboxEvent` onto the shared inbox ring |
-| `SERVER_STATE` | Writes to `ControllerRole::Impl::shadow`, `MetadataRole::Impl::shadow`, and `ColorRole::Impl::shadow` |
+| `SERVER_STATE` | Writes/merges into the controller, metadata, and color `InboxSlot`s via each role's `handle_server_state()` |
 | `SERVER_COMMAND` | Merges into `PlayerRole::Impl::shadow_command` |
 | `GROUP_UPDATE` | Merges into `Client::group_slot` (`InboxSlot<GroupUpdateObject>`) |
 | `STREAM_START` | Writes to `PlayerRole::Impl::shadow_stream_params`, enqueues `STREAM_START` into `stream_queue`. Marks the artwork stream active, flushes the decode thread's notification queue, and resets any pending per-slot display timestamps. Writes to `VisualizerRole::Impl::shadow_config`, enqueues a start event. |
@@ -223,7 +223,8 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    └─ Notify listener of sync error when burst completes
 
 3. Drain inbox event ring (when INBOX_TOPIC_EVENTS is set)
-   └─ Feed TIME_RESPONSE events into time_burst_->on_time_response()
+   ├─ Feed TIME_RESPONSE events into time_burst_->on_time_response()
+   └─ Fire CONTROLLER/METADATA/COLOR_CLEARED via each role's handle_cleared_event()
 
 4. Role event draining (each role's impl_->drain_events())
    ├─ player_->impl_->drain_events()
@@ -272,9 +273,9 @@ The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering
 
 ### Other Roles
 
-- **ControllerRole**: Takes from shadow, fires `on_controller_state()`.
-- **MetadataRole**: Fires `on_metadata_clear()` first if a `pending_clear` flag is set (deferred from `cleanup()` to avoid invoking the listener while `ConnectionManager` holds `conn_ptr_mutex_`). Then takes from shadow when the pending update's `timestamp` has been reached on the synced client clock (or immediately if there is no active connection), applies deltas, fires `on_metadata()`.
-- **ColorRole**: Fires `on_color_clear()` first if a `pending_clear` flag is set (deferred from `cleanup()` to avoid invoking the listener while `ConnectionManager` holds `conn_ptr_mutex_`). Then takes from shadow when the pending update's `timestamp` has been reached on the synced client clock (or immediately if there is no active connection), applies deltas, fires `on_color()`.
+- **ControllerRole**: Takes the latest `ServerStateControllerObject` from its `InboxSlot`, fires `on_controller_state()`. The disconnect clear is not handled here; it arrives as a `CONTROLLER_CLEARED` event on the shared ring, whose `handle_cleared_event()` fires `on_controller_state_clear()` (deferred from `cleanup()` to avoid invoking the listener while `ConnectionManager` holds `conn_ptr_mutex_`).
+- **MetadataRole**: `InboxSlot` has no `take_if`, so the deadline gate that used to run under the shadow slot's mutex is split in two: `take()` unconditionally moves any pending delta into a main-thread-only `held_delta` (folding it into an already-held delta), then the server-clock deadline is evaluated with no lock held, applying deltas and firing `on_metadata()` once the `timestamp` is reached (or immediately if there is no active connection). A future-dated `held_delta` persists across ticks with no topic bit set, which is why this `drain_events()` must be called unconditionally every tick (see the warning in `SendspinClient::loop()`). The clear arrives separately as a `METADATA_CLEARED` ring event (`handle_cleared_event()` fires `on_metadata_clear()`), deferred from `cleanup()` for the same `conn_ptr_mutex_` reason.
+- **ColorRole**: Same structure as MetadataRole: `take()` into `held_delta`, a lock-free server-clock deadline gate firing `on_color()`, and a `COLOR_CLEARED` ring event driving `on_color_clear()`.
 - **ArtworkRole**: Drains event queue for stream end/clear lifecycle events first (resetting all per-slot pending display timestamps and firing `on_image_clear()` for each configured slot). Then iterates the per-slot `DisplayScheduler::pending` shadow slots and fires `on_image_display(slot)` for any slot whose pending timestamp is due on the synced client clock (or immediately if there is no active connection). `on_image_decode` still happens on the dedicated artwork decode thread.
 - **VisualizerRole**: Drains event queue, processes stream start/end/clear with shadow config.
 
