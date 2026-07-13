@@ -78,8 +78,18 @@ static const char* to_cstr(SetupStage stage) {
 ConnectionManager::ConnectionManager(SendspinClient* client) : client_(client) {}
 
 ConnectionManager::~ConnectionManager() {
-    // Move everything out under the lock, destroy outside it: a connection destructor can join
-    // its transport thread (see DeferredRelease), which must not happen while the lock is held.
+    // Move everything out under the locks, destroy outside them: a connection destructor can join
+    // its transport thread (see DeferredRelease), which must not happen while a lock is held.
+    // The two mutexes guard disjoint state and are taken in separate scopes, never nested.
+    std::vector<std::shared_ptr<SendspinConnection>> pending_connected;
+    std::vector<std::shared_ptr<SendspinConnection>> pending_disconnects;
+    {
+        std::lock_guard<std::mutex> lock(this->conn_mutex_);
+        pending_connected = std::move(this->pending_connected_events_);
+        pending_disconnects = std::move(this->pending_disconnect_events_);
+        this->has_pending_events_.store(false, std::memory_order_release);
+    }
+
     std::shared_ptr<SendspinConnection> current;
     std::vector<NurseryEntry> nursery;
     std::vector<HelloRetryState> retries;
@@ -90,9 +100,10 @@ ConnectionManager::~ConnectionManager() {
         nursery = std::move(this->nursery_);
         retries = std::move(this->hello_retries_);
         releases = std::move(this->deferred_releases_);
-        // Keep the hint atomics in sync with the now-empty containers. Nothing reads them again
-        // after destruction, but this keeps the "atomic mirrors container" invariant unconditional
-        // rather than carving out an exception for teardown.
+        // Keep the hint atomics in sync with the now-empty containers (has_pending_events_ was
+        // handled above under its own mutex). Nothing reads them again after destruction, but
+        // this keeps the "atomic mirrors container" invariant unconditional rather than carving
+        // out an exception for teardown.
         this->has_current_.store(false, std::memory_order_release);
         this->nursery_size_.store(0, std::memory_order_release);
         this->deferred_size_.store(0, std::memory_order_release);
