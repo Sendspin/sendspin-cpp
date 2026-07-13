@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include "platform/logging.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -214,6 +216,24 @@ private:
         this->pending_.fetch_and(~bit, std::memory_order_acq_rel);
     }
 
+    /// @brief Records `bit` as owned by a slot (called from InboxSlot::bind())
+    ///
+    /// Enforces the exclusive-ownership invariant documented on InboxSlot: a bit claimed by two
+    /// live slots would let draining one clear the other's wakeup. Loud (assertion failure) in
+    /// debug builds; release builds keep today's behavior.
+    void claim_bit(uint32_t bit) {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        assert((this->claimed_bits_ & bit) == 0 && "INBOX_TOPIC bit already claimed by a slot");
+        this->claimed_bits_ |= bit;
+    }
+
+    /// @brief Releases a slot's bit claim (called from ~InboxSlot(), which must run before this
+    /// Inbox is destroyed)
+    void release_bit(uint32_t bit) {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->claimed_bits_ &= ~bit;
+    }
+
     // Struct fields
     std::mutex mutex_;
     std::array<InboxEvent, EVENT_CAPACITY> events_{};
@@ -224,7 +244,26 @@ private:
 
     // 32-bit fields
     std::atomic<uint32_t> pending_{0};
+    // Bits owned by a live InboxSlot, plus the ring's own bit. Guarded by mutex_; exists to
+    // catch a copy-pasted bind() reusing a bit, which would otherwise compile clean and drop
+    // wakeups intermittently in production.
+    uint32_t claimed_bits_{INBOX_TOPIC_EVENTS};
 };
+
+/// @brief Pushes a payload-free lifecycle event, logging a drop if the ring is full
+///
+/// Shared by the role stream-event and cleared-event producers so the build/push/log-on-drop
+/// pattern stays uniform across roles. `what` names the dropped event in the log line; `code`
+/// carries the role-local enum value (0 when unused).
+inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, const char* tag,
+                              const char* what) {
+    InboxEvent event{};
+    event.type = type;
+    event.code = code;
+    if (inbox == nullptr || !inbox->push_event(event)) {
+        SS_LOGW(tag, "Inbox event ring full; dropping %s", what);
+    }
+}
 
 // ============================================================================
 // InboxSlot
@@ -266,7 +305,13 @@ public:
         this->bind(inbox, topic_bit);
     }
 
-    ~InboxSlot() = default;
+    ~InboxSlot() {
+        // Release the bit claim so a replacement slot (e.g. a role re-added before start) can
+        // bind it. Requires the bound Inbox to outlive this slot.
+        if (this->inbox_ != nullptr) {
+            this->inbox_->release_bit(this->topic_bit_);
+        }
+    }
 
     // Not copyable or movable
     InboxSlot(const InboxSlot&) = delete;
@@ -275,10 +320,15 @@ public:
     /// @brief Binds this slot to a shared Inbox and the topic bit it exclusively owns
     ///
     /// Must be called exactly once before any other method is used.
-    /// @param inbox Shared Inbox whose mutex this slot locks for every operation.
+    /// @param inbox Shared Inbox whose mutex this slot locks for every operation. Must outlive
+    /// this slot (the destructor releases the bit claim).
     /// @param topic_bit Single INBOX_TOPIC_* bit this slot owns; must not be shared with any
-    /// other slot or with the event ring.
+    /// other slot or with the event ring. Ownership is debug-asserted via Inbox::claim_bit().
     void bind(Inbox& inbox, uint32_t topic_bit) {
+        assert(topic_bit != 0 && (topic_bit & (topic_bit - 1)) == 0 &&
+               "InboxSlot topic_bit must be exactly one bit");
+        assert(this->inbox_ == nullptr && "InboxSlot bound twice");
+        inbox.claim_bit(topic_bit);
         this->inbox_ = &inbox;
         this->topic_bit_ = topic_bit;
     }
