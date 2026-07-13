@@ -18,6 +18,7 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `SyncTask` (`sync_task.h`): decodes encoded audio, synchronizes to server timestamps, writes PCM via audio write callback
 - `SendspinConnection` (`connection.h`): abstract WebSocket connection base
 - `SendspinServerConnection` / `SendspinClientConnection`: platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
+- `Inbox` / `InboxSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle/time events
 - `SendspinTimeFilter` (`time_filter.h`): 2D Kalman filter for NTP-style time sync
 - `SendspinTimeBurst` (`time_burst.h`): burst-based time message coordinator
 - `SendspinDecoder` (`decoder.h`): FLAC/Opus/PCM decoder wrapper
@@ -102,7 +103,7 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `spsc_ring_buffer.h`: single-producer/single-consumer ring buffer (ESP: FreeRTOS `xRingbuffer`, host: mutex/condition variable)
 - `thread_safe_queue.h`: thread-safe queue (ESP: FreeRTOS queue, host: mutex/condition variable)
 - `event_flags.h`: event flag group (ESP: FreeRTOS event group, host: mutex/condition variable)
-- `shadow_slot.h`: mutex-protected slot for publishing state from one thread and reading from another
+- `shadow_slot.h`: mutex-protected slot for publishing state between two non-main-loop threads (e.g. the sync task's playback-progress slot); main-loop-bound traffic goes through the inbox (`inbox.h`) instead
 
 Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform differences are isolated to the platform layer and the `src/esp/`/`src/host/` directories.
 

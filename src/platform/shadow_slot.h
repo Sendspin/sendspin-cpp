@@ -23,9 +23,15 @@
 
 namespace sendspin {
 
-/// @brief Thread-safe shadow slot for passing state between threads
-/// The writer (e.g., network thread) locks briefly to write or merge a value.
-/// The reader (e.g., main loop) locks briefly to move the value out if dirty.
+/// @brief Thread-safe shadow slot for passing state between a producer and a consumer thread,
+/// neither of which is the main loop
+///
+/// The writer thread locks briefly to write or merge a value; the reader thread locks briefly to
+/// move the value out if dirty. Remains the right primitive for producer/consumer pairs outside
+/// the main loop -- its one user today is the sync task's playback-progress slot (audio callback
+/// thread to sync task thread). State bound for the main loop instead goes through Inbox /
+/// InboxSlot (see inbox.h), which consolidates many such producers onto one shared mutex and a
+/// single lock-free poll() read per tick.
 template <typename T>
 class ShadowSlot {
 public:
@@ -60,24 +66,6 @@ public:
     bool take(T& out) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         if (!this->dirty_) {
-            return false;
-        }
-        out = std::move(this->slot_);
-        this->slot_ = T{};
-        this->dirty_ = false;
-        return true;
-    }
-
-    /// @brief Move the accumulated value out if dirty and the predicate accepts it
-    /// @param[out] out Receives the stored value if taken.
-    /// @param pred Callable invoked as `bool(const T&)` under the lock; the value is taken
-    /// only if it returns true. The value is left in place unchanged if the predicate returns
-    /// false, so a later call can re-check.
-    /// @return true if a value was taken, false if the slot was clean or the predicate rejected.
-    template <typename Predicate>
-    bool take_if(T& out, Predicate&& pred) {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        if (!this->dirty_ || !pred(static_cast<const T&>(this->slot_))) {
             return false;
         }
         out = std::move(this->slot_);
