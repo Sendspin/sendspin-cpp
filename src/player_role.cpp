@@ -542,15 +542,11 @@ void PlayerRole::Impl::enqueue_state_update(SendspinClientState state) const {
 }
 
 void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event) const {
-    InboxEvent ring_event{};
-    ring_event.type = InboxEventType::PLAYER_STREAM;
-    ring_event.code = static_cast<uint8_t>(event);
-    if (this->inbox == nullptr || !this->inbox->push_event(ring_event)) {
-        // A lost STREAM_START would leave the sync task waiting for its start signal forever;
-        // a lost STREAM_END would leave the consumer believing the stream is still active
-        SS_LOGE(TAG, "Inbox event ring full; dropping %s event",
-                event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END");
-    }
+    // A dropped STREAM_START would leave the sync task waiting for its start signal forever;
+    // a dropped STREAM_END would leave the consumer believing the stream is still active
+    push_event_or_log(
+        this->inbox, InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(event), TAG,
+        event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END");
 }
 
 void PlayerRole::Impl::load_static_delay() {

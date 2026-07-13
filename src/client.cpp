@@ -520,6 +520,14 @@ void SendspinClient::cleanup_connection_state() {
 
     // Reset client event state. The generation bump makes an in-progress ring drain abandon any
     // events it already copied out of the ring before this reset (see the drain in loop()).
+    //
+    // A second teardown in the same tick (a handoff chain can displace two current connections
+    // in one manager pass) wipes the first teardown's just-pushed CLEARED/STREAM_END events
+    // here before they are ever drained. That is safe only because every role's cleanup() below
+    // pushes its full event set unconditionally, so this call re-creates exactly what it wiped
+    // and the drain still fires each (payload-free, idempotent) callback once -- the same
+    // coalescing the old per-role pending_clear booleans provided. Keep role cleanups
+    // unconditional or this reset starts losing clear signals.
     this->event_state_->drain_generation++;
     this->event_state_->inbox.reset_events();
     this->event_state_->group_slot.reset();
