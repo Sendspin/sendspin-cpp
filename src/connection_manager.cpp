@@ -78,8 +78,18 @@ static const char* to_cstr(SetupStage stage) {
 ConnectionManager::ConnectionManager(SendspinClient* client) : client_(client) {}
 
 ConnectionManager::~ConnectionManager() {
-    // Move everything out under the lock, destroy outside it: a connection destructor can join
-    // its transport thread (see DeferredRelease), which must not happen while the lock is held.
+    // Move everything out under the locks, destroy outside them: a connection destructor can join
+    // its transport thread (see DeferredRelease), which must not happen while a lock is held.
+    // The two mutexes guard disjoint state and are taken in separate scopes, never nested.
+    std::vector<std::shared_ptr<SendspinConnection>> pending_connected;
+    std::vector<std::shared_ptr<SendspinConnection>> pending_disconnects;
+    {
+        std::lock_guard<std::mutex> lock(this->conn_mutex_);
+        pending_connected = std::move(this->pending_connected_events_);
+        pending_disconnects = std::move(this->pending_disconnect_events_);
+        this->has_pending_events_.store(false, std::memory_order_release);
+    }
+
     std::shared_ptr<SendspinConnection> current;
     std::vector<NurseryEntry> nursery;
     std::vector<HelloRetryState> retries;
@@ -90,6 +100,13 @@ ConnectionManager::~ConnectionManager() {
         nursery = std::move(this->nursery_);
         retries = std::move(this->hello_retries_);
         releases = std::move(this->deferred_releases_);
+        // Keep the hint atomics in sync with the now-empty containers (has_pending_events_ was
+        // handled above under its own mutex). Nothing reads them again after destruction, but
+        // this keeps the "atomic mirrors container" invariant unconditional rather than carving
+        // out an exception for teardown.
+        this->has_current_.store(false, std::memory_order_release);
+        this->nursery_size_.store(0, std::memory_order_release);
+        this->deferred_size_.store(0, std::memory_order_release);
     }
     // Locals release here. Queued goodbyes are skipped on destruction; shutdown drops slots
     // without a send.
@@ -115,12 +132,12 @@ void ConnectionManager::connect_to(const std::string& url) {
         // Inbound connections arrive already upgraded and arm their hello at admission.
         c->mark_ws_upgraded();
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->pending_connected_events_.push_back(c->shared_from_this());
+        this->queue_pending_connected(c->shared_from_this());
     };
     client_conn->on_disconnected_cb = [this](SendspinConnection* conn) {
         // Defer to loop(); this callback runs on IXWebSocket's internal thread
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->pending_disconnect_events_.push_back(conn->shared_from_this());
+        this->queue_pending_disconnect(conn->shared_from_this());
     };
 
     client_conn->init_time_filter();
@@ -155,7 +172,7 @@ void ConnectionManager::connect_to(const std::string& url) {
         // A user-initiated connect is admitted even against a full nursery: there is at most one
         // outbound entry (replaced above), so the nursery is still bounded (NURSERY_CAPACITY + 1)
         // and an explicit user request never fails against inbound peers.
-        this->nursery_.push_back(NurseryEntry{client_conn, /*inbound=*/false});
+        this->push_nursery_entry(NurseryEntry{client_conn, /*inbound=*/false});
         client_conn->start();
     }
     this->flush_deferred_releases();
@@ -229,7 +246,7 @@ void ConnectionManager::init_server(SendspinClient* client) {
             // queue: both carry the connection itself, so a stale event can never be mis-routed to
             // a new connection (drop_connection no-ops on connections it does not manage).
             std::lock_guard<std::mutex> lock(this->conn_mutex_);
-            this->pending_disconnect_events_.push_back(std::move(conn));
+            this->queue_pending_disconnect(std::move(conn));
         });
 
     // Connection lookup-by-sockfd. Used by the host build's ws_server to route IXWebSocket
@@ -269,13 +286,22 @@ void ConnectionManager::loop() {
     {
         std::vector<std::shared_ptr<SendspinConnection>> connected_events;
         std::vector<std::shared_ptr<SendspinConnection>> disconnect_events;
-        {
+        // Skip the conn_mutex_ acquisition entirely when the hint says both queues are empty.
+        // Sound because every push site sets has_pending_events_ = true under conn_mutex_ before
+        // releasing it (see the field's doc comment in connection_manager.h).
+        if (this->has_pending_events_.load(std::memory_order_acquire)) {
             std::lock_guard<std::mutex> lock(this->conn_mutex_);
             connected_events.swap(this->pending_connected_events_);
             disconnect_events.swap(this->pending_disconnect_events_);
+            this->has_pending_events_.store(false, std::memory_order_release);
         }
 
-        {
+        // Also runs whenever the nursery is non-empty even with no swapped-out events: the
+        // promotion scan below is level-triggered on handshake flags set by network threads with
+        // no corresponding event push, so it must keep running every tick a nursery connection
+        // exists, not just on the tick its flags happen to flip.
+        if (!connected_events.empty() || !disconnect_events.empty() ||
+            this->nursery_size_.load(std::memory_order_acquire) > 0) {
             std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
 
             // Connection close/disconnect events (inbound ws_server closes on both platforms,
@@ -312,10 +338,11 @@ void ConnectionManager::loop() {
                 }
                 auto conn = std::move(it->conn);
                 it = this->nursery_.erase(it);
+                this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
                 this->remove_hello_retry(conn.get());
 
                 if (this->current_connection_ == nullptr) {
-                    this->current_connection_ = std::move(conn);
+                    this->set_current_connection(std::move(conn));
                 } else if (this->should_switch_to_new_server(this->current_connection_.get(),
                                                              conn.get())) {
                     // Both sides of the comparison are established, so the PLAYBACK-reason and
@@ -324,14 +351,14 @@ void ConnectionManager::loop() {
                     SS_LOGI(TAG, "Handoff decision: switch to new server");
                     this->drop_connection(this->current_connection_.get(),
                                           SendspinGoodbyeReason::ANOTHER_SERVER);
-                    this->current_connection_ = std::move(conn);
+                    this->set_current_connection(std::move(conn));
                 } else {
                     SS_LOGI(TAG, "Handoff decision: keep current server");
                     // Leaving management: block stale network-thread dispatch during the goodbye
                     // window (outgoing sends, including the goodbye itself, are unaffected).
                     conn->disable_message_dispatch();
-                    this->deferred_releases_.push_back(
-                        {std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER});
+                    this->queue_deferred_release(std::move(conn),
+                                                 SendspinGoodbyeReason::ANOTHER_SERVER);
                     continue;
                 }
 
@@ -355,7 +382,10 @@ void ConnectionManager::loop() {
     std::shared_ptr<SendspinConnection> current_copy;
     std::array<std::shared_ptr<SendspinConnection>, NURSERY_CAPACITY + 1> nursery_copies;
     size_t nursery_count = 0;
-    {
+    // Skip the copy (and thus every conn->loop() call below) when there is nothing to call it
+    // on: no current connection and an empty nursery.
+    if (this->nursery_size_.load(std::memory_order_acquire) > 0 ||
+        this->has_current_.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         current_copy = this->current_connection_;
         for (const auto& entry : this->nursery_) {
@@ -369,63 +399,75 @@ void ConnectionManager::loop() {
         nursery_copies[i]->loop();
     }
 
-    // Check hello retry timers (one entry per managed connection, so a second connection arriving
-    // mid-handshake cannot clobber the first connection's pending hello).
-    {
+    // Hello retry timers and the nursery establish-deadline reap both operate purely on nursery
+    // membership: hello_retries_ entries exist only for nursery members (initiate_hello is only
+    // ever called for a connection that is already in, or about to be inserted into, the
+    // nursery -- see its call sites), and every path that erases from nursery_
+    // (release_nursery_entry() and the promotion scan's erase above) calls remove_hello_retry()
+    // immediately after. So an empty nursery implies hello_retries_ is empty too, and both scans
+    // are skipped together, under one lock, when nursery_size_ == 0. (The lazy erase inside the
+    // first scan below, for a retry whose connection already left the nursery, is purely
+    // defensive given that invariant -- it should never actually fire.)
+    if (this->nursery_size_.load(std::memory_order_acquire) > 0) {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        const int64_t now_us = platform_time_us();
-        for (auto it = this->hello_retries_.begin(); it != this->hello_retries_.end();) {
-            HelloRetryState& retry = *it;
 
-            // Drop retries whose connection has left the nursery. A retry entry is live only for
-            // nursery members: the current connection is established by construction and never
-            // awaits a hello.
-            if (this->find_in_nursery(retry.conn.get()) == this->nursery_.end()) {
-                it = this->hello_retries_.erase(it);
-                continue;
-            }
+        // Check hello retry timers (one entry per managed connection, so a second connection
+        // arriving mid-handshake cannot clobber the first connection's pending hello).
+        {
+            const int64_t now_us = platform_time_us();
+            for (auto it = this->hello_retries_.begin(); it != this->hello_retries_.end();) {
+                HelloRetryState& retry = *it;
 
-            if (retry.retry_time_us == 0 || now_us < retry.retry_time_us) {
-                ++it;
-                continue;
-            }
+                // Drop retries whose connection has left the nursery. A retry entry is live only
+                // for nursery members: the current connection is established by construction and
+                // never awaits a hello.
+                if (this->find_in_nursery(retry.conn.get()) == this->nursery_.end()) {
+                    it = this->hello_retries_.erase(it);
+                    continue;
+                }
 
-            if (this->send_hello_message(retry.attempts - 1, retry.conn.get())) {
-                // Sent, or the connection left the nursery; the retry is complete.
-                it = this->hello_retries_.erase(it);
-                continue;
-            }
+                if (retry.retry_time_us == 0 || now_us < retry.retry_time_us) {
+                    ++it;
+                    continue;
+                }
 
-            // Transient failure: retry with exponential backoff until attempts are exhausted.
-            if (retry.attempts > 1) {
-                retry.delay_ms *= 2;
-                retry.attempts--;
-                retry.retry_time_us = now_us + static_cast<int64_t>(retry.delay_ms) * US_PER_MS;
-                ++it;
-            } else {
-                it = this->hello_retries_.erase(it);
+                if (this->send_hello_message(retry.attempts - 1, retry.conn.get())) {
+                    // Sent, or the connection left the nursery; the retry is complete.
+                    it = this->hello_retries_.erase(it);
+                    continue;
+                }
+
+                // Transient failure: retry with exponential backoff until attempts are exhausted.
+                if (retry.attempts > 1) {
+                    retry.delay_ms *= 2;
+                    retry.attempts--;
+                    retry.retry_time_us = now_us + static_cast<int64_t>(retry.delay_ms) * US_PER_MS;
+                    ++it;
+                } else {
+                    it = this->hello_retries_.erase(it);
+                }
             }
         }
-    }
 
-    // Nursery tick: reap connections that miss the establish deadline. This is the only release
-    // path for peers that connect and then stall without completing the hello, and for outbound
-    // sockets whose transport never delivers a close (host IXWebSocket, issue #75). Hello arming
-    // is event-driven (admission for inbound, connected event for outbound), so the tick only
-    // ever reaps.
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        const int64_t now_us = platform_time_us();
-        for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
-            NurseryEntry& entry = *it;
-            if (now_us - entry.conn->get_provisional_time_us() >= NURSERY_ESTABLISH_TIMEOUT_US) {
-                SS_LOGW(TAG, "Nursery connection stalled at %s (>%d s), dropping",
-                        to_cstr(setup_stage(*entry.conn)),
-                        static_cast<int>(NURSERY_ESTABLISH_TIMEOUT_US / US_PER_SECOND));
-                it = this->release_nursery_entry(it, SendspinGoodbyeReason::ANOTHER_SERVER);
-                continue;
+        // Nursery tick: reap connections that miss the establish deadline. This is the only
+        // release path for peers that connect and then stall without completing the hello, and
+        // for outbound sockets whose transport never delivers a close (host IXWebSocket, issue
+        // #75). Hello arming is event-driven (admission for inbound, connected event for
+        // outbound), so the tick only ever reaps.
+        {
+            const int64_t now_us = platform_time_us();
+            for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
+                NurseryEntry& entry = *it;
+                if (now_us - entry.conn->get_provisional_time_us() >=
+                    NURSERY_ESTABLISH_TIMEOUT_US) {
+                    SS_LOGW(TAG, "Nursery connection stalled at %s (>%d s), dropping",
+                            to_cstr(setup_stage(*entry.conn)),
+                            static_cast<int>(NURSERY_ESTABLISH_TIMEOUT_US / US_PER_SECOND));
+                    it = this->release_nursery_entry(it, SendspinGoodbyeReason::ANOTHER_SERVER);
+                    continue;
+                }
+                ++it;
             }
-            ++it;
         }
     }
 
@@ -520,15 +562,14 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             // Never managed, but its callbacks are already wired: block dispatch so it cannot
             // inject messages during the goodbye window.
             conn->disable_message_dispatch();
-            this->deferred_releases_.push_back(
-                {std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER});
+            this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
         } else {
             SS_LOGD(TAG, "Admitting new connection into the nursery");
             // Arm the hello right away: the connection arrives WS-upgraded, so there is no
             // earlier signal to wait for. (Outbound connections instead arm theirs when the
             // transport's connected event is processed in loop().)
             this->initiate_hello(conn.get());
-            this->nursery_.push_back(NurseryEntry{std::move(conn), /*inbound=*/true});
+            this->push_nursery_entry(NurseryEntry{std::move(conn), /*inbound=*/true});
         }
     }
     this->flush_deferred_releases();
@@ -636,25 +677,80 @@ std::vector<NurseryEntry>::iterator ConnectionManager::find_in_nursery(
     return this->nursery_.end();
 }
 
+void ConnectionManager::push_nursery_entry(NurseryEntry entry) {
+    // Note: caller must hold conn_ptr_mutex_
+    this->nursery_.push_back(std::move(entry));
+    this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
+}
+
+void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnection> conn) {
+    // Note: caller must hold conn_ptr_mutex_
+    this->has_current_.store(conn != nullptr, std::memory_order_release);
+    this->current_connection_ = std::move(conn);
+}
+
+void ConnectionManager::queue_pending_connected(std::shared_ptr<SendspinConnection> conn) {
+    // Note: caller must hold conn_mutex_
+    this->pending_connected_events_.push_back(std::move(conn));
+    this->has_pending_events_.store(true, std::memory_order_release);
+}
+
+void ConnectionManager::queue_pending_disconnect(std::shared_ptr<SendspinConnection> conn) {
+    // Note: caller must hold conn_mutex_
+    this->pending_disconnect_events_.push_back(std::move(conn));
+    this->has_pending_events_.store(true, std::memory_order_release);
+}
+
 std::vector<NurseryEntry>::iterator ConnectionManager::release_nursery_entry(
     std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason) {
     // Note: caller must hold conn_ptr_mutex_ and flush_deferred_releases() after dropping it
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
+    this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
     // Leaving management: block stale network-thread dispatch into role/state queues during the
     // goodbye window. Outgoing sends, including the goodbye itself, are unaffected.
     conn->disable_message_dispatch();
     this->remove_hello_retry(conn.get());
-    this->deferred_releases_.push_back({std::move(conn), reason});
+    this->queue_deferred_release(std::move(conn), reason);
     return next;
+}
+
+void ConnectionManager::queue_deferred_release(std::shared_ptr<SendspinConnection> conn,
+                                               std::optional<SendspinGoodbyeReason> reason) {
+    // Note: caller must hold conn_ptr_mutex_ and call flush_deferred_releases() after dropping it
+    this->deferred_releases_.push_back({std::move(conn), reason});
+    this->deferred_size_.store(this->deferred_releases_.size(), std::memory_order_release);
 }
 
 void ConnectionManager::flush_deferred_releases() {
     // Note: caller must NOT hold conn_ptr_mutex_ (see DeferredRelease)
+    //
+    // Lock-free early return: deferred_size_ mirrors deferred_releases_.size() and is refreshed
+    // only under conn_ptr_mutex_, at every push (queue_deferred_release()) and at the drain swap
+    // below, so observing 0 here means the container was empty as of that acquire-load. This is
+    // sound because every push site is followed by a call to this function on the SAME thread
+    // before the pushing function returns to its caller: loop()'s lifecycle block (Block 2) is
+    // followed by the Block-3 call below it in loop() itself; connect_to() and disconnect() each
+    // call this function right after their locked section; on_new_connection() calls it right
+    // after its locked section too (on the network/httpd thread, not the main loop thread -- the
+    // "same thread" guarantee is about the call stack that did the push, not about which thread
+    // that happens to be). So a push is normally drained by its own triggering call before that
+    // call returns. If a concurrently racing flush call (a different thread, or loop()'s other
+    // backstop call within the same tick) wins the lock first and drains it, that is equally
+    // fine: a queued release is performed exactly once by whichever call actually swaps it out,
+    // and the pushing call's own subsequent gate check then correctly observes 0 and skips a
+    // lock it no longer needs. Either way nothing pushed is ever left stranded: loop() also
+    // calls this function unconditionally twice per tick (after the lifecycle block and after
+    // the nursery reap), so even a hypothetical gap in the reasoning above is bounded to the
+    // very next tick.
+    if (this->deferred_size_.load(std::memory_order_acquire) == 0) {
+        return;
+    }
     std::vector<DeferredRelease> releases;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         releases.swap(this->deferred_releases_);
+        this->deferred_size_.store(this->deferred_releases_.size(), std::memory_order_release);
     }
     for (auto& release : releases) {
         if (release.goodbye.has_value()) {
@@ -698,10 +794,12 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         // deferred (see DeferredRelease).
         conn->disable_message_dispatch();
         this->client_->cleanup_connection_state();
-        // std::exchange (not std::move) so the slot is never left in a moved-from state the
-        // static analyzer flags when a later event in the same loop() pass reads it.
-        this->deferred_releases_.push_back(
-            {std::exchange(this->current_connection_, nullptr), goodbye});
+        // set_current_connection(nullptr) reassigns the slot to a clean null (not a moved-from
+        // state) after we move the old connection out, so a later event in the same loop() pass
+        // that reads current_connection_ never trips the static analyzer.
+        auto dropped = std::move(this->current_connection_);
+        this->set_current_connection(nullptr);
+        this->queue_deferred_release(std::move(dropped), goodbye);
         return;
     }
 

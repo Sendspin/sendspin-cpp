@@ -22,6 +22,7 @@
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -152,6 +153,14 @@ public:
 
     /// @brief Drives connection state: starts server when network ready, processes lifecycle
     /// events, retries hello, calls loop() on active connections.
+    ///
+    /// Tick cost: every section below the ws_server start-retry check is gated on one of the
+    /// atomic hints in "Atomic fields" below (has_pending_events_, nursery_size_, has_current_,
+    /// deferred_size_), so an idle tick only pays for the atomic loads it needs to decide there
+    /// is nothing to do. Steady state: connected and idle (no pending events, empty nursery)
+    /// costs exactly one conn_ptr_mutex_ acquisition (the current/nursery copy ahead of the
+    /// conn->loop() calls) plus a handful of atomic loads; disconnected and idle costs zero
+    /// mutex acquisitions.
     void loop();
 
     // ========================================
@@ -213,6 +222,30 @@ private:
     /// @return Iterator into nursery_, or nursery_.end() if the connection is not in the nursery.
     std::vector<NurseryEntry>::iterator find_in_nursery(const SendspinConnection* conn);
 
+    /// @brief Appends an entry to the nursery and refreshes nursery_size_ in the same critical
+    /// section, so the hint atomic can never drift from nursery_.size(). Caller must hold
+    /// conn_ptr_mutex_.
+    /// @param entry The nursery entry to add.
+    void push_nursery_entry(NurseryEntry entry);
+
+    /// @brief Assigns current_connection_ and refreshes has_current_ in the same critical section,
+    /// so the hint atomic can never drift from "current_connection_ != nullptr". Pass nullptr to
+    /// clear the slot. Caller must hold conn_ptr_mutex_.
+    /// @param conn The connection to install as current, or nullptr to clear; moved from.
+    void set_current_connection(std::shared_ptr<SendspinConnection> conn);
+
+    /// @brief Appends a connection to pending_connected_events_ and sets has_pending_events_ in
+    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
+    /// Caller must hold conn_mutex_.
+    /// @param conn The freshly connected connection to defer to loop().
+    void queue_pending_connected(std::shared_ptr<SendspinConnection> conn);
+
+    /// @brief Appends a connection to pending_disconnect_events_ and sets has_pending_events_ in
+    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
+    /// Caller must hold conn_mutex_.
+    /// @param conn The disconnected connection to defer to loop().
+    void queue_pending_disconnect(std::shared_ptr<SendspinConnection> conn);
+
     /// @brief Releases a nursery entry: erases it, prunes its hello retry, and queues the
     /// goodbye+release on deferred_releases_. Caller must hold conn_ptr_mutex_ and call
     /// flush_deferred_releases() after dropping it.
@@ -223,10 +256,22 @@ private:
     std::vector<NurseryEntry>::iterator release_nursery_entry(
         std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason);
 
+    /// @brief Appends a release to deferred_releases_ and refreshes deferred_size_ in the same
+    /// critical section, so the hint atomic can never drift from deferred_releases_.size().
+    /// Caller must hold conn_ptr_mutex_ and call flush_deferred_releases() after dropping it.
+    /// @param conn The connection to release; empty on return (moved from).
+    /// @param reason The goodbye reason to send before closing, or nullopt when the transport is
+    ///        already gone so no goodbye should be attempted.
+    void queue_deferred_release(std::shared_ptr<SendspinConnection> conn,
+                                std::optional<SendspinGoodbyeReason> reason);
+
     /// @brief Performs the queued goodbye sends and connection releases from deferred_releases_.
     /// Caller must NOT hold conn_ptr_mutex_ (see DeferredRelease). Safe to call from any thread;
     /// a queued release is performed exactly once. Called after every locked section that can
     /// queue a release; loop() also calls it as a backstop.
+    ///
+    /// Early-returns without locking when deferred_size_ reads 0 -- see the definition for the
+    /// soundness argument.
     void flush_deferred_releases();
 
     // ========================================
@@ -317,6 +362,33 @@ private:
 
     // 8-bit fields
     bool has_last_played_server_{false};
+
+    // Atomic fields (lock-free hints for loop() tick gating; ground truth remains the
+    // mutex-protected containers/pointer above -- see the "Tick cost" note on loop())
+
+    /// True while pending_connected_events_ or pending_disconnect_events_ holds an unswapped
+    /// entry. Set under conn_mutex_ at every push into either queue; cleared under conn_mutex_
+    /// once loop() has swapped both queues out. Lets loop() skip the conn_mutex_ acquisition
+    /// entirely when neither queue has anything pending.
+    std::atomic<bool> has_pending_events_{false};
+
+    /// nursery_.size(), refreshed under conn_ptr_mutex_ immediately after every nursery_
+    /// mutation (always re-derived from .size(), never incremented/decremented in place, so it
+    /// cannot drift). Lets loop() skip the copies/loop() block, the hello-retry scan, and the
+    /// nursery reap scan when the nursery is empty, and keeps the lifecycle block running while
+    /// any nursery connection exists even with no swapped-out events (its promotion scan is
+    /// level-triggered on connection flags, not edge-triggered on events).
+    std::atomic<size_t> nursery_size_{0};
+
+    /// True whenever current_connection_ is non-null. Refreshed under conn_ptr_mutex_ at every
+    /// assignment (promotion, handoff, drop_connection's exchange, destructor). Lets loop() skip
+    /// the copies/loop() block when there is no current connection and the nursery is empty.
+    std::atomic<bool> has_current_{false};
+
+    /// deferred_releases_.size(), refreshed under conn_ptr_mutex_ after every push (see
+    /// queue_deferred_release()) and after the drain swap in flush_deferred_releases(). Lets
+    /// flush_deferred_releases() early-return without locking when nothing is queued.
+    std::atomic<size_t> deferred_size_{0};
 };
 
 }  // namespace sendspin

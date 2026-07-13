@@ -136,6 +136,14 @@ struct ArtworkRole::Impl {
     void handle_stream_end();
     void handle_stream_clear();
     void handle_stream_ring_event(ArtworkEventType event);
+    // True if this tick has drainable artwork work. The display-slot bit covers newly decoded
+    // images; a nonzero held_display_mask means displays folded in on a prior tick are still
+    // waiting out their server-clock deadlines (see held_display_ts) -- the deadline itself sets
+    // no inbox bit, so a nonzero mask must be polled every tick until each slot fires or is
+    // dropped for a stream-epoch mismatch.
+    bool needs_drain(uint32_t pending_bits) const {
+        return (pending_bits & INBOX_TOPIC_ARTWORK_DISPLAY) != 0 || this->held_display_mask != 0;
+    }
     void drain_events();
     void cleanup();
 

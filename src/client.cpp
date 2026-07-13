@@ -22,7 +22,6 @@
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/network_info.h"
-#include "platform/time.h"
 #ifdef SENDSPIN_ENABLE_ARTWORK
 #include "artwork_role_impl.h"
 #endif
@@ -44,9 +43,6 @@
 #endif
 #include "time_burst.h"
 #include <ArduinoJson.h>
-
-#include <algorithm>
-#include <cstring>
 
 static const char* const TAG = "sendspin.client";
 
@@ -188,8 +184,13 @@ void SendspinClient::loop() {
     }
 
     // Process deferred events: all state mutations and user callbacks happen here, on the main
-    // loop thread, to avoid cross-thread data races. Each role drains its own queues/shadows
-    // internally.
+    // loop thread, to avoid cross-thread data races. Two poll() snapshots gate the work below:
+    // inbox_bits (here) gates only the event-ring drain immediately following it; slot_bits
+    // (taken after that drain completes, below) gates the role drains and the group-update drain,
+    // since a role's InboxSlot can be written by a producer between this snapshot and that one.
+    // Both are lock-free atomic loads, so a tick with nothing pending performs zero inbox mutex
+    // acquisitions in this section. A bit either snapshot races and misses is picked up by the
+    // next tick's poll() -- bounded staleness, already documented on Inbox::poll().
     const uint32_t inbox_bits = this->event_state_->inbox.poll();
 
     // --- Time sync events ---
@@ -324,41 +325,41 @@ void SendspinClient::loop() {
         } while (!drain_aborted && event_count == EVENT_DRAIN_BATCH_SIZE);
     }
 
-    // --- Role events (each role handles its own synchronization) ---
-    // These drains must stay unconditional (gated only on the role existing), NOT wrapped in an
-    // `inbox_bits & INBOX_TOPIC_*` test like the group slot below. metadata/color drain_events()
-    // take() clears the topic bit even when it defers a future-dated delta into held_delta; that
-    // deferred delta is re-evaluated against its deadline on later ticks only because this call
-    // runs every tick. Bit-gating it would strand the delta until an unrelated new delta happened
-    // to re-set the bit, silently starving deadline-based delivery.
+    // Second snapshot: catches topic bits a producer set while the ring drain above was running
+    // (e.g. a role's own ring-event side effects re-entering the inbox, or any other producer
+    // thread racing the drain). Gates the role drains and the group drain below; see the
+    // inbox_bits comment above for the staleness argument, which applies identically here.
+    const uint32_t slot_bits = this->event_state_->inbox.poll();
+
+    // --- Role events: bit-gated so an idle tick performs zero inbox mutex acquisitions here ---
 #ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
+    if (this->player_ && this->player_->impl_->needs_drain(slot_bits)) {
         this->player_->impl_->drain_events();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
-    if (this->controller_) {
+    if (this->controller_ && this->controller_->impl_->needs_drain(slot_bits)) {
         this->controller_->impl_->drain_events();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
-    if (this->metadata_) {
+    if (this->metadata_ && this->metadata_->impl_->needs_drain(slot_bits)) {
         this->metadata_->impl_->drain_events();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_COLOR
-    if (this->color_) {
+    if (this->color_ && this->color_->impl_->needs_drain(slot_bits)) {
         this->color_->impl_->drain_events();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_) {
+    if (this->artwork_ && this->artwork_->impl_->needs_drain(slot_bits)) {
         this->artwork_->impl_->drain_events();
     }
 #endif
 
     // --- Group update events ---
-    if (inbox_bits & INBOX_TOPIC_GROUP) {
+    if (slot_bits & INBOX_TOPIC_GROUP) {
         GroupUpdateObject group_delta;
         if (this->event_state_->group_slot.take(group_delta)) {
             apply_group_update_deltas(&this->group_state_, group_delta);
