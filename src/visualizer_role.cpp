@@ -130,8 +130,6 @@ VisualizerRole::Impl::Impl(VisualizerRoleConfig config, SendspinClient* client)
       visualizer_support(std::move(this->config.support)),
       client(client),
       event_state(std::make_unique<EventState>()) {
-    this->event_state->queue.create(8);
-
     if (this->visualizer_support.has_value()) {
         // Normalize the advertised type order so the server packs fields in the order the
         // drain thread parser expects. See normalize_type_order() above for the constraint.
@@ -169,6 +167,11 @@ void VisualizerRole::set_listener(VisualizerRoleListener* listener) {
 // ============================================================================
 // Impl method implementations
 // ============================================================================
+
+void VisualizerRole::Impl::attach_inbox(Inbox& inbox) {
+    this->inbox = &inbox;
+    this->event_state->config_slot.bind(inbox, INBOX_TOPIC_VISUALIZER_CONFIG);
+}
 
 bool VisualizerRole::Impl::start() {
     if (!this->drain_task || !this->drain_task->ring_buffer.is_created()) {
@@ -314,11 +317,11 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    // Shadow the config for main-thread callback, then signal
-    this->event_state->shadow_config.write(stream);
-    if (!this->event_state->queue.send(VisualizerEventType::STREAM_START, 0)) {
-        SS_LOGW(TAG, "Visualizer event queue full; dropping STREAM_START");
-    }
+    // Write the config to the inbox slot for the main thread, then push the event. Both lock the
+    // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
+    // guaranteed to observe this config (see config_slot.take() in handle_stream_ring_event()).
+    this->event_state->config_slot.write(stream);
+    this->enqueue_stream_event(VisualizerEventType::STREAM_START);
 }
 
 void VisualizerRole::Impl::handle_stream_end() {
@@ -328,9 +331,7 @@ void VisualizerRole::Impl::handle_stream_end() {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    if (!this->event_state->queue.send(VisualizerEventType::STREAM_END, 0)) {
-        SS_LOGW(TAG, "Visualizer event queue full; dropping STREAM_END");
-    }
+    this->enqueue_stream_event(VisualizerEventType::STREAM_END);
 }
 
 void VisualizerRole::Impl::handle_stream_clear() {
@@ -340,37 +341,48 @@ void VisualizerRole::Impl::handle_stream_clear() {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    if (!this->event_state->queue.send(VisualizerEventType::STREAM_CLEAR, 0)) {
-        SS_LOGW(TAG, "Visualizer event queue full; dropping STREAM_CLEAR");
+    this->enqueue_stream_event(VisualizerEventType::STREAM_CLEAR);
+}
+
+void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event) const {
+    InboxEvent ring_event{};
+    ring_event.type = InboxEventType::VISUALIZER_STREAM;
+    ring_event.code = static_cast<uint8_t>(event);
+    if (this->inbox == nullptr || !this->inbox->push_event(ring_event)) {
+        const char* name = "STREAM_CLEAR";
+        if (event == VisualizerEventType::STREAM_START) {
+            name = "STREAM_START";
+        } else if (event == VisualizerEventType::STREAM_END) {
+            name = "STREAM_END";
+        }
+        SS_LOGW(TAG, "Inbox event ring full; dropping %s", name);
     }
 }
 
 // ============================================================================
-// Event draining (main thread) - lifecycle events only
+// Event dispatch (main thread) - lifecycle events only, called from the ring drain in
+// SendspinClient::loop()
 // ============================================================================
 
-void VisualizerRole::Impl::drain_events() const {
-    VisualizerEventType event_type{};
-    while (this->event_state->queue.receive(event_type, 0)) {
-        switch (event_type) {
-            case VisualizerEventType::STREAM_START: {
-                ServerVisualizerStreamObject config{};
-                if (this->event_state->shadow_config.take(config) && this->listener) {
-                    this->listener->on_visualizer_stream_start(config);
-                }
-                break;
+void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event) {
+    switch (event) {
+        case VisualizerEventType::STREAM_START: {
+            ServerVisualizerStreamObject config{};
+            if (this->event_state->config_slot.take(config) && this->listener) {
+                this->listener->on_visualizer_stream_start(config);
             }
-            case VisualizerEventType::STREAM_END:
-                if (this->listener) {
-                    this->listener->on_visualizer_stream_end();
-                }
-                break;
-            case VisualizerEventType::STREAM_CLEAR:
-                if (this->listener) {
-                    this->listener->on_visualizer_stream_clear();
-                }
-                break;
+            break;
         }
+        case VisualizerEventType::STREAM_END:
+            if (this->listener) {
+                this->listener->on_visualizer_stream_end();
+            }
+            break;
+        case VisualizerEventType::STREAM_CLEAR:
+            if (this->listener) {
+                this->listener->on_visualizer_stream_clear();
+            }
+            break;
     }
 }
 
@@ -385,9 +397,16 @@ void VisualizerRole::Impl::cleanup() {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
     }
 
-    this->event_state->queue.reset();
-    this->event_state->shadow_config.reset();
-    this->event_state->queue.send(VisualizerEventType::STREAM_END, 0);
+    // Discard stale slot content from the dead connection. Stale ring-borne events (an in-flight
+    // STREAM_START/STREAM_END/STREAM_CLEAR queued before this cleanup) are already discarded by
+    // SendspinClient::cleanup_connection_state()'s inbox.reset_events() call, which runs before
+    // any role's cleanup() -- so there is no per-event ring reset to do here.
+    this->event_state->config_slot.reset();
+
+    // Enqueue a clean STREAM_END - handle_stream_ring_event() will fire the callback (the ring
+    // was just reset above us, so this push should not fail; enqueue_stream_event() logs if it
+    // somehow does).
+    this->enqueue_stream_event(VisualizerEventType::STREAM_END);
 }
 
 // ============================================================================

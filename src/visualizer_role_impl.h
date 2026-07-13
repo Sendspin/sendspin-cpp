@@ -17,11 +17,10 @@
 
 #pragma once
 
+#include "inbox.h"
 #include "platform/event_flags.h"
 #include "platform/memory.h"
-#include "platform/shadow_slot.h"
 #include "platform/spsc_ring_buffer.h"
-#include "platform/thread_safe_queue.h"
 #include "sendspin/visualizer_role.h"
 
 #include <atomic>
@@ -58,23 +57,24 @@ struct VisualizerRole::Impl {
         std::thread drain_thread;
     };
 
-    /// @brief Deferred event state for thread-safe visualizer stream lifecycle delivery
+    /// @brief Deferred event state for the visualizer stream config, delivered to the main thread
+    /// via the shared Inbox
     struct EventState {
-        ThreadSafeQueue<VisualizerEventType> queue;
-        ShadowSlot<ServerVisualizerStreamObject> shadow_config;
+        InboxSlot<ServerVisualizerStreamObject> config_slot;
     };
 
     // ========================================
     // Internal integration methods (called by SendspinClient)
     // ========================================
 
+    void attach_inbox(Inbox& inbox);
     bool start();
     void build_hello_fields(ClientHelloMessage& msg);
     void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len);
     void handle_stream_start(const ServerVisualizerStreamObject& stream);
     void handle_stream_end();
     void handle_stream_clear();
-    void drain_events() const;
+    void handle_stream_ring_event(VisualizerEventType event);
     void cleanup();
 
     // ========================================
@@ -83,6 +83,7 @@ struct VisualizerRole::Impl {
 
     void stop() const;
     void flush_ring_buffer() const;
+    void enqueue_stream_event(VisualizerEventType event) const;
 
     static void drain_thread_func(VisualizerRole::Impl* self);
 
@@ -98,6 +99,7 @@ struct VisualizerRole::Impl {
     SendspinClient* client;
     std::unique_ptr<DrainTask> drain_task;
     std::unique_ptr<EventState> event_state;
+    Inbox* inbox{nullptr};
     VisualizerRoleListener* listener{nullptr};
 
     // Atomic fields (written by network thread, read by drain thread / cleanup)

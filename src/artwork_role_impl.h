@@ -17,9 +17,9 @@
 
 #pragma once
 
+#include "inbox.h"
 #include "platform/event_flags.h"
 #include "platform/memory.h"
-#include "platform/shadow_slot.h"
 #include "platform/thread_safe_queue.h"
 #include "protocol_messages.h"
 #include "sendspin/artwork_role.h"
@@ -85,6 +85,19 @@ struct ArtworkNotification {
     uint32_t stream_epoch;
 };
 
+/// @brief Latest-wins display timestamps accumulated across artwork slots
+///
+/// Merged cross-thread by the decode thread (one slot per merge) and taken whole by the
+/// main-loop drain; a bit set in valid_mask means timestamps[i] holds a pending display.
+/// epochs[i] carries the stream_epoch the decode ran under, so the main-loop deadline check can
+/// drop a display whose stream has since been replaced (a stream restart bumps the epoch but
+/// cannot reach a display already folded into the main-thread holds).
+struct ArtworkDisplayUpdate {
+    int64_t timestamps[ARTWORK_MAX_SLOTS]{};
+    uint32_t epochs[ARTWORK_MAX_SLOTS]{};
+    uint8_t valid_mask{0};
+};
+
 /// @brief Private implementation of the artwork role
 struct ArtworkRole::Impl {
     Impl(ArtworkRoleConfig config, SendspinClient* client);
@@ -105,31 +118,24 @@ struct ArtworkRole::Impl {
         std::mutex slot_mutex;
     };
 
-    /// @brief Deferred event state for thread-safe artwork stream lifecycle delivery
+    /// @brief Deferred event state for artwork display timestamps, delivered to the main thread
+    /// via the shared Inbox
     struct EventState {
-        ThreadSafeQueue<ArtworkEventType> queue;
-    };
-
-    /// @brief Pending display timestamps, one slot per artwork slot
-    ///
-    /// The decode thread writes the server timestamp after on_image_decode() completes; the
-    /// main loop reads the timestamp and fires on_image_display() once it is reached. Latest-
-    /// wins per slot: if a newer frame finishes decoding before the pending display fires,
-    /// the older timestamp is overwritten and only the newer display is delivered.
-    struct DisplayScheduler {
-        ShadowSlot<int64_t> pending[ARTWORK_MAX_SLOTS];
+        InboxSlot<ArtworkDisplayUpdate> display_slot;
     };
 
     // ========================================
     // Internal integration methods (called by SendspinClient)
     // ========================================
 
+    void attach_inbox(Inbox& inbox);
     bool start();
     void build_hello_fields(ClientHelloMessage& msg) const;
     void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
     void handle_stream_start(const ServerArtworkStreamObject& stream);
     void handle_stream_end();
     void handle_stream_clear();
+    void handle_stream_ring_event(ArtworkEventType event);
     void drain_events();
     void cleanup();
 
@@ -138,6 +144,7 @@ struct ArtworkRole::Impl {
     // ========================================
 
     void stop() const;
+    void enqueue_stream_event(ArtworkEventType event) const;
     static void drain_thread_func(ArtworkRole::Impl* self);
 
     // ========================================
@@ -152,11 +159,27 @@ struct ArtworkRole::Impl {
     SendspinClient* client;
     std::unique_ptr<DrainTask> drain_task;
     std::unique_ptr<EventState> event_state;
-    std::unique_ptr<DisplayScheduler> display_scheduler;
+    Inbox* inbox{nullptr};
     ArtworkRoleListener* listener{nullptr};
+
+    // 64-bit fields
+    // Latest-wins display timestamps folded in from display_slot, awaiting their server-clock
+    // deadlines. Main-thread only: written and read exclusively from drain_events()/
+    // handle_stream_ring_event()/cleanup() on the loop thread. held_display_ts[i] is valid only
+    // when bit i of held_display_mask is set.
+    int64_t held_display_ts[ARTWORK_MAX_SLOTS]{};
+
+    // 32-bit fields
+    // Stream epoch each held display was decoded under; a mismatch against stream_epoch at
+    // deadline-check time means the stream was since replaced (e.g. a restart with no
+    // intervening end/clear) and the display must be dropped, since the network thread cannot
+    // reach the main-thread holds to cancel it. Main-thread only; see held_display_ts.
+    uint32_t held_display_epoch[ARTWORK_MAX_SLOTS]{};
 
     // 8-bit fields
     std::atomic<bool> stream_active{false};
+    // Main-thread only; see held_display_ts.
+    uint8_t held_display_mask{0};
 
     /// @brief Bumped on stream start/end/clear/cleanup so in-flight notifications from a
     /// previous stream are recognized as stale and skipped by the decode thread, instead of
