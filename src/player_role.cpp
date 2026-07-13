@@ -417,6 +417,7 @@ void PlayerRole::Impl::drain_events() {
         // callbacks below may re-enter connection teardown, whose cleanup() clears this vector
         // mid-loop. Cached range-for iterators would dangle; re-checking size() ends the loop
         // and the clamp before the erase below keeps the range valid.
+        // NOLINTNEXTLINE(modernize-loop-convert): body mutates the vector, see above
         for (size_t idx = 0; idx < this->awaiting_sync_idle_events.size(); ++idx) {
             const PlayerStreamCallbackType event = this->awaiting_sync_idle_events[idx];
             if (event == PlayerStreamCallbackType::STREAM_END && !sync_idle) {
