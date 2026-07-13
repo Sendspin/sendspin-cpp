@@ -296,9 +296,13 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
 
     // Write stream params to the inbox slot for the main thread, then signal. The high-performance
     // acquire for playback happens when the main loop drains the STREAM_START event, keeping
-    // high_performance_requested_for_playback main-thread-only. Both operations lock the same
-    // shared Inbox mutex, in this order, so a consumer that later takes the START event is
-    // guaranteed to observe these params (see stream_params_slot.take() in drain_events()).
+    // high_performance_requested_for_playback main-thread-only. The params write and the event push
+    // are two separate Inbox lock acquisitions, not one critical section: the mutex orders the
+    // write before the push for visibility, but a concurrent main-thread cleanup() can slip its
+    // stream_params_slot.reset() between them. If that happens the drain takes START and finds the
+    // slot empty, so take() returns false and current_stream_params keeps its prior value (see
+    // stream_params_slot.take() in drain_events()). That window is benign: the same teardown
+    // enqueues a STREAM_END right behind this START.
     this->event_state->stream_params_slot.write(player_obj);
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START);
 }
@@ -447,6 +451,11 @@ void PlayerRole::Impl::drain_events() {
                     if (this->event_state->stream_params_slot.take(stream_params)) {
                         this->current_stream_params = std::move(stream_params);
                     }
+                    // Mark the stream active before invoking the listener. on_stream_start() may
+                    // re-enter teardown, and the STREAM_END that cleanup() enqueues fires
+                    // on_stream_end() only when stream_active is set (see the gate above). Setting
+                    // it first keeps start/end paired even when the batch is abandoned below.
+                    this->stream_active = true;
                     if (this->listener) {
                         const uint32_t generation = this->cleanup_generation;
                         this->listener->on_stream_start();
@@ -454,13 +463,13 @@ void PlayerRole::Impl::drain_events() {
                         // already ended the stream, cleared this vector, and enqueued a fresh
                         // STREAM_END. Re-arming the sync task below would resurrect the dead
                         // stream, so abandon the batch instead (the clamp below then erases
-                        // nothing from the already-cleared vector).
+                        // nothing from the already-cleared vector). stream_active stays true so the
+                        // enqueued STREAM_END still delivers a paired on_stream_end().
                         if (this->cleanup_generation != generation) {
                             teardown_reentered = true;
                             break;
                         }
                     }
-                    this->stream_active = true;
                     this->sync_task->signal_stream_start();
                     // The sync task sets TASK_RUNNING asynchronously after this signal, so the
                     // pre-loop snapshot is stale now: a STREAM_END later in this same batch must
@@ -543,10 +552,13 @@ void PlayerRole::Impl::enqueue_state_update(SendspinClientState state) const {
 
 void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event) const {
     // A dropped STREAM_START would leave the sync task waiting for its start signal forever;
-    // a dropped STREAM_END would leave the consumer believing the stream is still active
+    // a dropped STREAM_END would leave the consumer believing the stream is still active. Both
+    // wedge the stream, so log the drop at ERROR (the helper defaults to WARN, which suits the
+    // idempotent CLEARED events but understates a wedged player stream).
     push_event_or_log(
         this->inbox, InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(event), TAG,
-        event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END");
+        event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END",
+        /*error_level=*/true);
 }
 
 void PlayerRole::Impl::load_static_delay() {

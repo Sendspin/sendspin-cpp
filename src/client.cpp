@@ -291,6 +291,14 @@ void SendspinClient::loop() {
                     }
                 }
             }
+            // A teardown that re-entered on the final event of a full batch bumps the drain
+            // generation but leaves drain_aborted false: the check at the top of the inner loop
+            // never runs again because there is no next iteration. Re-check here so the loop stops
+            // instead of calling take_events() again and destructively pulling the cleanup's
+            // freshly re-pushed CLEARED/STREAM_END events off the live ring (dropping them).
+            if (this->event_state_->drain_generation != drain_generation) {
+                drain_aborted = true;
+            }
         } while (!drain_aborted && event_count == EVENT_DRAIN_BATCH_SIZE);
     }
 

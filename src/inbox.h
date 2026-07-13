@@ -254,14 +254,20 @@ private:
 ///
 /// Shared by the role stream-event and cleared-event producers so the build/push/log-on-drop
 /// pattern stays uniform across roles. `what` names the dropped event in the log line; `code`
-/// carries the role-local enum value (0 when unused).
+/// carries the role-local enum value (0 when unused). `error_level` logs the drop at ERROR rather
+/// than WARN: use it for events whose loss wedges the stream (player START/END), not for the
+/// idempotent CLEARED events whose loss leaves merely recoverable stale state.
 inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, const char* tag,
-                              const char* what) {
+                              const char* what, bool error_level = false) {
     InboxEvent event{};
     event.type = type;
     event.code = code;
     if (inbox == nullptr || !inbox->push_event(event)) {
-        SS_LOGW(tag, "Inbox event ring full; dropping %s", what);
+        if (error_level) {
+            SS_LOGE(tag, "Inbox event ring full; dropping %s", what);
+        } else {
+            SS_LOGW(tag, "Inbox event ring full; dropping %s", what);
+        }
     }
 }
 
