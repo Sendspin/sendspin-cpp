@@ -16,13 +16,12 @@
 
 #include "connection.h"
 #include "connection_manager.h"
+#include "inbox.h"
 #include "platform/compiler.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/network_info.h"
-#include "platform/shadow_slot.h"
-#include "platform/thread_safe_queue.h"
 #include "platform/time.h"
 #ifdef SENDSPIN_ENABLE_ARTWORK
 #include "artwork_role_impl.h"
@@ -53,23 +52,10 @@ static const char* const TAG = "sendspin.client";
 
 namespace sendspin {
 
-/// @brief Deferred event from the network thread, processed in loop()
-struct TimeResponseEvent {
-    int64_t offset;
-    int64_t max_error;
-    int64_t timestamp;
-    /// Instance id of the connection the response arrived on, compared against the current
-    /// connection at drain time so a measurement from a displaced or pending server cannot
-    /// contaminate the current connection's time filter. An id (not a pointer) so a since-freed
-    /// connection cannot ABA-match a later connection reusing its address; 0 never matches a live
-    /// connection (ids start at 1).
-    uint64_t source_id;
-};
-
 /// @brief Deferred event state for time responses and group updates on the main thread
 struct SendspinClient::EventState {
-    ThreadSafeQueue<TimeResponseEvent> time_queue;
-    ShadowSlot<GroupUpdateObject> shadow_group;
+    Inbox inbox;
+    InboxSlot<GroupUpdateObject> group_slot{inbox, INBOX_TOPIC_GROUP};
 };
 
 // ============================================================================
@@ -84,7 +70,6 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
     if (this->config_.json_arena_size > 0) {
         this->json_arena_ = std::make_unique<SendspinArenaAllocator>(this->config_.json_arena_size);
     }
-    this->event_state_->time_queue.create(16);
     this->time_burst_->configure(this->config_.time_burst_size,
                                  this->config_.time_burst_interval_ms,
                                  this->config_.time_burst_response_timeout_ms);
@@ -186,20 +171,43 @@ void SendspinClient::loop() {
     // Process deferred events: all state mutations and user callbacks happen here, on the main
     // loop thread, to avoid cross-thread data races. Each role drains its own queues/shadows
     // internally.
+    const uint32_t inbox_bits = this->event_state_->inbox.poll();
 
     // --- Time sync events ---
-    {
-        TimeResponseEvent time_event{};
-        while (this->event_state_->time_queue.receive(time_event, 0)) {
-            auto* current = this->connection_manager_->current();
-            // Apply only measurements from the connection that is still current; a response queued
-            // by a since-displaced (or pending) server carries that server's clock and would
-            // contaminate this connection's Kalman filter.
-            if (current != nullptr && current->get_instance_id() == time_event.source_id) {
-                this->time_burst_->on_time_response(current, time_event.offset,
-                                                    time_event.max_error, time_event.timestamp);
+    if (inbox_bits & INBOX_TOPIC_EVENTS) {
+        // Drain in small batches to bound the stack cost on the shared main-loop task (the ring
+        // holds up to EVENT_CAPACITY entries of ~40 bytes each). A batch that comes back partial
+        // means the ring is empty, ending the loop; events pushed mid-drain are still delivered
+        // this tick as long as full batches keep arriving.
+        InboxEvent events[8];
+        size_t event_count = 0;
+        do {
+            event_count = this->event_state_->inbox.take_events(events, 8);
+            for (size_t i = 0; i < event_count; ++i) {
+                const InboxEvent& event = events[i];
+                switch (event.type) {
+                    case InboxEventType::TIME_RESPONSE: {
+                        auto* current = this->connection_manager_->current();
+                        // Apply only measurements from the connection that is still current; a
+                        // response queued by a since-displaced (or pending) server carries that
+                        // server's clock and would contaminate this connection's Kalman filter.
+                        if (current != nullptr &&
+                            current->get_instance_id() == event.time.source_id) {
+                            this->time_burst_->on_time_response(current, event.time.offset,
+                                                                event.time.max_error,
+                                                                event.time.timestamp);
+                        }
+                        break;
+                    }
+                    default: {
+                        // Role event types are not produced yet; later phases add drains here.
+                        SS_LOGD(TAG, "Unhandled inbox event type: %d",
+                                static_cast<int>(event.type));
+                        break;
+                    }
+                }
             }
-        }
+        } while (event_count == 8);
     }
 
     // --- Role events (each role handles its own synchronization) ---
@@ -235,9 +243,9 @@ void SendspinClient::loop() {
 #endif
 
     // --- Group update events ---
-    {
+    if (inbox_bits & INBOX_TOPIC_GROUP) {
         GroupUpdateObject group_delta;
-        if (this->event_state_->shadow_group.take(group_delta)) {
+        if (this->event_state_->group_slot.take(group_delta)) {
             apply_group_update_deltas(&this->group_state_, group_delta);
 
             if (this->listener_) {
@@ -417,8 +425,8 @@ void SendspinClient::cleanup_connection_state() {
     this->time_burst_->reset();
 
     // Reset client event state
-    this->event_state_->time_queue.reset();
-    this->event_state_->shadow_group.reset();
+    this->event_state_->inbox.reset_events();
+    this->event_state_->group_slot.reset();
 
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
@@ -687,9 +695,12 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             int64_t offset{0};
             int64_t max_error{0};
             if (process_server_time_message(root, timestamp, &offset, &max_error)) {
-                if (!this->event_state_->time_queue.send(
-                        {offset, max_error, timestamp, conn->get_instance_id()}, 0)) {
-                    SS_LOGW(TAG, "Time response queue full; dropping measurement");
+                InboxEvent event{};
+                event.type = InboxEventType::TIME_RESPONSE;
+                event.time =
+                    TimeResponsePayload{offset, max_error, timestamp, conn->get_instance_id()};
+                if (!this->event_state_->inbox.push_event(event)) {
+                    SS_LOGW(TAG, "Inbox event ring full; dropping time response measurement");
                 }
             }
             break;
@@ -733,7 +744,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
         case SendspinServerToClientMessageType::GROUP_UPDATE: {
             GroupUpdateMessage group_msg;
             if (process_group_update_message(root, &group_msg)) {
-                this->event_state_->shadow_group.merge(
+                this->event_state_->group_slot.merge(
                     [](GroupUpdateObject& current, GroupUpdateObject&& delta) {
                         apply_group_update_deltas(&current, delta);
                     },
