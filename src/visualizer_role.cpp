@@ -345,18 +345,14 @@ void VisualizerRole::Impl::handle_stream_clear() {
 }
 
 void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event) const {
-    InboxEvent ring_event{};
-    ring_event.type = InboxEventType::VISUALIZER_STREAM;
-    ring_event.code = static_cast<uint8_t>(event);
-    if (this->inbox == nullptr || !this->inbox->push_event(ring_event)) {
-        const char* name = "STREAM_CLEAR";
-        if (event == VisualizerEventType::STREAM_START) {
-            name = "STREAM_START";
-        } else if (event == VisualizerEventType::STREAM_END) {
-            name = "STREAM_END";
-        }
-        SS_LOGW(TAG, "Inbox event ring full; dropping %s", name);
+    const char* name = "STREAM_CLEAR";
+    if (event == VisualizerEventType::STREAM_START) {
+        name = "STREAM_START";
+    } else if (event == VisualizerEventType::STREAM_END) {
+        name = "STREAM_END";
     }
+    push_event_or_log(this->inbox, InboxEventType::VISUALIZER_STREAM, static_cast<uint8_t>(event),
+                      TAG, name);
 }
 
 // ============================================================================

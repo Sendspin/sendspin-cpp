@@ -282,13 +282,8 @@ void ArtworkRole::Impl::handle_stream_clear() {
 }
 
 void ArtworkRole::Impl::enqueue_stream_event(ArtworkEventType event) const {
-    InboxEvent ring_event{};
-    ring_event.type = InboxEventType::ARTWORK_STREAM;
-    ring_event.code = static_cast<uint8_t>(event);
-    if (this->inbox == nullptr || !this->inbox->push_event(ring_event)) {
-        SS_LOGW(TAG, "Inbox event ring full; dropping %s",
-                event == ArtworkEventType::STREAM_END ? "STREAM_END" : "STREAM_CLEAR");
-    }
+    push_event_or_log(this->inbox, InboxEventType::ARTWORK_STREAM, static_cast<uint8_t>(event), TAG,
+                      event == ArtworkEventType::STREAM_END ? "STREAM_END" : "STREAM_CLEAR");
 }
 
 // ============================================================================
@@ -334,7 +329,10 @@ void ArtworkRole::Impl::drain_events() {
         }
     }
 
-    if (!this->listener || this->held_display_mask == 0) {
+    // No listener guard here: the epoch/deadline sweep below must still consume held bits so a
+    // listener-less role does not report needs_drain() forever; only the callback itself is
+    // gated on the listener.
+    if (this->held_display_mask == 0) {
         return;
     }
 
@@ -361,7 +359,9 @@ void ArtworkRole::Impl::drain_events() {
             continue;
         }
         this->held_display_mask &= static_cast<uint8_t>(~(1U << slot));
-        this->listener->on_image_display(slot);
+        if (this->listener) {
+            this->listener->on_image_display(slot);
+        }
     }
 }
 
