@@ -309,6 +309,16 @@ public:
         // Release the bit claim so a replacement slot (e.g. a role re-added before start) can
         // bind it. Requires the bound Inbox to outlive this slot.
         if (this->inbox_ != nullptr) {
+            // Clear the owned topic bit if a value is still pending. release_bit() only drops the
+            // claim; without this a slot destroyed while dirty would leave its bit set in
+            // pending_ forever -- a phantom wakeup no live slot can clear, and one a replacement
+            // slot would inherit while its own dirty_ is false.
+            {
+                std::lock_guard<std::mutex> lock(this->inbox_->mutex_);
+                if (this->dirty_) {
+                    this->inbox_->clear_bit_locked(this->topic_bit_);
+                }
+            }
             this->inbox_->release_bit(this->topic_bit_);
         }
     }
