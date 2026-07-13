@@ -26,11 +26,10 @@ static const char* const TAG = "sendspin.server_conn";
 
 SendspinServerConnection::SendspinServerConnection(std::shared_ptr<ix::WebSocket> ws, int sockfd)
     : ws_(std::move(ws)), sockfd_(sockfd) {
-    // Note: IXWebSocket only sets TCP_NODELAY on outbound connects, not on accepted sockets,
-    // and its public API does not expose the accepted socket's fd, so Nagle stays enabled
-    // here. Time messages on this host-server path can therefore see up to ~40 ms of
-    // coalescing delay. The ESP server path sets TCP_NODELAY explicitly; revisit if
-    // IXWebSocket ever exposes the accepted socket.
+    // No TCP_NODELAY setsockopt is needed here: IXWebSocket disables Nagle on accepted sockets
+    // itself. SocketServer::run() calls SocketConnect::configure(clientFd) on every accepted
+    // client fd (the same routine that sets TCP_NODELAY on outbound connects) so time messages
+    // on this host-server path are not subject to Nagle coalescing delay.
 }
 
 void SendspinServerConnection::start() {
