@@ -201,6 +201,37 @@ void SendspinClient::loop() {
                         }
                         break;
                     }
+                    // CONTROLLER_CLEARED / METADATA_CLEARED / COLOR_CLEARED: pushed by each
+                    // role's cleanup() in place of the old boolean coalescing flag. Unlike that
+                    // flag, the ring does not coalesce repeats: a back-to-back disconnect/reconnect
+                    // within one tick can enqueue more than one CLEARED for the same role before
+                    // this drain runs, firing its clear callback more than once. That is safe
+                    // only because clear callbacks are idempotent by contract (see
+                    // on_controller_state_clear() / on_metadata_clear() / on_color_clear()).
+                    case InboxEventType::CONTROLLER_CLEARED: {
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+                        if (this->controller_) {
+                            this->controller_->impl_->handle_cleared_event();
+                        }
+#endif
+                        break;
+                    }
+                    case InboxEventType::METADATA_CLEARED: {
+#ifdef SENDSPIN_ENABLE_METADATA
+                        if (this->metadata_) {
+                            this->metadata_->impl_->handle_cleared_event();
+                        }
+#endif
+                        break;
+                    }
+                    case InboxEventType::COLOR_CLEARED: {
+#ifdef SENDSPIN_ENABLE_COLOR
+                        if (this->color_) {
+                            this->color_->impl_->handle_cleared_event();
+                        }
+#endif
+                        break;
+                    }
                     default: {
                         // No role event types are produced yet; unhandled types are logged and
                         // dropped.
@@ -298,6 +329,7 @@ ControllerRole& SendspinClient::add_controller() {
         SS_LOGW(TAG, "add_controller() called after start_server()");
     }
     this->controller_ = std::make_unique<ControllerRole>(this);
+    this->controller_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->controller_;
 }
 #endif
@@ -308,6 +340,7 @@ MetadataRole& SendspinClient::add_metadata() {
         SS_LOGW(TAG, "add_metadata() called after start_server()");
     }
     this->metadata_ = std::make_unique<MetadataRole>(this);
+    this->metadata_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->metadata_;
 }
 #endif
@@ -318,6 +351,7 @@ ColorRole& SendspinClient::add_color() {
         SS_LOGW(TAG, "add_color() called after start_server()");
     }
     this->color_ = std::make_unique<ColorRole>(this);
+    this->color_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->color_;
 }
 #endif

@@ -13,8 +13,11 @@
 // limitations under the License.
 
 #include "controller_role_impl.h"
+#include "platform/logging.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
+
+static const char* const TAG = "sendspin.controller";
 
 namespace sendspin {
 
@@ -50,6 +53,11 @@ void ControllerRole::send_command(SendspinControllerCommand cmd, std::optional<u
 // Impl method implementations
 // ============================================================================
 
+void ControllerRole::Impl::attach_inbox(Inbox& inbox) {
+    this->inbox = &inbox;
+    this->event_state->slot.bind(inbox, INBOX_TOPIC_CONTROLLER);
+}
+
 void ControllerRole::Impl::send_command(SendspinControllerCommand cmd,
                                         std::optional<uint8_t> volume,
                                         std::optional<bool> mute) const {
@@ -62,21 +70,12 @@ void ControllerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
 }
 
 void ControllerRole::Impl::handle_server_state(ServerStateControllerObject state) const {
-    this->event_state->shadow.write(std::move(state));
+    this->event_state->slot.write(std::move(state));
 }
 
 void ControllerRole::Impl::drain_events() {
-    // Deferred from cleanup() to avoid invoking the listener while ConnectionManager holds
-    // conn_ptr_mutex_; a listener that calls back into the client would otherwise deadlock.
-    if (this->event_state->pending_clear) {
-        this->event_state->pending_clear = false;
-        if (this->listener) {
-            this->listener->on_controller_state_clear();
-        }
-    }
-
     ServerStateControllerObject state;
-    if (this->event_state->shadow.take(state)) {
+    if (this->event_state->slot.take(state)) {
         this->controller_state = std::move(state);
         if (this->listener) {
             this->listener->on_controller_state(this->controller_state);
@@ -84,10 +83,26 @@ void ControllerRole::Impl::drain_events() {
     }
 }
 
+void ControllerRole::Impl::handle_cleared_event() {
+    // Deferred from cleanup() to avoid invoking the listener while ConnectionManager holds
+    // conn_ptr_mutex_; a listener that calls back into the client would otherwise deadlock.
+    if (this->listener) {
+        this->listener->on_controller_state_clear();
+    }
+}
+
 void ControllerRole::Impl::cleanup() {
-    this->event_state->shadow.reset();
+    this->event_state->slot.reset();
     this->controller_state = {};
-    this->event_state->pending_clear = true;
+
+    if (this->inbox != nullptr) {
+        InboxEvent event{};
+        event.type = InboxEventType::CONTROLLER_CLEARED;
+        event.code = 0;
+        if (!this->inbox->push_event(event)) {
+            SS_LOGW(TAG, "Inbox event ring full; dropping controller cleared event");
+        }
+    }
 }
 
 }  // namespace sendspin
