@@ -297,6 +297,13 @@ TEST(Inbox, ConcurrentProducerDrainedWithoutLossOrDuplication) {
         if (!did_work) {
             // Nothing was pending this pass. Stop only once the producer has finished and a
             // fresh poll() still finds nothing, so a last-moment write cannot be missed.
+            //
+            // This is race-free across the two atomics: the producer sets every pending_ bit
+            // (release RMW) before storing producer_done with release, so observing
+            // producer_done == true here (acquire) synchronizes-with that store and makes all of
+            // the producer's prior pending_ writes visible to the poll() sequenced after it. A
+            // bit set right before the producer finished is therefore guaranteed to be seen by
+            // this re-poll -- release/acquire publishes every prior write, not just the flag.
             if (producer_done.load(std::memory_order_acquire) && inbox.poll() == 0) {
                 break;
             }
