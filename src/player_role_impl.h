@@ -107,6 +107,12 @@ struct PlayerRole::Impl {
     SendspinPersistenceProvider* persistence;
     std::unique_ptr<SyncTask> sync_task;
 
+    // 32-bit fields
+    // Bumped by cleanup() so a drain_events() listener callback that re-enters connection
+    // teardown is detected when control returns: the STREAM_START tail must not re-arm the
+    // sync task for a stream cleanup() just ended. Main-thread only.
+    uint32_t cleanup_generation{0};
+
     // 16-bit fields
     std::atomic<uint16_t> static_delay_ms{0};
 

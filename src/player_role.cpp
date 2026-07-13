@@ -415,6 +415,7 @@ void PlayerRole::Impl::drain_events() {
     if (!this->awaiting_sync_idle_events.empty()) {
         bool sync_idle = !this->sync_task->is_running();
         size_t processed = 0;
+        bool teardown_reentered = false;
 
         // Indexed with a fresh size() check per iteration (not a range-for): the listener
         // callbacks below may re-enter connection teardown, whose cleanup() clears this vector
@@ -455,7 +456,17 @@ void PlayerRole::Impl::drain_events() {
                         this->current_stream_params = std::move(stream_params);
                     }
                     if (this->listener) {
+                        const uint32_t generation = this->cleanup_generation;
                         this->listener->on_stream_start();
+                        // on_stream_start() may re-enter connection teardown, whose cleanup()
+                        // already ended the stream, cleared this vector, and enqueued a fresh
+                        // STREAM_END. Re-arming the sync task below would resurrect the dead
+                        // stream, so abandon the batch instead (the clamp below then erases
+                        // nothing from the already-cleared vector).
+                        if (this->cleanup_generation != generation) {
+                            teardown_reentered = true;
+                            break;
+                        }
                     }
                     this->stream_active = true;
                     this->sync_task->signal_stream_start();
@@ -465,6 +476,9 @@ void PlayerRole::Impl::drain_events() {
                     sync_idle = false;
                     break;
                 }
+            }
+            if (teardown_reentered) {
+                break;
             }
             ++processed;
         }
@@ -483,6 +497,10 @@ void PlayerRole::Impl::drain_events() {
 }
 
 void PlayerRole::Impl::cleanup() {
+    // Flag the teardown for a drain_events() frame that may be on the call stack right now (a
+    // listener callback re-entering teardown); see the STREAM_START branch there.
+    this->cleanup_generation++;
+
     // End the current stream: the sync task drains and returns to idle. (Not signal_stream_clear():
     // that path is a seek within a live stream and expects a marker to follow.)
     this->sync_task->signal_stream_end();
