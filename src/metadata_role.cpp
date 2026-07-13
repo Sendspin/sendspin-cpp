@@ -14,7 +14,6 @@
 
 #include "audio_stream_info.h"
 #include "metadata_role_impl.h"
-#include "platform/logging.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
@@ -179,6 +178,11 @@ void MetadataRole::Impl::drain_events() {
         return;
     }
 
+    // A future-dated delta is held across ticks below without any topic bit set (take() above
+    // cleared it). It is re-evaluated against its deadline only because the client calls this
+    // drain_events() unconditionally every tick -- see the warning at the drain-call site in
+    // SendspinClient::loop().
+    //
     // get_client_time returns 0 when there is no current connection. Without a connection we
     // cannot honor the server-clock deadline, so fire immediately rather than starving the
     // listener.

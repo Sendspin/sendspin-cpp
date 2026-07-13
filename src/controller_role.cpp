@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include "controller_role_impl.h"
-#include "platform/logging.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 

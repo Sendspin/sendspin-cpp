@@ -214,12 +214,16 @@ void SendspinClient::loop() {
                         break;
                     }
                     // CONTROLLER_CLEARED / METADATA_CLEARED / COLOR_CLEARED: pushed by each
-                    // role's cleanup() in place of the old boolean coalescing flag. Unlike that
-                    // flag, the ring does not coalesce repeats: a back-to-back disconnect/reconnect
-                    // within one tick can enqueue more than one CLEARED for the same role before
-                    // this drain runs, firing its clear callback more than once. That is safe
-                    // only because clear callbacks are idempotent by contract (see
-                    // on_controller_state_clear() / on_metadata_clear() / on_color_clear()).
+                    // role's cleanup() in place of the old boolean coalescing flag. At most one
+                    // CLEARED per role is ever pending when this drain runs: cleanup() is called
+                    // only from cleanup_connection_state(), which first calls inbox.reset_events()
+                    // (wiping the whole ring) before any role re-pushes its CLEARED, and that path
+                    // runs only under conn_ptr_mutex_ (ConnectionManager::drop_connection), so it
+                    // cannot interleave with itself. So even a back-to-back disconnect/reconnect
+                    // coalesces to a single CLEARED -- the reset_events() ordering is what
+                    // guarantees it, not clear-callback idempotency. (Callbacks are idempotent by
+                    // contract anyway; see on_controller_state_clear() / on_metadata_clear() /
+                    // on_color_clear().)
                     case InboxEventType::CONTROLLER_CLEARED: {
 #ifdef SENDSPIN_ENABLE_CONTROLLER
                         if (this->controller_) {
@@ -257,6 +261,12 @@ void SendspinClient::loop() {
     }
 
     // --- Role events (each role handles its own synchronization) ---
+    // These drains must stay unconditional (gated only on the role existing), NOT wrapped in an
+    // `inbox_bits & INBOX_TOPIC_*` test like the group slot below. metadata/color drain_events()
+    // take() clears the topic bit even when it defers a future-dated delta into held_delta; that
+    // deferred delta is re-evaluated against its deadline on later ticks only because this call
+    // runs every tick. Bit-gating it would strand the delta until an unrelated new delta happened
+    // to re-set the bit, silently starving deadline-based delivery.
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         this->player_->impl_->drain_events();
