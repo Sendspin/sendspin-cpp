@@ -56,6 +56,13 @@ namespace sendspin {
 struct SendspinClient::EventState {
     Inbox inbox;
     InboxSlot<GroupUpdateObject> group_slot{inbox, INBOX_TOPIC_GROUP};
+    /// Bumped by cleanup_connection_state() so an in-progress ring drain abandons the rest of
+    /// its already-copied batch. Main-thread only: the ring drain copies events out before
+    /// dispatching, so a listener callback that re-enters connection teardown (e.g. connect_to()
+    /// replacing a present-but-disconnected connection from inside a clear callback) wipes the
+    /// live ring but cannot un-copy the local batch; without this counter the drain would keep
+    /// dispatching those stale events (worst case a PLAYER_STREAM start for the dead stream).
+    uint32_t drain_generation{0};
 };
 
 // ============================================================================
@@ -195,9 +202,21 @@ void SendspinClient::loop() {
         constexpr size_t EVENT_DRAIN_BATCH_SIZE = Inbox::EVENT_CAPACITY / 4;
         InboxEvent events[EVENT_DRAIN_BATCH_SIZE];
         size_t event_count = 0;
+        // Snapshot the drain generation: a dispatched event below can run a listener callback
+        // that re-enters connection teardown (cleanup_connection_state() bumps the counter and
+        // wipes the ring). Events already copied into the local batch are stale at that point
+        // and must be dropped, exactly as the ring reset intended; events pushed after the
+        // reset (e.g. the role cleanups' own STREAM_END) sit in the live ring and are picked up
+        // next tick.
+        const uint32_t drain_generation = this->event_state_->drain_generation;
+        bool drain_aborted = false;
         do {
             event_count = this->event_state_->inbox.take_events(events, EVENT_DRAIN_BATCH_SIZE);
             for (size_t i = 0; i < event_count; ++i) {
+                if (this->event_state_->drain_generation != drain_generation) {
+                    drain_aborted = true;
+                    break;
+                }
                 const InboxEvent& event = events[i];
                 switch (event.type) {
                     case InboxEventType::TIME_RESPONSE: {
@@ -211,6 +230,30 @@ void SendspinClient::loop() {
                                                                 event.time.max_error,
                                                                 event.time.timestamp);
                         }
+                        break;
+                    }
+                    // Stream lifecycle / client state events from the player role. Dispatched to
+                    // main-thread-only Impl methods that mirror the arrival exactly as the old
+                    // per-role queues delivered it: PLAYER_STREAM appends to
+                    // awaiting_sync_idle_events (the sync-idle gate itself is untouched);
+                    // PLAYER_STATE overwrites a latest-wins pending slot consumed once by
+                    // drain_events() below.
+                    case InboxEventType::PLAYER_STREAM: {
+#ifdef SENDSPIN_ENABLE_PLAYER
+                        if (this->player_) {
+                            this->player_->impl_->on_stream_ring_event(
+                                static_cast<PlayerStreamCallbackType>(event.code));
+                        }
+#endif
+                        break;
+                    }
+                    case InboxEventType::PLAYER_STATE: {
+#ifdef SENDSPIN_ENABLE_PLAYER
+                        if (this->player_) {
+                            this->player_->impl_->on_state_ring_event(
+                                static_cast<SendspinClientState>(event.code));
+                        }
+#endif
                         break;
                     }
                     // CONTROLLER_CLEARED / METADATA_CLEARED / COLOR_CLEARED: pushed by each
@@ -257,7 +300,7 @@ void SendspinClient::loop() {
                     }
                 }
             }
-        } while (event_count == EVENT_DRAIN_BATCH_SIZE);
+        } while (!drain_aborted && event_count == EVENT_DRAIN_BATCH_SIZE);
     }
 
     // --- Role events (each role handles its own synchronization) ---
@@ -341,6 +384,7 @@ PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
     }
     this->player_ =
         std::make_unique<PlayerRole>(std::move(config), this, this->persistence_provider_);
+    this->player_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->player_;
 }
 #endif
@@ -483,7 +527,9 @@ void SendspinClient::cleanup_connection_state() {
     // down a connection without also stopping its burst.
     this->time_burst_->reset();
 
-    // Reset client event state
+    // Reset client event state. The generation bump makes an in-progress ring drain abandon any
+    // events it already copied out of the ring before this reset (see the drain in loop()).
+    this->event_state_->drain_generation++;
     this->event_state_->inbox.reset_events();
     this->event_state_->group_slot.reset();
 

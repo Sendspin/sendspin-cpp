@@ -17,8 +17,7 @@
 
 #pragma once
 
-#include "platform/shadow_slot.h"
-#include "platform/thread_safe_queue.h"
+#include "inbox.h"
 #include "sendspin/player_role.h"
 #include "sync_task.h"
 
@@ -49,16 +48,15 @@ struct PlayerRole::Impl {
     // ========================================
 
     struct EventState {
-        ThreadSafeQueue<PlayerStreamCallbackType> stream_queue;
-        ThreadSafeQueue<SendspinClientState> state_queue;
-        ShadowSlot<ServerPlayerStreamObject> shadow_stream_params;
-        ShadowSlot<ServerCommandMessage> shadow_command;
+        InboxSlot<ServerPlayerStreamObject> stream_params_slot;
+        InboxSlot<ServerCommandMessage> command_slot;
     };
 
     // ========================================
     // Internal integration methods (called by SendspinClient)
     // ========================================
 
+    void attach_inbox(Inbox& inbox);
     bool start();
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
@@ -67,6 +65,8 @@ struct PlayerRole::Impl {
     void handle_stream_end() const;
     void handle_stream_clear() const;
     void handle_server_command(const ServerCommandMessage& cmd) const;
+    void on_stream_ring_event(PlayerStreamCallbackType event);
+    void on_state_ring_event(SendspinClientState state);
     void drain_events();
     void cleanup();
 
@@ -102,6 +102,7 @@ struct PlayerRole::Impl {
     // Pointer fields
     SendspinClient* client;
     std::unique_ptr<EventState> event_state;
+    Inbox* inbox{nullptr};
     PlayerRoleListener* listener{nullptr};
     SendspinPersistenceProvider* persistence;
     std::unique_ptr<SyncTask> sync_task;
@@ -117,6 +118,12 @@ struct PlayerRole::Impl {
     bool stream_active{false};
     std::atomic<bool> static_delay_adjustable{false};
     uint8_t volume{0};
+    // Main-thread only: latest state delivered by on_state_ring_event() from the ring drain,
+    // awaiting drain_events()'s single update_state() call; pending_state is valid only when
+    // has_pending_state is true. Reproduces the prior collapse-to-last (latest-wins) semantics
+    // exactly, since the ring is fully drained before drain_events() runs each tick.
+    SendspinClientState pending_state{SendspinClientState::SYNCHRONIZED};
+    bool has_pending_state{false};
 };
 
 }  // namespace sendspin

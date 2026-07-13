@@ -72,10 +72,7 @@ PlayerRole::Impl::Impl(PlayerRoleConfig config, SendspinClient* client,
       client(client),
       event_state(std::make_unique<EventState>()),
       persistence(persistence),
-      sync_task(std::make_unique<SyncTask>()) {
-    this->event_state->stream_queue.create(8);
-    this->event_state->state_queue.create(4);
-}
+      sync_task(std::make_unique<SyncTask>()) {}
 
 PlayerRole::Impl::~Impl() {
     // Stop the sync task thread first, before destroying other members.
@@ -167,6 +164,12 @@ void PlayerRole::Impl::update_static_delay(uint16_t delay_ms) {
 // ============================================================================
 // Impl: Internal integration methods
 // ============================================================================
+
+void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
+    this->inbox = &inbox;
+    this->event_state->stream_params_slot.bind(inbox, INBOX_TOPIC_PLAYER_STREAM_PARAMS);
+    this->event_state->command_slot.bind(inbox, INBOX_TOPIC_PLAYER_COMMAND);
+}
 
 bool PlayerRole::Impl::start() {
     this->load_static_delay();
@@ -290,10 +293,12 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
         return;
     }
 
-    // Shadow stream params for main thread, then signal. The high-performance acquire for
-    // playback happens when the main loop drains the STREAM_START event, keeping
-    // high_performance_requested_for_playback main-thread-only.
-    this->event_state->shadow_stream_params.write(player_obj);
+    // Write stream params to the inbox slot for the main thread, then signal. The high-performance
+    // acquire for playback happens when the main loop drains the STREAM_START event, keeping
+    // high_performance_requested_for_playback main-thread-only. Both operations lock the same
+    // shared Inbox mutex, in this order, so a consumer that later takes the START event is
+    // guaranteed to observe these params (see stream_params_slot.take() in drain_events()).
+    this->event_state->stream_params_slot.write(player_obj);
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START);
 }
 
@@ -324,7 +329,7 @@ void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) co
         SS_LOGV(TAG, "Server command has no player commands");
         return;
     }
-    this->event_state->shadow_command.merge(
+    this->event_state->command_slot.merge(
         [](ServerCommandMessage& current, ServerCommandMessage&& delta) {
             if (!delta.player.has_value()) {
                 return;
@@ -350,24 +355,31 @@ void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) co
         cmd);
 }
 
+void PlayerRole::Impl::on_stream_ring_event(PlayerStreamCallbackType event) {
+    this->awaiting_sync_idle_events.push_back(event);
+}
+
+void PlayerRole::Impl::on_state_ring_event(SendspinClientState state) {
+    this->pending_state = state;
+    this->has_pending_state = true;
+}
+
 void PlayerRole::Impl::drain_events() {
-    // --- Client state events (from sync task) ---
-    SendspinClientState state{};
-    SendspinClientState last_state{};
-    bool has_state = false;
-    while (this->event_state->state_queue.receive(state, 0)) {
-        last_state = state;
-        has_state = true;
-    }
-    if (has_state) {
-        this->client->update_state(last_state);
+    // --- Client state events (from sync task, delivered via on_state_ring_event) ---
+    // Latest-wins: the ring is fully drained (and on_state_ring_event() called for each
+    // PLAYER_STATE entry) before drain_events() runs each tick, so has_pending_state/pending_state
+    // already hold the last state pushed this tick -- equivalent to the collapse loop this
+    // replaces.
+    if (this->has_pending_state) {
+        this->client->update_state(this->pending_state);
+        this->has_pending_state = false;
     }
 
     // --- Server command events (volume, mute, static delay) ---
     // Check each field independently since multiple command types may have been
-    // merged into one shadow slot between drain ticks.
+    // merged into one inbox slot between drain ticks.
     ServerCommandMessage cmd_msg{};
-    if (this->event_state->shadow_command.take(cmd_msg)) {
+    if (this->event_state->command_slot.take(cmd_msg)) {
         if (cmd_msg.player.has_value()) {
             const ServerPlayerCommandObject& player_cmd = cmd_msg.player.value();
 
@@ -395,18 +407,21 @@ void PlayerRole::Impl::drain_events() {
         }
     }
 
-    // --- Stream lifecycle callback events ---
-    PlayerStreamCallbackType stream_event{};
-    while (this->event_state->stream_queue.receive(stream_event, 0)) {
-        this->awaiting_sync_idle_events.push_back(stream_event);
-    }
-
     // --- Process awaiting sync idle events ---
+    // Stream lifecycle arrivals (STREAM_START/STREAM_END) are appended directly to
+    // awaiting_sync_idle_events by on_stream_ring_event(), called from the ring drain in
+    // SendspinClient::loop() before role drain_events() runs each tick -- so every event pushed
+    // this tick is already in the vector below in FIFO arrival order.
     if (!this->awaiting_sync_idle_events.empty()) {
         bool sync_idle = !this->sync_task->is_running();
         size_t processed = 0;
 
-        for (auto& event : this->awaiting_sync_idle_events) {
+        // Indexed with a fresh size() check per iteration (not a range-for): the listener
+        // callbacks below may re-enter connection teardown, whose cleanup() clears this vector
+        // mid-loop. Cached range-for iterators would dangle; re-checking size() ends the loop
+        // and the clamp before the erase below keeps the range valid.
+        for (size_t idx = 0; idx < this->awaiting_sync_idle_events.size(); ++idx) {
+            const PlayerStreamCallbackType event = this->awaiting_sync_idle_events[idx];
             if (event == PlayerStreamCallbackType::STREAM_END && !sync_idle) {
                 break;  // Wait for sync task to go idle before firing this and anything after it
             }
@@ -436,7 +451,7 @@ void PlayerRole::Impl::drain_events() {
                         this->high_performance_requested_for_playback = true;
                     }
                     ServerPlayerStreamObject stream_params;
-                    if (this->event_state->shadow_stream_params.take(stream_params)) {
+                    if (this->event_state->stream_params_slot.take(stream_params)) {
                         this->current_stream_params = std::move(stream_params);
                     }
                     if (this->listener) {
@@ -454,6 +469,11 @@ void PlayerRole::Impl::drain_events() {
             ++processed;
         }
 
+        // Clamp: a re-entrant cleanup() may have cleared the vector mid-loop, so processed can
+        // exceed the current size.
+        if (processed > this->awaiting_sync_idle_events.size()) {
+            processed = this->awaiting_sync_idle_events.size();
+        }
         if (processed > 0) {
             this->awaiting_sync_idle_events.erase(
                 this->awaiting_sync_idle_events.begin(),
@@ -467,15 +487,16 @@ void PlayerRole::Impl::cleanup() {
     // that path is a seek within a live stream and expects a marker to follow.)
     this->sync_task->signal_stream_end();
 
-    // Discard stale events from the dead connection
-    this->event_state->stream_queue.reset();
-    this->event_state->state_queue.reset();
-    this->event_state->shadow_stream_params.reset();
-    this->event_state->shadow_command.reset();
+    // Discard stale slot content from the dead connection. Stale ring-borne events (an
+    // in-flight STREAM_START/STREAM_END/state update queued before this cleanup) are already
+    // discarded by SendspinClient::cleanup_connection_state()'s inbox.reset_events() call, which
+    // runs before any role's cleanup() -- so there is no per-queue ring reset to do here.
+    this->event_state->stream_params_slot.reset();
+    this->event_state->command_slot.reset();
 
-    // Enqueue a clean STREAM_END - drain_events() will fire the callback (the queue was just
-    // reset, so this send cannot fail)
-    this->event_state->stream_queue.send(PlayerStreamCallbackType::STREAM_END, 0);
+    // Enqueue a clean STREAM_END - drain_events() will fire the callback (the ring was just
+    // reset above us, so this push should not fail; enqueue_stream_event() logs if it somehow does)
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END);
 
     // Clear awaiting events too (main-thread only, no mutex needed)
     this->awaiting_sync_idle_events.clear();
@@ -502,18 +523,24 @@ bool PlayerRole::Impl::send_audio_chunk(const uint8_t* data, size_t data_size, i
 }
 
 void PlayerRole::Impl::enqueue_state_update(SendspinClientState state) const {
-    if (!this->event_state->state_queue.send(state, 0)) {
+    InboxEvent event{};
+    event.type = InboxEventType::PLAYER_STATE;
+    event.code = static_cast<uint8_t>(state);
+    if (this->inbox == nullptr || !this->inbox->push_event(event)) {
         // The drain takes only the newest state, so a dropped older one is recoverable -- but
-        // a full queue means the main loop has stalled for several ticks
-        SS_LOGW(TAG, "Client state queue full; dropping state update");
+        // a full ring means the main loop has stalled for several ticks
+        SS_LOGW(TAG, "Inbox event ring full; dropping state update");
     }
 }
 
 void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event) const {
-    if (!this->event_state->stream_queue.send(event, 0)) {
+    InboxEvent ring_event{};
+    ring_event.type = InboxEventType::PLAYER_STREAM;
+    ring_event.code = static_cast<uint8_t>(event);
+    if (this->inbox == nullptr || !this->inbox->push_event(ring_event)) {
         // A lost STREAM_START would leave the sync task waiting for its start signal forever;
         // a lost STREAM_END would leave the consumer believing the stream is still active
-        SS_LOGE(TAG, "Stream event queue full; dropping %s event",
+        SS_LOGE(TAG, "Inbox event ring full; dropping %s event",
                 event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END");
     }
 }
