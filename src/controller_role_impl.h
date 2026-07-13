@@ -48,7 +48,7 @@ struct ControllerRole::Impl {
     void build_hello_fields(ClientHelloMessage& msg);
     void handle_server_state(ServerStateControllerObject state) const;
     void drain_events();
-    void handle_cleared_event();
+    void handle_cleared_event() const;
     void cleanup();
 
     // ========================================

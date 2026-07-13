@@ -82,7 +82,7 @@ void ControllerRole::Impl::drain_events() {
     }
 }
 
-void ControllerRole::Impl::handle_cleared_event() {
+void ControllerRole::Impl::handle_cleared_event() const {
     // Deferred from cleanup() to avoid invoking the listener while ConnectionManager holds
     // conn_ptr_mutex_; a listener that calls back into the client would otherwise deadlock.
     if (this->listener) {

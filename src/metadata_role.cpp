@@ -198,7 +198,7 @@ void MetadataRole::Impl::drain_events() {
     this->held_delta.reset();
 }
 
-void MetadataRole::Impl::handle_cleared_event() {
+void MetadataRole::Impl::handle_cleared_event() const {
     // Deferred from cleanup() to avoid invoking the listener while ConnectionManager holds
     // conn_ptr_mutex_; a listener that calls back into the client would otherwise deadlock.
     if (this->listener) {

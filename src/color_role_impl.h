@@ -52,7 +52,7 @@ struct ColorRole::Impl {
     void build_hello_fields(ClientHelloMessage& msg);
     void handle_server_state(ServerColorStateDelta delta) const;
     void drain_events();
-    void handle_cleared_event();
+    void handle_cleared_event() const;
     void cleanup();
 
     // ========================================

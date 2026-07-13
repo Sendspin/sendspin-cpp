@@ -34,7 +34,8 @@ namespace {
 /// (handle_server_state); and main-thread, folding a freshly taken slot value into the held delta
 /// (ColorRole::Impl::drain_events). ServerColorStateDelta is trivially copyable (RgbColor is
 /// std::array<uint8_t, 3>), so fields are assigned directly without std::move.
-void merge_color_state_delta(ServerColorStateDelta& current, ServerColorStateDelta&& incoming) {
+void merge_color_state_delta(ServerColorStateDelta& current,
+                             const ServerColorStateDelta& incoming) {
     current.timestamp = incoming.timestamp;
     if (incoming.background_dark.has_value()) {
         current.background_dark = incoming.background_dark;
@@ -100,9 +101,9 @@ void ColorRole::Impl::drain_events() {
     ServerColorStateDelta delta{};
     if (this->event_state->slot.take(delta)) {
         if (this->held_delta.has_value()) {
-            merge_color_state_delta(*this->held_delta, std::move(delta));
+            merge_color_state_delta(*this->held_delta, delta);
         } else {
-            this->held_delta = std::move(delta);
+            this->held_delta = delta;
         }
     }
 
@@ -131,7 +132,7 @@ void ColorRole::Impl::drain_events() {
     this->held_delta.reset();
 }
 
-void ColorRole::Impl::handle_cleared_event() {
+void ColorRole::Impl::handle_cleared_event() const {
     // Deferred from cleanup() to avoid invoking the listener while ConnectionManager holds
     // conn_ptr_mutex_; a listener that calls back into the client would otherwise deadlock.
     if (this->listener) {
