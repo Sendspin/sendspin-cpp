@@ -94,7 +94,6 @@ Fixed-depth FIFO queue with timed send/receive. Used to defer events from networ
 |-------|-------|------|----------|----------|
 | `PlayerRole::Impl::stream_queue` | 8 | `PlayerStreamCallbackType` | Network thread | Main loop (`drain_events`) |
 | `PlayerRole::Impl::state_queue` | 4 | `SendspinClientState` | Sync task thread | Main loop (`drain_events`) |
-| `Client::time_queue` | 16 | `TimeResponseEvent` | Network thread | Main loop (`loop`) |
 | `ArtworkRole::Impl::notify_queue` | 8 | `ArtworkNotification` | Network thread | Artwork decode thread |
 | `ArtworkRole::Impl::queue` | 8 | `ArtworkEventType` | Network thread | Main loop (`drain_events`) |
 | `VisualizerRole::Impl::queue` | 8 | `VisualizerEventType` | Network thread | Main loop (`drain_events`) |
@@ -105,7 +104,6 @@ Single-slot state container with "latest wins" or custom merge semantics. The ne
 
 | Shadow Slot | Data | Merge Strategy |
 |-------------|------|----------------|
-| `Client::shadow_group` | `GroupUpdateObject` | Field-by-field delta merge |
 | `PlayerRole::Impl::shadow_stream_params` | `ServerPlayerStreamObject` | Latest wins |
 | `PlayerRole::Impl::shadow_command` | `ServerCommandMessage` | Field-by-field merge (volume, mute, delay independent) |
 | `ControllerRole::Impl::shadow` | `ServerStateControllerObject` | Latest wins |
@@ -116,6 +114,24 @@ Single-slot state container with "latest wins" or custom merge semantics. The ne
 | `SyncTask::playback_progress_slot_` | `PlaybackProgress` | Sum `frames_played`, keep latest `finish_timestamp` |
 
 The merge strategy for `shadow_command` is important: if a volume change and a mute change arrive between two drain ticks, both are preserved because the merge function only overwrites fields that have values in the delta.
+
+### Inbox (`src/inbox.h`)
+
+Shared main-loop mailbox that consolidates client-level cross-thread traffic behind a single mutex and a lock-free dirty-topic bitmask. It provides two endpoint styles:
+
+- A fixed-capacity event ring (`push_event` / `take_events`) for lifecycle events, discriminated by `InboxEventType`. The ring drops on full (matching the old queue behavior) and the producer logs the drop.
+- `InboxSlot<T>`, a latest-value slot (`write` / `merge` / `take`) that replaces `ShadowSlot` for a single topic. Each slot exclusively owns one `INBOX_TOPIC_*` bit.
+
+The main loop calls `poll()` once per tick to read the bitmask lock-free and only locks the mutex to drain topics whose bit is set. A bit set by a producer just after the snapshot is never lost: it stays set until a consumer drains it, so the next tick observes it. The Inbox is a leaf in the lock order, and merge functors must be pure data operations (no callbacks into application code while the mutex is held).
+
+Client-level state currently on the Inbox:
+
+| Endpoint | Topic bit | Data | Producer |
+|----------|-----------|------|----------|
+| Event ring | `INBOX_TOPIC_EVENTS` | `TimeResponsePayload` (via `InboxEvent`) | Network thread |
+| `Client::group_slot` | `INBOX_TOPIC_GROUP` | `GroupUpdateObject` (field-by-field delta merge) | Network thread |
+
+Role-level state (player, controller, metadata, color, artwork, visualizer) still uses the per-role `ThreadSafeQueue`/`ShadowSlot` endpoints above; migrating those onto the Inbox is a later phase.
 
 ### SpscRingBuffer (`src/platform/spsc_ring_buffer.h`)
 
@@ -162,10 +178,10 @@ Network thread (IXWebSocket / esp_http_server)
 | Message | Action on Network Thread |
 |---------|------------------------|
 | `SERVER_HELLO` | Stores server info and connection reason on the connection, then sets `server_hello_received_` (an atomic store that publishes the fields to the main loop; the manager's promotion scan observes `is_handshake_complete()` on its next tick) |
-| `SERVER_TIME` | Enqueues `TimeResponseEvent` into `time_queue` |
+| `SERVER_TIME` | Pushes a `TIME_RESPONSE` `InboxEvent` onto the shared inbox ring |
 | `SERVER_STATE` | Writes to `ControllerRole::Impl::shadow`, `MetadataRole::Impl::shadow`, and `ColorRole::Impl::shadow` |
 | `SERVER_COMMAND` | Merges into `PlayerRole::Impl::shadow_command` |
-| `GROUP_UPDATE` | Merges into `Client::shadow_group` |
+| `GROUP_UPDATE` | Merges into `Client::group_slot` (`InboxSlot<GroupUpdateObject>`) |
 | `STREAM_START` | Writes to `PlayerRole::Impl::shadow_stream_params`, enqueues `STREAM_START` into `stream_queue`. Marks the artwork stream active, flushes the decode thread's notification queue, and resets any pending per-slot display timestamps. Writes to `VisualizerRole::Impl::shadow_config`, enqueues a start event. |
 | `STREAM_END` | Enqueues `STREAM_END` into player/artwork/visualizer queues, signals sync task `COMMAND_STREAM_END` |
 | `STREAM_CLEAR` | Enqueues `STREAM_CLEAR` into artwork/visualizer queues; for the player, signals sync task `COMMAND_STREAM_CLEAR` and enqueues a `CHUNK_TYPE_STREAM_CLEAR_MARKER` chunk into the encoded ring buffer (no player listener callback — a seek is not a stream lifecycle event) |
@@ -206,8 +222,8 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    ├─ Acquire/release high-performance networking around burst
    └─ Notify listener of sync error when burst completes
 
-3. Drain time_queue
-   └─ Feed time responses into time_burst_->on_time_response()
+3. Drain inbox event ring (when INBOX_TOPIC_EVENTS is set)
+   └─ Feed TIME_RESPONSE events into time_burst_->on_time_response()
 
 4. Role event draining (each role's impl_->drain_events())
    ├─ player_->impl_->drain_events()
@@ -217,7 +233,7 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    ├─ artwork_->impl_->drain_events()
    └─ visualizer_->impl_->drain_events()
 
-5. Drain shadow_group
+5. Drain group_slot (when INBOX_TOPIC_GROUP is set)
    └─ Apply group deltas, fire on_group_update, persist last played server
 ```
 

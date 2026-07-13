@@ -38,15 +38,15 @@ namespace sendspin {
 /// One bit per main-loop-drained endpoint. A bit is owned by exactly one InboxSlot
 /// (or by the event ring); it is set when that endpoint has pending content and
 /// cleared when the endpoint is drained, always under the Inbox mutex.
-static constexpr uint32_t INBOX_TOPIC_EVENTS = 1u << 0;                // Shared event ring
-static constexpr uint32_t INBOX_TOPIC_GROUP = 1u << 1;                 // Group update slot
-static constexpr uint32_t INBOX_TOPIC_CONTROLLER = 1u << 2;            // Controller state slot
-static constexpr uint32_t INBOX_TOPIC_METADATA = 1u << 3;              // Metadata delta slot
-static constexpr uint32_t INBOX_TOPIC_COLOR = 1u << 4;                 // Color delta slot
-static constexpr uint32_t INBOX_TOPIC_PLAYER_COMMAND = 1u << 5;        // Player command slot
-static constexpr uint32_t INBOX_TOPIC_PLAYER_STREAM_PARAMS = 1u << 6;  // Player stream params slot
-static constexpr uint32_t INBOX_TOPIC_VISUALIZER_CONFIG = 1u << 7;     // Visualizer config slot
-static constexpr uint32_t INBOX_TOPIC_ARTWORK_DISPLAY = 1u << 8;       // Artwork display slot
+static constexpr uint32_t INBOX_TOPIC_EVENTS = 1U << 0;                // Shared event ring
+static constexpr uint32_t INBOX_TOPIC_GROUP = 1U << 1;                 // Group update slot
+static constexpr uint32_t INBOX_TOPIC_CONTROLLER = 1U << 2;            // Controller state slot
+static constexpr uint32_t INBOX_TOPIC_METADATA = 1U << 3;              // Metadata delta slot
+static constexpr uint32_t INBOX_TOPIC_COLOR = 1U << 4;                 // Color delta slot
+static constexpr uint32_t INBOX_TOPIC_PLAYER_COMMAND = 1U << 5;        // Player command slot
+static constexpr uint32_t INBOX_TOPIC_PLAYER_STREAM_PARAMS = 1U << 6;  // Player stream params slot
+static constexpr uint32_t INBOX_TOPIC_VISUALIZER_CONFIG = 1U << 7;     // Visualizer config slot
+static constexpr uint32_t INBOX_TOPIC_ARTWORK_DISPLAY = 1U << 8;       // Artwork display slot
 
 // ============================================================================
 // Event ring types
@@ -68,13 +68,15 @@ enum class InboxEventType : uint8_t {
 };
 
 /// @brief Payload for TIME_RESPONSE events
-///
-/// Mirrors the fields of the current TimeResponseEvent in client.cpp; that struct migrates here
-/// in a later phase.
 struct TimeResponsePayload {
     int64_t offset{0};
     int64_t max_error{0};
     int64_t timestamp{0};
+    /// Instance id of the connection the response arrived on, compared against the current
+    /// connection at drain time so a measurement from a displaced or pending server cannot
+    /// contaminate the current connection's time filter. An id (not a pointer) so a since-freed
+    /// connection cannot ABA-match a later connection reusing its address; 0 never matches a live
+    /// connection (ids start at 1).
     uint64_t source_id{0};
 };
 
