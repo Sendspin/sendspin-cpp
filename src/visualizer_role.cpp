@@ -360,7 +360,7 @@ void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event) const
 // SendspinClient::loop()
 // ============================================================================
 
-void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event) {
+void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event) const {
     switch (event) {
         case VisualizerEventType::STREAM_START: {
             ServerVisualizerStreamObject config{};

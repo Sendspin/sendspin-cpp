@@ -74,7 +74,7 @@ struct VisualizerRole::Impl {
     void handle_stream_start(const ServerVisualizerStreamObject& stream);
     void handle_stream_end();
     void handle_stream_clear();
-    void handle_stream_ring_event(VisualizerEventType event);
+    void handle_stream_ring_event(VisualizerEventType event) const;
     void cleanup();
 
     // ========================================
