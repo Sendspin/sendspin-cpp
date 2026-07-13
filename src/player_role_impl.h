@@ -17,8 +17,7 @@
 
 #pragma once
 
-#include "platform/shadow_slot.h"
-#include "platform/thread_safe_queue.h"
+#include "inbox.h"
 #include "sendspin/player_role.h"
 #include "sync_task.h"
 
@@ -49,16 +48,21 @@ struct PlayerRole::Impl {
     // ========================================
 
     struct EventState {
-        ThreadSafeQueue<PlayerStreamCallbackType> stream_queue;
-        ThreadSafeQueue<SendspinClientState> state_queue;
-        ShadowSlot<ServerPlayerStreamObject> shadow_stream_params;
-        ShadowSlot<ServerCommandMessage> shadow_command;
+        InboxSlot<ServerPlayerStreamObject> stream_params_slot;
+        InboxSlot<ServerCommandMessage> command_slot;
+        // Client state from the sync task. Latest-wins by design (the old ring events were
+        // collapsed to the newest at drain time anyway), and deliberately NOT on the event
+        // ring: the sync task is the one producer that can keep emitting while the main loop
+        // stalls, and un-coalesced state transitions must not be able to fill the shared ring
+        // and starve non-idempotent lifecycle events out of it.
+        InboxSlot<SendspinClientState> state_slot;
     };
 
     // ========================================
     // Internal integration methods (called by SendspinClient)
     // ========================================
 
+    void attach_inbox(Inbox& inbox);
     bool start();
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
@@ -67,6 +71,7 @@ struct PlayerRole::Impl {
     void handle_stream_end() const;
     void handle_stream_clear() const;
     void handle_server_command(const ServerCommandMessage& cmd) const;
+    void on_stream_ring_event(PlayerStreamCallbackType event);
     void drain_events();
     void cleanup();
 
@@ -102,9 +107,16 @@ struct PlayerRole::Impl {
     // Pointer fields
     SendspinClient* client;
     std::unique_ptr<EventState> event_state;
+    Inbox* inbox{nullptr};
     PlayerRoleListener* listener{nullptr};
     SendspinPersistenceProvider* persistence;
     std::unique_ptr<SyncTask> sync_task;
+
+    // 32-bit fields
+    // Bumped by cleanup() so a drain_events() listener callback that re-enters connection
+    // teardown is detected when control returns: the STREAM_START tail must not re-arm the
+    // sync task for a stream cleanup() just ended. Main-thread only.
+    uint32_t cleanup_generation{0};
 
     // 16-bit fields
     std::atomic<uint16_t> static_delay_ms{0};

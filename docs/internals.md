@@ -92,8 +92,6 @@ Fixed-depth FIFO queue with timed send/receive. Used to defer events from networ
 
 | Queue | Depth | Data | Producer | Consumer |
 |-------|-------|------|----------|----------|
-| `PlayerRole::Impl::stream_queue` | 8 | `PlayerStreamCallbackType` | Network thread | Main loop (`drain_events`) |
-| `PlayerRole::Impl::state_queue` | 4 | `SendspinClientState` | Sync task thread | Main loop (`drain_events`) |
 | `ArtworkRole::Impl::notify_queue` | 8 | `ArtworkNotification` | Network thread | Artwork decode thread |
 | `ArtworkRole::Impl::queue` | 8 | `ArtworkEventType` | Network thread | Main loop (`drain_events`) |
 | `VisualizerRole::Impl::queue` | 8 | `VisualizerEventType` | Network thread | Main loop (`drain_events`) |
@@ -104,13 +102,11 @@ Single-slot state container with "latest wins" or custom merge semantics. The ne
 
 | Shadow Slot | Data | Merge Strategy |
 |-------------|------|----------------|
-| `PlayerRole::Impl::shadow_stream_params` | `ServerPlayerStreamObject` | Latest wins |
-| `PlayerRole::Impl::shadow_command` | `ServerCommandMessage` | Field-by-field merge (volume, mute, delay independent) |
 | `ArtworkRole::Impl::display_scheduler->pending[slot]` (×4) | `int64_t` (server display timestamp) | Latest wins |
 | `VisualizerRole::Impl::shadow_config` | `ServerVisualizerStreamObject` | Latest wins |
 | `SyncTask::playback_progress_slot_` | `PlaybackProgress` | Sum `frames_played`, keep latest `finish_timestamp` |
 
-The merge strategy for `shadow_command` is important: if a volume change and a mute change arrive between two drain ticks, both are preserved because the merge function only overwrites fields that have values in the delta.
+The field-by-field merge pattern - preserving, say, a volume change and a mute change that arrive between two drain ticks because the merge only overwrites fields present in the delta - now lives on the Inbox merge slots (the player's `command_slot`, and the metadata/color/group delta slots below) rather than on a `ShadowSlot`.
 
 ### Inbox (`src/inbox.h`)
 
@@ -125,13 +121,16 @@ State currently on the Inbox:
 
 | Endpoint | Topic bit | Data | Producer |
 |----------|-----------|------|----------|
-| Event ring | `INBOX_TOPIC_EVENTS` | Lifecycle events (`TimeResponsePayload`, plus `CONTROLLER_CLEARED` / `METADATA_CLEARED` / `COLOR_CLEARED`) via `InboxEvent` | Network thread (`TimeResponsePayload`) / main-loop thread (`*_CLEARED` via role `cleanup()`) |
+| Event ring | `INBOX_TOPIC_EVENTS` | Lifecycle events (`TimeResponsePayload` and `PLAYER_STREAM` STREAM_START/STREAM_END, plus `CONTROLLER_CLEARED` / `METADATA_CLEARED` / `COLOR_CLEARED`) via `InboxEvent` | Network thread (`TimeResponsePayload`, `PLAYER_STREAM`) / main-loop thread (`*_CLEARED` via role `cleanup()`) |
 | `Client::group_slot` | `INBOX_TOPIC_GROUP` | `GroupUpdateObject` (field-by-field delta merge) | Network thread |
 | `ControllerRole::Impl::slot` | `INBOX_TOPIC_CONTROLLER` | `ServerStateControllerObject` (latest wins) | Network thread |
 | `MetadataRole::Impl::slot` | `INBOX_TOPIC_METADATA` | `ServerMetadataStateDelta` (field-by-field delta merge) | Network thread |
 | `ColorRole::Impl::slot` | `INBOX_TOPIC_COLOR` | `ServerColorStateDelta` (field-by-field delta merge) | Network thread |
+| `PlayerRole::Impl::EventState::stream_params_slot` | `INBOX_TOPIC_PLAYER_STREAM_PARAMS` | `ServerPlayerStreamObject` (latest wins) | Network thread |
+| `PlayerRole::Impl::EventState::command_slot` | `INBOX_TOPIC_PLAYER_COMMAND` | `ServerCommandMessage` (field-by-field merge) | Network thread |
+| `PlayerRole::Impl::EventState::state_slot` | `INBOX_TOPIC_PLAYER_STATE` | `SendspinClientState` (latest wins) | Sync task thread |
 
-The controller, metadata, and color roles have been migrated onto the Inbox: each `handle_server_state()` writes or merges into its `InboxSlot`, and the disconnect clear is delivered as a `*_CLEARED` lifecycle event on the shared ring rather than a per-role flag. The remaining role-level state (player, artwork, visualizer) still uses the per-role `ThreadSafeQueue`/`ShadowSlot` endpoints above; migrating those onto the Inbox is a later phase.
+The controller, metadata, color, and player roles have been migrated onto the Inbox. The controller/metadata/color roles write or merge server state into their `InboxSlot` from `handle_server_state()`, and their disconnect clear arrives as a `*_CLEARED` lifecycle event on the shared ring rather than a per-role flag. The player role owns three `InboxSlot`s (stream params, command, and client state, on its `EventState`) plus `PLAYER_STREAM` lifecycle events on the shared ring; its disconnect clear is the synthetic STREAM_END that `cleanup()` pushes onto the ring. The remaining role-level state (artwork, visualizer) still uses the per-role `ThreadSafeQueue`/`ShadowSlot` endpoints above; migrating those onto the Inbox is a later phase.
 
 ### SpscRingBuffer (`src/platform/spsc_ring_buffer.h`)
 
@@ -180,10 +179,10 @@ Network thread (IXWebSocket / esp_http_server)
 | `SERVER_HELLO` | Stores server info and connection reason on the connection, then sets `server_hello_received_` (an atomic store that publishes the fields to the main loop; the manager's promotion scan observes `is_handshake_complete()` on its next tick) |
 | `SERVER_TIME` | Pushes a `TIME_RESPONSE` `InboxEvent` onto the shared inbox ring |
 | `SERVER_STATE` | Writes/merges into the controller, metadata, and color `InboxSlot`s via each role's `handle_server_state()` |
-| `SERVER_COMMAND` | Merges into `PlayerRole::Impl::shadow_command` |
+| `SERVER_COMMAND` | Merges into the player's `command_slot` (`InboxSlot<ServerCommandMessage>`) |
 | `GROUP_UPDATE` | Merges into `Client::group_slot` (`InboxSlot<GroupUpdateObject>`) |
-| `STREAM_START` | Writes to `PlayerRole::Impl::shadow_stream_params`, enqueues `STREAM_START` into `stream_queue`. Marks the artwork stream active, flushes the decode thread's notification queue, and resets any pending per-slot display timestamps. Writes to `VisualizerRole::Impl::shadow_config`, enqueues a start event. |
-| `STREAM_END` | Enqueues `STREAM_END` into player/artwork/visualizer queues, signals sync task `COMMAND_STREAM_END` |
+| `STREAM_START` | Writes to the player's `stream_params_slot`, pushes a `PLAYER_STREAM` (STREAM_START) event onto the inbox ring. Marks the artwork stream active, flushes the decode thread's notification queue, and resets any pending per-slot display timestamps. Writes to `VisualizerRole::Impl::shadow_config`, enqueues a start event. |
+| `STREAM_END` | Pushes a `PLAYER_STREAM` (STREAM_END) event onto the inbox ring and signals sync task `COMMAND_STREAM_END`; enqueues `STREAM_END` into the artwork/visualizer queues |
 | `STREAM_CLEAR` | Enqueues `STREAM_CLEAR` into artwork/visualizer queues; for the player, signals sync task `COMMAND_STREAM_CLEAR` and enqueues a `CHUNK_TYPE_STREAM_CLEAR_MARKER` chunk into the encoded ring buffer (no player listener callback — a seek is not a stream lifecycle event) |
 
 #### JSON parse arena (`src/platform/json_arena.h`)
@@ -244,18 +243,18 @@ This ordering matters: connection lifecycle events are processed before role eve
 
 Each role implements `drain_events()` to process its deferred events on the main loop thread. This is the mechanism that converts thread-safe queue/shadow writes into sequential, single-threaded callback delivery.
 
-### PlayerRole::Impl::drain_events() (`src/player_role.cpp:341`)
+### PlayerRole::Impl::drain_events() (`src/player_role.cpp:363`)
 
 Three stages, processed in order:
 
-**1. Client state updates**: Drains `state_queue` (last value wins). Calls `client_->update_state()`.
+**1. Client state updates**: Takes from `state_slot` (latest-wins `InboxSlot`, written by the sync task). Calls `client_->update_state()`.
 
-**2. Server commands**: Takes from `shadow_command`. Checks each field independently (volume, mute, static_delay) and fires the corresponding listener callback.
+**2. Server commands**: Takes from `command_slot`. Checks each field independently (volume, mute, static_delay) and fires the corresponding listener callback.
 
 **3. Stream lifecycle**: The most complex part:
 
 ```api
-stream_queue → awaiting_sync_idle_events_ list
+PLAYER_STREAM ring events → on_stream_ring_event() → awaiting_sync_idle_events list
                        │
                        ▼
          For each event in order:
@@ -264,8 +263,8 @@ stream_queue → awaiting_sync_idle_events_ list
            │    If sync task is idle → fire on_stream_end(), continue
            │
            └─ STREAM_START:
-                Take shadow_stream_params
-                Fire on_stream_start()
+                Take stream_params_slot
+                Mark stream active, fire on_stream_start()
                 Signal sync task COMMAND_START
 ```
 
@@ -326,7 +325,7 @@ The sync task (`SyncTask::thread_entry`, `src/sync_task.cpp`) runs a two-level s
 └──────────────────────────────────────────────────────────┘
 ```
 
-The **WAIT FOR CLIENT ACK** step is critical. Without it, the sync task could race from IDLE back to ACTIVE so fast that the main loop never observes TASK_IDLE, and the `awaiting_sync_idle_events_` mechanism in `PlayerRole::drain_events()` would deadlock waiting for an idle transition that already passed.
+The **WAIT FOR CLIENT ACK** step is critical. Without it, the sync task could race from IDLE back to ACTIVE so fast that the main loop never observes TASK_IDLE, and the `awaiting_sync_idle_events` mechanism in `PlayerRole::drain_events()` would deadlock waiting for an idle transition that already passed.
 
 ### Inner State Machine (active stream)
 
@@ -427,8 +426,8 @@ When a connection is lost (`on_connection_lost`):
 
 ```api
 1. conn->disable_message_dispatch()      ← atomic, immediate on network thread
-2. client_->cleanup_connection_state()  ← stop time sync, drain all role queues/shadows,
-                                           signal stream end
+2. client_->cleanup_connection_state()  ← stop time sync, reset the inbox event ring and every
+                                           role's slots, signal stream end
 3. Queue the connection on deferred_releases_ (released outside the manager lock)
 4. The current slot stays empty; the next promotion scan fills it from the nursery
 ```
@@ -469,11 +468,11 @@ All network thread actions are deferred to the main loop via queues, shadow slot
 
 ### Stream Lifecycle Ordering
 
-The combination of `awaiting_sync_idle_events_` (main loop) and `COMMAND_START` (sync task wait) creates a two-way handshake:
+The combination of `awaiting_sync_idle_events` (main loop) and `COMMAND_START` (sync task wait) creates a two-way handshake:
 
-1. Network thread enqueues STREAM_END → STREAM_START into `stream_queue`.
+1. Network thread pushes STREAM_END → STREAM_START as `PLAYER_STREAM` events onto the inbox event ring.
 2. Sync task receives `COMMAND_STREAM_END`, finishes active stream, enters IDLE, sets `TASK_IDLE`.
-3. Main loop sees STREAM_END in queue, checks `is_running()` → false (idle), fires `on_stream_end()`.
+3. Main loop drains the ring into `awaiting_sync_idle_events`, sees STREAM_END, checks `is_running()` → false (idle), fires `on_stream_end()`.
 4. Main loop sees STREAM_START, fires `on_stream_start()`, signals `COMMAND_START`.
 5. Sync task receives `COMMAND_START`, exits wait, enters ACTIVE.
 
@@ -491,3 +490,12 @@ Audio output callbacks run on a platform audio thread. They report consumed fram
 - All pending events are discarded.
 - The sync task is signaled to end its current stream.
 - The main loop will process the synthetic STREAM_END on its next tick.
+
+### Re-entrant Teardown During Callback Dispatch
+
+A listener callback fired from the main loop can synchronously re-enter connection teardown - for example an `on_stream_start()` or `on_*_clear()` handler that calls `connect_to()`, whose `drop_connection()` runs `cleanup_connection_state()` on the same stack. That cleanup wipes the inbox event ring (`reset_events()`) and each role re-pushes its synthetic clear/STREAM_END, so a drain already in progress must not act on the stale events it copied out before the wipe. Two plain `uint32_t` generation counters, both touched only on the main loop, guard this:
+
+- `SendspinClient::event_state_->drain_generation`, bumped by `cleanup_connection_state()`. The event-ring drain in `loop()` snapshots it before the batch and aborts the instant it changes, discarding the events it had already copied out (they were wiped deliberately) and leaving the cleanup's freshly re-pushed events in the live ring for the next tick. The abort is checked both at the top of the inner per-event loop and once more after the loop body, so a teardown that re-enters on the final event of a full batch cannot fall through into a second `take_events()` that would destructively pull, and then drop, those re-pushed events.
+- `PlayerRole::Impl::cleanup_generation`, bumped by the player's `cleanup()`. `drain_events()` snapshots it around each `on_stream_start()` call; if it changes, the stream was torn down from inside the callback, so the player abandons the rest of the batch rather than re-arm the sync task for a dead stream. `stream_active` is set before the callback runs, so the STREAM_END that `cleanup()` enqueued still passes its gate and delivers a paired `on_stream_end()`.
+
+Neither counter needs atomics: they only let an in-flight drain notice that teardown ran underneath it and stop touching state that cleanup already reset.

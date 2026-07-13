@@ -47,6 +47,7 @@ static constexpr uint32_t INBOX_TOPIC_PLAYER_COMMAND = 1U << 5;        // Player
 static constexpr uint32_t INBOX_TOPIC_PLAYER_STREAM_PARAMS = 1U << 6;  // Player stream params slot
 static constexpr uint32_t INBOX_TOPIC_VISUALIZER_CONFIG = 1U << 7;     // Visualizer config slot
 static constexpr uint32_t INBOX_TOPIC_ARTWORK_DISPLAY = 1U << 8;       // Artwork display slot
+static constexpr uint32_t INBOX_TOPIC_PLAYER_STATE = 1U << 9;          // Player client-state slot
 
 // ============================================================================
 // Event ring types
@@ -59,7 +60,6 @@ static constexpr uint32_t INBOX_TOPIC_ARTWORK_DISPLAY = 1U << 8;       // Artwor
 enum class InboxEventType : uint8_t {
     TIME_RESPONSE,       // Time-sync measurement; payload in InboxEvent::time
     PLAYER_STREAM,       // Player stream lifecycle; code = PlayerStreamCallbackType
-    PLAYER_STATE,        // Client state from sync task; code = SendspinClientState
     CONTROLLER_CLEARED,  // Controller state cleared on disconnect; no payload
     METADATA_CLEARED,    // Metadata cleared on disconnect; no payload
     COLOR_CLEARED,       // Color state cleared on disconnect; no payload
@@ -254,14 +254,20 @@ private:
 ///
 /// Shared by the role stream-event and cleared-event producers so the build/push/log-on-drop
 /// pattern stays uniform across roles. `what` names the dropped event in the log line; `code`
-/// carries the role-local enum value (0 when unused).
+/// carries the role-local enum value (0 when unused). `error_level` logs the drop at ERROR rather
+/// than WARN: use it for events whose loss wedges the stream (player START/END), not for the
+/// idempotent CLEARED events whose loss leaves merely recoverable stale state.
 inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, const char* tag,
-                              const char* what) {
+                              const char* what, bool error_level = false) {
     InboxEvent event{};
     event.type = type;
     event.code = code;
     if (inbox == nullptr || !inbox->push_event(event)) {
-        SS_LOGW(tag, "Inbox event ring full; dropping %s", what);
+        if (error_level) {
+            SS_LOGE(tag, "Inbox event ring full; dropping %s", what);
+        } else {
+            SS_LOGW(tag, "Inbox event ring full; dropping %s", what);
+        }
     }
 }
 
