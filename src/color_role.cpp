@@ -100,15 +100,14 @@ void ColorRole::Impl::handle_server_state(ServerColorStateDelta delta) const {
 void ColorRole::Impl::drain_events() {
     ServerColorStateDelta delta{};
     if (this->event_state->slot.take(delta)) {
-        if (this->has_held_delta) {
-            merge_color_state_delta(this->held_delta, std::move(delta));
+        if (this->held_delta.has_value()) {
+            merge_color_state_delta(*this->held_delta, std::move(delta));
         } else {
             this->held_delta = std::move(delta);
-            this->has_held_delta = true;
         }
     }
 
-    if (!this->has_held_delta) {
+    if (!this->held_delta.has_value()) {
         return;
     }
 
@@ -116,17 +115,16 @@ void ColorRole::Impl::drain_events() {
     // cannot honor the server-clock deadline, so fire immediately rather than starving the
     // listener. No lock is held here (the slot value was already taken above), unlike the old
     // take_if predicate which ran under the shadow slot's mutex.
-    int64_t client_ts = this->client->get_client_time(this->held_delta.timestamp);
+    int64_t client_ts = this->client->get_client_time(this->held_delta->timestamp);
     if (client_ts != 0 && client_ts > platform_time_us()) {
         return;
     }
 
-    apply_color_state_deltas(&this->color, this->held_delta);
+    apply_color_state_deltas(&this->color, *this->held_delta);
     if (this->listener) {
         this->listener->on_color(this->color);
     }
-    this->held_delta = {};
-    this->has_held_delta = false;
+    this->held_delta.reset();
 }
 
 void ColorRole::Impl::handle_cleared_event() {
@@ -140,17 +138,9 @@ void ColorRole::Impl::handle_cleared_event() {
 void ColorRole::Impl::cleanup() {
     this->event_state->slot.reset();
     this->color = {};
-    this->held_delta = {};
-    this->has_held_delta = false;
+    this->held_delta.reset();
 
-    if (this->inbox != nullptr) {
-        InboxEvent event{};
-        event.type = InboxEventType::COLOR_CLEARED;
-        event.code = 0;
-        if (!this->inbox->push_event(event)) {
-            SS_LOGW(TAG, "Inbox event ring full; dropping color cleared event");
-        }
-    }
+    push_event_or_log(this->inbox, InboxEventType::COLOR_CLEARED, 0, TAG, "color cleared event");
 }
 
 }  // namespace sendspin

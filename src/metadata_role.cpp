@@ -168,32 +168,30 @@ void MetadataRole::Impl::drain_events() {
     // or here, folding a taken slot value into held_delta.
     ServerMetadataStateDelta delta{};
     if (this->event_state->slot.take(delta)) {
-        if (this->has_held_delta) {
-            merge_metadata_state_delta(this->held_delta, std::move(delta));
+        if (this->held_delta.has_value()) {
+            merge_metadata_state_delta(*this->held_delta, std::move(delta));
         } else {
             this->held_delta = std::move(delta);
-            this->has_held_delta = true;
         }
     }
 
-    if (!this->has_held_delta) {
+    if (!this->held_delta.has_value()) {
         return;
     }
 
     // get_client_time returns 0 when there is no current connection. Without a connection we
     // cannot honor the server-clock deadline, so fire immediately rather than starving the
     // listener.
-    int64_t client_ts = this->client->get_client_time(this->held_delta.timestamp);
+    int64_t client_ts = this->client->get_client_time(this->held_delta->timestamp);
     if (client_ts != 0 && client_ts > platform_time_us()) {
         return;
     }
 
-    apply_metadata_state_deltas(&this->metadata, this->held_delta);
+    apply_metadata_state_deltas(&this->metadata, *this->held_delta);
     if (this->listener) {
         this->listener->on_metadata(this->metadata);
     }
-    this->held_delta = {};
-    this->has_held_delta = false;
+    this->held_delta.reset();
 }
 
 void MetadataRole::Impl::handle_cleared_event() {
@@ -207,17 +205,10 @@ void MetadataRole::Impl::handle_cleared_event() {
 void MetadataRole::Impl::cleanup() {
     this->event_state->slot.reset();
     this->metadata = {};
-    this->held_delta = {};
-    this->has_held_delta = false;
+    this->held_delta.reset();
 
-    if (this->inbox != nullptr) {
-        InboxEvent event{};
-        event.type = InboxEventType::METADATA_CLEARED;
-        event.code = 0;
-        if (!this->inbox->push_event(event)) {
-            SS_LOGW(TAG, "Inbox event ring full; dropping metadata cleared event");
-        }
-    }
+    push_event_or_log(this->inbox, InboxEventType::METADATA_CLEARED, 0, TAG,
+                      "metadata cleared event");
 }
 
 }  // namespace sendspin

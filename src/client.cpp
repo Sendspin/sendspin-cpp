@@ -76,7 +76,10 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
 }
 
 SendspinClient::~SendspinClient() {
-    // Stop background threads before tearing down connections.
+    // Stop background threads before tearing down connections. Every role is reset explicitly
+    // (not just the threaded ones): role InboxSlots release their topic-bit claims against
+    // event_state_'s Inbox on destruction, so all roles must be gone before the alphabetized
+    // member order destroys event_state_.
 #ifdef SENDSPIN_ENABLE_PLAYER
     this->player_.reset();
 #endif
@@ -85,6 +88,15 @@ SendspinClient::~SendspinClient() {
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
     this->artwork_.reset();
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    this->controller_.reset();
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+    this->metadata_.reset();
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    this->color_.reset();
 #endif
     this->connection_manager_.reset();
 }

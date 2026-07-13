@@ -95,14 +95,8 @@ void ControllerRole::Impl::cleanup() {
     this->event_state->slot.reset();
     this->controller_state = {};
 
-    if (this->inbox != nullptr) {
-        InboxEvent event{};
-        event.type = InboxEventType::CONTROLLER_CLEARED;
-        event.code = 0;
-        if (!this->inbox->push_event(event)) {
-            SS_LOGW(TAG, "Inbox event ring full; dropping controller cleared event");
-        }
-    }
+    push_event_or_log(this->inbox, InboxEventType::CONTROLLER_CLEARED, 0, TAG,
+                      "controller cleared event");
 }
 
 }  // namespace sendspin

@@ -22,6 +22,7 @@
 #include "sendspin/color_role.h"
 
 #include <memory>
+#include <optional>
 
 namespace sendspin {
 
@@ -62,17 +63,13 @@ struct ColorRole::Impl {
     ServerColorStateObject color{};
     // Delta accumulated from the inbox slot, awaiting its server-clock deadline. Main-thread
     // only: written and read exclusively from drain_events()/cleanup() on the loop thread.
-    ServerColorStateDelta held_delta{};
+    std::optional<ServerColorStateDelta> held_delta;
 
     // Pointer fields
     SendspinClient* client;
     std::unique_ptr<EventState> event_state;
     Inbox* inbox{nullptr};
     ColorRoleListener* listener{nullptr};
-
-    // 8-bit fields
-    // Main-thread only; see held_delta.
-    bool has_held_delta{false};
 };
 
 }  // namespace sendspin
