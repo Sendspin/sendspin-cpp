@@ -228,6 +228,24 @@ private:
     /// @param entry The nursery entry to add.
     void push_nursery_entry(NurseryEntry entry);
 
+    /// @brief Assigns current_connection_ and refreshes has_current_ in the same critical section,
+    /// so the hint atomic can never drift from "current_connection_ != nullptr". Pass nullptr to
+    /// clear the slot. Caller must hold conn_ptr_mutex_.
+    /// @param conn The connection to install as current, or nullptr to clear; moved from.
+    void set_current_connection(std::shared_ptr<SendspinConnection> conn);
+
+    /// @brief Appends a connection to pending_connected_events_ and sets has_pending_events_ in
+    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
+    /// Caller must hold conn_mutex_.
+    /// @param conn The freshly connected connection to defer to loop().
+    void queue_pending_connected(std::shared_ptr<SendspinConnection> conn);
+
+    /// @brief Appends a connection to pending_disconnect_events_ and sets has_pending_events_ in
+    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
+    /// Caller must hold conn_mutex_.
+    /// @param conn The disconnected connection to defer to loop().
+    void queue_pending_disconnect(std::shared_ptr<SendspinConnection> conn);
+
     /// @brief Releases a nursery entry: erases it, prunes its hello retry, and queues the
     /// goodbye+release on deferred_releases_. Caller must hold conn_ptr_mutex_ and call
     /// flush_deferred_releases() after dropping it.

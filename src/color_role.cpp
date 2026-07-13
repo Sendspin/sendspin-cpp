@@ -112,9 +112,10 @@ void ColorRole::Impl::drain_events() {
     }
 
     // A future-dated delta is held across ticks below without any topic bit set (take() above
-    // cleared it). It is re-evaluated against its deadline only because the client calls this
-    // drain_events() unconditionally every tick -- see the warning at the drain-call site in
-    // SendspinClient::loop().
+    // cleared it). It is re-evaluated against its deadline on later ticks only because
+    // needs_drain() ORs in held_delta.has_value() alongside the INBOX_TOPIC_COLOR bit test, so
+    // this drain_events() keeps running each tick until the deadline fires. Dropping that OR term
+    // would strand the delta until an unrelated new delta re-set the topic bit.
     //
     // get_client_time returns 0 when there is no current connection. Without a connection we
     // cannot honor the server-clock deadline, so fire immediately rather than starving the

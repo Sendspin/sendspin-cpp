@@ -132,14 +132,12 @@ void ConnectionManager::connect_to(const std::string& url) {
         // Inbound connections arrive already upgraded and arm their hello at admission.
         c->mark_ws_upgraded();
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->pending_connected_events_.push_back(c->shared_from_this());
-        this->has_pending_events_.store(true, std::memory_order_release);
+        this->queue_pending_connected(c->shared_from_this());
     };
     client_conn->on_disconnected_cb = [this](SendspinConnection* conn) {
         // Defer to loop(); this callback runs on IXWebSocket's internal thread
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->pending_disconnect_events_.push_back(conn->shared_from_this());
-        this->has_pending_events_.store(true, std::memory_order_release);
+        this->queue_pending_disconnect(conn->shared_from_this());
     };
 
     client_conn->init_time_filter();
@@ -248,8 +246,7 @@ void ConnectionManager::init_server(SendspinClient* client) {
             // queue: both carry the connection itself, so a stale event can never be mis-routed to
             // a new connection (drop_connection no-ops on connections it does not manage).
             std::lock_guard<std::mutex> lock(this->conn_mutex_);
-            this->pending_disconnect_events_.push_back(std::move(conn));
-            this->has_pending_events_.store(true, std::memory_order_release);
+            this->queue_pending_disconnect(std::move(conn));
         });
 
     // Connection lookup-by-sockfd. Used by the host build's ws_server to route IXWebSocket
@@ -345,8 +342,7 @@ void ConnectionManager::loop() {
                 this->remove_hello_retry(conn.get());
 
                 if (this->current_connection_ == nullptr) {
-                    this->current_connection_ = std::move(conn);
-                    this->has_current_.store(true, std::memory_order_release);
+                    this->set_current_connection(std::move(conn));
                 } else if (this->should_switch_to_new_server(this->current_connection_.get(),
                                                              conn.get())) {
                     // Both sides of the comparison are established, so the PLAYBACK-reason and
@@ -355,8 +351,7 @@ void ConnectionManager::loop() {
                     SS_LOGI(TAG, "Handoff decision: switch to new server");
                     this->drop_connection(this->current_connection_.get(),
                                           SendspinGoodbyeReason::ANOTHER_SERVER);
-                    this->current_connection_ = std::move(conn);
-                    this->has_current_.store(true, std::memory_order_release);
+                    this->set_current_connection(std::move(conn));
                 } else {
                     SS_LOGI(TAG, "Handoff decision: keep current server");
                     // Leaving management: block stale network-thread dispatch during the goodbye
@@ -688,6 +683,24 @@ void ConnectionManager::push_nursery_entry(NurseryEntry entry) {
     this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
 }
 
+void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnection> conn) {
+    // Note: caller must hold conn_ptr_mutex_
+    this->has_current_.store(conn != nullptr, std::memory_order_release);
+    this->current_connection_ = std::move(conn);
+}
+
+void ConnectionManager::queue_pending_connected(std::shared_ptr<SendspinConnection> conn) {
+    // Note: caller must hold conn_mutex_
+    this->pending_connected_events_.push_back(std::move(conn));
+    this->has_pending_events_.store(true, std::memory_order_release);
+}
+
+void ConnectionManager::queue_pending_disconnect(std::shared_ptr<SendspinConnection> conn) {
+    // Note: caller must hold conn_mutex_
+    this->pending_disconnect_events_.push_back(std::move(conn));
+    this->has_pending_events_.store(true, std::memory_order_release);
+}
+
 std::vector<NurseryEntry>::iterator ConnectionManager::release_nursery_entry(
     std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason) {
     // Note: caller must hold conn_ptr_mutex_ and flush_deferred_releases() after dropping it
@@ -781,10 +794,11 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         // deferred (see DeferredRelease).
         conn->disable_message_dispatch();
         this->client_->cleanup_connection_state();
-        // std::exchange (not std::move) so the slot is never left in a moved-from state the
-        // static analyzer flags when a later event in the same loop() pass reads it.
-        auto dropped = std::exchange(this->current_connection_, nullptr);
-        this->has_current_.store(false, std::memory_order_release);
+        // set_current_connection(nullptr) reassigns the slot to a clean null (not a moved-from
+        // state) after we move the old connection out, so a later event in the same loop() pass
+        // that reads current_connection_ never trips the static analyzer.
+        auto dropped = std::move(this->current_connection_);
+        this->set_current_connection(nullptr);
         this->queue_deferred_release(std::move(dropped), goodbye);
         return;
     }
