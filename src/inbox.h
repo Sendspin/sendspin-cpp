@@ -97,15 +97,13 @@ class InboxSlot;
 /**
  * @brief Shared main-loop mailbox: one mutex, one dirty-topic bitmask, one fixed event ring
  *
- * Consolidates the ~13 separate ShadowSlot/ThreadSafeQueue endpoints that the main loop
- * previously drained every tick onto a single endpoint. Producer threads (network, decode)
- * write latest-value state through an InboxSlot bound to this Inbox, or push lifecycle events
- * directly with push_event(). The main loop reads poll() once per tick and only locks the
- * mutex to drain topics whose bit is set.
+ * Producer threads (network, decode) write latest-value state through an InboxSlot bound to
+ * this Inbox, or push lifecycle events directly with push_event(). The main loop reads poll()
+ * once per tick and only locks the mutex to drain topics whose bit is set.
  *
  * @note HARD RULE: no user-visible code (listener callbacks, client/role methods) may run while
  * the inbox mutex is held. merge() functors passed to InboxSlot must be pure data operations on
- * the slot value -- nothing that calls back into application code. The Inbox is a leaf in the
+ * the slot value, so nothing that calls back into application code. The Inbox is a leaf in the
  * lock order: code holding any other lock in this library must not then lock the Inbox, only
  * the reverse.
  *
@@ -149,7 +147,7 @@ public:
     /// per-endpoint content guarded by the mutex: a bit observed here can go stale the instant
     /// after this call returns (a producer thread may set or another consumer may clear it), so
     /// callers must still tolerate a drain call finding nothing (bit was cleared) and must not
-    /// skip a drain call just because poll() raced and momentarily missed a freshly-set bit --
+    /// skip a drain call just because poll() raced and momentarily missed a freshly-set bit, as
     /// the next tick's poll() will observe it.
     /// @return Bitmask (OR of INBOX_TOPIC_* bits) of topics with pending content as of the load.
     uint32_t poll() const {
@@ -206,12 +204,12 @@ public:
     }
 
 private:
-    /// @brief Sets `bit` in the dirty-topic mask. Caller must hold `mutex_`.
+    /// @brief Sets `bit` in the dirty-topic mask. Caller must hold `mutex_`
     void set_bit_locked(uint32_t bit) {
         this->pending_.fetch_or(bit, std::memory_order_release);
     }
 
-    /// @brief Clears `bit` in the dirty-topic mask. Caller must hold `mutex_`.
+    /// @brief Clears `bit` in the dirty-topic mask. Caller must hold `mutex_`
     void clear_bit_locked(uint32_t bit) {
         this->pending_.fetch_and(~bit, std::memory_order_acq_rel);
     }
@@ -239,15 +237,15 @@ private:
     std::array<InboxEvent, EVENT_CAPACITY> events_{};
 
     // size_t fields
-    size_t head_{0};
     size_t count_{0};
+    size_t head_{0};
 
     // 32-bit fields
-    std::atomic<uint32_t> pending_{0};
     // Bits owned by a live InboxSlot, plus the ring's own bit. Guarded by mutex_; exists to
     // catch a copy-pasted bind() reusing a bit, which would otherwise compile clean and drop
     // wakeups intermittently in production.
     uint32_t claimed_bits_{INBOX_TOPIC_EVENTS};
+    std::atomic<uint32_t> pending_{0};
 };
 
 /// @brief Pushes a payload-free lifecycle event, logging a drop if the ring is full
@@ -274,8 +272,8 @@ inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, c
  *
  * Owns its T storage and dirty flag but has no mutex of its own: every operation locks the
  * bound Inbox's shared mutex and, while holding it, keeps the slot's owned topic bit in sync
- * with its dirty flag. A topic bit must be owned by exactly one slot (or the event ring) --
- * sharing a bit between two slots would let draining one clear the bit while the other still
+ * with its dirty flag. A topic bit must be owned by exactly one slot (or the event ring).
+ * Sharing a bit between two slots would let draining one clear the bit while the other still
  * has pending content, silently losing that endpoint's next wakeup.
  *
  * Usage:
@@ -300,7 +298,7 @@ class InboxSlot {
 public:
     InboxSlot() = default;
 
-    /// @brief Constructs and immediately binds to `inbox` (see bind()).
+    /// @brief Constructs and immediately binds to `inbox` (see bind())
     InboxSlot(Inbox& inbox, uint32_t topic_bit) {
         this->bind(inbox, topic_bit);
     }
@@ -311,7 +309,7 @@ public:
         if (this->inbox_ != nullptr) {
             // Clear the owned topic bit if a value is still pending. release_bit() only drops the
             // claim; without this a slot destroyed while dirty would leave its bit set in
-            // pending_ forever -- a phantom wakeup no live slot can clear, and one a replacement
+            // pending_ forever, so a phantom wakeup no live slot can clear, and one a replacement
             // slot would inherit while its own dirty_ is false.
             {
                 std::lock_guard<std::mutex> lock(this->inbox_->mutex_);
