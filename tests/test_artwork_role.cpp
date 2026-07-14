@@ -66,7 +66,7 @@ public:
         this->cv.notify_all();
     }
 
-    void on_image_display(uint8_t slot) override {
+    void on_image_display(uint8_t slot, uint32_t /*lateness_ms*/) override {
         {
             std::lock_guard<std::mutex> lock(this->mutex);
             this->displays.push_back(slot);
@@ -549,45 +549,64 @@ TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
 }
 
 // ============================================================================
-// display_deadline_reached: the drain_events() display-deadline arithmetic, including the
-// per-slot display_offset_ms shift. Pure function, so tested directly: the integration tests
-// above all run without a connection (client_ts == 0), which bypasses the offset path.
+// display_overdue_us: the drain_events() display-deadline arithmetic, including the per-slot
+// display_offset_ms shift and the lateness (>= 0 overdue) value reported to on_image_display.
+// Pure function, so tested directly: the integration tests above all run without a connection
+// (client_ts == 0), which bypasses the offset and lateness paths.
 // ============================================================================
 
 TEST(ArtworkDisplayDeadline, NoConnectionSentinelFiresImmediately) {
-    // client_ts == 0 means no connection; fires regardless of offset in either direction.
-    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(0, 0, 5'000'000));
-    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(0, 1000, 5'000'000));
-    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(0, -1000, 5'000'000));
+    // client_ts == 0 means no connection: due immediately with lateness 0, regardless of offset
+    // in either direction (no deadline exists to be late against).
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(0, 0, 5'000'000), 0);
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(0, 1000, 5'000'000), 0);
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(0, -1000, 5'000'000), 0);
 }
 
 TEST(ArtworkDisplayDeadline, ZeroOffsetMatchesServerDeadline) {
     const int64_t now = 10'000'000;  // 10 s in us
-    EXPECT_FALSE(ArtworkRole::Impl::display_deadline_reached(now + 1, 0, now));
-    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now, 0, now));
-    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now - 1, 0, now));
+    EXPECT_LT(ArtworkRole::Impl::display_overdue_us(now + 1, 0, now), 0);
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now, 0, now), 0);
+    // 1 us past the deadline: due, with 1 us of lateness.
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now - 1, 0, now), 1);
 }
 
 TEST(ArtworkDisplayDeadline, PositiveOffsetFiresEarly) {
     const int64_t now = 10'000'000;
-    // Deadline 900 ms in the future, offset 1000 ms: already due.
-    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now + 900 * US_PER_MS, 1000, now));
+    // Deadline 900 ms in the future, offset 1000 ms: already due, 100 ms past the shifted
+    // deadline.
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now + 900 * US_PER_MS, 1000, now),
+              100 * US_PER_MS);
     // Deadline 1100 ms in the future, offset 1000 ms: still 100 ms out.
-    EXPECT_FALSE(ArtworkRole::Impl::display_deadline_reached(now + 1100 * US_PER_MS, 1000, now));
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now + 1100 * US_PER_MS, 1000, now),
+              -100 * US_PER_MS);
     // Exact boundary: deadline minus offset equals now.
-    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now + 1000 * US_PER_MS, 1000, now));
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now + 1000 * US_PER_MS, 1000, now), 0);
 }
 
 TEST(ArtworkDisplayDeadline, NegativeOffsetDelays) {
     const int64_t now = 10'000'000;
     // Deadline 500 ms in the past, but a -1000 ms offset holds it another 500 ms.
-    EXPECT_FALSE(ArtworkRole::Impl::display_deadline_reached(now - 500 * US_PER_MS, -1000, now));
-    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now - 1000 * US_PER_MS, -1000, now));
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now - 500 * US_PER_MS, -1000, now),
+              -500 * US_PER_MS);
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now - 1000 * US_PER_MS, -1000, now), 0);
+}
+
+TEST(ArtworkDisplayDeadline, LatenessReportsPastDeadlineSlip) {
+    const int64_t now = 10'000'000;
+    // A frame that arrived 600 ms after its shifted deadline reports exactly that slip, letting
+    // a consumer shorten its cross-fade (e.g. 2000 ms - 600 ms) so the fade still ends on time.
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now + 400 * US_PER_MS, 1000, now),
+              600 * US_PER_MS);
+    // Mid-track join: the artwork timestamp is minutes past, so the lateness is huge and the
+    // consumer can snap instead of fading.
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now - 120'000 * US_PER_MS, 0, now),
+              120'000 * US_PER_MS);
 }
 
 TEST(ArtworkDisplayDeadline, LargeOffsetDoesNotOverflow) {
     // INT32_MIN/MAX offsets must be widened to 64-bit before the ms-to-us multiply.
     const int64_t now = 10'000'000;
-    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now + US_PER_MS, INT32_MAX, now));
-    EXPECT_FALSE(ArtworkRole::Impl::display_deadline_reached(now - US_PER_MS, INT32_MIN, now));
+    EXPECT_GE(ArtworkRole::Impl::display_overdue_us(now + US_PER_MS, INT32_MAX, now), 0);
+    EXPECT_LT(ArtworkRole::Impl::display_overdue_us(now - US_PER_MS, INT32_MIN, now), 0);
 }

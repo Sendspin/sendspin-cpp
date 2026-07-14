@@ -176,12 +176,13 @@ struct ArtworkRole::Impl {
 
     void stop() const;
     void enqueue_stream_event(ArtworkEventType event) const;
-    // True if the display deadline for a held slot has been reached. client_ts is the
-    // server-clock deadline already converted to the client clock (0 = no connection, fire
-    // immediately); display_offset_ms shifts the deadline, positive firing early (mirroring
-    // PlayerRoleConfig::fixed_delay_us) and negative delaying. Pure and static for direct unit
-    // testing.
-    static bool display_deadline_reached(int64_t client_ts, int32_t display_offset_ms, int64_t now);
+    // How far past its display deadline a held slot is, in microseconds: >= 0 means due (the
+    // value is the lateness reported to on_image_display), < 0 means not yet due. client_ts is
+    // the server-clock deadline already converted to the client clock (0 = no connection: due
+    // immediately with lateness 0, since no deadline exists); display_offset_ms shifts the
+    // deadline, positive firing early (mirroring PlayerRoleConfig::fixed_delay_us) and negative
+    // delaying. Pure and static for direct unit testing.
+    static int64_t display_overdue_us(int64_t client_ts, int32_t display_offset_ms, int64_t now);
     // True if `slot` is within range and configured with require_frame_done.
     bool ack_enabled(uint8_t slot) const;
     // Sends a sentinel ARTWORK_RECHECK_SLOT notification to unblock the decode thread's queue

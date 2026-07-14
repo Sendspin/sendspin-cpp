@@ -148,18 +148,18 @@ void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
 // Display-deadline and ack-gate helpers (used from network, decode, and main threads)
 // ============================================================================
 
-bool ArtworkRole::Impl::display_deadline_reached(int64_t client_ts, int32_t display_offset_ms,
-                                                 int64_t now) {
+int64_t ArtworkRole::Impl::display_overdue_us(int64_t client_ts, int32_t display_offset_ms,
+                                              int64_t now) {
     // get_client_time returns 0 when there is no current connection. Without a connection we
     // cannot honor the server-clock deadline, so fire immediately rather than starving the
-    // listener. The check must precede the offset shift so the sentinel is never mistaken for a
-    // real deadline.
+    // listener; the lateness is 0 by definition since no deadline exists. The check must precede
+    // the offset shift so the sentinel is never mistaken for a real deadline.
     if (client_ts == 0) {
-        return true;
+        return 0;
     }
     // Positive display_offset_ms fires the display early (mirroring
     // PlayerRoleConfig::fixed_delay_us), negative delays it; see ImageSlotPreference.
-    return client_ts - static_cast<int64_t>(display_offset_ms) * US_PER_MS <= now;
+    return now - (client_ts - static_cast<int64_t>(display_offset_ms) * US_PER_MS);
 }
 
 bool ArtworkRole::Impl::ack_enabled(uint8_t slot) const {
@@ -439,7 +439,8 @@ void ArtworkRole::Impl::drain_events() {
         int32_t display_offset_ms = slot < this->config.preferred_formats.size()
                                         ? this->config.preferred_formats[slot].display_offset_ms
                                         : 0;
-        if (!display_deadline_reached(client_ts, display_offset_ms, now)) {
+        int64_t overdue_us = display_overdue_us(client_ts, display_offset_ms, now);
+        if (overdue_us < 0) {
             continue;
         }
         this->held_display_mask &= static_cast<uint8_t>(~(1U << slot));
@@ -451,7 +452,10 @@ void ArtworkRole::Impl::drain_events() {
             this->drain_task->slot_buffers[slot].ack_state = SlotAckState::PRESENTED;
         }
         if (this->listener) {
-            this->listener->on_image_display(slot);
+            // Clamp defensively: a lateness past UINT32_MAX ms (~49 days) is not meaningful.
+            uint32_t lateness_ms =
+                static_cast<uint32_t>(std::min<int64_t>(overdue_us / US_PER_MS, UINT32_MAX));
+            this->listener->on_image_display(slot, lateness_ms);
         }
     }
 }
