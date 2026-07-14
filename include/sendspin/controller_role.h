@@ -161,6 +161,9 @@ public:
     /// @brief Sends a controller command to the server
     /// @deprecated Use send_command(const ClientCommandControllerObject&) instead. This overload
     /// cannot carry seek parameters and will be removed in v0.8.0.
+    [[deprecated(
+        "use send_command(const ClientCommandControllerObject&); this overload cannot carry seek "
+        "parameters and will be removed in v0.8.0")]]
     void send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume = {},
                       std::optional<bool> mute = {});
 
