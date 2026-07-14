@@ -59,8 +59,7 @@ struct ControllerRole::Impl {
     // Consumer-facing method implementations
     // ========================================
 
-    void send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume,
-                      std::optional<bool> mute) const;
+    void send_command(const ClientCommandControllerObject& cmd) const;
 
     // ========================================
     // Fields

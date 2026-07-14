@@ -43,9 +43,13 @@ void ControllerRole::set_listener(ControllerRoleListener* listener) {
     this->impl_->listener = listener;
 }
 
+void ControllerRole::send_command(const ClientCommandControllerObject& cmd) {
+    this->impl_->send_command(cmd);
+}
+
 void ControllerRole::send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume,
                                   std::optional<bool> mute) {
-    this->impl_->send_command(cmd, volume, mute);
+    this->impl_->send_command({.command = cmd, .volume = volume, .muted = mute});
 }
 
 // ============================================================================
@@ -57,10 +61,8 @@ void ControllerRole::Impl::attach_inbox(Inbox& inbox) {
     this->event_state->slot.bind(inbox, INBOX_TOPIC_CONTROLLER);
 }
 
-void ControllerRole::Impl::send_command(SendspinControllerCommand cmd,
-                                        std::optional<uint8_t> volume,
-                                        std::optional<bool> mute) const {
-    std::string command_message = format_client_command_message(cmd, volume, mute);
+void ControllerRole::Impl::send_command(const ClientCommandControllerObject& cmd) const {
+    std::string command_message = format_client_command_message(cmd);
     this->client->send_text(command_message);
 }
 

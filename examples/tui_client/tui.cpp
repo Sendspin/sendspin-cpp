@@ -27,6 +27,14 @@ namespace sendspin {
 
 using namespace ftxui;
 
+// How far a single Shift+Arrow relative-seek jumps, in milliseconds.
+constexpr int32_t SEEK_STEP_MS = 10000;
+
+// Shift+Arrow key events. FTXUI predefines Ctrl+Arrow but not Shift+Arrow, so match the raw
+// xterm-style CSI sequences directly (modifier 2 = Shift): ESC [ 1 ; 2 D/C for Left/Right.
+static const Event kSeekBackEvent = Event::Special("\x1B[1;2D");     // Shift+Left
+static const Event kSeekForwardEvent = Event::Special("\x1B[1;2C");  // Shift+Right
+
 // Immutable snapshot of TuiState for rendering without holding the mutex.
 struct TuiSnapshot {
     std::string title;
@@ -193,7 +201,9 @@ static Element render_now_playing(const TuiSnapshot& snap) {
                 shortcut_label(snap, "Space", "<space>"),
                 text(" play/pause  ") | color(Color::White) | dim,
                 shortcut_label(snap, ">", "\u2192"),
-                text(" next") | color(Color::White) | dim,
+                text(" next  ") | color(Color::White) | dim,
+                shortcut_label(snap, "Seek", "\u21e7\u2190/\u21e7\u2192"),
+                text(" seek") | color(Color::White) | dim,
             }),
         });
     };
@@ -746,9 +756,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             set_highlight(state, "Space");
         }
         if (current == SendspinPlaybackState::PLAYING) {
-            client.controller()->send_command(SendspinControllerCommand::PAUSE);
+            client.controller()->send_command({.command = SendspinControllerCommand::PAUSE});
         } else {
-            client.controller()->send_command(SendspinControllerCommand::PLAY);
+            client.controller()->send_command({.command = SendspinControllerCommand::PLAY});
         }
         return true;
     }
@@ -759,7 +769,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, ">");
         }
-        client.controller()->send_command(SendspinControllerCommand::NEXT);
+        client.controller()->send_command({.command = SendspinControllerCommand::NEXT});
         return true;
     }
 
@@ -769,7 +779,30 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, "<");
         }
-        client.controller()->send_command(SendspinControllerCommand::PREVIOUS);
+        client.controller()->send_command({.command = SendspinControllerCommand::PREVIOUS});
+        return true;
+    }
+
+    // Seek backward (relative). Server clamps to the seekable range and ignores 'seek_relative' if
+    // it isn't in the controller's supported_commands.
+    if (event == kSeekBackEvent) {
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            set_highlight(state, "Seek");
+        }
+        client.controller()->send_command(
+            {.command = SendspinControllerCommand::SEEK_RELATIVE, .offset_ms = -SEEK_STEP_MS});
+        return true;
+    }
+
+    // Seek forward (relative)
+    if (event == kSeekForwardEvent) {
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            set_highlight(state, "Seek");
+        }
+        client.controller()->send_command(
+            {.command = SendspinControllerCommand::SEEK_RELATIVE, .offset_ms = SEEK_STEP_MS});
         return true;
     }
 
@@ -805,7 +838,8 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         }
         auto& cs = client.controller()->get_controller_state();
         uint8_t new_vol = static_cast<uint8_t>(std::min(100, cs.volume + 5));
-        client.controller()->send_command(SendspinControllerCommand::VOLUME, new_vol);
+        client.controller()->send_command(
+            {.command = SendspinControllerCommand::VOLUME, .volume = new_vol});
         return true;
     }
 
@@ -817,7 +851,8 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         }
         auto& cs = client.controller()->get_controller_state();
         uint8_t new_vol = static_cast<uint8_t>(std::max(0, cs.volume - 5));
-        client.controller()->send_command(SendspinControllerCommand::VOLUME, new_vol);
+        client.controller()->send_command(
+            {.command = SendspinControllerCommand::VOLUME, .volume = new_vol});
         return true;
     }
 
@@ -838,7 +873,8 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             set_highlight(state, "M");
         }
         auto& cs = client.controller()->get_controller_state();
-        client.controller()->send_command(SendspinControllerCommand::MUTE, std::nullopt, !cs.muted);
+        client.controller()->send_command(
+            {.command = SendspinControllerCommand::MUTE, .muted = !cs.muted});
         return true;
     }
 
@@ -852,13 +888,16 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         }
         switch (current) {
             case SendspinRepeatMode::OFF:
-                client.controller()->send_command(SendspinControllerCommand::REPEAT_ALL);
+                client.controller()->send_command(
+                    {.command = SendspinControllerCommand::REPEAT_ALL});
                 break;
             case SendspinRepeatMode::ALL:
-                client.controller()->send_command(SendspinControllerCommand::REPEAT_ONE);
+                client.controller()->send_command(
+                    {.command = SendspinControllerCommand::REPEAT_ONE});
                 break;
             case SendspinRepeatMode::ONE:
-                client.controller()->send_command(SendspinControllerCommand::REPEAT_OFF);
+                client.controller()->send_command(
+                    {.command = SendspinControllerCommand::REPEAT_OFF});
                 break;
         }
         return true;
@@ -872,8 +911,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             current = state.shuffle;
             set_highlight(state, "x");
         }
-        client.controller()->send_command(current ? SendspinControllerCommand::UNSHUFFLE
-                                                  : SendspinControllerCommand::SHUFFLE);
+        client.controller()->send_command({.command = current
+                                                          ? SendspinControllerCommand::UNSHUFFLE
+                                                          : SendspinControllerCommand::SHUFFLE});
         return true;
     }
 
@@ -883,7 +923,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, "g");
         }
-        client.controller()->send_command(SendspinControllerCommand::SWITCH);
+        client.controller()->send_command({.command = SendspinControllerCommand::SWITCH});
         return true;
     }
 

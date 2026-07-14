@@ -409,13 +409,6 @@ inline std::optional<SendspinRepeatMode> repeat_mode_from_string(const std::stri
     return std::nullopt;
 }
 
-/// @brief A playback command sent from the client to the server via client/command messages
-struct ClientCommandControllerObject {
-    SendspinControllerCommand command{};
-    std::optional<uint8_t> volume;
-    std::optional<bool> mute;
-};
-
 // --- artwork_role.h ---
 
 inline const char* to_cstr(SendspinImageFormat format) {
@@ -634,11 +627,6 @@ struct ClientStateMessage {
     std::optional<ClientPlayerStateObject> player{};
 };
 
-/// @brief Outgoing client/command message carrying a playback command to the server
-struct ClientCommandMessage {
-    std::optional<ClientCommandControllerObject> controller;
-};
-
 /// @brief Parsed server/state message containing per-role state updates
 struct ServerStateMessage {
     std::optional<ServerStateControllerObject> controller;
@@ -800,12 +788,9 @@ static constexpr size_t TIME_MESSAGE_BUF_SIZE = 96;
 size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmitted);
 
 /// @brief Formats a client/command message as a JSON string for sending to the server
-/// @param command The playback command to send.
-/// @param volume Optional volume level to include (0-100).
-/// @param mute Optional mute state to include.
+/// @param cmd The playback command plus any command-specific parameters. Only the parameter
+/// relevant to the command is serialized (e.g. position_ms for SEEK); others are ignored.
 /// @return Command message serialized into JSON format.
-std::string format_client_command_message(SendspinControllerCommand command,
-                                          std::optional<uint8_t> volume = std::nullopt,
-                                          std::optional<bool> mute = std::nullopt);
+std::string format_client_command_message(const ClientCommandControllerObject& cmd);
 
 }  // namespace sendspin
