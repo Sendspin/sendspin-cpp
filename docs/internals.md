@@ -84,7 +84,7 @@ TASK_ERROR           (1 << 11)  Allocation or decode failure
 TASK_IDLE            (1 << 12)  Waiting for work
 ```
 
-The sync task, visualizer drain thread, and artwork decode thread all use event flags for command signaling from the main loop and status reporting back. The artwork decode thread uses a simpler subset: `COMMAND_STOP` and `COMMAND_FLUSH`. The visualizer drain thread adds `COMMAND_CLEAR`, which discards buffered entries up to a 1-byte marker the network thread enqueues on `stream/start` and `stream/clear` (mirroring the sync task's clear-marker chunk) so frames received after the boundary survive; its `COMMAND_FLUSH` (drain to empty) is only used when the producer is already stopped (`stream/end`, cleanup).
+The sync task, visualizer drain thread, and artwork decode thread all use event flags for command signaling from the main loop and status reporting back. The artwork decode thread uses a simpler subset: just `COMMAND_STOP`. The visualizer drain thread adds `COMMAND_FLUSH` and `COMMAND_CLEAR`. `COMMAND_CLEAR` discards buffered entries up to a 1-byte marker the network thread enqueues on `stream/start` and `stream/clear` (mirroring the sync task's clear-marker chunk) so frames received after the boundary survive; `COMMAND_FLUSH` (drain to empty) is only used when the producer is already stopped (`stream/end`, cleanup).
 
 ### ThreadSafeQueue (`src/platform/thread_safe_queue.h`)
 
@@ -403,7 +403,7 @@ Two-dimensional state vector: `[offset, drift]`.
 - First measurement establishes the offset baseline.
 - Second measurement estimates initial drift from finite differences.
 - Subsequent measurements: predict offset forward by `drift * dt`, then correct using the new measurement.
-- Adaptive forgetting: if the residual exceeds `2.0 * max_error`, the covariance is inflated by a forgetting factor (1.1) to recover from step changes.
+- Adaptive forgetting: if the residual exceeds `3.0 * max_error`, the covariance is inflated by a forgetting factor (2.0) to recover from step changes.
 - Drift compensation is only enabled after 100 samples and only when drift significance exceeds its noise floor.
 
 The filter is protected by `state_mutex_` so that `compute_client_time()` can be called from the sync task thread while `update()` runs from the main loop thread.

@@ -33,6 +33,6 @@ macOS has mDNS support built in; no extra dependencies needed.
 
 The client listens on port 8928 by default. When mDNS is enabled it advertises `_sendspin._tcp` with the configured port so Sendspin servers on the local network discover and connect automatically; otherwise tell the server to connect with `ws://<this-host>:8928/sendspin`, replacing `8928` if you passed `-p`.
 
-If PortAudio is available, audio is played through the default output device. Otherwise, audio is discarded (NullAudioSink).
+If PortAudio is available, audio is played through the default output device. Otherwise, decoded audio is discarded (its byte count is tallied but nothing is played).
 
 Press Ctrl+C to stop.
