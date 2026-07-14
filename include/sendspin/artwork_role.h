@@ -60,9 +60,11 @@ public:
     /// @brief Called on the main loop thread at the correct timestamp when the decoded image
     /// should be displayed
     ///
-    /// Fires after on_image_decode() once the server timestamp is reached. If a newer frame for
-    /// the same slot finishes decoding before the pending display fires, the older pending
-    /// display is superseded and only the newer one is delivered.
+    /// Fires after on_image_decode() once the server timestamp is reached. The deadline can be
+    /// shifted per slot via ImageSlotPreference::display_offset_ms (positive fires early, e.g.
+    /// to start a cross-fade before the track boundary). If a newer frame for the same slot
+    /// finishes decoding before the pending display fires, the older pending display is
+    /// superseded and only the newer one is delivered.
     /// @param slot The artwork slot index.
     virtual void on_image_display(uint8_t /*slot*/) {}
 

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "artwork_role_impl.h"
+#include "constants.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 #include <gtest/gtest.h>
@@ -545,4 +546,48 @@ TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
     ASSERT_TRUE(listener.wait_for([&] { return count_for_slot(1) >= 3; }, POSITIVE_TIMEOUT));
 
     EXPECT_EQ(listener.decode_count_for_slot(0), 1U);
+}
+
+// ============================================================================
+// display_deadline_reached: the drain_events() display-deadline arithmetic, including the
+// per-slot display_offset_ms shift. Pure function, so tested directly: the integration tests
+// above all run without a connection (client_ts == 0), which bypasses the offset path.
+// ============================================================================
+
+TEST(ArtworkDisplayDeadline, NoConnectionSentinelFiresImmediately) {
+    // client_ts == 0 means no connection; fires regardless of offset in either direction.
+    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(0, 0, 5'000'000));
+    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(0, 1000, 5'000'000));
+    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(0, -1000, 5'000'000));
+}
+
+TEST(ArtworkDisplayDeadline, ZeroOffsetMatchesServerDeadline) {
+    const int64_t now = 10'000'000;  // 10 s in us
+    EXPECT_FALSE(ArtworkRole::Impl::display_deadline_reached(now + 1, 0, now));
+    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now, 0, now));
+    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now - 1, 0, now));
+}
+
+TEST(ArtworkDisplayDeadline, PositiveOffsetFiresEarly) {
+    const int64_t now = 10'000'000;
+    // Deadline 900 ms in the future, offset 1000 ms: already due.
+    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now + 900 * US_PER_MS, 1000, now));
+    // Deadline 1100 ms in the future, offset 1000 ms: still 100 ms out.
+    EXPECT_FALSE(ArtworkRole::Impl::display_deadline_reached(now + 1100 * US_PER_MS, 1000, now));
+    // Exact boundary: deadline minus offset equals now.
+    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now + 1000 * US_PER_MS, 1000, now));
+}
+
+TEST(ArtworkDisplayDeadline, NegativeOffsetDelays) {
+    const int64_t now = 10'000'000;
+    // Deadline 500 ms in the past, but a -1000 ms offset holds it another 500 ms.
+    EXPECT_FALSE(ArtworkRole::Impl::display_deadline_reached(now - 500 * US_PER_MS, -1000, now));
+    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now - 1000 * US_PER_MS, -1000, now));
+}
+
+TEST(ArtworkDisplayDeadline, LargeOffsetDoesNotOverflow) {
+    // INT32_MIN/MAX offsets must be widened to 64-bit before the ms-to-us multiply.
+    const int64_t now = 10'000'000;
+    EXPECT_TRUE(ArtworkRole::Impl::display_deadline_reached(now + US_PER_MS, INT32_MAX, now));
+    EXPECT_FALSE(ArtworkRole::Impl::display_deadline_reached(now - US_PER_MS, INT32_MIN, now));
 }

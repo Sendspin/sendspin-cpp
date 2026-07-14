@@ -145,8 +145,22 @@ void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
 }
 
 // ============================================================================
-// Ack-gate helpers (used from network, decode, and main threads)
+// Display-deadline and ack-gate helpers (used from network, decode, and main threads)
 // ============================================================================
+
+bool ArtworkRole::Impl::display_deadline_reached(int64_t client_ts, int32_t display_offset_ms,
+                                                 int64_t now) {
+    // get_client_time returns 0 when there is no current connection. Without a connection we
+    // cannot honor the server-clock deadline, so fire immediately rather than starving the
+    // listener. The check must precede the offset shift so the sentinel is never mistaken for a
+    // real deadline.
+    if (client_ts == 0) {
+        return true;
+    }
+    // Positive display_offset_ms fires the display early (mirroring
+    // PlayerRoleConfig::fixed_delay_us), negative delays it; see ImageSlotPreference.
+    return client_ts - static_cast<int64_t>(display_offset_ms) * US_PER_MS <= now;
+}
 
 bool ArtworkRole::Impl::ack_enabled(uint8_t slot) const {
     return slot < this->config.preferred_formats.size() &&
@@ -421,11 +435,11 @@ void ArtworkRole::Impl::drain_events() {
             }
             continue;
         }
-        // get_client_time returns 0 when there is no current connection. Without a connection we
-        // cannot honor the server-clock deadline, so fire immediately rather than starving the
-        // listener.
         int64_t client_ts = this->client->get_client_time(this->held_display_ts[slot]);
-        if (client_ts != 0 && client_ts > now) {
+        int32_t display_offset_ms = slot < this->config.preferred_formats.size()
+                                        ? this->config.preferred_formats[slot].display_offset_ms
+                                        : 0;
+        if (!display_deadline_reached(client_ts, display_offset_ms, now)) {
             continue;
         }
         this->held_display_mask &= static_cast<uint8_t>(~(1U << slot));
