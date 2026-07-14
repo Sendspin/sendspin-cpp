@@ -785,7 +785,7 @@ Configuration passed to `client.add_visualizer()`.
 | Field | Type | Description |
 |---|---|---|
 | `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`) |
-| `buffer_capacity` | `size_t` | Max total size in bytes of buffered visualizer messages, counting each message's full wire size |
+| `buffer_capacity` | `size_t` | Total RAM budget in bytes for the internal ring buffer. Per-entry overhead means only ~1/3 holds wire data; the client advertises that effective capacity to the server |
 | `rate_max` | `uint16_t` | Maximum periodic frames per second; set to the display refresh rate |
 | `spectrum` | `std::optional<VisualizerSpectrumConfig>` | Spectrum analysis parameters; required when `SPECTRUM` is in `types` |
 

@@ -228,10 +228,12 @@ struct VisualizerSpectrumConfig {
 struct VisualizerSupportObject {
     /// @brief Data types the client wants to receive
     std::vector<VisualizerDataType> types{};
-    /// @brief Max total size in bytes of buffered visualizer binary messages, counting each
-    /// message's full wire size (message-type byte + timestamp + data). This is also the total
-    /// RAM budget for the internal ring buffer; because each entry carries per-entry overhead,
-    /// roughly a third of it holds actual wire data
+    /// @brief Total RAM budget in bytes for the internal ring buffer (the exact allocation size).
+    /// This is not the amount of wire data that fits: each entry stores its full wire message
+    /// (message-type byte + timestamp + data) plus an aligned per-entry ItemHeader, so for the
+    /// small visualizer entries only roughly a third of this budget holds actual wire data. The
+    /// client advertises that effective (~1/3) capacity to the server, not this raw budget, so the
+    /// server's flow control does not overrun the ring
     size_t buffer_capacity{};
     /// @brief Maximum periodic visualization frames per second (applies to LOUDNESS, F_PEAK,
     /// SPECTRUM). Event types (BEAT, PEAK) are not throttled. Set to the display refresh rate

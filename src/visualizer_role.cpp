@@ -29,8 +29,9 @@ static const char* const TAG = "sendspin.visualizer";
 // ============================================================================
 
 // Each ring buffer entry preserves the full wire message: [wire_type(1)][server_ts(8)][payload].
-// This matches the spec's buffer_capacity accounting, which counts each message's full wire
-// size (message-type byte + timestamp + data).
+// buffer_capacity is the ring's total RAM budget, not a wire-data quota: on top of these bytes
+// each entry costs an aligned per-entry ItemHeader, so effective wire-data capacity is smaller
+// (see the buffer_capacity note in config.h).
 static constexpr size_t ENTRY_TYPE_SIZE = 1;
 static constexpr size_t TIMESTAMP_SIZE = 8;
 
@@ -42,6 +43,13 @@ static constexpr size_t PEAK_PAYLOAD_SIZE = 1;      // uint8 strength
 
 /// @brief Bit 0 of the beat flags byte marks a downbeat (bar start)
 static constexpr uint8_t BEAT_FLAG_DOWNBEAT = 0x01;
+
+// buffer_capacity is the ring's RAM budget, but each entry costs an 8-byte ItemHeader plus 8-byte
+// alignment on top of its wire message, so the smallest entries (beat/peak, 10 wire bytes -> 24
+// stored) leave only ~1/3 of the budget for actual wire data. Advertise that effective fraction to
+// the server (not the raw budget) so its flow control never sends more than the ring can hold. This
+// mirrors the player role's conservative buffer advertisement.
+static constexpr size_t BUFFER_ADVERTISE_DIVISOR = 3;
 
 // Event flag bits for drain thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
@@ -182,7 +190,13 @@ void VisualizerRole::Impl::stop() const {
 void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     if (this->visualizer_support.has_value()) {
         msg.supported_roles.push_back(SendspinRole::VISUALIZER);
-        msg.visualizer_support = this->visualizer_support.value();
+        // Advertise the effective wire-data capacity, not the raw RAM budget: the ring is sized at
+        // buffer_capacity bytes but per-entry overhead leaves only ~1/3 for wire data (see
+        // BUFFER_ADVERTISE_DIVISOR). The RAM allocation in the constructor still uses the full
+        // value.
+        VisualizerSupportObject advertised = this->visualizer_support.value();
+        advertised.buffer_capacity /= BUFFER_ADVERTISE_DIVISOR;
+        msg.visualizer_support = std::move(advertised);
     }
 }
 
