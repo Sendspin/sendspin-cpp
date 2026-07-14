@@ -204,12 +204,14 @@ namespace {
 
 // A visualizer Impl with a real ring buffer and no client (handle_binary never touches it).
 // Heap-allocated because Impl holds atomics and so is neither copyable nor movable. The stream is
-// marked active so handle_binary will accept messages.
+// marked active and all defined wire types are marked negotiated so handle_binary will accept
+// messages (bits 0-4 = wire types 16-20).
 std::unique_ptr<VisualizerRole::Impl> make_impl() {
     VisualizerRoleConfig config;
     config.support.buffer_capacity = 4096;
     auto impl = std::make_unique<VisualizerRole::Impl>(std::move(config), nullptr);
     impl->stream_active = true;
+    impl->negotiated_types_mask = 0x1F;
     return impl;
 }
 
@@ -285,18 +287,110 @@ TEST(VisualizerHandleBinary, ForwardsOversizedMessageWithoutCapping) {
     EXPECT_EQ(entry.size(), data.size() + 1);  // stored at full length, uncapped
 }
 
-TEST(VisualizerHandleBinary, ForwardsReservedTypeVerbatim) {
-    // The network thread is type-agnostic; reserved types are forwarded and dropped later by the
-    // drain thread's decode step.
+TEST(VisualizerHandleBinary, DropsUnnegotiatedType) {
+    // Only wire types the stream/start negotiated are admitted; a defined-but-unnegotiated type
+    // and a reserved type (which can never be negotiated) are both dropped at the network thread.
+    auto impl = make_impl();
+    impl->negotiated_types_mask =
+        1U << (SENDSPIN_BINARY_VISUALIZER_LOUDNESS - SENDSPIN_BINARY_VISUALIZER_FIRST);
+
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    put_be16(data, 0x0042);
+
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_BEAT, data.data(), data.size());
+    impl->handle_binary(21, data.data(), data.size());  // reserved type
+
+    std::vector<uint8_t> entry;
+    EXPECT_FALSE(pop_entry(*impl, entry));
+
+    // Control: the negotiated type is still forwarded.
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+    ASSERT_TRUE(pop_entry(*impl, entry));
+    EXPECT_EQ(entry[0], SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
+}
+
+TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
+    // handle_stream_start derives the admission mask from the advertised types.
+    auto impl = make_impl();
+    impl->negotiated_types_mask = 0;
+
+    ServerVisualizerStreamObject stream;
+    stream.types = {VisualizerDataType::BEAT};
+    impl->handle_stream_start(stream);
+
+    // stream/start enqueues a 1-byte boundary marker; consume it first.
+    std::vector<uint8_t> entry;
+    ASSERT_TRUE(pop_entry(*impl, entry));
+    ASSERT_EQ(entry.size(), 1U);
+
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    data.push_back(0x01);
+
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_BEAT, data.data(), data.size());
+    ASSERT_TRUE(pop_entry(*impl, entry));
+    EXPECT_EQ(entry[0], SENDSPIN_BINARY_VISUALIZER_BEAT);
+
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+    EXPECT_FALSE(pop_entry(*impl, entry));
+}
+
+// ============================================================================
+// Clear-boundary marker: stream/clear (and stream/start) enqueue a sentinel so
+// the drain thread discards exactly the entries that predate the boundary.
+// ============================================================================
+
+TEST(VisualizerClearMarker, StreamClearEnqueuesMarker) {
+    auto impl = make_impl();
+
+    impl->handle_stream_clear();
+
+    // The marker is a single 0xFF byte, outside the visualizer wire-type range.
+    std::vector<uint8_t> entry;
+    ASSERT_TRUE(pop_entry(*impl, entry));
+    ASSERT_EQ(entry.size(), 1U);
+    EXPECT_EQ(entry[0], 0xFF);
+}
+
+TEST(VisualizerClearMarker, DiscardPreservesPostClearFrames) {
+    auto impl = make_impl();
+
+    std::vector<uint8_t> pre;
+    put_be64(pre, 1);
+    put_be16(pre, 0x0001);
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, pre.data(), pre.size());
+
+    impl->handle_stream_clear();
+
+    std::vector<uint8_t> post;
+    put_be64(post, 2);
+    put_be16(post, 0x0002);
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, post.data(), post.size());
+
+    impl->discard_to_clear_marker();
+
+    // The pre-clear frame and the marker are gone; the post-clear frame survives.
+    std::vector<uint8_t> entry;
+    ASSERT_TRUE(pop_entry(*impl, entry));
+    EXPECT_EQ(entry[0], SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
+    EXPECT_EQ(entry.back(), 0x02);
+    EXPECT_FALSE(pop_entry(*impl, entry));
+}
+
+TEST(VisualizerClearMarker, DiscardDrainsToEmptyWithoutMarker) {
+    // If the marker is missing (failed enqueue or already consumed), the discard degrades to
+    // draining whatever is buffered.
     auto impl = make_impl();
 
     std::vector<uint8_t> data;
     put_be64(data, 1);
-    data.push_back(0x00);
+    put_be16(data, 0x0001);
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
 
-    impl->handle_binary(21, data.data(), data.size());
+    impl->discard_to_clear_marker();
 
     std::vector<uint8_t> entry;
-    ASSERT_TRUE(pop_entry(*impl, entry));
-    EXPECT_EQ(entry[0], 21);
+    EXPECT_FALSE(pop_entry(*impl, entry));
 }

@@ -113,6 +113,8 @@ struct VisualizerRole::Impl {
 
     void stop() const;
     void flush_ring_buffer() const;
+    void signal_clear_marker() const;
+    void discard_to_clear_marker() const;
     void enqueue_stream_event(VisualizerEventType event) const;
 
     static void drain_thread_func(VisualizerRole::Impl* self);
@@ -136,6 +138,11 @@ struct VisualizerRole::Impl {
     std::atomic<uint8_t> spectrum_bin_count{0};
     std::atomic<bool> tracks_downbeats{false};
     std::atomic<bool> stream_active{false};
+    // Bitmask of negotiated wire types, bit N = wire type SENDSPIN_BINARY_VISUALIZER_FIRST + N.
+    // Written by handle_stream_start and read by handle_binary on the same network thread, so
+    // admission is always judged against the config in force when a message arrives; atomic only
+    // because cleanup() clears it from the main thread.
+    std::atomic<uint8_t> negotiated_types_mask{0};
 };
 
 }  // namespace sendspin

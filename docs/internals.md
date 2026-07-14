@@ -84,7 +84,7 @@ TASK_ERROR           (1 << 11)  Allocation or decode failure
 TASK_IDLE            (1 << 12)  Waiting for work
 ```
 
-The sync task, visualizer drain thread, and artwork decode thread all use event flags for command signaling from the main loop and status reporting back. The artwork decode thread and visualizer drain thread use a simpler subset: `COMMAND_STOP` and `COMMAND_FLUSH`.
+The sync task, visualizer drain thread, and artwork decode thread all use event flags for command signaling from the main loop and status reporting back. The artwork decode thread uses a simpler subset: `COMMAND_STOP` and `COMMAND_FLUSH`. The visualizer drain thread adds `COMMAND_CLEAR`, which discards buffered entries up to a 1-byte marker the network thread enqueues on `stream/start` and `stream/clear` (mirroring the sync task's clear-marker chunk) so frames received after the boundary survive; its `COMMAND_FLUSH` (drain to empty) is only used when the producer is already stopped (`stream/end`, cleanup).
 
 ### ThreadSafeQueue (`src/platform/thread_safe_queue.h`)
 

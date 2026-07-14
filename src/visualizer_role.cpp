@@ -45,7 +45,20 @@ static constexpr uint8_t BEAT_FLAG_DOWNBEAT = 0x01;
 
 // Event flag bits for drain thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
-static constexpr uint32_t COMMAND_FLUSH = (1 << 1);
+static constexpr uint32_t COMMAND_FLUSH = (1 << 1);  // Drain to empty (producer already stopped)
+static constexpr uint32_t COMMAND_CLEAR = (1 << 2);  // Discard up to the clear marker entry
+
+// Sentinel entry marking a stream/start or stream/clear boundary in the ring buffer. Entries
+// before the marker predate the boundary and are discarded; entries after it survive. The value
+// is outside the visualizer wire-type range (16-23) so it can never collide with a real message,
+// and the entry is a single byte so the drain loop's minimum-size check drops any leftover marker
+// encountered in normal flow.
+static constexpr uint8_t ENTRY_TYPE_CLEAR_MARKER = 0xFF;
+
+/// @brief Timeout for enqueueing the clear marker. The drain thread is concurrently discarding,
+/// so a full buffer frees quickly; if this still times out the boundary is lost and the drain
+/// falls back to discarding everything it finds (matching the player's marker semantics).
+static constexpr uint32_t MARKER_ENQUEUE_TIMEOUT_MS = 100U;
 
 /// @brief Timeout for blocking ring buffer receive in drain thread (allows periodic command checks)
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 50U;
@@ -66,6 +79,23 @@ static int64_t read_be64(const uint8_t* p) {
 
 static uint16_t read_be16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0]) << 8 | static_cast<uint16_t>(p[1]);
+}
+
+/// @brief Maps a negotiated data type to its binary wire-type byte
+static uint8_t wire_type_for(sendspin::VisualizerDataType type) {
+    switch (type) {
+        case sendspin::VisualizerDataType::LOUDNESS:
+            return sendspin::SENDSPIN_BINARY_VISUALIZER_LOUDNESS;
+        case sendspin::VisualizerDataType::BEAT:
+            return sendspin::SENDSPIN_BINARY_VISUALIZER_BEAT;
+        case sendspin::VisualizerDataType::F_PEAK:
+            return sendspin::SENDSPIN_BINARY_VISUALIZER_F_PEAK;
+        case sendspin::VisualizerDataType::SPECTRUM:
+            return sendspin::SENDSPIN_BINARY_VISUALIZER_SPECTRUM;
+        case sendspin::VisualizerDataType::PEAK:
+            return sendspin::SENDSPIN_BINARY_VISUALIZER_PEAK;
+    }
+    return 0;
 }
 
 namespace sendspin {
@@ -171,12 +201,20 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
         return;
     }
 
+    // Admit only wire types the active stream negotiated in stream/start. The mask is written by
+    // handle_stream_start on this same thread, so a message is always judged against the config
+    // in force when it arrived. The caller guarantees binary_type is in the visualizer range.
+    uint8_t type_bit = 1U << (binary_type - SENDSPIN_BINARY_VISUALIZER_FIRST);
+    if ((this->negotiated_types_mask & type_bit) == 0) {
+        return;
+    }
+
     // Forward the raw message verbatim: [wire_type][server_ts(8)][payload]. Like the player and
     // artwork roles, the network thread stays dumb -- it records the message and hands it to the
-    // drain thread, which owns all structural validation and per-type truncation. The only check
-    // here is that a timestamp is present, since the drain thread needs it to schedule the entry.
-    // No size cap is applied: the ring buffer records each entry's length, so an oversized message
-    // is self-limiting (it either fits or is dropped when acquire() fails).
+    // drain thread, which owns all structural validation and per-type truncation. The only other
+    // check here is that a timestamp is present, since the drain thread needs it to schedule the
+    // entry. No size cap is applied: the ring buffer records each entry's length, so an oversized
+    // message is self-limiting (it either fits or is dropped when acquire() fails).
     if (len < TIMESTAMP_SIZE) {
         return;
     }
@@ -202,23 +240,25 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
 void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObject& stream) {
     // Cache stream config for handle_binary (same thread) and the drain thread
     uint8_t bin_count = 0;
+    uint8_t types_mask = 0;
     bool has_spectrum = false;
     for (auto type : stream.types) {
         if (type == VisualizerDataType::SPECTRUM) {
             has_spectrum = true;
         }
+        types_mask |= 1U << (wire_type_for(type) - SENDSPIN_BINARY_VISUALIZER_FIRST);
     }
     if (has_spectrum && stream.spectrum.has_value()) {
         bin_count = stream.spectrum->n_disp_bins;
     }
     this->spectrum_bin_count = bin_count;
     this->tracks_downbeats = stream.tracks_downbeats;
+    this->negotiated_types_mask = types_mask;
     this->stream_active = true;
 
-    // Signal drain thread to flush old data
-    if (this->drain_task) {
-        this->drain_task->event_flags.set(COMMAND_FLUSH);
-    }
+    // Mark the config boundary: buffered entries predate this (re)start and must be discarded,
+    // while entries arriving after it belong to the new config and must survive.
+    this->signal_clear_marker();
 
     // Write the config to the inbox slot for the main thread, then push the event. Both lock the
     // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
@@ -229,6 +269,7 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
 
 void VisualizerRole::Impl::handle_stream_end() {
     this->stream_active = false;
+    this->negotiated_types_mask = 0;
 
     if (this->drain_task) {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
@@ -239,10 +280,9 @@ void VisualizerRole::Impl::handle_stream_end() {
 
 void VisualizerRole::Impl::handle_stream_clear() {
     // Per spec, stream/clear discards buffered data but the stream stays active; data
-    // received after this message continues to flow.
-    if (this->drain_task) {
-        this->drain_task->event_flags.set(COMMAND_FLUSH);
-    }
+    // received after this message continues to flow. The marker separates the two: a blind
+    // flush would race this thread and drop post-clear frames it has already enqueued.
+    this->signal_clear_marker();
 
     this->enqueue_stream_event(VisualizerEventType::STREAM_CLEAR);
 }
@@ -291,6 +331,7 @@ void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event) c
 
 void VisualizerRole::Impl::cleanup() {
     this->stream_active = false;
+    this->negotiated_types_mask = 0;
 
     if (this->drain_task) {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
@@ -377,6 +418,47 @@ void VisualizerRole::Impl::flush_ring_buffer() const {
     }
 }
 
+void VisualizerRole::Impl::signal_clear_marker() const {
+    // Network-thread side of a clear boundary. Set the flag before enqueueing the marker (like
+    // PlayerRole::handle_stream_clear) so the drain thread starts discarding -- freeing ring
+    // space -- while we wait for the marker slot.
+    if (!this->drain_task || !this->drain_task->ring_buffer.is_created()) {
+        return;
+    }
+    this->drain_task->event_flags.set(COMMAND_CLEAR);
+
+    void* dest = this->drain_task->ring_buffer.acquire(1, MARKER_ENQUEUE_TIMEOUT_MS);
+    if (dest == nullptr) {
+        // Boundary lost: the drain thread will discard to empty instead, so frames enqueued
+        // after this point may be dropped along with the old ones (brief visual gap, no harm).
+        SS_LOGW(TAG, "Failed to enqueue clear marker; clear boundary may be imprecise");
+        return;
+    }
+    static_cast<uint8_t*>(dest)[0] = ENTRY_TYPE_CLEAR_MARKER;
+    this->drain_task->ring_buffer.commit(dest);
+}
+
+void VisualizerRole::Impl::discard_to_clear_marker() const {
+    // Drain-thread side of a clear boundary: discard entries up to and including the marker.
+    // Stopping at the marker preserves frames the network thread enqueued after the clear,
+    // which per spec must survive. If the buffer empties without a marker, either the marker
+    // could not be enqueued or it was already consumed in normal flow (it is a 1-byte entry,
+    // dropped by the drain loop's minimum-size check); nothing is left to discard either way.
+    if (!this->drain_task) {
+        return;
+    }
+    size_t item_size = 0;
+    void* item = nullptr;
+    while ((item = this->drain_task->ring_buffer.receive(&item_size, 0)) != nullptr) {
+        bool is_marker =
+            item_size == 1 && static_cast<const uint8_t*>(item)[0] == ENTRY_TYPE_CLEAR_MARKER;
+        this->drain_task->ring_buffer.return_item(item);
+        if (is_marker) {
+            return;
+        }
+    }
+}
+
 void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     SS_LOGD(TAG, "Drain thread started");
 
@@ -408,12 +490,17 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
 
     while (true) {
         // Non-blocking check for commands
-        uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, 0);
+        uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR, false, true, 0);
         if (cmd & COMMAND_STOP) {
             break;
         }
-        if (cmd & COMMAND_FLUSH) {
-            self->flush_ring_buffer();
+        if (cmd & (COMMAND_FLUSH | COMMAND_CLEAR)) {
+            if (cmd & COMMAND_FLUSH) {
+                self->flush_ring_buffer();
+            }
+            if (cmd & COMMAND_CLEAR) {
+                self->discard_to_clear_marker();
+            }
             continue;
         }
 
@@ -430,7 +517,9 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Entry format: [wire_type][server_ts(8)][payload]
+        // Entry format: [wire_type][server_ts(8)][payload]. This also drops any leftover 1-byte
+        // clear marker whose COMMAND_CLEAR was already handled (everything before it was consumed
+        // in order, so the boundary it marks has already been honored).
         if (item_size < ENTRY_TYPE_SIZE + TIMESTAMP_SIZE) {
             rb.return_item(item);
             continue;
@@ -450,14 +539,22 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         if (client_ts > now) {
             uint32_t wait_ms = static_cast<uint32_t>((client_ts - now) / US_PER_MS);
             if (wait_ms > 0) {
-                cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, wait_ms);
+                cmd =
+                    flags.wait(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR, false, true, wait_ms);
                 if (cmd & COMMAND_STOP) {
                     rb.return_item(item);
                     break;
                 }
-                if (cmd & COMMAND_FLUSH) {
+                if (cmd & (COMMAND_FLUSH | COMMAND_CLEAR)) {
+                    // The held item was popped before the signal, so it predates the boundary
+                    // and is discarded along with the buffered pre-boundary entries.
                     rb.return_item(item);
-                    self->flush_ring_buffer();
+                    if (cmd & COMMAND_FLUSH) {
+                        self->flush_ring_buffer();
+                    }
+                    if (cmd & COMMAND_CLEAR) {
+                        self->discard_to_clear_marker();
+                    }
                     continue;
                 }
             }

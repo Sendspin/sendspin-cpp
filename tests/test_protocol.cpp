@@ -378,8 +378,9 @@ TEST(Protocol, ServerHelloRejectsInvalidVersion) {
 
 // If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a non-zero
 // bin count must be present. Otherwise the expected size of binary spectrum messages would be
-// indeterminate, so the whole stream/start is rejected.
-TEST(Protocol, StreamStartRejectsSpectrumWithoutValidConfig) {
+// indeterminate, so the visualizer object is dropped -- but only the visualizer object: the message
+// itself still parses so a well-formed player/artwork start alongside it is not lost.
+TEST(Protocol, StreamStartDropsSpectrumWithoutValidConfig) {
     // (a) SPECTRUM advertised but no spectrum object at all.
     {
         JsonDocument doc;
@@ -388,7 +389,8 @@ TEST(Protocol, StreamStartRejectsSpectrumWithoutValidConfig) {
             R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"]}}})", doc,
             root));
         StreamStartMessage msg;
-        EXPECT_FALSE(process_stream_start_message(root, &msg));
+        EXPECT_TRUE(process_stream_start_message(root, &msg));
+        EXPECT_FALSE(msg.visualizer.has_value());
     }
     // (b) spectrum object present but n_disp_bins is zero.
     {
@@ -398,7 +400,8 @@ TEST(Protocol, StreamStartRejectsSpectrumWithoutValidConfig) {
                           R"("spectrum":{"n_disp_bins":0}}}})",
                           doc, root));
         StreamStartMessage msg;
-        EXPECT_FALSE(process_stream_start_message(root, &msg));
+        EXPECT_TRUE(process_stream_start_message(root, &msg));
+        EXPECT_FALSE(msg.visualizer.has_value());
     }
     // (c) n_disp_bins present but not an integer.
     {
@@ -408,7 +411,23 @@ TEST(Protocol, StreamStartRejectsSpectrumWithoutValidConfig) {
                           R"("spectrum":{"n_disp_bins":"32"}}}})",
                           doc, root));
         StreamStartMessage msg;
-        EXPECT_FALSE(process_stream_start_message(root, &msg));
+        EXPECT_TRUE(process_stream_start_message(root, &msg));
+        EXPECT_FALSE(msg.visualizer.has_value());
+    }
+    // (d) a valid player start in the same message survives the malformed visualizer object.
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{)"
+                          R"("player":{"codec":"pcm","sample_rate":48000,"channels":2,)"
+                          R"("bit_depth":16},)"
+                          R"("visualizer":{"types":["spectrum"]}}})",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_TRUE(process_stream_start_message(root, &msg));
+        EXPECT_FALSE(msg.visualizer.has_value());
+        ASSERT_TRUE(msg.player.has_value());
+        EXPECT_EQ(msg.player->sample_rate, 48000U);
     }
 
     // Control: SPECTRUM advertised with a valid config is accepted.
@@ -642,6 +661,13 @@ TEST(Protocol, FormatStreamRequestFormatVisualizer) {
     EXPECT_STREQ(doc2["payload"]["visualizer"]["types"][0], "spectrum");
     EXPECT_EQ(doc2["payload"]["visualizer"]["spectrum"]["n_disp_bins"].as<int>(), 16);
     EXPECT_STREQ(doc2["payload"]["visualizer"]["spectrum"]["scale"], "log");
+
+    // All-empty request: no "visualizer" key at all. A present-but-empty object could read as
+    // "reset to defaults" rather than "no change" on the server.
+    msg.visualizer = VisualizerFormatRequest{};
+    JsonDocument doc3;
+    ASSERT_FALSE(deserializeJson(doc3, format_stream_request_format_message(&msg)));
+    EXPECT_FALSE(doc3["payload"]["visualizer"].is<JsonObject>());
 }
 
 // Unset optional identity fields must not emit their keys.
