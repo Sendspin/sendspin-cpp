@@ -713,7 +713,7 @@ Main client configuration passed to the `SendspinClient` constructor.
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |
 | `server_port` | `uint16_t` | `8928` | WebSocket server port |
-| `server_max_connections` | `uint8_t` | `2` | Maximum simultaneous WebSocket connections (default supports the handoff protocol) |
+| `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye) |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |
 | `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |
 | `time_burst_interval_ms` | `int64_t` | `10000` | Milliseconds between time sync bursts |
