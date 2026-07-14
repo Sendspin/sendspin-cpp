@@ -597,7 +597,7 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
         // Parse seek_max_ms. Present only when the server offers 'seek' and the range is known;
         // left absent (nullopt) otherwise so consumers can distinguish "unknown range" from 0.
         if (auto v = read_uint_field<uint32_t>(controller_object["seek_max_ms"], "seek_max_ms")) {
-            controller_state.seek_max_ms = *v;
+            controller_state.seek_max_ms = v;
         }
 
         state_msg->controller = std::move(controller_state);
