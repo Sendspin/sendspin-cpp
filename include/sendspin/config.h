@@ -200,10 +200,11 @@ struct ArtworkRoleConfig {
 
 /// @brief Visualizer data stream types
 enum class VisualizerDataType : uint8_t {
-    BEAT,      // Beat detection events
+    BEAT,      // Musical beat events from tempo/beat tracking
     LOUDNESS,  // Overall loudness level
-    F_PEAK,    // Peak frequency
+    F_PEAK,    // Dominant frequency and amplitude
     SPECTRUM,  // Full frequency spectrum bins
+    PEAK,      // Energy onset (transient) events
 };
 
 /// @brief Frequency scale used for spectrum visualization bins
@@ -213,24 +214,31 @@ enum class VisualizerSpectrumScale : uint8_t {
     LIN,  // Linear scale
 };
 
-/// @brief Spectrum visualization parameters: bin count, frequency range, scale, and rate cap
+/// @brief Spectrum visualization parameters: bin count, frequency range, and scale
 struct VisualizerSpectrumConfig {
+    /// @brief Number of display bins (bars on a graphical equalizer). Capped at 255 by the
+    /// uint8_t width; typical equalizer bin counts are well below this
     uint8_t n_disp_bins;
     VisualizerSpectrumScale scale;
     uint16_t f_min;
     uint16_t f_max;
-    uint16_t rate_max;
 };
 
 /// @brief Visualizer capabilities advertised to the server during the hello handshake
 struct VisualizerSupportObject {
-    /// @brief Data types the client wants to receive.
-    /// The order here does not need to match the wire order: VisualizerRole normalizes this
-    /// list internally to LOUDNESS, F_PEAK, SPECTRUM, then BEAT (duplicates removed) before it
-    /// is sent, so the server always packs per-frame fields in the order the client parses them.
+    /// @brief Data types the client wants to receive
     std::vector<VisualizerDataType> types{};
+    /// @brief Total RAM budget in bytes for the internal ring buffer (the exact allocation size).
+    /// This is not the amount of wire data that fits: each entry stores its full wire message
+    /// (message-type byte + timestamp + data) plus an aligned per-entry ItemHeader, so for the
+    /// small visualizer entries only roughly a third of this budget holds actual wire data. The
+    /// client advertises that effective (~1/3) capacity to the server, not this raw budget, so the
+    /// server's flow control does not overrun the ring
     size_t buffer_capacity{};
-    uint8_t batch_max{};
+    /// @brief Maximum periodic visualization frames per second (applies to LOUDNESS, F_PEAK,
+    /// SPECTRUM). Event types (BEAT, PEAK) are not throttled. Set to the display refresh rate
+    uint16_t rate_max{};
+    /// @brief Spectrum configuration, required if types includes SPECTRUM
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 

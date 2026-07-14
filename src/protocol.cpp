@@ -649,55 +649,40 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         if (vis_json["types"].is<JsonArray>()) {
             JsonArray types_array = vis_json["types"].as<JsonArray>();
             for (JsonVariant type_var : types_array) {
-                if (type_var.is<const char*>()) {
-                    std::string type_str = type_var.as<std::string>();
-                    if (type_str == "loudness") {
-                        vis_obj.types.push_back(VisualizerDataType::LOUDNESS);
-                    } else if (type_str == "f_peak") {
-                        vis_obj.types.push_back(VisualizerDataType::F_PEAK);
-                    } else if (type_str == "spectrum") {
-                        vis_obj.types.push_back(VisualizerDataType::SPECTRUM);
-                    } else if (type_str == "beat") {
-                        vis_obj.types.push_back(VisualizerDataType::BEAT);
-                    }
+                if (auto type =
+                        read_enum_field(type_var, "types", visualizer_data_type_from_string)) {
+                    vis_obj.types.push_back(*type);
                 }
             }
         }
 
-        if (auto v = read_uint_field<uint8_t>(vis_json["batch_max"], "batch_max")) {
-            vis_obj.batch_max = *v;
+        if (auto v = read_uint_field<uint16_t>(vis_json["rate_max"], "rate_max")) {
+            vis_obj.rate_max = *v;
         }
 
-        // Parse spectrum config if present
+        if (auto v = read_bool_field(vis_json["tracks_downbeats"], "tracks_downbeats")) {
+            vis_obj.tracks_downbeats = *v;
+        }
+
+        // Parse spectrum config if present. Every field is required by the spec; if any is
+        // absent or malformed, leave the config unset so the SPECTRUM validation below rejects
+        // the stream rather than acting on a fabricated default.
         if (vis_json["spectrum"].is<JsonObject>()) {
             JsonObject spec_json = vis_json["spectrum"];
-            VisualizerSpectrumConfig spec_cfg{};
-            if (auto v = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins", 1)) {
-                spec_cfg.n_disp_bins = *v;
+            auto n_disp_bins = read_uint_field<uint8_t>(spec_json["n_disp_bins"], "n_disp_bins", 1);
+            auto scale =
+                read_enum_field(spec_json["scale"], "scale", visualizer_spectrum_scale_from_string);
+            auto f_min = read_uint_field<uint16_t>(spec_json["f_min"], "f_min");
+            auto f_max = read_uint_field<uint16_t>(spec_json["f_max"], "f_max");
+            if (n_disp_bins && scale && f_min && f_max) {
+                vis_obj.spectrum = VisualizerSpectrumConfig{*n_disp_bins, *scale, *f_min, *f_max};
             }
-            std::string scale_str = spec_json["scale"].as<std::string>();
-            if (scale_str == "log") {
-                spec_cfg.scale = VisualizerSpectrumScale::LOG;
-            } else if (scale_str == "lin") {
-                spec_cfg.scale = VisualizerSpectrumScale::LIN;
-            } else {
-                spec_cfg.scale = VisualizerSpectrumScale::MEL;
-            }
-            if (auto v = read_uint_field<uint16_t>(spec_json["f_min"], "f_min")) {
-                spec_cfg.f_min = *v;
-            }
-            if (auto v = read_uint_field<uint16_t>(spec_json["f_max"], "f_max")) {
-                spec_cfg.f_max = *v;
-            }
-            if (auto v = read_uint_field<uint16_t>(spec_json["rate_max"], "rate_max")) {
-                spec_cfg.rate_max = *v;
-            }
-            vis_obj.spectrum = spec_cfg;
         }
 
-        // If SPECTRUM is advertised, a valid spectrum config with a non-zero bin count must be
-        // present; otherwise raw_frame_size is indeterminate and subsequent binary visualizer
-        // frames would misparse.
+        // If SPECTRUM is advertised, a fully valid spectrum config must be present; otherwise the
+        // expected size of binary spectrum messages is indeterminate and they could not be
+        // validated. The defect is local to the visualizer object, so drop only that object and
+        // let a well-formed player/artwork start in the same message go through.
         bool advertises_spectrum = false;
         for (auto type : vis_obj.types) {
             if (type == VisualizerDataType::SPECTRUM) {
@@ -705,14 +690,12 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
                 break;
             }
         }
-        if (advertises_spectrum &&
-            (!vis_obj.spectrum.has_value() || vis_obj.spectrum->n_disp_bins == 0)) {
-            SS_LOGE(TAG, "Invalid stream/start message: SPECTRUM advertised without valid spectrum "
-                         "config");
-            return false;
+        if (advertises_spectrum && !vis_obj.spectrum.has_value()) {
+            SS_LOGE(TAG, "Ignoring visualizer stream config: SPECTRUM advertised without valid "
+                         "spectrum config");
+        } else {
+            stream_msg->visualizer = std::move(vis_obj);
         }
-
-        stream_msg->visualizer = std::move(vis_obj);
     }
 
     return true;
@@ -827,6 +810,15 @@ void apply_color_state_deltas(ServerColorStateObject* current, const ServerColor
 
 // Message formatting
 
+// Writes a spectrum config as the "spectrum" key of a visualizer JSON object. Shared between
+// client/hello and stream/request-format so the two serializations cannot silently diverge.
+static void write_visualizer_spectrum(JsonObject vis_json, const VisualizerSpectrumConfig& spec) {
+    vis_json["spectrum"]["n_disp_bins"] = spec.n_disp_bins;
+    vis_json["spectrum"]["scale"] = to_cstr(spec.scale);
+    vis_json["spectrum"]["f_min"] = spec.f_min;
+    vis_json["spectrum"]["f_max"] = spec.f_max;
+}
+
 std::string format_client_hello_message(const ClientHelloMessage* msg) {
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();
@@ -887,22 +879,15 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
 
     if (msg->visualizer_support.has_value()) {
         const auto& vis = msg->visualizer_support.value();
-        JsonArray types_list =
-            root["payload"]["visualizer@_draft_r1_support"]["types"].to<JsonArray>();
+        JsonObject vis_json = root["payload"]["visualizer@v1_support"].to<JsonObject>();
+        JsonArray types_list = vis_json["types"].to<JsonArray>();
         for (const auto& type : vis.types) {
             types_list.add(to_cstr(type));
         }
-        root["payload"]["visualizer@_draft_r1_support"]["buffer_capacity"] = vis.buffer_capacity;
-        root["payload"]["visualizer@_draft_r1_support"]["batch_max"] = vis.batch_max;
+        vis_json["buffer_capacity"] = vis.buffer_capacity;
+        vis_json["rate_max"] = vis.rate_max;
         if (vis.spectrum.has_value()) {
-            const auto& spec = vis.spectrum.value();
-            root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["n_disp_bins"] =
-                spec.n_disp_bins;
-            root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["scale"] =
-                to_cstr(spec.scale);
-            root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["f_min"] = spec.f_min;
-            root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["f_max"] = spec.f_max;
-            root["payload"]["visualizer@_draft_r1_support"]["spectrum"]["rate_max"] = spec.rate_max;
+            write_visualizer_spectrum(vis_json, vis.spectrum.value());
         }
     }
 
@@ -975,6 +960,28 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
         }
         if (artwork.media_height.has_value()) {
             root["payload"]["artwork"]["media_height"] = artwork.media_height.value();
+        }
+    }
+
+    if (msg->visualizer.has_value()) {
+        const auto& vis = msg->visualizer.value();
+        // Only create the "visualizer" key when at least one field is set: an all-empty request
+        // must emit no key at all, since a present-but-empty object could read as "reset to
+        // defaults" rather than "no change" on the server.
+        if (vis.types.has_value() || vis.rate_max.has_value() || vis.spectrum.has_value()) {
+            JsonObject vis_json = root["payload"]["visualizer"].to<JsonObject>();
+            if (vis.types.has_value()) {
+                JsonArray types_list = vis_json["types"].to<JsonArray>();
+                for (const auto& type : vis.types.value()) {
+                    types_list.add(to_cstr(type));
+                }
+            }
+            if (vis.rate_max.has_value()) {
+                vis_json["rate_max"] = vis.rate_max.value();
+            }
+            if (vis.spectrum.has_value()) {
+                write_visualizer_spectrum(vis_json, vis.spectrum.value());
+            }
         }
     }
 

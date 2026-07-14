@@ -903,6 +903,18 @@ SS_HOT void SendspinClient::process_binary_message(const uint8_t* payload, size_
     const uint8_t* data = payload + 1;
     size_t data_len = len - 1;
 
+    // The visualizer role has an expanded 8-slot allocation (IDs 16-23), so it is
+    // dispatched by ID range before the standard 4-slot role decoding below
+    if (binary_type >= SENDSPIN_BINARY_VISUALIZER_FIRST &&
+        binary_type <= SENDSPIN_BINARY_VISUALIZER_LAST) {
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+        if (this->visualizer_) {
+            this->visualizer_->impl_->handle_binary(binary_type, data, data_len);
+        }
+#endif
+        return;
+    }
+
     switch (role) {
         case SENDSPIN_ROLE_PLAYER: {
 #ifdef SENDSPIN_ENABLE_PLAYER
@@ -920,14 +932,6 @@ SS_HOT void SendspinClient::process_binary_message(const uint8_t* payload, size_
 #ifdef SENDSPIN_ENABLE_ARTWORK
             if (this->artwork_) {
                 this->artwork_->impl_->handle_binary(slot, data, data_len);
-            }
-#endif
-            break;
-        }
-        case SENDSPIN_ROLE_VISUALIZER: {
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-            if (this->visualizer_) {
-                this->visualizer_->impl_->handle_binary(binary_type, data, data_len);
             }
 #endif
             break;

@@ -28,26 +28,45 @@ static const char* const TAG = "sendspin.visualizer";
 // Entry format constants
 // ============================================================================
 
-// Type tag in first byte of each ring buffer entry
-static constexpr uint8_t ENTRY_BEAT = 0x00;
-static constexpr uint8_t ENTRY_FRAME = 0x80;  // bit 7 distinguishes frame from beat
-
-// Frame field flags packed into bits 0-2 of the type byte
-static constexpr uint8_t FLAG_HAS_LOUDNESS = (1 << 0);
-static constexpr uint8_t FLAG_HAS_F_PEAK = (1 << 1);
-static constexpr uint8_t FLAG_HAS_SPECTRUM = (1 << 2);
-
-/// @brief Mask to extract the flags portion (bits 0-6) from a frame type byte
-static constexpr uint8_t FRAME_FLAGS_MASK = 0x7FU;
-
-// Entry header sizes (before the 8-byte server timestamp)
-static constexpr size_t FRAME_HEADER_SIZE = 2;  // type+flags byte, bin_count byte
-static constexpr size_t BEAT_HEADER_SIZE = 1;   // type byte only
+// Each ring buffer entry preserves the full wire message: [wire_type(1)][server_ts(8)][payload].
+// buffer_capacity is the ring's total RAM budget, not a wire-data quota: on top of these bytes
+// each entry costs an aligned per-entry ItemHeader, so effective wire-data capacity is smaller
+// (see the buffer_capacity note in config.h).
+static constexpr size_t ENTRY_TYPE_SIZE = 1;
 static constexpr size_t TIMESTAMP_SIZE = 8;
+
+// Minimum payload bytes after the timestamp, per wire message type
+static constexpr size_t LOUDNESS_PAYLOAD_SIZE = 2;  // uint16 value
+static constexpr size_t BEAT_PAYLOAD_SIZE = 1;      // uint8 flags
+static constexpr size_t F_PEAK_PAYLOAD_SIZE = 4;    // uint16 freq + uint16 amp
+static constexpr size_t PEAK_PAYLOAD_SIZE = 1;      // uint8 strength
+
+/// @brief Bit 0 of the beat flags byte marks a downbeat (bar start)
+static constexpr uint8_t BEAT_FLAG_DOWNBEAT = 0x01;
+
+// buffer_capacity is the ring's RAM budget, but each entry costs an 8-byte ItemHeader plus 8-byte
+// alignment on top of its wire message, so the smallest entries (beat/peak, 10 wire bytes -> 24
+// stored) leave only ~1/3 of the budget for actual wire data. Advertise that effective fraction to
+// the server (not the raw budget) so its flow control never sends more than the ring can hold. This
+// mirrors the player role's conservative buffer advertisement.
+static constexpr size_t BUFFER_ADVERTISE_DIVISOR = 3;
 
 // Event flag bits for drain thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
-static constexpr uint32_t COMMAND_FLUSH = (1 << 1);
+static constexpr uint32_t COMMAND_FLUSH = (1 << 1);  // Drain to empty (producer already stopped)
+static constexpr uint32_t COMMAND_CLEAR = (1 << 2);  // Discard up to the clear marker entry
+
+// Sentinel entry marking a stream/start or stream/clear boundary in the ring buffer. Entries
+// before the marker predate the boundary and are discarded; entries after it survive. The value
+// is outside the visualizer wire-type range (16-23) so it can never collide with a real message,
+// and the entry is a single byte so the drain loop's minimum-size check drops any leftover marker
+// encountered in normal flow.
+static constexpr uint8_t ENTRY_TYPE_CLEAR_MARKER = 0xFF;
+
+/// @brief Timeout for enqueueing the clear marker. The drain thread is concurrently discarding,
+/// so a full buffer frees quickly; if this still times out the boundary is lost and the drain
+/// falls back to discarding everything it finds (matching the player's marker semantics).
+static constexpr uint32_t MARKER_ENQUEUE_TIMEOUT_MS = 100U;
 
 /// @brief Timeout for blocking ring buffer receive in drain thread (allows periodic command checks)
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 50U;
@@ -70,56 +89,24 @@ static uint16_t read_be16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0]) << 8 | static_cast<uint16_t>(p[1]);
 }
 
-namespace sendspin {
-
-namespace {
-
-// The server packs per-frame fields in the order of the `types` list advertised in the
-// client's hello (see ClientHelloMessage::visualizer_support), but the drain thread parser
-// always reads fields in a fixed order: LOUDNESS, then F_PEAK, then SPECTRUM (see
-// drain_thread_func below). If the advertised order did not match, the server would pack
-// fields in an order the parser cannot decode correctly. Reorder (and de-duplicate) the
-// advertised types here so the wire order always matches the parser, regardless of what
-// order the caller populated VisualizerRoleConfig::support.types in. BEAT is not a per-frame
-// field (it arrives as a separate binary message type), so it is kept but sorted last. Any
-// type the parser does not recognize is dropped, since the fixed-order parser cannot decode a
-// field it does not understand.
-std::vector<VisualizerDataType> normalize_type_order(const std::vector<VisualizerDataType>& types) {
-    bool has_loudness = false;
-    bool has_f_peak = false;
-    bool has_spectrum = false;
-    bool has_beat = false;
-
-    for (auto type : types) {
-        if (type == VisualizerDataType::LOUDNESS) {
-            has_loudness = true;
-        } else if (type == VisualizerDataType::F_PEAK) {
-            has_f_peak = true;
-        } else if (type == VisualizerDataType::SPECTRUM) {
-            has_spectrum = true;
-        } else if (type == VisualizerDataType::BEAT) {
-            has_beat = true;
-        }
+/// @brief Maps a negotiated data type to its binary wire-type byte
+static uint8_t wire_type_for(sendspin::VisualizerDataType type) {
+    switch (type) {
+        case sendspin::VisualizerDataType::LOUDNESS:
+            return sendspin::SENDSPIN_BINARY_VISUALIZER_LOUDNESS;
+        case sendspin::VisualizerDataType::BEAT:
+            return sendspin::SENDSPIN_BINARY_VISUALIZER_BEAT;
+        case sendspin::VisualizerDataType::F_PEAK:
+            return sendspin::SENDSPIN_BINARY_VISUALIZER_F_PEAK;
+        case sendspin::VisualizerDataType::SPECTRUM:
+            return sendspin::SENDSPIN_BINARY_VISUALIZER_SPECTRUM;
+        case sendspin::VisualizerDataType::PEAK:
+            return sendspin::SENDSPIN_BINARY_VISUALIZER_PEAK;
     }
-
-    std::vector<VisualizerDataType> ordered;
-    ordered.reserve(types.size());
-    if (has_loudness) {
-        ordered.push_back(VisualizerDataType::LOUDNESS);
-    }
-    if (has_f_peak) {
-        ordered.push_back(VisualizerDataType::F_PEAK);
-    }
-    if (has_spectrum) {
-        ordered.push_back(VisualizerDataType::SPECTRUM);
-    }
-    if (has_beat) {
-        ordered.push_back(VisualizerDataType::BEAT);
-    }
-    return ordered;
+    return 0;
 }
 
-}  // namespace
+namespace sendspin {
 
 // ============================================================================
 // Impl constructor / destructor
@@ -131,16 +118,12 @@ VisualizerRole::Impl::Impl(VisualizerRoleConfig config, SendspinClient* client)
       client(client),
       event_state(std::make_unique<EventState>()) {
     if (this->visualizer_support.has_value()) {
-        // Normalize the advertised type order so the server packs fields in the order the
-        // drain thread parser expects. See normalize_type_order() above for the constraint.
-        this->visualizer_support->types = normalize_type_order(this->visualizer_support->types);
-
         this->drain_task = std::make_unique<DrainTask>();
 
-        // The ring buffer needs more space than the raw data capacity because each entry
-        // has internal overhead: an 8-byte ItemHeader plus our 1-2 byte entry header, all
-        // aligned to 8 bytes. Allocate 3x the advertised capacity to account for this.
-        size_t capacity = this->visualizer_support->buffer_capacity * 3;
+        // buffer_capacity is the total RAM budget for the ring buffer. Each entry carries an
+        // 8-byte ItemHeader aligned to 8 bytes, so with the small visualizer entries roughly a
+        // third of this storage holds actual wire data and the rest is per-entry overhead.
+        size_t capacity = this->visualizer_support->buffer_capacity;
         if (this->drain_task->ring_storage.allocate(capacity)) {
             this->drain_task->ring_buffer.create(capacity, this->drain_task->ring_storage.data());
         }
@@ -162,6 +145,10 @@ VisualizerRole::~VisualizerRole() = default;
 
 void VisualizerRole::set_listener(VisualizerRoleListener* listener) {
     this->impl_->listener = listener;
+}
+
+void VisualizerRole::request_format(const VisualizerFormatRequest& request) {
+    this->impl_->request_format(request);
 }
 
 // ============================================================================
@@ -203,8 +190,20 @@ void VisualizerRole::Impl::stop() const {
 void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     if (this->visualizer_support.has_value()) {
         msg.supported_roles.push_back(SendspinRole::VISUALIZER);
-        msg.visualizer_support = this->visualizer_support.value();
+        // Advertise the effective wire-data capacity, not the raw RAM budget: the ring is sized at
+        // buffer_capacity bytes but per-entry overhead leaves only ~1/3 for wire data (see
+        // BUFFER_ADVERTISE_DIVISOR). The RAM allocation in the constructor still uses the full
+        // value.
+        VisualizerSupportObject advertised = this->visualizer_support.value();
+        advertised.buffer_capacity /= BUFFER_ADVERTISE_DIVISOR;
+        msg.visualizer_support = std::move(advertised);
     }
+}
+
+void VisualizerRole::Impl::request_format(const VisualizerFormatRequest& request) const {
+    StreamRequestFormatMessage msg{};
+    msg.visualizer = request;
+    this->client->send_text(format_stream_request_format_message(&msg));
 }
 
 // ============================================================================
@@ -216,70 +215,36 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
         return;
     }
 
-    // Build the frame flags byte from cached config
-    uint8_t flags = ENTRY_FRAME;
-    if (this->has_loudness) {
-        flags |= FLAG_HAS_LOUDNESS;
-    }
-    if (this->has_f_peak) {
-        flags |= FLAG_HAS_F_PEAK;
-    }
-    if (this->has_spectrum) {
-        flags |= FLAG_HAS_SPECTRUM;
+    // Admit only wire types the active stream negotiated in stream/start. The mask is written by
+    // handle_stream_start on this same thread, so a message is always judged against the config
+    // in force when it arrived. The caller guarantees binary_type is in the visualizer range.
+    uint8_t type_bit = 1U << (binary_type - SENDSPIN_BINARY_VISUALIZER_FIRST);
+    if ((this->negotiated_types_mask & type_bit) == 0) {
+        return;
     }
 
-    if (binary_type == SENDSPIN_BINARY_VISUALIZER_BEAT) {
-        // Beat format: [num_beats(1)][per-beat: server_timestamp(8)]
-        if (len < 1) {
-            return;
-        }
-        uint8_t num_beats = data[0];
-        size_t offset = 1;
-
-        for (uint8_t i = 0; i < num_beats; ++i) {
-            if (offset + TIMESTAMP_SIZE > len) {
-                break;
-            }
-
-            // Build beat entry: [ENTRY_BEAT][8-byte server_ts]
-            uint8_t entry[BEAT_HEADER_SIZE + TIMESTAMP_SIZE];
-            entry[0] = ENTRY_BEAT;
-            std::memcpy(entry + BEAT_HEADER_SIZE, data + offset, TIMESTAMP_SIZE);
-
-            this->drain_task->ring_buffer.send(entry, sizeof(entry), 0);
-            offset += TIMESTAMP_SIZE;
-        }
-    } else {
-        // Visualizer data format: [num_frames(1)][per-frame: timestamp(8) + fields...]
-        if (len < 1) {
-            return;
-        }
-        uint8_t num_frames = data[0];
-        size_t offset = 1;
-        size_t wire_frame_size = TIMESTAMP_SIZE + this->raw_frame_size;
-        size_t entry_size = FRAME_HEADER_SIZE + TIMESTAMP_SIZE + this->raw_frame_size;
-
-        for (uint8_t i = 0; i < num_frames; ++i) {
-            if (offset + wire_frame_size > len) {
-                break;
-            }
-
-            // Build frame entry: [flags][bin_count][8-byte server_ts][raw field bytes]
-            // Use acquire+commit to avoid double-copy
-            void* dest = this->drain_task->ring_buffer.acquire(entry_size, 0);
-            if (dest == nullptr) {
-                break;  // Buffer full, drop remaining frames
-            }
-
-            auto* entry = static_cast<uint8_t*>(dest);
-            entry[0] = flags;
-            entry[1] = this->spectrum_bin_count;
-            std::memcpy(entry + FRAME_HEADER_SIZE, data + offset, wire_frame_size);
-
-            this->drain_task->ring_buffer.commit(dest);
-            offset += wire_frame_size;
-        }
+    // Forward the raw message verbatim: [wire_type][server_ts(8)][payload]. Like the player and
+    // artwork roles, the network thread stays dumb -- it records the message and hands it to the
+    // drain thread, which owns all structural validation and per-type truncation. The only other
+    // check here is that a timestamp is present, since the drain thread needs it to schedule the
+    // entry. No size cap is applied: the ring buffer records each entry's length, so an oversized
+    // message is self-limiting (it either fits or is dropped when acquire() fails).
+    if (len < TIMESTAMP_SIZE) {
+        return;
     }
+
+    // Build entry: [wire_type][server_ts(8)][payload]. Use acquire+commit to avoid double-copy.
+    size_t entry_size = ENTRY_TYPE_SIZE + len;
+    void* dest = this->drain_task->ring_buffer.acquire(entry_size, 0);
+    if (dest == nullptr) {
+        return;  // Buffer full, drop
+    }
+
+    auto* entry = static_cast<uint8_t*>(dest);
+    entry[0] = binary_type;
+    std::memcpy(entry + ENTRY_TYPE_SIZE, data, len);
+
+    this->drain_task->ring_buffer.commit(dest);
 }
 
 // ============================================================================
@@ -287,35 +252,27 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
 // ============================================================================
 
 void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObject& stream) {
-    // Cache stream config for handle_binary (same thread)
-    this->has_loudness = false;
-    this->has_f_peak = false;
-    this->has_spectrum = false;
-    this->spectrum_bin_count = 0;
-
+    // Cache stream config for handle_binary (same thread) and the drain thread
+    uint8_t bin_count = 0;
+    uint8_t types_mask = 0;
+    bool has_spectrum = false;
     for (auto type : stream.types) {
-        if (type == VisualizerDataType::LOUDNESS) {
-            this->has_loudness = true;
-        }
-        if (type == VisualizerDataType::F_PEAK) {
-            this->has_f_peak = true;
-        }
         if (type == VisualizerDataType::SPECTRUM) {
-            this->has_spectrum = true;
+            has_spectrum = true;
         }
+        types_mask |= 1U << (wire_type_for(type) - SENDSPIN_BINARY_VISUALIZER_FIRST);
     }
-    if (this->has_spectrum && stream.spectrum.has_value()) {
-        this->spectrum_bin_count = stream.spectrum->n_disp_bins;
+    if (has_spectrum && stream.spectrum.has_value()) {
+        bin_count = stream.spectrum->n_disp_bins;
     }
-
-    this->raw_frame_size = (this->has_loudness ? 2 : 0) + (this->has_f_peak ? 2 : 0) +
-                           (this->has_spectrum ? 2 * this->spectrum_bin_count : 0);
+    this->spectrum_bin_count = bin_count;
+    this->tracks_downbeats = stream.tracks_downbeats;
+    this->negotiated_types_mask = types_mask;
     this->stream_active = true;
 
-    // Signal drain thread to flush old data
-    if (this->drain_task) {
-        this->drain_task->event_flags.set(COMMAND_FLUSH);
-    }
+    // Mark the config boundary: buffered entries predate this (re)start and must be discarded,
+    // while entries arriving after it belong to the new config and must survive.
+    this->signal_clear_marker();
 
     // Write the config to the inbox slot for the main thread, then push the event. Both lock the
     // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
@@ -326,6 +283,7 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
 
 void VisualizerRole::Impl::handle_stream_end() {
     this->stream_active = false;
+    this->negotiated_types_mask = 0;
 
     if (this->drain_task) {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
@@ -334,12 +292,11 @@ void VisualizerRole::Impl::handle_stream_end() {
     this->enqueue_stream_event(VisualizerEventType::STREAM_END);
 }
 
-void VisualizerRole::Impl::handle_stream_clear() {
-    this->stream_active = false;
-
-    if (this->drain_task) {
-        this->drain_task->event_flags.set(COMMAND_FLUSH);
-    }
+void VisualizerRole::Impl::handle_stream_clear() const {
+    // Per spec, stream/clear discards buffered data but the stream stays active; data
+    // received after this message continues to flow. The marker separates the two: a blind
+    // flush would race this thread and drop post-clear frames it has already enqueued.
+    this->signal_clear_marker();
 
     this->enqueue_stream_event(VisualizerEventType::STREAM_CLEAR);
 }
@@ -388,6 +345,7 @@ void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event) c
 
 void VisualizerRole::Impl::cleanup() {
     this->stream_active = false;
+    this->negotiated_types_mask = 0;
 
     if (this->drain_task) {
         this->drain_task->event_flags.set(COMMAND_FLUSH);
@@ -409,6 +367,60 @@ void VisualizerRole::Impl::cleanup() {
 // Drain thread helpers
 // ============================================================================
 
+VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* payload,
+                                             size_t payload_len, uint8_t configured_bins,
+                                             bool tracks_downbeats,
+                                             std::vector<uint16_t>& spectrum_out) {
+    VisualizerDelivery out;
+    switch (wire_type) {
+        case SENDSPIN_BINARY_VISUALIZER_LOUDNESS:
+            if (payload_len < LOUDNESS_PAYLOAD_SIZE) {
+                break;
+            }
+            out.kind = VisualizerDelivery::Kind::LOUDNESS;
+            out.loudness = read_be16(payload);
+            break;
+        case SENDSPIN_BINARY_VISUALIZER_BEAT:
+            if (payload_len < BEAT_PAYLOAD_SIZE) {
+                break;
+            }
+            out.kind = VisualizerDelivery::Kind::BEAT;
+            // Bit 0 is only meaningful when the stream tracks downbeats
+            out.downbeat = tracks_downbeats && (payload[0] & BEAT_FLAG_DOWNBEAT) != 0;
+            break;
+        case SENDSPIN_BINARY_VISUALIZER_F_PEAK:
+            if (payload_len < F_PEAK_PAYLOAD_SIZE) {
+                break;
+            }
+            out.kind = VisualizerDelivery::Kind::F_PEAK;
+            out.frequency_hz = read_be16(payload);
+            out.amplitude = read_be16(payload + 2);
+            break;
+        case SENDSPIN_BINARY_VISUALIZER_SPECTRUM:
+            // Deliver exactly the negotiated n_disp_bins. Drop the frame if SPECTRUM was not
+            // negotiated (bin count 0) or the payload is short; ignore any trailing bytes.
+            if (configured_bins == 0 || payload_len < static_cast<size_t>(configured_bins) * 2) {
+                break;
+            }
+            spectrum_out.resize(configured_bins);
+            for (uint8_t b = 0; b < configured_bins; ++b) {
+                spectrum_out[b] = read_be16(payload + static_cast<size_t>(b) * 2);
+            }
+            out.kind = VisualizerDelivery::Kind::SPECTRUM;
+            break;
+        case SENDSPIN_BINARY_VISUALIZER_PEAK:
+            if (payload_len < PEAK_PAYLOAD_SIZE) {
+                break;
+            }
+            out.kind = VisualizerDelivery::Kind::PEAK;
+            out.strength = payload[0];
+            break;
+        default:
+            break;  // Reserved types 21-23
+    }
+    return out;
+}
+
 void VisualizerRole::Impl::flush_ring_buffer() const {
     if (!this->drain_task) {
         return;
@@ -420,24 +432,89 @@ void VisualizerRole::Impl::flush_ring_buffer() const {
     }
 }
 
+void VisualizerRole::Impl::signal_clear_marker() const {
+    // Network-thread side of a clear boundary. Set the flag before enqueueing the marker (like
+    // PlayerRole::handle_stream_clear) so the drain thread starts discarding -- freeing ring
+    // space -- while we wait for the marker slot.
+    if (!this->drain_task || !this->drain_task->ring_buffer.is_created()) {
+        return;
+    }
+    this->drain_task->event_flags.set(COMMAND_CLEAR);
+
+    void* dest = this->drain_task->ring_buffer.acquire(1, MARKER_ENQUEUE_TIMEOUT_MS);
+    if (dest == nullptr) {
+        // Boundary lost: the drain thread will discard to empty instead, so frames enqueued
+        // after this point may be dropped along with the old ones (brief visual gap, no harm).
+        SS_LOGW(TAG, "Failed to enqueue clear marker; clear boundary may be imprecise");
+        return;
+    }
+    static_cast<uint8_t*>(dest)[0] = ENTRY_TYPE_CLEAR_MARKER;
+    this->drain_task->ring_buffer.commit(dest);
+}
+
+void VisualizerRole::Impl::discard_to_clear_marker() const {
+    // Drain-thread side of a clear boundary: discard entries up to and including the marker.
+    // Stopping at the marker preserves frames the network thread enqueued after the clear,
+    // which per spec must survive. If the buffer empties without a marker, either the marker
+    // could not be enqueued or it was already consumed in normal flow (it is a 1-byte entry,
+    // dropped by the drain loop's minimum-size check); nothing is left to discard either way.
+    if (!this->drain_task) {
+        return;
+    }
+    size_t item_size = 0;
+    void* item = nullptr;
+    while ((item = this->drain_task->ring_buffer.receive(&item_size, 0)) != nullptr) {
+        bool is_marker =
+            item_size == 1 && static_cast<const uint8_t*>(item)[0] == ENTRY_TYPE_CLEAR_MARKER;
+        this->drain_task->ring_buffer.return_item(item);
+        if (is_marker) {
+            return;
+        }
+    }
+}
+
 void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     SS_LOGD(TAG, "Drain thread started");
 
     auto& rb = self->drain_task->ring_buffer;
     auto& flags = self->drain_task->event_flags;
 
-    // Reused across iterations to avoid a heap alloc/free per frame. The spectrum vector's
-    // capacity grows to the largest bin_count seen and is resized (not reallocated) after that.
-    VisualizerFrame frame{};
+    // Reused across iterations to avoid a heap alloc/free per frame. The vector's capacity
+    // grows to the largest bin count seen and is resized (not reallocated) after that.
+    std::vector<uint16_t> spectrum_bins;
+
+    // RAII guard so the ring-buffer slot is returned exactly once on every exit path. Each branch
+    // calls release() to hand the slot back *before* invoking the listener callback, so a slow
+    // callback never blocks the network producer; if a branch exits without releasing (a short-
+    // payload drop, or a future wire type that forgets), the destructor returns it. Stack-only.
+    struct SlotGuard {
+        SpscRingBuffer& rb;
+        void* item = nullptr;
+        bool released = false;
+        void release() {
+            if (!this->released) {
+                this->rb.return_item(this->item);
+                this->released = true;
+            }
+        }
+        ~SlotGuard() {
+            this->release();
+        }
+    };
 
     while (true) {
         // Non-blocking check for commands
-        uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, 0);
+        uint32_t cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR, false, true, 0);
         if (cmd & COMMAND_STOP) {
             break;
         }
-        if (cmd & COMMAND_FLUSH) {
-            self->flush_ring_buffer();
+        if (cmd & (COMMAND_FLUSH | COMMAND_CLEAR)) {
+            if (cmd & COMMAND_FLUSH) {
+                self->flush_ring_buffer();
+            }
+            if (cmd & COMMAND_CLEAR) {
+                self->discard_to_clear_marker();
+            }
             continue;
         }
 
@@ -454,17 +531,16 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        auto* raw = static_cast<const uint8_t*>(item);
-        uint8_t type_byte = raw[0];
-        bool is_frame = (type_byte & ENTRY_FRAME) != 0;
-
-        // Read server timestamp
-        size_t ts_offset = is_frame ? FRAME_HEADER_SIZE : BEAT_HEADER_SIZE;
-        if (item_size < ts_offset + TIMESTAMP_SIZE) {
+        // Entry format: [wire_type][server_ts(8)][payload]. This also drops any leftover 1-byte
+        // clear marker whose COMMAND_CLEAR was already handled (everything before it was consumed
+        // in order, so the boundary it marks has already been honored).
+        if (item_size < ENTRY_TYPE_SIZE + TIMESTAMP_SIZE) {
             rb.return_item(item);
             continue;
         }
-        int64_t server_ts = read_be64(raw + ts_offset);
+        auto* raw = static_cast<const uint8_t*>(item);
+        uint8_t wire_type = raw[0];
+        int64_t server_ts = read_be64(raw + ENTRY_TYPE_SIZE);
         int64_t client_ts = self->client->get_client_time(server_ts);
 
         if (client_ts == 0) {
@@ -477,14 +553,22 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         if (client_ts > now) {
             uint32_t wait_ms = static_cast<uint32_t>((client_ts - now) / US_PER_MS);
             if (wait_ms > 0) {
-                cmd = flags.wait(COMMAND_STOP | COMMAND_FLUSH, false, true, wait_ms);
+                cmd =
+                    flags.wait(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR, false, true, wait_ms);
                 if (cmd & COMMAND_STOP) {
                     rb.return_item(item);
                     break;
                 }
-                if (cmd & COMMAND_FLUSH) {
+                if (cmd & (COMMAND_FLUSH | COMMAND_CLEAR)) {
+                    // The held item was popped before the signal, so it predates the boundary
+                    // and is discarded along with the buffered pre-boundary entries.
                     rb.return_item(item);
-                    self->flush_ring_buffer();
+                    if (cmd & COMMAND_FLUSH) {
+                        self->flush_ring_buffer();
+                    }
+                    if (cmd & COMMAND_CLEAR) {
+                        self->discard_to_clear_marker();
+                    }
                     continue;
                 }
             }
@@ -497,48 +581,41 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Parse and deliver
-        if (is_frame && self->listener) {
-            uint8_t frame_flags = type_byte & FRAME_FLAGS_MASK;
-            uint8_t bin_count = raw[1];
-            const uint8_t* fields = raw + FRAME_HEADER_SIZE + TIMESTAMP_SIZE;
-            size_t data_len = item_size - FRAME_HEADER_SIZE - TIMESTAMP_SIZE;
-            size_t offset = 0;
-
-            // Reset all fields so no stale data from a previous frame leaks through.
-            frame.timestamp = client_ts;
-            frame.loudness.reset();
-            frame.peak_freq.reset();
-
-            if ((frame_flags & FLAG_HAS_LOUDNESS) && offset + 2 <= data_len) {
-                frame.loudness = read_be16(fields + offset);
-                offset += 2;
-            }
-            if ((frame_flags & FLAG_HAS_F_PEAK) && offset + 2 <= data_len) {
-                frame.peak_freq = read_be16(fields + offset);
-                offset += 2;
-            }
-            if ((frame_flags & FLAG_HAS_SPECTRUM) && bin_count > 0) {
-                // assign() zero-initializes all bin_count elements and reuses the existing
-                // allocation when capacity suffices (no per-frame heap churn). Zeroing up front
-                // means a short or corrupt entry that exits the fill loop early cannot leak
-                // stale bins from a previous frame through the reused vector.
-                frame.spectrum.assign(bin_count, 0);
-                for (uint8_t b = 0; b < bin_count && offset + 2 <= data_len; ++b) {
-                    frame.spectrum[b] = read_be16(fields + offset);
-                    offset += 2;
-                }
-            } else {
-                frame.spectrum.clear();
-            }
-
+        if (self->listener == nullptr) {
             rb.return_item(item);
-            self->listener->on_visualizer_frame(frame);
-        } else if (!is_frame && self->listener) {
-            rb.return_item(item);
-            self->listener->on_beat(client_ts);
-        } else {
-            rb.return_item(item);
+            continue;
+        }
+
+        // Decode and deliver. The network thread forwards messages verbatim, so decode validates
+        // each payload's length before reading. Copy out of the slot, release it via the guard,
+        // then deliver -- so a slow listener callback never blocks the network producer.
+        const uint8_t* payload = raw + ENTRY_TYPE_SIZE + TIMESTAMP_SIZE;
+        size_t payload_len = item_size - ENTRY_TYPE_SIZE - TIMESTAMP_SIZE;
+
+        SlotGuard guard{rb, item};
+        VisualizerDelivery out =
+            decode_visualizer_message(wire_type, payload, payload_len, self->spectrum_bin_count,
+                                      self->tracks_downbeats, spectrum_bins);
+        guard.release();
+
+        switch (out.kind) {
+            case VisualizerDelivery::Kind::LOUDNESS:
+                self->listener->on_loudness(client_ts, out.loudness);
+                break;
+            case VisualizerDelivery::Kind::BEAT:
+                self->listener->on_beat(client_ts, out.downbeat);
+                break;
+            case VisualizerDelivery::Kind::F_PEAK:
+                self->listener->on_f_peak(client_ts, out.frequency_hz, out.amplitude);
+                break;
+            case VisualizerDelivery::Kind::SPECTRUM:
+                self->listener->on_spectrum(client_ts, spectrum_bins);
+                break;
+            case VisualizerDelivery::Kind::PEAK:
+                self->listener->on_peak(client_ts, out.strength);
+                break;
+            case VisualizerDelivery::Kind::NONE:
+                break;
         }
     }
 

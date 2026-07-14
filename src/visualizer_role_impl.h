@@ -24,9 +24,11 @@
 #include "sendspin/visualizer_role.h"
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <thread>
+#include <vector>
 
 namespace sendspin {
 
@@ -39,6 +41,33 @@ enum class VisualizerEventType : uint8_t {
     STREAM_END,
     STREAM_CLEAR,
 };
+
+/// @brief Result of decoding one visualizer wire message, ready to hand to the listener.
+/// A kind of None means the entry was malformed, short, or non-deliverable and should be dropped.
+/// For Spectrum, the decoded bins are written into the caller-supplied scratch vector.
+struct VisualizerDelivery {
+    enum class Kind : uint8_t { NONE, LOUDNESS, BEAT, F_PEAK, SPECTRUM, PEAK };
+    Kind kind{Kind::NONE};
+    uint16_t loudness{0};
+    bool downbeat{false};
+    uint16_t frequency_hz{0};
+    uint16_t amplitude{0};
+    uint8_t strength{0};
+};
+
+/// @brief Validates and decodes one visualizer entry payload. Pure drain-thread logic with no I/O,
+/// factored out so it can be unit tested independently of the client and drain thread.
+/// @param wire_type        SENDSPIN_BINARY_VISUALIZER_* type byte.
+/// @param payload          Bytes following the entry's wire-type byte and 8-byte timestamp.
+/// @param payload_len      Number of payload bytes available.
+/// @param configured_bins  Negotiated spectrum n_disp_bins (0 if SPECTRUM was not negotiated).
+/// @param tracks_downbeats Whether the active stream reports downbeats.
+/// @param spectrum_out     Scratch vector reused for SPECTRUM bins; resized to configured_bins.
+/// @return What to deliver; Kind::None if the entry is malformed, short, or non-deliverable.
+VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* payload,
+                                             size_t payload_len, uint8_t configured_bins,
+                                             bool tracks_downbeats,
+                                             std::vector<uint16_t>& spectrum_out);
 
 /// @brief Private implementation of the visualizer role
 struct VisualizerRole::Impl {
@@ -73,9 +102,10 @@ struct VisualizerRole::Impl {
     void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len);
     void handle_stream_start(const ServerVisualizerStreamObject& stream);
     void handle_stream_end();
-    void handle_stream_clear();
+    void handle_stream_clear() const;
     void handle_stream_ring_event(VisualizerEventType event) const;
     void cleanup();
+    void request_format(const VisualizerFormatRequest& request) const;
 
     // ========================================
     // Internal helpers
@@ -83,6 +113,8 @@ struct VisualizerRole::Impl {
 
     void stop() const;
     void flush_ring_buffer() const;
+    void signal_clear_marker() const;
+    void discard_to_clear_marker() const;
     void enqueue_stream_event(VisualizerEventType event) const;
 
     static void drain_thread_func(VisualizerRole::Impl* self);
@@ -103,12 +135,14 @@ struct VisualizerRole::Impl {
     VisualizerRoleListener* listener{nullptr};
 
     // Atomic fields (written by network thread, read by drain thread / cleanup)
-    std::atomic<size_t> raw_frame_size{0};
-    std::atomic<bool> has_f_peak{false};
-    std::atomic<bool> has_loudness{false};
-    std::atomic<bool> has_spectrum{false};
     std::atomic<uint8_t> spectrum_bin_count{0};
+    std::atomic<bool> tracks_downbeats{false};
     std::atomic<bool> stream_active{false};
+    // Bitmask of negotiated wire types, bit N = wire type SENDSPIN_BINARY_VISUALIZER_FIRST + N.
+    // Written by handle_stream_start and read by handle_binary on the same network thread, so
+    // admission is always judged against the config in force when a message arrives; atomic only
+    // because cleanup() clears it from the main thread.
+    std::atomic<uint8_t> negotiated_types_mask{0};
 };
 
 }  // namespace sendspin

@@ -42,31 +42,46 @@ namespace sendspin {
 ///
 /// Bits 7-2 encode the role (upper 6 bits of the type byte); bits 1-0 encode
 /// the slot. Each role therefore has 4 slots (IDs = role << 2 through role << 2 + 3).
+/// The visualizer role has an expanded 8-slot allocation (IDs 16-23, bits 2-0 as slot)
+/// and is dispatched by ID range rather than through this enum.
 enum SendspinBinaryRole : uint8_t {
-    SENDSPIN_ROLE_PLAYER = 1,      // 000001xx (IDs 4-7)
-    SENDSPIN_ROLE_ARTWORK = 2,     // 000010xx (IDs 8-11)
-    SENDSPIN_ROLE_VISUALIZER = 4,  // 000100xx (IDs 16-19)
+    SENDSPIN_ROLE_PLAYER = 1,   // 000001xx (IDs 4-7)
+    SENDSPIN_ROLE_ARTWORK = 2,  // 000010xx (IDs 8-11)
 };
 
 /// @brief Extracts the role field from a standard 4-slot binary message type byte
 /// @param type Binary message type byte.
 /// @return Role portion of the type (bits 7-2).
+/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK, IDs 4-11). The visualizer
+///          range (IDs 16-23) is dispatched by range in SendspinClient::process_binary_message
+///          and must not be routed through this helper: get_binary_role(16) yields 4, which
+///          matches no SendspinBinaryRole enumerator.
 inline uint8_t get_binary_role(uint8_t type) {
     return type >> 2;
 }
 /// @brief Extracts the slot field from a standard 4-slot binary message type byte
 /// @param type Binary message type byte.
 /// @return Slot portion of the type (bits 1-0).
+/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK, IDs 4-11). It masks bits
+///          1-0, so it cannot address the visualizer's 8-slot range (e.g. IDs 16 and 20 both
+///          alias to slot 0); those messages are dispatched by range, not by slot.
 inline uint8_t get_binary_slot(uint8_t type) {
     return type & 0x03;
 }
 
 /// @brief Binary message type byte values for known message kinds
 enum SendspinBinaryType : uint8_t {
-    SENDSPIN_BINARY_PLAYER_AUDIO = 4,      // Player slot 0: encoded audio chunk
-    SENDSPIN_BINARY_ARTWORK_IMAGE = 8,     // Artwork slot 0: image data
-    SENDSPIN_BINARY_VISUALIZER = 16,       // Visualizer slot 0: loudness, f_peak, spectrum
-    SENDSPIN_BINARY_VISUALIZER_BEAT = 17,  // Visualizer slot 1: beat events
+    SENDSPIN_BINARY_PLAYER_AUDIO = 4,   // Player slot 0: encoded audio chunk
+    SENDSPIN_BINARY_ARTWORK_IMAGE = 8,  // Artwork slot 0: image data
+    // Visualizer expanded allocation (IDs 16-23); each data type is its own message
+    // carrying exactly one frame of [timestamp:8][data]
+    SENDSPIN_BINARY_VISUALIZER_LOUDNESS = 16,  // uint16 A-weighted loudness
+    SENDSPIN_BINARY_VISUALIZER_BEAT = 17,      // uint8 flags (bit 0 = downbeat)
+    SENDSPIN_BINARY_VISUALIZER_F_PEAK = 18,    // uint16 freq Hz + uint16 amplitude
+    SENDSPIN_BINARY_VISUALIZER_SPECTRUM = 19,  // uint16[n_disp_bins] magnitudes
+    SENDSPIN_BINARY_VISUALIZER_PEAK = 20,      // uint8 onset strength
+    SENDSPIN_BINARY_VISUALIZER_FIRST = 16,     // Start of visualizer ID range
+    SENDSPIN_BINARY_VISUALIZER_LAST = 23,      // End of visualizer ID range (21-23 reserved)
 };
 
 /// @brief JSON message types sent from the server to the client
@@ -106,7 +121,7 @@ inline const char* to_cstr(SendspinRole role) {
         case SendspinRole::ARTWORK:
             return "artwork@v1";
         case SendspinRole::VISUALIZER:
-            return "visualizer@_draft_r1";
+            return "visualizer@v1";
         case SendspinRole::COLOR:
             return "color@v1";
         default:
@@ -506,9 +521,30 @@ inline const char* to_cstr(VisualizerDataType type) {
             return "f_peak";
         case VisualizerDataType::SPECTRUM:
             return "spectrum";
+        case VisualizerDataType::PEAK:
+            return "peak";
         default:
             return "unknown";
     }
+}
+
+inline std::optional<VisualizerDataType> visualizer_data_type_from_string(const std::string& str) {
+    if (str == "beat") {
+        return VisualizerDataType::BEAT;
+    }
+    if (str == "loudness") {
+        return VisualizerDataType::LOUDNESS;
+    }
+    if (str == "f_peak") {
+        return VisualizerDataType::F_PEAK;
+    }
+    if (str == "spectrum") {
+        return VisualizerDataType::SPECTRUM;
+    }
+    if (str == "peak") {
+        return VisualizerDataType::PEAK;
+    }
+    return std::nullopt;
 }
 
 inline const char* to_cstr(VisualizerSpectrumScale scale) {
@@ -522,6 +558,20 @@ inline const char* to_cstr(VisualizerSpectrumScale scale) {
         default:
             return "mel";
     }
+}
+
+inline std::optional<VisualizerSpectrumScale> visualizer_spectrum_scale_from_string(
+    const std::string& str) {
+    if (str == "mel") {
+        return VisualizerSpectrumScale::MEL;
+    }
+    if (str == "log") {
+        return VisualizerSpectrumScale::LOG;
+    }
+    if (str == "lin") {
+        return VisualizerSpectrumScale::LIN;
+    }
+    return std::nullopt;
 }
 
 // --- metadata_role.h ---
@@ -616,10 +666,12 @@ struct StreamStartMessage {
     std::optional<ServerVisualizerStreamObject> visualizer;
 };
 
-/// @brief Outgoing stream/request_format message used for codec and artwork format negotiation
+/// @brief Outgoing stream/request_format message used for codec, artwork, and visualizer
+/// format negotiation
 struct StreamRequestFormatMessage {
     std::optional<ServerPlayerStreamObject> player;
     std::optional<ClientArtworkRequestObject> artwork;
+    std::optional<VisualizerFormatRequest> visualizer;
 };
 
 /// @brief Parsed stream/end message listing which roles the stream end applies to

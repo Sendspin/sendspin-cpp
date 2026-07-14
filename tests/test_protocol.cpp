@@ -377,9 +377,10 @@ TEST(Protocol, ServerHelloRejectsInvalidVersion) {
 }
 
 // If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a non-zero
-// bin count must be present. Otherwise raw_frame_size would be indeterminate and subsequent binary
-// visualizer frames would misparse, so the whole stream/start is rejected.
-TEST(Protocol, StreamStartRejectsSpectrumWithoutValidConfig) {
+// bin count must be present. Otherwise the expected size of binary spectrum messages would be
+// indeterminate, so the visualizer object is dropped -- but only the visualizer object: the message
+// itself still parses so a well-formed player/artwork start alongside it is not lost.
+TEST(Protocol, StreamStartDropsSpectrumWithoutValidConfig) {
     // (a) SPECTRUM advertised but no spectrum object at all.
     {
         JsonDocument doc;
@@ -388,7 +389,8 @@ TEST(Protocol, StreamStartRejectsSpectrumWithoutValidConfig) {
             R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"]}}})", doc,
             root));
         StreamStartMessage msg;
-        EXPECT_FALSE(process_stream_start_message(root, &msg));
+        EXPECT_TRUE(process_stream_start_message(root, &msg));
+        EXPECT_FALSE(msg.visualizer.has_value());
     }
     // (b) spectrum object present but n_disp_bins is zero.
     {
@@ -398,7 +400,8 @@ TEST(Protocol, StreamStartRejectsSpectrumWithoutValidConfig) {
                           R"("spectrum":{"n_disp_bins":0}}}})",
                           doc, root));
         StreamStartMessage msg;
-        EXPECT_FALSE(process_stream_start_message(root, &msg));
+        EXPECT_TRUE(process_stream_start_message(root, &msg));
+        EXPECT_FALSE(msg.visualizer.has_value());
     }
     // (c) n_disp_bins present but not an integer.
     {
@@ -408,19 +411,37 @@ TEST(Protocol, StreamStartRejectsSpectrumWithoutValidConfig) {
                           R"("spectrum":{"n_disp_bins":"32"}}}})",
                           doc, root));
         StreamStartMessage msg;
-        EXPECT_FALSE(process_stream_start_message(root, &msg));
+        EXPECT_TRUE(process_stream_start_message(root, &msg));
+        EXPECT_FALSE(msg.visualizer.has_value());
+    }
+    // (d) a valid player start in the same message survives the malformed visualizer object.
+    {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{)"
+                          R"("player":{"codec":"pcm","sample_rate":48000,"channels":2,)"
+                          R"("bit_depth":16},)"
+                          R"("visualizer":{"types":["spectrum"]}}})",
+                          doc, root));
+        StreamStartMessage msg;
+        EXPECT_TRUE(process_stream_start_message(root, &msg));
+        EXPECT_FALSE(msg.visualizer.has_value());
+        ASSERT_TRUE(msg.player.has_value());
+        EXPECT_EQ(msg.player->sample_rate, 48000U);
     }
 
     // Control: SPECTRUM advertised with a valid config is accepted.
     JsonDocument doc_ok;
     JsonObject root_ok;
     ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
-                      R"("spectrum":{"n_disp_bins":32,"scale":"log","f_min":20,"f_max":20000,)"
-                      R"("rate_max":30}}}})",
+                      R"("rate_max":30,)"
+                      R"("spectrum":{"n_disp_bins":32,"scale":"log","f_min":20,"f_max":20000}}}})",
                       doc_ok, root_ok));
     StreamStartMessage ok;
     ASSERT_TRUE(process_stream_start_message(root_ok, &ok));
     ASSERT_TRUE(ok.visualizer.has_value());
+    EXPECT_EQ(ok.visualizer->rate_max, 30);
+    EXPECT_FALSE(ok.visualizer->tracks_downbeats);
     ASSERT_TRUE(ok.visualizer->spectrum.has_value());
     EXPECT_EQ(ok.visualizer->spectrum->n_disp_bins, 32);
 }
@@ -567,6 +588,86 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsPresent) {
     EXPECT_STREQ(doc["payload"]["device_info"]["manufacturer"], "ESPHome");
     EXPECT_STREQ(doc["payload"]["device_info"]["software_version"], "1.2.3");
     EXPECT_STREQ(doc["payload"]["device_info"]["mac_address"], "aa:bb:cc:dd:ee:ff");
+}
+
+// The visualizer@v1 support object serializes with the spec's field layout: types (including
+// the event types), buffer_capacity, top-level rate_max, and a spectrum object without a
+// nested rate cap.
+TEST(Protocol, FormatClientHelloVisualizerSupport) {
+    ClientHelloMessage msg;
+    msg.client_id = "abc";
+    msg.name = "Speaker";
+    msg.version = 1;
+    msg.supported_roles.push_back(SendspinRole::VISUALIZER);
+    VisualizerSupportObject vis{};
+    vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
+                 VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
+                 VisualizerDataType::PEAK};
+    vis.buffer_capacity = 8192;
+    vis.rate_max = 60;
+    vis.spectrum = VisualizerSpectrumConfig{
+        .n_disp_bins = 32,
+        .scale = VisualizerSpectrumScale::MEL,
+        .f_min = 40,
+        .f_max = 16000,
+    };
+    msg.visualizer_support = vis;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    EXPECT_STREQ(doc["payload"]["supported_roles"][0], "visualizer@v1");
+    JsonObject support = doc["payload"]["visualizer@v1_support"];
+    ASSERT_TRUE(support["types"].is<JsonArray>());
+    EXPECT_EQ(support["types"].size(), 5U);
+    EXPECT_STREQ(support["types"][4], "peak");
+    EXPECT_EQ(support["buffer_capacity"].as<int>(), 8192);
+    EXPECT_EQ(support["rate_max"].as<int>(), 60);
+    EXPECT_EQ(support["spectrum"]["n_disp_bins"].as<int>(), 32);
+    EXPECT_STREQ(support["spectrum"]["scale"], "mel");
+    EXPECT_EQ(support["spectrum"]["f_min"].as<int>(), 40);
+    EXPECT_EQ(support["spectrum"]["f_max"].as<int>(), 16000);
+    EXPECT_FALSE(support["spectrum"]["rate_max"].is<int>());
+    EXPECT_FALSE(support["batch_max"].is<int>());
+}
+
+// stream/request-format serializes the visualizer object with only the fields the caller set;
+// omitted optionals keep their current server-side value and must not emit keys.
+TEST(Protocol, FormatStreamRequestFormatVisualizer) {
+    StreamRequestFormatMessage msg;
+    VisualizerFormatRequest req{};
+    req.rate_max = 24;
+    msg.visualizer = req;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_stream_request_format_message(&msg)));
+    EXPECT_STREQ(doc["type"], "stream/request-format");
+    EXPECT_EQ(doc["payload"]["visualizer"]["rate_max"].as<int>(), 24);
+    EXPECT_FALSE(doc["payload"]["visualizer"]["types"].is<JsonArray>());
+    EXPECT_FALSE(doc["payload"]["visualizer"]["spectrum"].is<JsonObject>());
+
+    // Full request: all fields emitted.
+    VisualizerFormatRequest full{};
+    full.types = std::vector<VisualizerDataType>{VisualizerDataType::SPECTRUM};
+    full.rate_max = 30;
+    full.spectrum = VisualizerSpectrumConfig{
+        .n_disp_bins = 16,
+        .scale = VisualizerSpectrumScale::LOG,
+        .f_min = 20,
+        .f_max = 20000,
+    };
+    msg.visualizer = full;
+    JsonDocument doc2;
+    ASSERT_FALSE(deserializeJson(doc2, format_stream_request_format_message(&msg)));
+    EXPECT_STREQ(doc2["payload"]["visualizer"]["types"][0], "spectrum");
+    EXPECT_EQ(doc2["payload"]["visualizer"]["spectrum"]["n_disp_bins"].as<int>(), 16);
+    EXPECT_STREQ(doc2["payload"]["visualizer"]["spectrum"]["scale"], "log");
+
+    // All-empty request: no "visualizer" key at all. A present-but-empty object could read as
+    // "reset to defaults" rather than "no change" on the server.
+    msg.visualizer = VisualizerFormatRequest{};
+    JsonDocument doc3;
+    ASSERT_FALSE(deserializeJson(doc3, format_stream_request_format_message(&msg)));
+    EXPECT_FALSE(doc3["payload"]["visualizer"].is<JsonObject>());
 }
 
 // Unset optional identity fields must not emit their keys.

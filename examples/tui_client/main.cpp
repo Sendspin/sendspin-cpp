@@ -530,22 +530,26 @@ int main(int argc, char* argv[]) {
     (void)controller;
 
     // Visualizer support (disabled with -V flag)
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     VisualizerRole* vis_role = nullptr;
     if (enable_visualizer) {
         VisualizerSupportObject vis;
         vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
-                     VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM};
-        vis.buffer_capacity = 8192;
-        vis.batch_max = 4;
+                     VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
+                     VisualizerDataType::PEAK};
+        vis.buffer_capacity = 32768;
+        vis.rate_max = 30;
         vis.spectrum = VisualizerSpectrumConfig{
             .n_disp_bins = 32,
             .scale = VisualizerSpectrumScale::MEL,
             .f_min = 40,
             .f_max = 16000,
-            .rate_max = 30,
         };
         vis_role = &client.add_visualizer(VisualizerRoleConfig{.support = vis});
     }
+#else
+    (void)enable_visualizer;
+#endif
 
     // --- Listener implementations ---
 
@@ -654,6 +658,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     struct TuiVisualizerListener : VisualizerRoleListener {
         TuiState& state;
         explicit TuiVisualizerListener(TuiState& s) : state(s) {}
@@ -677,6 +682,7 @@ int main(int argc, char* argv[]) {
             std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
             state.vis_display_loudness = 0.0f;
             state.vis_beat = false;
+            state.vis_peak = false;
         }
 
         void on_visualizer_stream_clear() override {
@@ -687,28 +693,41 @@ int main(int argc, char* argv[]) {
             std::fill(state.vis_display_spectrum.begin(), state.vis_display_spectrum.end(), 0.0f);
             state.vis_display_loudness = 0.0f;
             state.vis_beat = false;
+            state.vis_peak = false;
         }
 
-        void on_visualizer_frame(const VisualizerFrame& frame) override {
+        void on_loudness(int64_t /*client_timestamp*/, uint16_t loudness) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            if (frame.loudness.has_value()) {
-                state.vis_loudness = *frame.loudness;
-            }
-            if (frame.peak_freq.has_value()) {
-                state.vis_peak_freq = *frame.peak_freq;
-            }
-            if (!frame.spectrum.empty()) {
-                state.vis_spectrum = frame.spectrum;
-            }
+            state.vis_loudness = loudness;
         }
 
-        void on_beat(int64_t /*client_timestamp*/) override {
+        void on_f_peak(int64_t /*client_timestamp*/, uint16_t frequency_hz,
+                       uint16_t /*amplitude*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.vis_peak_freq = frequency_hz;
+        }
+
+        void on_spectrum(int64_t /*client_timestamp*/,
+                         const std::vector<uint16_t>& bins) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.vis_spectrum = bins;
+        }
+
+        void on_beat(int64_t /*client_timestamp*/, bool /*downbeat*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);
             int64_t current_us = now_us();
             state.vis_beat = true;
             state.vis_beat_expire_us = current_us + 100000;  // 100ms flash
         }
+
+        void on_peak(int64_t /*client_timestamp*/, uint8_t /*strength*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            int64_t current_us = now_us();
+            state.vis_peak = true;
+            state.vis_peak_expire_us = current_us + 100000;  // 100ms flash
+        }
     };
+#endif
 
     struct HostNetworkProvider : SendspinNetworkProvider {
         bool is_network_ready() override { return true; }
@@ -728,16 +747,20 @@ int main(int argc, char* argv[]) {
 #endif
     TuiMetadataListener metadata_listener(state);
     TuiClientListener client_listener(state);
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     TuiVisualizerListener visualizer_listener(state);
+#endif
     HostNetworkProvider network_provider;
 
     player.set_listener(&player_listener);
     metadata.set_listener(&metadata_listener);
     client.set_listener(&client_listener);
     client.set_network_provider(&network_provider);
+#ifdef SENDSPIN_ENABLE_VISUALIZER
     if (vis_role) {
         vis_role->set_listener(&visualizer_listener);
     }
+#endif
 
     // Start the server
     if (!client.start_server()) {
@@ -838,9 +861,12 @@ int main(int argc, char* argv[]) {
                     state.vis_display_loudness = current + alpha * (target - current);
                 }
 
-                // Expire beat flash
+                // Expire beat and peak flashes
                 if (state.vis_beat && current_us >= state.vis_beat_expire_us) {
                     state.vis_beat = false;
+                }
+                if (state.vis_peak && current_us >= state.vis_peak_expire_us) {
+                    state.vis_peak = false;
                 }
             }
 

@@ -98,6 +98,8 @@ struct TuiState {
     float vis_display_loudness{0.0f};            // smoothed loudness for display
     bool vis_beat{false};
     int64_t vis_beat_expire_us{0};
+    bool vis_peak{false};         // energy-onset (peak) blinker
+    int64_t vis_peak_expire_us{0};
 
     // Tab state
     bool show_visualizer{false};
