@@ -489,25 +489,35 @@ client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
 
 ## Sending Commands
 
-If you added the controller role, use it to send playback commands:
+If you added the controller role, use it to send playback commands. `send_command` takes a `ClientCommandControllerObject`, built with designated initializers - set only the field the command uses:
 
 ```cpp
-controller.send_command(SendspinControllerCommand::PLAY);
-controller.send_command(SendspinControllerCommand::PAUSE);
-controller.send_command(SendspinControllerCommand::NEXT);
-controller.send_command(SendspinControllerCommand::PREVIOUS);
-controller.send_command(SendspinControllerCommand::STOP);
-controller.send_command(SendspinControllerCommand::SHUFFLE);
-controller.send_command(SendspinControllerCommand::UNSHUFFLE);
-controller.send_command(SendspinControllerCommand::REPEAT_OFF);
-controller.send_command(SendspinControllerCommand::REPEAT_ONE);
-controller.send_command(SendspinControllerCommand::REPEAT_ALL);
+controller.send_command({.command = SendspinControllerCommand::PLAY});
+controller.send_command({.command = SendspinControllerCommand::PAUSE});
+controller.send_command({.command = SendspinControllerCommand::NEXT});
+controller.send_command({.command = SendspinControllerCommand::PREVIOUS});
+controller.send_command({.command = SendspinControllerCommand::STOP});
+controller.send_command({.command = SendspinControllerCommand::SHUFFLE});
+controller.send_command({.command = SendspinControllerCommand::UNSHUFFLE});
+controller.send_command({.command = SendspinControllerCommand::REPEAT_OFF});
+controller.send_command({.command = SendspinControllerCommand::REPEAT_ONE});
+controller.send_command({.command = SendspinControllerCommand::REPEAT_ALL});
 
-// Volume and mute take additional arguments
-controller.send_command(SendspinControllerCommand::VOLUME, 75);       // Volume 0-100
-controller.send_command(SendspinControllerCommand::MUTE, {}, true);   // Mute on
-controller.send_command(SendspinControllerCommand::MUTE, {}, false);  // Mute off
+// Commands that carry a parameter set the matching field:
+controller.send_command({.command = SendspinControllerCommand::VOLUME, .volume = 75});
+controller.send_command({.command = SendspinControllerCommand::MUTE, .muted = true});
+controller.send_command({.command = SendspinControllerCommand::MUTE, .muted = false});
+
+// Seek to an absolute position (0 to the controller state's seek_max_ms):
+controller.send_command({.command = SendspinControllerCommand::SEEK, .position_ms = 30000});
+
+// Seek by a signed offset from the current position (negative seeks backward):
+controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .offset_ms = -10000});
 ```
+
+Fields that do not match the command are ignored when the message is serialized. The server clamps seeks to the seekable range and ignores any command not present in the controller state's `supported_commands`.
+
+> **Deprecated:** the earlier positional overload `send_command(cmd, volume, mute)` still works but cannot carry seek parameters and will be removed in v0.8.0. Migrate to the struct form above.
 
 ## Accessing Roles
 
@@ -518,7 +528,7 @@ if (auto* p = client.player()) {
     p->update_volume(75);
 }
 if (auto* c = client.controller()) {
-    c->send_command(SendspinControllerCommand::NEXT);
+    c->send_command({.command = SendspinControllerCommand::NEXT});
 }
 if (auto* m = client.metadata()) {
     uint32_t progress = m->get_track_progress_ms();
@@ -574,7 +584,7 @@ int32_t fixed = player.get_fixed_delay_us();
 auto& stream = player.get_current_stream_params();
 
 // Controller state
-auto& ctrl = controller.get_controller_state();  // volume, muted, repeat, shuffle, supported_commands
+auto& ctrl = controller.get_controller_state();  // volume, muted, repeat, shuffle, supported_commands, seek_max_ms
 
 // Metadata
 uint32_t progress = metadata.get_track_progress_ms();  // Interpolated
@@ -820,14 +830,16 @@ Configuration passed to `client.add_visualizer()`.
 | `STOP` | Stop playback |
 | `NEXT` | Skip to next track |
 | `PREVIOUS` | Skip to previous track |
-| `VOLUME` | Set volume (pass value via volume parameter) |
-| `MUTE` | Set mute state (pass value via mute parameter) |
+| `VOLUME` | Set volume (pass value via the `volume` field) |
+| `MUTE` | Set mute state (pass value via the `muted` field) |
 | `REPEAT_OFF` | Disable repeat |
 | `REPEAT_ONE` | Repeat current track |
 | `REPEAT_ALL` | Repeat all tracks |
 | `SHUFFLE` | Enable shuffle |
 | `UNSHUFFLE` | Disable shuffle |
 | `SWITCH` | Switch source |
+| `SEEK` | Seek to an absolute position (pass value via the `position_ms` field) |
+| `SEEK_RELATIVE` | Seek by a signed offset from the current position (pass value via the `offset_ms` field) |
 
 ### SendspinPlayerCommand
 
