@@ -32,8 +32,6 @@ static const char* const TAG = "sendspin.conn_mgr";
 
 static constexpr uint32_t FNV_OFFSET_BASIS = 2166136261UL;
 static constexpr uint32_t FNV_PRIME = 16777619UL;
-static constexpr int64_t HELLO_INITIAL_DELAY_MS = 100LL;
-static constexpr int64_t HELLO_INITIAL_DELAY_US = HELLO_INITIAL_DELAY_MS * US_PER_MS;
 static constexpr int64_t WS_SERVER_START_RETRY_MS = 5000LL;
 static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * US_PER_MS;
 
@@ -581,11 +579,12 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
 
 void ConnectionManager::initiate_hello(SendspinConnection* conn) {
     // Note: caller must hold conn_ptr_mutex_
-    // Arm a per-connection hello retry: initial delay, 3 attempts. If an entry for this connection
-    // already exists (a duplicate connected event for the same connection would land here twice),
-    // re-arm it in place instead of pushing a second one, so a connection never gets two timers.
+    // Arm a per-connection hello retry: send on the next tick, 3 attempts. If an entry for this
+    // connection already exists (a duplicate connected event for the same connection would land
+    // here twice), re-arm it in place instead of pushing a second one, so a connection never gets
+    // two timers.
     auto conn_sp = conn->shared_from_this();
-    const int64_t retry_time_us = platform_time_us() + HELLO_INITIAL_DELAY_US;
+    const int64_t retry_time_us = platform_time_us();
 
     for (auto& retry : this->hello_retries_) {
         if (retry.conn == conn_sp) {
