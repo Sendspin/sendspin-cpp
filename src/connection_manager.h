@@ -277,7 +277,7 @@ private:
     // ========================================
     // Hello handshake
     // ========================================
-    /// @brief Arms the hello retry state so loop() will send the hello after a 100ms initial delay.
+    /// @brief Arms the hello retry state so loop() will send the hello on its next tick.
     /// @param conn The connection to send the hello to.
     void initiate_hello(SendspinConnection* conn);
     /// @brief Sends the hello message to a connection, returning true if no retry is needed.
