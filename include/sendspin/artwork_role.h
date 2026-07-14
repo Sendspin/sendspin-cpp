@@ -32,6 +32,16 @@ class SendspinClient;
 /// THREAD SAFETY: on_image_decode() fires on a dedicated decode thread and must be
 /// thread-safe with respect to the other callbacks. on_image_display() and on_image_clear()
 /// fire on the main loop thread.
+///
+/// ACK GATE (opt-in per slot via ImageSlotPreference::require_frame_done): a "delivery" is
+/// either a frame (on_image_decode() followed later by on_image_display()) or a clear
+/// (on_image_clear()). For an ack-enabled slot, at most one un-acked delivery is ever in flight;
+/// the newest payload that arrives while a delivery is un-acked is buffered latest-wins and
+/// delivered only after the consumer calls ArtworkRole::frame_done(slot). A clear supersedes any
+/// un-acked frame for that slot -- exactly one ack is owed, and it is for the clear. A stream
+/// restart automatically releases a frame that was decoded but never displayed (its display can
+/// no longer fire), but a delivery that already reached on_image_display()/on_image_clear() stays
+/// gated until frame_done() is called; there is no timeout.
 class ArtworkRoleListener {
 public:
     virtual ~ArtworkRoleListener() = default;
@@ -72,6 +82,10 @@ public:
  * loop thread, with on_image_display() scheduled to the server timestamp. Supports multiple
  * image slots with configurable format and resolution preferences.
  *
+ * A slot may opt into a back-pressure gate via ImageSlotPreference::require_frame_done: see
+ * the ArtworkRoleListener class comment for the ack contract. Call frame_done() once the
+ * consumer has finished presenting a delivery for such a slot.
+ *
  * Usage:
  * 1. Implement ArtworkRoleListener with on_image_decode() and on_image_display()
  * 2. Build an ArtworkRoleConfig with the desired slot/format/resolution preferences
@@ -85,18 +99,27 @@ public:
  *         decoded_images[slot] = decode(data, length, format);
  *     }
  *     void on_image_display(uint8_t slot) override {
- *         display.show_image(slot, decoded_images[slot]);
+ *         // Slot 0 has require_frame_done set, so this starts a cross-fade; frame_done() is
+ *         // called once the fade finishes instead of immediately.
+ *         display.start_fade(slot, decoded_images[slot]);
  *     }
  *     void on_image_clear(uint8_t slot) override {
  *         display.clear_slot(slot);
+ *         artwork_role->frame_done(slot);
  *     }
+ *     void on_fade_complete(uint8_t slot) {
+ *         artwork_role->frame_done(slot);
+ *     }
+ *
+ *     ArtworkRole* artwork_role{nullptr};
  * };
  *
  * MyArtworkListener listener;
  * ArtworkRoleConfig config;
  * config.preferred_formats = {{SendspinImageSource::ALBUM,
- *                            SendspinImageFormat::JPEG, 240, 240}};
+ *                            SendspinImageFormat::JPEG, 240, 240, true}};
  * auto& artwork = client.add_artwork(config);
+ * listener.artwork_role = &artwork;
  * artwork.set_listener(&listener);
  * @endcode
  */
@@ -113,6 +136,16 @@ public:
     /// @note The listener must outlive this role.
     /// @param listener Pointer to the listener implementation; must outlive this role
     void set_listener(ArtworkRoleListener* listener);
+
+    /// @brief Acknowledges the most recent delivery for an ack-gated slot, releasing the gate
+    ///
+    /// Call from the main loop thread after finishing presentation of the most recent delivery
+    /// (frame or clear) for a slot with ImageSlotPreference::require_frame_done set, e.g. once a
+    /// cross-fade animation completes. Safe no-op if the slot has nothing un-acked (including
+    /// slots where require_frame_done is false). Also safe to call from inside
+    /// on_image_display() or on_image_clear() for instant (non-animated) presentation.
+    /// @param slot The artwork slot index to acknowledge.
+    void frame_done(uint8_t slot);
 
 private:
     std::unique_ptr<Impl> impl_;

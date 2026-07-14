@@ -181,6 +181,15 @@ struct ImageSlotPreference {
     SendspinImageFormat format{};
     uint16_t width{};
     uint16_t height{};
+
+    /// @brief Opt-in per-slot back-pressure gate. When true, the role delivers at most one
+    /// un-acked "delivery" at a time for this slot: a delivery is either a frame
+    /// (on_image_decode() followed by on_image_display()) or a clear (on_image_clear()). While a
+    /// delivery is un-acked, any newer payload that arrives is buffered latest-wins and only
+    /// delivered once the consumer calls ArtworkRole::frame_done(slot) from the main loop (e.g.
+    /// after a cross-fade animation completes). Defaults to false, which preserves today's
+    /// behavior of decoding and displaying every frame as it arrives.
+    bool require_frame_done{false};
 };
 
 /// @brief Configuration for the artwork role

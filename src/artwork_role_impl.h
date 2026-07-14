@@ -46,22 +46,14 @@ enum class ArtworkEventType : uint8_t {
 /// @brief Maximum number of artwork slots (2-bit slot field in protocol binary type byte)
 static constexpr size_t ARTWORK_MAX_SLOTS = 4;
 
-/// @brief Double-buffered image storage for a single artwork slot
-///
-/// All fields here are guarded by DrainTask::slot_mutex (shared across all slots; artwork is
-/// not a hot path so contention is negligible). The network thread and decode thread both read
-/// and write these fields, so they must never be touched outside that lock:
-///  - write_idx: which buffer the network thread writes to next.
-///  - drain_active / drain_buf_idx: which buffer the decode thread is currently decoding.
-///  - write_generation[i]: bumped every time buffers[i] is overwritten by the network thread.
-///    The decode thread compares this against the generation stamped on the notification it
-///    dequeued to detect whether the buffer was overwritten again before it could be claimed.
-struct SlotBuffer {
-    PlatformBuffer buffers[2];
-    uint8_t write_idx{0};
-    bool drain_active{false};
-    uint8_t drain_buf_idx{0};
-    uint32_t write_generation[2]{0, 0};
+/// @brief Sentinel notification slot used to wake the decode thread for a parked-frame recheck
+static constexpr uint8_t ARTWORK_RECHECK_SLOT = 0xFF;
+
+/// @brief Ack-gate state for a slot with require_frame_done enabled
+enum class SlotAckState : uint8_t {
+    IDLE,              // no un-acked delivery; next frame may decode
+    DECODE_DELIVERED,  // on_image_decode fired, on_image_display not yet fired
+    PRESENTED,         // on_image_display or on_image_clear fired, awaiting frame_done()
 };
 
 /// @brief Notification sent from the network thread to the decode thread when new image data
@@ -83,6 +75,31 @@ struct ArtworkNotification {
     SendspinImageFormat format;
     uint32_t generation;
     uint32_t stream_epoch;
+};
+
+/// @brief Double-buffered image storage for a single artwork slot
+///
+/// All fields here are guarded by DrainTask::slot_mutex (shared across all slots; artwork is
+/// not a hot path so contention is negligible). The network thread and decode thread both read
+/// and write these fields, so they must never be touched outside that lock:
+///  - write_idx: which buffer the network thread writes to next.
+///  - drain_active / drain_buf_idx: which buffer the decode thread is currently decoding.
+///  - write_generation[i]: bumped every time buffers[i] is overwritten by the network thread.
+///    The decode thread compares this against the generation stamped on the notification it
+///    dequeued to detect whether the buffer was overwritten again before it could be claimed.
+///  - ack_state: only meaningful when the slot has require_frame_done set (see ack_enabled());
+///    tracks whether a delivery is currently un-acked for the slot (see SlotAckState).
+///  - has_parked / parked: while ack_state is not IDLE, at most one newer notification is parked
+///    here (latest-wins) instead of being decoded; it is replayed once the gate reopens.
+struct SlotBuffer {
+    PlatformBuffer buffers[2];
+    uint8_t write_idx{0};
+    bool drain_active{false};
+    uint8_t drain_buf_idx{0};
+    uint32_t write_generation[2]{0, 0};
+    SlotAckState ack_state{SlotAckState::IDLE};
+    bool has_parked{false};
+    ArtworkNotification parked{};
 };
 
 /// @brief Latest-wins display timestamps accumulated across artwork slots
@@ -148,11 +165,28 @@ struct ArtworkRole::Impl {
     void cleanup();
 
     // ========================================
+    // Consumer-facing method implementations
+    // ========================================
+
+    void frame_done(uint8_t slot);
+
+    // ========================================
     // Helpers
     // ========================================
 
     void stop() const;
     void enqueue_stream_event(ArtworkEventType event) const;
+    // True if `slot` is within range and configured with require_frame_done.
+    bool ack_enabled(uint8_t slot) const;
+    // Sends a sentinel ARTWORK_RECHECK_SLOT notification to unblock the decode thread's queue
+    // receive so it re-runs the parked-slot sweep at the top of its loop. Best-effort: the send
+    // uses a 0 timeout and any failure is ignored, since the decode thread's 100ms receive
+    // timeout plus the loop-top sweep is the fallback that guarantees the parked notification is
+    // eventually rechecked even if this wakeup is dropped.
+    void wake_drain_thread() const;
+    // Validates and, if appropriate, decodes a single notification; called both from the normal
+    // queue-receive path and from the parked-slot sweep in drain_thread_func().
+    void process_notification(const ArtworkNotification& notif);
     static void drain_thread_func(ArtworkRole::Impl* self);
 
     // ========================================
