@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -206,10 +207,19 @@ namespace {
 // Heap-allocated because Impl holds atomics and so is neither copyable nor movable. The stream is
 // marked active and all defined wire types are marked negotiated so handle_binary will accept
 // messages (bits 0-4 = wire types 16-20).
+//
+// handle_stream_start writes the stream config into an InboxSlot, which asserts it has been bound
+// to an Inbox first. Give each Impl its own Inbox with program lifetime: Inbox is non-movable, so
+// a deque (which never relocates existing elements) provides a stable address that outlives the
+// returned Impl, which only holds a pointer to it.
 std::unique_ptr<VisualizerRole::Impl> make_impl() {
+    static std::deque<Inbox> inboxes;
+
     VisualizerRoleConfig config;
     config.support.buffer_capacity = 4096;
     auto impl = std::make_unique<VisualizerRole::Impl>(std::move(config), nullptr);
+    inboxes.emplace_back();
+    impl->attach_inbox(inboxes.back());
     impl->stream_active = true;
     impl->negotiated_types_mask = 0x1F;
     return impl;
