@@ -102,7 +102,7 @@ struct VisualizerRole::Impl {
     void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len);
     void handle_stream_start(const ServerVisualizerStreamObject& stream);
     void handle_stream_end();
-    void handle_stream_clear();
+    void handle_stream_clear() const;
     void handle_stream_ring_event(VisualizerEventType event) const;
     void cleanup();
     void request_format(const VisualizerFormatRequest& request) const;

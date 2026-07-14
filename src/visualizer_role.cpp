@@ -292,7 +292,7 @@ void VisualizerRole::Impl::handle_stream_end() {
     this->enqueue_stream_event(VisualizerEventType::STREAM_END);
 }
 
-void VisualizerRole::Impl::handle_stream_clear() {
+void VisualizerRole::Impl::handle_stream_clear() const {
     // Per spec, stream/clear discards buffered data but the stream stays active; data
     // received after this message continues to flow. The marker separates the two: a blind
     // flush would race this thread and drop post-clear frames it has already enqueued.
@@ -399,12 +399,12 @@ VisualizerDelivery decode_visualizer_message(uint8_t wire_type, const uint8_t* p
         case SENDSPIN_BINARY_VISUALIZER_SPECTRUM:
             // Deliver exactly the negotiated n_disp_bins. Drop the frame if SPECTRUM was not
             // negotiated (bin count 0) or the payload is short; ignore any trailing bytes.
-            if (configured_bins == 0 || payload_len < 2U * configured_bins) {
+            if (configured_bins == 0 || payload_len < static_cast<size_t>(configured_bins) * 2) {
                 break;
             }
             spectrum_out.resize(configured_bins);
             for (uint8_t b = 0; b < configured_bins; ++b) {
-                spectrum_out[b] = read_be16(payload + 2 * b);
+                spectrum_out[b] = read_be16(payload + static_cast<size_t>(b) * 2);
             }
             out.kind = VisualizerDelivery::Kind::SPECTRUM;
             break;
@@ -489,7 +489,7 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
     // payload drop, or a future wire type that forgets), the destructor returns it. Stack-only.
     struct SlotGuard {
         SpscRingBuffer& rb;
-        void* item;
+        void* item = nullptr;
         bool released = false;
         void release() {
             if (!this->released) {
