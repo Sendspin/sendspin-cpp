@@ -64,6 +64,30 @@ struct ServerStateControllerObject {
     bool muted{};
     SendspinRepeatMode repeat{SendspinRepeatMode::OFF};
     bool shuffle{};
+    // Maximum absolute position (ms) a 'seek' may target. Present only when the server offers the
+    // 'seek' command and the seekable range is known; absent for live/unknown-duration streams.
+    std::optional<uint32_t> seek_max_ms{};
+};
+
+/// @brief A playback command sent from the client to the server via client/command messages.
+///
+/// Construct with designated initializers, setting only the field the command uses:
+/// @code
+/// controller.send_command({.command = SendspinControllerCommand::PLAY});
+/// controller.send_command({.command = SendspinControllerCommand::VOLUME, .volume = 75});
+/// controller.send_command({.command = SendspinControllerCommand::MUTE, .muted = true});
+/// controller.send_command({.command = SendspinControllerCommand::SEEK, .position_ms = 30000});
+/// controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE,
+///                          .offset_ms = -10000});
+/// @endcode
+/// Fields not relevant to the command are ignored when the message is serialized.
+struct ClientCommandControllerObject {
+    SendspinControllerCommand command{};
+    std::optional<uint8_t> volume{};        // only for VOLUME (0-100)
+    std::optional<bool> muted{};            // only for MUTE
+    std::optional<uint32_t> position_ms{};  // only for SEEK (0 to ServerStateControllerObject::
+                                            // seek_max_ms)
+    std::optional<int32_t> offset_ms{};     // only for SEEK_RELATIVE (signed offset from current)
 };
 
 /// @brief Listener for controller role events. All methods fire on the main loop thread.
@@ -108,8 +132,8 @@ public:
  * MyControllerListener listener;
  * auto& controller = client.add_controller();
  * controller.set_listener(&listener);
- * controller.send_command(SendspinControllerCommand::PLAY);
- * controller.send_command(SendspinControllerCommand::VOLUME, 75);  // volume range is 0-100
+ * controller.send_command({.command = SendspinControllerCommand::PLAY});
+ * controller.send_command({.command = SendspinControllerCommand::VOLUME, .volume = 75});
  * @endcode
  */
 class ControllerRole {
@@ -131,6 +155,15 @@ public:
     void set_listener(ControllerRoleListener* listener);
 
     /// @brief Sends a controller command to the server
+    /// @param cmd The command plus any command-specific parameters
+    void send_command(const ClientCommandControllerObject& cmd);
+
+    /// @brief Sends a controller command to the server
+    /// @deprecated Use send_command(const ClientCommandControllerObject&) instead. This overload
+    /// cannot carry seek parameters and will be removed in v0.8.0.
+    [[deprecated(
+        "use send_command(const ClientCommandControllerObject&); this overload cannot carry seek "
+        "parameters and will be removed in v0.8.0")]]
     void send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume = {},
                       std::optional<bool> mute = {});
 

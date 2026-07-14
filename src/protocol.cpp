@@ -594,6 +594,12 @@ bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg
             controller_state.shuffle = *v;
         }
 
+        // Parse seek_max_ms. Present only when the server offers 'seek' and the range is known;
+        // left absent (nullopt) otherwise so consumers can distinguish "unknown range" from 0.
+        if (auto v = read_uint_field<uint32_t>(controller_object["seek_max_ms"], "seek_max_ms")) {
+            controller_state.seek_max_ms = v;
+        }
+
         state_msg->controller = std::move(controller_state);
     }
 
@@ -1118,18 +1124,24 @@ size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmit
     return static_cast<size_t>(p - buf);
 }
 
-std::string format_client_command_message(SendspinControllerCommand command,
-                                          std::optional<uint8_t> volume, std::optional<bool> mute) {
+std::string format_client_command_message(const ClientCommandControllerObject& cmd) {
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/command";
-    root["payload"]["controller"]["command"] = to_cstr(command);
-    if (command == SendspinControllerCommand::VOLUME && volume.has_value()) {
-        root["payload"]["controller"]["volume"] = volume.value();
+    JsonObject controller = root["payload"]["controller"].to<JsonObject>();
+    controller["command"] = to_cstr(cmd.command);
+    if (cmd.command == SendspinControllerCommand::VOLUME && cmd.volume.has_value()) {
+        controller["volume"] = cmd.volume.value();
     }
-    if (command == SendspinControllerCommand::MUTE && mute.has_value()) {
-        root["payload"]["controller"]["mute"] = mute.value();
+    if (cmd.command == SendspinControllerCommand::MUTE && cmd.muted.has_value()) {
+        controller["mute"] = cmd.muted.value();
+    }
+    if (cmd.command == SendspinControllerCommand::SEEK && cmd.position_ms.has_value()) {
+        controller["position_ms"] = cmd.position_ms.value();
+    }
+    if (cmd.command == SendspinControllerCommand::SEEK_RELATIVE && cmd.offset_ms.has_value()) {
+        controller["offset_ms"] = cmd.offset_ms.value();
     }
 
     std::string output;

@@ -482,6 +482,33 @@ TEST(Protocol, ControllerSupportedCommandsValidation) {
     EXPECT_EQ(commands[1], SendspinControllerCommand::MUTE);
 }
 
+// seek_max_ms is parsed when the server includes it (the seekable upper bound for absolute seeks).
+TEST(Protocol, ControllerSeekMaxParsed) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
+                      R"({"supported_commands":["seek"],"seek_max_ms":215000}}})",
+                      doc, root));
+    ServerStateMessage msg;
+    ASSERT_TRUE(process_server_state_message(root, &msg));
+    ASSERT_TRUE(msg.controller.has_value());
+    ASSERT_TRUE(msg.controller->seek_max_ms.has_value());
+    EXPECT_EQ(*msg.controller->seek_max_ms, 215000u);
+}
+
+// seek_max_ms stays absent (nullopt) when omitted, so consumers can tell "unknown range" from 0.
+TEST(Protocol, ControllerSeekMaxAbsentWhenOmitted) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
+                      R"({"supported_commands":["seek_relative"]}}})",
+                      doc, root));
+    ServerStateMessage msg;
+    ASSERT_TRUE(process_server_state_message(root, &msg));
+    ASSERT_TRUE(msg.controller.has_value());
+    EXPECT_FALSE(msg.controller->seek_max_ms.has_value());
+}
+
 // ============================================================================
 // format_client_time_message: hand-rolled int64 formatter checked against snprintf
 // ============================================================================
@@ -531,7 +558,8 @@ TEST(Protocol, FormatTimeMessageRejectsTooSmallBuffer) {
 // ============================================================================
 
 TEST(Protocol, FormatClientCommandVolume) {
-    const std::string out = format_client_command_message(SendspinControllerCommand::VOLUME, 50);
+    const std::string out = format_client_command_message(
+        {.command = SendspinControllerCommand::VOLUME, .volume = 50});
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
@@ -545,7 +573,7 @@ TEST(Protocol, FormatClientCommandVolume) {
 // MUTE carries a boolean payload (a separate branch from VOLUME's uint8_t).
 TEST(Protocol, FormatClientCommandMute) {
     const std::string out =
-        format_client_command_message(SendspinControllerCommand::MUTE, std::nullopt, true);
+        format_client_command_message({.command = SendspinControllerCommand::MUTE, .muted = true});
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
@@ -555,9 +583,49 @@ TEST(Protocol, FormatClientCommandMute) {
     EXPECT_FALSE(doc["payload"]["controller"]["volume"].is<int>());
 }
 
-// A no-argument command (PLAY) emits just the command, with neither payload field present.
+// SEEK carries an absolute position_ms; unrelated payload fields must not leak in.
+TEST(Protocol, FormatClientCommandSeek) {
+    const std::string out = format_client_command_message(
+        {.command = SendspinControllerCommand::SEEK, .position_ms = 30000});
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, out));
+    EXPECT_STREQ(doc["payload"]["controller"]["command"], "seek");
+    ASSERT_TRUE(doc["payload"]["controller"]["position_ms"].is<uint32_t>());
+    EXPECT_EQ(doc["payload"]["controller"]["position_ms"].as<uint32_t>(), 30000u);
+    EXPECT_FALSE(doc["payload"]["controller"]["offset_ms"].is<int>());
+    EXPECT_FALSE(doc["payload"]["controller"]["volume"].is<int>());
+}
+
+// SEEK_RELATIVE carries a signed offset_ms (negative offsets seek backward).
+TEST(Protocol, FormatClientCommandSeekRelative) {
+    const std::string out = format_client_command_message(
+        {.command = SendspinControllerCommand::SEEK_RELATIVE, .offset_ms = -10000});
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, out));
+    EXPECT_STREQ(doc["payload"]["controller"]["command"], "seek_relative");
+    ASSERT_TRUE(doc["payload"]["controller"]["offset_ms"].is<int>());
+    EXPECT_EQ(doc["payload"]["controller"]["offset_ms"].as<int>(), -10000);
+    EXPECT_FALSE(doc["payload"]["controller"]["position_ms"].is<int>());
+}
+
+// A parameter that does not match the command is dropped at serialization (position_ms on VOLUME).
+TEST(Protocol, FormatClientCommandDropsMismatchedParam) {
+    const std::string out = format_client_command_message(
+        {.command = SendspinControllerCommand::VOLUME, .volume = 40, .position_ms = 99999});
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, out));
+    EXPECT_STREQ(doc["payload"]["controller"]["command"], "volume");
+    EXPECT_EQ(doc["payload"]["controller"]["volume"].as<int>(), 40);
+    EXPECT_FALSE(doc["payload"]["controller"]["position_ms"].is<int>());
+}
+
+// A no-argument command (PLAY) emits just the command, with no payload fields present.
 TEST(Protocol, FormatClientCommandNoArgs) {
-    const std::string out = format_client_command_message(SendspinControllerCommand::PLAY);
+    const std::string out =
+        format_client_command_message({.command = SendspinControllerCommand::PLAY});
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
