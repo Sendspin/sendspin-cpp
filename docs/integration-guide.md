@@ -271,6 +271,8 @@ struct MyControllerListener : ControllerRoleListener {
 
 The artwork role uses a dedicated decode thread for the CPU-bound decode step and the main loop for scheduled display. `on_image_decode()` fires on the decode thread immediately when encoded image data arrives; once decode returns, the server display timestamp is handed off to the main loop, which fires `on_image_display()` once the timestamp is reached. If a newer frame for the same slot finishes decoding before its predecessor's display fires, only the newer one is delivered. Lifecycle callbacks also fire on the main loop thread.
 
+`on_image_display()` reports `lateness_ms`: how far past the (offset-shifted) deadline it fired. Displays are best-effort, so an image that arrives or decodes after its deadline fires as soon as it is ready. Treat a small value as on time; a huge value (e.g. joining mid-track, where the artwork timestamp is long past) is the cue to snap instantly. `lateness_ms` is `0` only when there is no connection (no deadline exists), so a connected on-time display always reports a small nonzero value.
+
 ```cpp
 struct MyArtworkListener : ArtworkRoleListener {
     // THREAD SAFETY: Called from the dedicated decode thread.
@@ -282,8 +284,8 @@ struct MyArtworkListener : ArtworkRoleListener {
     }
 
     // Called from the main loop thread once the server display timestamp is reached.
-    // Swap the decoded image onto the display.
-    void on_image_display(uint8_t slot) override {
+    // lateness_ms reports how late the display fired (0 = no connection).
+    void on_image_display(uint8_t slot, uint32_t lateness_ms) override {
         display.show_image(slot, decoded_images[slot]);
     }
 
@@ -293,6 +295,27 @@ struct MyArtworkListener : ArtworkRoleListener {
     }
 };
 ```
+
+**Cross-fades with back-pressure (opt-in).** By default the role decodes and displays every frame as it arrives. A slot can instead opt into a back-pressure gate by setting `ImageSlotPreference::require_frame_done`. With the gate on, the role keeps at most one un-acked *delivery* (a frame or a clear) in flight for that slot; any newer payload that arrives is buffered latest-wins and delivered only after the consumer calls `ArtworkRole::frame_done(slot)` from the main loop -- e.g. once a cross-fade animation finishes. A clear is itself a delivery and supersedes any un-acked frame, so exactly one `frame_done()` is owed after it. There is no timeout: the acknowledgment is the contract.
+
+Pair the gate with `ImageSlotPreference::display_offset_ms` to start a fade before the track boundary (positive fires the display early, mirroring `PlayerRoleConfig::fixed_delay_us`), and use `lateness_ms` to shorten the fade so it still ends on schedule:
+
+```cpp
+// Slot 0 has require_frame_done set, so on_image_display() starts a cross-fade and the gate
+// stays held until on_fade_complete() acks it.
+void on_image_display(uint8_t slot, uint32_t lateness_ms) override {
+    display.start_fade(slot, decoded_images[slot], FADE_MS - std::min(lateness_ms, FADE_MS));
+}
+void on_image_clear(uint8_t slot) override {
+    display.clear_slot(slot);
+    artwork_role->frame_done(slot);  // a clear is a delivery; ack it
+}
+void on_fade_complete(uint8_t slot) {
+    artwork_role->frame_done(slot);  // release the gate so the next frame can decode
+}
+```
+
+Call `frame_done()` from the main loop thread. It is a safe no-op when the slot has nothing un-acked (including slots where `require_frame_done` is false), so calling it from inside `on_image_display()`/`on_image_clear()` for an instant, non-animated swap is fine.
 
 ### VisualizerRoleListener
 
@@ -608,6 +631,8 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 
 `PlayerRole::notify_audio_played()` is thread-safe and is designed to be called from an audio output callback thread.
 
+`ArtworkRole::frame_done()` must be called from the main loop thread (typically from inside `on_image_display()`/`on_image_clear()` or when a cross-fade animation completes).
+
 ## Minimal Example
 
 A minimal integration that receives and discards audio:
@@ -777,6 +802,8 @@ Each entry in `preferred_formats` is an `ImageSlotPreference`. The slot/channel 
 | `format` | `SendspinImageFormat` | Image format (`JPEG`, `PNG`, or `BMP`) |
 | `width` | `uint16_t` | Desired image width in pixels |
 | `height` | `uint16_t` | Desired image height in pixels |
+| `require_frame_done` | `bool` | Opt-in back-pressure gate (default `false`). When set, the role delivers at most one un-acked frame or clear at a time for this slot; the consumer must call `ArtworkRole::frame_done(slot)` to release the gate. See [ArtworkRoleListener](#artworkrolelistener). |
+| `display_offset_ms` | `int32_t` | Shifts the display deadline (default `0`). Positive fires `on_image_display()` earlier (mirroring `PlayerRoleConfig::fixed_delay_us`), negative delays it; lets a cross-fade straddle the track boundary. |
 
 ---
 
