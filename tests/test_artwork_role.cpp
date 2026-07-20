@@ -610,3 +610,25 @@ TEST(ArtworkDisplayDeadline, LargeOffsetDoesNotOverflow) {
     EXPECT_GE(ArtworkRole::Impl::display_overdue_us(now + US_PER_MS, INT32_MAX, now), 0);
     EXPECT_LT(ArtworkRole::Impl::display_overdue_us(now - US_PER_MS, INT32_MIN, now), 0);
 }
+
+// ============================================================================
+// display_lateness_ms: maps a due display's overdue microseconds to the lateness_ms passed to
+// on_image_display(). Pure function; the integration tests above all run without a connection so
+// only its client_ts == 0 branch is otherwise exercised.
+// ============================================================================
+
+TEST(ArtworkDisplayLateness, ZeroIsReservedForNoConnection) {
+    // The one non-obvious invariant on_image_display() consumers rely on: lateness_ms == 0 means
+    // "no connection" and nothing else. With a connection, a display firing under a millisecond
+    // late must not truncate to 0 and collide with that sentinel -- it is floored to 1 ms -- while
+    // a normal multi-millisecond slip passes through unchanged.
+    EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(0, 0), 0u);                  // no connection
+    EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, US_PER_MS - 1), 1u);      // connected, <1ms
+    EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, 600 * US_PER_MS), 600u);  // connected slip
+}
+
+TEST(ArtworkDisplayLateness, HugeLatenessSaturatesAtUint32Max) {
+    // A mid-track join can be minutes late; the ms value must saturate at UINT32_MAX rather than
+    // wrap when narrowed to uint32_t.
+    EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, INT64_MAX), UINT32_MAX);
+}

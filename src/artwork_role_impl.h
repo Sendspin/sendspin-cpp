@@ -183,6 +183,13 @@ struct ArtworkRole::Impl {
     // deadline, positive firing early (mirroring PlayerRoleConfig::fixed_delay_us) and negative
     // delaying. Pure and static for direct unit testing.
     static int64_t display_overdue_us(int64_t client_ts, int32_t display_offset_ms, int64_t now);
+    // Maps a due display's overdue microseconds (from display_overdue_us) to the lateness_ms
+    // reported to on_image_display(). client_ts == 0 means no connection: report 0, the
+    // documented "no deadline exists" sentinel. When connected, floor the result at 1 ms so a
+    // sub-millisecond-late display never truncates to 0 and collides with that sentinel; the top
+    // is clamped at UINT32_MAX ms (~49 days), past which lateness is not meaningful. Pure and
+    // static for direct unit testing.
+    static uint32_t display_lateness_ms(int64_t client_ts, int64_t overdue_us);
     // True if `slot` is within range and configured with require_frame_done.
     bool ack_enabled(uint8_t slot) const;
     // Sends a sentinel ARTWORK_RECHECK_SLOT notification to unblock the decode thread's queue
