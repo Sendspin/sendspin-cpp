@@ -359,7 +359,11 @@ void ArtworkRole::Impl::handle_stream_ring_event(ArtworkEventType event) {
                 // before firing the callbacks below so a listener calling frame_done() from
                 // inside on_image_clear() does not deadlock on this same mutex.
                 std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-                for (size_t i = 0; i < this->config.preferred_formats.size(); ++i) {
+                // Sweep the whole fixed-size slot_buffers array (ARTWORK_MAX_SLOTS), matching
+                // handle_stream_start(): ack_enabled() already gates the PRESENTED arm to
+                // configured ack slots, and clearing has_parked on any others is a harmless reset
+                // (they never park).
+                for (size_t i = 0; i < ARTWORK_MAX_SLOTS; ++i) {
                     auto& sb = this->drain_task->slot_buffers[i];
                     sb.has_parked = false;
                     if (this->ack_enabled(static_cast<uint8_t>(i))) {
