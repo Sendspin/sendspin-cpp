@@ -271,7 +271,7 @@ struct MyControllerListener : ControllerRoleListener {
 
 The artwork role uses a dedicated decode thread for the CPU-bound decode step and the main loop for scheduled display. `on_image_decode()` fires on the decode thread immediately when encoded image data arrives; once decode returns, the server display timestamp is handed off to the main loop, which fires `on_image_display()` once the timestamp is reached. If a newer frame for the same slot finishes decoding before its predecessor's display fires, only the newer one is delivered. Lifecycle callbacks also fire on the main loop thread.
 
-`on_image_display()` reports `lateness_ms`: how far past the (offset-shifted) deadline it fired. Displays are best-effort, so an image that arrives or decodes after its deadline fires as soon as it is ready. Treat a small value as on time; a huge value (e.g. joining mid-track, where the artwork timestamp is long past) is the cue to snap instantly. `lateness_ms` is `0` only when there is no connection (no deadline exists), so a connected on-time display always reports a small nonzero value.
+`on_image_display()` reports `lateness_ms`: how far past the (offset-shifted) deadline it fired. Displays are best-effort, so an image that arrives or decodes after its deadline fires as soon as it is ready. Treat a small value as on time; a huge value is the cue to snap instantly. `lateness_ms` is `0` only when there is no connection (no deadline exists), so a connected on-time display always reports a small nonzero value.
 
 ```cpp
 struct MyArtworkListener : ArtworkRoleListener {

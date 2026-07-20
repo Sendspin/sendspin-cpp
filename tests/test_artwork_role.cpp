@@ -598,8 +598,8 @@ TEST(ArtworkDisplayDeadline, LatenessReportsPastDeadlineSlip) {
     // a consumer shorten its cross-fade (e.g. 2000 ms - 600 ms) so the fade still ends on time.
     EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now + 400 * US_PER_MS, 1000, now),
               600 * US_PER_MS);
-    // Mid-track join: the artwork timestamp is minutes past, so the lateness is huge and the
-    // consumer can snap instead of fading.
+    // A deadline far in the past reports a correspondingly huge lateness, the cue for a consumer
+    // to snap instead of fading.
     EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now - 120'000 * US_PER_MS, 0, now),
               120'000 * US_PER_MS);
 }
@@ -628,7 +628,7 @@ TEST(ArtworkDisplayLateness, ZeroIsReservedForNoConnection) {
 }
 
 TEST(ArtworkDisplayLateness, HugeLatenessSaturatesAtUint32Max) {
-    // A mid-track join can be minutes late; the ms value must saturate at UINT32_MAX rather than
-    // wrap when narrowed to uint32_t.
+    // A pathological far-past deadline can exceed UINT32_MAX ms (~49 days); the ms value must
+    // saturate there rather than wrap when narrowed to uint32_t.
     EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, INT64_MAX), UINT32_MAX);
 }

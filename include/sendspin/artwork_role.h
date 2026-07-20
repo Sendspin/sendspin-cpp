@@ -69,10 +69,10 @@ public:
     /// @param lateness_ms How far past the (offset-shifted) deadline this display fired. Displays
     /// are best-effort: an image that arrives or decodes after its deadline fires as soon as it
     /// is ready, and lateness_ms reports the slip so a consumer can compensate (e.g. shorten a
-    /// cross-fade by the lateness so it still ends on schedule, or snap instantly on a huge value
-    /// such as joining mid-track, where the artwork timestamp is long past). On-time displays
-    /// report a few milliseconds of main-loop polling granularity, never exactly 0, so treat
-    /// small values as on time. Reports 0 when there is no connection, since no deadline exists.
+    /// cross-fade by the lateness so it still ends on schedule, or snap instantly on a huge
+    /// value). On-time displays report a few milliseconds of main-loop polling granularity, never
+    /// exactly 0, so treat small values as on time. Reports 0 when there is no connection, since
+    /// no deadline exists.
     virtual void on_image_display(uint8_t /*slot*/, uint32_t /*lateness_ms*/) {}
 
     /// @brief Called on the main loop thread when artwork should be cleared for a slot
