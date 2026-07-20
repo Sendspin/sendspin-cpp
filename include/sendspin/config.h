@@ -181,6 +181,23 @@ struct ImageSlotPreference {
     SendspinImageFormat format{};
     uint16_t width{};
     uint16_t height{};
+
+    /// @brief Opt-in per-slot back-pressure gate. When true, the role delivers at most one
+    /// un-acked "delivery" at a time for this slot: a delivery is either a frame
+    /// (on_image_decode() followed by on_image_display()) or a clear (on_image_clear()). While a
+    /// delivery is un-acked, any newer payload that arrives is buffered latest-wins and only
+    /// delivered once the consumer calls ArtworkRole::frame_done(slot) from the main loop (e.g.
+    /// after a cross-fade animation completes). Defaults to false, which preserves today's
+    /// behavior of decoding and displaying every frame as it arrives.
+    bool require_frame_done{false};
+
+    /// @brief Fires on_image_display() this many milliseconds before the server's display
+    /// timestamp (negative delays it). Lets a cross-fade straddle the track boundary: with a
+    /// 2 s fade, an offset of 1000 starts the fade 1 s before the boundary so the incoming image
+    /// is fully shown 1 s after it. Positive-equals-earlier mirrors
+    /// PlayerRoleConfig::fixed_delay_us. Best-effort: an image that arrives or decodes after the
+    /// offset deadline fires as soon as it is ready, same as any past-timestamp display.
+    int32_t display_offset_ms{0};
 };
 
 /// @brief Configuration for the artwork role

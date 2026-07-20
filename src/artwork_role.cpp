@@ -145,6 +145,53 @@ void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
 }
 
 // ============================================================================
+// Display-deadline and ack-gate helpers (used from network, decode, and main threads)
+// ============================================================================
+
+int64_t ArtworkRole::Impl::display_overdue_us(int64_t client_ts, int32_t display_offset_ms,
+                                              int64_t now) {
+    // get_client_time returns 0 when there is no current connection. Without a connection we
+    // cannot honor the server-clock deadline, so fire immediately rather than starving the
+    // listener; the lateness is 0 by definition since no deadline exists. The check must precede
+    // the offset shift so the sentinel is never mistaken for a real deadline.
+    if (client_ts == 0) {
+        return 0;
+    }
+    // Positive display_offset_ms fires the display early (mirroring
+    // PlayerRoleConfig::fixed_delay_us), negative delays it; see ImageSlotPreference.
+    return now - (client_ts - static_cast<int64_t>(display_offset_ms) * US_PER_MS);
+}
+
+uint32_t ArtworkRole::Impl::display_lateness_ms(int64_t client_ts, int64_t overdue_us) {
+    // No connection: no deadline exists, so report the documented 0 sentinel (see
+    // display_overdue_us and on_image_display's contract).
+    if (client_ts == 0) {
+        return 0;
+    }
+    // Connected: floor at 1 ms. A display firing under a millisecond late truncates to 0 ms,
+    // which would collide with the no-connection sentinel above; on-time displays must report a
+    // small nonzero value, never exactly 0. Clamp the top so a huge lateness (~49 days) saturates
+    // instead of wrapping.
+    int64_t ms = std::min<int64_t>(overdue_us / US_PER_MS, UINT32_MAX);
+    return static_cast<uint32_t>(std::max<int64_t>(ms, 1));
+}
+
+bool ArtworkRole::Impl::ack_enabled(uint8_t slot) const {
+    return slot < this->config.preferred_formats.size() &&
+           this->config.preferred_formats[slot].require_frame_done;
+}
+
+void ArtworkRole::Impl::wake_drain_thread() const {
+    // Best-effort wakeup: a dropped send just means the decode thread's own
+    // DRAIN_RECEIVE_TIMEOUT_MS receive timeout, plus the parked-slot sweep it runs at the top
+    // of every loop iteration, picks up the parked notification a little later instead of
+    // immediately.
+    ArtworkNotification wake{};
+    wake.slot = ARTWORK_RECHECK_SLOT;
+    this->drain_task->notify_queue.send(wake, 0);
+}
+
+// ============================================================================
 // Binary handling (network thread)
 // ============================================================================
 
@@ -265,6 +312,22 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
     // holds is not reachable from here, but it carries the epoch it was decoded under
     // (held_display_epoch), so the epoch bump above makes the main-loop deadline check drop it.
     this->event_state->display_slot.reset();
+
+    {
+        // Release any DECODE_DELIVERED ack gate: display_slot was just reset and the epoch was
+        // just bumped, so that decode's eventual display can no longer fire, and leaving the
+        // gate armed would wedge the slot forever. PRESENTED must stay armed here: the consumer
+        // may still be mid-fade on the previous stream's last delivery, and its buffers must not
+        // be disturbed until frame_done() is called. Protocol messages are serialized on the
+        // network thread, so this runs before any of the new stream's handle_binary() calls.
+        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+        for (auto& sb : this->drain_task->slot_buffers) {
+            sb.has_parked = false;
+            if (sb.ack_state == SlotAckState::DECODE_DELIVERED) {
+                sb.ack_state = SlotAckState::IDLE;
+            }
+        }
+    }
 }
 
 void ArtworkRole::Impl::handle_stream_end() {
@@ -301,6 +364,26 @@ void ArtworkRole::Impl::handle_stream_ring_event(ArtworkEventType event) {
         case ArtworkEventType::STREAM_CLEAR:
             this->held_display_mask = 0;
             this->event_state->display_slot.reset();
+            {
+                // A clear is itself a delivery that must be acked: it may drive a fade-out, and
+                // it supersedes any un-acked frame for the slot, so exactly one frame_done() is
+                // owed afterward regardless of what ack_state held before. Drop any notification
+                // parked behind an un-acked frame -- it is superseded by the clear. Released
+                // before firing the callbacks below so a listener calling frame_done() from
+                // inside on_image_clear() does not deadlock on this same mutex.
+                std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+                // Sweep the whole fixed-size slot_buffers array (ARTWORK_MAX_SLOTS), matching
+                // handle_stream_start(): ack_enabled() already gates the PRESENTED arm to
+                // configured ack slots, and clearing has_parked on any others is a harmless reset
+                // (they never park).
+                for (size_t i = 0; i < ARTWORK_MAX_SLOTS; ++i) {
+                    auto& sb = this->drain_task->slot_buffers[i];
+                    sb.has_parked = false;
+                    if (this->ack_enabled(static_cast<uint8_t>(i))) {
+                        sb.ack_state = SlotAckState::PRESENTED;
+                    }
+                }
+            }
             if (this->listener) {
                 // Array index is the authoritative slot number; see the Impl constructor.
                 for (size_t i = 0; i < this->config.preferred_formats.size(); ++i) {
@@ -349,18 +432,44 @@ void ArtworkRole::Impl::drain_events() {
         // end/clear bumps the epoch but cannot reach these main-thread holds to cancel it).
         if (this->held_display_epoch[slot] != current_epoch) {
             this->held_display_mask &= static_cast<uint8_t>(~(1U << slot));
+            if (this->ack_enabled(slot)) {
+                bool should_wake = false;
+                {
+                    std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+                    auto& sb = this->drain_task->slot_buffers[slot];
+                    // The consumer got a decode whose display will never fire now; release the
+                    // gate so the slot does not wedge on this stream restart. PRESENTED is left
+                    // untouched: a delivery that already reached on_image_display()/
+                    // on_image_clear() still owes its frame_done() regardless of epoch.
+                    if (sb.ack_state == SlotAckState::DECODE_DELIVERED) {
+                        sb.ack_state = SlotAckState::IDLE;
+                    }
+                    should_wake = sb.has_parked;
+                }
+                if (should_wake) {
+                    this->wake_drain_thread();
+                }
+            }
             continue;
         }
-        // get_client_time returns 0 when there is no current connection. Without a connection we
-        // cannot honor the server-clock deadline, so fire immediately rather than starving the
-        // listener.
         int64_t client_ts = this->client->get_client_time(this->held_display_ts[slot]);
-        if (client_ts != 0 && client_ts > now) {
+        int32_t display_offset_ms = slot < this->config.preferred_formats.size()
+                                        ? this->config.preferred_formats[slot].display_offset_ms
+                                        : 0;
+        int64_t overdue_us = display_overdue_us(client_ts, display_offset_ms, now);
+        if (overdue_us < 0) {
             continue;
         }
         this->held_display_mask &= static_cast<uint8_t>(~(1U << slot));
+        if (this->ack_enabled(slot)) {
+            // Arm the "awaiting frame_done()" state before the callback fires and release the
+            // mutex before invoking it: frame_done() may be called synchronously from inside
+            // on_image_display(), which would deadlock if this mutex were still held.
+            std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+            this->drain_task->slot_buffers[slot].ack_state = SlotAckState::PRESENTED;
+        }
         if (this->listener) {
-            this->listener->on_image_display(slot);
+            this->listener->on_image_display(slot, display_lateness_ms(client_ts, overdue_us));
         }
     }
 }
@@ -387,8 +496,110 @@ void ArtworkRole::Impl::cleanup() {
 }
 
 // ============================================================================
+// Consumer-facing methods (main thread)
+// ============================================================================
+
+void ArtworkRole::Impl::frame_done(uint8_t slot) const {
+    if (slot >= ARTWORK_MAX_SLOTS) {
+        return;
+    }
+
+    bool should_wake = false;
+    {
+        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+        auto& sb = this->drain_task->slot_buffers[slot];
+        if (sb.ack_state == SlotAckState::IDLE) {
+            // Safe no-op: nothing un-acked for this slot, whether because require_frame_done is
+            // disabled, the delivery was already acked, or a clear already acked it for us.
+            return;
+        }
+        sb.ack_state = SlotAckState::IDLE;
+        should_wake = sb.has_parked;
+    }
+    if (should_wake) {
+        this->wake_drain_thread();
+    }
+}
+
+// ============================================================================
 // Decode thread
 // ============================================================================
+
+void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
+    uint8_t slot = notif.slot;
+    uint8_t buf_idx = notif.buffer_idx;
+
+    uint8_t* decode_data = nullptr;
+    size_t decode_length = 0;
+    {
+        // Validate the notification is still current before touching the buffer: a newer
+        // stream (stream_epoch changed) or a newer write to the same buffer (write_generation
+        // changed) means this notification is stale and the bytes it names may have already
+        // been overwritten by the network thread, or are about to be. Skip it instead of
+        // risking a torn read; a fresher notification for the same slot is already queued or
+        // on its way.
+        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+        auto& sb = this->drain_task->slot_buffers[slot];
+
+        if (notif.stream_epoch != this->stream_epoch.load(std::memory_order_relaxed)) {
+            return;
+        }
+        if (notif.generation != sb.write_generation[buf_idx]) {
+            return;
+        }
+
+        auto& buf = sb.buffers[buf_idx];
+        if (notif.data_length == 0 || buf.data() == nullptr) {
+            return;
+        }
+
+        // Ack gate: a slot with require_frame_done set allows only one un-acked delivery in
+        // flight. If one is already outstanding, park this (newer) notification instead of
+        // decoding it now -- overwriting any previously parked notification is latest-wins by
+        // design. Otherwise arm the gate (DECODE_DELIVERED) before decoding, so any later
+        // notification for this slot parks instead of decoding concurrently with this un-acked
+        // delivery. Arming gates on ack_enabled() alone, matching drain_events() and
+        // handle_stream_ring_event(); the listener is set before start() (see set_listener) so it
+        // is non-null here, and the callback invocation below is the crash-guard for that pointer.
+        if (this->ack_enabled(slot) && sb.ack_state != SlotAckState::IDLE) {
+            sb.parked = notif;
+            sb.has_parked = true;
+            return;
+        }
+        if (this->ack_enabled(slot)) {
+            sb.ack_state = SlotAckState::DECODE_DELIVERED;
+        }
+
+        // Mark this buffer as in-use so the network thread avoids it while we decode.
+        sb.drain_buf_idx = buf_idx;
+        sb.drain_active = true;
+        decode_data = buf.data();
+        decode_length = notif.data_length;
+    }
+
+    if (this->listener) {
+        this->listener->on_image_decode(slot, decode_data, decode_length, notif.format);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+        this->drain_task->slot_buffers[slot].drain_active = false;
+    }
+
+    // Hand off the timestamp to the main loop. Skip if the stream ended while we were
+    // decoding so the main loop doesn't fire a display after on_image_clear. The delta
+    // carries just this slot's bit; merge_artwork_display_update ORs it into whatever the
+    // main loop hasn't drained out of display_slot yet.
+    if (this->stream_active.load(std::memory_order_acquire)) {
+        ArtworkDisplayUpdate delta{};
+        delta.timestamps[slot] = notif.timestamp;
+        // The epoch this decode was validated under: lets the main-loop deadline check drop
+        // the display if the stream is replaced after this hand-off (see held_display_epoch).
+        delta.epochs[slot] = notif.stream_epoch;
+        delta.valid_mask = static_cast<uint8_t>(1U << slot);
+        this->event_state->display_slot.merge(merge_artwork_display_update, delta);
+    }
+}
 
 void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
     SS_LOGD(TAG, "Decode thread started");
@@ -403,71 +614,50 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
             break;
         }
 
-        // Blocking receive with 100ms timeout (allows periodic command checks)
+        // Replay any parked notification whose slot's gate has reopened (ack_state back to
+        // IDLE via frame_done() or an epoch-mismatch release in drain_events()).
+        // process_notification() revalidates the notification itself, so a since-stale
+        // generation/epoch is simply skipped -- correct, since a fresher notification is either
+        // already queued or has itself been freshly parked. Loop until no parked slot is ready
+        // so one wakeup can drain several slots without waiting on separate receive timeouts.
+        while (true) {
+            ArtworkNotification parked_notif{};
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> lock(self->drain_task->slot_mutex);
+                for (auto& sb : self->drain_task->slot_buffers) {
+                    if (sb.has_parked && sb.ack_state == SlotAckState::IDLE) {
+                        parked_notif = sb.parked;
+                        sb.has_parked = false;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                break;
+            }
+            self->process_notification(parked_notif);
+        }
+
+        // Blocking receive with 100ms timeout (allows periodic command checks and, when nothing
+        // ever wakes the queue, an upper bound on how long a parked notification waits before the
+        // sweep above rechecks it).
         ArtworkNotification notif{};
         if (!queue.receive(notif, DRAIN_RECEIVE_TIMEOUT_MS)) {
             continue;
         }
 
-        uint8_t slot = notif.slot;
-        uint8_t buf_idx = notif.buffer_idx;
-        if (slot >= ARTWORK_MAX_SLOTS) {
+        if (notif.slot == ARTWORK_RECHECK_SLOT) {
+            // Sentinel used only to unblock receive() so the parked-slot sweep above re-runs
+            // promptly; carries no work of its own.
+            continue;
+        }
+        if (notif.slot >= ARTWORK_MAX_SLOTS) {
             continue;
         }
 
-        uint8_t* decode_data = nullptr;
-        size_t decode_length = 0;
-        {
-            // Validate the notification is still current before touching the buffer: a newer
-            // stream (stream_epoch changed) or a newer write to the same buffer (write_generation
-            // changed) means this notification is stale and the bytes it names may have already
-            // been overwritten by the network thread, or are about to be. Skip it instead of
-            // risking a torn read; a fresher notification for the same slot is already queued or
-            // on its way.
-            std::lock_guard<std::mutex> lock(self->drain_task->slot_mutex);
-            auto& sb = self->drain_task->slot_buffers[slot];
-
-            if (notif.stream_epoch != self->stream_epoch.load(std::memory_order_relaxed)) {
-                continue;
-            }
-            if (notif.generation != sb.write_generation[buf_idx]) {
-                continue;
-            }
-
-            auto& buf = sb.buffers[buf_idx];
-            if (notif.data_length == 0 || buf.data() == nullptr) {
-                continue;
-            }
-
-            // Mark this buffer as in-use so the network thread avoids it while we decode.
-            sb.drain_buf_idx = buf_idx;
-            sb.drain_active = true;
-            decode_data = buf.data();
-            decode_length = notif.data_length;
-        }
-
-        if (self->listener) {
-            self->listener->on_image_decode(slot, decode_data, decode_length, notif.format);
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(self->drain_task->slot_mutex);
-            self->drain_task->slot_buffers[slot].drain_active = false;
-        }
-
-        // Hand off the timestamp to the main loop. Skip if the stream ended while we were
-        // decoding so the main loop doesn't fire a display after on_image_clear. The delta
-        // carries just this slot's bit; merge_artwork_display_update ORs it into whatever the
-        // main loop hasn't drained out of display_slot yet.
-        if (self->stream_active.load(std::memory_order_acquire)) {
-            ArtworkDisplayUpdate delta{};
-            delta.timestamps[slot] = notif.timestamp;
-            // The epoch this decode was validated under: lets the main-loop deadline check drop
-            // the display if the stream is replaced after this hand-off (see held_display_epoch).
-            delta.epochs[slot] = notif.stream_epoch;
-            delta.valid_mask = static_cast<uint8_t>(1U << slot);
-            self->event_state->display_slot.merge(merge_artwork_display_update, delta);
-        }
+        self->process_notification(notif);
     }
 
     SS_LOGD(TAG, "Decode thread stopped");
@@ -484,6 +674,10 @@ ArtworkRole::~ArtworkRole() = default;
 
 void ArtworkRole::set_listener(ArtworkRoleListener* listener) {
     this->impl_->listener = listener;
+}
+
+void ArtworkRole::frame_done(uint8_t slot) {
+    this->impl_->frame_done(slot);
 }
 
 }  // namespace sendspin
