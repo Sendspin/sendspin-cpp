@@ -168,7 +168,7 @@ struct ArtworkRole::Impl {
     // Consumer-facing method implementations
     // ========================================
 
-    void frame_done(uint8_t slot);
+    void frame_done(uint8_t slot) const;
 
     // ========================================
     // Helpers

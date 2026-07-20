@@ -321,8 +321,7 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         // be disturbed until frame_done() is called. Protocol messages are serialized on the
         // network thread, so this runs before any of the new stream's handle_binary() calls.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        for (size_t i = 0; i < ARTWORK_MAX_SLOTS; ++i) {
-            auto& sb = this->drain_task->slot_buffers[i];
+        for (auto& sb : this->drain_task->slot_buffers) {
             sb.has_parked = false;
             if (sb.ack_state == SlotAckState::DECODE_DELIVERED) {
                 sb.ack_state = SlotAckState::IDLE;
@@ -500,7 +499,7 @@ void ArtworkRole::Impl::cleanup() {
 // Consumer-facing methods (main thread)
 // ============================================================================
 
-void ArtworkRole::Impl::frame_done(uint8_t slot) {
+void ArtworkRole::Impl::frame_done(uint8_t slot) const {
     if (slot >= ARTWORK_MAX_SLOTS) {
         return;
     }
@@ -626,8 +625,7 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
             bool found = false;
             {
                 std::lock_guard<std::mutex> lock(self->drain_task->slot_mutex);
-                for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
-                    auto& sb = self->drain_task->slot_buffers[slot];
+                for (auto& sb : self->drain_task->slot_buffers) {
                     if (sb.has_parked && sb.ack_state == SlotAckState::IDLE) {
                         parked_notif = sb.parked;
                         sb.has_parked = false;
