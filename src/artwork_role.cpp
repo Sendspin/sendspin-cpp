@@ -559,13 +559,15 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
         // decoding it now -- overwriting any previously parked notification is latest-wins by
         // design. Otherwise arm the gate (DECODE_DELIVERED) before decoding, so any later
         // notification for this slot parks instead of decoding concurrently with this un-acked
-        // delivery. If there is no listener nothing will decode below, so do not arm.
+        // delivery. Arming gates on ack_enabled() alone, matching drain_events() and
+        // handle_stream_ring_event(); the listener is set before start() (see set_listener) so it
+        // is non-null here, and the callback invocation below is the crash-guard for that pointer.
         if (this->ack_enabled(slot) && sb.ack_state != SlotAckState::IDLE) {
             sb.parked = notif;
             sb.has_parked = true;
             return;
         }
-        if (this->ack_enabled(slot) && this->listener != nullptr) {
+        if (this->ack_enabled(slot)) {
             sb.ack_state = SlotAckState::DECODE_DELIVERED;
         }
 
