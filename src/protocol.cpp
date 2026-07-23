@@ -34,6 +34,12 @@ static const char* const TAG = "sendspin.protocol";
 /// @brief Protocol maximum for volume fields (volume is 0-100 on the wire).
 static constexpr uint8_t VOLUME_MAX = 100;
 
+/// @brief Protocol maximum for the announcement media_duck_db field (0-50 dB on the wire).
+static constexpr uint8_t MEDIA_DUCK_DB_MAX = 50;
+
+/// @brief Protocol maximum for the announcement duck_ramp_ms field (0-2000 ms on the wire).
+static constexpr uint16_t DUCK_RAMP_MS_MAX = 2000;
+
 /// @brief Reads an optional unsigned-integer field with strict type and optional range validation.
 /// Absent or null returns nullopt silently (a legal state for an optional field). A present value
 /// that is the wrong JSON type, outside the target type's range, or outside [min, max] is logged
@@ -704,6 +710,33 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         }
     }
 
+    if (root["payload"]["announcement"].is<JsonObject>()) {
+        JsonObject announcement_json = root["payload"]["announcement"];
+        ServerAnnouncementStreamObject announcement_obj{};
+        // The codec parameters share the player stream-object shape and validation
+        if (process_player_stream_object(announcement_json, &announcement_obj.format, true)) {
+            if (!announcement_obj.is_complete()) {
+                SS_LOGE(TAG, "Invalid stream/start message: incomplete announcement object");
+                return false;
+            }
+            if (auto v = read_uint_field<uint8_t>(announcement_json["media_duck_db"],
+                                                  "media_duck_db", 0, MEDIA_DUCK_DB_MAX)) {
+                announcement_obj.media_duck_db = *v;
+            }
+            if (auto v = read_uint_field<uint16_t>(announcement_json["duck_ramp_ms"],
+                                                   "duck_ramp_ms", 0, DUCK_RAMP_MS_MAX)) {
+                announcement_obj.duck_ramp_ms = *v;
+            }
+            if (auto v = read_uint_field<uint8_t>(announcement_json["volume"], "volume", 0,
+                                                  VOLUME_MAX)) {
+                announcement_obj.volume = v;
+            }
+            stream_msg->announcement = std::move(announcement_obj);
+        } else {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -897,6 +930,20 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         }
     }
 
+    if (msg->announcement_v1_support.has_value()) {
+        JsonArray formats_list =
+            root["payload"]["announcement@v1_support"]["supported_formats"].to<JsonArray>();
+        for (const auto& format : msg->announcement_v1_support.value().supported_formats) {
+            JsonObject format_obj = formats_list.add<JsonObject>();
+            format_obj["codec"] = to_cstr(format.codec);
+            format_obj["channels"] = format.channels;
+            format_obj["sample_rate"] = format.sample_rate;
+            format_obj["bit_depth"] = format.bit_depth;
+        }
+        root["payload"]["announcement@v1_support"]["buffer_capacity"] =
+            msg->announcement_v1_support.value().buffer_capacity;
+    }
+
     std::string output;
     serializeJson(doc, output);
     return output;
@@ -919,6 +966,24 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
                 root["payload"]["player"]["supported_commands"].to<JsonArray>();
             for (const auto& cmd : player_state.supported_commands) {
                 commands_list.add(to_cstr(cmd));
+            }
+        }
+    }
+
+    if (msg->announcement.has_value()) {
+        const ClientAnnouncementStateObject& announcement_state = msg->announcement.value();
+        // Only create the "announcement" key when at least one field is set (all fields are
+        // optional on the wire)
+        if (announcement_state.playing.has_value() ||
+            announcement_state.required_lead_time_ms.has_value()) {
+            JsonObject announcement_json = root["payload"]["announcement"].to<JsonObject>();
+            if (announcement_state.playing.has_value()) {
+                announcement_json["state"] =
+                    announcement_state.playing.value() ? "playing" : "idle";
+            }
+            if (announcement_state.required_lead_time_ms.has_value()) {
+                announcement_json["required_lead_time_ms"] =
+                    announcement_state.required_lead_time_ms.value();
             }
         }
     }
