@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "sendspin/announcement_role.h"
 #include "sendspin/artwork_role.h"
 #include "sendspin/color_role.h"
 #include "sendspin/controller_role.h"
@@ -45,26 +46,28 @@ namespace sendspin {
 /// The visualizer role has an expanded 8-slot allocation (IDs 16-23, bits 2-0 as slot)
 /// and is dispatched by ID range rather than through this enum.
 enum SendspinBinaryRole : uint8_t {
-    SENDSPIN_ROLE_PLAYER = 1,   // 000001xx (IDs 4-7)
-    SENDSPIN_ROLE_ARTWORK = 2,  // 000010xx (IDs 8-11)
+    SENDSPIN_ROLE_PLAYER = 1,        // 000001xx (IDs 4-7)
+    SENDSPIN_ROLE_ARTWORK = 2,       // 000010xx (IDs 8-11)
+    SENDSPIN_ROLE_ANNOUNCEMENT = 6,  // 000110xx (IDs 24-27)
 };
 
 /// @brief Extracts the role field from a standard 4-slot binary message type byte
 /// @param type Binary message type byte.
 /// @return Role portion of the type (bits 7-2).
-/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK, IDs 4-11). The visualizer
-///          range (IDs 16-23) is dispatched by range in SendspinClient::process_binary_message
-///          and must not be routed through this helper: get_binary_role(16) yields 4, which
-///          matches no SendspinBinaryRole enumerator.
+/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK IDs 4-11, ANNOUNCEMENT IDs
+///          24-27). The visualizer range (IDs 16-23) is dispatched by range in
+///          SendspinClient::process_binary_message and must not be routed through this helper:
+///          get_binary_role(16) yields 4, which matches no SendspinBinaryRole enumerator.
 inline uint8_t get_binary_role(uint8_t type) {
     return type >> 2;
 }
 /// @brief Extracts the slot field from a standard 4-slot binary message type byte
 /// @param type Binary message type byte.
 /// @return Slot portion of the type (bits 1-0).
-/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK, IDs 4-11). It masks bits
-///          1-0, so it cannot address the visualizer's 8-slot range (e.g. IDs 16 and 20 both
-///          alias to slot 0); those messages are dispatched by range, not by slot.
+/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK IDs 4-11, ANNOUNCEMENT IDs
+///          24-27). It masks bits 1-0, so it cannot address the visualizer's 8-slot range (e.g.
+///          IDs 16 and 20 both alias to slot 0); those messages are dispatched by range, not by
+///          slot.
 inline uint8_t get_binary_slot(uint8_t type) {
     return type & 0x03;
 }
@@ -82,6 +85,7 @@ enum SendspinBinaryType : uint8_t {
     SENDSPIN_BINARY_VISUALIZER_PEAK = 20,      // uint8 onset strength
     SENDSPIN_BINARY_VISUALIZER_FIRST = 16,     // Start of visualizer ID range
     SENDSPIN_BINARY_VISUALIZER_LAST = 23,      // End of visualizer ID range (21-23 reserved)
+    SENDSPIN_BINARY_ANNOUNCEMENT_AUDIO = 24,   // Announcement slot 0: encoded audio chunk
 };
 
 /// @brief JSON message types sent from the server to the client
@@ -99,12 +103,13 @@ enum class SendspinServerToClientMessageType : uint8_t {
 
 /// @brief Protocol role identifiers used in hello messages and role negotiation
 enum class SendspinRole : uint8_t {
-    PLAYER,      // Audio playback role
-    CONTROLLER,  // Playback command/state role
-    METADATA,    // Track metadata role
-    ARTWORK,     // Album artwork role
-    VISUALIZER,  // Audio visualization role
-    COLOR,       // Audio-derived color palette role
+    PLAYER,        // Audio playback role
+    CONTROLLER,    // Playback command/state role
+    METADATA,      // Track metadata role
+    ARTWORK,       // Album artwork role
+    VISUALIZER,    // Audio visualization role
+    COLOR,         // Audio-derived color palette role
+    ANNOUNCEMENT,  // Per-client announcement audio role
 };
 
 /// @brief Converts a SendspinRole value to its protocol wire string representation
@@ -124,6 +129,8 @@ inline const char* to_cstr(SendspinRole role) {
             return "visualizer@v1";
         case SendspinRole::COLOR:
             return "color@v1";
+        case SendspinRole::ANNOUNCEMENT:
+            return "announcement@v1";
         default:
             return "unknown";
     }
@@ -292,6 +299,23 @@ struct ClientPlayerStateObject {
     bool muted{};
     uint16_t static_delay_ms{};
     std::vector<SendspinPlayerCommand> supported_commands{};
+};
+
+// --- announcement_role.h ---
+
+/// @brief Announcement capabilities advertised to the server during the hello handshake
+struct AnnouncementSupportObject {
+    std::vector<AudioSupportedFormatObject> supported_formats{};
+    size_t buffer_capacity{};
+};
+
+/// @brief Announcement state reported by the client to the server in client/state messages
+///
+/// All fields are optional on the wire; the server derives announcement completion from the
+/// stream timeline regardless, so this state is informational.
+struct ClientAnnouncementStateObject {
+    std::optional<bool> playing{};
+    std::optional<uint32_t> required_lead_time_ms{};
 };
 
 // --- controller_role.h ---
@@ -619,12 +643,14 @@ struct ClientHelloMessage {
     std::optional<PlayerSupportObject> player_v1_support{};
     std::optional<ArtworkSupportObject> artwork_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
+    std::optional<AnnouncementSupportObject> announcement_v1_support{};
 };
 
 /// @brief Outgoing client/state message reporting client playback state to the server
 struct ClientStateMessage {
     SendspinClientState state{};
     std::optional<ClientPlayerStateObject> player{};
+    std::optional<ClientAnnouncementStateObject> announcement{};
 };
 
 /// @brief Parsed server/state message containing per-role state updates
@@ -652,6 +678,7 @@ struct StreamStartMessage {
     std::optional<ServerPlayerStreamObject> player;
     std::optional<ServerArtworkStreamObject> artwork;
     std::optional<ServerVisualizerStreamObject> visualizer;
+    std::optional<ServerAnnouncementStreamObject> announcement;
 };
 
 /// @brief Outgoing stream/request_format message used for codec, artwork, and visualizer

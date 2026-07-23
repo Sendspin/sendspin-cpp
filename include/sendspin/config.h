@@ -158,6 +158,36 @@ struct PlayerRoleConfig {
 };
 
 // ============================================================================
+// Announcement config types
+// ============================================================================
+
+/// @brief Configuration for the announcement role
+struct AnnouncementRoleConfig {
+    /// @brief Default encoded announcement buffer size (~128 KB; announcements are short clips)
+    static constexpr size_t DEFAULT_AUDIO_BUFFER_CAPACITY = 131072U;
+
+    /// Announcement formats advertised to the server, in priority order. These are decoded on a
+    /// second concurrent pipeline next to the media stream, so prefer inexpensive formats
+    /// (mono, 16-bit, modest sample rates).
+    std::vector<AudioSupportedFormatObject> audio_formats{};
+    size_t audio_buffer_capacity{DEFAULT_AUDIO_BUFFER_CAPACITY};
+
+    bool psram_stack{false};  ///< Allocate announcement task stack in PSRAM (ESP-IDF only)
+
+    /// @brief Default FreeRTOS priority for the announcement decode task (ESP-IDF only).
+    /// Below the httpd server and media sync tasks so a playing announcement can never starve
+    /// the synchronized media pipeline.
+    static constexpr unsigned DEFAULT_ANNOUNCEMENT_TASK_PRIORITY = 4U;
+
+    unsigned priority{DEFAULT_ANNOUNCEMENT_TASK_PRIORITY};  ///< FreeRTOS priority for the
+                                                            ///< announcement task (ESP-IDF only)
+
+    /// @brief Memory placement for the decode buffer (ESP-IDF only; ignored on host).
+    /// Defaults to PREFER_EXTERNAL (SPIRAM).
+    MemoryLocation decode_buffer_location{MemoryLocation::PREFER_EXTERNAL};
+};
+
+// ============================================================================
 // Artwork config types
 // ============================================================================
 
