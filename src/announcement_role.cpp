@@ -178,7 +178,8 @@ void AnnouncementRole::Impl::handle_stream_start(
     bool header_sent = false;
     const ServerPlayerStreamObject& format = announcement_obj.format;
 
-    if (!format.is_complete()) {
+    if (!format.bit_depth.has_value() || !format.channels.has_value() ||
+        !format.sample_rate.has_value() || !format.codec.has_value()) {
         SS_LOGE(TAG, "Announcement stream start missing required audio parameters");
     } else {
         auto codec = format.codec.value();

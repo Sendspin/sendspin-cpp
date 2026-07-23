@@ -40,6 +40,9 @@ class SendspinClient;
 /// The codec parameters share the player stream-object shape; the additional fields carry the
 /// per-announcement ducking policy and optional output level.
 struct ServerAnnouncementStreamObject {
+    /// @brief Default ducking ramp duration in milliseconds, used when the server omits the field
+    static constexpr uint16_t DEFAULT_DUCK_RAMP_MS = 100U;
+
     ServerPlayerStreamObject format{};
 
     /// Reduction in decibel (0-50) to apply to this client's own media output while the
@@ -47,7 +50,7 @@ struct ServerAnnouncementStreamObject {
     uint8_t media_duck_db{0};
 
     /// Ramp duration in milliseconds (0-2000) for both applying and releasing the ducking.
-    uint16_t duck_ramp_ms{100};
+    uint16_t duck_ramp_ms{DEFAULT_DUCK_RAMP_MS};
 
     /// When set, the announcement should be rendered at the loudness that master volume
     /// `volume` (0-100) would produce, regardless of the current master volume. When absent,
