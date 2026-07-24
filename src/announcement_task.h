@@ -139,7 +139,9 @@ protected:
     void play_stream();
 
     /// @brief Sleeps until the first chunk's timestamp (translated to the local clock), bounded
-    /// and abortable. No-op when time sync is unavailable or the timestamp already passed
+    /// and abortable. No-op when time sync is unavailable or the timestamp already passed.
+    /// Honoring the timestamp is what aligns a coordinated multi-speaker announcement, where the
+    /// server schedules the same start time on every targeted client
     void wait_for_start_time(int64_t server_timestamp);
 
     /// @brief Non-blocking drain of all chunks currently in the ring buffer

@@ -105,7 +105,8 @@ public:
  * arrive from the WebSocket network thread, are written into a dedicated ring buffer, decoded,
  * and delivered to the platform through AnnouncementRoleListener::on_announcement_write().
  * Unlike the player role there is no sample-accurate sync machinery: announcements are
- * per-client, start at (or as soon as possible after) their first chunk's timestamp, and are
+ * per-client, start at (or as soon as possible after) their first chunk's timestamp - which is
+ * also what aligns a coordinated multi-speaker announcement scheduled by the server - and are
  * paced by the sink.
  *
  * Usage:
