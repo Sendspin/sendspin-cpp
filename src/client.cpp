@@ -838,28 +838,37 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             break;
         }
         case SendspinServerToClientMessageType::SERVER_STATE: {
-            ServerStateMessage state_msg;
-            if (process_server_state_message(root, &state_msg)) {
+            // Parse and hand off one section at a time, each in its own scope. Parsing the whole
+            // message into an aggregate would hold every section's storage (a metadata delta alone
+            // is 200 bytes) in this frame at once, and this runs on the network task, whose stack
+            // is small on ESP-IDF. Scoping the sections lets the compiler reuse the same slots, and
+            // a section is only parsed at all when its role is present.
 #ifdef SENDSPIN_ENABLE_CONTROLLER
-                if (this->controller_ && state_msg.controller.has_value()) {
-                    this->controller_->impl_->handle_server_state(
-                        std::move(state_msg.controller.value()));
+            if (this->controller_ != nullptr) {
+                ServerStateControllerObject controller_state;
+                if (process_server_state_controller(root, &controller_state)) {
+                    this->controller_->impl_->handle_server_state(std::move(controller_state));
                 }
+            }
 #endif
 
 #ifdef SENDSPIN_ENABLE_METADATA
-                if (this->metadata_ && state_msg.metadata.has_value()) {
-                    this->metadata_->impl_->handle_server_state(
-                        std::move(state_msg.metadata.value()));
+            if (this->metadata_ != nullptr) {
+                ServerMetadataStateDelta metadata_delta;
+                if (process_server_state_metadata(root, &metadata_delta)) {
+                    this->metadata_->impl_->handle_server_state(std::move(metadata_delta));
                 }
+            }
 #endif
 
 #ifdef SENDSPIN_ENABLE_COLOR
-                if (this->color_ && state_msg.color.has_value()) {
-                    this->color_->impl_->handle_server_state(state_msg.color.value());
+            if (this->color_ != nullptr) {
+                ServerColorStateDelta color_delta;
+                if (process_server_state_color(root, &color_delta)) {
+                    this->color_->impl_->handle_server_state(std::move(color_delta));
                 }
-#endif
             }
+#endif
             break;
         }
         case SendspinServerToClientMessageType::SERVER_COMMAND: {

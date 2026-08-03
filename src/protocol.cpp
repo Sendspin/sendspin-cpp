@@ -243,54 +243,6 @@ static void parse_metadata_uint16_field(JsonVariantConst var, const char* name,
     }
 }
 
-static bool process_server_metadata_state_object(const JsonObject metadata_object,
-                                                 ServerMetadataStateDelta* metadata_delta) {
-    if (metadata_delta == nullptr) {
-        return false;
-    }
-
-    // timestamp is required (not optional)
-    if (!metadata_object["timestamp"].is<JsonVariant>()) {
-        SS_LOGE(TAG, "Invalid metadata state object: missing timestamp");
-        return false;
-    }
-    metadata_delta->timestamp = metadata_object["timestamp"].as<int64_t>();
-
-    parse_metadata_string_field(metadata_object["title"], "title", &metadata_delta->title);
-    parse_metadata_string_field(metadata_object["artist"], "artist", &metadata_delta->artist);
-    parse_metadata_string_field(metadata_object["album_artist"], "album_artist",
-                                &metadata_delta->album_artist);
-    parse_metadata_string_field(metadata_object["album"], "album", &metadata_delta->album);
-    parse_metadata_string_field(metadata_object["artwork_url"], "artwork_url",
-                                &metadata_delta->artwork_url);
-    parse_metadata_uint16_field(metadata_object["year"], "year", &metadata_delta->year);
-    parse_metadata_uint16_field(metadata_object["track"], "track", &metadata_delta->track);
-
-    // Parse progress object - present object engages inner; explicit null clears; absent leaves
-    // outer nullopt.
-    if (metadata_object["progress"].is<JsonObject>()) {
-        JsonObject progress_object = metadata_object["progress"];
-        MetadataProgressObject progress{};
-        if (auto v =
-                read_uint_field<uint32_t>(progress_object["track_progress"], "track_progress")) {
-            progress.track_progress = *v;
-        }
-        if (auto v =
-                read_uint_field<uint32_t>(progress_object["track_duration"], "track_duration")) {
-            progress.track_duration = *v;
-        }
-        if (auto v =
-                read_uint_field<uint32_t>(progress_object["playback_speed"], "playback_speed")) {
-            progress.playback_speed = *v;
-        }
-        metadata_delta->progress = progress;
-    } else if (!metadata_object["progress"].isUnbound() && metadata_object["progress"].isNull()) {
-        metadata_delta->progress = std::optional<MetadataProgressObject>{};
-    }
-
-    return true;
-}
-
 // Parses a single `[R, G, B]` color field into a tri-state delta entry. Absent leaves `out`
 // untouched (outer nullopt); explicit `null` writes outer-engaged + inner-nullopt (clear); a
 // 3-element array of 0-255 integers writes the color. Any malformed value is logged and skipped
@@ -323,30 +275,6 @@ static void parse_color_field(JsonVariantConst var, const char* name,
         color[i] = *component;
     }
     *out = color;
-}
-
-static bool process_server_color_state_object(const JsonObject color_object,
-                                              ServerColorStateDelta* color_delta) {
-    if (color_delta == nullptr) {
-        return false;
-    }
-
-    if (!color_object["timestamp"].is<JsonVariant>()) {
-        SS_LOGE(TAG, "Invalid color state object: missing timestamp");
-        return false;
-    }
-    color_delta->timestamp = color_object["timestamp"].as<int64_t>();
-
-    parse_color_field(color_object["background_dark"], "background_dark",
-                      &color_delta->background_dark);
-    parse_color_field(color_object["background_light"], "background_light",
-                      &color_delta->background_light);
-    parse_color_field(color_object["primary"], "primary", &color_delta->primary);
-    parse_color_field(color_object["accent"], "accent", &color_delta->accent);
-    parse_color_field(color_object["on_dark"], "on_dark", &color_delta->on_dark);
-    parse_color_field(color_object["on_light"], "on_light", &color_delta->on_light);
-
-    return true;
 }
 
 // ============================================================================
@@ -532,75 +460,131 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
     return true;
 }
 
-bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg) {
-    if (state_msg == nullptr) {
-        return true;
+// server/state is parsed one section at a time rather than into a single aggregate struct. The
+// caller runs on the network task (the ESP httpd task has a 4 KB stack), and an aggregate would
+// keep every section's fields alive in the caller's frame for the whole parse while the section
+// parser built a second copy of the same fields in its own. Each section here is an out-of-line
+// function that fills a caller-owned struct directly, so only one section's storage is live at a
+// time and nothing is materialized twice.
+
+bool process_server_state_metadata(JsonObject root, ServerMetadataStateDelta* metadata_delta) {
+    if (metadata_delta == nullptr || !root["payload"]["metadata"].is<JsonObject>()) {
+        return false;
     }
+    const JsonObject metadata_object = root["payload"]["metadata"];
 
-    (void)root;
-
-    // Parse optional metadata object
-    if (root["payload"]["metadata"].is<JsonObject>()) {
-        ServerMetadataStateDelta metadata_delta{};
-        if (process_server_metadata_state_object(root["payload"]["metadata"], &metadata_delta)) {
-            state_msg->metadata = std::move(metadata_delta);
-        }
+    // timestamp is required (not optional)
+    if (!metadata_object["timestamp"].is<JsonVariant>()) {
+        SS_LOGE(TAG, "Invalid metadata state object: missing timestamp");
+        return false;
     }
+    metadata_delta->timestamp = metadata_object["timestamp"].as<int64_t>();
 
-    if (root["payload"]["color"].is<JsonObject>()) {
-        ServerColorStateDelta color_delta{};
-        if (process_server_color_state_object(root["payload"]["color"], &color_delta)) {
-            state_msg->color = color_delta;
-        }
-    }
+    parse_metadata_string_field(metadata_object["title"], "title", &metadata_delta->title);
+    parse_metadata_string_field(metadata_object["artist"], "artist", &metadata_delta->artist);
+    parse_metadata_string_field(metadata_object["album_artist"], "album_artist",
+                                &metadata_delta->album_artist);
+    parse_metadata_string_field(metadata_object["album"], "album", &metadata_delta->album);
+    parse_metadata_string_field(metadata_object["artwork_url"], "artwork_url",
+                                &metadata_delta->artwork_url);
+    parse_metadata_uint16_field(metadata_object["year"], "year", &metadata_delta->year);
+    parse_metadata_uint16_field(metadata_object["track"], "track", &metadata_delta->track);
 
-    if (root["payload"]["controller"].is<JsonObject>()) {
-        ServerStateControllerObject controller_state{};
-        JsonObject controller_object = root["payload"]["controller"];
-
-        // Parse supported_commands array. The controller role is frozen at v1, so an unrecognized
-        // command is a non-compliant value rather than a forward-compatible one: drop and log it.
-        if (controller_object["supported_commands"].is<JsonArray>()) {
-            std::vector<SendspinControllerCommand> commands;
-            for (JsonVariantConst command_var :
-                 controller_object["supported_commands"].as<JsonArrayConst>()) {
-                if (auto command = read_enum_field(command_var, "supported_commands",
-                                                   controller_command_from_string)) {
-                    commands.push_back(*command);
-                }
-            }
-            controller_state.supported_commands = std::move(commands);
-        }
-
-        // Parse volume
+    // Parse progress object - present object engages inner; explicit null clears; absent leaves
+    // outer nullopt.
+    if (metadata_object["progress"].is<JsonObject>()) {
+        JsonObject progress_object = metadata_object["progress"];
+        MetadataProgressObject progress{};
         if (auto v =
-                read_uint_field<uint8_t>(controller_object["volume"], "volume", 0, VOLUME_MAX)) {
-            controller_state.volume = *v;
+                read_uint_field<uint32_t>(progress_object["track_progress"], "track_progress")) {
+            progress.track_progress = *v;
         }
-
-        // Parse muted
-        if (auto v = read_bool_field(controller_object["muted"], "muted")) {
-            controller_state.muted = *v;
+        if (auto v =
+                read_uint_field<uint32_t>(progress_object["track_duration"], "track_duration")) {
+            progress.track_duration = *v;
         }
-
-        // Parse repeat
-        if (auto repeat =
-                read_enum_field(controller_object["repeat"], "repeat", repeat_mode_from_string)) {
-            controller_state.repeat = *repeat;
+        if (auto v =
+                read_uint_field<uint32_t>(progress_object["playback_speed"], "playback_speed")) {
+            progress.playback_speed = *v;
         }
+        metadata_delta->progress = progress;
+    } else if (!metadata_object["progress"].isUnbound() && metadata_object["progress"].isNull()) {
+        metadata_delta->progress = std::optional<MetadataProgressObject>{};
+    }
 
-        // Parse shuffle
-        if (auto v = read_bool_field(controller_object["shuffle"], "shuffle")) {
-            controller_state.shuffle = *v;
+    return true;
+}
+
+bool process_server_state_color(JsonObject root, ServerColorStateDelta* color_delta) {
+    if (color_delta == nullptr || !root["payload"]["color"].is<JsonObject>()) {
+        return false;
+    }
+    const JsonObject color_object = root["payload"]["color"];
+
+    if (!color_object["timestamp"].is<JsonVariant>()) {
+        SS_LOGE(TAG, "Invalid color state object: missing timestamp");
+        return false;
+    }
+    color_delta->timestamp = color_object["timestamp"].as<int64_t>();
+
+    parse_color_field(color_object["background_dark"], "background_dark",
+                      &color_delta->background_dark);
+    parse_color_field(color_object["background_light"], "background_light",
+                      &color_delta->background_light);
+    parse_color_field(color_object["primary"], "primary", &color_delta->primary);
+    parse_color_field(color_object["accent"], "accent", &color_delta->accent);
+    parse_color_field(color_object["on_dark"], "on_dark", &color_delta->on_dark);
+    parse_color_field(color_object["on_light"], "on_light", &color_delta->on_light);
+
+    return true;
+}
+
+bool process_server_state_controller(JsonObject root,
+                                     ServerStateControllerObject* controller_state) {
+    if (controller_state == nullptr || !root["payload"]["controller"].is<JsonObject>()) {
+        return false;
+    }
+    const JsonObject controller_object = root["payload"]["controller"];
+
+    // Parse supported_commands array. The controller role is frozen at v1, so an unrecognized
+    // command is a non-compliant value rather than a forward-compatible one: drop and log it.
+    if (controller_object["supported_commands"].is<JsonArray>()) {
+        std::vector<SendspinControllerCommand> commands;
+        for (JsonVariantConst command_var :
+             controller_object["supported_commands"].as<JsonArrayConst>()) {
+            if (auto command = read_enum_field(command_var, "supported_commands",
+                                               controller_command_from_string)) {
+                commands.push_back(*command);
+            }
         }
+        controller_state->supported_commands = std::move(commands);
+    }
 
-        // Parse seek_max_ms. Present only when the server offers 'seek' and the range is known;
-        // left absent (nullopt) otherwise so consumers can distinguish "unknown range" from 0.
-        if (auto v = read_uint_field<uint32_t>(controller_object["seek_max_ms"], "seek_max_ms")) {
-            controller_state.seek_max_ms = v;
-        }
+    // Parse volume
+    if (auto v = read_uint_field<uint8_t>(controller_object["volume"], "volume", 0, VOLUME_MAX)) {
+        controller_state->volume = *v;
+    }
 
-        state_msg->controller = std::move(controller_state);
+    // Parse muted
+    if (auto v = read_bool_field(controller_object["muted"], "muted")) {
+        controller_state->muted = *v;
+    }
+
+    // Parse repeat
+    if (auto repeat =
+            read_enum_field(controller_object["repeat"], "repeat", repeat_mode_from_string)) {
+        controller_state->repeat = *repeat;
+    }
+
+    // Parse shuffle
+    if (auto v = read_bool_field(controller_object["shuffle"], "shuffle")) {
+        controller_state->shuffle = *v;
+    }
+
+    // Parse seek_max_ms. Present only when the server offers 'seek' and the range is known;
+    // left absent (nullopt) otherwise so consumers can distinguish "unknown range" from 0.
+    if (auto v = read_uint_field<uint32_t>(controller_object["seek_max_ms"], "seek_max_ms")) {
+        controller_state->seek_max_ms = v;
     }
 
     return true;
@@ -611,24 +595,26 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         return true;
     }
 
-    (void)root;
+    // Each section is parsed straight into the caller's struct rather than into a local that is
+    // then moved in. Both copies would otherwise be live at once in this frame, which matters on
+    // the ESP httpd task (4 KB stack); on a parse failure the section is reset instead.
 
     if (root["payload"]["player"].is<JsonObject>()) {
-        ServerPlayerStreamObject player_obj{};
-        if (process_player_stream_object(root["payload"]["player"], &player_obj, true)) {
-            if (!player_obj.is_complete()) {
-                SS_LOGE(TAG, "Invalid stream/start message: incomplete player object");
-                return false;
-            }
-            stream_msg->player = std::move(player_obj);
-        } else {
+        ServerPlayerStreamObject& player_obj = stream_msg->player.emplace();
+        if (!process_player_stream_object(root["payload"]["player"], &player_obj, true)) {
+            stream_msg->player.reset();
+            return false;
+        }
+        if (!player_obj.is_complete()) {
+            SS_LOGE(TAG, "Invalid stream/start message: incomplete player object");
+            stream_msg->player.reset();
             return false;
         }
     }
 
     if (root["payload"]["artwork"]["channels"].is<JsonArray>()) {
-        ServerArtworkStreamObject artwork_obj{};
-        std::vector<ServerArtworkChannelObject> channels;
+        std::vector<ServerArtworkChannelObject>& channels =
+            stream_msg->artwork.emplace().channels.emplace();
 
         JsonArray channels_array = root["payload"]["artwork"]["channels"].as<JsonArray>();
         for (JsonObject channel_json : channels_array) {
@@ -636,19 +622,19 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             if (process_artwork_channel_object(channel_json, &channel, true)) {
                 if (!channel.is_complete()) {
                     SS_LOGE(TAG, "Invalid stream/start message: incomplete artwork channel");
+                    stream_msg->artwork.reset();
                     return false;
                 }
                 channels.push_back(channel);
             } else {
+                stream_msg->artwork.reset();
                 return false;
             }
         }
-        artwork_obj.channels = std::move(channels);
-        stream_msg->artwork = std::move(artwork_obj);
     }
 
     if (root["payload"]["visualizer"].is<JsonObject>()) {
-        ServerVisualizerStreamObject vis_obj{};
+        ServerVisualizerStreamObject& vis_obj = stream_msg->visualizer.emplace();
         JsonObject vis_json = root["payload"]["visualizer"];
 
         // Parse types array
@@ -699,8 +685,7 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
         if (advertises_spectrum && !vis_obj.spectrum.has_value()) {
             SS_LOGE(TAG, "Ignoring visualizer stream config: SPECTRUM advertised without valid "
                          "spectrum config");
-        } else {
-            stream_msg->visualizer = std::move(vis_obj);
+            stream_msg->visualizer.reset();
         }
     }
 
