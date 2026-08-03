@@ -48,7 +48,7 @@ struct MetadataRole::Impl {
 
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerMetadataStateDelta delta) const;
+    void handle_server_state(ServerMetadataStateDelta&& delta) const;
     // True if a slot delta needs folding in, or a delta already held from a prior tick (see
     // held_delta) is still waiting out its server-clock deadline -- the deadline itself sets no
     // inbox bit, so held_delta must be polled every tick until it fires.
