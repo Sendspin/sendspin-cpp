@@ -29,6 +29,7 @@
 
 #include "sendspin/client.h"
 
+#include <mutex>
 #include <string>
 
 namespace sendspin {
@@ -70,6 +71,13 @@ public:
     void clear_pairing_psk() override;
 
     // ========================================================================
+    // Static PIN
+    // ========================================================================
+    std::optional<std::string> load_static_pin() override;
+    bool save_static_pin(const std::string& pin) override;
+    void clear_static_pin() override;
+
+    // ========================================================================
     // Pairing config
     // ========================================================================
     std::optional<SendspinPairingConfig> load_pairing_config() override;
@@ -82,6 +90,10 @@ public:
     std::optional<uint16_t> load_static_delay() override;
 
 private:
+    // save_pairing_record is called on the network thread during pairing finalize, while the
+    // other methods run on the main loop. This mutex serializes the read-modify-write of the
+    // backing file so concurrent calls cannot lose an update.
+    std::mutex mutex_;
     std::string path_;
 };
 

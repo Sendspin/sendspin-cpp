@@ -32,11 +32,13 @@
 #pragma once
 
 #include "crypto/constants.h"
+#include "protocol_messages.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -192,6 +194,68 @@ public:
         return this->unpaired_access_enabled_;
     }
 
+    /// @brief Return whether dynamic-PIN pairing is enabled.
+    [[nodiscard]] bool dynamic_pin_enabled() const {
+        return this->dynamic_pin_enabled_;
+    }
+
+    /// @brief Return the minimum PIN length the client will accept.
+    [[nodiscard]] int dynamic_pin_min_length() const {
+        return this->dynamic_pin_min_length_;
+    }
+
+    // ========================================================================
+    // PIN lockout (Phase 8b/8c, in-memory only)
+    // ========================================================================
+
+    /// @brief Number of consecutive PIN failures before lockout.
+    static constexpr int PIN_LOCKOUT_THRESHOLD = 10;
+
+    /// @brief Return true if `method`'s PIN pairing is currently locked out.
+    /// Lockout is in-memory only (not persisted); cleared on restart.
+    [[nodiscard]] bool is_pin_locked_out(SendspinPairMethod method) const {
+        auto it = this->pin_failures_.find(method);
+        if (it == this->pin_failures_.end()) {
+            return false;
+        }
+        return it->second >= PIN_LOCKOUT_THRESHOLD;
+    }
+
+    /// @brief Return the current PIN failure count for `method` (0 if none recorded).
+    [[nodiscard]] int pin_failure_count(SendspinPairMethod method) const {
+        auto it = this->pin_failures_.find(method);
+        return it == this->pin_failures_.end() ? 0 : it->second;
+    }
+
+    /// @brief Increment the PIN failure counter for `method`.
+    void record_pin_failure(SendspinPairMethod method);
+
+    /// @brief Reset the PIN failure counter for `method` to zero (on success or lockout clear).
+    void reset_pin_failures(SendspinPairMethod method);
+
+    // ========================================================================
+    // Static PIN (Phase 8c)
+    // ========================================================================
+
+    /// @brief Return the configured static PIN, if any.
+    [[nodiscard]] const std::optional<std::string>& static_pin() const {
+        return this->static_pin_;
+    }
+
+    /// @brief Return whether static-PIN pairing is enabled.
+    [[nodiscard]] bool static_pin_enabled() const {
+        return this->static_pin_enabled_;
+    }
+
+    /// @brief Set the configured static PIN (8 decimal digits), replacing any existing one.
+    void set_static_pin(const std::string& pin);
+
+    /// @brief Clear the configured static PIN. No-op if absent.
+    void clear_static_pin();
+
+    /// @brief Set the static-PIN-enabled flag and persist the config.
+    void set_static_pin_enabled(bool enabled);
+
     /// @brief Return the psk_id of the shared-PSK fallback record.
     [[nodiscard]] const std::string& record_mode_psk_id() const {
         return this->record_mode_psk_id_;
@@ -206,6 +270,12 @@ public:
 
     /// @brief Set the unpaired-access-enabled flag and persist the config.
     void set_unpaired_access_enabled(bool enabled);
+
+    /// @brief Set the dynamic-PIN-enabled flag and persist the config.
+    void set_dynamic_pin_enabled(bool enabled);
+
+    /// @brief Set the minimum PIN length and persist the config.
+    void set_dynamic_pin_min_length(int length);
 
     // ========================================================================
     // Pairing outcome (Phase 5+, declared now for completeness)
@@ -230,6 +300,31 @@ public:
         return true;
     }
 
+    // ========================================================================
+    // Storage accounting (Phase 6)
+    // ========================================================================
+
+    /// @brief Storage accounting report returned by storage_accounting().
+    struct StorageReport {
+        int free{0};             ///< Number of free record slots.
+        int capacity{0};         ///< Total record slot capacity.
+        int cost_individual{1};  ///< Slots consumed by a stored-pubkey record.
+        int cost_shared{1};      ///< Slots consumed by a shared-PSK record.
+    };
+
+    /// @brief Return storage accounting info, or nullopt for unbounded/unknown storage.
+    ///
+    /// The default implementation returns nullopt (host-backed provider: unbounded).
+    /// A future bounded-storage provider can override this to report capacity to the
+    /// managing server. When nullopt, the management/result omits the "storage" key.
+    ///
+    /// include_static semantics (attachment point in management.h with_storage):
+    ///   - list-records and get-pairing-config: include capacity/costs.
+    ///   - all other results: free only.
+    [[nodiscard]] virtual std::optional<StorageReport> storage_accounting() const {
+        return std::nullopt;
+    }
+
 private:
     /// @brief Return true if a resolved PSK is a shared-PSK record (long-term, no counterparty).
     static bool is_shared_record(const ResolvedPsk& r);
@@ -242,13 +337,18 @@ private:
 
     std::vector<SendspinPairingRecord> records_;
     std::optional<SendspinPairingPsk> pairing_psk_;
+    std::optional<std::string> static_pin_;  ///< Configured static PIN (8 decimal digits).
 
     // Pairing config
     bool pairing_psk_enabled_{true};
     bool unpaired_access_enabled_{false};
-    // Deferred PIN fields (forward-compat; a later phase implements the state machine)
-    // std::optional<std::string> static_pin_;  // not used until that phase
+    bool dynamic_pin_enabled_{true};
+    bool static_pin_enabled_{false};
+    int dynamic_pin_min_length_{6};
     std::string record_mode_psk_id_;
+
+    // PIN lockout (in-memory; not persisted; cleared on restart)
+    std::map<SendspinPairMethod, int> pin_failures_;
 
     SendspinPersistenceProvider* provider_{nullptr};
 

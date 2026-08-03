@@ -17,10 +17,12 @@
 // malformed-input handling) where a bug is silent rather than a crash, plus a hand-rolled int64
 // formatter that we can check against snprintf as a free correctness oracle.
 
+#include "platform/base64.h"
 #include "protocol_messages.h"
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -793,4 +795,441 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
     EXPECT_FALSE(doc["payload"]["device_info"]["manufacturer"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["software_version"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["mac_address"].is<const char*>());
+}
+
+// ============================================================================
+// Phase 3: client/hello new shape (no client_id/version, new fields)
+// ============================================================================
+
+// Under encryption, client/hello must NOT contain client_id or version (they move to client/init).
+TEST(Protocol, ClientHelloNoClientIdOrVersion) {
+    ClientHelloMessage msg;
+    msg.name = "TestDevice";
+    const std::string out = format_client_hello_message(&msg);
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, out));
+    EXPECT_FALSE(doc["payload"]["client_id"].is<const char*>())
+        << "client_id must NOT appear in client/hello under encryption";
+    EXPECT_FALSE(doc["payload"]["version"].is<int>())
+        << "version must NOT appear in client/hello under encryption";
+}
+
+// trust_level is always emitted (either "none" or "user").
+TEST(Protocol, ClientHelloTrustLevelNone) {
+    ClientHelloMessage msg;
+    msg.name = "TestDevice";
+    msg.trust_level = "none";
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    EXPECT_STREQ(doc["payload"]["trust_level"], "none");
+}
+
+TEST(Protocol, ClientHelloTrustLevelUser) {
+    ClientHelloMessage msg;
+    msg.name = "TestDevice";
+    msg.trust_level = "user";
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    EXPECT_STREQ(doc["payload"]["trust_level"], "user");
+}
+
+// unpaired_access.enabled is always emitted.
+TEST(Protocol, ClientHelloUnpairedAccessEnabled) {
+    ClientHelloMessage msg;
+    msg.name = "TestDevice";
+    msg.unpaired_access_enabled = true;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    EXPECT_TRUE(doc["payload"]["unpaired_access"]["enabled"].as<bool>());
+}
+
+TEST(Protocol, ClientHelloUnpairedAccessDisabled) {
+    ClientHelloMessage msg;
+    msg.name = "TestDevice";
+    msg.unpaired_access_enabled = false;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    EXPECT_FALSE(doc["payload"]["unpaired_access"]["enabled"].as<bool>());
+}
+
+// supported_pair_methods: pairing_psk emitted with correct wire shape.
+TEST(Protocol, ClientHelloPairingPskMethodDescriptor) {
+    ClientHelloMessage msg;
+    msg.name = "TestDevice";
+    PairMethodDescriptor psk_desc;
+    psk_desc.method = SendspinPairMethod::PAIRING_PSK;
+    msg.supported_pair_methods.push_back(std::move(psk_desc));
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    JsonArrayConst methods = doc["payload"]["supported_pair_methods"].as<JsonArrayConst>();
+    ASSERT_EQ(methods.size(), 1u);
+    EXPECT_STREQ(methods[0]["method"], "pairing_psk");
+}
+
+// supported_pair_methods: field omitted entirely when no methods (matches the reference's
+// omit_none; an empty array would be a wire deviation).
+TEST(Protocol, ClientHelloNoSupportedPairMethods) {
+    ClientHelloMessage msg;
+    msg.name = "TestDevice";
+    // supported_pair_methods is empty by default
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    // Field must be absent (not an empty array).
+    EXPECT_FALSE(doc["payload"]["supported_pair_methods"].is<JsonArrayConst>());
+    EXPECT_TRUE(doc["payload"]["supported_pair_methods"].isNull());
+}
+
+// ============================================================================
+// Phase 3: server/hello slim parse (only name)
+// ============================================================================
+
+TEST(Protocol, ServerHelloSlimParse) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"MySpeaker"}})", doc, root));
+
+    ServerHelloMessage msg;
+    ASSERT_TRUE(process_server_hello_message(root, &msg));
+    EXPECT_EQ(msg.name, "MySpeaker");
+}
+
+// server/hello must ignore (not fail on) absence of the old fields.
+TEST(Protocol, ServerHelloIgnoresOldFields) {
+    JsonDocument doc;
+    JsonObject root;
+    // Old-style fields (connection_reason, active_roles, version, server_id) are absent.
+    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"X"}})", doc, root));
+
+    ServerHelloMessage msg;
+    EXPECT_TRUE(process_server_hello_message(root, &msg));
+    EXPECT_EQ(msg.name, "X");
+}
+
+// server/hello with missing name must fail.
+TEST(Protocol, ServerHelloMissingNameFails) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{}})", doc, root));
+
+    ServerHelloMessage msg;
+    EXPECT_FALSE(process_server_hello_message(root, &msg));
+}
+
+// ============================================================================
+// Phase 3: server/activate parse
+// ============================================================================
+
+TEST(Protocol, ServerActivateActivitiesOnly) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":["playback"]}})", doc, root));
+
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    ASSERT_EQ(msg.activities.size(), 1u);
+    EXPECT_EQ(msg.activities[0], SendspinActivity::PLAYBACK);
+    EXPECT_FALSE(msg.active_roles.has_value());
+    EXPECT_FALSE(msg.selected_pair_method.has_value());
+}
+
+TEST(Protocol, ServerActivateAllActivities) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":["playback","pairing","management"]}})",
+        doc, root));
+
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    ASSERT_EQ(msg.activities.size(), 3u);
+    EXPECT_EQ(msg.activities[0], SendspinActivity::PLAYBACK);
+    EXPECT_EQ(msg.activities[1], SendspinActivity::PAIRING);
+    EXPECT_EQ(msg.activities[2], SendspinActivity::MANAGEMENT);
+}
+
+TEST(Protocol, ServerActivateEmptyActivities) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":[]}})", doc, root));
+
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    EXPECT_TRUE(msg.activities.empty());
+}
+
+TEST(Protocol, ServerActivateWithActiveRoles) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":["playback"],"active_roles":["player@v1","metadata@v1"]}})",
+        doc, root));
+
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    ASSERT_TRUE(msg.active_roles.has_value());
+    ASSERT_EQ(msg.active_roles->size(), 2u);
+    EXPECT_EQ((*msg.active_roles)[0], "player@v1");
+    EXPECT_EQ((*msg.active_roles)[1], "metadata@v1");
+}
+
+// active_roles absent -> nullopt (sticky: caller should keep previous set).
+TEST(Protocol, ServerActivateActiveRolesAbsentIsNullopt) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":["playback"]}})", doc, root));
+
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    EXPECT_FALSE(msg.active_roles.has_value())
+        << "absent active_roles must be nullopt (sticky)";
+}
+
+TEST(Protocol, ServerActivateWithSelectedPairMethod) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":["pairing"],"selected_pair_method":"pairing_psk"}})",
+        doc, root));
+
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    ASSERT_TRUE(msg.selected_pair_method.has_value());
+    EXPECT_EQ(msg.selected_pair_method.value(), SendspinPairMethod::PAIRING_PSK);
+}
+
+TEST(Protocol, ServerActivateMissingActivitiesFails) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/activate","payload":{}})", doc, root));
+
+    ServerActivateMessage msg;
+    EXPECT_FALSE(process_server_activate_message(root, &msg));
+}
+
+// ============================================================================
+// Phase 3: Activity enum round-trips
+// ============================================================================
+
+TEST(Protocol, ActivityToString) {
+    EXPECT_STREQ(to_cstr(SendspinActivity::PLAYBACK), "playback");
+    EXPECT_STREQ(to_cstr(SendspinActivity::PAIRING), "pairing");
+    EXPECT_STREQ(to_cstr(SendspinActivity::MANAGEMENT), "management");
+}
+
+TEST(Protocol, ActivityFromString) {
+    EXPECT_EQ(activity_from_string("playback"), SendspinActivity::PLAYBACK);
+    EXPECT_EQ(activity_from_string("pairing"), SendspinActivity::PAIRING);
+    EXPECT_EQ(activity_from_string("management"), SendspinActivity::MANAGEMENT);
+    EXPECT_FALSE(activity_from_string("unknown_activity").has_value());
+}
+
+// ============================================================================
+// Phase 3: PairMethod enum round-trips
+// ============================================================================
+
+TEST(Protocol, PairMethodToString) {
+    EXPECT_STREQ(to_cstr(SendspinPairMethod::PAIRING_PSK), "pairing_psk");
+    EXPECT_STREQ(to_cstr(SendspinPairMethod::DYNAMIC_PIN), "dynamic_pin");
+    EXPECT_STREQ(to_cstr(SendspinPairMethod::STATIC_PIN), "static_pin");
+}
+
+TEST(Protocol, PairMethodFromString) {
+    EXPECT_EQ(pair_method_from_string("pairing_psk"), SendspinPairMethod::PAIRING_PSK);
+    EXPECT_EQ(pair_method_from_string("dynamic_pin"), SendspinPairMethod::DYNAMIC_PIN);
+    EXPECT_EQ(pair_method_from_string("static_pin"), SendspinPairMethod::STATIC_PIN);
+    EXPECT_FALSE(pair_method_from_string("invalid_method").has_value());
+}
+
+// ============================================================================
+// Phase 3: New SendspinGoodbyeReason values
+// ============================================================================
+
+TEST(Protocol, GoodbyeReasonNewValues) {
+    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::UNAUTHORIZED), "unauthorized");
+    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::PAIRING_REQUIRED), "pairing_required");
+    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::CONCURRENT_ATTEMPT), "concurrent_attempt");
+    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::UNPAIRED), "unpaired");
+}
+
+// All pre-existing GoodbyeReason values must still work.
+TEST(Protocol, GoodbyeReasonExistingValues) {
+    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::ANOTHER_SERVER), "another_server");
+    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::SHUTDOWN), "shutdown");
+    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::RESTART), "restart");
+    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::USER_REQUEST), "user_request");
+}
+
+// ============================================================================
+// Phase 5: Pairing-PSK protocol messages
+// ============================================================================
+
+// Determine message type recognizes the two new pairing types.
+TEST(Protocol, DetermineMessageTypePairingTypes) {
+    JsonDocument doc;
+    JsonObject root;
+
+    ASSERT_TRUE(parse(R"({"type":"server/pair-finalize"})", doc, root));
+    EXPECT_EQ(determine_message_type(root),
+              SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE);
+
+    ASSERT_TRUE(parse(R"({"type":"pair/abort"})", doc, root));
+    EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::PAIR_ABORT);
+}
+
+// PairAbortReason: every value survives a to_cstr -> from_string round-trip.
+TEST(Protocol, PairAbortReasonRoundTrip) {
+    const PairAbortReason reasons[] = {
+        PairAbortReason::ATTEMPT_TIMEOUT,
+        PairAbortReason::CONCURRENT_ATTEMPT,
+        PairAbortReason::LOCKED_OUT,
+        PairAbortReason::METHOD_NOT_SUPPORTED,
+        PairAbortReason::PIN_LENGTH_UNACCEPTABLE,
+        PairAbortReason::PIN_MISMATCH,
+        PairAbortReason::USER_CANCELLED,
+    };
+    for (const auto reason : reasons) {
+        const char* wire = to_cstr(reason);
+        auto parsed = pair_abort_reason_from_string(wire);
+        ASSERT_TRUE(parsed.has_value()) << "no round-trip for " << wire;
+        EXPECT_EQ(parsed.value(), reason);
+    }
+    EXPECT_FALSE(pair_abort_reason_from_string("not_a_reason").has_value());
+}
+
+// format_client_pair_finalize_message: produces the exact wire shape.
+// The long_term_psk field must be exactly 43 chars (base64url of 32 bytes, no padding).
+TEST(Protocol, FormatClientPairFinalizeWireShape) {
+    // Known 32-byte PSK: all-zeros for deterministic output.
+    std::array<uint8_t, 32> psk{};
+    const std::string out = format_client_pair_finalize_message(psk);
+
+    // Must be valid JSON.
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_finalize produced invalid JSON";
+
+    // type field.
+    EXPECT_STREQ(doc["type"], "client/pair-finalize");
+
+    // long_term_psk must be a 43-character base64url string (no padding).
+    ASSERT_TRUE(doc["payload"]["long_term_psk"].is<const char*>())
+        << "long_term_psk field missing or not a string";
+    const std::string psk_b64 = doc["payload"]["long_term_psk"].as<std::string>();
+    EXPECT_EQ(psk_b64.size(), 43u)
+        << "base64url of 32 bytes without padding must be exactly 43 chars";
+
+    // Verify the encoded value decodes back to the original 32-byte PSK.
+    auto decoded = b64url_decode(psk_b64);
+    ASSERT_TRUE(decoded.has_value()) << "long_term_psk is not valid base64url";
+    ASSERT_EQ(decoded->size(), 32u);
+    for (size_t i = 0; i < 32; ++i) {
+        EXPECT_EQ((*decoded)[i], psk[i]) << "decoded byte mismatch at index " << i;
+    }
+}
+
+// format_client_pair_finalize_message: non-zero PSK encodes correctly.
+TEST(Protocol, FormatClientPairFinalizeNonZeroPsk) {
+    std::array<uint8_t, 32> psk{};
+    for (size_t i = 0; i < 32; ++i) {
+        psk[i] = static_cast<uint8_t>(i + 1);  // 1..32
+    }
+    const std::string out = format_client_pair_finalize_message(psk);
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, out));
+    const std::string psk_b64 = doc["payload"]["long_term_psk"].as<std::string>();
+    EXPECT_EQ(psk_b64.size(), 43u);
+
+    // Decode and verify round-trip.
+    auto decoded = b64url_decode(psk_b64);
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->size(), 32u);
+    for (size_t i = 0; i < 32; ++i) {
+        EXPECT_EQ((*decoded)[i], psk[i]) << "round-trip mismatch at " << i;
+    }
+}
+
+// format_pair_abort_message: produces the correct wire shape for every reason.
+TEST(Protocol, FormatPairAbortWireShape) {
+    const PairAbortReason reasons[] = {
+        PairAbortReason::METHOD_NOT_SUPPORTED,
+        PairAbortReason::ATTEMPT_TIMEOUT,
+        PairAbortReason::USER_CANCELLED,
+    };
+    for (const auto reason : reasons) {
+        const std::string out = format_pair_abort_message(reason);
+        JsonDocument doc;
+        ASSERT_FALSE(deserializeJson(doc, out)) << "invalid JSON for reason " << to_cstr(reason);
+        EXPECT_STREQ(doc["type"], "pair/abort");
+        ASSERT_TRUE(doc["payload"]["reason"].is<const char*>());
+        EXPECT_STREQ(doc["payload"]["reason"], to_cstr(reason));
+    }
+}
+
+// process_server_pair_finalize_message: accepts the empty payload ack.
+TEST(Protocol, ServerPairFinalizeAck) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/pair-finalize","payload":{}})", doc, root));
+    EXPECT_TRUE(process_server_pair_finalize_message(root));
+}
+
+// process_server_pair_finalize_message: accepts minimal envelope (no payload key).
+TEST(Protocol, ServerPairFinalizeMinimalEnvelope) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/pair-finalize"})", doc, root));
+    EXPECT_TRUE(process_server_pair_finalize_message(root));
+}
+
+// process_pair_abort_message: round-trips every PairAbortReason.
+TEST(Protocol, PairAbortMessageParseRoundTrip) {
+    const PairAbortReason reasons[] = {
+        PairAbortReason::ATTEMPT_TIMEOUT,
+        PairAbortReason::CONCURRENT_ATTEMPT,
+        PairAbortReason::LOCKED_OUT,
+        PairAbortReason::METHOD_NOT_SUPPORTED,
+        PairAbortReason::PIN_LENGTH_UNACCEPTABLE,
+        PairAbortReason::PIN_MISMATCH,
+        PairAbortReason::USER_CANCELLED,
+    };
+    for (const auto reason : reasons) {
+        // Serialize with the format function, then parse back.
+        const std::string out = format_pair_abort_message(reason);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(out, doc, root)) << "invalid JSON for " << to_cstr(reason);
+
+        PairAbortMessage msg;
+        ASSERT_TRUE(process_pair_abort_message(root, &msg)) << "parse failed for " << to_cstr(reason);
+        EXPECT_EQ(msg.reason, reason);
+    }
+}
+
+// process_pair_abort_message: missing reason field returns false.
+TEST(Protocol, PairAbortMessageMissingReason) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"pair/abort","payload":{}})", doc, root));
+    PairAbortMessage msg;
+    EXPECT_FALSE(process_pair_abort_message(root, &msg));
+}
+
+// process_pair_abort_message: unrecognized reason returns false.
+TEST(Protocol, PairAbortMessageUnknownReason) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"pair/abort","payload":{"reason":"not_a_reason"}})", doc, root));
+    PairAbortMessage msg;
+    EXPECT_FALSE(process_pair_abort_message(root, &msg))
+        << "unrecognized reason should return false";
 }

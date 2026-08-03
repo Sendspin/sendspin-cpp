@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 
@@ -107,12 +108,14 @@ FilePersistenceProvider::FilePersistenceProvider(std::string path) : path_(std::
 // ============================================================================
 
 bool FilePersistenceProvider::save_static_keypair(const std::array<uint8_t, 32>& private_key) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     doc["static_keypair"]["private_key"] = b64url_encode(private_key.data(), private_key.size());
     return save_doc(path_, doc);
 }
 
 std::optional<std::array<uint8_t, 32>> FilePersistenceProvider::load_static_keypair() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     if (!doc["static_keypair"]["private_key"].is<const char*>()) {
         return std::nullopt;
@@ -131,12 +134,14 @@ std::optional<std::array<uint8_t, 32>> FilePersistenceProvider::load_static_keyp
 // ============================================================================
 
 bool FilePersistenceProvider::save_last_played_server_id(const std::string& server_id) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     doc["last_played_server_id"] = server_id;
     return save_doc(path_, doc);
 }
 
 std::optional<std::string> FilePersistenceProvider::load_last_played_server_id() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     if (!doc["last_played_server_id"].is<const char*>()) {
         return std::nullopt;
@@ -153,6 +158,7 @@ std::optional<std::string> FilePersistenceProvider::load_last_played_server_id()
 // ============================================================================
 
 std::vector<SendspinPairingRecord> FilePersistenceProvider::load_pairing_records() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     std::vector<SendspinPairingRecord> out;
     JsonArray arr = doc["pairing_records"].as<JsonArray>();
@@ -181,6 +187,7 @@ std::vector<SendspinPairingRecord> FilePersistenceProvider::load_pairing_records
 }
 
 bool FilePersistenceProvider::save_pairing_record(const SendspinPairingRecord& record) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     JsonArray arr = doc["pairing_records"].is<JsonArray>() ? doc["pairing_records"].as<JsonArray>()
                                                            : doc["pairing_records"].to<JsonArray>();
@@ -220,6 +227,7 @@ bool FilePersistenceProvider::save_pairing_record(const SendspinPairingRecord& r
 }
 
 void FilePersistenceProvider::remove_pairing_record(const std::string& psk_id) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     if (!doc["pairing_records"].is<JsonArray>()) {
         return;
@@ -244,6 +252,7 @@ void FilePersistenceProvider::remove_pairing_record(const std::string& psk_id) {
 // ============================================================================
 
 std::optional<SendspinPairingPsk> FilePersistenceProvider::load_pairing_psk() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     if (!doc["pairing_psk"]["psk_id"].is<const char*>() ||
         !doc["pairing_psk"]["psk"].is<const char*>()) {
@@ -261,6 +270,7 @@ std::optional<SendspinPairingPsk> FilePersistenceProvider::load_pairing_psk() {
 }
 
 bool FilePersistenceProvider::save_pairing_psk(const SendspinPairingPsk& psk) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     doc["pairing_psk"]["psk_id"] = psk.psk_id;
     doc["pairing_psk"]["psk"] = b64url_encode(psk.psk.data(), psk.psk.size());
@@ -271,8 +281,36 @@ bool FilePersistenceProvider::save_pairing_psk(const SendspinPairingPsk& psk) {
 }
 
 void FilePersistenceProvider::clear_pairing_psk() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     doc.remove("pairing_psk");
+    save_doc(path_, doc);
+}
+
+// ============================================================================
+// Static PIN
+// ============================================================================
+
+std::optional<std::string> FilePersistenceProvider::load_static_pin() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    JsonDocument doc = load_doc(path_);
+    if (!doc["static_pin"].is<const char*>()) {
+        return std::nullopt;
+    }
+    return std::string(doc["static_pin"].as<const char*>());
+}
+
+bool FilePersistenceProvider::save_static_pin(const std::string& pin) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    JsonDocument doc = load_doc(path_);
+    doc["static_pin"] = pin;
+    return save_doc(path_, doc);
+}
+
+void FilePersistenceProvider::clear_static_pin() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    JsonDocument doc = load_doc(path_);
+    doc.remove("static_pin");
     save_doc(path_, doc);
 }
 
@@ -281,6 +319,7 @@ void FilePersistenceProvider::clear_pairing_psk() {
 // ============================================================================
 
 std::optional<SendspinPairingConfig> FilePersistenceProvider::load_pairing_config() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     if (!doc["pairing_config"]["record_mode_psk_id"].is<const char*>()) {
         return std::nullopt;
@@ -293,6 +332,15 @@ std::optional<SendspinPairingConfig> FilePersistenceProvider::load_pairing_confi
     if (doc["pairing_config"]["unpaired_access_enabled"].is<bool>()) {
         cfg.unpaired_access_enabled = doc["pairing_config"]["unpaired_access_enabled"].as<bool>();
     }
+    if (doc["pairing_config"]["dynamic_pin_enabled"].is<bool>()) {
+        cfg.dynamic_pin_enabled = doc["pairing_config"]["dynamic_pin_enabled"].as<bool>();
+    }
+    if (doc["pairing_config"]["static_pin_enabled"].is<bool>()) {
+        cfg.static_pin_enabled = doc["pairing_config"]["static_pin_enabled"].as<bool>();
+    }
+    if (doc["pairing_config"]["dynamic_pin_min_length"].is<int>()) {
+        cfg.dynamic_pin_min_length = doc["pairing_config"]["dynamic_pin_min_length"].as<int>();
+    }
     if (cfg.record_mode_psk_id.empty()) {
         return std::nullopt;
     }
@@ -300,10 +348,14 @@ std::optional<SendspinPairingConfig> FilePersistenceProvider::load_pairing_confi
 }
 
 bool FilePersistenceProvider::save_pairing_config(const SendspinPairingConfig& config) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     doc["pairing_config"]["record_mode_psk_id"] = config.record_mode_psk_id;
     doc["pairing_config"]["pairing_psk_enabled"] = config.pairing_psk_enabled;
     doc["pairing_config"]["unpaired_access_enabled"] = config.unpaired_access_enabled;
+    doc["pairing_config"]["dynamic_pin_enabled"] = config.dynamic_pin_enabled;
+    doc["pairing_config"]["static_pin_enabled"] = config.static_pin_enabled;
+    doc["pairing_config"]["dynamic_pin_min_length"] = config.dynamic_pin_min_length;
     return save_doc(path_, doc);
 }
 
@@ -312,12 +364,14 @@ bool FilePersistenceProvider::save_pairing_config(const SendspinPairingConfig& c
 // ============================================================================
 
 bool FilePersistenceProvider::save_static_delay(uint16_t delay_ms) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     doc["static_delay_ms"] = delay_ms;
     return save_doc(path_, doc);
 }
 
 std::optional<uint16_t> FilePersistenceProvider::load_static_delay() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     if (!doc["static_delay_ms"].is<uint16_t>()) {
         return std::nullopt;

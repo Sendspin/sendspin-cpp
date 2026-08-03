@@ -68,6 +68,9 @@ namespace {
 
 constexpr uint16_t RESUME_TEST_PORT = 18991;
 constexpr uint16_t DOWNGRADE_TEST_PORT = 18992;
+constexpr uint16_t PAIRING_TEST_PORT = 18993;
+constexpr uint16_t MANAGEMENT_TEST_PORT = 18994;
+constexpr uint16_t PAIRING_PERSIST_FAILURE_TEST_PORT = 18995;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -98,6 +101,86 @@ public:
 
 private:
     SendspinPairingRecord record_;
+};
+
+// Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
+// record store_record() persists via save_pairing_record(), so the pairing-flow test below can
+// assert on the psk_id/server_id/psk that pairing generated and persisted, and hand the same
+// psk/psk_id back to the fake server for the follow-up in-band re-handshake. Thread-safe: the
+// server/pair-finalize commit runs on the network thread (see client.cpp's SERVER_PAIR_FINALIZE
+// handler), while the test thread reads captured_record().
+class PairingCapturePersistenceProvider : public SendspinPersistenceProvider {
+public:
+    std::vector<SendspinPairingRecord> load_pairing_records() override {
+        return {};
+    }
+
+    bool save_pairing_record(const SendspinPairingRecord& record) override {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        // Only capture/reject records with a server_id: the RecordStore also persists a
+        // shared-PSK fallback record (no server_id) on first boot, which is not the pairing
+        // outcome under test and must always succeed so first-boot provisioning is unaffected.
+        if (!record.server_id.has_value()) {
+            return true;
+        }
+        if (this->reject_pairing_records_) {
+            return false;
+        }
+        this->captured_ = record;
+        return true;
+    }
+
+    std::optional<SendspinPairingRecord> captured_record() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->captured_;
+    }
+
+    // When set, save_pairing_record() rejects any record with a server_id (simulating a
+    // persistence-provider failure, e.g. storage full), while still succeeding for the
+    // first-boot shared-PSK fallback record. Used to verify the fail-closed contract: a
+    // rejected persist must not report pairing success (see client.cpp's SERVER_PAIR_FINALIZE
+    // handler, which must check RecordStore::store_record()'s return value).
+    void set_reject_pairing_records(bool reject) {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->reject_pairing_records_ = reject;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::optional<SendspinPairingRecord> captured_;
+    bool reject_pairing_records_{false};
+};
+
+// Records on_trust_changed / on_pairing_succeeded notifications so the pairing-flow test can
+// assert both that pairing was reported successful and that trust was later upgraded to USER
+// once the post-pairing re-handshake completes. Callbacks fire from SendspinClient::loop() on
+// the test thread (see EventState's dispatch block), so no locking is needed here.
+class RecordingClientListener : public SendspinClientListener {
+public:
+    void on_trust_changed(ConnectionTrust trust) override {
+        this->trust_history_.push_back(trust);
+    }
+
+    void on_pairing_succeeded(const std::string& server_id) override {
+        this->pairing_succeeded_server_id_ = server_id;
+    }
+
+    bool trust_ever_reached(ConnectionTrust trust) const {
+        for (const auto& t : this->trust_history_) {
+            if (t == trust) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    const std::optional<std::string>& pairing_succeeded_server_id() const {
+        return this->pairing_succeeded_server_id_;
+    }
+
+private:
+    std::vector<ConnectionTrust> trust_history_;
+    std::optional<std::string> pairing_succeeded_server_id_;
 };
 
 bool pump_until(SendspinClient& client, const std::function<bool()>& pred, int timeout_ms) {
@@ -266,6 +349,9 @@ struct FakeEncryptedServerOptions {
     // Sent in server/activate after the FIRST client/hello.
     std::string first_activities_json{R"(["playback"])"};
     std::string first_roles_json{R"(["player@v1"])"};
+    // Present only when the first server/activate should select a pairing method (e.g.
+    // "pairing_psk"); omitted (nullopt) for the normal playback/management admission path.
+    std::optional<std::string> first_selected_pair_method;
     // Sent in server/activate after the SECOND client/hello (i.e. the one that follows a
     // trigger_rehandshake() call and its resulting fresh hello cycle).
     std::string second_activities_json{R"(["playback"])"};
@@ -338,6 +424,36 @@ public:
     std::optional<std::string> goodbye_reason() const {
         std::lock_guard<std::mutex> lock(this->goodbye_mutex_);
         return this->goodbye_reason_;
+    }
+
+    // The PSK (and its derived psk_id) the client generated and sent via client/pair-finalize,
+    // captured by the client/pair-finalize handler in handle_binary(). nullopt until pairing has
+    // reached that point.
+    std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> learned_psk() const {
+        std::lock_guard<std::mutex> lock(this->pair_mutex_);
+        return this->learned_psk_;
+    }
+
+    std::optional<std::string> learned_psk_id() const {
+        std::lock_guard<std::mutex> lock(this->pair_mutex_);
+        return this->learned_psk_id_;
+    }
+
+    // Sends a management/list-records request to the client over the active encrypted session
+    // (mirrors the server-initiated management request pattern; the client responds with
+    // management/result, captured by the "management/result" branch in handle_binary()).
+    bool send_management_list_records() {
+        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+        if (this->active_.send_cs == nullptr) {
+            return false;
+        }
+        this->send_encrypted_locked(R"({"type":"management/list-records","payload":{}})");
+        return true;
+    }
+
+    std::optional<std::string> last_management_result() const {
+        std::lock_guard<std::mutex> lock(this->management_mutex_);
+        return this->last_management_result_;
     }
 
 private:
@@ -488,8 +604,12 @@ private:
             const std::string& roles =
                 count <= 1 ? this->options_.first_roles_json : this->options_.second_roles_json;
             std::string activate = std::string(R"({"type":"server/activate","payload":{)") +
-                                   R"("activities":)" + activities + R"(,"active_roles":)" +
-                                   roles + "}}";
+                                   R"("activities":)" + activities + R"(,"active_roles":)" + roles;
+            if (count <= 1 && this->options_.first_selected_pair_method.has_value()) {
+                activate += R"(,"selected_pair_method":")" +
+                           this->options_.first_selected_pair_method.value() + "\"";
+            }
+            activate += "}}";
             this->send_encrypted_locked(activate);
             return;
         }
@@ -500,6 +620,32 @@ private:
                 std::lock_guard<std::mutex> glock(this->goodbye_mutex_);
                 this->goodbye_reason_ = reason;
             }
+            return;
+        }
+
+        if (std::strcmp(type, "client/pair-finalize") == 0) {
+            // The client generated a fresh long-term PSK and is handing it to us to store
+            // server-side; ack it so the client commits its own pending record. Capture the PSK
+            // (and its derived psk_id) so the test can later trigger the post-pairing in-band
+            // re-handshake with it, exactly like a real server rekeying onto the new PSK.
+            const char* psk_b64 = doc["payload"]["long_term_psk"] | "";
+            auto psk_bytes = b64url_decode(psk_b64);
+            if (psk_bytes.has_value() && psk_bytes->size() == NOISE_PSK_SIZE) {
+                std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+                std::copy(psk_bytes->begin(), psk_bytes->end(), psk.begin());
+                {
+                    std::lock_guard<std::mutex> plock(this->pair_mutex_);
+                    this->learned_psk_ = psk;
+                    this->learned_psk_id_ = psk_id_for(psk);
+                }
+                this->send_encrypted_locked(R"({"type":"server/pair-finalize","payload":{}})");
+            }
+            return;
+        }
+
+        if (std::strcmp(type, "management/result") == 0) {
+            std::lock_guard<std::mutex> mlock(this->management_mutex_);
+            this->last_management_result_ = json;
             return;
         }
 
@@ -575,6 +721,13 @@ private:
     std::atomic<bool> closed_{false};
     mutable std::mutex goodbye_mutex_;
     std::optional<std::string> goodbye_reason_;
+
+    mutable std::mutex pair_mutex_;
+    std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> learned_psk_;
+    std::optional<std::string> learned_psk_id_;
+
+    mutable std::mutex management_mutex_;
+    std::optional<std::string> last_management_result_;
 };
 
 }  // namespace
@@ -705,5 +858,194 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
     ASSERT_TRUE(reason.has_value()) << "No client/goodbye observed before close";
     EXPECT_EQ(reason.value(), "unauthorized");
 
+    pump_for(client, 100);
+}
+
+// Full pairing-PSK flow end to end: an unpaired client (Sentinel trust) connects, the server
+// selects the pairing_psk method, the client generates a fresh long-term PSK client-side (CSPRNG)
+// and sends it via client/pair-finalize, the server acks, the client persists the record, and
+// then -- exactly like a real server immediately rekeying onto the new PSK -- the fake server
+// triggers an in-band re-handshake with the learned psk_id/psk. The connection must resume
+// operational under the new session with trust upgraded from Sentinel to USER (LONG_TERM).
+TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+    SendspinClientConfig config;
+    config.name = "Pairing Flow Test Client";
+    config.server_port = PAIRING_TEST_PORT;
+
+    RecordingClientListener listener;
+    SendspinClient client(config);
+    client.set_listener(&listener);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start_server());
+    pump_for(client, 50);
+
+    // Initial handshake uses the well-known Sentinel PSK: an unpaired client always resolves it,
+    // matching the "not yet paired" starting state a real pairing flow begins from.
+    Identity server_identity = Identity::generate();
+    FakeEncryptedServerOptions options;
+    options.first_activities_json = R"(["pairing"])";
+    options.first_roles_json = R"([])";
+    options.first_selected_pair_method = "pairing_psk";
+    FakeEncryptedServer server(server_url(PAIRING_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                               server_identity, std::string(SENTINEL_PSK_ID), SENTINEL_PSK, options);
+
+    // handle_enter_pairing (PAIRING_PSK branch) fires as soon as the pairing activate is admitted
+    // and sends client/pair-finalize; the fake server acks it immediately in handle_binary().
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.learned_psk_id().has_value(); }, 4000))
+        << "client/pair-finalize (with a freshly generated long_term_psk) was never observed";
+
+    // The server's ack must have made the client persist the record before this returns (see
+    // client.cpp's SERVER_PAIR_FINALIZE handler: the commit happens synchronously on the network
+    // thread, not deferred to the main loop).
+    ASSERT_TRUE(pump_until(
+        client, [&] { return persistence.captured_record().has_value(); }, 4000))
+        << "Pairing record was never persisted";
+    auto captured = persistence.captured_record();
+    ASSERT_TRUE(captured.has_value());
+    EXPECT_EQ(captured->psk_id, server.learned_psk_id().value());
+    EXPECT_EQ(captured->server_id.value_or(""), server_identity.peer_id());
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return listener.pairing_succeeded_server_id().has_value(); }, 4000))
+        << "on_pairing_succeeded was never fired";
+    EXPECT_EQ(listener.pairing_succeeded_server_id().value(), server_identity.peer_id());
+
+    // Rekey onto the newly paired PSK, exactly like the real server does immediately after
+    // acking pair-finalize (see connection.h's note_pairing_finalize_ack()/provisional-timeout
+    // re-arm, which exists precisely to bound this step).
+    auto learned_psk = server.learned_psk();
+    auto learned_psk_id = server.learned_psk_id();
+    ASSERT_TRUE(learned_psk.has_value() && learned_psk_id.has_value());
+    ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
+
+    // The connection must resume operational under the new session, now with LONG_TERM/USER trust
+    // instead of the Sentinel/pairing trust it started with.
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "Connection did not resume operational after the post-pairing re-handshake";
+    EXPECT_TRUE(listener.trust_ever_reached(ConnectionTrust::USER))
+        << "Trust was never upgraded to USER after pairing completed";
+    auto info = client.get_server_information();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->server_id, server_identity.peer_id());
+    EXPECT_FALSE(server.closed());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// Fail-closed persistence: when the persistence provider rejects the pair-finalize record (e.g.
+// storage exhausted, write error), the client must NOT report pairing success. Pins the fix to
+// client.cpp's SERVER_PAIR_FINALIZE handler, which previously hardcoded stored_record = true
+// regardless of RecordStore::store_record()'s return value.
+TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+    persistence.set_reject_pairing_records(true);
+    SendspinClientConfig config;
+    config.name = "Pairing Flow Persist-Failure Test Client";
+    config.server_port = PAIRING_PERSIST_FAILURE_TEST_PORT;
+
+    RecordingClientListener listener;
+    SendspinClient client(config);
+    client.set_listener(&listener);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start_server());
+    pump_for(client, 50);
+
+    Identity server_identity = Identity::generate();
+    FakeEncryptedServerOptions options;
+    options.first_activities_json = R"(["pairing"])";
+    options.first_roles_json = R"([])";
+    options.first_selected_pair_method = "pairing_psk";
+    FakeEncryptedServer server(server_url(PAIRING_PERSIST_FAILURE_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               std::string(SENTINEL_PSK_ID), SENTINEL_PSK, options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.learned_psk_id().has_value(); }, 4000))
+        << "client/pair-finalize was never observed";
+
+    // Give the client plenty of ticks to process the server's ack. The provider rejects the
+    // record, so it must never appear as captured, and on_pairing_succeeded must never fire.
+    pump_for(client, 500);
+
+    EXPECT_FALSE(persistence.captured_record().has_value())
+        << "A rejected record must not be captured (provider returned false)";
+    EXPECT_FALSE(listener.pairing_succeeded_server_id().has_value())
+        << "on_pairing_succeeded must not fire when the persistence provider rejects the record";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// Management-suite round trip over an already-encrypted, already-admitted (LONG_TERM/MANAGEMENT)
+// transport: the fake server sends management/list-records and the client must reply
+// management/result with result=ok and the one seeded record, proving the management dispatch
+// path (trust gating -> handle_management_request -> format_management_result_message) works
+// end to end over the real Noise transport, not just at the unit level (test_management.cpp).
+TEST(EncryptedLifecycle, ManagementListRecordsRoundTripOverEncryptedTransport) {
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+    platform_random_bytes(psk.data(), psk.size());
+    std::string psk_id = psk_id_for(psk);
+
+    SendspinPairingRecord record;
+    record.psk_id = psk_id;
+    record.psk = psk;
+
+    TestNetworkProvider network;
+    TestPersistenceProvider persistence(record);
+    SendspinClientConfig config;
+    config.name = "Management Round-Trip Test Client";
+    config.server_port = MANAGEMENT_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start_server());
+    pump_for(client, 50);
+
+    // A LONG_TERM PSK activated with the MANAGEMENT activity (no roles): admissible per
+    // admission.h::activities_allowed (LONG_TERM allows any subset of {PLAYBACK, MANAGEMENT}),
+    // and satisfies handle_management_request()'s has_activity(MANAGEMENT) trust gate.
+    Identity server_identity = Identity::generate();
+    FakeEncryptedServerOptions options;
+    options.first_activities_json = R"(["management"])";
+    options.first_roles_json = R"([])";
+    FakeEncryptedServer server(server_url(MANAGEMENT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                               server_identity, psk_id, psk, options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "Initial encrypted handshake/hello/activate(management) did not complete";
+
+    ASSERT_TRUE(server.send_management_list_records());
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.last_management_result().has_value(); }, 4000))
+        << "management/result was never observed";
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, server.last_management_result().value()));
+    JsonObject root = doc.as<JsonObject>();
+    EXPECT_STREQ(root["type"] | "", "management/result");
+    EXPECT_STREQ(root["payload"]["result"] | "", "ok");
+    JsonArray records = root["payload"]["data"]["records"].as<JsonArray>();
+    ASSERT_FALSE(records.isNull());
+    bool found_seeded_record = false;
+    for (JsonObject rec : records) {
+        if (std::string(rec["psk_id"] | "") == psk_id) {
+            found_seeded_record = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_seeded_record) << "management/result did not list the seeded record";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
 }

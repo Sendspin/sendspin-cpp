@@ -19,7 +19,9 @@
 #pragma once
 
 #include "constants.h"
+#include "management.h"
 #include "protocol_messages.h"
+#include "record_store.h"
 #include "sendspin/client.h"
 
 #include <atomic>
@@ -29,6 +31,11 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+// Forward declaration of the Phase 8d test fixture (defined in tests/test_pin_state_machine.cpp,
+// global namespace). Declared here, outside namespace sendspin, so the friend declaration below
+// can name it unambiguously with the "::" qualifier.
+class PinStateMachineTest;
 
 namespace sendspin {
 
@@ -78,6 +85,82 @@ struct DeferredRelease {
     std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: transport gone, just release
 };
 
+/// @brief Deferred pair/abort event: the server (or wire) sent pair/abort during pairing.
+/// Processed on the main loop in ConnectionManager::loop().
+/// (The server/pair-finalize ack is committed synchronously on the network thread, and the
+/// leftover-activate case is handled inline in the activate handler, so neither is deferred.)
+struct PairAbortEvent {
+    std::shared_ptr<SendspinConnection> conn;  ///< Connection on which the abort arrived
+    PairAbortReason reason;                    ///< Parsed abort reason
+};
+
+// ============================================================================
+// Management deferred events
+// ============================================================================
+
+/// @brief Type tag for which management/* request arrived.
+enum class ManagementRequestKind : uint8_t {
+    LIST_RECORDS,
+    ADD_RECORD,
+    REMOVE_RECORD,
+    GET_PAIRING_CONFIG,
+    SET_PAIRING_CONFIG,
+};
+
+/// @brief Deferred management request event.
+///
+/// Parsed on the network thread; handler runs on the main loop so it can safely
+/// mutate the RecordStore and send the result from the main-loop thread.
+/// management is request/response at-most-one-in-flight; FIFO deferred processing
+/// preserves the reference's single-concurrent-request property naturally.
+struct ManagementRequestEvent {
+    std::shared_ptr<SendspinConnection> conn;              ///< Connection that received the request
+    ManagementRequestKind kind;                            ///< Which management/* request type
+    ManagementAddRecordPayload add_payload;                ///< Populated for ADD_RECORD
+    ManagementRemoveRecordPayload remove_payload;          ///< Populated for REMOVE_RECORD
+    ManagementSetPairingConfigPayload set_config_payload;  ///< Populated for SET_PAIRING_CONFIG
+};
+
+/// @brief Deferred server/unpair event.
+///
+/// Parsed on the network thread; the record removal and disconnect run on the main loop.
+struct ServerUnpairEvent {
+    std::shared_ptr<SendspinConnection> conn;  ///< Connection that received server/unpair
+    std::string matched_psk_id;                ///< psk_id matched for this connection
+    PskCategory psk_category;                  ///< PSK category (must be LONG_TERM to act)
+};
+
+// ============================================================================
+// Dynamic-PIN pairing deferred events
+// ============================================================================
+
+/// @brief Which server-to-client PIN pairing message arrived.
+enum class PinPairingMessageKind : uint8_t {
+    PAIR_INIT,     ///< server/pair-init: nonce_A + pin_length
+    PAIR_AUTH,     ///< server/pair-auth: pake_msg_1
+    PAIR_CONFIRM,  ///< server/pair-confirm: server_kc
+    MALFORMED,     ///< a pairing message failed to parse; abort any active PIN session
+};
+
+/// @brief Deferred server PIN pairing message event.
+///
+/// Parsed on the network thread; the PAKE state machine (CPace, nonces, hash) runs
+/// on the main loop only, so all PIN message processing is deferred here.
+struct ServerPairingMessageEvent {
+    std::shared_ptr<SendspinConnection> conn;  ///< Connection that received the message
+    PinPairingMessageKind kind;                ///< Which PIN message arrived
+
+    // server/pair-init fields
+    std::array<uint8_t, 32> nonce_a{};  ///< nonce_A decoded from the wire
+    int pin_length{0};                  ///< Server-chosen PIN digit count
+
+    // server/pair-auth fields
+    std::array<uint8_t, 32> pake_msg_1{};  ///< Server CPace public share
+
+    // server/pair-confirm fields
+    std::array<uint8_t, 64> server_kc{};  ///< Server CPace confirmation tag
+};
+
 /// @brief Hello retry state for exponential backoff
 struct HelloRetryState {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection awaiting hello
@@ -96,7 +179,8 @@ struct HelloRetryState {
 struct ServerActivateEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection the activate was received on
     std::vector<SendspinActivity> activities;  ///< Activities declared by this activate
-    std::optional<std::vector<std::string>> active_roles;  ///< nullopt = sticky/keep prior set
+    std::optional<std::vector<std::string>> active_roles;    ///< nullopt = sticky/keep prior set
+    std::optional<SendspinPairMethod> selected_pair_method;  ///< Server-selected pairing method
 };
 
 /**
@@ -141,6 +225,12 @@ struct ServerActivateEvent {
  * @endcode
  */
 class ConnectionManager {
+    // Test-only: lets the Phase 8d PIN state-machine integration harness inject a fake
+    // current_connection_ directly and drive on_connection_lost, bypassing the real
+    // WebSocket transport and Noise handshake. No production code depends on this;
+    // it exists solely so tests/test_pin_state_machine.cpp can reach private state.
+    friend class ::PinStateMachineTest;
+
 public:
     explicit ConnectionManager(SendspinClient* client);
     ~ConnectionManager();
@@ -207,6 +297,38 @@ public:
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         return this->current_connection_;
     }
+
+    /// @brief Schedules a pair/abort event for deferred processing in loop().
+    /// @param event The pair-abort event to schedule (moved).
+    void schedule_pair_abort(PairAbortEvent event);
+
+    /// @brief Schedules a management request event for deferred processing in loop().
+    /// @param event The management request event to schedule (moved).
+    void schedule_management_request(ManagementRequestEvent event);
+
+    /// @brief Schedules a server/unpair event for deferred processing in loop().
+    /// @param event The server/unpair event to schedule (moved).
+    void schedule_server_unpair(ServerUnpairEvent event);
+
+    /// @brief Schedules a dynamic-PIN pairing message event for deferred processing in loop().
+    /// @param event The server pairing message event to schedule (moved).
+    void schedule_pin_pairing_message(ServerPairingMessageEvent event);
+
+    /// @brief Schedules an on_pairing_succeeded notification for deferred delivery in loop().
+    ///
+    /// Called from SendspinClient::process_json_message() on the NETWORK thread when the
+    /// server/pair-finalize ack handler actually stores a long-term record. This is the one
+    /// pairing outcome notification that originates off the main loop, so it rides the same
+    /// pending_*_events_ / has_pending_events_ idiom as every other cross-thread mutation in
+    /// this class (not a bespoke thread-safe queue): loop() drains it and calls
+    /// SendspinClient::note_pairing_succeeded(), which queues the actual listener callback for
+    /// SendspinClient::loop() to fire unlocked.
+    /// @param server_id The base64url public key of the newly paired server (moved).
+    void schedule_pairing_succeeded(std::string server_id);
+
+    /// @brief Schedules a static-PIN pairing-window confirmation for deferred processing in
+    /// loop(). Thread-safe; called from SendspinClient::confirm_pairing_window().
+    void schedule_pairing_window_confirm();
 
     // ========================================
     // Handoff support
@@ -302,6 +424,36 @@ private:
     /// Caller must hold conn_mutex_.
     /// @param conn The re-handshaked connection to defer to loop() (moved).
     void queue_pending_rehandshake(std::shared_ptr<SendspinConnection> conn);
+
+    /// @brief Appends an event to pending_pair_abort_events_ and sets has_pending_events_ in the
+    /// same critical section, so loop()'s lock-free gate can never miss a pushed event. Caller
+    /// must hold conn_mutex_.
+    /// @param event The pair/abort event to defer to loop() (moved).
+    void queue_pending_pair_abort(PairAbortEvent event);
+
+    /// @brief Appends an event to pending_management_request_events_ and sets has_pending_events_
+    /// in the same critical section, so loop()'s lock-free gate can never miss a pushed event.
+    /// Caller must hold conn_mutex_.
+    /// @param event The management/* request event to defer to loop() (moved).
+    void queue_pending_management_request(ManagementRequestEvent event);
+
+    /// @brief Appends an event to pending_server_unpair_events_ and sets has_pending_events_ in
+    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
+    /// Caller must hold conn_mutex_.
+    /// @param event The server/unpair event to defer to loop() (moved).
+    void queue_pending_server_unpair(ServerUnpairEvent event);
+
+    /// @brief Appends an event to pending_pin_pairing_events_ and sets has_pending_events_ in
+    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
+    /// Caller must hold conn_mutex_.
+    /// @param event The dynamic-PIN pairing message event to defer to loop() (moved).
+    void queue_pending_pin_pairing_message(ServerPairingMessageEvent event);
+
+    /// @brief Appends a server_id to pending_pairing_succeeded_events_ and sets
+    /// has_pending_events_ in the same critical section, so loop()'s lock-free gate can never
+    /// miss a pushed event. Caller must hold conn_mutex_.
+    /// @param server_id The newly paired server's base64url public key (moved).
+    void queue_pending_pairing_succeeded(std::string server_id);
 
     /// @brief Releases a nursery entry: erases it, prunes its hello retry, and queues the
     /// goodbye+release on deferred_releases_. Caller must hold conn_ptr_mutex_ and call
@@ -432,6 +584,65 @@ private:
     /// satisfies this; init_server warns when a configured value does not.
     static constexpr size_t NURSERY_CAPACITY = 2;
 
+    // ========================================
+    // Phase 5: Pairing main-loop handlers
+    // ========================================
+
+    /// @brief Enters the pairing exchange for the given connection.
+    /// Called on the main loop when a server/activate with activities=["pairing"] and
+    /// selected_pair_method=PAIRING_PSK is admitted as the first activate.
+    /// @param conn The connection entering pairing.
+    void handle_enter_pairing(SendspinConnection* conn);
+
+    /// @brief Handles a pair/abort event on the main loop.
+    /// Cleans up pairing state and closes the connection.
+    /// @param conn The connection on which the abort arrived.
+    /// @param reason The abort reason.
+    void handle_pair_abort(SendspinConnection* conn, PairAbortReason reason);
+
+    // ========================================
+    // Phase 8b: Dynamic-PIN pairing main-loop handlers
+    // ========================================
+
+    /// @brief Handle a dynamic-PIN server message on the main loop.
+    /// Advances the PinStep state machine for the connection.
+    /// @param conn The connection that received the message.
+    /// @param event The parsed server PIN pairing message.
+    void handle_pin_pairing_message(SendspinConnection* conn,
+                                    const ServerPairingMessageEvent& event);
+
+    /// @brief Abort the current dynamic-PIN session: send pair/abort, notify, close connection.
+    /// @param conn The connection to abort.
+    /// @param reason The abort reason to send.
+    void local_abort_pin_pairing(SendspinConnection* conn, PairAbortReason reason);
+
+    // ========================================
+    // Phase 8c: Static-PIN pairing main-loop handlers
+    // ========================================
+
+    /// @brief Handle a confirmed pairing-window gesture on the main loop.
+    /// Finds the connection (current or pending) awaiting AWAIT_PAIRING_WINDOW, sends the empty
+    /// client/pair-init, and starts CPace RESPONDER with the preconfigured static PIN.
+    void handle_pairing_window_confirmed();
+
+    // ========================================
+    // Phase 6: Management main-loop handlers
+    // ========================================
+
+    /// @brief Handles a management/* request on the main loop.
+    /// Enforces trust gating, dispatches to the appropriate handler, formats and sends the result,
+    /// and applies the effect (GOODBYE_UNAUTHORIZED -> disconnect).
+    /// @param conn The connection that received the request.
+    /// @param event The management request event carrying the parsed payload.
+    void handle_management_request(SendspinConnection* conn, const ManagementRequestEvent& event);
+
+    /// @brief Handles a server/unpair event on the main loop.
+    /// Checks PSK category (LONG_TERM only), removes the matched record (unless shared),
+    /// and disconnects with UNPAIRED reason.
+    /// @param conn The connection that received server/unpair.
+    /// @param event The server/unpair event.
+    void handle_server_unpair(SendspinConnection* conn, const ServerUnpairEvent& event);
+
     // Struct fields
     std::mutex conn_mutex_;                           // Protects deferred lifecycle event queues
     mutable std::mutex conn_ptr_mutex_;               // Protects current_connection_, nursery_, and
@@ -448,6 +659,12 @@ private:
     std::vector<ServerActivateEvent> pending_activate_events_;  // Deferred server/activate events
     // Connections whose in-band re-handshake just swapped sessions; loop() re-arms their hello.
     std::vector<std::shared_ptr<SendspinConnection>> pending_rehandshake_events_;
+    std::vector<PairAbortEvent> pending_pair_abort_events_;  // Deferred pair/abort events
+    std::vector<ManagementRequestEvent> pending_management_request_events_;
+    std::vector<ServerUnpairEvent> pending_server_unpair_events_;
+    std::vector<ServerPairingMessageEvent> pending_pin_pairing_events_;
+    std::vector<std::string> pending_pairing_succeeded_events_;  // server_ids to notify
+    bool pending_pairing_window_confirm_{false};  // Static-PIN pairing-window confirm
 
     // Pointer fields
     SendspinClient* client_;

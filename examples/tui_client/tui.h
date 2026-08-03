@@ -80,6 +80,10 @@ struct TuiState {
     std::string connected_host;
     uint16_t connected_port{0};
 
+    // Trust / pairing
+    ConnectionTrust trust{ConnectionTrust::NONE};
+    std::string pairing_status;
+
     // Server selector
     bool server_selector_active{false};
     int server_selector_index{0};

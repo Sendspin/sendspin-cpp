@@ -27,6 +27,7 @@
 #include "sendspin/visualizer_role.h"
 #include <ArduinoJson.h>
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -86,17 +87,28 @@ enum SendspinBinaryType : uint8_t {
 
 /// @brief JSON message types sent from the server to the client
 enum class SendspinServerToClientMessageType : uint8_t {
-    SERVER_HELLO,     // server/hello handshake
-    SERVER_ACTIVATE,  // server/activate declares activities and active_roles
-    SERVER_TIME,      // server/time clock sync reply
-    SERVER_STATE,     // server/state playback state update
-    SERVER_COMMAND,   // server/command player command
-    STREAM_START,     // stream/start new stream parameters
-    STREAM_END,       // stream/end normal stream completion
-    STREAM_CLEAR,     // stream/clear immediate buffer flush
-    GROUP_UPDATE,     // group/update group membership change
-    NOISE_HANDSHAKE,  // noise/handshake in-band re-handshake (Phase 4b)
-    UNKNOWN,          // Unrecognized message type
+    SERVER_HELLO,                   // server/hello handshake
+    SERVER_ACTIVATE,                // server/activate declares activities and active_roles
+    SERVER_TIME,                    // server/time clock sync reply
+    SERVER_STATE,                   // server/state playback state update
+    SERVER_COMMAND,                 // server/command player command
+    STREAM_START,                   // stream/start new stream parameters
+    STREAM_END,                     // stream/end normal stream completion
+    STREAM_CLEAR,                   // stream/clear immediate buffer flush
+    GROUP_UPDATE,                   // group/update group membership change
+    NOISE_HANDSHAKE,                // noise/handshake in-band re-handshake
+    SERVER_PAIR_FINALIZE,           // server/pair-finalize empty ack from server
+    PAIR_ABORT,                     // pair/abort pairing failure from either side
+    SERVER_UNPAIR,                  // server/unpair request to drop pairing record
+    MANAGEMENT_LIST_RECORDS,        // management/list-records
+    MANAGEMENT_ADD_RECORD,          // management/add-record
+    MANAGEMENT_REMOVE_RECORD,       // management/remove-record
+    MANAGEMENT_GET_PAIRING_CONFIG,  // management/get-pairing-config
+    MANAGEMENT_SET_PAIRING_CONFIG,  // management/set-pairing-config
+    SERVER_PAIR_INIT,               // server/pair-init: nonce_A + pin_length
+    SERVER_PAIR_AUTH,               // server/pair-auth: pake_msg_1
+    SERVER_PAIR_CONFIRM,            // server/pair-confirm: server_kc
+    UNKNOWN,                        // Unrecognized message type
 };
 
 /// @brief Protocol role identifiers used in hello messages and role negotiation
@@ -214,6 +226,97 @@ inline std::optional<SendspinPairMethod> pair_method_from_string(const std::stri
     return std::nullopt;
 }
 
+/// @brief Reason a pairing attempt was aborted.
+/// Mirrors PairAbortReason in aiosendspin/models/types.py.
+/// The C++ client only EMITS method_not_supported (and potentially user_cancelled /
+/// attempt_timeout). The PIN-specific reasons are parsed when received but never emitted
+/// by the Pairing-PSK flow.
+enum class PairAbortReason : uint8_t {
+    ATTEMPT_TIMEOUT,          // attempt_timeout
+    CONCURRENT_ATTEMPT,       // concurrent_attempt
+    LOCKED_OUT,               // locked_out
+    METHOD_NOT_SUPPORTED,     // method_not_supported
+    PIN_LENGTH_UNACCEPTABLE,  // pin_length_unacceptable
+    PIN_MISMATCH,             // pin_mismatch
+    USER_CANCELLED,           // user_cancelled
+};
+
+/// @brief Converts a PairAbortReason to its wire string.
+/// @param reason The reason to convert.
+/// @return Null-terminated wire string (e.g., "method_not_supported").
+inline const char* to_cstr(PairAbortReason reason) {
+    switch (reason) {
+        case PairAbortReason::ATTEMPT_TIMEOUT:
+            return "attempt_timeout";
+        case PairAbortReason::CONCURRENT_ATTEMPT:
+            return "concurrent_attempt";
+        case PairAbortReason::LOCKED_OUT:
+            return "locked_out";
+        case PairAbortReason::METHOD_NOT_SUPPORTED:
+            return "method_not_supported";
+        case PairAbortReason::PIN_LENGTH_UNACCEPTABLE:
+            return "pin_length_unacceptable";
+        case PairAbortReason::PIN_MISMATCH:
+            return "pin_mismatch";
+        case PairAbortReason::USER_CANCELLED:
+            return "user_cancelled";
+        default:
+            return "unknown";
+    }
+}
+
+/// @brief Maps the internal PairAbortReason to the public SendspinPairAbortReason.
+/// @param reason The internal reason to map.
+/// @return The matching SendspinPairAbortReason, or UNKNOWN if unrecognized.
+inline SendspinPairAbortReason to_public_abort_reason(PairAbortReason reason) {
+    switch (reason) {
+        case PairAbortReason::ATTEMPT_TIMEOUT:
+            return SendspinPairAbortReason::ATTEMPT_TIMEOUT;
+        case PairAbortReason::CONCURRENT_ATTEMPT:
+            return SendspinPairAbortReason::CONCURRENT_ATTEMPT;
+        case PairAbortReason::LOCKED_OUT:
+            return SendspinPairAbortReason::LOCKED_OUT;
+        case PairAbortReason::METHOD_NOT_SUPPORTED:
+            return SendspinPairAbortReason::METHOD_NOT_SUPPORTED;
+        case PairAbortReason::PIN_LENGTH_UNACCEPTABLE:
+            return SendspinPairAbortReason::PIN_LENGTH_UNACCEPTABLE;
+        case PairAbortReason::PIN_MISMATCH:
+            return SendspinPairAbortReason::PIN_MISMATCH;
+        case PairAbortReason::USER_CANCELLED:
+            return SendspinPairAbortReason::USER_CANCELLED;
+        default:
+            return SendspinPairAbortReason::UNKNOWN;
+    }
+}
+
+/// @brief Parses a wire string into a PairAbortReason.
+/// @param str The string to parse.
+/// @return The matching enum value, or std::nullopt if unrecognized.
+inline std::optional<PairAbortReason> pair_abort_reason_from_string(const std::string& str) {
+    if (str == "attempt_timeout") {
+        return PairAbortReason::ATTEMPT_TIMEOUT;
+    }
+    if (str == "concurrent_attempt") {
+        return PairAbortReason::CONCURRENT_ATTEMPT;
+    }
+    if (str == "locked_out") {
+        return PairAbortReason::LOCKED_OUT;
+    }
+    if (str == "method_not_supported") {
+        return PairAbortReason::METHOD_NOT_SUPPORTED;
+    }
+    if (str == "pin_length_unacceptable") {
+        return PairAbortReason::PIN_LENGTH_UNACCEPTABLE;
+    }
+    if (str == "pin_mismatch") {
+        return PairAbortReason::PIN_MISMATCH;
+    }
+    if (str == "user_cancelled") {
+        return PairAbortReason::USER_CANCELLED;
+    }
+    return std::nullopt;
+}
+
 // ============================================================================
 // Conversion helpers (moved from public headers — internal use only)
 // ============================================================================
@@ -249,6 +352,8 @@ inline const char* to_cstr(SendspinGoodbyeReason reason) {
             return "pairing_required";
         case SendspinGoodbyeReason::CONCURRENT_ATTEMPT:
             return "concurrent_attempt";
+        case SendspinGoodbyeReason::UNPAIRED:
+            return "unpaired";
         default:
             return "shutdown";
     }
@@ -666,10 +771,167 @@ struct ServerColorStateDelta {
 // Message envelope structs
 // ============================================================================
 
+// ============================================================================
+// Phase 6: Management result types
+// ============================================================================
+
+/// @brief Result code for management/result messages.
+/// Mirrors ManagementResult in aiosendspin/models/types.py.
+enum class ManagementResult : uint8_t {
+    OK,                 // ok
+    PERMISSION_DENIED,  // permission_denied
+    ALREADY_EXISTS,     // already_exists
+    INVALID,            // invalid
+    NOT_FOUND,          // not_found
+    STORAGE_EXHAUSTED,  // storage_exhausted
+};
+
+/// @brief Converts a ManagementResult to its wire string.
+/// @param result The result to convert.
+/// @return Null-terminated wire string (e.g., "ok").
+inline const char* to_cstr(ManagementResult result) {
+    switch (result) {
+        case ManagementResult::OK:
+            return "ok";
+        case ManagementResult::PERMISSION_DENIED:
+            return "permission_denied";
+        case ManagementResult::ALREADY_EXISTS:
+            return "already_exists";
+        case ManagementResult::INVALID:
+            return "invalid";
+        case ManagementResult::NOT_FOUND:
+            return "not_found";
+        case ManagementResult::STORAGE_EXHAUSTED:
+            return "storage_exhausted";
+        default:
+            return "invalid";
+    }
+}
+
+/// @brief One entry in a list-records result.
+/// Mirrors RecordSummary in aiosendspin/models/management.py.
+struct RecordSummary {
+    std::string psk_id{};
+    std::optional<std::string>
+        server_id;     ///< Present for stored-pubkey records; absent for shared.
+    bool used{false};  ///< True once a server authenticated a session with this record's PSK.
+};
+
+/// @brief Pairing method config in a get-pairing-config result.
+/// Mirrors PairingMethodConfig in aiosendspin/models/management.py.
+struct PairingMethodConfig {
+    bool enabled{false};
+    /// @brief Only present for PIN methods; true if locked out.
+    std::optional<bool> locked_out;
+    /// @brief For dynamic_pin only: shortest PIN length in digits the client will accept (4-12).
+    std::optional<int> min_pin_length;
+};
+
+/// @brief Record mode config in get/set-pairing-config messages.
+/// Mirrors RecordModeConfig in aiosendspin/models/management.py.
+struct RecordModeConfig {
+    std::string psk_id{};
+};
+
+/// @brief Unpaired access config in get/set-pairing-config messages.
+struct UnpairedAccessConfig {
+    std::optional<bool> enabled;
+};
+
+/// @brief Patch for the Pairing PSK method in set-pairing-config.
+/// Mirrors SetPairingPskConfig in aiosendspin/models/management.py.
+struct SetPairingPskConfig {
+    std::optional<bool> enabled;
+    std::optional<std::string> psk;  ///< 43-char base64url 32-byte PSK; replaces current.
+};
+
+/// @brief Patch for the static-PIN method in set-pairing-config.
+/// Mirrors SetStaticPinConfig in aiosendspin/models/management.py.
+struct SetStaticPinConfig {
+    std::optional<bool> enabled;
+    std::optional<std::string> pin;  ///< 8 decimal digits; replaces the configured static PIN.
+    std::optional<bool> locked_out;  ///< Only false is accepted; clears terminal lockout.
+};
+
+/// @brief Patch for the dynamic-PIN method in set-pairing-config.
+/// Mirrors SetDynamicPinConfig in aiosendspin/models/management.py.
+struct SetDynamicPinConfig {
+    std::optional<bool> enabled;
+    std::optional<bool> locked_out;     ///< Only false is accepted; clears terminal lockout.
+    std::optional<int> min_pin_length;  ///< Shortest PIN length in digits accepted; must be 4-12.
+};
+
+/// @brief Operation-specific data for management/result (present only on ok).
+/// Mirrors ManagementResultData in aiosendspin/models/management.py.
+struct ManagementResultData {
+    /// Present for list-records.
+    std::optional<std::vector<RecordSummary>> records;
+    /// Present for get-pairing-config: pairing_psk config.
+    std::optional<PairingMethodConfig> pairing_psk;
+    /// Present for get-pairing-config: record mode.
+    std::optional<RecordModeConfig> record_mode;
+    /// Present for get-pairing-config: unpaired access.
+    std::optional<UnpairedAccessConfig> unpaired_access;
+    /// Present for get-pairing-config: static_pin config.
+    std::optional<PairingMethodConfig> static_pin;
+    /// Present for get-pairing-config: dynamic_pin config.
+    std::optional<PairingMethodConfig> dynamic_pin;
+};
+
+/// @brief Storage accounting attached to management/result responses.
+/// Mirrors StorageAccounting in aiosendspin/models/management.py.
+struct StorageAccountingPayload {
+    int free{0};                         ///< Number of free slots; always present.
+    std::optional<int> capacity;         ///< Present on list-records and get-pairing-config only.
+    std::optional<int> cost_individual;  ///< Present on list-records and get-pairing-config only.
+    std::optional<int> cost_shared;      ///< Present on list-records and get-pairing-config only.
+};
+
+/// @brief Result payload for management/result messages.
+/// Mirrors ManagementResultPayload in aiosendspin/models/management.py.
+struct ManagementResultPayload {
+    ManagementResult result{ManagementResult::INVALID};
+    std::optional<ManagementResultData> data;  ///< Present only on ok, and only when relevant.
+    std::optional<StorageAccountingPayload>
+        storage;  ///< Present when the store reports accounting.
+};
+
+// ============================================================================
+// Phase 6: Management request message structs (server -> client)
+// ============================================================================
+
+/// @brief Parsed management/add-record payload.
+struct ManagementAddRecordPayload {
+    std::string psk{};  ///< 43-char base64url 32-byte PSK.
+    std::optional<std::string>
+        server_id;  ///< Present for stored-pubkey records; absent for shared.
+};
+
+/// @brief Parsed management/remove-record payload.
+struct ManagementRemoveRecordPayload {
+    std::string psk_id{};
+};
+
+/// @brief Parsed management/set-pairing-config payload.
+struct ManagementSetPairingConfigPayload {
+    std::optional<SetPairingPskConfig> pairing_psk;
+    std::optional<SetStaticPinConfig> static_pin;
+    std::optional<SetDynamicPinConfig> dynamic_pin;
+    std::optional<RecordModeConfig> record_mode;
+    std::optional<UnpairedAccessConfig> unpaired_access;
+};
+
 /// @brief A pairing method descriptor for client/hello supported_pair_methods.
-/// Only pairing_psk is ever populated today; PIN methods are deferred.
+/// Optional fields are omitted from the wire when not set (omit_none semantics).
 struct PairMethodDescriptor {
     SendspinPairMethod method{SendspinPairMethod::PAIRING_PSK};
+    /// @brief For methods with output channels (e.g., dynamic_pin: ["display"]).
+    /// Absent for pairing_psk.
+    std::optional<std::vector<std::string>> out_channels;
+    /// @brief True when the method is currently locked out. Absent when not locked out.
+    std::optional<bool> locked_out;
+    /// @brief Minimum PIN length the client will accept. Absent for non-PIN methods.
+    std::optional<int> min_pin_length;
 };
 
 /// @brief Outgoing client/hello handshake message sent at connection startup.
@@ -743,6 +1005,36 @@ struct StreamEndMessage {
 /// @brief Parsed stream/clear message listing which roles the buffer flush applies to
 struct StreamClearMessage {
     std::optional<std::vector<std::string>> roles{};
+};
+
+/// @brief Parsed pair/abort message (received or sent during a pairing exchange)
+/// The reason field identifies why the pairing attempt was aborted.
+struct PairAbortMessage {
+    PairAbortReason reason{PairAbortReason::METHOD_NOT_SUPPORTED};
+};
+
+// ============================================================================
+// Phase 8b: Dynamic-PIN pairing message structs (server -> client)
+// ============================================================================
+
+/// @brief Parsed server/pair-init payload (Phase 8b).
+/// Carries nonce_A (32 raw bytes, base64url-encoded on the wire, 43 chars) and the
+/// server-chosen pin_length. The client responds with client/pair-init carrying commit_B.
+struct ServerPairInitPayload {
+    std::array<uint8_t, 32> nonce_a{};  ///< 32-byte server nonce decoded from base64url.
+    int pin_length{0};                  ///< Server-chosen PIN digit count.
+};
+
+/// @brief Parsed server/pair-auth payload (Phase 8b).
+/// Carries pake_msg_1 (32 raw bytes, base64url-encoded, 43 chars): the server's CPace share.
+struct ServerPairAuthPayload {
+    std::array<uint8_t, 32> pake_msg_1{};  ///< Server CPace public share.
+};
+
+/// @brief Parsed server/pair-confirm payload (Phase 8b).
+/// Carries server_kc (64 raw bytes, base64url-encoded, 86 chars): the server confirmation tag.
+struct ServerPairConfirmPayload {
+    std::array<uint8_t, 64> server_kc{};  ///< Server CPace confirmation tag (HMAC-SHA-512).
 };
 
 // ============================================================================
@@ -892,5 +1184,117 @@ size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmit
 /// relevant to the command is serialized (e.g. position_ms for SEEK); others are ignored.
 /// @return Command message serialized into JSON format.
 std::string format_client_command_message(const ClientCommandControllerObject& cmd);
+
+/// @brief Formats a client/pair-finalize message as a JSON string for sending to the server.
+/// The long_term_psk is 32 raw bytes which are base64url-encoded (no padding, 43 chars).
+/// @param psk 32-byte long-term PSK to embed in the message.
+/// @return JSON string for the client/pair-finalize message.
+std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk);
+
+/// @brief Formats a pair/abort message as a JSON string.
+/// Sent by the client when it cannot proceed with the selected pairing method.
+/// @param reason The abort reason.
+/// @return JSON string for the pair/abort message.
+std::string format_pair_abort_message(PairAbortReason reason);
+
+/// @brief Parses a server/pair-finalize JSON message.
+/// The payload is an empty object ({}); this merely validates the message shape.
+/// @param root Parsed JSON object from the message.
+/// @return true if the message is a valid server/pair-finalize ack, false otherwise.
+bool process_server_pair_finalize_message(JsonObject root);
+
+/// @brief Parses a pair/abort JSON message into the provided struct.
+/// @param root Parsed JSON object from the message.
+/// @param abort_msg [out] Struct to populate with the parsed abort reason.
+/// @return true if parsing succeeded, false on missing or unrecognized reason.
+bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg);
+
+// ============================================================================
+// Phase 8b: Dynamic-PIN pairing protocol functions
+// ============================================================================
+
+/// @brief Parses a server/pair-init JSON message into the provided struct.
+/// Validates base64url encoding and decoded length of nonce_A (must be 32 bytes).
+/// @param root Parsed JSON object.
+/// @param payload [out] Struct to populate; nullptr for validation-only.
+/// @return true if the message is well-formed, false otherwise.
+bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* payload);
+
+/// @brief Parses a server/pair-auth JSON message into the provided struct.
+/// Validates base64url encoding and decoded length of pake_msg_1 (must be 32 bytes).
+/// @param root Parsed JSON object.
+/// @param payload [out] Struct to populate; nullptr for validation-only.
+/// @return true if the message is well-formed, false otherwise.
+bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* payload);
+
+/// @brief Parses a server/pair-confirm JSON message into the provided struct.
+/// Validates base64url encoding and decoded length of server_kc (must be 64 bytes).
+/// @param root Parsed JSON object.
+/// @param payload [out] Struct to populate; nullptr for validation-only.
+/// @return true if the message is well-formed, false otherwise.
+bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPayload* payload);
+
+/// @brief Formats a client/pair-init message as a JSON string.
+/// Sent in response to server/pair-init; carries commit_B = SHA-256(nonce_B).
+/// @param commit_b 32-byte commit_B value to embed (base64url-encoded on the wire).
+/// @return JSON string for the client/pair-init message.
+std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b);
+
+/// @brief Formats an empty client/pair-init message as a JSON string (static PIN, Phase 8c).
+/// Static PIN carries no commit_B (mirrors the reference's ClientPairInitPayload with omit_none:
+/// an empty payload object since no field is set). Sent after the operator confirms the
+/// pairing-window gesture, before starting CPace RESPONDER.
+/// @return JSON string for the client/pair-init message with an empty payload.
+std::string format_client_pair_init_message();
+
+/// @brief Formats a client/pair-auth message as a JSON string.
+/// Sent in response to server/pair-auth; carries the client's CPace public share.
+/// @param pake_msg_2 32-byte client CPace public share (base64url-encoded on the wire).
+/// @return JSON string for the client/pair-auth message.
+std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2);
+
+/// @brief Formats a client/pair-confirm message as a JSON string.
+/// Sent in response to server/pair-confirm; carries client_kc and nonce_B.
+/// @param client_kc 64-byte client CPace confirmation tag (base64url-encoded on the wire).
+/// @param nonce_b   32-byte client nonce (base64url-encoded on the wire).
+/// @return JSON string for the client/pair-confirm message.
+std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
+                                               const std::array<uint8_t, 32>& nonce_b);
+
+/// @brief Formats a client/pair-confirm message with no nonce (static PIN, Phase 8c).
+/// Static PIN carries client_kc only (no nonce_B opening, since there is no commit_B to open).
+/// @param client_kc 64-byte client CPace confirmation tag (base64url-encoded on the wire).
+/// @return JSON string for the client/pair-confirm message with client_kc only.
+std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc);
+
+// ============================================================================
+// Phase 6: Management protocol functions
+// ============================================================================
+
+/// @brief Parses a management/add-record JSON message payload into the provided struct.
+/// @param root Parsed JSON object from the message.
+/// @param payload [out] Struct to populate with the parsed psk and optional server_id.
+/// @return true if parsing succeeded (psk field present), false otherwise.
+bool process_management_add_record_message(JsonObject root, ManagementAddRecordPayload* payload);
+
+/// @brief Parses a management/remove-record JSON message payload into the provided struct.
+/// @param root Parsed JSON object from the message.
+/// @param payload [out] Struct to populate with the parsed psk_id.
+/// @return true if parsing succeeded (psk_id field present), false otherwise.
+bool process_management_remove_record_message(JsonObject root,
+                                              ManagementRemoveRecordPayload* payload);
+
+/// @brief Parses a management/set-pairing-config JSON message payload into the provided struct.
+/// @param root Parsed JSON object from the message.
+/// @param payload [out] Struct to populate.
+/// @return Always returns true (all fields are optional; only fields present with the right JSON
+///         type are populated, leaving the corresponding optional unset otherwise).
+bool process_management_set_pairing_config_message(JsonObject root,
+                                                   ManagementSetPairingConfigPayload* payload);
+
+/// @brief Formats a management/result message as a JSON string for sending to the server.
+/// @param payload The result payload to serialize.
+/// @return JSON string for the management/result message.
+std::string format_management_result_message(const ManagementResultPayload& payload);
 
 }  // namespace sendspin

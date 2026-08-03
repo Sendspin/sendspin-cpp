@@ -299,6 +299,46 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, ">>> Time sync error: %.1f us\n", error);
             }
         }
+
+        void on_trust_changed(ConnectionTrust trust) override {
+            if (trust == ConnectionTrust::USER) {
+                fprintf(stderr, ">>> Trust: user (paired server)\n");
+            } else {
+                fprintf(stderr, ">>> Trust: none (unpaired)\n");
+            }
+        }
+
+        void on_pairing_started(const std::string& server_id) override {
+            fprintf(stderr, ">>> Pairing started with server: %s\n", server_id.c_str());
+        }
+
+        void on_pairing_succeeded(const std::string& server_id) override {
+            fprintf(stderr, ">>> Pairing succeeded with server: %s\n", server_id.c_str());
+            fprintf(stderr, "    Long-term record stored. Future connections from this server\n");
+            fprintf(stderr, "    will be trusted (ConnectionTrust::USER).\n");
+        }
+
+        void on_pairing_failed(const std::string& server_id,
+                               SendspinPairAbortReason reason) override {
+            fprintf(stderr, ">>> Pairing failed with server: %s (reason %d)\n", server_id.c_str(),
+                    static_cast<int>(reason));
+        }
+
+        void on_display_pairing_pin(const std::string& /*pin*/) override {
+            // Dynamic-PIN display not supported in the basic_client example.
+        }
+
+        void on_clear_pairing_pin() override {
+            // Dynamic-PIN clear not supported in the basic_client example.
+        }
+
+        void on_open_pairing_window() override {
+            // Static-PIN pairing window not supported in the basic_client example.
+        }
+
+        void on_close_pairing_window() override {
+            // Static-PIN pairing window not supported in the basic_client example.
+        }
     };
 
     struct HostNetworkProvider : SendspinNetworkProvider {

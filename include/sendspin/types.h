@@ -43,7 +43,7 @@ enum class SendspinGoodbyeReason : uint8_t {
     UNAUTHORIZED,        // Server requested an activity the client's trust level does not permit
     PAIRING_REQUIRED,    // Server requested playback but client requires pairing first
     CONCURRENT_ATTEMPT,  // Incoming connection rejected because another is already admitted
-    // UNPAIRED (server/unpair) is deferred to the management phase (Phase 6).
+    UNPAIRED,            // Server unpaired this device via management/server-unpair
 };
 
 /// @brief Server identity fields received in server/hello messages
@@ -82,12 +82,24 @@ enum class MemoryLocation : uint8_t {
 /// Derived from which PSK category was matched during the Noise handshake:
 ///   LONG_TERM PSK -> USER (the server has a stored pairing record)
 ///   PAIRING or SENTINEL PSK -> NONE (no prior pairing or unpaired access)
-///
-/// Not yet surfaced through a listener callback (that lands with the public API pass in a
-/// later phase); declared here now because admission/trust-enforcement code needs the type.
 enum class ConnectionTrust : uint8_t {
     NONE,  // No long-term pairing record; Sentinel or Pairing PSK was used.
     USER,  // Long-term pairing record matched; connection is from a paired server.
+};
+
+/// @brief Reason a pairing exchange was aborted.
+///
+/// Mirrors the wire values in the Sendspin pairing protocol.
+/// Carried by SendspinClientListener::on_pairing_failed().
+enum class SendspinPairAbortReason : uint8_t {
+    ATTEMPT_TIMEOUT,          // Server did not complete the exchange in time.
+    CONCURRENT_ATTEMPT,       // Another pairing attempt is already in progress.
+    LOCKED_OUT,               // Too many failed attempts; pairing is temporarily locked.
+    METHOD_NOT_SUPPORTED,     // The selected pairing method is not available.
+    PIN_LENGTH_UNACCEPTABLE,  // Proposed PIN length is outside the accepted range.
+    PIN_MISMATCH,             // PIN verification failed.
+    USER_CANCELLED,           // User or application cancelled the pairing.
+    UNKNOWN,                  // Unrecognized reason from the wire.
 };
 
 }  // namespace sendspin

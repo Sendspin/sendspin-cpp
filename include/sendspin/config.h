@@ -55,9 +55,14 @@ struct SendspinPairingPsk {
 struct SendspinPairingConfig {
     bool pairing_psk_enabled{true};
     bool unpaired_access_enabled{false};
-    // PIN fields are deferred to a later phase of the encryption port. Carried as a
-    // comment for forward-compat only; do not add live fields here until that phase.
-    // std::optional<std::string> static_pin;
+    /// @brief When true, the client advertises dynamic_pin as a supported pair method.
+    bool dynamic_pin_enabled{true};
+    /// @brief When true, the client advertises static_pin as a supported pair method (also
+    /// requires a configured static PIN and platform pairing-window support).
+    bool static_pin_enabled{false};
+    /// @brief Minimum PIN length the client will accept; server chooses within [min, MAX].
+    int dynamic_pin_min_length{6};
+    // static_pin fields are deferred to a later phase of the encryption port.
     std::string record_mode_psk_id;  ///< psk_id of the shared-PSK fallback record.
 };
 
@@ -102,6 +107,18 @@ struct SendspinClientConfig {
     /// detected value (recommended on multi-homed hosts where detection may pick the wrong
     /// interface).
     std::optional<std::string> mac_address{};
+
+    /// @brief When true, the platform can display a dynamic PIN to the user.
+    /// Set this to true when the application implements on_display_pairing_pin /
+    /// on_clear_pairing_pin callbacks on its SendspinClientListener. When false,
+    /// dynamic_pin is not advertised even if dynamic_pin_enabled is set in the config.
+    bool pin_display_supported{false};
+
+    /// @brief When true, the platform implements the operator pairing-window gesture.
+    /// Set this to true when the application implements on_open_pairing_window /
+    /// on_close_pairing_window callbacks on its SendspinClientListener. When false,
+    /// static_pin is not advertised even if a static PIN is configured and enabled.
+    bool pairing_window_supported{false};
 
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
 

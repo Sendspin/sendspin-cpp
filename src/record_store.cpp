@@ -45,10 +45,18 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider) : provider_(prov
             pairing_psk_ = std::move(pairing_psk);
         }
 
+        auto static_pin = provider_->load_static_pin();
+        if (static_pin.has_value()) {
+            static_pin_ = std::move(static_pin);
+        }
+
         auto config = provider_->load_pairing_config();
         if (config.has_value()) {
             pairing_psk_enabled_ = config->pairing_psk_enabled;
             unpaired_access_enabled_ = config->unpaired_access_enabled;
+            dynamic_pin_enabled_ = config->dynamic_pin_enabled;
+            static_pin_enabled_ = config->static_pin_enabled;
+            dynamic_pin_min_length_ = config->dynamic_pin_min_length;
             record_mode_psk_id_ = config->record_mode_psk_id;
             loaded_config = true;
             SS_LOGD(TAG, "Loaded pairing config: record_mode_psk_id=%s",
@@ -255,6 +263,53 @@ void RecordStore::set_unpaired_access_enabled(bool enabled) {
     persist_config();
 }
 
+void RecordStore::set_dynamic_pin_enabled(bool enabled) {
+    dynamic_pin_enabled_ = enabled;
+    persist_config();
+}
+
+void RecordStore::set_dynamic_pin_min_length(int length) {
+    dynamic_pin_min_length_ = length;
+    persist_config();
+}
+
+// ============================================================================
+// PIN lockout (Phase 8b/8c)
+// ============================================================================
+
+void RecordStore::record_pin_failure(SendspinPairMethod method) {
+    pin_failures_[method]++;
+    SS_LOGW(TAG, "PIN failure recorded for %s (count=%d, threshold=%d)", to_cstr(method),
+            pin_failures_[method], PIN_LOCKOUT_THRESHOLD);
+}
+
+void RecordStore::reset_pin_failures(SendspinPairMethod method) {
+    pin_failures_.erase(method);
+}
+
+// ============================================================================
+// Static PIN (Phase 8c)
+// ============================================================================
+
+void RecordStore::set_static_pin(const std::string& pin) {
+    static_pin_ = pin;
+    if (provider_ != nullptr) {
+        provider_->save_static_pin(pin);
+    }
+}
+
+void RecordStore::clear_static_pin() {
+    static_pin_.reset();
+    if (provider_ != nullptr) {
+        provider_->clear_static_pin();
+    }
+}
+
+void RecordStore::set_static_pin_enabled(bool enabled) {
+    static_pin_enabled_ = enabled;
+    persist_config();
+}
+
 // ============================================================================
 // Pairing outcome
 // ============================================================================
@@ -303,6 +358,9 @@ void RecordStore::persist_config() {
     SendspinPairingConfig config;
     config.pairing_psk_enabled = pairing_psk_enabled_;
     config.unpaired_access_enabled = unpaired_access_enabled_;
+    config.dynamic_pin_enabled = dynamic_pin_enabled_;
+    config.static_pin_enabled = static_pin_enabled_;
+    config.dynamic_pin_min_length = dynamic_pin_min_length_;
     config.record_mode_psk_id = record_mode_psk_id_;
     provider_->save_pairing_config(config);
 }

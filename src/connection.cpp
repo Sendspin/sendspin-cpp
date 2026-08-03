@@ -17,6 +17,7 @@
 #include "crypto/constants.h"
 #include "platform/compiler.h"
 #include "platform/logging.h"
+#include "platform/time.h"
 #include "time_filter.h"
 
 #include <memory>
@@ -63,11 +64,9 @@ SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
 
 SsErr SendspinConnection::send_app_json(const std::string& json, SendCompleteCallback cb,
                                         bool allow_before_hello) {
-    // is_active() is an atomic read; nothing on this connection mutates the transport
-    // concurrently in this phase (re-handshake, the only concurrent mutator, lands in a
-    // later phase), so this check is race-free today and stays race-free once that phase
-    // wires a concurrent swap, since NoiseTransport re-checks the session under its own
-    // mutex.
+    // is_active() is an atomic read; NoiseTransport owns its own session mutex, so this
+    // main-loop check cannot race the network-thread re-handshake swap: send_encrypted_text
+    // re-checks the session under NoiseTransport's own lock.
     if (this->noise_transport_.is_active()) {
         // Post-handshake: all application JSON must be encrypted.
         // The callback is not forwarded through the encrypted path (the transport's send
@@ -161,15 +160,15 @@ bool SendspinConnection::handle_noise_handshake_text(const std::string& text) {
         // noise_handshake_complete_ just after it, so main-loop readers that observe
         // is_operational() (itself gated behind server_hello_received_/client_hello_sent_,
         // which cannot be true before the Noise transport is active) see these values.
-        this->server_information_.server_id = outcome->server_id;
-        this->psk_category_ = outcome->resolved_psk.category;
-        this->psk_id_ = outcome->resolved_psk.psk_id;
+        this->set_noise_handshake_result(outcome->server_id, outcome->resolved_psk.category,
+                                         outcome->resolved_psk.psk_id);
         // Install the cipher session; send_app_json() routes encrypted from here on.
         this->noise_transport_.activate(std::move(outcome->session));
         this->noise_handshake_.reset();
         this->noise_handshake_complete_.store(true, std::memory_order_release);
-        SS_LOGI(TAG, "Noise transport active (server_id=%s)",
-                this->server_information_.server_id.c_str());
+        SS_LOGI(TAG, "Noise transport active (server_id=%s, psk_category=%d)",
+                this->server_information_.server_id.c_str(),
+                static_cast<int>(this->get_psk_category()));
     }
 
     return true;  // Frame was consumed by the handshake state machine
@@ -195,6 +194,20 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     // cleanly stops publish_client_state()/the time burst until the new server/activate
     // arrives after the session swap.
     this->first_activate_received_.store(false, std::memory_order_release);
+
+    // Clear the pairing-in-progress flag: the re-handshake is the server's signal that
+    // pairing finalized and it is rekeying onto the new long-term PSK.  The quiesce gate
+    // (pairing_in_progress) must be cleared here (network thread) before the new
+    // server/activate arrives, so the main loop can resume time sync and state publishing.
+    // Atomic store - written on network thread, read on main loop.
+    this->pairing_in_progress_.store(false, std::memory_order_release);
+
+    // Restart the provisional-connection timeout window: the connection is once again
+    // "awaiting its first server/activate" (under the new keys). Without this, a connection
+    // older than the establish timeout would be torn down by ConnectionManager::loop() the
+    // instant first_activate_received_ goes false, before the post-swap server/activate can
+    // arrive.
+    this->set_provisional_time_us(platform_time_us());
 
     // Run the two-handshake PSK trick with prologue = the prior handshake hash h.
     auto prior_h = this->noise_transport_.handshake_hash();
@@ -223,16 +236,18 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     }
 
     // Update PSK metadata from the re-handshake result. server_id is unchanged (same server).
-    this->psk_category_ = result->resolved_psk.category;
+    this->psk_category_.store(result->resolved_psk.category, std::memory_order_release);
     this->psk_id_ = result->resolved_psk.psk_id;
 
     // Reset hello handshake state so the post-swap server/hello -> client/hello ->
-    // server/activate flow re-runs under the new session keys.
+    // server/activate flow re-runs under the new session keys. The caller (network thread)
+    // arms the actual hello retry via ConnectionManager::schedule_rehandshake_rearm() once
+    // this call returns true.
     this->server_hello_received_.store(false, std::memory_order_release);
     this->client_hello_sent_.store(false, std::memory_order_release);
 
     SS_LOGI(TAG, "Noise re-handshake complete: server_id=%s psk_category=%d; awaiting server/hello",
-            current_server_id.c_str(), static_cast<int>(this->psk_category_));
+            current_server_id.c_str(), static_cast<int>(this->get_psk_category()));
     return true;
 }
 
@@ -390,6 +405,19 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
         this->on_binary_message_cb(this, this->websocket_payload_.data(), msg_len);
     }
     this->reset_websocket_payload();
+}
+
+// ============================================================================
+// Phase 5: Pairing finalize watchdog
+// ============================================================================
+
+void SendspinConnection::note_pairing_finalize_ack() {
+    // After the server acks pair-finalize it rekeys via an in-band re-handshake. Resetting
+    // first_activate_received_ and re-arming the provisional timer means the existing 30 s
+    // ConnectionManager provisional timeout will tear the connection down if the server acks
+    // but never re-handshakes.
+    this->first_activate_received_.store(false, std::memory_order_release);
+    this->set_provisional_time_us(platform_time_us());
 }
 
 }  // namespace sendspin

@@ -18,6 +18,9 @@
 
 #pragma once
 
+#include "crypto/constants.h"
+#include "crypto/cpace.h"
+#include "crypto/keys.h"
 #include "noise_handshake.h"
 #include "noise_transport.h"
 #include "platform/memory.h"
@@ -30,6 +33,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -343,14 +347,144 @@ public:
     /// re-handshake). Defaults to SENTINEL when no Noise handshake has completed (e.g. when
     /// encryption is not required on this connection).
     PskCategory get_psk_category() const {
-        return this->psk_category_;
+        return this->psk_category_.load(std::memory_order_acquire);
     }
 
     /// @brief Returns the psk_id of the matched PSK (set at COMPLETE; empty for Sentinel or
-    /// when no Noise handshake has completed).
+    /// when no Noise handshake has completed). Written on the network thread at COMPLETE /
+    /// re-handshake.
+    /// Read sites:
+    ///   1. Main loop (the activate handler, for mark_record_used): safe because the read is
+    ///      sequenced after the write via the conn_mutex_-synchronized server/activate event.
+    ///   2. Network thread (client.cpp SERVER_UNPAIR handler): captures psk_id into the event
+    ///      before scheduling. Safe because psk_id_ was written earlier on the same network
+    ///      thread (same-thread sequencing), and the value is captured by value into the event
+    ///      before any later write.
     const std::string& get_psk_id() const {
         return this->psk_id_;
     }
+
+    /// @brief Returns the pairing method the server selected (from the last server/activate
+    /// that carried one). Used by the pairing flow.
+    const std::optional<SendspinPairMethod>& get_selected_pair_method() const {
+        return this->selected_pair_method_;
+    }
+
+    // ========================================
+    // PIN pairing state (dynamic and static)
+    // ========================================
+
+    /// @brief Steps in the PIN PAKE state machine (main-loop-only).
+    /// Shared by both dynamic-PIN and static-PIN pairing; AWAIT_PAIRING_WINDOW and
+    /// AWAIT_SERVER_PAIR_INIT are exclusive to their respective methods (see PinSession::method),
+    /// the remaining steps (AWAIT_SERVER_PAIR_AUTH onward) are common to both.
+    enum class PinStep : uint8_t {
+        IDLE,                    ///< No PIN session active.
+        AWAIT_PAIRING_WINDOW,    ///< static PIN only: awaiting the operator pairing-window gesture
+                                 ///< before sending client/pair-init.
+        AWAIT_SERVER_PAIR_INIT,  ///< dynamic PIN only: sent client/pair-init (commit_B);
+                                 ///< waiting for server/pair-init.
+        AWAIT_SERVER_PAIR_AUTH,  ///< CPace RESPONDER started; waiting for server/pair-auth.
+        AWAIT_SERVER_PAIR_CONFIRM,   ///< Sent client/pair-auth and derived; waiting for
+                                     ///< server/pair-confirm.
+        AWAIT_SERVER_PAIR_FINALIZE,  ///< Sent client/pair-finalize; waiting for
+                                     ///< server/pair-finalize.
+    };
+
+    /// @brief All PIN-pairing session state (main-loop-only; never touched by network thread).
+    /// Shared by both dynamic-PIN and static-PIN pairing; `method` selects which lockout counter
+    /// and pair-confirm wire shape applies.
+    struct PinSession {
+        CPace cpace;
+        std::array<uint8_t, 32> nonce_b{};
+        std::array<uint8_t, 32> handshake_hash{};
+        std::string static_pin_value;  ///< static PIN captured at pairing start (static PIN only).
+        int64_t attempt_deadline_us{0};  ///< platform_time_us() deadline for the whole attempt.
+        int pin_length{0};
+        SendspinPairMethod method{
+            SendspinPairMethod::DYNAMIC_PIN};  ///< Which PIN method this session is running.
+        PinStep step{PinStep::IDLE};
+        bool pin_displayed{false};  ///< True once a PIN was surfaced via on_display_pairing_pin.
+        bool window_shown{false};   ///< True once on_open_pairing_window was surfaced, so
+                                    ///< abort/teardown knows to fire on_close_pairing_window.
+    };
+
+    /// @brief Return the current PIN session state. Main-loop-only.
+    PinSession& pin_session() {
+        return this->pin_session_;
+    }
+
+    /// @brief Return the Noise handshake hash, or nullopt if no active transport session.
+    ///
+    /// Safe to call from the main loop during a pairing flow because the NoiseTransport session
+    /// is only written on the network thread at handshake COMPLETE (before any server/activate
+    /// that can trigger pairing) or at re-handshake swap. During a DYNAMIC_PIN pairing activation
+    /// the transport session is stable and active.
+    ///
+    /// Virtual so tests can inject a fake connection that reports a canned hash without an
+    /// active Noise session (see PinStateMachineTest's FakeConnection); production connections
+    /// keep the same implementation via dynamic dispatch.
+    virtual std::optional<std::array<uint8_t, 32>> get_noise_handshake_hash() const {
+        return this->noise_transport_.handshake_hash();
+    }
+
+    // ========================================
+    // Pairing state
+    // ========================================
+
+    /// @brief Returns true if a pairing exchange is in progress on this connection.
+    /// Written on the main loop (set when entering pairing, cleared on abort).
+    /// Also cleared on the network thread by handle_noise_rehandshake().
+    /// Must be atomic: written main-loop + network thread, read on main loop.
+    bool is_pairing_in_progress() const {
+        return this->pairing_in_progress_.load(std::memory_order_acquire);
+    }
+
+    /// @brief Sets the pairing-in-progress flag.
+    /// Call on the main loop when entering the pairing exchange.
+    void set_pairing_in_progress(bool value) {
+        this->pairing_in_progress_.store(value, std::memory_order_release);
+    }
+
+    /// @brief Stores the pending pairing record, committed if/when the server acks with
+    /// server/pair-finalize. A nullopt record = storage-exhausted / shared-PSK case: send the
+    /// shared PSK but store nothing on ack. Written on the main loop when entering pairing; taken
+    /// on the network thread in the server/pair-finalize handler (the commit must happen there,
+    /// before the server's re-handshake msg1 - next message on the same thread - resolves the new
+    /// PSK against the RecordStore). pending_pairing_mutex_ guards the cross-thread access.
+    void set_pending_pairing_record(std::optional<SendspinPairingRecord> record) {
+        std::lock_guard<std::mutex> lock(this->pending_pairing_mutex_);
+        this->pending_pairing_record_ = std::move(record);
+    }
+
+    /// @brief Atomically returns and clears the pending pairing record. A returned value is a
+    /// record to store; nullopt means store nothing (shared-PSK case or no pending pairing).
+    /// Called on the network thread when the server/pair-finalize ack arrives.
+    std::optional<SendspinPairingRecord> take_pending_pairing_record() {
+        std::lock_guard<std::mutex> lock(this->pending_pairing_mutex_);
+        return std::exchange(this->pending_pairing_record_, std::nullopt);
+    }
+
+    /// @brief Clears all pairing state on this connection. Called on abort or leftover-activate.
+    void clear_pairing_state() {
+        this->pairing_in_progress_.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(this->pending_pairing_mutex_);
+            this->pending_pairing_record_ = std::nullopt;
+        }
+        // Reset the dynamic-PIN session (main-loop-only fields; no lock needed).
+        this->pin_session_ = PinSession{};
+    }
+
+    /// @brief Re-arm the provisional timeout after the server acks server/pair-finalize.
+    ///
+    /// After the server acks pair-finalize it rekeys via an in-band re-handshake. Re-arming the
+    /// provisional timer means the existing nursery-establish provisional timeout in
+    /// ConnectionManager::loop() will tear the connection down if the server acks but never
+    /// re-handshakes (mirrors the reference's post-pairing timeout). Runs on the network thread;
+    /// provisional_time_us_ is atomic. Implemented in connection.cpp to avoid pulling
+    /// platform/time.h into this header.
+    void note_pairing_finalize_ack();
 
     /// @brief Returns true if any active role is in the given family (e.g., "player" matches
     /// the active role "player@v1").
@@ -384,12 +518,15 @@ public:
     /// no synchronization of their own.
     /// @param activities Activity list from the message.
     /// @param active_roles Optional roles list (nullopt = keep prior set).
+    /// @param selected_pair_method Server-selected pairing method (nullopt outside pairing).
     void apply_server_activate(const std::vector<SendspinActivity>& activities,
-                               const std::optional<std::vector<std::string>>& active_roles) {
+                               const std::optional<std::vector<std::string>>& active_roles,
+                               const std::optional<SendspinPairMethod>& selected_pair_method) {
         this->activities_ = activities;
         if (active_roles.has_value()) {
             this->active_roles_ = active_roles.value();
         }
+        this->selected_pair_method_ = selected_pair_method;
         this->first_activate_received_.store(true, std::memory_order_release);
     }
 
@@ -511,6 +648,15 @@ public:
     /// @brief Returns whether the WebSocket upgrade completed.
     bool is_ws_upgraded() const {
         return this->ws_upgraded_.load(std::memory_order_acquire);
+    }
+
+    /// @brief Sets the server_id and PSK metadata from the Noise handshake result.
+    /// Called at COMPLETE in connection.cpp.
+    void set_noise_handshake_result(const std::string& server_id, PskCategory psk_category,
+                                    const std::string& psk_id) {
+        this->server_information_.server_id = server_id;
+        this->psk_category_.store(psk_category, std::memory_order_release);
+        this->psk_id_ = psk_id;
     }
 
     /// @brief Sets the server hello received flag
@@ -685,14 +831,40 @@ protected:
     /// the field). Empty until the first activate that includes active_roles.
     std::vector<std::string> active_roles_{};
 
+    /// Pairing method the server selected (from the last server/activate carrying one);
+    /// nullopt outside a pairing activation. Read by the Phase 5 pairing flow. Written and
+    /// read on the main loop (apply_server_activate runs in ConnectionManager::loop()).
+    std::optional<SendspinPairMethod> selected_pair_method_{};
+
+    // ========================================
+    // Phase 5 / 8b: Pairing state members
+    // ========================================
+
+    /// Dynamic-PIN PAKE session (all fields are main-loop-only; no lock needed).
+    PinSession pin_session_{};
+
+    /// True while a Pairing-PSK exchange is in progress on this connection.
+    /// Written on the main loop (enter/abort) and by the network thread
+    /// (handle_noise_rehandshake clears it when the re-handshake begins).
+    /// Read on the main loop (time-burst and publish_client_state quiesce gates).
+    /// Atomic because of the network-thread write in handle_noise_rehandshake.
+    std::atomic<bool> pairing_in_progress_{false};
+
+    /// Pending pairing record to be committed when the server/pair-finalize ack arrives (nullopt
+    /// = shared-PSK / nothing to store). Written on the main loop (enter pairing), taken on the
+    /// network thread (server/pair-finalize handler), cleared on the main loop (abort/leftover);
+    /// guarded by pending_pairing_mutex_.
+    std::optional<SendspinPairingRecord> pending_pairing_record_{};
+
+    /// Guards pending_pairing_record_ across the main-loop writer and the network-thread taker.
+    std::mutex pending_pairing_mutex_{};
+
     // 8-bit fields
 
     /// PSK category resolved by the Noise handshake (set at COMPLETE, or re-handshake).
-    /// Written on the network thread before noise_handshake_complete_ is stored (release);
-    /// safe to read on the main loop after observing is_operational() (which happens-after
-    /// server_hello_received_/client_hello_sent_, both themselves gated behind the Noise
-    /// transport becoming active), matching the existing server_information_ discipline.
-    PskCategory psk_category_{PskCategory::SENTINEL};
+    /// Atomic because get_psk_category() is read on the main loop (build_hello_message via the
+    /// hello-retry path) while the network thread writes it at COMPLETE / re-handshake.
+    std::atomic<PskCategory> psk_category_{PskCategory::SENTINEL};
 
     /// Hello handshake state. Atomic because it is set from the send-completion callback (the httpd
     /// worker thread on ESP) and the disconnect handlers (network thread), while

@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "platform/base64.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "protocol_messages.h"
 #include <ArduinoJson.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -318,6 +320,39 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     }
     if (type_str == "noise/handshake") {
         return SendspinServerToClientMessageType::NOISE_HANDSHAKE;
+    }
+    if (type_str == "server/pair-finalize") {
+        return SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE;
+    }
+    if (type_str == "pair/abort") {
+        return SendspinServerToClientMessageType::PAIR_ABORT;
+    }
+    if (type_str == "server/unpair") {
+        return SendspinServerToClientMessageType::SERVER_UNPAIR;
+    }
+    if (type_str == "management/list-records") {
+        return SendspinServerToClientMessageType::MANAGEMENT_LIST_RECORDS;
+    }
+    if (type_str == "management/add-record") {
+        return SendspinServerToClientMessageType::MANAGEMENT_ADD_RECORD;
+    }
+    if (type_str == "management/remove-record") {
+        return SendspinServerToClientMessageType::MANAGEMENT_REMOVE_RECORD;
+    }
+    if (type_str == "management/get-pairing-config") {
+        return SendspinServerToClientMessageType::MANAGEMENT_GET_PAIRING_CONFIG;
+    }
+    if (type_str == "management/set-pairing-config") {
+        return SendspinServerToClientMessageType::MANAGEMENT_SET_PAIRING_CONFIG;
+    }
+    if (type_str == "server/pair-init") {
+        return SendspinServerToClientMessageType::SERVER_PAIR_INIT;
+    }
+    if (type_str == "server/pair-auth") {
+        return SendspinServerToClientMessageType::SERVER_PAIR_AUTH;
+    }
+    if (type_str == "server/pair-confirm") {
+        return SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM;
     }
 
     return SendspinServerToClientMessageType::UNKNOWN;
@@ -868,6 +903,20 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         for (const auto& desc : msg->supported_pair_methods) {
             JsonObject method_obj = methods_list.add<JsonObject>();
             method_obj["method"] = to_cstr(desc.method);
+            if (desc.out_channels.has_value() && !desc.out_channels->empty()) {
+                JsonArray ch_arr = method_obj["out_channels"].to<JsonArray>();
+                for (const auto& ch : desc.out_channels.value()) {
+                    ch_arr.add(ch.c_str());
+                }
+            }
+            // Emit locked_out whenever it is set (true or false), matching the reference's
+            // omit_none: a PIN method always carries locked_out; a non-PIN method omits it.
+            if (desc.locked_out.has_value()) {
+                method_obj["locked_out"] = desc.locked_out.value();
+            }
+            if (desc.min_pin_length.has_value()) {
+                method_obj["min_pin_length"] = desc.min_pin_length.value();
+            }
         }
     }
     root["payload"]["unpaired_access"]["enabled"] = msg->unpaired_access_enabled;
@@ -1165,6 +1214,409 @@ std::string format_client_command_message(const ClientCommandControllerObject& c
     }
     if (cmd.command == SendspinControllerCommand::SEEK_RELATIVE && cmd.offset_ms.has_value()) {
         controller["offset_ms"] = cmd.offset_ms.value();
+    }
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+// ============================================================================
+// Phase 5: Pairing-PSK protocol messages
+// ============================================================================
+
+std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-finalize";
+    // Encode the 32-byte PSK as 43-char base64url (no padding).
+    root["payload"]["long_term_psk"] = b64url_encode(psk.data(), psk.size());
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_pair_abort_message(PairAbortReason reason) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "pair/abort";
+    root["payload"]["reason"] = to_cstr(reason);
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+bool process_server_pair_finalize_message(JsonObject root) {
+    // server/pair-finalize carries an empty payload object.
+    // Validate that the type field is correct (already checked by determine_message_type).
+    // We accept any valid JSON object as the payload (including an empty one).
+    if (!root["type"].is<const char*>()) {
+        SS_LOGE(TAG, "process_server_pair_finalize_message: missing type field");
+        return false;
+    }
+    // payload is allowed to be absent or empty
+    return true;
+}
+
+bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
+    if (!root["payload"]["reason"].is<const char*>()) {
+        SS_LOGE(TAG, "Invalid pair/abort message: missing reason");
+        return false;
+    }
+
+    if (abort_msg == nullptr) {
+        return true;
+    }
+
+    const std::string reason_str = root["payload"]["reason"].as<std::string>();
+    auto reason = pair_abort_reason_from_string(reason_str);
+    if (!reason.has_value()) {
+        SS_LOGW(TAG, "pair/abort: unrecognized reason '%s'", reason_str.c_str());
+        return false;
+    }
+
+    abort_msg->reason = reason.value();
+    return true;
+}
+
+// ============================================================================
+// Phase 8b: Dynamic-PIN pairing protocol functions
+// ============================================================================
+
+bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* payload) {
+    // Required fields: nonce_A (base64url, 43 chars -> 32 bytes), pin_length (int)
+    if (!root["payload"]["nonce_A"].is<const char*>()) {
+        SS_LOGE(TAG, "server/pair-init: missing nonce_A");
+        return false;
+    }
+    if (!root["payload"]["pin_length"].is<int>()) {
+        SS_LOGE(TAG, "server/pair-init: missing pin_length");
+        return false;
+    }
+
+    if (payload == nullptr) {
+        return true;
+    }
+
+    const std::string nonce_a_b64 = root["payload"]["nonce_A"].as<std::string>();
+    auto nonce_a_bytes = b64url_decode(nonce_a_b64);
+    if (!nonce_a_bytes.has_value() || nonce_a_bytes->size() != 32) {
+        SS_LOGE(TAG, "server/pair-init: nonce_A is not 32 bytes");
+        return false;
+    }
+    std::memcpy(payload->nonce_a.data(), nonce_a_bytes->data(), 32);
+
+    payload->pin_length = root["payload"]["pin_length"].as<int>();
+    return true;
+}
+
+bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* payload) {
+    if (!root["payload"]["pake_msg_1"].is<const char*>()) {
+        SS_LOGE(TAG, "server/pair-auth: missing pake_msg_1");
+        return false;
+    }
+
+    if (payload == nullptr) {
+        return true;
+    }
+
+    const std::string msg1_b64 = root["payload"]["pake_msg_1"].as<std::string>();
+    auto msg1_bytes = b64url_decode(msg1_b64);
+    if (!msg1_bytes.has_value() || msg1_bytes->size() != 32) {
+        SS_LOGE(TAG, "server/pair-auth: pake_msg_1 is not 32 bytes");
+        return false;
+    }
+    std::memcpy(payload->pake_msg_1.data(), msg1_bytes->data(), 32);
+    return true;
+}
+
+bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPayload* payload) {
+    if (!root["payload"]["server_kc"].is<const char*>()) {
+        SS_LOGE(TAG, "server/pair-confirm: missing server_kc");
+        return false;
+    }
+
+    if (payload == nullptr) {
+        return true;
+    }
+
+    const std::string kc_b64 = root["payload"]["server_kc"].as<std::string>();
+    auto kc_bytes = b64url_decode(kc_b64);
+    if (!kc_bytes.has_value() || kc_bytes->size() != 64) {
+        SS_LOGE(TAG, "server/pair-confirm: server_kc is not 64 bytes");
+        return false;
+    }
+    std::memcpy(payload->server_kc.data(), kc_bytes->data(), 64);
+    return true;
+}
+
+std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-init";
+    root["payload"]["commit_B"] = b64url_encode(commit_b.data(), commit_b.size());
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_init_message() {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-init";
+    // Static PIN: no commit_B. Create an empty payload object so the wire matches the reference's
+    // empty ClientPairInitPayload (omit_none drops the unset commit_B field).
+    root["payload"].to<JsonObject>();
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-auth";
+    root["payload"]["pake_msg_2"] = b64url_encode(pake_msg_2.data(), pake_msg_2.size());
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
+                                               const std::array<uint8_t, 32>& nonce_b) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-confirm";
+    root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
+    root["payload"]["nonce_B"] = b64url_encode(nonce_b.data(), nonce_b.size());
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-confirm";
+    // Static PIN: no nonce_B opening (there was no commit_B to open).
+    root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+// ============================================================================
+// Phase 6: Management protocol functions
+// ============================================================================
+
+bool process_management_add_record_message(JsonObject root, ManagementAddRecordPayload* payload) {
+    if (!root["payload"]["psk"].is<const char*>()) {
+        SS_LOGE(TAG, "management/add-record: missing psk field");
+        return false;
+    }
+
+    if (payload == nullptr) {
+        return true;
+    }
+
+    payload->psk = root["payload"]["psk"].as<std::string>();
+
+    // server_id is optional (absent for shared-PSK records).
+    JsonVariantConst server_id_var = root["payload"]["server_id"];
+    if (server_id_var.is<const char*>()) {
+        payload->server_id = server_id_var.as<std::string>();
+    } else {
+        payload->server_id = std::nullopt;
+    }
+
+    return true;
+}
+
+bool process_management_remove_record_message(JsonObject root,
+                                              ManagementRemoveRecordPayload* payload) {
+    if (!root["payload"]["psk_id"].is<const char*>()) {
+        SS_LOGE(TAG, "management/remove-record: missing psk_id field");
+        return false;
+    }
+
+    if (payload == nullptr) {
+        return true;
+    }
+
+    payload->psk_id = root["payload"]["psk_id"].as<std::string>();
+    return true;
+}
+
+bool process_management_set_pairing_config_message(JsonObject root,
+                                                   ManagementSetPairingConfigPayload* payload) {
+    if (payload == nullptr) {
+        return true;
+    }
+
+    // Parse pairing_psk (optional sub-object).
+    if (root["payload"]["pairing_psk"].is<JsonObject>()) {
+        SetPairingPskConfig psk_cfg;
+        JsonObject psk_obj = root["payload"]["pairing_psk"].as<JsonObject>();
+        if (psk_obj["enabled"].is<bool>()) {
+            psk_cfg.enabled = psk_obj["enabled"].as<bool>();
+        }
+        if (psk_obj["psk"].is<const char*>()) {
+            psk_cfg.psk = psk_obj["psk"].as<std::string>();
+        }
+        payload->pairing_psk = std::move(psk_cfg);
+    }
+
+    // Parse static_pin (optional sub-object).
+    if (root["payload"]["static_pin"].is<JsonObject>()) {
+        SetStaticPinConfig static_cfg;
+        JsonObject static_obj = root["payload"]["static_pin"].as<JsonObject>();
+        if (static_obj["enabled"].is<bool>()) {
+            static_cfg.enabled = static_obj["enabled"].as<bool>();
+        }
+        if (static_obj["pin"].is<const char*>()) {
+            static_cfg.pin = static_obj["pin"].as<std::string>();
+        }
+        if (static_obj["locked_out"].is<bool>()) {
+            static_cfg.locked_out = static_obj["locked_out"].as<bool>();
+        }
+        payload->static_pin = std::move(static_cfg);
+    }
+
+    // Parse dynamic_pin (optional sub-object).
+    if (root["payload"]["dynamic_pin"].is<JsonObject>()) {
+        SetDynamicPinConfig dynamic_cfg;
+        JsonObject dynamic_obj = root["payload"]["dynamic_pin"].as<JsonObject>();
+        if (dynamic_obj["enabled"].is<bool>()) {
+            dynamic_cfg.enabled = dynamic_obj["enabled"].as<bool>();
+        }
+        if (dynamic_obj["locked_out"].is<bool>()) {
+            dynamic_cfg.locked_out = dynamic_obj["locked_out"].as<bool>();
+        }
+        if (dynamic_obj["min_pin_length"].is<int>()) {
+            dynamic_cfg.min_pin_length = dynamic_obj["min_pin_length"].as<int>();
+        }
+        payload->dynamic_pin = std::move(dynamic_cfg);
+    }
+
+    // Parse record_mode (optional sub-object).
+    if (root["payload"]["record_mode"].is<JsonObject>()) {
+        JsonObject rm_obj = root["payload"]["record_mode"].as<JsonObject>();
+        if (rm_obj["psk_id"].is<const char*>()) {
+            RecordModeConfig rm;
+            rm.psk_id = rm_obj["psk_id"].as<std::string>();
+            payload->record_mode = std::move(rm);
+        }
+    }
+
+    // Parse unpaired_access (optional sub-object).
+    if (root["payload"]["unpaired_access"].is<JsonObject>()) {
+        JsonObject ua_obj = root["payload"]["unpaired_access"].as<JsonObject>();
+        UnpairedAccessConfig ua;
+        if (ua_obj["enabled"].is<bool>()) {
+            ua.enabled = ua_obj["enabled"].as<bool>();
+        }
+        payload->unpaired_access = std::move(ua);
+    }
+
+    return true;
+}
+
+std::string format_management_result_message(const ManagementResultPayload& payload) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "management/result";
+    root["payload"]["result"] = to_cstr(payload.result);
+
+    if (payload.data.has_value()) {
+        const ManagementResultData& data = payload.data.value();
+
+        // records (list-records result)
+        if (data.records.has_value()) {
+            JsonArray records_arr = root["payload"]["data"]["records"].to<JsonArray>();
+            for (const auto& rec : data.records.value()) {
+                JsonObject rec_obj = records_arr.add<JsonObject>();
+                rec_obj["psk_id"] = rec.psk_id;
+                if (rec.server_id.has_value()) {
+                    rec_obj["server_id"] = rec.server_id.value();
+                }
+                rec_obj["used"] = rec.used;
+            }
+        }
+
+        // pairing_psk (get-pairing-config result): enabled only, no secrets.
+        if (data.pairing_psk.has_value()) {
+            root["payload"]["data"]["pairing_psk"]["enabled"] = data.pairing_psk->enabled;
+        }
+
+        // static_pin (get-pairing-config result): enabled always; locked_out only when set;
+        // min_pin_length never set for static_pin (omitted per PairingMethodConfig contract).
+        if (data.static_pin.has_value()) {
+            const PairingMethodConfig& cfg = data.static_pin.value();
+            root["payload"]["data"]["static_pin"]["enabled"] = cfg.enabled;
+            if (cfg.locked_out.has_value()) {
+                root["payload"]["data"]["static_pin"]["locked_out"] = cfg.locked_out.value();
+            }
+            if (cfg.min_pin_length.has_value()) {
+                root["payload"]["data"]["static_pin"]["min_pin_length"] =
+                    cfg.min_pin_length.value();
+            }
+        }
+
+        // dynamic_pin (get-pairing-config result): enabled always; locked_out and
+        // min_pin_length only when set.
+        if (data.dynamic_pin.has_value()) {
+            const PairingMethodConfig& cfg = data.dynamic_pin.value();
+            root["payload"]["data"]["dynamic_pin"]["enabled"] = cfg.enabled;
+            if (cfg.locked_out.has_value()) {
+                root["payload"]["data"]["dynamic_pin"]["locked_out"] = cfg.locked_out.value();
+            }
+            if (cfg.min_pin_length.has_value()) {
+                root["payload"]["data"]["dynamic_pin"]["min_pin_length"] =
+                    cfg.min_pin_length.value();
+            }
+        }
+
+        // record_mode (get-pairing-config result)
+        if (data.record_mode.has_value()) {
+            root["payload"]["data"]["record_mode"]["psk_id"] = data.record_mode->psk_id;
+        }
+
+        // unpaired_access (get-pairing-config result): always emit enabled when the object is
+        // present -- the spec requires unpaired_access:{enabled:<bool>} in every get-config result.
+        if (data.unpaired_access.has_value()) {
+            root["payload"]["data"]["unpaired_access"]["enabled"] =
+                data.unpaired_access->enabled.value_or(false);
+        }
+    }
+
+    // storage (optional accounting)
+    if (payload.storage.has_value()) {
+        const StorageAccountingPayload& storage = payload.storage.value();
+        root["payload"]["storage"]["free"] = storage.free;
+        if (storage.capacity.has_value()) {
+            root["payload"]["storage"]["capacity"] = storage.capacity.value();
+        }
+        if (storage.cost_individual.has_value()) {
+            root["payload"]["storage"]["cost_individual"] = storage.cost_individual.value();
+        }
+        if (storage.cost_shared.has_value()) {
+            root["payload"]["storage"]["cost_shared"] = storage.cost_shared.value();
+        }
     }
 
     std::string output;

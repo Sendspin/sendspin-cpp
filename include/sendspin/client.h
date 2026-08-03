@@ -30,6 +30,11 @@
 #include <string>
 #include <vector>
 
+// Forward declaration of the Phase 8d test fixture (defined in tests/test_pin_state_machine.cpp,
+// global namespace). Declared here, outside namespace sendspin, so the friend declaration below
+// can name it unambiguously with the "::" qualifier.
+class PinStateMachineTest;
+
 namespace sendspin {
 
 // Forward declarations for enabled roles
@@ -73,6 +78,69 @@ public:
 
     /// @brief Called when the library no longer needs high-performance networking
     virtual void on_release_high_performance() {}
+
+    // ========================================
+    // Encryption / pairing callbacks
+    // ========================================
+
+    /// @brief Called when a server begins a Pairing-PSK pairing exchange
+    ///
+    /// server_id is the base64url public key of the server entering pairing.
+    /// At this point client/pair-finalize has been sent; the exchange completes
+    /// when on_pairing_succeeded or on_pairing_failed fires.
+    /// Fires on the main loop.
+    virtual void on_pairing_started(const std::string& /*server_id*/) {}
+
+    /// @brief Called when a pairing exchange completes and a long-term record is stored
+    ///
+    /// server_id is the base64url public key of the newly paired server. After this
+    /// callback the server re-handshakes on the new long-term PSK. Subsequent
+    /// connections from this server will report ConnectionTrust::USER.
+    /// Fires on the main loop.
+    virtual void on_pairing_succeeded(const std::string& /*server_id*/) {}
+
+    /// @brief Called when a pairing exchange is aborted (by the server or by the protocol)
+    ///
+    /// server_id identifies the server whose pairing was aborted. reason explains why.
+    /// The connection is closed immediately after this callback.
+    /// Fires on the main loop.
+    virtual void on_pairing_failed(const std::string& /*server_id*/,
+                                   SendspinPairAbortReason /*reason*/) {}
+
+    /// @brief Called when the active connection's trust level is known after handshake
+    ///
+    /// Fires on the main loop when the active connection's trust level becomes known: on the
+    /// initial handshake and after each successful re-handshake (for example, after pairing).
+    /// trust reflects the PSK category matched during the Noise handshake:
+    ///   ConnectionTrust::USER    -- long-term record (paired server)
+    ///   ConnectionTrust::NONE    -- Sentinel or Pairing PSK (unpaired access)
+    virtual void on_trust_changed(ConnectionTrust /*trust*/) {}
+
+    /// @brief Called when a dynamic-PIN should be displayed to the user.
+    ///
+    /// pin is the zero-padded decimal PIN string (e.g., "042735").  Fires on the main loop.
+    /// Called at most once per pairing attempt; always followed by on_clear_pairing_pin when
+    /// the attempt concludes (success, failure, or abort).
+    /// Only called when SendspinClientConfig::pin_display_supported is true.
+    virtual void on_display_pairing_pin(const std::string& /*pin*/) {}
+
+    /// @brief Called to clear the dynamic PIN from the display.
+    ///
+    /// Fires on the main loop after every pairing attempt that triggered on_display_pairing_pin,
+    /// regardless of outcome.  Always called after on_display_pairing_pin, never before it.
+    virtual void on_clear_pairing_pin() {}
+
+    /// @brief Called when the operator must perform the device pairing-window gesture to allow
+    /// static-PIN pairing.
+    ///
+    /// Fires on the main loop. Only called when SendspinClientConfig::pairing_window_supported is
+    /// true. Always followed by on_close_pairing_window when the attempt concludes. The
+    /// application confirms the gesture by calling SendspinClient::confirm_pairing_window().
+    virtual void on_open_pairing_window() {}
+
+    /// @brief Called to dismiss the pairing-window prompt after every attempt that triggered
+    /// on_open_pairing_window, regardless of outcome.
+    virtual void on_close_pairing_window() {}
 };
 
 /// @brief Platform hook for network readiness
@@ -166,6 +234,23 @@ public:
 
     /// @brief Clear the accepted Pairing PSK.
     virtual void clear_pairing_psk() {}
+
+    // ========================================================================
+    // Static PIN (Phase 8c)
+    // ========================================================================
+
+    /// @brief Load the configured static PIN, if any.
+    virtual std::optional<std::string> load_static_pin() {
+        return std::nullopt;
+    }
+
+    /// @brief Save the configured static PIN.
+    virtual bool save_static_pin(const std::string& /*pin*/) {
+        return false;
+    }
+
+    /// @brief Clear the configured static PIN.
+    virtual void clear_static_pin() {}
 
     // ========================================================================
     // Pairing config
@@ -268,6 +353,10 @@ struct Identity;
  */
 class SendspinClient {
     friend class ConnectionManager;
+    // Test-only: lets the Phase 8d PIN state-machine integration harness reach
+    // connection_manager_ (private) to inject a fake connection. See the matching
+    // friend declaration on ConnectionManager in src/connection_manager.h.
+    friend class ::PinStateMachineTest;
 
 public:
     explicit SendspinClient(SendspinClientConfig config);
@@ -455,6 +544,15 @@ public:
     void update_state(SendspinClientState state);
 
     // ========================================
+    // Pairing
+    // ========================================
+
+    /// @brief Signals that the operator performed the device pairing-window gesture.
+    /// Thread-safe. Advances a pending static-PIN pairing. No-op if no static PIN pairing is
+    /// awaiting the window.
+    void confirm_pairing_window();
+
+    // ========================================
     // Listener and provider setters
     // ========================================
 
@@ -548,6 +646,37 @@ private:
     /// @brief Publishes the initial client state after handshake completes
     /// @param conn The connection that completed the handshake
     void on_handshake_complete(SendspinConnection* conn);
+
+    /// @brief Queue an on_pairing_started notification for delivery from loop()
+    /// Called by ConnectionManager while conn_ptr_mutex_ is held; the callback itself fires
+    /// later from loop() so it runs unlocked. Main loop only.
+    void note_pairing_started(const std::string& server_id);
+
+    /// @brief Queue an on_pairing_succeeded notification for delivery from loop()
+    /// Called by ConnectionManager on the main loop once the network thread's
+    /// schedule_pairing_succeeded() event has been drained (see ConnectionManager::loop()).
+    /// Main loop only.
+    void note_pairing_succeeded(const std::string& server_id);
+
+    /// @brief Queue an on_pairing_failed notification for delivery from loop()
+    /// Same deferral as note_pairing_started. Main loop only.
+    void note_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason);
+
+    /// @brief Queue an on_display_pairing_pin notification for delivery from loop().
+    /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
+    void note_display_pin(const std::string& pin);
+
+    /// @brief Queue an on_clear_pairing_pin notification for delivery from loop().
+    /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
+    void note_clear_pin();
+
+    /// @brief Queue an on_open_pairing_window notification for delivery from loop().
+    /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
+    void note_open_pairing_window();
+
+    /// @brief Queue an on_close_pairing_window notification for delivery from loop().
+    /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
+    void note_close_pairing_window();
 
     struct EventState;
 

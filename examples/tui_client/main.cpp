@@ -656,6 +656,43 @@ int main(int argc, char* argv[]) {
                 state.group_name = *group.group_name;
             }
         }
+
+        void on_trust_changed(ConnectionTrust trust) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.trust = trust;
+        }
+
+        void on_pairing_started(const std::string& /*server_id*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pairing_status = "Pairing...";
+        }
+
+        void on_pairing_succeeded(const std::string& /*server_id*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pairing_status = "Paired";
+        }
+
+        void on_pairing_failed(const std::string& /*server_id*/,
+                               SendspinPairAbortReason /*reason*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pairing_status = "Pairing failed";
+        }
+
+        void on_display_pairing_pin(const std::string& /*pin*/) override {
+            // Dynamic-PIN display not supported in the tui_client example.
+        }
+
+        void on_clear_pairing_pin() override {
+            // Dynamic-PIN clear not supported in the tui_client example.
+        }
+
+        void on_open_pairing_window() override {
+            // Static-PIN pairing window not supported in the tui_client example.
+        }
+
+        void on_close_pairing_window() override {
+            // Static-PIN pairing window not supported in the tui_client example.
+        }
     };
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
