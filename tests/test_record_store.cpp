@@ -695,6 +695,51 @@ TEST(RecordStore, ResolvePairingOutcomeThenStore) {
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
 }
 
+// records_snapshot() returns a thread-safe copy of every long-term record, including the
+// auto-provisioned shared fallback and any records added afterward.
+TEST(RecordStore, RecordsSnapshotReturnsAllRecords) {
+    RecordStore store(nullptr);
+    // Auto-provisioned shared fallback is already present (1 record).
+    ASSERT_EQ(store.records_snapshot().size(), 1u);
+
+    SendspinPairingRecord a = make_client_record("server-A");
+    SendspinPairingRecord b = make_client_record("server-B");
+    store.store_record(a);
+    store.store_record(b);
+
+    auto snap = store.records_snapshot();
+    EXPECT_EQ(snap.size(), 3u);
+
+    // The snapshot must contain both added records.
+    bool found_a = false;
+    bool found_b = false;
+    for (const auto& r : snap) {
+        if (r.psk_id == a.psk_id) found_a = true;
+        if (r.psk_id == b.psk_id) found_b = true;
+    }
+    EXPECT_TRUE(found_a);
+    EXPECT_TRUE(found_b);
+}
+
+TEST(RecordStore, RecordByPskIdCopyReturnsValueForPresent) {
+    RecordStore store(nullptr);
+    SendspinPairingRecord rec = make_client_record("server-copy-test");
+    store.store_record(rec);
+
+    auto copy = store.record_by_psk_id_copy(rec.psk_id);
+    ASSERT_TRUE(copy.has_value());
+    EXPECT_EQ(copy->psk_id, rec.psk_id);
+    ASSERT_TRUE(copy->server_id.has_value());
+    EXPECT_EQ(copy->server_id.value(), "server-copy-test");
+    EXPECT_EQ(copy->psk, rec.psk);
+}
+
+TEST(RecordStore, RecordByPskIdCopyReturnsNulloptForAbsent) {
+    RecordStore store(nullptr);
+    auto copy = store.record_by_psk_id_copy("nonexistent-psk-id");
+    EXPECT_FALSE(copy.has_value());
+}
+
 // Exhausted case: resolve_pairing_outcome with nullopt inner record -> store nothing.
 // After the "pairing", the server_id must not appear as a long-term record.
 TEST(RecordStore, ResolvePairingOutcomeExhaustedNoStore) {

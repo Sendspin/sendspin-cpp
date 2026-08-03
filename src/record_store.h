@@ -37,6 +37,7 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -75,9 +76,19 @@ struct ResolvedPsk {
 
 /// @brief In-memory client pairing record store.
 ///
-/// Thread-safety: intended to run only on the main loop thread, matching
-/// the existing deferred-event pattern in client.cpp / connection_manager.cpp.
-/// Do NOT call from the network thread.
+/// Thread-safety:
+///   - `records_` and `pairing_psk_` are guarded by `mutex_`. ALL cross-thread access
+///     must go through `resolve_by_psk_id` or the `*_snapshot` / `*_copy` variants.
+///   - The pointer/reference-returning getters (`record_by_psk_id`, `record_by_server_id`,
+///     `records`) are for internal-locked or single-threaded (main-loop-only) use ONLY;
+///     callers must not retain a returned pointer or reference across any mutation, and must
+///     never call them from the network thread.
+///   - The config fields (`pairing_psk_enabled_`, `unpaired_access_enabled_`,
+///     `record_mode_psk_id_`) are main-loop-only; they are never written from the network
+///     thread, so no lock is needed for reads on the main loop.
+///   - `resolve_by_psk_id` runs on the network thread (Noise handshake and re-handshake)
+///     under `mutex_` so a network-thread resolve cannot race a main-loop mutation of
+///     `records_` / `pairing_psk_`.
 class RecordStore {
 public:
     /// @brief Construct and pre-provision the shared-PSK fallback record.
@@ -109,8 +120,26 @@ public:
         const std::string& server_id) const;
 
     /// @brief Return all long-term records (includes the shared fallback).
+    /// Main-loop-only: the reference is invalidated by any concurrent mutation.
     [[nodiscard]] const std::vector<SendspinPairingRecord>& records() const {
         return this->records_;
+    }
+
+    /// @brief Return a locked copy of all long-term records (thread-safe).
+    /// Safe to call from any thread; iterates under mutex_ so the copy is consistent.
+    [[nodiscard]] std::vector<SendspinPairingRecord> records_snapshot() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->records_;
+    }
+
+    /// @brief Return a locked copy of the record identified by psk_id, if any (thread-safe).
+    /// Calls the unlocked record_by_psk_id helper while holding mutex_ -- no recursion since
+    /// record_by_psk_id does not lock. Returns nullopt when the psk_id is not found.
+    [[nodiscard]] std::optional<SendspinPairingRecord> record_by_psk_id_copy(
+        const std::string& psk_id) const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        const SendspinPairingRecord* r = record_by_psk_id(psk_id);
+        return r ? std::optional<SendspinPairingRecord>(*r) : std::nullopt;
     }
 
     /// @brief Persist and store a long-term record. Replaces any existing record
@@ -222,6 +251,10 @@ private:
     std::string record_mode_psk_id_;
 
     SendspinPersistenceProvider* provider_{nullptr};
+
+    /// Guards `records_` and `pairing_psk_` against a network-thread `resolve_by_psk_id`
+    /// racing a main-loop mutation. Mutable so the const `resolve_by_psk_id` can lock it.
+    mutable std::mutex mutex_;
 };
 
 }  // namespace sendspin

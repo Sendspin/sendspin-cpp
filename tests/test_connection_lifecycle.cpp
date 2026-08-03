@@ -60,10 +60,27 @@ std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
 }
 
-std::string server_hello_json(const std::string& server_id, const std::string& reason) {
+// Under the encrypted protocol, server/hello no longer carries server_id (it comes from the
+// Noise handshake result instead) and server/activate replaces the old discovery/playback
+// connection_reason with an activities/active_roles model. This suite runs with
+// encryption_required = false (see make_config()) so its fake servers can stay plaintext WS
+// peers and exercise the nursery's structural admission/reaping/arbitration mechanics
+// independently of the Noise crypto layer (which has its own dedicated coverage in
+// test_noise_transport.cpp / test_noise_rehandshake.cpp / test_admission.cpp). server/hello's
+// server_id field is therefore still accepted here as a legacy/test-only fallback: the
+// connection adopts it only when the Noise handshake never set one (see client.cpp's
+// SERVER_HELLO handling).
+std::string server_hello_json(const std::string& server_id) {
     return std::string(R"({"type":"server/hello","payload":{"server_id":")") + server_id +
-           R"(","name":"Fake Server","version":1,"active_roles":["player"],)" +
-           R"("connection_reason":")" + reason + R"("}})";
+           R"(","name":"Fake Server"}})";
+}
+
+// `reason` is "discovery" (empty activities; used by every fixture here, including the
+// last-played-server_id tiebreak race) or "playback" (activities: ["playback"]).
+std::string server_activate_json(const std::string& reason) {
+    const std::string activities = (reason == "playback") ? R"(["playback"])" : R"([])";
+    return std::string(R"({"type":"server/activate","payload":{"activities":)") + activities +
+           R"(,"active_roles":["player@v1"]}})";
 }
 
 SendspinClientConfig make_config(uint16_t port) {
@@ -71,6 +88,10 @@ SendspinClientConfig make_config(uint16_t port) {
     config.client_id = "lifecycle-test-client";
     config.name = "Lifecycle Test Client";
     config.server_port = port;
+    // This suite exercises the nursery's structural lifecycle (accept/prove/admit, reaping,
+    // arbitration) over plaintext WS, independent of the Noise crypto layer -- see the comment
+    // on server_hello_json() above.
+    config.encryption_required = false;
     return config;
 }
 
@@ -164,13 +185,15 @@ public:
         this->ws_.setOnMessageCallback([this, options](const ix::WebSocketMessagePtr& msg) {
             if (msg->type == ix::WebSocketMessageType::Open) {
                 if (options.hello_on_open) {
-                    this->ws_.send(server_hello_json(this->server_id_, "discovery"));
+                    this->ws_.send(server_hello_json(this->server_id_));
+                    this->ws_.send(server_activate_json("discovery"));
                 }
             } else if (msg->type == ix::WebSocketMessageType::Message &&
                        msg->str.find("client/hello") != std::string::npos) {
                 this->got_client_hello_.store(true);
                 if (options.answer_hello) {
-                    this->ws_.send(server_hello_json(this->server_id_, "discovery"));
+                    this->ws_.send(server_hello_json(this->server_id_));
+                    this->ws_.send(server_activate_json("discovery"));
                 }
             } else if (msg->type == ix::WebSocketMessageType::Message &&
                        msg->str.find("client/goodbye") != std::string::npos) {
@@ -394,7 +417,8 @@ TEST(ConnectionLifecycle, SlowOutboundSurvivesUpgradeTier) {
             if (msg->type == ix::WebSocketMessageType::Message &&
                 msg->str.find("client/hello") != std::string::npos) {
                 if (auto locked = weak_ws.lock()) {
-                    locked->send(server_hello_json("server-slow", "discovery"));
+                    locked->send(server_hello_json("server-slow"));
+                    locked->send(server_activate_json("discovery"));
                 }
             }
         });

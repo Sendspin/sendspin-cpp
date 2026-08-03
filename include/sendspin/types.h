@@ -36,10 +36,14 @@ enum class SendspinClientState : uint8_t {
 
 /// @brief Reason sent in a client/goodbye message when disconnecting
 enum class SendspinGoodbyeReason : uint8_t {
-    ANOTHER_SERVER,  // Client is switching to another server
-    SHUTDOWN,        // Client is shutting down
-    RESTART,         // Client is restarting
-    USER_REQUEST,    // User explicitly requested disconnect
+    ANOTHER_SERVER,      // Client is switching to another server
+    SHUTDOWN,            // Client is shutting down
+    RESTART,             // Client is restarting
+    USER_REQUEST,        // User explicitly requested disconnect
+    UNAUTHORIZED,        // Server requested an activity the client's trust level does not permit
+    PAIRING_REQUIRED,    // Server requested playback but client requires pairing first
+    CONCURRENT_ATTEMPT,  // Incoming connection rejected because another is already admitted
+    // UNPAIRED (server/unpair) is deferred to the management phase (Phase 6).
 };
 
 /// @brief Server identity fields received in server/hello messages
@@ -67,6 +71,23 @@ struct GroupUpdateObject {
 enum class MemoryLocation : uint8_t {
     PREFER_EXTERNAL,  // Prefer SPIRAM, fall back to internal RAM
     PREFER_INTERNAL,  // Prefer internal RAM, fall back to SPIRAM
+};
+
+// ============================================================================
+// Encryption / trust types (public API surface)
+// ============================================================================
+
+/// @brief Trust level of an active connection.
+///
+/// Derived from which PSK category was matched during the Noise handshake:
+///   LONG_TERM PSK -> USER (the server has a stored pairing record)
+///   PAIRING or SENTINEL PSK -> NONE (no prior pairing or unpaired access)
+///
+/// Not yet surfaced through a listener callback (that lands with the public API pass in a
+/// later phase); declared here now because admission/trust-enforcement code needs the type.
+enum class ConnectionTrust : uint8_t {
+    NONE,  // No long-term pairing record; Sentinel or Pairing PSK was used.
+    USER,  // Long-term pairing record matched; connection is from a paired server.
 };
 
 }  // namespace sendspin

@@ -89,6 +89,10 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider) : provider_(prov
 // ============================================================================
 
 std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk_id) const {
+    // Runs on the network thread; lock against main-loop mutations of records_/pairing_psk_.
+    // Calls the unlocked record_by_psk_id() helper, so no recursive acquisition occurs.
+    std::lock_guard<std::mutex> lock(this->mutex_);
+
     // 1. Long-term records (highest priority).
     const SendspinPairingRecord* rec = record_by_psk_id(psk_id);
     if (rec != nullptr) {
@@ -160,6 +164,7 @@ bool RecordStore::store_record(SendspinPairingRecord record) {
         SS_LOGW(TAG, "Provider rejected pairing record %s; not storing", record.psk_id.c_str());
         return false;
     }
+    std::lock_guard<std::mutex> lock(this->mutex_);
     size_t idx = find_index(record.psk_id);
     if (idx != static_cast<size_t>(-1)) {
         records_[idx] = std::move(record);
@@ -170,6 +175,7 @@ bool RecordStore::store_record(SendspinPairingRecord record) {
 }
 
 void RecordStore::remove_record(const std::string& psk_id) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     size_t idx = find_index(psk_id);
     if (idx == static_cast<size_t>(-1)) {
         return;  // No-op if absent.
@@ -181,6 +187,7 @@ void RecordStore::remove_record(const std::string& psk_id) {
 }
 
 void RecordStore::mark_record_used(const std::string& psk_id) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     size_t idx = find_index(psk_id);
     if (idx == static_cast<size_t>(-1) || records_[idx].used) {
         return;
@@ -200,6 +207,7 @@ bool RecordStore::can_remove_record(const std::string& psk_id) const {
 // ============================================================================
 
 void RecordStore::set_pairing_psk(SendspinPairingPsk psk) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     pairing_psk_ = std::move(psk);
     if (provider_ != nullptr) {
         provider_->save_pairing_psk(pairing_psk_.value());
@@ -207,6 +215,7 @@ void RecordStore::set_pairing_psk(SendspinPairingPsk psk) {
 }
 
 void RecordStore::clear_pairing_psk() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
     pairing_psk_.reset();
     if (provider_ != nullptr) {
         provider_->clear_pairing_psk();

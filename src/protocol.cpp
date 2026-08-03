@@ -292,6 +292,9 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     if (type_str == "server/hello") {
         return SendspinServerToClientMessageType::SERVER_HELLO;
     }
+    if (type_str == "server/activate") {
+        return SendspinServerToClientMessageType::SERVER_ACTIVATE;
+    }
     if (type_str == "server/time") {
         return SendspinServerToClientMessageType::SERVER_TIME;
     }
@@ -313,6 +316,9 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     if (type_str == "group/update") {
         return SendspinServerToClientMessageType::GROUP_UPDATE;
     }
+    if (type_str == "noise/handshake") {
+        return SendspinServerToClientMessageType::NOISE_HANDSHAKE;
+    }
 
     return SendspinServerToClientMessageType::UNKNOWN;
 }
@@ -320,42 +326,63 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
 // Message processing
 
 bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg) {
-    if (!root["payload"]["server_id"].is<JsonVariant>() ||
-        !root["payload"]["name"].is<JsonVariant>() ||
-        !root["payload"]["version"].is<JsonVariant>() ||
-        !root["payload"]["active_roles"].is<JsonVariant>() ||
-        !root["payload"]["connection_reason"].is<const char*>()) {
-        SS_LOGE(TAG, "Invalid server/hello message");
+    // Under the encrypted protocol, server/hello carries only the server name.
+    // server_id is taken from the Noise handshake result, not parsed here.
+    if (!root["payload"]["name"].is<const char*>()) {
+        SS_LOGE(TAG, "Invalid server/hello message: missing name");
         return false;
     }
 
     if (hello_msg != nullptr) {
-        hello_msg->server.server_id = root["payload"]["server_id"].as<std::string>();
-        hello_msg->server.name = root["payload"]["name"].as<std::string>();
-        auto version = read_uint_field<uint16_t>(root["payload"]["version"], "version");
-        if (!version.has_value()) {
-            SS_LOGE(TAG, "Invalid version in server/hello message");
-            return false;
+        hello_msg->name = root["payload"]["name"].as<std::string>();
+        if (root["payload"]["server_id"].is<const char*>()) {
+            hello_msg->server_id = root["payload"]["server_id"].as<std::string>();
         }
-        hello_msg->version = *version;
+    }
 
-        // Parse active_roles array
-        hello_msg->active_roles.clear();
-        JsonArrayConst active_roles_array = root["payload"]["active_roles"].as<JsonArrayConst>();
-        for (JsonVariantConst role_var : active_roles_array) {
-            if (role_var.is<const char*>()) {
-                hello_msg->active_roles.push_back(role_var.as<std::string>());
+    return true;
+}
+
+bool process_server_activate_message(JsonObject root, ServerActivateMessage* activate_msg) {
+    if (!root["payload"]["activities"].is<JsonArrayConst>()) {
+        SS_LOGE(TAG, "Invalid server/activate message: missing activities array");
+        return false;
+    }
+
+    if (activate_msg == nullptr) {
+        return true;
+    }
+
+    activate_msg->activities.clear();
+    JsonArrayConst activities_array = root["payload"]["activities"].as<JsonArrayConst>();
+    for (JsonVariantConst act_var : activities_array) {
+        if (act_var.is<const char*>()) {
+            auto act = activity_from_string(act_var.as<std::string>());
+            if (act.has_value()) {
+                activate_msg->activities.push_back(act.value());
             }
         }
+    }
 
-        auto reason =
-            connection_reason_from_string(root["payload"]["connection_reason"].as<std::string>());
-        if (!reason.has_value()) {
-            SS_LOGE(TAG, "Invalid connection_reason in server/hello message: %s",
-                    root["payload"]["connection_reason"].as<const char*>());
-            return false;
+    // active_roles is optional and sticky (omitted = keep prior set).
+    JsonVariantConst roles_var = root["payload"]["active_roles"];
+    if (roles_var.is<JsonArrayConst>()) {
+        activate_msg->active_roles = std::vector<std::string>{};
+        for (JsonVariantConst role_var : roles_var.as<JsonArrayConst>()) {
+            if (role_var.is<const char*>()) {
+                activate_msg->active_roles->push_back(role_var.as<std::string>());
+            }
         }
-        hello_msg->connection_reason = reason.value();
+    } else {
+        activate_msg->active_roles = std::nullopt;
+    }
+
+    // selected_pair_method is optional.
+    JsonVariantConst method_var = root["payload"]["selected_pair_method"];
+    if (method_var.is<const char*>()) {
+        activate_msg->selected_pair_method = pair_method_from_string(method_var.as<std::string>());
+    } else {
+        activate_msg->selected_pair_method = std::nullopt;
     }
 
     return true;
@@ -816,7 +843,7 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/hello";
-    root["payload"]["client_id"] = msg->client_id;
+    // Under encryption: client_id and version are carried in client/init, not repeated here.
     root["payload"]["name"] = msg->name;
     if (msg->device_info.has_value()) {
         const auto& info = msg->device_info.value();
@@ -833,7 +860,17 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             root["payload"]["device_info"]["mac_address"] = info.mac_address.value();
         }
     }
-    root["payload"]["version"] = msg->version;
+    root["payload"]["trust_level"] = msg->trust_level;
+    // Omit supported_pair_methods entirely when empty (matches the reference's omit_none),
+    // rather than emitting an empty array.
+    if (!msg->supported_pair_methods.empty()) {
+        JsonArray methods_list = root["payload"]["supported_pair_methods"].to<JsonArray>();
+        for (const auto& desc : msg->supported_pair_methods) {
+            JsonObject method_obj = methods_list.add<JsonObject>();
+            method_obj["method"] = to_cstr(desc.method);
+        }
+    }
+    root["payload"]["unpaired_access"]["enabled"] = msg->unpaired_access_enabled;
     JsonArray supported_roles_list = root["payload"]["supported_roles"].to<JsonArray>();
     for (const auto& role : msg->supported_roles) {
         supported_roles_list.add(to_cstr(role));

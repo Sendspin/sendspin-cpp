@@ -23,13 +23,16 @@
 #include "platform/memory.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
+#include "record_store.h"
 #include "time_filter.h"
 
 #include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace sendspin {
 
@@ -114,12 +117,28 @@ public:
         return this->client_hello_sent_ && this->server_hello_received_;
     }
 
+    /// @brief Checks if the connection has fully proven itself: hello handshake complete AND
+    /// the first server/activate has been received and applied.
+    ///
+    /// This is the nursery's PROVE gate (see ConnectionManager): a connection never occupies
+    /// the current slot until this is true, so admission/trust/arbitration always run on real
+    /// activity data. Note that is_handshake_complete() already implies the Noise handshake is
+    /// complete when one is installed, because client/hello and server/hello are themselves
+    /// encrypted application traffic that cannot be sent/received before the Noise transport
+    /// is active.
+    /// @return true once hello + first server/activate are both done.
+    bool is_operational() const {
+        return this->is_handshake_complete() && this->first_activate_received();
+    }
+
     // ========================================
     // Noise transport (Phase 2)
     // ========================================
 
     /// @brief Initialize the Noise handshake driver for this connection.
-    /// Must be called before the WS connection is open.
+    /// Must be called before the WS connection is open. Also retains identity/record_store/
+    /// suite_name pointers so a later in-band re-handshake (Phase 4b) can be driven after this
+    /// initial NoiseHandshake object is destroyed.
     /// @param identity     Client static X25519 identity.
     /// @param record_store Record store for psk_id resolution.
     /// @param suite_name   Noise suite name string.
@@ -140,6 +159,25 @@ public:
     /// No-op if no handshake driver is installed.
     /// Must be called after the WebSocket connection is open (from on_connected_cb).
     void send_noise_client_init();  // implemented in connection.cpp
+
+    /// @brief Handle an in-band re-handshake initiated by the server (Phase 4b).
+    ///
+    /// Called on the NETWORK thread when a decrypted noise/handshake JSON message arrives
+    /// after transport is already active (routed here from the SERVER_ACTIVATE-adjacent
+    /// dispatch for the "noise/handshake" message type). Runs the two-handshake trick with
+    /// prologue = the current NoiseTransport's handshake_hash(), then commits the new
+    /// session via NoiseTransport::send_msg2_and_swap() (msg2 sent under the OLD session,
+    /// swap happens under the same lock so a concurrent main-loop encrypt cannot interleave).
+    ///
+    /// Resets first_activate_received_/server_hello_received_/client_hello_sent_ so the
+    /// post-swap server/hello -> client/hello -> server/activate flow re-runs under the new
+    /// session keys; the manager's nursery is not involved (the connection stays current/
+    /// established throughout -- no drop/reconnect).
+    ///
+    /// @param msg1_json  The decrypted noise/handshake JSON string (msg1 envelope).
+    /// @return true on success (session swapped; a post-swap server/hello is expected next).
+    ///         false on any failure (caller should close the WebSocket).
+    bool handle_noise_rehandshake(const std::string& msg1_json);
 
     /// @brief Encrypt and send a JSON string as a Noise transport binary frame.
     /// Thin delegate to NoiseTransport::send_json().
@@ -261,17 +299,12 @@ public:
     SsErr send_goodbye_reason(SendspinGoodbyeReason reason, SendCompleteCallback on_complete);
 
     // ========================================
-    // Server information accessors (populated after server/hello message is received)
+    // Server information accessors
     // ========================================
 
-    /// @brief Gets the connection reason from the server/hello message
-    /// @return The connection reason (discovery or playback).
-    SendspinConnectionReason get_connection_reason() const {
-        return this->connection_reason_;
-    }
-
-    /// @brief Gets the server ID from the server/hello message
-    /// @return The server ID string (empty until hello is received).
+    /// @brief Gets the server ID (from the Noise handshake result, set at COMPLETE; empty
+    /// until then when a Noise handshake is installed on this connection).
+    /// @return The server ID string.
     const std::string& get_server_id() const {
         return this->server_information_.server_id;
     }
@@ -280,6 +313,84 @@ public:
     /// @return The ServerInformationObject (fields empty until hello is received).
     const ServerInformationObject& get_server_information() const {
         return this->server_information_;
+    }
+
+    // ========================================
+    // server/activate state accessors
+    // ========================================
+
+    /// @brief Returns the current activity set declared by server/activate.
+    /// Main-loop-only: mutated only by apply_server_activate(), which the connection manager
+    /// calls while applying a deferred ServerActivateEvent on the main loop.
+    const std::vector<SendspinActivity>& get_activities() const {
+        return this->activities_;
+    }
+
+    /// @brief Returns the sticky active_roles set declared by server/activate.
+    const std::vector<std::string>& get_active_roles() const {
+        return this->active_roles_;
+    }
+
+    /// @brief Returns true once the first server/activate has been received and applied.
+    /// Atomic because re-handshake (network thread, see handle_noise_rehandshake) resets it
+    /// to false at the start of a key rotation, while the main loop reads it here and via
+    /// is_operational().
+    bool first_activate_received() const {
+        return this->first_activate_received_.load(std::memory_order_acquire);
+    }
+
+    /// @brief Returns the PSK category resolved by the Noise handshake (set at COMPLETE, or
+    /// re-handshake). Defaults to SENTINEL when no Noise handshake has completed (e.g. when
+    /// encryption is not required on this connection).
+    PskCategory get_psk_category() const {
+        return this->psk_category_;
+    }
+
+    /// @brief Returns the psk_id of the matched PSK (set at COMPLETE; empty for Sentinel or
+    /// when no Noise handshake has completed).
+    const std::string& get_psk_id() const {
+        return this->psk_id_;
+    }
+
+    /// @brief Returns true if any active role is in the given family (e.g., "player" matches
+    /// the active role "player@v1").
+    /// @param family Role family name without the "@vN" version suffix.
+    bool is_role_active(const std::string& family) const {
+        for (const auto& role : this->active_roles_) {
+            auto at = role.find('@');
+            if (at != std::string::npos && role.substr(0, at) == family) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// @brief Returns true if the given activity is in the current activity set.
+    bool has_activity(SendspinActivity activity) const {
+        for (const auto& a : this->activities_) {
+            if (a == activity) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// @brief Applies a server/activate update: stores activities and updates active_roles
+    /// (sticky: a nullopt active_roles in the message leaves the prior set unchanged). Sets
+    /// first_activate_received_ on every call (including after a re-handshake reset it).
+    ///
+    /// Main-loop-only: called by ConnectionManager::loop() while applying a deferred
+    /// ServerActivateEvent, never from the network thread, so activities_/active_roles_ need
+    /// no synchronization of their own.
+    /// @param activities Activity list from the message.
+    /// @param active_roles Optional roles list (nullopt = keep prior set).
+    void apply_server_activate(const std::vector<SendspinActivity>& activities,
+                               const std::optional<std::vector<std::string>>& active_roles) {
+        this->activities_ = activities;
+        if (active_roles.has_value()) {
+            this->active_roles_ = active_roles.value();
+        }
+        this->first_activate_received_.store(true, std::memory_order_release);
     }
 
     // ========================================
@@ -402,13 +513,6 @@ public:
         return this->ws_upgraded_.load(std::memory_order_acquire);
     }
 
-    /// @brief Sets the connection reason (from server/hello message)
-    /// @param reason The connection reason.
-    /// @note Called by hub after receiving server/hello message.
-    void set_connection_reason(SendspinConnectionReason reason) {
-        this->connection_reason_ = reason;
-    }
-
     /// @brief Sets the server hello received flag
     /// @param received True if server hello message has been received.
     /// @note Called by hub when SERVER_HELLO is processed.
@@ -511,7 +615,7 @@ protected:
     }
 
     // ========================================
-    // Noise transport state (Phase 2)
+    // Noise transport state (Phase 2 + 4b)
     // ========================================
 
     /// Noise handshake driver (active from connection open until handshake complete).
@@ -526,13 +630,22 @@ protected:
     /// Message buffering (for websocket frame assembly).
     PlatformBuffer websocket_payload_;
 
-    /// Server identity (from server/hello message).
+    /// Server identity: name from server/hello, server_id from the Noise handshake result
+    /// (or re-handshake; unchanged across a re-handshake since it is the same server).
     ServerInformationObject server_information_{};
 
     // Pointer fields
 
     /// Time synchronization filter (Kalman-based).
     std::unique_ptr<SendspinTimeFilter> time_filter_;
+
+    /// Retained for re-handshake: pointer to the client identity supplied at
+    /// init_noise_handshake(). Lifetime is owned by SendspinClient (outlives connections).
+    const Identity* noise_identity_{nullptr};
+
+    /// Retained for re-handshake: pointer to the RecordStore supplied at
+    /// init_noise_handshake(). Lifetime is owned by SendspinClient (outlives connections).
+    const RecordStore* noise_record_store_{nullptr};
 
     // 64-bit fields
 
@@ -551,12 +664,35 @@ protected:
     // size_t fields
     size_t websocket_write_offset_{0};
 
-    // 32-bit fields
+    // String fields
 
-    /// Connection reason (discovery or playback, from server/hello).
-    SendspinConnectionReason connection_reason_{SendspinConnectionReason::DISCOVERY};
+    /// Retained for re-handshake: Noise suite name supplied at init_noise_handshake().
+    std::string noise_suite_name_{};
+
+    /// psk_id of the PSK matched by the Noise handshake (empty for Sentinel, or when no
+    /// Noise handshake has completed). Main-loop-only readers gate on first_activate_received()
+    /// (or is_operational()), which happens-after the network-thread write at handshake
+    /// COMPLETE via the same publishing discipline as server_information_.
+    std::string psk_id_{};
+
+    // Vector fields
+
+    /// Activities declared by server/activate (empty until the first activate is applied).
+    /// Main-loop-only: see apply_server_activate().
+    std::vector<SendspinActivity> activities_{};
+
+    /// Active roles declared by server/activate (sticky: preserved across activates that omit
+    /// the field). Empty until the first activate that includes active_roles.
+    std::vector<std::string> active_roles_{};
 
     // 8-bit fields
+
+    /// PSK category resolved by the Noise handshake (set at COMPLETE, or re-handshake).
+    /// Written on the network thread before noise_handshake_complete_ is stored (release);
+    /// safe to read on the main loop after observing is_operational() (which happens-after
+    /// server_hello_received_/client_hello_sent_, both themselves gated behind the Noise
+    /// transport becoming active), matching the existing server_information_ discipline.
+    PskCategory psk_category_{PskCategory::SENTINEL};
 
     /// Hello handshake state. Atomic because it is set from the send-completion callback (the httpd
     /// worker thread on ESP) and the disconnect handlers (network thread), while
@@ -588,6 +724,12 @@ protected:
     /// Atomic for the same reason as client_hello_sent_: written on network threads, read from the
     /// main loop via is_handshake_complete().
     std::atomic<bool> server_hello_received_{false};
+
+    /// True after the first server/activate message has been received and applied. Atomic
+    /// because re-handshake (network thread, handle_noise_rehandshake) resets it to false at
+    /// the start of a key rotation, while the main loop reads it via first_activate_received()
+    /// / is_operational() and apply_server_activate() (main-loop-only) sets it back to true.
+    std::atomic<bool> first_activate_received_{false};
 
     /// Memory placement preference for `websocket_payload_` allocations (ESP-IDF only).
     MemoryLocation websocket_payload_location_{MemoryLocation::PREFER_EXTERNAL};

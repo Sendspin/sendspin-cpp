@@ -212,9 +212,11 @@ enum class LogLevel : uint8_t {
 
 // Forward declarations
 class ConnectionManager;
+class RecordStore;
 class SendspinArenaAllocator;
 class SendspinConnection;
 class SendspinTimeBurst;
+struct Identity;
 
 /**
  * @brief Main orchestration class for the sendspin-cpp library
@@ -494,7 +496,9 @@ private:
     void cleanup_connection_state();
 
     /// @brief Builds the formatted client hello message from config
-    std::string build_hello_message();
+    /// @param conn The connection the hello will be sent on; used to derive trust_level from
+    ///        the resolved PSK category. May be null (trust_level defaults to "none").
+    std::string build_hello_message(SendspinConnection* conn);
 
     // ========================================
     // Message processing
@@ -523,8 +527,13 @@ private:
     void publish_client_state(SendspinConnection* conn);
 
     // ========================================
-    // Persistence
+    // Persistence & identity
     // ========================================
+
+    /// @brief Loads or generates the static X25519 identity keypair via the persistence
+    /// provider. Sets identity_. Called once from start_server(), before the connection
+    /// manager can hand the identity out to any connection.
+    void load_or_generate_identity();
 
     /// @brief Loads the last played server_id from persistence
     void load_last_played_server();
@@ -558,6 +567,10 @@ private:
     std::unique_ptr<ControllerRole> controller_;
 #endif
     std::unique_ptr<EventState> event_state_;
+    /// Static X25519 identity (generated on first boot, persisted via the persistence
+    /// provider). Set by load_or_generate_identity() in start_server(); outlives every
+    /// connection the manager hands it out to.
+    std::unique_ptr<Identity> identity_;
     /// Internal-RAM scratch arena for parsing incoming JSON; null unless config_.json_arena_size >
     /// 0
     std::unique_ptr<SendspinArenaAllocator> json_arena_;
@@ -573,6 +586,9 @@ private:
 #ifdef SENDSPIN_ENABLE_PLAYER
     std::unique_ptr<PlayerRole> player_;
 #endif
+    /// In-memory pairing record store (PSK resolution, trust config). Set in start_server();
+    /// outlives every connection the manager hands it out to.
+    std::unique_ptr<RecordStore> record_store_;
     std::unique_ptr<SendspinTimeBurst> time_burst_;
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     std::unique_ptr<VisualizerRole> visualizer_;

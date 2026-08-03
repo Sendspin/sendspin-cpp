@@ -86,15 +86,17 @@ enum SendspinBinaryType : uint8_t {
 
 /// @brief JSON message types sent from the server to the client
 enum class SendspinServerToClientMessageType : uint8_t {
-    SERVER_HELLO,    // server/hello handshake
-    SERVER_TIME,     // server/time clock sync reply
-    SERVER_STATE,    // server/state playback state update
-    SERVER_COMMAND,  // server/command player command
-    STREAM_START,    // stream/start new stream parameters
-    STREAM_END,      // stream/end normal stream completion
-    STREAM_CLEAR,    // stream/clear immediate buffer flush
-    GROUP_UPDATE,    // group/update group membership change
-    UNKNOWN,         // Unrecognized message type
+    SERVER_HELLO,     // server/hello handshake
+    SERVER_ACTIVATE,  // server/activate declares activities and active_roles
+    SERVER_TIME,      // server/time clock sync reply
+    SERVER_STATE,     // server/state playback state update
+    SERVER_COMMAND,   // server/command player command
+    STREAM_START,     // stream/start new stream parameters
+    STREAM_END,       // stream/end normal stream completion
+    STREAM_CLEAR,     // stream/clear immediate buffer flush
+    GROUP_UPDATE,     // group/update group membership change
+    NOISE_HANDSHAKE,  // noise/handshake in-band re-handshake (Phase 4b)
+    UNKNOWN,          // Unrecognized message type
 };
 
 /// @brief Protocol role identifiers used in hello messages and role negotiation
@@ -129,36 +131,85 @@ inline const char* to_cstr(SendspinRole role) {
     }
 }
 
-/// @brief Connection reason reported in server/hello messages
-enum class SendspinConnectionReason : uint8_t {
-    DISCOVERY,  // Server connected for device discovery only
-    PLAYBACK,   // Server connected for active audio playback
+/// @brief Activity declared in a server/activate message.
+/// Replaces the old discovery/playback SendspinConnectionReason model (spec PR #84): a
+/// connection now declares a SET of activities rather than a single reason.
+/// Mirrors Activity in aiosendspin/models/types.py.
+enum class SendspinActivity : uint8_t {
+    PLAYBACK,    // Active or upcoming playback
+    PAIRING,     // A pairing exchange
+    MANAGEMENT,  // A dedicated management session
 };
 
-/// @brief Converts a SendspinConnectionReason value to its protocol string representation
-/// @param reason The connection reason to convert.
-/// @return Null-terminated string representation of the reason.
-inline const char* to_cstr(SendspinConnectionReason reason) {
-    switch (reason) {
-        case SendspinConnectionReason::DISCOVERY:
-            return "discovery";
-        case SendspinConnectionReason::PLAYBACK:
+/// @brief Converts a SendspinActivity value to its protocol wire string
+/// @param activity The activity to convert.
+/// @return Null-terminated protocol string (e.g., "playback").
+inline const char* to_cstr(SendspinActivity activity) {
+    switch (activity) {
+        case SendspinActivity::PLAYBACK:
             return "playback";
+        case SendspinActivity::PAIRING:
+            return "pairing";
+        case SendspinActivity::MANAGEMENT:
+            return "management";
         default:
-            return "discovery";
+            return "unknown";
     }
 }
 
-/// @brief Parses a protocol string into a SendspinConnectionReason
+/// @brief Parses a wire string into a SendspinActivity.
 /// @param str The string to parse.
 /// @return The matching enum value, or std::nullopt if the string is unrecognized.
-inline std::optional<SendspinConnectionReason> connection_reason_from_string(
-    const std::string& str) {
-    if (str == "discovery") {
-        return SendspinConnectionReason::DISCOVERY;
-    }
+inline std::optional<SendspinActivity> activity_from_string(const std::string& str) {
     if (str == "playback") {
-        return SendspinConnectionReason::PLAYBACK;
+        return SendspinActivity::PLAYBACK;
+    }
+    if (str == "pairing") {
+        return SendspinActivity::PAIRING;
+    }
+    if (str == "management") {
+        return SendspinActivity::MANAGEMENT;
+    }
+    return std::nullopt;
+}
+
+/// @brief Pairing method on the wire (advertised in client/hello, selected in server/activate).
+/// DYNAMIC_PIN/STATIC_PIN are declared for wire completeness; the pairing flow that uses them
+/// is deferred (Phase 5/8) and never appears in supported_pair_methods yet.
+enum class SendspinPairMethod : uint8_t {
+    PAIRING_PSK,  // Out-of-band distributed Pairing PSK
+    DYNAMIC_PIN,  // Dynamic PIN via PAKE (deferred)
+    STATIC_PIN,   // Static PIN via PAKE (deferred)
+};
+
+/// @brief Converts a SendspinPairMethod value to its protocol wire string.
+/// @param method The method to convert.
+/// @return Null-terminated protocol string (e.g., "pairing_psk").
+inline const char* to_cstr(SendspinPairMethod method) {
+    switch (method) {
+        case SendspinPairMethod::PAIRING_PSK:
+            return "pairing_psk";
+        case SendspinPairMethod::DYNAMIC_PIN:
+            return "dynamic_pin";
+        case SendspinPairMethod::STATIC_PIN:
+            return "static_pin";
+        default:
+            return "unknown";
+    }
+}
+
+/// @brief Parses a wire string into a SendspinPairMethod.
+/// @param str The string to parse.
+/// @return The matching enum value, or std::nullopt if unrecognized.
+inline std::optional<SendspinPairMethod> pair_method_from_string(const std::string& str) {
+    if (str == "pairing_psk") {
+        return SendspinPairMethod::PAIRING_PSK;
+    }
+    if (str == "dynamic_pin") {
+        return SendspinPairMethod::DYNAMIC_PIN;
+    }
+    if (str == "static_pin") {
+        return SendspinPairMethod::STATIC_PIN;
     }
     return std::nullopt;
 }
@@ -192,6 +243,12 @@ inline const char* to_cstr(SendspinGoodbyeReason reason) {
             return "restart";
         case SendspinGoodbyeReason::USER_REQUEST:
             return "user_request";
+        case SendspinGoodbyeReason::UNAUTHORIZED:
+            return "unauthorized";
+        case SendspinGoodbyeReason::PAIRING_REQUIRED:
+            return "pairing_required";
+        case SendspinGoodbyeReason::CONCURRENT_ATTEMPT:
+            return "concurrent_attempt";
         default:
             return "shutdown";
     }
@@ -609,16 +666,25 @@ struct ServerColorStateDelta {
 // Message envelope structs
 // ============================================================================
 
-/// @brief Outgoing client/hello handshake message sent at connection startup
+/// @brief A pairing method descriptor for client/hello supported_pair_methods.
+/// Only pairing_psk is ever populated today; PIN methods are deferred.
+struct PairMethodDescriptor {
+    SendspinPairMethod method{SendspinPairMethod::PAIRING_PSK};
+};
+
+/// @brief Outgoing client/hello handshake message sent at connection startup.
+/// Under encryption, client_id and version are carried in client/init (the cleartext Noise
+/// handshake frame), not repeated here.
 struct ClientHelloMessage {
-    std::string client_id{};
     std::string name{};
     std::optional<DeviceInfoObject> device_info{};
-    uint8_t version{};
     std::vector<SendspinRole> supported_roles{};
     std::optional<PlayerSupportObject> player_v1_support{};
     std::optional<ArtworkSupportObject> artwork_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
+    std::string trust_level{"none"};  // "none" or "user"
+    bool unpaired_access_enabled{false};
+    std::vector<PairMethodDescriptor> supported_pair_methods{};
 };
 
 /// @brief Outgoing client/state message reporting client playback state to the server
@@ -627,12 +693,26 @@ struct ClientStateMessage {
     std::optional<ClientPlayerStateObject> player{};
 };
 
-/// @brief Parsed server/hello handshake message received at connection startup
+/// @brief Parsed server/hello handshake message received at connection startup.
+/// Under encryption, server/hello carries only the server's display name; server_id comes
+/// from the Noise handshake result (set on the connection at COMPLETE), and activities/
+/// active_roles come from the server/activate message that follows.
 struct ServerHelloMessage {
-    ServerInformationObject server{};
-    uint16_t version{};
-    std::vector<std::string> active_roles{};
-    SendspinConnectionReason connection_reason{};
+    std::string name{};
+    /// Legacy/test-only fallback: a server_id field on server/hello itself, parsed if present
+    /// but never required. The client only ever adopts it when the connection has no Noise
+    /// handshake result to source server_id from (encryption_required == false); see
+    /// SendspinClient's SERVER_HELLO handling. Real (encrypted) peers should not send this.
+    std::optional<std::string> server_id{};
+};
+
+/// @brief Parsed server/activate message that follows server/hello.
+/// Declares the server's current activity set and active roles for this connection.
+/// Replaces the old connection_reason field of server/hello (spec PR #84).
+struct ServerActivateMessage {
+    std::vector<SendspinActivity> activities{};
+    std::optional<std::vector<std::string>> active_roles;  // sticky: nullopt = keep prior set
+    std::optional<SendspinPairMethod> selected_pair_method;
 };
 
 /// @brief Parsed group/update message containing the group state delta
@@ -674,11 +754,19 @@ struct StreamClearMessage {
 /// @return The matching message type, or UNKNOWN if not recognized.
 SendspinServerToClientMessageType determine_message_type(JsonObject root);
 
-/// @brief Parses a server/hello JSON message into the provided struct
+/// @brief Parses a server/hello JSON message into the provided struct.
+/// Under encryption, only the name field is parsed; server_id comes from the Noise
+/// handshake result, not from server/hello.
 /// @param root Parsed JSON object from the message.
 /// @param hello_msg [out] Struct to populate with parsed fields.
 /// @return true if parsing succeeded, false on missing required fields.
 bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg);
+
+/// @brief Parses a server/activate JSON message into the provided struct.
+/// @param root Parsed JSON object from the message.
+/// @param activate_msg [out] Struct to populate with parsed fields.
+/// @return true if parsing succeeded, false on missing required fields.
+bool process_server_activate_message(JsonObject root, ServerActivateMessage* activate_msg);
 
 /// @brief Parses a server/time JSON message and computes time offset and max error
 /// @param root Parsed JSON object from the message.

@@ -16,12 +16,14 @@
 
 #include "connection.h"
 #include "connection_manager.h"
+#include "crypto/keys.h"
 #include "inbox.h"
 #include "platform/compiler.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/network_info.h"
+#include "record_store.h"
 #ifdef SENDSPIN_ENABLE_ARTWORK
 #include "artwork_role_impl.h"
 #endif
@@ -102,6 +104,11 @@ SendspinClient::~SendspinClient() {
     this->color_.reset();
 #endif
     this->connection_manager_.reset();
+    // Destroyed after the connection manager: every connection holds raw pointers into
+    // identity_/record_store_ (see SendspinConnection::init_noise_handshake), so both must
+    // outlive every connection the manager could still be tearing down.
+    this->record_store_.reset();
+    this->identity_.reset();
 }
 
 void SendspinClient::set_log_level(LogLevel level) {
@@ -118,6 +125,13 @@ LogLevel SendspinClient::get_log_level() {
 
 bool SendspinClient::start_server() {
     this->started_ = true;
+
+    // Create the record store (needs the persistence provider, so done here rather than at
+    // construction) and load or generate the static X25519 identity. Both must exist before
+    // the connection manager can hand them out to any connection (init_server() below starts
+    // the ws_server, and connect_to() may be called any time after start_server()).
+    this->record_store_ = std::make_unique<RecordStore>(this->persistence_provider_);
+    this->load_or_generate_identity();
 
     // Load persisted state
     this->load_last_played_server();
@@ -164,9 +178,13 @@ void SendspinClient::loop() {
     // Process connection lifecycle events (close, disconnect, hello, handoff, retry)
     this->connection_manager_->loop();
 
-    // Handle time synchronization for the active connection via burst strategy
+    // Handle time synchronization for the active connection via burst strategy. Gate on
+    // is_operational() (hello + first server/activate), not just non-null: an in-band
+    // re-handshake (Phase 4b) resets first_activate_received_ (and the hello flags) on the
+    // still-current connection, and a stale pre-re-handshake time exchange must not resume
+    // mid-rotation.
     auto* conn = this->connection_manager_->current();
-    if (conn != nullptr) {
+    if (conn != nullptr && conn->is_operational()) {
         auto result = this->time_burst_->loop(conn);
 
         if (result.sent && !this->high_performance_held_for_time_) {
@@ -511,7 +529,7 @@ void SendspinClient::publish_state() {
 void SendspinClient::send_text(const std::string& text) {
     auto* conn = this->connection_manager_->current();
     if (conn != nullptr && conn->is_connected()) {
-        conn->send_text_message(text, nullptr);
+        conn->send_app_json(text, nullptr);
     }
 }
 
@@ -598,7 +616,7 @@ void SendspinClient::cleanup_connection_state() {
     }
 }
 
-std::string SendspinClient::build_hello_message() {
+std::string SendspinClient::build_hello_message(SendspinConnection* conn) {
     ClientHelloMessage msg;
     msg.name = this->config_.name;
 
@@ -607,14 +625,6 @@ std::string SendspinClient::build_hello_message() {
     const std::optional<std::string> interface_mac =
         this->config_.mac_address ? this->config_.mac_address : platform_get_interface_mac();
 
-    // Some integrations use the network MAC as the Sendspin client_id. If they leave it empty,
-    // default to the same active-interface MAC advertised in device_info instead of forcing them
-    // to duplicate platform-specific MAC detection.
-    msg.client_id = this->config_.client_id;
-    if (msg.client_id.empty() && interface_mac.has_value()) {
-        msg.client_id = interface_mac.value();
-    }
-
     DeviceInfoObject device_info{};
     device_info.product_name = this->config_.product_name;
     device_info.manufacturer = this->config_.manufacturer;
@@ -622,7 +632,20 @@ std::string SendspinClient::build_hello_message() {
     device_info.mac_address = interface_mac;
     msg.device_info = device_info;
 
-    msg.version = 1;
+    // trust_level: "user" iff the PSK the Noise handshake matched is a long-term (paired)
+    // record; "none" for Sentinel/Pairing PSKs or when no Noise handshake ran on this
+    // connection at all (encryption not required).
+    msg.trust_level =
+        (conn != nullptr && conn->get_psk_category() == PskCategory::LONG_TERM) ? "user" : "none";
+
+    // Advertise supported pair methods from the record store. Only pairing_psk today; PIN
+    // methods are deferred.
+    if (this->record_store_ && this->record_store_->pairing_psk_enabled()) {
+        msg.supported_pair_methods.push_back(PairMethodDescriptor{SendspinPairMethod::PAIRING_PSK});
+    }
+
+    msg.unpaired_access_enabled =
+        this->record_store_ != nullptr && this->record_store_->unpaired_access_enabled();
 
     // Let each role add its fields to the hello message
 #ifdef SENDSPIN_ENABLE_PLAYER
@@ -803,17 +826,66 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
         case SendspinServerToClientMessageType::SERVER_HELLO: {
             ServerHelloMessage hello_msg;
             if (process_server_hello_message(root, &hello_msg)) {
-                SS_LOGD(TAG, "Connected to server %s with id %s (reason: %s)",
-                        hello_msg.server.name.c_str(), hello_msg.server.server_id.c_str(),
-                        to_cstr(hello_msg.connection_reason));
-
+                // server_id comes from the Noise handshake result (already set on the
+                // connection when one ran); server/hello only carries the display name. The
+                // legacy server_id field on server/hello is a test-only fallback, adopted only
+                // when the Noise handshake never set one (encryption_required == false).
                 if (conn != nullptr) {
-                    conn->set_server_information(std::move(hello_msg.server));
-                    conn->set_connection_reason(hello_msg.connection_reason);
-                    // Set last: this atomic store publishes the fields above to the manager's
+                    ServerInformationObject info = conn->get_server_information();
+                    info.name = hello_msg.name;
+                    if (info.server_id.empty() && hello_msg.server_id.has_value()) {
+                        info.server_id = hello_msg.server_id.value();
+                    }
+                    conn->set_server_information(std::move(info));
+                    // Set last: this atomic store publishes the field above to the manager's
                     // promotion scan on the main loop, which observes is_handshake_complete()
                     // and establishes the connection; nothing needs to be scheduled here.
                     conn->set_server_hello_received(true);
+
+                    SS_LOGD(TAG, "Connected to server '%s' (server_id=%s)", hello_msg.name.c_str(),
+                            conn->get_server_id().c_str());
+                }
+            }
+            break;
+        }
+        case SendspinServerToClientMessageType::SERVER_ACTIVATE: {
+            ServerActivateMessage activate_msg;
+            if (process_server_activate_message(root, &activate_msg)) {
+                if (conn != nullptr) {
+                    // This runs on the network thread. The connection's activity state
+                    // (activities_/active_roles_/first_activate_received_) is read on the main
+                    // loop, so defer the mutation there: carry the parsed payload in the event
+                    // and let ConnectionManager::loop() apply it (and decide is_first, trust
+                    // enforcement, and admission arbitration) on the main thread.
+                    SS_LOGD(TAG, "server/activate received (activities_count=%zu)",
+                            activate_msg.activities.size());
+                    this->connection_manager_->schedule_activate(
+                        {conn->shared_from_this(), std::move(activate_msg.activities),
+                         std::move(activate_msg.active_roles)});
+                }
+            }
+            break;
+        }
+        case SendspinServerToClientMessageType::NOISE_HANDSHAKE: {
+            // In-band re-handshake initiated by the server (Phase 4b). This runs on the
+            // network thread (same thread as decrypt), so no lock is needed on this side; the
+            // NoiseTransport session mutex is only acquired inside handle_noise_rehandshake for
+            // the encrypt + swap.
+            if (conn != nullptr) {
+                SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
+                std::string msg1_json(data, len);
+                if (conn->handle_noise_rehandshake(msg1_json)) {
+                    // handle_noise_rehandshake() reset server_hello_received_/
+                    // client_hello_sent_/first_activate_received_ so the hello cycle re-runs
+                    // under the new session keys, but nothing else ever re-sends client/hello
+                    // for a connection outside the nursery. Defer the re-arm to the main loop,
+                    // matching every other cross-thread connection-state mutation.
+                    this->connection_manager_->schedule_rehandshake_rearm(conn->shared_from_this());
+                } else {
+                    SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
+                    // Close the WebSocket silently (do not leave a half-swapped session).
+                    // UNAUTHORIZED is the closest available reason for a crypto failure.
+                    conn->disconnect(SendspinGoodbyeReason::UNAUTHORIZED, nullptr);
                 }
             }
             break;
@@ -961,22 +1033,57 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
         return;
     }
 
+    // Gate on receipt of the first server/activate: before that we do not yet know which
+    // activities/roles this connection is admitted for.
+    if (!conn->first_activate_received()) {
+        return;
+    }
+
     ClientStateMessage state_msg;
     state_msg.state = this->state_;
 
 #ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
+    // Only include player state when the "player" role is active on this connection.
+    if (this->player_ && conn->is_role_active("player")) {
         this->player_->impl_->build_state_fields(state_msg);
     }
 #endif
 
     std::string state_message = format_client_state_message(&state_msg);
-    conn->send_text_message(state_message, nullptr);
+    conn->send_app_json(state_message, nullptr);
 }
 
 // ============================================================================
-// Persistence
+// Persistence & identity
 // ============================================================================
+
+void SendspinClient::load_or_generate_identity() {
+    if (this->persistence_provider_ != nullptr) {
+        auto saved_priv = this->persistence_provider_->load_static_keypair();
+        if (saved_priv.has_value()) {
+            this->identity_ =
+                std::make_unique<Identity>(Identity::from_private_bytes(saved_priv.value()));
+            SS_LOGI(TAG, "Loaded static keypair; client_id=%s", this->identity_->peer_id().c_str());
+            return;
+        }
+    }
+
+    // No saved key -- generate a new one.
+    this->identity_ = std::make_unique<Identity>(Identity::generate());
+
+    if (this->persistence_provider_ != nullptr) {
+        if (this->persistence_provider_->save_static_keypair(this->identity_->private_bytes)) {
+            SS_LOGI(TAG, "Generated and persisted static keypair; client_id=%s",
+                    this->identity_->peer_id().c_str());
+        } else {
+            SS_LOGW(TAG, "Generated static keypair but failed to persist it; client_id=%s",
+                    this->identity_->peer_id().c_str());
+        }
+    } else {
+        SS_LOGI(TAG, "Generated ephemeral static keypair (no provider); client_id=%s",
+                this->identity_->peer_id().c_str());
+    }
+}
 
 void SendspinClient::load_last_played_server() {
     if (!this->persistence_provider_) {

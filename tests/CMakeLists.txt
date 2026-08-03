@@ -22,6 +22,7 @@ FetchContent_MakeAvailable(googletest)
 add_executable(sendspin_tests
     test_audio_stream_info.cpp
     test_connection_lifecycle.cpp
+    test_encrypted_lifecycle.cpp
     test_time_filter.cpp
     test_protocol.cpp
     test_network_info.cpp
@@ -35,6 +36,7 @@ add_executable(sendspin_tests
     test_record_store.cpp
     test_noise_transport.cpp
     test_noise_rehandshake.cpp
+    test_admission.cpp
 
     # FilePersistenceProvider is a host example helper (examples/common/), not part of the
     # library; compile it into the test target so the record-store tests can exercise it.

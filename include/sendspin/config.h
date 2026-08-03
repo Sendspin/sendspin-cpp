@@ -68,10 +68,27 @@ struct SendspinPairingConfig {
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start_server()
 struct SendspinClientConfig {
-    /// Unique client identifier. When left empty, the library falls back to the detected local
-    /// network interface MAC address (the same value used for device_info.mac_address).
+    /// Unique client identifier. Superseded by the derived cryptographic identity
+    /// (base64url(X25519 public key), generated/persisted internally) now that the Sendspin
+    /// wire protocol carries client_id in client/init rather than client/hello. No longer read
+    /// by the library; kept only so existing callers do not fail to compile. Removing it (and
+    /// surfacing the derived identity through a public accessor instead) is deferred to the
+    /// public-API pass in a later phase.
     std::string client_id;
     std::string name;  ///< Friendly display name
+
+    /// @brief Whether every connection must complete a Noise KKpsk2 handshake before the hello
+    /// exchange (spec PR #84's always-on encryption model).
+    ///
+    /// Defaults to true, matching the eventual mandatory-encryption design: the client is always
+    /// the Noise responder, and admission/trust enforcement (see admission.h) key off the PSK
+    /// category resolved by that handshake. Set to false only to run the connection nursery
+    /// (accept/reap/admission-arbitration) without the crypto layer, e.g. plaintext test
+    /// fixtures that exercise nursery structure independently of Noise (already covered
+    /// separately by the Noise handshake/re-handshake/admission unit tests). This knob is
+    /// internal for now; it is not part of the public-API surfacing pass planned for a later
+    /// phase and may be removed once every fixture speaks Noise.
+    bool encryption_required{true};
 
     std::optional<std::string> product_name{};  ///< Device product name (optional)
     std::optional<std::string> manufacturer{};  ///< Manufacturer name, e.g., "ESPHome" (optional)

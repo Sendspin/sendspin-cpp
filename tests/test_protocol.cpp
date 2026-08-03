@@ -345,31 +345,64 @@ TEST(Protocol, GroupUpdatePlaybackStateValidation) {
     }
 }
 
-// server/hello declares `version` a required field, so a present-but-malformed value (wrong type or
-// out of uint16 range) rejects the whole message rather than silently defaulting to 0, which would
-// break protocol version gating downstream.
-TEST(Protocol, ServerHelloRejectsInvalidVersion) {
-    const char* kBadVersions[] = {"\"1\"", "1.5", "70000", "null"};
-    for (const char* version : kBadVersions) {
-        JsonDocument doc;
-        JsonObject root;
-        std::string json = std::string(R"({"type":"server/hello","payload":{"server_id":"s1",)"
-                                        R"("name":"srv","version":)") +
-                           version + R"(,"active_roles":[],"connection_reason":"playback"}})";
-        ASSERT_TRUE(parse(json, doc, root)) << json;
-        ServerHelloMessage msg;
-        EXPECT_FALSE(process_server_hello_message(root, &msg)) << json;
-    }
+// Under the encrypted protocol, server/hello carries only the server's display name (server_id
+// comes from the Noise handshake result instead); a message missing "name" is rejected.
+TEST(Protocol, ServerHelloRequiresName) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{}})", doc, root));
+    ServerHelloMessage msg;
+    EXPECT_FALSE(process_server_hello_message(root, &msg));
 
-    // Control: a valid integer version is accepted and stored.
     JsonDocument doc_ok;
     JsonObject root_ok;
-    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"server_id":"s1","name":"srv",)"
-                      R"("version":7,"active_roles":[],"connection_reason":"playback"}})",
-                      doc_ok, root_ok));
+    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"srv"}})", doc_ok, root_ok));
     ServerHelloMessage ok;
     ASSERT_TRUE(process_server_hello_message(root_ok, &ok));
-    EXPECT_EQ(ok.version, 7);
+    EXPECT_EQ(ok.name, "srv");
+    EXPECT_FALSE(ok.server_id.has_value());  // legacy fallback field, absent on the real wire
+
+    // The legacy server_id fallback field parses when present (test/no-encryption fixtures only).
+    JsonDocument doc_legacy;
+    JsonObject root_legacy;
+    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"srv","server_id":"s1"}})",
+                      doc_legacy, root_legacy));
+    ServerHelloMessage legacy;
+    ASSERT_TRUE(process_server_hello_message(root_legacy, &legacy));
+    ASSERT_TRUE(legacy.server_id.has_value());
+    EXPECT_EQ(legacy.server_id.value(), "s1");
+}
+
+// server/activate declares the activity set (and, sticky, active_roles); activities is required.
+TEST(Protocol, ServerActivateParsesActivitiesAndStickyRoles) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/activate","payload":{"activities":["playback"],)"
+                      R"("active_roles":["player@v1"]}})",
+                      doc, root));
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    ASSERT_EQ(msg.activities.size(), 1u);
+    EXPECT_EQ(msg.activities[0], SendspinActivity::PLAYBACK);
+    ASSERT_TRUE(msg.active_roles.has_value());
+    ASSERT_EQ(msg.active_roles->size(), 1u);
+    EXPECT_EQ((*msg.active_roles)[0], "player@v1");
+
+    // A subsequent activate omitting active_roles must parse it as nullopt (sticky: keep prior).
+    JsonDocument doc2;
+    JsonObject root2;
+    ASSERT_TRUE(
+        parse(R"({"type":"server/activate","payload":{"activities":["playback"]}})", doc2, root2));
+    ServerActivateMessage msg2;
+    ASSERT_TRUE(process_server_activate_message(root2, &msg2));
+    EXPECT_FALSE(msg2.active_roles.has_value());
+
+    // Missing activities array rejects the message.
+    JsonDocument doc3;
+    JsonObject root3;
+    ASSERT_TRUE(parse(R"({"type":"server/activate","payload":{}})", doc3, root3));
+    ServerActivateMessage msg3;
+    EXPECT_FALSE(process_server_activate_message(root3, &msg3));
 }
 
 // If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a non-zero
@@ -630,9 +663,7 @@ TEST(Protocol, FormatClientCommandNoArgs) {
 // is optional and serialized only when present.
 TEST(Protocol, FormatClientHelloDeviceInfoFieldsPresent) {
     ClientHelloMessage msg;
-    msg.client_id = "abc";
     msg.name = "Speaker";
-    msg.version = 1;
     DeviceInfoObject info{};
     info.product_name = "Speaker Pro";
     info.manufacturer = "ESPHome";
@@ -650,14 +681,34 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsPresent) {
     EXPECT_STREQ(doc["payload"]["device_info"]["mac_address"], "aa:bb:cc:dd:ee:ff");
 }
 
+// client/hello's trust_level/unpaired_access/supported_pair_methods fields (Phase 3+ shape):
+// supported_pair_methods is omitted entirely (not an empty array) when there are none to
+// advertise, matching the reference's omit_none.
+TEST(Protocol, FormatClientHelloTrustAndPairMethods) {
+    ClientHelloMessage msg;
+    msg.name = "Speaker";
+    msg.trust_level = "user";
+    msg.unpaired_access_enabled = true;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    EXPECT_STREQ(doc["payload"]["trust_level"], "user");
+    EXPECT_TRUE(doc["payload"]["unpaired_access"]["enabled"].as<bool>());
+    EXPECT_FALSE(doc["payload"]["supported_pair_methods"].is<JsonArray>());
+
+    msg.supported_pair_methods.push_back(PairMethodDescriptor{SendspinPairMethod::PAIRING_PSK});
+    JsonDocument doc2;
+    ASSERT_FALSE(deserializeJson(doc2, format_client_hello_message(&msg)));
+    ASSERT_TRUE(doc2["payload"]["supported_pair_methods"].is<JsonArray>());
+    EXPECT_STREQ(doc2["payload"]["supported_pair_methods"][0]["method"], "pairing_psk");
+}
+
 // The visualizer@v1 support object serializes with the spec's field layout: types (including
 // the event types), buffer_capacity, top-level rate_max, and a spectrum object without a
 // nested rate cap.
 TEST(Protocol, FormatClientHelloVisualizerSupport) {
     ClientHelloMessage msg;
-    msg.client_id = "abc";
     msg.name = "Speaker";
-    msg.version = 1;
     msg.supported_roles.push_back(SendspinRole::VISUALIZER);
     VisualizerSupportObject vis{};
     vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
@@ -733,9 +784,7 @@ TEST(Protocol, FormatStreamRequestFormatVisualizer) {
 // Unset optional identity fields must not emit their keys.
 TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
     ClientHelloMessage msg;
-    msg.client_id = "abc";
     msg.name = "Speaker";
-    msg.version = 1;
     msg.device_info = DeviceInfoObject{};
 
     JsonDocument doc;

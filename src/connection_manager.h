@@ -87,6 +87,18 @@ struct HelloRetryState {
     uint8_t attempts{3};                                      ///< Remaining retry attempts
 };
 
+/// @brief Deferred server/activate event, processed in ConnectionManager::loop()
+///
+/// Pushed from SendspinClient::process_json_message() (network thread) so trust enforcement,
+/// RecordStore mutations (mark_record_used), and admission arbitration all happen on the main
+/// loop, never on the network thread. Carries the parsed payload rather than requiring the main
+/// loop to re-read connection state that a concurrent event could have changed.
+struct ServerActivateEvent {
+    std::shared_ptr<SendspinConnection> conn;  ///< Connection the activate was received on
+    std::vector<SendspinActivity> activities;  ///< Activities declared by this activate
+    std::optional<std::vector<std::string>> active_roles;  ///< nullopt = sticky/keep prior set
+};
+
 /**
  * @brief Manages WebSocket connection lifecycle.
  *
@@ -94,12 +106,20 @@ struct HelloRetryState {
  * decisions, and performs graceful disconnection with deferred cleanup.
  *
  * Connections prove themselves before they are trusted: every new connection enters a bounded
- * nursery and leaves it only by completing the hello handshake (promotion, or a fair comparison
- * against the incumbent) or by missing the establish deadline (reaped). The platform ws_server
- * delivers inbound connections only after observing their WebSocket upgrade, so the manager never
- * reasons about raw sockets that might not speak WebSocket; those are closed inside the platform
- * layer. Invariant: `current_connection_ != nullptr` implies
- * `current_connection_->is_handshake_complete()`.
+ * nursery and leaves it only by completing the hello handshake AND being admitted by its first
+ * server/activate (promotion, or a fair arbitration against the incumbent) or by missing the
+ * establish deadline (reaped). When encryption is required (SendspinClientConfig::
+ * encryption_required, the default), the prove stage additionally starts with the Noise
+ * handshake: accept/connect -> Noise handshake complete -> hello handshake complete -> first
+ * server/activate admitted. The platform ws_server delivers inbound connections only after
+ * observing their WebSocket upgrade, so the manager never reasons about raw sockets that might
+ * not speak WebSocket; those are closed inside the platform layer. Invariant:
+ * `current_connection_ != nullptr` implies `current_connection_->is_operational()`, EXCEPT for
+ * the transient window while an already-admitted connection re-proves itself after a successful
+ * in-band re-handshake (schedule_rehandshake_rearm(): the hello cycle re-arms and re-runs, and
+ * the invariant is restored once it completes; if the hello send keeps failing until retries are
+ * exhausted, the connection is dropped rather than left wedged -- see the hello-retry-timer scan
+ * in loop()).
  *
  * Typical usage:
  *  1. Construct with a `SendspinClient*`.
@@ -196,6 +216,29 @@ public:
     /// @param server_id The server_id string of the last-played server.
     void set_last_played_server_id(const std::string& server_id);
 
+    // ========================================
+    // Event queuing (thread-safe)
+    // ========================================
+
+    /// @brief Schedules a server/activate event for deferred processing in loop().
+    /// Called from SendspinClient::process_json_message() on the NETWORK thread; trust
+    /// enforcement, RecordStore mutations, and admission arbitration all happen in loop() on
+    /// the main loop instead, matching every other cross-thread mutation in this class.
+    /// @param event The server/activate event to schedule (moved).
+    void schedule_activate(ServerActivateEvent event);
+
+    /// @brief Schedules a hello-cycle re-arm after a successful in-band re-handshake.
+    ///
+    /// Called from SendspinClient::process_json_message() on the NETWORK thread right after
+    /// SendspinConnection::handle_noise_rehandshake() succeeds. That call resets
+    /// server_hello_received_/client_hello_sent_/first_activate_received_ on an already-admitted
+    /// (current) connection so the post-swap server/hello -> client/hello -> server/activate
+    /// cycle re-runs under the new session keys, but nothing else ever re-sends client/hello for
+    /// a connection outside the nursery. loop() arms the hello retry for it, matching every
+    /// other cross-thread connection-state mutation in this class.
+    /// @param conn The connection whose Noise session was just swapped (moved).
+    void schedule_rehandshake_rearm(std::shared_ptr<SendspinConnection> conn);
+
 private:
     // ========================================
     // Connection setup
@@ -203,11 +246,16 @@ private:
     /// @brief Attaches message and lifecycle callbacks to a connection.
     /// @param conn The connection to configure.
     void setup_connection_callbacks(SendspinConnection* conn);
-    /// @brief Admits an incoming server connection into the nursery and arms its hello
+    /// @brief Admits an incoming server connection into the nursery and starts its prove stage
     ///
-    /// Never enters the current slot directly (the hello handshake is not complete yet). If the
+    /// Never enters the current slot directly (the connection has not proven itself yet). If the
     /// inbound slots are full (outbound entries do not count) the newcomer is rejected with a
     /// goodbye, which reaches the peer because its session is already upgraded.
+    ///
+    /// When encryption is required, this installs the Noise handshake driver and sends
+    /// client/init immediately (the connection is already WS-upgraded, so there is no earlier
+    /// signal to wait for); the hello is armed later, once the Noise handshake completes (see
+    /// the noise-completion scan in loop()). Otherwise the hello is armed right away, as before.
     /// @param conn The newly delivered server connection. The session slot keeps a parallel
     ///             refcount, so this observer can be reset at any time without freeing the conn
     ///             out from under in-flight httpd workers.
@@ -243,6 +291,18 @@ private:
     /// @param conn The disconnected connection to defer to loop().
     void queue_pending_disconnect(std::shared_ptr<SendspinConnection> conn);
 
+    /// @brief Appends an event to pending_activate_events_ and sets has_pending_events_ in the
+    /// same critical section, so loop()'s lock-free gate can never miss a pushed event. Caller
+    /// must hold conn_mutex_.
+    /// @param event The server/activate event to defer to loop() (moved).
+    void queue_pending_activate(ServerActivateEvent event);
+
+    /// @brief Appends a connection to pending_rehandshake_events_ and sets has_pending_events_ in
+    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
+    /// Caller must hold conn_mutex_.
+    /// @param conn The re-handshaked connection to defer to loop() (moved).
+    void queue_pending_rehandshake(std::shared_ptr<SendspinConnection> conn);
+
     /// @brief Releases a nursery entry: erases it, prunes its hello retry, and queues the
     /// goodbye+release on deferred_releases_. Caller must hold conn_ptr_mutex_ and call
     /// flush_deferred_releases() after dropping it.
@@ -275,6 +335,11 @@ private:
     // Hello handshake
     // ========================================
     /// @brief Arms the hello retry state so loop() will send the hello on its next tick.
+    ///
+    /// Usually called for a nursery member, but also for the current (already-admitted)
+    /// connection to re-arm its hello after a successful in-band re-handshake (see
+    /// schedule_rehandshake_rearm()) -- hello_retries_ is not exclusively a nursery-membership
+    /// concept, see the field's doc comment.
     /// @param conn The connection to send the hello to.
     void initiate_hello(SendspinConnection* conn);
     /// @brief Sends the hello message to a connection, returning true if no retry is needed.
@@ -286,6 +351,11 @@ private:
     /// @brief Removes any pending hello-retry entry associated with the given connection.
     /// @param conn The connection whose retry state should be dropped.
     void remove_hello_retry(SendspinConnection* conn);
+    /// @brief Returns true if conn already has a pending hello-retry entry. Caller must hold
+    /// conn_ptr_mutex_. Used by the noise-completion scan in loop() to arm a connection's hello
+    /// exactly once (idempotent re-arming would otherwise reset the backoff every tick).
+    /// @param conn The connection to check.
+    bool has_hello_retry(const SendspinConnection* conn) const;
 
     // ========================================
     // Connection lifecycle
@@ -293,12 +363,39 @@ private:
     /// @brief Tears down a lost connection (current or nursery). Caller must hold conn_ptr_mutex_.
     /// @param conn The connection that was lost.
     void on_connection_lost(SendspinConnection* conn);
-    /// @brief Decides whether to switch from the current connection to the new one.
-    /// @param current The existing active connection. Must not be null.
-    /// @param new_conn The newly connected candidate connection. Must not be null.
-    /// @return True if the new connection should become current, false to keep the existing one.
+    /// @brief Decides whether an incoming connection should be admitted over the current one.
+    ///
+    /// Ports admission.h::should_admit_connection (activity-priority arbitration: management >
+    /// playback > pairing > empty, with last-played-server_id as the empty/empty tiebreak and an
+    /// in-flight pairing immune to displacement by incoming pairing/playback). Trust enforcement
+    /// (admission.h::admissible) is applied separately, before this is ever consulted, in
+    /// loop()'s server/activate handling.
+    /// @param current The existing active connection, or nullptr if none is admitted yet.
+    /// @param new_conn The newly proven candidate connection. Must not be null.
+    /// @return True if the new connection should become current, false to keep the existing one
+    ///         (or reject the newcomer, when current is null this always returns true).
     bool should_switch_to_new_server(SendspinConnection* current,
                                      SendspinConnection* new_conn) const;
+    /// @brief Updates last_played_server_id when the ADMITTED (current) connection carries the
+    /// PLAYBACK activity. Mirrors note_playback_activity in aiosendspin/client/client.py.
+    /// No-op if conn is not the current connection, or does not declare PLAYBACK.
+    /// Caller must hold conn_ptr_mutex_.
+    /// @param conn The connection to check (typically the connection an activate just applied to).
+    void note_playback_activity(SendspinConnection* conn);
+
+    /// @brief Promotes a proven nursery entry (it->conn->is_operational() must already be true)
+    /// into the current slot, or arbitrates it against an existing current connection, or
+    /// rejects it with concurrent_attempt if arbitration favors the incumbent.
+    ///
+    /// Erases the entry from the nursery unconditionally (it never returns to the nursery).
+    /// Calls should_switch_to_new_server() when a current connection already exists; both sides
+    /// of that comparison are always operational, so arbitration never runs on partial data.
+    /// On the winning outcome (promotion, whether or not it displaced an incumbent), notifies the
+    /// client, publishes state, and records playback activity. Caller must hold conn_ptr_mutex_.
+    /// @param it Valid iterator into nursery_ whose connection satisfies is_operational().
+    /// @return Iterator to the entry after the erased one (for use in a scanning loop).
+    std::vector<NurseryEntry>::iterator promote_or_arbitrate_nursery_entry(
+        std::vector<NurseryEntry>::iterator it);
     /// @brief Sends a goodbye and takes ownership of the caller's shared_ptr so it drops at
     /// function exit.
     /// @param conn The connection to disconnect and release. Caller's shared_ptr is left empty.
@@ -341,9 +438,16 @@ private:
                                                       // deferred_releases_
     std::vector<DeferredRelease> deferred_releases_;  // Queued releases; see DeferredRelease
     std::vector<NurseryEntry> nursery_;               // Unproven connections awaiting establishment
-    std::vector<HelloRetryState> hello_retries_;      // One entry per connection awaiting its hello
+    // One entry per connection awaiting its hello. Almost always a nursery member, but also,
+    // transiently, the current (already-admitted) connection while it re-runs the hello cycle
+    // after a successful in-band re-handshake (see schedule_rehandshake_rearm()); the reap scan
+    // and the "left the nursery" cleanup below both account for that case explicitly.
+    std::vector<HelloRetryState> hello_retries_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_disconnect_events_;
+    std::vector<ServerActivateEvent> pending_activate_events_;  // Deferred server/activate events
+    // Connections whose in-band re-handshake just swapped sessions; loop() re-arms their hello.
+    std::vector<std::shared_ptr<SendspinConnection>> pending_rehandshake_events_;
 
     // Pointer fields
     SendspinClient* client_;
@@ -381,6 +485,14 @@ private:
     /// assignment (promotion, handoff, drop_connection's exchange, destructor). Lets loop() skip
     /// the copies/loop() block when there is no current connection and the nursery is empty.
     std::atomic<bool> has_current_{false};
+
+    /// hello_retries_.size(), refreshed under conn_ptr_mutex_ immediately after every
+    /// hello_retries_ mutation (initiate_hello(), remove_hello_retry(), and the retry-timer scan's
+    /// erases in loop()). Lets loop() run the hello-retry-timer scan even when the nursery is
+    /// empty, which happens whenever the only pending retry belongs to the current (already-
+    /// admitted) connection re-arming its hello after an in-band re-handshake -- that connection
+    /// is never a nursery member, so nursery_size_ alone would miss it.
+    std::atomic<size_t> hello_retries_size_{0};
 
     /// deferred_releases_.size(), refreshed under conn_ptr_mutex_ after every push (see
     /// queue_deferred_release()) and after the drain swap in flush_deferred_releases(). Lets

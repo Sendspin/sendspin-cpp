@@ -106,6 +106,11 @@ void SendspinConnection::init_noise_handshake(const Identity& identity,
                                               const RecordStore& record_store,
                                               const std::string& suite_name) {
     this->noise_handshake_ = std::make_unique<NoiseHandshake>(identity, record_store, suite_name);
+    // Retain for re-handshake (Phase 4b): these pointers outlive connections (owned by the
+    // SendspinClient that constructed the manager which called this).
+    this->noise_identity_ = &identity;
+    this->noise_record_store_ = &record_store;
+    this->noise_suite_name_ = suite_name;
 }
 
 void SendspinConnection::send_noise_client_init() {
@@ -149,10 +154,16 @@ bool SendspinConnection::handle_noise_handshake_text(const std::string& text) {
             this->noise_handshake_.reset();
             return true;
         }
-        // Record the server's identity (public key) resolved by the handshake. Reconciling
-        // this against server/hello's own server_id (and the matched PSK's trust category)
-        // is a later phase's job; today this is purely informational/for logging.
+        // Record the server's identity (public key) and the PSK category/psk_id that admitted
+        // the connection, resolved by the handshake. Trust enforcement (ConnectionManager,
+        // reading get_psk_category()/get_psk_id()) happens on the main loop against
+        // server/activate, not here. Every write below happens-before the release store of
+        // noise_handshake_complete_ just after it, so main-loop readers that observe
+        // is_operational() (itself gated behind server_hello_received_/client_hello_sent_,
+        // which cannot be true before the Noise transport is active) see these values.
         this->server_information_.server_id = outcome->server_id;
+        this->psk_category_ = outcome->resolved_psk.category;
+        this->psk_id_ = outcome->resolved_psk.psk_id;
         // Install the cipher session; send_app_json() routes encrypted from here on.
         this->noise_transport_.activate(std::move(outcome->session));
         this->noise_handshake_.reset();
@@ -162,6 +173,67 @@ bool SendspinConnection::handle_noise_handshake_text(const std::string& text) {
     }
 
     return true;  // Frame was consumed by the handshake state machine
+}
+
+bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) {
+    // Runs on the NETWORK thread (dispatched from the JSON callback for a decrypted
+    // "noise/handshake" message, itself only reachable post-COMPLETE, so this always runs on
+    // the same network thread as the decrypt path -- sequential with it, never concurrent).
+    if (!this->noise_transport_.is_active()) {
+        SS_LOGE(TAG, "handle_noise_rehandshake: no active Noise transport");
+        return false;
+    }
+    if (this->noise_identity_ == nullptr || this->noise_record_store_ == nullptr ||
+        this->noise_suite_name_.empty()) {
+        SS_LOGE(TAG, "handle_noise_rehandshake: missing identity/record_store/suite -- "
+                     "init_noise_handshake() was not called");
+        return false;
+    }
+
+    // Suppress app-level sends (client/state, client/time) for the duration of the
+    // re-handshake. The main loop gates on first_activate_received(), so clearing it here
+    // cleanly stops publish_client_state()/the time burst until the new server/activate
+    // arrives after the session swap.
+    this->first_activate_received_.store(false, std::memory_order_release);
+
+    // Run the two-handshake PSK trick with prologue = the prior handshake hash h.
+    auto prior_h = this->noise_transport_.handshake_hash();
+    if (!prior_h.has_value()) {
+        SS_LOGE(TAG, "handle_noise_rehandshake: no handshake hash available");
+        return false;
+    }
+    const std::string current_server_id = this->server_information_.server_id;
+
+    auto result =
+        run_rehandshake_msg1(msg1_json, current_server_id, *this->noise_identity_,
+                             *this->noise_record_store_, this->noise_suite_name_, prior_h.value());
+    if (!result.has_value()) {
+        SS_LOGW(TAG, "handle_noise_rehandshake: re-handshake failed; closing connection");
+        return false;
+    }
+
+    // Commit: encrypt msg2 under the OLD session and send it, then swap to the new session,
+    // both under NoiseTransport's session_mutex_ so a concurrent main-loop encrypt cannot
+    // interleave between the msg2 send and the swap.
+    SsErr err =
+        this->noise_transport_.send_msg2_and_swap(result->msg2_text, std::move(result->session));
+    if (err != SsErr::OK) {
+        SS_LOGE(TAG, "handle_noise_rehandshake: failed to send msg2 / swap session");
+        return false;
+    }
+
+    // Update PSK metadata from the re-handshake result. server_id is unchanged (same server).
+    this->psk_category_ = result->resolved_psk.category;
+    this->psk_id_ = result->resolved_psk.psk_id;
+
+    // Reset hello handshake state so the post-swap server/hello -> client/hello ->
+    // server/activate flow re-runs under the new session keys.
+    this->server_hello_received_.store(false, std::memory_order_release);
+    this->client_hello_sent_.store(false, std::memory_order_release);
+
+    SS_LOGI(TAG, "Noise re-handshake complete: server_id=%s psk_category=%d; awaiting server/hello",
+            current_server_id.c_str(), static_cast<int>(this->psk_category_));
+    return true;
 }
 
 void SendspinConnection::dispatch_complete_noise_message(uint8_t* plaintext, size_t len,
