@@ -14,14 +14,20 @@
 
 #include "tui.h"
 
+#include "sendspin/config.h"
+#include "sendspin/types.h"
+#include <ftxui/component/component.hpp>
+#include <ftxui/component/component_base.hpp>
 #include <ftxui/component/event.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/screen/color.hpp>
 #include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <utility>
 
 namespace sendspin {
 

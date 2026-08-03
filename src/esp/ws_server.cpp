@@ -14,14 +14,17 @@
 
 #include "ws_server.h"
 
-#include "connection.h"
 #include "lwip/sockets.h"  // for close()
 #include "platform/compiler.h"
 #include "platform/logging.h"
 #include "sendspin/config.h"
 #include "server_connection.h"
-#include <esp_idf_version.h>
+#include <esp_err.h>
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
+
+#include <cstddef>
+#include <utility>
 
 namespace sendspin {
 
@@ -80,7 +83,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
     config.max_open_sockets = this->max_connections_;
     config.open_fn = SendspinWsServer::open_callback;
     config.close_fn = SendspinWsServer::close_callback;
-    config.global_user_ctx = (void*)this;
+    config.global_user_ctx = static_cast<void*>(this);
     config.global_user_ctx_free_fn = nullptr;
     // Use the configured ctrl_port, or fall back to ESP_HTTPD_DEF_CTRL_PORT + 1 to avoid
     // conflict with the web_server component
@@ -106,7 +109,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
     const httpd_uri_t sendspin_ws_uri = {.uri = "/sendspin",
                                          .method = HTTP_GET,
                                          .handler = SendspinWsServer::websocket_handler,
-                                         .user_ctx = (void*)this,
+                                         .user_ctx = static_cast<void*>(this),
                                          .is_websocket = true,
                                          .handle_ws_control_frames = false,
                                          .supported_subprotocol = nullptr,
@@ -135,6 +138,10 @@ void SendspinWsServer::stop() {
 
     // httpd_stop tore down every session (each close_callback dropped its pending entry), so
     // this is normally already empty; clear defensively so a restart begins from a clean table.
+    // Declared above the lock (not narrowed into it, despite cppcheck's variableScope
+    // suggestion) so its shared_ptr entries release after pending_mutex_ is dropped, matching
+    // the same lock-scope-extension pattern documented in ConnectionManager::~ConnectionManager.
+    // cppcheck-suppress variableScope
     std::vector<PendingUpgrade> stale;
     {
         std::lock_guard<std::mutex> lock(this->pending_mutex_);
@@ -211,7 +218,7 @@ std::shared_ptr<SendspinServerConnection> SendspinWsServer::pop_pending(int sock
 esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
     SS_LOGD(TAG, "New client connection on socket %d", sockfd);
 
-    SendspinWsServer* server = (SendspinWsServer*)httpd_get_global_user_ctx(handle);
+    SendspinWsServer* server = static_cast<SendspinWsServer*>(httpd_get_global_user_ctx(handle));
     if (server == nullptr) {
         SS_LOGE(TAG, "Server context is null in open_callback");
         return ESP_FAIL;
@@ -258,7 +265,7 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
         (*slot)->mark_closed();
     }
 
-    SendspinWsServer* server = (SendspinWsServer*)httpd_get_global_user_ctx(handle);
+    SendspinWsServer* server = static_cast<SendspinWsServer*>(httpd_get_global_user_ctx(handle));
 
     if (server != nullptr) {
         // Drop a still-pending entry: this session closed before its upgrade was ever observed,
@@ -295,7 +302,7 @@ SS_HOT esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
     // is always valid. Copying the shared_ptr keeps the conn alive for the duration of dispatch
     // even if a teardown is racing on another thread.
     int sockfd = httpd_req_to_sockfd(req);
-    auto* slot = static_cast<std::shared_ptr<SendspinServerConnection>*>(
+    const auto* slot = static_cast<const std::shared_ptr<SendspinServerConnection>*>(
         httpd_sess_get_ctx(req->handle, sockfd));
     if (slot == nullptr || !*slot) {
         SS_LOGE(TAG, "No connection found for sockfd %d", sockfd);

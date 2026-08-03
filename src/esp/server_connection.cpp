@@ -18,10 +18,15 @@
 #include "platform/compiler.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
+#include "platform/types.h"
 #include "protocol_messages.h"
+#include "sendspin/types.h"
+#include <esp_err.h>
 #include <esp_timer.h>
 
 #include <cstring>
+#include <string>
+#include <utility>
 
 namespace sendspin {
 
@@ -156,7 +161,8 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
         resp_arg->on_complete = std::move(on_complete);
     }
 
-    std::memcpy((void*)resp_arg->payload, (void*)message.data(), message.size());
+    std::memcpy(static_cast<void*>(resp_arg->payload), static_cast<const void*>(message.data()),
+                message.size());
 
     if (httpd_queue_work(this->server_, async_send_text, resp_arg) != ESP_OK) {
         SS_LOGE(TAG, "httpd_queue_work failed!");
@@ -212,7 +218,7 @@ SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t 
         resp_arg->on_complete = std::move(on_complete);
     }
 
-    std::memcpy((void*)resp_arg->payload, (void*)data, len);
+    std::memcpy(static_cast<void*>(resp_arg->payload), static_cast<const void*>(data), len);
 
     if (httpd_queue_work(this->server_, async_send_binary, resp_arg) != ESP_OK) {
         SS_LOGE(TAG, "httpd_queue_work failed for binary send!");
@@ -396,7 +402,7 @@ void SendspinServerConnection::async_send_binary(void* arg) {
 }
 
 void SendspinServerConnection::async_send_text(void* arg) {
-    struct AsyncRespArg* resp_arg = (AsyncRespArg*)arg;
+    struct AsyncRespArg* resp_arg = static_cast<AsyncRespArg*>(arg);
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
 

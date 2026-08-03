@@ -18,7 +18,6 @@
 
 #pragma once
 
-#include "crypto/constants.h"
 #include "crypto/cpace.h"
 #include "crypto/keys.h"
 #include "noise_handshake.h"
@@ -27,15 +26,20 @@
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "record_store.h"
+#include "sendspin/config.h"
+#include "sendspin/types.h"
 #include "time_filter.h"
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sendspin {
@@ -597,6 +601,9 @@ public:
     /// the constant bias subtracted from the embedded timestamp. Reported alongside per-burst
     /// stats for diagnostics. Atomic so the httpd worker (ESP server) can update it while the
     /// hub thread reads it.
+    // cppcheck-suppress unusedFunction
+    // Diagnostics API surface built ahead of the feature that will call it; not currently read
+    // by this repo's own sources.
     int64_t get_serialize_ema_us() const {
         return this->serialize_ema_us_.load(std::memory_order_relaxed);
     }

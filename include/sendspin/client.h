@@ -437,6 +437,8 @@ public:
 #ifdef SENDSPIN_ENABLE_ARTWORK
     /// @brief Returns the artwork role, or nullptr if not added
     /// @return Pointer to the artwork role, or nullptr
+    // cppcheck-suppress unusedFunction
+    // Public API: live entry point the reference examples don't happen to exercise, not dead code.
     ArtworkRole* artwork() {
         return this->artwork_.get();
     }
@@ -497,6 +499,8 @@ public:
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     /// @brief Returns the visualizer role, or nullptr if not added
     /// @return Pointer to the visualizer role, or nullptr
+    // cppcheck-suppress unusedFunction
+    // Public API: live entry point the reference examples don't happen to exercise, not dead code.
     VisualizerRole* visualizer() {
         return this->visualizer_.get();
     }
@@ -603,7 +607,7 @@ private:
     /// @brief Builds the formatted client hello message from config
     /// @param conn The connection the hello will be sent on; used to derive trust_level from
     ///        the resolved PSK category. May be null (trust_level defaults to "none").
-    std::string build_hello_message(SendspinConnection* conn);
+    std::string build_hello_message(const SendspinConnection* conn);
 
     // ========================================
     // Message processing

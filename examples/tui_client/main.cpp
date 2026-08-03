@@ -28,35 +28,50 @@
 #include "tui.h"
 
 #include "sendspin/client.h"
+#include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
+#include "sendspin/types.h"
 #include "sendspin/visualizer_role.h"
 #include "file_persistence_provider.h"
 #ifdef SENDSPIN_HAS_PORTAUDIO
 #include "portaudio_sink.h"
 #endif
 
+#include <ftxui/component/event.hpp>
+#include <ftxui/component/screen_interactive.hpp>
 #include <getopt.h>
 
 #ifdef SENDSPIN_HAS_MDNS
+// IWYU pragma: begin_keep
+// The include-what-you-use checker misattributes arpa/inet.h's htons/ntohs/htonl/ntohl and
+// sys/select.h's select()/fd_set to macOS libc++'s private headers when analyzed on a macOS
+// host toolchain (a known include-checker false-positive class for
+// macOS private headers like _abort.h/_endian.h); both are still the correct, portable headers on macOS and Linux CI.
 #include <arpa/inet.h>
+#include <sys/select.h>
+// IWYU pragma: end_keep
 #include <dns_sd.h>
 #include <netdb.h>
-#include <sys/select.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #endif
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace sendspin;
@@ -926,6 +941,9 @@ int main(int argc, char* argv[]) {
             }
 
             // Post UI refresh at ~30fps (every 3 ticks) when visualizer is showing
+            // cppcheck-suppress duplicateCondition
+            // Deliberate: an independent guard for a second, unrelated purpose (smoothing above
+            // vs. refresh throttling here), not a leftover duplicate of the same check.
             if (vis_showing) {
                 if (++vis_refresh_counter % 3 == 0) {
                     screen.PostEvent(ftxui::Event::Custom);

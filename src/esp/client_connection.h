@@ -18,6 +18,8 @@
 #pragma once
 
 #include "connection.h"
+#include "platform/types.h"
+#include "sendspin/types.h"
 #include <esp_websocket_client.h>
 
 #include <atomic>

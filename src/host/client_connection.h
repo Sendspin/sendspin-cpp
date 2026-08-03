@@ -18,6 +18,8 @@
 #pragma once
 
 #include "connection.h"
+#include "platform/types.h"
+#include "sendspin/types.h"
 #include <ixwebsocket/IXWebSocket.h>
 
 #include <atomic>
@@ -97,6 +99,12 @@ public:
     }
 
     /// @brief No-op on host builds; task configuration is an ESP-IDF concept
+    // cppcheck-suppress functionStatic
+    // Instance method by API design, matching the ESP build's set_task_config() (see
+    // src/esp/client_connection.h): both platforms expose the same shape so callers do not need
+    // to special-case one over the other. (The "missing override" half of cppcheck's message is
+    // also a false positive: the host and ESP SendspinClientConnection classes are separate,
+    // platform-selected-at-build-time types, not runtime polymorphic siblings.)
     void set_task_config(unsigned /*priority*/) {}
 
     /// @brief Returns true if the WebSocket connection is currently open

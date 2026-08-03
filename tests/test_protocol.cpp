@@ -19,15 +19,24 @@
 
 #include "platform/base64.h"
 #include "protocol_messages.h"
+#include "sendspin/color_role.h"
+#include "sendspin/config.h"
+#include "sendspin/controller_role.h"
+#include "sendspin/metadata_role.h"
+#include "sendspin/player_role.h"
+#include "sendspin/types.h"
+#include "sendspin/visualizer_role.h"
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
 #include <array>
-#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <random>
 #include <string>
+#include <utility>
+#include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
 

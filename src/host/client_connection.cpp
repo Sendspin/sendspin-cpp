@@ -16,11 +16,16 @@
 
 #include "platform/logging.h"
 #include "platform/time.h"
+#include "platform/types.h"
 #include "protocol_messages.h"
+#include "sendspin/types.h"
+#include <ixwebsocket/IXWebSocketMessage.h>
+#include <ixwebsocket/IXWebSocketMessageType.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <utility>
 
 namespace sendspin {
 

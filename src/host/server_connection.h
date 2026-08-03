@@ -18,12 +18,15 @@
 #pragma once
 
 #include "connection.h"
+#include "platform/types.h"
+#include "sendspin/types.h"
 #include <ixwebsocket/IXWebSocket.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace sendspin {
 

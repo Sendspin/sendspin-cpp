@@ -18,12 +18,15 @@
 #pragma once
 
 #include "sendspin/config.h"
+#include <esp_err.h>
 #include <esp_http_server.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace sendspin {
@@ -39,8 +42,8 @@ class SendspinServerConnection;
 /// this entry's shared_ptr is dropped when the session is delivered, closed, or reaped.
 struct PendingUpgrade {
     std::shared_ptr<SendspinServerConnection> conn;  ///< Parallel refcount to the session slot
-    int64_t accept_time_us;                          ///< Accept stamp for the upgrade deadline
-    int sockfd;                                      ///< httpd socket fd, the lookup key
+    int64_t accept_time_us{0};                       ///< Accept stamp for the upgrade deadline
+    int sockfd{-1};                                  ///< httpd socket fd, the lookup key
 };
 
 /**
@@ -146,6 +149,10 @@ public:
     /// up directly via `httpd_sess_get_ctx`, which is also where the connection's authoritative
     /// owner lives. The setter is kept for API symmetry with the host build.
     /// @param callback Ignored.
+    // cppcheck-suppress functionStatic
+    // Instance method by API design, matching the host build's stateful
+    // set_find_connection_callback() (see src/host/ws_server.h): both platforms expose the same
+    // shape so callers do not need to special-case one over the other.
     void set_find_connection_callback(FindConnectionCallback&& /*callback*/) {}
 
     /// @brief Configures the maximum number of simultaneous connections
@@ -184,6 +191,10 @@ public:
 
     /// @brief Gets the httpd handle (for use by connections)
     /// @return The httpd server handle, or nullptr if not started.
+    // cppcheck-suppress unusedFunction
+    // Public accessor for ESP-side connection code; not currently exercised by this repo's own
+    // sources but part of the class's intended API surface (mirrors the connection.h
+    // unusedFunction rationale for encryption-work API built ahead of its caller).
     httpd_handle_t get_server() const {
         return this->server_;
     }

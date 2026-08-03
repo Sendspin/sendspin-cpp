@@ -27,17 +27,18 @@
 // established in test_noise_rehandshake.cpp (build_initiator / raw_encrypt / raw_decrypt) but
 // driven over a real socket instead of in-process function calls.
 
-#include "admission.h"
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
-#include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/types.h"
 
 #include <gtest/gtest.h>
 #include <ixwebsocket/IXWebSocket.h>
+#include <ixwebsocket/IXWebSocketMessage.h>
+#include <ixwebsocket/IXWebSocketMessageType.h>
 
 // noise-c is a C library
 extern "C" {
@@ -50,6 +51,7 @@ extern "C" {
 
 #include <ArduinoJson.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -60,6 +62,7 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
@@ -112,9 +115,8 @@ private:
 // handler), while the test thread reads captured_record().
 class PairingCapturePersistenceProvider : public SendspinPersistenceProvider {
 public:
-    std::vector<SendspinPairingRecord> load_pairing_records() override {
-        return {};
-    }
+    // load_pairing_records() is not overridden: the base class default (no records) is exactly
+    // "starts with no pairing records" above, so restating it here would be a no-op override.
 
     bool save_pairing_record(const SendspinPairingRecord& record) override {
         std::lock_guard<std::mutex> lock(this->mutex_);

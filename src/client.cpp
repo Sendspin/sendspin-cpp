@@ -38,13 +38,16 @@
 #endif
 #ifdef SENDSPIN_ENABLE_PLAYER
 #include "player_role_impl.h"
+#include "sendspin/player_role.h"
 #endif
 #include "protocol_messages.h"
+#include "time_burst.h"
 #ifdef SENDSPIN_ENABLE_VISUALIZER
 #include "visualizer_role_impl.h"
 #endif
-#include "time_burst.h"
 #include <ArduinoJson.h>
+
+#include <utility>
 
 static const char* const TAG = "sendspin.client";
 
@@ -455,7 +458,7 @@ void SendspinClient::loop() {
             // Persist last played server when playback starts
             if (group_delta.playback_state.has_value() &&
                 group_delta.playback_state.value() == SendspinPlaybackState::PLAYING) {
-                auto* current = this->connection_manager_->current();
+                const auto* current = this->connection_manager_->current();
                 if (current != nullptr) {
                     const std::string& server_id = current->get_server_id();
                     if (!server_id.empty()) {
@@ -513,6 +516,8 @@ MetadataRole& SendspinClient::add_metadata() {
 #endif
 
 #ifdef SENDSPIN_ENABLE_COLOR
+// cppcheck-suppress unusedFunction
+// Public API: live entry point the reference examples don't happen to exercise, not dead code.
 ColorRole& SendspinClient::add_color() {
     if (this->started_) {
         SS_LOGW(TAG, "add_color() called after start_server()");
@@ -524,6 +529,8 @@ ColorRole& SendspinClient::add_color() {
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
+// cppcheck-suppress unusedFunction
+// Public API: live entry point the reference examples don't happen to exercise, not dead code.
 ArtworkRole& SendspinClient::add_artwork(ArtworkRoleConfig config) {
     if (this->started_) {
         SS_LOGW(TAG, "add_artwork() called after start_server()");
@@ -695,7 +702,7 @@ void SendspinClient::cleanup_connection_state() {
     }
 }
 
-std::string SendspinClient::build_hello_message(SendspinConnection* conn) {
+std::string SendspinClient::build_hello_message(const SendspinConnection* conn) {
     ClientHelloMessage msg;
     msg.name = this->config_.name;
 

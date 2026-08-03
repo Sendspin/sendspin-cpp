@@ -19,7 +19,7 @@
 #include "platform/crypto.h"
 #include "platform/logging.h"
 
-#include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <utility>
 

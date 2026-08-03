@@ -15,10 +15,16 @@
 #include "client_connection.h"
 
 #include "platform/logging.h"
+#include "platform/types.h"
 #include "protocol_messages.h"
+#include "sendspin/types.h"
+#include <esp_err.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <cstring>
+#include <utility>
 
 namespace sendspin {
 

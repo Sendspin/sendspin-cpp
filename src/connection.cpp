@@ -18,8 +18,10 @@
 #include "platform/compiler.h"
 #include "platform/logging.h"
 #include "platform/time.h"
+#include "sendspin/types.h"
 #include "time_filter.h"
 
+#include <cstddef>
 #include <memory>
 #include <utility>
 

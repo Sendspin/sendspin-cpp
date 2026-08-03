@@ -29,6 +29,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience

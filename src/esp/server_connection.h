@@ -18,10 +18,16 @@
 #pragma once
 
 #include "connection.h"
+#include "platform/types.h"
+#include "sendspin/types.h"
+#include <esp_err.h>
 #include <esp_http_server.h>
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
+#include <string>
 
 namespace sendspin {
 

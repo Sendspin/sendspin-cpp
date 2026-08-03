@@ -38,6 +38,7 @@
 #include "crypto/pin.h"
 #include "platform/base64.h"
 #include "platform/time.h"
+#include "platform/types.h"
 #include "protocol_messages.h"
 #include "record_store.h"
 #include "sendspin/client.h"
@@ -50,9 +51,12 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
@@ -114,10 +118,6 @@ public:
         return this->canned_hash_;
     }
 
-    void set_canned_hash(const std::array<uint8_t, 32>& hash) { this->canned_hash_ = hash; }
-
-    void set_connected(bool connected) { this->connected_ = connected; }
-
     // -- Accumulated outgoing messages / disconnect bookkeeping --
 
     std::vector<std::string> sent_text_;
@@ -145,7 +145,7 @@ enum class PairingEventKind {
 };
 
 struct PairingEvent {
-    PairingEventKind kind;
+    PairingEventKind kind{};
     std::string server_id;                            // STARTED / SUCCEEDED / FAILED
     SendspinPairAbortReason reason{};                  // FAILED
     std::string pin;                                   // DISPLAY_PIN
@@ -307,7 +307,6 @@ std::vector<uint8_t> ascii_bytes(const std::string& s) {
 /// answer either the dynamic-PIN or static-PIN device flow.
 struct ServerStandIn {
     CPace initiator;
-    std::array<uint8_t, 32> nonce_a{};
     std::string prs_pin;
 
     /// Start the initiator for a given PRS (PIN ASCII bytes) and SID (label || handshake hash).

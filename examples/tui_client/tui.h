@@ -15,11 +15,12 @@
 #pragma once
 
 #include "sendspin/client.h"
+#include "sendspin/config.h"
 #include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
+#include "sendspin/types.h"
 
-#include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 
 #include <chrono>

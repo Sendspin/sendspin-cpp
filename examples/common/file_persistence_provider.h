@@ -27,9 +27,14 @@
 #pragma once
 
 #include "sendspin/client.h"
+#include "sendspin/config.h"
 
+#include <array>
+#include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace sendspin {
 

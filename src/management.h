@@ -25,15 +25,21 @@
 
 #pragma once
 
+#include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "crypto/pin.h"
 #include "platform/base64.h"
 #include "platform/logging.h"
 #include "protocol_messages.h"
 #include "record_store.h"
+#include "sendspin/config.h"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sendspin {
@@ -83,7 +89,7 @@ inline void handle_unpair(RecordStore& store, const std::string& matched_psk_id)
 /// @param store RecordStore to query.
 /// @param[out] result Populated with result=ok, data.records=[...].
 /// @param[out] effect Always NONE.
-inline void handle_list_records(RecordStore& store, ManagementResultPayload& result,
+inline void handle_list_records(const RecordStore& store, ManagementResultPayload& result,
                                 ManagementEffect& effect) {
     result.result = ManagementResult::OK;
     result.data = ManagementResultData{};

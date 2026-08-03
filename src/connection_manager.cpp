@@ -22,11 +22,13 @@
 #include "crypto/cpace.h"
 #include "crypto/pin.h"
 #include "management.h"
-#include "platform/base64.h"
 #include "platform/logging.h"
 #include "platform/time.h"
+#include "platform/types.h"
 #include "protocol_messages.h"
 #include "record_store.h"
+#include "sendspin/config.h"
+#include "sendspin/types.h"
 #include "server_connection.h"
 #include "time_burst.h"
 #include "ws_server.h"
@@ -138,28 +140,51 @@ ConnectionManager::~ConnectionManager() {
     // Move everything out under the locks, destroy outside them: a connection destructor can join
     // its transport thread (see DeferredRelease), which must not happen while a lock is held.
     // The two mutexes guard disjoint state and are taken in separate scopes, never nested.
+    //
+    // cppcheck misreads this whole pattern: it suggests narrowing each vector's scope into the
+    // lock_guard block below (variableScope) and calls the move-assignment a dead store
+    // (unreadVariable) because nothing reads the variable again by name. Both suggestions are
+    // wrong here on purpose -- the point of declaring these above the lock and only moving into
+    // them inside it is to extend their lifetime past the lock_guard's scope, so their
+    // destructors (which can join a transport thread) run after the mutex is released rather
+    // than while it is held. Narrowing the scope would destroy them before the closing brace,
+    // i.e. while still locked, reintroducing the deadlock this pattern exists to avoid.
+    // cppcheck-suppress variableScope
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected;
+    // cppcheck-suppress variableScope
     std::vector<std::shared_ptr<SendspinConnection>> pending_disconnects;
+    // cppcheck-suppress variableScope
     std::vector<ServerActivateEvent> pending_activates;
+    // cppcheck-suppress variableScope
     std::vector<std::shared_ptr<SendspinConnection>> pending_rehandshakes;
     {
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
+        // cppcheck-suppress unreadVariable
         pending_connected = std::move(this->pending_connected_events_);
+        // cppcheck-suppress unreadVariable
         pending_disconnects = std::move(this->pending_disconnect_events_);
+        // cppcheck-suppress unreadVariable
         pending_activates = std::move(this->pending_activate_events_);
+        // cppcheck-suppress unreadVariable
         pending_rehandshakes = std::move(this->pending_rehandshake_events_);
         this->has_pending_events_.store(false, std::memory_order_release);
     }
 
     std::shared_ptr<SendspinConnection> current;
+    // cppcheck-suppress variableScope
     std::vector<NurseryEntry> nursery;
+    // cppcheck-suppress variableScope
     std::vector<HelloRetryState> retries;
+    // cppcheck-suppress variableScope
     std::vector<DeferredRelease> releases;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         current = std::move(this->current_connection_);
+        // cppcheck-suppress unreadVariable
         nursery = std::move(this->nursery_);
+        // cppcheck-suppress unreadVariable
         retries = std::move(this->hello_retries_);
+        // cppcheck-suppress unreadVariable
         releases = std::move(this->deferred_releases_);
         // Keep the hint atomics in sync with the now-empty containers (has_pending_events_ was
         // handled above under its own mutex). Nothing reads them again after destruction, but
@@ -623,7 +648,7 @@ void ConnectionManager::loop() {
             // disconnect event earlier in this same pass) still gets the listener notification --
             // handle_pair_storage_failed() reports it unconditionally -- but skips the redundant
             // drop_connection()/pair-abort send.
-            for (auto& event : pair_storage_failed_events) {
+            for (const auto& event : pair_storage_failed_events) {
                 this->handle_pair_storage_failed(event);
             }
 
@@ -771,7 +796,7 @@ void ConnectionManager::loop() {
         {
             const int64_t now_us = platform_time_us();
             for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
-                NurseryEntry& entry = *it;
+                const NurseryEntry& entry = *it;
                 if (now_us - entry.conn->get_provisional_time_us() >=
                     NURSERY_ESTABLISH_TIMEOUT_US) {
                     SS_LOGW(TAG, "Nursery connection stalled at %s (>%d s), dropping",
@@ -1012,7 +1037,7 @@ void ConnectionManager::initiate_hello(SendspinConnection* conn) {
     this->hello_retries_size_.store(this->hello_retries_.size(), std::memory_order_release);
 }
 
-void ConnectionManager::remove_hello_retry(SendspinConnection* conn) {
+void ConnectionManager::remove_hello_retry(const SendspinConnection* conn) {
     // Note: caller must hold conn_ptr_mutex_
     // Safe to call unconditionally: a no-op if conn never had a retry entry (e.g. a connection
     // rejected before initiate_hello, or one whose hello already sent and cleared its entry).
@@ -1308,8 +1333,8 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
     // Not a managed connection: nothing to do (already released by an earlier event this tick).
 }
 
-bool ConnectionManager::should_switch_to_new_server(SendspinConnection* current,
-                                                    SendspinConnection* new_conn) const {
+bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* current,
+                                                    const SendspinConnection* new_conn) const {
     // Ports admission.h::should_admit_connection (activity-priority arbitration). `current` may
     // be null (nothing admitted yet); the pure function's has_admitted=false path always admits.
     const bool has_current = current != nullptr;
@@ -1324,7 +1349,7 @@ bool ConnectionManager::should_switch_to_new_server(SendspinConnection* current,
         /*has_last_playback=*/this->has_last_played_server_);
 }
 
-void ConnectionManager::note_playback_activity(SendspinConnection* conn) {
+void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     // Note: caller must hold conn_ptr_mutex_
     // Mirrors note_playback_activity in aiosendspin/client/client.py: only the ADMITTED
     // (current) connection updates last_played_server_id, and only when it carries PLAYBACK.
@@ -1453,7 +1478,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
 
     // ---- Phase 8b: Dynamic-PIN branch ----
     if (selected_method.has_value() && selected_method.value() == SendspinPairMethod::DYNAMIC_PIN) {
-        RecordStore& store = *this->client_->record_store_;
+        const RecordStore& store = *this->client_->record_store_;
 
         // Lockout check: if dynamic_pin is locked out, abort immediately.
         if (store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN)) {
@@ -1500,7 +1525,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     // exchange starts: no client/pair-init is sent here. handle_pairing_window_confirmed() sends
     // it once the operator confirms (see D6c in the Phase 8c brief).
     if (selected_method.has_value() && selected_method.value() == SendspinPairMethod::STATIC_PIN) {
-        RecordStore& store = *this->client_->record_store_;
+        const RecordStore& store = *this->client_->record_store_;
 
         // Lockout check: if static_pin is locked out, abort immediately.
         if (store.is_pin_locked_out(SendspinPairMethod::STATIC_PIN)) {

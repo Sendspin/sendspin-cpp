@@ -21,11 +21,21 @@
 
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/types.h"
 #include <gtest/gtest.h>
+#include <ixwebsocket/IXConnectionState.h>
 #include <ixwebsocket/IXWebSocket.h>
+#include <ixwebsocket/IXWebSocketMessage.h>
+#include <ixwebsocket/IXWebSocketMessageType.h>
 #include <ixwebsocket/IXWebSocketServer.h>
 
+// IWYU pragma: begin_keep
+// The include-what-you-use checker misattributes arpa/inet.h's htons/ntohs/htonl/ntohl to
+// macOS libc++'s private headers when analyzed on a macOS host toolchain (a known
+// include-checker false-positive class for macOS private headers like _abort.h/_endian.h); arpa/inet.h is
+// still the correct, portable header on both macOS and Linux CI.
 #include <arpa/inet.h>
+// IWYU pragma: end_keep
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -34,8 +44,11 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>

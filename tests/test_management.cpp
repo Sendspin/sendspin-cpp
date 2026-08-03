@@ -27,10 +27,13 @@
 #include "platform/crypto.h"
 #include "protocol_messages.h"
 #include "record_store.h"
+#include "sendspin/client.h"
+#include "sendspin/config.h"
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>

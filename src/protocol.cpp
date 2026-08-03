@@ -16,6 +16,13 @@
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "protocol_messages.h"
+#include "sendspin/color_role.h"
+#include "sendspin/config.h"
+#include "sendspin/controller_role.h"
+#include "sendspin/metadata_role.h"
+#include "sendspin/player_role.h"
+#include "sendspin/types.h"
+#include "sendspin/visualizer_role.h"
 #include <ArduinoJson.h>
 
 #include <array>
@@ -24,6 +31,9 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace sendspin {
 
@@ -276,6 +286,10 @@ static void parse_color_field(JsonVariantConst var, const char* name,
         }
         color[i] = *component;
     }
+    // cppcheck-suppress autoVariables
+    // False positive: RgbColor is std::array<uint8_t, 3> (include/sendspin/color_role.h), a
+    // plain value type. This assigns *out by value through std::optional's assignment operator;
+    // it does not take the address of the local `color`.
     *out = color;
 }
 

@@ -16,9 +16,13 @@
 
 #include "platform/logging.h"
 #include "platform/time.h"
+#include "platform/types.h"
 #include "protocol_messages.h"
+#include "sendspin/types.h"
 
 #include <algorithm>
+#include <string>
+#include <utility>
 
 namespace sendspin {
 

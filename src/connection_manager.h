@@ -19,12 +19,14 @@
 #pragma once
 
 #include "constants.h"
-#include "management.h"
 #include "protocol_messages.h"
 #include "record_store.h"
 #include "sendspin/client.h"
+#include "sendspin/types.h"
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -70,7 +72,7 @@ static constexpr int64_t NURSERY_ESTABLISH_TIMEOUT_US = seconds_to_us(NURSERY_ES
 /// admission; outbound entries arm theirs when the transport's connected event arrives.
 struct NurseryEntry {
     std::shared_ptr<SendspinConnection> conn;  ///< Observer; the session slot / transport owns
-    bool inbound;  ///< true if accepted by the WS server, false for connect_to()
+    bool inbound{false};  ///< true if accepted by the WS server, false for connect_to()
 };
 
 /// @brief A connection release deferred until conn_ptr_mutex_ has been dropped
@@ -91,7 +93,7 @@ struct DeferredRelease {
 /// leftover-activate case is handled inline in the activate handler, so neither is deferred.)
 struct PairAbortEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection on which the abort arrived
-    PairAbortReason reason;                    ///< Parsed abort reason
+    PairAbortReason reason{};                  ///< Parsed abort reason
 };
 
 /// @brief Deferred local pairing abort: the persistence provider rejected the long-term
@@ -127,7 +129,7 @@ enum class ManagementRequestKind : uint8_t {
 /// preserves the reference's single-concurrent-request property naturally.
 struct ManagementRequestEvent {
     std::shared_ptr<SendspinConnection> conn;              ///< Connection that received the request
-    ManagementRequestKind kind;                            ///< Which management/* request type
+    ManagementRequestKind kind{};                          ///< Which management/* request type
     ManagementAddRecordPayload add_payload;                ///< Populated for ADD_RECORD
     ManagementRemoveRecordPayload remove_payload;          ///< Populated for REMOVE_RECORD
     ManagementSetPairingConfigPayload set_config_payload;  ///< Populated for SET_PAIRING_CONFIG
@@ -139,7 +141,7 @@ struct ManagementRequestEvent {
 struct ServerUnpairEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection that received server/unpair
     std::string matched_psk_id;                ///< psk_id matched for this connection
-    PskCategory psk_category;                  ///< PSK category (must be LONG_TERM to act)
+    PskCategory psk_category{};                ///< PSK category (must be LONG_TERM to act)
 };
 
 // ============================================================================
@@ -160,7 +162,7 @@ enum class PinPairingMessageKind : uint8_t {
 /// on the main loop only, so all PIN message processing is deferred here.
 struct ServerPairingMessageEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection that received the message
-    PinPairingMessageKind kind;                ///< Which PIN message arrived
+    PinPairingMessageKind kind{};              ///< Which PIN message arrived
 
     // server/pair-init fields
     std::array<uint8_t, 32> nonce_a{};  ///< nonce_A decoded from the wire
@@ -529,7 +531,7 @@ private:
     bool send_hello_message(uint8_t remaining_attempts, SendspinConnection* conn);
     /// @brief Removes any pending hello-retry entry associated with the given connection.
     /// @param conn The connection whose retry state should be dropped.
-    void remove_hello_retry(SendspinConnection* conn);
+    void remove_hello_retry(const SendspinConnection* conn);
     /// @brief Returns true if conn already has a pending hello-retry entry. Caller must hold
     /// conn_ptr_mutex_. Used by the noise-completion scan in loop() to arm a connection's hello
     /// exactly once (idempotent re-arming would otherwise reset the backoff every tick).
@@ -553,14 +555,14 @@ private:
     /// @param new_conn The newly proven candidate connection. Must not be null.
     /// @return True if the new connection should become current, false to keep the existing one
     ///         (or reject the newcomer, when current is null this always returns true).
-    bool should_switch_to_new_server(SendspinConnection* current,
-                                     SendspinConnection* new_conn) const;
+    bool should_switch_to_new_server(const SendspinConnection* current,
+                                     const SendspinConnection* new_conn) const;
     /// @brief Updates last_played_server_id when the ADMITTED (current) connection carries the
     /// PLAYBACK activity. Mirrors note_playback_activity in aiosendspin/client/client.py.
     /// No-op if conn is not the current connection, or does not declare PLAYBACK.
     /// Caller must hold conn_ptr_mutex_.
     /// @param conn The connection to check (typically the connection an activate just applied to).
-    void note_playback_activity(SendspinConnection* conn);
+    void note_playback_activity(const SendspinConnection* conn);
 
     /// @brief Promotes a proven nursery entry (it->conn->is_operational() must already be true)
     /// into the current slot, or arbitrates it against an existing current connection, or
@@ -579,8 +581,8 @@ private:
     /// function exit.
     /// @param conn The connection to disconnect and release. Caller's shared_ptr is left empty.
     /// @param reason The goodbye reason to send before closing.
-    void disconnect_and_release(std::shared_ptr<SendspinConnection>&& conn,
-                                SendspinGoodbyeReason reason);
+    static void disconnect_and_release(std::shared_ptr<SendspinConnection>&& conn,
+                                       SendspinGoodbyeReason reason);
     /// @brief Single teardown path: removes a managed connection (the current slot or a nursery
     /// entry), cleans up client state (current slot only), and queues the goodbye+release on
     /// deferred_releases_. The current slot stays empty after a drop; the next nursery

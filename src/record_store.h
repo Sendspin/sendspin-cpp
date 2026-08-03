@@ -37,6 +37,7 @@
 #include "sendspin/config.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -123,6 +124,10 @@ public:
 
     /// @brief Return all long-term records (includes the shared fallback).
     /// Main-loop-only: the reference is invalidated by any concurrent mutation.
+    // cppcheck-suppress unusedFunction
+    // Public accessor, not currently called by this repo's own sources or tests; kept for
+    // consumers that need main-loop-thread, zero-copy record access (records_snapshot() below
+    // is the thread-safe copying alternative already used internally).
     [[nodiscard]] const std::vector<SendspinPairingRecord>& records() const {
         return this->records_;
     }

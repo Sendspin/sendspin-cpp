@@ -21,9 +21,11 @@
 #include "sendspin/config.h"
 #include <ixwebsocket/IXWebSocketServer.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <utility>
 
 namespace sendspin {
 
@@ -91,6 +93,10 @@ public:
     /// @brief No-op on host builds. On ESP the manager loop drives the pending-upgrade reap
     /// through this; here IXWebSocket delivers Open events and times out stalled handshakes on
     /// its own threads (bounded by WS_HANDSHAKE_TIMEOUT_SECS, pinned in start()).
+    // cppcheck-suppress functionStatic
+    // Instance method by API design, matching the ESP build's stateful tick() (see
+    // src/esp/ws_server.h): both platforms expose the same shape so ConnectionManager::loop()
+    // does not need to special-case one over the other.
     void tick() {}
 
     /// @brief Sets the callback invoked when a client connection closes
@@ -122,6 +128,10 @@ public:
     }
 
     /// @brief No-op on host builds; control port is an ESP-IDF httpd concept
+    // cppcheck-suppress functionStatic
+    // Instance method by API design, matching the ESP build's stateful set_ctrl_port() (see
+    // src/esp/ws_server.h): both platforms expose the same shape so callers do not need to
+    // special-case one over the other.
     void set_ctrl_port(uint16_t /*ctrl_port*/) {}
 
     /// @brief Sets the callback invoked when a new client connection is accepted

@@ -14,6 +14,7 @@
 
 #include "file_persistence_provider.h"
 
+#include "sendspin/config.h"
 #include <ArduinoJson.h>
 
 #include <array>
@@ -21,10 +22,12 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <ios>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sendspin {
