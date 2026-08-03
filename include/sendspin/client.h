@@ -20,6 +20,7 @@
 #include "sendspin/config.h"
 #include "sendspin/types.h"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -84,24 +85,105 @@ public:
     virtual bool is_network_ready() = 0;
 };
 
-/// @brief Optional persistence provider for saving/loading client and role state
-/// All methods fire on the main loop thread
+/// @brief Optional persistence provider for saving/loading client state.
+///
+/// All methods fire on the main loop thread.
+///
+/// The platform (e.g., ESPHome) provides a concrete implementation that
+/// serializes to NVS/Preferences (ESP) or a file (host). Every method has a
+/// default no-op / nullopt implementation so a platform can opt in
+/// incrementally, matching the existing style.
 class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;
 
-    /// @brief Saves the FNV1 hash of the last server that was playing
-    /// @param hash FNV1 hash of the last played server ID
-    /// @return true on success, false on failure
-    virtual bool save_last_server_hash(uint32_t /*hash*/) {
+    // ========================================================================
+    // Static X25519 keypair
+    // ========================================================================
+
+    /// @brief Save the static X25519 private key (32 raw bytes).
+    /// @return true on success, false on failure.
+    virtual bool save_static_keypair(const std::array<uint8_t, 32>& /*private_key*/) {
         return false;
     }
 
-    /// @brief Loads the persisted last-played server hash
-    /// @return The saved hash, or nullopt if none saved
-    virtual std::optional<uint32_t> load_last_server_hash() {
+    /// @brief Load the static X25519 private key (32 raw bytes).
+    /// @return The 32-byte private key, or nullopt if not yet saved.
+    virtual std::optional<std::array<uint8_t, 32>> load_static_keypair() {
         return std::nullopt;
     }
+
+    // ========================================================================
+    // Last-played server_id
+    // ========================================================================
+
+    /// @brief Save the server_id of the last server that played audio.
+    /// @param server_id base64url-encoded public key of the server.
+    /// @return true on success, false on failure.
+    virtual bool save_last_played_server_id(const std::string& /*server_id*/) {
+        return false;
+    }
+
+    /// @brief Load the last-played server_id.
+    /// @return The saved server_id string, or nullopt if none saved.
+    virtual std::optional<std::string> load_last_played_server_id() {
+        return std::nullopt;
+    }
+
+    // ========================================================================
+    // Pairing records
+    // ========================================================================
+
+    /// @brief Load all persisted pairing records.
+    /// @return All stored records (may be empty).
+    virtual std::vector<SendspinPairingRecord> load_pairing_records() {
+        return {};
+    }
+
+    /// @brief Persist (add or replace) a pairing record, keyed by psk_id.
+    /// @return true on success, false on failure.
+    virtual bool save_pairing_record(const SendspinPairingRecord& /*record*/) {
+        return false;
+    }
+
+    /// @brief Remove the pairing record with the given psk_id.
+    /// No-op if absent.
+    virtual void remove_pairing_record(const std::string& /*psk_id*/) {}
+
+    // ========================================================================
+    // Accepted Pairing PSK
+    // ========================================================================
+
+    /// @brief Load the accepted Pairing PSK, if any.
+    virtual std::optional<SendspinPairingPsk> load_pairing_psk() {
+        return std::nullopt;
+    }
+
+    /// @brief Save the accepted Pairing PSK.
+    virtual bool save_pairing_psk(const SendspinPairingPsk& /*psk*/) {
+        return false;
+    }
+
+    /// @brief Clear the accepted Pairing PSK.
+    virtual void clear_pairing_psk() {}
+
+    // ========================================================================
+    // Pairing config
+    // ========================================================================
+
+    /// @brief Load the pairing policy config.
+    virtual std::optional<SendspinPairingConfig> load_pairing_config() {
+        return std::nullopt;
+    }
+
+    /// @brief Save the pairing policy config.
+    virtual bool save_pairing_config(const SendspinPairingConfig& /*config*/) {
+        return false;
+    }
+
+    // ========================================================================
+    // Player static delay (unrelated to encryption; kept from pre-Phase-1)
+    // ========================================================================
 
     /// @brief Saves the player's static delay
     /// @param delay_ms Static delay in milliseconds
@@ -444,10 +526,10 @@ private:
     // Persistence
     // ========================================
 
-    /// @brief Loads the last played server hash from persistence
+    /// @brief Loads the last played server_id from persistence
     void load_last_played_server();
 
-    /// @brief Persists the server ID as the last played server (hashed)
+    /// @brief Persists the server_id as the last played server
     void persist_last_played_server(const std::string& server_id);
 
     // ========================================

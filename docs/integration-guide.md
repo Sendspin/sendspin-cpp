@@ -427,14 +427,14 @@ Allows the library to persist and restore state across reboots. Useful on embedd
 
 ```cpp
 struct MyPersistenceProvider : SendspinPersistenceProvider {
-    // Save/load the hash of the last server that was playing audio.
+    // Save/load the server_id of the last server that was playing audio.
     // Used to prioritize reconnection to the same server.
-    bool save_last_server_hash(uint32_t hash) override {
-        return nvs_write("last_server", hash);
+    bool save_last_played_server_id(const std::string& server_id) override {
+        return nvs_write_string("last_server", server_id);
     }
-    std::optional<uint32_t> load_last_server_hash() override {
-        uint32_t hash;
-        if (nvs_read("last_server", &hash)) return hash;
+    std::optional<std::string> load_last_played_server_id() override {
+        std::string server_id;
+        if (nvs_read_string("last_server", &server_id)) return server_id;
         return std::nullopt;
     }
 

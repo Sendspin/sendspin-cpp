@@ -32,6 +32,11 @@ add_executable(sendspin_tests
     test_crypto.cpp
     test_cpace.cpp
     test_pin.cpp
+    test_record_store.cpp
+
+    # FilePersistenceProvider is a host example helper (examples/common/), not part of the
+    # library; compile it into the test target so the record-store tests can exercise it.
+    ../examples/common/file_persistence_provider.cpp
 )
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...) and
@@ -42,6 +47,7 @@ add_executable(sendspin_tests
 target_include_directories(sendspin_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/crypto
+    ${CMAKE_CURRENT_SOURCE_DIR}/../examples/common
 )
 
 target_link_libraries(sendspin_tests PRIVATE sendspin GTest::gtest_main)

@@ -27,6 +27,9 @@ function(sendspin_get_sources BASE_DIR)
         # Connection management
         ${BASE_DIR}/src/connection_manager.cpp
 
+        # Pairing record store
+        ${BASE_DIR}/src/record_store.cpp
+
         # Client orchestration
         ${BASE_DIR}/src/client.cpp
 

@@ -1,0 +1,227 @@
+// Copyright 2026 Sendspin Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/// @file record_store.h
+/// @brief In-memory client pairing record store.
+///
+/// Mirrors the client side of `aiosendspin/noise/trust_store.py`
+/// (`InMemoryClientPairingStore`). Holds records in memory, calls the
+/// `SendspinPersistenceProvider` for durability, and resolves `psk_id` ->
+/// PSK for the Noise handshake layer.
+///
+/// Resolution order: long-term record -> accepted Pairing PSK -> Sentinel PSK.
+///
+/// Construction pre-provisions a shared-PSK fallback record and points
+/// `record_mode_psk_id` at it, mirroring the Python store's `__init__`.
+///
+/// The record types used here (`SendspinPairingRecord`, `SendspinPairingPsk`,
+/// `SendspinPairingConfig`) are the public types from `sendspin/config.h` so
+/// that the persistence provider can pass them through without conversion.
+
+#pragma once
+
+#include "crypto/constants.h"
+#include "sendspin/client.h"
+#include "sendspin/config.h"
+
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace sendspin {
+
+// ============================================================================
+// PSK category
+// ============================================================================
+
+/// @brief Which kind of PSK was matched during a handshake.
+/// Mirrors `PskCategory` in `aiosendspin/noise/trust_store.py`.
+enum class PskCategory : uint8_t {
+    LONG_TERM,  ///< Per-pair long-term PSK from a successful pairing.
+    PAIRING,    ///< Pairing PSK distributed out-of-band to admit a new server.
+    SENTINEL,   ///< Published Sentinel PSK - authenticates nothing on its own.
+};
+
+// ============================================================================
+// Resolved PSK (handshake currency)
+// ============================================================================
+
+/// @brief A PSK selected during a handshake, with its trust metadata.
+/// Mirrors `ResolvedPsk` in `aiosendspin/noise/trust_store.py`.
+struct ResolvedPsk {
+    std::string psk_id;
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+    PskCategory category{PskCategory::SENTINEL};
+    /// Peer server_id for stored-pubkey records; empty optional = shared / sentinel / pairing.
+    std::optional<std::string> counterparty_id;
+};
+
+// ============================================================================
+// RecordStore
+// ============================================================================
+
+/// @brief In-memory client pairing record store.
+///
+/// Thread-safety: intended to run only on the main loop thread, matching
+/// the existing deferred-event pattern in client.cpp / connection_manager.cpp.
+/// Do NOT call from the network thread.
+class RecordStore {
+public:
+    /// @brief Construct and pre-provision the shared-PSK fallback record.
+    /// If a persistence provider is supplied, attempts to load saved records
+    /// and pairing config first; generates fresh material only when absent.
+    explicit RecordStore(SendspinPersistenceProvider* provider);
+
+    virtual ~RecordStore() = default;
+
+    // ========================================================================
+    // PSK resolution (used by the Noise handshake, Phase 2+)
+    // ========================================================================
+
+    /// @brief Resolve a psk_id to its PSK for the handshake.
+    /// Order: long-term record -> accepted Pairing PSK -> Sentinel PSK.
+    /// Returns nullopt only if psk_id is entirely unknown (not even Sentinel).
+    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id(const std::string& psk_id) const;
+
+    // ========================================================================
+    // Long-term record management
+    // ========================================================================
+
+    /// @brief Return the long-term record identified by psk_id, if any.
+    [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(const std::string& psk_id) const;
+
+    /// @brief Return the stored-pubkey record bound to server_id, if any.
+    /// Shared-PSK records (server_id absent) are never returned here.
+    [[nodiscard]] const SendspinPairingRecord* record_by_server_id(
+        const std::string& server_id) const;
+
+    /// @brief Return all long-term records (includes the shared fallback).
+    [[nodiscard]] const std::vector<SendspinPairingRecord>& records() const {
+        return this->records_;
+    }
+
+    /// @brief Persist and store a long-term record. Replaces any existing record
+    /// with the same psk_id.
+    ///
+    /// The provider write happens first: when it fails, the in-memory store is left
+    /// untouched so the caller can fail the exchange closed instead of completing it on
+    /// a key that would be lost at the next reboot.
+    /// @return true when the record is stored (and persisted, when a provider is set);
+    /// false when the persistence provider rejected the write.
+    bool store_record(SendspinPairingRecord record);
+
+    /// @brief Remove the long-term record identified by psk_id.
+    /// No-op if absent.
+    void remove_record(const std::string& psk_id);
+
+    /// @brief Flag the record at psk_id as used. No-op if absent or already used.
+    void mark_record_used(const std::string& psk_id);
+
+    /// @brief Return whether the record may be removed.
+    /// The record referenced by record_mode_psk_id is protected.
+    [[nodiscard]] bool can_remove_record(const std::string& psk_id) const;
+
+    // ========================================================================
+    // Pairing PSK (the one the client accepts to admit a new server)
+    // ========================================================================
+
+    /// @brief Set the accepted Pairing PSK, replacing any existing one.
+    void set_pairing_psk(SendspinPairingPsk psk);
+
+    /// @brief Clear the accepted Pairing PSK. No-op if absent.
+    void clear_pairing_psk();
+
+    /// @brief Return the accepted Pairing PSK, if any.
+    [[nodiscard]] const std::optional<SendspinPairingPsk>& pairing_psk() const {
+        return this->pairing_psk_;
+    }
+
+    // ========================================================================
+    // Pairing config
+    // ========================================================================
+
+    /// @brief Return whether Pairing-PSK pairing is enabled.
+    [[nodiscard]] bool pairing_psk_enabled() const {
+        return this->pairing_psk_enabled_;
+    }
+
+    /// @brief Return whether unpaired (Sentinel) access is allowed.
+    [[nodiscard]] bool unpaired_access_enabled() const {
+        return this->unpaired_access_enabled_;
+    }
+
+    /// @brief Return the psk_id of the shared-PSK fallback record.
+    [[nodiscard]] const std::string& record_mode_psk_id() const {
+        return this->record_mode_psk_id_;
+    }
+
+    /// @brief Set the shared-PSK fallback record.
+    /// @return false if psk_id does not reference an existing shared-PSK record.
+    bool set_record_mode_psk_id(const std::string& psk_id);
+
+    /// @brief Set the pairing-PSK-enabled flag and persist the config.
+    void set_pairing_psk_enabled(bool enabled);
+
+    /// @brief Set the unpaired-access-enabled flag and persist the config.
+    void set_unpaired_access_enabled(bool enabled);
+
+    // ========================================================================
+    // Pairing outcome (Phase 5+, declared now for completeness)
+    // ========================================================================
+
+    /// @brief Decide a pairing outcome.
+    ///
+    /// When storage is not exhausted (`can_store_record()` is true), generates a
+    /// fresh PSK bound to server_id and returns {psk, record}.
+    /// When storage is exhausted, returns the shared fallback PSK and record=nullopt.
+    /// Returns nullopt on error (missing shared fallback).
+    struct PairingOutcome {
+        std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+        /// nullopt = storage exhausted, use the shared-PSK fallback record.
+        std::optional<SendspinPairingRecord> record;
+    };
+    [[nodiscard]] std::optional<PairingOutcome> resolve_pairing_outcome(
+        const std::string& server_id, const std::optional<std::string>& label = std::nullopt);
+
+    /// @brief Return true if a new record can be stored (default: always true).
+    [[nodiscard]] virtual bool can_store_record() const {
+        return true;
+    }
+
+private:
+    /// @brief Return true if a resolved PSK is a shared-PSK record (long-term, no counterparty).
+    static bool is_shared_record(const ResolvedPsk& r);
+
+    /// @brief Find the index of a record by psk_id, or npos if absent.
+    [[nodiscard]] size_t find_index(const std::string& psk_id) const;
+
+    /// @brief Persist the current pairing config via the provider.
+    void persist_config();
+
+    std::vector<SendspinPairingRecord> records_;
+    std::optional<SendspinPairingPsk> pairing_psk_;
+
+    // Pairing config
+    bool pairing_psk_enabled_{true};
+    bool unpaired_access_enabled_{false};
+    // Deferred PIN fields (forward-compat; a later phase implements the state machine)
+    // std::optional<std::string> static_pin_;  // not used until that phase
+    std::string record_mode_psk_id_;
+
+    SendspinPersistenceProvider* provider_{nullptr};
+};
+
+}  // namespace sendspin

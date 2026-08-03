@@ -30,8 +30,6 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.conn_mgr";
 
-static constexpr uint32_t FNV_OFFSET_BASIS = 2166136261UL;
-static constexpr uint32_t FNV_PRIME = 16777619UL;
 static constexpr int64_t WS_SERVER_START_RETRY_MS = 5000LL;
 static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * US_PER_MS;
 
@@ -494,18 +492,9 @@ bool ConnectionManager::is_connected() const {
 // Handoff support
 // ============================================================================
 
-void ConnectionManager::set_last_played_server_hash(uint32_t hash) {
-    this->last_played_server_hash_ = hash;
-    this->has_last_played_server_ = true;
-}
-
-uint32_t ConnectionManager::fnv1_hash(const char* str) {
-    uint32_t hash = FNV_OFFSET_BASIS;
-    while (*str != '\0') {
-        hash *= FNV_PRIME;
-        hash ^= static_cast<uint8_t>(*str++);
-    }
-    return hash;
+void ConnectionManager::set_last_played_server_id(const std::string& server_id) {
+    this->last_played_server_id_ = server_id;
+    this->has_last_played_server_ = !server_id.empty();
 }
 
 // ============================================================================
@@ -827,13 +816,13 @@ bool ConnectionManager::should_switch_to_new_server(SendspinConnection* current,
         return false;
     }
 
-    // Both discovery -> prefer last played server
+    // Both discovery -> prefer last played server (compare server_id strings directly)
     if (this->has_last_played_server_) {
-        if (fnv1_hash(new_conn->get_server_id().c_str()) == this->last_played_server_hash_) {
+        if (new_conn->get_server_id() == this->last_played_server_id_) {
             SS_LOGD(TAG, "New server matches last played server, switching");
             return true;
         }
-        if (fnv1_hash(current->get_server_id().c_str()) == this->last_played_server_hash_) {
+        if (current->get_server_id() == this->last_played_server_id_) {
             SS_LOGD(TAG, "Current server matches last played server, keeping");
             return false;
         }

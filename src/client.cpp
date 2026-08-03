@@ -983,10 +983,10 @@ void SendspinClient::load_last_played_server() {
         return;
     }
 
-    auto hash = this->persistence_provider_->load_last_server_hash();
-    if (hash.has_value() && hash.value() != 0) {
-        this->connection_manager_->set_last_played_server_hash(hash.value());
-        SS_LOGI(TAG, "Loaded last played server hash: 0x%08X", hash.value());
+    auto server_id = this->persistence_provider_->load_last_played_server_id();
+    if (server_id.has_value() && !server_id->empty()) {
+        this->connection_manager_->set_last_played_server_id(server_id.value());
+        SS_LOGI(TAG, "Loaded last played server: %s", server_id->c_str());
     }
 }
 
@@ -995,13 +995,11 @@ void SendspinClient::persist_last_played_server(const std::string& server_id) {
         return;
     }
 
-    uint32_t hash = ConnectionManager::fnv1_hash(server_id.c_str());
-    this->connection_manager_->set_last_played_server_hash(hash);
+    this->connection_manager_->set_last_played_server_id(server_id);
 
     if (this->persistence_provider_) {
-        if (this->persistence_provider_->save_last_server_hash(hash)) {
-            SS_LOGD(TAG, "Persisted last played server: %s (hash: 0x%08X)", server_id.c_str(),
-                    hash);
+        if (this->persistence_provider_->save_last_played_server_id(server_id)) {
+            SS_LOGD(TAG, "Persisted last played server: %s", server_id.c_str());
         } else {
             SS_LOGW(TAG, "Failed to persist last played server");
         }

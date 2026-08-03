@@ -19,6 +19,7 @@
 
 #include "sendspin/types.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -26,6 +27,39 @@
 #include <vector>
 
 namespace sendspin {
+
+// ============================================================================
+// Persistence types (used by SendspinPersistenceProvider)
+// ============================================================================
+
+/// @brief A long-term pairing record stored on behalf of the client.
+/// Mirrors `ClientPairingRecord` in `aiosendspin/noise/trust_store.py`.
+/// `server_id` is absent for shared-PSK (fallback) records.
+struct SendspinPairingRecord {
+    std::string psk_id;
+    std::array<uint8_t, 32> psk{};
+    std::optional<std::string> server_id;  ///< Absent = shared-PSK record.
+    std::optional<std::string> label;
+    bool used{false};
+};
+
+/// @brief An accepted Pairing PSK the client stores for admitting a server.
+/// Mirrors `PairingPsk` in trust_store.py.
+struct SendspinPairingPsk {
+    std::string psk_id;
+    std::array<uint8_t, 32> psk{};
+    std::optional<std::string> label;
+};
+
+/// @brief Pairing policy persisted by the client.
+struct SendspinPairingConfig {
+    bool pairing_psk_enabled{true};
+    bool unpaired_access_enabled{false};
+    // PIN fields are deferred to a later phase of the encryption port. Carried as a
+    // comment for forward-compat only; do not add live fields here until that phase.
+    // std::optional<std::string> static_pin;
+    std::string record_mode_psk_id;  ///< psk_id of the shared-PSK fallback record.
+};
 
 // ============================================================================
 // Client config

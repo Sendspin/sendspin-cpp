@@ -19,7 +19,6 @@
 // property or the delivery-at-upgrade contract (connections reach the manager only after their
 // WebSocket upgrade; raw-TCP junk is closed inside the transport layer and never occupies a slot).
 
-#include "connection_manager.h"  // fnv1_hash for the last-played preference
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include <gtest/gtest.h>
@@ -84,14 +83,14 @@ public:
 
 class TestPersistenceProvider : public SendspinPersistenceProvider {
 public:
-    explicit TestPersistenceProvider(uint32_t hash) : hash_(hash) {}
+    explicit TestPersistenceProvider(std::string server_id) : server_id_(std::move(server_id)) {}
 
-    std::optional<uint32_t> load_last_server_hash() override {
-        return this->hash_;
+    std::optional<std::string> load_last_played_server_id() override {
+        return this->server_id_;
     }
 
 private:
-    uint32_t hash_;
+    std::string server_id_;
 };
 
 /// Pumps client.loop() (like a platform main loop would) until the predicate returns true or the
@@ -502,7 +501,7 @@ TEST(ConnectionLifecycle, EarlyServerHelloDoesNotWedge) {
 // rather than the empty-slot promotion.
 TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     TestNetworkProvider network;
-    TestPersistenceProvider persistence(ConnectionManager::fnv1_hash("server-b"));
+    TestPersistenceProvider persistence("server-b");
     SendspinClient client(make_config(RACE_TEST_PORT));
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);

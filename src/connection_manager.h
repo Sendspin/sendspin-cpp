@@ -192,12 +192,9 @@ public:
     // Handoff support
     // ========================================
 
-    /// @brief Sets the last-played server hash for handoff preference decisions.
-    /// @param hash FNV-1 hash of the last-played server ID.
-    void set_last_played_server_hash(uint32_t hash);
-
-    /// @brief FNV-1 hash function for strings.
-    static uint32_t fnv1_hash(const char* str);
+    /// @brief Sets the last-played server_id for handoff preference decisions.
+    /// @param server_id The server_id string of the last-played server.
+    void set_last_played_server_id(const std::string& server_id);
 
 private:
     // ========================================
@@ -353,8 +350,8 @@ private:
     std::shared_ptr<SendspinConnection> current_connection_;
     std::unique_ptr<SendspinWsServer> ws_server_;
 
-    // 32-bit fields
-    uint32_t last_played_server_hash_{0};
+    // String fields
+    std::string last_played_server_id_;  ///< server_id of the last-played server (empty if unset).
 
     // 64-bit fields
     /// Earliest time (us) to attempt another WS server start after a failure. Main-loop only.
