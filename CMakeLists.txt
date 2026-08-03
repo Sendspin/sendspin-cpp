@@ -44,7 +44,7 @@ if(ESP_IDF_BUILD)
     # Assemble source list from core + enabled roles (driven by Kconfig)
     set(SENDSPIN_ALL_SOURCES ${SENDSPIN_CORE_SOURCES} ${SENDSPIN_ESP_SOURCES})
 
-    set(SENDSPIN_REQUIRES esp_http_server esp_netif esp_timer esp_ringbuf pthread mbedtls bblanchon__arduinojson esphome__noise-c)
+    set(SENDSPIN_REQUIRES esp_http_server esp_netif esp_timer esp_ringbuf esp_hw_support pthread mbedtls bblanchon__arduinojson esphome__noise-c)
     set(SENDSPIN_COMPILE_DEFS "")
 
     if(CONFIG_SENDSPIN_ENABLE_PLAYER)
@@ -79,12 +79,20 @@ if(ESP_IDF_BUILD)
     endif()
 
     # Register the component — uses assembled source list
+    # WHOLE_ARCHIVE: this component defines noise_rand_bytes() (src/esp/noise_rand.cpp), which the
+    # esphome__noise-c component references but does not define (it is built with
+    # NOISE_USE_CUSTOM_RAND=1). Because noise-c depends on sendspin-cpp and sendspin-cpp depends on
+    # noise-c, the link is circular; without --whole-archive the linker never pulls noise_rand.o
+    # from libsendspin-cpp.a (it is not referenced at the point that archive is scanned) and the
+    # link fails with "undefined reference to noise_rand_bytes". --gc-sections still strips genuinely
+    # unused sections, so this does not bloat the image.
     idf_component_register(
         SRCS ${SENDSPIN_ALL_SOURCES}
         INCLUDE_DIRS "include"
         PRIV_INCLUDE_DIRS "src" "src/esp" "src/crypto"
         REQUIRES ${SENDSPIN_REQUIRES}
         PRIV_REQUIRES espressif__esp_websocket_client
+        WHOLE_ARCHIVE
     )
 
     # Apply compile definitions for enabled roles

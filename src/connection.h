@@ -18,12 +18,15 @@
 
 #pragma once
 
+#include "noise_handshake.h"
+#include "noise_transport.h"
 #include "platform/memory.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "time_filter.h"
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -71,6 +74,9 @@ using SendCompleteCallback = std::function<void(bool)>;
  */
 class SendspinConnection : public std::enable_shared_from_this<SendspinConnection> {
 public:
+    /// @brief Wires the NoiseTransport frame sink to this connection's send_binary_message().
+    SendspinConnection();
+
     virtual ~SendspinConnection();
 
     /// @brief Starts the connection (e.g., initiates client connection or begins message
@@ -106,6 +112,81 @@ public:
     /// @return true if handshake complete (hello exchange done), false otherwise.
     bool is_handshake_complete() const {
         return this->client_hello_sent_ && this->server_hello_received_;
+    }
+
+    // ========================================
+    // Noise transport (Phase 2)
+    // ========================================
+
+    /// @brief Initialize the Noise handshake driver for this connection.
+    /// Must be called before the WS connection is open.
+    /// @param identity     Client static X25519 identity.
+    /// @param record_store Record store for psk_id resolution.
+    /// @param suite_name   Noise suite name string.
+    void init_noise_handshake(const Identity& identity, const RecordStore& record_store,
+                              const std::string& suite_name);
+
+    /// @brief Return true once the Noise handshake has completed and transport is encrypted.
+    bool is_noise_handshake_complete() const {
+        return this->noise_handshake_complete_.load(std::memory_order_acquire);
+    }
+
+    /// @brief Return true if a Noise handshake driver has been installed on this connection.
+    bool has_noise_handshake() const {
+        return this->noise_handshake_ != nullptr;
+    }
+
+    /// @brief Build and send the client/init TEXT frame that starts the Noise handshake.
+    /// No-op if no handshake driver is installed.
+    /// Must be called after the WebSocket connection is open (from on_connected_cb).
+    void send_noise_client_init();  // implemented in connection.cpp
+
+    /// @brief Encrypt and send a JSON string as a Noise transport binary frame.
+    /// Thin delegate to NoiseTransport::send_json().
+    /// @return SsErr::OK on success.
+    SsErr send_encrypted_text(const char* json, size_t len) {
+        return this->noise_transport_.send_json(json, len);
+    }
+    SsErr send_encrypted_text(const std::string& json) {
+        return this->noise_transport_.send_json(json);
+    }
+
+    /// @brief Send an application-level JSON message.
+    ///
+    /// This is the single choke point for all post-handshake application JSON.
+    /// - If the Noise transport is active, routes through send_encrypted_text() so the
+    ///   frame is encrypted.
+    /// - If not yet encrypted (pre-handshake), routes through send_text_message().
+    ///
+    /// All role senders (client/hello, client/state, client/command, client/goodbye,
+    /// client/time) should use this method once Noise is wired up by the connection manager
+    /// (Phase 4); today they still call send_text_message() directly, so this choke point is
+    /// exercised only by send_goodbye_reason() and the two send_time_message() overrides that
+    /// already avoid std::string materialization on the hot path.
+    /// @param json    JSON string to send.
+    /// @param cb      Optional send-complete callback (best-effort; see send_text_message).
+    /// @param allow_before_hello  Passed through to send_text_message on the pre-noise path.
+    /// @return SsErr::OK if queued/sent, error code otherwise.
+    SsErr send_app_json(const std::string& json, SendCompleteCallback cb = nullptr,
+                        bool allow_before_hello = false);
+
+    /// @brief Pointer/length overload of send_app_json for stack-formatted JSON (e.g. the
+    /// periodic client/time messages): encrypts straight from the caller's buffer with no
+    /// std::string materialization on the hot encrypted path. The pre-handshake text fallback
+    /// (cold: only client/hello-era traffic) builds the string it needs.
+    SsErr send_app_json(const char* json, size_t len, SendCompleteCallback cb = nullptr,
+                        bool allow_before_hello = false);
+
+    /// @brief Encrypt and send pre-typed binary data as a Noise transport binary frame.
+    /// Thin delegate to NoiseTransport::send_binary().
+    /// @param data  Pointer to type-prefixed binary bytes (first byte is the role type byte).
+    /// @param len   Total length including the type byte.
+    /// @return SsErr::OK on success.
+    // No client-to-server binary message exists yet, so nothing calls this today; kept as the
+    // entry point for the first such feature rather than removed and re-added later.
+    // cppcheck-suppress unusedFunction
+    SsErr send_encrypted_binary(const uint8_t* data, size_t len) {
+        return this->noise_transport_.send_binary(data, len);
     }
 
     /// @brief Gets the socket file descriptor for this connection
@@ -161,6 +242,17 @@ public:
     ///
     /// @return true if the message was queued/sent successfully, false otherwise.
     virtual bool send_time_message() = 0;
+
+    /// @brief Sends a binary WebSocket frame to the peer.
+    /// @param data   Pointer to the binary payload bytes.
+    /// @param len    Number of bytes to send.
+    /// @param cb     Optional completion callback (best-effort, may be skipped on teardown).
+    /// @param allow_before_hello  If true, bypasses the pre-hello send gate (mirrors the
+    ///               same flag on send_text_message; binary frames should not precede the
+    ///               Noise handshake, so the default is false).
+    /// @return SsErr::OK if queued/sent, error code otherwise.
+    virtual SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
+                                      bool allow_before_hello = false) = 0;
 
     /// @brief Sends a goodbye message with completion callback
     /// @param reason The reason for disconnecting.
@@ -280,6 +372,14 @@ public:
         this->client_hello_sent_ = sent;
     }
 
+    /// @brief Called by dispatch_completed_message() to drive the noise handshake for an
+    /// incoming text frame received before transport mode is established.
+    /// @param text         The raw text content of the received TEXT frame.
+    /// @return true if the frame was consumed by the handshake (caller must not dispatch it).
+    ///         false if the frame should be treated as normal application traffic (no handshake
+    ///         driver installed on this connection).
+    bool handle_noise_handshake_text(const std::string& text);
+
     /// @brief Returns whether this connection has successfully sent its client/hello.
     /// @return true once a client/hello send has completed on this connection.
     bool has_client_hello_sent() const {
@@ -350,7 +450,27 @@ public:
         this->websocket_payload_location_ = location;
     }
 
+    /// @brief Sets the memory location preference for the Noise transport's fragment
+    /// reassembly and fragmentation buffers.
+    /// @param location PREFER_EXTERNAL (SPIRAM-first) or PREFER_INTERNAL (internal-RAM-first).
+    /// @note Must be called before the handshake completes; takes effect on the next allocation.
+    void set_noise_buffer_location(MemoryLocation location) {
+        this->noise_transport_.set_buffer_location(location);
+    }
+
 protected:
+    // ========================================
+    // Noise transport helpers (connection.cpp)
+    // ========================================
+
+    /// @brief Dispatch a complete (non-fragment, fully reassembled) transport message:
+    /// type 0 as JSON (without the type byte), all other types as binary role messages.
+    void dispatch_complete_noise_message(uint8_t* plaintext, size_t len, int64_t receive_time);
+
+    // ========================================
+    // WebSocket payload buffer management
+    // ========================================
+
     /// @brief Deallocates the websocket payload buffer if allocated
     void deallocate_websocket_payload();
 
@@ -389,6 +509,17 @@ protected:
         static std::atomic<uint64_t> counter{1};
         return counter.fetch_add(1, std::memory_order_relaxed);
     }
+
+    // ========================================
+    // Noise transport state (Phase 2)
+    // ========================================
+
+    /// Noise handshake driver (active from connection open until handshake complete).
+    std::unique_ptr<NoiseHandshake> noise_handshake_;
+
+    /// Encrypted transport: owns the cipher session, its mutex, outbound fragmentation,
+    /// and inbound reassembly. See noise_transport.h for the threading contract.
+    NoiseTransport noise_transport_;
 
     // Struct fields
 
@@ -431,6 +562,10 @@ protected:
     /// worker thread on ESP) and the disconnect handlers (network thread), while
     /// is_handshake_complete() and the pre-hello send gate read it from other threads.
     std::atomic<bool> client_hello_sent_{false};
+
+    /// True once the Noise transport handshake has completed (set on the network thread,
+    /// read from the main loop via is_noise_handshake_complete()).
+    std::atomic<bool> noise_handshake_complete_{false};
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).
     /// Written from the transport connected callback (network thread), read by the manager's

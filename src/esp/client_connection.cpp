@@ -157,6 +157,35 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     return SsErr::OK;
 }
 
+SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len,
+                                                    SendCompleteCallback cb,
+                                                    bool /*allow_before_hello*/) {
+    if (!this->is_connected()) {
+        if (cb) {
+            cb(false);
+        }
+        return SsErr::INVALID_STATE;
+    }
+
+    // esp_websocket_client_send_bin sends a binary-opcode WebSocket frame.
+    int sent = esp_websocket_client_send_bin(this->client_, reinterpret_cast<const char*>(data),
+                                             static_cast<int>(len),
+                                             pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
+
+    bool success = (sent >= 0);
+
+    if (cb) {
+        cb(success);
+    }
+
+    if (!success) {
+        SS_LOGE(TAG, "Failed to send binary message (timeout or error): %d", sent);
+        return SsErr::FAIL;
+    }
+
+    return SsErr::OK;
+}
+
 bool SendspinClientConnection::send_time_message() {
     if (!this->is_connected()) {
         return false;
@@ -173,6 +202,13 @@ bool SendspinClientConnection::send_time_message() {
     }
     this->update_serialize_ema(esp_timer_get_time() - client_transmitted);
 
+    if (this->noise_transport_.is_active()) {
+        // Noise transport active: encrypt the JSON frame straight from the stack buffer.
+        // Atomic check, safe on this thread.
+        return this->send_app_json(buf, len, nullptr) == SsErr::OK;
+    }
+
+    // Pre-Noise: send as plain text.
     int sent = esp_websocket_client_send_text(this->client_, buf, len,
                                               pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
     if (sent < 0) {

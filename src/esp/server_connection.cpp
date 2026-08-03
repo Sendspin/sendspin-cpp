@@ -172,6 +172,61 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
     return SsErr::OK;
 }
 
+SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
+                                                    SendCompleteCallback on_complete,
+                                                    bool allow_before_hello) {
+    if (!this->is_connected()) {
+        if (on_complete) {
+            on_complete(false);
+        }
+        return SsErr::INVALID_STATE;
+    }
+
+    struct AsyncRespArg* resp_arg =
+        static_cast<AsyncRespArg*>(platform_malloc(sizeof(AsyncRespArg)));
+    if (resp_arg == nullptr) {
+        SS_LOGE(TAG, "Failed to allocate AsyncRespArg for binary send");
+        if (on_complete) {
+            on_complete(false);
+        }
+        return SsErr::NO_MEM;
+    }
+
+    new (resp_arg) AsyncRespArg();
+    resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
+    resp_arg->allow_before_hello = allow_before_hello;
+    resp_arg->payload = static_cast<uint8_t*>(platform_malloc(len));
+    if (resp_arg->payload == nullptr) {
+        SS_LOGE(TAG, "Failed to allocate %zu bytes for binary payload", len);
+        resp_arg->~AsyncRespArg();
+        platform_free(resp_arg);
+        if (on_complete) {
+            on_complete(false);
+        }
+        return SsErr::NO_MEM;
+    }
+    resp_arg->len = len;
+
+    if (on_complete) {
+        resp_arg->has_callback = true;
+        resp_arg->on_complete = std::move(on_complete);
+    }
+
+    std::memcpy((void*)resp_arg->payload, (void*)data, len);
+
+    if (httpd_queue_work(this->server_, async_send_binary, resp_arg) != ESP_OK) {
+        SS_LOGE(TAG, "httpd_queue_work failed for binary send!");
+        platform_free(resp_arg->payload);
+        if (resp_arg->has_callback) {
+            resp_arg->on_complete(false);
+        }
+        resp_arg->~AsyncRespArg();
+        platform_free(resp_arg);
+        return SsErr::FAIL;
+    }
+    return SsErr::OK;
+}
+
 void SendspinServerConnection::trigger_close() {
     // Gate on is_connected(): once close_callback has marked this connection closed, httpd may
     // recycle the fd onto a freshly-accepted session, and closing by the stale fd would kill the
@@ -300,12 +355,44 @@ void SendspinServerConnection::async_send_time_text(void* arg) {
         return;
     }
 
-    ws_pkt.payload = reinterpret_cast<uint8_t*>(buf);
-    ws_pkt.len = len;
-
     conn->update_serialize_ema(esp_timer_get_time() - client_transmitted);
 
+    if (conn->noise_transport_.is_active()) {
+        // Noise transport active: encrypt the JSON frame straight from the stack buffer.
+        // send_app_json calls send_encrypted_text which calls send_binary_message which
+        // calls httpd_queue_work (async). This is safe to call from the httpd worker;
+        // is_active() is an atomic read.
+        conn->send_app_json(buf, len, nullptr);
+        return;
+    }
+
+    // Pre-Noise or no Noise: send as plain text frame directly.
+    ws_pkt.payload = reinterpret_cast<uint8_t*>(buf);
+    ws_pkt.len = len;
     httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt);
+}
+
+void SendspinServerConnection::async_send_binary(void* arg) {
+    auto* resp_arg = static_cast<AsyncRespArg*>(arg);
+    httpd_ws_frame_t ws_pkt;
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+
+    ws_pkt.payload = resp_arg->payload;
+    ws_pkt.len = resp_arg->len;
+    ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+
+    auto conn = resp_arg->conn.lock();
+    if (conn && conn->is_connected() &&
+        (resp_arg->allow_before_hello || conn->client_hello_sent_)) {
+        esp_err_t err = httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt);
+        if (resp_arg->has_callback) {
+            resp_arg->on_complete(err == ESP_OK);
+        }
+    }
+
+    platform_free(ws_pkt.payload);
+    resp_arg->~AsyncRespArg();
+    platform_free(resp_arg);
 }
 
 void SendspinServerConnection::async_send_text(void* arg) {

@@ -83,6 +83,27 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
     return success ? SsErr::OK : SsErr::FAIL;
 }
 
+SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
+                                                    SendCompleteCallback on_complete,
+                                                    bool /*allow_before_hello*/) {
+    if (!this->is_connected()) {
+        if (on_complete) {
+            on_complete(false);
+        }
+        return SsErr::INVALID_STATE;
+    }
+
+    std::string buf(reinterpret_cast<const char*>(data), len);
+    auto info = this->ws_->sendBinary(buf);
+    bool success = info.success;
+
+    if (on_complete) {
+        on_complete(success);
+    }
+
+    return success ? SsErr::OK : SsErr::FAIL;
+}
+
 bool SendspinServerConnection::send_time_message() {
     if (!this->is_connected()) {
         return false;
@@ -95,7 +116,9 @@ bool SendspinServerConnection::send_time_message() {
         return false;
     }
     this->update_serialize_ema(platform_time_us() - client_transmitted);
-    return this->ws_->send(std::string(buf, len)).success;
+    // Route through send_app_json so the frame is encrypted when Noise is active;
+    // the pointer/length overload encrypts straight from the stack buffer.
+    return this->send_app_json(buf, len, nullptr) == SsErr::OK;
 }
 
 void SendspinServerConnection::trigger_close() {

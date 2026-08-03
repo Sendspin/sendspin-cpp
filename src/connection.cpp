@@ -14,11 +14,13 @@
 
 #include "connection.h"
 
+#include "crypto/constants.h"
 #include "platform/compiler.h"
 #include "platform/logging.h"
 #include "time_filter.h"
 
 #include <memory>
+#include <utility>
 
 namespace sendspin {
 
@@ -27,6 +29,14 @@ static const char* const TAG = "sendspin.connection";
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
+
+SendspinConnection::SendspinConnection() {
+    // The transport emits encrypted frames through this connection's binary send path.
+    // allow_before_hello=true: Noise frames are transport-level and precede the app hello.
+    this->noise_transport_.set_frame_sink([this](const uint8_t* data, size_t len) {
+        return this->send_binary_message(data, len, nullptr, /*allow_before_hello=*/true);
+    });
+}
 
 SendspinConnection::~SendspinConnection() = default;
 
@@ -44,10 +54,146 @@ void SendspinConnection::init_time_filter() {
 
 SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
                                               SendCompleteCallback on_complete) {
-    // Goodbye is a control message that may legitimately be sent before the client/hello (e.g.,
-    // when rejecting an excess connection), so it bypasses the pre-hello send gate.
-    return this->send_text_message(format_client_goodbye_message(reason), std::move(on_complete),
-                                   /*allow_before_hello=*/true);
+    // Goodbye must be sent even when Noise transport is active - route through send_app_json
+    // so it is encrypted. allow_before_hello=true because goodbye can precede the hello (e.g.,
+    // when rejecting an excess connection before the handshake finishes).
+    return this->send_app_json(format_client_goodbye_message(reason), std::move(on_complete),
+                               /*allow_before_hello=*/true);
+}
+
+SsErr SendspinConnection::send_app_json(const std::string& json, SendCompleteCallback cb,
+                                        bool allow_before_hello) {
+    // is_active() is an atomic read; nothing on this connection mutates the transport
+    // concurrently in this phase (re-handshake, the only concurrent mutator, lands in a
+    // later phase), so this check is race-free today and stays race-free once that phase
+    // wires a concurrent swap, since NoiseTransport re-checks the session under its own
+    // mutex.
+    if (this->noise_transport_.is_active()) {
+        // Post-handshake: all application JSON must be encrypted.
+        // The callback is not forwarded through the encrypted path (the transport's send
+        // methods call send_binary_message with a null cb). Best-effort: fire it as success
+        // if encryption succeeds, fire it as failure otherwise.
+        SsErr err = this->send_encrypted_text(json);
+        if (cb) {
+            cb(err == SsErr::OK);
+        }
+        return err;
+    }
+    // Pre-handshake: send as plain text.
+    return this->send_text_message(json, std::move(cb), allow_before_hello);
+}
+
+SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendCompleteCallback cb,
+                                        bool allow_before_hello) {
+    // Same routing as the std::string overload, but the encrypted hot path consumes the
+    // caller's buffer directly (no std::string materialization).
+    if (this->noise_transport_.is_active()) {
+        SsErr err = this->send_encrypted_text(json, len);
+        if (cb) {
+            cb(err == SsErr::OK);
+        }
+        return err;
+    }
+    // Pre-handshake cold path: the text-frame API takes a std::string.
+    return this->send_text_message(std::string(json, len), std::move(cb), allow_before_hello);
+}
+
+// ============================================================================
+// Noise transport (Phase 2)
+// ============================================================================
+
+void SendspinConnection::init_noise_handshake(const Identity& identity,
+                                              const RecordStore& record_store,
+                                              const std::string& suite_name) {
+    this->noise_handshake_ = std::make_unique<NoiseHandshake>(identity, record_store, suite_name);
+}
+
+void SendspinConnection::send_noise_client_init() {
+    if (!this->noise_handshake_) {
+        return;
+    }
+    std::string client_init = this->noise_handshake_->build_client_init();
+    if (!client_init.empty()) {
+        this->send_text_message(client_init, nullptr, /*allow_before_hello=*/true);
+    }
+}
+
+bool SendspinConnection::handle_noise_handshake_text(const std::string& text) {
+    if (!this->noise_handshake_) {
+        return false;
+    }
+    if (this->noise_handshake_complete_.load(std::memory_order_acquire)) {
+        // Post-handshake TEXT frame is an error (all traffic must be binary).
+        SS_LOGW(TAG, "Unexpected TEXT frame after Noise handshake; closing");
+        return false;
+    }
+
+    auto send_fn = [this](const std::string& msg) -> bool {
+        auto err = this->send_text_message(msg, nullptr, /*allow_before_hello=*/true);
+        return err == SsErr::OK;
+    };
+
+    HandshakeFrameResult result = this->noise_handshake_->on_text_frame(text, send_fn);
+
+    if (result == HandshakeFrameResult::ABORT) {
+        SS_LOGW(TAG, "Noise handshake aborted");
+        // Discard handshake state; caller will close the WS.
+        this->noise_handshake_.reset();
+        return true;  // consumed (don't re-dispatch as JSON)
+    }
+
+    if (result == HandshakeFrameResult::COMPLETE) {
+        auto outcome = this->noise_handshake_->take_result();
+        if (!outcome.has_value()) {
+            SS_LOGE(TAG, "Noise handshake: COMPLETE but no result");
+            this->noise_handshake_.reset();
+            return true;
+        }
+        // Record the server's identity (public key) resolved by the handshake. Reconciling
+        // this against server/hello's own server_id (and the matched PSK's trust category)
+        // is a later phase's job; today this is purely informational/for logging.
+        this->server_information_.server_id = outcome->server_id;
+        // Install the cipher session; send_app_json() routes encrypted from here on.
+        this->noise_transport_.activate(std::move(outcome->session));
+        this->noise_handshake_.reset();
+        this->noise_handshake_complete_.store(true, std::memory_order_release);
+        SS_LOGI(TAG, "Noise transport active (server_id=%s)",
+                this->server_information_.server_id.c_str());
+    }
+
+    return true;  // Frame was consumed by the handshake state machine
+}
+
+void SendspinConnection::dispatch_complete_noise_message(uint8_t* plaintext, size_t len,
+                                                         int64_t receive_time) {
+    // A complete (non-fragment, fully reassembled) transport message. plaintext[0] is the
+    // message type; fragment types never reach here.
+    const uint8_t type_byte = plaintext[0];
+
+    if (type_byte == MSG_TYPE_JSON_BODY) {
+        // Type 0: JSON control body, routed without the type byte. A frame carrying only
+        // the type byte (no body) is a malformed/empty JSON message; drop it.
+        if (len < 2) {
+            SS_LOGW(TAG, "empty JSON body after Noise decrypt; dropping");
+            return;
+        }
+        if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (this->on_json_message_cb) {
+            this->on_json_message_cb(this, reinterpret_cast<const char*>(plaintext + 1), len - 1,
+                                     receive_time);
+        }
+        return;
+    }
+
+    // All other types: route as binary role message (full type-prefixed plaintext).
+    if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (this->on_binary_message_cb) {
+        this->on_binary_message_cb(this, plaintext, len);
+    }
 }
 
 // ============================================================================
@@ -93,30 +239,84 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
         return;
     }
 
-    if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
+    const size_t msg_len = this->websocket_write_offset_;
+
+    // -------------------------------------------------------------------------
+    // Pre-handshake: TEXT frames feed the Noise handshake state machine (when one is
+    // installed - see init_noise_handshake()). Post-handshake: every frame is BINARY
+    // (Noise ciphertext); a connection with no handshake driver installed falls through to
+    // the legacy direct-dispatch path unchanged.
+    // -------------------------------------------------------------------------
+    const bool noise_active = this->noise_handshake_complete_.load(std::memory_order_acquire);
+    const bool noise_pending = !noise_active && this->noise_handshake_;
+
+    if (is_text) {
+        if (noise_pending) {
+            // Feed the handshake driver; it handles server/init and noise/handshake frames.
+            std::string text(reinterpret_cast<const char*>(this->websocket_payload_.data()),
+                             msg_len);
+            this->reset_websocket_payload();
+            this->handle_noise_handshake_text(text);
+            return;
+        }
+
+        if (noise_active) {
+            // Post-handshake TEXT frames are a protocol error.
+            SS_LOGW(TAG, "Unexpected TEXT frame after Noise handshake is complete; ignoring");
+            this->reset_websocket_payload();
+            return;
+        }
+
+        // No Noise handshake installed on this connection: legacy path (direct JSON dispatch).
+        // Hand the JSON callback a pointer straight into the reassembly buffer instead of
+        // copying it into a std::string. The callback parses synchronously;
+        // reset_websocket_payload() below makes the buffer reusable as soon as it returns, so
+        // the callback must not retain the pointer. Not null-terminated; the length is
+        // authoritative.
+        if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
+            this->reset_websocket_payload();
+            return;
+        }
+        if (this->on_json_message_cb) {
+            this->on_json_message_cb(this,
+                                     reinterpret_cast<const char*>(this->websocket_payload_.data()),
+                                     msg_len, receive_time);
+        }
         this->reset_websocket_payload();
         return;
     }
 
-    if (is_text) {
-        // Hand the JSON callback a pointer straight into the reassembly buffer instead of copying
-        // it into a std::string. The callback parses synchronously; reset_websocket_payload()
-        // below makes the buffer reusable as soon as it returns, so the callback must not retain
-        // the pointer. Not null-terminated; the length is authoritative.
-        if (this->on_json_message_cb) {
-            this->on_json_message_cb(this,
-                                     reinterpret_cast<const char*>(this->websocket_payload_.data()),
-                                     this->websocket_write_offset_, receive_time);
+    // -------------------------------------------------------------------------
+    // Binary frame
+    // -------------------------------------------------------------------------
+    if (noise_active) {
+        // Decrypt in-place; buffer has the full ciphertext (plaintext + 16-byte tag).
+        size_t pt_len =
+            this->noise_transport_.decrypt_in_place(this->websocket_payload_.data(), msg_len);
+        if (pt_len == 0) {
+            SS_LOGW(TAG, "Noise decrypt failed; dropping frame");
+            this->reset_websocket_payload();
+            return;
         }
-    } else {
-        // Binary message - connection retains buffer ownership, callback reads in-place
-        if (this->on_binary_message_cb) {
-            this->on_binary_message_cb(this, this->websocket_payload_.data(),
-                                       this->websocket_write_offset_);
+        // Route through the fragment state machine; dispatch any completed message.
+        NoiseTransport::CompleteMessage msg =
+            this->noise_transport_.accept_plaintext(this->websocket_payload_.data(), pt_len);
+        if (msg.data != nullptr) {
+            this->dispatch_complete_noise_message(msg.data, msg.len, receive_time);
         }
+        this->reset_websocket_payload();
+        return;
     }
 
-    // Reset write offset for next message; keep buffer allocated for reuse
+    // No Noise handshake installed / not yet active: legacy binary dispatch
+    // (connection retains buffer ownership, callback reads in-place).
+    if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
+        this->reset_websocket_payload();
+        return;
+    }
+    if (this->on_binary_message_cb) {
+        this->on_binary_message_cb(this, this->websocket_payload_.data(), msg_len);
+    }
     this->reset_websocket_payload();
 }
 

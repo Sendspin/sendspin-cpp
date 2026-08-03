@@ -33,6 +33,8 @@ add_executable(sendspin_tests
     test_cpace.cpp
     test_pin.cpp
     test_record_store.cpp
+    test_noise_transport.cpp
+    test_noise_rehandshake.cpp
 
     # FilePersistenceProvider is a host example helper (examples/common/), not part of the
     # library; compile it into the test target so the record-store tests can exercise it.

@@ -111,6 +111,15 @@ public:
     /// @return true if the worker job was queued successfully, false otherwise.
     bool send_time_message() override;
 
+    /// @brief Sends a binary WebSocket frame to the connected client (async, via httpd worker)
+    /// @param data   Binary payload bytes.
+    /// @param len    Number of bytes.
+    /// @param on_complete Optional completion callback (best-effort; may be skipped on teardown).
+    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
+    /// @return SsErr::OK if queued successfully, error code otherwise.
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback on_complete,
+                              bool allow_before_hello) override;
+
     /// @brief Triggers the underlying socket to close
     ///
     /// This is a low-level method that directly triggers the httpd session to close.
@@ -141,6 +150,10 @@ protected:
     /// @brief httpd_queue_work callback that sends a queued text frame over the WebSocket
     /// @param arg Pointer to the AsyncRespArg context allocated by send_text_message().
     static void async_send_text(void* arg);
+
+    /// @brief httpd_queue_work callback that sends a queued binary frame over the WebSocket
+    /// @param arg Pointer to the AsyncRespArg context allocated by send_binary_message().
+    static void async_send_binary(void* arg);
 
     /// @brief httpd_queue_work callback that builds and sends a client/time frame
     ///

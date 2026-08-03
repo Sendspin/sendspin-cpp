@@ -21,6 +21,8 @@
 #include <esp_websocket_client.h>
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -93,6 +95,15 @@ public:
     /// @brief Sends a client/time message, capturing the timestamp just before send
     /// @return true if the message was sent successfully, false otherwise.
     bool send_time_message() override;
+
+    /// @brief Sends a binary WebSocket frame to the server
+    /// @param data   Binary payload bytes.
+    /// @param len    Number of bytes.
+    /// @param cb     Optional completion callback.
+    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
+    /// @return SsErr::OK if sent successfully, error code otherwise.
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
+                              bool allow_before_hello) override;
 
     // ========================================
     // Client connection-specific configuration

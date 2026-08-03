@@ -10,6 +10,11 @@ function(sendspin_get_sources BASE_DIR)
         ${BASE_DIR}/src/crypto/cpace.cpp
         ${BASE_DIR}/src/crypto/pin.cpp
 
+        # Noise KKpsk2 session wrapper and handshake state machine
+        ${BASE_DIR}/src/noise_session.cpp
+        ${BASE_DIR}/src/noise_handshake.cpp
+        ${BASE_DIR}/src/noise_transport.cpp
+
         # Audio utilities
         ${BASE_DIR}/src/audio_stream_info.cpp
         ${BASE_DIR}/src/transfer_buffer.cpp
@@ -82,6 +87,9 @@ function(sendspin_get_sources BASE_DIR)
         ${BASE_DIR}/src/esp/client_connection.cpp
         ${BASE_DIR}/src/esp/ws_server.cpp
         ${BASE_DIR}/src/esp/network_info.cpp
+
+        # noise-c custom RNG hook (NOISE_USE_CUSTOM_RAND=1 on ESP; host uses rand_os.c instead)
+        ${BASE_DIR}/src/esp/noise_rand.cpp
 
         PARENT_SCOPE
     )

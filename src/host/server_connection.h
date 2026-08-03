@@ -20,6 +20,8 @@
 #include "connection.h"
 #include <ixwebsocket/IXWebSocket.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 
@@ -80,6 +82,14 @@ public:
     /// @brief Sends a client/time message, capturing the timestamp synchronously before send
     /// @return true if the message was sent successfully, false otherwise.
     bool send_time_message() override;
+
+    /// @brief Sends a binary message to the connected client
+    /// @param data   Pointer to the binary payload bytes.
+    /// @param len    Number of bytes to send.
+    /// @param on_complete Optional completion callback.
+    /// @return SsErr::OK if sent successfully, error code otherwise.
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback on_complete,
+                              bool allow_before_hello) override;
 
     /// @brief Requests the WebSocket connection to close
     void trigger_close();
