@@ -44,7 +44,7 @@ if(ESP_IDF_BUILD)
     # Assemble source list from core + enabled roles (driven by Kconfig)
     set(SENDSPIN_ALL_SOURCES ${SENDSPIN_CORE_SOURCES} ${SENDSPIN_ESP_SOURCES})
 
-    set(SENDSPIN_REQUIRES esp_http_server esp_netif esp_timer esp_ringbuf pthread mbedtls bblanchon__arduinojson)
+    set(SENDSPIN_REQUIRES esp_http_server esp_netif esp_timer esp_ringbuf pthread mbedtls bblanchon__arduinojson esphome__noise-c)
     set(SENDSPIN_COMPILE_DEFS "")
 
     if(CONFIG_SENDSPIN_ENABLE_PLAYER)
@@ -82,7 +82,7 @@ if(ESP_IDF_BUILD)
     idf_component_register(
         SRCS ${SENDSPIN_ALL_SOURCES}
         INCLUDE_DIRS "include"
-        PRIV_INCLUDE_DIRS "src" "src/esp"
+        PRIV_INCLUDE_DIRS "src" "src/esp" "src/crypto"
         REQUIRES ${SENDSPIN_REQUIRES}
         PRIV_REQUIRES espressif__esp_websocket_client
     )
@@ -100,7 +100,7 @@ if(ESP_IDF_BUILD)
 # ==============================================================================
 
 else()
-    project(sendspin VERSION 0.1.0 LANGUAGES CXX)
+    project(sendspin VERSION 0.1.0 LANGUAGES C CXX)
 
     # Role selection options
     option(SENDSPIN_ENABLE_PLAYER "Enable player role (audio decoding)" ON)

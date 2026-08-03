@@ -3,6 +3,13 @@
 function(sendspin_get_sources BASE_DIR)
     # Core sources — always compiled on both ESP-IDF and host
     set(SENDSPIN_CORE_SOURCES
+        # Crypto primitives and Noise-protocol constants/keys (always on - encryption
+        # is not role-gated; see CLAUDE.md #ifdef discipline)
+        ${BASE_DIR}/src/crypto/constants.cpp
+        ${BASE_DIR}/src/crypto/keys.cpp
+        ${BASE_DIR}/src/crypto/cpace.cpp
+        ${BASE_DIR}/src/crypto/pin.cpp
+
         # Audio utilities
         ${BASE_DIR}/src/audio_stream_info.cpp
         ${BASE_DIR}/src/transfer_buffer.cpp

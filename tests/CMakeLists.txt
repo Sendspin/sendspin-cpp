@@ -29,13 +29,20 @@ add_executable(sendspin_tests
     test_inbox.cpp
     test_visualizer_role.cpp
     test_artwork_role.cpp
+    test_crypto.cpp
+    test_cpace.cpp
+    test_pin.cpp
 )
 
-# Reach the library's private headers (protocol_messages.h, time_filter.h, ...).
+# Reach the library's private headers (protocol_messages.h, time_filter.h, ...) and
+# the src/crypto/ headers.
 # The public include/ dir and ArduinoJson propagate transitively from `sendspin`.
 # Use CMAKE_CURRENT_SOURCE_DIR (not CMAKE_SOURCE_DIR) so the path stays correct even
 # if sendspin is ever added as a subdirectory of a larger superproject.
-target_include_directories(sendspin_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_include_directories(sendspin_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/crypto
+)
 
 target_link_libraries(sendspin_tests PRIVATE sendspin GTest::gtest_main)
 

@@ -1,0 +1,322 @@
+// Copyright 2026 Sendspin Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/// @file field25519.h
+/// @brief Self-contained 256-bit modular arithmetic over GF(2^255-19).
+///
+/// Provides only what CPace-X25519-SHA512 needs:
+///   - fp_mul(a, b)   -- modular multiplication
+///   - fp_pow(base, exp) -- modular exponentiation (used for inv and Legendre)
+///   - fp_inv(a)      -- modular inverse via Fermat: a^(p-2) mod p
+///   - fp_from_le(bytes) -- decode 32 little-endian bytes to a Fp value
+///   - fp_to_le(v)    -- encode a Fp value to 32 little-endian bytes
+///
+/// No external dependencies; compiles on both host (x86/arm) and ESP32.
+
+#pragma once
+
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+
+namespace sendspin {
+namespace field25519 {
+
+// p = 2^255 - 19, stored as four 64-bit limbs in little-endian order.
+// Verified against Python: (2**255-19).to_bytes(32,'little') split into 8-byte chunks.
+
+/// @brief A field element mod p = 2^255-19, stored as four 64-bit limbs (little-endian).
+struct Fp {
+    uint64_t limbs[4]{};  // limbs[0] = least significant 64 bits
+};
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+// p = 2^255 - 19
+static constexpr Fp FP_P = {{
+    0xFFFFFFFFFFFFFFEDULL,
+    0xFFFFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL,
+    0x7FFFFFFFFFFFFFFFULL,
+}};
+
+// p - 2 (for Fermat inverse: a^(p-2) mod p)
+static constexpr Fp FP_P_MINUS_2 = {{
+    0xFFFFFFFFFFFFFFEBULL,
+    0xFFFFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL,
+    0x7FFFFFFFFFFFFFFFULL,
+}};
+
+// (p - 1) / 2 (for Legendre symbol exponentiation)
+// (2^255 - 20) / 2 = 2^254 - 10
+static constexpr Fp FP_LEGENDRE = {{
+    0xFFFFFFFFFFFFFFF6ULL,
+    0xFFFFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL,
+    0x3FFFFFFFFFFFFFFFULL,
+}};
+
+/// @brief Decode 32 little-endian bytes into a Fp.
+/// The top bit is NOT cleared here; callers (Elligator2) clear it themselves.
+inline Fp fp_from_le(const uint8_t* b) {
+    Fp r;
+    for (int i = 0; i < 4; ++i) {
+        r.limbs[i] = 0;
+        for (int j = 0; j < 8; ++j) {
+            r.limbs[i] |= static_cast<uint64_t>(b[i * 8 + j]) << (j * 8);
+        }
+    }
+    return r;
+}
+
+/// @brief Encode a Fp into 32 little-endian bytes.
+inline std::array<uint8_t, 32> fp_to_le(const Fp& a) {
+    std::array<uint8_t, 32> out{};
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            out[i * 8 + j] = static_cast<uint8_t>((a.limbs[i] >> (j * 8)) & 0xFF);
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Portable wide-arithmetic helpers.
+//
+// The field arithmetic below works on four 64-bit limbs and needs 64x64->128
+// products plus add/subtract carry propagation. A 64-bit host could express these
+// with `unsigned __int128`, but 32-bit targets (e.g. Xtensa/ESP32) have no such
+// type. These helpers implement the wide operations using only uint64_t, so there
+// is a SINGLE code path on every platform and the host tests validate exactly what
+// runs on the device.
+// ---------------------------------------------------------------------------
+
+/// @brief 64x64 -> 128 bit unsigned multiply. Sets hi:lo to the full product.
+inline void mul64_wide(uint64_t a, uint64_t b, uint64_t& hi, uint64_t& lo) {
+    constexpr uint64_t M = 0xFFFFFFFFULL;
+    const uint64_t a_lo = a & M, a_hi = a >> 32;
+    const uint64_t b_lo = b & M, b_hi = b >> 32;
+    const uint64_t ll = a_lo * b_lo;
+    const uint64_t lh = a_lo * b_hi;
+    const uint64_t hl = a_hi * b_lo;
+    const uint64_t hh = a_hi * b_hi;
+    const uint64_t cross = (ll >> 32) + (lh & M) + (hl & M);
+    lo = (ll & M) | (cross << 32);
+    hi = hh + (lh >> 32) + (hl >> 32) + (cross >> 32);
+}
+
+/// @brief Add a + b + carry_in. Returns the low 64 bits; sets carry_out to 0/1.
+inline uint64_t adc64(uint64_t a, uint64_t b, uint64_t carry_in, uint64_t& carry_out) {
+    const uint64_t s1 = a + b;
+    const uint64_t c1 = (s1 < a) ? 1ULL : 0ULL;
+    const uint64_t s2 = s1 + carry_in;
+    const uint64_t c2 = (s2 < s1) ? 1ULL : 0ULL;
+    carry_out = c1 + c2;  // 0 or 1: a+b and +carry_in cannot both overflow.
+    return s2;
+}
+
+/// @brief Subtract a - b - borrow_in. Returns the low 64 bits; sets borrow_out to 0/1.
+inline uint64_t sbb64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t& borrow_out) {
+    const uint64_t d1 = a - b;
+    const uint64_t b1 = (a < b) ? 1ULL : 0ULL;
+    const uint64_t d2 = d1 - borrow_in;
+    const uint64_t b2 = (d1 < borrow_in) ? 1ULL : 0ULL;
+    borrow_out = b1 + b2;  // 0 or 1.
+    return d2;
+}
+
+// ---------------------------------------------------------------------------
+// Fully reduce a value that may be in [0, 2p-1] to [0, p-1].
+//
+// Uses a conditional subtraction: try to subtract p; if no borrow, the
+// subtracted result is correct; otherwise keep the original.
+// Called after add, sub, and mul operations.
+// ---------------------------------------------------------------------------
+
+inline Fp fp_reduce(const Fp& a) {
+    // Attempt to subtract p: compute r = a - p.
+    // If a >= p, r is in [0, p-1] (no borrow from the top).
+    // If a < p, the subtraction underflows (borrow set) and we keep a.
+    Fp r;
+    uint64_t borrow = 0;
+    for (int i = 0; i < 4; ++i) {
+        r.limbs[i] = sbb64(a.limbs[i], FP_P.limbs[i], borrow, borrow);
+    }
+    // If borrow == 0: a >= p, use r (the subtracted result).
+    // If borrow != 0: a < p, keep a.
+    if (borrow == 0) {
+        return r;
+    }
+    return a;
+}
+
+// Overload accepting an explicit carry argument for fp_mul's call site; the carry must
+// already be zero after fp_mul's fold, so this forwards to the single-argument reduce.
+inline Fp fp_reduce(const Fp& a, uint64_t /*top_carry_must_be_zero*/) {
+    return fp_reduce(a);
+}
+
+// ---------------------------------------------------------------------------
+// Montgomery-free 256-bit mod-p multiplication using schoolbook 128-bit math.
+//
+// We compute a * b as a 512-bit product then reduce mod p.
+// Reduction of a 512-bit number n mod (2^255-19):
+//   n = n_lo + n_hi * 2^255
+//   n mod p = n_lo + n_hi * 19   (because 2^255 = p + 19 => 2^255 mod p = 19)
+// Applied twice (since n_lo + n_hi*19 < 2^256) this gives a fully reduced result.
+// ---------------------------------------------------------------------------
+
+inline Fp fp_mul(const Fp& a, const Fp& b) {
+    // Compute a 512-bit product using 64-bit limbs.
+    // lo[0..7]: product limbs (lo[0] = least significant 64 bits)
+    uint64_t lo[8]{};
+
+    for (int i = 0; i < 4; ++i) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 4; ++j) {
+            // prod = a[i]*b[j] + lo[i+j] + carry, spread across (phi:plo).
+            uint64_t phi, plo;
+            mul64_wide(a.limbs[i], b.limbs[j], phi, plo);
+            uint64_t c1 = 0, c2 = 0;
+            uint64_t t = adc64(plo, lo[i + j], 0, c1);
+            t = adc64(t, carry, 0, c2);
+            lo[i + j] = t;
+            // Equals the full 128-bit prod >> 64; provably <= 2^64-1, so no overflow.
+            carry = phi + c1 + c2;
+        }
+        lo[i + 4] += carry;
+    }
+
+    // Now reduce: n = lo[0..3] + lo[4..7] * 2^256
+    // 2^256 = 2 * 2^255 = 2 * (p + 19) = 2p + 38
+    // So lo[4..7] * 2^256 mod p = lo[4..7] * 38  (mod p, since 2p = 0).
+    // Actually: 2^255 mod p = 19, so 2^256 mod p = 38.
+    // Apply: result = lo[0..3] + lo[4..7] * 38, then reduce the top bit.
+
+    // Pass 1: fold upper 256 bits (lo[4..7]) using multiplier 38.
+    Fp r;
+    {
+        uint64_t carry = 0;
+        for (int i = 0; i < 4; ++i) {
+            // v = lo[i] + lo[i+4]*38 + carry, spread across (mhi:mlo) for the product.
+            uint64_t mhi, mlo;
+            mul64_wide(lo[i + 4], 38ULL, mhi, mlo);  // mhi <= 37
+            uint64_t c1 = 0, c2 = 0;
+            uint64_t t = adc64(lo[i], mlo, 0, c1);
+            t = adc64(t, carry, 0, c2);
+            r.limbs[i] = t;
+            carry = mhi + c1 + c2;  // small (<= ~38)
+        }
+        // carry is at most a few bits; fold it using 38 again.
+        // carry * 2^256 mod p = carry * 38 (carry*38 fits in 64 bits).
+        uint64_t c1 = 0;
+        r.limbs[0] = adc64(r.limbs[0], carry * 38ULL, 0, c1);
+        uint64_t c2 = c1;  // 0 or 1
+        if (c2) {
+            // One more fold, carry is tiny (further carry is provably zero here).
+            r.limbs[0] = r.limbs[0] + c2 * 38ULL;
+        }
+    }
+
+    // Pass 2: reduce the top bit if set (value may be in [p, 2p)).
+    return fp_reduce(r, 0);
+}
+
+/// @brief Modular addition: (a + b) mod p.
+inline Fp fp_add(const Fp& a, const Fp& b) {
+    // Compute 256-bit sum (no overflow out of the top since a, b < p < 2^255).
+    Fp r;
+    uint64_t carry = 0;
+    for (int i = 0; i < 4; ++i) {
+        r.limbs[i] = adc64(a.limbs[i], b.limbs[i], carry, carry);
+    }
+    // Result in [0, 2p-2]; conditionally subtract p.
+    return fp_reduce(r);
+}
+
+/// @brief Modular subtraction: (a - b) mod p.
+inline Fp fp_sub(const Fp& a, const Fp& b) {
+    // a - b mod p = a + (p - b) mod p
+    // Compute p - b (no underflow if b < p).
+    Fp p_minus_b;
+    {
+        uint64_t borrow = 0;
+        for (int i = 0; i < 4; ++i) {
+            p_minus_b.limbs[i] = sbb64(FP_P.limbs[i], b.limbs[i], borrow, borrow);
+        }
+    }
+    return fp_add(a, p_minus_b);
+}
+
+/// @brief Modular exponentiation: base^exp mod p using square-and-multiply.
+inline Fp fp_pow(const Fp& base, const Fp& exp) {
+    Fp result = {{1, 0, 0, 0}};
+    Fp cur = base;
+    for (int limb = 0; limb < 4; ++limb) {
+        uint64_t e = exp.limbs[limb];
+        for (int bit = 0; bit < 64; ++bit) {
+            if ((e >> bit) & 1) {
+                result = fp_mul(result, cur);
+            }
+            cur = fp_mul(cur, cur);
+        }
+    }
+    return result;
+}
+
+/// @brief Modular inverse: a^(p-2) mod p (Fermat's little theorem).
+inline Fp fp_inv(const Fp& a) {
+    return fp_pow(a, FP_P_MINUS_2);
+}
+
+/// @brief Legendre symbol exponentiation: a^((p-1)/2) mod p.
+/// Returns Fp with value 0, 1, or p-1.
+inline Fp fp_legendre_pow(const Fp& a) {
+    return fp_pow(a, FP_LEGENDRE);
+}
+
+/// @brief Scale a Fp by a small integer constant (< 2^63) without full multiplication.
+inline Fp fp_scale(const Fp& a, uint64_t s) {
+    // The single-step carry fold below is only exact for small scalars: the loop carry can
+    // reach ~s, and it is folded back with multiplier 38 assuming it fits alongside limb 0.
+    // Callers only pass tiny constants (2 and 486662). Guard against a future large-s caller.
+    assert(s < (static_cast<uint64_t>(1) << 26));
+    uint64_t carry = 0;
+    Fp r;
+    for (int i = 0; i < 4; ++i) {
+        // prod = a[i]*s + carry, spread across (phi:plo).
+        uint64_t phi, plo;
+        mul64_wide(a.limbs[i], s, phi, plo);
+        uint64_t c1 = 0;
+        r.limbs[i] = adc64(plo, carry, 0, c1);
+        carry = phi + c1;  // small: s < 2^26 so phi < 2^26
+    }
+    // Fold carry * 2^256 using multiplier 38 (since 2^256 mod p = 38); carry*38 fits in 64 bits.
+    {
+        uint64_t c1 = 0;
+        r.limbs[0] = adc64(r.limbs[0], carry * 38ULL, 0, c1);
+        uint64_t c2 = c1;  // 0 or 1
+        if (c2) {
+            r.limbs[0] = r.limbs[0] + c2 * 38ULL;
+        }
+    }
+    return fp_reduce(r, 0);
+}
+
+}  // namespace field25519
+}  // namespace sendspin
