@@ -19,7 +19,10 @@
 
 #include "sendspin/config.h"
 #include <esp_http_server.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -214,6 +217,11 @@ protected:
     /// @return The pending connection, or nullptr if the session was not pending.
     std::shared_ptr<SendspinServerConnection> pop_pending(int sockfd);
 
+    /// @brief Samples the httpd task's stack high water mark and reports new lows.
+    /// Called from tick(), rate-limited to STACK_CHECK_INTERVAL_US. No-op until the httpd task
+    /// has run at least once (the handle is published from open_callback).
+    void check_task_stack();
+
     // Struct fields
 
     /// @brief Guards pending_. Held only for table mutation/scan; delivery and closing happen
@@ -237,7 +245,20 @@ protected:
     /// @brief The HTTP server handle
     httpd_handle_t server_{nullptr};
 
+    /// @brief Handle of the httpd task, published by open_callback (which runs on it)
+    ///
+    /// httpd does not expose its task handle, so it is captured the first time our code runs on
+    /// that task. Read from tick() on the main loop, hence atomic; it only ever transitions from
+    /// null to one stable value for the life of the server.
+    std::atomic<TaskHandle_t> task_handle_{nullptr};
+
     // Numeric fields
+
+    /// @brief Lowest stack headroom (bytes) seen so far on the httpd task; SIZE_MAX = none yet
+    size_t min_free_stack_{SIZE_MAX};
+
+    /// @brief Timestamp of the last check_task_stack() sample (microseconds)
+    int64_t last_stack_check_us_{0};
 
     /// @brief Maximum number of simultaneous connections (see set_max_connections)
     uint8_t max_connections_{SendspinClientConfig::DEFAULT_SERVER_MAX_CONNECTIONS};

@@ -45,6 +45,21 @@ static const char* const TAG = "sendspin.ws_server";
 /// handshake timeout.
 static constexpr int64_t WS_UPGRADE_TIMEOUT_US = 5LL * 1000 * 1000;
 
+/// @brief How often tick() samples the httpd task's stack high water mark
+///
+/// uxTaskGetStackHighWaterMark walks the untouched part of the stack looking for the end of the
+/// fill pattern, so a sample is not free, and the mark it returns only ever decreases. Sampling at
+/// loop rate would cost far more than it reveals.
+static constexpr int64_t STACK_CHECK_INTERVAL_US = 10LL * 1000 * 1000;
+
+/// @brief Headroom (bytes) below which the httpd task's remaining stack is reported as a warning
+///
+/// httpd runs with HTTPD_DEFAULT_CONFIG's 4 KB stack, and every inbound JSON message is parsed and
+/// dispatched on it underneath httpd's own call chain. Below this the next slightly deeper message
+/// (a longer metadata payload, a warning that drags in printf formatting) can overflow it, so the
+/// remaining margin is worth surfacing before it becomes a panic.
+static constexpr size_t STACK_HEADROOM_WARN_BYTES = 512;
+
 SendspinWsServer::~SendspinWsServer() {
     this->stop();
 }
@@ -128,6 +143,12 @@ void SendspinWsServer::stop() {
         std::lock_guard<std::mutex> lock(this->pending_mutex_);
         stale.swap(this->pending_);
     }
+
+    // The task is gone; a restart creates a new one with a fresh stack, so drop the stale handle
+    // and the mark measured against the old one.
+    this->task_handle_.store(nullptr, std::memory_order_release);
+    this->min_free_stack_ = SIZE_MAX;
+    this->last_stack_check_us_ = 0;
 }
 
 void SendspinWsServer::tick() {
@@ -161,6 +182,39 @@ void SendspinWsServer::tick() {
         SS_LOGW(TAG, "Session did not complete a WebSocket upgrade within %d s, closing",
                 static_cast<int>(WS_UPGRADE_TIMEOUT_US / (1000 * 1000)));
         conn->trigger_close();
+    }
+
+    this->check_task_stack();
+}
+
+void SendspinWsServer::check_task_stack() {
+    TaskHandle_t task = this->task_handle_.load(std::memory_order_acquire);
+    if (task == nullptr) {
+        return;  // No session has been accepted yet, so the httpd task has not run our code
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us - this->last_stack_check_us_ < STACK_CHECK_INTERVAL_US) {
+        return;
+    }
+    this->last_stack_check_us_ = now_us;
+
+    // uxTaskGetStackHighWaterMark returns the lowest free space ever observed, counted in
+    // StackType_t units; ESP-IDF defines that as uint8_t on both Xtensa and RISC-V, so this is
+    // already bytes, but scale it anyway rather than depending on the port.
+    const size_t free_bytes =
+        static_cast<size_t>(uxTaskGetStackHighWaterMark(task)) * sizeof(StackType_t);
+    if (free_bytes >= this->min_free_stack_) {
+        return;  // The mark never rises, so an unchanged reading is not worth logging
+    }
+    this->min_free_stack_ = free_bytes;
+
+    // The whole JSON receive path runs on this task under httpd's own frames, so its headroom is
+    // the budget that a deep protocol message has to fit in.
+    if (free_bytes < STACK_HEADROOM_WARN_BYTES) {
+        SS_LOGW(TAG, "httpd task stack headroom down to %zu bytes; overflow is close", free_bytes);
+    } else {
+        SS_LOGD(TAG, "httpd task stack headroom: %zu bytes", free_bytes);
     }
 }
 
@@ -204,6 +258,10 @@ esp_err_t SendspinWsServer::open_callback(httpd_handle_t handle, int sockfd) {
         SS_LOGE(TAG, "Server context is null in open_callback");
         return ESP_FAIL;
     }
+
+    // Publish the httpd task handle for check_task_stack(). This callback runs on that task, and
+    // httpd offers no other way to obtain it. Repeated stores write the same value.
+    server->task_handle_.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
 
     // Reject the session before allocating anything if there is nobody to deliver the connection
     // to; otherwise the session would sit pinned with no one driving its handshake until the peer

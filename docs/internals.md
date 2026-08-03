@@ -189,6 +189,25 @@ The `JsonDocument` used to parse each incoming message comes from `make_json_doc
 
 The bump arena suits ArduinoJson's allocation pattern: during a parse the variant pool is allocated once up front and the deserializer's string scratch buffer is always the most-recently-allocated block while it grows and shrinks, so those reallocations happen in place; document teardown frees strings newest-first and the pool last (LIFO), draining the arena back to empty on its own. `reset()` between messages is a safety net for any arena block left behind by a non-LIFO free; it cannot free PSRAM fallbacks (those are released by `deallocate()` on document teardown like any other allocation). The allocator is not thread-safe; the single instance is owned by `SendspinClient` and touched only on the network thread (`process_json_message()` runs serialized on the httpd worker task, and the previous call's `JsonDocument` is destroyed before the next call). Outgoing-message serialization in `src/protocol.cpp` still uses the PSRAM allocator.
 
+#### Network task stack budget (ESP)
+
+On ESP the network thread is the httpd task, and `SendspinWsServer::start()` leaves
+`HTTPD_DEFAULT_CONFIG()`'s stack size alone: **4096 bytes** total. Frame reassembly, JSON parsing,
+and role dispatch all run there, on top of httpd's own call frames, so the library's share of that
+budget is whatever is left once httpd has reached the WebSocket handler.
+
+That makes the receive path the one place in the library where stack frames are a design
+constraint rather than an afterthought. Two rules follow:
+
+- **Parse sections in place.** `server/state` has no aggregate message struct; `process_server_state_metadata()`, `process_server_state_color()`, and `process_server_state_controller()` each fill a caller-owned struct directly. An aggregate would hold every section's storage in the caller's frame for the entire parse while each section parser built a second copy in its own, and these structs are not small (a `ServerMetadataStateDelta` is 200 bytes). `process_stream_start_message()` follows the same pattern via `emplace()` into its output. The role `handle_server_state()` entry points take an rvalue reference for the same reason.
+- **No large locals, and watch for merged frames.** GCC will inline a section parser into its caller and then fail to overlap the locals, so several sections' storage can end up coexisting in one frame. Frame sizes are worth checking with `-fstack-usage` when adding to this path.
+
+`SendspinWsServer::tick()` samples the httpd task's stack high water mark every 10 seconds
+(`check_task_stack()`). A new low is logged at debug level, and a headroom below 512 bytes is
+logged as a warning, so a shrinking margin is visible before it becomes a stack overflow panic.
+The task handle is captured in `open_callback()`, which runs on the httpd task; httpd does not
+expose it any other way.
+
 ### Binary Message Dispatch (network thread)
 
 `process_binary_message()` extracts the type byte and routes:
