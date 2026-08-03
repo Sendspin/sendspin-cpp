@@ -1,6 +1,7 @@
-add_executable(basic_client main.cpp)
+add_executable(basic_client main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../common/file_persistence_provider.cpp)
 target_link_libraries(basic_client PRIVATE sendspin)
 target_compile_features(basic_client PRIVATE cxx_std_20)
+target_include_directories(basic_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)
 
 # mDNS service advertisement via dns_sd.h (optional)
 # macOS: built-in (no extra link flags needed — dns_sd is in libSystem)

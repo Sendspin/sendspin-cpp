@@ -111,6 +111,23 @@ static constexpr int64_t PIN_ATTEMPT_TIMEOUT_US = 120LL * 1000LL * US_PER_MS;
 /// check in loop() also enforces this window without a second timer.
 static constexpr int64_t WINDOW_LIFETIME_US = 300LL * 1000LL * US_PER_MS;
 
+/// @brief Map NoiseCipherSuitePreference to the full Noise protocol suite name string.
+/// On ESP-IDF, AESGCM is unusable: esphome__noise-c routes AES-GCM through libsodium's
+/// crypto_aead_aes256gcm, which is stubbed out (returns ENOSYS) on Xtensa (no AES-NI /
+/// ARMv8 crypto), so the cipher never initializes. Fall back to ChaChaPoly and warn.
+static std::string suite_name_for(NoiseCipherSuitePreference pref) {
+    if (pref == NoiseCipherSuitePreference::AESGCM) {
+#ifdef ESP_PLATFORM
+        SS_LOGW(TAG, "AESGCM cipher suite is not supported on ESP-IDF (libsodium AES-GCM is "
+                     "unavailable on Xtensa); falling back to ChaChaPoly");
+        return std::string(NOISE_SUITE_CHACHAPOLY);
+#else
+        return std::string(NOISE_SUITE_AESGCM);
+#endif
+    }
+    return std::string(NOISE_SUITE_CHACHAPOLY);
+}
+
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
@@ -168,6 +185,7 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->set_auto_reconnect(false);
     client_conn->set_task_config(this->client_->config_.websocket_priority);
     client_conn->set_websocket_payload_location(this->client_->config_.websocket_payload_location);
+    client_conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
 
     this->setup_connection_callbacks(client_conn.get());
     client_conn->on_connected_cb = [this](SendspinConnection* c) {
@@ -321,7 +339,8 @@ void ConnectionManager::loop() {
         if (now_us >= this->ws_server_start_retry_time_us_ && this->client_->network_provider_ &&
             this->client_->network_provider_->is_network_ready()) {
             if (!this->ws_server_->start(this->client_, this->client_->config_.httpd_psram_stack,
-                                         this->client_->config_.httpd_priority)) {
+                                         this->client_->config_.httpd_priority,
+                                         this->client_->config_.httpd_stack_size)) {
                 this->ws_server_start_retry_time_us_ = now_us + WS_SERVER_START_RETRY_US;
             }
         }
@@ -338,6 +357,7 @@ void ConnectionManager::loop() {
         std::vector<ServerUnpairEvent> server_unpair_events;
         std::vector<ServerPairingMessageEvent> pin_pairing_events;
         std::vector<std::string> pairing_succeeded_events;
+        std::vector<PairStorageFailedEvent> pair_storage_failed_events;
         bool pairing_window_confirm_event = false;
         // Skip the conn_mutex_ acquisition entirely when the hint says all queues are
         // empty. Sound because every push site sets has_pending_events_ = true under
@@ -353,6 +373,7 @@ void ConnectionManager::loop() {
             server_unpair_events.swap(this->pending_server_unpair_events_);
             pin_pairing_events.swap(this->pending_pin_pairing_events_);
             pairing_succeeded_events.swap(this->pending_pairing_succeeded_events_);
+            pair_storage_failed_events.swap(this->pending_pair_storage_failed_events_);
             pairing_window_confirm_event =
                 std::exchange(this->pending_pairing_window_confirm_, false);
             this->has_pending_events_.store(false, std::memory_order_release);
@@ -366,7 +387,7 @@ void ConnectionManager::loop() {
             !rehandshake_events.empty() || !pair_abort_events.empty() ||
             !management_request_events.empty() || !server_unpair_events.empty() ||
             !pin_pairing_events.empty() || !pairing_succeeded_events.empty() ||
-            pairing_window_confirm_event ||
+            !pair_storage_failed_events.empty() || pairing_window_confirm_event ||
             this->nursery_size_.load(std::memory_order_acquire) > 0) {
             std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
 
@@ -395,7 +416,7 @@ void ConnectionManager::loop() {
                 if (this->client_->config_.encryption_required) {
                     conn->init_noise_handshake(*this->client_->identity_,
                                                *this->client_->record_store_,
-                                               std::string(NOISE_SUITE_CHACHAPOLY));
+                                               suite_name_for(this->client_->config_.cipher_suite));
                     conn->send_noise_client_init();
                 } else {
                     this->initiate_hello(conn.get());
@@ -593,6 +614,17 @@ void ConnectionManager::loop() {
             // connection for the same reason as pin_pairing_events above.
             for (const auto& server_id : pairing_succeeded_events) {
                 this->client_->note_pairing_succeeded(server_id);
+            }
+
+            // ---- Pairing storage-failure deferred events ----
+            // Only ever targets the current connection, for the same reason as
+            // pairing_succeeded_events above: pairing only exists on a connection that already
+            // won promotion. A connection that already left current_connection_ (e.g. raced by a
+            // disconnect event earlier in this same pass) still gets the listener notification --
+            // handle_pair_storage_failed() reports it unconditionally -- but skips the redundant
+            // drop_connection()/pair-abort send.
+            for (auto& event : pair_storage_failed_events) {
+                this->handle_pair_storage_failed(event);
             }
 
             // ---- Static-PIN pairing-window confirm deferred event ----
@@ -859,6 +891,13 @@ void ConnectionManager::schedule_pairing_succeeded(std::string server_id) {
     this->queue_pending_pairing_succeeded(std::move(server_id));
 }
 
+void ConnectionManager::schedule_pair_storage_failed(PairStorageFailedEvent event) {
+    // Called from SendspinClient::process_json_message() on the network thread when
+    // RecordStore::store_record() reports that the persistence provider rejected the record.
+    std::lock_guard<std::mutex> lock(this->conn_mutex_);
+    this->queue_pending_pair_storage_failed(std::move(event));
+}
+
 void ConnectionManager::schedule_pairing_window_confirm() {
     // Called from SendspinClient::confirm_pairing_window(), which may run on any thread
     // (typically the application's UI thread relaying an operator gesture).
@@ -889,6 +928,7 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
     // the conn out from under in-flight workers.
     conn->init_time_filter();
     conn->set_websocket_payload_location(this->client_->config_.websocket_payload_location);
+    conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
 
     this->setup_connection_callbacks(conn.get());
     conn->on_disconnected_cb = [](SendspinConnection* /*c*/) {
@@ -927,7 +967,7 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
                 // (there is no earlier signal to wait for). The hello is armed later, once the
                 // Noise handshake completes (see the noise-completion scan in loop()).
                 conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
-                                           std::string(NOISE_SUITE_CHACHAPOLY));
+                                           suite_name_for(this->client_->config_.cipher_suite));
                 conn->send_noise_client_init();
             } else {
                 // Arm the hello right away: the connection arrives WS-upgraded, so there is no
@@ -1126,6 +1166,12 @@ void ConnectionManager::queue_pending_pin_pairing_message(ServerPairingMessageEv
 void ConnectionManager::queue_pending_pairing_succeeded(std::string server_id) {
     // Note: caller must hold conn_mutex_
     this->pending_pairing_succeeded_events_.push_back(std::move(server_id));
+    this->has_pending_events_.store(true, std::memory_order_release);
+}
+
+void ConnectionManager::queue_pending_pair_storage_failed(PairStorageFailedEvent event) {
+    // Note: caller must hold conn_mutex_
+    this->pending_pair_storage_failed_events_.push_back(std::move(event));
     this->has_pending_events_.store(true, std::memory_order_release);
 }
 
@@ -1573,6 +1619,33 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
     if (window_was_shown) {
         this->client_->note_close_pairing_window();
     }
+}
+
+void ConnectionManager::handle_pair_storage_failed(const PairStorageFailedEvent& event) {
+    // Runs on the main loop (caller holds conn_ptr_mutex_). The persistence provider rejected
+    // the long-term record when server/pair-finalize was acked on the network thread
+    // (RecordStore::store_record fails closed, see SendspinClient::process_json_message), so the
+    // record was never stored and this pairing cannot survive a reboot. The server has already
+    // persisted its side (server/pair-finalize acks its own store), so it is left holding a
+    // record this client never had; aborting loudly here makes that visible immediately rather
+    // than at the next reconnect. Note: the server's follow-up re-handshake msg1 may race this
+    // event and fail on the unresolvable psk_id first -- both paths drop the connection, and the
+    // listener notification below does not depend on the connection still being managed.
+    if (event.conn && event.conn.get() == this->current_connection_.get()) {
+        SS_LOGE(TAG, "Pairing record persist failed for server_id=%s; aborting pairing",
+                event.server_id.c_str());
+        // Best-effort pair/abort. The wire enum has no storage-failure value (candidate spec
+        // addition); user_cancelled is the closest fit: the application cancelled the exchange.
+        event.conn->send_app_json(format_pair_abort_message(PairAbortReason::USER_CANCELLED),
+                                  nullptr);
+        event.conn->clear_pairing_state();
+        this->drop_connection(event.conn.get(), SendspinGoodbyeReason::UNAUTHORIZED);
+    }
+
+    // Queued after drop_connection() so it survives cleanup_connection_state() (same ordering
+    // rule as handle_pair_abort above). Uses the production-time server_id, so the listener is
+    // notified even when the connection already left current_connection_ by the time this drains.
+    this->client_->note_pairing_failed(event.server_id, SendspinPairAbortReason::STORAGE_FAILED);
 }
 
 // ============================================================================

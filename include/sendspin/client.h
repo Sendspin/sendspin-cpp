@@ -334,7 +334,6 @@ struct Identity;
  * MyNetworkProvider network_provider;
  *
  * SendspinClientConfig config;
- * config.client_id = "device-id";
  * config.name = "My Device";
  * config.product_name = "Speaker";
  * config.manufacturer = "Acme";
@@ -512,6 +511,14 @@ public:
     // Queries
     // ========================================
 
+    /// @brief Returns the client's cryptographic identity string.
+    /// This is base64url(X25519 public key), 43 chars - the Sendspin client_id.
+    /// Generated on first boot and persisted via the persistence provider.
+    /// Empty until start_server() is called.
+    [[nodiscard]] const std::string& client_id() const {
+        return this->client_id_;
+    }
+
     /// @brief Returns true if there is an active connection with completed handshake
     /// @return true if connected with a completed handshake, false otherwise
     bool is_connected() const;
@@ -683,6 +690,9 @@ private:
     // Struct fields
     SendspinClientConfig config_;
     GroupUpdateObject group_state_{};
+
+    // String fields
+    std::string client_id_;  ///< Derived from the static keypair: base64url(public_key).
 
     // Pointer fields
 #ifdef SENDSPIN_ENABLE_ARTWORK

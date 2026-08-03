@@ -31,6 +31,7 @@
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
 #include "sendspin/visualizer_role.h"
+#include "file_persistence_provider.h"
 #ifdef SENDSPIN_HAS_PORTAUDIO
 #include "portaudio_sink.h"
 #endif
@@ -450,7 +451,7 @@ int main(int argc, char* argv[]) {
 
     // Configure the client
     SendspinClientConfig config;
-    config.client_id = "host-tui-example";
+    // client_id is derived from the static X25519 keypair; do not set it here.
     config.name = friendly_name;
     config.product_name = "sendspin-cpp host TUI";
     config.manufacturer = "sendspin-cpp";
@@ -516,7 +517,17 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+    // Persist the static keypair (and pairing state) so client_id and pairing records survive
+    // restarts. Path: $HOME/.sendspin_tui.json (distinct from basic_client's
+    // .sendspin.json so the two examples do not share an identity/pairing file;
+    // regenerated if the file is absent).
+    const char* home_dir = getenv("HOME");
+    const std::string persistence_path =
+        std::string(home_dir != nullptr ? home_dir : ".") + "/.sendspin_tui.json";
+    FilePersistenceProvider persistence_provider(persistence_path);
+
     SendspinClient client(std::move(config));
+    client.set_persistence_provider(&persistence_provider);
 
     // Add roles
     PlayerRoleConfig player_config;
@@ -803,6 +814,13 @@ int main(int argc, char* argv[]) {
     if (!client.start_server()) {
         fprintf(stderr, "Failed to start server\n");
         return 1;
+    }
+
+    // Expose client_id in the TUI state for display.
+    // client_id is base64url(static X25519 public key), 43 chars.
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.client_id = client.client_id();
     }
 
     // Advertise via mDNS and browse for other servers (when compiled in)

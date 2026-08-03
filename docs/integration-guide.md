@@ -40,7 +40,6 @@ using namespace sendspin;
 SendspinClient::set_log_level(LogLevel::INFO);
 
 SendspinClientConfig config;
-config.client_id = "my-device-mac-addr";       // Unique identifier (e.g., MAC address)
 config.name = "Living Room Speaker";            // Friendly display name
 config.product_name = "My Speaker";             // Device product name (optional)
 config.manufacturer = "My Company";             // Manufacturer name (optional)
@@ -48,6 +47,16 @@ config.software_version = "1.0.0";              // Software version string (opti
 
 SendspinClient client(std::move(config));
 ```
+
+`client_id` is not a configuration field. The library derives it automatically from the
+static X25519 keypair (`base64url(public_key)`, 43 characters). The keypair is generated
+on first boot and, when a `SendspinPersistenceProvider` is set, persisted so that the same
+identity survives reboots. After `start_server()` the derived `client_id` is available
+via `client.client_id()`.
+
+The `client_id` uniquely identifies this device to Sendspin servers and must be stable
+across reboots for pairing and server-preference to work correctly. Without a persistence
+provider the keypair is regenerated on every boot (development use only).
 
 ## Step 2: Add Roles
 
@@ -423,36 +432,105 @@ struct HostNetworkProvider : SendspinNetworkProvider {
 
 ### SendspinPersistenceProvider (Optional)
 
-Allows the library to persist and restore state across reboots. Useful on embedded devices.
+Allows the library to persist state across reboots. Required for stable identity and
+pairing. On host platforms `examples/common/file_persistence_provider.h` provides
+`FilePersistenceProvider`, which persists to a JSON file -- use it directly or as a
+reference implementation.
+
+Most methods are called on the main loop thread. The exception is `save_pairing_record`,
+which is also called on the network thread when a pairing finalizes (the record must be
+stored before the server's immediate re-handshake resolves it). A network-thread
+`save_pairing_record` can therefore overlap a main-loop call to another method, so an
+implementation that shares state across methods (a file, a handle) must serialize its own
+access. `FilePersistenceProvider` guards every method with a mutex.
+
+#### Method contract
+
+**Static keypair** (required for stable identity and pairing):
+
+- `save_static_keypair(key)` -- store the 32-byte raw X25519 private key. Called once on
+  first boot, or after a key reset. Return `true` on success.
+- `load_static_keypair()` -- return the saved private key, or `nullopt` if not yet saved.
+  Returning `nullopt` causes the library to generate a new keypair and call
+  `save_static_keypair` immediately.
+
+**Last-played server** (used for server-preference arbitration):
+
+- `save_last_played_server_id(server_id)` -- store the `server_id` string (base64url
+  public key of the server) whenever a playback connection completes. May be called
+  frequently; implementations should tolerate repeated calls with the same value.
+- `load_last_played_server_id()` -- return the saved `server_id`, or `nullopt` if none.
+
+**Pairing records** (long-term trust, required for paired connections to survive reboots):
+
+- `load_pairing_records()` -- return all stored records (may be empty).
+- `save_pairing_record(record)` -- persist a `SendspinPairingRecord`, adding it or
+  replacing any existing entry with the same `psk_id`. Called on the main loop (management
+  add-record, and provisioning during `start_server`) and on the network thread when a
+  pairing finalizes; must be safe to call from either thread. Return `true` on success. A
+  `false` return fails the pairing closed: the client reports
+  `SendspinPairAbortReason::STORAGE_FAILED` via `on_pairing_failed` and drops the
+  connection rather than complete a pairing that could not survive a reboot.
+- `remove_pairing_record(psk_id)` -- remove the record with the given `psk_id`. No-op if
+  absent.
+
+**Accepted Pairing PSK** (distributes an out-of-band PSK to admit servers before pairing):
+
+- `load_pairing_psk()` -- return the stored `SendspinPairingPsk`, or `nullopt` if none.
+- `save_pairing_psk(psk)` -- persist a new accepted Pairing PSK. Return `true` on success.
+- `clear_pairing_psk()` -- remove the accepted Pairing PSK.
+
+**Static PIN** (used by the static-PIN pairing method, when enabled):
+
+- `load_static_pin()` -- return the configured static PIN, or `nullopt` if none.
+- `save_static_pin(pin)` -- persist the configured static PIN. Return `true` on success.
+- `clear_static_pin()` -- remove the configured static PIN.
+
+**Pairing policy** (whether unpaired access or the Pairing PSK method is enabled):
+
+- `load_pairing_config()` -- return the stored `SendspinPairingConfig`, or `nullopt` to
+  use the compile-time defaults.
+- `save_pairing_config(config)` -- persist updated policy. Return `true` on success.
+
+**Player static delay** (optional, unrelated to encryption):
+
+- `save_static_delay(delay_ms)` -- persist the user-adjustable static delay in
+  milliseconds. Return `true` on success.
+- `load_static_delay()` -- return the saved delay, or `nullopt` if none saved. When
+  `nullopt` the `PlayerRoleConfig::initial_static_delay_ms` value is used.
+
+Every method has a default no-op / `nullopt` / empty-vector implementation so you can
+implement only the methods you need. The minimum useful set for a deployed device is
+`save_static_keypair` + `load_static_keypair` (for stable identity) and
+`save_pairing_record` + `load_pairing_records` (for pairing to survive reboots).
 
 ```cpp
 struct MyPersistenceProvider : SendspinPersistenceProvider {
-    // Save/load the server_id of the last server that was playing audio.
-    // Used to prioritize reconnection to the same server.
-    bool save_last_played_server_id(const std::string& server_id) override {
-        return nvs_write_string("last_server", server_id);
+    bool save_static_keypair(const std::array<uint8_t, 32>& key) override {
+        return nvs_write_bytes("static_keypair", key.data(), key.size());
     }
-    std::optional<std::string> load_last_played_server_id() override {
-        std::string server_id;
-        if (nvs_read_string("last_server", &server_id)) return server_id;
+    std::optional<std::array<uint8_t, 32>> load_static_keypair() override {
+        std::array<uint8_t, 32> key{};
+        if (nvs_read_bytes("static_keypair", key.data(), key.size())) return key;
         return std::nullopt;
     }
 
-    // Save/load the player's user-adjustable static delay.
-    bool save_static_delay(uint16_t delay_ms) override {
-        return nvs_write("static_delay", delay_ms);
+    bool save_last_played_server_id(const std::string& server_id) override {
+        return nvs_write_str("last_server", server_id);
     }
-    std::optional<uint16_t> load_static_delay() override {
-        uint16_t delay;
-        if (nvs_read("static_delay", &delay)) return delay;
+    std::optional<std::string> load_last_played_server_id() override {
+        std::string id;
+        if (nvs_read_str("last_server", id)) return id;
         return std::nullopt;
     }
+
+    // Implement save/load_pairing_record, save/load_static_delay, etc. as needed.
 };
 ```
 
 ### SendspinClientListener (Optional)
 
-Receives client-level events.
+Receives client-level events. All callbacks fire on the main loop thread.
 
 ```cpp
 struct MyClientListener : SendspinClientListener {
@@ -476,6 +554,52 @@ struct MyClientListener : SendspinClientListener {
     // Called when the library no longer needs low-latency networking.
     void on_release_high_performance() override {
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    }
+
+    // Called when a server starts a Pairing-PSK pairing exchange.
+    // server_id is the base64url public key of the server initiating pairing.
+    void on_pairing_started(const std::string& server_id) override {
+        printf("Pairing started with server %s\n", server_id.c_str());
+    }
+
+    // Called when pairing completes successfully and the long-term record is stored.
+    // Subsequent connections from this server will report ConnectionTrust::USER.
+    void on_pairing_succeeded(const std::string& server_id) override {
+        printf("Pairing succeeded with server %s\n", server_id.c_str());
+    }
+
+    // Called when a pairing exchange is aborted. The connection is closed immediately
+    // after this callback.
+    void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
+        printf("Pairing failed with server %s\n", server_id.c_str());
+    }
+
+    // Called once per admitted connection after the Noise handshake completes.
+    // trust reflects the PSK category used:
+    //   ConnectionTrust::USER  -- long-term pairing record (paired server)
+    //   ConnectionTrust::NONE  -- Sentinel or Pairing PSK (unpaired access)
+    void on_trust_changed(ConnectionTrust trust) override {
+        bool paired = (trust == ConnectionTrust::USER);
+        update_trust_indicator(paired);
+    }
+
+    // Dynamic-PIN pairing: display/clear a server-issued PIN. Only invoked when
+    // SendspinClientConfig::pin_display_supported is true.
+    void on_display_pairing_pin(const std::string& pin) override {
+        show_pin_on_display(pin);
+    }
+    void on_clear_pairing_pin() override {
+        clear_pin_from_display();
+    }
+
+    // Static-PIN pairing: prompt/dismiss the operator pairing-window gesture. Only invoked
+    // when SendspinClientConfig::pairing_window_supported is true. Confirm the gesture by
+    // calling client.confirm_pairing_window() (thread-safe) once the operator performs it.
+    void on_open_pairing_window() override {
+        prompt_pairing_button_press();
+    }
+    void on_close_pairing_window() override {
+        dismiss_pairing_prompt();
     }
 };
 ```
@@ -523,6 +647,104 @@ while (running) {
 // Clean shutdown
 client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
 ```
+
+## Encryption and Pairing
+
+All connections are encrypted with Noise KKpsk2 (X25519 + ChaChaPoly or AES-GCM). This
+requires no application-level configuration beyond providing a `SendspinPersistenceProvider`
+(so the static keypair survives reboots). Encryption is mandatory; there is no cleartext
+fallback.
+
+### Client Identity
+
+The library derives `client_id` from the static X25519 keypair: `base64url(public_key)`
+(43 characters, URL-safe, no padding). This string identifies the device to servers. It is
+fixed for the lifetime of the keypair.
+
+Without a persistence provider the keypair is regenerated on every boot. Pairing records
+and server preferences will not survive reboots in that case.
+
+```cpp
+client.start_server();
+printf("client_id: %s\n", client.client_id().c_str());
+```
+
+### Cipher Suite
+
+The default cipher suite is `ChaChaPoly` (lower CPU on bare-metal). On host targets AES-GCM
+may be faster; set the preference in `SendspinClientConfig`:
+
+```cpp
+config.cipher_suite = NoiseCipherSuitePreference::AESGCM;
+```
+
+Both suites are always supported on host; this field only sets the preference sent to the
+server. On ESP-IDF, `AESGCM` is not usable (see the `NoiseCipherSuitePreference` reference
+below) and the library falls back to `ChaChaPoly` regardless of this setting.
+
+### Pairing
+
+Pairing creates a long-term trust record for a specific server. After pairing, connections
+from that server resolve via the long-term PSK and report `ConnectionTrust::USER`.
+
+Pairing is server-initiated. The server includes `pairing` in the `activities` of its
+`server/activate` message; the library handles the exchange automatically. The application
+observes pairing via `SendspinClientListener` callbacks:
+
+1. `on_pairing_started(server_id)` -- the exchange has begun.
+2. `on_pairing_succeeded(server_id)` -- the record is stored; the server will
+   re-handshake immediately on the new long-term PSK.
+3. `on_pairing_failed(server_id, reason)` -- the exchange failed; connection closed. See
+   `SendspinPairAbortReason` below for the possible reasons, including the client-local
+   `STORAGE_FAILED` case (the persistence provider rejected the record).
+
+To enable pairing, the server must hold a Pairing PSK that this client accepts. Configure
+an accepted Pairing PSK via the persistence provider before `start_server()`:
+
+```cpp
+SendspinPairingPsk psk;
+psk.psk_id = "my-setup-psk-id";
+// 32 raw bytes distributed out-of-band during provisioning
+psk.psk = { /* ... */ };
+persistence_provider.save_pairing_psk(psk);
+```
+
+After pairing completes, `on_pairing_succeeded` fires and the long-term record is stored
+by the library via `save_pairing_record`. Subsequent boots load the record via
+`load_pairing_records`; no further provisioning is needed.
+
+The library also supports PIN-based pairing (dynamic and static), gated by
+`SendspinClientConfig::pin_display_supported` / `pairing_window_supported` and the
+`SendspinClientListener::on_display_pairing_pin` / `on_clear_pairing_pin` /
+`on_open_pairing_window` / `on_close_pairing_window` callbacks documented in Step 3 above.
+
+### Trust Levels
+
+`ConnectionTrust` reflects which PSK resolved during the Noise handshake:
+
+| Value | PSK used | Meaning |
+|-------|---------|---------|
+| `ConnectionTrust::USER` | Long-term pairing record | Server has been paired with this client |
+| `ConnectionTrust::NONE` | Sentinel or Pairing PSK | Unpaired access |
+
+`on_trust_changed` fires once per admitted connection, after `server/activate` is
+processed and the connection is promoted to current. Connections that are rejected
+(e.g., missing record when unpaired access is disabled) do not fire this callback.
+
+### Unpaired Access
+
+By default only paired servers (long-term record) and servers holding the accepted Pairing
+PSK are admitted. To allow connections from servers that only know the Sentinel PSK (no
+pairing required), enable `unpaired_access_enabled` in `SendspinPairingConfig`:
+
+```cpp
+SendspinPairingConfig pairing_cfg;
+pairing_cfg.unpaired_access_enabled = true;
+persistence_provider.save_pairing_config(pairing_cfg);
+```
+
+Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
+unpaired access after the device is paired is the typical production configuration.
 
 ## Sending Commands
 
@@ -647,6 +869,10 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 
 `ArtworkRole::frame_done()` must be called from the main loop thread (typically from inside `on_image_display()`/`on_image_clear()` or when a cross-fade animation completes).
 
+`SendspinPersistenceProvider` methods are called on the main loop thread, except
+`save_pairing_record`, which is also called on the network thread when a pairing finalizes
+(see the `SendspinPersistenceProvider` section above).
+
 ## Minimal Example
 
 A minimal integration that receives and discards audio:
@@ -669,7 +895,6 @@ struct AlwaysReady : SendspinNetworkProvider {
 
 int main() {
     SendspinClientConfig config;
-    config.client_id = "minimal-example";
     config.name = "Minimal Client";
 
     SendspinClient client(std::move(config));
@@ -750,16 +975,22 @@ When a role is disabled, its `add_*()` method, accessor method, and backing memb
 
 Main client configuration passed to the `SendspinClient` constructor.
 
+`client_id` is not a field in `SendspinClientConfig`. It is derived from the static
+X25519 keypair and read back via `client.client_id()` after `start_server()`.
+
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `client_id` | `std::string` | — | Unique client identifier (e.g., MAC address) |
 | `name` | `std::string` | — | Friendly display name shown in the Sendspin UI |
+| `cipher_suite` | `NoiseCipherSuitePreference` | `CHACHAPOLY` | Preferred Noise cipher suite advertised to the server. `CHACHAPOLY` (default) is lower CPU on bare-metal; `AESGCM` is host-only (see the enum reference below). Both suites are always supported; the server selects the actual cipher used. |
 | `product_name` | `std::optional<std::string>` | unset | Device product name; sent in `client/hello` only when set |
 | `manufacturer` | `std::optional<std::string>` | unset | Manufacturer name (e.g., `"ESPHome"`); sent in `client/hello` only when set |
 | `software_version` | `std::optional<std::string>` | unset | Software version string; sent in `client/hello` only when set |
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
+| `pin_display_supported` | `bool` | `false` | Set to `true` when the application implements `on_display_pairing_pin` / `on_clear_pairing_pin` on its `SendspinClientListener`. When `false`, dynamic-PIN pairing is not advertised even if enabled in `SendspinPairingConfig`. |
+| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, static-PIN pairing is not advertised even if a static PIN is configured. |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
+| `httpd_stack_size` | `size_t` | `8192` | HTTP server task stack size in bytes (ESP-IDF only). The Noise handshake (and especially the in-band re-handshake after pairing) runs its X25519 crypto on this task; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
 | `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |
 | `server_port` | `uint16_t` | `8928` | WebSocket server port |
 | `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye) |
@@ -768,7 +999,14 @@ Main client configuration passed to the `SendspinClient` constructor.
 | `time_burst_interval_ms` | `int64_t` | `10000` | Milliseconds between time sync bursts |
 | `time_burst_response_timeout_ms` | `int64_t` | `10000` | Milliseconds before a burst message times out |
 | `websocket_payload_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the per-connection WebSocket payload reassembly buffer (sized to the largest incoming frame, holds raw audio chunks delivered by httpd). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
+| `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `websocket_payload_location` (which covers the raw WebSocket frame buffer). ESP-IDF only; ignored on host. |
 | `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer used to parse incoming JSON protocol messages, instead of the default PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the network task on every message. Messages too large for the budget fall back to PSRAM; the default covers steady-state traffic (including the FLAC stream-start header), while large track-metadata messages may spill over (but those arrive only once per song). Set to `0` to disable and keep PSRAM-only behaviour. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer for the parse (still used, harmless). |
+
+`encryption_required` is intentionally not documented here: it is an internal/testing knob
+(default `true`) that skips the Noise layer entirely when set to `false`, for test fixtures
+that exercise the connection-nursery structure independently of Noise. The Sendspin spec
+requires encryption to be always-on; every shipping deployment must leave this at its
+default and it is not part of the supported public configuration surface.
 
 ---
 
@@ -852,6 +1090,40 @@ Configuration passed to `client.add_visualizer()`.
 ---
 
 ## Enums Reference
+
+### NoiseCipherSuitePreference
+
+| Value | Description |
+|---|---|
+| `CHACHAPOLY` | Prefer Noise_KKpsk2_25519_ChaChaPoly_SHA256 (default; lower CPU on bare-metal) |
+| `AESGCM` | Prefer Noise_KKpsk2_25519_AESGCM_SHA256 (host only; on ESP-IDF the library ignores this preference and falls back to ChaChaPoly, since ESP-IDF's libsodium AES-GCM backend is a stub) |
+
+Set in `SendspinClientConfig::cipher_suite`. The server selects the actual cipher; this is a preference only.
+
+### ConnectionTrust
+
+| Value | Description |
+|---|---|
+| `NONE` | Sentinel or Pairing PSK was used; this server has not been paired |
+| `USER` | Long-term pairing record matched; this server is paired |
+
+Reported via `SendspinClientListener::on_trust_changed` once per admitted connection.
+
+### SendspinPairAbortReason
+
+| Value | Description |
+|---|---|
+| `ATTEMPT_TIMEOUT` | Pairing timed out waiting for the next step |
+| `CONCURRENT_ATTEMPT` | The server rejected pairing because another pairing is in progress |
+| `LOCKED_OUT` | Too many failed pairing attempts |
+| `METHOD_NOT_SUPPORTED` | The proposed pairing method is not supported by the client |
+| `PIN_LENGTH_UNACCEPTABLE` | The PIN length requirement is out of the accepted range |
+| `PIN_MISMATCH` | The PIN entered does not match |
+| `USER_CANCELLED` | The pairing was cancelled by the user (on the server side) |
+| `STORAGE_FAILED` | This device could not persist the pairing record (client-local; the wire carries `user_cancelled`) |
+| `UNKNOWN` | Unrecognized abort reason from the server |
+
+Delivered via `SendspinClientListener::on_pairing_failed`.
 
 ### SendspinCodecFormat
 
@@ -977,4 +1249,4 @@ Set with `SendspinClient::set_log_level()`. Only affects host builds; ESP-IDF bu
 | `PREFER_EXTERNAL` | Prefer SPIRAM, fall back to internal RAM (ESP-IDF only) |
 | `PREFER_INTERNAL` | Prefer internal RAM, fall back to SPIRAM (ESP-IDF only) |
 
-Used by `SendspinClientConfig::websocket_payload_location` to control where the per-connection WebSocket payload reassembly buffer is allocated, and by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated. Ignored on host platforms (no internal/external distinction).
+Used by `SendspinClientConfig::websocket_payload_location` to control where the per-connection WebSocket payload reassembly buffer is allocated, by `SendspinClientConfig::noise_buffer_location` to control where the Noise transport's fragment reassembly and fragmentation buffers are allocated, and by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated. Ignored on host platforms (no internal/external distinction).

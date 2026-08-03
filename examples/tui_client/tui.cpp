@@ -62,6 +62,11 @@ struct TuiSnapshot {
     std::string connected_host;
     uint16_t connected_port{0};
 
+    // Identity and trust
+    std::string client_id;
+    ConnectionTrust trust{ConnectionTrust::NONE};
+    std::string pairing_status;
+
     // Server selector
     bool server_selector_active{false};
     int server_selector_index{0};
@@ -108,6 +113,9 @@ static TuiSnapshot take_snapshot(TuiState& state) {
     snap.streaming = state.streaming;
     snap.connected_host = state.connected_host;
     snap.connected_port = state.connected_port;
+    snap.client_id = state.client_id;
+    snap.trust = state.trust;
+    snap.pairing_status = state.pairing_status;
     snap.server_selector_active = state.server_selector_active;
     snap.server_selector_index = state.server_selector_index;
     snap.discovered_servers = state.discovered_servers;
@@ -389,7 +397,7 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
     auto host_display = snap.connected_host.empty() ? "\u2014" : snap.connected_host;
     auto port_display = snap.connected_port > 0 ? std::to_string(snap.connected_port) : "\u2014";
 
-    // Build server info rows — group only shown when set (matches reference)
+    // Build server info rows -- group, trust, and identity shown when applicable
     Elements server_rows;
     server_rows.push_back(hbox({text("  Status: ") | color(Color::White) | dim, text(connection_str) | bold | color(connection_color)}));
     server_rows.push_back(info_row("Host:    ", host_display, !snap.connected_host.empty()));
@@ -398,6 +406,19 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
     }
     if (!snap.group_name.empty()) {
         server_rows.push_back(info_row("Group:   ", snap.group_name, true));
+    }
+    // Trust level: show when connected
+    if (snap.connected) {
+        std::string trust_str = (snap.trust == ConnectionTrust::USER) ? "user (paired)" : "none";
+        Color trust_color = (snap.trust == ConnectionTrust::USER) ? Color::Green : Color::GrayDark;
+        server_rows.push_back(hbox({
+            text("  Trust:  ") | color(Color::White) | dim,
+            text(trust_str) | color(trust_color),
+        }));
+    }
+    // Pairing status: show when non-empty
+    if (!snap.pairing_status.empty()) {
+        server_rows.push_back(info_row("Pair:    ", snap.pairing_status, true));
     }
     // Pad to match stream panel height (5 data rows + separator + shortcut = 7)
     while (server_rows.size() < 5) {
@@ -614,7 +635,12 @@ static Element render_server_selector(const TuiSnapshot& snap) {
 }
 
 static Element render_footer(const TuiSnapshot& snap) {
+    // Show truncated client_id (first 12 chars) on the left; shortcuts on the right.
+    std::string id_display = snap.client_id.empty()
+                                 ? "id: ..."
+                                 : "id: " + snap.client_id.substr(0, 12) + "...";
     return hbox({
+        text(id_display) | color(Color::GrayDark) | dim,
         filler(),
         shortcut_label(snap, "v", "v"),
         text(" visualizer  ") | dim,

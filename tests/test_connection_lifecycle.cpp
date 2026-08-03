@@ -85,7 +85,6 @@ std::string server_activate_json(const std::string& reason) {
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
-    config.client_id = "lifecycle-test-client";
     config.name = "Lifecycle Test Client";
     config.server_port = port;
     // This suite exercises the nursery's structural lifecycle (accept/prove/admit, reaping,

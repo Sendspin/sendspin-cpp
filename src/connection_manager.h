@@ -94,6 +94,18 @@ struct PairAbortEvent {
     PairAbortReason reason;                    ///< Parsed abort reason
 };
 
+/// @brief Deferred local pairing abort: the persistence provider rejected the long-term
+/// record at server/pair-finalize (network thread), so the record was never stored
+/// (RecordStore::store_record fails closed) and the pairing must fail closed. Processed on
+/// the main loop: sends a best-effort pair/abort, drops the connection, and reports
+/// SendspinPairAbortReason::STORAGE_FAILED to the listener. server_id is captured at
+/// production time for the same reason as PairingSucceededEvent's server_id (the connection
+/// may already be torn down by the time this drains).
+struct PairStorageFailedEvent {
+    std::shared_ptr<SendspinConnection> conn;  ///< Connection whose pairing failed to persist
+    std::string server_id;                     ///< server_id captured when the event was posted
+};
+
 // ============================================================================
 // Management deferred events
 // ============================================================================
@@ -326,6 +338,15 @@ public:
     /// @param server_id The base64url public key of the newly paired server (moved).
     void schedule_pairing_succeeded(std::string server_id);
 
+    /// @brief Schedules a pairing storage-failure abort for deferred processing in loop().
+    ///
+    /// Called from SendspinClient::process_json_message() on the NETWORK thread when
+    /// RecordStore::store_record() reports that the persistence provider rejected the
+    /// long-term record at server/pair-finalize. Rides the same pending_*_events_ /
+    /// has_pending_events_ idiom as schedule_pairing_succeeded above.
+    /// @param event The storage-failed event to schedule (moved).
+    void schedule_pair_storage_failed(PairStorageFailedEvent event);
+
     /// @brief Schedules a static-PIN pairing-window confirmation for deferred processing in
     /// loop(). Thread-safe; called from SendspinClient::confirm_pairing_window().
     void schedule_pairing_window_confirm();
@@ -454,6 +475,12 @@ private:
     /// miss a pushed event. Caller must hold conn_mutex_.
     /// @param server_id The newly paired server's base64url public key (moved).
     void queue_pending_pairing_succeeded(std::string server_id);
+
+    /// @brief Appends an event to pending_pair_storage_failed_events_ and sets
+    /// has_pending_events_ in the same critical section, so loop()'s lock-free gate can never
+    /// miss a pushed event. Caller must hold conn_mutex_.
+    /// @param event The storage-failed event to defer to loop() (moved).
+    void queue_pending_pair_storage_failed(PairStorageFailedEvent event);
 
     /// @brief Releases a nursery entry: erases it, prunes its hello retry, and queues the
     /// goodbye+release on deferred_releases_. Caller must hold conn_ptr_mutex_ and call
@@ -600,6 +627,14 @@ private:
     /// @param reason The abort reason.
     void handle_pair_abort(SendspinConnection* conn, PairAbortReason reason);
 
+    /// @brief Handles a pairing storage-failure event on the main loop.
+    /// The persistence provider rejected the long-term record at server/pair-finalize, so the
+    /// record was never stored (RecordStore::store_record fails closed) and the pairing cannot
+    /// survive a reboot. Sends a best-effort pair/abort, drops the connection, and reports
+    /// SendspinPairAbortReason::STORAGE_FAILED to the listener.
+    /// @param event The storage-failed event (conn + the server_id captured when it was posted).
+    void handle_pair_storage_failed(const PairStorageFailedEvent& event);
+
     // ========================================
     // Phase 8b: Dynamic-PIN pairing main-loop handlers
     // ========================================
@@ -664,6 +699,8 @@ private:
     std::vector<ServerUnpairEvent> pending_server_unpair_events_;
     std::vector<ServerPairingMessageEvent> pending_pin_pairing_events_;
     std::vector<std::string> pending_pairing_succeeded_events_;  // server_ids to notify
+    // Deferred storage-failure aborts (persist rejected the record at server/pair-finalize)
+    std::vector<PairStorageFailedEvent> pending_pair_storage_failed_events_;
     bool pending_pairing_window_confirm_{false};  // Static-PIN pairing-window confirm
 
     // Pointer fields

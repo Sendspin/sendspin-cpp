@@ -18,6 +18,7 @@
 #include "lwip/sockets.h"  // for close()
 #include "platform/compiler.h"
 #include "platform/logging.h"
+#include "sendspin/config.h"
 #include "server_connection.h"
 #include <esp_idf_version.h>
 #include <esp_timer.h>
@@ -50,7 +51,7 @@ SendspinWsServer::~SendspinWsServer() {
 }
 
 bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
-                             unsigned task_priority) {
+                             unsigned task_priority, size_t task_stack_size) {
     if (this->server_ != nullptr) {
         SS_LOGW(TAG, "Server already started");
         return true;
@@ -64,6 +65,17 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
         config.task_caps = MALLOC_CAP_SPIRAM;
     }
     config.task_priority = task_priority;
+    // The Noise handshake (and especially the in-band re-handshake) runs its X25519 crypto on
+    // this task; the esp_http_server 4096-byte default overflows during the post-pairing
+    // re-handshake. Clamp to the documented minimum so a lowered config value cannot
+    // reintroduce that overflow.
+    if (task_stack_size < SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE) {
+        SS_LOGW(TAG, "httpd_stack_size %u below minimum %u; clamping",
+                static_cast<unsigned>(task_stack_size),
+                static_cast<unsigned>(SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE));
+        task_stack_size = SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE;
+    }
+    config.stack_size = task_stack_size;
     config.server_port = this->server_port_;
     config.max_open_sockets = this->max_connections_;
     config.open_fn = SendspinWsServer::open_callback;

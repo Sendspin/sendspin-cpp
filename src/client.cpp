@@ -1081,6 +1081,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                 if (process_server_pair_finalize_message(root)) {
                     auto record = conn->take_pending_pairing_record();
                     bool stored_record = false;
+                    bool persist_failed = false;
                     if (record.has_value() && this->record_store_ != nullptr) {
                         const std::string psk_id = record->psk_id;
                         // store_record() persists to the provider before mutating in-memory
@@ -1090,8 +1091,9 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                         // PSK the client never actually retained. The server will rekey onto
                         // this PSK regardless (it already acked pair-finalize); since the client
                         // does not have it, the follow-up re-handshake will fail to resolve the
-                        // psk_id and the connection will be dropped, which is the correct
-                        // fail-closed outcome here.
+                        // psk_id and the connection would otherwise dangle waiting for a
+                        // watchdog. schedule_pair_storage_failed() below aborts it explicitly
+                        // instead.
                         if (this->record_store_->store_record(std::move(record.value()))) {
                             SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
                                     psk_id.c_str());
@@ -1099,24 +1101,37 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                         } else {
                             SS_LOGW(TAG,
                                     "server/pair-finalize: failed to persist pairing record "
-                                    "(psk_id=%s); not reporting pairing success",
+                                    "(psk_id=%s); aborting pairing",
                                     psk_id.c_str());
+                            persist_failed = true;
                         }
                     } else {
                         SS_LOGI(TAG, "server/pair-finalize: no record to store "
                                      "(shared-PSK fallback or no pending pairing)");
                     }
-                    // Defer on_pairing_succeeded to the main loop via the same
-                    // pending_*_events_ / has_pending_events_ idiom every other cross-thread
-                    // connection-state mutation in ConnectionManager uses. Only fire when an
-                    // actual long-term record was stored (not the shared-PSK fallback case).
-                    if (stored_record) {
-                        this->connection_manager_->schedule_pairing_succeeded(
-                            conn->get_server_id());
+                    if (persist_failed) {
+                        // The persistence provider rejected the record, so it was never stored
+                        // (store_record fails closed) and this pairing could not survive a
+                        // reboot. Defer the local abort (pair/abort + drop + on_pairing_failed
+                        // with STORAGE_FAILED) to the main loop via the same pending_*_events_ /
+                        // has_pending_events_ idiom every other cross-thread connection-state
+                        // mutation in ConnectionManager uses. No note_pairing_finalize_ack() here:
+                        // the connection is being aborted, not kept alive to await a re-handshake.
+                        this->connection_manager_->schedule_pair_storage_failed(
+                            {conn->shared_from_this(), conn->get_server_id()});
+                    } else {
+                        // Defer on_pairing_succeeded to the main loop via the same
+                        // pending_*_events_ / has_pending_events_ idiom every other cross-thread
+                        // connection-state mutation in ConnectionManager uses. Only fire when an
+                        // actual long-term record was stored (not the shared-PSK fallback case).
+                        if (stored_record) {
+                            this->connection_manager_->schedule_pairing_succeeded(
+                                conn->get_server_id());
+                        }
+                        // Re-arm the provisional timeout so the 30 s watchdog fires if the server
+                        // acks but never sends the in-band re-handshake that follows pair-finalize.
+                        conn->note_pairing_finalize_ack();
                     }
-                    // Re-arm the provisional timeout so the 30 s watchdog fires if the server
-                    // acks but never sends the in-band re-handshake that follows pair-finalize.
-                    conn->note_pairing_finalize_ack();
                 } else {
                     SS_LOGW(TAG, "Malformed server/pair-finalize; ignoring");
                 }
@@ -1385,25 +1400,27 @@ void SendspinClient::load_or_generate_identity() {
         if (saved_priv.has_value()) {
             this->identity_ =
                 std::make_unique<Identity>(Identity::from_private_bytes(saved_priv.value()));
-            SS_LOGI(TAG, "Loaded static keypair; client_id=%s", this->identity_->peer_id().c_str());
+            this->client_id_ = this->identity_->peer_id();
+            SS_LOGI(TAG, "Loaded static keypair; client_id=%s", this->client_id_.c_str());
             return;
         }
     }
 
     // No saved key -- generate a new one.
     this->identity_ = std::make_unique<Identity>(Identity::generate());
+    this->client_id_ = this->identity_->peer_id();
 
     if (this->persistence_provider_ != nullptr) {
         if (this->persistence_provider_->save_static_keypair(this->identity_->private_bytes)) {
             SS_LOGI(TAG, "Generated and persisted static keypair; client_id=%s",
-                    this->identity_->peer_id().c_str());
+                    this->client_id_.c_str());
         } else {
             SS_LOGW(TAG, "Generated static keypair but failed to persist it; client_id=%s",
-                    this->identity_->peer_id().c_str());
+                    this->client_id_.c_str());
         }
     } else {
         SS_LOGI(TAG, "Generated ephemeral static keypair (no provider); client_id=%s",
-                this->identity_->peer_id().c_str());
+                this->client_id_.c_str());
     }
 }
 

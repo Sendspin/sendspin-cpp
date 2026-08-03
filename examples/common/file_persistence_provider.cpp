@@ -14,18 +14,18 @@
 
 #include "file_persistence_provider.h"
 
-#include "platform/base64.h"
-#include "platform/logging.h"
 #include <ArduinoJson.h>
 
+#include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
-
-static const char* const TAG = "sendspin.file_persist";
+#include <vector>
 
 namespace sendspin {
 
@@ -34,6 +34,78 @@ namespace sendspin {
 // ============================================================================
 
 namespace {
+
+// ----------------------------------------------------------------------------
+// Base64url (RFC 4648 section 5, no `=` padding). Inlined here so this example helper
+// depends only on the public API + ArduinoJson, not on the library's internal
+// platform/ headers. Matches the library's src/platform/base64.h encoding so
+// files written by either remain compatible.
+// ----------------------------------------------------------------------------
+
+// clang-format off
+static constexpr char B64URL_ENCODE_TABLE[65] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+static constexpr unsigned char B64URL_DECODE_TABLE[128] = {
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,  //   0-15
+    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,  //  16-31
+    255,255,255,255,255,255,255,255,255,255,255,255,255, 62,255,255,  //  32-47  (-, no +, no /)
+     52, 53, 54, 55, 56, 57, 58, 59, 60, 61,255,255,255,255,255,255,  //  48-63  (0-9)
+    255,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,  //  64-79  (A-O)
+     15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,255,255,255,255, 63,  //  80-95  (P-Z, _)
+    255, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,  //  96-111 (a-o)
+     41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,255,255,255,255,255,  // 112-127 (p-z)
+};
+// clang-format on
+
+/// Encode bytes to base64url, no `=` padding.
+static std::string b64url_encode(const uint8_t* data, size_t len) {
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t b = static_cast<uint32_t>(data[i]) << 16;
+        if (i + 1 < len) {
+            b |= static_cast<uint32_t>(data[i + 1]) << 8;
+        }
+        if (i + 2 < len) {
+            b |= static_cast<uint32_t>(data[i + 2]);
+        }
+        out += B64URL_ENCODE_TABLE[(b >> 18) & 0x3F];
+        out += B64URL_ENCODE_TABLE[(b >> 12) & 0x3F];
+        if (i + 1 < len) {
+            out += B64URL_ENCODE_TABLE[(b >> 6) & 0x3F];
+        }
+        if (i + 2 < len) {
+            out += B64URL_ENCODE_TABLE[b & 0x3F];
+        }
+    }
+    return out;
+}
+
+/// Decode base64url, tolerating missing `=` padding. Returns nullopt on invalid input.
+static std::optional<std::vector<uint8_t>> b64url_decode(const std::string& s) {
+    size_t slen = s.size();
+    while (slen > 0 && s[slen - 1] == '=') {
+        --slen;
+    }
+    std::vector<uint8_t> out;
+    out.reserve((slen * 3) / 4);
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < slen; ++i) {
+        auto c = static_cast<unsigned char>(s[i]);
+        if (c >= 128 || B64URL_DECODE_TABLE[c] == 255) {
+            return std::nullopt;  // Invalid character.
+        }
+        acc = (acc << 6) | B64URL_DECODE_TABLE[c];
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
 
 /// Read the entire file into a string. Returns empty string on error.
 static std::string read_file(const std::string& path) {
@@ -72,7 +144,8 @@ static JsonDocument load_doc(const std::string& path) {
     }
     DeserializationError err = deserializeJson(doc, raw);
     if (err) {
-        SS_LOGW(TAG, "Failed to parse persistence file '%s': %s", path.c_str(), err.c_str());
+        std::fprintf(stderr, "[FilePersistenceProvider] failed to parse '%s': %s\n", path.c_str(),
+                     err.c_str());
         doc.to<JsonObject>();
     }
     return doc;
@@ -123,7 +196,7 @@ std::optional<std::array<uint8_t, 32>> FilePersistenceProvider::load_static_keyp
     std::string s = doc["static_keypair"]["private_key"].as<const char*>();
     std::array<uint8_t, 32> out{};
     if (!b64u_to_32(s, out)) {
-        SS_LOGW(TAG, "Bad static_keypair in persistence file");
+        std::fprintf(stderr, "[FilePersistenceProvider] bad static_keypair in persistence file\n");
         return std::nullopt;
     }
     return out;
@@ -276,6 +349,9 @@ bool FilePersistenceProvider::save_pairing_psk(const SendspinPairingPsk& psk) {
     doc["pairing_psk"]["psk"] = b64url_encode(psk.psk.data(), psk.psk.size());
     if (psk.label.has_value()) {
         doc["pairing_psk"]["label"] = psk.label.value();
+    } else {
+        // Drop any stale label left over from a previously-saved PSK that had one.
+        doc["pairing_psk"].remove("label");
     }
     return save_doc(path_, doc);
 }

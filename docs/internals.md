@@ -409,6 +409,114 @@ Two-dimensional state vector: `[offset, drift]`.
 
 The filter is protected by `state_mutex_` so that `compute_client_time()` can be called from the sync task thread while `update()` runs from the main loop thread.
 
+## Noise Encryption
+
+Every connection is encrypted with Noise KKpsk2 when `SendspinClientConfig::encryption_required` is set (the default). The C++ library is always the Noise responder; the Python server is always the initiator.
+
+### Transport Stack (`src/noise_transport.h`, `src/noise_transport.cpp`)
+
+Once transport is active, all application-level messages travel through `NoiseTransport`. The wire framing is:
+
+```api
+[type byte][app payload] --> Noise encrypt --> [ciphertext]   (binary WebSocket frame)
+[ciphertext] (binary WebSocket frame) --> Noise decrypt --> [type byte][app payload]
+```
+
+The ciphertext is the body of a binary WebSocket frame; there is no application-level length prefix (the WebSocket layer delimits frames). The first byte of the decrypted plaintext is a type tag (`src/crypto/constants.h`):
+
+| Type byte | Constant | Meaning |
+|-----------|----------|---------|
+| 0 | `MSG_TYPE_JSON_BODY` | JSON message (UTF-8, no null terminator) |
+| 2 | `MSG_TYPE_FRAGMENT_MORE` | Non-final fragment (more fragments follow) |
+| 3 | `MSG_TYPE_FRAGMENT_END` | Final fragment (completes a fragmented message) |
+| other | -- | Binary role message (player audio, artwork, visualizer); dispatched via `get_binary_role()`/`get_binary_slot()` in `process_binary_message()` |
+
+Types 2 and 3 implement app-level fragmentation for payloads too large for a single Noise transport frame (`MAX_TRANSPORT_PLAINTEXT`, 65519 bytes). The first fragment carries `[MSG_TYPE_FRAGMENT_MORE][original type byte][chunk]`, intermediate fragments carry `[MSG_TYPE_FRAGMENT_MORE][chunk]`, and the final fragment carries `[MSG_TYPE_FRAGMENT_END][chunk]`. `NoiseTransport::accept_plaintext()` reassembles them and returns the completed `[orig_type][data...]` message when the final fragment arrives; `SendspinConnection` dispatches it from there. The reassembly buffer (`reasm_buf_`, a `PlatformBuffer`) accumulates the final message shape directly rather than staging a separate copy, grows geometrically as fragments arrive, retains its capacity across messages (capped at `MAX_REASSEMBLED_MESSAGE_BYTES`, 64 MiB), and is placed per `SendspinClientConfig::noise_buffer_location` (PSRAM-preferring by default on ESP). The ~64 KB per-frame fragmentation buffer used when *sending* a large payload is placed the same way.
+
+### Cleartext Handshake (Initial Exchange)
+
+Before Noise transport is active, a short cleartext exchange establishes the prologue and negotiates cipher suite. All frames in this phase are WebSocket text (JSON).
+
+```api
+Client -> Server: client/init   (client_id, version, cipher suite preference)
+Server -> Client: server/init   (server_id, cipher suite selection)
+Server -> Client: noise/handshake msg1 (Noise KKpsk2 initiator message)
+Client -> Server: noise/handshake msg2 (Noise KKpsk2 responder message)
+-- transport active from here --
+Server -> Client: server/hello  (encrypted, server name)
+Client -> Server: client/hello  (encrypted, device info, trust_level, pair_methods)
+Server -> Client: server/activate (encrypted, activities, active_roles)
+```
+
+The prologue fed into the Noise handshake is `bytes(client/init) || bytes(server/init)`. `ConnectionManager` sends `client/init` as soon as the WebSocket upgrade completes (`init_noise_handshake()` followed by `send_noise_client_init()`), for both inbound (`on_new_connection`) and outbound (`connect_to()`/the connected-event scan in `loop()`) connections. The cipher suite sent is `suite_name_for(config_.cipher_suite)`: `SendspinClientConfig::cipher_suite` selects a preference (`NoiseCipherSuitePreference::CHACHAPOLY` or `AESGCM`); on ESP-IDF, `AESGCM` is unusable (the `esphome__noise-c` libsodium backend stubs AES-GCM on Xtensa) and `suite_name_for()` silently falls back to ChaChaPoly with a warning.
+
+### PSK Resolution (`src/record_store.cpp`)
+
+The Noise KKpsk2 handshake requires a pre-shared key (PSK). The server embeds a `psk_id` in msg1; `RecordStore::resolve_by_psk_id()` matches it to the correct PSK, in order:
+
+1. Long-term record (stored after a successful pairing). `PskCategory::LONG_TERM`.
+2. Accepted Pairing PSK (distributed out-of-band). `PskCategory::PAIRING`.
+3. Sentinel PSK (shared fallback, authenticates nothing on its own). `PskCategory::SENTINEL`.
+
+The resolved `PskCategory` is stored on the connection and determines the trust level reported in `client/hello` (`trust_level="user"` for `LONG_TERM`, `"none"` otherwise) and the `ConnectionTrust` value delivered to `SendspinClientListener::on_trust_changed`.
+
+### Two-Handshake PSK Trick (`src/noise_handshake.cpp`)
+
+In KKpsk2 the PSK is mixed only into msg2, so msg1 can be read with the static keys alone. But noise-c requires a PSK to be set before the handshake starts, and the client does not know which PSK applies until it reads the `psk_id` carried in msg1. The library resolves this with a two-step read:
+
+1. Build a probe responder with a zero placeholder PSK and read msg1. msg1 is PSK-independent, so this succeeds and exposes the `psk_id` in its payload.
+2. Discard the probe. Resolve the `psk_id` to the real PSK via `RecordStore`, build a fresh responder with that PSK, and re-read the same msg1 bytes.
+3. Write msg2 and split into transport keys.
+
+The in-band re-handshake below uses the same probe-then-real sequence.
+
+### In-Band Re-Handshake (Key Rotation)
+
+After transport is active, the server may initiate a new KKpsk2 handshake to rotate session keys or move an admitted connection onto a different PSK (e.g. the post-pairing rekey below). The server sends a `noise/handshake` JSON envelope (decrypted through the active transport). `SendspinConnection::handle_noise_rehandshake()`:
+
+1. Runs the probe-then-real msg1 read with the re-handshake PSK.
+2. Builds msg2 and encrypts it under the old session.
+3. Atomically swaps the active `NoiseSession` under a per-connection mutex (`session_mutex_` in `NoiseTransport`).
+4. Resets `first_activate_received_` / `server_hello_received_` / `client_hello_sent_`, so the connection goes momentarily non-operational and `ConnectionManager::schedule_rehandshake_rearm()` re-arms `client/hello` for it on the main loop -- without that re-arm the connection would stay non-operational forever after the swap (see the hello re-arm scan in `loop()`).
+
+This is the mechanism that upgrades a Pairing-PSK connection to a long-term PSK immediately after pairing finalizes.
+
+### Pairing Flow (Pairing-PSK Method)
+
+When the server's `server/activate` declares `activities=["pairing"]` with `selected_pair_method=PAIRING_PSK`, `promote_or_arbitrate_nursery_entry()` (or the subsequent-activate branch in the main activate-event loop, for an already-operational connection) calls `handle_enter_pairing()` instead of `on_handshake_complete()`:
+
+```api
+Server -> Client: server/activate (activities=["pairing"], method=pairing_psk)
+-- ConnectionManager::handle_enter_pairing (main loop) --
+Client -> Server: client/pair-finalize (long-term PSK, base64url-encoded)
+-- server/pair-finalize received on network thread; record stored immediately --
+Client stores the long-term pairing record in RecordStore (thread-safe mutator)
+Server -> Client: noise/handshake msg1 (re-keying onto the new long-term PSK)
+Client -> Server: noise/handshake msg2
+-- transport upgraded to long-term PSK --
+Server -> Client: server/hello, server/activate (normal operational flow)
+```
+
+The long-term record is stored on the network thread (synchronously, inside `SendspinClient::process_json_message()`'s `SERVER_PAIR_FINALIZE` handler) so the immediately following `noise/handshake` msg1 can resolve the new `psk_id` from the record store. `RecordStore::store_record()` writes to the persistence provider first and fails closed: if the provider rejects the write, the in-memory store is left untouched and `store_record()` returns `false`.
+
+- **Success**: `ConnectionManager::schedule_pairing_succeeded()` posts the server_id through the same `pending_*_events_` / `has_pending_events_` idiom every other cross-thread mutation in `ConnectionManager` uses; `loop()` drains it and calls `SendspinClient::note_pairing_succeeded()`, which queues the actual `on_pairing_succeeded` listener callback for `SendspinClient::loop()` to fire unlocked. `conn->note_pairing_finalize_ack()` re-arms the 30 s provisional timeout so the connection is still bounded if the server never follows up with the re-handshake.
+- **Persistence failure**: `ConnectionManager::schedule_pair_storage_failed()` posts a `PairStorageFailedEvent` (conn + server_id) through the same idiom. `handle_pair_storage_failed()` sends a best-effort `pair/abort` (wire reason `user_cancelled`, the closest fit -- the wire enum has no storage-failure value), drops the connection, and reports `SendspinPairAbortReason::STORAGE_FAILED` via `note_pairing_failed()`. No `note_pairing_finalize_ack()` in this path: the connection is being aborted outright, not kept alive to await a re-handshake that could never resolve the never-stored `psk_id` anyway.
+
+If the server sends `pair/abort` at any point, `ConnectionManager::handle_pair_abort()` runs on the main loop, fires `on_pairing_failed`, and closes the connection. The dynamic-PIN (CPace PAKE) and static-PIN pairing methods follow a similar main-loop-only state-machine shape but are driven by their own deferred event types (`ServerPairingMessageEvent`, the pairing-window confirm flag); see `handle_pin_pairing_message()` / `local_abort_pin_pairing()` / `handle_pairing_window_confirmed()` in `connection_manager.cpp`.
+
+### PSK Admission (trust gating)
+
+The `server/activate` handler in `ConnectionManager::loop()` evaluates each activate against `RecordStore::unpaired_access_enabled()` and the connection's resolved `PskCategory`, via the pure functions in `src/admission.h`:
+
+- Any activity set that contains `pairing` is admitted only when it is exactly `{pairing}`.
+- `LONG_TERM`: any subset of `{playback, management}`.
+- `PAIRING`: only `{pairing}`.
+- `SENTINEL`: the empty set always; `{playback}` only when `unpaired_access_enabled` is true; nothing else.
+
+A rejected activate closes the connection with `SendspinGoodbyeReason::PAIRING_REQUIRED` when it would have been admissible had unpaired access been enabled (a Sentinel connection requesting `{playback}` while unpaired access is off), and `SendspinGoodbyeReason::UNAUTHORIZED` otherwise. Trust enforcement is skipped entirely when `encryption_required` is false (no PSK category was ever resolved), matching pre-encryption behavior for the plaintext nursery-structure test fixtures that use it.
+
+Multi-server admission arbitration (deciding whether an incoming connection displaces the current one) ranks each side by its highest activity (`activity_rank()` in `admission.h`: management=3, playback=2, pairing=1, none=0) and applies `should_admit_connection()`'s rules, described in [Handshake and Handoff](#handshake-and-handoff) above.
+
 ## Connection Lifecycle
 
 ### Connection Management (`src/connection_manager.cpp`)
@@ -425,13 +533,11 @@ All are `std::shared_ptr<SendspinConnection>`, and on the ESP server path they a
 ### Handshake and Handoff
 
 1. A new connection (outbound or inbound) enters the nursery. Inbound connections are delivered by the platform ws_server only after their WebSocket upgrade is observed.
-2. The connection sends a CLIENT_HELLO. Retry with exponential backoff (100 ms base, 3 attempts). Each managed connection has its own retry entry in `ConnectionManager::hello_retries_`, so a handoff candidate arriving mid-handshake cannot clobber another connection's pending hello.
-3. The handshake state lives on the connection as two atomic flags: `client_hello_sent_` (set by the hello send-completion callback) and `server_hello_received_` (set when SERVER_HELLO is processed on the network thread, after the server info fields it publishes).
-4. Establishment is level-triggered: each `loop()` tick, the promotion scan promotes any nursery connection whose `is_handshake_complete()` is true, so the order in which the two flags were set is irrelevant. If an incumbent exists, the handoff decision runs:
-   - Prefer PLAYBACK reason over DISCOVERY.
-   - Among two DISCOVERY connections, prefer the last-played server.
-   - Default: keep current.
-5. Handoff executes: disable the loser's message dispatch → cleanup client state (winner only gets `on_handshake_complete`) → send goodbye to the rejected connection via the deferred-release queue.
+2. When `SendspinClientConfig::encryption_required` is set (the default), the connection first runs the cleartext Noise handshake (`client/init` / `server/init` / `noise/handshake` msg1 / msg2) on the network thread before any application message is processed; see [Noise Encryption](#noise-encryption) below. No `client/hello` is sent until Noise transport is active.
+3. The connection sends `client/hello` (over the encrypted transport, once Noise is active). Retry with exponential backoff (100 ms base, 3 attempts). Each managed connection has its own retry entry in `ConnectionManager::hello_retries_`, so a handoff candidate arriving mid-handshake cannot clobber another connection's pending hello.
+4. The handshake state lives on the connection as two atomic flags: `client_hello_sent_` (set by the hello send-completion callback) and `server_hello_received_` (set when `server/hello` is processed on the network thread, after the server info fields it publishes). `is_handshake_complete()` (`client_hello_sent_ && server_hello_received_`) therefore already implies the Noise handshake completed, since `client/hello` cannot be sent before transport is active.
+5. Establishment is level-triggered: each `loop()` tick, the promotion scan promotes any nursery connection whose `is_operational()` (`is_handshake_complete() && first_activate_received()`) is true, so it does not matter whether the hello handshake or the first `server/activate` completes first. `server/activate` trust enforcement (admissibility against the connection's PSK category) runs as soon as the activate event is processed, independent of promotion timing; a rejected activate closes the connection immediately. Admission arbitration against an incumbent (rank by highest activity: management > playback > pairing > none; equal non-zero rank admits the incoming connection; an in-flight pairing is not displaced by an incoming pairing or playback connection) happens inside the promotion scan itself. See [PSK Admission (trust gating)](#psk-admission-trust-gating) below.
+6. Handoff executes: disable the loser's message dispatch -> cleanup client state (winner only gets `on_handshake_complete`) -> send goodbye to the rejected connection via the deferred-release queue.
 
 ### Disconnection and Cleanup
 

@@ -39,7 +39,7 @@ SendspinWsServer::~SendspinWsServer() {
 }
 
 bool SendspinWsServer::start(SendspinClient* client, bool /*task_stack_in_psram*/,
-                             unsigned /*task_priority*/) {
+                             unsigned /*task_priority*/, size_t /*task_stack_size*/) {
     if (this->server_ != nullptr) {
         SS_LOGW(TAG, "Server already started");
         return true;

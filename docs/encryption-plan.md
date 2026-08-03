@@ -1,6 +1,19 @@
 # Sendspin Encryption - Implementation Gameplan
 
-Status: **planning complete, implementation not started** (branch `encryption`).
+Status: **implemented** (originally on branch `encryption`; re-implemented on this
+branch as a state-port onto the nursery/inbox architecture - see the note below).
+
+> **State-port status.** This document describes the plan as written on the original
+> `encryption` branch. The current branch (`claude/encryption-rebase-strategy-*`) re-implements
+> that same feature set as a state port onto `main` after main gained a substantially rewritten
+> connection lifecycle (the Inbox/nursery rework, PRs #84-#97) that `encryption` predates.
+> Completed so far, against the phase numbering below: Phase 1 (crypto and dependency
+> foundation), Phase 2 (identity records and persistence-provider redesign), Phase 3 (Noise
+> transport wired into the connection layer), Phase 4 (admission/trust/nursery lifecycle),
+> Phase 5 (pairing flows, management suite, PIN state machine), and Phase 6 (public API
+> surfacing, config completion, example polish, and this doc pass). What remains unported is
+> scoped to hygiene-gate parity (the original branch's later `fix:`/`refactor:` commits, e.g.
+> the include-what-you-use and cppcheck gates) and ESP-IDF hardware bring-up/validation.
 
 This document is the master plan for bringing `sendspin-cpp` up to the merged
 [Sendspin spec PR #84 "Add encryption support"](https://github.com/Sendspin/spec/pull/84).

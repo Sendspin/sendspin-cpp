@@ -35,6 +35,7 @@
 #include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
+#include "file_persistence_provider.h"
 #ifdef SENDSPIN_HAS_PORTAUDIO
 #include "portaudio_sink.h"
 #endif
@@ -207,7 +208,7 @@ int main(int argc, char* argv[]) {
 
     // Configure the client
     SendspinClientConfig config;
-    config.client_id = "basic-client-example";
+    // client_id is derived from the static X25519 keypair; do not set it here.
     config.name = friendly_name;
     config.product_name = "sendspin-cpp host example";
     config.manufacturer = "sendspin-cpp";
@@ -219,7 +220,15 @@ int main(int argc, char* argv[]) {
     PortAudioSink audio_sink;
 #endif
 
+    // Persist the static keypair (and pairing state) so client_id and pairing records survive
+    // restarts. Path: $HOME/.sendspin.json (regenerated if the file is absent).
+    const char* home_dir = getenv("HOME");
+    const std::string persistence_path =
+        std::string(home_dir != nullptr ? home_dir : ".") + "/.sendspin.json";
+    FilePersistenceProvider persistence_provider(persistence_path);
+
     SendspinClient client(std::move(config));
+    client.set_persistence_provider(&persistence_provider);
 
     // Add roles
     PlayerRoleConfig player_config;
@@ -369,6 +378,12 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Failed to start server\n");
         return 1;
     }
+
+    // client_id is base64url(static X25519 public key), 43 chars.
+    // The server uses this to identify the client. The keypair is persisted in
+    // ~/.sendspin.json and regenerated only if the file is absent.
+    fprintf(stderr, "client_id: %s\n", client.client_id().c_str());
+    fprintf(stderr, "Persistence: %s\n", persistence_path.c_str());
 
 #ifdef SENDSPIN_HAS_MDNS
     MdnsAdvertiser mdns;

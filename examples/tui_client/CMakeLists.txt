@@ -11,7 +11,7 @@ set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(ftxui)
 
-add_executable(tui_client main.cpp tui.cpp)
+add_executable(tui_client main.cpp tui.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../common/file_persistence_provider.cpp)
 target_link_libraries(tui_client PRIVATE
     sendspin
     ftxui::screen
@@ -19,6 +19,7 @@ target_link_libraries(tui_client PRIVATE
     ftxui::component
 )
 target_compile_features(tui_client PRIVATE cxx_std_20)
+target_include_directories(tui_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)
 
 # mDNS service advertisement and browsing via dns_sd.h (optional)
 # macOS: built-in (no extra link flags needed — dns_sd is in libSystem)

@@ -119,8 +119,12 @@ public:
     /// @param client Pointer to the SendspinClient (used for context in callbacks).
     /// @param task_stack_in_psram Whether to allocate the HTTP server task stack in PSRAM.
     /// @param task_priority Priority for the HTTP server task.
+    /// @param task_stack_size HTTP server task stack size in bytes. Clamped up to
+    ///        SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE if lower (the Noise in-band
+    ///        re-handshake runs on this task and overflows a smaller stack).
     /// @return true if server started successfully, false otherwise.
-    bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority);
+    bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority,
+               size_t task_stack_size);
 
     /// @brief Stops the HTTP server
     void stop();

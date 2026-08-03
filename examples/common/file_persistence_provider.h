@@ -19,10 +19,9 @@
 /// and the player static delay to a JSON file via ArduinoJson. This is a shared
 /// example/test helper, not part of the library: persistence is the consumer's
 /// responsibility, and this shows one way to implement the provider on host.
-/// Note: the implementation currently uses private library headers
-/// (platform/base64.h, platform/logging.h), so copying it into a downstream
-/// project also requires inlining those helpers.
-/// On a real device the platform (e.g. ESPHome) implements the provider
+/// It depends only on the public API (sendspin/client.h) plus ArduinoJson, so it
+/// is self-contained and can be copied into a downstream project as a starting
+/// point. On a real device the platform (e.g. ESPHome) implements the provider
 /// against NVS/Preferences instead.
 
 #pragma once

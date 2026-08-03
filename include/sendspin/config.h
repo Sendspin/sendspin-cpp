@@ -67,32 +67,53 @@ struct SendspinPairingConfig {
 };
 
 // ============================================================================
+// Cipher suite preference
+// ============================================================================
+
+/// @brief Which Noise cipher suite the client prefers for the handshake.
+/// This sets the preference advertised to the server. ChaChaPoly is the
+/// default and works on every platform.
+///
+/// AESGCM is NOT usable on ESP-IDF: the esphome__noise-c component routes
+/// AES-GCM through libsodium's crypto_aead_aes256gcm, which is only
+/// implemented for x86 AES-NI / ARMv8 crypto. On Xtensa (ESP32/ESP32-S3)
+/// those functions are stubs that return ENOSYS, so the cipher never
+/// initializes (there is no path to the ESP32 AES hardware peripheral).
+/// On ESP-IDF the library ignores an AESGCM preference and falls back to
+/// ChaChaPoly (see suite_name_for() in connection_manager.cpp).
+enum class NoiseCipherSuitePreference : uint8_t {
+    CHACHAPOLY = 0,  ///< Prefer Noise_KKpsk2_25519_ChaChaPoly_SHA256 (all platforms).
+    AESGCM = 1,      ///< Prefer Noise_KKpsk2_25519_AESGCM_SHA256 (host only; ignored on ESP-IDF).
+};
+
+// ============================================================================
 // Client config
 // ============================================================================
 
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start_server()
 struct SendspinClientConfig {
-    /// Unique client identifier. Superseded by the derived cryptographic identity
-    /// (base64url(X25519 public key), generated/persisted internally) now that the Sendspin
-    /// wire protocol carries client_id in client/init rather than client/hello. No longer read
-    /// by the library; kept only so existing callers do not fail to compile. Removing it (and
-    /// surfacing the derived identity through a public accessor instead) is deferred to the
-    /// public-API pass in a later phase.
-    std::string client_id;
+    // NOTE: client_id is not a field here. The library derives it from the static X25519
+    // keypair (client_id = base64url(public_key)), generated on first boot and persisted via
+    // SendspinPersistenceProvider. Read it back via SendspinClient::client_id() after
+    // start_server().
     std::string name;  ///< Friendly display name
+
+    /// @brief Noise cipher suite preference. Defaults to ChaChaPoly (lower CPU on bare-metal).
+    NoiseCipherSuitePreference cipher_suite{NoiseCipherSuitePreference::CHACHAPOLY};
 
     /// @brief Whether every connection must complete a Noise KKpsk2 handshake before the hello
     /// exchange (spec PR #84's always-on encryption model).
     ///
-    /// Defaults to true, matching the eventual mandatory-encryption design: the client is always
-    /// the Noise responder, and admission/trust enforcement (see admission.h) key off the PSK
-    /// category resolved by that handshake. Set to false only to run the connection nursery
-    /// (accept/reap/admission-arbitration) without the crypto layer, e.g. plaintext test
-    /// fixtures that exercise nursery structure independently of Noise (already covered
-    /// separately by the Noise handshake/re-handshake/admission unit tests). This knob is
-    /// internal for now; it is not part of the public-API surfacing pass planned for a later
-    /// phase and may be removed once every fixture speaks Noise.
+    /// Internal/testing knob, not part of the supported public surface: the Sendspin spec
+    /// requires encryption to be always-on, and every shipping deployment must leave this at
+    /// its default of true. The client is always the Noise responder, and admission/trust
+    /// enforcement (see admission.h) key off the PSK category resolved by that handshake.
+    /// Setting this to false skips the crypto layer entirely and runs the connection nursery
+    /// (accept/reap/admission-arbitration) in plaintext; it exists only for test fixtures that
+    /// exercise nursery structure independently of Noise (already covered separately by the
+    /// Noise handshake/re-handshake/admission unit tests). May be removed once every fixture
+    /// speaks Noise.
     bool encryption_required{true};
 
     std::optional<std::string> product_name{};  ///< Device product name (optional)
@@ -127,6 +148,18 @@ struct SendspinClientConfig {
 
     unsigned httpd_priority{DEFAULT_HTTPD_PRIORITY};  ///< FreeRTOS priority for the HTTP server
                                                       ///< task (ESP-IDF only)
+
+    /// @brief Default HTTP server task stack size in bytes (ESP-IDF only). Larger than the
+    /// esp_http_server 4096-byte default because the Noise handshake runs on this task: the
+    /// initial handshake fits in 4096, but the in-band re-handshake (server-initiated after
+    /// pairing finalize) runs the full KKpsk2 X25519 handshake twice (the two-handshake psk_id
+    /// probe) nested under the transport decrypt/encrypt layers, which overflows 4096.
+    static constexpr size_t DEFAULT_HTTPD_STACK_SIZE = 8192U;
+
+    size_t httpd_stack_size{DEFAULT_HTTPD_STACK_SIZE};  ///< HTTP server task stack size in bytes
+                                                        ///< (ESP-IDF only). Values below
+                                                        ///< DEFAULT_HTTPD_STACK_SIZE are clamped
+                                                        ///< up to it; raising it is allowed.
     unsigned websocket_priority{5};  ///< FreeRTOS priority for the WebSocket client task
                                      ///< (ESP-IDF only)
 
@@ -157,6 +190,12 @@ struct SendspinClientConfig {
     /// @brief Memory placement for the per-connection WebSocket payload reassembly buffer
     /// (ESP-IDF only; ignored on host). Defaults to PREFER_EXTERNAL (SPIRAM).
     MemoryLocation websocket_payload_location{MemoryLocation::PREFER_EXTERNAL};
+
+    /// @brief Memory placement for the Noise transport's fragment reassembly buffer and the
+    /// ~64 KB fragmentation frame buffer (ESP-IDF only; ignored on host). The reassembly
+    /// buffer grows with the largest fragmented message received (e.g. album artwork) and
+    /// retains its capacity, so PREFER_EXTERNAL keeps it out of internal RAM.
+    MemoryLocation noise_buffer_location{MemoryLocation::PREFER_EXTERNAL};
 
     /// @brief Size in bytes of an internal-RAM scratch arena for parsing incoming JSON messages.
     /// When non-zero, the JSON document used to parse each incoming protocol message is allocated

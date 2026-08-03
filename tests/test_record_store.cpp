@@ -16,9 +16,9 @@
 // Mirrors the CLIENT-relevant cases from:
 //   aiosendspin/tests/noise/test_trust_store.py
 // and adds C++-specific tests for keypair persistence and first-boot
-// provisioning. RecordStore is not yet wired into SendspinClient (that lands
-// in a later phase alongside the Noise handshake); these tests exercise
-// RecordStore and FilePersistenceProvider standalone.
+// provisioning. Most tests exercise RecordStore and FilePersistenceProvider
+// standalone; the KeypairPersistsViaClientStartServer test below exercises
+// the full SendspinClient::start_server() -> client_id() path.
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
@@ -505,6 +505,38 @@ TEST(FilePersistenceProvider, KeypairPersistsAcrossReboots) {
         Identity rehydrated = Identity::from_private_bytes(loaded.value());
         EXPECT_EQ(rehydrated.public_bytes, pub_first);
         EXPECT_EQ(rehydrated.peer_id(), client_id_first);
+    }
+}
+
+// Exercises the full public path: SendspinClient::start_server() loads or generates the
+// identity via load_or_generate_identity() and exposes it through client_id(). Two separate
+// SendspinClient instances sharing the same FilePersistenceProvider file must derive the same
+// client_id -- the second instance is the "reboot" case.
+TEST(FilePersistenceProvider, KeypairPersistsViaClientStartServer) {
+    TempFile tmp;
+
+    std::string client_id_first;
+    {
+        FilePersistenceProvider provider(tmp.path());
+        SendspinClientConfig config;
+        config.name = "test-client";
+        SendspinClient client(std::move(config));
+        client.set_persistence_provider(&provider);
+        ASSERT_TRUE(client.start_server());
+        client_id_first = client.client_id();
+        EXPECT_FALSE(client_id_first.empty());
+    }
+
+    // "Reboot": a fresh SendspinClient over the same persistence file must derive the same
+    // client_id from the persisted keypair.
+    {
+        FilePersistenceProvider provider(tmp.path());
+        SendspinClientConfig config;
+        config.name = "test-client";
+        SendspinClient client(std::move(config));
+        client.set_persistence_provider(&provider);
+        ASSERT_TRUE(client.start_server());
+        EXPECT_EQ(client.client_id(), client_id_first);
     }
 }
 

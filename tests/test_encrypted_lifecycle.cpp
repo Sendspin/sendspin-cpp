@@ -71,6 +71,7 @@ constexpr uint16_t DOWNGRADE_TEST_PORT = 18992;
 constexpr uint16_t PAIRING_TEST_PORT = 18993;
 constexpr uint16_t MANAGEMENT_TEST_PORT = 18994;
 constexpr uint16_t PAIRING_PERSIST_FAILURE_TEST_PORT = 18995;
+constexpr uint16_t CIPHER_SUITE_AESGCM_TEST_PORT = 18996;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -165,6 +166,11 @@ public:
         this->pairing_succeeded_server_id_ = server_id;
     }
 
+    void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
+        this->pairing_failed_server_id_ = server_id;
+        this->pairing_failed_reason_ = reason;
+    }
+
     bool trust_ever_reached(ConnectionTrust trust) const {
         for (const auto& t : this->trust_history_) {
             if (t == trust) {
@@ -178,9 +184,19 @@ public:
         return this->pairing_succeeded_server_id_;
     }
 
+    const std::optional<std::string>& pairing_failed_server_id() const {
+        return this->pairing_failed_server_id_;
+    }
+
+    const std::optional<SendspinPairAbortReason>& pairing_failed_reason() const {
+        return this->pairing_failed_reason_;
+    }
+
 private:
     std::vector<ConnectionTrust> trust_history_;
     std::optional<std::string> pairing_succeeded_server_id_;
+    std::optional<std::string> pairing_failed_server_id_;
+    std::optional<SendspinPairAbortReason> pairing_failed_reason_;
 };
 
 bool pump_until(SendspinClient& client, const std::function<bool()>& pred, int timeout_ms) {
@@ -804,6 +820,50 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     pump_for(client, 100);
 }
 
+// SendspinClientConfig::cipher_suite must actually reach the Noise handshake: setting it to
+// AESGCM should make init_noise_handshake() (via connection_manager.cpp's suite_name_for())
+// build the client's side of the handshake with Noise_KKpsk2_25519_AESGCM_SHA256 rather than
+// the ChaChaPoly default. The Noise protocol name is mixed into the handshake hash on both
+// sides, so a mismatched suite string would fail the handshake outright; a fake server built
+// with the matching AESGCM suite name completing the full handshake/hello/activate cycle is
+// therefore proof the preference was threaded through, not just accepted and ignored.
+TEST(EncryptedLifecycle, CipherSuitePreferenceAesgcmCompletesHandshake) {
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+    platform_random_bytes(psk.data(), psk.size());
+    std::string psk_id = psk_id_for(psk);
+
+    SendspinPairingRecord record;
+    record.psk_id = psk_id;
+    record.psk = psk;
+
+    TestNetworkProvider network;
+    TestPersistenceProvider persistence(record);
+    SendspinClientConfig config;
+    config.name = "Cipher Suite AESGCM Test Client";
+    config.server_port = CIPHER_SUITE_AESGCM_TEST_PORT;
+    config.cipher_suite = NoiseCipherSuitePreference::AESGCM;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start_server());
+    pump_for(client, 50);
+
+    Identity server_identity = Identity::generate();
+    FakeEncryptedServer server(server_url(CIPHER_SUITE_AESGCM_TEST_PORT),
+                               std::string(NOISE_SUITE_AESGCM), server_identity, psk_id, psk);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "AESGCM-suite handshake/hello/activate did not complete";
+    auto info = client.get_server_information();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->server_id, server_identity.peer_id());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
 // Negative path: a post-re-handshake server/activate that the new PSK category cannot admit must
 // still go through the existing inadmissible-activate drop path (trust enforcement applies
 // identically whether the activate follows the initial handshake or a re-handshake), closing with
@@ -939,9 +999,12 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 }
 
 // Fail-closed persistence: when the persistence provider rejects the pair-finalize record (e.g.
-// storage exhausted, write error), the client must NOT report pairing success. Pins the fix to
-// client.cpp's SERVER_PAIR_FINALIZE handler, which previously hardcoded stored_record = true
-// regardless of RecordStore::store_record()'s return value.
+// storage exhausted, write error), the client must NOT report pairing success, must instead
+// report on_pairing_failed with the client-local SendspinPairAbortReason::STORAGE_FAILED reason,
+// and must close the connection (schedule_pair_storage_failed -> handle_pair_storage_failed).
+// Pins both halves of the fix to client.cpp's SERVER_PAIR_FINALIZE handler: RecordStore::
+// store_record()'s return value gates on_pairing_succeeded, and a rejection now drives an
+// explicit local abort instead of silently leaving the connection to the 30 s watchdog.
 TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
@@ -971,14 +1034,24 @@ TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
         client, [&] { return server.learned_psk_id().has_value(); }, 4000))
         << "client/pair-finalize was never observed";
 
-    // Give the client plenty of ticks to process the server's ack. The provider rejects the
-    // record, so it must never appear as captured, and on_pairing_succeeded must never fire.
-    pump_for(client, 500);
+    // The rejection must drive an explicit local abort (schedule_pair_storage_failed ->
+    // handle_pair_storage_failed), not just a silent no-op left to the watchdog.
+    ASSERT_TRUE(pump_until(
+        client, [&] { return listener.pairing_failed_server_id().has_value(); }, 4000))
+        << "on_pairing_failed was never fired after the persistence provider rejected the record";
 
     EXPECT_FALSE(persistence.captured_record().has_value())
         << "A rejected record must not be captured (provider returned false)";
     EXPECT_FALSE(listener.pairing_succeeded_server_id().has_value())
         << "on_pairing_succeeded must not fire when the persistence provider rejects the record";
+    EXPECT_EQ(listener.pairing_failed_server_id().value(), server_identity.peer_id());
+    ASSERT_TRUE(listener.pairing_failed_reason().has_value());
+    EXPECT_EQ(listener.pairing_failed_reason().value(), SendspinPairAbortReason::STORAGE_FAILED);
+
+    // The connection must be closed rather than left dangling for the 30 s watchdog.
+    EXPECT_TRUE(pump_until(
+        client, [&] { return !client.is_connected(); }, 4000))
+        << "Connection must be dropped after a storage-failure abort";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

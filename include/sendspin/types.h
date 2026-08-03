@@ -89,7 +89,8 @@ enum class ConnectionTrust : uint8_t {
 
 /// @brief Reason a pairing exchange was aborted.
 ///
-/// Mirrors the wire values in the Sendspin pairing protocol.
+/// Mirrors the wire values in the Sendspin pairing protocol, plus STORAGE_FAILED, a
+/// client-local reason with no wire equivalent.
 /// Carried by SendspinClientListener::on_pairing_failed().
 enum class SendspinPairAbortReason : uint8_t {
     ATTEMPT_TIMEOUT,          // Server did not complete the exchange in time.
@@ -99,6 +100,8 @@ enum class SendspinPairAbortReason : uint8_t {
     PIN_LENGTH_UNACCEPTABLE,  // Proposed PIN length is outside the accepted range.
     PIN_MISMATCH,             // PIN verification failed.
     USER_CANCELLED,           // User or application cancelled the pairing.
+    STORAGE_FAILED,           // This device could not persist the pairing record (local
+                              // failure; the wire carries user_cancelled).
     UNKNOWN,                  // Unrecognized reason from the wire.
 };
 

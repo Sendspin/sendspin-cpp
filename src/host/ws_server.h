@@ -80,8 +80,10 @@ public:
     /// @param client Pointer to the SendspinClient (stored for context).
     /// @param task_stack_in_psram Ignored on host builds.
     /// @param task_priority Ignored on host builds.
+    /// @param task_stack_size Ignored on host builds (ESP-IDF httpd task stack size).
     /// @return true if the server started successfully, false on error
-    bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority);
+    bool start(SendspinClient* client, bool task_stack_in_psram, unsigned task_priority,
+               size_t task_stack_size);
 
     /// @brief Stops the WebSocket server and releases its resources
     void stop();
