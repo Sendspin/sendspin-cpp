@@ -62,13 +62,17 @@ TEST(PinCommit, WrongCommitmentSizeFailsVerify) {
 // =============================================================================
 
 TEST(PinCommit, Kat) {
-    // commit(nonce=bytes(range(32))) = SHA-256(0x00..0x1f)
-    // Expected from Python: hashlib.sha256(bytes(range(32))).hexdigest()
-    // = "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd"
+    // commit(nonce=bytes(range(32))) = SHA-256("sendspin-pair-commit-v1" || 0x00..0x1f)
+    // (spec #118: domain separator added to pair commit; this invalidates the old
+    // SHA-256(nonce)-only KAT below.)
+    // Independently re-derived via: python3 -c "
+    //   import hashlib
+    //   print(hashlib.sha256(b'sendspin-pair-commit-v1' + bytes(range(32))).hexdigest())"
+    // = "ea08c0aee3c421ace702f31591b3d213e8c371a8a8e3b0be3fd405ed841755a3"
     std::array<uint8_t, 32> nonce{};
     for (int i = 0; i < 32; ++i) nonce[i] = static_cast<uint8_t>(i);
     auto commitment = pin_commit(nonce.data(), nonce.size());
-    EXPECT_EQ(to_hex(commitment), "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd");
+    EXPECT_EQ(to_hex(commitment), "ea08c0aee3c421ace702f31591b3d213e8c371a8a8e3b0be3fd405ed841755a3");
 }
 
 // =============================================================================

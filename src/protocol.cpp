@@ -910,9 +910,10 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         }
     }
     root["payload"]["trust_level"] = msg->trust_level;
-    // Omit supported_pair_methods entirely when empty (matches the reference's omit_none),
-    // rather than emitting an empty array.
-    if (!msg->supported_pair_methods.empty()) {
+    // supported_pair_methods is REQUIRED on the wire (spec #113/#122: every client implements at
+    // least pairing_psk, so the field can never be legitimately absent) -- always emit the array,
+    // even if empty in a degenerate configuration with every method disabled.
+    {
         JsonArray methods_list = root["payload"]["supported_pair_methods"].to<JsonArray>();
         for (const auto& desc : msg->supported_pair_methods) {
             JsonObject method_obj = methods_list.add<JsonObject>();
@@ -1252,6 +1253,21 @@ std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& p
     return output;
 }
 
+std::string format_client_pair_finalize_wrapped_message(
+    const std::array<uint8_t, 48>& wrapped_psk) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-finalize";
+    // Encode the 48-byte wrapped PSK as 64-char base64url (no padding). PIN flows only (spec
+    // #117: PSK Wrapping); exactly one of long_term_psk/wrapped_psk is present per message.
+    root["payload"]["wrapped_psk"] = b64url_encode(wrapped_psk.data(), wrapped_psk.size());
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
 std::string format_pair_abort_message(PairAbortReason reason) {
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();
@@ -1368,26 +1384,27 @@ bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPaylo
     return true;
 }
 
-std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b) {
+std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
+                                            uint32_t pairing_index) {
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
     root["payload"]["commit_B"] = b64url_encode(commit_b.data(), commit_b.size());
+    root["payload"]["pairing_index"] = pairing_index;
 
     std::string output;
     serializeJson(doc, output);
     return output;
 }
 
-std::string format_client_pair_init_message() {
+std::string format_client_pair_init_message(uint32_t pairing_index) {
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
-    // Static PIN: no commit_B. Create an empty payload object so the wire matches the reference's
-    // empty ClientPairInitPayload (omit_none drops the unset commit_B field).
-    root["payload"].to<JsonObject>();
+    // Static PIN: no commit_B, but pairing_index is required on every client/pair-init (#120).
+    root["payload"]["pairing_index"] = pairing_index;
 
     std::string output;
     serializeJson(doc, output);

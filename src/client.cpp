@@ -17,6 +17,7 @@
 #include "connection.h"
 #include "connection_manager.h"
 #include "crypto/keys.h"
+#include "crypto/pairing_token.h"
 #include "inbox.h"
 #include "platform/compiler.h"
 #include "platform/json_arena.h"
@@ -555,6 +556,14 @@ VisualizerRole& SendspinClient::add_visualizer(VisualizerRoleConfig config) {
 // ============================================================================
 // Queries
 // ============================================================================
+
+std::optional<std::string> SendspinClient::format_pairing_token(
+    const std::array<uint8_t, 32>& pairing_psk) const {
+    if (this->identity_ == nullptr) {
+        return std::nullopt;
+    }
+    return sendspin::format_pairing_token(this->identity_->public_bytes, pairing_psk);
+}
 
 bool SendspinClient::is_connected() const {
     return this->connection_manager_->is_connected();

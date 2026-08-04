@@ -692,9 +692,10 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsPresent) {
     EXPECT_STREQ(doc["payload"]["device_info"]["mac_address"], "aa:bb:cc:dd:ee:ff");
 }
 
-// client/hello's trust_level/unpaired_access/supported_pair_methods fields (Phase 3+ shape):
-// supported_pair_methods is omitted entirely (not an empty array) when there are none to
-// advertise, matching the reference's omit_none.
+// client/hello's trust_level/unpaired_access/supported_pair_methods fields: supported_pair_
+// methods is now a REQUIRED field on the wire (spec #113/#122: every client implements at least
+// pairing_psk, so the field can never be legitimately absent) -- always emitted as an array, even
+// an empty one in a degenerate all-disabled configuration.
 TEST(Protocol, FormatClientHelloTrustAndPairMethods) {
     ClientHelloMessage msg;
     msg.name = "Speaker";
@@ -705,7 +706,8 @@ TEST(Protocol, FormatClientHelloTrustAndPairMethods) {
     ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
     EXPECT_STREQ(doc["payload"]["trust_level"], "user");
     EXPECT_TRUE(doc["payload"]["unpaired_access"]["enabled"].as<bool>());
-    EXPECT_FALSE(doc["payload"]["supported_pair_methods"].is<JsonArray>());
+    ASSERT_TRUE(doc["payload"]["supported_pair_methods"].is<JsonArray>());
+    EXPECT_EQ(doc["payload"]["supported_pair_methods"].as<JsonArrayConst>().size(), 0u);
 
     msg.supported_pair_methods.push_back(PairMethodDescriptor{SendspinPairMethod::PAIRING_PSK});
     JsonDocument doc2;
@@ -881,8 +883,10 @@ TEST(Protocol, ClientHelloPairingPskMethodDescriptor) {
     EXPECT_STREQ(methods[0]["method"], "pairing_psk");
 }
 
-// supported_pair_methods: field omitted entirely when no methods (matches the reference's
-// omit_none; an empty array would be a wire deviation).
+// supported_pair_methods: the field itself is REQUIRED on the wire even when there are no
+// methods to advertise (spec #113/#122) -- emitted as an empty array, not omitted. Superseded
+// requirement; the field used to be omitted entirely in this case (see git history), which is
+// no longer spec-conformant now that every client is expected to implement at least pairing_psk.
 TEST(Protocol, ClientHelloNoSupportedPairMethods) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
@@ -890,9 +894,9 @@ TEST(Protocol, ClientHelloNoSupportedPairMethods) {
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
-    // Field must be absent (not an empty array).
-    EXPECT_FALSE(doc["payload"]["supported_pair_methods"].is<JsonArrayConst>());
-    EXPECT_TRUE(doc["payload"]["supported_pair_methods"].isNull());
+    // Field must be present as an empty array, not absent.
+    ASSERT_TRUE(doc["payload"]["supported_pair_methods"].is<JsonArrayConst>());
+    EXPECT_EQ(doc["payload"]["supported_pair_methods"].as<JsonArrayConst>().size(), 0u);
 }
 
 // ============================================================================

@@ -523,6 +523,18 @@ public:
         return this->client_id_;
     }
 
+    /// @brief Builds the pairing token (spec #125) for a Sendspin Pairing PSK: the single
+    /// "SP:"-prefixed, base32 string that carries this client's static public key alongside
+    /// `pairing_psk`, for an operator to transfer into a server via copy/paste or QR code to
+    /// begin the Pairing PSK flow. Clients offering `pairing_psk` SHOULD surface this token
+    /// rather than the bare PSK.
+    /// @param pairing_psk The 32-byte Sendspin Pairing PSK to encode alongside this client's
+    ///                    identity.
+    /// @return The 107-character token string, or nullopt if no identity has been initialized
+    ///         yet (before start_server() is called).
+    [[nodiscard]] std::optional<std::string> format_pairing_token(
+        const std::array<uint8_t, 32>& pairing_psk) const;
+
     /// @brief Returns true if there is an active connection with completed handshake
     /// @return true if connected with a completed handshake, false otherwise
     bool is_connected() const;

@@ -112,8 +112,10 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
         return r;
     }
 
-    // 2. Accepted Pairing PSK.
-    if (pairing_psk_.has_value() && pairing_psk_->psk_id == psk_id) {
+    // 2. Accepted Pairing PSK. Excluded from the candidate set when pairing_psk is disabled in
+    // the live pairing config (spec #116/#122): a handshake referencing it then fails as a
+    // lookup miss, exactly as if no Pairing PSK were configured at all.
+    if (pairing_psk_.has_value() && pairing_psk_->psk_id == psk_id && pairing_psk_enabled_) {
         ResolvedPsk r;
         r.psk_id = pairing_psk_->psk_id;
         r.psk = pairing_psk_->psk;

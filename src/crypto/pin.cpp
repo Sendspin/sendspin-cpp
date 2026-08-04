@@ -31,15 +31,17 @@ std::array<uint8_t, PIN_NONCE_SIZE> pin_generate_nonce() {
 }
 
 // ---------------------------------------------------------------------------
-// pin_commit: SHA-256(nonce)
+// pin_commit: SHA-256(PIN_COMMIT_LABEL || nonce)  (see #118: domain separator)
 // ---------------------------------------------------------------------------
 
 std::array<uint8_t, PIN_COMMIT_SIZE> pin_commit(const uint8_t* nonce, size_t nonce_len) {
-    return sha256_oneshot(nonce, nonce_len);
+    const auto* label = reinterpret_cast<const uint8_t*>(PIN_COMMIT_LABEL);
+    size_t label_len = sizeof(PIN_COMMIT_LABEL) - 1;  // exclude NUL
+    return sha256_oneshot(label, label_len, nonce, nonce_len);
 }
 
 // ---------------------------------------------------------------------------
-// pin_verify_commit: constant-time compare SHA-256(nonce) vs commitment
+// pin_verify_commit: constant-time compare SHA-256(LABEL || nonce) vs commitment
 // ---------------------------------------------------------------------------
 
 bool pin_verify_commit(const uint8_t* nonce, size_t nonce_len, const uint8_t* commitment,

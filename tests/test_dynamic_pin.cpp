@@ -267,7 +267,7 @@ TEST(DynamicPin, FormatClientPairInitWireShape) {
     std::array<uint8_t, 32> commit_b{};
     for (int i = 0; i < 32; ++i) commit_b[i] = static_cast<uint8_t>(i);
 
-    const std::string out = format_client_pair_init_message(commit_b);
+    const std::string out = format_client_pair_init_message(commit_b, /*pairing_index=*/3);
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_init produced invalid JSON";
@@ -287,6 +287,10 @@ TEST(DynamicPin, FormatClientPairInitWireShape) {
     for (size_t i = 0; i < 32; ++i) {
         EXPECT_EQ((*decoded)[i], commit_b[i]) << "decoded byte mismatch at index " << i;
     }
+
+    // pairing_index is required on every client/pair-init (spec #120).
+    ASSERT_TRUE(doc["payload"]["pairing_index"].is<uint32_t>());
+    EXPECT_EQ(doc["payload"]["pairing_index"].as<uint32_t>(), 3u);
 }
 
 // ============================================================================
@@ -465,12 +469,17 @@ TEST(PinLockoutPerMethod, ResetOnlyClearsTheGivenMethod) {
 
 namespace {
 
-// Build a SID = "sendspin-pair-pake-v1" (21 bytes) || 32 zero bytes.
-static std::vector<uint8_t> make_test_sid() {
+// Build a SID = "sendspin-pair-pake-v1" (21 bytes) || 32 zero bytes || 4-byte BE counter
+// (spec #120: the sid now includes the pairing_index counter).
+static std::vector<uint8_t> make_test_sid(uint32_t counter = 0) {
     const char* prefix = "sendspin-pair-pake-v1";
     const size_t prefix_len = 21;
     std::vector<uint8_t> sid(prefix_len + 32, 0);
     std::memcpy(sid.data(), prefix, prefix_len);
+    sid.push_back(static_cast<uint8_t>((counter >> 24) & 0xFF));
+    sid.push_back(static_cast<uint8_t>((counter >> 16) & 0xFF));
+    sid.push_back(static_cast<uint8_t>((counter >> 8) & 0xFF));
+    sid.push_back(static_cast<uint8_t>(counter & 0xFF));
     return sid;
 }
 
@@ -481,21 +490,31 @@ static std::vector<uint8_t> to_bytes(const char* s) {
                                 reinterpret_cast<const uint8_t*>(s) + len);
 }
 
+// ADa = "server" (initiator's own AD), ADb = "client" (responder's own AD) -- spec #117.
+static std::vector<uint8_t> ad_server() {
+    return to_bytes("server");
+}
+static std::vector<uint8_t> ad_client() {
+    return to_bytes("client");
+}
+
 }  // namespace
 
 TEST(DynamicPinCPace, RoundTripWithMatchingPassword) {
-    const auto sid = make_test_sid();
+    const auto sid = make_test_sid(/*counter=*/1);
     const auto prs = to_bytes("123456");
     const std::vector<uint8_t> empty;
 
     // Initiator (A = server role in the protocol; we test the library regardless).
+    // Own AD = ADa = "server"; peer AD = ADb = "client".
     CPace initiator;
-    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs, sid, empty, empty, empty));
+    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs, sid, empty, ad_server(), ad_client()));
     const auto& share_a = initiator.public_share();
 
-    // Responder (B = client role in the protocol).
+    // Responder (B = client role in the protocol). Own AD = ADb = "client"; peer AD = ADa =
+    // "server".
     CPace responder;
-    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs, sid, empty, empty, empty));
+    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs, sid, empty, ad_client(), ad_server()));
     const auto& share_b = responder.public_share();
 
     // Cross-derive.
@@ -512,6 +531,12 @@ TEST(DynamicPinCPace, RoundTripWithMatchingPassword) {
     EXPECT_TRUE(initiator.verify(tag_b->data(), tag_b->size()));
     // Responder verifies initiator tag.
     EXPECT_TRUE(responder.verify(tag_a->data(), tag_a->size()));
+
+    // Both sides agree on ISK and sid -- needed for PSK Wrapping (spec #117).
+    ASSERT_TRUE(initiator.isk().has_value());
+    ASSERT_TRUE(responder.isk().has_value());
+    EXPECT_EQ(initiator.isk().value(), responder.isk().value());
+    EXPECT_EQ(initiator.sid(), sid);
 }
 
 TEST(DynamicPinCPace, RoundTripMismatchedPasswordFails) {
@@ -521,10 +546,10 @@ TEST(DynamicPinCPace, RoundTripMismatchedPasswordFails) {
     const std::vector<uint8_t> empty;
 
     CPace initiator;
-    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs_a, sid, empty, empty, empty));
+    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs_a, sid, empty, ad_server(), ad_client()));
 
     CPace responder;
-    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs_b, sid, empty, empty, empty));
+    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs_b, sid, empty, ad_client(), ad_server()));
 
     const auto& share_a = initiator.public_share();
     const auto& share_b = responder.public_share();
@@ -539,6 +564,35 @@ TEST(DynamicPinCPace, RoundTripMismatchedPasswordFails) {
 
     // With mismatched passwords, verification must fail.
     EXPECT_FALSE(initiator.verify(tag_b->data(), tag_b->size()));
+    EXPECT_FALSE(responder.verify(tag_a->data(), tag_a->size()));
+}
+
+TEST(DynamicPinCPace, MismatchedAssociatedDataFailsVerify) {
+    // Regression test for spec #117 (distinct ADa/ADb fixes a reflected-MAC issue): if a side
+    // uses the WRONG associated data (e.g. swapped, or both sides use the same AD instead of
+    // distinct "server"/"client" values), confirmation must fail even with a matching password.
+    const auto sid = make_test_sid();
+    const auto prs = to_bytes("123456");
+    const std::vector<uint8_t> empty;
+
+    CPace initiator;
+    // Bug: initiator uses "client" as its own AD instead of "server".
+    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs, sid, empty, ad_client(), ad_client()));
+
+    CPace responder;
+    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs, sid, empty, ad_client(), ad_server()));
+
+    const auto& share_a = initiator.public_share();
+    const auto& share_b = responder.public_share();
+
+    ASSERT_TRUE(initiator.derive(share_b.data(), share_b.size()));
+    ASSERT_TRUE(responder.derive(share_a.data(), share_a.size()));
+
+    auto tag_a = initiator.tag();
+    ASSERT_TRUE(tag_a.has_value());
+
+    // The responder expects the initiator's tag to authenticate (Ya, ADa="server"), but the
+    // initiator signed (Ya, ADa="client") instead -- verification must fail.
     EXPECT_FALSE(responder.verify(tag_a->data(), tag_a->size()));
 }
 
@@ -620,13 +674,14 @@ TEST(DynamicPin, ClientHelloDynamicPinLockedOutFalseField) {
 // Phase 8c: static-PIN wire messages
 // ============================================================================
 
-// format_client_pair_init_message() (no-arg overload): static PIN sends an EMPTY payload
-// object, no commit_B. Mirrors ClientPairInitPayload() with omit_none in the reference
-// (aiosendspin/noise/models.py ClientPairInitPayload, ~lines 138-147) and
-// run_static_pin_client's `ClientPairInitMessage(payload=ClientPairInitPayload())`
-// (aiosendspin/noise/pairing.py, ~line 285).
+// format_client_pair_init_message(pairing_index) (single-arg overload): static PIN sends no
+// commit_B, but pairing_index is required on every client/pair-init since spec #120. Mirrors
+// ClientPairInitPayload() with omit_none in the reference (aiosendspin/noise/models.py
+// ClientPairInitPayload, ~lines 138-147) and run_static_pin_client's
+// `ClientPairInitMessage(payload=ClientPairInitPayload())` (aiosendspin/noise/pairing.py,
+// ~line 285), extended with the new required pairing_index field.
 TEST(StaticPin, FormatClientPairInitEmptyWireShape) {
-    const std::string out = format_client_pair_init_message();
+    const std::string out = format_client_pair_init_message(/*pairing_index=*/1);
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out))
@@ -636,8 +691,11 @@ TEST(StaticPin, FormatClientPairInitEmptyWireShape) {
 
     ASSERT_TRUE(doc["payload"].is<JsonObjectConst>());
     JsonObjectConst payload_obj = doc["payload"].as<JsonObjectConst>();
-    EXPECT_EQ(payload_obj.size(), 0u) << "static client/pair-init payload must be an empty object";
+    EXPECT_EQ(payload_obj.size(), 1u)
+        << "static client/pair-init payload must carry only pairing_index";
     EXPECT_TRUE(doc["payload"]["commit_B"].isUnbound()) << "commit_B must be absent for static PIN";
+    ASSERT_TRUE(doc["payload"]["pairing_index"].is<uint32_t>());
+    EXPECT_EQ(doc["payload"]["pairing_index"].as<uint32_t>(), 1u);
 }
 
 // format_client_pair_confirm_message() (client_kc-only overload): static PIN carries client_kc
@@ -732,11 +790,11 @@ TEST(StaticPinCPace, RoundTripWithMatchingStaticPin) {
     const std::vector<uint8_t> empty;
 
     CPace initiator;  // Stand-in for the server.
-    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs, sid, empty, empty, empty));
+    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs, sid, empty, ad_server(), ad_client()));
     const auto& share_a = initiator.public_share();
 
     CPace responder;  // The client, per handle_pairing_window_confirmed().
-    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs, sid, empty, empty, empty));
+    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs, sid, empty, ad_client(), ad_server()));
     const auto& share_b = responder.public_share();
 
     ASSERT_TRUE(initiator.derive(share_b.data(), share_b.size()));
@@ -758,10 +816,10 @@ TEST(StaticPinCPace, RoundTripMismatchedStaticPinFails) {
     const std::vector<uint8_t> empty;
 
     CPace initiator;
-    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs_a, sid, empty, empty, empty));
+    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs_a, sid, empty, ad_server(), ad_client()));
 
     CPace responder;
-    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs_b, sid, empty, empty, empty));
+    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs_b, sid, empty, ad_client(), ad_server()));
 
     const auto& share_a = initiator.public_share();
     const auto& share_b = responder.public_share();

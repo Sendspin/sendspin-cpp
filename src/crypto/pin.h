@@ -40,6 +40,10 @@ static constexpr size_t PIN_COMMIT_SIZE = 32;
 /// @brief Label prepended to the SHA-256 input in derive_pin.
 static constexpr char PIN_DERIVE_LABEL[] = "sendspin-pin-derive-v1";
 
+/// @brief Domain-separation label prepended to nonce_B in pin_commit (see #118: "Add domain
+/// separator to pair commit"). commit_B = SHA-256(PIN_COMMIT_LABEL || nonce_B).
+static constexpr char PIN_COMMIT_LABEL[] = "sendspin-pair-commit-v1";
+
 /// @brief Minimum number of PIN digits.
 static constexpr int PIN_MIN_DIGITS = 4;
 
@@ -74,10 +78,10 @@ inline bool is_valid_static_pin(const std::string& pin) {
 /// @brief Generate a fresh 32-byte CSPRNG nonce (nonce_A or nonce_B).
 std::array<uint8_t, PIN_NONCE_SIZE> pin_generate_nonce();
 
-/// @brief Compute the commitment commit_B = SHA-256(nonce).
+/// @brief Compute the commitment commit_B = SHA-256(PIN_COMMIT_LABEL || nonce).
 std::array<uint8_t, PIN_COMMIT_SIZE> pin_commit(const uint8_t* nonce, size_t nonce_len);
 
-/// @brief Return true if SHA-256(nonce) equals commitment (constant-time).
+/// @brief Return true if SHA-256(PIN_COMMIT_LABEL || nonce) equals commitment (constant-time).
 bool pin_verify_commit(const uint8_t* nonce, size_t nonce_len, const uint8_t* commitment,
                        size_t commitment_len);
 

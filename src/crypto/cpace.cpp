@@ -374,7 +374,9 @@ bool CPace::derive(const uint8_t* peer_share, size_t peer_share_len) {
     h_isk.update(lv_prefix.data(), lv_prefix.size());
     h_isk.update(t_init.data(), t_init.size());
     h_isk.update(t_resp.data(), t_resp.size());
-    auto isk = h_isk.finalize();
+    // ISK is retained (not wiped) on this->isk_: PSK Wrapping (#117) derives K_wrap from it
+    // after key confirmation succeeds. Zeroized in the destructor along with mac_key_.
+    this->isk_ = h_isk.finalize();
 
     // mac_key = SHA512(MAC_LABEL + sid + ISK)
     const auto* mac_label = reinterpret_cast<const uint8_t*>(CPACE_MAC_LABEL);
@@ -383,12 +385,11 @@ bool CPace::derive(const uint8_t* peer_share, size_t peer_share_len) {
     Sha512 h_mac;
     h_mac.update(mac_label, mac_label_len);
     h_mac.update(this->sid_.data(), this->sid_.size());
-    h_mac.update(isk.data(), isk.size());
+    h_mac.update(this->isk_.data(), this->isk_.size());
     this->mac_key_ = h_mac.finalize();
 
-    // Wipe the DH shared secret and ISK from the stack; only mac_key_ is retained.
+    // Wipe the DH shared secret from the stack; mac_key_ and isk_ are retained on the object.
     secure_zero(shared.data(), shared.size());
-    secure_zero(isk.data(), isk.size());
 
     this->derived_ = true;
     return true;
@@ -416,6 +417,7 @@ std::array<uint8_t, CPACE_TAG_SIZE> CPace::compute_mac(bool own) const {
 CPace::~CPace() {
     secure_zero(this->scalar_.data(), this->scalar_.size());
     secure_zero(this->mac_key_.data(), this->mac_key_.size());
+    secure_zero(this->isk_.data(), this->isk_.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +444,17 @@ bool CPace::verify(const uint8_t* peer_tag, size_t peer_tag_len) const {
     }
     auto expected = this->compute_mac(false);
     return constant_time_equal(expected.data(), peer_tag, CPACE_TAG_SIZE);
+}
+
+// ---------------------------------------------------------------------------
+// CPace::isk
+// ---------------------------------------------------------------------------
+
+std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> CPace::isk() const {
+    if (!this->derived_) {
+        return std::nullopt;
+    }
+    return this->isk_;
 }
 
 }  // namespace sendspin

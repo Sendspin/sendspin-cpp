@@ -21,7 +21,9 @@
 #include "crypto/constants.h"
 #include "crypto/cpace.h"
 #include "crypto/pin.h"
+#include "crypto/psk_wrap.h"
 #include "management.h"
+#include "platform/crypto.h"
 #include "platform/logging.h"
 #include "platform/time.h"
 #include "platform/types.h"
@@ -112,6 +114,40 @@ static constexpr int64_t PIN_ATTEMPT_TIMEOUT_US = 120LL * 1000LL * US_PER_MS;
 /// attempt_deadline_us while step == AWAIT_PAIRING_WINDOW, so the existing PIN-attempt-timeout
 /// check in loop() also enforces this window without a second timer.
 static constexpr int64_t WINDOW_LIFETIME_US = 300LL * 1000LL * US_PER_MS;
+
+/// @brief CPace sid label (spec #120): sid = LABEL || h || counter (big-endian uint32).
+static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
+
+/// @brief CPace ADa/ADb (spec #117): distinct associated data per side fixes a reflected-MAC
+/// issue. The server is CPace role A, the client is role B.
+static constexpr char PAKE_AD_SERVER[] = "server";  // ADa
+static constexpr char PAKE_AD_CLIENT[] = "client";  // ADb
+
+/// @brief Build the CPace sid for a PIN-pairing attempt: LABEL || h (32 bytes) || counter
+/// (4-byte big-endian uint32), per spec #120. `counter` is the pairing_index captured for this
+/// attempt (SendspinConnection::PinSession::pairing_index).
+static std::vector<uint8_t> build_pake_sid(const std::array<uint8_t, 32>& handshake_hash,
+                                           uint32_t counter) {
+    std::vector<uint8_t> sid;
+    sid.reserve(sizeof(PAKE_SID_LABEL) - 1 + 32 + 4);
+    sid.insert(sid.end(), PAKE_SID_LABEL, PAKE_SID_LABEL + sizeof(PAKE_SID_LABEL) - 1);
+    sid.insert(sid.end(), handshake_hash.begin(), handshake_hash.end());
+    sid.push_back(static_cast<uint8_t>((counter >> 24) & 0xFF));
+    sid.push_back(static_cast<uint8_t>((counter >> 16) & 0xFF));
+    sid.push_back(static_cast<uint8_t>((counter >> 8) & 0xFF));
+    sid.push_back(static_cast<uint8_t>(counter & 0xFF));
+    return sid;
+}
+
+/// @brief The client's own CPace associated data (ADb = "client"), as raw bytes.
+static std::vector<uint8_t> pake_ad_client() {
+    return std::vector<uint8_t>(PAKE_AD_CLIENT, PAKE_AD_CLIENT + sizeof(PAKE_AD_CLIENT) - 1);
+}
+
+/// @brief The peer's (server's) CPace associated data (ADa = "server"), as raw bytes.
+static std::vector<uint8_t> pake_ad_server() {
+    return std::vector<uint8_t>(PAKE_AD_SERVER, PAKE_AD_SERVER + sizeof(PAKE_AD_SERVER) - 1);
+}
 
 /// @brief Map NoiseCipherSuitePreference to the full Noise protocol suite name string.
 /// On ESP-IDF, AESGCM is unusable: esphome__noise-c routes AES-GCM through libsodium's
@@ -480,14 +516,23 @@ void ConnectionManager::loop() {
                 }
 
                 // ---- Trust enforcement (admissibility check) ----
-                // Compute the effective active_roles (sticky: nullopt keeps the prior set).
-                const std::vector<std::string>& effective_roles =
-                    event.active_roles.has_value() ? event.active_roles.value()
-                                                   : event.conn->get_active_roles();
-                const bool has_roles = !effective_roles.empty();
                 const bool unpaired_access =
                     this->client_->record_store_ != nullptr &&
                     this->client_->record_store_->unpaired_access_enabled();
+
+                // Compute the effective active_roles (sticky: nullopt keeps the prior set) --
+                // EXCEPT when this activate omits active_roles and its activities are no longer
+                // playback-capable: spec #122 says the client treats the persisted roles as empty
+                // in that case rather than rejecting the message (a later activate can legally
+                // narrow activities without re-sending an empty active_roles).
+                const bool playback_capable = is_playback_capable(
+                    event.conn->get_psk_category(), event.activities, unpaired_access);
+                static const std::vector<std::string> EMPTY_ROLES{};
+                const std::vector<std::string>& effective_roles =
+                    event.active_roles.has_value()
+                        ? event.active_roles.value()
+                        : (playback_capable ? event.conn->get_active_roles() : EMPTY_ROLES);
+                const bool has_roles = !effective_roles.empty();
 
                 // Trust enforcement only applies when encryption resolved a PSK category for
                 // this connection; without it (encryption_required == false) there is no trust
@@ -513,9 +558,82 @@ void ConnectionManager::loop() {
                     continue;
                 }
 
+                // ---- pairing_index counter (spec #120) ----
+                // "the number of pairing server/activate messages received since the last Noise
+                // handshake" is a RAW MESSAGE COUNT, not an accepted-attempt count: the server
+                // counts every pairing activate it sends, including ones the client goes on to
+                // reject (e.g. method_not_supported below). Bump here, at the single point every
+                // pairing server/activate is received (structurally admissible activates only --
+                // one rejected by the trust-enforcement block above is about to close the
+                // connection and a fresh handshake will reset the counter anyway), so that a
+                // rejected activate does not leave the client permanently behind the server's own
+                // count. handle_enter_pairing() reads this value; it must not bump again.
+                const bool is_pairing_activate = event.activities.size() == 1 &&
+                                                 event.activities[0] == SendspinActivity::PAIRING;
+                if (is_pairing_activate) {
+                    event.conn->bump_pairing_index();
+                }
+
+                // ---- Pairing-method admissibility (spec #120/#123) ----
+                // Structurally admissible ('pairing' alone is always an allowed activity set),
+                // but a pairing activate additionally names a selected_pair_method that must (a)
+                // match the matched PSK's category (pairing_psk iff the matched PSK IS the
+                // Pairing PSK) and (b) currently be offered per the LIVE pairing config, which
+                // may have drifted from the supported_pair_methods advertised at hello time. When
+                // it is not, reply pair/abort(method_not_supported) and leave the connection open
+                // (unlike the reasons above, this does not close the connection).
+                if (event.activities.size() == 1 &&
+                    event.activities[0] == SendspinActivity::PAIRING &&
+                    event.selected_pair_method.has_value()) {
+                    const SendspinPairMethod method = event.selected_pair_method.value();
+                    const bool category_ok =
+                        (method == SendspinPairMethod::PAIRING_PSK) ==
+                        (event.conn->get_psk_category() == PskCategory::PAIRING);
+                    // "Currently offered" mirrors exactly what build_hello_message() advertises
+                    // in supported_pair_methods (client.cpp): the RecordStore's live enabled
+                    // flags AND the platform-capability flags (a device with no PIN display
+                    // never offers dynamic_pin, regardless of the enabled flag).
+                    bool offered = true;
+                    if (this->client_->record_store_ != nullptr) {
+                        const RecordStore& rs = *this->client_->record_store_;
+                        const auto& cfg = this->client_->config_;
+                        switch (method) {
+                            case SendspinPairMethod::PAIRING_PSK:
+                                offered = rs.pairing_psk_enabled();
+                                break;
+                            case SendspinPairMethod::DYNAMIC_PIN:
+                                offered = cfg.pin_display_supported && rs.dynamic_pin_enabled();
+                                break;
+                            case SendspinPairMethod::STATIC_PIN:
+                                offered = cfg.pairing_window_supported && rs.static_pin_enabled() &&
+                                          rs.static_pin().has_value();
+                                break;
+                        }
+                    }
+                    if (!category_ok || !offered) {
+                        SS_LOGW(TAG,
+                                "server/activate selects unsupported pairing method (%s) for "
+                                "server_id=%s; replying pair/abort(method_not_supported), "
+                                "connection stays open",
+                                to_cstr(method), event.conn->get_server_id().c_str());
+                        event.conn->send_app_json(
+                            format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED),
+                            nullptr);
+                        continue;
+                    }
+                }
+
                 // ---- Admissible: apply the activate's state on the main loop ----
                 const bool is_first = !event.conn->first_activate_received();
-                event.conn->apply_server_activate(event.activities, event.active_roles,
+                // Pass the same active_roles the admissibility check above used: when the message
+                // omitted active_roles but the connection is no longer playback-capable, that is
+                // effective_roles == EMPTY_ROLES, and it must be applied (not left sticky) so the
+                // persisted active_roles_ is actually cleared (spec #122).
+                const std::optional<std::vector<std::string>> active_roles_to_apply =
+                    event.active_roles.has_value()
+                        ? event.active_roles
+                        : (!playback_capable ? std::make_optional(EMPTY_ROLES) : std::nullopt);
+                event.conn->apply_server_activate(event.activities, active_roles_to_apply,
                                                   event.selected_pair_method);
 
                 // First activate on a long-term PSK: mark the record used (reference parity).
@@ -1473,6 +1591,17 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     // Quiesce: suppress time sync and client/state while pairing is in progress.
     conn->set_pairing_in_progress(true);
 
+    // The pairing server/activate counter (spec #120) was already bumped by the caller at the
+    // point this activate was received (see the activate_events loop in loop() -- every pairing
+    // server/activate counts there, whether or not it turns out to be admissible, so a
+    // method_not_supported rejection does not desync the count from the server's). Do NOT bump
+    // again here: this handler can also be reached well after reception (the "subsequent activate
+    // transitions into pairing" branch applies the activate first, then calls this), so bumping
+    // here would double-count or use a stale value. The current value is captured into the PIN
+    // session below for the PIN-method branches (sent as pairing_index and reused for the CPace
+    // sid).
+    const uint32_t pairing_index = conn->get_pairing_index();
+
     const std::string& server_id = conn->get_server_id();
     const auto& selected_method = conn->get_selected_pair_method();
 
@@ -1505,15 +1634,16 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
         ps.method = SendspinPairMethod::DYNAMIC_PIN;
         ps.step = SendspinConnection::PinStep::AWAIT_SERVER_PAIR_INIT;
         ps.handshake_hash = hash_opt.value();
+        ps.pairing_index = pairing_index;
         ps.attempt_deadline_us = platform_time_us() + PIN_ATTEMPT_TIMEOUT_US;
 
         // Generate nonce_B and its commitment.
         ps.nonce_b = pin_generate_nonce();
         auto commit_b = pin_commit(ps.nonce_b.data(), ps.nonce_b.size());
 
-        // Send client/pair-init with commit_B.
+        // Send client/pair-init with commit_B and the required pairing_index (#120).
         SS_LOGI(TAG, "Sending client/pair-init (dynamic_pin) for server_id=%s", server_id.c_str());
-        conn->send_app_json(format_client_pair_init_message(commit_b), nullptr);
+        conn->send_app_json(format_client_pair_init_message(commit_b, ps.pairing_index), nullptr);
 
         // Notify the listener.
         this->client_->note_pairing_started(server_id);
@@ -1556,6 +1686,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
         auto& ps = conn->pin_session();
         ps.method = SendspinPairMethod::STATIC_PIN;
         ps.handshake_hash = hash_opt.value();
+        ps.pairing_index = pairing_index;
         // Capture the static PIN now, before the operator window wait, so a concurrent management
         // PIN change during the open window cannot swap the CPace secret mid-attempt. Mirrors the
         // reference capturing static_pin before awaiting pairing_window().
@@ -1618,25 +1749,44 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
         return;
     }
 
-    SS_LOGW(TAG, "pair/abort received for server_id=%s reason=%s; closing connection",
-            conn->get_server_id().c_str(), to_cstr(reason));
+    // A pair/abort that arrives after the receiver (us) has already ended the attempt -- locally
+    // aborted, or the server itself left pairing via a leftover server/activate -- has no effect
+    // (spec #120: "A pair/abort received after the receiver has itself ended the attempt has no
+    // effect"). is_pairing_in_progress() is cleared by clear_pairing_state() on every path that
+    // ends an attempt, so it is the right proxy for "already ended" here.
+    if (!conn->is_pairing_in_progress()) {
+        SS_LOGI(TAG,
+                "pair/abort (reason=%s) received for server_id=%s after the attempt already "
+                "ended; ignoring (stale)",
+                to_cstr(reason), conn->get_server_id().c_str());
+        return;
+    }
+
+    SS_LOGW(TAG, "pair/abort received for server_id=%s reason=%s", conn->get_server_id().c_str(),
+            to_cstr(reason));
 
     // Capture the deferred-notification inputs BEFORE clear_pairing_state() resets the PIN session
-    // and before the connection is released (server_id is copied so it survives the tear-down).
+    // and before the connection is possibly released (server_id is copied so it survives any
+    // tear-down).
     const std::string server_id = conn->get_server_id();
     const bool pin_was_displayed = conn->pin_session().pin_displayed;
     const bool window_was_shown = conn->pin_session().window_shown;
 
-    // Clean up pairing state and close the connection (see the drop_connection() note in
-    // handle_enter_pairing). On the current-slot path drop_connection() ->
-    // cleanup_connection_state() clears the pending notification vectors, so the note_* calls below
-    // MUST come after this call.
+    // Clean up pairing state. Per spec #120/#123, the sender of pair/abort closes the connection
+    // only for reason concurrent_attempt; every other reason leaves the connection open so the
+    // server can re-activate pairing (or resume normal operation) on the same connection. We
+    // mirror that here: only concurrent_attempt drops the connection on our side too (the server,
+    // as sender, is closing its side regardless; closing here just avoids waiting on the TCP
+    // teardown). On the current-slot path drop_connection() -> cleanup_connection_state() clears
+    // the pending notification vectors, so the note_* calls below MUST come after it.
     conn->clear_pairing_state();
-    this->drop_connection(conn, SendspinGoodbyeReason::UNAUTHORIZED);
+    if (reason == PairAbortReason::CONCURRENT_ATTEMPT) {
+        this->drop_connection(conn, SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
+    }
 
-    // Queue listener notifications AFTER drop_connection() so they survive to be dispatched from
-    // SendspinClient::loop() after conn_ptr_mutex_ is released. Only the queue push happens while
-    // the lock is held.
+    // Queue listener notifications AFTER any drop_connection() so they survive to be dispatched
+    // from SendspinClient::loop() after conn_ptr_mutex_ is released. Only the queue push happens
+    // while the lock is held.
     this->client_->note_pairing_failed(server_id, to_public_abort_reason(reason));
     if (pin_was_displayed) {
         this->client_->note_clear_pin();
@@ -1661,6 +1811,12 @@ void ConnectionManager::handle_pair_storage_failed(const PairStorageFailedEvent&
                 event.server_id.c_str());
         // Best-effort pair/abort. The wire enum has no storage-failure value (candidate spec
         // addition); user_cancelled is the closest fit: the application cancelled the exchange.
+        // Per spec #120/#123, a pair/abort sender only closes the connection for reason
+        // concurrent_attempt -- but this is not an ordinary protocol-level pairing abort: the
+        // server has already persisted its side (it acked server/pair-finalize) and is about to
+        // re-handshake to a PSK this client never stored, which is guaranteed to fail anyway. We
+        // close proactively here (an independent local decision, not the wire pair/abort
+        // semantics) so the client gets a clean reconnect instead of a doomed re-handshake.
         event.conn->send_app_json(format_pair_abort_message(PairAbortReason::USER_CANCELLED),
                                   nullptr);
         event.conn->clear_pairing_state();
@@ -1678,11 +1834,13 @@ void ConnectionManager::handle_pair_storage_failed(const PairStorageFailedEvent&
 // ============================================================================
 
 void ConnectionManager::local_abort_pin_pairing(SendspinConnection* conn, PairAbortReason reason) {
-    // Runs on the main loop (caller holds conn_ptr_mutex_). Aborts the dynamic-PIN session
+    // Runs on the main loop (caller holds conn_ptr_mutex_). Aborts the PIN-pairing session
     // locally:
     //   1. Send pair/abort to the server.
     //   2. Clear PIN display / pairing state on the connection.
-    //   3. Close the connection.
+    //   3. Close the connection, but ONLY for reason concurrent_attempt (spec #120/#123: every
+    //      other reason -- attempt_timeout, locked_out, method_not_supported,
+    //      pin_length_unacceptable, pin_mismatch, user_cancelled -- leaves the connection open).
     //   4. Queue on_pairing_failed (and on_clear_pairing_pin, if a PIN was shown) for delivery
     //      from loop().
     if (conn == nullptr) {
@@ -1693,7 +1851,8 @@ void ConnectionManager::local_abort_pin_pairing(SendspinConnection* conn, PairAb
             to_cstr(reason));
 
     // Capture the deferred-notification inputs BEFORE clear_pairing_state() resets the PIN session
-    // and before the connection is released (server_id is copied so it survives the tear-down).
+    // and before the connection is possibly released (server_id is copied so it survives any
+    // tear-down).
     const std::string server_id = conn->get_server_id();
     const bool pin_was_displayed = conn->pin_session().pin_displayed;
     const bool window_was_shown = conn->pin_session().window_shown;
@@ -1702,9 +1861,11 @@ void ConnectionManager::local_abort_pin_pairing(SendspinConnection* conn, PairAb
     conn->send_app_json(format_pair_abort_message(reason), nullptr);
 
     // drop_connection() -> cleanup_connection_state() clears the pending notification vectors on
-    // the current-slot path, so the note_* calls below MUST come after this call.
+    // the current-slot path, so the note_* calls below MUST come after it when it runs.
     conn->clear_pairing_state();
-    this->drop_connection(conn, SendspinGoodbyeReason::UNAUTHORIZED);
+    if (reason == PairAbortReason::CONCURRENT_ATTEMPT) {
+        this->drop_connection(conn, SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
+    }
 
     this->client_->note_pairing_failed(server_id, to_public_abort_reason(reason));
     if (pin_was_displayed) {
@@ -1758,22 +1919,21 @@ void ConnectionManager::handle_pairing_window_confirmed() {
         return;
     }
 
-    // Send the empty client/pair-init (static PIN carries no commit_B; see D7).
+    // Send client/pair-init with just pairing_index (static PIN carries no commit_B; see D7).
+    // pairing_index is required on every client/pair-init since #120.
     SS_LOGI(TAG, "Sending client/pair-init (static_pin) for server_id=%s", server_id.c_str());
-    conn->send_app_json(format_client_pair_init_message(), nullptr);
+    conn->send_app_json(format_client_pair_init_message(ps.pairing_index), nullptr);
 
-    // Build SID = "sendspin-pair-pake-v1" (21 bytes) || 32-byte handshake hash, identical to the
-    // dynamic-PIN PAIR_INIT case in handle_pin_pairing_message. PRS = the static PIN's ASCII
-    // bytes (mirrors run_static_pin_client in aiosendspin/noise/pairing.py, ~lines 267-309).
-    static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
-    std::vector<uint8_t> sid;
-    sid.insert(sid.end(), PAKE_SID_LABEL, PAKE_SID_LABEL + sizeof(PAKE_SID_LABEL) - 1);
-    sid.insert(sid.end(), ps.handshake_hash.begin(), ps.handshake_hash.end());
+    // Build SID = LABEL || 32-byte handshake hash || 4-byte BE pairing_index counter (#120),
+    // identical to the dynamic-PIN PAIR_INIT case in handle_pin_pairing_message. PRS = the
+    // static PIN's ASCII bytes (mirrors run_static_pin_client in aiosendspin/noise/pairing.py).
+    std::vector<uint8_t> sid = build_pake_sid(ps.handshake_hash, ps.pairing_index);
 
     const std::string& pin_str = ps.static_pin_value;
     std::vector<uint8_t> prs(pin_str.begin(), pin_str.end());
 
-    if (!ps.cpace.start(CPaceRole::RESPONDER, prs, sid, {}, {}, {})) {
+    // ADb = "client" (our own AD), ADa = "server" (peer's AD) -- spec #117.
+    if (!ps.cpace.start(CPaceRole::RESPONDER, prs, sid, {}, pake_ad_client(), pake_ad_server())) {
         SS_LOGE(TAG, "handle_pairing_window_confirmed: CPace::start failed for server_id=%s",
                 server_id.c_str());
         this->local_abort_pin_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
@@ -1788,6 +1948,20 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
                                                    const ServerPairingMessageEvent& event) {
     // Runs on the main loop. All CPace / nonce / hash state is main-loop-only.
     if (conn == nullptr || this->client_->record_store_ == nullptr) {
+        return;
+    }
+
+    // Spec #120: "After the client has aborted an attempt, silently discard pairing messages
+    // received before the next server/activate." is_pairing_in_progress() is cleared by
+    // clear_pairing_state() on every path that ends an attempt (local abort, received pair/abort,
+    // leftover activate), so a pairing message that races the abort and lands here after the fact
+    // is discarded without re-aborting (which would otherwise fire on every stray, now-stale
+    // message since ps.step is back to IDLE).
+    if (!conn->is_pairing_in_progress()) {
+        SS_LOGI(TAG,
+                "handle_pin_pairing_message: discarding pairing message (kind=%d) for "
+                "server_id=%s; no attempt in progress",
+                static_cast<int>(event.kind), conn->get_server_id().c_str());
         return;
     }
 
@@ -1844,16 +2018,15 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
 
             // Start CPace RESPONDER.
             // PRS = PIN as UTF-8 bytes.
-            // SID = "sendspin-pair-pake-v1" (21 bytes) || 32-byte handshake hash.
-            static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
-            std::vector<uint8_t> sid;
-            sid.insert(sid.end(), PAKE_SID_LABEL, PAKE_SID_LABEL + sizeof(PAKE_SID_LABEL) - 1);
-            sid.insert(sid.end(), ps.handshake_hash.begin(), ps.handshake_hash.end());
+            // SID = LABEL || 32-byte handshake hash || 4-byte BE pairing_index counter (#120).
+            std::vector<uint8_t> sid = build_pake_sid(ps.handshake_hash, ps.pairing_index);
 
             const std::string& pin_str = pin_opt.value();
             std::vector<uint8_t> prs(pin_str.begin(), pin_str.end());
 
-            if (!ps.cpace.start(CPaceRole::RESPONDER, prs, sid, {}, {}, {})) {
+            // ADb = "client" (our own AD), ADa = "server" (peer's AD) -- spec #117.
+            if (!ps.cpace.start(CPaceRole::RESPONDER, prs, sid, {}, pake_ad_client(),
+                                pake_ad_server())) {
                 SS_LOGE(TAG, "handle_pin_pairing_message: CPace::start failed for server_id=%s",
                         server_id.c_str());
                 this->local_abort_pin_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
@@ -1965,10 +2138,35 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
                 return;
             }
 
+            // PIN flows carry the new PSK wrapped under the CPace output, not in the clear
+            // (spec #117: PSK Wrapping). K_wrap = SHA-256(LABEL || sid || ISK); the PSK is
+            // sealed with the connection's negotiated AEAD, a 12-byte all-zero nonce, and
+            // empty AD.
+            const char* cipher_name =
+                aead_cipher_name_from_noise_suite(conn->get_noise_suite_name());
+            auto isk_opt = ps.cpace.isk();
+            if (cipher_name == nullptr || !isk_opt.has_value()) {
+                SS_LOGE(TAG,
+                        "handle_pin_pairing_message: cannot wrap PSK (cipher=%s, isk=%s) for "
+                        "server_id=%s",
+                        cipher_name != nullptr ? cipher_name : "unknown",
+                        isk_opt.has_value() ? "present" : "missing", server_id.c_str());
+                this->local_abort_pin_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+                return;
+            }
+            auto wrapped = wrap_psk(cipher_name, ps.cpace.sid(), isk_opt.value(), outcome->psk);
+            if (!wrapped.has_value()) {
+                SS_LOGE(TAG, "handle_pin_pairing_message: wrap_psk failed for server_id=%s",
+                        server_id.c_str());
+                this->local_abort_pin_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+                return;
+            }
+
             SS_LOGI(TAG, "Sending client/pair-finalize (%s) for server_id=%s (record=%s)",
                     to_cstr(ps.method), server_id.c_str(),
                     outcome->record.has_value() ? "stored" : "shared-psk-fallback");
-            conn->send_app_json(format_client_pair_finalize_message(outcome->psk), nullptr);
+            conn->send_app_json(format_client_pair_finalize_wrapped_message(wrapped.value()),
+                                nullptr);
             conn->set_pending_pairing_record(std::move(outcome->record));
 
             ps.step = SendspinConnection::PinStep::AWAIT_SERVER_PAIR_FINALIZE;

@@ -164,6 +164,9 @@ bool SendspinConnection::handle_noise_handshake_text(const std::string& text) {
         // which cannot be true before the Noise transport is active) see these values.
         this->set_noise_handshake_result(outcome->server_id, outcome->resolved_psk.category,
                                          outcome->resolved_psk.psk_id);
+        // Reset the pairing server/activate counter (spec #120): a fresh handshake starts a
+        // fresh count for the pairing_index / CPace-sid counter.
+        this->reset_pairing_index();
         // Install the cipher session; send_app_json() routes encrypted from here on.
         this->noise_transport_.activate(std::move(outcome->session));
         this->noise_handshake_.reset();
@@ -240,6 +243,10 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     // Update PSK metadata from the re-handshake result. server_id is unchanged (same server).
     this->psk_category_.store(result->resolved_psk.category, std::memory_order_release);
     this->psk_id_ = result->resolved_psk.psk_id;
+
+    // Reset the pairing server/activate counter (spec #120): a re-handshake starts a fresh
+    // count for the pairing_index / CPace-sid counter, same as an initial handshake.
+    this->reset_pairing_index();
 
     // Reset hello handshake state so the post-swap server/hello -> client/hello ->
     // server/activate flow re-runs under the new session keys. The caller (network thread)

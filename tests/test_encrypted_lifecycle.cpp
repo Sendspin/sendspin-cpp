@@ -118,6 +118,20 @@ public:
     // load_pairing_records() is not overridden: the base class default (no records) is exactly
     // "starts with no pairing records" above, so restating it here would be a no-op override.
 
+    // Optionally pre-seed an accepted Pairing PSK (spec #113/#122/#123: selected_pair_method
+    // MUST be 'pairing_psk' if and only if the matched PSK IS the Pairing PSK, and the client
+    // now enforces this -- see ConnectionManager::loop()'s pairing-method admissibility check).
+    // The Pairing PSK Flow test below needs the fake server to connect using this PSK directly
+    // (matching PskCategory::PAIRING immediately), not the Sentinel PSK, so this must be set
+    // before start_server() reads it into the RecordStore.
+    void set_configured_pairing_psk(SendspinPairingPsk psk) {
+        this->configured_pairing_psk_ = std::move(psk);
+    }
+
+    std::optional<SendspinPairingPsk> load_pairing_psk() override {
+        return this->configured_pairing_psk_;
+    }
+
     bool save_pairing_record(const SendspinPairingRecord& record) override {
         std::lock_guard<std::mutex> lock(this->mutex_);
         // Only capture/reject records with a server_id: the RecordStore also persists a
@@ -152,6 +166,7 @@ private:
     mutable std::mutex mutex_;
     std::optional<SendspinPairingRecord> captured_;
     bool reject_pairing_records_{false};
+    std::optional<SendspinPairingPsk> configured_pairing_psk_;
 };
 
 // Records on_trust_changed / on_pairing_succeeded notifications so the pairing-flow test can
@@ -923,15 +938,32 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
     pump_for(client, 100);
 }
 
-// Full pairing-PSK flow end to end: an unpaired client (Sentinel trust) connects, the server
-// selects the pairing_psk method, the client generates a fresh long-term PSK client-side (CSPRNG)
-// and sends it via client/pair-finalize, the server acks, the client persists the record, and
-// then -- exactly like a real server immediately rekeying onto the new PSK -- the fake server
-// triggers an in-band re-handshake with the learned psk_id/psk. The connection must resume
-// operational under the new session with trust upgraded from Sentinel to USER (LONG_TERM).
+// Full pairing-PSK flow end to end: the operator has already transferred a Pairing PSK to the
+// server out of band (a pairing token; see crypto/pairing_token.h), so the server's initial
+// handshake resolves it directly to PskCategory::PAIRING (spec: "selected_pair_method MUST be
+// 'pairing_psk' if and only if the matched PSK IS the Pairing PSK" -- the client now enforces
+// this, see ConnectionManager::loop()'s pairing-method admissibility check, so a fake server that
+// selected pairing_psk over a Sentinel-matched connection would now be correctly rejected as
+// method_not_supported). The client generates a fresh long-term PSK client-side (CSPRNG) and
+// sends it via client/pair-finalize, the server acks, the client persists the record, and then --
+// exactly like a real server immediately rekeying onto the new PSK -- the fake server triggers an
+// in-band re-handshake with the learned psk_id/psk. The connection must resume operational under
+// the new session with trust upgraded from PAIRING to USER (LONG_TERM).
 TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
+    // The Pairing PSK the operator "typed in" (e.g. via a pairing token): known to both the
+    // client (so its RecordStore resolves the fake server's handshake to PskCategory::PAIRING)
+    // and the fake server (so it can perform that handshake).
+    std::array<uint8_t, 32> pairing_psk_bytes{};
+    for (size_t i = 0; i < pairing_psk_bytes.size(); ++i) {
+        pairing_psk_bytes[i] = static_cast<uint8_t>(0xD0 + i);
+    }
+    SendspinPairingPsk configured_pairing_psk;
+    configured_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
+    configured_pairing_psk.psk = pairing_psk_bytes;
+    persistence.set_configured_pairing_psk(configured_pairing_psk);
+
     SendspinClientConfig config;
     config.name = "Pairing Flow Test Client";
     config.server_port = PAIRING_TEST_PORT;
@@ -944,15 +976,18 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
-    // Initial handshake uses the well-known Sentinel PSK: an unpaired client always resolves it,
-    // matching the "not yet paired" starting state a real pairing flow begins from.
+    // Initial handshake uses the accepted Pairing PSK directly (matching PskCategory::PAIRING),
+    // not the Sentinel PSK: the Pairing PSK Flow's initial handshake IS the Pairing PSK (the
+    // Sentinel-then-re-handshake path in the spec is only for upgrading an ALREADY-open Sentinel
+    // connection into pairing_psk pairing, a different scenario from this one).
     Identity server_identity = Identity::generate();
     FakeEncryptedServerOptions options;
     options.first_activities_json = R"(["pairing"])";
     options.first_roles_json = R"([])";
     options.first_selected_pair_method = "pairing_psk";
     FakeEncryptedServer server(server_url(PAIRING_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-                               server_identity, std::string(SENTINEL_PSK_ID), SENTINEL_PSK, options);
+                               server_identity, configured_pairing_psk.psk_id, pairing_psk_bytes,
+                               options);
 
     // handle_enter_pairing (PAIRING_PSK branch) fires as soon as the pairing activate is admitted
     // and sends client/pair-finalize; the fake server acks it immediately in handle_binary().
@@ -985,7 +1020,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
 
     // The connection must resume operational under the new session, now with LONG_TERM/USER trust
-    // instead of the Sentinel/pairing trust it started with.
+    // instead of the PAIRING/none trust it started with.
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000))
         << "Connection did not resume operational after the post-pairing re-handshake";
@@ -1011,6 +1046,18 @@ TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
     persistence.set_reject_pairing_records(true);
+    // As in PairingPskFlowPersistsAndUpgradesTrust: the fake server must connect using an
+    // accepted Pairing PSK directly (PskCategory::PAIRING), not Sentinel, now that the client
+    // enforces selected_pair_method=pairing_psk iff the matched PSK IS the Pairing PSK.
+    std::array<uint8_t, 32> pairing_psk_bytes{};
+    for (size_t i = 0; i < pairing_psk_bytes.size(); ++i) {
+        pairing_psk_bytes[i] = static_cast<uint8_t>(0xE0 + i);
+    }
+    SendspinPairingPsk configured_pairing_psk;
+    configured_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
+    configured_pairing_psk.psk = pairing_psk_bytes;
+    persistence.set_configured_pairing_psk(configured_pairing_psk);
+
     SendspinClientConfig config;
     config.name = "Pairing Flow Persist-Failure Test Client";
     config.server_port = PAIRING_PERSIST_FAILURE_TEST_PORT;
@@ -1030,7 +1077,7 @@ TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
     options.first_selected_pair_method = "pairing_psk";
     FakeEncryptedServer server(server_url(PAIRING_PERSIST_FAILURE_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
-                               std::string(SENTINEL_PSK_ID), SENTINEL_PSK, options);
+                               configured_pairing_psk.psk_id, pairing_psk_bytes, options);
 
     ASSERT_TRUE(pump_until(
         client, [&] { return server.learned_psk_id().has_value(); }, 4000))

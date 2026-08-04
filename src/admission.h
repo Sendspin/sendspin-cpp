@@ -97,6 +97,37 @@ inline bool activities_allowed(PskCategory category,
     return false;
 }
 
+/// @brief Whether a connection declaring `activities` is "playback-capable": `activities`
+/// extended with PLAYBACK is an allowed set for the matched PSK category. A connection already
+/// declaring PLAYBACK is playback-capable exactly when its own `activities` are allowed.
+///
+/// Used both by admissible() (below) and by the client's re-evaluation of persisted
+/// `active_roles` on every server/activate (spec #122: "if a later activation changes activities
+/// so the connection is no longer playback-capable without explicitly sending active_roles, the
+/// persisted roles are treated as empty rather than the message rejected").
+///
+/// @param category    PSK category matched during the Noise handshake.
+/// @param activities  Activities declared in the server/activate message.
+/// @param unpaired_access Whether unpaired (Sentinel) access is enabled.
+/// @return true if the connection is playback-capable under these activities.
+inline bool is_playback_capable(PskCategory category,
+                                const std::vector<SendspinActivity>& activities,
+                                bool unpaired_access) {
+    bool already_has_playback = false;
+    for (const auto& a : activities) {
+        if (a == SendspinActivity::PLAYBACK) {
+            already_has_playback = true;
+            break;
+        }
+    }
+    if (already_has_playback) {
+        return activities_allowed(category, activities, unpaired_access);
+    }
+    std::vector<SendspinActivity> with_playback = activities;
+    with_playback.push_back(SendspinActivity::PLAYBACK);
+    return activities_allowed(category, with_playback, unpaired_access);
+}
+
 /// @brief Whether `activities`/`active_roles` satisfy the matched PSK's structural constraints.
 ///
 /// Ports `_admissible` from

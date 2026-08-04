@@ -1186,11 +1186,18 @@ size_t format_client_time_message(char* buf, size_t cap, int64_t client_transmit
 /// @return Command message serialized into JSON format.
 std::string format_client_command_message(const ClientCommandControllerObject& cmd);
 
-/// @brief Formats a client/pair-finalize message as a JSON string for sending to the server.
-/// The long_term_psk is 32 raw bytes which are base64url-encoded (no padding, 43 chars).
+/// @brief Formats a client/pair-finalize message carrying long_term_psk directly (Pairing PSK
+/// flow only). The PSK is 32 raw bytes, base64url-encoded (no padding, 43 chars).
 /// @param psk 32-byte long-term PSK to embed in the message.
 /// @return JSON string for the client/pair-finalize message.
 std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk);
+
+/// @brief Formats a client/pair-finalize message carrying wrapped_psk (PIN flows only; see
+/// PSK Wrapping, spec #117). wrapped_psk is 48 raw bytes, base64url-encoded (no padding, 64
+/// chars).
+/// @param wrapped_psk 48-byte wrapped PSK (ciphertext || tag) to embed in the message.
+/// @return JSON string for the client/pair-finalize message.
+std::string format_client_pair_finalize_wrapped_message(const std::array<uint8_t, 48>& wrapped_psk);
 
 /// @brief Formats a pair/abort message as a JSON string.
 /// Sent by the client when it cannot proceed with the selected pairing method.
@@ -1236,17 +1243,23 @@ bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* pa
 bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPayload* payload);
 
 /// @brief Formats a client/pair-init message as a JSON string.
-/// Sent in response to server/pair-init; carries commit_B = SHA-256(nonce_B).
+/// Sent in response to server/pair-init; carries commit_B = SHA-256(LABEL || nonce_B) and the
+/// required pairing_index counter (spec #120).
 /// @param commit_b 32-byte commit_B value to embed (base64url-encoded on the wire).
+/// @param pairing_index Count of pairing server/activate messages received since the last Noise
+///                      handshake (see SendspinConnection::get_pairing_index()).
 /// @return JSON string for the client/pair-init message.
-std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b);
+std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
+                                            uint32_t pairing_index);
 
-/// @brief Formats an empty client/pair-init message as a JSON string (static PIN, Phase 8c).
+/// @brief Formats a client/pair-init message with only pairing_index (static PIN, Phase 8c).
 /// Static PIN carries no commit_B (mirrors the reference's ClientPairInitPayload with omit_none:
-/// an empty payload object since no field is set). Sent after the operator confirms the
-/// pairing-window gesture, before starting CPace RESPONDER.
-/// @return JSON string for the client/pair-init message with an empty payload.
-std::string format_client_pair_init_message();
+/// commit_B is unset). Sent after the operator confirms the pairing-window gesture, before
+/// starting CPace RESPONDER.
+/// @param pairing_index Count of pairing server/activate messages received since the last Noise
+///                      handshake.
+/// @return JSON string for the client/pair-init message with only pairing_index set.
+std::string format_client_pair_init_message(uint32_t pairing_index);
 
 /// @brief Formats a client/pair-auth message as a JSON string.
 /// Sent in response to server/pair-auth; carries the client's CPace public share.

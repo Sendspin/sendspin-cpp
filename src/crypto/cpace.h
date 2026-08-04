@@ -60,6 +60,10 @@ static constexpr size_t CPACE_SHARE_SIZE = 32;
 /// @brief Size of a CPace confirmation tag (HMAC-SHA-512 output) in bytes.
 static constexpr size_t CPACE_TAG_SIZE = 64;
 
+/// @brief Size of the CPace intermediate session key (ISK, raw SHA-512 output) in bytes.
+/// See #117 (PSK Wrapping): ISK feeds K_wrap = SHA-256("sendspin-pair-psk-wrap-v1" || sid || ISK).
+static constexpr size_t CPACE_ISK_SIZE = 64;
+
 // -----------------------------------------------------------------------------
 // CPaceRole
 // -----------------------------------------------------------------------------
@@ -129,6 +133,17 @@ public:
     /// Constant-time comparison.  Returns false if derive() has not been called.
     [[nodiscard]] bool verify(const uint8_t* peer_tag, size_t peer_tag_len) const;
 
+    /// @brief Return the 64-byte CPace intermediate session key (ISK) computed by derive().
+    /// Used for PSK Wrapping (#117): K_wrap = SHA-256("sendspin-pair-psk-wrap-v1" || sid || ISK).
+    /// Returns an empty optional if derive() has not been called successfully.
+    [[nodiscard]] std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk() const;
+
+    /// @brief Return this side's session id (sid), as passed to start(). Needed alongside isk()
+    /// to derive K_wrap (#117: PSK Wrapping).
+    [[nodiscard]] const std::vector<uint8_t>& sid() const {
+        return this->sid_;
+    }
+
 private:
     CPaceRole role_{CPaceRole::RESPONDER};
     std::array<uint8_t, CPACE_FIELD_BYTES> scalar_{};
@@ -140,6 +155,7 @@ private:
 
     // Set by derive()
     std::array<uint8_t, CPACE_TAG_SIZE> mac_key_{};
+    std::array<uint8_t, CPACE_ISK_SIZE> isk_{};
     std::array<uint8_t, CPACE_SHARE_SIZE> initiator_share_{};
     std::vector<uint8_t> initiator_ad_{};
     std::array<uint8_t, CPACE_SHARE_SIZE> responder_share_{};

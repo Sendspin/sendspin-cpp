@@ -9,6 +9,8 @@ function(sendspin_get_sources BASE_DIR)
         ${BASE_DIR}/src/crypto/keys.cpp
         ${BASE_DIR}/src/crypto/cpace.cpp
         ${BASE_DIR}/src/crypto/pin.cpp
+        ${BASE_DIR}/src/crypto/psk_wrap.cpp
+        ${BASE_DIR}/src/crypto/pairing_token.cpp
 
         # Noise KKpsk2 session wrapper and handshake state machine
         ${BASE_DIR}/src/noise_session.cpp

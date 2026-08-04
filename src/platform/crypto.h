@@ -30,6 +30,7 @@
 // noise-c is a C library; wrap the includes in extern "C" to avoid C++
 // name-mangling issues when compiling under -Wpedantic.
 extern "C" {
+#include <noise/protocol/cipherstate.h>
 #include <noise/protocol/constants.h>
 #include <noise/protocol/hashstate.h>
 #include <noise/protocol/randstate.h>
@@ -379,6 +380,117 @@ inline std::vector<uint8_t> platform_random_bytes(size_t len) {
     std::vector<uint8_t> out(len);
     platform_random_bytes(out.data(), len);
     return out;
+}
+
+// =============================================================================
+// AEAD (one-shot, explicit key + nonce)
+// =============================================================================
+//
+// Used for PSK Wrapping (spec #117): the client seals the new PSK under a key derived from the
+// CPace output using the AEAD of the connection's negotiated cipher suite, a 12-byte all-zero
+// nonce, and empty associated data. This is independent of the Noise transport's own
+// monotonic-counter nonces (see noise_transport.h) -- it is a single-shot construction with a
+// fixed nonce, safe here only because K_wrap is used to encrypt exactly one message.
+
+/// @brief Number of bytes of authentication-tag overhead added by every Sendspin AEAD cipher
+/// (ChaChaPoly and AESGCM both use a 16-byte tag).
+static constexpr size_t AEAD_TAG_SIZE = 16;
+
+/// @brief Number of bytes in the fixed nonce used by aead_oneshot_encrypt/decrypt.
+static constexpr size_t AEAD_ONESHOT_NONCE_SIZE = 12;
+
+/// @brief Map a full Noise suite name (e.g. "Noise_KKpsk2_25519_ChaChaPoly_SHA256") to the
+/// noise-c cipher name ("ChaChaPoly" or "AESGCM") for use with aead_oneshot_encrypt/decrypt.
+/// Returns nullptr if the suite name does not contain a recognized cipher component.
+inline const char* aead_cipher_name_from_noise_suite(const std::string& noise_suite_name) {
+    if (noise_suite_name.find("ChaChaPoly") != std::string::npos) {
+        return "ChaChaPoly";
+    }
+    if (noise_suite_name.find("AESGCM") != std::string::npos) {
+        return "AESGCM";
+    }
+    return nullptr;
+}
+
+/// @brief Encrypt `plaintext` with the named AEAD cipher ("ChaChaPoly" or "AESGCM"), key `key`,
+/// an all-zero 12-byte nonce, and empty associated data. Returns ciphertext || tag
+/// (plaintext_len + AEAD_TAG_SIZE bytes), or nullopt on any cipher-allocation or key-length
+/// failure.
+///
+/// The all-zero nonce is safe here because the Noise per-message counter n=0 encodes to an
+/// all-zero 96-bit nonce regardless of the cipher's internal byte-order convention (ChaChaPoly
+/// packs the counter little-endian, AESGCM big-endian; zero is representation-independent), and
+/// K_wrap is a single-use key (see PSK Wrapping above).
+inline std::optional<std::vector<uint8_t>> aead_oneshot_encrypt(const char* cipher_name,
+                                                                const uint8_t* key, size_t key_len,
+                                                                const uint8_t* plaintext,
+                                                                size_t plaintext_len) {
+    NoiseCipherState* cipher = nullptr;
+    int err = noise_cipherstate_new_by_name(&cipher, cipher_name);
+    if (err != NOISE_ERROR_NONE || cipher == nullptr) {
+        return std::nullopt;
+    }
+    err = noise_cipherstate_init_key(cipher, key, key_len);
+    if (err != NOISE_ERROR_NONE) {
+        noise_cipherstate_free(cipher);
+        return std::nullopt;
+    }
+    err = noise_cipherstate_set_nonce(cipher, 0);
+    if (err != NOISE_ERROR_NONE) {
+        noise_cipherstate_free(cipher);
+        return std::nullopt;
+    }
+
+    const size_t mac_len = noise_cipherstate_get_mac_length(cipher);
+    std::vector<uint8_t> buf(plaintext_len + mac_len);
+    if (plaintext_len > 0) {
+        std::memcpy(buf.data(), plaintext, plaintext_len);
+    }
+
+    NoiseBuffer nbuf;
+    noise_buffer_set_inout(nbuf, buf.data(), plaintext_len, buf.size());
+    err = noise_cipherstate_encrypt_with_ad(cipher, nullptr, 0, &nbuf);
+    noise_cipherstate_free(cipher);
+    if (err != NOISE_ERROR_NONE) {
+        return std::nullopt;
+    }
+    buf.resize(nbuf.size);
+    return buf;
+}
+
+/// @brief Decrypt `ciphertext` (ciphertext || tag) with the named AEAD cipher, key `key`, an
+/// all-zero 12-byte nonce, and empty associated data. Returns the plaintext, or nullopt on any
+/// cipher-allocation failure or AEAD authentication failure (wrong key or corrupted input).
+inline std::optional<std::vector<uint8_t>> aead_oneshot_decrypt(const char* cipher_name,
+                                                                const uint8_t* key, size_t key_len,
+                                                                const uint8_t* ciphertext,
+                                                                size_t ciphertext_len) {
+    NoiseCipherState* cipher = nullptr;
+    int err = noise_cipherstate_new_by_name(&cipher, cipher_name);
+    if (err != NOISE_ERROR_NONE || cipher == nullptr) {
+        return std::nullopt;
+    }
+    err = noise_cipherstate_init_key(cipher, key, key_len);
+    if (err != NOISE_ERROR_NONE) {
+        noise_cipherstate_free(cipher);
+        return std::nullopt;
+    }
+    err = noise_cipherstate_set_nonce(cipher, 0);
+    if (err != NOISE_ERROR_NONE) {
+        noise_cipherstate_free(cipher);
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> buf(ciphertext, ciphertext + ciphertext_len);
+    NoiseBuffer nbuf;
+    noise_buffer_set_inout(nbuf, buf.data(), buf.size(), buf.size());
+    err = noise_cipherstate_decrypt_with_ad(cipher, nullptr, 0, &nbuf);
+    noise_cipherstate_free(cipher);
+    if (err != NOISE_ERROR_NONE) {
+        return std::nullopt;
+    }
+    buf.resize(nbuf.size);
+    return buf;
 }
 
 // =============================================================================

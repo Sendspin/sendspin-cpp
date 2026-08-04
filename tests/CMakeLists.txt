@@ -33,6 +33,8 @@ add_executable(sendspin_tests
     test_crypto.cpp
     test_cpace.cpp
     test_pin.cpp
+    test_psk_wrap.cpp
+    test_pairing_token.cpp
     test_record_store.cpp
     test_noise_transport.cpp
     test_noise_rehandshake.cpp

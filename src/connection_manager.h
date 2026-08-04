@@ -624,7 +624,9 @@ private:
     void handle_enter_pairing(SendspinConnection* conn);
 
     /// @brief Handles a pair/abort event on the main loop.
-    /// Cleans up pairing state and closes the connection.
+    /// Cleans up pairing state. Per spec #120/#123, only closes the connection for reason
+    /// concurrent_attempt; every other reason leaves it open. A pair/abort that arrives after the
+    /// attempt has already ended (is_pairing_in_progress() false) is silently ignored (stale).
     /// @param conn The connection on which the abort arrived.
     /// @param reason The abort reason.
     void handle_pair_abort(SendspinConnection* conn, PairAbortReason reason);
@@ -648,7 +650,9 @@ private:
     void handle_pin_pairing_message(SendspinConnection* conn,
                                     const ServerPairingMessageEvent& event);
 
-    /// @brief Abort the current dynamic-PIN session: send pair/abort, notify, close connection.
+    /// @brief Abort the current PIN-pairing session: send pair/abort, notify, and close the
+    /// connection only for reason concurrent_attempt (spec #120/#123; every other reason leaves
+    /// the connection open).
     /// @param conn The connection to abort.
     /// @param reason The abort reason to send.
     void local_abort_pin_pairing(SendspinConnection* conn, PairAbortReason reason);

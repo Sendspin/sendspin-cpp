@@ -36,6 +36,7 @@
 #include "connection_manager.h"
 #include "crypto/cpace.h"
 #include "crypto/pin.h"
+#include "crypto/psk_wrap.h"
 #include "platform/base64.h"
 #include "platform/time.h"
 #include "platform/types.h"
@@ -118,6 +119,13 @@ public:
         return this->canned_hash_;
     }
 
+    /// Report a canned Noise suite name without an active Noise session, so PSK Wrapping
+    /// (spec #117) can resolve an AEAD cipher during the PAIR_CONFIRM step. Overrides the
+    /// now-virtual base implementation (see connection.h).
+    const std::string& get_noise_suite_name() const override {
+        return this->canned_suite_name_;
+    }
+
     // -- Accumulated outgoing messages / disconnect bookkeeping --
 
     std::vector<std::string> sent_text_;
@@ -127,6 +135,7 @@ public:
 
 private:
     std::optional<std::array<uint8_t, 32>> canned_hash_{std::array<uint8_t, 32>{}};
+    std::string canned_suite_name_{"Noise_KKpsk2_25519_ChaChaPoly_SHA256"};
     bool connected_{true};
 };
 
@@ -290,17 +299,34 @@ std::string last_pair_abort_reason(const std::vector<std::string>& sent_text) {
 // Server-side ("stand-in initiator") frame builders, mirroring test_dynamic_pin.cpp
 // =============================================================================
 
-/// Build the SID CPace expects: "sendspin-pair-pake-v1" (21 bytes, no NUL) || 32-byte hash.
-std::vector<uint8_t> make_sid(const std::array<uint8_t, 32>& handshake_hash) {
+/// Build the SID CPace expects: "sendspin-pair-pake-v1" (21 bytes, no NUL) || 32-byte hash ||
+/// 4-byte big-endian pairing_index counter (spec #120). `counter` must equal the pairing_index
+/// the client captured for this attempt (SendspinConnection::bump_pairing_index(), which returns
+/// 1 for the first pairing server/activate on a fresh connection -- the value every single-
+/// enter_pairing() test in this file uses).
+std::vector<uint8_t> make_sid(const std::array<uint8_t, 32>& handshake_hash, uint32_t counter = 1) {
     static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
     std::vector<uint8_t> sid;
     sid.insert(sid.end(), PAKE_SID_LABEL, PAKE_SID_LABEL + sizeof(PAKE_SID_LABEL) - 1);
     sid.insert(sid.end(), handshake_hash.begin(), handshake_hash.end());
+    sid.push_back(static_cast<uint8_t>((counter >> 24) & 0xFF));
+    sid.push_back(static_cast<uint8_t>((counter >> 16) & 0xFF));
+    sid.push_back(static_cast<uint8_t>((counter >> 8) & 0xFF));
+    sid.push_back(static_cast<uint8_t>(counter & 0xFF));
     return sid;
 }
 
 std::vector<uint8_t> ascii_bytes(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
+}
+
+/// ADa = "server" (the (stand-in) server's own AD), ADb = "client" (the device's own AD) --
+/// spec #117.
+std::vector<uint8_t> ad_server() {
+    return ascii_bytes("server");
+}
+std::vector<uint8_t> ad_client() {
+    return ascii_bytes("client");
 }
 
 /// One side of a simulated server: a CPace INITIATOR plus the nonce/hash bookkeeping needed to
@@ -309,12 +335,16 @@ struct ServerStandIn {
     CPace initiator;
     std::string prs_pin;
 
-    /// Start the initiator for a given PRS (PIN ASCII bytes) and SID (label || handshake hash).
-    bool start(const std::string& pin, const std::array<uint8_t, 32>& handshake_hash) {
+    /// Start the initiator for a given PRS (PIN ASCII bytes) and SID (label || handshake hash ||
+    /// pairing_index counter). `counter` defaults to 1, matching the pairing_index every
+    /// single-enter_pairing() test in this file captures.
+    bool start(const std::string& pin, const std::array<uint8_t, 32>& handshake_hash,
+              uint32_t counter = 1) {
         this->prs_pin = pin;
         const std::vector<uint8_t> empty;
-        return this->initiator.start(CPaceRole::INITIATOR, ascii_bytes(pin), make_sid(handshake_hash),
-                                     empty, empty, empty);
+        return this->initiator.start(CPaceRole::INITIATOR, ascii_bytes(pin),
+                                     make_sid(handshake_hash, counter), empty, ad_server(),
+                                     ad_client());
     }
 };
 
@@ -330,11 +360,23 @@ protected:
     void SetUp() override {
         SendspinClientConfig config;
         config.name = "PinStateMachineTestDevice";
+        // This harness exercises both dynamic-PIN and static-PIN device flows, so the platform
+        // capability flags gating their advertisement/admissibility must both be set (spec
+        // #120/#123's pairing-method admissibility check in ConnectionManager::loop() mirrors
+        // build_hello_message()'s gating exactly, including these).
+        config.pin_display_supported = true;
+        config.pairing_window_supported = true;
         this->client_ = std::make_unique<SendspinClient>(config);
         this->client_->set_listener(&this->listener_);
         this->client_->set_network_provider(&this->network_provider_);
         this->client_->set_persistence_provider(&this->persistence_provider_);
         ASSERT_TRUE(this->client_->start_server());
+        // A device that implements static_pin enables it in its live pairing config (the flag a
+        // real client would flip once, independent of whether a PIN is currently configured).
+        // Needed since spec #120/#123's pairing-method admissibility check (see
+        // ConnectionManager::loop()) now gates entry on RecordStore::static_pin_enabled(), not
+        // just on a PIN being configured.
+        this->record_store().set_static_pin_enabled(true);
     }
 
     /// Inject a fresh FakeConnection as current_connection_, with the given server_id and
@@ -384,7 +426,15 @@ protected:
     /// the friend seam) rather than replaying the full activate-arbitration path, per the
     /// brief's "if intractable" fallback -- arbitration itself is exercised by test_admission.cpp
     /// and is not the subject of this harness.
+    ///
+    /// Production bumps pairing_index at the point a pairing server/activate is RECEIVED (the
+    /// activate_events loop in ConnectionManager::loop(), before the admissibility gate), not
+    /// inside handle_enter_pairing() itself -- see the fix for the pairing_index undercount bug.
+    /// This seam skips that loop entirely, so it must bump here to stand in for "a pairing
+    /// server/activate was just received for this connection", matching what every real caller
+    /// of handle_enter_pairing() already observes.
     void enter_pairing(SendspinConnection* conn) {
+        conn->bump_pairing_index();
         this->client_->connection_manager_->handle_enter_pairing(conn);
     }
 
@@ -532,6 +582,29 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
         << "dynamic PIN pair-confirm must open nonce_B";
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
 
+    // PSK Wrapping round-trip (spec #117): client/pair-finalize must carry wrapped_psk (NOT
+    // long_term_psk) in a PIN flow, and the server-side ServerStandIn -- using its own
+    // independently-derived ISK/sid, exactly as a real server would -- must be able to unwrap it.
+    // A successful AEAD decrypt here proves the client used the same K_wrap the server derives.
+    JsonDocument finalize_doc;
+    JsonObject finalize_root;
+    ASSERT_TRUE(parse_json(conn->sent_text_.back(), finalize_doc, finalize_root));
+    EXPECT_TRUE(finalize_root["payload"]["long_term_psk"].isUnbound())
+        << "PIN flows must not send long_term_psk in the clear";
+    ASSERT_TRUE(finalize_root["payload"]["wrapped_psk"].is<const char*>());
+    auto wrapped_bytes =
+        b64url_decode(std::string(finalize_root["payload"]["wrapped_psk"] | ""));
+    ASSERT_TRUE(wrapped_bytes.has_value());
+    ASSERT_EQ(wrapped_bytes->size(), WRAPPED_PSK_SIZE);
+    std::array<uint8_t, WRAPPED_PSK_SIZE> wrapped_psk{};
+    std::memcpy(wrapped_psk.data(), wrapped_bytes->data(), WRAPPED_PSK_SIZE);
+
+    ASSERT_TRUE(server.initiator.isk().has_value());
+    auto unwrapped =
+        unwrap_psk("ChaChaPoly", server.initiator.sid(), server.initiator.isk().value(), wrapped_psk);
+    ASSERT_TRUE(unwrapped.has_value()) << "server-side unwrap_psk failed";
+    EXPECT_EQ(unwrapped->size(), 32u);
+
     // Success callbacks: on_clear_pairing_pin fires (display -> clear ordering), and the
     // DYNAMIC_PIN failure counter is reset (was already 0, but exercise the call path by
     // checking it stays at 0 and is not locked out).
@@ -654,7 +727,9 @@ TEST_F(PinStateMachineTest, DynamicPinMalformedFrameDuringSessionAborts) {
 
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "method_not_supported");
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
-    EXPECT_EQ(conn->disconnect_count_, 1);
+    // Spec #120/#123: only reason concurrent_attempt closes the connection; every other reason
+    // (method_not_supported here) leaves it open.
+    EXPECT_EQ(conn->disconnect_count_, 0);
 }
 
 TEST_F(PinStateMachineTest, DynamicPinMalformedFrameWithNoActiveSessionIsIgnored) {
@@ -721,7 +796,8 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
 
     const std::array<uint8_t, 32> handshake_hash = conn->pin_session().handshake_hash;
 
-    // Operator confirms the pairing-window gesture: this must send the empty client/pair-init.
+    // Operator confirms the pairing-window gesture: this must send client/pair-init with no
+    // commit_B, but WITH the required pairing_index (spec #120).
     this->client_->confirm_pairing_window();
     this->client_->loop();
 
@@ -731,8 +807,10 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
     ASSERT_TRUE(parse_json(conn->sent_text_.back(), init_doc, init_root));
     EXPECT_STREQ(init_root["type"], "client/pair-init");
     ASSERT_TRUE(init_root["payload"].is<JsonObjectConst>());
-    EXPECT_EQ(init_root["payload"].as<JsonObjectConst>().size(), 0u)
-        << "static-PIN client/pair-init payload must be empty (no commit_B)";
+    EXPECT_TRUE(init_root["payload"]["commit_B"].isUnbound())
+        << "static-PIN client/pair-init must not carry commit_B";
+    ASSERT_TRUE(init_root["payload"]["pairing_index"].is<uint32_t>());
+    EXPECT_EQ(init_root["payload"]["pairing_index"].as<uint32_t>(), 1u);
 
     ServerStandIn server;
     ASSERT_TRUE(server.start("13572468", handshake_hash));
@@ -774,6 +852,26 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
     EXPECT_TRUE(confirm_root["payload"]["nonce_B"].isUnbound())
         << "static PIN pair-confirm must NOT carry nonce_B";
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
+
+    // PSK Wrapping round-trip (spec #117), static-PIN flavor: see the identical block in
+    // DynamicPinHappyPath above for the full rationale.
+    JsonDocument finalize_doc;
+    JsonObject finalize_root;
+    ASSERT_TRUE(parse_json(conn->sent_text_.back(), finalize_doc, finalize_root));
+    EXPECT_TRUE(finalize_root["payload"]["long_term_psk"].isUnbound())
+        << "PIN flows must not send long_term_psk in the clear";
+    ASSERT_TRUE(finalize_root["payload"]["wrapped_psk"].is<const char*>());
+    auto wrapped_bytes =
+        b64url_decode(std::string(finalize_root["payload"]["wrapped_psk"] | ""));
+    ASSERT_TRUE(wrapped_bytes.has_value());
+    ASSERT_EQ(wrapped_bytes->size(), WRAPPED_PSK_SIZE);
+    std::array<uint8_t, WRAPPED_PSK_SIZE> wrapped_psk{};
+    std::memcpy(wrapped_psk.data(), wrapped_bytes->data(), WRAPPED_PSK_SIZE);
+
+    ASSERT_TRUE(server.initiator.isk().has_value());
+    auto unwrapped =
+        unwrap_psk("ChaChaPoly", server.initiator.sid(), server.initiator.isk().value(), wrapped_psk);
+    ASSERT_TRUE(unwrapped.has_value()) << "server-side unwrap_psk failed";
 
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
     EXPECT_LT(this->listener_.first_index_of(PairingEventKind::OPEN_WINDOW),
@@ -1058,7 +1156,10 @@ TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_PIN))
         << "on_clear_pairing_pin must survive cleanup_connection_state() (Phase 8b BLOCKER)";
-    EXPECT_EQ(conn->disconnect_count_, 1);
+    // Spec #120/#123: only reason concurrent_attempt closes the connection; user_cancelled
+    // leaves it open (pairing state is still cleared above).
+    EXPECT_EQ(conn->disconnect_count_, 0);
+    EXPECT_FALSE(conn->is_pairing_in_progress());
 }
 
 TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupStaticWindow) {
@@ -1081,7 +1182,8 @@ TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupStaticW
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
-    EXPECT_EQ(conn->disconnect_count_, 1);
+    // Spec #120/#123: only reason concurrent_attempt closes the connection.
+    EXPECT_EQ(conn->disconnect_count_, 0);
 }
 
 // =============================================================================
@@ -1118,4 +1220,171 @@ TEST_F(PinStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPinSession) 
         << "leftover activate must discard the received long_term_psk";
     EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::IDLE);
     EXPECT_EQ(conn->pin_session().attempt_deadline_us, 0);
+}
+
+// =============================================================================
+// pairing_index counter (spec #120)
+// =============================================================================
+
+// The pairing_index counter -- sent on every client/pair-init and folded into the CPace sid --
+// must keep incrementing across repeated pairing server/activate messages on the SAME
+// connection (e.g. the operator retries after a stalled attempt), not reset with each attempt.
+// It only resets on a fresh Noise handshake (initial or re-handshake).
+TEST_F(PinStateMachineTest, PairingIndexIncrementsAcrossRepeatedPairingActivates) {
+    FakeConnection* conn =
+        this->inject_current_connection("server-dyn-idx", SendspinPairMethod::DYNAMIC_PIN);
+    EXPECT_EQ(conn->get_pairing_index(), 0u);
+
+    auto sent_pairing_index = [&]() -> uint32_t {
+        JsonDocument doc;
+        JsonObject root;
+        if (!parse_json(conn->sent_text_.back(), doc, root)) {
+            return 0;
+        }
+        return root["payload"]["pairing_index"] | 0u;
+    };
+
+    this->enter_pairing(conn);
+    this->client_->loop();
+    ASSERT_FALSE(conn->sent_text_.empty());
+    EXPECT_EQ(sent_pairing_index(), 1u);
+    EXPECT_EQ(conn->get_pairing_index(), 1u);
+    EXPECT_EQ(conn->pin_session().pairing_index, 1u);
+
+    // A second pairing activate on the same connection (no intervening handshake): the counter
+    // advances to 2, not back to 1.
+    conn->clear_pairing_state();
+    conn->set_pairing_in_progress(false);
+    this->enter_pairing(conn);
+    this->client_->loop();
+    EXPECT_EQ(sent_pairing_index(), 2u);
+    EXPECT_EQ(conn->get_pairing_index(), 2u);
+
+    // A third.
+    conn->clear_pairing_state();
+    conn->set_pairing_in_progress(false);
+    this->enter_pairing(conn);
+    this->client_->loop();
+    EXPECT_EQ(sent_pairing_index(), 3u);
+    EXPECT_EQ(conn->get_pairing_index(), 3u);
+
+    // A fresh Noise handshake resets the counter to zero (reset_pairing_index() is called from
+    // connection.cpp at handshake/re-handshake completion; exercised directly here since
+    // FakeConnection never runs a real Noise handshake).
+    conn->reset_pairing_index();
+    EXPECT_EQ(conn->get_pairing_index(), 0u);
+}
+
+// pairing_index counts RECEIVED pairing server/activate messages, not accepted attempts: a
+// pairing activate the pairing-method admissibility gate rejects (method_not_supported) must
+// still count. Unlike PairingIndexIncrementsAcrossRepeatedPairingActivates above (which drives
+// handle_enter_pairing() directly via the enter_pairing() test seam, bypassing the gate
+// entirely), this test goes through the REAL ConnectionManager::loop() admissibility gate via
+// post_activate()/schedule_activate() -- the same code path a stray or drifted server activate
+// takes in production -- to prove the bump in the activate_events loop (connection_manager.cpp,
+// before the pairing-method admissibility check) fires for a rejected activate too, so a second,
+// admissible activate on the same connection is not left one behind the server's own count.
+TEST_F(PinStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
+    FakeConnection* conn = this->inject_provisional_current_connection("server-rejected-idx");
+
+    // First activate: empty activities -> connection goes operational (first_activate_received()
+    // becomes true), no pairing. Needed so the next two activates are genuinely "subsequent" and
+    // take the same real arbitration path SubsequentActivateEntersStaticPinPairing exercises,
+    // rather than the nursery-promotion path (which this lightweight harness does not model).
+    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->client_->loop();
+    EXPECT_TRUE(conn->sent_text_.empty());
+
+    // Second activate: [pairing] + pairing_psk, but this connection resolved via the Sentinel PSK
+    // (PskCategory::SENTINEL, not PAIRING) -- category_ok fails, so the admissibility gate rejects
+    // it with pair/abort(method_not_supported) and leaves the connection open, WITHOUT ever
+    // reaching handle_enter_pairing(). The counter must still have advanced to 1.
+    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+                        SendspinPairMethod::PAIRING_PSK);
+    this->client_->loop();
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "method_not_supported");
+    EXPECT_EQ(conn->disconnect_count_, 0) << "method_not_supported must not close the connection";
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED))
+        << "a rejected activate must not start a pairing attempt";
+    EXPECT_EQ(conn->get_pairing_index(), 1u)
+        << "a rejected pairing server/activate must still count toward pairing_index";
+
+    // Third activate: [pairing] + dynamic_pin, admissible this time (category_ok: dynamic_pin
+    // does not require a Pairing-category PSK; offered: pin_display_supported=true and
+    // dynamic_pin_enabled_ defaults true). Must proceed into pairing and its client/pair-init
+    // must carry pairing_index == 2 -- BOTH the rejected and the accepted activate counted.
+    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+                        SendspinPairMethod::DYNAMIC_PIN);
+    this->client_->loop();
+
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED))
+        << "the second, admissible pairing activate must proceed";
+    // sent_text_ accumulates across the whole test: [0] is the pair/abort from the rejected
+    // activate, [1] (the most recent) must be the client/pair-init from the accepted one.
+    ASSERT_EQ(conn->sent_text_.size(), 2u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+    EXPECT_EQ(conn->get_pairing_index(), 2u);
+    EXPECT_EQ(conn->pin_session().pairing_index, 2u);
+
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse_json(conn->sent_text_.back(), doc, root));
+    EXPECT_EQ(root["payload"]["pairing_index"] | 0u, 2u)
+        << "the surviving attempt's client/pair-init must carry pairing_index == 2, proving the "
+           "rejected activate was not silently dropped from the count";
+}
+
+// =============================================================================
+// pair/abort close-vs-stay-open semantics (spec #120/#123)
+// =============================================================================
+
+// Reason concurrent_attempt is the ONE pair/abort reason whose sender (and, symmetrically, this
+// client on receipt) still closes the connection.
+TEST_F(PinStateMachineTest, PairAbortConcurrentAttemptStillClosesConnection) {
+    FakeConnection* conn = this->inject_current_connection("server-dyn-concurrent",
+                                                            SendspinPairMethod::DYNAMIC_PIN);
+    this->enter_pairing(conn);
+    this->client_->loop();
+
+    auto current_conn_sp = this->current_connection_sp();
+    PairAbortEvent abort_event;
+    abort_event.conn = current_conn_sp;
+    abort_event.reason = PairAbortReason::CONCURRENT_ATTEMPT;
+    this->schedule_abort(std::move(abort_event));
+    this->client_->loop();
+
+    ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
+    EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::CONCURRENT_ATTEMPT);
+    EXPECT_EQ(conn->disconnect_count_, 1);
+}
+
+// A pair/abort that arrives after the receiver has already ended the attempt (here: a local
+// attempt-timeout abort) has no effect -- it must not fire a second on_pairing_failed, and must
+// not touch the connection.
+TEST_F(PinStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
+    FakeConnection* conn =
+        this->inject_current_connection("server-dyn-stale", SendspinPairMethod::DYNAMIC_PIN);
+    this->enter_pairing(conn);
+    this->client_->loop();
+
+    // The client locally aborts first (attempt timeout).
+    conn->pin_session().attempt_deadline_us = platform_time_us() - 1;
+    this->client_->loop();
+    ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
+    EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::ATTEMPT_TIMEOUT);
+    EXPECT_FALSE(conn->is_pairing_in_progress());
+    const size_t events_before = this->listener_.events_.size();
+    const int disconnects_before = conn->disconnect_count_;
+
+    // A pair/abort from the server races in AFTER the local abort already ended the attempt.
+    auto current_conn_sp = this->current_connection_sp();
+    PairAbortEvent stale_event;
+    stale_event.conn = current_conn_sp;
+    stale_event.reason = PairAbortReason::PIN_MISMATCH;
+    this->schedule_abort(std::move(stale_event));
+    this->client_->loop();
+
+    EXPECT_EQ(this->listener_.events_.size(), events_before)
+        << "a stale pair/abort must not fire any new listener event";
+    EXPECT_EQ(conn->disconnect_count_, disconnects_before);
 }

@@ -163,6 +163,19 @@ public:
         return this->noise_handshake_ != nullptr;
     }
 
+    /// @brief Return the full Noise suite name supplied at init_noise_handshake() (e.g.
+    /// "Noise_KKpsk2_25519_ChaChaPoly_SHA256"), or an empty string if none was set.
+    /// Used to select the AEAD cipher for PSK Wrapping (spec #117; see
+    /// platform/crypto.h aead_cipher_name_from_noise_suite()).
+    ///
+    /// Virtual so tests can inject a fake connection that reports a canned suite name without an
+    /// active Noise session (see PinStateMachineTest's FakeConnection, mirroring
+    /// get_noise_handshake_hash() below); production connections keep the same implementation
+    /// via dynamic dispatch.
+    virtual const std::string& get_noise_suite_name() const {
+        return this->noise_suite_name_;
+    }
+
     /// @brief Build and send the client/init TEXT frame that starts the Noise handshake.
     /// No-op if no handshake driver is installed.
     /// Must be called after the WebSocket connection is open (from on_connected_cb).
@@ -374,6 +387,25 @@ public:
         return this->selected_pair_method_;
     }
 
+    /// @brief Returns the count of pairing server/activate messages received since the last
+    /// Noise handshake (or re-handshake). See pairing_index_ for the cross-thread contract.
+    uint32_t get_pairing_index() const {
+        return this->pairing_index_.load(std::memory_order_acquire);
+    }
+
+    /// @brief Increments the pairing-server/activate counter and returns the new value.
+    /// Call on the main loop exactly once per pairing server/activate that starts or re-enters a
+    /// pairing attempt (handle_enter_pairing).
+    uint32_t bump_pairing_index() {
+        return this->pairing_index_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+
+    /// @brief Resets the pairing-server/activate counter to zero.
+    /// Call on the network thread when a Noise handshake (initial or re-handshake) completes.
+    void reset_pairing_index() {
+        this->pairing_index_.store(0, std::memory_order_release);
+    }
+
     // ========================================
     // PIN pairing state (dynamic and static)
     // ========================================
@@ -405,6 +437,11 @@ public:
         std::string static_pin_value;  ///< static PIN captured at pairing start (static PIN only).
         int64_t attempt_deadline_us{0};  ///< platform_time_us() deadline for the whole attempt.
         int pin_length{0};
+        /// pairing_index captured when this attempt entered pairing (see
+        /// SendspinConnection::bump_pairing_index()). Sent on client/pair-init and reused
+        /// verbatim for the CPace sid counter, so both stay consistent even if the connection's
+        /// running counter advances again before the PAKE steps run.
+        uint32_t pairing_index{0};
         SendspinPairMethod method{
             SendspinPairMethod::DYNAMIC_PIN};  ///< Which PIN method this session is running.
         PinStep step{PinStep::IDLE};
@@ -523,6 +560,9 @@ public:
     /// @param activities Activity list from the message.
     /// @param active_roles Optional roles list (nullopt = keep prior set).
     /// @param selected_pair_method Server-selected pairing method (nullopt outside pairing).
+    ///                             Ignored (stored as nullopt) unless `activities` includes
+    ///                             PAIRING (spec #113/#122: "A client ignores this field when
+    ///                             activities does not include 'pairing'").
     void apply_server_activate(const std::vector<SendspinActivity>& activities,
                                const std::optional<std::vector<std::string>>& active_roles,
                                const std::optional<SendspinPairMethod>& selected_pair_method) {
@@ -530,7 +570,14 @@ public:
         if (active_roles.has_value()) {
             this->active_roles_ = active_roles.value();
         }
-        this->selected_pair_method_ = selected_pair_method;
+        bool has_pairing = false;
+        for (const auto& a : activities) {
+            if (a == SendspinActivity::PAIRING) {
+                has_pairing = true;
+                break;
+            }
+        }
+        this->selected_pair_method_ = has_pairing ? selected_pair_method : std::nullopt;
         this->first_activate_received_.store(true, std::memory_order_release);
     }
 
@@ -865,6 +912,15 @@ protected:
 
     /// Guards pending_pairing_record_ across the main-loop writer and the network-thread taker.
     std::mutex pending_pairing_mutex_{};
+
+    /// Count of pairing server/activate messages received since the last Noise handshake (or
+    /// re-handshake) (spec #120). Feeds both the wire `pairing_index` field on
+    /// client/pair-init and the CPace `sid` counter (see PinSession::pairing_index, captured at
+    /// handle_enter_pairing() so a later PAKE step reuses the exact value client/pair-init sent).
+    /// Written on the main loop (bump_pairing_index(), each pairing server/activate) and on the
+    /// network thread (reset_pairing_index(), at handshake/re-handshake completion); atomic for
+    /// that cross-thread reset.
+    std::atomic<uint32_t> pairing_index_{0};
 
     // 8-bit fields
 
