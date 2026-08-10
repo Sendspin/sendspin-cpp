@@ -91,7 +91,7 @@ void ColorRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::COLOR);
 }
 
-void ColorRole::Impl::handle_server_state(ServerColorStateDelta&& delta) const {
+void ColorRole::Impl::handle_server_state(const ServerColorStateDelta& delta) const {
     // Merge incoming wire delta into the accumulated delta in the inbox slot; see
     // merge_color_state_delta for the field-overlay semantics.
     this->event_state->slot.merge(merge_color_state_delta, delta);

@@ -865,7 +865,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             if (this->color_ != nullptr) {
                 ServerColorStateDelta color_delta;
                 if (process_server_state_color(root, &color_delta)) {
-                    this->color_->impl_->handle_server_state(std::move(color_delta));
+                    this->color_->impl_->handle_server_state(color_delta);
                 }
             }
 #endif
