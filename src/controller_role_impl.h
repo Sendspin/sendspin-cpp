@@ -46,7 +46,7 @@ struct ControllerRole::Impl {
 
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerStateControllerObject state) const;
+    void handle_server_state(ServerStateControllerObject&& state) const;
     // True if a controller-state delta is waiting in the inbox slot.
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & INBOX_TOPIC_CONTROLLER) != 0;

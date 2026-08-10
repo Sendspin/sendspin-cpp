@@ -50,7 +50,10 @@ struct ColorRole::Impl {
 
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerColorStateDelta delta) const;
+    // Takes a const reference, unlike the metadata and controller overloads: a
+    // ServerColorStateDelta is trivially copyable (see merge_color_state_delta), so there is
+    // nothing for an rvalue reference to move out of.
+    void handle_server_state(const ServerColorStateDelta& delta) const;
     // True if a slot delta needs folding in, or a delta already held from a prior tick (see
     // held_delta) is still waiting out its server-clock deadline -- the deadline itself sets no
     // inbox bit, so held_delta must be polled every tick until it fires.

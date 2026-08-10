@@ -70,7 +70,7 @@ void ControllerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::CONTROLLER);
 }
 
-void ControllerRole::Impl::handle_server_state(ServerStateControllerObject state) const {
+void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& state) const {
     this->event_state->slot.write(std::move(state));
 }
 

@@ -147,7 +147,7 @@ void MetadataRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::METADATA);
 }
 
-void MetadataRole::Impl::handle_server_state(ServerMetadataStateDelta delta) const {
+void MetadataRole::Impl::handle_server_state(ServerMetadataStateDelta&& delta) const {
     // Merge incoming wire delta into the accumulated delta in the inbox slot; see
     // merge_metadata_state_delta for the field-overlay semantics.
     this->event_state->slot.merge(merge_metadata_state_delta, std::move(delta));

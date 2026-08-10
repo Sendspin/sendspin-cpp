@@ -145,12 +145,11 @@ TEST(Protocol, MetadataValueUpdate) {
                       R"({"timestamp":123,"title":"Song","artist":"Band"}}})",
                       doc, root));
 
-    ServerStateMessage msg;
-    ASSERT_TRUE(process_server_state_message(root, &msg));
-    ASSERT_TRUE(msg.metadata.has_value());
+    ServerMetadataStateDelta delta;
+    ASSERT_TRUE(process_server_state_metadata(root, &delta));
 
     ServerMetadataStateObject current;
-    apply_metadata_state_deltas(&current, msg.metadata.value());
+    apply_metadata_state_deltas(&current, delta);
 
     EXPECT_EQ(current.timestamp, 123);
     ASSERT_TRUE(current.title.has_value());
@@ -172,10 +171,9 @@ TEST(Protocol, MetadataNullClearsAndAbsentPreserves) {
                       R"({"timestamp":200,"title":null}}})",
                       doc, root));
 
-    ServerStateMessage msg;
-    ASSERT_TRUE(process_server_state_message(root, &msg));
-    ASSERT_TRUE(msg.metadata.has_value());
-    apply_metadata_state_deltas(&current, msg.metadata.value());
+    ServerMetadataStateDelta delta;
+    ASSERT_TRUE(process_server_state_metadata(root, &delta));
+    apply_metadata_state_deltas(&current, delta);
 
     EXPECT_FALSE(current.title.has_value());  // explicit null cleared it
     ASSERT_TRUE(current.artist.has_value());  // absent left it untouched
@@ -188,10 +186,9 @@ TEST(Protocol, MetadataMissingTimestampIsRejected) {
     ASSERT_TRUE(
         parse(R"({"type":"server/state","payload":{"metadata":{"title":"X"}}})", doc, root));
 
-    ServerStateMessage msg;
-    // The top-level call still succeeds, but the malformed metadata sub-object is dropped.
-    ASSERT_TRUE(process_server_state_message(root, &msg));
-    EXPECT_FALSE(msg.metadata.has_value());
+    // The malformed metadata section is reported as absent rather than partially applied.
+    ServerMetadataStateDelta delta;
+    EXPECT_FALSE(process_server_state_metadata(root, &delta));
 }
 
 // ============================================================================
@@ -210,10 +207,9 @@ TEST(Protocol, ColorRangeValidationAndMerge) {
                       R"("primary":[10,20,30],"accent":[300,0,0],"on_dark":null}}})",
                       doc, root));
 
-    ServerStateMessage msg;
-    ASSERT_TRUE(process_server_state_message(root, &msg));
-    ASSERT_TRUE(msg.color.has_value());
-    apply_color_state_deltas(&current, msg.color.value());
+    ServerColorStateDelta delta;
+    ASSERT_TRUE(process_server_state_color(root, &delta));
+    apply_color_state_deltas(&current, delta);
 
     ASSERT_TRUE(current.primary.has_value());
     EXPECT_EQ(current.primary.value(), (RgbColor{10, 20, 30}));
@@ -454,12 +450,11 @@ TEST(Protocol, ColorRejectsNonIntegerComponent) {
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"color":)"
                       R"({"timestamp":1,"primary":[10,"x",30]}}})",
                       doc, root));
-    ServerStateMessage msg;
-    ASSERT_TRUE(process_server_state_message(root, &msg));
-    ASSERT_TRUE(msg.color.has_value());
+    ServerColorStateDelta delta;
+    ASSERT_TRUE(process_server_state_color(root, &delta));
 
     ServerColorStateObject current;
-    apply_color_state_deltas(&current, msg.color.value());
+    apply_color_state_deltas(&current, delta);
     EXPECT_FALSE(current.primary.has_value());  // malformed component -> whole color dropped
 }
 
@@ -472,11 +467,10 @@ TEST(Protocol, ControllerSupportedCommandsValidation) {
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
                       R"({"supported_commands":["play","bogus","mute"]}}})",
                       doc, root));
-    ServerStateMessage msg;
-    ASSERT_TRUE(process_server_state_message(root, &msg));
-    ASSERT_TRUE(msg.controller.has_value());
+    ServerStateControllerObject controller;
+    ASSERT_TRUE(process_server_state_controller(root, &controller));
 
-    const auto& commands = msg.controller->supported_commands;
+    const auto& commands = controller.supported_commands;
     ASSERT_EQ(commands.size(), 2u);  // "bogus" dropped
     EXPECT_EQ(commands[0], SendspinControllerCommand::PLAY);
     EXPECT_EQ(commands[1], SendspinControllerCommand::MUTE);
@@ -489,11 +483,10 @@ TEST(Protocol, ControllerSeekMaxParsed) {
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
                       R"({"supported_commands":["seek"],"seek_max_ms":215000}}})",
                       doc, root));
-    ServerStateMessage msg;
-    ASSERT_TRUE(process_server_state_message(root, &msg));
-    ASSERT_TRUE(msg.controller.has_value());
-    ASSERT_TRUE(msg.controller->seek_max_ms.has_value());
-    EXPECT_EQ(*msg.controller->seek_max_ms, 215000u);
+    ServerStateControllerObject controller;
+    ASSERT_TRUE(process_server_state_controller(root, &controller));
+    ASSERT_TRUE(controller.seek_max_ms.has_value());
+    EXPECT_EQ(*controller.seek_max_ms, 215000u);
 }
 
 // seek_max_ms stays absent (nullopt) when omitted, so consumers can tell "unknown range" from 0.
@@ -503,10 +496,9 @@ TEST(Protocol, ControllerSeekMaxAbsentWhenOmitted) {
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
                       R"({"supported_commands":["seek_relative"]}}})",
                       doc, root));
-    ServerStateMessage msg;
-    ASSERT_TRUE(process_server_state_message(root, &msg));
-    ASSERT_TRUE(msg.controller.has_value());
-    EXPECT_FALSE(msg.controller->seek_max_ms.has_value());
+    ServerStateControllerObject controller;
+    ASSERT_TRUE(process_server_state_controller(root, &controller));
+    EXPECT_FALSE(controller.seek_max_ms.has_value());
 }
 
 // ============================================================================

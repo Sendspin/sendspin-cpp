@@ -627,13 +627,6 @@ struct ClientStateMessage {
     std::optional<ClientPlayerStateObject> player{};
 };
 
-/// @brief Parsed server/state message containing per-role state updates
-struct ServerStateMessage {
-    std::optional<ServerStateControllerObject> controller;
-    std::optional<ServerMetadataStateDelta> metadata;
-    std::optional<ServerColorStateDelta> color;
-};
-
 /// @brief Parsed server/hello handshake message received at connection startup
 struct ServerHelloMessage {
     ServerInformationObject server{};
@@ -713,11 +706,30 @@ void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObje
 /// @return true if parsing succeeded, false on missing required fields.
 bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg);
 
-/// @brief Parses a server/state JSON message into the provided struct
+/// @brief Parses the metadata section of a server/state JSON message
+///
+/// The server/state sections are parsed individually rather than into one aggregate struct: the
+/// caller runs on the network task, whose stack is small on ESP-IDF (the httpd task gets 4 KB), and
+/// an aggregate would keep every section's storage live in the caller's frame for the whole parse.
+/// Each function fills a caller-owned struct in place and reports whether that section was present.
+///
 /// @param root Parsed JSON object from the message.
-/// @param state_msg [out] Struct to populate with parsed fields.
-/// @return true if parsing succeeded, false on missing required fields.
-bool process_server_state_message(JsonObject root, ServerStateMessage* state_msg);
+/// @param metadata_delta [out] Struct to populate with the parsed delta.
+/// @return true if the message carried a metadata section that parsed successfully.
+bool process_server_state_metadata(JsonObject root, ServerMetadataStateDelta* metadata_delta);
+
+/// @brief Parses the color section of a server/state JSON message
+/// @param root Parsed JSON object from the message.
+/// @param color_delta [out] Struct to populate with the parsed delta.
+/// @return true if the message carried a color section that parsed successfully.
+bool process_server_state_color(JsonObject root, ServerColorStateDelta* color_delta);
+
+/// @brief Parses the controller section of a server/state JSON message
+/// @param root Parsed JSON object from the message.
+/// @param controller_state [out] Struct to populate with parsed fields.
+/// @return true if the message carried a controller section that parsed successfully.
+bool process_server_state_controller(JsonObject root,
+                                     ServerStateControllerObject* controller_state);
 
 /// @brief Parses a stream/start JSON message into the provided struct
 /// @param root Parsed JSON object from the message.
