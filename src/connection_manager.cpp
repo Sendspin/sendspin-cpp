@@ -1006,21 +1006,21 @@ void ConnectionManager::schedule_pair_abort(PairAbortEvent event) {
     this->queue_pending_pair_abort(std::move(event));
 }
 
-void ConnectionManager::schedule_management_request(ManagementRequestEvent event) {
+void ConnectionManager::schedule_management_request(ManagementRequestEvent&& event) {
     // Called from SendspinClient::process_json_message() on the network thread when a
     // management/* request arrives.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->queue_pending_management_request(std::move(event));
 }
 
-void ConnectionManager::schedule_server_unpair(ServerUnpairEvent event) {
+void ConnectionManager::schedule_server_unpair(ServerUnpairEvent&& event) {
     // Called from SendspinClient::process_json_message() on the network thread when
     // server/unpair arrives.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->queue_pending_server_unpair(std::move(event));
 }
 
-void ConnectionManager::schedule_pin_pairing_message(ServerPairingMessageEvent event) {
+void ConnectionManager::schedule_pin_pairing_message(ServerPairingMessageEvent&& event) {
     // Called from SendspinClient::process_json_message() on the network thread when a dynamic-PIN
     // pairing message arrives (or a malformed pairing frame forces a MALFORMED event).
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
@@ -1288,19 +1288,19 @@ void ConnectionManager::queue_pending_pair_abort(PairAbortEvent event) {
     this->has_pending_events_.store(true, std::memory_order_release);
 }
 
-void ConnectionManager::queue_pending_management_request(ManagementRequestEvent event) {
+void ConnectionManager::queue_pending_management_request(ManagementRequestEvent&& event) {
     // Note: caller must hold conn_mutex_
     this->pending_management_request_events_.push_back(std::move(event));
     this->has_pending_events_.store(true, std::memory_order_release);
 }
 
-void ConnectionManager::queue_pending_server_unpair(ServerUnpairEvent event) {
+void ConnectionManager::queue_pending_server_unpair(ServerUnpairEvent&& event) {
     // Note: caller must hold conn_mutex_
     this->pending_server_unpair_events_.push_back(std::move(event));
     this->has_pending_events_.store(true, std::memory_order_release);
 }
 
-void ConnectionManager::queue_pending_pin_pairing_message(ServerPairingMessageEvent event) {
+void ConnectionManager::queue_pending_pin_pairing_message(ServerPairingMessageEvent&& event) {
     // Note: caller must hold conn_mutex_
     this->pending_pin_pairing_events_.push_back(std::move(event));
     this->has_pending_events_.store(true, std::memory_order_release);

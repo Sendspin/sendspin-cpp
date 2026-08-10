@@ -318,15 +318,15 @@ public:
 
     /// @brief Schedules a management request event for deferred processing in loop().
     /// @param event The management request event to schedule (moved).
-    void schedule_management_request(ManagementRequestEvent event);
+    void schedule_management_request(ManagementRequestEvent&& event);
 
     /// @brief Schedules a server/unpair event for deferred processing in loop().
     /// @param event The server/unpair event to schedule (moved).
-    void schedule_server_unpair(ServerUnpairEvent event);
+    void schedule_server_unpair(ServerUnpairEvent&& event);
 
     /// @brief Schedules a dynamic-PIN pairing message event for deferred processing in loop().
     /// @param event The server pairing message event to schedule (moved).
-    void schedule_pin_pairing_message(ServerPairingMessageEvent event);
+    void schedule_pin_pairing_message(ServerPairingMessageEvent&& event);
 
     /// @brief Schedules an on_pairing_succeeded notification for deferred delivery in loop().
     ///
@@ -458,19 +458,19 @@ private:
     /// in the same critical section, so loop()'s lock-free gate can never miss a pushed event.
     /// Caller must hold conn_mutex_.
     /// @param event The management/* request event to defer to loop() (moved).
-    void queue_pending_management_request(ManagementRequestEvent event);
+    void queue_pending_management_request(ManagementRequestEvent&& event);
 
     /// @brief Appends an event to pending_server_unpair_events_ and sets has_pending_events_ in
     /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
     /// Caller must hold conn_mutex_.
     /// @param event The server/unpair event to defer to loop() (moved).
-    void queue_pending_server_unpair(ServerUnpairEvent event);
+    void queue_pending_server_unpair(ServerUnpairEvent&& event);
 
     /// @brief Appends an event to pending_pin_pairing_events_ and sets has_pending_events_ in
     /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
     /// Caller must hold conn_mutex_.
     /// @param event The dynamic-PIN pairing message event to defer to loop() (moved).
-    void queue_pending_pin_pairing_message(ServerPairingMessageEvent event);
+    void queue_pending_pin_pairing_message(ServerPairingMessageEvent&& event);
 
     /// @brief Appends a server_id to pending_pairing_succeeded_events_ and sets
     /// has_pending_events_ in the same critical section, so loop()'s lock-free gate can never

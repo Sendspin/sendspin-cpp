@@ -1199,12 +1199,10 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
         }
         case SendspinServerToClientMessageType::MANAGEMENT_ADD_RECORD: {
             if (conn != nullptr) {
-                ManagementAddRecordPayload payload;
-                if (process_management_add_record_message(root, &payload)) {
-                    ManagementRequestEvent event;
+                ManagementRequestEvent event;
+                if (process_management_add_record_message(root, &event.add_payload)) {
                     event.conn = conn->shared_from_this();
                     event.kind = ManagementRequestKind::ADD_RECORD;
-                    event.add_payload = std::move(payload);
                     this->connection_manager_->schedule_management_request(std::move(event));
                 } else {
                     SS_LOGW(TAG, "Malformed management/add-record; ignoring");
@@ -1214,12 +1212,10 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
         }
         case SendspinServerToClientMessageType::MANAGEMENT_REMOVE_RECORD: {
             if (conn != nullptr) {
-                ManagementRemoveRecordPayload payload;
-                if (process_management_remove_record_message(root, &payload)) {
-                    ManagementRequestEvent event;
+                ManagementRequestEvent event;
+                if (process_management_remove_record_message(root, &event.remove_payload)) {
                     event.conn = conn->shared_from_this();
                     event.kind = ManagementRequestKind::REMOVE_RECORD;
-                    event.remove_payload = std::move(payload);
                     this->connection_manager_->schedule_management_request(std::move(event));
                 } else {
                     SS_LOGW(TAG, "Malformed management/remove-record; ignoring");
@@ -1238,12 +1234,11 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
         }
         case SendspinServerToClientMessageType::MANAGEMENT_SET_PAIRING_CONFIG: {
             if (conn != nullptr) {
-                ManagementSetPairingConfigPayload payload;
-                if (process_management_set_pairing_config_message(root, &payload)) {
-                    ManagementRequestEvent event;
+                ManagementRequestEvent event;
+                if (process_management_set_pairing_config_message(root,
+                                                                  &event.set_config_payload)) {
                     event.conn = conn->shared_from_this();
                     event.kind = ManagementRequestKind::SET_PAIRING_CONFIG;
-                    event.set_config_payload = std::move(payload);
                     this->connection_manager_->schedule_management_request(std::move(event));
                 } else {
                     SS_LOGW(TAG, "Malformed management/set-pairing-config; ignoring");
