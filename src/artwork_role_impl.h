@@ -51,8 +51,9 @@ static constexpr uint8_t ARTWORK_RECHECK_SLOT = 0xFF;
 
 /// @brief Ack-gate state for a slot with require_frame_done enabled
 enum class SlotAckState : uint8_t {
-    IDLE,              // no un-acked delivery; next frame may decode
-    DECODE_DELIVERED,  // on_image_decode fired, on_image_display not yet fired
+    IDLE,              // no un-acked delivery; next frame or clear may be processed
+    DECODE_DELIVERED,  // the decode thread claimed a delivery (on_image_decode fired for a frame;
+                       // nothing fires for a per-channel clear), its display/clear not yet fired
     PRESENTED,         // on_image_display or on_image_clear fired, awaiting frame_done()
 };
 
@@ -67,6 +68,11 @@ enum class SlotAckState : uint8_t {
 /// buffer it names has since been overwritten (generation mismatch) or the stream has moved on
 /// (stream_epoch mismatch), the notification is skipped rather than decoding torn or
 /// superseded data. See ArtworkRole::Impl::drain_thread_func.
+///
+/// `data_length == 0` marks the protocol's per-channel clear (an artwork binary message carrying
+/// only the type byte and timestamp). It names no buffer, so `buffer_idx`/`generation` are unused
+/// and left at 0; everything else about it -- queue ordering, the ack gate, and the
+/// timestamp-scheduled hand-off to the main loop -- matches a frame. See handle_binary().
 struct ArtworkNotification {
     uint8_t slot;
     uint8_t buffer_idx;
@@ -108,11 +114,15 @@ struct SlotBuffer {
 /// main-loop drain; a bit set in valid_mask means timestamps[i] holds a pending display.
 /// epochs[i] carries the stream_epoch the decode ran under, so the main-loop deadline check can
 /// drop a display whose stream has since been replaced (a stream restart bumps the epoch but
-/// cannot reach a display already folded into the main-thread holds).
+/// cannot reach a display already folded into the main-thread holds). A bit set in clear_mask
+/// means slot i's pending delivery is a per-channel clear rather than a decoded frame, so the
+/// deadline fires on_image_clear() instead of on_image_display(); it is meaningful only where
+/// valid_mask is set.
 struct ArtworkDisplayUpdate {
     int64_t timestamps[ARTWORK_MAX_SLOTS]{};
     uint32_t epochs[ARTWORK_MAX_SLOTS]{};
     uint8_t valid_mask{0};
+    uint8_t clear_mask{0};
 };
 
 /// @brief Private implementation of the artwork role
@@ -236,6 +246,10 @@ struct ArtworkRole::Impl {
     std::atomic<bool> stream_active{false};
     // Main-thread only; see held_display_ts.
     uint8_t held_display_mask{0};
+    // Which held deliveries are per-channel clears rather than decoded frames: bit i selects
+    // on_image_clear() over on_image_display() when slot i's deadline fires. Only meaningful where
+    // held_display_mask is set. Main-thread only; see held_display_ts.
+    uint8_t held_display_clear{0};
 
     /// @brief Bumped on stream start/end/clear/cleanup so in-flight notifications from a
     /// previous stream are recognized as stale and skipped by the decode thread, instead of

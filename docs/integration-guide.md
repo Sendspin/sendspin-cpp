@@ -289,14 +289,23 @@ struct MyArtworkListener : ArtworkRoleListener {
         display.show_image(slot, decoded_images[slot]);
     }
 
-    // Called from the main loop thread when artwork should be cleared.
+    // Called from the main loop thread when artwork should be cleared, either for this slot
+    // alone or for every slot at the end of a stream.
     void on_image_clear(uint8_t slot) override {
         display.clear_slot(slot);
     }
 };
 ```
 
-**Cross-fades with back-pressure (opt-in).** By default the role decodes and displays every frame as it arrives. A slot can instead opt into a back-pressure gate by setting `ImageSlotPreference::require_frame_done`. With the gate on, the role keeps at most one un-acked *delivery* (a frame or a clear) in flight for that slot; any newer payload that arrives is buffered latest-wins and delivered only after the consumer calls `ArtworkRole::frame_done(slot)` from the main loop -- e.g. once a cross-fade animation finishes. A clear is itself a delivery and supersedes any un-acked frame, so exactly one `frame_done()` is owed after it. There is no timeout: the acknowledgment is the contract.
+**Knowing when there is no artwork.** Artwork stays valid until the server replaces or clears it, and the artwork role is independent of the metadata role, so a track change alone sends nothing: the next track of the same album keeps showing the image already delivered. When an item genuinely has no artwork, the server clears that channel and `on_image_clear()` fires for that slot alone, scheduled to its server timestamp like a display (`display_offset_ms` included) so it lands on the item boundary. `on_image_clear()` also fires for every configured slot on stream end, stream clear, and disconnect.
+
+| What happened | What the listener sees |
+| --- | --- |
+| Artwork unchanged (e.g. next track of the same album) | nothing; the current image stays valid |
+| Item has no artwork | `on_image_clear(slot)` for that slot |
+| Stream ended, cleared, or connection lost | `on_image_clear(slot)` for every configured slot |
+
+**Cross-fades with back-pressure (opt-in).** By default the role decodes and displays every frame as it arrives. A slot can instead opt into a back-pressure gate by setting `ImageSlotPreference::require_frame_done`. With the gate on, the role keeps at most one un-acked *delivery* (a frame or a clear, whether per-slot or stream-level) in flight for that slot; any newer payload that arrives is buffered latest-wins and delivered only after the consumer calls `ArtworkRole::frame_done(slot)` from the main loop -- e.g. once a cross-fade animation finishes. A clear is itself a delivery and supersedes any un-acked frame, so exactly one `frame_done()` is owed after it. There is no timeout: the acknowledgment is the contract.
 
 Pair the gate with `ImageSlotPreference::display_offset_ms` to start a fade before the track boundary (positive fires the display early, mirroring `PlayerRoleConfig::fixed_delay_us`), and use `lateness_ms` to shorten the fade so it still ends on schedule:
 

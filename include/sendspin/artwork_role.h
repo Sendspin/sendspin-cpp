@@ -38,7 +38,9 @@ class SendspinClient;
 /// (on_image_clear()). For an ack-enabled slot, at most one un-acked delivery is ever in flight;
 /// the newest payload that arrives while a delivery is un-acked is buffered latest-wins and
 /// delivered only after the consumer calls ArtworkRole::frame_done(slot). A clear supersedes any
-/// un-acked frame for that slot -- exactly one ack is owed, and it is for the clear. A stream
+/// un-acked delivery for that slot, including an earlier clear -- exactly one ack is owed, and it
+/// is for the newest clear, so a stream end or stream clear arriving on top of an un-acked
+/// per-channel clear fires on_image_clear() again and still owes exactly one ack. A stream
 /// restart automatically releases a frame that was decoded but never displayed (its display can
 /// no longer fire), but a delivery that already reached on_image_display()/on_image_clear() stays
 /// gated until frame_done() is called; there is no timeout.
@@ -77,7 +79,15 @@ public:
 
     /// @brief Called on the main loop thread when artwork should be cleared for a slot
     ///
-    /// Fires on stream end or stream clear for each configured slot.
+    /// Fires on stream end or stream clear for each configured slot, and for a single slot when
+    /// the server clears that channel (the artwork for the current item is gone, e.g. a track
+    /// with no album art). A per-channel clear is scheduled to its server timestamp exactly like
+    /// on_image_display(), ImageSlotPreference::display_offset_ms included, so it lands on the
+    /// item boundary rather than as soon as it arrives.
+    ///
+    /// Artwork stays valid until it is replaced or cleared, so the server does not resend an
+    /// unchanged image on every track: no callback at a track boundary means the image already
+    /// delivered still applies.
     /// @param slot The artwork slot index to clear.
     virtual void on_image_clear(uint8_t /*slot*/) {}
 };
