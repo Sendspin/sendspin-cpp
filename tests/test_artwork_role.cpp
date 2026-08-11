@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace sendspin;
@@ -776,6 +777,98 @@ TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
     ASSERT_TRUE(listener.wait_for([&] { return count_for_slot(1) >= 3; }, POSITIVE_TIMEOUT));
 
     EXPECT_EQ(listener.decode_count_for_slot(0), 1U);
+}
+
+// ============================================================================
+// merge_artwork_display_update: the cross-thread latest-wins accumulation the decode thread runs
+// under the Inbox mutex. Pure function, so tested directly: reaching it end to end needs two
+// same-slot deliveries to accumulate before the main loop takes the slot, and the integration
+// tests above all run without a connection (client_ts == 0), so every folded-in entry fires in
+// the same drain_events() call that folds it in and nothing is ever left pending to replace.
+// ============================================================================
+
+namespace {
+
+// A single-slot delta shaped like the one process_notification() publishes.
+ArtworkDisplayUpdate make_delta(uint8_t slot, int64_t timestamp, uint32_t epoch, bool is_clear) {
+    ArtworkDisplayUpdate delta{};
+    const auto bit = static_cast<uint8_t>(1U << slot);
+    delta.timestamps[slot] = timestamp;
+    delta.epochs[slot] = epoch;
+    delta.valid_mask = bit;
+    if (is_clear) {
+        delta.clear_mask = bit;
+    }
+    return delta;
+}
+
+void merge_into(ArtworkDisplayUpdate& current, ArtworkDisplayUpdate delta) {
+    ArtworkRole::Impl::merge_artwork_display_update(current, std::move(delta));
+}
+
+}  // namespace
+
+TEST(ArtworkDisplayMerge, FrameAfterUndrainedClearResetsKind) {
+    // The case the assigned-not-OR-ed clear_mask exists for: an item with no artwork is cleared
+    // and the next item's frame lands before the main loop drains. The pending entry is now a
+    // frame, so the bit must be reset -- OR-ing it would fire on_image_clear() for a decoded
+    // image, blanking the display and dropping the frame.
+    ArtworkDisplayUpdate current{};
+    merge_into(current, make_delta(0, 100, 7, /*is_clear=*/true));
+    ASSERT_EQ(current.clear_mask, 0x01);
+
+    merge_into(current, make_delta(0, 200, 8, /*is_clear=*/false));
+    EXPECT_EQ(current.valid_mask, 0x01);
+    EXPECT_EQ(current.clear_mask, 0x00);
+    EXPECT_EQ(current.timestamps[0], 200);
+    EXPECT_EQ(current.epochs[0], 8U);
+}
+
+TEST(ArtworkDisplayMerge, ClearAfterUndrainedFrameSetsKind) {
+    ArtworkDisplayUpdate current{};
+    merge_into(current, make_delta(0, 100, 7, /*is_clear=*/false));
+    ASSERT_EQ(current.clear_mask, 0x00);
+
+    merge_into(current, make_delta(0, 200, 7, /*is_clear=*/true));
+    EXPECT_EQ(current.valid_mask, 0x01);
+    EXPECT_EQ(current.clear_mask, 0x01);
+    EXPECT_EQ(current.timestamps[0], 200);
+}
+
+TEST(ArtworkDisplayMerge, SameKindReplacementsKeepTheirKind) {
+    ArtworkDisplayUpdate clears{};
+    merge_into(clears, make_delta(0, 100, 7, /*is_clear=*/true));
+    merge_into(clears, make_delta(0, 200, 7, /*is_clear=*/true));
+    EXPECT_EQ(clears.clear_mask, 0x01);
+    EXPECT_EQ(clears.timestamps[0], 200);
+
+    ArtworkDisplayUpdate frames{};
+    merge_into(frames, make_delta(0, 100, 7, /*is_clear=*/false));
+    merge_into(frames, make_delta(0, 200, 7, /*is_clear=*/false));
+    EXPECT_EQ(frames.clear_mask, 0x00);
+    EXPECT_EQ(frames.timestamps[0], 200);
+}
+
+TEST(ArtworkDisplayMerge, OtherSlotsAreUntouched) {
+    // Latest-wins is per slot: a delta carries exactly one slot's bit and must leave every other
+    // slot's accumulated entry -- timestamp, epoch, and kind alike -- alone.
+    ArtworkDisplayUpdate current{};
+    merge_into(current, make_delta(1, 100, 7, /*is_clear=*/true));
+    merge_into(current, make_delta(0, 200, 8, /*is_clear=*/false));
+
+    EXPECT_EQ(current.valid_mask, 0x03);
+    EXPECT_EQ(current.clear_mask, 0x02);
+    EXPECT_EQ(current.timestamps[1], 100);
+    EXPECT_EQ(current.epochs[1], 7U);
+    EXPECT_EQ(current.timestamps[0], 200);
+    EXPECT_EQ(current.epochs[0], 8U);
+
+    // And the reverse: slot 0's clear must not disturb slot 1's pending frame.
+    ArtworkDisplayUpdate reverse{};
+    merge_into(reverse, make_delta(1, 100, 7, /*is_clear=*/false));
+    merge_into(reverse, make_delta(0, 200, 7, /*is_clear=*/true));
+    EXPECT_EQ(reverse.valid_mask, 0x03);
+    EXPECT_EQ(reverse.clear_mask, 0x01);
 }
 
 // ============================================================================

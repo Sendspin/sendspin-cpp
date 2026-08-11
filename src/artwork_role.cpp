@@ -53,36 +53,6 @@ static int64_t be64_to_host(const uint8_t* bytes) {
 
 namespace sendspin {
 
-namespace {
-
-/// @brief Merges a single-slot display delta into the accumulated cross-thread update
-///
-/// Called under the Inbox mutex via InboxSlot::merge() (see Impl::drain_thread_func), so it must
-/// stay a pure data operation with no callbacks into application code. `delta` carries exactly
-/// one slot's bit (set by the decode thread after a single image finishes decoding); OR-ing
-/// valid_mask and overwriting only the masked timestamps entries preserves latest-wins per slot
-/// while leaving any other slot's already-accumulated (not yet drained) timestamp untouched.
-void merge_artwork_display_update(ArtworkDisplayUpdate& current, ArtworkDisplayUpdate&& delta) {
-    current.valid_mask |= delta.valid_mask;
-    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
-        const uint8_t bit = static_cast<uint8_t>(1U << slot);
-        if (delta.valid_mask & bit) {
-            current.timestamps[slot] = delta.timestamps[slot];
-            current.epochs[slot] = delta.epochs[slot];
-            // clear_mask is assigned, not OR-ed: it says what kind of delivery this slot's
-            // (latest-wins) pending entry is, so a frame arriving after an undrained clear must
-            // reset the bit just as a clear after an undrained frame sets it.
-            if (delta.clear_mask & bit) {
-                current.clear_mask |= bit;
-            } else {
-                current.clear_mask &= static_cast<uint8_t>(~bit);
-            }
-        }
-    }
-}
-
-}  // namespace
-
 // ============================================================================
 // ArtworkRole::Impl lifecycle
 // ============================================================================
@@ -156,6 +126,26 @@ void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
 // ============================================================================
 // Display-deadline and ack-gate helpers (used from network, decode, and main threads)
 // ============================================================================
+
+void ArtworkRole::Impl::merge_artwork_display_update(ArtworkDisplayUpdate& current,
+                                                     ArtworkDisplayUpdate&& delta) {
+    current.valid_mask |= delta.valid_mask;
+    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+        const uint8_t bit = static_cast<uint8_t>(1U << slot);
+        if (delta.valid_mask & bit) {
+            current.timestamps[slot] = delta.timestamps[slot];
+            current.epochs[slot] = delta.epochs[slot];
+            // clear_mask is assigned, not OR-ed: it says what kind of delivery this slot's
+            // (latest-wins) pending entry is, so a frame arriving after an undrained clear must
+            // reset the bit just as a clear after an undrained frame sets it.
+            if (delta.clear_mask & bit) {
+                current.clear_mask |= bit;
+            } else {
+                current.clear_mask &= static_cast<uint8_t>(~bit);
+            }
+        }
+    }
+}
 
 int64_t ArtworkRole::Impl::display_overdue_us(int64_t client_ts, int32_t display_offset_ms,
                                               int64_t now) {
@@ -429,7 +419,9 @@ void ArtworkRole::Impl::drain_events() {
                 this->held_display_mask |= bit;
                 // Assigned rather than OR-ed, for the same latest-wins reason as the cross-thread
                 // merge: this slot's held entry has just been replaced wholesale, so the kind of
-                // delivery it is must be replaced too.
+                // delivery it is must be replaced too. This mirrors
+                // merge_artwork_display_update(), which is unit-tested directly
+                // (ArtworkDisplayMerge); the two must stay in agreement.
                 if (update.clear_mask & bit) {
                     this->held_display_clear |= bit;
                 } else {

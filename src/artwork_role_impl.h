@@ -186,6 +186,17 @@ struct ArtworkRole::Impl {
 
     void stop() const;
     void enqueue_stream_event(ArtworkEventType event) const;
+    // Merges a single-slot display delta into the accumulated cross-thread update. Called under
+    // the Inbox mutex via InboxSlot::merge() (see process_notification), so it must stay a pure
+    // data operation with no callbacks into application code. `delta` carries exactly one slot's
+    // bit (set by the decode thread after a single image finishes decoding or a clear is
+    // validated); OR-ing valid_mask and overwriting only the masked entries preserves latest-wins
+    // per slot while leaving any other slot's already-accumulated (not yet drained) entry
+    // untouched. clear_mask is assigned per bit rather than OR-ed; drain_events() folds the taken
+    // update into the main-thread holds with the same per-bit assignment, so the two must agree.
+    // Pure and static for direct unit testing.
+    static void merge_artwork_display_update(ArtworkDisplayUpdate& current,
+                                             ArtworkDisplayUpdate&& delta);
     // How far past its display deadline a held slot is, in microseconds: >= 0 means due (the
     // value is the lateness reported to on_image_display), < 0 means not yet due. client_ts is
     // the server-clock deadline already converted to the client clock (0 = no connection: due
