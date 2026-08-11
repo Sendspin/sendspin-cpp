@@ -305,7 +305,12 @@ struct MyArtworkListener : ArtworkRoleListener {
 | Item has no artwork | `on_image_clear(slot)` for that slot |
 | Stream ended, cleared, or connection lost | `on_image_clear(slot)` for every configured slot |
 
-**Cross-fades with back-pressure (opt-in).** By default the role decodes and displays every frame as it arrives. A slot can instead opt into a back-pressure gate by setting `ImageSlotPreference::require_frame_done`. With the gate on, the role keeps at most one un-acked *delivery* (a frame or a clear, whether per-slot or stream-level) in flight for that slot; any newer payload that arrives is buffered latest-wins and delivered only after the consumer calls `ArtworkRole::frame_done(slot)` from the main loop -- e.g. once a cross-fade animation finishes. A clear is itself a delivery and supersedes any un-acked frame, so exactly one `frame_done()` is owed after it. There is no timeout: the acknowledgment is the contract.
+**Cross-fades with back-pressure (opt-in).** By default the role decodes and displays every frame as it arrives. A slot can instead opt into a back-pressure gate by setting `ImageSlotPreference::require_frame_done`. With the gate on, the role keeps at most one un-acked *delivery* (a frame or a clear) in flight for that slot. Call `ArtworkRole::frame_done(slot)` from the main loop exactly once for every `on_image_display()` and `on_image_clear()` that slot receives -- e.g. once a cross-fade animation finishes. An extra call is a harmless no-op, but a missed one wedges the slot: there is no timeout, the acknowledgment is the contract.
+
+Payloads and stream-level clears reach the gate differently:
+
+- A **frame or per-channel clear** arriving while a delivery is un-acked is buffered latest-wins and delivered only after `frame_done(slot)`, and then owes its own `frame_done()`. It waits behind the outstanding delivery rather than replacing it, so a consumer is never interrupted mid-fade.
+- A **stream end or stream clear** is a lifecycle event, not a payload, so it is never buffered: it fires `on_image_clear()` immediately for every configured slot, discards anything buffered, and replaces whatever delivery was outstanding. Exactly one `frame_done()` is owed afterward whatever was in flight.
 
 Pair the gate with `ImageSlotPreference::display_offset_ms` to start a fade before the track boundary (positive fires the display early, mirroring `PlayerRoleConfig::fixed_delay_us`), and use `lateness_ms` to shorten the fade so it still ends on schedule:
 

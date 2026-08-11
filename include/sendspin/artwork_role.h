@@ -35,15 +35,25 @@ class SendspinClient;
 ///
 /// ACK GATE (opt-in per slot via ImageSlotPreference::require_frame_done): a "delivery" is
 /// either a frame (on_image_decode() followed later by on_image_display()) or a clear
-/// (on_image_clear()). For an ack-enabled slot, at most one un-acked delivery is ever in flight;
-/// the newest payload that arrives while a delivery is un-acked is buffered latest-wins and
-/// delivered only after the consumer calls ArtworkRole::frame_done(slot). A clear supersedes any
-/// un-acked delivery for that slot, including an earlier clear -- exactly one ack is owed, and it
-/// is for the newest clear, so a stream end or stream clear arriving on top of an un-acked
-/// per-channel clear fires on_image_clear() again and still owes exactly one ack. A stream
-/// restart automatically releases a frame that was decoded but never displayed (its display can
-/// no longer fire), but a delivery that already reached on_image_display()/on_image_clear() stays
-/// gated until frame_done() is called; there is no timeout.
+/// (on_image_clear()). Call ArtworkRole::frame_done(slot) exactly once for every
+/// on_image_display() and on_image_clear() that slot receives. An extra call is a harmless no-op,
+/// but a missed one wedges the slot forever: there is no timeout.
+///
+/// For an ack-enabled slot, at most one un-acked delivery is ever in flight. The two ways a clear
+/// reaches the gate differ, so they are worth keeping apart:
+///  - A payload -- a frame, or the server's per-channel clear for that slot -- arriving while a
+///    delivery is un-acked is buffered latest-wins and delivered only after frame_done(slot), and
+///    then owes its own frame_done(). It waits behind the outstanding delivery rather than
+///    replacing it, so a consumer is never interrupted mid-presentation.
+///  - A stream end or stream clear is a lifecycle event, not a payload, so it is never buffered:
+///    it fires on_image_clear() immediately for every configured slot, discards anything buffered,
+///    and replaces whatever delivery was outstanding. Exactly one frame_done() is owed afterward
+///    whatever was in flight -- including when it lands on an un-acked per-channel clear, which
+///    fires on_image_clear() again and still owes exactly one ack.
+///
+/// A stream restart automatically releases a frame that was decoded but never displayed (its
+/// display can no longer fire), but a delivery that already reached on_image_display()/
+/// on_image_clear() stays gated until frame_done() is called.
 class ArtworkRoleListener {
 public:
     virtual ~ArtworkRoleListener() = default;
