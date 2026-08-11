@@ -53,27 +53,6 @@ static int64_t be64_to_host(const uint8_t* bytes) {
 
 namespace sendspin {
 
-namespace {
-
-/// @brief Merges a single-slot display delta into the accumulated cross-thread update
-///
-/// Called under the Inbox mutex via InboxSlot::merge() (see Impl::drain_thread_func), so it must
-/// stay a pure data operation with no callbacks into application code. `delta` carries exactly
-/// one slot's bit (set by the decode thread after a single image finishes decoding); OR-ing
-/// valid_mask and overwriting only the masked timestamps entries preserves latest-wins per slot
-/// while leaving any other slot's already-accumulated (not yet drained) timestamp untouched.
-void merge_artwork_display_update(ArtworkDisplayUpdate& current, ArtworkDisplayUpdate&& delta) {
-    current.valid_mask |= delta.valid_mask;
-    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
-        if (delta.valid_mask & (1U << slot)) {
-            current.timestamps[slot] = delta.timestamps[slot];
-            current.epochs[slot] = delta.epochs[slot];
-        }
-    }
-}
-
-}  // namespace
-
 // ============================================================================
 // ArtworkRole::Impl lifecycle
 // ============================================================================
@@ -148,6 +127,26 @@ void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
 // Display-deadline and ack-gate helpers (used from network, decode, and main threads)
 // ============================================================================
 
+void ArtworkRole::Impl::merge_artwork_display_update(ArtworkDisplayUpdate& current,
+                                                     ArtworkDisplayUpdate&& delta) {
+    current.valid_mask |= delta.valid_mask;
+    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+        const uint8_t bit = static_cast<uint8_t>(1U << slot);
+        if (delta.valid_mask & bit) {
+            current.timestamps[slot] = delta.timestamps[slot];
+            current.epochs[slot] = delta.epochs[slot];
+            // clear_mask is assigned, not OR-ed: it says what kind of delivery this slot's
+            // (latest-wins) pending entry is, so a frame arriving after an undrained clear must
+            // reset the bit just as a clear after an undrained frame sets it.
+            if (delta.clear_mask & bit) {
+                current.clear_mask |= bit;
+            } else {
+                current.clear_mask &= static_cast<uint8_t>(~bit);
+            }
+        }
+    }
+}
+
 int64_t ArtworkRole::Impl::display_overdue_us(int64_t client_ts, int32_t display_offset_ms,
                                               int64_t now) {
     // get_client_time returns 0 when there is no current connection. Without a connection we
@@ -218,9 +217,16 @@ void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
         image_format = this->config.preferred_formats[slot].format;
     }
 
+    // An empty payload -- a binary message carrying only the type byte and timestamp -- is the
+    // protocol's per-channel clear: the artwork on this channel is no longer valid, as distinct
+    // from the server simply not resending an image that still is. There are no bytes to stage, so
+    // the buffer machinery below is skipped entirely and the notification travels with
+    // data_length == 0 (see ArtworkNotification). It still goes through the decode thread rather
+    // than straight to the main loop, so it stays ordered behind any image already queued for this
+    // slot and takes the same ack-gate path a frame does.
     uint32_t generation = 0;
     uint8_t write_idx = 0;
-    {
+    if (image_len > 0) {
         // Hold the slot mutex across the read-modify-write of write_idx/drain_active/
         // write_generation and the memcpy itself, so the decode thread can never observe a
         // buffer mid-write (torn image) and can never have a buffer stolen out from under it
@@ -260,7 +266,8 @@ void ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
     ArtworkNotification notif{slot,         write_idx,  image_len, timestamp,
                               image_format, generation, epoch};
     if (!this->drain_task->notify_queue.send(notif, 0)) {
-        SS_LOGW(TAG, "Artwork notify queue full; dropping image for slot %u", slot);
+        SS_LOGW(TAG, "Artwork notify queue full; dropping %s for slot %u",
+                image_len > 0 ? "image" : "clear", slot);
     }
 }
 
@@ -363,6 +370,7 @@ void ArtworkRole::Impl::handle_stream_ring_event(ArtworkEventType event) {
         case ArtworkEventType::STREAM_END:
         case ArtworkEventType::STREAM_CLEAR:
             this->held_display_mask = 0;
+            this->held_display_clear = 0;
             this->event_state->display_slot.reset();
             {
                 // A clear is itself a delivery that must be acked: it may drive a fade-out, and
@@ -404,10 +412,21 @@ void ArtworkRole::Impl::drain_events() {
     ArtworkDisplayUpdate update{};
     if (this->event_state->display_slot.take(update)) {
         for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
-            if (update.valid_mask & (1U << slot)) {
+            const uint8_t bit = static_cast<uint8_t>(1U << slot);
+            if (update.valid_mask & bit) {
                 this->held_display_ts[slot] = update.timestamps[slot];
                 this->held_display_epoch[slot] = update.epochs[slot];
-                this->held_display_mask |= static_cast<uint8_t>(1U << slot);
+                this->held_display_mask |= bit;
+                // Assigned rather than OR-ed, for the same latest-wins reason as the cross-thread
+                // merge: this slot's held entry has just been replaced wholesale, so the kind of
+                // delivery it is must be replaced too. This mirrors
+                // merge_artwork_display_update(), which is unit-tested directly
+                // (ArtworkDisplayMerge); the two must stay in agreement.
+                if (update.clear_mask & bit) {
+                    this->held_display_clear |= bit;
+                } else {
+                    this->held_display_clear &= static_cast<uint8_t>(~bit);
+                }
             }
         }
     }
@@ -425,13 +444,15 @@ void ArtworkRole::Impl::drain_events() {
     const int64_t now = platform_time_us();
     const uint32_t current_epoch = this->stream_epoch.load(std::memory_order_relaxed);
     for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
-        if (!(this->held_display_mask & (1U << slot))) {
+        const uint8_t bit = static_cast<uint8_t>(1U << slot);
+        if (!(this->held_display_mask & bit)) {
             continue;
         }
         // Drop a display decoded under a since-replaced stream (restart with no intervening
         // end/clear bumps the epoch but cannot reach these main-thread holds to cancel it).
         if (this->held_display_epoch[slot] != current_epoch) {
-            this->held_display_mask &= static_cast<uint8_t>(~(1U << slot));
+            this->held_display_mask &= static_cast<uint8_t>(~bit);
+            this->held_display_clear &= static_cast<uint8_t>(~bit);
             if (this->ack_enabled(slot)) {
                 bool should_wake = false;
                 {
@@ -460,16 +481,25 @@ void ArtworkRole::Impl::drain_events() {
         if (overdue_us < 0) {
             continue;
         }
-        this->held_display_mask &= static_cast<uint8_t>(~(1U << slot));
+        this->held_display_mask &= static_cast<uint8_t>(~bit);
+        // A per-channel clear is scheduled exactly like a frame, offset shift included, so a
+        // consumer can fade out on the same lead it would have faded in on.
+        const bool is_clear = (this->held_display_clear & bit) != 0;
+        this->held_display_clear &= static_cast<uint8_t>(~bit);
         if (this->ack_enabled(slot)) {
             // Arm the "awaiting frame_done()" state before the callback fires and release the
             // mutex before invoking it: frame_done() may be called synchronously from inside
-            // on_image_display(), which would deadlock if this mutex were still held.
+            // on_image_display()/on_image_clear(), which would deadlock if this mutex were still
+            // held.
             std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
             this->drain_task->slot_buffers[slot].ack_state = SlotAckState::PRESENTED;
         }
         if (this->listener) {
-            this->listener->on_image_display(slot, display_lateness_ms(client_ts, overdue_us));
+            if (is_clear) {
+                this->listener->on_image_clear(slot);
+            } else {
+                this->listener->on_image_display(slot, display_lateness_ms(client_ts, overdue_us));
+            }
         }
     }
 }
@@ -487,6 +517,7 @@ void ArtworkRole::Impl::cleanup() {
     // call, which runs before any role's cleanup() -- so there is no per-event ring reset to do
     // here.
     this->held_display_mask = 0;
+    this->held_display_clear = 0;
     this->event_state->display_slot.reset();
 
     // Enqueue a clean STREAM_END - handle_stream_ring_event() will fire the on_image_clear()
@@ -529,6 +560,13 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
     uint8_t slot = notif.slot;
     uint8_t buf_idx = notif.buffer_idx;
 
+    // A per-channel clear (see handle_binary) names no buffer, so it skips the buffer validation
+    // and the decode callback below. Everything else is deliberately shared with a frame: the same
+    // stream-epoch staleness check, the same ack gate (a clear is a delivery owing exactly one
+    // frame_done()), and the same timestamp-scheduled hand-off to the main loop, which fires
+    // on_image_clear() rather than on_image_display() when the deadline is reached.
+    const bool is_clear = notif.data_length == 0;
+
     uint8_t* decode_data = nullptr;
     size_t decode_length = 0;
     {
@@ -544,13 +582,13 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
         if (notif.stream_epoch != this->stream_epoch.load(std::memory_order_relaxed)) {
             return;
         }
-        if (notif.generation != sb.write_generation[buf_idx]) {
-            return;
-        }
-
-        auto& buf = sb.buffers[buf_idx];
-        if (notif.data_length == 0 || buf.data() == nullptr) {
-            return;
+        if (!is_clear) {
+            if (notif.generation != sb.write_generation[buf_idx]) {
+                return;
+            }
+            if (sb.buffers[buf_idx].data() == nullptr) {
+                return;
+            }
         }
 
         // Ack gate: a slot with require_frame_done set allows only one un-acked delivery in
@@ -570,18 +608,20 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
             sb.ack_state = SlotAckState::DECODE_DELIVERED;
         }
 
-        // Mark this buffer as in-use so the network thread avoids it while we decode.
-        sb.drain_buf_idx = buf_idx;
-        sb.drain_active = true;
-        decode_data = buf.data();
-        decode_length = notif.data_length;
+        if (!is_clear) {
+            // Mark this buffer as in-use so the network thread avoids it while we decode.
+            sb.drain_buf_idx = buf_idx;
+            sb.drain_active = true;
+            decode_data = sb.buffers[buf_idx].data();
+            decode_length = notif.data_length;
+        }
     }
 
-    if (this->listener) {
-        this->listener->on_image_decode(slot, decode_data, decode_length, notif.format);
-    }
+    if (!is_clear) {
+        if (this->listener) {
+            this->listener->on_image_decode(slot, decode_data, decode_length, notif.format);
+        }
 
-    {
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
         this->drain_task->slot_buffers[slot].drain_active = false;
     }
@@ -597,6 +637,9 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
         // the display if the stream is replaced after this hand-off (see held_display_epoch).
         delta.epochs[slot] = notif.stream_epoch;
         delta.valid_mask = static_cast<uint8_t>(1U << slot);
+        if (is_clear) {
+            delta.clear_mask = static_cast<uint8_t>(1U << slot);
+        }
         this->event_state->display_slot.merge(merge_artwork_display_update, delta);
     }
 }

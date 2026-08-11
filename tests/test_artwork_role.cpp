@@ -25,6 +25,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace sendspin;
@@ -120,6 +121,13 @@ public:
         return this->clears.size();
     }
 
+    // Slot recorded for the clear at `index`, used to tell a per-channel clear (one slot) from a
+    // stream-level one (every configured slot).
+    uint8_t clear_at(size_t index) {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        return this->clears.at(index);
+    }
+
     // First byte of the payload decoded at `index`, used to identify which frame decoded.
     uint8_t decode_marker_at(size_t index) {
         std::lock_guard<std::mutex> lock(this->mutex);
@@ -204,6 +212,15 @@ void send_frame(ArtworkRole::Impl& impl, uint8_t slot, uint8_t marker, int64_t t
     impl.handle_binary(slot, data.data(), data.size());
 }
 
+// Sends a per-channel clear to `slot`: an artwork binary message carrying only the timestamp and
+// no image bytes, which is how the server says the artwork on that channel is no longer valid
+// (as opposed to simply not resending an image that still is).
+void send_clear(ArtworkRole::Impl& impl, uint8_t slot, int64_t timestamp = 1) {
+    std::vector<uint8_t> data;
+    put_be64(data, timestamp);
+    impl.handle_binary(slot, data.data(), data.size());
+}
+
 // Polls drain_events() until `pred` is true or the timeout elapses. drain_events() must run on
 // the "main loop" thread (here, the test thread), so it cannot be driven from inside the
 // listener's condition variable wait -- it has to be called from an ordinary polling loop.
@@ -218,6 +235,19 @@ bool poll_drain_until(ArtworkRole::Impl& impl, Pred pred, std::chrono::milliseco
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     } while (std::chrono::steady_clock::now() < deadline);
     return pred();
+}
+
+// Asserts pred() stays false for the whole window while the main loop keeps draining: the
+// drain-driving counterpart of RecordingListener::never_within(). A negative check on clears or
+// displays must use this one rather than never_within(), because on_image_clear()/
+// on_image_display() fire only from drain_events() and handle_stream_ring_event(), both on this
+// (main loop) thread -- a window that parks the test thread instead of driving the loop freezes
+// the very counter it is watching, so the assertion could never fail. never_within() stays correct
+// for decodes, which the decode thread produces on its own. Returns true if pred() never became
+// true (the expected outcome).
+template <typename Pred>
+bool poll_drain_never(ArtworkRole::Impl& impl, Pred pred, std::chrono::milliseconds window) {
+    return !poll_drain_until(impl, pred, window);
 }
 
 // Polls until `pred` (evaluated under impl.drain_task->slot_mutex) is true or the timeout
@@ -404,6 +434,207 @@ TEST(ArtworkFrameDoneGate, ClearGateHoldsNextStreamFirstFrame) {
 }
 
 // ============================================================================
+// Per-channel clear: an artwork binary message with no image bytes clears just that channel,
+// scheduled to its timestamp like any other delivery
+// ============================================================================
+
+TEST(ArtworkChannelClear, EmptyPayloadFiresClearWithoutDecoding) {
+    auto impl = make_impl(make_single_slot_config(false));
+    RecordingListener listener;
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    send_clear(*impl, 0);
+
+    ASSERT_TRUE(
+        poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; }, POSITIVE_TIMEOUT));
+    EXPECT_EQ(listener.clear_at(0), 0);
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+    // There are no image bytes, so nothing may reach the decode callback -- and nothing may be
+    // presented as a frame either.
+    EXPECT_EQ(listener.decode_count(), 0U);
+    EXPECT_EQ(listener.display_count(), 0U);
+}
+
+TEST(ArtworkChannelClear, ClearAfterDisplayedFrameFiresAgain) {
+    auto impl = make_impl(make_single_slot_config(false));
+    RecordingListener listener;
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // The album's first track: artwork arrives and is displayed.
+    send_frame(*impl, 0, 'A');
+    ASSERT_TRUE(listener.wait_for([&] { return listener.decodes.size() >= 1; }, POSITIVE_TIMEOUT));
+    ASSERT_TRUE(
+        poll_drain_until(*impl, [&] { return listener.display_count() >= 1; }, POSITIVE_TIMEOUT));
+
+    // A later track with no artwork of its own: the clear must reach the listener while the
+    // stream is still running, so a consumer can tell "no artwork for this item" apart from
+    // "artwork unchanged, nothing sent".
+    send_clear(*impl, 0);
+    ASSERT_TRUE(
+        poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; }, POSITIVE_TIMEOUT));
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+    EXPECT_EQ(listener.display_count(), 1U);
+    EXPECT_EQ(listener.decode_count(), 1U);
+}
+
+TEST(ArtworkChannelClear, ClearOnlyAffectsItsOwnSlot) {
+    auto impl = make_impl(make_two_slot_config());
+    RecordingListener listener;
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // Slot 1 (ungated) is cleared; slot 0 (gated) must be left alone entirely -- a stream-level
+    // clear fires for every configured slot, a per-channel clear for exactly one.
+    send_clear(*impl, 1);
+    ASSERT_TRUE(
+        poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; }, POSITIVE_TIMEOUT));
+    EXPECT_EQ(listener.clear_at(0), 1);
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+
+    // Slot 0's gate was never armed by slot 1's clear, so its frame decodes without any ack.
+    send_frame(*impl, 0, 'A');
+    ASSERT_TRUE(listener.wait_for([&] { return listener.decodes.size() >= 1; }, POSITIVE_TIMEOUT));
+    EXPECT_EQ(listener.decode_marker_at(0), 'A');
+}
+
+TEST(ArtworkChannelClear, GatedClearParksBehindUnackedFrame) {
+    auto impl = make_impl(make_single_slot_config(true));
+    RecordingListener listener;
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    send_frame(*impl, 0, 'A');
+    ASSERT_TRUE(listener.wait_for([&] { return listener.decodes.size() >= 1; }, POSITIVE_TIMEOUT));
+
+    // A's delivery is un-acked, so the clear parks rather than overtaking it: the consumer is
+    // mid-presentation of A and its buffers must not be disturbed.
+    send_clear(*impl, 0);
+    ASSERT_TRUE(wait_slot_state(
+        *impl, [&] { return impl->drain_task->slot_buffers[0].has_parked; }, POSITIVE_TIMEOUT));
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW));
+
+    // A's own display still fires; only then does acking it release the parked clear.
+    ASSERT_TRUE(
+        poll_drain_until(*impl, [&] { return listener.display_count() >= 1; }, POSITIVE_TIMEOUT));
+    impl->frame_done(0);
+    ASSERT_TRUE(
+        poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; }, POSITIVE_TIMEOUT));
+    EXPECT_EQ(listener.clear_at(0), 0);
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+}
+
+TEST(ArtworkChannelClear, GatedClearOwesExactlyOneAck) {
+    auto impl = make_impl(make_single_slot_config(true));
+    RecordingListener listener;
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    send_clear(*impl, 0);
+    ASSERT_TRUE(
+        poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; }, POSITIVE_TIMEOUT));
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+
+    // The clear is a delivery like any frame, so it holds the gate until it is acked.
+    send_frame(*impl, 0, 'A');
+    EXPECT_TRUE(
+        listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+
+    impl->frame_done(0);
+    ASSERT_TRUE(listener.wait_for([&] { return listener.decodes.size() >= 1; }, POSITIVE_TIMEOUT));
+    EXPECT_EQ(listener.decode_marker_at(0), 'A');
+}
+
+TEST(ArtworkChannelClear, GatedClearSupersedesParkedClear) {
+    auto impl = make_impl(make_single_slot_config(true));
+    RecordingListener listener;
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    send_frame(*impl, 0, 'A');
+    ASSERT_TRUE(listener.wait_for([&] { return listener.decodes.size() >= 1; }, POSITIVE_TIMEOUT));
+
+    // Two clears arrive back to back while A is un-acked. Both park, and the second must overwrite
+    // the first (latest-wins) rather than queue behind it, so the consumer is asked to clear once
+    // rather than twice. Distinct timestamps make the handoff observable: waiting for the parked
+    // notification to carry the second clear's timestamp is what keeps this deterministic, since
+    // has_parked is already true from the first.
+    send_clear(*impl, 0, /*timestamp=*/1);
+    ASSERT_TRUE(wait_slot_state(
+        *impl, [&] { return impl->drain_task->slot_buffers[0].has_parked; }, POSITIVE_TIMEOUT));
+    send_clear(*impl, 0, /*timestamp=*/2);
+    ASSERT_TRUE(wait_slot_state(
+        *impl, [&] { return impl->drain_task->slot_buffers[0].parked.timestamp == 2; },
+        POSITIVE_TIMEOUT));
+
+    ASSERT_TRUE(
+        poll_drain_until(*impl, [&] { return listener.display_count() >= 1; }, POSITIVE_TIMEOUT));
+    impl->frame_done(0);
+    ASSERT_TRUE(
+        poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; }, POSITIVE_TIMEOUT));
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+}
+
+TEST(ArtworkChannelClear, StreamEndOnTopOfUnackedChannelClearFiresAgain) {
+    auto impl = make_impl(make_single_slot_config(true));
+    RecordingListener listener;
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // A per-channel clear is delivered and left un-acked, e.g. the consumer is running a fade-out.
+    send_clear(*impl, 0);
+    ASSERT_TRUE(
+        poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; }, POSITIVE_TIMEOUT));
+
+    // The queue then ends. stream/end is a distinct lifecycle event, so it fires on_image_clear()
+    // again rather than being swallowed because a clear is already outstanding -- it supersedes
+    // that clear the same way it supersedes an un-acked frame.
+    impl->handle_stream_ring_event(ArtworkEventType::STREAM_END);
+    ASSERT_TRUE(listener.wait_for([&] { return listener.clears.size() >= 2; }, POSITIVE_TIMEOUT));
+
+    // Superseded, not stacked: exactly one ack is owed for the two clears, so a single frame_done()
+    // releases the gate for the next stream's first frame.
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+    send_frame(*impl, 0, 'A');
+    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+
+    impl->frame_done(0);
+    ASSERT_TRUE(listener.wait_for([&] { return listener.decodes.size() >= 1; }, POSITIVE_TIMEOUT));
+    EXPECT_EQ(listener.decode_marker_at(0), 'A');
+}
+
+TEST(ArtworkChannelClear, ClearIgnoredWithoutActiveStream) {
+    auto impl = make_impl(make_single_slot_config(false));
+    RecordingListener listener;
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+
+    // No stream/start yet, so handle_binary()'s stream_active guard rejects the message before any
+    // clear-specific handling runs. That guard is not new, so unlike the tests above this one does
+    // not fail without the per-channel clear path -- it pins that the clear path stays behind the
+    // guard rather than short-circuiting ahead of it.
+    send_clear(*impl, 0);
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW));
+    EXPECT_EQ(listener.clear_count(), 0U);
+}
+
+// ============================================================================
 // frame_done() edge cases
 // ============================================================================
 
@@ -546,6 +777,98 @@ TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
     ASSERT_TRUE(listener.wait_for([&] { return count_for_slot(1) >= 3; }, POSITIVE_TIMEOUT));
 
     EXPECT_EQ(listener.decode_count_for_slot(0), 1U);
+}
+
+// ============================================================================
+// merge_artwork_display_update: the cross-thread latest-wins accumulation the decode thread runs
+// under the Inbox mutex. Pure function, so tested directly: reaching it end to end needs two
+// same-slot deliveries to accumulate before the main loop takes the slot, and the integration
+// tests above all run without a connection (client_ts == 0), so every folded-in entry fires in
+// the same drain_events() call that folds it in and nothing is ever left pending to replace.
+// ============================================================================
+
+namespace {
+
+// A single-slot delta shaped like the one process_notification() publishes.
+ArtworkDisplayUpdate make_delta(uint8_t slot, int64_t timestamp, uint32_t epoch, bool is_clear) {
+    ArtworkDisplayUpdate delta{};
+    const auto bit = static_cast<uint8_t>(1U << slot);
+    delta.timestamps[slot] = timestamp;
+    delta.epochs[slot] = epoch;
+    delta.valid_mask = bit;
+    if (is_clear) {
+        delta.clear_mask = bit;
+    }
+    return delta;
+}
+
+void merge_into(ArtworkDisplayUpdate& current, ArtworkDisplayUpdate delta) {
+    ArtworkRole::Impl::merge_artwork_display_update(current, std::move(delta));
+}
+
+}  // namespace
+
+TEST(ArtworkDisplayMerge, FrameAfterUndrainedClearResetsKind) {
+    // The case the assigned-not-OR-ed clear_mask exists for: an item with no artwork is cleared
+    // and the next item's frame lands before the main loop drains. The pending entry is now a
+    // frame, so the bit must be reset -- OR-ing it would fire on_image_clear() for a decoded
+    // image, blanking the display and dropping the frame.
+    ArtworkDisplayUpdate current{};
+    merge_into(current, make_delta(0, 100, 7, /*is_clear=*/true));
+    ASSERT_EQ(current.clear_mask, 0x01);
+
+    merge_into(current, make_delta(0, 200, 8, /*is_clear=*/false));
+    EXPECT_EQ(current.valid_mask, 0x01);
+    EXPECT_EQ(current.clear_mask, 0x00);
+    EXPECT_EQ(current.timestamps[0], 200);
+    EXPECT_EQ(current.epochs[0], 8U);
+}
+
+TEST(ArtworkDisplayMerge, ClearAfterUndrainedFrameSetsKind) {
+    ArtworkDisplayUpdate current{};
+    merge_into(current, make_delta(0, 100, 7, /*is_clear=*/false));
+    ASSERT_EQ(current.clear_mask, 0x00);
+
+    merge_into(current, make_delta(0, 200, 7, /*is_clear=*/true));
+    EXPECT_EQ(current.valid_mask, 0x01);
+    EXPECT_EQ(current.clear_mask, 0x01);
+    EXPECT_EQ(current.timestamps[0], 200);
+}
+
+TEST(ArtworkDisplayMerge, SameKindReplacementsKeepTheirKind) {
+    ArtworkDisplayUpdate clears{};
+    merge_into(clears, make_delta(0, 100, 7, /*is_clear=*/true));
+    merge_into(clears, make_delta(0, 200, 7, /*is_clear=*/true));
+    EXPECT_EQ(clears.clear_mask, 0x01);
+    EXPECT_EQ(clears.timestamps[0], 200);
+
+    ArtworkDisplayUpdate frames{};
+    merge_into(frames, make_delta(0, 100, 7, /*is_clear=*/false));
+    merge_into(frames, make_delta(0, 200, 7, /*is_clear=*/false));
+    EXPECT_EQ(frames.clear_mask, 0x00);
+    EXPECT_EQ(frames.timestamps[0], 200);
+}
+
+TEST(ArtworkDisplayMerge, OtherSlotsAreUntouched) {
+    // Latest-wins is per slot: a delta carries exactly one slot's bit and must leave every other
+    // slot's accumulated entry -- timestamp, epoch, and kind alike -- alone.
+    ArtworkDisplayUpdate current{};
+    merge_into(current, make_delta(1, 100, 7, /*is_clear=*/true));
+    merge_into(current, make_delta(0, 200, 8, /*is_clear=*/false));
+
+    EXPECT_EQ(current.valid_mask, 0x03);
+    EXPECT_EQ(current.clear_mask, 0x02);
+    EXPECT_EQ(current.timestamps[1], 100);
+    EXPECT_EQ(current.epochs[1], 7U);
+    EXPECT_EQ(current.timestamps[0], 200);
+    EXPECT_EQ(current.epochs[0], 8U);
+
+    // And the reverse: slot 0's clear must not disturb slot 1's pending frame.
+    ArtworkDisplayUpdate reverse{};
+    merge_into(reverse, make_delta(1, 100, 7, /*is_clear=*/false));
+    merge_into(reverse, make_delta(0, 200, 7, /*is_clear=*/true));
+    EXPECT_EQ(reverse.valid_mask, 0x03);
+    EXPECT_EQ(reverse.clear_mask, 0x01);
 }
 
 // ============================================================================
