@@ -550,8 +550,9 @@ bool process_server_state_controller(JsonObject root,
     // command is a non-compliant value rather than a forward-compatible one: drop and log it.
     if (controller_object["supported_commands"].is<JsonArray>()) {
         std::vector<SendspinControllerCommand> commands;
-        for (JsonVariantConst command_var :
-             controller_object["supported_commands"].as<JsonArrayConst>()) {
+        JsonArrayConst commands_array =
+            controller_object["supported_commands"].as<JsonArrayConst>();
+        for (JsonVariantConst command_var : commands_array) {
             if (auto command = read_enum_field(command_var, "supported_commands",
                                                controller_command_from_string)) {
                 commands.push_back(*command);
