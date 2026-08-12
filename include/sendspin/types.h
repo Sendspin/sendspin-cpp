@@ -95,7 +95,6 @@ enum class ConnectionTrust : uint8_t {
 enum class SendspinPairAbortReason : uint8_t {
     ATTEMPT_TIMEOUT,          // Server did not complete the exchange in time.
     CONCURRENT_ATTEMPT,       // Another pairing attempt is already in progress.
-    LOCKED_OUT,               // Too many failed attempts; pairing is temporarily locked.
     METHOD_NOT_SUPPORTED,     // The selected pairing method is not available.
     PIN_LENGTH_UNACCEPTABLE,  // Proposed PIN length is outside the accepted range.
     PIN_MISMATCH,             // PIN verification failed.

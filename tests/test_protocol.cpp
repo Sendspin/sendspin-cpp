@@ -709,7 +709,9 @@ TEST(Protocol, FormatClientHelloTrustAndPairMethods) {
     ASSERT_TRUE(doc["payload"]["supported_pair_methods"].is<JsonArray>());
     EXPECT_EQ(doc["payload"]["supported_pair_methods"].as<JsonArrayConst>().size(), 0u);
 
-    msg.supported_pair_methods.push_back(PairMethodDescriptor{SendspinPairMethod::PAIRING_PSK});
+    PairMethodDescriptor psk_desc;
+    psk_desc.method = SendspinPairMethod::PAIRING_PSK;
+    msg.supported_pair_methods.push_back(psk_desc);
     JsonDocument doc2;
     ASSERT_FALSE(deserializeJson(doc2, format_client_hello_message(&msg)));
     ASSERT_TRUE(doc2["payload"]["supported_pair_methods"].is<JsonArray>());
@@ -950,7 +952,7 @@ TEST(Protocol, ServerActivateActivitiesOnly) {
     ASSERT_EQ(msg.activities.size(), 1u);
     EXPECT_EQ(msg.activities[0], SendspinActivity::PLAYBACK);
     EXPECT_FALSE(msg.active_roles.has_value());
-    EXPECT_FALSE(msg.selected_pair_method.has_value());
+    EXPECT_FALSE(msg.pairing_method.has_value());
 }
 
 TEST(Protocol, ServerActivateAllActivities) {
@@ -1007,7 +1009,44 @@ TEST(Protocol, ServerActivateActiveRolesAbsentIsNullopt) {
         << "absent active_roles must be nullopt (sticky)";
 }
 
-TEST(Protocol, ServerActivateWithSelectedPairMethod) {
+// The current spec nests the pairing parameters: payload.pairing = {method, pin_length?,
+// languages?}. Regression guard for the resync away from the removed flat
+// payload.selected_pair_method field.
+TEST(Protocol, ServerActivateWithPairingObject) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":["pairing"],"pairing":{"method":"pairing_psk"}}})",
+        doc, root));
+
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    ASSERT_TRUE(msg.pairing_method.has_value());
+    EXPECT_EQ(msg.pairing_method.value(), SendspinPairMethod::PAIRING_PSK);
+    EXPECT_FALSE(msg.pairing_pin_length.has_value());
+}
+
+// dynamic_pin activations carry pin_length (and optionally languages) inside the pairing
+// object; languages is an informational hint and deliberately unparsed, but must not break
+// parsing of its siblings.
+TEST(Protocol, ServerActivatePairingObjectCarriesPinLength) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":["pairing"],"pairing":{"method":"dynamic_pin","pin_length":6,"languages":["ca","es","en"]}}})",
+        doc, root));
+
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    ASSERT_TRUE(msg.pairing_method.has_value());
+    EXPECT_EQ(msg.pairing_method.value(), SendspinPairMethod::DYNAMIC_PIN);
+    ASSERT_TRUE(msg.pairing_pin_length.has_value());
+    EXPECT_EQ(msg.pairing_pin_length.value(), 6);
+}
+
+// The pre-resync flat field must no longer be honored: a server sending only the removed
+// payload.selected_pair_method yields no usable method.
+TEST(Protocol, ServerActivateLegacyFlatSelectedPairMethodIgnored) {
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(
@@ -1016,8 +1055,21 @@ TEST(Protocol, ServerActivateWithSelectedPairMethod) {
 
     ServerActivateMessage msg;
     ASSERT_TRUE(process_server_activate_message(root, &msg));
-    ASSERT_TRUE(msg.selected_pair_method.has_value());
-    EXPECT_EQ(msg.selected_pair_method.value(), SendspinPairMethod::PAIRING_PSK);
+    EXPECT_FALSE(msg.pairing_method.has_value());
+}
+
+// An unrecognized pairing.method string parses as no usable method (the caller answers
+// pair/abort method_not_supported).
+TEST(Protocol, ServerActivateUnknownPairingMethodIsNullopt) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":["pairing"],"pairing":{"method":"telepathy"}}})",
+        doc, root));
+
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    EXPECT_FALSE(msg.pairing_method.has_value());
 }
 
 TEST(Protocol, ServerActivateMissingActivitiesFails) {
@@ -1104,7 +1156,6 @@ TEST(Protocol, PairAbortReasonRoundTrip) {
     const PairAbortReason reasons[] = {
         PairAbortReason::ATTEMPT_TIMEOUT,
         PairAbortReason::CONCURRENT_ATTEMPT,
-        PairAbortReason::LOCKED_OUT,
         PairAbortReason::METHOD_NOT_SUPPORTED,
         PairAbortReason::PIN_LENGTH_UNACCEPTABLE,
         PairAbortReason::PIN_MISMATCH,
@@ -1209,7 +1260,6 @@ TEST(Protocol, PairAbortMessageParseRoundTrip) {
     const PairAbortReason reasons[] = {
         PairAbortReason::ATTEMPT_TIMEOUT,
         PairAbortReason::CONCURRENT_ATTEMPT,
-        PairAbortReason::LOCKED_OUT,
         PairAbortReason::METHOD_NOT_SUPPORTED,
         PairAbortReason::PIN_LENGTH_UNACCEPTABLE,
         PairAbortReason::PIN_MISMATCH,

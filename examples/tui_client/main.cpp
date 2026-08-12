@@ -472,6 +472,9 @@ int main(int argc, char* argv[]) {
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
     config.server_port = server_port;
+    // The TUI shows a dynamic PIN in the pairing status line, so the client can advertise the
+    // dynamic_pin pairing method alongside the mandatory pairing_psk one.
+    config.pin_display_supported = true;
 
     // Create audio output
 #ifdef SENDSPIN_HAS_PORTAUDIO
@@ -704,12 +707,16 @@ int main(int argc, char* argv[]) {
             state.pairing_status = "Pairing failed";
         }
 
-        void on_display_pairing_pin(const std::string& /*pin*/) override {
-            // Dynamic-PIN display not supported in the tui_client example.
+        void on_display_pairing_pin(const std::string& pin) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pairing_status = "PIN " + pin;
         }
 
         void on_clear_pairing_pin() override {
-            // Dynamic-PIN clear not supported in the tui_client example.
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (state.pairing_status.rfind("PIN ", 0) == 0) {
+                state.pairing_status = "Pairing...";
+            }
         }
 
         void on_open_pairing_window() override {

@@ -131,11 +131,15 @@ public:
     virtual void on_clear_pairing_pin() {}
 
     /// @brief Called when the operator must perform the device pairing-window gesture to allow
-    /// static-PIN pairing.
+    /// a gesture-gated PIN pairing attempt (static PIN: every attempt; dynamic PIN: when the
+    /// method is escalated by its failure counter or the session PIN is shorter than 6 digits).
     ///
-    /// Fires on the main loop. Only called when SendspinClientConfig::pairing_window_supported is
-    /// true. Always followed by on_close_pairing_window when the attempt concludes. The
-    /// application confirms the gesture by calling SendspinClient::confirm_pairing_window().
+    /// Fires on the main loop. Only called when SendspinClientConfig::pairing_window_supported
+    /// is true; a device offering dynamic_pin should therefore also implement this gesture UI,
+    /// or an escalated/short-PIN attempt can only proceed via management/open-pairing-window
+    /// (or stall until the server cancels it). Always followed by on_close_pairing_window when
+    /// the attempt concludes. The application confirms the gesture by calling
+    /// SendspinClient::confirm_pairing_window().
     virtual void on_open_pairing_window() {}
 
     /// @brief Called to dismiss the pairing-window prompt after every attempt that triggered
@@ -535,6 +539,14 @@ public:
     [[nodiscard]] std::optional<std::string> format_pairing_token(
         const std::array<uint8_t, 32>& pairing_psk) const;
 
+    /// @brief Builds the pairing token for the client's own Sendspin Pairing PSK.
+    /// The Pairing PSK is provisioned automatically on first boot and persisted, so this token
+    /// is stable for the lifetime of the stored key: display it (or its QR code) for the
+    /// operator to transfer into a server that is setting this client up.
+    /// @return The 107-character token string, or nullopt before start_server() or when no
+    ///         Pairing PSK is configured.
+    [[nodiscard]] std::optional<std::string> pairing_token() const;
+
     /// @brief Returns true if there is an active connection with completed handshake
     /// @return true if connected with a completed handshake, false otherwise
     bool is_connected() const;
@@ -571,8 +583,10 @@ public:
     // ========================================
 
     /// @brief Signals that the operator performed the device pairing-window gesture.
-    /// Thread-safe. Advances a pending static-PIN pairing. No-op if no static PIN pairing is
-    /// awaiting the window.
+    /// Thread-safe. Opens a pairing window: a gesture-gated PIN attempt already waiting
+    /// (static PIN always; dynamic PIN when escalated or the session PIN is short) proceeds
+    /// immediately; otherwise the window stands open for 5 minutes and admits the next pairing
+    /// attempt without a further gesture.
     void confirm_pairing_window();
 
     // ========================================

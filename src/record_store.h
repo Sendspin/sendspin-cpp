@@ -32,14 +32,12 @@
 #pragma once
 
 #include "crypto/constants.h"
-#include "protocol_messages.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -94,7 +92,7 @@ struct ResolvedPsk {
 ///     `records_` / `pairing_psk_`.
 class RecordStore {
 public:
-    /// @brief Construct and pre-provision the shared-PSK fallback record.
+    /// @brief Construct and pre-provision the shared-PSK fallback record and the Pairing PSK.
     /// If a persistence provider is supplied, attempts to load saved records
     /// and pairing config first; generates fresh material only when absent.
     explicit RecordStore(SendspinPersistenceProvider* provider);
@@ -175,6 +173,7 @@ public:
     // ========================================================================
 
     /// @brief Set the accepted Pairing PSK, replacing any existing one.
+    /// psk_id is re-derived from the supplied secret; any id in `psk` is ignored.
     void set_pairing_psk(SendspinPairingPsk psk);
 
     /// @brief Clear the accepted Pairing PSK. No-op if absent.
@@ -210,33 +209,31 @@ public:
     }
 
     // ========================================================================
-    // PIN lockout (Phase 8b/8c, in-memory only)
+    // Dynamic-PIN failure counter (escalation, persisted)
     // ========================================================================
 
-    /// @brief Number of consecutive PIN failures before lockout.
-    static constexpr int PIN_LOCKOUT_THRESHOLD = 10;
+    /// @brief Failure count at which dynamic_pin becomes escalated (gesture-gated).
+    static constexpr int DYNAMIC_PIN_ESCALATION_THRESHOLD = 10;
 
-    /// @brief Return true if `method`'s PIN pairing is currently locked out.
-    /// Lockout is in-memory only (not persisted); cleared on restart.
-    [[nodiscard]] bool is_pin_locked_out(SendspinPairMethod method) const {
-        auto it = this->pin_failures_.find(method);
-        if (it == this->pin_failures_.end()) {
-            return false;
-        }
-        return it->second >= PIN_LOCKOUT_THRESHOLD;
+    /// @brief Return true if dynamic_pin is escalated: every attempt is gesture-gated until a
+    /// successful server_kc verification de-escalates it. Escalation is not an error state --
+    /// the method stays offered.
+    [[nodiscard]] bool dynamic_pin_escalated() const {
+        return this->dynamic_pin_failures_ >= DYNAMIC_PIN_ESCALATION_THRESHOLD;
     }
 
-    /// @brief Return the current PIN failure count for `method` (0 if none recorded).
-    [[nodiscard]] int pin_failure_count(SendspinPairMethod method) const {
-        auto it = this->pin_failures_.find(method);
-        return it == this->pin_failures_.end() ? 0 : it->second;
+    /// @brief Return the current dynamic-PIN failure count.
+    [[nodiscard]] int dynamic_pin_failure_count() const {
+        return this->dynamic_pin_failures_;
     }
 
-    /// @brief Increment the PIN failure counter for `method`.
-    void record_pin_failure(SendspinPairMethod method);
+    /// @brief Increment the dynamic-PIN failure counter and persist it. Called only when the
+    /// client's own verification of server_kc fails; no other event increments it.
+    void record_dynamic_pin_failure();
 
-    /// @brief Reset the PIN failure counter for `method` to zero (on success or lockout clear).
-    void reset_pin_failures(SendspinPairMethod method);
+    /// @brief Reset the dynamic-PIN failure counter to zero and persist it. Called when the
+    /// client's own verification of server_kc succeeds, whether or not the attempt finalizes.
+    void reset_dynamic_pin_failures();
 
     // ========================================================================
     // Static PIN (Phase 8c)
@@ -350,10 +347,10 @@ private:
     bool dynamic_pin_enabled_{true};
     bool static_pin_enabled_{false};
     int dynamic_pin_min_length_{6};
+    /// Dynamic-PIN failure counter (persisted through SendspinPairingConfig so escalation
+    /// survives reboots). static_pin has no counter: it is gesture-gated on every attempt.
+    int dynamic_pin_failures_{0};
     std::string record_mode_psk_id_;
-
-    // PIN lockout (in-memory; not persisted; cleared on restart)
-    std::map<SendspinPairMethod, int> pin_failures_;
 
     SendspinPersistenceProvider* provider_{nullptr};
 

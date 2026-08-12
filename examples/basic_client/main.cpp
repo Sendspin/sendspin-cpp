@@ -224,6 +224,9 @@ int main(int argc, char* argv[]) {
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
     config.server_port = server_port;
+    // The example prints a dynamic PIN to the terminal, so the client can advertise the
+    // dynamic_pin pairing method alongside the mandatory pairing_psk one.
+    config.pin_display_supported = true;
 
     // Create audio output and client
 #ifdef SENDSPIN_HAS_PORTAUDIO
@@ -343,12 +346,13 @@ int main(int argc, char* argv[]) {
                     static_cast<int>(reason));
         }
 
-        void on_display_pairing_pin(const std::string& /*pin*/) override {
-            // Dynamic-PIN display not supported in the basic_client example.
+        void on_display_pairing_pin(const std::string& pin) override {
+            fprintf(stderr, "\n>>> Pairing PIN: %s\n", pin.c_str());
+            fprintf(stderr, "    Enter this PIN on the server to finish pairing.\n\n");
         }
 
         void on_clear_pairing_pin() override {
-            // Dynamic-PIN clear not supported in the basic_client example.
+            fprintf(stderr, ">>> Pairing PIN cleared\n");
         }
 
         void on_open_pairing_window() override {
@@ -394,6 +398,14 @@ int main(int argc, char* argv[]) {
     // ~/.sendspin.json and regenerated only if the file is absent.
     fprintf(stderr, "client_id: %s\n", client.client_id().c_str());
     fprintf(stderr, "Persistence: %s\n", persistence_path.c_str());
+
+    // The pairing token carries the client_id and the Pairing PSK together. Paste it into a
+    // server that asks for one to pair via the pairing_psk method; pairing with a PIN instead
+    // needs nothing from here (the PIN is printed when the server starts that flow).
+    auto token = client.pairing_token();
+    if (token.has_value()) {
+        fprintf(stderr, "Pairing token: %s\n", token->c_str());
+    }
 
 #ifdef SENDSPIN_HAS_MDNS
     MdnsAdvertiser mdns;

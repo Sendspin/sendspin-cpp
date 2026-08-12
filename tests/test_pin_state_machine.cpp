@@ -358,14 +358,20 @@ struct ServerStandIn {
 class PinStateMachineTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        // This harness exercises both dynamic-PIN and static-PIN device flows, so the platform
+        // capability flags gating their advertisement/admissibility default to both set (spec
+        // #120/#123's pairing-method admissibility check in ConnectionManager::loop() mirrors
+        // build_hello_message()'s gating exactly, including these). Tests that need a different
+        // capability shape call init_client() again with other flags.
+        this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/true);
+    }
+
+    /// (Re)build the SendspinClient under test with the given platform capability flags.
+    void init_client(bool pin_display_supported, bool pairing_window_supported) {
         SendspinClientConfig config;
         config.name = "PinStateMachineTestDevice";
-        // This harness exercises both dynamic-PIN and static-PIN device flows, so the platform
-        // capability flags gating their advertisement/admissibility must both be set (spec
-        // #120/#123's pairing-method admissibility check in ConnectionManager::loop() mirrors
-        // build_hello_message()'s gating exactly, including these).
-        config.pin_display_supported = true;
-        config.pairing_window_supported = true;
+        config.pin_display_supported = pin_display_supported;
+        config.pairing_window_supported = pairing_window_supported;
         this->client_ = std::make_unique<SendspinClient>(config);
         this->client_->set_listener(&this->listener_);
         this->client_->set_network_provider(&this->network_provider_);
@@ -380,8 +386,9 @@ protected:
     }
 
     /// Inject a fresh FakeConnection as current_connection_, with the given server_id and
-    /// selected pair method already applied (as if a server/activate had been admitted), and
-    /// pairing_in_progress cleared. Returns a raw pointer valid for the test's lifetime.
+    /// pairing method already applied (as if a server/activate had been admitted; dynamic_pin
+    /// activations carry the session pin_length, default 6 = ungated), and pairing_in_progress
+    /// cleared. Returns a raw pointer valid for the test's lifetime.
     ///
     /// The test fixture also keeps its own shared_ptr (injected_conn_) alive independently of
     /// ConnectionManager::current_connection_: abort/cleanup paths (local_abort_pin_pairing,
@@ -389,10 +396,13 @@ protected:
     /// tearing the connection down, which would otherwise destroy the FakeConnection out from
     /// under the test (its sent_text_ / disconnect_count_ are asserted AFTER those paths run).
     FakeConnection* inject_current_connection(const std::string& server_id,
-                                              SendspinPairMethod method) {
+                                              SendspinPairMethod method, int pin_length = 6) {
         auto conn = std::make_shared<FakeConnection>();
         conn->set_noise_handshake_result(server_id, PskCategory::SENTINEL, /*psk_id=*/"");
-        conn->apply_server_activate({SendspinActivity::PAIRING}, std::nullopt, method);
+        conn->apply_server_activate({SendspinActivity::PAIRING}, std::nullopt, method,
+                                    method == SendspinPairMethod::DYNAMIC_PIN
+                                        ? std::optional<int>(pin_length)
+                                        : std::nullopt);
         conn->set_pairing_in_progress(false);
         FakeConnection* raw = conn.get();
         this->injected_conn_ = conn;
@@ -462,6 +472,11 @@ protected:
         this->client_->connection_manager_->schedule_pair_abort(std::move(event));
     }
 
+    /// Schedule a management/* request event for deferred processing, without pumping loop().
+    void schedule_management(ManagementRequestEvent event) {
+        this->client_->connection_manager_->schedule_management_request(std::move(event));
+    }
+
     /// Schedule a server/activate event on the injected current connection for deferred
     /// processing, without pumping loop(). Drives the real activate-arbitration path in
     /// ConnectionManager::loop() (trust check, apply_server_activate, then either the
@@ -469,13 +484,25 @@ protected:
     /// the same entry point process_json_message() uses on the network thread.
     void post_activate(std::vector<SendspinActivity> activities,
                        std::optional<std::vector<std::string>> active_roles,
-                       std::optional<SendspinPairMethod> selected_pair_method) {
+                       std::optional<SendspinPairMethod> pairing_method,
+                       std::optional<int> pairing_pin_length = std::nullopt) {
         ServerActivateEvent event;
         event.conn = this->current_connection_sp();
         event.activities = std::move(activities);
         event.active_roles = std::move(active_roles);
-        event.selected_pair_method = selected_pair_method;
+        event.pairing_method = pairing_method;
+        event.pairing_pin_length = pairing_pin_length;
         this->client_->connection_manager_->schedule_activate(std::move(event));
+    }
+
+    /// Read the standing pairing-window deadline (0 = closed) through the friend seam.
+    int64_t window_deadline() {
+        return this->client_->connection_manager_->pairing_window_open_until_us_;
+    }
+
+    /// Force the standing pairing window's deadline (e.g. into the past to simulate expiry).
+    void set_window_deadline(int64_t deadline_us) {
+        this->client_->connection_manager_->pairing_window_open_until_us_ = deadline_us;
     }
 
     RecordStore& record_store() { return *this->client_->record_store_; }
@@ -511,7 +538,7 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
     const std::array<uint8_t, 32> nonce_b = conn->pin_session().nonce_b;
     const std::array<uint8_t, 32> handshake_hash = conn->pin_session().handshake_hash;
 
-    // ---- server/pair-init: nonce_A + pin_length ----
+    // ---- server/pair-init: nonce_A only; pin_length (6) came from the activation ----
     std::array<uint8_t, 32> nonce_a{};
     for (size_t i = 0; i < nonce_a.size(); ++i) {
         nonce_a[i] = static_cast<uint8_t>(i + 1);
@@ -527,7 +554,6 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
     pair_init_event.conn = conn_sp;
     pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
     pair_init_event.nonce_a = nonce_a;
-    pair_init_event.pin_length = pin_length;
     this->schedule_pin_message(std::move(pair_init_event));
     this->client_->loop();
 
@@ -606,14 +632,14 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
     EXPECT_EQ(unwrapped->size(), 32u);
 
     // Success callbacks: on_clear_pairing_pin fires (display -> clear ordering), and the
-    // DYNAMIC_PIN failure counter is reset (was already 0, but exercise the call path by
-    // checking it stays at 0 and is not locked out).
+    // dynamic-PIN failure counter is reset (was already 0, but exercise the call path by
+    // checking it stays at 0 and the method is not escalated).
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_PIN));
     EXPECT_LT(this->listener_.first_index_of(PairingEventKind::DISPLAY_PIN),
              this->listener_.first_index_of(PairingEventKind::CLEAR_PIN));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
-    EXPECT_FALSE(this->record_store().is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
-    EXPECT_EQ(this->record_store().pin_failure_count(SendspinPairMethod::DYNAMIC_PIN), 0);
+    EXPECT_FALSE(this->record_store().dynamic_pin_escalated());
+    EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 0);
 }
 
 // =============================================================================
@@ -644,7 +670,6 @@ TEST_F(PinStateMachineTest, DynamicPinMismatchRecordsFailureAndAborts) {
     pair_init_event.conn = current_conn_sp;
     pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
     pair_init_event.nonce_a = nonce_a;
-    pair_init_event.pin_length = pin_length;
     this->schedule_pin_message(std::move(pair_init_event));
     this->client_->loop();
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
@@ -677,7 +702,7 @@ TEST_F(PinStateMachineTest, DynamicPinMismatchRecordsFailureAndAborts) {
     // callbacks (abort-ordering regression: on_pairing_failed AND on_clear_pairing_pin both
     // survive cleanup_connection_state()).
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pin_mismatch");
-    EXPECT_EQ(this->record_store().pin_failure_count(SendspinPairMethod::DYNAMIC_PIN), 1);
+    EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 1);
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::PIN_MISMATCH);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_PIN));
@@ -753,26 +778,225 @@ TEST_F(PinStateMachineTest, DynamicPinMalformedFrameWithNoActiveSessionIsIgnored
 }
 
 // =============================================================================
-// Dynamic PIN: lockout
+// Dynamic PIN: escalation (gesture gating, replaces the old lockout)
 // =============================================================================
 
-TEST_F(PinStateMachineTest, DynamicPinLockoutBlocksNewAttempt) {
+// At the failure threshold the method is escalated, NOT locked out: the attempt is not
+// refused, it is gesture-gated. The client reports the pending gesture with
+// client/pair-pending and proceeds normally once the operator opens the window.
+TEST_F(PinStateMachineTest, EscalatedDynamicPinIsGestureGatedNotRefused) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-6", SendspinPairMethod::DYNAMIC_PIN);
 
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD; ++i) {
-        this->record_store().record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
+    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
+        this->record_store().record_dynamic_pin_failure();
     }
-    ASSERT_TRUE(this->record_store().is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
+    ASSERT_TRUE(this->record_store().dynamic_pin_escalated());
 
     this->enter_pairing(conn);
     this->client_->loop();
 
-    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "locked_out");
-    ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
-    EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::LOCKED_OUT);
-    EXPECT_FALSE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
+    // No abort, no refusal: client/pair-pending goes out and the operator is prompted.
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW);
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED));
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-init"));
+
+    // pair-pending does not start the attempt or its timeout.
+    EXPECT_EQ(conn->pin_session().attempt_deadline_us, 0);
+
+    // The operator gesture opens the window: the attempt starts (client/pair-init with
+    // commit_B) and the attempt timeout is armed.
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    ASSERT_EQ(conn->sent_text_.size(), 2u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_SERVER_PAIR_INIT);
+    EXPECT_GT(conn->pin_session().attempt_deadline_us, 0);
+}
+
+// A session pin_length below 6 gesture-gates the attempt even when the method is not
+// escalated: short PINs are bought with a gesture (spec: Pairing Window).
+TEST_F(PinStateMachineTest, ShortDynamicPinIsGestureGated) {
+    // Allow short PINs so the activation passes pin_length validation.
+    this->record_store().set_dynamic_pin_min_length(4);
+    ASSERT_FALSE(this->record_store().dynamic_pin_escalated());
+
+    FakeConnection* conn = this->inject_current_connection(
+        "server-dyn-short", SendspinPairMethod::DYNAMIC_PIN, /*pin_length=*/4);
+
+    this->enter_pairing(conn);
+    this->client_->loop();
+
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW);
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
+
+    // client/pair-pending must carry the pairing_index.
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse_json(conn->sent_text_.back(), doc, root));
+    EXPECT_EQ(root["payload"]["pairing_index"] | 0u, 1u);
+
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    ASSERT_EQ(conn->sent_text_.size(), 2u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+}
+
+// A pairing window opened by the operator BEFORE the pairing activate arrives is standing
+// state: a gated attempt arriving within its lifetime proceeds without a further gesture
+// (and without a client/pair-pending).
+TEST_F(PinStateMachineTest, StandingWindowAdmitsLaterGatedAttempt) {
+    this->record_store().set_static_pin("13572468");
+
+    // Gesture first: no attempt is waiting, so the window stands open.
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    EXPECT_GT(this->window_deadline(), 0);
+
+    // The gated (static PIN) pairing activate arrives: pair-init goes out immediately.
+    FakeConnection* conn =
+        this->inject_current_connection("server-standing", SendspinPairMethod::STATIC_PIN);
+    this->enter_pairing(conn);
+    this->client_->loop();
+
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-pending"));
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_SERVER_PAIR_AUTH);
+    // Sending client/pair-init consumed the window (its lifetime runs until pair-init).
+    EXPECT_EQ(this->window_deadline(), 0);
+}
+
+// An expired standing window admits nothing: the gated attempt falls back to
+// client/pair-pending and a fresh gesture.
+TEST_F(PinStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
+    this->record_store().set_static_pin("13572468");
+
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    ASSERT_GT(this->window_deadline(), 0);
+    // Simulate the 5-minute lifetime passing.
+    this->set_window_deadline(platform_time_us() - 1);
+
+    FakeConnection* conn =
+        this->inject_current_connection("server-expired", SendspinPairMethod::STATIC_PIN);
+    this->enter_pairing(conn);
+    this->client_->loop();
+
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW);
+}
+
+// A device that offers dynamic_pin but has no pairing-window gesture UI
+// (pairing_window_supported=false) can still hit the gesture gate through escalation. The
+// on_open_pairing_window prompt must NOT fire (its contract requires the flag), but the
+// spec-mandated client/pair-pending still goes out, and the attempt remains recoverable by a
+// window opened without the local gesture (management/open-pairing-window remotely; modeled
+// here via confirm_pairing_window(), which drives the same open_pairing_window() path).
+TEST_F(PinStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
+    this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/false);
+
+    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
+        this->record_store().record_dynamic_pin_failure();
+    }
+    ASSERT_TRUE(this->record_store().dynamic_pin_escalated());
+
+    FakeConnection* conn =
+        this->inject_current_connection("server-dyn-nowindow", SendspinPairMethod::DYNAMIC_PIN);
+    this->enter_pairing(conn);
+    this->client_->loop();
+
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW);
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED));
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::OPEN_WINDOW))
+        << "on_open_pairing_window must not fire when pairing_window_supported is false";
+    EXPECT_FALSE(conn->pin_session().window_shown);
+
+    // A window opened without the local gesture still starts the waiting attempt.
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    ASSERT_EQ(conn->sent_text_.size(), 2u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+}
+
+// =============================================================================
+// management/open-pairing-window
+// =============================================================================
+
+// Fixture-level helpers for driving a management/open-pairing-window request through the real
+// deferred-event path (schedule_management_request + loop), on a connection whose activate
+// declared the MANAGEMENT activity.
+
+TEST_F(PinStateMachineTest, ManagementOpenPairingWindowOpensWindow) {
+    FakeConnection* conn = this->inject_provisional_current_connection("server-mgmt-1");
+    conn->apply_server_activate({SendspinActivity::MANAGEMENT}, std::vector<std::string>{},
+                                std::nullopt, std::nullopt);
+    ASSERT_EQ(this->window_deadline(), 0);
+
+    ManagementRequestEvent event;
+    event.conn = this->current_connection_sp();
+    event.kind = ManagementRequestKind::OPEN_PAIRING_WINDOW;
+    this->schedule_management(std::move(event));
+    this->client_->loop();
+
+    // The result is ok and a standing window is now open.
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse_json(conn->sent_text_.back(), doc, root));
+    EXPECT_STREQ(root["type"], "management/result");
+    EXPECT_STREQ(root["payload"]["result"], "ok");
+    EXPECT_GT(this->window_deadline(), 0);
+
+    // A second request while the window is open is a no-op ok: the deadline is not extended.
+    const int64_t deadline_before = this->window_deadline();
+    ManagementRequestEvent again;
+    again.conn = this->current_connection_sp();
+    again.kind = ManagementRequestKind::OPEN_PAIRING_WINDOW;
+    this->schedule_management(std::move(again));
+    this->client_->loop();
+
+    ASSERT_EQ(conn->sent_text_.size(), 2u);
+    JsonDocument doc2;
+    JsonObject root2;
+    ASSERT_TRUE(parse_json(conn->sent_text_.back(), doc2, root2));
+    EXPECT_STREQ(root2["payload"]["result"], "ok");
+    EXPECT_EQ(this->window_deadline(), deadline_before)
+        << "a no-op ok must not extend the open window's lifetime";
+}
+
+TEST_F(PinStateMachineTest, ManagementOpenPairingWindowInvalidWhenNoPinMethodEnabled) {
+    // Disable dynamic_pin; static_pin is enabled in the fixture but has no PIN configured, so
+    // neither PIN method is offered.
+    this->record_store().set_dynamic_pin_enabled(false);
+    ASSERT_FALSE(this->record_store().static_pin().has_value());
+
+    FakeConnection* conn = this->inject_provisional_current_connection("server-mgmt-2");
+    conn->apply_server_activate({SendspinActivity::MANAGEMENT}, std::vector<std::string>{},
+                                std::nullopt, std::nullopt);
+
+    ManagementRequestEvent event;
+    event.conn = this->current_connection_sp();
+    event.kind = ManagementRequestKind::OPEN_PAIRING_WINDOW;
+    this->schedule_management(std::move(event));
+    this->client_->loop();
+
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse_json(conn->sent_text_.back(), doc, root));
+    EXPECT_STREQ(root["type"], "management/result");
+    EXPECT_STREQ(root["payload"]["result"], "invalid");
+    EXPECT_EQ(this->window_deadline(), 0) << "a rejected request must not open a window";
 }
 
 // =============================================================================
@@ -787,8 +1011,10 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
     this->enter_pairing(conn);
     this->client_->loop();
 
-    // Entering static-PIN pairing surfaces the pairing-window prompt and sends NOTHING yet.
-    EXPECT_TRUE(conn->sent_text_.empty());
+    // Entering static-PIN pairing (gesture-gated, no window open) sends client/pair-pending
+    // and surfaces the pairing-window prompt; nothing else is sent yet.
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED));
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::DISPLAY_PIN))
@@ -801,7 +1027,7 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
     this->client_->confirm_pairing_window();
     this->client_->loop();
 
-    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    ASSERT_EQ(conn->sent_text_.size(), 2u);
     JsonDocument init_doc;
     JsonObject init_root;
     ASSERT_TRUE(parse_json(conn->sent_text_.back(), init_doc, init_root));
@@ -877,8 +1103,8 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
     EXPECT_LT(this->listener_.first_index_of(PairingEventKind::OPEN_WINDOW),
              this->listener_.first_index_of(PairingEventKind::CLOSE_WINDOW));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
-    EXPECT_FALSE(this->record_store().is_pin_locked_out(SendspinPairMethod::STATIC_PIN));
-    EXPECT_EQ(this->record_store().pin_failure_count(SendspinPairMethod::STATIC_PIN), 0);
+    EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 0)
+        << "a static-PIN attempt must never touch the dynamic-PIN failure counter";
 }
 
 // =============================================================================
@@ -902,7 +1128,8 @@ TEST_F(PinStateMachineTest, SubsequentActivateEntersStaticPinPairing) {
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
     EXPECT_TRUE(conn->sent_text_.empty());
 
-    // Subsequent activate: [pairing] + static_pin -> must enter pairing and open the window.
+    // Subsequent activate: [pairing] + static_pin -> must enter pairing, send
+    // client/pair-pending, and prompt for the window gesture.
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::STATIC_PIN);
     this->client_->loop();
@@ -911,12 +1138,14 @@ TEST_F(PinStateMachineTest, SubsequentActivateEntersStaticPinPairing) {
         << "a subsequent pairing activate must open the operator pairing window";
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED));
     EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW);
-    EXPECT_TRUE(conn->sent_text_.empty()) << "nothing is sent until the operator confirms";
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending")
+        << "only client/pair-pending is sent until the operator confirms";
 
     // Confirming the window sends the empty client/pair-init, proving the flow is live.
     this->client_->confirm_pairing_window();
     this->client_->loop();
-    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    ASSERT_EQ(conn->sent_text_.size(), 2u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 }
 
@@ -932,9 +1161,10 @@ TEST_F(PinStateMachineTest, SubsequentActivateEntersDynamicPinPairing) {
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
     EXPECT_TRUE(conn->sent_text_.empty());
 
-    // Subsequent activate: [pairing] + dynamic_pin -> must enter pairing.
+    // Subsequent activate: [pairing] + dynamic_pin (pin_length 6 from the pairing object) ->
+    // must enter pairing.
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
-                        SendspinPairMethod::DYNAMIC_PIN);
+                        SendspinPairMethod::DYNAMIC_PIN, /*pairing_pin_length=*/6);
     this->client_->loop();
 
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED))
@@ -942,6 +1172,64 @@ TEST_F(PinStateMachineTest, SubsequentActivateEntersDynamicPinPairing) {
     EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_SERVER_PAIR_INIT);
     ASSERT_EQ(conn->sent_text_.size(), 1u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+}
+
+// The client validates pin_length on receipt of the ACTIVATION (not at server/pair-init,
+// which now carries only nonce_A): a value below min_pin_length or outside 4-12 is rejected
+// with pair/abort(pin_length_unacceptable), leaving the connection open.
+TEST_F(PinStateMachineTest, OutOfRangePinLengthOnActivationIsRejected) {
+    FakeConnection* conn = this->inject_provisional_current_connection("server-badlen");
+
+    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->client_->loop();
+    ASSERT_TRUE(conn->sent_text_.empty());
+
+    // Above the protocol maximum of 12.
+    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+                        SendspinPairMethod::DYNAMIC_PIN, /*pairing_pin_length=*/13);
+    this->client_->loop();
+
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::IDLE);
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pin_length_unacceptable");
+    EXPECT_EQ(conn->disconnect_count_, 0) << "the connection must stay open after the abort";
+
+    // Below the client's min_pin_length (default 6) but inside 4-12: also rejected.
+    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+                        SendspinPairMethod::DYNAMIC_PIN, /*pairing_pin_length=*/4);
+    this->client_->loop();
+    ASSERT_EQ(conn->sent_text_.size(), 2u);
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pin_length_unacceptable");
+
+    // Missing entirely on a dynamic_pin activation (required field): also rejected.
+    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
+                        SendspinPairMethod::DYNAMIC_PIN, std::nullopt);
+    this->client_->loop();
+    ASSERT_EQ(conn->sent_text_.size(), 3u);
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pin_length_unacceptable");
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
+}
+
+// A pairing activate that names no method (absent, or a method string the parser did not
+// recognize) starts nothing, so the client must say so instead of ignoring the message: an
+// unanswered pairing activate leaves the server waiting on the device indefinitely.
+TEST_F(PinStateMachineTest, PairingActivateWithoutMethodIsAborted) {
+    FakeConnection* conn = this->inject_provisional_current_connection("server-no-method");
+
+    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->client_->loop();
+    ASSERT_TRUE(conn->sent_text_.empty());
+
+    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{}, std::nullopt);
+    this->client_->loop();
+
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::IDLE);
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "pair/abort");
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "method_not_supported");
+    EXPECT_EQ(conn->disconnect_count_, 0) << "the connection must stay open after the abort";
 }
 
 // =============================================================================
@@ -984,20 +1272,23 @@ TEST_F(PinStateMachineTest, StaticPinMismatchRecordsFailureAndAborts) {
     this->client_->loop();
 
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pin_mismatch");
-    EXPECT_EQ(this->record_store().pin_failure_count(SendspinPairMethod::STATIC_PIN), 1);
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::PIN_MISMATCH);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::SUCCEEDED));
-    // DYNAMIC_PIN's counter must be untouched (independent lockout counters).
-    EXPECT_EQ(this->record_store().pin_failure_count(SendspinPairMethod::DYNAMIC_PIN), 0);
+    // The failure counter is dynamic-PIN only (spec: Failure counter); a static-PIN mismatch
+    // must not touch it.
+    EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 0);
 }
 
 // =============================================================================
-// Static PIN: pairing-window timeout
+// Static PIN: the gesture wait is unbounded client-side
 // =============================================================================
 
-TEST_F(PinStateMachineTest, StaticPinWindowTimeout) {
+// client/pair-pending does not start the attempt or its timeout (spec: the server applies its
+// own timeout and cancels via server/activate), so the wait for the gesture must not be
+// aborted by the client's attempt-timeout check.
+TEST_F(PinStateMachineTest, GestureWaitHasNoClientTimeout) {
     this->record_store().set_static_pin("13572468");
     FakeConnection* conn =
         this->inject_current_connection("server-static-3", SendspinPairMethod::STATIC_PIN);
@@ -1006,9 +1297,19 @@ TEST_F(PinStateMachineTest, StaticPinWindowTimeout) {
 
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
     ASSERT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW);
-    EXPECT_TRUE(conn->sent_text_.empty());
+    EXPECT_EQ(conn->pin_session().attempt_deadline_us, 0)
+        << "client/pair-pending must not arm the attempt timeout";
 
-    // Force the pairing-window deadline into the past (reused as attempt_deadline_us).
+    // Further loop() ticks must not abort the waiting session.
+    this->client_->loop();
+    this->client_->loop();
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW);
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
+
+    // Once the gesture starts the attempt, the timeout IS armed and enforceable.
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    ASSERT_GT(conn->pin_session().attempt_deadline_us, 0);
     conn->pin_session().attempt_deadline_us = platform_time_us() - 1;
     this->client_->loop();
 
@@ -1018,30 +1319,6 @@ TEST_F(PinStateMachineTest, StaticPinWindowTimeout) {
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
     EXPECT_LT(this->listener_.first_index_of(PairingEventKind::OPEN_WINDOW),
              this->listener_.first_index_of(PairingEventKind::CLOSE_WINDOW));
-}
-
-// =============================================================================
-// Static PIN: lockout independent of dynamic PIN
-// =============================================================================
-
-TEST_F(PinStateMachineTest, StaticPinLockoutIsIndependentOfDynamicPin) {
-    this->record_store().set_static_pin("13572468");
-    FakeConnection* conn =
-        this->inject_current_connection("server-static-4", SendspinPairMethod::STATIC_PIN);
-
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD; ++i) {
-        this->record_store().record_pin_failure(SendspinPairMethod::STATIC_PIN);
-    }
-    ASSERT_TRUE(this->record_store().is_pin_locked_out(SendspinPairMethod::STATIC_PIN));
-    ASSERT_FALSE(this->record_store().is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
-
-    this->enter_pairing(conn);
-    this->client_->loop();
-
-    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "locked_out");
-    ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
-    EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::LOCKED_OUT);
-    EXPECT_FALSE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
 }
 
 // =============================================================================
@@ -1090,7 +1367,6 @@ TEST_F(PinStateMachineTest, ConnectionLossWithPinDisplayedClearsPin) {
     pair_init_event.conn = current_conn_sp;
     pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
     pair_init_event.nonce_a = nonce_a;
-    pair_init_event.pin_length = 6;
     this->schedule_pin_message(std::move(pair_init_event));
     this->client_->loop();
 
@@ -1137,7 +1413,6 @@ TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
     pair_init_event.conn = current_conn_sp;
     pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
     pair_init_event.nonce_a = nonce_a;
-    pair_init_event.pin_length = 6;
     this->schedule_pin_message(std::move(pair_init_event));
     this->client_->loop();
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
@@ -1314,7 +1589,7 @@ TEST_F(PinStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
     // dynamic_pin_enabled_ defaults true). Must proceed into pairing and its client/pair-init
     // must carry pairing_index == 2 -- BOTH the rejected and the accepted activate counted.
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
-                        SendspinPairMethod::DYNAMIC_PIN);
+                        SendspinPairMethod::DYNAMIC_PIN, /*pairing_pin_length=*/6);
     this->client_->loop();
 
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED))

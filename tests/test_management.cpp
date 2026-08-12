@@ -239,7 +239,7 @@ TEST(ManagementProtocol, ParseSetPairingConfigStaticPin) {
     JsonObject root;
     ASSERT_TRUE(parse(
         R"({"type":"management/set-pairing-config","payload":{"static_pin":{"enabled":true,)"
-        R"("pin":"12345678","locked_out":false}}})",
+        R"("pin":"12345678"}}})",
         doc, root));
     ManagementSetPairingConfigPayload payload;
     EXPECT_TRUE(process_management_set_pairing_config_message(root, &payload));
@@ -248,8 +248,6 @@ TEST(ManagementProtocol, ParseSetPairingConfigStaticPin) {
     EXPECT_TRUE(payload.static_pin->enabled.value());
     ASSERT_TRUE(payload.static_pin->pin.has_value());
     EXPECT_EQ(payload.static_pin->pin.value(), "12345678");
-    ASSERT_TRUE(payload.static_pin->locked_out.has_value());
-    EXPECT_FALSE(payload.static_pin->locked_out.value());
     EXPECT_FALSE(payload.dynamic_pin.has_value());
 }
 
@@ -258,7 +256,7 @@ TEST(ManagementProtocol, ParseSetPairingConfigDynamicPin) {
     JsonObject root;
     ASSERT_TRUE(parse(
         R"({"type":"management/set-pairing-config","payload":{"dynamic_pin":{"enabled":false,)"
-        R"("locked_out":false,"min_pin_length":8}}})",
+        R"("min_pin_length":8}}})",
         doc, root));
     ManagementSetPairingConfigPayload payload;
     EXPECT_TRUE(process_management_set_pairing_config_message(root, &payload));
@@ -266,8 +264,6 @@ TEST(ManagementProtocol, ParseSetPairingConfigDynamicPin) {
     ASSERT_TRUE(payload.dynamic_pin.has_value());
     ASSERT_TRUE(payload.dynamic_pin->enabled.has_value());
     EXPECT_FALSE(payload.dynamic_pin->enabled.value());
-    ASSERT_TRUE(payload.dynamic_pin->locked_out.has_value());
-    EXPECT_FALSE(payload.dynamic_pin->locked_out.value());
     ASSERT_TRUE(payload.dynamic_pin->min_pin_length.has_value());
     EXPECT_EQ(payload.dynamic_pin->min_pin_length.value(), 8);
 }
@@ -406,13 +402,12 @@ TEST(ManagementProtocol, FormatResultGetPairingConfigStaticAndDynamicPin) {
 
     PairingMethodConfig static_cfg;
     static_cfg.enabled = true;
-    static_cfg.locked_out = false;
     payload.data->static_pin = static_cfg;
 
     PairingMethodConfig dynamic_cfg;
     dynamic_cfg.enabled = true;
-    dynamic_cfg.locked_out = true;
     dynamic_cfg.min_pin_length = 6;
+    dynamic_cfg.escalated = true;
     payload.data->dynamic_pin = dynamic_cfg;
 
     std::string json = format_management_result_message(payload);
@@ -420,13 +415,18 @@ TEST(ManagementProtocol, FormatResultGetPairingConfigStaticAndDynamicPin) {
     ASSERT_FALSE(deserializeJson(doc, json));
 
     EXPECT_EQ(doc["payload"]["data"]["static_pin"]["enabled"].as<bool>(), true);
-    EXPECT_EQ(doc["payload"]["data"]["static_pin"]["locked_out"].as<bool>(), false);
     EXPECT_TRUE(doc["payload"]["data"]["static_pin"]["min_pin_length"].isUnbound())
         << "static_pin must never carry min_pin_length";
+    EXPECT_TRUE(doc["payload"]["data"]["static_pin"]["locked_out"].isUnbound())
+        << "locked_out is gone from the wire";
+    EXPECT_TRUE(doc["payload"]["data"]["static_pin"]["escalated"].isUnbound())
+        << "static_pin has no failure counter, so no escalated flag";
 
     EXPECT_EQ(doc["payload"]["data"]["dynamic_pin"]["enabled"].as<bool>(), true);
-    EXPECT_EQ(doc["payload"]["data"]["dynamic_pin"]["locked_out"].as<bool>(), true);
     EXPECT_EQ(doc["payload"]["data"]["dynamic_pin"]["min_pin_length"].as<int>(), 6);
+    EXPECT_EQ(doc["payload"]["data"]["dynamic_pin"]["escalated"].as<bool>(), true);
+    EXPECT_TRUE(doc["payload"]["data"]["dynamic_pin"]["locked_out"].isUnbound())
+        << "locked_out is gone from the wire";
 }
 
 TEST(ManagementProtocol, FormatResultStorageAbsent) {
@@ -736,7 +736,8 @@ TEST(ManagementHandler, GetPairingConfigDefaultValues) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_get_pairing_config(store, result, effect);
+    handle_get_pairing_config(store, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
 
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_EQ(effect, ManagementEffect::NONE);
@@ -757,18 +758,17 @@ TEST(ManagementHandler, GetPairingConfigDefaultValues) {
 
     EXPECT_FALSE(result.data->records.has_value());
 
-    // static_pin: disabled by default, not locked out, no min_pin_length.
+    // static_pin: disabled by default, no min_pin_length, no escalated flag.
     ASSERT_TRUE(result.data->static_pin.has_value());
     EXPECT_EQ(result.data->static_pin->enabled, store.static_pin_enabled());
-    ASSERT_TRUE(result.data->static_pin->locked_out.has_value());
-    EXPECT_FALSE(result.data->static_pin->locked_out.value());
     EXPECT_FALSE(result.data->static_pin->min_pin_length.has_value());
+    EXPECT_FALSE(result.data->static_pin->escalated.has_value());
 
-    // dynamic_pin: enabled by default, not locked out, min_pin_length matches the store.
+    // dynamic_pin: enabled by default, not escalated, min_pin_length matches the store.
     ASSERT_TRUE(result.data->dynamic_pin.has_value());
     EXPECT_EQ(result.data->dynamic_pin->enabled, store.dynamic_pin_enabled());
-    ASSERT_TRUE(result.data->dynamic_pin->locked_out.has_value());
-    EXPECT_FALSE(result.data->dynamic_pin->locked_out.value());
+    ASSERT_TRUE(result.data->dynamic_pin->escalated.has_value());
+    EXPECT_FALSE(result.data->dynamic_pin->escalated.value());
     ASSERT_TRUE(result.data->dynamic_pin->min_pin_length.has_value());
     EXPECT_EQ(result.data->dynamic_pin->min_pin_length.value(), store.dynamic_pin_min_length());
 }
@@ -777,7 +777,8 @@ TEST(ManagementHandler, GetPairingConfigStaticPinNeverCarriesMinPinLength) {
     RecordStore store(nullptr);
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_get_pairing_config(store, result, effect);
+    handle_get_pairing_config(store, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
 
     // Verify via JSON round-trip: static_pin has no min_pin_length; dynamic_pin does.
     std::string json = format_management_result_message(result);
@@ -787,21 +788,81 @@ TEST(ManagementHandler, GetPairingConfigStaticPinNeverCarriesMinPinLength) {
     EXPECT_FALSE(doc["payload"]["data"]["dynamic_pin"]["min_pin_length"].isUnbound());
 }
 
-TEST(ManagementHandler, GetPairingConfigReflectsLockoutPerMethod) {
+TEST(ManagementHandler, GetPairingConfigReportsEscalated) {
     RecordStore store(nullptr);
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD; ++i) {
-        store.record_pin_failure(SendspinPairMethod::STATIC_PIN);
+    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
+        store.record_dynamic_pin_failure();
     }
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_get_pairing_config(store, result, effect);
+    handle_get_pairing_config(store, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
 
-    ASSERT_TRUE(result.data->static_pin->locked_out.has_value());
-    EXPECT_TRUE(result.data->static_pin->locked_out.value());
-    ASSERT_TRUE(result.data->dynamic_pin->locked_out.has_value());
-    EXPECT_FALSE(result.data->dynamic_pin->locked_out.value())
-        << "dynamic_pin lockout must be independent of static_pin";
+    ASSERT_TRUE(result.data->dynamic_pin->escalated.has_value());
+    EXPECT_TRUE(result.data->dynamic_pin->escalated.value());
+    // The method stays enabled: escalation gates attempts behind a gesture, nothing more.
+    EXPECT_TRUE(result.data->dynamic_pin->enabled);
+}
+
+// A PIN-method object is absent when the device does not implement that method (spec: "A
+// PIN-method object is absent if the client does not implement that method").
+TEST(ManagementHandler, GetPairingConfigOmitsUnimplementedMethods) {
+    RecordStore store(nullptr);
+
+    ManagementResultPayload result;
+    ManagementEffect effect;
+    handle_get_pairing_config(store, /*dynamic_pin_implemented=*/false,
+                              /*static_pin_implemented=*/false, result, effect);
+
+    EXPECT_EQ(result.result, ManagementResult::OK);
+    EXPECT_FALSE(result.data->static_pin.has_value());
+    EXPECT_FALSE(result.data->dynamic_pin.has_value());
+    ASSERT_TRUE(result.data->pairing_psk.has_value())
+        << "pairing_psk is client-mandatory and always reported";
+}
+
+// Fields set on an unimplemented method are rejected as invalid.
+TEST(ManagementHandler, SetPairingConfigRejectsUnimplementedMethodFields) {
+    RecordStore store(nullptr);
+
+    ManagementSetPairingConfigPayload payload;
+    SetDynamicPinConfig dyn_cfg;
+    dyn_cfg.enabled = false;
+    payload.dynamic_pin = dyn_cfg;
+
+    ManagementResultPayload result;
+    ManagementEffect effect;
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/false,
+                              /*static_pin_implemented=*/true, result, effect);
+    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    EXPECT_TRUE(store.dynamic_pin_enabled()) << "a rejected patch must not be applied";
+}
+
+// Enabling static_pin with no PIN configured and none supplied is rejected as invalid.
+TEST(ManagementHandler, SetPairingConfigRejectsEnablingStaticPinWithoutPin) {
+    RecordStore store(nullptr);
+    ASSERT_FALSE(store.static_pin().has_value());
+
+    ManagementSetPairingConfigPayload payload;
+    SetStaticPinConfig static_cfg;
+    static_cfg.enabled = true;
+    payload.static_pin = static_cfg;
+
+    ManagementResultPayload result;
+    ManagementEffect effect;
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
+    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    EXPECT_FALSE(store.static_pin_enabled());
+
+    // Supplying the PIN in the same request passes.
+    static_cfg.pin = "12345678";
+    payload.static_pin = static_cfg;
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
+    EXPECT_EQ(result.result, ManagementResult::OK);
+    EXPECT_TRUE(store.static_pin_enabled());
 }
 
 // ===========================================================================
@@ -819,7 +880,8 @@ TEST(ManagementHandler, SetPairingConfigEnablePairingPsk) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_EQ(effect, ManagementEffect::NONE);
     EXPECT_TRUE(store.pairing_psk_enabled());
@@ -837,7 +899,8 @@ TEST(ManagementHandler, SetPairingConfigSetNewPsk) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
 
     // The pairing PSK must be set.
@@ -854,7 +917,8 @@ TEST(ManagementHandler, SetPairingConfigStaticPinValidPinAccepted) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
     ASSERT_TRUE(store.static_pin().has_value());
     EXPECT_EQ(store.static_pin().value(), "12345678");
@@ -869,7 +933,8 @@ TEST(ManagementHandler, SetPairingConfigInvalidStaticPinWrongLength) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::INVALID);
     EXPECT_FALSE(store.static_pin().has_value());
 }
@@ -883,7 +948,8 @@ TEST(ManagementHandler, SetPairingConfigInvalidStaticPinNonDigit) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::INVALID);
     EXPECT_FALSE(store.static_pin().has_value());
 }
@@ -891,6 +957,9 @@ TEST(ManagementHandler, SetPairingConfigInvalidStaticPinNonDigit) {
 TEST(ManagementHandler, SetPairingConfigStaticPinEnabledToggle) {
     RecordStore store(nullptr);
     EXPECT_FALSE(store.static_pin_enabled());
+    // Enabling requires a configured PIN (else INVALID; see
+    // SetPairingConfigRejectsEnablingStaticPinWithoutPin).
+    store.set_static_pin("13572468");
 
     ManagementSetPairingConfigPayload payload;
     SetStaticPinConfig static_cfg;
@@ -899,7 +968,8 @@ TEST(ManagementHandler, SetPairingConfigStaticPinEnabledToggle) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_TRUE(store.static_pin_enabled());
 }
@@ -915,7 +985,8 @@ TEST(ManagementHandler, SetPairingConfigDynamicPinEnabledToggle) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_FALSE(store.dynamic_pin_enabled());
 }
@@ -929,7 +1000,8 @@ TEST(ManagementHandler, SetPairingConfigDynamicPinMinLengthOutOfRangeTooLow) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::INVALID);
 }
 
@@ -942,7 +1014,8 @@ TEST(ManagementHandler, SetPairingConfigDynamicPinMinLengthOutOfRangeTooHigh) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::INVALID);
 }
 
@@ -955,78 +1028,61 @@ TEST(ManagementHandler, SetPairingConfigDynamicPinMinLengthAppliesWhenValid) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_EQ(store.dynamic_pin_min_length(), 8);
 }
 
-TEST(ManagementHandler, SetPairingConfigStaticLockedOutTrueRejected) {
+// The spec has no locked_out-clearing field: an unknown locked_out key inside a method patch
+// is simply not parsed, and the escalation counter is untouchable via management. The counter
+// resets only through the client's own successful server_kc verification.
+TEST(ManagementHandler, SetPairingConfigCannotTouchEscalation) {
     RecordStore store(nullptr);
-    ManagementSetPairingConfigPayload payload;
-    SetStaticPinConfig static_cfg;
-    static_cfg.locked_out = true;  // Only false is accepted.
-    payload.static_pin = static_cfg;
+    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
+        store.record_dynamic_pin_failure();
+    }
+    ASSERT_TRUE(store.dynamic_pin_escalated());
 
-    ManagementResultPayload result;
-    ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
-}
-
-TEST(ManagementHandler, SetPairingConfigDynamicLockedOutTrueRejected) {
-    RecordStore store(nullptr);
+    // A dynamic_pin patch (any fields) leaves the counter alone.
     ManagementSetPairingConfigPayload payload;
     SetDynamicPinConfig dynamic_cfg;
-    dynamic_cfg.locked_out = true;  // Only false is accepted.
+    dynamic_cfg.enabled = true;
     payload.dynamic_pin = dynamic_cfg;
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
+    EXPECT_EQ(result.result, ManagementResult::OK);
+    EXPECT_TRUE(store.dynamic_pin_escalated())
+        << "management must not be able to de-escalate the failure counter";
 }
 
-TEST(ManagementHandler, SetPairingConfigStaticLockedOutFalseClearsLockout) {
+// A rotated Pairing PSK whose psk_id collides with a candidate PSK in a different category
+// (here: a stored long-term record) is rejected as already_exists.
+TEST(ManagementHandler, SetPairingConfigPskCollidingWithRecordRejected) {
     RecordStore store(nullptr);
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD; ++i) {
-        store.record_pin_failure(SendspinPairMethod::STATIC_PIN);
-    }
-    ASSERT_TRUE(store.is_pin_locked_out(SendspinPairMethod::STATIC_PIN));
+    auto psk = make_random_psk();
+
+    SendspinPairingRecord rec;
+    rec.psk = psk;
+    auto id_opt = psk_id_for(psk.data(), psk.size());
+    ASSERT_TRUE(id_opt.has_value());
+    rec.psk_id = id_opt.value();
+    rec.server_id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    ASSERT_TRUE(store.store_record(rec));
 
     ManagementSetPairingConfigPayload payload;
-    SetStaticPinConfig static_cfg;
-    static_cfg.locked_out = false;
-    payload.static_pin = static_cfg;
+    SetPairingPskConfig psk_cfg;
+    psk_cfg.psk = psk_to_b64url(psk);
+    payload.pairing_psk = psk_cfg;
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
-    EXPECT_FALSE(store.is_pin_locked_out(SendspinPairMethod::STATIC_PIN));
-    // The other method's lockout counter must be untouched.
-}
-
-TEST(ManagementHandler, SetPairingConfigDynamicLockedOutFalseClearsOnlyDynamicMethod) {
-    RecordStore store(nullptr);
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD; ++i) {
-        store.record_pin_failure(SendspinPairMethod::STATIC_PIN);
-        store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
-    }
-    ASSERT_TRUE(store.is_pin_locked_out(SendspinPairMethod::STATIC_PIN));
-    ASSERT_TRUE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
-
-    ManagementSetPairingConfigPayload payload;
-    SetDynamicPinConfig dynamic_cfg;
-    dynamic_cfg.locked_out = false;
-    payload.dynamic_pin = dynamic_cfg;
-
-    ManagementResultPayload result;
-    ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
-    EXPECT_TRUE(store.is_pin_locked_out(SendspinPairMethod::STATIC_PIN))
-        << "clearing dynamic_pin lockout must not affect static_pin";
-    EXPECT_FALSE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
+    EXPECT_EQ(result.result, ManagementResult::ALREADY_EXISTS);
 }
 
 // A patch mixing a valid field (pairing_psk enabled toggle) and an invalid field (bad static PIN)
@@ -1047,7 +1103,8 @@ TEST(ManagementHandler, SetPairingConfigMixedValidAndInvalidMutatesNothing) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::INVALID);
 
     // Nothing must have been mutated.
@@ -1067,7 +1124,8 @@ TEST(ManagementHandler, SetPairingConfigInvalidBadPskBytes) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::INVALID);
 }
 
@@ -1084,7 +1142,8 @@ TEST(ManagementHandler, SetPairingConfigInvalidRecordMode) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::INVALID);
 }
 
@@ -1105,7 +1164,8 @@ TEST(ManagementHandler, SetPairingConfigAppliesRecordMode) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_EQ(store.record_mode_psk_id(), shared.psk_id);
 }
@@ -1121,7 +1181,8 @@ TEST(ManagementHandler, SetPairingConfigUnpairedAccess) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, result, effect);
+    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
+                              /*static_pin_implemented=*/true, result, effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_TRUE(store.unpaired_access_enabled());
 }

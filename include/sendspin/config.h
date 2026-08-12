@@ -62,7 +62,10 @@ struct SendspinPairingConfig {
     bool static_pin_enabled{false};
     /// @brief Minimum PIN length the client will accept; server chooses within [min, MAX].
     int dynamic_pin_min_length{6};
-    // static_pin fields are deferred to a later phase of the encryption port.
+    /// @brief Dynamic-PIN failure counter, persisted across reboots (spec: a single counter for
+    /// the method, not partitioned by server). At 10 the method is escalated to gesture-gating
+    /// (still offered); the client's own successful server_kc verification resets it.
+    int dynamic_pin_failures{0};
     std::string record_mode_psk_id;  ///< psk_id of the shared-PSK fallback record.
 };
 
@@ -140,6 +143,16 @@ struct SendspinClientConfig {
     /// on_close_pairing_window callbacks on its SendspinClientListener. When false,
     /// static_pin is not advertised even if a static PIN is configured and enabled.
     bool pairing_window_supported{false};
+
+    /// @brief Where the operator can find the Pairing PSK (as a pairing token): any of
+    /// "device", "leaflet", "operator". Advertised as the informational `locations` hint on the
+    /// pairing_psk descriptor in client/hello; empty = omit the hint.
+    std::vector<std::string> pairing_psk_locations{};
+
+    /// @brief Where the operator can find the static PIN: any of "device", "leaflet",
+    /// "operator". Advertised as the informational `locations` hint on the static_pin
+    /// descriptor in client/hello; empty = omit the hint.
+    std::vector<std::string> static_pin_locations{};
 
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
 

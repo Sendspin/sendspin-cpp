@@ -223,36 +223,45 @@ inline void handle_remove_record(RecordStore& store, const ManagementRemoveRecor
 
 /// @brief Handle management/get-pairing-config.
 /// Returns the current pairing configuration. Secrets (raw PSK, raw static PIN) are never
-/// included.
+/// included. A PIN-method object is absent when the client does not implement that method on
+/// this device (no PIN display / no pairing-window gesture).
 ///
 /// @param store RecordStore to query.
+/// @param dynamic_pin_implemented True when the device can emit a dynamic PIN
+///        (SendspinClientConfig::pin_display_supported).
+/// @param static_pin_implemented True when the device supports the pairing-window gesture
+///        (SendspinClientConfig::pairing_window_supported).
 /// @param[out] result Populated with result=ok, data containing pairing_psk, static_pin,
 ///             dynamic_pin, record_mode, unpaired_access.
 /// @param[out] effect Always NONE.
-inline void handle_get_pairing_config(RecordStore& store, ManagementResultPayload& result,
+inline void handle_get_pairing_config(RecordStore& store, bool dynamic_pin_implemented,
+                                      bool static_pin_implemented, ManagementResultPayload& result,
                                       ManagementEffect& effect) {
     result.result = ManagementResult::OK;
     result.data = ManagementResultData{};
 
-    // pairing_psk: report enabled flag only (no secrets). Mirrors _method_config(is_pin=False).
+    // pairing_psk: report enabled flag only (no secrets).
     PairingMethodConfig pairing_psk_cfg;
     pairing_psk_cfg.enabled = store.pairing_psk_enabled();
     result.data->pairing_psk = pairing_psk_cfg;
 
-    // static_pin: enabled + locked_out, no min_pin_length (mirrors _method_config(is_pin=True)
-    // called without min_pin_length for PairMethod.STATIC_PIN).
-    PairingMethodConfig static_pin_cfg;
-    static_pin_cfg.enabled = store.static_pin_enabled();
-    static_pin_cfg.locked_out = store.is_pin_locked_out(SendspinPairMethod::STATIC_PIN);
-    result.data->static_pin = static_pin_cfg;
+    // static_pin: enabled only (no min_pin_length, no escalated -- the method has no failure
+    // counter; it is gesture-gated on every attempt).
+    if (static_pin_implemented) {
+        PairingMethodConfig static_pin_cfg;
+        static_pin_cfg.enabled = store.static_pin_enabled();
+        result.data->static_pin = static_pin_cfg;
+    }
 
-    // dynamic_pin: enabled + locked_out + min_pin_length (mirrors _method_config(is_pin=True,
-    // min_pin_length=config.dynamic_pin_min_length) for PairMethod.DYNAMIC_PIN).
-    PairingMethodConfig dynamic_pin_cfg;
-    dynamic_pin_cfg.enabled = store.dynamic_pin_enabled();
-    dynamic_pin_cfg.locked_out = store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN);
-    dynamic_pin_cfg.min_pin_length = store.dynamic_pin_min_length();
-    result.data->dynamic_pin = dynamic_pin_cfg;
+    // dynamic_pin: enabled + min_pin_length + escalated (true when the failure counter has
+    // reached the threshold and every attempt is gesture-gated until a reset de-escalates it).
+    if (dynamic_pin_implemented) {
+        PairingMethodConfig dynamic_pin_cfg;
+        dynamic_pin_cfg.enabled = store.dynamic_pin_enabled();
+        dynamic_pin_cfg.min_pin_length = store.dynamic_pin_min_length();
+        dynamic_pin_cfg.escalated = store.dynamic_pin_escalated();
+        result.data->dynamic_pin = dynamic_pin_cfg;
+    }
 
     // record_mode: psk_id of the shared-PSK fallback record.
     RecordModeConfig record_mode_cfg;
@@ -271,36 +280,48 @@ inline void handle_get_pairing_config(RecordStore& store, ManagementResultPayloa
 // Handler: management/set-pairing-config
 // ============================================================================
 
-/// @brief Return whether `cfg` sets locked_out to anything but false (only false clears lockout).
-/// Mirrors `_rejects_lockout` in aiosendspin/client/management.py.
-template <typename PinConfig>
-inline bool rejects_lockout(const std::optional<PinConfig>& cfg) {
-    return cfg.has_value() && cfg->locked_out.has_value() && cfg->locked_out.value();
-}
-
 /// @brief Handle management/set-pairing-config.
 /// Validates the entire patch before mutating anything, then applies atomically.
 ///
-/// Validation order (mirrors aiosendspin/client/management.py handle_set_pairing_config):
-///   1. pairing_psk.psk present -> decode + must be 32 bytes else INVALID.
-///   2. static_pin.pin present -> must be exactly 8 decimal digits else INVALID.
-///   3. static_pin.locked_out or dynamic_pin.locked_out present and not false -> INVALID (only
-///      false is accepted, to clear lockout).
+/// Validation order:
+///   1. static_pin or dynamic_pin fields present for a method this device does not implement
+///      -> INVALID (spec: "Fields set on a method the client does not implement are rejected as
+///      invalid").
+///   2. pairing_psk.psk present -> decode + must be 32 bytes else INVALID; its derived psk_id
+///      must not collide with a candidate PSK in a different category (the Sentinel PSK or a
+///      stored record) else ALREADY_EXISTS.
+///   3. static_pin.pin present -> must be exactly 8 decimal digits else INVALID.
 ///   4. dynamic_pin.min_pin_length present -> must be within [PIN_MIN_DIGITS, PIN_MAX_DIGITS]
 ///      else INVALID.
-///   5. record_mode present -> must name a shared-PSK (long-term, no server_id) else INVALID.
-///   6. Apply all changes (nothing below fails).
+///   5. Enabling static_pin with no static PIN configured and none supplied in the same request
+///      -> INVALID.
+///   6. record_mode present -> must name a shared-PSK (long-term, no server_id) else INVALID.
+///   7. Apply all changes (nothing below fails).
+///
+/// There is no locked_out-clearing field: the dynamic-PIN failure counter de-escalates only
+/// through the client's own successful server_kc verification.
 ///
 /// @param store RecordStore to mutate.
 /// @param payload Parsed set-pairing-config payload.
+/// @param dynamic_pin_implemented True when the device can emit a dynamic PIN.
+/// @param static_pin_implemented True when the device supports the pairing-window gesture.
 /// @param[out] result Populated with result code.
 /// @param[out] effect Always NONE.
 inline void handle_set_pairing_config(RecordStore& store,
                                       const ManagementSetPairingConfigPayload& payload,
+                                      bool dynamic_pin_implemented, bool static_pin_implemented,
                                       ManagementResultPayload& result, ManagementEffect& effect) {
     effect = ManagementEffect::NONE;
 
-    // 1. Validate pairing_psk.psk if present.
+    // 1. Reject fields set on a method this device does not implement.
+    if ((payload.static_pin.has_value() && !static_pin_implemented) ||
+        (payload.dynamic_pin.has_value() && !dynamic_pin_implemented)) {
+        SS_LOGW(MGMT_TAG, "set-pairing-config: fields set on an unimplemented PIN method");
+        result.result = ManagementResult::INVALID;
+        return;
+    }
+
+    // 2. Validate pairing_psk.psk if present.
     std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> new_psk;
     if (payload.pairing_psk.has_value() && payload.pairing_psk->psk.has_value()) {
         auto decoded_opt = b64url_decode(payload.pairing_psk->psk.value());
@@ -311,20 +332,27 @@ inline void handle_set_pairing_config(RecordStore& store,
         }
         std::array<uint8_t, NOISE_PSK_SIZE> arr;
         std::copy(decoded_opt->begin(), decoded_opt->end(), arr.begin());
+        // A psk_id collision with a candidate PSK in a different category (Sentinel or a stored
+        // record) would shadow that key at handshake time; reject as already_exists. A collision
+        // with the CURRENT Pairing PSK is a no-op rotation and passes.
+        auto psk_id_opt = psk_id_for(arr.data(), arr.size());
+        if (psk_id_opt.has_value()) {
+            auto resolved = store.resolve_by_psk_id(psk_id_opt.value());
+            if (resolved.has_value() && resolved->category != PskCategory::PAIRING) {
+                SS_LOGW(MGMT_TAG,
+                        "set-pairing-config: pairing_psk.psk collides with a %s-category PSK",
+                        resolved->category == PskCategory::LONG_TERM ? "long-term" : "sentinel");
+                result.result = ManagementResult::ALREADY_EXISTS;
+                return;
+            }
+        }
         new_psk = arr;
     }
 
-    // 2. Validate static_pin.pin if present: exactly 8 decimal digits.
+    // 3. Validate static_pin.pin if present: exactly 8 decimal digits.
     if (payload.static_pin.has_value() && payload.static_pin->pin.has_value() &&
         !is_valid_static_pin(payload.static_pin->pin.value())) {
         SS_LOGW(MGMT_TAG, "set-pairing-config: invalid static_pin.pin");
-        result.result = ManagementResult::INVALID;
-        return;
-    }
-
-    // 3. locked_out: only false is accepted (clears lockout); true or any other value -> INVALID.
-    if (rejects_lockout(payload.static_pin) || rejects_lockout(payload.dynamic_pin)) {
-        SS_LOGW(MGMT_TAG, "set-pairing-config: locked_out must be false to clear lockout");
         result.result = ManagementResult::INVALID;
         return;
     }
@@ -338,7 +366,16 @@ inline void handle_set_pairing_config(RecordStore& store,
         return;
     }
 
-    // 5. Validate record_mode if present.
+    // 5. Enabling static_pin requires a configured PIN or one supplied in the same request.
+    if (payload.static_pin.has_value() && payload.static_pin->enabled.has_value() &&
+        payload.static_pin->enabled.value() && !store.static_pin().has_value() &&
+        !payload.static_pin->pin.has_value()) {
+        SS_LOGW(MGMT_TAG, "set-pairing-config: enabling static_pin with no PIN configured");
+        result.result = ManagementResult::INVALID;
+        return;
+    }
+
+    // 6. Validate record_mode if present.
     if (payload.record_mode.has_value()) {
         const std::string& candidate_psk_id = payload.record_mode->psk_id;
         auto resolved = store.resolve_by_psk_id(candidate_psk_id);
@@ -351,7 +388,7 @@ inline void handle_set_pairing_config(RecordStore& store,
         }
     }
 
-    // 6. Apply (all inputs validated; nothing below fails).
+    // 7. Apply (all inputs validated; nothing below fails).
     if (payload.record_mode.has_value()) {
         store.set_record_mode_psk_id(payload.record_mode->psk_id);
     }
@@ -385,15 +422,6 @@ inline void handle_set_pairing_config(RecordStore& store,
 
     if (payload.static_pin.has_value() && payload.static_pin->pin.has_value()) {
         store.set_static_pin(payload.static_pin->pin.value());
-    }
-
-    if (payload.static_pin.has_value() && payload.static_pin->locked_out.has_value() &&
-        !payload.static_pin->locked_out.value()) {
-        store.reset_pin_failures(SendspinPairMethod::STATIC_PIN);
-    }
-    if (payload.dynamic_pin.has_value() && payload.dynamic_pin->locked_out.has_value() &&
-        !payload.dynamic_pin->locked_out.value()) {
-        store.reset_pin_failures(SendspinPairMethod::DYNAMIC_PIN);
     }
 
     result.result = ManagementResult::OK;

@@ -55,10 +55,11 @@ static std::string b64url(const std::array<uint8_t, N>& a) {
     return b64url_encode(a.data(), a.size());
 }
 
-/// Build the wire JSON for server/pair-init from raw values.
-static std::string make_pair_init_json(const std::string& nonce_a_b64, int pin_length) {
+/// Build the wire JSON for server/pair-init from raw values. Per the current spec the payload
+/// carries ONLY nonce_A (pin_length arrives in the activation's pairing object).
+static std::string make_pair_init_json(const std::string& nonce_a_b64) {
     return std::string(R"({"type":"server/pair-init","payload":{"nonce_A":")") + nonce_a_b64 +
-           R"(","pin_length":)" + std::to_string(pin_length) + "}}";
+           R"("}})";
 }
 
 /// Build the wire JSON for server/pair-auth from raw values.
@@ -83,7 +84,7 @@ TEST(DynamicPin, ParseServerPairInitValid) {
     std::array<uint8_t, 32> nonce_a{};
     for (int i = 0; i < 32; ++i) nonce_a[i] = static_cast<uint8_t>(i);
 
-    const std::string json = make_pair_init_json(b64url(nonce_a), 6);
+    const std::string json = make_pair_init_json(b64url(nonce_a));
 
     JsonDocument doc;
     JsonObject root;
@@ -93,11 +94,10 @@ TEST(DynamicPin, ParseServerPairInitValid) {
     ASSERT_TRUE(process_server_pair_init_message(root, &payload));
 
     EXPECT_EQ(payload.nonce_a, nonce_a);
-    EXPECT_EQ(payload.pin_length, 6);
 }
 
 TEST(DynamicPin, ParseServerPairInitMissingNonce) {
-    const std::string json = R"({"type":"server/pair-init","payload":{"pin_length":6}})";
+    const std::string json = R"({"type":"server/pair-init","payload":{}})";
 
     JsonDocument doc;
     JsonObject root;
@@ -107,25 +107,27 @@ TEST(DynamicPin, ParseServerPairInitMissingNonce) {
     EXPECT_FALSE(process_server_pair_init_message(root, &payload));
 }
 
-TEST(DynamicPin, ParseServerPairInitMissingPinLength) {
+// A pre-resync server that still sends pin_length alongside nonce_A parses fine: the extra
+// field is simply ignored (the session pin_length came from the activation).
+TEST(DynamicPin, ParseServerPairInitExtraPinLengthIgnored) {
     std::array<uint8_t, 32> nonce_a{};
     const std::string json =
         std::string(R"({"type":"server/pair-init","payload":{"nonce_A":")") + b64url(nonce_a) +
-        R"("}})";
+        R"(","pin_length":6}})";
 
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(json, doc, root));
 
     ServerPairInitPayload payload;
-    EXPECT_FALSE(process_server_pair_init_message(root, &payload));
+    EXPECT_TRUE(process_server_pair_init_message(root, &payload));
 }
 
 TEST(DynamicPin, ParseServerPairInitWrongNonceLength) {
     // Encode only 16 bytes (wrong size).
     std::array<uint8_t, 16> short_nonce{};
     const std::string nonce_b64 = b64url_encode(short_nonce.data(), short_nonce.size());
-    const std::string json = make_pair_init_json(nonce_b64, 6);
+    const std::string json = make_pair_init_json(nonce_b64);
 
     JsonDocument doc;
     JsonObject root;
@@ -137,7 +139,7 @@ TEST(DynamicPin, ParseServerPairInitWrongNonceLength) {
 
 TEST(DynamicPin, ParseServerPairInitInvalidBase64) {
     const std::string json =
-        R"({"type":"server/pair-init","payload":{"nonce_A":"!!!not_base64!!!","pin_length":6}})";
+        R"({"type":"server/pair-init","payload":{"nonce_A":"!!!not_base64!!!"}})";
 
     JsonDocument doc;
     JsonObject root;
@@ -363,104 +365,117 @@ TEST(DynamicPin, FormatClientPairConfirmWireShape) {
 }
 
 // ============================================================================
-// PIN lockout (RecordStore)
+// Dynamic-PIN failure counter (escalation, RecordStore)
 // ============================================================================
 
-TEST(DynamicPinLockout, NotLockedOutInitially) {
+// Escalation replaces the old lockout model (spec: Failure counter): a single dynamic_pin
+// counter, persisted across reboots, that gesture-gates the method at the threshold. The
+// method STAYS OFFERED while escalated; there is no refusal state and static_pin has no
+// counter at all (it is gesture-gated on every attempt).
+
+TEST(DynamicPinEscalation, NotEscalatedInitially) {
     RecordStore store(nullptr);
-    EXPECT_FALSE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
+    EXPECT_FALSE(store.dynamic_pin_escalated());
+    EXPECT_EQ(store.dynamic_pin_failure_count(), 0);
 }
 
-TEST(DynamicPinLockout, LocksOutAfterThresholdFailures) {
+TEST(DynamicPinEscalation, EscalatesAtThresholdFailures) {
     RecordStore store(nullptr);
-    // One fewer than the threshold must NOT lock out.
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD - 1; ++i) {
-        store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
-        EXPECT_FALSE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN))
-            << "should not be locked out after " << (i + 1) << " failure(s)";
+    // One fewer than the threshold must NOT escalate.
+    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD - 1; ++i) {
+        store.record_dynamic_pin_failure();
+        EXPECT_FALSE(store.dynamic_pin_escalated())
+            << "should not be escalated after " << (i + 1) << " failure(s)";
     }
-    // The threshold-th failure locks out.
-    store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
-    EXPECT_TRUE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
+    // The threshold-th failure escalates.
+    store.record_dynamic_pin_failure();
+    EXPECT_TRUE(store.dynamic_pin_escalated());
 }
 
-TEST(DynamicPinLockout, StaysLockedAfterMoreFailures) {
+TEST(DynamicPinEscalation, StaysEscalatedAfterMoreFailures) {
     RecordStore store(nullptr);
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD + 5; ++i) {
-        store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
+    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD + 5; ++i) {
+        store.record_dynamic_pin_failure();
     }
-    EXPECT_TRUE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
+    EXPECT_TRUE(store.dynamic_pin_escalated());
 }
 
-TEST(DynamicPinLockout, ClearFailuresUnlocks) {
+TEST(DynamicPinEscalation, ResetDeEscalates) {
     RecordStore store(nullptr);
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD; ++i) {
-        store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
+    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
+        store.record_dynamic_pin_failure();
     }
-    ASSERT_TRUE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
+    ASSERT_TRUE(store.dynamic_pin_escalated());
 
-    store.reset_pin_failures(SendspinPairMethod::DYNAMIC_PIN);
-    EXPECT_FALSE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
+    store.reset_dynamic_pin_failures();
+    EXPECT_FALSE(store.dynamic_pin_escalated());
+    EXPECT_EQ(store.dynamic_pin_failure_count(), 0);
 }
 
-TEST(DynamicPinLockout, CanFailAgainAfterClear) {
+TEST(DynamicPinEscalation, CanFailAgainAfterReset) {
     RecordStore store(nullptr);
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD; ++i) {
-        store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
+    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
+        store.record_dynamic_pin_failure();
     }
-    store.reset_pin_failures(SendspinPairMethod::DYNAMIC_PIN);
+    store.reset_dynamic_pin_failures();
 
     // Should be able to accumulate failures again.
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD - 1; ++i) {
-        store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
+    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD - 1; ++i) {
+        store.record_dynamic_pin_failure();
     }
-    EXPECT_FALSE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
+    EXPECT_FALSE(store.dynamic_pin_escalated());
 
-    store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
-    EXPECT_TRUE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
+    store.record_dynamic_pin_failure();
+    EXPECT_TRUE(store.dynamic_pin_escalated());
 }
 
-// ============================================================================
-// PIN lockout: per-method independence (Phase 8c)
-// ============================================================================
+// The counter must survive a reboot (spec: "persisted across reboots"): failures recorded in
+// one RecordStore lifetime escalate a store constructed later from the same provider.
+TEST(DynamicPinEscalation, EscalationSurvivesReboot) {
+    /// Minimal provider persisting only the pairing config, as save_pairing_config does.
+    class ConfigOnlyProvider : public SendspinPersistenceProvider {
+    public:
+        std::optional<SendspinPairingConfig> load_pairing_config() override {
+            return this->config_;
+        }
+        bool save_pairing_config(const SendspinPairingConfig& config) override {
+            this->config_ = config;
+            return true;
+        }
 
-TEST(PinLockoutPerMethod, FailureCountsAreIndependentPerMethod) {
-    RecordStore store(nullptr);
-    EXPECT_EQ(store.pin_failure_count(SendspinPairMethod::DYNAMIC_PIN), 0);
-    EXPECT_EQ(store.pin_failure_count(SendspinPairMethod::STATIC_PIN), 0);
+    private:
+        std::optional<SendspinPairingConfig> config_;
+    };
 
-    store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
-    store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
-    store.record_pin_failure(SendspinPairMethod::STATIC_PIN);
+    ConfigOnlyProvider provider;
 
-    EXPECT_EQ(store.pin_failure_count(SendspinPairMethod::DYNAMIC_PIN), 2);
-    EXPECT_EQ(store.pin_failure_count(SendspinPairMethod::STATIC_PIN), 1);
-}
-
-TEST(PinLockoutPerMethod, LockoutIsIndependentPerMethod) {
-    RecordStore store(nullptr);
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD; ++i) {
-        store.record_pin_failure(SendspinPairMethod::STATIC_PIN);
+    // First boot: escalate.
+    {
+        RecordStore store(&provider);
+        for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
+            store.record_dynamic_pin_failure();
+        }
+        ASSERT_TRUE(store.dynamic_pin_escalated());
     }
-    EXPECT_TRUE(store.is_pin_locked_out(SendspinPairMethod::STATIC_PIN));
-    EXPECT_FALSE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
-}
 
-TEST(PinLockoutPerMethod, ResetOnlyClearsTheGivenMethod) {
-    RecordStore store(nullptr);
-    for (int i = 0; i < RecordStore::PIN_LOCKOUT_THRESHOLD; ++i) {
-        store.record_pin_failure(SendspinPairMethod::STATIC_PIN);
-        store.record_pin_failure(SendspinPairMethod::DYNAMIC_PIN);
+    // Second boot: still escalated.
+    {
+        RecordStore store(&provider);
+        EXPECT_TRUE(store.dynamic_pin_escalated())
+            << "the failure counter must persist across reboots";
+        EXPECT_EQ(store.dynamic_pin_failure_count(),
+                  RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD);
+
+        // A reset (successful server_kc verification) persists too.
+        store.reset_dynamic_pin_failures();
     }
-    ASSERT_TRUE(store.is_pin_locked_out(SendspinPairMethod::STATIC_PIN));
-    ASSERT_TRUE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
 
-    store.reset_pin_failures(SendspinPairMethod::STATIC_PIN);
-    EXPECT_FALSE(store.is_pin_locked_out(SendspinPairMethod::STATIC_PIN));
-    EXPECT_TRUE(store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN));
-    EXPECT_EQ(store.pin_failure_count(SendspinPairMethod::STATIC_PIN), 0);
-    EXPECT_EQ(store.pin_failure_count(SendspinPairMethod::DYNAMIC_PIN),
-              RecordStore::PIN_LOCKOUT_THRESHOLD);
+    // Third boot: de-escalated.
+    {
+        RecordStore store(&provider);
+        EXPECT_FALSE(store.dynamic_pin_escalated());
+        EXPECT_EQ(store.dynamic_pin_failure_count(), 0);
+    }
 }
 
 // ============================================================================
@@ -625,49 +640,10 @@ TEST(DynamicPin, ClientHelloDynamicPinDescriptorOutChannels) {
     // min_pin_length
     EXPECT_EQ(methods[0]["min_pin_length"].as<int>(), 6);
 
-    // locked_out must be absent when not set.
-    EXPECT_TRUE(methods[0]["locked_out"].isNull());
-}
-
-TEST(DynamicPin, ClientHelloDynamicPinLockedOutField) {
-    ClientHelloMessage msg;
-    msg.name = "TestDevice";
-    PairMethodDescriptor dyn_pin;
-    dyn_pin.method = SendspinPairMethod::DYNAMIC_PIN;
-    dyn_pin.out_channels = std::vector<std::string>{"display"};
-    dyn_pin.locked_out = true;
-    dyn_pin.min_pin_length = 6;
-    msg.supported_pair_methods.push_back(std::move(dyn_pin));
-
-    const std::string out = format_client_hello_message(&msg);
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, out));
-
-    JsonArrayConst methods = doc["payload"]["supported_pair_methods"].as<JsonArrayConst>();
-    ASSERT_EQ(methods.size(), 1u);
-    EXPECT_TRUE(methods[0]["locked_out"].as<bool>());
-}
-
-// A descriptor with locked_out explicitly false emits "locked_out": false on the wire
-// (not omitted), matching the reference where a PIN method always carries the field.
-TEST(DynamicPin, ClientHelloDynamicPinLockedOutFalseField) {
-    ClientHelloMessage msg;
-    msg.name = "TestDevice";
-    PairMethodDescriptor dyn_pin;
-    dyn_pin.method = SendspinPairMethod::DYNAMIC_PIN;
-    dyn_pin.out_channels = std::vector<std::string>{"display"};
-    dyn_pin.locked_out = false;
-    dyn_pin.min_pin_length = 6;
-    msg.supported_pair_methods.push_back(std::move(dyn_pin));
-
-    const std::string out = format_client_hello_message(&msg);
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, out));
-
-    JsonArrayConst methods = doc["payload"]["supported_pair_methods"].as<JsonArrayConst>();
-    ASSERT_EQ(methods.size(), 1u);
-    ASSERT_FALSE(methods[0]["locked_out"].isNull()) << "locked_out must be present when set";
-    EXPECT_FALSE(methods[0]["locked_out"].as<bool>());
+    // locked_out is gone from the wire (escalation replaced lockout); it must never be
+    // emitted. locations is a static_pin/pairing_psk hint, absent for dynamic_pin.
+    EXPECT_TRUE(methods[0]["locked_out"].isUnbound());
+    EXPECT_TRUE(methods[0]["locations"].isUnbound());
 }
 
 // ============================================================================
@@ -733,14 +709,13 @@ TEST(StaticPin, FormatClientPairConfirmNoNonceWireShape) {
 // Phase 8c: client/hello static_pin method descriptor fields
 // ============================================================================
 
-// Reference _pair_method_descriptor: static_pin carries neither out_channels nor
-// min_pin_length (those are set only for DYNAMIC_PIN); only method + locked_out.
+// static_pin carries neither out_channels nor min_pin_length (those are set only for
+// DYNAMIC_PIN); its only optional hint is locations. locked_out is gone from the wire.
 TEST(StaticPin, ClientHelloStaticPinDescriptorShape) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
     PairMethodDescriptor static_pin_desc;
     static_pin_desc.method = SendspinPairMethod::STATIC_PIN;
-    static_pin_desc.locked_out = false;
     msg.supported_pair_methods.push_back(std::move(static_pin_desc));
 
     const std::string out = format_client_hello_message(&msg);
@@ -751,21 +726,22 @@ TEST(StaticPin, ClientHelloStaticPinDescriptorShape) {
     ASSERT_EQ(methods.size(), 1u);
     EXPECT_STREQ(methods[0]["method"], "static_pin");
 
-    // locked_out must be present (set to false).
-    ASSERT_FALSE(methods[0]["locked_out"].isNull()) << "locked_out must be present when set";
-    EXPECT_FALSE(methods[0]["locked_out"].as<bool>());
-
-    // out_channels and min_pin_length must be absent for static_pin.
+    // locked_out is never emitted; out_channels and min_pin_length are absent for static_pin,
+    // and so is locations when the descriptor sets none.
+    EXPECT_TRUE(methods[0]["locked_out"].isUnbound());
     EXPECT_TRUE(methods[0]["out_channels"].isUnbound());
     EXPECT_TRUE(methods[0]["min_pin_length"].isUnbound());
+    EXPECT_TRUE(methods[0]["locations"].isUnbound());
 }
 
-TEST(StaticPin, ClientHelloStaticPinLockedOutTrue) {
+// The locations hint ('device' | 'leaflet' | 'operator') serializes for static_pin (and
+// pairing_psk) descriptors that set it.
+TEST(StaticPin, ClientHelloStaticPinLocationsHint) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
     PairMethodDescriptor static_pin_desc;
     static_pin_desc.method = SendspinPairMethod::STATIC_PIN;
-    static_pin_desc.locked_out = true;
+    static_pin_desc.locations = std::vector<std::string>{"device", "leaflet"};
     msg.supported_pair_methods.push_back(std::move(static_pin_desc));
 
     const std::string out = format_client_hello_message(&msg);
@@ -774,7 +750,10 @@ TEST(StaticPin, ClientHelloStaticPinLockedOutTrue) {
 
     JsonArrayConst methods = doc["payload"]["supported_pair_methods"].as<JsonArrayConst>();
     ASSERT_EQ(methods.size(), 1u);
-    EXPECT_TRUE(methods[0]["locked_out"].as<bool>());
+    JsonArrayConst locations = methods[0]["locations"].as<JsonArrayConst>();
+    ASSERT_EQ(locations.size(), 2u);
+    EXPECT_STREQ(locations[0], "device");
+    EXPECT_STREQ(locations[1], "leaflet");
 }
 
 // ============================================================================

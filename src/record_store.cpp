@@ -43,6 +43,16 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider) : provider_(prov
         auto pairing_psk = provider_->load_pairing_psk();
         if (pairing_psk.has_value()) {
             pairing_psk_ = std::move(pairing_psk);
+            // psk_id is a pure function of the PSK, and the server derives it the same way to
+            // reference the key in its handshake. A stored id that disagrees with the secret
+            // (hand-provisioned by an application, or corrupted) would never resolve, so correct
+            // it here rather than advertising a method that cannot complete.
+            std::string derived = psk_id_for(pairing_psk_->psk);
+            if (pairing_psk_->psk_id != derived) {
+                SS_LOGW(TAG, "Stored Pairing PSK id %s does not match the PSK; using %s",
+                        pairing_psk_->psk_id.c_str(), derived.c_str());
+                pairing_psk_->psk_id = std::move(derived);
+            }
         }
 
         auto static_pin = provider_->load_static_pin();
@@ -57,6 +67,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider) : provider_(prov
             dynamic_pin_enabled_ = config->dynamic_pin_enabled;
             static_pin_enabled_ = config->static_pin_enabled;
             dynamic_pin_min_length_ = config->dynamic_pin_min_length;
+            dynamic_pin_failures_ = config->dynamic_pin_failures;
             record_mode_psk_id_ = config->record_mode_psk_id;
             loaded_config = true;
             SS_LOGD(TAG, "Loaded pairing config: record_mode_psk_id=%s",
@@ -89,6 +100,26 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider) : provider_(prov
         }
 
         SS_LOGI(TAG, "Provisioned shared-PSK fallback record: %s", shared_psk_id.c_str());
+    }
+
+    // Pairing PSK provisioning: pairing_psk is the one pairing method every client must
+    // implement (spec #113/#122), so a client with no Pairing PSK would advertise a method it
+    // cannot complete. Generate one when absent and persist it; the operator transfers it to a
+    // server as a pairing token (SendspinClient::pairing_token()). The key is stable across
+    // reboots once persisted, so a token printed at any time stays valid.
+    if (!pairing_psk_.has_value()) {
+        std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+        platform_random_bytes(psk.data(), psk.size());
+
+        SendspinPairingPsk provisioned;
+        provisioned.psk_id = psk_id_for(psk);
+        provisioned.psk = psk;
+
+        if (provider_ != nullptr) {
+            provider_->save_pairing_psk(provisioned);
+        }
+        SS_LOGI(TAG, "Provisioned Sendspin Pairing PSK: %s", provisioned.psk_id.c_str());
+        pairing_psk_ = std::move(provisioned);
     }
 }
 
@@ -218,6 +249,9 @@ bool RecordStore::can_remove_record(const std::string& psk_id) const {
 
 void RecordStore::set_pairing_psk(SendspinPairingPsk psk) {
     std::lock_guard<std::mutex> lock(this->mutex_);
+    // Derive psk_id from the secret rather than trusting the caller's: it is the id the server
+    // will reference in its handshake, so a supplied mismatch would make the key unresolvable.
+    psk.psk_id = psk_id_for(psk.psk);
     pairing_psk_ = std::move(psk);
     if (provider_ != nullptr) {
         provider_->save_pairing_psk(pairing_psk_.value());
@@ -276,17 +310,22 @@ void RecordStore::set_dynamic_pin_min_length(int length) {
 }
 
 // ============================================================================
-// PIN lockout (Phase 8b/8c)
+// Dynamic-PIN failure counter (escalation)
 // ============================================================================
 
-void RecordStore::record_pin_failure(SendspinPairMethod method) {
-    pin_failures_[method]++;
-    SS_LOGW(TAG, "PIN failure recorded for %s (count=%d, threshold=%d)", to_cstr(method),
-            pin_failures_[method], PIN_LOCKOUT_THRESHOLD);
+void RecordStore::record_dynamic_pin_failure() {
+    dynamic_pin_failures_++;
+    SS_LOGW(TAG, "Dynamic-PIN failure recorded (count=%d, escalation threshold=%d)",
+            dynamic_pin_failures_, DYNAMIC_PIN_ESCALATION_THRESHOLD);
+    persist_config();
 }
 
-void RecordStore::reset_pin_failures(SendspinPairMethod method) {
-    pin_failures_.erase(method);
+void RecordStore::reset_dynamic_pin_failures() {
+    if (dynamic_pin_failures_ == 0) {
+        return;  // Nothing to reset; skip the persistence write.
+    }
+    dynamic_pin_failures_ = 0;
+    persist_config();
 }
 
 // ============================================================================
@@ -363,6 +402,7 @@ void RecordStore::persist_config() {
     config.dynamic_pin_enabled = dynamic_pin_enabled_;
     config.static_pin_enabled = static_pin_enabled_;
     config.dynamic_pin_min_length = dynamic_pin_min_length_;
+    config.dynamic_pin_failures = dynamic_pin_failures_;
     config.record_mode_psk_id = record_mode_psk_id_;
     provider_->save_pairing_config(config);
 }

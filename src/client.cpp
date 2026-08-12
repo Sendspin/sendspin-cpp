@@ -565,6 +565,15 @@ std::optional<std::string> SendspinClient::format_pairing_token(
     return sendspin::format_pairing_token(this->identity_->public_bytes, pairing_psk);
 }
 
+std::optional<std::string> SendspinClient::pairing_token() const {
+    // Main-loop-only, like the other record-store config reads: the Pairing PSK is mutated only
+    // from the main loop (first-boot provisioning and set-pairing-config management).
+    if (this->record_store_ == nullptr || !this->record_store_->pairing_psk().has_value()) {
+        return std::nullopt;
+    }
+    return this->format_pairing_token(this->record_store_->pairing_psk()->psk);
+}
+
 bool SendspinClient::is_connected() const {
     return this->connection_manager_->is_connected();
 }
@@ -733,34 +742,40 @@ std::string SendspinClient::build_hello_message(const SendspinConnection* conn) 
     msg.trust_level =
         (conn != nullptr && conn->get_psk_category() == PskCategory::LONG_TERM) ? "user" : "none";
 
-    // Advertise supported pair methods from the record store.
-    if (this->record_store_ && this->record_store_->pairing_psk_enabled()) {
+    // Advertise supported pair methods from the record store. pairing_psk needs an actual
+    // Pairing PSK behind it (normally auto-provisioned on first boot): advertising the method
+    // without one offers a server a flow whose handshake could only miss.
+    if (this->record_store_ && this->record_store_->pairing_psk_enabled() &&
+        this->record_store_->pairing_psk().has_value()) {
         PairMethodDescriptor psk_desc;
         psk_desc.method = SendspinPairMethod::PAIRING_PSK;
+        if (!this->config_.pairing_psk_locations.empty()) {
+            psk_desc.locations = this->config_.pairing_psk_locations;
+        }
         msg.supported_pair_methods.push_back(std::move(psk_desc));
     }
-    // Advertise dynamic_pin when enabled and the platform can display a PIN.
+    // Advertise dynamic_pin when enabled and the platform can display a PIN. An escalated
+    // failure counter does NOT drop the method from the hello: escalation only gesture-gates
+    // attempts (spec: Failure counter), it is not an error state.
     if (this->config_.pin_display_supported && this->record_store_ &&
         this->record_store_->dynamic_pin_enabled()) {
         PairMethodDescriptor dyn_pin;
         dyn_pin.method = SendspinPairMethod::DYNAMIC_PIN;
         dyn_pin.out_channels = std::vector<std::string>{"display"};
-        // Always advertise locked_out (true or false) for a PIN method, matching the reference.
-        dyn_pin.locked_out =
-            this->record_store_->is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN);
         dyn_pin.min_pin_length = this->record_store_->dynamic_pin_min_length();
         msg.supported_pair_methods.push_back(std::move(dyn_pin));
     }
     // Advertise static_pin when enabled, the platform supports the pairing-window gesture, and a
-    // static PIN is configured. Reference _pair_method_descriptor: out_channels and
-    // min_pin_length are set only for DYNAMIC_PIN, so static_pin carries neither.
+    // static PIN is configured. out_channels and min_pin_length are set only for DYNAMIC_PIN, so
+    // static_pin carries neither; locations is its only optional hint.
     if (this->config_.pairing_window_supported && this->record_store_ &&
         this->record_store_->static_pin_enabled() &&
         this->record_store_->static_pin().has_value()) {
         PairMethodDescriptor static_pin_desc;
         static_pin_desc.method = SendspinPairMethod::STATIC_PIN;
-        static_pin_desc.locked_out =
-            this->record_store_->is_pin_locked_out(SendspinPairMethod::STATIC_PIN);
+        if (!this->config_.static_pin_locations.empty()) {
+            static_pin_desc.locations = this->config_.static_pin_locations;
+        }
         msg.supported_pair_methods.push_back(std::move(static_pin_desc));
     }
 
@@ -981,7 +996,8 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                             activate_msg.activities.size());
                     this->connection_manager_->schedule_activate(
                         {conn->shared_from_this(), std::move(activate_msg.activities),
-                         std::move(activate_msg.active_roles), activate_msg.selected_pair_method});
+                         std::move(activate_msg.active_roles), activate_msg.pairing_method,
+                         activate_msg.pairing_pin_length});
                 }
             }
             break;
@@ -1246,9 +1262,20 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             }
             break;
         }
+        case SendspinServerToClientMessageType::MANAGEMENT_OPEN_PAIRING_WINDOW: {
+            // No payload fields; opens a pairing window in place of the operator gesture.
+            if (conn != nullptr) {
+                ManagementRequestEvent event;
+                event.conn = conn->shared_from_this();
+                event.kind = ManagementRequestKind::OPEN_PAIRING_WINDOW;
+                this->connection_manager_->schedule_management_request(std::move(event));
+            }
+            break;
+        }
         case SendspinServerToClientMessageType::SERVER_PAIR_INIT: {
-            // server/pair-init: nonce_A + pin_length from the server (Phase 8b).
-            // Parse on the network thread; PIN state machine runs on the main loop.
+            // server/pair-init: nonce_A from the server (the session pin_length arrived in the
+            // activation's pairing object). Parse on the network thread; PIN state machine runs
+            // on the main loop.
             if (conn != nullptr) {
                 ServerPairInitPayload payload;
                 if (process_server_pair_init_message(root, &payload)) {
@@ -1256,7 +1283,6 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                     event.conn = conn->shared_from_this();
                     event.kind = PinPairingMessageKind::PAIR_INIT;
                     event.nonce_a = payload.nonce_a;
-                    event.pin_length = payload.pin_length;
                     this->connection_manager_->schedule_pin_pairing_message(std::move(event));
                 } else {
                     SS_LOGW(TAG, "Malformed server/pair-init; aborting any active PIN pairing");

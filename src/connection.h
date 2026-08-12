@@ -381,10 +381,16 @@ public:
         return this->psk_id_;
     }
 
-    /// @brief Returns the pairing method the server selected (from the last server/activate
-    /// that carried one). Used by the pairing flow.
-    const std::optional<SendspinPairMethod>& get_selected_pair_method() const {
-        return this->selected_pair_method_;
+    /// @brief Returns the pairing method the server selected (from the pairing object of the
+    /// last pairing server/activate). Used by the pairing flow.
+    const std::optional<SendspinPairMethod>& get_pairing_method() const {
+        return this->pairing_method_;
+    }
+
+    /// @brief Returns the session PIN length from the pairing object of the last pairing
+    /// server/activate (present only for dynamic_pin, validated on receipt).
+    const std::optional<int>& get_pairing_pin_length() const {
+        return this->pairing_pin_length_;
     }
 
     /// @brief Returns the count of pairing server/activate messages received since the last
@@ -411,16 +417,17 @@ public:
     // ========================================
 
     /// @brief Steps in the PIN PAKE state machine (main-loop-only).
-    /// Shared by both dynamic-PIN and static-PIN pairing; AWAIT_PAIRING_WINDOW and
-    /// AWAIT_SERVER_PAIR_INIT are exclusive to their respective methods (see PinSession::method),
-    /// the remaining steps (AWAIT_SERVER_PAIR_AUTH onward) are common to both.
+    /// Shared by both dynamic-PIN and static-PIN pairing; AWAIT_SERVER_PAIR_INIT is exclusive
+    /// to dynamic PIN (see PinSession::method), the remaining steps (AWAIT_SERVER_PAIR_AUTH
+    /// onward) are common to both.
     enum class PinStep : uint8_t {
-        IDLE,                    ///< No PIN session active.
-        AWAIT_PAIRING_WINDOW,    ///< static PIN only: awaiting the operator pairing-window gesture
-                                 ///< before sending client/pair-init.
-        AWAIT_SERVER_PAIR_INIT,  ///< dynamic PIN only: sent client/pair-init (commit_B);
-                                 ///< waiting for server/pair-init.
-        AWAIT_SERVER_PAIR_AUTH,  ///< CPace RESPONDER started; waiting for server/pair-auth.
+        IDLE,                        ///< No PIN session active.
+        AWAIT_PAIRING_WINDOW,        ///< Gesture-gated attempt (static PIN always; dynamic PIN when
+                                     ///< escalated or pin_length < 6): client/pair-pending was sent
+                                     ///< and client/pair-init waits for a pairing window to open.
+        AWAIT_SERVER_PAIR_INIT,      ///< dynamic PIN only: sent client/pair-init (commit_B);
+                                     ///< waiting for server/pair-init.
+        AWAIT_SERVER_PAIR_AUTH,      ///< CPace RESPONDER started; waiting for server/pair-auth.
         AWAIT_SERVER_PAIR_CONFIRM,   ///< Sent client/pair-auth and derived; waiting for
                                      ///< server/pair-confirm.
         AWAIT_SERVER_PAIR_FINALIZE,  ///< Sent client/pair-finalize; waiting for
@@ -428,8 +435,8 @@ public:
     };
 
     /// @brief All PIN-pairing session state (main-loop-only; never touched by network thread).
-    /// Shared by both dynamic-PIN and static-PIN pairing; `method` selects which lockout counter
-    /// and pair-confirm wire shape applies.
+    /// Shared by both dynamic-PIN and static-PIN pairing; `method` selects the gating policy
+    /// and pair-confirm wire shape (only dynamic PIN has a failure counter).
     struct PinSession {
         CPace cpace;
         std::array<uint8_t, 32> nonce_b{};
@@ -559,13 +566,16 @@ public:
     /// no synchronization of their own.
     /// @param activities Activity list from the message.
     /// @param active_roles Optional roles list (nullopt = keep prior set).
-    /// @param selected_pair_method Server-selected pairing method (nullopt outside pairing).
-    ///                             Ignored (stored as nullopt) unless `activities` includes
-    ///                             PAIRING (spec #113/#122: "A client ignores this field when
-    ///                             activities does not include 'pairing'").
+    /// @param pairing_method Method from the activation's pairing object (nullopt when absent).
+    ///                       Ignored (stored as nullopt) unless `activities` includes PAIRING
+    ///                       (spec: "A client ignores this field when activities does not
+    ///                       include 'pairing'").
+    /// @param pairing_pin_length Session PIN length from the pairing object (dynamic_pin only);
+    ///                           stored under the same PAIRING-activity condition.
     void apply_server_activate(const std::vector<SendspinActivity>& activities,
                                const std::optional<std::vector<std::string>>& active_roles,
-                               const std::optional<SendspinPairMethod>& selected_pair_method) {
+                               const std::optional<SendspinPairMethod>& pairing_method,
+                               const std::optional<int>& pairing_pin_length) {
         this->activities_ = activities;
         if (active_roles.has_value()) {
             this->active_roles_ = active_roles.value();
@@ -577,7 +587,8 @@ public:
                 break;
             }
         }
-        this->selected_pair_method_ = has_pairing ? selected_pair_method : std::nullopt;
+        this->pairing_method_ = has_pairing ? pairing_method : std::nullopt;
+        this->pairing_pin_length_ = has_pairing ? pairing_pin_length : std::nullopt;
         this->first_activate_received_.store(true, std::memory_order_release);
     }
 
@@ -885,10 +896,14 @@ protected:
     /// the field). Empty until the first activate that includes active_roles.
     std::vector<std::string> active_roles_{};
 
-    /// Pairing method the server selected (from the last server/activate carrying one);
-    /// nullopt outside a pairing activation. Read by the Phase 5 pairing flow. Written and
-    /// read on the main loop (apply_server_activate runs in ConnectionManager::loop()).
-    std::optional<SendspinPairMethod> selected_pair_method_{};
+    /// Pairing method from the pairing object of the last pairing server/activate; nullopt
+    /// outside a pairing activation. Read by the Phase 5 pairing flow. Written and read on
+    /// the main loop (apply_server_activate runs in ConnectionManager::loop()).
+    std::optional<SendspinPairMethod> pairing_method_{};
+
+    /// Session PIN length from the same pairing object (dynamic_pin only); nullopt outside a
+    /// pairing activation. Same main-loop-only contract as pairing_method_.
+    std::optional<int> pairing_pin_length_{};
 
     // ========================================
     // Phase 5 / 8b: Pairing state members

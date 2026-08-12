@@ -109,11 +109,14 @@ static const char* to_cstr(SetupStage stage) {
 /// cleared from the display, rather than hanging until the transport eventually drops.
 static constexpr int64_t PIN_ATTEMPT_TIMEOUT_US = 120LL * 1000LL * US_PER_MS;
 
-/// @brief Window during which the operator may perform the static-PIN pairing-window gesture
-/// (mirrors the reference's WINDOW_LIFETIME_S = 300.0). Reused as the PinSession
-/// attempt_deadline_us while step == AWAIT_PAIRING_WINDOW, so the existing PIN-attempt-timeout
-/// check in loop() also enforces this window without a second timer.
+/// @brief Lifetime of an open pairing window, from opening until client/pair-init is sent
+/// (spec-recommended 5 minutes). On expiry the window closes silently.
 static constexpr int64_t WINDOW_LIFETIME_US = 300LL * 1000LL * US_PER_MS;
+
+/// @brief Dynamic-PIN gesture-gating floor (spec: Pairing Window): a session PIN shorter than
+/// this many digits is gesture-gated even when the method is not escalated -- short PINs are
+/// bought with a gesture. static_pin is gesture-gated on every attempt.
+static constexpr int PIN_GESTURE_GATE_MIN_LENGTH = 6;
 
 /// @brief CPace sid label (spec #120): sid = LABEL || h || counter (big-endian uint32).
 static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
@@ -576,16 +579,31 @@ void ConnectionManager::loop() {
 
                 // ---- Pairing-method admissibility (spec #120/#123) ----
                 // Structurally admissible ('pairing' alone is always an allowed activity set),
-                // but a pairing activate additionally names a selected_pair_method that must (a)
-                // match the matched PSK's category (pairing_psk iff the matched PSK IS the
+                // but a pairing activate additionally carries a pairing object whose method must
+                // (a) match the matched PSK's category (pairing_psk iff the matched PSK IS the
                 // Pairing PSK) and (b) currently be offered per the LIVE pairing config, which
                 // may have drifted from the supported_pair_methods advertised at hello time. When
                 // it is not, reply pair/abort(method_not_supported) and leave the connection open
                 // (unlike the reasons above, this does not close the connection).
-                if (event.activities.size() == 1 &&
-                    event.activities[0] == SendspinActivity::PAIRING &&
-                    event.selected_pair_method.has_value()) {
-                    const SendspinPairMethod method = event.selected_pair_method.value();
+                // A pairing activate that names NO usable method (pairing object absent, or a
+                // method string this client does not recognize --
+                // process_server_activate_message logs the raw value) cannot start any flow.
+                // Answering pair/abort here rather than ignoring the activate matters: a server
+                // that never hears back sits waiting for the device forever, with nothing on
+                // either side to explain the stall.
+                if (is_pairing_activate && !event.pairing_method.has_value()) {
+                    SS_LOGW(TAG,
+                            "server/activate declares pairing with no usable pairing.method "
+                            "for server_id=%s; replying pair/abort(method_not_supported), "
+                            "connection stays open",
+                            event.conn->get_server_id().c_str());
+                    event.conn->send_app_json(
+                        format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
+                    continue;
+                }
+
+                if (is_pairing_activate && event.pairing_method.has_value()) {
+                    const SendspinPairMethod method = event.pairing_method.value();
                     const bool category_ok =
                         (method == SendspinPairMethod::PAIRING_PSK) ==
                         (event.conn->get_psk_category() == PskCategory::PAIRING);
@@ -599,7 +617,7 @@ void ConnectionManager::loop() {
                         const auto& cfg = this->client_->config_;
                         switch (method) {
                             case SendspinPairMethod::PAIRING_PSK:
-                                offered = rs.pairing_psk_enabled();
+                                offered = rs.pairing_psk_enabled() && rs.pairing_psk().has_value();
                                 break;
                             case SendspinPairMethod::DYNAMIC_PIN:
                                 offered = cfg.pin_display_supported && rs.dynamic_pin_enabled();
@@ -621,6 +639,33 @@ void ConnectionManager::loop() {
                             nullptr);
                         continue;
                     }
+
+                    // ---- pin_length validation (dynamic_pin only) ----
+                    // The server computes L = max(client_min, server_min) clamped to 4-12 and
+                    // sends it in the activation's pairing object; the client validates it HERE,
+                    // on receipt of the activation (server/pair-init carries only nonce_A).
+                    // Absent, below the configured minimum, or outside the protocol's 4-12
+                    // range -> pair/abort(pin_length_unacceptable), connection stays open.
+                    if (method == SendspinPairMethod::DYNAMIC_PIN) {
+                        const int min_len =
+                            this->client_->record_store_ != nullptr
+                                ? this->client_->record_store_->dynamic_pin_min_length()
+                                : PIN_MIN_DIGITS;
+                        const int pin_len = event.pairing_pin_length.value_or(0);
+                        if (pin_len < min_len || pin_len < PIN_MIN_DIGITS ||
+                            pin_len > PIN_MAX_DIGITS) {
+                            SS_LOGW(TAG,
+                                    "server/activate pairing.pin_length=%d unacceptable (min=%d "
+                                    "floor=%d max=%d) for server_id=%s; replying "
+                                    "pair/abort(pin_length_unacceptable), connection stays open",
+                                    pin_len, min_len, PIN_MIN_DIGITS, PIN_MAX_DIGITS,
+                                    event.conn->get_server_id().c_str());
+                            event.conn->send_app_json(
+                                format_pair_abort_message(PairAbortReason::PIN_LENGTH_UNACCEPTABLE),
+                                nullptr);
+                            continue;
+                        }
+                    }
                 }
 
                 // ---- Admissible: apply the activate's state on the main loop ----
@@ -634,7 +679,7 @@ void ConnectionManager::loop() {
                         ? event.active_roles
                         : (!playback_capable ? std::make_optional(EMPTY_ROLES) : std::nullopt);
                 event.conn->apply_server_activate(event.activities, active_roles_to_apply,
-                                                  event.selected_pair_method);
+                                                  event.pairing_method, event.pairing_pin_length);
 
                 // First activate on a long-term PSK: mark the record used (reference parity).
                 // Safe here because RecordStore mutations stay on the main loop.
@@ -670,26 +715,26 @@ void ConnectionManager::loop() {
                         // ---- Subsequent activate transitions into pairing ----
                         // The operator can initiate pairing on an already-operational connection,
                         // not only on the very first activate: the server re-activates the
-                        // connection with the PAIRING activity and a selected_pair_method.
+                        // connection with the PAIRING activity and a pairing object.
                         // Mirrors the reference's _handle_server_activate, which runs _pair()
                         // whenever the applied activate is a pairing activate, not only on the
                         // first one. Only reached when pairing is not already in progress (the
                         // leftover-activate branch above handles that case).
                         const auto& activities = event.conn->get_activities();
-                        const auto& selected_pair_method = event.conn->get_selected_pair_method();
+                        const auto& pairing_method = event.conn->get_pairing_method();
                         const bool is_pairing_activity_only =
                             activities.size() == 1 && activities[0] == SendspinActivity::PAIRING &&
-                            selected_pair_method.has_value();
+                            pairing_method.has_value();
                         const bool is_supported_pair_method =
                             is_pairing_activity_only &&
-                            (selected_pair_method.value() == SendspinPairMethod::PAIRING_PSK ||
-                             selected_pair_method.value() == SendspinPairMethod::DYNAMIC_PIN ||
-                             selected_pair_method.value() == SendspinPairMethod::STATIC_PIN);
+                            (pairing_method.value() == SendspinPairMethod::PAIRING_PSK ||
+                             pairing_method.value() == SendspinPairMethod::DYNAMIC_PIN ||
+                             pairing_method.value() == SendspinPairMethod::STATIC_PIN);
                         if (is_supported_pair_method) {
                             SS_LOGI(TAG,
                                     "Subsequent activate selects pairing (%s): entering pairing "
                                     "for server_id=%s",
-                                    to_cstr(selected_pair_method.value()),
+                                    to_cstr(pairing_method.value()),
                                     event.conn->get_server_id().c_str());
                             this->handle_enter_pairing(event.conn.get());
                         }
@@ -1526,33 +1571,19 @@ std::vector<NurseryEntry>::iterator ConnectionManager::promote_or_arbitrate_nurs
 
     // ---- Pairing branch ----
     // If the winning activate declares only the PAIRING activity with a supported
-    // selected_pair_method (pairing_psk or dynamic_pin), enter the pairing flow instead of the
-    // normal operational path. The connection still occupies current_connection_ (so admission.h's
-    // "in-flight pairing is not displaced" rule applies), but is not announced to the client
-    // as operational until pairing finishes and the post-finalize re-handshake completes.
+    // pairing.method, enter the pairing flow instead of the normal operational path. The
+    // connection still occupies current_connection_ (so admission.h's "in-flight pairing is not
+    // displaced" rule applies), but is not announced to the client as operational until pairing
+    // finishes and the post-finalize re-handshake completes.
     const auto& activities = this->current_connection_->get_activities();
-    const auto& selected_pair_method = this->current_connection_->get_selected_pair_method();
+    const auto& pairing_method = this->current_connection_->get_pairing_method();
     const bool is_pairing_activity_only = activities.size() == 1 &&
                                           activities[0] == SendspinActivity::PAIRING &&
-                                          selected_pair_method.has_value();
+                                          pairing_method.has_value();
 
-    if (is_pairing_activity_only &&
-        selected_pair_method.value() == SendspinPairMethod::PAIRING_PSK) {
-        SS_LOGI(TAG, "Pairing activate received (pairing_psk): entering pairing for server_id=%s",
-                this->current_connection_->get_server_id().c_str());
-        this->handle_enter_pairing(this->current_connection_.get());
-    } else if (is_pairing_activity_only &&
-               selected_pair_method.value() == SendspinPairMethod::DYNAMIC_PIN) {
-        SS_LOGI(TAG,
-                "Pairing activate received (dynamic_pin): entering dynamic-PIN pairing for "
-                "server_id=%s",
-                this->current_connection_->get_server_id().c_str());
-        this->handle_enter_pairing(this->current_connection_.get());
-    } else if (is_pairing_activity_only &&
-               selected_pair_method.value() == SendspinPairMethod::STATIC_PIN) {
-        SS_LOGI(TAG,
-                "Pairing activate received (static_pin): entering static-PIN pairing for "
-                "server_id=%s",
+    if (is_pairing_activity_only) {
+        SS_LOGI(TAG, "Pairing activate received (%s): entering pairing for server_id=%s",
+                to_cstr(pairing_method.value()),
                 this->current_connection_->get_server_id().c_str());
         this->handle_enter_pairing(this->current_connection_.get());
     } else {
@@ -1603,17 +1634,20 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     const uint32_t pairing_index = conn->get_pairing_index();
 
     const std::string& server_id = conn->get_server_id();
-    const auto& selected_method = conn->get_selected_pair_method();
+    const auto& selected_method = conn->get_pairing_method();
 
-    // ---- Phase 8b: Dynamic-PIN branch ----
-    if (selected_method.has_value() && selected_method.value() == SendspinPairMethod::DYNAMIC_PIN) {
+    // ---- PIN branches (dynamic and static) ----
+    if (selected_method.has_value() &&
+        (selected_method.value() == SendspinPairMethod::DYNAMIC_PIN ||
+         selected_method.value() == SendspinPairMethod::STATIC_PIN)) {
+        const bool is_dynamic = selected_method.value() == SendspinPairMethod::DYNAMIC_PIN;
         const RecordStore& store = *this->client_->record_store_;
 
-        // Lockout check: if dynamic_pin is locked out, abort immediately.
-        if (store.is_pin_locked_out(SendspinPairMethod::DYNAMIC_PIN)) {
-            SS_LOGW(TAG, "handle_enter_pairing: dynamic_pin locked out for server_id=%s",
+        // Defensive: the client should not have advertised static_pin without a configured PIN.
+        if (!is_dynamic && !store.static_pin().has_value()) {
+            SS_LOGE(TAG, "handle_enter_pairing: no static PIN configured for server_id=%s",
                     server_id.c_str());
-            this->local_abort_pin_pairing(conn, PairAbortReason::LOCKED_OUT);
+            this->local_abort_pin_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
             return;
         }
 
@@ -1631,76 +1665,63 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
         }
 
         auto& ps = conn->pin_session();
-        ps.method = SendspinPairMethod::DYNAMIC_PIN;
-        ps.step = SendspinConnection::PinStep::AWAIT_SERVER_PAIR_INIT;
+        ps.method = selected_method.value();
         ps.handshake_hash = hash_opt.value();
         ps.pairing_index = pairing_index;
-        ps.attempt_deadline_us = platform_time_us() + PIN_ATTEMPT_TIMEOUT_US;
+        if (is_dynamic) {
+            // Validated against [min_pin_length, 12] when the activation was admitted.
+            ps.pin_length = conn->get_pairing_pin_length().value_or(0);
+        } else {
+            // Capture the static PIN now, before any operator window wait, so a concurrent
+            // management PIN change during the open window cannot swap the CPace secret
+            // mid-attempt. Mirrors the reference capturing static_pin before awaiting
+            // pairing_window().
+            ps.static_pin_value = store.static_pin().value();
+        }
 
-        // Generate nonce_B and its commitment.
-        ps.nonce_b = pin_generate_nonce();
-        auto commit_b = pin_commit(ps.nonce_b.data(), ps.nonce_b.size());
+        // Gesture gating (spec: Pairing Window). static_pin: every attempt. dynamic_pin: only
+        // when the method is escalated by its failure counter, or the session PIN is short.
+        const bool gesture_gated = !is_dynamic || store.dynamic_pin_escalated() ||
+                                   ps.pin_length < PIN_GESTURE_GATE_MIN_LENGTH;
 
-        // Send client/pair-init with commit_B and the required pairing_index (#120).
-        SS_LOGI(TAG, "Sending client/pair-init (dynamic_pin) for server_id=%s", server_id.c_str());
-        conn->send_app_json(format_client_pair_init_message(commit_b, ps.pairing_index), nullptr);
+        if (gesture_gated && !this->pairing_window_open()) {
+            // No window open: report the pending gesture with client/pair-pending and wait.
+            // pair-pending does not start the attempt or its timeout (the server applies its
+            // own timeout and cancels via server/activate), so no attempt deadline is armed
+            // here (attempt_deadline_us == 0 disables the loop() timeout check).
+            ps.step = SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW;
+            ps.attempt_deadline_us = 0;
+            SS_LOGI(TAG,
+                    "Sending client/pair-pending (%s, gesture-gated, no window open) for "
+                    "server_id=%s",
+                    to_cstr(ps.method), server_id.c_str());
+            conn->send_app_json(format_client_pair_pending_message(ps.pairing_index), nullptr);
 
-        // Notify the listener.
-        this->client_->note_pairing_started(server_id);
-        return;
-    }
+            // Surface the pairing-window prompt to the operator -- but only when the platform
+            // actually implements the gesture UI (on_open_pairing_window's contract is that it
+            // fires only when pairing_window_supported is true). A gated dynamic_pin attempt can
+            // still reach this branch on a device without that UI (escalation and the short-PIN
+            // gate apply to dynamic_pin regardless of the flag); the attempt then waits for a
+            // window opened remotely via management/open-pairing-window, or for the server's own
+            // timeout to cancel it. Log loudly so the stall is diagnosable.
+            if (this->client_->config_.pairing_window_supported) {
+                this->client_->note_open_pairing_window();
+                ps.window_shown = true;
+            } else {
+                SS_LOGW(TAG,
+                        "Gesture-gated %s attempt for server_id=%s but "
+                        "pairing_window_supported=false: no operator prompt can be shown; "
+                        "waiting for management/open-pairing-window or server cancel",
+                        to_cstr(ps.method), server_id.c_str());
+            }
 
-    // ---- Phase 8c: Static-PIN branch ----
-    // Unlike dynamic PIN, static PIN requires an operator pairing-window gesture before the
-    // exchange starts: no client/pair-init is sent here. handle_pairing_window_confirmed() sends
-    // it once the operator confirms (see D6c in the Phase 8c brief).
-    if (selected_method.has_value() && selected_method.value() == SendspinPairMethod::STATIC_PIN) {
-        const RecordStore& store = *this->client_->record_store_;
-
-        // Lockout check: if static_pin is locked out, abort immediately.
-        if (store.is_pin_locked_out(SendspinPairMethod::STATIC_PIN)) {
-            SS_LOGW(TAG, "handle_enter_pairing: static_pin locked out for server_id=%s",
-                    server_id.c_str());
-            this->local_abort_pin_pairing(conn, PairAbortReason::LOCKED_OUT);
+            this->client_->note_pairing_started(server_id);
             return;
         }
 
-        // Defensive: the client should not have advertised static_pin without a configured PIN.
-        if (!store.static_pin().has_value()) {
-            SS_LOGE(TAG, "handle_enter_pairing: no static PIN configured for server_id=%s",
-                    server_id.c_str());
-            this->local_abort_pin_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
-            return;
-        }
-
-        // Capture the Noise handshake hash now (see the dynamic-PIN branch above for why this is
-        // safe on the main loop).
-        auto hash_opt = conn->get_noise_handshake_hash();
-        if (!hash_opt.has_value()) {
-            SS_LOGE(TAG, "handle_enter_pairing: no handshake hash for server_id=%s; aborting",
-                    server_id.c_str());
-            this->local_abort_pin_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
-            return;
-        }
-
-        auto& ps = conn->pin_session();
-        ps.method = SendspinPairMethod::STATIC_PIN;
-        ps.handshake_hash = hash_opt.value();
-        ps.pairing_index = pairing_index;
-        // Capture the static PIN now, before the operator window wait, so a concurrent management
-        // PIN change during the open window cannot swap the CPace secret mid-attempt. Mirrors the
-        // reference capturing static_pin before awaiting pairing_window().
-        ps.static_pin_value = store.static_pin().value();
-        ps.step = SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW;
-        // Reused as the pairing-window deadline: the existing PIN-attempt-timeout check in
-        // loop() aborts any non-IDLE step whose attempt_deadline_us has passed, so this alone
-        // enforces the 300 s window without a second timer.
-        ps.attempt_deadline_us = platform_time_us() + WINDOW_LIFETIME_US;
-
-        // Surface the pairing-window prompt to the operator; do not send anything yet.
-        this->client_->note_open_pairing_window();
-        ps.window_shown = true;
-
+        // Not gated, or a standing window is already open: start the attempt immediately
+        // (start_pin_attempt consumes the window; its lifetime runs until pair-init is sent).
+        this->start_pin_attempt(conn);
         this->client_->note_pairing_started(server_id);
         return;
     }
@@ -1839,8 +1860,8 @@ void ConnectionManager::local_abort_pin_pairing(SendspinConnection* conn, PairAb
     //   1. Send pair/abort to the server.
     //   2. Clear PIN display / pairing state on the connection.
     //   3. Close the connection, but ONLY for reason concurrent_attempt (spec #120/#123: every
-    //      other reason -- attempt_timeout, locked_out, method_not_supported,
-    //      pin_length_unacceptable, pin_mismatch, user_cancelled -- leaves the connection open).
+    //      other reason -- attempt_timeout, method_not_supported, pin_length_unacceptable,
+    //      pin_mismatch, user_cancelled -- leaves the connection open).
     //   4. Queue on_pairing_failed (and on_clear_pairing_pin, if a PIN was shown) for delivery
     //      from loop().
     if (conn == nullptr) {
@@ -1877,43 +1898,38 @@ void ConnectionManager::local_abort_pin_pairing(SendspinConnection* conn, PairAb
 }
 
 // ============================================================================
-// Phase 8c: Static-PIN pairing main-loop handlers
+// Pairing-window main-loop handlers
 // ============================================================================
 
-void ConnectionManager::handle_pairing_window_confirmed() {
-    // Runs on the main loop. A PIN session only ever exists on current_connection_: pairing only
-    // starts once a nursery entry has won promotion (see the pairing branch in
-    // promote_or_arbitrate_nursery_entry()), so there is no separate "pending" slot to check in
-    // this architecture. If nothing is awaiting the window, the confirm is spurious or arrived
-    // late (e.g. after the window already timed out) -- log and return.
-    if (this->client_->record_store_ == nullptr) {
-        return;
-    }
-
-    auto awaiting_window = [](SendspinConnection* c) {
-        return c != nullptr &&
-               c->pin_session().step == SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW;
-    };
-
-    SendspinConnection* conn = nullptr;
-    if (awaiting_window(this->current_connection_.get())) {
-        conn = this->current_connection_.get();
-    }
-
-    if (conn == nullptr) {
-        SS_LOGW(TAG, "handle_pairing_window_confirmed: no connection awaiting the pairing window; "
-                     "ignoring (spurious or late confirm)");
-        return;
-    }
-
-    const std::string& server_id = conn->get_server_id();
+void ConnectionManager::start_pin_attempt(SendspinConnection* conn) {
+    // Runs on the main loop (caller holds conn_ptr_mutex_). The PinSession was populated by
+    // handle_enter_pairing; this sends the client/pair-init that starts the attempt. Sending
+    // pair-init ends the pairing window's lifetime (spec: Pairing Window), so any standing
+    // window is consumed here whether the attempt was gated or not.
+    this->pairing_window_open_until_us_ = 0;
 
     auto& ps = conn->pin_session();
-    // Use the static PIN captured at pairing start (see handle_enter_pairing), not a fresh store
-    // read, so a mid-window PIN change cannot swap the CPace secret. Empty means it was never
-    // captured (defensive; the enter-pairing path always captures a configured PIN).
+    const std::string& server_id = conn->get_server_id();
+
+    if (ps.method == SendspinPairMethod::DYNAMIC_PIN) {
+        // Generate nonce_B and its commitment, then send client/pair-init with commit_B and
+        // the required pairing_index (#120).
+        ps.nonce_b = pin_generate_nonce();
+        auto commit_b = pin_commit(ps.nonce_b.data(), ps.nonce_b.size());
+
+        SS_LOGI(TAG, "Sending client/pair-init (dynamic_pin) for server_id=%s", server_id.c_str());
+        conn->send_app_json(format_client_pair_init_message(commit_b, ps.pairing_index), nullptr);
+
+        ps.step = SendspinConnection::PinStep::AWAIT_SERVER_PAIR_INIT;
+        ps.attempt_deadline_us = platform_time_us() + PIN_ATTEMPT_TIMEOUT_US;
+        return;
+    }
+
+    // Static PIN. Use the PIN captured at pairing start (see handle_enter_pairing), not a fresh
+    // store read, so a mid-window PIN change cannot swap the CPace secret. Empty means it was
+    // never captured (defensive; the enter-pairing path always captures a configured PIN).
     if (ps.static_pin_value.empty()) {
-        SS_LOGE(TAG, "handle_pairing_window_confirmed: no static PIN captured for server_id=%s",
+        SS_LOGE(TAG, "start_pin_attempt: no static PIN captured for server_id=%s",
                 server_id.c_str());
         this->local_abort_pin_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
         return;
@@ -1934,14 +1950,48 @@ void ConnectionManager::handle_pairing_window_confirmed() {
 
     // ADb = "client" (our own AD), ADa = "server" (peer's AD) -- spec #117.
     if (!ps.cpace.start(CPaceRole::RESPONDER, prs, sid, {}, pake_ad_client(), pake_ad_server())) {
-        SS_LOGE(TAG, "handle_pairing_window_confirmed: CPace::start failed for server_id=%s",
-                server_id.c_str());
+        SS_LOGE(TAG, "start_pin_attempt: CPace::start failed for server_id=%s", server_id.c_str());
         this->local_abort_pin_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
         return;
     }
 
     ps.step = SendspinConnection::PinStep::AWAIT_SERVER_PAIR_AUTH;
     ps.attempt_deadline_us = platform_time_us() + PIN_ATTEMPT_TIMEOUT_US;
+}
+
+bool ConnectionManager::pairing_window_open() const {
+    return this->pairing_window_open_until_us_ != 0 &&
+           platform_time_us() < this->pairing_window_open_until_us_;
+}
+
+void ConnectionManager::open_pairing_window() {
+    // Runs on the main loop (caller holds conn_ptr_mutex_). A PIN session only ever exists on
+    // current_connection_: pairing only starts once a nursery entry has won promotion (see the
+    // pairing branch in promote_or_arbitrate_nursery_entry()). If an attempt is already waiting
+    // for the gesture, the freshly opened window is consumed by it immediately; otherwise the
+    // window stands open (spec: Pairing Window) so a pairing activate arriving within its
+    // lifetime can proceed without a further gesture.
+    SendspinConnection* conn = this->current_connection_.get();
+    const bool awaiting = conn != nullptr && conn->pin_session().step ==
+                                                 SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW;
+
+    if (awaiting) {
+        SS_LOGI(TAG, "Pairing window opened: starting the waiting %s attempt for server_id=%s",
+                to_cstr(conn->pin_session().method), conn->get_server_id().c_str());
+        this->start_pin_attempt(conn);
+        return;
+    }
+
+    this->pairing_window_open_until_us_ = platform_time_us() + WINDOW_LIFETIME_US;
+    SS_LOGI(TAG, "Pairing window opened: standing open for %lld s awaiting a pairing attempt",
+            static_cast<long long>(WINDOW_LIFETIME_US / (1000LL * US_PER_MS)));
+}
+
+void ConnectionManager::handle_pairing_window_confirmed() {
+    if (this->client_->record_store_ == nullptr) {
+        return;
+    }
+    this->open_pairing_window();
 }
 
 void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
@@ -1986,24 +2036,12 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
                 return;
             }
 
-            // Validate pin_length. PIN_MIN_DIGITS is the absolute protocol floor, applied even
-            // if the configured minimum is somehow lower (mirrors the reference's clamp to 4-12).
-            const int min_len = store.dynamic_pin_min_length();
-            const int pin_len = event.pin_length;
-            if (pin_len < min_len || pin_len < PIN_MIN_DIGITS || pin_len > PIN_MAX_DIGITS) {
-                SS_LOGW(TAG,
-                        "handle_pin_pairing_message: pin_length=%d unacceptable (min=%d floor=%d "
-                        "max=%d)",
-                        pin_len, min_len, PIN_MIN_DIGITS, PIN_MAX_DIGITS);
-                this->local_abort_pin_pairing(conn, PairAbortReason::PIN_LENGTH_UNACCEPTABLE);
-                return;
-            }
-            ps.pin_length = pin_len;
-
-            // Derive the PIN.
-            auto pin_opt =
-                pin_derive(ps.handshake_hash.data(), ps.handshake_hash.size(), event.nonce_a.data(),
-                           event.nonce_a.size(), ps.nonce_b.data(), ps.nonce_b.size(), pin_len);
+            // Derive the PIN. The session pin_length arrived in the activation's pairing
+            // object and was validated against [min_pin_length, 12] when the activation was
+            // admitted (server/pair-init carries only nonce_A).
+            auto pin_opt = pin_derive(ps.handshake_hash.data(), ps.handshake_hash.size(),
+                                      event.nonce_a.data(), event.nonce_a.size(), ps.nonce_b.data(),
+                                      ps.nonce_b.size(), ps.pin_length);
             if (!pin_opt.has_value()) {
                 SS_LOGE(TAG, "handle_pin_pairing_message: pin_derive failed for server_id=%s",
                         server_id.c_str());
@@ -2081,19 +2119,27 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
                 return;
             }
 
-            // Verify server_kc (server confirmation tag).
+            // Verify server_kc (server confirmation tag). Only dynamic_pin carries a failure
+            // counter (spec: Failure counter): the client's own verification of server_kc
+            // failing is the ONE event that increments it, and it escalates the method to
+            // gesture-gating at the threshold rather than locking it out.
             if (!ps.cpace.verify(event.server_kc.data(), event.server_kc.size())) {
                 SS_LOGW(TAG,
                         "handle_pin_pairing_message: server_kc verification failed "
                         "(PIN mismatch) for server_id=%s",
                         server_id.c_str());
-                store.record_pin_failure(ps.method);
+                if (ps.method == SendspinPairMethod::DYNAMIC_PIN) {
+                    store.record_dynamic_pin_failure();
+                }
                 this->local_abort_pin_pairing(conn, PairAbortReason::PIN_MISMATCH);
                 return;
             }
 
-            // PIN matched: clear failure counter for this session's method.
-            store.reset_pin_failures(ps.method);
+            // server_kc verified: the dynamic-PIN failure counter resets (whether or not the
+            // attempt goes on to finalize), de-escalating the method.
+            if (ps.method == SendspinPairMethod::DYNAMIC_PIN) {
+                store.reset_dynamic_pin_failures();
+            }
 
             // Compute client_kc (our confirmation tag).
             auto client_kc_opt = ps.cpace.tag();
@@ -2245,11 +2291,37 @@ void ConnectionManager::handle_management_request(SendspinConnection* conn,
         }
         case ManagementRequestKind::GET_PAIRING_CONFIG:
             include_static_storage = true;
-            handle_get_pairing_config(store, result, effect);
+            handle_get_pairing_config(store, this->client_->config_.pin_display_supported,
+                                      this->client_->config_.pairing_window_supported, result,
+                                      effect);
             break;
         case ManagementRequestKind::SET_PAIRING_CONFIG:
-            handle_set_pairing_config(store, event.set_config_payload, result, effect);
+            handle_set_pairing_config(
+                store, event.set_config_payload, this->client_->config_.pin_display_supported,
+                this->client_->config_.pairing_window_supported, result, effect);
             break;
+        case ManagementRequestKind::OPEN_PAIRING_WINDOW: {
+            // Opens a pairing window in place of the operator gesture. Handled here rather than
+            // in management.h because the window state lives on the ConnectionManager, not the
+            // RecordStore. Rejected as invalid when no PIN method is enabled (the same offered
+            // logic as build_hello_message); a no-op ok when a window is already open.
+            const auto& cfg = this->client_->config_;
+            const bool dynamic_offered = cfg.pin_display_supported && store.dynamic_pin_enabled();
+            const bool static_offered = cfg.pairing_window_supported &&
+                                        store.static_pin_enabled() &&
+                                        store.static_pin().has_value();
+            if (!dynamic_offered && !static_offered) {
+                SS_LOGW(TAG, "management/open-pairing-window: no PIN method enabled; invalid");
+                result.result = ManagementResult::INVALID;
+            } else {
+                if (!this->pairing_window_open()) {
+                    this->open_pairing_window();
+                }
+                result.result = ManagementResult::OK;
+            }
+            effect = ManagementEffect::NONE;
+            break;
+        }
     }
 
     // Attach storage accounting when the store provides it.

@@ -592,9 +592,12 @@ struct MyClientListener : SendspinClientListener {
         clear_pin_from_display();
     }
 
-    // Static-PIN pairing: prompt/dismiss the operator pairing-window gesture. Only invoked
-    // when SendspinClientConfig::pairing_window_supported is true. Confirm the gesture by
-    // calling client.confirm_pairing_window() (thread-safe) once the operator performs it.
+    // PIN pairing: prompt/dismiss the operator pairing-window gesture for a gesture-gated
+    // attempt (static PIN: every attempt; dynamic PIN: when the method is escalated by its
+    // failure counter or the session PIN is shorter than 6 digits). Confirm the gesture by
+    // calling client.confirm_pairing_window() (thread-safe) once the operator performs it;
+    // calling it with no attempt waiting opens a standing 5-minute pairing window that admits
+    // the next attempt without a further gesture.
     void on_open_pairing_window() override {
         prompt_pairing_button_press();
     }
@@ -698,14 +701,31 @@ observes pairing via `SendspinClientListener` callbacks:
    `SendspinPairAbortReason` below for the possible reasons, including the client-local
    `STORAGE_FAILED` case (the persistence provider rejected the record).
 
-To enable pairing, the server must hold a Pairing PSK that this client accepts. Configure
-an accepted Pairing PSK via the persistence provider before `start_server()`:
+#### Pairing PSK
+
+`pairing_psk` is the pairing method every client must implement, so the library provisions a
+random Pairing PSK on first boot and persists it through `save_pairing_psk`. Nothing is
+required of the application to enable the method.
+
+To pair, the server must learn that PSK out of band. Surface it as a **pairing token** -- one
+`"SP:"`-prefixed string carrying the `client_id` and the PSK together, for the operator to
+paste (or scan) into the server:
+
+```cpp
+auto token = client.pairing_token();  // e.g. "SP:0AAAQ..." (107 chars), nullopt before start_server()
+```
+
+The token is stable for the lifetime of the stored PSK, so it can be printed at startup, shown
+in a UI, or rendered as a QR code.
+
+To pin a specific PSK instead (for factory provisioning, where the same key is baked into a
+setup tool), write one through the persistence provider before `start_server()`:
 
 ```cpp
 SendspinPairingPsk psk;
-psk.psk_id = "my-setup-psk-id";
 // 32 raw bytes distributed out-of-band during provisioning
 psk.psk = { /* ... */ };
+psk.psk_id = "";  // derived from psk by the library; any value here is ignored
 persistence_provider.save_pairing_psk(psk);
 ```
 
@@ -713,10 +733,38 @@ After pairing completes, `on_pairing_succeeded` fires and the long-term record i
 by the library via `save_pairing_record`. Subsequent boots load the record via
 `load_pairing_records`; no further provisioning is needed.
 
+#### PIN pairing
+
 The library also supports PIN-based pairing (dynamic and static), gated by
 `SendspinClientConfig::pin_display_supported` / `pairing_window_supported` and the
 `SendspinClientListener::on_display_pairing_pin` / `on_clear_pairing_pin` /
 `on_open_pairing_window` / `on_close_pairing_window` callbacks documented in Step 3 above.
+A method is advertised only when the platform capability flag is set: a client that leaves
+`pin_display_supported` false never offers `dynamic_pin`, whatever the stored pairing config
+says, and the server is then limited to the pairing-token flow.
+
+Some PIN attempts are **gesture-gated**: the client answers the pairing activation with
+`client/pair-pending` and withholds `client/pair-init` until a pairing window is open. Static
+PIN gates every attempt; dynamic PIN gates an attempt only when the method is *escalated* or
+the session's PIN length is below 6 digits. The window opens on the operator gesture
+(`confirm_pairing_window()`) or via `management/open-pairing-window` from a paired server, it
+lives for 5 minutes, and it admits exactly one attempt. A gesture performed before the
+activation arrives leaves the window standing open, so the next attempt within its lifetime
+proceeds without a prompt.
+
+The gating rules apply to dynamic PIN even on a device that leaves
+`pairing_window_supported` false. On such a device the `on_open_pairing_window` prompt cannot
+fire, so a gated attempt sends `client/pair-pending`, logs a warning, and waits for either a
+window opened remotely via `management/open-pairing-window` or the server's own timeout. To
+keep escalated recovery in the operator's hands, a device that offers `dynamic_pin` should
+set `pairing_window_supported` and implement the gesture callbacks.
+
+Repeated dynamic-PIN failures escalate the method rather than locking it out: the client
+keeps a single failure counter (persisted across reboots) that increments only when its own
+verification of the server's key-confirmation tag fails, and resets when that verification
+succeeds. At 10 failures the method becomes escalated -- every attempt is gesture-gated --
+but it stays offered; there is no lockout state and no management command to clear the
+counter.
 
 ### Trust Levels
 
@@ -987,7 +1035,7 @@ X25519 keypair and read back via `client.client_id()` after `start_server()`.
 | `software_version` | `std::optional<std::string>` | unset | Software version string; sent in `client/hello` only when set |
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
 | `pin_display_supported` | `bool` | `false` | Set to `true` when the application implements `on_display_pairing_pin` / `on_clear_pairing_pin` on its `SendspinClientListener`. When `false`, dynamic-PIN pairing is not advertised even if enabled in `SendspinPairingConfig`. |
-| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, static-PIN pairing is not advertised even if a static PIN is configured. |
+| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, static-PIN pairing is not advertised even if a static PIN is configured. Dynamic-PIN devices should also set it: escalated or short-PIN dynamic attempts are gesture-gated through the same callbacks, and without them such an attempt can only proceed via `management/open-pairing-window` (or stalls until the server cancels it). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `httpd_stack_size` | `size_t` | `8192` | HTTP server task stack size in bytes (ESP-IDF only). The Noise handshake (and especially the in-band re-handshake after pairing) runs its X25519 crypto on this task; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |

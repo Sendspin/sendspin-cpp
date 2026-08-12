@@ -88,28 +88,29 @@ enum SendspinBinaryType : uint8_t {
 
 /// @brief JSON message types sent from the server to the client
 enum class SendspinServerToClientMessageType : uint8_t {
-    SERVER_HELLO,                   // server/hello handshake
-    SERVER_ACTIVATE,                // server/activate declares activities and active_roles
-    SERVER_TIME,                    // server/time clock sync reply
-    SERVER_STATE,                   // server/state playback state update
-    SERVER_COMMAND,                 // server/command player command
-    STREAM_START,                   // stream/start new stream parameters
-    STREAM_END,                     // stream/end normal stream completion
-    STREAM_CLEAR,                   // stream/clear immediate buffer flush
-    GROUP_UPDATE,                   // group/update group membership change
-    NOISE_HANDSHAKE,                // noise/handshake in-band re-handshake
-    SERVER_PAIR_FINALIZE,           // server/pair-finalize empty ack from server
-    PAIR_ABORT,                     // pair/abort pairing failure from either side
-    SERVER_UNPAIR,                  // server/unpair request to drop pairing record
-    MANAGEMENT_LIST_RECORDS,        // management/list-records
-    MANAGEMENT_ADD_RECORD,          // management/add-record
-    MANAGEMENT_REMOVE_RECORD,       // management/remove-record
-    MANAGEMENT_GET_PAIRING_CONFIG,  // management/get-pairing-config
-    MANAGEMENT_SET_PAIRING_CONFIG,  // management/set-pairing-config
-    SERVER_PAIR_INIT,               // server/pair-init: nonce_A + pin_length
-    SERVER_PAIR_AUTH,               // server/pair-auth: pake_msg_1
-    SERVER_PAIR_CONFIRM,            // server/pair-confirm: server_kc
-    UNKNOWN,                        // Unrecognized message type
+    SERVER_HELLO,                    // server/hello handshake
+    SERVER_ACTIVATE,                 // server/activate declares activities and active_roles
+    SERVER_TIME,                     // server/time clock sync reply
+    SERVER_STATE,                    // server/state playback state update
+    SERVER_COMMAND,                  // server/command player command
+    STREAM_START,                    // stream/start new stream parameters
+    STREAM_END,                      // stream/end normal stream completion
+    STREAM_CLEAR,                    // stream/clear immediate buffer flush
+    GROUP_UPDATE,                    // group/update group membership change
+    NOISE_HANDSHAKE,                 // noise/handshake in-band re-handshake
+    SERVER_PAIR_FINALIZE,            // server/pair-finalize empty ack from server
+    PAIR_ABORT,                      // pair/abort pairing failure from either side
+    SERVER_UNPAIR,                   // server/unpair request to drop pairing record
+    MANAGEMENT_LIST_RECORDS,         // management/list-records
+    MANAGEMENT_ADD_RECORD,           // management/add-record
+    MANAGEMENT_REMOVE_RECORD,        // management/remove-record
+    MANAGEMENT_GET_PAIRING_CONFIG,   // management/get-pairing-config
+    MANAGEMENT_SET_PAIRING_CONFIG,   // management/set-pairing-config
+    MANAGEMENT_OPEN_PAIRING_WINDOW,  // management/open-pairing-window
+    SERVER_PAIR_INIT,                // server/pair-init: nonce_A
+    SERVER_PAIR_AUTH,                // server/pair-auth: pake_msg_1
+    SERVER_PAIR_CONFIRM,             // server/pair-confirm: server_kc
+    UNKNOWN,                         // Unrecognized message type
 };
 
 /// @brief Protocol role identifiers used in hello messages and role negotiation
@@ -235,7 +236,6 @@ inline std::optional<SendspinPairMethod> pair_method_from_string(const std::stri
 enum class PairAbortReason : uint8_t {
     ATTEMPT_TIMEOUT,          // attempt_timeout
     CONCURRENT_ATTEMPT,       // concurrent_attempt
-    LOCKED_OUT,               // locked_out
     METHOD_NOT_SUPPORTED,     // method_not_supported
     PIN_LENGTH_UNACCEPTABLE,  // pin_length_unacceptable
     PIN_MISMATCH,             // pin_mismatch
@@ -251,8 +251,6 @@ inline const char* to_cstr(PairAbortReason reason) {
             return "attempt_timeout";
         case PairAbortReason::CONCURRENT_ATTEMPT:
             return "concurrent_attempt";
-        case PairAbortReason::LOCKED_OUT:
-            return "locked_out";
         case PairAbortReason::METHOD_NOT_SUPPORTED:
             return "method_not_supported";
         case PairAbortReason::PIN_LENGTH_UNACCEPTABLE:
@@ -275,8 +273,6 @@ inline SendspinPairAbortReason to_public_abort_reason(PairAbortReason reason) {
             return SendspinPairAbortReason::ATTEMPT_TIMEOUT;
         case PairAbortReason::CONCURRENT_ATTEMPT:
             return SendspinPairAbortReason::CONCURRENT_ATTEMPT;
-        case PairAbortReason::LOCKED_OUT:
-            return SendspinPairAbortReason::LOCKED_OUT;
         case PairAbortReason::METHOD_NOT_SUPPORTED:
             return SendspinPairAbortReason::METHOD_NOT_SUPPORTED;
         case PairAbortReason::PIN_LENGTH_UNACCEPTABLE:
@@ -299,9 +295,6 @@ inline std::optional<PairAbortReason> pair_abort_reason_from_string(const std::s
     }
     if (str == "concurrent_attempt") {
         return PairAbortReason::CONCURRENT_ATTEMPT;
-    }
-    if (str == "locked_out") {
-        return PairAbortReason::LOCKED_OUT;
     }
     if (str == "method_not_supported") {
         return PairAbortReason::METHOD_NOT_SUPPORTED;
@@ -822,10 +815,11 @@ struct RecordSummary {
 /// Mirrors PairingMethodConfig in aiosendspin/models/management.py.
 struct PairingMethodConfig {
     bool enabled{false};
-    /// @brief Only present for PIN methods; true if locked out.
-    std::optional<bool> locked_out;
     /// @brief For dynamic_pin only: shortest PIN length in digits the client will accept (4-12).
     std::optional<int> min_pin_length;
+    /// @brief For dynamic_pin only: true when the method is escalated to gesture-gating by its
+    /// failure counter.
+    std::optional<bool> escalated;
 };
 
 /// @brief Record mode config in get/set-pairing-config messages.
@@ -851,14 +845,14 @@ struct SetPairingPskConfig {
 struct SetStaticPinConfig {
     std::optional<bool> enabled;
     std::optional<std::string> pin;  ///< 8 decimal digits; replaces the configured static PIN.
-    std::optional<bool> locked_out;  ///< Only false is accepted; clears terminal lockout.
 };
 
 /// @brief Patch for the dynamic-PIN method in set-pairing-config.
 /// Mirrors SetDynamicPinConfig in aiosendspin/models/management.py.
+/// The failure counter is not settable: escalation de-escalates only through the client's own
+/// successful server_kc verification (there is no locked_out-clearing field in the spec).
 struct SetDynamicPinConfig {
     std::optional<bool> enabled;
-    std::optional<bool> locked_out;     ///< Only false is accepted; clears terminal lockout.
     std::optional<int> min_pin_length;  ///< Shortest PIN length in digits accepted; must be 4-12.
 };
 
@@ -929,10 +923,12 @@ struct PairMethodDescriptor {
     /// @brief For methods with output channels (e.g., dynamic_pin: ["display"]).
     /// Absent for pairing_psk.
     std::optional<std::vector<std::string>> out_channels;
-    /// @brief True when the method is currently locked out. Absent when not locked out.
-    std::optional<bool> locked_out;
     /// @brief Minimum PIN length the client will accept. Absent for non-PIN methods.
     std::optional<int> min_pin_length;
+    /// @brief Where the operator can find the method's configured secret:
+    /// 'device' | 'leaflet' | 'operator'. Informational hint for static_pin and
+    /// pairing_psk only; absent for dynamic_pin.
+    std::optional<std::vector<std::string>> locations;
 };
 
 /// @brief Outgoing client/hello handshake message sent at connection startup.
@@ -975,7 +971,13 @@ struct ServerHelloMessage {
 struct ServerActivateMessage {
     std::vector<SendspinActivity> activities{};
     std::optional<std::vector<std::string>> active_roles;  // sticky: nullopt = keep prior set
-    std::optional<SendspinPairMethod> selected_pair_method;
+    /// From payload.pairing.method -- the pairing method the server picked. nullopt when the
+    /// message carries no pairing object or names an unrecognized method string.
+    std::optional<SendspinPairMethod> pairing_method;
+    /// From payload.pairing.pin_length -- the session PIN digit count. Required on the wire
+    /// when pairing_method is dynamic_pin; validated against [min_pin_length, 12] on receipt
+    /// of the activation (not at server/pair-init, which carries only nonce_A).
+    std::optional<int> pairing_pin_length;
 };
 
 /// @brief Parsed group/update message containing the group state delta
@@ -1019,11 +1021,11 @@ struct PairAbortMessage {
 // ============================================================================
 
 /// @brief Parsed server/pair-init payload (Phase 8b).
-/// Carries nonce_A (32 raw bytes, base64url-encoded on the wire, 43 chars) and the
-/// server-chosen pin_length. The client responds with client/pair-init carrying commit_B.
+/// Carries only nonce_A (32 raw bytes, base64url-encoded on the wire, 43 chars); the session
+/// pin_length arrives earlier, in the activation's pairing object. Sent by the server in
+/// response to client/pair-init (which carried commit_B).
 struct ServerPairInitPayload {
     std::array<uint8_t, 32> nonce_a{};  ///< 32-byte server nonce decoded from base64url.
-    int pin_length{0};                  ///< Server-chosen PIN digit count.
 };
 
 /// @brief Parsed server/pair-auth payload (Phase 8b).
@@ -1242,8 +1244,17 @@ bool process_server_pair_auth_message(JsonObject root, ServerPairAuthPayload* pa
 /// @return true if the message is well-formed, false otherwise.
 bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPayload* payload);
 
+/// @brief Formats a client/pair-pending message as a JSON string.
+/// Sent immediately on receiving a pairing server/activate whose attempt is gesture-gated while
+/// no pairing window is open; client/pair-init follows once a window opens. Does not start the
+/// attempt or its timeout.
+/// @param pairing_index Count of pairing server/activate messages received since the last Noise
+///                      handshake.
+/// @return JSON string for the client/pair-pending message.
+std::string format_client_pair_pending_message(uint32_t pairing_index);
+
 /// @brief Formats a client/pair-init message as a JSON string.
-/// Sent in response to server/pair-init; carries commit_B = SHA-256(LABEL || nonce_B) and the
+/// Starts the dynamic-PIN attempt; carries commit_B = SHA-256(LABEL || nonce_B) and the
 /// required pairing_index counter (spec #120).
 /// @param commit_b 32-byte commit_B value to embed (base64url-encoded on the wire).
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise

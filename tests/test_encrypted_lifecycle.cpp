@@ -75,6 +75,7 @@ constexpr uint16_t PAIRING_TEST_PORT = 18993;
 constexpr uint16_t MANAGEMENT_TEST_PORT = 18994;
 constexpr uint16_t PAIRING_PERSIST_FAILURE_TEST_PORT = 18995;
 constexpr uint16_t CIPHER_SUITE_AESGCM_TEST_PORT = 18996;
+constexpr uint16_t PAIR_METHODS_TEST_PORT = 18997;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -118,7 +119,7 @@ public:
     // load_pairing_records() is not overridden: the base class default (no records) is exactly
     // "starts with no pairing records" above, so restating it here would be a no-op override.
 
-    // Optionally pre-seed an accepted Pairing PSK (spec #113/#122/#123: selected_pair_method
+    // Optionally pre-seed an accepted Pairing PSK (spec #113/#122/#123: pairing.method
     // MUST be 'pairing_psk' if and only if the matched PSK IS the Pairing PSK, and the client
     // now enforces this -- see ConnectionManager::loop()'s pairing-method admissibility check).
     // The Pairing PSK Flow test below needs the fake server to connect using this PSK directly
@@ -383,8 +384,9 @@ struct FakeEncryptedServerOptions {
     std::string first_activities_json{R"(["playback"])"};
     std::string first_roles_json{R"(["player@v1"])"};
     // Present only when the first server/activate should select a pairing method (e.g.
-    // "pairing_psk"); omitted (nullopt) for the normal playback/management admission path.
-    std::optional<std::string> first_selected_pair_method;
+    // "pairing_psk"), emitted as the nested payload.pairing object per the current spec;
+    // omitted (nullopt) for the normal playback/management admission path.
+    std::optional<std::string> first_pairing_method;
     // Sent in server/activate after the SECOND client/hello (i.e. the one that follows a
     // trigger_rehandshake() call and its resulting fresh hello cycle).
     std::string second_activities_json{R"(["playback"])"};
@@ -448,6 +450,12 @@ public:
 
     int client_hello_count() const {
         return this->client_hello_count_.load();
+    }
+
+    /// supported_pair_methods from the most recent client/hello, in wire order.
+    std::vector<std::string> hello_pair_methods() const {
+        std::lock_guard<std::mutex> lock(this->pair_methods_mutex_);
+        return this->hello_pair_methods_;
     }
 
     bool closed() const {
@@ -631,6 +639,14 @@ private:
 
         if (std::strcmp(type, "client/hello") == 0) {
             int count = this->client_hello_count_.fetch_add(1) + 1;
+            {
+                std::lock_guard<std::mutex> plock(this->pair_methods_mutex_);
+                this->hello_pair_methods_.clear();
+                for (JsonVariantConst m :
+                     doc["payload"]["supported_pair_methods"].as<JsonArrayConst>()) {
+                    this->hello_pair_methods_.emplace_back(m["method"] | "");
+                }
+            }
             const std::string& activities =
                 count <= 1 ? this->options_.first_activities_json
                           : this->options_.second_activities_json;
@@ -638,9 +654,9 @@ private:
                 count <= 1 ? this->options_.first_roles_json : this->options_.second_roles_json;
             std::string activate = std::string(R"({"type":"server/activate","payload":{)") +
                                    R"("activities":)" + activities + R"(,"active_roles":)" + roles;
-            if (count <= 1 && this->options_.first_selected_pair_method.has_value()) {
-                activate += R"(,"selected_pair_method":")" +
-                           this->options_.first_selected_pair_method.value() + "\"";
+            if (count <= 1 && this->options_.first_pairing_method.has_value()) {
+                activate += R"(,"pairing":{"method":")" +
+                           this->options_.first_pairing_method.value() + "\"}";
             }
             activate += "}}";
             this->send_encrypted_locked(activate);
@@ -751,6 +767,8 @@ private:
     std::array<uint8_t, 32> prior_h_{};
 
     std::atomic<int> client_hello_count_{0};
+    mutable std::mutex pair_methods_mutex_;
+    std::vector<std::string> hello_pair_methods_;
     std::atomic<bool> closed_{false};
     mutable std::mutex goodbye_mutex_;
     std::optional<std::string> goodbye_reason_;
@@ -938,9 +956,57 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
     pump_for(client, 100);
 }
 
+// The hello must advertise a pairing method the server can actually start. pairing_psk is the
+// client-mandatory method and its PSK is auto-provisioned by the RecordStore on first boot, so it
+// is advertised even though nothing was persisted here; dynamic_pin joins it because this client
+// declares pin_display_supported. A client that advertises neither leaves a server (and its
+// operator) with no way into pairing at all.
+TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+    platform_random_bytes(psk.data(), psk.size());
+    std::string psk_id = psk_id_for(psk);
+
+    SendspinPairingRecord record;
+    record.psk_id = psk_id;
+    record.psk = psk;
+
+    TestNetworkProvider network;
+    TestPersistenceProvider persistence(record);
+    SendspinClientConfig config;
+    config.name = "Pair Methods Test Client";
+    config.server_port = PAIR_METHODS_TEST_PORT;
+    config.pin_display_supported = true;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start_server());
+    pump_for(client, 50);
+
+    Identity server_identity = Identity::generate();
+    FakeEncryptedServer server(server_url(PAIR_METHODS_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity, psk_id, psk);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "Initial encrypted handshake/hello/activate did not complete";
+
+    std::vector<std::string> methods = server.hello_pair_methods();
+    auto advertises = [&methods](const std::string& name) {
+        return std::find(methods.begin(), methods.end(), name) != methods.end();
+    };
+    EXPECT_TRUE(advertises("pairing_psk"))
+        << "pairing_psk is client-mandatory and its PSK is auto-provisioned";
+    EXPECT_TRUE(advertises("dynamic_pin")) << "pin_display_supported was set on this client";
+    EXPECT_FALSE(advertises("static_pin")) << "no static PIN or pairing window on this client";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
 // Full pairing-PSK flow end to end: the operator has already transferred a Pairing PSK to the
 // server out of band (a pairing token; see crypto/pairing_token.h), so the server's initial
-// handshake resolves it directly to PskCategory::PAIRING (spec: "selected_pair_method MUST be
+// handshake resolves it directly to PskCategory::PAIRING (spec: "pairing.method MUST be
 // 'pairing_psk' if and only if the matched PSK IS the Pairing PSK" -- the client now enforces
 // this, see ConnectionManager::loop()'s pairing-method admissibility check, so a fake server that
 // selected pairing_psk over a Sentinel-matched connection would now be correctly rejected as
@@ -984,7 +1050,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     FakeEncryptedServerOptions options;
     options.first_activities_json = R"(["pairing"])";
     options.first_roles_json = R"([])";
-    options.first_selected_pair_method = "pairing_psk";
+    options.first_pairing_method = "pairing_psk";
     FakeEncryptedServer server(server_url(PAIRING_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                                server_identity, configured_pairing_psk.psk_id, pairing_psk_bytes,
                                options);
@@ -1048,7 +1114,7 @@ TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
     persistence.set_reject_pairing_records(true);
     // As in PairingPskFlowPersistsAndUpgradesTrust: the fake server must connect using an
     // accepted Pairing PSK directly (PskCategory::PAIRING), not Sentinel, now that the client
-    // enforces selected_pair_method=pairing_psk iff the matched PSK IS the Pairing PSK.
+    // enforces pairing.method=pairing_psk iff the matched PSK IS the Pairing PSK.
     std::array<uint8_t, 32> pairing_psk_bytes{};
     for (size_t i = 0; i < pairing_psk_bytes.size(); ++i) {
         pairing_psk_bytes[i] = static_cast<uint8_t>(0xE0 + i);
@@ -1074,7 +1140,7 @@ TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
     FakeEncryptedServerOptions options;
     options.first_activities_json = R"(["pairing"])";
     options.first_roles_json = R"([])";
-    options.first_selected_pair_method = "pairing_psk";
+    options.first_pairing_method = "pairing_psk";
     FakeEncryptedServer server(server_url(PAIRING_PERSIST_FAILURE_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                configured_pairing_psk.psk_id, pairing_psk_bytes, options);

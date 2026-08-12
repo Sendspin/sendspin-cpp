@@ -359,6 +359,9 @@ SendspinServerToClientMessageType determine_message_type(JsonObject root) {
     if (type_str == "management/set-pairing-config") {
         return SendspinServerToClientMessageType::MANAGEMENT_SET_PAIRING_CONFIG;
     }
+    if (type_str == "management/open-pairing-window") {
+        return SendspinServerToClientMessageType::MANAGEMENT_OPEN_PAIRING_WINDOW;
+    }
     if (type_str == "server/pair-init") {
         return SendspinServerToClientMessageType::SERVER_PAIR_INIT;
     }
@@ -426,12 +429,27 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
         activate_msg->active_roles = std::nullopt;
     }
 
-    // selected_pair_method is optional.
-    JsonVariantConst method_var = root["payload"]["selected_pair_method"];
-    if (method_var.is<const char*>()) {
-        activate_msg->selected_pair_method = pair_method_from_string(method_var.as<std::string>());
-    } else {
-        activate_msg->selected_pair_method = std::nullopt;
+    // pairing object: required when 'pairing' is in activities, ignored otherwise (the
+    // activities check lives in apply_server_activate, which nulls the method outside pairing).
+    activate_msg->pairing_method = std::nullopt;
+    activate_msg->pairing_pin_length = std::nullopt;
+    JsonVariantConst pairing_var = root["payload"]["pairing"];
+    if (pairing_var.is<JsonObjectConst>()) {
+        JsonVariantConst method_var = pairing_var["method"];
+        if (method_var.is<const char*>()) {
+            activate_msg->pairing_method = pair_method_from_string(method_var.as<std::string>());
+            if (!activate_msg->pairing_method.has_value()) {
+                SS_LOGW(TAG, "server/activate pairing object names an unknown method: %s",
+                        method_var.as<const char*>());
+            }
+        }
+        if (pairing_var["pin_length"].is<int>()) {
+            activate_msg->pairing_pin_length = pairing_var["pin_length"].as<int>();
+        }
+        // pairing.languages (BCP 47 tags, descending operator preference) is an informational
+        // hint for SPOKEN PIN emission only. This client emits PINs through the listener's
+        // display callback, so the hint is deliberately not parsed; a client adding speaker
+        // emission should parse it here and apply RFC 4647 Lookup matching.
     }
 
     return true;
@@ -924,13 +942,14 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
                     ch_arr.add(ch.c_str());
                 }
             }
-            // Emit locked_out whenever it is set (true or false), matching the reference's
-            // omit_none: a PIN method always carries locked_out; a non-PIN method omits it.
-            if (desc.locked_out.has_value()) {
-                method_obj["locked_out"] = desc.locked_out.value();
-            }
             if (desc.min_pin_length.has_value()) {
                 method_obj["min_pin_length"] = desc.min_pin_length.value();
+            }
+            if (desc.locations.has_value() && !desc.locations->empty()) {
+                JsonArray loc_arr = method_obj["locations"].to<JsonArray>();
+                for (const auto& loc : desc.locations.value()) {
+                    loc_arr.add(loc.c_str());
+                }
             }
         }
     }
@@ -1318,13 +1337,10 @@ bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
 // ============================================================================
 
 bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* payload) {
-    // Required fields: nonce_A (base64url, 43 chars -> 32 bytes), pin_length (int)
+    // Required field: nonce_A (base64url, 43 chars -> 32 bytes). The session pin_length is not
+    // carried here; it arrived in the activation's pairing object.
     if (!root["payload"]["nonce_A"].is<const char*>()) {
         SS_LOGE(TAG, "server/pair-init: missing nonce_A");
-        return false;
-    }
-    if (!root["payload"]["pin_length"].is<int>()) {
-        SS_LOGE(TAG, "server/pair-init: missing pin_length");
         return false;
     }
 
@@ -1340,7 +1356,6 @@ bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* pa
     }
     std::memcpy(payload->nonce_a.data(), nonce_a_bytes->data(), 32);
 
-    payload->pin_length = root["payload"]["pin_length"].as<int>();
     return true;
 }
 
@@ -1382,6 +1397,18 @@ bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPaylo
     }
     std::memcpy(payload->server_kc.data(), kc_bytes->data(), 64);
     return true;
+}
+
+std::string format_client_pair_pending_message(uint32_t pairing_index) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-pending";
+    root["payload"]["pairing_index"] = pairing_index;
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
 }
 
 std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
@@ -1521,9 +1548,6 @@ bool process_management_set_pairing_config_message(JsonObject root,
         if (static_obj["pin"].is<const char*>()) {
             static_cfg.pin = static_obj["pin"].as<std::string>();
         }
-        if (static_obj["locked_out"].is<bool>()) {
-            static_cfg.locked_out = static_obj["locked_out"].as<bool>();
-        }
         payload->static_pin = std::move(static_cfg);
     }
 
@@ -1534,13 +1558,10 @@ bool process_management_set_pairing_config_message(JsonObject root,
         if (dynamic_obj["enabled"].is<bool>()) {
             dynamic_cfg.enabled = dynamic_obj["enabled"].as<bool>();
         }
-        if (dynamic_obj["locked_out"].is<bool>()) {
-            dynamic_cfg.locked_out = dynamic_obj["locked_out"].as<bool>();
-        }
         if (dynamic_obj["min_pin_length"].is<int>()) {
             dynamic_cfg.min_pin_length = dynamic_obj["min_pin_length"].as<int>();
         }
-        payload->dynamic_pin = std::move(dynamic_cfg);
+        payload->dynamic_pin = dynamic_cfg;
     }
 
     // Parse record_mode (optional sub-object).
@@ -1560,7 +1581,7 @@ bool process_management_set_pairing_config_message(JsonObject root,
         if (ua_obj["enabled"].is<bool>()) {
             ua.enabled = ua_obj["enabled"].as<bool>();
         }
-        payload->unpaired_access = std::move(ua);
+        payload->unpaired_access = ua;
     }
 
     return true;
@@ -1594,31 +1615,28 @@ std::string format_management_result_message(const ManagementResultPayload& payl
             root["payload"]["data"]["pairing_psk"]["enabled"] = data.pairing_psk->enabled;
         }
 
-        // static_pin (get-pairing-config result): enabled always; locked_out only when set;
-        // min_pin_length never set for static_pin (omitted per PairingMethodConfig contract).
+        // static_pin (get-pairing-config result): enabled only; min_pin_length and escalated
+        // never set for static_pin (omitted per PairingMethodConfig contract).
         if (data.static_pin.has_value()) {
             const PairingMethodConfig& cfg = data.static_pin.value();
             root["payload"]["data"]["static_pin"]["enabled"] = cfg.enabled;
-            if (cfg.locked_out.has_value()) {
-                root["payload"]["data"]["static_pin"]["locked_out"] = cfg.locked_out.value();
-            }
             if (cfg.min_pin_length.has_value()) {
                 root["payload"]["data"]["static_pin"]["min_pin_length"] =
                     cfg.min_pin_length.value();
             }
         }
 
-        // dynamic_pin (get-pairing-config result): enabled always; locked_out and
-        // min_pin_length only when set.
+        // dynamic_pin (get-pairing-config result): enabled always; min_pin_length and
+        // escalated only when set.
         if (data.dynamic_pin.has_value()) {
             const PairingMethodConfig& cfg = data.dynamic_pin.value();
             root["payload"]["data"]["dynamic_pin"]["enabled"] = cfg.enabled;
-            if (cfg.locked_out.has_value()) {
-                root["payload"]["data"]["dynamic_pin"]["locked_out"] = cfg.locked_out.value();
-            }
             if (cfg.min_pin_length.has_value()) {
                 root["payload"]["data"]["dynamic_pin"]["min_pin_length"] =
                     cfg.min_pin_length.value();
+            }
+            if (cfg.escalated.has_value()) {
+                root["payload"]["data"]["dynamic_pin"]["escalated"] = cfg.escalated.value();
             }
         }
 

@@ -119,6 +119,7 @@ enum class ManagementRequestKind : uint8_t {
     REMOVE_RECORD,
     GET_PAIRING_CONFIG,
     SET_PAIRING_CONFIG,
+    OPEN_PAIRING_WINDOW,
 };
 
 /// @brief Deferred management request event.
@@ -150,7 +151,7 @@ struct ServerUnpairEvent {
 
 /// @brief Which server-to-client PIN pairing message arrived.
 enum class PinPairingMessageKind : uint8_t {
-    PAIR_INIT,     ///< server/pair-init: nonce_A + pin_length
+    PAIR_INIT,     ///< server/pair-init: nonce_A
     PAIR_AUTH,     ///< server/pair-auth: pake_msg_1
     PAIR_CONFIRM,  ///< server/pair-confirm: server_kc
     MALFORMED,     ///< a pairing message failed to parse; abort any active PIN session
@@ -166,7 +167,6 @@ struct ServerPairingMessageEvent {
 
     // server/pair-init fields
     std::array<uint8_t, 32> nonce_a{};  ///< nonce_A decoded from the wire
-    int pin_length{0};                  ///< Server-chosen PIN digit count
 
     // server/pair-auth fields
     std::array<uint8_t, 32> pake_msg_1{};  ///< Server CPace public share
@@ -193,8 +193,9 @@ struct HelloRetryState {
 struct ServerActivateEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection the activate was received on
     std::vector<SendspinActivity> activities;  ///< Activities declared by this activate
-    std::optional<std::vector<std::string>> active_roles;    ///< nullopt = sticky/keep prior set
-    std::optional<SendspinPairMethod> selected_pair_method;  ///< Server-selected pairing method
+    std::optional<std::vector<std::string>> active_roles;  ///< nullopt = sticky/keep prior set
+    std::optional<SendspinPairMethod> pairing_method;      ///< From the pairing object's method
+    std::optional<int> pairing_pin_length;                 ///< From the pairing object's pin_length
 };
 
 /**
@@ -619,7 +620,7 @@ private:
 
     /// @brief Enters the pairing exchange for the given connection.
     /// Called on the main loop when a server/activate with activities=["pairing"] and
-    /// selected_pair_method=PAIRING_PSK is admitted as the first activate.
+    /// pairing.method=PAIRING_PSK is admitted as the first activate.
     /// @param conn The connection entering pairing.
     void handle_enter_pairing(SendspinConnection* conn);
 
@@ -658,12 +659,30 @@ private:
     void local_abort_pin_pairing(SendspinConnection* conn, PairAbortReason reason);
 
     // ========================================
-    // Phase 8c: Static-PIN pairing main-loop handlers
+    // Pairing-window main-loop handlers
     // ========================================
 
-    /// @brief Handle a confirmed pairing-window gesture on the main loop.
-    /// Finds the connection (current or pending) awaiting AWAIT_PAIRING_WINDOW, sends the empty
-    /// client/pair-init, and starts CPace RESPONDER with the preconfigured static PIN.
+    /// @brief Start the prepared PIN attempt on `conn`: send client/pair-init (with commit_B for
+    /// dynamic PIN, bare plus CPace start for static PIN), advance the PinStep, and arm the
+    /// attempt timeout. Sending client/pair-init ends the pairing window's lifetime, so this
+    /// also consumes any standing window.
+    /// The PinSession must already be populated by handle_enter_pairing.
+    /// @param conn The connection whose session starts.
+    void start_pin_attempt(SendspinConnection* conn);
+
+    /// @brief Return true if a standing pairing window is open (opened by an operator gesture or
+    /// management/open-pairing-window and neither consumed by a client/pair-init nor past its
+    /// 5-minute lifetime). Main-loop-only.
+    [[nodiscard]] bool pairing_window_open() const;
+
+    /// @brief Open the pairing window on the main loop (operator gesture or
+    /// management/open-pairing-window). If an attempt is already waiting in
+    /// AWAIT_PAIRING_WINDOW, the window is consumed immediately by starting it; otherwise the
+    /// window stands open for WINDOW_LIFETIME (5 minutes) awaiting a pairing activate.
+    void open_pairing_window();
+
+    /// @brief Handle a confirmed pairing-window gesture on the main loop
+    /// (SendspinClient::confirm_pairing_window()). Delegates to open_pairing_window().
     void handle_pairing_window_confirmed();
 
     // ========================================
@@ -707,7 +726,11 @@ private:
     std::vector<std::string> pending_pairing_succeeded_events_;  // server_ids to notify
     // Deferred storage-failure aborts (persist rejected the record at server/pair-finalize)
     std::vector<PairStorageFailedEvent> pending_pair_storage_failed_events_;
-    bool pending_pairing_window_confirm_{false};  // Static-PIN pairing-window confirm
+    bool pending_pairing_window_confirm_{false};  // Pairing-window gesture confirm
+    // Standing pairing window: platform_time_us() deadline until which the window admits one
+    // pairing attempt; 0 = closed. Opened by the operator gesture or
+    // management/open-pairing-window, consumed when client/pair-init is sent. Main-loop-only.
+    int64_t pairing_window_open_until_us_{0};
 
     // Pointer fields
     SendspinClient* client_;

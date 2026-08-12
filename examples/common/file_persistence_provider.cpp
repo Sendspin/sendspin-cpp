@@ -420,6 +420,9 @@ std::optional<SendspinPairingConfig> FilePersistenceProvider::load_pairing_confi
     if (doc["pairing_config"]["dynamic_pin_min_length"].is<int>()) {
         cfg.dynamic_pin_min_length = doc["pairing_config"]["dynamic_pin_min_length"].as<int>();
     }
+    if (doc["pairing_config"]["dynamic_pin_failures"].is<int>()) {
+        cfg.dynamic_pin_failures = doc["pairing_config"]["dynamic_pin_failures"].as<int>();
+    }
     if (cfg.record_mode_psk_id.empty()) {
         return std::nullopt;
     }
@@ -435,6 +438,7 @@ bool FilePersistenceProvider::save_pairing_config(const SendspinPairingConfig& c
     doc["pairing_config"]["dynamic_pin_enabled"] = config.dynamic_pin_enabled;
     doc["pairing_config"]["static_pin_enabled"] = config.static_pin_enabled;
     doc["pairing_config"]["dynamic_pin_min_length"] = config.dynamic_pin_min_length;
+    doc["pairing_config"]["dynamic_pin_failures"] = config.dynamic_pin_failures;
     return save_doc(path_, doc);
 }
 

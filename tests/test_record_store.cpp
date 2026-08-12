@@ -126,6 +126,25 @@ TEST(RecordStore, FirstBootProvisioningCreatesSharedFallback) {
     EXPECT_FALSE(rec->server_id.has_value()) << "fallback record must be a shared-PSK record";
 }
 
+TEST(RecordStore, FirstBootProvisioningCreatesPairingPsk) {
+    RecordStore store(nullptr);
+
+    // pairing_psk is the client-mandatory pairing method, so a Pairing PSK must exist even
+    // when nothing was ever persisted, and it must resolve as the PAIRING category.
+    ASSERT_TRUE(store.pairing_psk().has_value());
+    EXPECT_EQ(store.pairing_psk()->psk_id, psk_id_for(store.pairing_psk()->psk));
+
+    auto resolved = store.resolve_by_psk_id(store.pairing_psk()->psk_id);
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->category, PskCategory::PAIRING);
+    EXPECT_EQ(resolved->psk, store.pairing_psk()->psk);
+
+    // It must also differ from the shared-PSK fallback record's key.
+    const auto* shared = store.record_by_psk_id(store.record_mode_psk_id());
+    ASSERT_NE(shared, nullptr);
+    EXPECT_NE(store.pairing_psk()->psk, shared->psk);
+}
+
 TEST(RecordStore, FirstBootPskIdIsSentinelPskIdResolvable) {
     RecordStore store(nullptr);
 
@@ -435,12 +454,15 @@ TEST(RecordStore, ResolveOutcomeFallsBackToSharedOnExhaustion) {
 TEST(RecordStore, PairingPskLifecycle) {
     RecordStore store(nullptr);
 
-    EXPECT_FALSE(store.pairing_psk().has_value());
+    // First-boot provisioning already installed one; setting replaces it.
+    ASSERT_TRUE(store.pairing_psk().has_value());
+    const std::string provisioned_psk_id = store.pairing_psk()->psk_id;
 
     SendspinPairingPsk p = make_pairing_psk();
     store.set_pairing_psk(p);
     EXPECT_TRUE(store.pairing_psk().has_value());
     EXPECT_EQ(store.pairing_psk()->psk_id, p.psk_id);
+    EXPECT_FALSE(store.resolve_by_psk_id(provisioned_psk_id).has_value());
 
     // Setting a new one replaces the old.
     SendspinPairingPsk other = make_pairing_psk();
@@ -453,6 +475,57 @@ TEST(RecordStore, PairingPskLifecycle) {
 
     // Clearing when absent is a no-op.
     store.clear_pairing_psk();
+}
+
+/// A persistence provider that hands back a Pairing PSK whose psk_id does not match its secret.
+class MismatchedPairingPskProvider : public SendspinPersistenceProvider {
+public:
+    explicit MismatchedPairingPskProvider(SendspinPairingPsk psk) : psk_(std::move(psk)) {}
+
+    std::optional<SendspinPairingPsk> load_pairing_psk() override {
+        return this->psk_;
+    }
+
+    bool save_pairing_psk(const SendspinPairingPsk& psk) override {
+        this->saved = psk;
+        return true;
+    }
+
+    std::optional<SendspinPairingPsk> saved;
+
+private:
+    SendspinPairingPsk psk_;
+};
+
+TEST(RecordStore, PairingPskIdIsDerivedFromTheSecret) {
+    // A caller-supplied psk_id is ignored: the server references the derived id, so anything
+    // else would never resolve.
+    RecordStore store(nullptr);
+    SendspinPairingPsk p = make_pairing_psk();
+    const std::string correct_psk_id = p.psk_id;
+    p.psk_id = "not-a-derived-psk-id";
+    store.set_pairing_psk(p);
+
+    ASSERT_TRUE(store.pairing_psk().has_value());
+    EXPECT_EQ(store.pairing_psk()->psk_id, correct_psk_id);
+    EXPECT_TRUE(store.resolve_by_psk_id(correct_psk_id).has_value());
+    EXPECT_FALSE(store.resolve_by_psk_id("not-a-derived-psk-id").has_value());
+}
+
+TEST(RecordStore, LoadedPairingPskIdIsCorrected) {
+    SendspinPairingPsk stored = make_pairing_psk();
+    const std::string correct_psk_id = stored.psk_id;
+    stored.psk_id = "stale-psk-id";
+    MismatchedPairingPskProvider provider(stored);
+
+    RecordStore store(&provider);
+
+    ASSERT_TRUE(store.pairing_psk().has_value());
+    EXPECT_EQ(store.pairing_psk()->psk_id, correct_psk_id);
+    EXPECT_EQ(store.pairing_psk()->psk, stored.psk) << "the secret itself must be preserved";
+    EXPECT_TRUE(store.resolve_by_psk_id(correct_psk_id).has_value());
+    EXPECT_FALSE(provider.saved.has_value())
+        << "a loaded Pairing PSK must not trigger re-provisioning";
 }
 
 // =============================================================================
@@ -623,20 +696,27 @@ TEST(RecordStoreWithFile, FirstBootProvisioningPersists) {
     TempFile tmp;
 
     std::string initial_mode_psk_id;
+    std::array<uint8_t, NOISE_PSK_SIZE> initial_pairing_psk{};
 
-    // First boot: should create and persist the shared fallback record.
+    // First boot: should create and persist the shared fallback record and the Pairing PSK.
     {
         FilePersistenceProvider provider(tmp.path());
         RecordStore store(&provider);
         initial_mode_psk_id = store.record_mode_psk_id();
         EXPECT_FALSE(initial_mode_psk_id.empty());
+        ASSERT_TRUE(store.pairing_psk().has_value());
+        initial_pairing_psk = store.pairing_psk()->psk;
     }
 
-    // Second boot: should load the same record, not generate a new one.
+    // Second boot: should load the same material, not generate new keys. A rotating Pairing PSK
+    // would invalidate any pairing token the operator has already been shown.
     {
         FilePersistenceProvider provider(tmp.path());
         RecordStore store(&provider);
         EXPECT_EQ(store.record_mode_psk_id(), initial_mode_psk_id);
+        ASSERT_TRUE(store.pairing_psk().has_value());
+        EXPECT_EQ(store.pairing_psk()->psk, initial_pairing_psk);
+        EXPECT_EQ(store.pairing_psk()->psk_id, psk_id_for(initial_pairing_psk));
     }
 }
 
