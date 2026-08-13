@@ -620,6 +620,22 @@ private:
     ///        already gone (connection-lost path) so no goodbye should be attempted.
     void drop_connection(SendspinConnection* conn, std::optional<SendspinGoodbyeReason> goodbye);
 
+    /// @brief Drop every managed connection that authenticated with `psk_id`.
+    ///
+    /// Removing a record from the RecordStore does not by itself end a session that is already
+    /// running on it: a connection caches its resolved psk_id and PSK category at Noise-handshake
+    /// completion (see SendspinConnection::get_psk_category()) and never re-resolves them against
+    /// the store. Without this sweep a revoked device would keep its LONG_TERM trust -- and with
+    /// it management authority and playback -- until it happened to disconnect, so revocation
+    /// would not take effect until the peer's next connection.
+    ///
+    /// Covers the current slot and the nursery. Caller must hold conn_ptr_mutex_ and call
+    /// flush_deferred_releases() after dropping it.
+    ///
+    /// @param psk_id psk_id whose sessions are no longer trusted.
+    /// @param except Connection to leave alone (its caller is already dropping it), or nullptr.
+    void drop_connections_using_psk_id(const std::string& psk_id, const SendspinConnection* except);
+
     /// @brief Maximum number of unproven inbound connections held at once
     ///
     /// The platform ws_server delivers only WS-upgraded sessions, so nursery slots are only ever

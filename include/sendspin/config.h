@@ -155,11 +155,14 @@ struct SendspinClientConfig {
     std::vector<std::string> static_pin_locations{};
 
     /// @brief First-boot default for unpaired (Sentinel) access.
-    /// Seeds `SendspinPairingConfig::unpaired_access_enabled` only when no pairing config has
-    /// ever been persisted; the seeded value is then written through the persistence provider.
-    /// Once a config exists the stored value always wins, so a server that turns unpaired access
-    /// off via management/set-pairing-config keeps it off across reboots. With no persistence
-    /// provider there is no stored config, so this value applies on every start.
+    /// Seeds `SendspinPairingConfig::unpaired_access_enabled` only on a genuine first boot; the
+    /// seeded value is then written through the persistence provider. Once a config exists the
+    /// stored value always wins, so a server that turns unpaired access off via
+    /// management/set-pairing-config keeps it off across reboots. With no persistence provider
+    /// there is no stored config, so this value applies on every start.
+    /// A config that fails to load does not count as a first boot when any provisioned material
+    /// (a pairing record or the Pairing PSK) survived: the seed is skipped and unpaired access
+    /// stays disabled, so a damaged config fails closed. See the integration guide.
     bool initial_unpaired_access_enabled{false};
 
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)

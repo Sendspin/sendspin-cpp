@@ -473,6 +473,16 @@ protected:
         return this->client_->connection_manager_->current();
     }
 
+    /// Drive ConnectionManager's real teardown path for `conn`, through the friend seam, taking
+    /// the same lock and running the same deferred-release flush loop() would.
+    void drop_connection(SendspinConnection* conn, SendspinGoodbyeReason goodbye) {
+        {
+            std::lock_guard<std::mutex> lock(this->client_->connection_manager_->conn_ptr_mutex_);
+            this->client_->connection_manager_->drop_connection(conn, goodbye);
+        }
+        this->client_->connection_manager_->flush_deferred_releases();
+    }
+
     /// Schedule a server-to-client PIN pairing message for deferred processing (the same public
     /// entry point process_json_message() uses on the network thread), without pumping loop().
     void schedule_pin_message(ServerPairingMessageEvent event) {
@@ -1828,4 +1838,34 @@ TEST_F(PinStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingHumanPin
            "re-proving watchdog";
     EXPECT_TRUE(conn->is_operational());
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
+}
+
+// The admitted flag must be cleared when the admitted connection is dropped.
+//
+// SendspinConnection::is_admitted() is what the network-thread dispatch gate reads to decide
+// whether a connection may drive the roles (see requires_admitted_connection() in client.cpp).
+// drop_connection() moves the connection out of current_connection_ BEFORE calling
+// set_current_connection(nullptr), so the setter sees an already-null slot and cannot clear the
+// outgoing occupant -- drop_connection() has to do it itself. The dropped connection outlives the
+// call (queue_deferred_release keeps it alive through the goodbye window), so a missed clear
+// leaves an object that still claims admission.
+//
+// Asserted on the flag directly rather than end to end: disable_message_dispatch(), called a few
+// lines earlier in the same function, independently blocks dispatch from a dropped connection, so
+// an end-to-end test cannot tell a cleared flag from a stale one. That masking is why this is
+// defence in depth rather than the only barrier, and it is exactly why the invariant needs its
+// own test.
+TEST_F(PinStateMachineTest, DropClearsTheAdmittedFlag) {
+    FakeConnection* conn = this->inject_current_connection("server-drop-admitted",
+                                                           SendspinPairMethod::PAIRING_PSK);
+    // inject_current_connection() assigns current_connection_ directly (bypassing
+    // set_current_connection), so set the flag the way promotion would.
+    conn->set_admitted(true);
+    ASSERT_TRUE(conn->is_admitted());
+
+    this->drop_connection(conn, SendspinGoodbyeReason::SHUTDOWN);
+
+    EXPECT_EQ(this->current_connection(), nullptr) << "the slot must be empty after the drop";
+    EXPECT_FALSE(conn->is_admitted())
+        << "a dropped connection must not keep claiming the admitted slot";
 }

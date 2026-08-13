@@ -1139,8 +1139,8 @@ void ConnectionManager::setup_connection_callbacks(SendspinConnection* conn) {
                                       int64_t timestamp) {
         this->client_->process_json_message(c, data, len, timestamp);
     };
-    conn->on_binary_message_cb = [this](SendspinConnection* /*c*/, uint8_t* payload, size_t len) {
-        this->client_->process_binary_message(payload, len);
+    conn->on_binary_message_cb = [this](SendspinConnection* c, uint8_t* payload, size_t len) {
+        this->client_->process_binary_message(c, payload, len);
     };
 }
 
@@ -1335,6 +1335,21 @@ void ConnectionManager::push_nursery_entry(NurseryEntry entry) {
 
 void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnection> conn) {
     // Note: caller must hold conn_ptr_mutex_
+    // The admitted flag tracks this slot exactly: it is what the network-thread dispatch gate
+    // reads to decide whether a connection may drive the roles (see SendspinConnection::
+    // is_admitted()). Clear the outgoing occupant before marking the incoming one so a handoff
+    // never leaves two connections flagged as admitted, and skip the clear when the same
+    // connection is being re-set.
+    //
+    // This only covers an occupant still sitting in the slot. drop_connection() moves the
+    // outgoing connection out BEFORE calling here, so it clears the flag itself; keep the two
+    // in step if either changes.
+    if (this->current_connection_ != nullptr && this->current_connection_ != conn) {
+        this->current_connection_->set_admitted(false);
+    }
+    if (conn != nullptr) {
+        conn->set_admitted(true);
+    }
     this->has_current_.store(conn != nullptr, std::memory_order_release);
     this->current_connection_ = std::move(conn);
 }
@@ -1411,6 +1426,38 @@ std::vector<NurseryEntry>::iterator ConnectionManager::release_nursery_entry(
     this->remove_hello_retry(conn.get());
     this->queue_deferred_release(std::move(conn), reason);
     return next;
+}
+
+void ConnectionManager::drop_connections_using_psk_id(const std::string& psk_id,
+                                                      const SendspinConnection* except) {
+    // Note: caller must hold conn_ptr_mutex_ and flush_deferred_releases() after dropping it
+    if (psk_id.empty()) {
+        return;
+    }
+
+    // Collect first, then drop: drop_connection() mutates both the current slot and nursery_,
+    // so dropping while walking the nursery would invalidate the iterator underneath us.
+    //
+    // psk_id_copy() rather than get_psk_id(): a nursery member can be completing its Noise
+    // handshake on its own network thread right now, and that write rewrites the very string
+    // being compared here. get_psk_id() is only sound for its two sequenced call sites.
+    std::vector<std::shared_ptr<SendspinConnection>> doomed;
+    if (this->current_connection_ != nullptr && this->current_connection_.get() != except &&
+        this->current_connection_->psk_id_copy() == psk_id) {
+        doomed.push_back(this->current_connection_);
+    }
+    for (const auto& entry : this->nursery_) {
+        if (entry.conn != nullptr && entry.conn.get() != except &&
+            entry.conn->psk_id_copy() == psk_id) {
+            doomed.push_back(entry.conn);
+        }
+    }
+
+    for (const auto& conn : doomed) {
+        SS_LOGI(TAG, "Record %s revoked; dropping its live session (server_id=%s)", psk_id.c_str(),
+                conn->get_server_id().c_str());
+        this->drop_connection(conn.get(), SendspinGoodbyeReason::UNAUTHORIZED);
+    }
 }
 
 void ConnectionManager::queue_deferred_release(std::shared_ptr<SendspinConnection> conn,
@@ -1498,6 +1545,12 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         const bool pin_was_displayed = conn->pin_session().pin_displayed;
         const bool window_was_shown = conn->pin_session().window_shown;
         conn->disable_message_dispatch();
+        // Vacate the admitted slot explicitly. set_current_connection(nullptr) below cannot do
+        // it: the outgoing connection is moved out of current_connection_ first, so the setter
+        // sees an already-null slot and has nothing to clear. The connection outlives this call
+        // (queue_deferred_release keeps it alive through the goodbye window), so leaving the flag
+        // set would leave a dropped connection claiming admission.
+        conn->set_admitted(false);
         this->client_->cleanup_connection_state();
         // set_current_connection(nullptr) reassigns the slot to a clean null (not a moved-from
         // state) after we move the old connection out, so a later event in the same loop() pass
@@ -2377,6 +2430,14 @@ void ConnectionManager::handle_management_request(SendspinConnection* conn,
                 requester_psk_id = conn->get_psk_id();
             }
             handle_remove_record(store, event.remove_payload, requester_psk_id, result, effect);
+            // Revocation must end the revoked device's live sessions, not just delete the
+            // record: a connection resolves its psk_id/category once at handshake time and never
+            // re-checks the store. The requester's own connection is excluded here because the
+            // GOODBYE_UNAUTHORIZED effect below already drops it (and only after its
+            // management/result has been sent).
+            if (result.result == ManagementResult::OK) {
+                this->drop_connections_using_psk_id(event.remove_payload.psk_id, conn);
+            }
             break;
         }
         case ManagementRequestKind::GET_PAIRING_CONFIG:
@@ -2452,6 +2513,11 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
     if (this->client_->record_store_ != nullptr) {
         handle_unpair(*this->client_->record_store_, event.matched_psk_id);
     }
+
+    // Any OTHER session running on the same record is no longer trusted either -- see
+    // drop_connections_using_psk_id(). `conn` itself is excluded and dropped below with the
+    // spec's UNPAIRED reason rather than UNAUTHORIZED.
+    this->drop_connections_using_psk_id(event.matched_psk_id, conn);
 
     // Disconnect with UNPAIRED reason.
     this->drop_connection(conn, SendspinGoodbyeReason::UNPAIRED);

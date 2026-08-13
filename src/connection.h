@@ -163,6 +163,28 @@ public:
         return this->is_handshake_complete() && this->first_activate_received();
     }
 
+    /// @brief Whether this connection currently occupies the manager's admitted (current) slot.
+    ///
+    /// Being operational is not the same as being admitted: a nursery member can complete the
+    /// Noise handshake and the hello cycle and still lose arbitration, and every peer that knows
+    /// the Sentinel PSK (a spec constant, so effectively any peer on the network) can reach that
+    /// state. Admission is where the PSK category is actually checked against the requested
+    /// activities (see admission.h), so anything that drives shared client state -- the roles --
+    /// must gate on THIS, not on the handshake having succeeded.
+    ///
+    /// Set/cleared only by ConnectionManager::set_current_connection() on the main loop; atomic
+    /// because the network thread reads it on the message-dispatch path.
+    /// @return true while this connection is the admitted one.
+    bool is_admitted() const {
+        return this->admitted_.load(std::memory_order_acquire);
+    }
+
+    /// @brief Mark this connection as occupying (or vacating) the admitted slot.
+    /// ConnectionManager::set_current_connection() is the only caller.
+    void set_admitted(bool admitted) {
+        this->admitted_.store(admitted, std::memory_order_release);
+    }
+
     // ========================================
     // Noise transport (Phase 2)
     // ========================================
@@ -419,7 +441,23 @@ public:
     ///      before scheduling. Safe because psk_id_ was written earlier on the same network
     ///      thread (same-thread sequencing), and the value is captured by value into the event
     ///      before any later write.
+    /// Any read that fits NEITHER argument -- in particular a main-loop read of a connection
+    /// that is not the one whose event is being handled -- must use psk_id_copy() instead.
     const std::string& get_psk_id() const {
+        return this->psk_id_;
+    }
+
+    /// @brief Returns a copy of the matched psk_id, safe to call from any thread at any time.
+    ///
+    /// get_psk_id() returns a reference to a std::string the network thread rewrites at
+    /// handshake COMPLETE and at every in-band re-handshake, so it is only sound for the two
+    /// sequenced read sites documented above. ConnectionManager::drop_connections_using_psk_id()
+    /// is neither: it walks the nursery from the main loop, and a nursery member can be
+    /// completing its handshake on its own network thread at that very moment. This overload
+    /// takes psk_id_mutex_, which both writers also hold.
+    /// @return Copy of the psk_id, or an empty string if no handshake has completed.
+    std::string psk_id_copy() const {
+        std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
         return this->psk_id_;
     }
 
@@ -765,7 +803,12 @@ public:
                                     const std::string& psk_id) {
         this->server_information_.server_id = server_id;
         this->psk_category_.store(psk_category, std::memory_order_release);
-        this->psk_id_ = psk_id;
+        {
+            // Held so a main-loop psk_id_copy() (the revocation sweep walking the nursery) cannot
+            // observe this string mid-assignment.
+            std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
+            this->psk_id_ = psk_id;
+        }
     }
 
     /// @brief Sets the server hello received flag
@@ -927,8 +970,15 @@ protected:
     /// psk_id of the PSK matched by the Noise handshake (empty for Sentinel, or when no
     /// Noise handshake has completed). Main-loop-only readers gate on first_activate_received()
     /// (or is_operational()), which happens-after the network-thread write at handshake
-    /// COMPLETE via the same publishing discipline as server_information_.
+    /// COMPLETE via the same publishing discipline as server_information_. Readers with no such
+    /// gate use psk_id_copy() and take psk_id_mutex_ below.
     std::string psk_id_{};
+
+    /// Guards psk_id_ against a main-loop psk_id_copy() racing the network-thread write at
+    /// handshake COMPLETE / re-handshake. Held only around the assignment and the copy, never
+    /// across a send or a callback. Not taken by get_psk_id(), whose two call sites are sequenced
+    /// against the write by other means (see its doc comment).
+    mutable std::mutex psk_id_mutex_;
 
     // Vector fields
 
@@ -996,6 +1046,11 @@ protected:
     /// True once the Noise transport handshake has completed (set on the network thread,
     /// read from the main loop via is_noise_handshake_complete()).
     std::atomic<bool> noise_handshake_complete_{false};
+
+    /// True while this connection occupies the manager's admitted (current) slot. Written only
+    /// by ConnectionManager::set_current_connection() on the main loop; read on the network
+    /// thread by the role-dispatch gate. See is_admitted().
+    std::atomic<bool> admitted_{false};
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).
     /// Written from the transport connected callback (network thread), read by the manager's

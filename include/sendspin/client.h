@@ -649,9 +649,13 @@ private:
                               int64_t timestamp);
 
     /// @brief Processes a binary message from a connection
+    /// Every binary message is role-bound, so this is dropped unless `conn` holds the admitted
+    /// slot -- see the admission gate in process_json_message() for why finishing the Noise
+    /// handshake is not enough on its own.
+    /// @param conn The connection the message arrived on
     /// @param payload Pointer to the raw binary data
     /// @param len Length of the binary data in bytes
-    void process_binary_message(const uint8_t* payload, size_t len);
+    void process_binary_message(const SendspinConnection* conn, const uint8_t* payload, size_t len);
 
     // ========================================
     // State publishing

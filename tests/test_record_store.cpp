@@ -946,6 +946,55 @@ TEST(RecordStore, UnpairedAccessSeedYieldsToConfigWithEmptyRecordModeId) {
         << "an empty record_mode_psk_id still means a config was loaded";
 }
 
+/// A provider whose records survive but whose pairing config does not come back - the shape of
+/// a config blob lost or corrupted independently of the records (separate NVS keys, a torn
+/// write, or any provider whose parse failure collapses into "nothing stored", which is exactly
+/// what the bundled FilePersistenceProvider does).
+class RecordsWithoutConfigProvider : public SendspinPersistenceProvider {
+public:
+    explicit RecordsWithoutConfigProvider(std::vector<SendspinPairingRecord> records)
+        : records_(std::move(records)) {}
+
+    std::vector<SendspinPairingRecord> load_pairing_records() override {
+        return this->records_;
+    }
+
+    std::optional<SendspinPairingConfig> load_pairing_config() override {
+        return std::nullopt;
+    }
+
+    bool save_pairing_record(const SendspinPairingRecord& record) override {
+        this->records_.push_back(record);
+        return true;
+    }
+
+private:
+    std::vector<SendspinPairingRecord> records_;
+};
+
+TEST(RecordStore, UnpairedAccessSeedDoesNotApplyWhenOnlyTheConfigIsLost) {
+    // load_pairing_config() returning nullopt is not proof of a first boot: the interface cannot
+    // distinguish "never stored" from "could not be read back". Surviving records prove the
+    // device was provisioned before, so re-seeding unpaired access ON here would silently
+    // reopen unauthenticated access on a paired device whose operator had turned it off.
+    RecordsWithoutConfigProvider provider({make_client_record("server-1")});
+
+    RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true);
+
+    EXPECT_FALSE(store.unpaired_access_enabled())
+        << "a damaged config on a provisioned device must fail closed, not re-seed";
+}
+
+TEST(RecordStore, UnpairedAccessSeedStillAppliesWhenNothingSurvived) {
+    // A store that lost everything is indistinguishable from a factory-fresh device, so the
+    // seed does apply - same as the no-provider case.
+    RecordsWithoutConfigProvider provider({});
+
+    RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true);
+
+    EXPECT_TRUE(store.unpaired_access_enabled());
+}
+
 TEST(RecordStoreWithFile, UnpairedAccessSeedPersistsOnFirstBoot) {
     TempFile tmp;
 

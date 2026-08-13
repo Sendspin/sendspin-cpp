@@ -77,14 +77,44 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
         }
     }
 
-    // First-boot seed: the application's configured default for unpaired access applies only
-    // when no pairing config has ever been persisted. A loaded config always wins, so a server
-    // that turned unpaired access off through management/set-pairing-config keeps it off across
-    // reboots. The value is persisted below by the first-boot provisioning branch, which this
-    // same !loaded_config condition always enters.
-    if (!loaded_config) {
+    // First-boot seed: the application's configured default for unpaired access applies only on
+    // a genuine first boot. A loaded config always wins, so a server that turned unpaired access
+    // off through management/set-pairing-config keeps it off across reboots. The value is
+    // persisted below by the first-boot provisioning branch, which the !loaded_config condition
+    // always enters.
+    //
+    // !loaded_config alone is NOT sufficient evidence of a first boot, and getting that wrong
+    // fails open. load_pairing_config() returns nullopt both when nothing was ever stored and
+    // when the stored config could not be read back -- the interface gives a provider no way to
+    // distinguish the two, and the bundled FilePersistenceProvider collapses a JSON parse error
+    // into "nothing stored". Records and config are separate provider calls, so a provider that
+    // loses only the config blob (independent NVS keys, a torn write) would otherwise re-seed
+    // unpaired access ON for a device that is still paired and had it deliberately turned off.
+    // Any surviving provisioned material therefore vetoes the seed: this is a reboot with a
+    // damaged config, not a first boot, and the safe default is the restrictive one.
+    //
+    // A store that lost EVERYTHING is indistinguishable from a factory-fresh device by
+    // construction, so the seed does apply there -- as it does when there is no provider at all.
+    const bool previously_provisioned = !records_.empty() || pairing_psk_.has_value();
+    if (!loaded_config && !previously_provisioned) {
         unpaired_access_enabled_ = initial_unpaired_access_enabled;
+    } else if (!loaded_config) {
+        SS_LOGW(TAG,
+                "No pairing config loaded but %zu record(s) survived; ignoring the unpaired-"
+                "access seed and leaving unpaired access disabled",
+                records_.size());
     }
+    // Scope note: only unpaired_access_enabled_ is protected this way, and deliberately so. It
+    // defaults to false, so declining to seed it can only ever withhold a permission -- it
+    // cannot break a working device. The sibling flags (pairing_psk_enabled_,
+    // dynamic_pin_enabled_) default to TRUE, so a config that fails to load does resurrect a
+    // pairing method an operator had turned off, and the provisioning branch below persists
+    // that. Forcing those to false here is not a correct fix: a provider that seeds records or a
+    // Pairing PSK without implementing config persistence at all returns nullopt for exactly the
+    // same reason a damaged one does, and disabling pairing for it would break a legitimate
+    // integration. Closing that hole properly needs the provider interface to distinguish
+    // "never stored" from "could not be read" -- a tri-state load result -- rather than more
+    // guessing here.
 
     // First-boot provisioning: if no config was loaded (or the referenced shared
     // record is missing), generate a fresh shared-PSK fallback record.

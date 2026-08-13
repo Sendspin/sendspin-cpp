@@ -165,10 +165,31 @@ inline Fp fp_reduce(const Fp& a) {
     return a;
 }
 
-// Overload accepting an explicit carry argument for fp_mul's call site; the carry must
-// already be zero after fp_mul's fold, so this forwards to the single-argument reduce.
-inline Fp fp_reduce(const Fp& a, uint64_t /*top_carry_must_be_zero*/) {
-    return fp_reduce(a);
+// ---------------------------------------------------------------------------
+// Fully reduce a value anywhere in [0, 2^256) to [0, p-1].
+//
+// The single conditional subtraction above is only enough for inputs below 2p.
+// The 38-fold in fp_mul/fp_scale leaves a value that is merely below 2^256, and
+// 2^256 = 2p + 38, so an input in [2p, 2^256) needs a SECOND subtraction: one
+// pass would leave it in [p, p+38), i.e. still non-canonical. That band is not
+// exotic -- it is reachable whenever the true result is congruent to a value
+// below 38, which is exactly what an inverse or a Legendre exponentiation
+// produces (fp_mul(x, fp_inv(x)) hit it for ~25% of random x, returning p+1
+// instead of 1). A non-canonical Fp then encodes to the wrong 32 bytes through
+// fp_to_le(), which does not reduce.
+//
+// Two passes always suffice because 2^256 < 3p.
+// ---------------------------------------------------------------------------
+
+inline Fp fp_reduce_full(const Fp& a) {
+    return fp_reduce(fp_reduce(a));
+}
+
+// Overload accepting an explicit carry argument for the fp_mul/fp_scale call sites; the
+// carry must already be folded in there, leaving a value in [0, 2^256) that needs the
+// two-pass reduction.
+inline Fp fp_reduce(const Fp& a, uint64_t /*top_carry_must_be_folded_in*/) {
+    return fp_reduce_full(a);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +199,8 @@ inline Fp fp_reduce(const Fp& a, uint64_t /*top_carry_must_be_zero*/) {
 // Reduction of a 512-bit number n mod (2^255-19):
 //   n = n_lo + n_hi * 2^255
 //   n mod p = n_lo + n_hi * 19   (because 2^255 = p + 19 => 2^255 mod p = 19)
-// Applied twice (since n_lo + n_hi*19 < 2^256) this gives a fully reduced result.
+// The fold leaves a value below 2^256, which is 2p + 38 -- so the final step must be the
+// two-subtraction fp_reduce_full(), not a single conditional subtraction.
 // ---------------------------------------------------------------------------
 
 inline Fp fp_mul(const Fp& a, const Fp& b) {
@@ -244,7 +266,8 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
         }
     }
 
-    // Pass 2: reduce the top bit if set (value may be in [p, 2p)).
+    // Pass 2: fully reduce. The folded value is only bounded by 2^256 (= 2p + 38), not by
+    // 2p, so this needs the two-subtraction reduce -- see fp_reduce_full().
     return fp_reduce(r, 0);
 }
 

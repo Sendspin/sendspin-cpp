@@ -794,11 +794,19 @@ SendspinClientConfig config;
 config.initial_unpaired_access_enabled = true;
 ```
 
-The seed applies only when no pairing config has ever been persisted, and the seeded value is
-written through the persistence provider during first-boot provisioning. On every later start
-the stored config wins, so a server that turns unpaired access off through
-`management/set-pairing-config` keeps it off across reboots. With no persistence provider
-there is no stored config, so the seed applies on every start.
+The seed applies only on a genuine first boot, and the seeded value is written through the
+persistence provider during first-boot provisioning. On every later start the stored config
+wins, so a server that turns unpaired access off through `management/set-pairing-config` keeps
+it off across reboots. With no persistence provider there is no stored config, so the seed
+applies on every start.
+
+A config that fails to load is not treated as a first boot. `load_pairing_config()` returns
+`std::nullopt` both when nothing was ever stored and when the stored config could not be read
+back, and the interface gives a provider no way to tell the client which happened. If any
+provisioned material survives -- a pairing record or the Pairing PSK -- the seed is skipped and
+unpaired access stays disabled, so a damaged config on a paired device fails closed rather than
+silently reopening unauthenticated access. A store that lost everything is indistinguishable
+from a factory-fresh device, so the seed does apply there.
 
 An application that manages the persisted pairing config itself can write the flag directly,
 but it must read-modify-write the stored config rather than save a fresh one:

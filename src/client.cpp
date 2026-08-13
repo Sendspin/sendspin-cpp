@@ -826,6 +826,39 @@ std::string SendspinClient::build_hello_message(const SendspinConnection* conn) 
 // Message processing
 // ============================================================================
 
+namespace {
+
+/// @brief Whether a server message may only be acted on when it comes from the admitted
+/// (current) connection.
+///
+/// True for everything that drives the shared, client-global role state. Completing the Noise
+/// handshake is NOT authorization to do that: the Sentinel PSK is a spec constant that
+/// RecordStore::resolve_by_psk_id() accepts unconditionally, so any peer on the network can
+/// finish a handshake and sit in the nursery. Whether its PSK category actually permits the
+/// PLAYBACK activity is decided by admission (see admission.h), which runs on the main loop when
+/// server/activate arrives -- so until this connection holds the admitted slot, none of these
+/// messages may touch a role.
+///
+/// False for the establishment and trust-negotiation traffic a connection must be able to send
+/// before it is admitted (hello, activate, in-band re-handshake), and for the pairing and
+/// management messages, which carry their own gating on the main loop (management additionally
+/// requires the MANAGEMENT activity, which is itself only reachable through admission).
+bool requires_admitted_connection(SendspinServerToClientMessageType type) {
+    switch (type) {
+        case SendspinServerToClientMessageType::SERVER_STATE:
+        case SendspinServerToClientMessageType::SERVER_COMMAND:
+        case SendspinServerToClientMessageType::STREAM_START:
+        case SendspinServerToClientMessageType::STREAM_END:
+        case SendspinServerToClientMessageType::STREAM_CLEAR:
+        case SendspinServerToClientMessageType::GROUP_UPDATE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
 void SendspinClient::process_json_message(SendspinConnection* conn, const char* data, size_t len,
                                           int64_t timestamp) {
     // Two connections can deliver JSON concurrently on their own network threads (current +
@@ -849,6 +882,16 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
     JsonObject root = doc.as<JsonObject>();
 
     SendspinServerToClientMessageType message_type = determine_message_type(root);
+
+    // Admission gate for role-bound traffic. Dropped silently rather than closing the
+    // connection: a nursery member that is still racing toward promotion, or one that just lost
+    // arbitration, is not misbehaving, and the establish/re-prove watchdogs already reap a
+    // connection that never gets admitted.
+    if (requires_admitted_connection(message_type) && (conn == nullptr || !conn->is_admitted())) {
+        SS_LOGW(TAG, "Ignoring role message from a connection that is not admitted (server_id=%s)",
+                conn != nullptr ? conn->get_server_id().c_str() : "?");
+        return;
+    }
 
     switch (message_type) {
         case SendspinServerToClientMessageType::STREAM_START: {
@@ -1357,8 +1400,16 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
     }
 }
 
-SS_HOT void SendspinClient::process_binary_message(const uint8_t* payload, size_t len) {
+SS_HOT void SendspinClient::process_binary_message(const SendspinConnection* conn,
+                                                   const uint8_t* payload, size_t len) {
     if (len < 2) {
+        return;
+    }
+
+    // Every binary message feeds a role, so the same admission gate as the role-bound JSON
+    // messages applies -- see requires_admitted_connection().
+    if (conn == nullptr || !conn->is_admitted()) {
+        SS_LOGW(TAG, "Ignoring binary message from a connection that is not admitted");
         return;
     }
 

@@ -202,6 +202,12 @@ inline void handle_add_record(RecordStore& store, const ManagementAddRecordPaylo
 /// @param payload Parsed remove-record payload.
 /// @param requester_psk_id psk_id of the PSK that authenticated the requesting connection (for
 ///        own-record detection).
+/// Removing the record is only half of a revocation: connections resolve their psk_id and PSK
+/// category once, at Noise-handshake completion, so a session already running on this record
+/// keeps its trust until it is dropped. This handler has no visibility into live connections, so
+/// the caller must follow an OK result with
+/// ConnectionManager::drop_connections_using_psk_id().
+///
 /// @param[out] result Populated with result code.
 /// @param[out] effect GOODBYE_UNAUTHORIZED if the requester removed its own record; else NONE.
 inline void handle_remove_record(RecordStore& store, const ManagementRemoveRecordPayload& payload,

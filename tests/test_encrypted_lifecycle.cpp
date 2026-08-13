@@ -33,6 +33,7 @@
 #include "platform/crypto.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/metadata_role.h"
 #include "sendspin/types.h"
 
 #include <gtest/gtest.h>
@@ -80,6 +81,9 @@ constexpr uint16_t CIPHER_SUITE_AESGCM_TEST_PORT = 18996;
 constexpr uint16_t PAIR_METHODS_TEST_PORT = 18997;
 constexpr uint16_t AEAD_FAILURE_TEST_PORT = 18998;
 constexpr uint16_t AEAD_FAILURE_OUTBOUND_PORT = 18999;
+constexpr uint16_t PREHANDSHAKE_BINARY_TEST_PORT = 19000;
+constexpr uint16_t PREADMISSION_ROLE_TEST_PORT = 19001;
+constexpr uint16_t REVOCATION_SWEEP_TEST_PORT = 19002;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -395,6 +399,14 @@ struct FakeEncryptedServerOptions {
     // trigger_rehandshake() call and its resulting fresh hello cycle).
     std::string second_activities_json{R"(["playback"])"};
     std::string second_roles_json{R"(["player@v1"])"};
+    // When set, this raw JSON message is sent (encrypted) immediately BEFORE the first
+    // server/activate -- i.e. while the connection has finished the Noise handshake but has not
+    // yet been admitted. Used to prove role-bound traffic is refused until admission.
+    std::optional<std::string> pre_activate_message;
+    // When true, no server/activate is ever sent. The connection completes the Noise handshake
+    // (so its psk_id/category are resolved) and the hello exchange, but never proves itself, so
+    // it stays in the nursery instead of being promoted.
+    bool suppress_activate{false};
 };
 
 class FakeEncryptedServer {
@@ -493,6 +505,16 @@ public:
             return false;
         }
         this->send_encrypted_locked(R"({"type":"management/list-records","payload":{}})");
+        return true;
+    }
+
+    // Sends an arbitrary application JSON message over the active encrypted session.
+    bool send_app_json(const std::string& json) {
+        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+        if (this->active_.send_cs == nullptr) {
+            return false;
+        }
+        this->send_encrypted_locked(json);
         return true;
     }
 
@@ -663,6 +685,14 @@ private:
                            this->options_.first_pairing_method.value() + "\"}";
             }
             activate += "}}";
+            if (this->options_.suppress_activate) {
+                return;
+            }
+            if (count <= 1 && this->options_.pre_activate_message.has_value()) {
+                // Ordered strictly before the activate on the same encrypted stream, so the DUT
+                // sees it while the connection is handshake-complete but not yet admitted.
+                this->send_encrypted_locked(this->options_.pre_activate_message.value());
+            }
             this->send_encrypted_locked(activate);
             return;
         }
@@ -1566,6 +1596,224 @@ TEST(EncryptedLifecycle, ManagementListRecordsRoundTripOverEncryptedTransport) {
         }
     }
     EXPECT_TRUE(found_seeded_record) << "management/result did not list the seeded record";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// A binary WebSocket frame that arrives while the Noise handshake is still pending must close the
+// connection, not be dispatched.
+//
+// Regression test: dispatch_completed_message()'s binary branch only checked "is the transport
+// active", collapsing "handshake installed but not finished" into the same fall-through as "no
+// handshake at all" (encryption_required == false). The TEXT branch never had that gap -- it
+// routes pre-handshake text into the handshake driver -- so a peer that merely completed the
+// WebSocket upgrade could skip client/init entirely, send a raw binary frame, and have it handed
+// straight to the role binary handlers with the whole Noise/PSK/admission chain bypassed.
+TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
+    TestNetworkProvider network;
+    SendspinClientConfig config;
+    config.name = "Pre-Handshake Binary Test Client";
+    config.server_port = PREHANDSHAKE_BINARY_TEST_PORT;
+    ASSERT_TRUE(config.encryption_required);
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start_server());
+    pump_for(client, 50);
+
+    // A bare WebSocket peer: it completes the upgrade and then says nothing the protocol expects.
+    std::atomic<bool> opened{false};
+    std::atomic<bool> closed{false};
+    ix::WebSocket ws;
+    ws.setUrl(server_url(PREHANDSHAKE_BINARY_TEST_PORT));
+    ws.disableAutomaticReconnection();
+    ws.setOnMessageCallback([&](const ix::WebSocketMessagePtr& msg) {
+        if (msg->type == ix::WebSocketMessageType::Open) {
+            opened.store(true);
+        } else if (msg->type == ix::WebSocketMessageType::Close) {
+            closed.store(true);
+        }
+    });
+    ws.start();
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return opened.load(); }, 4000))
+        << "Raw peer never completed the WebSocket upgrade";
+
+    // No client/init, no handshake -- straight to a player-shaped binary frame (type byte 4 =
+    // player role, slot 0, followed by what would be an 8-byte timestamp and a payload).
+    const std::string binary_frame(
+        "\x04\x00\x00\x00\x00\x00\x00\x00\x00\xde\xad\xbe\xef", 13);
+    ws.sendBinary(binary_frame);
+
+    EXPECT_TRUE(pump_until(
+        client, [&] { return closed.load(); }, 4000))
+        << "An unauthenticated binary frame must close the connection, not be dispatched";
+
+    ws.stop();
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// Role-bound traffic from a connection that has finished the Noise handshake but has NOT been
+// admitted must be ignored.
+//
+// Completing the handshake is not authorization: the Sentinel PSK is a spec constant that
+// RecordStore::resolve_by_psk_id() accepts unconditionally, so any peer on the network can reach
+// handshake-complete and sit in the nursery. Whether its PSK category may drive playback at all is
+// decided by admission when server/activate arrives. Before the gate, a peer could simply send
+// stream/state traffic ahead of server/activate (or never send one) and drive the roles anyway for
+// the whole nursery establish window.
+TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+    platform_random_bytes(psk.data(), psk.size());
+    std::string psk_id = psk_id_for(psk);
+
+    SendspinPairingRecord record;
+    record.psk_id = psk_id;
+    record.psk = psk;
+
+    TestNetworkProvider network;
+    TestPersistenceProvider persistence(record);
+    SendspinClientConfig config;
+    config.name = "Pre-Admission Role Traffic Test Client";
+    config.server_port = PREADMISSION_ROLE_TEST_PORT;
+    ASSERT_TRUE(config.encryption_required);
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+
+    struct RecordingMetadataListener : MetadataRoleListener {
+        std::atomic<int> updates{0};
+        std::string last_title;
+        void on_metadata(const ServerMetadataStateObject& m) override {
+            this->last_title = m.title.value_or("");
+            this->updates.fetch_add(1);
+        }
+    };
+    RecordingMetadataListener metadata_listener;
+    client.add_metadata().set_listener(&metadata_listener);
+
+    ASSERT_TRUE(client.start_server());
+    pump_for(client, 50);
+
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServerOptions options;
+    // Sent on the encrypted stream immediately before the first server/activate, so the DUT sees
+    // it while the connection is handshake-complete but still unadmitted.
+    options.pre_activate_message =
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Pre-Admission Leak"}}})";
+    FakeEncryptedServer server(server_url(PREADMISSION_ROLE_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity, psk_id, psk,
+                               options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "Encrypted handshake/hello/activate did not complete";
+
+    // The pre-activate server/state must have been dropped on the floor.
+    EXPECT_EQ(metadata_listener.updates.load(), 0)
+        << "Role traffic from an unadmitted connection reached the metadata role (last_title='"
+        << metadata_listener.last_title << "')";
+
+    // ...and the same message on the now-admitted connection must go through, so the gate is
+    // refusing on admission and not just dropping metadata wholesale.
+    server.send_app_json(
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":2,"title":"Post-Admission OK"}}})");
+    EXPECT_TRUE(pump_until(
+        client, [&] { return metadata_listener.updates.load() > 0; }, 4000))
+        << "Role traffic from the admitted connection was incorrectly dropped";
+    EXPECT_EQ(metadata_listener.last_title, "Post-Admission OK");
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// Revoking a record via management/remove-record must also end the revoked device's live session.
+//
+// A connection resolves its psk_id and PSK category once, at Noise-handshake completion, and never
+// re-checks them against the RecordStore. Deleting the record therefore did not, on its own, stop
+// the revoked peer: handle_remove_record only ever disconnected the REQUESTER (the is_self path),
+// so a different live connection running on the removed record kept its LONG_TERM trust -- and
+// with it management authority and playback -- until it happened to disconnect. Revocation would
+// not take effect until the peer's next connection.
+TEST(EncryptedLifecycle, RemoveRecordDropsTheRevokedDevicesLiveSession) {
+    // Two distinct paired records: the admitted management session (A) and the peer it revokes (B).
+    std::array<uint8_t, NOISE_PSK_SIZE> psk_a{};
+    std::array<uint8_t, NOISE_PSK_SIZE> psk_b{};
+    platform_random_bytes(psk_a.data(), psk_a.size());
+    platform_random_bytes(psk_b.data(), psk_b.size());
+    const std::string psk_id_a = psk_id_for(psk_a);
+    const std::string psk_id_b = psk_id_for(psk_b);
+
+    class TwoRecordProvider : public SendspinPersistenceProvider {
+    public:
+        TwoRecordProvider(SendspinPairingRecord a, SendspinPairingRecord b)
+            : records_{std::move(a), std::move(b)} {}
+        std::vector<SendspinPairingRecord> load_pairing_records() override {
+            return this->records_;
+        }
+
+    private:
+        std::vector<SendspinPairingRecord> records_;
+    };
+
+    SendspinPairingRecord record_a;
+    record_a.psk_id = psk_id_a;
+    record_a.psk = psk_a;
+    SendspinPairingRecord record_b;
+    record_b.psk_id = psk_id_b;
+    record_b.psk = psk_b;
+
+    TestNetworkProvider network;
+    TwoRecordProvider persistence(record_a, record_b);
+    SendspinClientConfig config;
+    config.name = "Revocation Sweep Test Client";
+    config.server_port = REVOCATION_SWEEP_TEST_PORT;
+    ASSERT_TRUE(config.encryption_required);
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start_server());
+    pump_for(client, 50);
+
+    // A: admitted, with MANAGEMENT activity so its management/remove-record is honoured.
+    Identity identity_a = Identity::generate().value();
+    FakeEncryptedServerOptions options_a;
+    options_a.first_activities_json = R"(["management"])";
+    options_a.first_roles_json = R"([])";
+    FakeEncryptedServer server_a(server_url(REVOCATION_SWEEP_TEST_PORT),
+                                 std::string(NOISE_SUITE_CHACHAPOLY), identity_a, psk_id_a, psk_a,
+                                 options_a);
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "Management session did not reach operational";
+
+    // B: completes the Noise handshake (so its psk_id is resolved and cached on the connection)
+    // but never sends server/activate, so it sits in the nursery as a second live session.
+    Identity identity_b = Identity::generate().value();
+    FakeEncryptedServerOptions options_b;
+    options_b.suppress_activate = true;
+    FakeEncryptedServer server_b(server_url(REVOCATION_SWEEP_TEST_PORT),
+                                 std::string(NOISE_SUITE_CHACHAPOLY), identity_b, psk_id_b, psk_b,
+                                 options_b);
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server_b.client_hello_count() > 0; }, 4000))
+        << "Second session never completed its Noise handshake / hello";
+    ASSERT_FALSE(server_b.closed()) << "Second session closed before the revocation";
+
+    // A revokes B's record.
+    ASSERT_TRUE(server_a.send_app_json(
+        R"({"type":"management/remove-record","payload":{"psk_id":")" + psk_id_b + R"("}})"));
+
+    EXPECT_TRUE(pump_until(
+        client, [&] { return server_b.closed(); }, 4000))
+        << "Revoking a record left the revoked device's live session running";
+    // The requester keeps its own session: it removed someone else's record, not its own.
+    EXPECT_FALSE(server_a.closed()) << "The requesting management session must not be dropped";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

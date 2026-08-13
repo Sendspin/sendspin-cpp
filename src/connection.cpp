@@ -239,7 +239,12 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
 
     // Update PSK metadata from the re-handshake result. server_id is unchanged (same server).
     this->psk_category_.store(result->resolved_psk.category, std::memory_order_release);
-    this->psk_id_ = result->resolved_psk.psk_id;
+    {
+        // Same reason as in set_noise_handshake_result(): psk_id_copy() may be reading this
+        // string from the main loop (the revocation sweep) while this network thread rewrites it.
+        std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
+        this->psk_id_ = result->resolved_psk.psk_id;
+    }
 
     // Reset the pairing server/activate counter (spec #120): a re-handshake starts a fresh
     // count for the pairing_index / CPace-sid counter, same as an initial handshake.
@@ -415,7 +420,23 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
         return;
     }
 
-    // No Noise handshake installed / not yet active: legacy binary dispatch
+    if (noise_pending) {
+        // A handshake driver is installed but the transport is not up yet, so this frame is
+        // unauthenticated application data. It must NOT reach the legacy dispatch below: that
+        // path hands the bytes straight to the role binary handlers, which would let any peer
+        // that merely completed the WebSocket upgrade inject audio/artwork/visualizer data with
+        // the whole Noise/PSK/admission chain bypassed. The TEXT branch above already refuses
+        // the same trick by routing pre-handshake text into the handshake driver.
+        //
+        // Treated as a handshake-phase failure per spec "Failure Handling": close the WebSocket
+        // without sending any application-level message.
+        SS_LOGW(TAG, "Binary frame before the Noise handshake completed; closing connection");
+        this->reset_websocket_payload();
+        this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+        return;
+    }
+
+    // No Noise handshake installed (encryption_required == false): legacy binary dispatch
     // (connection retains buffer ownership, callback reads in-place).
     if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
         this->reset_websocket_payload();

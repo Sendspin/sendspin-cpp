@@ -220,6 +220,48 @@ TEST(FieldArithmetic, ScaleByCurveConstantForcesCarryPropagation) {
               "5d178d0000000000a9e7f9ffffffffffffffffffffffffffffffffffffffff7f");
 }
 
+// --- field25519 final-reduction regression ---
+//
+// The 38-fold in fp_mul/fp_scale leaves a value bounded only by 2^256, and 2^256 = 2p + 38, so
+// the final reduction needs TWO conditional subtractions of p. A single subtraction leaves an
+// input in [2p, 2^256) sitting in [p, p+38) -- still non-canonical -- and fp_to_le() does not
+// reduce, so the element then encodes to the wrong 32 bytes. The band is reachable exactly when
+// the true result is congruent to something below 38, which is what an inverse or a Legendre
+// exponentiation produces.
+
+TEST(FieldArithmetic, MulOfInverseIsCanonicalOne) {
+    // b is the modular inverse of a, so (a*b) mod p is exactly 1. With a single-subtraction
+    // final reduce this returned p+1 (LE "eeff..ff7f") instead.
+    auto a_le = from_hex_arr<32>("5171d8daf80eb7e4b7c102a6f8c63218d0bb218db264c644bfd6fd97c75f6312");
+    auto b_le = from_hex_arr<32>("a5aa1eb682b5de7c2d01e7936be026ea2db1f101dd883d3724f04d2461516960");
+    auto result = field25519::fp_mul(field25519::fp_from_le(a_le.data()),
+                                     field25519::fp_from_le(b_le.data()));
+    EXPECT_EQ(to_hex(field25519::fp_to_le(result)),
+              "0100000000000000000000000000000000000000000000000000000000000000");
+}
+
+TEST(FieldArithmetic, MulByInverseIsCanonicalOneAcrossManyInputs) {
+    // The failing band is hit for roughly a quarter of random inputs, so a deterministic sweep
+    // is enough to catch a regression. Uses fp_inv (a Legendre-style exponentiation), which is
+    // how the CPace pipeline reaches small residues in practice.
+    const std::string one_hex =
+        "0100000000000000000000000000000000000000000000000000000000000000";
+    for (uint64_t seed = 1; seed <= 200; ++seed) {
+        std::array<uint8_t, 32> buf{};
+        // Cheap deterministic fill; the exact values do not matter, only their spread.
+        uint64_t s = seed * 0x9E3779B97F4A7C15ULL;
+        for (size_t i = 0; i < buf.size(); ++i) {
+            s ^= s >> 30;
+            s *= 0xBF58476D1CE4E5B9ULL;
+            buf[i] = static_cast<uint8_t>(s >> 24);
+        }
+        buf[31] &= 0x7F;
+        field25519::Fp x = field25519::fp_from_le(buf.data());
+        field25519::Fp prod = field25519::fp_mul(x, field25519::fp_inv(x));
+        EXPECT_EQ(to_hex(field25519::fp_to_le(prod)), one_hex) << "seed=" << seed;
+    }
+}
+
 // --- cpace_calculate_generator ---
 
 TEST(CPacePrimitives, CalculateGeneratorKat) {
