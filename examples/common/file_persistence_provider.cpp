@@ -366,11 +366,11 @@ bool FilePersistenceProvider::save_pairing_record(const SendspinPairingRecord& r
     return save_doc(path_, doc);
 }
 
-void FilePersistenceProvider::remove_pairing_record(const std::string& psk_id) {
+bool FilePersistenceProvider::remove_pairing_record(const std::string& psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     if (!doc["pairing_records"].is<JsonArray>()) {
-        return;
+        return true;  // Nothing stored: the record is already absent.
     }
     JsonArray arr = doc["pairing_records"].as<JsonArray>();
     // ArduinoJson does not provide a remove-by-index on JsonArray directly; rebuild the array.
@@ -384,7 +384,7 @@ void FilePersistenceProvider::remove_pairing_record(const std::string& psk_id) {
         new_arr.add(obj);
     }
     doc["pairing_records"].set(new_arr);
-    save_doc(path_, doc);
+    return save_doc(path_, doc);
 }
 
 // ============================================================================
@@ -423,11 +423,11 @@ bool FilePersistenceProvider::save_pairing_psk(const SendspinPairingPsk& psk) {
     return save_doc(path_, doc);
 }
 
-void FilePersistenceProvider::clear_pairing_psk() {
+bool FilePersistenceProvider::clear_pairing_psk() {
     std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     doc.remove("pairing_psk");
-    save_doc(path_, doc);
+    return save_doc(path_, doc);
 }
 
 // ============================================================================
@@ -450,11 +450,11 @@ bool FilePersistenceProvider::save_static_pin(const std::string& pin) {
     return save_doc(path_, doc);
 }
 
-void FilePersistenceProvider::clear_static_pin() {
+bool FilePersistenceProvider::clear_static_pin() {
     std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     doc.remove("static_pin");
-    save_doc(path_, doc);
+    return save_doc(path_, doc);
 }
 
 // ============================================================================

@@ -301,8 +301,17 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
                 records_[i].server_id.value() == superseded_server_id) {
                 SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
                         records_[i].psk_id.c_str(), superseded_server_id.c_str());
-                if (provider_ != nullptr) {
-                    provider_->remove_pairing_record(records_[i].psk_id);
+                // The in-memory erase below is unconditional: the operator (or the pairing
+                // exchange) asked for this credential to stop working, and keeping it in RAM
+                // because the store could not be written would leave it usable right now, which
+                // is strictly worse. But a delete that did not reach the store means the record
+                // comes back at the next start, so say so loudly instead of reporting a
+                // revocation that silently half-happened.
+                if (provider_ != nullptr && !provider_->remove_pairing_record(records_[i].psk_id)) {
+                    SS_LOGW(TAG,
+                            "Superseded record %s but the provider did not delete it; it is gone "
+                            "for this boot only and will be valid again after a reboot",
+                            records_[i].psk_id.c_str());
                 }
                 records_.erase(records_.begin() + static_cast<ptrdiff_t>(i));
                 if (i < idx) {
@@ -323,8 +332,13 @@ void RecordStore::remove_record(const std::string& psk_id) {
         return;  // No-op if absent.
     }
     records_.erase(records_.begin() + static_cast<ptrdiff_t>(idx));
-    if (provider_ != nullptr) {
-        provider_->remove_pairing_record(psk_id);
+    // Erased from RAM regardless of the store's answer, and warned about when the store did not
+    // take it -- see the same reasoning in store_record_impl()'s supersede loop.
+    if (provider_ != nullptr && !provider_->remove_pairing_record(psk_id)) {
+        SS_LOGW(TAG,
+                "Removed record %s but the provider did not delete it; it is gone for this boot "
+                "only and will be valid again after a reboot",
+                psk_id.c_str());
     }
 }
 
@@ -362,8 +376,10 @@ void RecordStore::set_pairing_psk(SendspinPairingPsk psk) {
 void RecordStore::clear_pairing_psk() {
     std::lock_guard<std::mutex> lock(this->mutex_);
     pairing_psk_.reset();
-    if (provider_ != nullptr) {
-        provider_->clear_pairing_psk();
+    if (provider_ != nullptr && !provider_->clear_pairing_psk()) {
+        SS_LOGW(TAG,
+                "Cleared the Pairing PSK but the provider did not delete it; it is gone for this "
+                "boot only and will authenticate pairing again after a reboot");
     }
 }
 
@@ -442,8 +458,10 @@ void RecordStore::set_static_pin(const std::string& pin) {
 
 void RecordStore::clear_static_pin() {
     static_pin_.reset();
-    if (provider_ != nullptr) {
-        provider_->clear_static_pin();
+    if (provider_ != nullptr && !provider_->clear_static_pin()) {
+        SS_LOGW(TAG,
+                "Cleared the static PIN but the provider did not delete it; it is gone for this "
+                "boot only and will pair devices again after a reboot");
     }
 }
 

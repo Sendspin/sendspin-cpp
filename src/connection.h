@@ -432,31 +432,21 @@ public:
     }
 
     /// @brief Returns the psk_id of the matched PSK (set at COMPLETE; empty for Sentinel or
-    /// when no Noise handshake has completed). Written on the network thread at COMPLETE /
-    /// re-handshake.
-    /// Read sites:
-    ///   1. Main loop (the activate handler, for mark_record_used): safe because the read is
-    ///      sequenced after the write via the conn_mutex_-synchronized server/activate event.
-    ///   2. Network thread (client.cpp SERVER_UNPAIR handler): captures psk_id into the event
-    ///      before scheduling. Safe because psk_id_ was written earlier on the same network
-    ///      thread (same-thread sequencing), and the value is captured by value into the event
-    ///      before any later write.
-    /// Any read that fits NEITHER argument -- in particular a main-loop read of a connection
-    /// that is not the one whose event is being handled -- must use psk_id_copy() instead.
-    const std::string& get_psk_id() const {
-        return this->psk_id_;
-    }
-
-    /// @brief Returns a copy of the matched psk_id, safe to call from any thread at any time.
+    /// when no Noise handshake has completed).
     ///
-    /// get_psk_id() returns a reference to a std::string the network thread rewrites at
-    /// handshake COMPLETE and at every in-band re-handshake, so it is only sound for the two
-    /// sequenced read sites documented above. ConnectionManager::drop_connections_using_psk_id()
-    /// is neither: it walks the nursery from the main loop, and a nursery member can be
-    /// completing its handshake on its own network thread at that very moment. This overload
-    /// takes psk_id_mutex_, which both writers also hold.
+    /// Returns by value under psk_id_mutex_, which both writers also hold, so this is safe from
+    /// any thread at any time. It deliberately does NOT return a reference: psk_id_ is rewritten
+    /// on the network thread at handshake COMPLETE and at every in-band re-handshake, and a
+    /// server may start a re-handshake at any point after admission, so a reader has no way to
+    /// exclude a later write by argument. Reference-returning versions of this accessor were
+    /// misread as safe twice (the activate handler's mark_record_used() and the
+    /// management/remove-record requester lookup), which is why only the locking form exists.
+    ///
+    /// Every call site is cold (first activate per handshake, remove-record, unpair), so the
+    /// copy is not on any hot path. Callers that need the value more than once must read it once
+    /// into a local: two calls can straddle a re-handshake and observe different psk_ids.
     /// @return Copy of the psk_id, or an empty string if no handshake has completed.
-    std::string psk_id_copy() const {
+    std::string get_psk_id() const {
         std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
         return this->psk_id_;
     }
@@ -804,8 +794,8 @@ public:
         this->server_information_.server_id = server_id;
         this->psk_category_.store(psk_category, std::memory_order_release);
         {
-            // Held so a main-loop psk_id_copy() (the revocation sweep walking the nursery) cannot
-            // observe this string mid-assignment.
+            // Held so a concurrent get_psk_id() (the revocation sweep walking the nursery from
+            // the main loop) cannot observe this string mid-assignment.
             std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
             this->psk_id_ = psk_id;
         }
@@ -968,16 +958,15 @@ protected:
     std::string noise_suite_name_{};
 
     /// psk_id of the PSK matched by the Noise handshake (empty for Sentinel, or when no
-    /// Noise handshake has completed). Main-loop-only readers gate on first_activate_received()
-    /// (or is_operational()), which happens-after the network-thread write at handshake
-    /// COMPLETE via the same publishing discipline as server_information_. Readers with no such
-    /// gate use psk_id_copy() and take psk_id_mutex_ below.
+    /// Noise handshake has completed). Written on the network thread at handshake COMPLETE and
+    /// at every in-band re-handshake; read from both the network thread and the main loop.
+    /// Never read directly outside this class: go through get_psk_id(), which takes the mutex
+    /// below.
     std::string psk_id_{};
 
-    /// Guards psk_id_ against a main-loop psk_id_copy() racing the network-thread write at
-    /// handshake COMPLETE / re-handshake. Held only around the assignment and the copy, never
-    /// across a send or a callback. Not taken by get_psk_id(), whose two call sites are sequenced
-    /// against the write by other means (see its doc comment).
+    /// Guards psk_id_. Both writers (set_noise_handshake_result(), handle_noise_rehandshake())
+    /// and the sole reader (get_psk_id()) hold it. Held only around the assignment and the copy,
+    /// never across a send or a callback.
     mutable std::mutex psk_id_mutex_;
 
     // Vector fields

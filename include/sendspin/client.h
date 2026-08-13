@@ -219,8 +219,16 @@ public:
     }
 
     /// @brief Remove the pairing record with the given psk_id.
-    /// No-op if absent.
-    virtual void remove_pairing_record(const std::string& /*psk_id*/) {}
+    /// No-op if absent (which counts as success).
+    ///
+    /// Returning false is not cosmetic: the record is dropped from RAM either way, so the
+    /// revocation takes effect for the current boot, but a store that still holds it will hand
+    /// it back at the next start and the revoked PSK becomes valid again. The client logs a
+    /// warning saying exactly that, so report failure honestly rather than swallowing it.
+    /// @return true if the record is gone from the store, false if it may still be there.
+    virtual bool remove_pairing_record(const std::string& /*psk_id*/) {
+        return false;
+    }
 
     // ========================================================================
     // Accepted Pairing PSK
@@ -237,7 +245,12 @@ public:
     }
 
     /// @brief Clear the accepted Pairing PSK.
-    virtual void clear_pairing_psk() {}
+    /// Same contract as remove_pairing_record(): a false return means the PSK may survive a
+    /// reboot and keep authenticating pairing attempts.
+    /// @return true if the Pairing PSK is gone from the store, false if it may still be there.
+    virtual bool clear_pairing_psk() {
+        return false;
+    }
 
     // ========================================================================
     // Static PIN (Phase 8c)
@@ -254,7 +267,12 @@ public:
     }
 
     /// @brief Clear the configured static PIN.
-    virtual void clear_static_pin() {}
+    /// Same contract as remove_pairing_record(): a false return means the PIN may survive a
+    /// reboot and keep pairing devices.
+    /// @return true if the static PIN is gone from the store, false if it may still be there.
+    virtual bool clear_static_pin() {
+        return false;
+    }
 
     // ========================================================================
     // Pairing config

@@ -471,20 +471,27 @@ access. `FilePersistenceProvider` guards every method with a mutex.
   `false` return fails the pairing closed: the client reports
   `SendspinPairAbortReason::STORAGE_FAILED` via `on_pairing_failed` and drops the
   connection rather than complete a pairing that could not survive a reboot.
-- `remove_pairing_record(psk_id)` -- remove the record with the given `psk_id`. No-op if
-  absent.
+- `remove_pairing_record(psk_id)` -- remove the record with the given `psk_id`. Return
+  `true` if the record is gone from the store; an absent record counts as success. Report a
+  failed delete honestly: the client drops the record from RAM either way, so the revocation
+  holds for the current boot, but a store that still holds the record hands it back at the
+  next start and the revoked PSK becomes valid again. A `false` return makes the client log
+  a warning saying exactly that.
 
 **Accepted Pairing PSK** (distributes an out-of-band PSK to admit servers before pairing):
 
 - `load_pairing_psk()` -- return the stored `SendspinPairingPsk`, or `nullopt` if none.
 - `save_pairing_psk(psk)` -- persist a new accepted Pairing PSK. Return `true` on success.
-- `clear_pairing_psk()` -- remove the accepted Pairing PSK.
+- `clear_pairing_psk()` -- remove the accepted Pairing PSK. Return `true` on success; same
+  contract as `remove_pairing_record`, since a PSK that survives keeps authenticating
+  pairing attempts.
 
 **Static PIN** (used by the static-PIN pairing method, when enabled):
 
 - `load_static_pin()` -- return the configured static PIN, or `nullopt` if none.
 - `save_static_pin(pin)` -- persist the configured static PIN. Return `true` on success.
-- `clear_static_pin()` -- remove the configured static PIN.
+- `clear_static_pin()` -- remove the configured static PIN. Return `true` on success; same
+  contract as `remove_pairing_record`, since a PIN that survives keeps pairing devices.
 
 **Pairing policy** (whether unpaired access or the Pairing PSK method is enabled):
 

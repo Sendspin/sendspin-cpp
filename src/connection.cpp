@@ -240,7 +240,7 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     // Update PSK metadata from the re-handshake result. server_id is unchanged (same server).
     this->psk_category_.store(result->resolved_psk.category, std::memory_order_release);
     {
-        // Same reason as in set_noise_handshake_result(): psk_id_copy() may be reading this
+        // Same reason as in set_noise_handshake_result(): get_psk_id() may be reading this
         // string from the main loop (the revocation sweep) while this network thread rewrites it.
         std::lock_guard<std::mutex> lock(this->psk_id_mutex_);
         this->psk_id_ = result->resolved_psk.psk_id;

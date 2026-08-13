@@ -72,21 +72,21 @@ public:
     // ========================================================================
     std::vector<SendspinPairingRecord> load_pairing_records() override;
     bool save_pairing_record(const SendspinPairingRecord& record) override;
-    void remove_pairing_record(const std::string& psk_id) override;
+    bool remove_pairing_record(const std::string& psk_id) override;
 
     // ========================================================================
     // Accepted Pairing PSK
     // ========================================================================
     std::optional<SendspinPairingPsk> load_pairing_psk() override;
     bool save_pairing_psk(const SendspinPairingPsk& psk) override;
-    void clear_pairing_psk() override;
+    bool clear_pairing_psk() override;
 
     // ========================================================================
     // Static PIN
     // ========================================================================
     std::optional<std::string> load_static_pin() override;
     bool save_static_pin(const std::string& pin) override;
-    void clear_static_pin() override;
+    bool clear_static_pin() override;
 
     // ========================================================================
     // Pairing config

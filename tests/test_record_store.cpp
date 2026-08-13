@@ -24,12 +24,14 @@
 #include "crypto/keys.h"
 #include "file_persistence_provider.h"
 #include "platform/crypto.h"
+#include "platform/logging.h"
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -499,6 +501,247 @@ TEST(RecordStore, RemoveRecordAndList) {
     store.remove_record("absent-psk-id");
 }
 
+/// A provider that accepts writes but can refuse deletes, standing in for a store whose delete
+/// path fails on its own (full or read-only NVS, a torn write) while saves still work. A refused
+/// delete leaves the entry in `saved`, so a later load_pairing_records() hands it back exactly
+/// as a real store would after a reboot.
+class RejectingDeleteProvider : public SendspinPersistenceProvider {
+public:
+    bool save_pairing_record(const SendspinPairingRecord& record) override {
+        saved.push_back(record);
+        return true;
+    }
+    std::vector<SendspinPairingRecord> load_pairing_records() override {
+        return saved;
+    }
+    bool remove_pairing_record(const std::string& psk_id) override {
+        remove_attempts.push_back(psk_id);
+        if (refuse_delete) {
+            return false;  // The record stays on "disk".
+        }
+        saved.erase(std::remove_if(saved.begin(), saved.end(),
+                                   [&](const SendspinPairingRecord& r) {
+                                       return r.psk_id == psk_id;
+                                   }),
+                    saved.end());
+        return true;
+    }
+    bool save_pairing_psk(const SendspinPairingPsk& /*psk*/) override {
+        return true;
+    }
+    bool clear_pairing_psk() override {
+        clear_psk_attempts++;
+        return !refuse_delete;
+    }
+    bool save_static_pin(const std::string& /*pin*/) override {
+        return true;
+    }
+    bool clear_static_pin() override {
+        clear_pin_attempts++;
+        return !refuse_delete;
+    }
+    bool save_pairing_config(const SendspinPairingConfig& /*config*/) override {
+        return true;
+    }
+
+    bool refuse_delete{true};
+    std::vector<SendspinPairingRecord> saved{};
+    std::vector<std::string> remove_attempts{};
+    int clear_psk_attempts{0};
+    int clear_pin_attempts{0};
+};
+
+/// Captures stderr (where the host SS_LOG* macros write) for the duration of its scope, so a
+/// test can assert on the durability warning itself. The warning IS the behavioral delta of the
+/// bool return: without asserting on it, a reverted or inverted condition passes unnoticed,
+/// because the in-memory erase and the reload-after-reboot were already unconditional before.
+class StderrCapture {
+public:
+    StderrCapture() : prior_level_(platform_get_log_level()) {
+        platform_set_log_level(SS_LOG_WARN);
+        testing::internal::CaptureStderr();
+    }
+    ~StderrCapture() {
+        if (!released_) {
+            static_cast<void>(testing::internal::GetCapturedStderr());
+        }
+        platform_set_log_level(prior_level_);
+    }
+    StderrCapture(const StderrCapture&) = delete;
+    StderrCapture& operator=(const StderrCapture&) = delete;
+
+    /// Stops capturing and returns everything written so far.
+    std::string release() {
+        released_ = true;
+        return testing::internal::GetCapturedStderr();
+    }
+
+private:
+    int prior_level_;
+    bool released_{false};
+};
+
+/// The durability warning always says the credential comes back after a reboot; that phrase is
+/// what distinguishes it from the routine "Superseding prior record" info line.
+constexpr const char* REBOOT_WARNING = "after a reboot";
+
+// A delete the provider refuses must still revoke the credential for the current boot: leaving
+// it in RAM because the store could not be written would keep it usable right now, which is
+// strictly worse than a revocation that only fails to outlive a reboot. The provider is asked
+// exactly once, and its refusal must be reported rather than swallowed.
+TEST(RecordStore, RemoveRecordErasesFromMemoryAndWarnsWhenTheProviderRefusesTheDelete) {
+    RejectingDeleteProvider provider;
+    RecordStore store(&provider);
+
+    SendspinPairingRecord a = make_client_record("server-A");
+    store.store_record(a);
+    ASSERT_NE(store.record_by_psk_id(a.psk_id), nullptr);
+
+    std::string logs;
+    {
+        StderrCapture capture;
+        store.remove_record(a.psk_id);
+        logs = capture.release();
+    }
+
+    EXPECT_EQ(store.record_by_psk_id(a.psk_id), nullptr)
+        << "a refused delete must not leave the revoked credential resolvable this boot";
+    EXPECT_FALSE(store.resolve_by_psk_id(a.psk_id).has_value());
+    ASSERT_EQ(provider.remove_attempts.size(), 1u);
+    EXPECT_EQ(provider.remove_attempts[0], a.psk_id);
+    EXPECT_NE(logs.find(REBOOT_WARNING), std::string::npos)
+        << "a refused delete must be reported, not swallowed; got: " << logs;
+    EXPECT_NE(logs.find(a.psk_id), std::string::npos)
+        << "the warning must name the record that will come back; got: " << logs;
+}
+
+// The other half of the contract, and what pins the condition's direction: a delete the provider
+// accepted is durable, so it must NOT warn. Without this an inverted test would pass.
+TEST(RecordStore, RemoveRecordIsSilentWhenTheProviderAcceptsTheDelete) {
+    RejectingDeleteProvider provider;
+    provider.refuse_delete = false;
+    RecordStore store(&provider);
+
+    SendspinPairingRecord a = make_client_record("server-A");
+    store.store_record(a);
+
+    std::string logs;
+    {
+        StderrCapture capture;
+        store.remove_record(a.psk_id);
+        logs = capture.release();
+    }
+
+    EXPECT_EQ(store.record_by_psk_id(a.psk_id), nullptr);
+    ASSERT_EQ(provider.remove_attempts.size(), 1u);
+    EXPECT_EQ(logs.find(REBOOT_WARNING), std::string::npos)
+        << "a delete the store accepted is durable and must not warn; got: " << logs;
+}
+
+// Same contract on the pairing/supersede path: the prior record goes even though the provider
+// refused to delete it, and the refusal is reported.
+TEST(RecordStore, SupersedeErasesFromMemoryAndWarnsWhenTheProviderRefusesTheDelete) {
+    RejectingDeleteProvider provider;
+    RecordStore store(&provider);
+
+    SendspinPairingRecord original = make_client_record("server-X", "original");
+    ASSERT_TRUE(store.store_record_superseding(original));
+
+    SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
+    std::string logs;
+    {
+        StderrCapture capture;
+        ASSERT_TRUE(store.store_record_superseding(replacement));
+        logs = capture.release();
+    }
+
+    EXPECT_EQ(store.record_by_psk_id(original.psk_id), nullptr);
+    EXPECT_FALSE(store.resolve_by_psk_id(original.psk_id).has_value());
+    EXPECT_NE(store.record_by_psk_id(replacement.psk_id), nullptr);
+    ASSERT_EQ(provider.remove_attempts.size(), 1u);
+    EXPECT_EQ(provider.remove_attempts[0], original.psk_id);
+    EXPECT_NE(logs.find(REBOOT_WARNING), std::string::npos)
+        << "a refused supersede-delete must be reported; got: " << logs;
+}
+
+// A supersede whose delete the store accepted is durable: no warning, and the prior record is
+// really gone from the provider (so it does not come back on the next start).
+TEST(RecordStore, SupersedeIsSilentWhenTheProviderAcceptsTheDelete) {
+    RejectingDeleteProvider provider;
+    provider.refuse_delete = false;
+    RecordStore store(&provider);
+
+    SendspinPairingRecord original = make_client_record("server-X", "original");
+    ASSERT_TRUE(store.store_record_superseding(original));
+
+    SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
+    std::string logs;
+    {
+        StderrCapture capture;
+        ASSERT_TRUE(store.store_record_superseding(replacement));
+        logs = capture.release();
+    }
+
+    EXPECT_EQ(logs.find(REBOOT_WARNING), std::string::npos)
+        << "an accepted supersede-delete must not warn; got: " << logs;
+
+    RecordStore rebooted(&provider);
+    EXPECT_FALSE(rebooted.resolve_by_psk_id(original.psk_id).has_value());
+    EXPECT_TRUE(rebooted.resolve_by_psk_id(replacement.psk_id).has_value());
+}
+
+// The Pairing PSK and the static PIN are revocations too, and carry the same contract: a store
+// that keeps them keeps authenticating pairing / pairing devices after a reboot.
+TEST(RecordStore, ClearPairingPskAndStaticPinWarnOnlyWhenTheProviderRefuses) {
+    RejectingDeleteProvider provider;
+    RecordStore store(&provider);
+
+    std::string refused_logs;
+    {
+        StderrCapture capture;
+        store.clear_pairing_psk();
+        store.clear_static_pin();
+        refused_logs = capture.release();
+    }
+    EXPECT_EQ(provider.clear_psk_attempts, 1);
+    EXPECT_EQ(provider.clear_pin_attempts, 1);
+    EXPECT_NE(refused_logs.find(REBOOT_WARNING), std::string::npos)
+        << "refused clears must be reported; got: " << refused_logs;
+
+    provider.refuse_delete = false;
+    std::string accepted_logs;
+    {
+        StderrCapture capture;
+        store.clear_pairing_psk();
+        store.clear_static_pin();
+        accepted_logs = capture.release();
+    }
+    EXPECT_EQ(accepted_logs.find(REBOOT_WARNING), std::string::npos)
+        << "accepted clears must not warn; got: " << accepted_logs;
+}
+
+// The refused delete is exactly the durability hole the bool return exists to surface: the
+// record the store kept comes back on the next start, and resolves as LONG_TERM trust again.
+TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
+    RejectingDeleteProvider provider;
+
+    SendspinPairingRecord a = make_client_record("server-A");
+    {
+        RecordStore store(&provider);
+        store.store_record(a);
+        store.remove_record(a.psk_id);
+        ASSERT_EQ(store.record_by_psk_id(a.psk_id), nullptr);
+    }
+
+    // Reboot: a new store over the same provider reloads what the provider still holds.
+    RecordStore rebooted(&provider);
+    auto resolved = rebooted.resolve_by_psk_id(a.psk_id);
+    ASSERT_TRUE(resolved.has_value())
+        << "the provider kept the record, so it must come back -- this is what the false return "
+           "from remove_pairing_record() warns about";
+    EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
+}
+
 // =============================================================================
 // set_record_mode_psk_id: must reference a shared-PSK record
 // =============================================================================
@@ -796,10 +1039,46 @@ TEST(FilePersistenceProvider, RemovePairingRecord) {
     provider.save_pairing_record(a);
     provider.save_pairing_record(b);
 
-    provider.remove_pairing_record(a.psk_id);
+    EXPECT_TRUE(provider.remove_pairing_record(a.psk_id));
     auto loaded = provider.load_pairing_records();
     ASSERT_EQ(loaded.size(), 1u);
     EXPECT_EQ(loaded[0].psk_id, b.psk_id);
+
+    // Removing an absent record leaves the file alone and still reports success.
+    EXPECT_TRUE(provider.remove_pairing_record("absent-psk-id"));
+    EXPECT_EQ(provider.load_pairing_records().size(), 1u);
+}
+
+// Nothing stored at all: there is no record to delete, so the delete succeeded by definition.
+// A false here would make every removal on a fresh device log a spurious durability warning.
+TEST(FilePersistenceProvider, RemovePairingRecordOnEmptyStoreSucceeds) {
+    TempFile tmp;
+    FilePersistenceProvider provider(tmp.path());
+
+    EXPECT_TRUE(provider.remove_pairing_record("never-stored"));
+}
+
+// The clear_* revocations carry the same contract as remove_pairing_record().
+TEST(FilePersistenceProvider, ClearPairingPskAndStaticPinReportSuccess) {
+    TempFile tmp;
+    FilePersistenceProvider provider(tmp.path());
+
+    SendspinPairingPsk psk;
+    psk.psk_id = "pairing-psk-id";
+    psk.psk.fill(0x42);
+    ASSERT_TRUE(provider.save_pairing_psk(psk));
+    ASSERT_TRUE(provider.load_pairing_psk().has_value());
+    EXPECT_TRUE(provider.clear_pairing_psk());
+    EXPECT_FALSE(provider.load_pairing_psk().has_value());
+
+    ASSERT_TRUE(provider.save_static_pin("12345678"));
+    ASSERT_TRUE(provider.load_static_pin().has_value());
+    EXPECT_TRUE(provider.clear_static_pin());
+    EXPECT_FALSE(provider.load_static_pin().has_value());
+
+    // Clearing what is already absent is still success.
+    EXPECT_TRUE(provider.clear_pairing_psk());
+    EXPECT_TRUE(provider.clear_static_pin());
 }
 
 TEST(FilePersistenceProvider, LastPlayedServerIdRoundTrip) {

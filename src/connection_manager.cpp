@@ -683,10 +683,18 @@ void ConnectionManager::loop() {
 
                 // First activate on a long-term PSK: mark the record used (reference parity).
                 // Safe here because RecordStore mutations stay on the main loop.
+                //
+                // Read the psk_id ONCE into a local. is_first is true again after every in-band
+                // re-handshake (see the comment below), and a server may start the next
+                // re-handshake while this activate is still queued, so the two reads this used to
+                // do could straddle a network-thread rewrite and disagree.
                 if (is_first && this->client_->config_.encryption_required &&
                     event.conn->get_psk_category() == PskCategory::LONG_TERM &&
-                    !event.conn->get_psk_id().empty() && this->client_->record_store_ != nullptr) {
-                    this->client_->record_store_->mark_record_used(event.conn->get_psk_id());
+                    this->client_->record_store_ != nullptr) {
+                    const std::string psk_id = event.conn->get_psk_id();
+                    if (!psk_id.empty()) {
+                        this->client_->record_store_->mark_record_used(psk_id);
+                    }
                 }
 
                 if (event.conn.get() == this->current_connection_.get()) {
@@ -1438,17 +1446,16 @@ void ConnectionManager::drop_connections_using_psk_id(const std::string& psk_id,
     // Collect first, then drop: drop_connection() mutates both the current slot and nursery_,
     // so dropping while walking the nursery would invalidate the iterator underneath us.
     //
-    // psk_id_copy() rather than get_psk_id(): a nursery member can be completing its Noise
-    // handshake on its own network thread right now, and that write rewrites the very string
-    // being compared here. get_psk_id() is only sound for its two sequenced call sites.
+    // get_psk_id() locks: a nursery member can be completing its Noise handshake on its own
+    // network thread right now, and that write rewrites the very string being compared here.
     std::vector<std::shared_ptr<SendspinConnection>> doomed;
     if (this->current_connection_ != nullptr && this->current_connection_.get() != except &&
-        this->current_connection_->psk_id_copy() == psk_id) {
+        this->current_connection_->get_psk_id() == psk_id) {
         doomed.push_back(this->current_connection_);
     }
     for (const auto& entry : this->nursery_) {
         if (entry.conn != nullptr && entry.conn.get() != except &&
-            entry.conn->psk_id_copy() == psk_id) {
+            entry.conn->get_psk_id() == psk_id) {
             doomed.push_back(entry.conn);
         }
     }
@@ -2425,9 +2432,13 @@ void ConnectionManager::handle_management_request(SendspinConnection* conn,
             // requester_psk_id: the psk_id that authenticated this connection, used to detect
             // own-record removal (see handle_remove_record's doc comment for why psk_id, not
             // server_id, is the right key here).
+            //
+            // Read once into a local: this runs on the main loop, and the server can start an
+            // in-band re-handshake (which rewrites psk_id_ on the network thread) at any point
+            // between queueing this request and this drain.
             std::optional<std::string> requester_psk_id;
-            if (!conn->get_psk_id().empty()) {
-                requester_psk_id = conn->get_psk_id();
+            if (std::string psk_id = conn->get_psk_id(); !psk_id.empty()) {
+                requester_psk_id = std::move(psk_id);
             }
             handle_remove_record(store, event.remove_payload, requester_psk_id, result, effect);
             // Revocation must end the revoked device's live sessions, not just delete the
