@@ -157,7 +157,8 @@ bool SendspinClient::start_server() {
     // construction) and load or generate the static X25519 identity. Both must exist before
     // the connection manager can hand them out to any connection (init_server() below starts
     // the ws_server, and connect_to() may be called any time after start_server()).
-    this->record_store_ = std::make_unique<RecordStore>(this->persistence_provider_);
+    this->record_store_ = std::make_unique<RecordStore>(
+        this->persistence_provider_, this->config_.initial_unpaired_access_enabled);
     if (!this->load_or_generate_identity()) {
         // identity_ is left null: there is no safe key to fall back to (see
         // load_or_generate_identity()'s doc comment), so the client must not start.

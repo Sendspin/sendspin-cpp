@@ -31,7 +31,9 @@ namespace sendspin {
 // Constructor
 // ============================================================================
 
-RecordStore::RecordStore(SendspinPersistenceProvider* provider) : provider_(provider) {
+RecordStore::RecordStore(SendspinPersistenceProvider* provider,
+                         bool initial_unpaired_access_enabled)
+    : provider_(provider) {
     // Try loading persisted records and config first.
     bool loaded_config = false;
     if (provider_ != nullptr) {
@@ -73,6 +75,15 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider) : provider_(prov
             SS_LOGD(TAG, "Loaded pairing config: record_mode_psk_id=%s",
                     record_mode_psk_id_.c_str());
         }
+    }
+
+    // First-boot seed: the application's configured default for unpaired access applies only
+    // when no pairing config has ever been persisted. A loaded config always wins, so a server
+    // that turned unpaired access off through management/set-pairing-config keeps it off across
+    // reboots. The value is persisted below by the first-boot provisioning branch, which this
+    // same !loaded_config condition always enters.
+    if (!loaded_config) {
+        unpaired_access_enabled_ = initial_unpaired_access_enabled;
     }
 
     // First-boot provisioning: if no config was loaded (or the referenced shared

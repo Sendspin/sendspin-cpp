@@ -883,6 +883,107 @@ TEST(RecordStoreWithFile, FirstBootProvisioningPersists) {
 }
 
 // =============================================================================
+// Unpaired-access first-boot seed
+// =============================================================================
+
+/// A persistence provider that hands back a canned pairing config. Lets a test present a
+/// loaded config whose record_mode_psk_id is empty or dangling - states FilePersistenceProvider
+/// collapses into "nothing stored", so they are unreachable through it.
+class CannedConfigProvider : public SendspinPersistenceProvider {
+public:
+    explicit CannedConfigProvider(SendspinPairingConfig config) : config_(std::move(config)) {}
+
+    std::optional<SendspinPairingConfig> load_pairing_config() override {
+        return this->config_;
+    }
+
+    bool save_pairing_config(const SendspinPairingConfig& config) override {
+        this->config_ = config;
+        return true;
+    }
+
+private:
+    SendspinPairingConfig config_;
+};
+
+TEST(RecordStore, UnpairedAccessDefaultsOffWithoutSeed) {
+    RecordStore store(nullptr);
+    EXPECT_FALSE(store.unpaired_access_enabled());
+}
+
+TEST(RecordStore, UnpairedAccessSeedAppliesWithoutProvider) {
+    // No provider means no stored config to load, so the seed applies on every start.
+    RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/true);
+    EXPECT_TRUE(store.unpaired_access_enabled());
+}
+
+TEST(RecordStore, UnpairedAccessSeedYieldsToConfigWithDanglingRecordModeId) {
+    // The constructor re-provisions a shared fallback record when record_mode_psk_id names no
+    // stored record, but that repair must not be mistaken for a first boot: the config was
+    // loaded, so its unpaired-access decision stands.
+    SendspinPairingConfig stored;
+    stored.unpaired_access_enabled = false;
+    stored.record_mode_psk_id = "no-such-record";
+    CannedConfigProvider provider(stored);
+
+    RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true);
+
+    EXPECT_FALSE(store.unpaired_access_enabled())
+        << "a loaded config outranks the seed even when its fallback record is missing";
+    EXPECT_NE(store.record_mode_psk_id(), "no-such-record")
+        << "the dangling fallback reference should have been re-provisioned";
+}
+
+TEST(RecordStore, UnpairedAccessSeedYieldsToConfigWithEmptyRecordModeId) {
+    SendspinPairingConfig stored;
+    stored.unpaired_access_enabled = false;
+    stored.record_mode_psk_id = "";
+    CannedConfigProvider provider(stored);
+
+    RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true);
+
+    EXPECT_FALSE(store.unpaired_access_enabled())
+        << "an empty record_mode_psk_id still means a config was loaded";
+}
+
+TEST(RecordStoreWithFile, UnpairedAccessSeedPersistsOnFirstBoot) {
+    TempFile tmp;
+
+    {
+        FilePersistenceProvider provider(tmp.path());
+        RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true);
+        EXPECT_TRUE(store.unpaired_access_enabled());
+    }
+
+    // The seeded value must have been written through, so a later boot that passes no seed
+    // still comes up with unpaired access enabled.
+    {
+        FilePersistenceProvider provider(tmp.path());
+        RecordStore store(&provider);
+        EXPECT_TRUE(store.unpaired_access_enabled());
+    }
+}
+
+TEST(RecordStoreWithFile, UnpairedAccessSeedDoesNotOverrideStoredConfig) {
+    TempFile tmp;
+
+    // First boot with the seed on, then the server turns unpaired access off.
+    {
+        FilePersistenceProvider provider(tmp.path());
+        RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true);
+        store.set_unpaired_access_enabled(false);
+    }
+
+    // Reboot with the same seed still configured: the stored decision wins.
+    {
+        FilePersistenceProvider provider(tmp.path());
+        RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true);
+        EXPECT_FALSE(store.unpaired_access_enabled())
+            << "a persisted config must outrank the first-boot seed";
+    }
+}
+
+// =============================================================================
 // resolve_pairing_outcome: normal and storage-exhausted paths (declared in Phase 2 for
 // completeness; exercised for real once pairing lands in a later phase)
 // =============================================================================

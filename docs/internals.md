@@ -515,6 +515,8 @@ The `server/activate` handler in `ConnectionManager::loop()` evaluates each acti
 - `PAIRING`: only `{pairing}`.
 - `SENTINEL`: the empty set always; `{playback}` only when `unpaired_access_enabled` is true; nothing else.
 
+`unpaired_access_enabled` is persisted in `SendspinPairingConfig` and is normally written by the server through `management/set-pairing-config`. Its value on a device that has never persisted a pairing config comes from `SendspinClientConfig::initial_unpaired_access_enabled`, which `RecordStore`'s constructor applies only on the `!loaded_config` path (a loaded config always outranks the seed) and which the first-boot provisioning branch then persists.
+
 A rejected activate closes the connection with `SendspinGoodbyeReason::PAIRING_REQUIRED` when it would have been admissible had unpaired access been enabled (a Sentinel connection requesting `{playback}` while unpaired access is off), and `SendspinGoodbyeReason::UNAUTHORIZED` otherwise. Trust enforcement is skipped entirely when `encryption_required` is false (no PSK category was ever resolved), matching pre-encryption behavior for the plaintext nursery-structure test fixtures that use it.
 
 Multi-server admission arbitration (deciding whether an incoming connection displaces the current one) ranks each side by its highest activity (`activity_rank()` in `admission.h`: management=3, playback=2, pairing=1, none=0) and applies `should_admit_connection()`'s rules, described in [Handshake and Handoff](#handshake-and-handoff) above.

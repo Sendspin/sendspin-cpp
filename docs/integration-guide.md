@@ -782,14 +782,42 @@ processed and the connection is promoted to current. Connections that are reject
 ### Unpaired Access
 
 By default only paired servers (long-term record) and servers holding the accepted Pairing
-PSK are admitted. To allow connections from servers that only know the Sentinel PSK (no
-pairing required), enable `unpaired_access_enabled` in `SendspinPairingConfig`:
+PSK are admitted. Servers that only know the Sentinel PSK (no pairing required) are admitted
+when unpaired access is enabled, and the setting lives in the persisted
+`SendspinPairingConfig`.
+
+To ship a device that allows unpaired access out of the box, set the first-boot default in
+`SendspinClientConfig`:
 
 ```cpp
-SendspinPairingConfig pairing_cfg;
-pairing_cfg.unpaired_access_enabled = true;
-persistence_provider.save_pairing_config(pairing_cfg);
+SendspinClientConfig config;
+config.initial_unpaired_access_enabled = true;
 ```
+
+The seed applies only when no pairing config has ever been persisted, and the seeded value is
+written through the persistence provider during first-boot provisioning. On every later start
+the stored config wins, so a server that turns unpaired access off through
+`management/set-pairing-config` keeps it off across reboots. With no persistence provider
+there is no stored config, so the seed applies on every start.
+
+An application that manages the persisted pairing config itself can write the flag directly,
+but it must read-modify-write the stored config rather than save a fresh one:
+
+```cpp
+auto pairing_cfg = persistence_provider.load_pairing_config();
+if (pairing_cfg.has_value()) {
+    pairing_cfg->unpaired_access_enabled = true;
+    persistence_provider.save_pairing_config(*pairing_cfg);
+}
+```
+
+A default-constructed `SendspinPairingConfig` has an empty `record_mode_psk_id`, so saving one
+drops the client's reference to its shared-PSK fallback record. A provider is free to reject
+that config outright, and the bundled `FilePersistenceProvider` does -- it reports an empty
+`record_mode_psk_id` as "nothing stored". Writing a bare config to disable unpaired access is
+therefore doubly wrong: the write is discarded, and the resulting empty store makes the next
+start a first boot, which re-applies `initial_unpaired_access_enabled` and turns the flag back
+on. Before the first `start_server()` there is no stored config to modify, so use the seed.
 
 Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
 unpaired access after the device is paired is the typical production configuration.

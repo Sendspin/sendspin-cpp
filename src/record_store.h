@@ -95,7 +95,11 @@ public:
     /// @brief Construct and pre-provision the shared-PSK fallback record and the Pairing PSK.
     /// If a persistence provider is supplied, attempts to load saved records
     /// and pairing config first; generates fresh material only when absent.
-    explicit RecordStore(SendspinPersistenceProvider* provider);
+    /// @param provider Persistence provider, or nullptr for an in-memory-only store.
+    /// @param initial_unpaired_access_enabled First-boot default for unpaired (Sentinel) access.
+    ///        Applied only when no pairing config was loaded; a loaded config always wins.
+    explicit RecordStore(SendspinPersistenceProvider* provider,
+                         bool initial_unpaired_access_enabled = false);
 
     virtual ~RecordStore() = default;
 
