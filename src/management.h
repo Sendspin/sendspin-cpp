@@ -111,10 +111,14 @@ inline void handle_list_records(const RecordStore& store, ManagementResultPayloa
 /// @brief Handle management/add-record.
 /// Decodes the PSK, validates size, checks for duplicates and capacity, then stores.
 ///
-/// A server_id already bound to a different stored-pubkey record is not rejected: storing the
-/// new record supersedes (revokes) the prior one for that server_id, per RecordStore::store_record
-/// -- the same at-most-one-record-per-server_id invariant re-pairing relies on. The spec's
-/// already_exists outcome is reserved for a psk_id collision (checked above).
+/// A server_id already bound to a different stored-pubkey record is neither rejected nor
+/// superseded: both records are kept. The spec's only stated add-record collision rule is keyed
+/// on psk_id ("A psk whose psk_id is already known ... is rejected as already_exists", checked
+/// above) and it defines no outcome for a server_id collision, so silently revoking a record the
+/// caller never named would be unattested by any result code and would break a staged rotation
+/// (add the replacement, verify it, then retire the old one). This deliberately uses the plain
+/// RecordStore::store_record(); pairing completion is the path that supersedes, via
+/// RecordStore::store_record_superseding().
 ///
 /// @param store RecordStore to mutate.
 /// @param payload Parsed add-record payload.

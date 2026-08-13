@@ -219,6 +219,14 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
 }
 
 bool RecordStore::store_record(SendspinPairingRecord record) {
+    return this->store_record_impl(std::move(record), /*supersede_server_id=*/false);
+}
+
+bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
+    return this->store_record_impl(std::move(record), /*supersede_server_id=*/true);
+}
+
+bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede_server_id) {
     // Persist first: when the provider rejects the write, leave the in-memory store
     // untouched so the pairing fails closed (see the header contract). A deferred
     // provider (e.g. one that queues the flash write) reports success here and owns
@@ -236,12 +244,16 @@ bool RecordStore::store_record(SendspinPairingRecord record) {
         idx = records_.size() - 1;
     }
 
-    // At most one stored-pubkey record per server_id (see the header doc): the new record is
-    // already persisted above, so any OTHER record still bound to this server_id is now
-    // redundant. Drop it -- this is what makes re-pairing (or an add-record targeting an
-    // already-bound server_id) revoke the prior credential instead of accumulating a second
-    // working PSK for the same server. Shared-PSK records (server_id absent) never match here.
-    if (records_[idx].server_id.has_value()) {
+    // Pairing mints a fresh per-server PSK that REPLACES whatever that server held before, so
+    // the new record is already persisted above and any OTHER record still bound to this
+    // server_id is now redundant. Drop it, otherwise re-pairing accumulates a second working
+    // PSK for the same server and "rotation" never revokes anything. Only the pairing path
+    // asks for this: management/add-record stores plainly, because the spec's only stated
+    // add-record collision rule is keyed on psk_id (a psk whose psk_id is already known is
+    // already_exists) and it defines no outcome for a server_id collision -- silently deleting
+    // a record the caller never named would be unattested by any result code. Shared-PSK
+    // records (server_id absent) never match here.
+    if (supersede_server_id && records_[idx].server_id.has_value()) {
         const std::string superseded_server_id = records_[idx].server_id.value();
         for (size_t i = 0; i < records_.size();) {
             if (i != idx && records_[i].server_id.has_value() &&

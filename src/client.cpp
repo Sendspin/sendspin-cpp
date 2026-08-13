@@ -1126,9 +1126,9 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                     bool persist_failed = false;
                     if (record.has_value() && this->record_store_ != nullptr) {
                         const std::string psk_id = record->psk_id;
-                        // store_record() persists to the provider before mutating in-memory
-                        // state and fails closed: a provider rejection (full storage, write
-                        // error) must not be reported as a successful pairing, else
+                        // store_record_superseding() persists to the provider before mutating
+                        // in-memory state and fails closed: a provider rejection (full storage,
+                        // write error) must not be reported as a successful pairing, else
                         // on_pairing_succeeded fires and the re-handshake watchdog re-arms for a
                         // PSK the client never actually retained. The server will rekey onto
                         // this PSK regardless (it already acked pair-finalize); since the client
@@ -1136,7 +1136,13 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                         // psk_id and the connection would otherwise dangle waiting for a
                         // watchdog. schedule_pair_storage_failed() below aborts it explicitly
                         // instead.
-                        if (this->record_store_->store_record(std::move(record.value()))) {
+                        //
+                        // The superseding form is correct here and only here: this PSK replaces
+                        // whatever this server held before, so the prior record for the same
+                        // server_id must be retired or the old PSK stays valid forever.
+                        // management/add-record deliberately uses the plain store_record().
+                        if (this->record_store_->store_record_superseding(
+                                std::move(record.value()))) {
                             SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
                                     psk_id.c_str());
                             stored_record = true;

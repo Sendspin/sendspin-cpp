@@ -290,13 +290,13 @@ TEST(RecordStore, StoreRecordSupersedesPriorRecordForSameServerId) {
     auto outcome1 = store.resolve_pairing_outcome(server_id);
     ASSERT_TRUE(outcome1.has_value());
     ASSERT_TRUE(outcome1->record.has_value());
-    ASSERT_TRUE(store.store_record(outcome1->record.value()));
+    ASSERT_TRUE(store.store_record_superseding(outcome1->record.value()));
     const std::string first_psk_id = outcome1->record->psk_id;
 
     auto outcome2 = store.resolve_pairing_outcome(server_id);
     ASSERT_TRUE(outcome2.has_value());
     ASSERT_TRUE(outcome2->record.has_value());
-    ASSERT_TRUE(store.store_record(outcome2->record.value()));
+    ASSERT_TRUE(store.store_record_superseding(outcome2->record.value()));
     const std::string second_psk_id = outcome2->record->psk_id;
 
     ASSERT_NE(first_psk_id, second_psk_id);
@@ -333,11 +333,11 @@ TEST(RecordStore, StoreRecordSupersedeRejectedWriteKeepsOldRecord) {
     RecordStore store(&provider);
 
     SendspinPairingRecord original = make_client_record("server-X", "original");
-    ASSERT_TRUE(store.store_record(original));
+    ASSERT_TRUE(store.store_record_superseding(original));
 
     provider.reject = true;
     SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
-    EXPECT_FALSE(store.store_record(replacement))
+    EXPECT_FALSE(store.store_record_superseding(replacement))
         << "a rejected write must not supersede the working credential";
 
     // The old record must still resolve and be the only one for this server_id.

@@ -148,22 +148,33 @@ public:
     }
 
     /// @brief Persist and store a long-term record. Replaces any existing record
-    /// with the same psk_id.
+    /// with the same psk_id, and leaves records for other psk_ids alone.
     ///
     /// The provider write happens first: when it fails, the in-memory store is left
     /// untouched so the caller can fail the exchange closed instead of completing it on
     /// a key that would be lost at the next reboot.
     ///
-    /// At most one stored-pubkey record may exist per server_id: when `record.server_id`
-    /// has a value, any OTHER record already bound to that same server_id is removed (and,
-    /// if a provider is set, its persisted copy dropped too) as part of this call, once the
-    /// new record is safely persisted. This makes re-pairing (or `management/add-record`
-    /// targeting an already-bound server_id) revoke the prior credential instead of
-    /// accumulating a second working PSK for the same server. Shared-PSK records
-    /// (server_id absent) are never subject to this supersede.
+    /// This plain form does NOT supersede other records bound to the same server_id, so a
+    /// caller may deliberately hold more than one record for one server (for example an
+    /// operator staging a replacement credential via `management/add-record` before
+    /// retiring the old one). Use store_record_superseding() for the pairing path.
     /// @return true when the record is stored (and persisted, when a provider is set);
     /// false when the persistence provider rejected the write.
     bool store_record(SendspinPairingRecord record);
+
+    /// @brief Like store_record(), but additionally retires any OTHER record bound to the
+    /// same server_id once the new record is safely persisted.
+    ///
+    /// This is the pairing-completion form: pairing mints a fresh per-server PSK that
+    /// REPLACES whatever that server held before, so leaving the prior record in place
+    /// would keep the old PSK valid forever and let repeated re-pairs exhaust storage.
+    /// Ordering matters: the new record is persisted BEFORE the old one is dropped, so a
+    /// rejected write never destroys the working credential. Shared-PSK records (server_id
+    /// absent) are never subject to this supersede, which is what keeps the record-mode
+    /// fallback record safe.
+    /// @return true when the record is stored (and persisted, when a provider is set);
+    /// false when the persistence provider rejected the write (nothing is retired then).
+    bool store_record_superseding(SendspinPairingRecord record);
 
     /// @brief Remove the long-term record identified by psk_id.
     /// No-op if absent.
@@ -341,6 +352,11 @@ private:
 
     /// @brief Find the index of a record by psk_id, or npos if absent.
     [[nodiscard]] size_t find_index(const std::string& psk_id) const;
+
+    /// @brief Shared body of store_record() and store_record_superseding().
+    /// @param supersede_server_id When true, retire any other record bound to the stored
+    ///        record's server_id after the new record is persisted.
+    bool store_record_impl(SendspinPairingRecord record, bool supersede_server_id);
 
     /// @brief Persist the current pairing config via the provider.
     void persist_config();

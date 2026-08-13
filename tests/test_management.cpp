@@ -633,7 +633,13 @@ TEST(ManagementHandler, AddRecordAlreadyExists) {
 // Finding C: add-record twice with the same server_id but different PSKs supersedes the prior
 // record rather than accumulating two records for one server (consistent with the re-pairing
 // supersede semantics in RecordStore::store_record, see Finding A).
-TEST(ManagementHandler, AddRecordSameServerIdSupersedesPrior) {
+// management/add-record deliberately does NOT supersede: the spec's only stated add-record
+// collision rule is keyed on psk_id ("A psk whose psk_id is already known ... is rejected as
+// already_exists") and it defines no outcome for a server_id collision, so silently deleting a
+// record the caller never named would be unattested by any result code. It also breaks the
+// staged-rotation workflow (add the replacement, verify it, then retire the old one). Pairing
+// completion is the path that supersedes; see RecordStore.StoreRecordSupersedes* below.
+TEST(ManagementHandler, AddRecordSameServerIdKeepsBothRecords) {
     RecordStore store(nullptr);
     std::string server_id = make_test_server_id();
 
@@ -658,20 +664,18 @@ TEST(ManagementHandler, AddRecordSameServerIdSupersedesPrior) {
     handle_add_record(store, payload2, result, effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
 
-    // The prior record for this server_id must be superseded (revoked), not accumulated.
-    EXPECT_EQ(store.record_by_psk_id(first_psk_id), nullptr);
-    const auto* current = store.record_by_server_id(server_id);
-    ASSERT_NE(current, nullptr);
-    EXPECT_EQ(current->psk_id, second_psk_id);
+    // Both records remain valid: add-record stores plainly and revokes nothing.
+    EXPECT_NE(store.record_by_psk_id(first_psk_id), nullptr)
+        << "add-record must not silently revoke a record the caller never named";
+    EXPECT_NE(store.record_by_psk_id(second_psk_id), nullptr);
 
-    // Exactly one record must be bound to this server_id.
     int count = 0;
     for (const auto& r : store.records_snapshot()) {
         if (r.server_id.has_value() && r.server_id.value() == server_id) {
             count++;
         }
     }
-    EXPECT_EQ(count, 1);
+    EXPECT_EQ(count, 2);
 }
 
 TEST(ManagementHandler, AddRecordStorageExhausted) {
@@ -800,12 +804,11 @@ TEST(ManagementHandler, RemoveOwnSharedRecordGivesGoodbyeUnauthorized) {
     EXPECT_EQ(effect, ManagementEffect::GOODBYE_UNAUTHORIZED);
 }
 
-// Finding B (b2): removing a different record that merely happens to share the requester's
-// server_id must NOT tear down the connection -- only an exact psk_id match does. (RecordStore's
-// store_record() now supersedes on server_id -- see Finding A -- so two records can no longer
-// literally coexist under the same server_id; this test exercises the comparison directly with a
-// requester psk_id that differs from the record being removed, which is the scenario the old
-// server_id-based comparison would have mishandled.)
+// Removing a different record that merely happens to share the requester's server_id must NOT
+// tear down the connection -- only an exact psk_id match does. Two records CAN coexist under one
+// server_id (management/add-record stores plainly; see AddRecordSameServerIdKeepsBothRecords), so
+// this is reachable in practice, and it is exactly what the old server_id-based comparison
+// mishandled.
 TEST(ManagementHandler, RemoveRecordDifferentPskIdSameServerIdNoEffect) {
     RecordStore store(nullptr);
     SendspinPairingRecord rec = make_client_record("srv-shared");
