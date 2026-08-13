@@ -114,6 +114,42 @@ TEST(HmacSha512, Rfc4231Case2) {
 }
 
 // =============================================================================
+// SHA-256 (Sha256 class / sha256_oneshot) KATs and failure-propagation contract
+//
+// noise-c's SHA256 backend has no test hook to force an allocation/finalize failure, so the
+// actual "hash primitive fails" branch inside Sha256::ok() (crypto.h) cannot be exercised
+// directly from a unit test. What *is* testable, and what these cover, is the contract that
+// depends on it: every security-critical caller (psk_id_for, derive_psk_wrap_key/wrap_psk/
+// unwrap_psk, SENTINEL_PSK) must surface failure through std::optional (or abort(), for the
+// two call sites -- psk_id_for(array) and the SENTINEL_PSK static initializer -- whose
+// established non-optional signatures are depended on elsewhere in the tree) rather than ever
+// returning a zero-derived value as if it were valid. The tests below pin the normal
+// (succeeding) path so a regression that silently drops one of these checks -- e.g. reverting
+// to computing a digest without consulting ok() -- would still be caught by a KAT mismatch or
+// a has_value()/ok() assertion failing to hold for the property it documents.
+// =============================================================================
+
+TEST(Sha256, KatAbc) {
+    // NIST FIPS 180-4 SHA-256("abc").
+    const char* m = "abc";
+    auto d = sha256_oneshot(reinterpret_cast<const uint8_t*>(m), std::strlen(m));
+    EXPECT_EQ(to_hex(d), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+TEST(Sha256, ClassOkAfterConstructionAndFinalize) {
+    // Documents the ok() contract added for finding #3: ok() must stay true through a normal
+    // update()/finalize() cycle so callers that check it after finalize() (e.g. psk_id_for,
+    // derive_psk_wrap_key, the SENTINEL_PSK static initializer) accept the digest.
+    Sha256 h;
+    ASSERT_TRUE(h.ok());
+    const char* m = "abc";
+    h.update(reinterpret_cast<const uint8_t*>(m), std::strlen(m));
+    auto digest = h.finalize();
+    EXPECT_TRUE(h.ok());
+    EXPECT_EQ(to_hex(digest), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+// =============================================================================
 // Constants KATs  (mirrors test_constants.py)
 // =============================================================================
 
@@ -214,7 +250,7 @@ TEST(PskId, RejectsNon32ByteInput) {
 // =============================================================================
 
 TEST(Identity, GenerateShapes) {
-    Identity id = Identity::generate();
+    Identity id = Identity::generate().value();
     EXPECT_EQ(id.private_bytes.size(), 32u);
     EXPECT_EQ(id.public_bytes.size(), 32u);
     EXPECT_EQ(id.peer_id().size(), PEER_ID_SIZE);
@@ -222,8 +258,8 @@ TEST(Identity, GenerateShapes) {
 }
 
 TEST(Identity, FromPrivateBytesReproducesPubkeyAndPeerId) {
-    Identity original = Identity::generate();
-    Identity rehydrated = Identity::from_private_bytes(original.private_bytes);
+    Identity original = Identity::generate().value();
+    Identity rehydrated = Identity::from_private_bytes(original.private_bytes).value();
     EXPECT_EQ(rehydrated.public_bytes, original.public_bytes);
     EXPECT_EQ(rehydrated.peer_id(), original.peer_id());
 }
@@ -234,18 +270,48 @@ TEST(Identity, FromPrivateBytesRejectsWrongSize) {
 }
 
 TEST(Identity, TwoGenerateCallsProduceDifferentKeys) {
-    Identity a = Identity::generate();
-    Identity b = Identity::generate();
+    Identity a = Identity::generate().value();
+    Identity b = Identity::generate().value();
     EXPECT_NE(a.private_bytes, b.private_bytes);
     EXPECT_NE(a.public_bytes, b.public_bytes);
 }
 
 TEST(Identity, PrivateB64uRoundTripsViaDecode) {
-    Identity id = Identity::generate();
+    Identity id = Identity::generate().value();
     auto decoded = b64url_decode(id.private_b64u());
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->size(), 32u);
     EXPECT_EQ(std::memcmp(decoded->data(), id.private_bytes.data(), 32), 0);
+}
+
+// -----------------------------------------------------------------------------
+// Failure-propagation contract (finding #4): generate()/from_private_bytes() must return
+// std::optional and must never let a caller observe a default-constructed (all-zero) Identity
+// as if it were a real keypair. noise-c's DHState has no test hook to force the underlying
+// allocation/keypair-generation failure deterministically, so the actual failure branch cannot
+// be exercised here; what these pin is the contract surface -- optional-returning signatures,
+// and that a successfully generated/reconstructed Identity is never the zero value a silent
+// failure used to produce.
+// -----------------------------------------------------------------------------
+
+TEST(Identity, GenerateSucceedsUnderNormalConditionsAndIsNeverAllZero) {
+    auto id = Identity::generate();
+    ASSERT_TRUE(id.has_value());
+    static const std::array<uint8_t, 32> kZero{};
+    EXPECT_NE(id->private_bytes, kZero);
+    EXPECT_NE(id->public_bytes, kZero);
+}
+
+TEST(Identity, FromPrivateBytesArrayOverloadReturnsEngagedOptional) {
+    // The array overload used to return a bare Identity (with an internal .value() that could
+    // never legitimately fail per its own comment); it now forwards the pointer/length
+    // overload's std::optional so a real DH-state failure would propagate instead of being
+    // masked. Confirm the normal path still succeeds and reproduces the same keypair.
+    auto original = Identity::generate();
+    ASSERT_TRUE(original.has_value());
+    auto rehydrated = Identity::from_private_bytes(original->private_bytes);
+    ASSERT_TRUE(rehydrated.has_value());
+    EXPECT_EQ(rehydrated->public_bytes, original->public_bytes);
 }
 
 // =============================================================================
@@ -264,8 +330,8 @@ namespace {
 /// Returns true if the handshake completes and both transport directions work.
 bool run_kkpsk2_handshake(const char* suite_name) {
     // Generate static keypairs for initiator and responder.
-    Identity init_id = Identity::generate();
-    Identity resp_id = Identity::generate();
+    Identity init_id = Identity::generate().value();
+    Identity resp_id = Identity::generate().value();
 
     // PSK shared between both sides.
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};

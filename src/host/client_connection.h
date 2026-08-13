@@ -73,6 +73,10 @@ public:
     /// @param on_complete Callback invoked after the connection is closed.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
+    /// @brief Closes the transport immediately without blocking (see base class doc comment).
+    /// Safe to call from IX's own worker thread, unlike disconnect() -> ws_->stop().
+    void close_transport_now() override;
+
     /// @brief Sends a text message to the server
     /// @param message The message string to send.
     /// @param cb Callback invoked after send completes.

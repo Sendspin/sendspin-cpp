@@ -111,6 +111,11 @@ inline void handle_list_records(const RecordStore& store, ManagementResultPayloa
 /// @brief Handle management/add-record.
 /// Decodes the PSK, validates size, checks for duplicates and capacity, then stores.
 ///
+/// A server_id already bound to a different stored-pubkey record is not rejected: storing the
+/// new record supersedes (revokes) the prior one for that server_id, per RecordStore::store_record
+/// -- the same at-most-one-record-per-server_id invariant re-pairing relies on. The spec's
+/// already_exists outcome is reserved for a psk_id collision (checked above).
+///
 /// @param store RecordStore to mutate.
 /// @param payload Parsed add-record payload.
 /// @param[out] result Populated with result code.
@@ -183,13 +188,20 @@ inline void handle_add_record(RecordStore& store, const ManagementAddRecordPaylo
 /// @brief Handle management/remove-record.
 /// Finds the record, checks protections, removes it, and detects own-record removal.
 ///
+/// Own-record detection compares psk_id -- the credential that actually authenticated the
+/// requesting connection -- rather than server_id. server_id is absent for shared-PSK records
+/// (so a server_id-based check would silently miss a connection removing the shared record it
+/// authenticated with), and it is not a unique key across records (so it would also fire for a
+/// different record that merely shares the requester's server_id).
+///
 /// @param store RecordStore to mutate.
 /// @param payload Parsed remove-record payload.
-/// @param requester_server_id server_id of the requesting connection (for own-record detection).
+/// @param requester_psk_id psk_id of the PSK that authenticated the requesting connection (for
+///        own-record detection).
 /// @param[out] result Populated with result code.
 /// @param[out] effect GOODBYE_UNAUTHORIZED if the requester removed its own record; else NONE.
 inline void handle_remove_record(RecordStore& store, const ManagementRemoveRecordPayload& payload,
-                                 const std::optional<std::string>& requester_server_id,
+                                 const std::optional<std::string>& requester_psk_id,
                                  ManagementResultPayload& result, ManagementEffect& effect) {
     effect = ManagementEffect::NONE;
 
@@ -206,9 +218,8 @@ inline void handle_remove_record(RecordStore& store, const ManagementRemoveRecor
         return;
     }
 
-    // Check if the requester is removing its own stored-pubkey record.
-    const bool is_self = record->server_id.has_value() && requester_server_id.has_value() &&
-                         record->server_id.value() == requester_server_id.value();
+    // Check if the requester is removing the record that authenticated its own connection.
+    const bool is_self = requester_psk_id.has_value() && requester_psk_id.value() == payload.psk_id;
     if (is_self) {
         effect = ManagementEffect::GOODBYE_UNAUTHORIZED;
     }

@@ -64,6 +64,24 @@ static constexpr double NURSERY_ESTABLISH_TIMEOUT_S = 30.0;
 /// @brief Timeout in microseconds (derived from NURSERY_ESTABLISH_TIMEOUT_S).
 static constexpr int64_t NURSERY_ESTABLISH_TIMEOUT_US = seconds_to_us(NURSERY_ESTABLISH_TIMEOUT_S);
 
+/// @brief Deadline (seconds) for the current (already-admitted) connection to re-prove itself
+/// after SendspinConnection::handle_noise_rehandshake() or ::note_pairing_finalize_ack() resets
+/// its operational state.
+///
+/// Read by the re-proving watchdog in ConnectionManager::loop(), which is gated on
+/// !current_connection_->is_operational(). current_connection_ is never non-operational for any
+/// other reason: a nursery entry is only ever promoted once it is already operational (see
+/// promote_or_arbitrate_nursery_entry()), and an in-progress PIN-pairing PAKE exchange keeps
+/// is_operational() true throughout (that flow has its own timeouts -- PIN_ATTEMPT_TIMEOUT_US
+/// and pairing_window_open() -- see connection_manager.cpp). Shares
+/// NURSERY_ESTABLISH_TIMEOUT_S's value by design (same "reach the next protocol milestone
+/// within a bounded window" semantics) but is named separately because it applies to the
+/// current slot, not the nursery.
+static constexpr double REPROVE_TIMEOUT_S = NURSERY_ESTABLISH_TIMEOUT_S;
+
+/// @brief Timeout in microseconds (derived from REPROVE_TIMEOUT_S).
+static constexpr int64_t REPROVE_TIMEOUT_US = seconds_to_us(REPROVE_TIMEOUT_S);
+
 /// @brief A connection that has not completed the hello handshake
 ///
 /// Unproven connections never occupy the current-connection slot; they wait in the bounded nursery
@@ -154,7 +172,8 @@ enum class PinPairingMessageKind : uint8_t {
     PAIR_INIT,     ///< server/pair-init: nonce_A
     PAIR_AUTH,     ///< server/pair-auth: pake_msg_1
     PAIR_CONFIRM,  ///< server/pair-confirm: server_kc
-    MALFORMED,     ///< a pairing message failed to parse; abort any active PIN session
+    MALFORMED,     ///< a pairing message failed to parse; a spec Protocol Error when a PIN
+                   ///< session is active (silent close, no pair/abort), ignored otherwise
 };
 
 /// @brief Deferred server PIN pairing message event.
@@ -214,11 +233,13 @@ struct ServerActivateEvent {
  * observing their WebSocket upgrade, so the manager never reasons about raw sockets that might
  * not speak WebSocket; those are closed inside the platform layer. Invariant:
  * `current_connection_ != nullptr` implies `current_connection_->is_operational()`, EXCEPT for
- * the transient window while an already-admitted connection re-proves itself after a successful
- * in-band re-handshake (schedule_rehandshake_rearm(): the hello cycle re-arms and re-runs, and
- * the invariant is restored once it completes; if the hello send keeps failing until retries are
- * exhausted, the connection is dropped rather than left wedged -- see the hello-retry-timer scan
- * in loop()).
+ * the transient window while an already-admitted connection re-proves itself: after a successful
+ * in-band re-handshake (schedule_rehandshake_rearm(): the hello cycle re-arms and re-runs) or
+ * after the server acks client/pair-finalize and is expected to rekey via one
+ * (SendspinConnection::note_pairing_finalize_ack()). The invariant is restored once the cycle
+ * completes; if it does not -- the hello send keeps failing until retries are exhausted, or the
+ * server simply goes silent -- the connection is dropped rather than left wedged. See the
+ * hello-retry-timer scan and the re-proving-deadline check (REPROVE_TIMEOUT_US) in loop().
  *
  * Typical usage:
  *  1. Construct with a `SendspinClient*`.

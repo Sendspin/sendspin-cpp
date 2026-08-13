@@ -113,6 +113,17 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
     });
 }
 
+void SendspinServerConnection::close_transport_now() {
+    // trigger_close() -> httpd_sess_trigger_close() is already async/non-blocking (the same
+    // primitive disconnect() uses in its completion callback and handle_data() uses via the
+    // ESP_ERR_NO_MEM return path below), so it is safe to call directly here. on_disconnected_cb
+    // is intentionally not fired here: for inbound connections it is wired as a no-op
+    // (ConnectionManager::on_new_connection() -- cleanup happens via the ws_server's own close
+    // notification instead, see close_callback() in ws_server.cpp), so the resulting close
+    // notification is what reports the loss.
+    this->trigger_close();
+}
+
 bool SendspinServerConnection::is_connected() const {
     return this->sockfd_ >= 0 && !this->closed_.load(std::memory_order_acquire);
 }

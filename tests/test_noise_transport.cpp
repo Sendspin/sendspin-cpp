@@ -74,11 +74,14 @@ public:
 
     void start() override {}
     void loop() override {}
-    void disconnect(SendspinGoodbyeReason /*reason*/,
-                    std::function<void()> on_complete) override {
+    void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override {
+        disconnect_calls_.push_back(reason);
         if (on_complete) {
             on_complete();
         }
+    }
+    void close_transport_now() override {
+        this->close_transport_now_calls_++;
     }
     bool is_connected() const override { return true; }
 
@@ -115,6 +118,18 @@ public:
         this->dispatch_completed_message(/*is_text=*/false, receive_time);
     }
 
+    /// Inject a fully assembled TEXT frame into the dispatch path, bypassing the WS layer.
+    /// Used to drive the pre-transport Noise handshake (client/init, server/init,
+    /// noise/handshake) the same way a real WS TEXT frame would.
+    void inject_text_payload(const std::string& text, int64_t receive_time = 0) {
+        uint8_t* dest = this->prepare_receive_buffer(text.size());
+        if (dest != nullptr) {
+            std::memcpy(dest, text.data(), text.size());
+            this->commit_receive_buffer(text.size());
+        }
+        this->dispatch_completed_message(/*is_text=*/true, receive_time);
+    }
+
     /// Install a noise session directly (bypasses handshake, for transport-only tests).
     void set_noise_session(std::unique_ptr<NoiseSession> session) {
         this->noise_transport_.activate(std::move(session));
@@ -124,6 +139,14 @@ public:
     // Accumulated outgoing messages
     std::vector<std::string> sent_text_;
     std::vector<std::vector<uint8_t>> sent_binary_;
+
+    // Reasons passed to disconnect(), in call order.
+    std::vector<SendspinGoodbyeReason> disconnect_calls_;
+
+    // Number of times close_transport_now() was invoked (the silent-close path; see
+    // close_silently(), which calls this instead of disconnect() so it never blocks/joins the
+    // network thread it runs on).
+    int close_transport_now_calls_{0};
 };
 
 // =============================================================================
@@ -292,8 +315,8 @@ struct LoopbackResult {
 
 static std::optional<LoopbackResult> run_loopback_handshake(const std::string& suite_name) {
     // Generate identities
-    Identity client_id = Identity::generate();  // Noise responder
-    Identity server_id = Identity::generate();  // Noise initiator
+    Identity client_id = Identity::generate().value();  // Noise responder
+    Identity server_id = Identity::generate().value();  // Noise initiator
 
     // Generate a PSK
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
@@ -791,8 +814,8 @@ TEST(NoiseTransport, FragmentReassembleEndToEnd) {
 // =============================================================================
 
 TEST(NoiseHandshakeDriver, UnknownPskIdAborts) {
-    Identity client_id = Identity::generate();
-    Identity server_id = Identity::generate();
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
 
     // RecordStore has no matching PSK for the one the server will advertise
     RecordStore rs(nullptr);
@@ -845,9 +868,9 @@ TEST(NoiseHandshakeDriver, UnknownPskIdAborts) {
 }
 
 TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
-    Identity client_id = Identity::generate();
-    Identity server_id = Identity::generate();
-    Identity other_server = Identity::generate();  // A different server
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
+    Identity other_server = Identity::generate().value();  // A different server
 
     // PSK bound to other_server, not server_id
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
@@ -901,7 +924,7 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
 }
 
 TEST(NoiseHandshakeDriver, MalformedServerInitAborts) {
-    Identity client_id = Identity::generate();
+    Identity client_id = Identity::generate().value();
     RecordStore rs(nullptr);
 
     NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
@@ -915,8 +938,8 @@ TEST(NoiseHandshakeDriver, MalformedServerInitAborts) {
 }
 
 TEST(NoiseHandshakeDriver, WrongVersionAborts) {
-    Identity client_id = Identity::generate();
-    Identity server_id = Identity::generate();
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
     RecordStore rs(nullptr);
 
     NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
@@ -932,9 +955,11 @@ TEST(NoiseHandshakeDriver, WrongVersionAborts) {
 // dispatch_noise_plaintext: reassembly state machine edge cases
 // =============================================================================
 
-TEST(NoiseTransportDispatch, NonFragmentMidReassemblyDiscardsState) {
-    // Deliver FRAGMENT_MORE, then a non-fragment (type 0x00) frame.
-    // The 0x00 frame should cause the reassembly to be discarded.
+TEST(NoiseTransportDispatch, NonFragmentMidReassemblyClosesConnection) {
+    // Deliver FRAGMENT_MORE, then a non-fragment (type 0x00) frame while reassembly is in
+    // flight. Per spec "Malformed sequences" this is a protocol error: the connection must be
+    // closed, not just have its reassembly state discarded (the old, pre-fix behavior this test
+    // used to assert -- see FINDING 9 in the encryption failure-handling review).
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
 
@@ -986,11 +1011,22 @@ TEST(NoiseTransportDispatch, NonFragmentMidReassemblyDiscardsState) {
 
     conn.inject_binary_payload(ct2.data(), ct2.size());
 
-    // The JSON dispatch should NOT have fired (reassembly was aborted by the non-fragment)
+    // The JSON dispatch should NOT have fired (the non-fragment frame is dropped, not
+    // dispatched), and the connection must have been closed silently: torn down via
+    // close_transport_now() (not disconnect() -- see close_silently()'s doc comment: the
+    // network thread cannot safely call disconnect() on host/ESP outbound transports), with no
+    // application-level message sent as part of the close itself.
     EXPECT_EQ(json_dispatched, 0);
+    EXPECT_EQ(conn.close_transport_now_calls_, 1);
+    EXPECT_TRUE(conn.disconnect_calls_.empty());
+    EXPECT_TRUE(conn.sent_text_.empty());
+    EXPECT_TRUE(conn.sent_binary_.empty());
 }
 
-TEST(NoiseTransportDispatch, FragmentEndWithoutStartIsIgnored) {
+TEST(NoiseTransportDispatch, FragmentEndWithoutStartClosesConnection) {
+    // A fragment-end frame with no fragmented message in flight is a spec "Malformed
+    // sequences" protocol error: the connection must be closed, not merely have the stray
+    // frame dropped (the old, pre-fix behavior this test used to assert -- see FINDING 9).
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
 
@@ -1015,7 +1051,109 @@ TEST(NoiseTransportDispatch, FragmentEndWithoutStartIsIgnored) {
                                                size_t /*l*/) { ++dispatched; };
 
     conn.inject_binary_payload(ct.data(), ct.size());
-    EXPECT_EQ(dispatched, 0) << "FRAGMENT_END without prior FRAGMENT_MORE should be a no-op";
+    EXPECT_EQ(dispatched, 0) << "FRAGMENT_END without prior FRAGMENT_MORE must not be dispatched";
+    EXPECT_EQ(conn.close_transport_now_calls_, 1)
+        << "FRAGMENT_END without prior FRAGMENT_MORE is a malformed sequence and must close";
+    EXPECT_TRUE(conn.disconnect_calls_.empty());
+    EXPECT_TRUE(conn.sent_text_.empty());
+    EXPECT_TRUE(conn.sent_binary_.empty());
+}
+
+TEST(NoiseTransportDispatch, BenignMidReassemblyDoesNotClose) {
+    // Regression guard for FINDING 9: a normal, in-progress fragment reassembly (just the
+    // FRAGMENT_MORE start frame, no FRAGMENT_END yet) is the benign "no complete message yet"
+    // state and must NOT close the connection -- only the three enumerated malformed
+    // sequences (fragment-end with nothing in flight, a non-fragment frame while one is in
+    // flight, and orig_type 2/3) do.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+
+    TestConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    int dispatched = 0;
+    conn.on_json_message_cb = [&dispatched](SendspinConnection* /*c*/, const char* /*d*/,
+                                             size_t /*l*/, int64_t /*t*/) { ++dispatched; };
+
+    // FRAGMENT_MORE start: [0x02, orig_type=0x00, data...] -- valid start of a fragmented
+    // JSON message, no FRAGMENT_END yet.
+    std::vector<uint8_t> plaintext_frag_more{0x02, 0x00, 0xAA, 0xBB, 0xCC};
+    std::vector<uint8_t> ct(plaintext_frag_more.size() + 16);
+    std::copy(plaintext_frag_more.begin(), plaintext_frag_more.end(), ct.begin());
+    NoiseBuffer buf;
+    noise_buffer_set_inout(buf, ct.data(), plaintext_frag_more.size(), ct.size());
+    ASSERT_EQ(noise_cipherstate_encrypt(r->initiator.send_cs, &buf), NOISE_ERROR_NONE);
+    ct.resize(buf.size);
+
+    conn.inject_binary_payload(ct.data(), ct.size());
+
+    EXPECT_EQ(dispatched, 0) << "mid-reassembly: no complete message yet";
+    EXPECT_TRUE(conn.disconnect_calls_.empty())
+        << "a benign mid-reassembly frame must not close the connection";
+    EXPECT_EQ(conn.close_transport_now_calls_, 0)
+        << "a benign mid-reassembly frame must not close the connection";
+}
+
+TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
+    // FINDING 12: a fatal initial-handshake error (here: an unresolvable psk_id in msg1) must
+    // close the connection. This drives the full chain through dispatch_completed_message() ->
+    // handle_noise_handshake_text(), using the same fake-connection pattern (TestConnection,
+    // disconnect_calls_) as the other dispatch tests above -- unlike the
+    // NoiseHandshakeDriver.*Aborts tests, which call NoiseHandshake::on_text_frame() directly
+    // and only prove the state machine returns ABORT, not that the connection actually closes.
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
+    RecordStore rs(nullptr);  // Empty store: any psk_id lookup misses.
+
+    TestConnection conn;
+    conn.init_noise_handshake(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    conn.send_noise_client_init();
+    ASSERT_EQ(conn.sent_text_.size(), 1u);
+    std::string client_init_text = conn.sent_text_[0];
+
+    std::string server_init_text = make_server_init(server_id.peer_id());
+    conn.inject_text_payload(server_init_text);
+    EXPECT_TRUE(conn.disconnect_calls_.empty()) << "server/init alone must not close";
+    EXPECT_EQ(conn.close_transport_now_calls_, 0) << "server/init alone must not close";
+
+    // Build a syntactically valid msg1 whose psk_id is not in the (empty) record store.
+    std::string prologue_str = client_init_text + server_init_text;
+    const uint8_t* prologue = reinterpret_cast<const uint8_t*>(prologue_str.data());
+    size_t prologue_len = prologue_str.size();
+
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+    platform_random_bytes(psk.data(), psk.size());
+    std::string psk_id = psk_id_for(psk);
+
+    NoiseHandshakeState* init_hs_raw =
+        build_initiator_hs(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
+                           server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
+                           prologue, prologue_len);
+    ASSERT_NE(init_hs_raw, nullptr);
+    HsGuard guard(init_hs_raw);
+
+    std::string psk_id_json = "{\"psk_id\":\"" + psk_id + "\"}";
+    std::vector<uint8_t> msg1_raw(4096);
+    NoiseBuffer msg1_out;
+    noise_buffer_set_output(msg1_out, msg1_raw.data(), msg1_raw.size());
+    NoiseBuffer payload_in;
+    noise_buffer_set_input(
+        payload_in, const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(psk_id_json.data())),
+        psk_id_json.size());
+    ASSERT_EQ(noise_handshakestate_write_message(init_hs_raw, &msg1_out, &payload_in),
+              NOISE_ERROR_NONE);
+    msg1_raw.resize(msg1_out.size);
+
+    conn.inject_text_payload(make_noise_handshake_envelope(msg1_raw));
+
+    // The handshake must have aborted and the connection must have been closed silently: torn
+    // down via close_transport_now() (not disconnect()), with no goodbye (only the earlier
+    // client/init is in sent_text_).
+    EXPECT_EQ(conn.close_transport_now_calls_, 1)
+        << "an aborted initial handshake must close the connection";
+    EXPECT_TRUE(conn.disconnect_calls_.empty());
+    EXPECT_EQ(conn.sent_text_.size(), 1u) << "only client/init was sent; no goodbye";
+    EXPECT_TRUE(conn.sent_binary_.empty());
 }
 
 // =============================================================================
@@ -1155,7 +1293,11 @@ TEST(NoiseTransport, FragmentReassembleBinaryReceive) {
 // Transport-mode decrypt failure: a tampered ciphertext is dropped, not dispatched
 // =============================================================================
 
-TEST(NoiseTransport, TamperedCiphertextIsDropped) {
+TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
+    // FINDING 1: an AEAD failure in transport mode must not just drop the frame -- the
+    // underlying Noise decrypt never advances the receive-direction nonce counter on an auth
+    // failure, so leaving the connection open would desync it permanently (every later frame
+    // would also fail forever). Spec Failure Handling also mandates closing silently here.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     NoiseCipherState* server_send = r->initiator.send_cs;
@@ -1175,12 +1317,18 @@ TEST(NoiseTransport, TamperedCiphertextIsDropped) {
     pt.insert(pt.end(), json.begin(), json.end());
     auto ct = server_encrypt_frame(server_send, pt);
 
-    // Flip a byte; the AEAD tag check must fail and the frame must be dropped silently.
+    // Flip a byte; the AEAD tag check must fail, the frame must be dropped, and the
+    // connection must be closed -- silently, with no application-level message sent.
     ASSERT_GT(ct.size(), 0u);
     ct[ct.size() / 2] ^= 0xFF;
     conn.inject_binary_payload(ct.data(), ct.size());
 
     EXPECT_EQ(calls, 0) << "tampered ciphertext must not be dispatched";
+    EXPECT_EQ(conn.close_transport_now_calls_, 1)
+        << "a transport-mode AEAD failure must close the connection";
+    EXPECT_TRUE(conn.disconnect_calls_.empty());
+    EXPECT_TRUE(conn.sent_text_.empty());
+    EXPECT_TRUE(conn.sent_binary_.empty());
 }
 
 // =============================================================================
@@ -1213,8 +1361,8 @@ TEST(NoiseTransport, FragmentBoundaryExactLimit) {
 // =============================================================================
 
 TEST(NoiseHandshakeDriver, MalformedMsg1EmptyAborts) {
-    Identity client_id = Identity::generate();
-    Identity server_id = Identity::generate();
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
     RecordStore rs(nullptr);
 
     NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
@@ -1229,8 +1377,8 @@ TEST(NoiseHandshakeDriver, MalformedMsg1EmptyAborts) {
 }
 
 TEST(NoiseHandshakeDriver, MalformedMsg1GarbageAborts) {
-    Identity client_id = Identity::generate();
-    Identity server_id = Identity::generate();
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
     RecordStore rs(nullptr);
 
     NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));

@@ -106,6 +106,30 @@ public:
     ///                    thread.
     virtual void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) = 0;
 
+    /// @brief Closes the underlying transport immediately, without blocking and without ever
+    /// joining/stopping the calling thread.
+    ///
+    /// disconnect() is NOT safe to call from the network thread on every platform: on host
+    /// outbound it ends up calling ix::WebSocket::stop(), and on ESP outbound it ends up calling
+    /// esp_websocket_client_stop(), and both of those join/block the transport's own worker
+    /// thread. Calling either one from a callback already running on that same thread (e.g. from
+    /// dispatch_completed_message(), reached synchronously from the transport's own message
+    /// callback) deadlocks that thread; on host, joining the current thread additionally throws
+    /// std::system_error, which escapes IXWebSocket's thread entry point uncaught and crashes the
+    /// process via std::terminate().
+    ///
+    /// Each platform implements this with whichever non-blocking close primitive it already uses
+    /// elsewhere for the same hazard (see the allocation-failure paths in the platform .cpp files
+    /// for precedent): host uses ix::WebSocket::close() (async), ESP client reports the loss and
+    /// leaves the actual esp_websocket_client_stop() to the owning connection's destructor (run
+    /// off the websocket task), and both server transports use their existing trigger_close().
+    ///
+    /// The connection is still guaranteed to be reported lost exactly once from the manager's
+    /// point of view even when a platform's implementation also lets the transport's normal
+    /// asynchronous close/disconnect event fire afterwards: ConnectionManager::drop_connection()
+    /// treats a repeat disconnect for a connection it no longer manages as a no-op.
+    virtual void close_transport_now() = 0;
+
     /// @brief Checks if the transport connection is established
     /// @return true if connected, false otherwise.
     virtual bool is_connected() const = 0;
@@ -319,6 +343,24 @@ public:
     /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_goodbye_reason(SendspinGoodbyeReason reason, SendCompleteCallback on_complete);
 
+    /// @brief Closes the connection without sending any application-level message.
+    ///
+    /// Spec "Failure Handling": handshake-phase failures, an AEAD failure once in transport
+    /// mode, and malformed fragment sequences all close the WebSocket without sending a
+    /// client/goodbye (or any other application-level message). Every call site is reached from
+    /// dispatch_completed_message() on the network thread, so this routes to
+    /// close_transport_now() (non-blocking on every platform) instead of disconnect() (which is
+    /// not network-thread-safe on host/ESP outbound -- see close_transport_now()'s doc comment).
+    /// Also disables further message dispatch first, matching the existing allocation-failure
+    /// precedent in the platform .cpp files, so a stale frame cannot reach role queues while the
+    /// close is in flight.
+    /// @param reason Kept only for parity with disconnect()'s signature; no goodbye is
+    ///        actually transmitted.
+    void close_silently(SendspinGoodbyeReason /*reason*/) {
+        this->disable_message_dispatch();
+        this->close_transport_now();
+    }
+
     // ========================================
     // Server information accessors
     // ========================================
@@ -527,11 +569,11 @@ public:
     /// @brief Re-arm the provisional timeout after the server acks server/pair-finalize.
     ///
     /// After the server acks pair-finalize it rekeys via an in-band re-handshake. Re-arming the
-    /// provisional timer means the existing nursery-establish provisional timeout in
-    /// ConnectionManager::loop() will tear the connection down if the server acks but never
-    /// re-handshakes (mirrors the reference's post-pairing timeout). Runs on the network thread;
-    /// provisional_time_us_ is atomic. Implemented in connection.cpp to avoid pulling
-    /// platform/time.h into this header.
+    /// provisional timer means ConnectionManager::loop()'s re-proving-deadline check
+    /// (REPROVE_TIMEOUT_US, gated on this connection being current and !is_operational()) will
+    /// drop the connection if the server acks but never re-handshakes (mirrors the reference's
+    /// post-pairing timeout). Runs on the network thread; provisional_time_us_ is atomic.
+    /// Implemented in connection.cpp to avoid pulling platform/time.h into this header.
     void note_pairing_finalize_ack();
 
     /// @brief Returns true if any active role is in the given family (e.g., "player" matches
@@ -686,12 +728,14 @@ public:
     }
 
     /// @brief Called by dispatch_completed_message() to drive the noise handshake for an
-    /// incoming text frame received before transport mode is established.
-    /// @param text         The raw text content of the received TEXT frame.
-    /// @return true if the frame was consumed by the handshake (caller must not dispatch it).
-    ///         false if the frame should be treated as normal application traffic (no handshake
-    ///         driver installed on this connection).
-    bool handle_noise_handshake_text(const std::string& text);
+    /// incoming text frame received before transport mode is established. No-op if no
+    /// handshake driver is installed on this connection.
+    /// @param text The raw text content of the received TEXT frame.
+    ///
+    /// On HandshakeFrameResult::ABORT (spec Failure Handling: malformed cleartext message,
+    /// unsupported version, unknown suite, psk_id lookup miss, or a msg1 auth failure), this
+    /// closes the connection itself via close_silently(); the caller has nothing left to do.
+    void handle_noise_handshake_text(const std::string& text);
 
     /// @brief Returns whether this connection has successfully sent its client/hello.
     /// @return true once a client/hello send has completed on this connection.

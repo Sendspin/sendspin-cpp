@@ -17,6 +17,8 @@
 #include "keys.h"
 #include "platform/crypto.h"
 
+#include <cstdlib>
+
 namespace sendspin {
 
 // Sentinel PSK = SHA-256("sendspin-sentinel-psk-v1")
@@ -25,7 +27,21 @@ namespace sendspin {
 // NOLINTNEXTLINE(cert-err58-cpp)
 const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK = []() {
     static constexpr char label[] = "sendspin-sentinel-psk-v1";
-    return sha256_oneshot(reinterpret_cast<const uint8_t*>(label), sizeof(label) - 1);
+    Sha256 h;
+    if (!h.ok()) {
+        // SHA-256 is unavailable at process startup (noise-c allocation failure). There is no
+        // safe fallback value for this security-critical constant: an all-zero SENTINEL_PSK
+        // would be a fixed, publicly known PSK that every client and server would both derive
+        // and silently authenticate under. Fail loudly at startup instead (same rationale as
+        // the CSPRNG-failure abort() in platform_random_bytes()).
+        abort();
+    }
+    h.update(reinterpret_cast<const uint8_t*>(label), sizeof(label) - 1);
+    auto digest = h.finalize();
+    if (!h.ok()) {
+        abort();
+    }
+    return digest;
 }();
 
 // SENTINEL_PSK_ID = base64url(SHA-256(PSK_ID_LABEL || SENTINEL_PSK))

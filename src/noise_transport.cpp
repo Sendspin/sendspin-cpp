@@ -257,8 +257,10 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
 
     if (type_byte == MSG_TYPE_FRAGMENT_END) {
         if (!this->reasm_in_progress_) {
-            SS_LOGW(TAG, "fragment-end with no fragmented message in flight");
-            return {};
+            // Spec "Malformed sequences": a fragment-end frame with no fragmented message in
+            // flight is a protocol error; the caller must close the connection.
+            SS_LOGW(TAG, "fragment-end with no fragmented message in flight; malformed sequence");
+            return {nullptr, 0, true};
         }
         const size_t new_data = len - 1;
         if (this->reasm_len_ - 1 + new_data > MAX_REASSEMBLED_MESSAGE_BYTES) {
@@ -281,10 +283,12 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         // reassembled bytes directly instead of re-decoding them).
         const uint8_t orig_type = this->reasm_buf_.data()[0];
         if (orig_type == MSG_TYPE_FRAGMENT_MORE || orig_type == MSG_TYPE_FRAGMENT_END) {
-            SS_LOGW(TAG, "reassembled message has fragment orig_type=%d; dropping",
+            // Spec "Malformed sequences": an orig_type of 2 or 3 is a protocol error; the
+            // caller must close the connection.
+            SS_LOGW(TAG, "reassembled message has fragment orig_type=%d; malformed sequence",
                     static_cast<int>(orig_type));
             this->reasm_reset();
-            return {};
+            return {nullptr, 0, true};
         }
 
         // reasm_buf_ already holds [orig_type][data...]; the returned pointer stays valid
@@ -292,14 +296,15 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         return {this->reasm_buf_.data(), this->reasm_len_};
     }
 
-    // A non-fragment frame while a fragmented message is in flight is an error.
+    // Spec "Malformed sequences": a non-fragment frame while a fragmented message is in flight
+    // is a protocol error; the caller must close the connection.
     if (this->reasm_in_progress_) {
         SS_LOGW(TAG,
                 "non-fragment frame (type=%d) while a fragmented message is in flight; "
-                "discarding reassembly state",
+                "malformed sequence",
                 static_cast<int>(type_byte));
         this->reasm_reset();
-        return {};
+        return {nullptr, 0, true};
     }
 
     return {plaintext, len};

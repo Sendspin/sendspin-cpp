@@ -76,14 +76,20 @@ struct Identity {
     // -------------------------------------------------------------------------
 
     /// @brief Generate a new random X25519 identity using the platform CSPRNG.
-    static Identity generate();
+    /// Returns std::nullopt if the underlying noise-c DH-state allocation or keypair
+    /// generation fails (e.g. heap pressure); callers must not treat a default-constructed
+    /// Identity as a valid key.
+    static std::optional<Identity> generate();
 
     /// @brief Reconstruct an Identity from its 32-byte raw private key.
-    /// Returns std::nullopt if private_key_bytes.size() != X25519_KEY_SIZE.
+    /// Returns std::nullopt if private_key_bytes.size() != X25519_KEY_SIZE, or if the
+    /// underlying noise-c DH-state computation fails.
     static std::optional<Identity> from_private_bytes(const uint8_t* priv, size_t len);
 
     /// @brief Reconstruct an Identity from a 32-byte array private key.
-    static Identity from_private_bytes(const std::array<uint8_t, X25519_KEY_SIZE>& priv);
+    /// Returns std::nullopt on the same failure conditions as the pointer/length overload.
+    static std::optional<Identity> from_private_bytes(
+        const std::array<uint8_t, X25519_KEY_SIZE>& priv);
 };
 
 }  // namespace sendspin

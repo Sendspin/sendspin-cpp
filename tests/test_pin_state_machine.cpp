@@ -88,6 +88,9 @@ public:
             on_complete();
         }
     }
+    void close_transport_now() override {
+        this->close_transport_now_count_++;
+    }
     bool is_connected() const override { return this->connected_; }
 
     SsErr send_text_message(const std::string& msg, SendCompleteCallback cb,
@@ -131,6 +134,7 @@ public:
     std::vector<std::string> sent_text_;
     std::vector<std::vector<uint8_t>> sent_binary_;
     int disconnect_count_{0};
+    int close_transport_now_count_{0};
     std::optional<SendspinGoodbyeReason> last_disconnect_reason_;
 
 private:
@@ -461,6 +465,14 @@ protected:
     /// path has released ConnectionManager's slot.
     std::shared_ptr<SendspinConnection> current_connection_sp() { return this->injected_conn_; }
 
+    /// Returns ConnectionManager::current_connection_ (nullptr once dropped), through the
+    /// friend seam -- unlike current_connection_sp() above, this reflects whether the
+    /// connection is still actually managed, not just whether the fixture's own reference is
+    /// still alive.
+    SendspinConnection* current_connection() {
+        return this->client_->connection_manager_->current();
+    }
+
     /// Schedule a server-to-client PIN pairing message for deferred processing (the same public
     /// entry point process_json_message() uses on the network thread), without pumping loop().
     void schedule_pin_message(ServerPairingMessageEvent event) {
@@ -736,7 +748,12 @@ TEST_F(PinStateMachineTest, DynamicPinAttemptTimeout) {
 // Dynamic PIN: malformed server frame
 // =============================================================================
 
-TEST_F(PinStateMachineTest, DynamicPinMalformedFrameDuringSessionAborts) {
+// Spec "Protocol Errors" (line 999): "a malformed or missing field ... is a protocol error: the
+// detecting side closes the WebSocket without sending any application-level error message, and
+// persists nothing." Previously this path sent pair/abort(method_not_supported) and left the
+// connection open, deviating from the spec (see ConnectionManager::handle_pin_pairing_message's
+// MALFORMED case); this test now pins the corrected silent-close behavior.
+TEST_F(PinStateMachineTest, DynamicPinMalformedFrameDuringSessionClosesSilently) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-4", SendspinPairMethod::DYNAMIC_PIN);
     this->enter_pairing(conn);
@@ -750,11 +767,19 @@ TEST_F(PinStateMachineTest, DynamicPinMalformedFrameDuringSessionAborts) {
     this->schedule_pin_message(std::move(malformed_event));
     this->client_->loop();
 
-    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "method_not_supported");
-    ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
-    // Spec #120/#123: only reason concurrent_attempt closes the connection; every other reason
-    // (method_not_supported here) leaves it open.
+    // No pair/abort (or any other application-level message) is sent: sent_text_ still holds
+    // only the earlier client/pair-init.
+    ASSERT_EQ(conn->sent_text_.size(), 1u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+    // The close goes through drop_connection() with goodbye=std::nullopt (no client/goodbye
+    // either), so disconnect_count_ stays 0 -- unlike
+    // PairAbortConcurrentAttemptStillClosesConnection, which does send a goodbye.
     EXPECT_EQ(conn->disconnect_count_, 0);
+    EXPECT_EQ(this->current_connection(), nullptr)
+        << "a malformed pairing frame during an active PIN session must close the connection";
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::IDLE)
+        << "clear_pairing_state() must have reset the PIN session (persists nothing)";
+    ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
 }
 
 TEST_F(PinStateMachineTest, DynamicPinMalformedFrameWithNoActiveSessionIsIgnored) {
@@ -775,6 +800,74 @@ TEST_F(PinStateMachineTest, DynamicPinMalformedFrameWithNoActiveSessionIsIgnored
     EXPECT_EQ(conn->disconnect_count_, 0);
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::CLEAR_PIN));
+}
+
+// =============================================================================
+// Dynamic PIN: CPace derive() failure on server/pair-auth (low-order/malformed share)
+// =============================================================================
+
+// Spec Protocol Errors (line 999): "a CPace share with the wrong length or encoding a
+// low-order point" is a protocol error, not a pin_mismatch: the detecting side closes the
+// WebSocket without sending any application-level error message, and persists nothing. A
+// derive() failure happens on the peer's raw share BEFORE the PIN-derived generator can even
+// be compared, so it can never be produced by an operator simply mistyping the PIN (that
+// produces a well-formed shared secret that only fails the confirm-tag check exercised by
+// DynamicPinMismatchRecordsFailureAndAborts above) -- it must not count toward the dynamic-PIN
+// failure counter or escalate the method, which is the security-relevant half of this test.
+TEST_F(PinStateMachineTest, DynamicPinDeriveFailureOnPairAuthClosesSilentlyWithoutFailureCount) {
+    FakeConnection* conn =
+        this->inject_current_connection("server-dyn-7", SendspinPairMethod::DYNAMIC_PIN);
+    this->enter_pairing(conn);
+    this->client_->loop();
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+
+    std::array<uint8_t, 32> nonce_a{};
+    for (size_t i = 0; i < nonce_a.size(); ++i) {
+        nonce_a[i] = static_cast<uint8_t>(i + 3);
+    }
+
+    auto current_conn_sp = this->current_connection_sp();
+
+    ServerPairingMessageEvent pair_init_event;
+    pair_init_event.conn = current_conn_sp;
+    pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
+    pair_init_event.nonce_a = nonce_a;
+    this->schedule_pin_message(std::move(pair_init_event));
+    this->client_->loop();
+    ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_SERVER_PAIR_AUTH);
+
+    // server/pair-auth with an all-zero pake_msg_1: a well-formed-length but low-order X25519
+    // point, so CPace::derive() fails on the peer share itself (see
+    // CPaceDeriveRejects.AllZeroPeerShare in test_cpace.cpp), independent of any PIN value.
+    ServerPairingMessageEvent pair_auth_event;
+    pair_auth_event.conn = current_conn_sp;
+    pair_auth_event.kind = PinPairingMessageKind::PAIR_AUTH;
+    pair_auth_event.pake_msg_1.fill(0);
+    this->schedule_pin_message(std::move(pair_auth_event));
+    this->client_->loop();
+
+    // No pair/abort (or any other application-level message) beyond the earlier
+    // client/pair-init and the client/pair-auth this handler itself sends before deriving.
+    ASSERT_EQ(conn->sent_text_.size(), 2u);
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
+    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "pair/abort"));
+
+    // The close goes through drop_connection() with goodbye=std::nullopt (no client/goodbye
+    // either), matching the sibling MALFORMED close.
+    EXPECT_EQ(conn->disconnect_count_, 0);
+    EXPECT_EQ(this->current_connection(), nullptr)
+        << "a CPace derive() failure on the peer's share must close the connection";
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::IDLE)
+        << "clear_pairing_state() must have reset the PIN session (persists nothing)";
+    ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_PIN))
+        << "PIN was displayed for this session, so the close must clear it";
+
+    // Security-relevant assertion: a peer that never knew the PIN, and only sent a malformed
+    // share, must NOT be able to drive the dynamic-PIN failure counter or escalate the method.
+    EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 0);
+    EXPECT_FALSE(this->record_store().dynamic_pin_escalated());
 }
 
 // =============================================================================
@@ -1662,4 +1755,77 @@ TEST_F(PinStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
     EXPECT_EQ(this->listener_.events_.size(), events_before)
         << "a stale pair/abort must not fire any new listener event";
     EXPECT_EQ(conn->disconnect_count_, disconnects_before);
+}
+
+// =============================================================================
+// Re-proving watchdog (current_connection_ non-operational after a re-handshake or a
+// pair-finalize ack; see REPROVE_TIMEOUT_US in connection_manager.h)
+// =============================================================================
+
+// SendspinConnection::note_pairing_finalize_ack() resets first_activate_received_ (so
+// is_operational() goes false) and re-arms provisional_time_us_, anticipating the server's
+// follow-up in-band re-handshake. If the server goes silent instead, ConnectionManager::loop()
+// must eventually drop the connection rather than leave it wedged non-operational forever (the
+// bug: the only reaper that read provisional_time_us_ scanned the nursery, and this connection
+// is never a nursery member). Forces the deadline into the past instead of sleeping
+// REPROVE_TIMEOUT_US (30 s) in a unit test, matching the existing attempt_deadline_us pattern
+// (e.g. DynamicPinAttemptTimeout above).
+TEST_F(PinStateMachineTest, ReproveWatchdogDropsConnectionAfterFinalizeAckGoesSilent) {
+    FakeConnection* conn =
+        this->inject_current_connection("server-reprove-silent", SendspinPairMethod::DYNAMIC_PIN);
+
+    // Simulate: the server acked client/pair-finalize (the SERVER_PAIR_FINALIZE handler in
+    // client.cpp calls this on success) and is expected to rekey via an in-band re-handshake.
+    conn->note_pairing_finalize_ack();
+    ASSERT_FALSE(conn->is_operational());
+    ASSERT_NE(conn->get_provisional_time_us(), 0);
+
+    // The server then goes silent forever instead of re-handshaking.
+    conn->set_provisional_time_us(platform_time_us() - REPROVE_TIMEOUT_US - 1);
+    this->client_->loop();
+
+    EXPECT_EQ(this->current_connection(), nullptr)
+        << "a connection that never re-proves itself after a pair-finalize ack must eventually "
+           "be dropped instead of left wedged non-operational forever";
+}
+
+// Companion to the test above, proving the watchdog does NOT over-reap: a connection that is
+// operational (is_operational() == true, as a real promoted current_connection_ always is
+// outside the two re-proving windows -- see promote_or_arbitrate_nursery_entry()) and legitimately
+// mid-PIN-pairing, awaiting a human to press a physical gesture with no fixed deadline of its
+// own, must survive even though its provisional_time_us_ is stale by far more than
+// REPROVE_TIMEOUT_US.
+TEST_F(PinStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingHumanPinGesture) {
+    this->record_store().set_static_pin("13572468");
+    FakeConnection* conn =
+        this->inject_current_connection("server-reprove-pin-wait", SendspinPairMethod::STATIC_PIN);
+
+    // inject_current_connection() does not run a real hello handshake (see the comment on
+    // LeftoverActivateDiscardsPendingRecordAndPinSession above), so is_handshake_complete() --
+    // and therefore is_operational() -- would otherwise stay false regardless of pairing state.
+    // Set it explicitly so this test exercises the same !is_operational() gate a real connection
+    // would, and so a false pass (the watchdog skipping this connection only because
+    // is_operational() can never be true in this harness) cannot hide a real over-reap bug.
+    conn->set_client_hello_sent(true);
+    conn->set_server_hello_received(true);
+    ASSERT_TRUE(conn->is_operational());
+
+    // static_pin is always gesture-gated (spec: Pairing Window), so with no window open this
+    // attempt waits for a human to press a button. AWAIT_PAIRING_WINDOW leaves attempt_deadline_us
+    // at 0 (see handle_enter_pairing): the wait has no fixed deadline of its own.
+    this->enter_pairing(conn);
+    this->client_->loop();
+    ASSERT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW);
+    ASSERT_TRUE(conn->is_operational())
+        << "entering pairing must not itself clear first_activate_received_";
+
+    // A long time passes -- far beyond REPROVE_TIMEOUT_US -- while the human has not yet acted.
+    conn->set_provisional_time_us(platform_time_us() - REPROVE_TIMEOUT_US - 1);
+    this->client_->loop();
+
+    EXPECT_EQ(this->current_connection(), conn)
+        << "a connection legitimately awaiting a human PIN gesture must not be reaped by the "
+           "re-proving watchdog";
+    EXPECT_TRUE(conn->is_operational());
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 }

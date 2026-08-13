@@ -71,11 +71,18 @@ std::vector<uint8_t> make_fixed_sid() {
 //     sid = b'sendspin-pair-pake-v1' + bytes(range(32)) + bytes([0,0,0,1])
 //     isk = bytes(range(64))
 //     print(hashlib.sha256(label + sid + isk).hexdigest())"
+// derive_psk_wrap_key() returns std::optional<std::array<uint8_t, 32>> (finding #3): a failed
+// SHA-256 computation must not silently produce an all-zero K_wrap, since wrap_psk() would then
+// seal the freshly minted PSK under a publicly derivable key. noise-c has no hook to force that
+// failure deterministically, so this KAT (and the has_value() check it starts with) is the
+// regression coverage available -- it pins the success path and the optional-returning contract.
 TEST(PskWrap, KWrapKat) {
     const auto sid = make_fixed_sid();
     const auto isk = make_fixed_isk();
     auto k_wrap = derive_psk_wrap_key(sid, isk);
-    EXPECT_EQ(to_hex(k_wrap), "cc733464487dfca4f0dc6af4f355440ccbc5bd25a5b1c0f6475db440463d2ca1");
+    ASSERT_TRUE(k_wrap.has_value());
+    EXPECT_EQ(to_hex(k_wrap.value()),
+              "cc733464487dfca4f0dc6af4f355440ccbc5bd25a5b1c0f6475db440463d2ca1");
 }
 
 // =============================================================================

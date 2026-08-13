@@ -18,9 +18,11 @@
 #include <ArduinoJson.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <ios>
 #include <mutex>
@@ -29,6 +31,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace sendspin {
 
@@ -122,19 +128,77 @@ static std::string read_file(const std::string& path) {
 }
 
 /// Write content atomically via a temp file then rename.
+///
+/// This file can hold the device's static private key, long-term PSKs, the Pairing
+/// PSK, and the static PIN, so the temp file is created owner-only (0600) from the
+/// moment it exists rather than chmod'd afterward -- a post-write chmod would leave
+/// the secret readable by other local accounts for the duration of the write.
+/// std::ofstream has no portable way to specify a creation mode, so the temp file is
+/// opened with POSIX open()/O_CREAT and an explicit mode instead, and written via
+/// that descriptor. Because rename() replaces the destination's directory entry
+/// wholesale, the renamed-over file always ends up with the temp file's (0600)
+/// permissions, which also tightens the mode of a pre-existing file that an older,
+/// less careful version of this helper (or another tool) left group/world readable.
+///
+/// The temp file's contents are fsync'd before the rename, and the containing
+/// directory is fsync'd after the rename, so a crash cannot report success for data
+/// that never reached disk, and cannot leave the rename itself unobserved after a
+/// power loss.
 static bool write_file(const std::string& path, const std::string& content) {
     std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::trunc);
-        if (!f.is_open()) {
-            return false;
-        }
-        f << content;
-        if (!f.good()) {
-            return false;
-        }
+
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        return false;
     }
-    return std::rename(tmp.c_str(), path.c_str()) == 0;
+    // Defense in depth: the mode passed to open() only applies when the file is
+    // newly created. If a stale .tmp file happens to already exist with looser
+    // permissions, tighten it explicitly before any content is written.
+    if (::fchmod(fd, 0600) != 0) {
+        ::close(fd);
+        return false;
+    }
+
+    const char* data = content.data();
+    size_t remaining = content.size();
+    while (remaining > 0) {
+        ssize_t n = ::write(fd, data, remaining);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ::close(fd);
+            return false;
+        }
+        data += static_cast<size_t>(n);
+        remaining -= static_cast<size_t>(n);
+    }
+
+    if (::fsync(fd) != 0) {
+        ::close(fd);
+        return false;
+    }
+    if (::close(fd) != 0) {
+        return false;
+    }
+
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        return false;
+    }
+
+    // Sync the containing directory so the rename (the new directory entry) is
+    // itself durable, not just the file contents it points at.
+    std::filesystem::path dir = std::filesystem::path(path).parent_path();
+    if (dir.empty()) {
+        dir = ".";
+    }
+    int dfd = ::open(dir.c_str(), O_RDONLY);
+    if (dfd < 0) {
+        return false;
+    }
+    bool dir_synced = ::fsync(dfd) == 0;
+    ::close(dfd);
+    return dir_synced;
 }
 
 /// Parse the file as JSON. Returns an empty object on parse error or if absent.

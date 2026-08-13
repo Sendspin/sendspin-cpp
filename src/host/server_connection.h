@@ -71,6 +71,10 @@ public:
     /// @param on_complete Callback invoked after the connection is closed.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
+    /// @brief Closes the transport immediately without blocking (see base class doc comment).
+    /// Delegates to trigger_close(), the same async primitive disconnect() already uses.
+    void close_transport_now() override;
+
     /// @brief Returns true if the underlying WebSocket connection is open
     /// @return true if connected, false otherwise.
     bool is_connected() const override;

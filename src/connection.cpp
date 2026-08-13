@@ -124,14 +124,9 @@ void SendspinConnection::send_noise_client_init() {
     }
 }
 
-bool SendspinConnection::handle_noise_handshake_text(const std::string& text) {
+void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
     if (!this->noise_handshake_) {
-        return false;
-    }
-    if (this->noise_handshake_complete_.load(std::memory_order_acquire)) {
-        // Post-handshake TEXT frame is an error (all traffic must be binary).
-        SS_LOGW(TAG, "Unexpected TEXT frame after Noise handshake; closing");
-        return false;
+        return;
     }
 
     auto send_fn = [this](const std::string& msg) -> bool {
@@ -142,10 +137,12 @@ bool SendspinConnection::handle_noise_handshake_text(const std::string& text) {
     HandshakeFrameResult result = this->noise_handshake_->on_text_frame(text, send_fn);
 
     if (result == HandshakeFrameResult::ABORT) {
-        SS_LOGW(TAG, "Noise handshake aborted");
-        // Discard handshake state; caller will close the WS.
+        SS_LOGW(TAG, "Noise handshake aborted; closing connection");
+        // Discard handshake state, then close per spec Failure Handling: a handshake-phase
+        // failure closes the WebSocket without sending any application-level message.
         this->noise_handshake_.reset();
-        return true;  // consumed (don't re-dispatch as JSON)
+        this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+        return;
     }
 
     if (result == HandshakeFrameResult::COMPLETE) {
@@ -153,7 +150,7 @@ bool SendspinConnection::handle_noise_handshake_text(const std::string& text) {
         if (!outcome.has_value()) {
             SS_LOGE(TAG, "Noise handshake: COMPLETE but no result");
             this->noise_handshake_.reset();
-            return true;
+            return;
         }
         // Record the server's identity (public key) and the PSK category/psk_id that admitted
         // the connection, resolved by the handshake. Trust enforcement (ConnectionManager,
@@ -176,7 +173,7 @@ bool SendspinConnection::handle_noise_handshake_text(const std::string& text) {
                 static_cast<int>(this->get_psk_category()));
     }
 
-    return true;  // Frame was consumed by the handshake state machine
+    // NEED_MORE, or COMPLETE handled above: nothing else to do until the next frame.
 }
 
 bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) {
@@ -207,11 +204,11 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     // Atomic store - written on network thread, read on main loop.
     this->pairing_in_progress_.store(false, std::memory_order_release);
 
-    // Restart the provisional-connection timeout window: the connection is once again
-    // "awaiting its first server/activate" (under the new keys). Without this, a connection
-    // older than the establish timeout would be torn down by ConnectionManager::loop() the
-    // instant first_activate_received_ goes false, before the post-swap server/activate can
-    // arrive.
+    // Restart the re-proving watchdog: the connection is once again "awaiting its first
+    // server/activate" (under the new keys). ConnectionManager::loop()'s re-proving-deadline
+    // check reads this timestamp for current_connection_ (gated on !is_operational()) and
+    // drops the connection after REPROVE_TIMEOUT_US (see connection_manager.h) if the post-swap
+    // server/hello -> client/hello -> server/activate cycle does not complete in time.
     this->set_provisional_time_us(platform_time_us());
 
     // Run the two-handshake PSK trick with prologue = the prior handshake hash h.
@@ -390,13 +387,27 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
         size_t pt_len =
             this->noise_transport_.decrypt_in_place(this->websocket_payload_.data(), msg_len);
         if (pt_len == 0) {
-            SS_LOGW(TAG, "Noise decrypt failed; dropping frame");
+            // Spec Failure Handling: an AEAD failure once in transport mode closes the
+            // WebSocket silently. It is also unrecoverable if left open: the underlying Noise
+            // decrypt never advances the receive-direction nonce counter on an auth failure, so
+            // every later frame on this connection would fail authentication forever too.
+            SS_LOGW(TAG, "Noise AEAD failure in transport mode; closing connection");
             this->reset_websocket_payload();
+            this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
             return;
         }
         // Route through the fragment state machine; dispatch any completed message.
         NoiseTransport::CompleteMessage msg =
             this->noise_transport_.accept_plaintext(this->websocket_payload_.data(), pt_len);
+        if (msg.malformed) {
+            // Spec "Malformed sequences": a fragment-end with nothing in flight, a non-fragment
+            // frame while one is in flight, or a reassembled orig_type of 2/3 is a protocol
+            // error that MUST close the connection.
+            SS_LOGW(TAG, "Malformed fragment sequence; closing connection");
+            this->reset_websocket_payload();
+            this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+            return;
+        }
         if (msg.data != nullptr) {
             this->dispatch_complete_noise_message(msg.data, msg.len, receive_time);
         }
@@ -422,9 +433,10 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
 
 void SendspinConnection::note_pairing_finalize_ack() {
     // After the server acks pair-finalize it rekeys via an in-band re-handshake. Resetting
-    // first_activate_received_ and re-arming the provisional timer means the existing 30 s
-    // ConnectionManager provisional timeout will tear the connection down if the server acks
-    // but never re-handshakes.
+    // first_activate_received_ and re-arming the provisional timer means
+    // ConnectionManager::loop()'s re-proving-deadline check (REPROVE_TIMEOUT_US, gated on
+    // !current_connection_->is_operational()) will drop the connection if the server acks but
+    // never re-handshakes.
     this->first_activate_received_.store(false, std::memory_order_release);
     this->set_provisional_time_us(platform_time_us());
 }

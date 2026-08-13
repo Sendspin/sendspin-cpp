@@ -36,9 +36,11 @@
 #include "sendspin/types.h"
 
 #include <gtest/gtest.h>
+#include <ixwebsocket/IXConnectionState.h>
 #include <ixwebsocket/IXWebSocket.h>
 #include <ixwebsocket/IXWebSocketMessage.h>
 #include <ixwebsocket/IXWebSocketMessageType.h>
+#include <ixwebsocket/IXWebSocketServer.h>
 
 // noise-c is a C library
 extern "C" {
@@ -76,6 +78,8 @@ constexpr uint16_t MANAGEMENT_TEST_PORT = 18994;
 constexpr uint16_t PAIRING_PERSIST_FAILURE_TEST_PORT = 18995;
 constexpr uint16_t CIPHER_SUITE_AESGCM_TEST_PORT = 18996;
 constexpr uint16_t PAIR_METHODS_TEST_PORT = 18997;
+constexpr uint16_t AEAD_FAILURE_TEST_PORT = 18998;
+constexpr uint16_t AEAD_FAILURE_OUTBOUND_PORT = 18999;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -781,6 +785,259 @@ private:
     std::optional<std::string> last_management_result_;
 };
 
+// A fake Sendspin "server" that LISTENS for a real Sendspin client's OUTBOUND connection (backed
+// by ix::WebSocketServer, the same pattern test_connection_lifecycle.cpp's
+// SlowOutboundSurvivesUpgradeTier uses for its plaintext backend), speaking the same Noise
+// KKpsk2-initiator protocol as FakeEncryptedServer above.
+//
+// This exists only for the AeadFailureOnOutboundConnectionDoesNotCrash regression test below.
+// Every other test in this file drives client.start_server() and connects FakeEncryptedServer to
+// it as a WS client, which exercises SendspinServerConnection (host/server_connection.cpp) --
+// that class's disconnect() only ever calls the already-async trigger_close(), so it was never
+// susceptible to the network-thread deadlock/crash close_transport_now() (connection.h) guards
+// against. That bug lived specifically in SendspinClientConnection::disconnect()
+// (host/client_connection.cpp), reached only when the SendspinClient itself calls connect_to()
+// and dispatch_completed_message() runs synchronously on IXWebSocket's own outbound worker
+// thread. This class lets the DUT be the outbound connector so the test exercises that code path.
+class FakeOutboundEncryptedServer {
+public:
+    FakeOutboundEncryptedServer(uint16_t port, std::string suite_name, Identity server_identity,
+                                std::string psk_id, std::array<uint8_t, NOISE_PSK_SIZE> psk)
+        : server_(port, "127.0.0.1"),
+          suite_name_(std::move(suite_name)),
+          server_identity_(server_identity),
+          psk_id_(std::move(psk_id)),
+          psk_(psk) {
+        this->server_.setOnConnectionCallback(
+            [this](const std::weak_ptr<ix::WebSocket>& weak_ws,
+                   const std::shared_ptr<ix::ConnectionState>& /*state*/) {
+                auto ws = weak_ws.lock();
+                if (!ws) {
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+                    this->ws_ = weak_ws;
+                }
+                ws->setOnMessageCallback(
+                    [this](const ix::WebSocketMessagePtr& msg) { this->on_message(msg); });
+            });
+    }
+
+    ~FakeOutboundEncryptedServer() {
+        this->server_.stop();
+        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+        if (this->init_hs_ != nullptr) {
+            noise_handshakestate_free(this->init_hs_);
+        }
+    }
+
+    bool listen() {
+        return this->server_.listen().first;
+    }
+
+    void start() {
+        this->server_.start();
+    }
+
+    // Sends a single tampered (bit-flipped) frame under the currently active send cipher,
+    // simulating a Noise AEAD decrypt failure on an already-operational transport-mode
+    // connection. Returns false if no session is active yet or the socket has gone away.
+    bool send_tampered_frame() {
+        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+        auto ws = this->ws_.lock();
+        if (!ws || this->active_.send_cs == nullptr) {
+            return false;
+        }
+        std::vector<uint8_t> plaintext = {MSG_TYPE_JSON_BODY, 'x'};
+        auto ct = raw_encrypt(this->active_.send_cs, plaintext);
+        if (ct.empty()) {
+            return false;
+        }
+        ct[ct.size() / 2] ^= 0xFF;  // corrupt the ciphertext/AEAD tag
+        ws->sendBinary(std::string(ct.begin(), ct.end()));
+        return true;
+    }
+
+    std::optional<std::string> goodbye_reason() const {
+        std::lock_guard<std::mutex> lock(this->goodbye_mutex_);
+        return this->goodbye_reason_;
+    }
+
+private:
+    void on_message(const ix::WebSocketMessagePtr& msg) {
+        if (msg->type != ix::WebSocketMessageType::Message) {
+            return;
+        }
+        if (msg->binary) {
+            this->handle_binary(msg->str);
+        } else {
+            this->handle_text(msg->str);
+        }
+    }
+
+    // Sends `json` as one Noise transport binary frame, encrypted under the active send cipher.
+    // Caller must hold crypto_mutex_.
+    void send_encrypted_locked(const std::string& json) {
+        auto ws = this->ws_.lock();
+        if (!ws) {
+            return;
+        }
+        std::vector<uint8_t> plaintext(1 + json.size());
+        plaintext[0] = MSG_TYPE_JSON_BODY;
+        std::memcpy(plaintext.data() + 1, json.data(), json.size());
+        auto ct = raw_encrypt(this->active_.send_cs, plaintext);
+        if (ct.empty()) {
+            return;
+        }
+        ws->sendBinary(std::string(ct.begin(), ct.end()));
+    }
+
+    void handle_text(const std::string& text) {
+        JsonDocument doc;
+        if (deserializeJson(doc, text)) {
+            return;
+        }
+        const char* type = doc["type"] | "";
+
+        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+        auto ws = this->ws_.lock();
+        if (!ws) {
+            return;
+        }
+
+        if (std::strcmp(type, "client/init") == 0) {
+            const char* client_id_b64 = doc["payload"]["client_id"] | "";
+            auto client_pub = b64url_decode(client_id_b64);
+            if (!client_pub.has_value() || client_pub->size() != X25519_KEY_SIZE) {
+                return;
+            }
+            std::copy(client_pub->begin(), client_pub->end(), this->client_pubkey_.begin());
+            this->client_init_text_ = text;
+
+            JsonDocument sdoc;
+            sdoc["type"] = "server/init";
+            sdoc["payload"]["server_id"] = this->server_identity_.peer_id();
+            sdoc["payload"]["version"] = PROTOCOL_VERSION;
+            std::string server_init_text;
+            serializeJson(sdoc, server_init_text);
+            this->server_init_text_ = server_init_text;
+            ws->send(server_init_text);
+
+            std::string prologue_str = this->client_init_text_ + this->server_init_text_;
+            this->init_hs_ = build_initiator(
+                this->suite_name_, this->server_identity_.private_bytes.data(),
+                this->server_identity_.public_bytes.data(), this->client_pubkey_.data(),
+                this->psk_.data(), reinterpret_cast<const uint8_t*>(prologue_str.data()),
+                prologue_str.size());
+            if (this->init_hs_ == nullptr) {
+                return;
+            }
+            auto msg1_bytes = write_msg1(this->init_hs_, this->psk_id_);
+            if (msg1_bytes.empty()) {
+                noise_handshakestate_free(this->init_hs_);
+                this->init_hs_ = nullptr;
+                return;
+            }
+            ws->send(noise_handshake_envelope(msg1_bytes));
+            return;
+        }
+
+        if (std::strcmp(type, "noise/handshake") == 0 && this->init_hs_ != nullptr) {
+            // The client's msg2, still cleartext TEXT per the pre-transport exchange.
+            const char* data_b64 = doc["payload"]["data"] | "";
+            auto msg2_bytes = b64url_decode(data_b64);
+            if (!msg2_bytes.has_value()) {
+                return;
+            }
+            std::vector<uint8_t> payload_buf(512);
+            NoiseBuffer msg2_in;
+            noise_buffer_set_input(msg2_in, msg2_bytes->data(), msg2_bytes->size());
+            NoiseBuffer payload_out;
+            noise_buffer_set_output(payload_out, payload_buf.data(), payload_buf.size());
+            if (noise_handshakestate_read_message(this->init_hs_, &msg2_in, &payload_out) !=
+                NOISE_ERROR_NONE) {
+                noise_handshakestate_free(this->init_hs_);
+                this->init_hs_ = nullptr;
+                return;
+            }
+            NoiseCipherState* send_cs = nullptr;
+            NoiseCipherState* recv_cs = nullptr;
+            if (noise_handshakestate_split(this->init_hs_, &send_cs, &recv_cs) !=
+                NOISE_ERROR_NONE) {
+                noise_handshakestate_free(this->init_hs_);
+                this->init_hs_ = nullptr;
+                return;
+            }
+            noise_handshakestate_free(this->init_hs_);
+            this->init_hs_ = nullptr;
+
+            this->active_.reset();
+            this->active_.send_cs = send_cs;
+            this->active_.recv_cs = recv_cs;
+
+            // Kick off the post-handshake protocol flow: server/hello, encrypted.
+            JsonDocument hdoc;
+            hdoc["type"] = "server/hello";
+            hdoc["payload"]["name"] = "Fake Outbound Encrypted Server";
+            std::string hello_text;
+            serializeJson(hdoc, hello_text);
+            this->send_encrypted_locked(hello_text);
+        }
+    }
+
+    void handle_binary(const std::string& bytes) {
+        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+        if (this->active_.send_cs == nullptr) {
+            return;
+        }
+        std::vector<uint8_t> ct(bytes.begin(), bytes.end());
+        auto pt = raw_decrypt(this->active_.recv_cs, std::move(ct));
+        if (pt.empty() || pt[0] != MSG_TYPE_JSON_BODY) {
+            return;
+        }
+        std::string json(reinterpret_cast<char*>(pt.data() + 1), pt.size() - 1);
+        JsonDocument doc;
+        if (deserializeJson(doc, json)) {
+            return;
+        }
+        const char* type = doc["type"] | "";
+
+        if (std::strcmp(type, "client/hello") == 0) {
+            std::string activate =
+                R"({"type":"server/activate","payload":{"activities":["playback"],)"
+                R"("active_roles":["player@v1"]}})";
+            this->send_encrypted_locked(activate);
+            return;
+        }
+
+        if (std::strcmp(type, "client/goodbye") == 0) {
+            const char* reason = doc["payload"]["reason"] | "";
+            std::lock_guard<std::mutex> glock(this->goodbye_mutex_);
+            this->goodbye_reason_ = reason;
+        }
+    }
+
+    ix::WebSocketServer server_;
+    std::string suite_name_;
+    Identity server_identity_;
+    std::string psk_id_;
+    std::array<uint8_t, NOISE_PSK_SIZE> psk_;
+
+    // Guards every field below: on_message()/handle_text()/handle_binary() run on the WS server's
+    // own connection thread; the test thread calls send_tampered_frame().
+    mutable std::mutex crypto_mutex_;
+    std::weak_ptr<ix::WebSocket> ws_;
+    std::array<uint8_t, X25519_KEY_SIZE> client_pubkey_{};
+    std::string client_init_text_;
+    std::string server_init_text_;
+    NoiseHandshakeState* init_hs_{nullptr};
+    CipherPair active_;
+
+    mutable std::mutex goodbye_mutex_;
+    std::optional<std::string> goodbye_reason_;
+};
+
 }  // namespace
 
 // ============================================================================
@@ -815,7 +1072,7 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
-    Identity server_identity = Identity::generate();
+    Identity server_identity = Identity::generate().value();
     FakeEncryptedServer server(server_url(RESUME_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                                server_identity, psk_id, psk);
 
@@ -855,6 +1112,82 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     pump_for(client, 100);
 }
 
+// Regression test for a network-thread deadlock/crash: close_silently() (spec Failure Handling --
+// no application-level message on an AEAD failure/malformed fragment/handshake abort) used to call
+// disconnect(), which on a host OUTBOUND connection ends up calling ix::WebSocket::stop() from
+// inside dispatch_completed_message() -- itself invoked synchronously from IXWebSocket's own
+// worker thread callback. Joining the current thread from itself throws std::system_error, which
+// escapes WebSocket::run() uncaught and calls std::terminate(), crashing the whole test process.
+//
+// This must be driven through a real client.connect_to() (SendspinClientConnection): plugging a
+// fake peer into client.start_server() instead (as every other test in this file does) exercises
+// SendspinServerConnection, whose disconnect() only ever calls the already-async trigger_close()
+// and was never vulnerable to this bug. FakeOutboundEncryptedServer above plays the opposite role
+// (a real ix::WebSocketServer the DUT connects out to) specifically so this test reaches
+// SendspinClientConnection::disconnect().
+//
+// This test drives a real Noise AEAD decrypt failure on that real outbound host connection (the
+// simplest of the three close_silently() triggers to produce from a fake peer) against the fix
+// (close_silently() -> close_transport_now(), which never blocks/joins): merely completing this
+// test without the process aborting is the primary assertion. It also checks that the connection
+// is reported lost exactly once and that no client/goodbye is sent (the close is silent, per spec).
+TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+    platform_random_bytes(psk.data(), psk.size());
+    std::string psk_id = psk_id_for(psk);
+
+    SendspinPairingRecord record;
+    record.psk_id = psk_id;
+    record.psk = psk;
+
+    TestNetworkProvider network;
+    TestPersistenceProvider persistence(record);
+    SendspinClientConfig config;
+    config.name = "AEAD Failure Outbound Test Client";
+    config.server_port = AEAD_FAILURE_TEST_PORT;  // unused: this test never accepts inbound
+    ASSERT_TRUE(config.encryption_required);
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start_server());
+    pump_for(client, 50);
+
+    Identity server_identity = Identity::generate().value();
+    FakeOutboundEncryptedServer server(AEAD_FAILURE_OUTBOUND_PORT,
+                                       std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                                       psk_id, psk);
+    ASSERT_TRUE(server.listen());
+    server.start();
+
+    client.connect_to(server_url(AEAD_FAILURE_OUTBOUND_PORT));
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "Initial encrypted handshake/hello/activate did not complete";
+
+    // Send one tampered ciphertext frame. If close_silently() ever regresses back to calling
+    // disconnect() on the network thread here, the test process crashes via std::terminate()
+    // instead of reaching the assertions below.
+    ASSERT_TRUE(server.send_tampered_frame());
+
+    EXPECT_TRUE(pump_until(
+        client, [&] { return !client.is_connected(); }, 4000))
+        << "An AEAD failure must tear down the connection (reported lost)";
+
+    // Give any duplicate loss-report/close event a chance to arrive and confirm it is tolerated
+    // (drop_connection() no-ops on a connection it no longer manages) rather than double-freeing
+    // or otherwise misbehaving.
+    pump_for(client, 200);
+    EXPECT_FALSE(client.is_connected());
+
+    // Spec Failure Handling: no client/goodbye is sent for a silent close.
+    EXPECT_FALSE(server.goodbye_reason().has_value());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
 // SendspinClientConfig::cipher_suite must actually reach the Noise handshake: setting it to
 // AESGCM should make init_noise_handshake() (via connection_manager.cpp's suite_name_for())
 // build the client's side of the handshake with Noise_KKpsk2_25519_AESGCM_SHA256 rather than
@@ -884,7 +1217,7 @@ TEST(EncryptedLifecycle, CipherSuitePreferenceAesgcmCompletesHandshake) {
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
-    Identity server_identity = Identity::generate();
+    Identity server_identity = Identity::generate().value();
     FakeEncryptedServer server(server_url(CIPHER_SUITE_AESGCM_TEST_PORT),
                                std::string(NOISE_SUITE_AESGCM), server_identity, psk_id, psk);
 
@@ -924,7 +1257,7 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
-    Identity server_identity = Identity::generate();
+    Identity server_identity = Identity::generate().value();
     // After the re-handshake, the fake server switches to declaring ["management"], which the
     // SENTINEL-category PSK it re-handshakes to cannot satisfy (management requires a long-term
     // PSK match) -- see admission.h::activities_allowed.
@@ -983,7 +1316,7 @@ TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
-    Identity server_identity = Identity::generate();
+    Identity server_identity = Identity::generate().value();
     FakeEncryptedServer server(server_url(PAIR_METHODS_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity, psk_id, psk);
 
@@ -1046,7 +1379,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     // not the Sentinel PSK: the Pairing PSK Flow's initial handshake IS the Pairing PSK (the
     // Sentinel-then-re-handshake path in the spec is only for upgrading an ALREADY-open Sentinel
     // connection into pairing_psk pairing, a different scenario from this one).
-    Identity server_identity = Identity::generate();
+    Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
     options.first_activities_json = R"(["pairing"])";
     options.first_roles_json = R"([])";
@@ -1136,7 +1469,7 @@ TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
-    Identity server_identity = Identity::generate();
+    Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
     options.first_activities_json = R"(["pairing"])";
     options.first_roles_json = R"([])";
@@ -1201,7 +1534,7 @@ TEST(EncryptedLifecycle, ManagementListRecordsRoundTripOverEncryptedTransport) {
     // A LONG_TERM PSK activated with the MANAGEMENT activity (no roles): admissible per
     // admission.h::activities_allowed (LONG_TERM allows any subset of {PLAYBACK, MANAGEMENT}),
     // and satisfies handle_management_request()'s has_activity(MANAGEMENT) trust gate.
-    Identity server_identity = Identity::generate();
+    Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
     options.first_activities_json = R"(["management"])";
     options.first_roles_json = R"([])";

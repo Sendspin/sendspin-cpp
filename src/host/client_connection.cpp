@@ -100,6 +100,22 @@ void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
     });
 }
 
+void SendspinClientConnection::close_transport_now() {
+    // ws_->stop() (used by disconnect() above) joins IX's own worker thread, so it deadlocks (and
+    // on host, crashes via an uncaught std::system_error -> std::terminate()) when called from a
+    // callback already running on that thread. ws_->close() is async and does not join, so it is
+    // safe here. Report the loss immediately rather than waiting for the resulting Close event;
+    // that event still arrives later and repeats on_disconnected_cb, which the manager tolerates
+    // (drop_connection() no-ops on a connection it no longer manages).
+    this->connected_ = false;
+    if (this->on_disconnected_cb) {
+        this->on_disconnected_cb(this);
+    }
+    if (this->ws_) {
+        this->ws_->close();
+    }
+}
+
 SsErr SendspinClientConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback cb,
                                                   bool /*allow_before_hello*/) {
@@ -206,17 +222,11 @@ void SendspinClientConnection::setup_callbacks() {
                     uint8_t* dest = this->prepare_receive_buffer(data.size());
                     if (dest == nullptr) {
                         SS_LOGE(TAG, "Allocation failed, dropping connection");
-                        // Stop processing further frames and initiate a real transport close
-                        // (stop() would join IX's thread and deadlock here; close() is async
-                        // and safe). The later Close event repeats the disconnect callback,
-                        // which the manager tolerates (drop of an unmanaged connection is a
-                        // no-op).
+                        // Stop processing further frames and initiate a real transport close via
+                        // close_transport_now() (stop() would join IX's thread and deadlock here;
+                        // close() is async and safe -- see its doc comment).
                         this->disable_message_dispatch();
-                        this->connected_ = false;
-                        if (this->on_disconnected_cb) {
-                            this->on_disconnected_cb(this);
-                        }
-                        this->ws_->close();
+                        this->close_transport_now();
                         return;
                     }
                     std::copy(data.begin(), data.end(), dest);

@@ -20,16 +20,27 @@
 
 namespace sendspin {
 
-std::array<uint8_t, 32> derive_psk_wrap_key(const std::vector<uint8_t>& sid,
-                                            const std::array<uint8_t, CPACE_ISK_SIZE>& isk) {
+std::optional<std::array<uint8_t, 32>> derive_psk_wrap_key(
+    const std::vector<uint8_t>& sid, const std::array<uint8_t, CPACE_ISK_SIZE>& isk) {
     const auto* label = reinterpret_cast<const uint8_t*>(PSK_WRAP_LABEL);
     size_t label_len = sizeof(PSK_WRAP_LABEL) - 1;  // exclude NUL
 
     Sha256 h;
+    if (!h.ok()) {
+        // noise_hashstate_new_by_name() failed (allocation failure or missing algorithm); h is
+        // a no-op in this state and finalize() would silently yield an all-zero digest. Returning
+        // that as K_wrap would let wrap_psk() seal the freshly minted PSK under a publicly
+        // derivable key, defeating PSK Wrapping (spec #117) -- fail loudly instead.
+        return std::nullopt;
+    }
     h.update(label, label_len);
     h.update(sid.data(), sid.size());
     h.update(isk.data(), isk.size());
-    return h.finalize();
+    auto digest = h.finalize();
+    if (!h.ok()) {
+        return std::nullopt;
+    }
+    return digest;
 }
 
 std::optional<std::array<uint8_t, WRAPPED_PSK_SIZE>> wrap_psk(
@@ -39,8 +50,11 @@ std::optional<std::array<uint8_t, WRAPPED_PSK_SIZE>> wrap_psk(
         return std::nullopt;
     }
     auto k_wrap = derive_psk_wrap_key(sid, isk);
+    if (!k_wrap.has_value()) {
+        return std::nullopt;
+    }
     auto ct =
-        aead_oneshot_encrypt(cipher_name, k_wrap.data(), k_wrap.size(), psk.data(), psk.size());
+        aead_oneshot_encrypt(cipher_name, k_wrap->data(), k_wrap->size(), psk.data(), psk.size());
     if (!ct.has_value() || ct->size() != WRAPPED_PSK_SIZE) {
         return std::nullopt;
     }
@@ -57,7 +71,10 @@ std::optional<std::array<uint8_t, 32>> unwrap_psk(
         return std::nullopt;
     }
     auto k_wrap = derive_psk_wrap_key(sid, isk);
-    auto pt = aead_oneshot_decrypt(cipher_name, k_wrap.data(), k_wrap.size(), wrapped.data(),
+    if (!k_wrap.has_value()) {
+        return std::nullopt;
+    }
+    auto pt = aead_oneshot_decrypt(cipher_name, k_wrap->data(), k_wrap->size(), wrapped.data(),
                                    wrapped.size());
     if (!pt.has_value() || pt->size() != 32) {
         return std::nullopt;

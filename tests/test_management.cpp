@@ -630,6 +630,50 @@ TEST(ManagementHandler, AddRecordAlreadyExists) {
     EXPECT_EQ(result.result, ManagementResult::ALREADY_EXISTS);
 }
 
+// Finding C: add-record twice with the same server_id but different PSKs supersedes the prior
+// record rather than accumulating two records for one server (consistent with the re-pairing
+// supersede semantics in RecordStore::store_record, see Finding A).
+TEST(ManagementHandler, AddRecordSameServerIdSupersedesPrior) {
+    RecordStore store(nullptr);
+    std::string server_id = make_test_server_id();
+
+    auto psk1 = make_random_psk();
+    std::string first_psk_id = psk_id_for(psk1);
+    ManagementAddRecordPayload payload1;
+    payload1.psk = psk_to_b64url(psk1);
+    payload1.server_id = server_id;
+
+    ManagementResultPayload result;
+    ManagementEffect effect;
+    handle_add_record(store, payload1, result, effect);
+    ASSERT_EQ(result.result, ManagementResult::OK);
+    ASSERT_NE(store.record_by_psk_id(first_psk_id), nullptr);
+
+    auto psk2 = make_random_psk();
+    std::string second_psk_id = psk_id_for(psk2);
+    ManagementAddRecordPayload payload2;
+    payload2.psk = psk_to_b64url(psk2);
+    payload2.server_id = server_id;
+
+    handle_add_record(store, payload2, result, effect);
+    EXPECT_EQ(result.result, ManagementResult::OK);
+
+    // The prior record for this server_id must be superseded (revoked), not accumulated.
+    EXPECT_EQ(store.record_by_psk_id(first_psk_id), nullptr);
+    const auto* current = store.record_by_server_id(server_id);
+    ASSERT_NE(current, nullptr);
+    EXPECT_EQ(current->psk_id, second_psk_id);
+
+    // Exactly one record must be bound to this server_id.
+    int count = 0;
+    for (const auto& r : store.records_snapshot()) {
+        if (r.server_id.has_value() && r.server_id.value() == server_id) {
+            count++;
+        }
+    }
+    EXPECT_EQ(count, 1);
+}
+
 TEST(ManagementHandler, AddRecordStorageExhausted) {
     ExhaustedRecordStore store(nullptr);
     auto psk = make_random_psk();
@@ -692,6 +736,10 @@ TEST(ManagementHandler, RemoveRecordProtectedRecordMode) {
     EXPECT_EQ(effect, ManagementEffect::NONE);
 }
 
+// Regression (Finding B): own-record detection compares psk_id -- the credential that actually
+// authenticated the connection -- not server_id. This test previously passed the record's
+// server_id as the third argument; that encoded the old (buggy) server_id-based comparison.
+// Updated to pass the record's psk_id, which is what a real connection presents now.
 TEST(ManagementHandler, RemoveOwnRecordGivesGoodbyeUnauthorized) {
     RecordStore store(nullptr);
     SendspinPairingRecord rec = make_client_record("srv-self");
@@ -702,8 +750,8 @@ TEST(ManagementHandler, RemoveOwnRecordGivesGoodbyeUnauthorized) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    // requester_server_id matches the record's server_id.
-    handle_remove_record(store, payload, std::string("srv-self"), result, effect);
+    // requester_psk_id matches the record's own psk_id (the credential that authenticated it).
+    handle_remove_record(store, payload, std::string(rec.psk_id), result, effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_EQ(effect, ManagementEffect::GOODBYE_UNAUTHORIZED);
 
@@ -711,7 +759,11 @@ TEST(ManagementHandler, RemoveOwnRecordGivesGoodbyeUnauthorized) {
     EXPECT_EQ(store.record_by_psk_id(rec.psk_id), nullptr);
 }
 
-TEST(ManagementHandler, RemoveDifferentServerRecordNoEffect) {
+// Renamed from RemoveDifferentServerRecordNoEffect: the discriminator is now psk_id, not
+// server_id, so the "different requester" case is a different psk_id, not a different server_id
+// string. Previously this test passed an arbitrary server_id string as the third argument; now
+// it passes an arbitrary psk_id string that does not match the removed record's psk_id.
+TEST(ManagementHandler, RemoveRecordDifferentRequesterPskIdNoEffect) {
     RecordStore store(nullptr);
     SendspinPairingRecord rec = make_client_record("srv-other");
     store.store_record(rec);
@@ -721,8 +773,51 @@ TEST(ManagementHandler, RemoveDifferentServerRecordNoEffect) {
 
     ManagementResultPayload result;
     ManagementEffect effect;
-    // Requester is a different server.
-    handle_remove_record(store, payload, std::string("srv-requester"), result, effect);
+    // Requester authenticated via a different psk_id.
+    handle_remove_record(store, payload, std::string("requester-psk-id"), result, effect);
+    EXPECT_EQ(result.result, ManagementResult::OK);
+    EXPECT_EQ(effect, ManagementEffect::NONE);
+}
+
+// Finding B (b1): a connection authenticated via a non-record-mode SHARED record removing that
+// record must still get GOODBYE_UNAUTHORIZED. Shared records have no server_id at all, so the
+// old server_id-based comparison could never fire here -- this is the "missed teardown" case.
+TEST(ManagementHandler, RemoveOwnSharedRecordGivesGoodbyeUnauthorized) {
+    RecordStore store(nullptr);
+    // A second shared-PSK record, distinct from the auto-provisioned record_mode fallback, so
+    // it is removable (can_remove_record only protects the record_mode-referenced record).
+    SendspinPairingRecord shared = make_shared_record();
+    store.store_record(shared);
+    ASSERT_TRUE(store.can_remove_record(shared.psk_id));
+
+    ManagementRemoveRecordPayload payload;
+    payload.psk_id = shared.psk_id;
+
+    ManagementResultPayload result;
+    ManagementEffect effect;
+    handle_remove_record(store, payload, std::string(shared.psk_id), result, effect);
+    EXPECT_EQ(result.result, ManagementResult::OK);
+    EXPECT_EQ(effect, ManagementEffect::GOODBYE_UNAUTHORIZED);
+}
+
+// Finding B (b2): removing a different record that merely happens to share the requester's
+// server_id must NOT tear down the connection -- only an exact psk_id match does. (RecordStore's
+// store_record() now supersedes on server_id -- see Finding A -- so two records can no longer
+// literally coexist under the same server_id; this test exercises the comparison directly with a
+// requester psk_id that differs from the record being removed, which is the scenario the old
+// server_id-based comparison would have mishandled.)
+TEST(ManagementHandler, RemoveRecordDifferentPskIdSameServerIdNoEffect) {
+    RecordStore store(nullptr);
+    SendspinPairingRecord rec = make_client_record("srv-shared");
+    store.store_record(rec);
+
+    ManagementRemoveRecordPayload payload;
+    payload.psk_id = rec.psk_id;
+
+    ManagementResultPayload result;
+    ManagementEffect effect;
+    handle_remove_record(store, payload, std::string("some-other-psk-id-for-srv-shared"), result,
+                         effect);
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_EQ(effect, ManagementEffect::NONE);
 }

@@ -32,12 +32,15 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <sys/stat.h>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
 
@@ -145,6 +148,53 @@ TEST(RecordStore, FirstBootProvisioningCreatesPairingPsk) {
     EXPECT_NE(store.pairing_psk()->psk, shared->psk);
 }
 
+/// A persistence provider whose writes for the shared-PSK record, the Pairing PSK, and the
+/// pairing config always fail (e.g. full or read-only NVS), used to verify first-boot
+/// provisioning surfaces a rejected write instead of silently discarding it (Finding D).
+class AlwaysRejectingProvider : public SendspinPersistenceProvider {
+public:
+    bool save_pairing_record(const SendspinPairingRecord& /*record*/) override {
+        record_save_attempts++;
+        return false;
+    }
+    bool save_pairing_psk(const SendspinPairingPsk& /*psk*/) override {
+        psk_save_attempts++;
+        return false;
+    }
+    bool save_pairing_config(const SendspinPairingConfig& /*config*/) override {
+        config_save_attempts++;
+        return false;
+    }
+
+    int record_save_attempts{0};
+    int psk_save_attempts{0};
+    int config_save_attempts{0};
+};
+
+// Finding D: a provider that rejects every write during first-boot provisioning must not be
+// silently ignored. The device must still be fully usable for the current boot (RAM-only state),
+// and the provider must actually have been asked to persist each piece of material.
+TEST(RecordStore, FirstBootProvisioningSurvivesPersistenceFailureForThisBoot) {
+    AlwaysRejectingProvider provider;
+    RecordStore store(&provider);
+
+    EXPECT_GE(provider.record_save_attempts, 1)
+        << "the shared-PSK fallback record write must have been attempted";
+    EXPECT_GE(provider.psk_save_attempts, 1) << "the Pairing PSK write must have been attempted";
+
+    // Despite every write being rejected, the device remains usable for this boot: both the
+    // shared fallback record and the Pairing PSK are present and resolvable in memory.
+    ASSERT_FALSE(store.record_mode_psk_id().empty());
+    const auto* shared = store.record_by_psk_id(store.record_mode_psk_id());
+    ASSERT_NE(shared, nullptr);
+    EXPECT_FALSE(shared->server_id.has_value());
+
+    ASSERT_TRUE(store.pairing_psk().has_value());
+    auto resolved = store.resolve_by_psk_id(store.pairing_psk()->psk_id);
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->category, PskCategory::PAIRING);
+}
+
 TEST(RecordStore, FirstBootPskIdIsSentinelPskIdResolvable) {
     RecordStore store(nullptr);
 
@@ -223,6 +273,82 @@ TEST(RecordStore, StoreRecordRejectionDoesNotReplaceExistingRecord) {
     ASSERT_NE(kept, nullptr);
     EXPECT_EQ(kept->label, std::optional<std::string>("original"))
         << "a rejected overwrite must leave the existing record untouched";
+}
+
+// =============================================================================
+// store_record: at most one record per server_id (Finding A supersede invariant)
+// =============================================================================
+
+// Re-pairing the same server_id twice (e.g. after the server was factory-reset and re-paired)
+// must revoke the prior per-server PSK rather than leaving it valid forever alongside the new
+// one. Mirrors the server/pair-finalize ack commit path: resolve_pairing_outcome() mints a
+// fresh record, then store_record() commits it.
+TEST(RecordStore, StoreRecordSupersedesPriorRecordForSameServerId) {
+    RecordStore store(nullptr);
+    const std::string server_id = "server-repair";
+
+    auto outcome1 = store.resolve_pairing_outcome(server_id);
+    ASSERT_TRUE(outcome1.has_value());
+    ASSERT_TRUE(outcome1->record.has_value());
+    ASSERT_TRUE(store.store_record(outcome1->record.value()));
+    const std::string first_psk_id = outcome1->record->psk_id;
+
+    auto outcome2 = store.resolve_pairing_outcome(server_id);
+    ASSERT_TRUE(outcome2.has_value());
+    ASSERT_TRUE(outcome2->record.has_value());
+    ASSERT_TRUE(store.store_record(outcome2->record.value()));
+    const std::string second_psk_id = outcome2->record->psk_id;
+
+    ASSERT_NE(first_psk_id, second_psk_id);
+
+    // The prior PSK must no longer resolve at all: re-pairing revokes it instead of leaving a
+    // second working credential for the same server.
+    EXPECT_FALSE(store.resolve_by_psk_id(first_psk_id).has_value());
+    EXPECT_EQ(store.record_by_psk_id(first_psk_id), nullptr);
+
+    // The new PSK resolves as the server's long-term record.
+    auto resolved = store.resolve_by_psk_id(second_psk_id);
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
+    EXPECT_EQ(resolved->counterparty_id, server_id);
+
+    // Exactly one record remains bound to this server_id.
+    const auto* found = store.record_by_server_id(server_id);
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->psk_id, second_psk_id);
+    int count = 0;
+    for (const auto& r : store.records_snapshot()) {
+        if (r.server_id.has_value() && r.server_id.value() == server_id) {
+            count++;
+        }
+    }
+    EXPECT_EQ(count, 1);
+}
+
+// The supersede must not happen before the new record is safely persisted: a rejected write
+// leaves the OLD (still-working) record in place rather than destroying it for nothing.
+TEST(RecordStore, StoreRecordSupersedeRejectedWriteKeepsOldRecord) {
+    RejectingPersistenceProvider provider;
+    provider.reject = false;
+    RecordStore store(&provider);
+
+    SendspinPairingRecord original = make_client_record("server-X", "original");
+    ASSERT_TRUE(store.store_record(original));
+
+    provider.reject = true;
+    SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
+    EXPECT_FALSE(store.store_record(replacement))
+        << "a rejected write must not supersede the working credential";
+
+    // The old record must still resolve and be the only one for this server_id.
+    auto resolved = store.resolve_by_psk_id(original.psk_id);
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
+    EXPECT_EQ(store.record_by_psk_id(replacement.psk_id), nullptr);
+
+    const auto* found = store.record_by_server_id("server-X");
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->psk_id, original.psk_id);
 }
 
 // =============================================================================
@@ -564,7 +690,7 @@ TEST(FilePersistenceProvider, KeypairPersistsAcrossReboots) {
         auto loaded = provider.load_static_keypair();
         EXPECT_FALSE(loaded.has_value()) << "No key yet on first boot";
 
-        Identity id = Identity::generate();
+        Identity id = Identity::generate().value();
         EXPECT_TRUE(provider.save_static_keypair(id.private_bytes));
         client_id_first = id.peer_id();
         pub_first = id.public_bytes;
@@ -576,7 +702,7 @@ TEST(FilePersistenceProvider, KeypairPersistsAcrossReboots) {
         auto loaded = provider.load_static_keypair();
         ASSERT_TRUE(loaded.has_value()) << "Key should be present after first boot";
 
-        Identity rehydrated = Identity::from_private_bytes(loaded.value());
+        Identity rehydrated = Identity::from_private_bytes(loaded.value()).value();
         EXPECT_EQ(rehydrated.public_bytes, pub_first);
         EXPECT_EQ(rehydrated.peer_id(), client_id_first);
     }
@@ -612,6 +738,24 @@ TEST(FilePersistenceProvider, KeypairPersistsViaClientStartServer) {
         ASSERT_TRUE(client.start_server());
         EXPECT_EQ(client.client_id(), client_id_first);
     }
+}
+
+// Finding #4 regression: load_or_generate_identity() must never leave client_id_ as the peer_id
+// of an all-zero Identity (the old silent-failure value). This cannot force the underlying
+// noise-c DH-state generation to actually fail (no test hook for that), so it instead pins the
+// property that would have caught the original bug: a real client_id must differ from what an
+// all-zero keypair would have produced.
+TEST(FilePersistenceProvider, StartServerNeverProducesAllZeroClientId) {
+    TempFile tmp;
+    FilePersistenceProvider provider(tmp.path());
+    SendspinClientConfig config;
+    config.name = "test-client";
+    SendspinClient client(std::move(config));
+    client.set_persistence_provider(&provider);
+    ASSERT_TRUE(client.start_server());
+
+    Identity zero_identity{};  // default-constructed = all-zero private/public bytes
+    EXPECT_NE(client.client_id(), zero_identity.peer_id());
 }
 
 TEST(FilePersistenceProvider, PairingRecordRoundTrip) {
@@ -686,6 +830,24 @@ TEST(FilePersistenceProvider, PairingConfigRoundTrip) {
     EXPECT_EQ(loaded->pairing_psk_enabled, false);
     EXPECT_EQ(loaded->unpaired_access_enabled, true);
     EXPECT_EQ(loaded->record_mode_psk_id, "some-psk-id");
+}
+
+// The persistence file holds plaintext secrets (static private key, long-term PSKs,
+// Pairing PSK, static PIN), so it must never be group/world readable regardless of
+// the process umask. This is host-only POSIX, matching how
+// examples/common/file_persistence_provider.cpp itself creates the file.
+TEST(FilePersistenceProvider, PersistedFileIsOwnerOnly) {
+    TempFile tmp;
+    FilePersistenceProvider provider(tmp.path());
+
+    EXPECT_TRUE(provider.save_static_pin("1234"));
+
+    struct stat st{};
+    ASSERT_EQ(::stat(tmp.path().c_str(), &st), 0);
+    char mode_str[8];
+    std::snprintf(mode_str, sizeof(mode_str), "%04o", st.st_mode & 07777);
+    EXPECT_EQ(st.st_mode & 07777, static_cast<unsigned int>(0600))
+        << "persisted file must be owner-read/write only, got mode " << mode_str;
 }
 
 // =============================================================================

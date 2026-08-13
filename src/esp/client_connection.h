@@ -83,6 +83,13 @@ public:
     ///                    immediately.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
+    /// @brief Closes the transport immediately without blocking (see base class doc comment).
+    /// Reports the loss via handle_disconnected() without touching the transport; the actual
+    /// esp_websocket_client_stop() runs later in the destructor once the manager drops this
+    /// connection (off the websocket task), because esp_websocket_client_stop() cannot be called
+    /// from the websocket task's own event handler.
+    void close_transport_now() override;
+
     /// @brief Checks if the websocket connection is established
     /// @return true if connected, false otherwise.
     bool is_connected() const override;

@@ -23,6 +23,7 @@
 
 #include "crypto/cpace.h"
 #include "test_util.h"
+#include "field25519.h"
 #include "platform/crypto.h"
 
 #include <gtest/gtest.h>
@@ -174,6 +175,49 @@ TEST(CPacePrimitives, Elligator2FieldArithmeticStress) {
         auto result = cpace_elligator2(r);
         EXPECT_EQ(to_hex(result), v.out) << "elligator2 mismatch for input " << v.in_le;
     }
+}
+
+// --- field25519 fp_mul / fp_scale carry-chain regression ---
+//
+// fp_mul and fp_scale fold a carry that overflows past the top limb (limb 3) back into
+// limb 0 by multiplying it by 38 (since 2^256 mod p = 38). That fold-back addition can
+// itself carry out of limb 0 -- a carry with positional value 2^64, not 2^256 -- which
+// must ripple into limbs 1..3, not be folded by 38 a second time. The vectors below were
+// constructed (via a scratch Python/C++ cross-check against exact arbitrary-precision
+// (a*b) mod p) specifically to drive limb 0 to the edge of overflow after the main fold
+// loop, so they exercise that carry-propagation path. Expected outputs are little-endian
+// hex from fp_to_le, matching this file's to_hex/from_hex_arr convention.
+
+TEST(FieldArithmetic, MulAllOnesSquaredForcesCarryPropagation) {
+    // a = b = 2^256-1 (all four limbs all-ones). True (a*b) mod p = 0x559, verified against
+    // Python arbitrary-precision arithmetic.
+    field25519::Fp allones = {{0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL,
+                                0xFFFFFFFFFFFFFFFFULL}};
+    auto result = field25519::fp_mul(allones, allones);
+    EXPECT_EQ(to_hex(field25519::fp_to_le(result)),
+              "5905000000000000000000000000000000000000000000000000000000000000");
+}
+
+TEST(FieldArithmetic, MulAllOnesTimesAllOnesMinusOneForcesCarryPropagation) {
+    // a = 2^256-1, b = 2^256-2. True (a*b) mod p = 0x534.
+    field25519::Fp allones = {{0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL,
+                                0xFFFFFFFFFFFFFFFFULL}};
+    field25519::Fp allones_m1 = {{0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL,
+                                   0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL}};
+    auto result = field25519::fp_mul(allones, allones_m1);
+    EXPECT_EQ(to_hex(field25519::fp_to_le(result)),
+              "3405000000000000000000000000000000000000000000000000000000000000");
+}
+
+TEST(FieldArithmetic, ScaleByCurveConstantForcesCarryPropagation) {
+    // a is a fully reduced field element (a < p) chosen so that a*486662 (the real Elligator2
+    // curve-constant caller of fp_scale) drives limb 0 to the edge of overflow after the main
+    // fold loop. True (a*486662) mod p verified against Python arbitrary-precision arithmetic.
+    field25519::Fp a = {{0x2DE0BF53061137D5ULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL,
+                          0x7FFFFFFFFFFFFFFFULL}};
+    auto result = field25519::fp_scale(a, 486662ULL);
+    EXPECT_EQ(to_hex(field25519::fp_to_le(result)),
+              "5d178d0000000000a9e7f9ffffffffffffffffffffffffffffffffffffffff7f");
 }
 
 // --- cpace_calculate_generator ---

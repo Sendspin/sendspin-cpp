@@ -72,27 +72,41 @@ public:
 
     /// @brief Feed bytes into the hash.
     void update(const uint8_t* data, size_t len) {
-        if (state_ != nullptr) {
-            noise_hashstate_update(state_, data, len);
+        if (state_ == nullptr) {
+            return;
+        }
+        int err = noise_hashstate_update(state_, data, len);
+        if (err != NOISE_ERROR_NONE) {
+            failed_ = true;
         }
     }
 
-    /// @brief Finalize and return the 32-byte digest.
+    /// @brief Finalize and return the 32-byte digest. The digest is only meaningful if ok()
+    /// is true after this call; on any failure (construction or mid-stream) this returns a
+    /// zero-filled array and ok() reports false, so callers that skip the ok() check on a
+    /// security-critical digest will trip an obviously-wrong (not attacker-chosen) value
+    /// rather than silently trusting it.
     std::array<uint8_t, SHA256_DIGEST_SIZE> finalize() {
         std::array<uint8_t, SHA256_DIGEST_SIZE> digest{};
-        if (state_ != nullptr) {
-            noise_hashstate_finalize(state_, digest.data(), SHA256_DIGEST_SIZE);
+        if (state_ != nullptr && !failed_) {
+            int err = noise_hashstate_finalize(state_, digest.data(), SHA256_DIGEST_SIZE);
+            if (err != NOISE_ERROR_NONE) {
+                failed_ = true;
+                digest.fill(0);
+            }
         }
         return digest;
     }
 
-    /// @brief Return true if the hashstate was successfully initialized.
+    /// @brief Return true if the hashstate was successfully initialized and no update()/
+    /// finalize() call has failed so far.
     [[nodiscard]] bool ok() const {
-        return state_ != nullptr;
+        return state_ != nullptr && !failed_;
     }
 
 private:
     NoiseHashState* state_{nullptr};
+    bool failed_{false};
 };
 
 /// @brief Compute SHA-256(data, len).

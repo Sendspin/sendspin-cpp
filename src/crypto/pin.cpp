@@ -88,6 +88,11 @@ std::optional<std::string> pin_derive(const uint8_t* handshake_hash, size_t hash
     h.update(nonce_a, nonce_a_len);
     h.update(nonce_b, nonce_b_len);
     auto digest = h.finalize();
+    if (!h.ok()) {
+        // A mid-stream update()/finalize() failure after a successful construction; same
+        // rationale as the ok() check above -- do not derive a PIN from a zero digest.
+        return std::nullopt;
+    }
 
     // Interpret as a big-endian 256-bit unsigned integer mod 10^pin_length.
     // We compute the modulus using 128-bit arithmetic to avoid overflow:

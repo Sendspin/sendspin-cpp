@@ -160,8 +160,8 @@ struct InitialHandshakeResult {
 
 static std::optional<InitialHandshakeResult> run_initial_handshake(const std::string& suite_name) {
     InitialHandshakeResult r;
-    r.client_id = Identity::generate();
-    r.server_id = Identity::generate();
+    r.client_id = Identity::generate().value();
+    r.server_id = Identity::generate().value();
 
     platform_random_bytes(r.psk.data(), r.psk.size());
     r.psk_id = psk_id_for(r.psk);

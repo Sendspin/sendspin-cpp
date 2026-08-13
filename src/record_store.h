@@ -153,6 +153,14 @@ public:
     /// The provider write happens first: when it fails, the in-memory store is left
     /// untouched so the caller can fail the exchange closed instead of completing it on
     /// a key that would be lost at the next reboot.
+    ///
+    /// At most one stored-pubkey record may exist per server_id: when `record.server_id`
+    /// has a value, any OTHER record already bound to that same server_id is removed (and,
+    /// if a provider is set, its persisted copy dropped too) as part of this call, once the
+    /// new record is safely persisted. This makes re-pairing (or `management/add-record`
+    /// targeting an already-bound server_id) revoke the prior credential instead of
+    /// accumulating a second working PSK for the same server. Shared-PSK records
+    /// (server_id absent) are never subject to this supersede.
     /// @return true when the record is stored (and persisted, when a provider is set);
     /// false when the persistence provider rejected the write.
     bool store_record(SendspinPairingRecord record);

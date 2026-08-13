@@ -131,6 +131,17 @@ void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
     });
 }
 
+void SendspinClientConnection::close_transport_now() {
+    // esp_websocket_client_stop() (used by disconnect() above) cannot be called from the
+    // websocket task's own event handler (see handle_data()'s allocation-failure precedent
+    // below, and esp_websocket_client.h's doc comment on esp_websocket_client_stop()): it blocks
+    // until that task exits, which deadlocks when called from within the task itself. Report the
+    // loss immediately via handle_disconnected() without touching the transport; the manager
+    // reacts by dropping this connection, whose destructor calls esp_websocket_client_stop() to
+    // actually stop it, running off the websocket task.
+    this->handle_disconnected();
+}
+
 bool SendspinClientConnection::is_connected() const {
     return this->connected_;
 }
@@ -300,12 +311,11 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
         uint8_t* dest = this->prepare_receive_buffer(prepare_len);
         if (dest == nullptr) {
             SS_LOGE(TAG, "Allocation failed, dropping connection");
-            // Stop processing frames that keep arriving on the still-open transport; the
-            // manager reacts to the disconnect callback by dropping the connection, whose
-            // destructor stops the transport (esp_websocket_client_stop cannot be called
-            // from the websocket task's own event handler).
+            // Stop processing frames that keep arriving on the still-open transport via
+            // close_transport_now() (esp_websocket_client_stop cannot be called from the
+            // websocket task's own event handler -- see its doc comment).
             this->disable_message_dispatch();
-            this->handle_disconnected();
+            this->close_transport_now();
             return;
         }
         std::memcpy(dest, data->data_ptr, data->data_len);

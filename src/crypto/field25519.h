@@ -222,14 +222,25 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
             r.limbs[i] = t;
             carry = mhi + c1 + c2;  // small (<= ~38)
         }
-        // carry is at most a few bits; fold it using 38 again.
-        // carry * 2^256 mod p = carry * 38 (carry*38 fits in 64 bits).
-        uint64_t c1 = 0;
-        r.limbs[0] = adc64(r.limbs[0], carry * 38ULL, 0, c1);
-        uint64_t c2 = c1;  // 0 or 1
-        if (c2) {
-            // One more fold, carry is tiny (further carry is provably zero here).
-            r.limbs[0] = r.limbs[0] + c2 * 38ULL;
+        // `carry` here is the carry out of limb 3 from the loop above, i.e. the true
+        // overflow past 2^256 (bounded by ~38): its positional value is 2^256, and
+        // 2^256 mod p = 38, so folding it back in as carry*38 (added into limb 0) is
+        // correct. But that addition can itself carry out of limb 0 -- a carry with
+        // positional value 2^64, NOT 2^256 -- so it must be propagated limb-by-limb
+        // (0 -> 1 -> 2 -> 3), not folded by 38 again. Only a carry that makes it all
+        // the way out of limb 3 a second time has positional value 2^256 and is
+        // legitimately foldable by 38.
+        uint64_t addend = carry * 38ULL;
+        uint64_t prop = 0;
+        r.limbs[0] = adc64(r.limbs[0], addend, 0, prop);
+        for (int i = 1; i < 4 && prop; ++i) {
+            r.limbs[i] = adc64(r.limbs[i], prop, 0, prop);
+        }
+        if (prop) {
+            // Carry made it out of limb 3: limbs[1..3] just wrapped to zero and limbs[0]
+            // holds a value <= addend (a few thousand at most), so adding 38 more cannot
+            // overflow limb 0 again. A single non-looping add is provably sufficient.
+            r.limbs[0] = r.limbs[0] + 38ULL;
         }
     }
 
@@ -306,13 +317,26 @@ inline Fp fp_scale(const Fp& a, uint64_t s) {
         r.limbs[i] = adc64(plo, carry, 0, c1);
         carry = phi + c1;  // small: s < 2^26 so phi < 2^26
     }
-    // Fold carry * 2^256 using multiplier 38 (since 2^256 mod p = 38); carry*38 fits in 64 bits.
+    // `carry` here is the carry out of limb 3 from the loop above, i.e. the true
+    // overflow past 2^256 (bounded by s < 2^26): its positional value is 2^256, and
+    // 2^256 mod p = 38, so folding it back in as carry*38 (added into limb 0) is
+    // correct. But that addition can itself carry out of limb 0 -- a carry with
+    // positional value 2^64, NOT 2^256 -- so it must be propagated limb-by-limb
+    // (0 -> 1 -> 2 -> 3), not folded by 38 again. Only a carry that makes it all the
+    // way out of limb 3 a second time has positional value 2^256 and is legitimately
+    // foldable by 38.
     {
-        uint64_t c1 = 0;
-        r.limbs[0] = adc64(r.limbs[0], carry * 38ULL, 0, c1);
-        uint64_t c2 = c1;  // 0 or 1
-        if (c2) {
-            r.limbs[0] = r.limbs[0] + c2 * 38ULL;
+        uint64_t addend = carry * 38ULL;
+        uint64_t prop = 0;
+        r.limbs[0] = adc64(r.limbs[0], addend, 0, prop);
+        for (int i = 1; i < 4 && prop; ++i) {
+            r.limbs[i] = adc64(r.limbs[i], prop, 0, prop);
+        }
+        if (prop) {
+            // Carry made it out of limb 3: limbs[1..3] just wrapped to zero and limbs[0]
+            // holds a value <= addend, so adding 38 more cannot overflow limb 0 again.
+            // A single non-looping add is provably sufficient.
+            r.limbs[0] = r.limbs[0] + 38ULL;
         }
     }
     return fp_reduce(r, 0);

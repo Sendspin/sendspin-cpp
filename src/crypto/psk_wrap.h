@@ -43,8 +43,10 @@ static constexpr size_t WRAPPED_PSK_SIZE = 32 + 16;
 static constexpr char PSK_WRAP_LABEL[] = "sendspin-pair-psk-wrap-v1";
 
 /// @brief Derive K_wrap = SHA-256(PSK_WRAP_LABEL || sid || isk).
-std::array<uint8_t, 32> derive_psk_wrap_key(const std::vector<uint8_t>& sid,
-                                            const std::array<uint8_t, CPACE_ISK_SIZE>& isk);
+/// Returns std::nullopt if the underlying SHA-256 computation fails (e.g. noise-c allocation
+/// failure); callers must not treat this as a recoverable all-zero key.
+std::optional<std::array<uint8_t, 32>> derive_psk_wrap_key(
+    const std::vector<uint8_t>& sid, const std::array<uint8_t, CPACE_ISK_SIZE>& isk);
 
 /// @brief Seal a 32-byte PSK under K_wrap using the named AEAD cipher ("ChaChaPoly" or
 /// "AESGCM"), a 12-byte all-zero nonce, and empty associated data.

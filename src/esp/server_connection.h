@@ -88,6 +88,10 @@ public:
     ///                    needed.
     void disconnect(SendspinGoodbyeReason reason, std::function<void()> on_complete) override;
 
+    /// @brief Closes the transport immediately without blocking (see base class doc comment).
+    /// Delegates to trigger_close(), the same async primitive disconnect() already uses.
+    void close_transport_now() override;
+
     /// @brief Checks if the socket connection is valid
     /// @return true if connected, false otherwise.
     bool is_connected() const override;

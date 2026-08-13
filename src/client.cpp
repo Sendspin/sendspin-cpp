@@ -158,7 +158,11 @@ bool SendspinClient::start_server() {
     // the connection manager can hand them out to any connection (init_server() below starts
     // the ws_server, and connect_to() may be called any time after start_server()).
     this->record_store_ = std::make_unique<RecordStore>(this->persistence_provider_);
-    this->load_or_generate_identity();
+    if (!this->load_or_generate_identity()) {
+        // identity_ is left null: there is no safe key to fall back to (see
+        // load_or_generate_identity()'s doc comment), so the client must not start.
+        return false;
+    }
 
     // Load persisted state
     this->load_last_played_server();
@@ -1020,8 +1024,14 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                 } else {
                     SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
                     // Close the WebSocket silently (do not leave a half-swapped session).
-                    // UNAUTHORIZED is the closest available reason for a crypto failure.
-                    conn->disconnect(SendspinGoodbyeReason::UNAUTHORIZED, nullptr);
+                    // UNAUTHORIZED is the closest available reason for a crypto failure, though
+                    // close_silently() never actually transmits it (spec "Failure Handling":
+                    // close without any application-level message). This handler runs on the
+                    // network thread, so disconnect() here would be the same
+                    // join-the-calling-thread deadlock/std::terminate() hazard close_silently()
+                    // was added to avoid -- see close_transport_now()'s doc comment in
+                    // connection.h.
+                    conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
                 }
             }
             break;
@@ -1347,11 +1357,16 @@ SS_HOT void SendspinClient::process_binary_message(const uint8_t* payload, size_
 
     uint8_t binary_type = payload[0];
     uint8_t role = get_binary_role(binary_type);
-    uint8_t slot = get_binary_slot(binary_type);
 
-    // Strip the type byte; each role parses its own binary format from here
+    // Strip the type byte; each role parses its own binary format from here. Only declared when
+    // at least one role below actually consumes it, so an all-roles-disabled (or
+    // player+artwork-disabled, with visualizer also off) build does not warn/error on an unused
+    // variable under -Werror.
+#if defined(SENDSPIN_ENABLE_PLAYER) || defined(SENDSPIN_ENABLE_ARTWORK) || \
+    defined(SENDSPIN_ENABLE_VISUALIZER)
     const uint8_t* data = payload + 1;
     size_t data_len = len - 1;
+#endif
 
     // The visualizer role has an expanded 8-slot allocation (IDs 16-23), so it is
     // dispatched by ID range before the standard 4-slot role decoding below
@@ -1369,6 +1384,7 @@ SS_HOT void SendspinClient::process_binary_message(const uint8_t* payload, size_
         case SENDSPIN_ROLE_PLAYER: {
 #ifdef SENDSPIN_ENABLE_PLAYER
             if (this->player_) {
+                uint8_t slot = get_binary_slot(binary_type);
                 if (slot == 0) {
                     this->player_->impl_->handle_binary(data, data_len);
                 } else {
@@ -1381,6 +1397,7 @@ SS_HOT void SendspinClient::process_binary_message(const uint8_t* payload, size_
         case SENDSPIN_ROLE_ARTWORK: {
 #ifdef SENDSPIN_ENABLE_ARTWORK
             if (this->artwork_) {
+                uint8_t slot = get_binary_slot(binary_type);
                 this->artwork_->impl_->handle_binary(slot, data, data_len);
             }
 #endif
@@ -1431,20 +1448,35 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
 // Persistence & identity
 // ============================================================================
 
-void SendspinClient::load_or_generate_identity() {
+bool SendspinClient::load_or_generate_identity() {
     if (this->persistence_provider_ != nullptr) {
         auto saved_priv = this->persistence_provider_->load_static_keypair();
         if (saved_priv.has_value()) {
-            this->identity_ =
-                std::make_unique<Identity>(Identity::from_private_bytes(saved_priv.value()));
-            this->client_id_ = this->identity_->peer_id();
-            SS_LOGI(TAG, "Loaded static keypair; client_id=%s", this->client_id_.c_str());
-            return;
+            auto loaded = Identity::from_private_bytes(saved_priv.value());
+            if (loaded.has_value()) {
+                this->identity_ = std::make_unique<Identity>(loaded.value());
+                this->client_id_ = this->identity_->peer_id();
+                SS_LOGI(TAG, "Loaded static keypair; client_id=%s", this->client_id_.c_str());
+                return true;
+            }
+            // Stored key is corrupt/wrong-length, or the underlying DH computation failed --
+            // do not use it and do not treat this as an all-zero identity. Fall through and
+            // generate a fresh identity (the device will need to re-pair) rather than
+            // proceeding with a predictable/zero key.
+            SS_LOGW(TAG, "Stored static keypair is invalid; generating a new one");
         }
     }
 
-    // No saved key -- generate a new one.
-    this->identity_ = std::make_unique<Identity>(Identity::generate());
+    // No saved key (or the saved key was invalid) -- generate a new one.
+    auto generated = Identity::generate();
+    if (!generated.has_value()) {
+        // No safe fallback: identity_ must never be set to a default-constructed (all-zero)
+        // Identity, since that would be a fixed, publicly known private key that lets any peer
+        // impersonate this device and would be persisted to flash below. Fail closed instead.
+        SS_LOGE(TAG, "Failed to generate static identity keypair; cannot start");
+        return false;
+    }
+    this->identity_ = std::make_unique<Identity>(generated.value());
     this->client_id_ = this->identity_->peer_id();
 
     if (this->persistence_provider_ != nullptr) {
@@ -1459,6 +1491,7 @@ void SendspinClient::load_or_generate_identity() {
         SS_LOGI(TAG, "Generated ephemeral static keypair (no provider); client_id=%s",
                 this->client_id_.c_str());
     }
+    return true;
 }
 
 void SendspinClient::load_last_played_server() {

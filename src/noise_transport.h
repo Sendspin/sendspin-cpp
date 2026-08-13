@@ -58,11 +58,18 @@ public:
     using FrameSink = std::function<SsErr(const uint8_t* data, size_t len)>;
 
     /// @brief One complete (non-fragment, fully reassembled) plaintext transport message.
-    /// data == nullptr means "no complete message yet" (mid-reassembly, or a dropped frame).
-    /// The pointed-to bytes are valid until the next accept_plaintext() call.
+    /// data == nullptr means "no complete message yet" (mid-reassembly, or a dropped frame) --
+    /// unless `malformed` is set (see below). The pointed-to bytes are valid until the next
+    /// accept_plaintext() call.
     struct CompleteMessage {
         uint8_t* data{nullptr};
         size_t len{0};
+        /// True when this (empty) result is a spec "Malformed sequences" protocol error -- a
+        /// fragment-end frame with no fragmented message in flight, a non-fragment frame while
+        /// one is in flight, or a reassembled orig_type of 2 or 3 -- rather than the benign "no
+        /// complete message yet" mid-reassembly state. The caller MUST close the connection
+        /// when this is true.
+        bool malformed{false};
     };
 
     /// @brief Sets the sink used to emit encrypted frames. Must be set before activate().

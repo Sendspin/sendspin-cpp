@@ -93,20 +93,34 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider) : provider_(prov
         records_.push_back(shared_record);
         record_mode_psk_id_ = shared_psk_id;
 
-        // Persist the new record and config.
+        // Persist the new record and config. A rejected write leaves the record RAM-only for
+        // this boot: the device stays usable (pairing_token() etc. still work against the
+        // in-memory record), but the record will be regenerated on the next reboot, so any
+        // token printed before persistence is fixed would silently stop working. Surface that
+        // instead of logging success unconditionally.
+        bool record_persisted = true;
         if (provider_ != nullptr) {
-            provider_->save_pairing_record(shared_record);
+            record_persisted = provider_->save_pairing_record(shared_record);
             persist_config();
         }
 
-        SS_LOGI(TAG, "Provisioned shared-PSK fallback record: %s", shared_psk_id.c_str());
+        if (record_persisted) {
+            SS_LOGI(TAG, "Provisioned shared-PSK fallback record: %s", shared_psk_id.c_str());
+        } else {
+            SS_LOGW(TAG,
+                    "Provisioned shared-PSK fallback record %s but failed to persist it; it is "
+                    "RAM-only for this boot and will be replaced (invalidating this token) on "
+                    "the next reboot",
+                    shared_psk_id.c_str());
+        }
     }
 
     // Pairing PSK provisioning: pairing_psk is the one pairing method every client must
     // implement (spec #113/#122), so a client with no Pairing PSK would advertise a method it
     // cannot complete. Generate one when absent and persist it; the operator transfers it to a
     // server as a pairing token (SendspinClient::pairing_token()). The key is stable across
-    // reboots once persisted, so a token printed at any time stays valid.
+    // reboots once persisted; if persistence fails it is RAM-only for this boot, so a token
+    // printed then will not survive a reboot (a warning is logged when this happens).
     if (!pairing_psk_.has_value()) {
         std::array<uint8_t, NOISE_PSK_SIZE> psk{};
         platform_random_bytes(psk.data(), psk.size());
@@ -115,10 +129,18 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider) : provider_(prov
         provisioned.psk_id = psk_id_for(psk);
         provisioned.psk = psk;
 
+        bool psk_persisted = true;
         if (provider_ != nullptr) {
-            provider_->save_pairing_psk(provisioned);
+            psk_persisted = provider_->save_pairing_psk(provisioned);
         }
-        SS_LOGI(TAG, "Provisioned Sendspin Pairing PSK: %s", provisioned.psk_id.c_str());
+        if (psk_persisted) {
+            SS_LOGI(TAG, "Provisioned Sendspin Pairing PSK: %s", provisioned.psk_id.c_str());
+        } else {
+            SS_LOGW(TAG,
+                    "Provisioned Sendspin Pairing PSK %s but failed to persist it; a pairing "
+                    "token printed now will not survive a reboot",
+                    provisioned.psk_id.c_str());
+        }
         pairing_psk_ = std::move(provisioned);
     }
 }
@@ -211,6 +233,32 @@ bool RecordStore::store_record(SendspinPairingRecord record) {
         records_[idx] = std::move(record);
     } else {
         records_.push_back(std::move(record));
+        idx = records_.size() - 1;
+    }
+
+    // At most one stored-pubkey record per server_id (see the header doc): the new record is
+    // already persisted above, so any OTHER record still bound to this server_id is now
+    // redundant. Drop it -- this is what makes re-pairing (or an add-record targeting an
+    // already-bound server_id) revoke the prior credential instead of accumulating a second
+    // working PSK for the same server. Shared-PSK records (server_id absent) never match here.
+    if (records_[idx].server_id.has_value()) {
+        const std::string superseded_server_id = records_[idx].server_id.value();
+        for (size_t i = 0; i < records_.size();) {
+            if (i != idx && records_[i].server_id.has_value() &&
+                records_[i].server_id.value() == superseded_server_id) {
+                SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
+                        records_[i].psk_id.c_str(), superseded_server_id.c_str());
+                if (provider_ != nullptr) {
+                    provider_->remove_pairing_record(records_[i].psk_id);
+                }
+                records_.erase(records_.begin() + static_cast<ptrdiff_t>(i));
+                if (i < idx) {
+                    --idx;
+                }
+                continue;  // The element that shifted into position i still needs checking.
+            }
+            ++i;
+        }
     }
     return true;
 }
@@ -404,7 +452,12 @@ void RecordStore::persist_config() {
     config.dynamic_pin_min_length = dynamic_pin_min_length_;
     config.dynamic_pin_failures = dynamic_pin_failures_;
     config.record_mode_psk_id = record_mode_psk_id_;
-    provider_->save_pairing_config(config);
+    if (!provider_->save_pairing_config(config)) {
+        SS_LOGW(TAG,
+                "Provider rejected pairing config write (record_mode_psk_id=%s); the change is "
+                "RAM-only for this boot and will not survive a reboot",
+                config.record_mode_psk_id.c_str());
+    }
 }
 
 }  // namespace sendspin

@@ -666,9 +666,12 @@ private:
     // ========================================
 
     /// @brief Loads or generates the static X25519 identity keypair via the persistence
-    /// provider. Sets identity_. Called once from start_server(), before the connection
-    /// manager can hand the identity out to any connection.
-    void load_or_generate_identity();
+    /// provider. Sets identity_ on success. Called once from start_server(), before the
+    /// connection manager can hand the identity out to any connection.
+    /// @return false if the stored key was corrupt/wrong-length or key generation failed (e.g.
+    /// noise-c allocation failure); identity_ is left null in that case and the caller
+    /// (start_server()) must not proceed. Never leaves identity_ set to an all-zero keypair.
+    bool load_or_generate_identity();
 
     /// @brief Loads the last played server_id from persistence
     void load_last_played_server();

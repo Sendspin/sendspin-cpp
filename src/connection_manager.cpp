@@ -1006,6 +1006,42 @@ void ConnectionManager::loop() {
     }
     // Send the goodbye and release the connection if the PIN-timeout check above aborted one.
     this->flush_deferred_releases();
+
+    // ---- Re-proving watchdog ----
+    // current_connection_ is briefly non-operational while it re-proves itself: after a
+    // successful in-band re-handshake (SendspinConnection::handle_noise_rehandshake(), re-armed
+    // via schedule_rehandshake_rearm()) or after the server acks client/pair-finalize and is
+    // expected to rekey via one (SendspinConnection::note_pairing_finalize_ack()). Both call
+    // sites reset provisional_time_us_ to a fresh (non-zero) timestamp when they enter this
+    // window. current_connection_ is never non-operational for any other reason: a nursery
+    // entry is only ever promoted once it is already operational (see
+    // promote_or_arbitrate_nursery_entry()), and an in-progress PIN-pairing PAKE exchange keeps
+    // is_operational() true throughout (that flow has its own timeouts: the PIN_ATTEMPT_TIMEOUT_US
+    // check above, and pairing_window_open() while a gesture is awaited). Gating on
+    // !is_operational() here therefore reaps exactly the re-proving window and never a
+    // legitimate pairing wait. The provisional_time_us_ != 0 guard additionally excludes a
+    // connection that has never been given a real timestamp at all (never happens for a
+    // genuinely promoted connection -- both admission paths stamp it before the connection can
+    // even reach the nursery -- but keeps this check inert for anything that reaches
+    // current_connection_ by a route that skips that stamp).
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        if (this->current_connection_ != nullptr && !this->current_connection_->is_operational()) {
+            const int64_t provisional_us = this->current_connection_->get_provisional_time_us();
+            const int64_t now_us = platform_time_us();
+            if (provisional_us != 0 && now_us - provisional_us >= REPROVE_TIMEOUT_US) {
+                SS_LOGW(TAG,
+                        "Current connection failed to re-prove itself within %d s "
+                        "(server_id=%s); dropping",
+                        static_cast<int>(REPROVE_TIMEOUT_US / US_PER_SECOND),
+                        this->current_connection_->get_server_id().c_str());
+                this->drop_connection(this->current_connection_.get(),
+                                      SendspinGoodbyeReason::ANOTHER_SERVER);
+            }
+        }
+    }
+    // Send the goodbye and release the connection if the re-proving watchdog above dropped one.
+    this->flush_deferred_releases();
 }
 
 // ============================================================================
@@ -2092,15 +2128,41 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
             conn->send_app_json(format_client_pair_auth_message(client_share), nullptr);
 
             // Derive the MAC key from the server's share (pake_msg_1).
-            // A derive failure means the peer share is a low-order point (a malformed or
-            // hostile share), NOT a wrong PIN, so it does NOT count toward the lockout
-            // counter -- the reference records a failure only on the confirm-tag mismatch below.
+            // A derive failure means the peer share has the wrong length or encodes a
+            // low-order point (a malformed or hostile share), NOT a wrong PIN: a wrong PIN
+            // still produces a well-formed, non-low-order shared secret that only fails the
+            // confirm-tag check below, so it does NOT count toward the lockout counter -- the
+            // reference records a failure only on the confirm-tag mismatch below.
+            //
+            // Spec Protocol Errors: "a CPace share with the wrong length or encoding a
+            // low-order point" is a protocol error: the detecting side closes the WebSocket
+            // without sending any application-level error message, and persists nothing. This
+            // is the same class as the MALFORMED case below, so it follows the same shape: no
+            // pair/abort, unconditional close, no failure-counter increment.
             if (!ps.cpace.derive(event.pake_msg_1.data(), event.pake_msg_1.size())) {
                 SS_LOGW(TAG,
-                        "handle_pin_pairing_message: CPace::derive failed (low-order point) "
-                        "for server_id=%s",
+                        "handle_pin_pairing_message: CPace::derive failed (malformed/low-order "
+                        "peer share) for server_id=%s; closing per spec Protocol Errors (no "
+                        "pair/abort sent)",
                         server_id.c_str());
-                this->local_abort_pin_pairing(conn, PairAbortReason::PIN_MISMATCH);
+                const bool pin_was_displayed = ps.pin_displayed;
+                const bool window_was_shown = ps.window_shown;
+                // clear_pairing_state() drops any pending pairing record, so nothing is
+                // persisted; drop_connection() with goodbye=std::nullopt closes the transport
+                // without sending a client/goodbye (or any other application-level message).
+                conn->clear_pairing_state();
+                this->drop_connection(conn, std::nullopt);
+                // SendspinPairAbortReason has no dedicated "protocol error" value and none of
+                // the wire-facing reasons fit (no pair/abort was received or sent); UNKNOWN is
+                // reused here as the closest available local-only fit, matching the MALFORMED
+                // case below.
+                this->client_->note_pairing_failed(server_id, SendspinPairAbortReason::UNKNOWN);
+                if (pin_was_displayed) {
+                    this->client_->note_clear_pin();
+                }
+                if (window_was_shown) {
+                    this->client_->note_close_pairing_window();
+                }
                 return;
             }
 
@@ -2220,10 +2282,11 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
         }
 
         case PinPairingMessageKind::MALFORMED: {
-            // A server pairing message failed to parse. If a PIN session is active, abort it
-            // (the reference closes the connection on a malformed pairing frame). If no session
-            // is active, the frame is a stray protocol violation on a non-pairing connection;
-            // drop it without tearing the connection down.
+            // A server pairing message (server/pair-init, server/pair-auth, or
+            // server/pair-confirm) failed to parse. If no PIN session is active on this
+            // connection, the frame is a stray protocol violation -- e.g. a dynamic/static-PIN
+            // message arriving during a pairing_psk exchange, which never touches pin_session_
+            // (ps.step stays IDLE) -- so drop it without tearing the connection down.
             if (ps.step == SendspinConnection::PinStep::IDLE) {
                 SS_LOGW(TAG,
                         "handle_pin_pairing_message: malformed pairing frame with no active PIN "
@@ -2231,11 +2294,36 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
                         server_id.c_str());
                 return;
             }
+
+            // Spec Protocol Errors: "a malformed or missing field ... is a protocol error: the
+            // detecting side closes the WebSocket without sending any application-level error
+            // message, and persists nothing." This is the one pairing-abort path that must NOT
+            // send pair/abort and must close unconditionally, so it cannot route through
+            // local_abort_pin_pairing() (which always sends pair/abort and only closes for
+            // concurrent_attempt). Capture the display/window flags before clear_pairing_state()
+            // resets them, matching every other abort path in this function.
             SS_LOGW(TAG,
                     "handle_pin_pairing_message: malformed pairing frame during PIN pairing for "
-                    "server_id=%s; aborting",
+                    "server_id=%s; closing per spec Protocol Errors (no pair/abort sent)",
                     server_id.c_str());
-            this->local_abort_pin_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+            const bool pin_was_displayed = ps.pin_displayed;
+            const bool window_was_shown = ps.window_shown;
+            // clear_pairing_state() drops any pending pairing record, so nothing is persisted;
+            // drop_connection() with goodbye=std::nullopt closes the transport without sending a
+            // client/goodbye (or any other application-level message).
+            conn->clear_pairing_state();
+            this->drop_connection(conn, std::nullopt);
+            // SendspinPairAbortReason has no dedicated "protocol error" value and none of the
+            // wire-facing reasons fit (no pair/abort was received or sent); UNKNOWN is reused
+            // here as the closest available local-only fit, mirroring how STORAGE_FAILED is
+            // reused for the other client-local abort (see handle_pair_storage_failed()).
+            this->client_->note_pairing_failed(server_id, SendspinPairAbortReason::UNKNOWN);
+            if (pin_was_displayed) {
+                this->client_->note_clear_pin();
+            }
+            if (window_was_shown) {
+                this->client_->note_close_pairing_window();
+            }
             break;
         }
     }
@@ -2281,12 +2369,14 @@ void ConnectionManager::handle_management_request(SendspinConnection* conn,
             handle_add_record(store, event.add_payload, result, effect);
             break;
         case ManagementRequestKind::REMOVE_RECORD: {
-            // requester_server_id: used to detect own-record removal.
-            std::optional<std::string> requester_server_id;
-            if (!conn->get_server_id().empty()) {
-                requester_server_id = conn->get_server_id();
+            // requester_psk_id: the psk_id that authenticated this connection, used to detect
+            // own-record removal (see handle_remove_record's doc comment for why psk_id, not
+            // server_id, is the right key here).
+            std::optional<std::string> requester_psk_id;
+            if (!conn->get_psk_id().empty()) {
+                requester_psk_id = conn->get_psk_id();
             }
-            handle_remove_record(store, event.remove_payload, requester_server_id, result, effect);
+            handle_remove_record(store, event.remove_payload, requester_psk_id, result, effect);
             break;
         }
         case ManagementRequestKind::GET_PAIRING_CONFIG:
