@@ -888,9 +888,14 @@ protected:
     /// For the first fragment, allocates a new buffer of the given size.
     /// For continuation fragments, reallocates to grow the buffer if needed.
     ///
+    /// The cumulative size (write offset + data_len) is rejected once it would exceed
+    /// MAX_TRANSPORT_PLAINTEXT + 16 bytes, the largest legitimate single Noise transport frame.
+    /// This bound applies before the Noise handshake completes, since the caller sizes this
+    /// call from unauthenticated peer input (a frame-length probe or a declared message length).
+    ///
     /// @param data_len Number of bytes that will be written.
     /// @return Pointer to the write position (websocket_payload_ + websocket_write_offset_), or
-    /// nullptr on failure.
+    /// nullptr on allocation failure or on exceeding the cap above.
     uint8_t* prepare_receive_buffer(size_t data_len);
 
     /// @brief Advances the write offset after data has been written into the buffer

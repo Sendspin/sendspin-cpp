@@ -308,6 +308,22 @@ void SendspinConnection::reset_websocket_payload() {
 }
 
 uint8_t* SendspinConnection::prepare_receive_buffer(size_t data_len) {
+    // Cap the cumulative buffer before any Noise authentication: the ESP server path drives
+    // this call from a header-only frame-length probe and the ESP client path from the peer's
+    // declared message length, neither of which has been authenticated yet. The cap is
+    // MAX_TRANSPORT_PLAINTEXT + 16 (AEAD tag room), the largest legitimate single Noise
+    // transport frame; pre-handshake TEXT frames (server/init, noise/handshake msg1/msg2) are
+    // far smaller, so one cap holds in every connection phase. websocket_write_offset_ never
+    // exceeds the cap (every prior growth passed this same check), so the subtraction below
+    // cannot underflow.
+    constexpr size_t MAX_RECEIVE_BUFFER_BYTES = MAX_TRANSPORT_PLAINTEXT + 16;
+    if (data_len > MAX_RECEIVE_BUFFER_BYTES - this->websocket_write_offset_) {
+        SS_LOGW(TAG, "Declared frame size %zu (offset %zu) exceeds receive buffer cap of %zu bytes",
+                data_len, this->websocket_write_offset_, MAX_RECEIVE_BUFFER_BYTES);
+        this->deallocate_websocket_payload();
+        return nullptr;
+    }
+
     if (!this->websocket_payload_) {
         if (!this->websocket_payload_.allocate(data_len, this->websocket_payload_location_)) {
             SS_LOGE(TAG, "Failed to allocate %zu bytes for websocket payload", data_len);

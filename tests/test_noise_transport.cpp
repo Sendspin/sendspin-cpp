@@ -137,6 +137,14 @@ public:
         this->noise_handshake_complete_.store(true, std::memory_order_release);
     }
 
+    // --- Direct access to the receive-buffer cap, bypassing WS/dispatch ---
+
+    uint8_t* test_prepare_receive_buffer(size_t data_len) {
+        return this->prepare_receive_buffer(data_len);
+    }
+    void test_commit_receive_buffer(size_t data_len) { this->commit_receive_buffer(data_len); }
+    size_t test_write_offset() const { return this->websocket_write_offset_; }
+
     // Accumulated outgoing messages
     std::vector<std::string> sent_text_;
     std::vector<std::vector<uint8_t>> sent_binary_;
@@ -1029,6 +1037,54 @@ TEST(NoiseTransportDispatch, ReassemblyOverCapDropsWithoutClosing) {
 
     send_fragment(MSG_TYPE_JSON_BODY, {'{', '}'});
     EXPECT_EQ(dispatched, 2) << "connection must still be usable after the fragment-end drop";
+}
+
+// =============================================================================
+// Pre-authentication receive-buffer cap (prepare_receive_buffer)
+// =============================================================================
+
+TEST(ReceiveBufferCap, SingleFrameOverCapRejected) {
+    // A single call declaring more than MAX_TRANSPORT_PLAINTEXT + 16 (the largest legitimate
+    // Noise transport frame: plaintext plus the AEAD tag) must be rejected before any allocation,
+    // since this call is sized from unauthenticated peer input (a WS frame-length probe or a
+    // declared message length) on both the ESP server and ESP client paths.
+    constexpr size_t cap = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) + 16;
+    TestConnection conn;
+    uint8_t* dest = conn.test_prepare_receive_buffer(cap + 1);
+    EXPECT_EQ(dest, nullptr);
+    EXPECT_EQ(conn.test_write_offset(), 0u);
+}
+
+TEST(ReceiveBufferCap, CumulativeContinuationOverCapRejected) {
+    // A WS continuation sequence that stays under the cap on each individual call but whose
+    // running total crosses it must also be rejected: the check bounds
+    // websocket_write_offset_ + data_len, not just the current call's data_len, so an attacker
+    // cannot bypass the cap by splitting a message across many small continuation frames.
+    constexpr size_t cap = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) + 16;
+    TestConnection conn;
+
+    uint8_t* first = conn.test_prepare_receive_buffer(cap - 10);
+    ASSERT_NE(first, nullptr);
+    conn.test_commit_receive_buffer(cap - 10);
+    EXPECT_EQ(conn.test_write_offset(), cap - 10);
+
+    // This continuation only adds 20 bytes, but offset + data_len now exceeds the cap.
+    uint8_t* second = conn.test_prepare_receive_buffer(20);
+    EXPECT_EQ(second, nullptr);
+    // Rejection tears the buffer down the same way an allocation failure does, so a stale
+    // partial reassembly can never reach dispatch.
+    EXPECT_EQ(conn.test_write_offset(), 0u);
+}
+
+TEST(ReceiveBufferCap, ExactlyAtCapAccepted) {
+    // A frame declaring exactly the cap is the largest legitimate single Noise transport frame
+    // and must be accepted, not just rejected past it.
+    constexpr size_t cap = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) + 16;
+    TestConnection conn;
+    uint8_t* dest = conn.test_prepare_receive_buffer(cap);
+    ASSERT_NE(dest, nullptr);
+    conn.test_commit_receive_buffer(cap);
+    EXPECT_EQ(conn.test_write_offset(), cap);
 }
 
 TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
