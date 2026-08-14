@@ -1350,6 +1350,75 @@ TEST(NoiseTransport, FragmentBoundaryExactLimit) {
 }
 
 // =============================================================================
+// send_buf_ growth: the reused non-fragmented send buffer grows on demand instead of a fixed
+// MAX_TRANSPORT_PLAINTEXT + 16 allocation. There is no accessor for its capacity, so these
+// exercise growth indirectly: a sequence of increasing sizes (including a shrink back down,
+// which must not lose or corrupt data) and the exact MAX_TRANSPORT_PLAINTEXT boundary, all
+// round-tripping through encrypt/decrypt correctly on one shared transport instance.
+// =============================================================================
+
+TEST(NoiseTransport, SendJson_GrowingSizesRoundTrip) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+
+    TestConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
+    // json length -> plaintext length (1 + json length) stays <= maxp for every size here, so
+    // every send takes the single-frame (non-fragmented, send_buf_-backed) path. Includes a
+    // shrink (8192 -> 64) to confirm a smaller send after a large one still works correctly.
+    const size_t json_lens[] = {0, 1, 64, 200, 2000, 8192, 64, maxp - 1};
+
+    for (size_t json_len : json_lens) {
+        std::string json;
+        json.reserve(json_len);
+        for (size_t i = 0; i < json_len; ++i) {
+            json.push_back(static_cast<char>('a' + (i % 26)));
+        }
+
+        conn.sent_binary_.clear();
+        ASSERT_EQ(conn.send_encrypted_text(json), SsErr::OK) << "json_len=" << json_len;
+        ASSERT_EQ(conn.sent_binary_.size(), 1u) << "json_len=" << json_len;
+
+        auto pt = init_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
+        ASSERT_FALSE(pt.empty()) << "json_len=" << json_len;
+        EXPECT_EQ(pt[0], 0x00u);  // MSG_TYPE_JSON_BODY
+        std::string recovered(reinterpret_cast<char*>(pt.data() + 1), pt.size() - 1);
+        EXPECT_EQ(recovered, json) << "json_len=" << json_len;
+    }
+}
+
+TEST(NoiseTransport, SendBinary_GrowingSizesUpToMaxTransportPlaintextRoundTrip) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+
+    TestConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
+    // Total length including the leading type byte; maxp is the largest size the non-fragmented
+    // send_binary path ever handles (see send_binary's doc comment).
+    const size_t lens[] = {1, 32, 512, 4096, maxp};
+
+    for (size_t len : lens) {
+        std::vector<uint8_t> data(len);
+        data[0] = 0x01;  // arbitrary non-JSON role type byte
+        for (size_t i = 1; i < len; ++i) {
+            data[i] = static_cast<uint8_t>(i);
+        }
+
+        conn.sent_binary_.clear();
+        ASSERT_EQ(conn.send_encrypted_binary(data.data(), data.size()), SsErr::OK) << "len=" << len;
+        ASSERT_EQ(conn.sent_binary_.size(), 1u) << "len=" << len;
+
+        auto pt = init_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
+        ASSERT_EQ(pt.size(), len) << "len=" << len;
+        EXPECT_EQ(pt, data) << "len=" << len;
+    }
+}
+
+// =============================================================================
 // Malformed Noise message 1 aborts the handshake
 // =============================================================================
 

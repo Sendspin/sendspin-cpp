@@ -169,10 +169,11 @@ private:
     /// preserved, capacity retained across messages). Returns false on allocation failure.
     bool reasm_reserve(size_t needed);
 
-    /// @brief Lazily allocates send_buf_ to MAX_TRANSPORT_PLAINTEXT + 16 bytes (plaintext +
-    /// AEAD tag room) on first use, then reuses the allocation for the life of the transport.
-    /// Caller must hold session_mutex_ (see send_buf_). Returns false on allocation failure.
-    bool ensure_send_buf();
+    /// @brief Grows send_buf_ to at least `needed` bytes (geometric growth, capacity retained
+    /// across sends), capped at MAX_TRANSPORT_PLAINTEXT + 16 (the largest plaintext + AEAD tag
+    /// room the non-fragmented path ever handles). Caller must hold session_mutex_ (see
+    /// send_buf_). Returns false on allocation failure.
+    bool ensure_send_buf(size_t needed);
 
     /// @brief Discards any in-flight reassembly state (keeps the allocation).
     void reasm_reset() {
@@ -195,12 +196,15 @@ private:
     FrameSink frame_sink_;
 
     /// Reused scratch buffer for the non-fragmented send path (send_json, send_binary,
-    /// send_msg2_and_swap). Fixed at MAX_TRANSPORT_PLAINTEXT + 16 bytes (largest plaintext
-    /// that path ever handles, plus AEAD tag room) once allocated by ensure_send_buf().
-    /// Guarded by session_mutex_: every caller fills and encrypts it while holding the lock,
-    /// so concurrent send_json/send_binary/send_msg2_and_swap calls from different threads
-    /// (any thread may call these; see the file comment) never touch it at the same time.
-    /// Placed per buffer_location_ like reasm_buf_ (PSRAM-preferring by default on ESP).
+    /// send_msg2_and_swap). Grown on demand by ensure_send_buf() to fit each frame (geometric
+    /// growth, same idiom as reasm_buf_/reasm_reserve()), capped at MAX_TRANSPORT_PLAINTEXT + 16
+    /// bytes (largest plaintext that path ever handles, plus AEAD tag room). Typical traffic
+    /// (client/time, client/state, pairing/management JSON) settles at a working-set size well
+    /// under that ceiling instead of paying it on every connection. Guarded by session_mutex_:
+    /// every caller fills and encrypts it while holding the lock, so concurrent
+    /// send_json/send_binary/send_msg2_and_swap calls from different threads (any thread may
+    /// call these; see the file comment) never touch it at the same time. Placed per
+    /// buffer_location_ like reasm_buf_ (PSRAM-preferring by default on ESP).
     PlatformBuffer send_buf_;
 
     // Fragment reassembly state (network thread only).

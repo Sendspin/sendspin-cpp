@@ -147,7 +147,7 @@ SsErr NoiseTransport::send_json(const char* json, size_t len) {
         // member, so the whole read/write window over it must stay inside the critical
         // section (see send_buf_'s doc comment).
         std::lock_guard<std::mutex> lock(this->session_mutex_);
-        if (!this->ensure_send_buf()) {
+        if (!this->ensure_send_buf(plaintext_len + 16)) {
             return SsErr::FAIL;
         }
         this->send_buf_.data()[0] = MSG_TYPE_JSON_BODY;
@@ -177,7 +177,7 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
 
     if (len <= MAX_TRANSPORT_PLAINTEXT) {
         std::lock_guard<std::mutex> lock(this->session_mutex_);
-        if (!this->ensure_send_buf()) {
+        if (!this->ensure_send_buf(len + 16)) {
             return SsErr::FAIL;
         }
         std::memcpy(this->send_buf_.data(), data, len);
@@ -203,7 +203,7 @@ SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
         SS_LOGE(TAG, "send_msg2_and_swap: msg2 plaintext too large (%zu bytes)", plaintext_len);
         return SsErr::FAIL;
     }
-    if (!this->ensure_send_buf()) {
+    if (!this->ensure_send_buf(plaintext_len + 16)) {
         return SsErr::FAIL;
     }
     this->send_buf_.data()[0] = MSG_TYPE_JSON_BODY;
@@ -354,15 +354,29 @@ bool NoiseTransport::reasm_reserve(size_t needed) {
     return ok;
 }
 
-bool NoiseTransport::ensure_send_buf() {
-    if (this->send_buf_.data() != nullptr) {
+bool NoiseTransport::ensure_send_buf(size_t needed) {
+    if (this->send_buf_.size() >= needed) {
         return true;
     }
-    if (!this->send_buf_.allocate(MAX_TRANSPORT_PLAINTEXT + 16, this->buffer_location_)) {
-        SS_LOGE(TAG, "send buffer allocation failed");
-        return false;
+    // Geometric growth, same idiom as reasm_reserve(): capacity is retained across sends, so
+    // steady-state traffic (client/time, client/state) settles at its working-set size instead
+    // of paying the MAX_TRANSPORT_PLAINTEXT + 16 ceiling on every connection.
+    size_t new_size = this->send_buf_.size() * 2;
+    if (new_size < needed) {
+        new_size = needed;
     }
-    return true;
+    // Callers never request more than MAX_TRANSPORT_PLAINTEXT + 16 (the non-fragmented path's
+    // own size check enforces this), so the doubling never needs to grow past that ceiling.
+    if (new_size > MAX_TRANSPORT_PLAINTEXT + 16) {
+        new_size = MAX_TRANSPORT_PLAINTEXT + 16;
+    }
+    const bool ok = (this->send_buf_.data() == nullptr)
+                        ? this->send_buf_.allocate(new_size, this->buffer_location_)
+                        : this->send_buf_.realloc(new_size);
+    if (!ok) {
+        SS_LOGE(TAG, "send buffer allocation failed (%zu bytes)", new_size);
+    }
+    return ok;
 }
 
 }  // namespace sendspin
