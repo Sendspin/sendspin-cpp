@@ -152,6 +152,20 @@ struct SendspinClientConfig {
     /// stays disabled, so a damaged config fails closed. See the integration guide.
     bool initial_unpaired_access_enabled{false};
 
+    /// @brief Default maximum number of long-term pairing records the store retains (the
+    /// shared-PSK fallback record counts against this too). An encoded record is roughly 250
+    /// bytes (see persistence_codec.h's blob-size doc), so this default keeps the serialized
+    /// "records" blob comfortably under a typical NVS entry's ~4 KB limit even while a pairing
+    /// supersede transiently persists one extra record. Past the cap, a new pairing falls back
+    /// to the shared-PSK record instead of minting one, and management/add-record returns
+    /// storage_exhausted; replacing a record already held for a given psk_id or server_id is
+    /// unaffected, since that never grows the store.
+    static constexpr size_t DEFAULT_MAX_PAIRING_RECORDS = 12;
+
+    /// @brief Maximum number of long-term pairing records the store will retain. See
+    /// DEFAULT_MAX_PAIRING_RECORDS for the rationale behind the default.
+    size_t max_pairing_records{DEFAULT_MAX_PAIRING_RECORDS};
+
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
 
     /// @brief Default FreeRTOS priority for the HTTP server task (ESP-IDF only)

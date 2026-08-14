@@ -471,6 +471,87 @@ TEST(RecordStore, StoreRecordSupersedeRejectedWriteKeepsOldRecord) {
 }
 
 // =============================================================================
+// Capacity enforcement (max_records_)
+// =============================================================================
+
+// Filling the store to DEFAULT_MAX_RECORDS must succeed; the next genuine insert must be
+// rejected and must not change what is stored.
+TEST(RecordStore, CapacityRejectsInsertPastDefaultCap) {
+    RecordStore store(nullptr);  // 1 slot already used by the auto-provisioned shared fallback.
+    for (size_t i = 1; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
+        SendspinPairingRecord rec = make_client_record("server-" + std::to_string(i));
+        ASSERT_TRUE(store.store_record(rec)) << "insert " << i << " should still fit";
+    }
+    ASSERT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
+    EXPECT_FALSE(store.can_store_record());
+
+    SendspinPairingRecord overflow = make_client_record("server-overflow");
+    EXPECT_FALSE(store.store_record(overflow))
+        << "store_record must reject a genuine insert once the store is at capacity";
+    EXPECT_EQ(store.record_by_psk_id(overflow.psk_id), nullptr);
+    EXPECT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS)
+        << "a rejected insert must not change the record count";
+}
+
+// A supersede that replaces the record already held for a given server_id does not grow the
+// store, so it must succeed even when the store is otherwise completely full.
+TEST(RecordStore, CapacitySupersedeAtCapacityStillSucceeds) {
+    RecordStore store(nullptr);
+    const std::string existing_server = "server-existing";
+
+    auto outcome0 = store.resolve_pairing_outcome(existing_server);
+    ASSERT_TRUE(outcome0.has_value());
+    ASSERT_TRUE(outcome0->record.has_value());
+    ASSERT_TRUE(store.store_record_superseding(outcome0->record.value()));
+    const std::string first_psk_id = outcome0->record->psk_id;
+
+    // Fill every remaining slot with other servers' records.
+    for (size_t i = 1; i < RecordStore::DEFAULT_MAX_RECORDS - 1; ++i) {
+        SendspinPairingRecord rec = make_client_record("server-" + std::to_string(i));
+        ASSERT_TRUE(store.store_record(rec));
+    }
+    ASSERT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
+    ASSERT_FALSE(store.can_store_record());
+
+    // Re-pairing the already-known server must still mint and store a fresh record: it
+    // supersedes its own prior record rather than growing the store past capacity.
+    auto outcome1 = store.resolve_pairing_outcome(existing_server);
+    ASSERT_TRUE(outcome1.has_value());
+    ASSERT_TRUE(outcome1->record.has_value())
+        << "resolve_pairing_outcome must mint a fresh record for a re-pair even at capacity";
+    EXPECT_TRUE(store.store_record_superseding(outcome1->record.value()))
+        << "a supersede must not be blocked by the capacity cap";
+
+    EXPECT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS)
+        << "a supersede must not grow the store";
+    EXPECT_EQ(store.record_by_psk_id(first_psk_id), nullptr) << "the old record must be retired";
+    const auto* found = store.record_by_server_id(existing_server);
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->psk_id, outcome1->record->psk_id);
+}
+
+// A caller-supplied cap (the max_records constructor parameter, wired from
+// SendspinClientConfig::max_pairing_records) must be respected in place of the default, both
+// for store_record() and for storage_accounting()'s reported capacity.
+TEST(RecordStore, CapacityCustomCapIsRespected) {
+    RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/2);
+
+    // 1 slot already used by the shared fallback; one more genuine insert should still fit.
+    SendspinPairingRecord rec = make_client_record("server-A");
+    ASSERT_TRUE(store.store_record(rec));
+    EXPECT_FALSE(store.can_store_record());
+
+    SendspinPairingRecord overflow = make_client_record("server-B");
+    EXPECT_FALSE(store.store_record(overflow));
+    EXPECT_EQ(store.records_snapshot().size(), 2u);
+
+    auto report = store.storage_accounting();
+    ASSERT_TRUE(report.has_value());
+    EXPECT_EQ(report->capacity, 2);
+    EXPECT_EQ(report->free, 0);
+}
+
+// =============================================================================
 // resolve_by_psk_id: long-term first, then Pairing PSK, then Sentinel
 // =============================================================================
 

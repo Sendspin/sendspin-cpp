@@ -37,8 +37,8 @@ namespace sendspin {
 // ============================================================================
 
 RecordStore::RecordStore(SendspinPersistenceProvider* provider,
-                         bool initial_unpaired_access_enabled)
-    : provider_(provider) {
+                         bool initial_unpaired_access_enabled, size_t max_records)
+    : max_records_(max_records), provider_(provider) {
     // Try loading persisted records and config first. Every blob here (except static_pin, which
     // is raw UTF-8 bytes) is a codec-encoded blob; the provider itself is a pure byte store, so
     // decoding happens entirely on this side of the interface.
@@ -356,7 +356,27 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
 
     size_t idx = this->find_index(record.psk_id);
     const std::string incoming_psk_id = record.psk_id;
-    if (idx != static_cast<size_t>(-1)) {
+    const bool is_insert = (idx == static_cast<size_t>(-1));
+
+    // Capacity: a genuine insert grows records_ by one and is subject to max_records_. A
+    // replace by psk_id (idx already found, handled below) never grows it, so it is exempt.
+    // The pairing-supersede case is also exempt even though it inserts here first: phase 2
+    // below retires whatever record already holds this server_id right after this insert
+    // commits, so the net occupancy does not change. Without this exemption a device that
+    // already holds the store's last free slot could never re-pair once the rest of the store
+    // filled up with other servers' records.
+    if (is_insert) {
+        const bool will_supersede_existing =
+            supersede_server_id && record.server_id.has_value() &&
+            this->record_by_server_id(record.server_id.value()) != nullptr;
+        if (!will_supersede_existing && !this->has_capacity_locked()) {
+            SS_LOGW(TAG, "Storage full (%zu/%zu); rejecting new pairing record %s",
+                    this->records_.size(), this->max_records_, incoming_psk_id.c_str());
+            return false;
+        }
+    }
+
+    if (!is_insert) {
         this->records_[idx] = std::move(record);
     } else {
         this->records_.push_back(std::move(record));
@@ -620,7 +640,14 @@ void RecordStore::set_static_pin_enabled(bool enabled) {
 
 std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
     const std::string& server_id, const std::optional<std::string>& label) {
-    if (this->can_store_record()) {
+    // A re-pair for a server_id that already holds a long-term record supersedes it in place
+    // (store_record_superseding() retires the old record only once the new one is safely
+    // persisted; see store_record_impl()), so it does not grow the store and must not be
+    // blocked by can_store_record() even when the store reports itself full. Without this, a
+    // device that already occupies the store's last slot could never re-pair once other
+    // servers filled the rest of it.
+    const bool replaces_existing = this->record_by_server_id(server_id) != nullptr;
+    if (replaces_existing || this->can_store_record()) {
         std::array<uint8_t, NOISE_PSK_SIZE> psk{};
         platform_random_bytes(psk.data(), psk.size());
         std::string pid = psk_id_for(psk);
@@ -649,6 +676,28 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
     outcome.psk = resolved->psk;
     // outcome.record is nullopt: caller should not store a new record.
     return outcome;
+}
+
+bool RecordStore::can_store_record() const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->has_capacity_locked();
+}
+
+// ============================================================================
+// Storage accounting
+// ============================================================================
+
+std::optional<RecordStore::StorageReport> RecordStore::storage_accounting() const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    StorageReport report;
+    report.capacity = static_cast<int>(this->max_records_);
+    report.free = static_cast<int>(this->max_records_) - static_cast<int>(this->records_.size());
+    if (report.free < 0) {
+        report.free = 0;  // Defensive: a shrunk max_records_ must not advertise negative room.
+    }
+    report.cost_individual = 1;
+    report.cost_shared = 1;
+    return report;
 }
 
 // ============================================================================

@@ -164,7 +164,8 @@ bool SendspinClient::start_server() {
     // the ws_server, and connect_to() may be called any time after start_server() RETURNS TRUE;
     // connect_to() enforces that itself rather than trusting the caller's ordering).
     this->record_store_ = std::make_unique<RecordStore>(
-        this->persistence_provider_, this->config_.initial_unpaired_access_enabled);
+        this->persistence_provider_, this->config_.initial_unpaired_access_enabled,
+        this->config_.max_pairing_records);
     if (!this->load_or_generate_identity()) {
         // identity_ is left null: there is no safe key to fall back to (see
         // load_or_generate_identity()'s doc comment), so the client must not start.

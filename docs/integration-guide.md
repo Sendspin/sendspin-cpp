@@ -502,6 +502,24 @@ produces -- it is not something a provider hand-rolls its own version of.
   `false` return means the cleared PSK/PIN may still be in the store and will resume
   authenticating pairing attempts / admitting the static PIN after a reboot.
 
+#### Record capacity
+
+The library's built-in `RecordStore` caps the number of long-term records it will hold (the
+shared-PSK fallback record counts against the cap too) at
+`SendspinClientConfig::max_pairing_records`, which defaults to
+`SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS` (12). An encoded record is roughly 250
+bytes, so the default keeps the serialized `RECORDS` blob comfortably under a typical NVS
+entry's ~4 KB limit even while a pairing supersede transiently persists one extra record.
+Once the cap is reached, a new pairing falls back to the shared-PSK record instead of minting
+a per-server one, and `management/add-record` returns `storage_exhausted`; replacing a record
+already held for a given `psk_id` or `server_id` is unaffected, since that never grows the
+store. Raise or lower the cap by setting `max_pairing_records` before calling `start_server()`:
+
+```cpp
+SendspinClientConfig config;
+config.max_pairing_records = 32;
+```
+
 Every method has a default no-op / `nullopt` implementation, so you can implement only the
 keys your deployment actually needs. The minimum useful set for a deployed device is
 `persistence_keys::KEYPAIR` (for stable identity) and `persistence_keys::RECORDS` (for pairing
@@ -1103,6 +1121,7 @@ X25519 keypair and read back via `client.client_id()` after `start_server()`.
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
 | `pin_display_supported` | `bool` | `false` | Set to `true` when the application implements `on_display_pairing_pin` / `on_clear_pairing_pin` on its `SendspinClientListener`. When `false`, dynamic-PIN pairing is not advertised even if enabled in `SendspinPairingConfig`. |
 | `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, static-PIN pairing is not advertised even if a static PIN is configured. Dynamic-PIN devices should also set it: escalated or short-PIN dynamic attempts are gesture-gated through the same callbacks, and without them such an attempt can only proceed via `management/open-pairing-window` (or stalls until the server cancels it). |
+| `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains (the shared-PSK fallback record counts against it too). See [Record capacity](#record-capacity). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `httpd_stack_size` | `size_t` | `8192` | HTTP server task stack size in bytes (ESP-IDF only). The Noise handshake (and especially the in-band re-handshake after pairing) runs its X25519 crypto on this task; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |

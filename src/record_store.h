@@ -101,14 +101,22 @@ struct ResolvedPsk {
 ///     `records_` / `pairing_psk_`.
 class RecordStore {
 public:
+    /// @brief Default cap on the number of long-term records retained; see
+    /// SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS for the rationale, which this mirrors
+    /// so there is one source of truth for the number.
+    static constexpr size_t DEFAULT_MAX_RECORDS = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS;
+
     /// @brief Construct and pre-provision the shared-PSK fallback record and the Pairing PSK.
     /// If a persistence provider is supplied, attempts to load saved records
     /// and pairing config first; generates fresh material only when absent.
     /// @param provider Persistence provider, or nullptr for an in-memory-only store.
     /// @param initial_unpaired_access_enabled First-boot default for unpaired (Sentinel) access.
     ///        Applied only when no pairing config was loaded; a loaded config always wins.
+    /// @param max_records Cap on the number of long-term records retained (see
+    ///        can_store_record()). Defaults to DEFAULT_MAX_RECORDS.
     explicit RecordStore(SendspinPersistenceProvider* provider,
-                         bool initial_unpaired_access_enabled = false);
+                         bool initial_unpaired_access_enabled = false,
+                         size_t max_records = DEFAULT_MAX_RECORDS);
 
     virtual ~RecordStore() = default;
 
@@ -335,10 +343,20 @@ public:
     [[nodiscard]] std::optional<PairingOutcome> resolve_pairing_outcome(
         const std::string& server_id, const std::optional<std::string>& label = std::nullopt);
 
-    /// @brief Return true if a new record can be stored (default: always true).
-    [[nodiscard]] virtual bool can_store_record() const {
-        return true;
-    }
+    /// @brief Return true if a new record can be stored.
+    ///
+    /// The default implementation reports free capacity against max_records_ (see
+    /// DEFAULT_MAX_RECORDS). A provider with its own notion of available storage (for example
+    /// one that tracks actual bytes free in flash) may override this with different logic.
+    ///
+    /// This is an advisory pre-check consulted by callers (resolve_pairing_outcome(),
+    /// management/add-record) before attempting to store a record; the actual insert still goes
+    /// through store_record_impl() under mutex_, which enforces max_records_ directly against
+    /// genuine inserts regardless of what an override reports, so the in-memory array can never
+    /// grow past it. A record replacement (matching psk_id, or a pairing supersede of the
+    /// record already held for the target server_id) is exempt from the cap in both places: it
+    /// does not grow the store.
+    [[nodiscard]] virtual bool can_store_record() const;
 
     // ========================================
     // Storage accounting
@@ -354,20 +372,26 @@ public:
 
     /// @brief Return storage accounting info, or nullopt for unbounded/unknown storage.
     ///
-    /// The default implementation returns nullopt (host-backed provider: unbounded).
-    /// A future bounded-storage provider can override this to report capacity to the
-    /// managing server. When nullopt, the management/result omits the "storage" key.
+    /// The default implementation reports against max_records_ (free = max_records_ minus the
+    /// current record count, capacity = max_records_, both costs 1 slot), since the base store
+    /// is capacity-bounded. A provider whose underlying storage is genuinely unbounded, or that
+    /// tracks capacity some other way (e.g. bytes free in flash), may override this; returning
+    /// nullopt from an override means the management/result omits the "storage" key entirely.
     ///
     /// include_static semantics (attachment point in management.h with_storage):
     ///   - list-records and get-pairing-config: include capacity/costs.
     ///   - all other results: free only.
-    [[nodiscard]] virtual std::optional<StorageReport> storage_accounting() const {
-        return std::nullopt;
-    }
+    [[nodiscard]] virtual std::optional<StorageReport> storage_accounting() const;
 
 private:
     /// @brief Return true if a resolved PSK is a shared-PSK record (long-term, no counterparty).
     static bool is_shared_record(const ResolvedPsk& r);
+
+    /// @brief Return true if there is room for one genuine net-new record under max_records_.
+    /// MUST be called with mutex_ already held.
+    [[nodiscard]] bool has_capacity_locked() const {
+        return this->records_.size() < this->max_records_;
+    }
 
     /// @brief Find the index of a record by psk_id, or npos if absent.
     [[nodiscard]] size_t find_index(const std::string& psk_id) const;
@@ -396,6 +420,9 @@ private:
     bool persist_records_locked();
 
     std::vector<SendspinPairingRecord> records_;
+    /// Cap on records_.size() enforced by has_capacity_locked() / can_store_record() / the base
+    /// storage_accounting(); see DEFAULT_MAX_RECORDS. Set once at construction, then read-only.
+    size_t max_records_{DEFAULT_MAX_RECORDS};
     std::optional<SendspinPairingPsk> pairing_psk_;
     std::optional<std::string> static_pin_;  ///< Configured static PIN (8 decimal digits).
 

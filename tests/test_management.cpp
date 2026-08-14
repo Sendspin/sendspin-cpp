@@ -115,6 +115,17 @@ public:
     }
 };
 
+/// A RecordStore subclass whose underlying storage is genuinely unbounded (e.g. a host
+/// provider backed by unlimited disk), overriding the base's bounded default with nullopt.
+class UnboundedRecordStore : public RecordStore {
+public:
+    explicit UnboundedRecordStore(SendspinPersistenceProvider* provider) : RecordStore(provider) {}
+
+    std::optional<StorageReport> storage_accounting() const override {
+        return std::nullopt;
+    }
+};
+
 }  // namespace
 
 // ===========================================================================
@@ -680,6 +691,26 @@ TEST(ManagementHandler, AddRecordStorageExhausted) {
 
     ManagementAddRecordPayload payload;
     payload.psk = psk_to_b64url(psk);
+
+    ManagementResultPayload result;
+    ManagementEffect effect;
+    handle_add_record(store, payload, result, effect);
+    EXPECT_EQ(result.result, ManagementResult::STORAGE_EXHAUSTED);
+}
+
+// The base RecordStore's default cap (no ExhaustedRecordStore subclass involved) must also
+// produce STORAGE_EXHAUSTED once management/add-record fills every slot.
+TEST(ManagementHandler, AddRecordStorageExhaustedAtDefaultCap) {
+    RecordStore store(nullptr);  // 1 slot already used by the shared fallback record.
+    for (size_t i = 1; i < SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS; ++i) {
+        ASSERT_TRUE(store.store_record(make_client_record("srv-" + std::to_string(i))));
+    }
+    ASSERT_FALSE(store.can_store_record());
+
+    ManagementAddRecordPayload payload;
+    payload.psk = psk_to_b64url(make_random_psk());
+    // No server_id: STORAGE_EXHAUSTED must fire before any server_id well-formedness check, and
+    // omitting it here keeps the test independent of that unrelated validation.
 
     ManagementResultPayload result;
     ManagementEffect effect;
@@ -1387,12 +1418,30 @@ TEST(ManagementProtocol, FormatResultUnpairedAccessEnabledNulloptDefaultsFalse) 
 // ===========================================================================
 
 TEST(ManagementHandler, StorageAccountingNulloptDoesNotAttach) {
-    RecordStore store(nullptr);  // Default implementation returns nullopt.
+    // An override reporting genuinely unbounded storage (nullopt) must still omit "storage".
+    UnboundedRecordStore store(nullptr);
     ManagementResultPayload result;
     result.result = ManagementResult::OK;
 
     attach_storage_accounting(store, result, true);
     EXPECT_FALSE(result.storage.has_value());
+}
+
+// The base RecordStore is capacity-bounded (see SendspinClientConfig::max_pairing_records), so
+// its default storage_accounting() must report real numbers rather than nullopt: a managing
+// server needs to see the actual cap to avoid flooding it via management/add-record.
+TEST(ManagementHandler, StorageAccountingDefaultIsBounded) {
+    RecordStore store(nullptr);  // record_mode_psk_id's shared fallback already occupies 1 slot.
+    ManagementResultPayload result;
+    result.result = ManagementResult::OK;
+
+    attach_storage_accounting(store, result, true);
+    ASSERT_TRUE(result.storage.has_value());
+    ASSERT_TRUE(result.storage->capacity.has_value());
+    EXPECT_EQ(result.storage->capacity.value(),
+              static_cast<int>(SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS));
+    EXPECT_EQ(result.storage->free,
+              static_cast<int>(SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS) - 1);
 }
 
 TEST(ManagementHandler, StorageAccountingBoundedFreeOnly) {
