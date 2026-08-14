@@ -154,14 +154,14 @@ static std::vector<uint8_t> pake_ad_server() {
 }
 
 /// @brief Map NoiseCipherSuitePreference to the full Noise protocol suite name string.
-/// On ESP-IDF, AESGCM is unusable: esphome__noise-c routes AES-GCM through libsodium's
-/// crypto_aead_aes256gcm, which is stubbed out (returns ENOSYS) on Xtensa (no AES-NI /
-/// ARMv8 crypto), so the cipher never initializes. Fall back to ChaChaPoly and warn.
+/// On ESP-IDF, AESGCM is unusable: the esphome__noise-c ESP-IDF component builds with
+/// NOISE_USE_AES=0 by default, so the "AESGCM" cipher name is never registered and
+/// session creation by that suite name fails outright. Fall back to ChaChaPoly and warn.
 static std::string suite_name_for(NoiseCipherSuitePreference pref) {
     if (pref == NoiseCipherSuitePreference::AESGCM) {
 #ifdef ESP_PLATFORM
-        SS_LOGW(TAG, "AESGCM cipher suite is not supported on ESP-IDF (libsodium AES-GCM is "
-                     "unavailable on Xtensa); falling back to ChaChaPoly");
+        SS_LOGW(TAG, "AESGCM cipher suite is not supported on ESP-IDF (not compiled into the "
+                     "noise-c component); falling back to ChaChaPoly");
         return std::string(NOISE_SUITE_CHACHAPOLY);
 #else
         return std::string(NOISE_SUITE_AESGCM);

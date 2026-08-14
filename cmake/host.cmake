@@ -105,9 +105,15 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     #   2. Populate the rweather/noise-c upstream into _deps/noise_c_upstream-src
     #      to obtain the ghash (GCM authentication) source that the esphome-libs
     #      fork omits but that the reference AESGCM backend requires.
-    #   3. Build a `noise_c` STATIC target manually from the exact file list that
-    #      the IDF CMakeLists.txt uses (ref backend only, no libsodium, no OpenSSL),
-    #      plus the ghash sources from upstream.
+    #   3. Build a `noise_c` STATIC target manually with the reference backend only
+    #      (no libsodium, no OpenSSL), plus the ghash sources from upstream. This is
+    #      a deliberate choice for a self-contained host build, not a mirror of the
+    #      ESP-IDF component's active backend: the esphome-libs ESP-IDF component
+    #      compiles both the ref and sodium backends and defaults to
+    #      NOISE_USE_LIBSODIUM=1, so ESP-IDF runs the libsodium DH/cipher backend
+    #      while host runs ref. Host and ESP-IDF therefore exercise different
+    #      crypto backends, and crypto performance measured on host does not
+    #      transfer to ESP-IDF.
     #
     # Compile definitions:
     #   NOISE_USE_REFERENCE_BACKEND=1: use the pure-C reference backend

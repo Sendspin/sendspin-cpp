@@ -77,13 +77,14 @@ struct SendspinPairingConfig {
 /// This sets the preference advertised to the server. ChaChaPoly is the
 /// default and works on every platform.
 ///
-/// AESGCM is NOT usable on ESP-IDF: the esphome__noise-c component routes
-/// AES-GCM through libsodium's crypto_aead_aes256gcm, which is only
-/// implemented for x86 AES-NI / ARMv8 crypto. On Xtensa (ESP32/ESP32-S3)
-/// those functions are stubs that return ENOSYS, so the cipher never
-/// initializes (there is no path to the ESP32 AES hardware peripheral).
-/// On ESP-IDF the library ignores an AESGCM preference and falls back to
-/// ChaChaPoly (see suite_name_for() in connection_manager.cpp).
+/// AESGCM is NOT usable on ESP-IDF: the esphome__noise-c ESP-IDF component
+/// builds with NOISE_USE_AES=0 by default, so the "AESGCM" cipher name is
+/// never registered in noise-c's protocol name table and session creation
+/// by that suite name fails outright. Even if it were enabled, libsodium's
+/// AES-256-GCM implementation is x86 AES-NI / ARMv8 only, so it would not
+/// run on Xtensa (ESP32/ESP32-S3) either. On ESP-IDF the library ignores
+/// an AESGCM preference and falls back to ChaChaPoly (see suite_name_for()
+/// in connection_manager.cpp).
 enum class NoiseCipherSuitePreference : uint8_t {
     CHACHAPOLY = 0,  ///< Prefer Noise_KKpsk2_25519_ChaChaPoly_SHA256 (all platforms).
     AESGCM = 1,      ///< Prefer Noise_KKpsk2_25519_AESGCM_SHA256 (host only; ignored on ESP-IDF).

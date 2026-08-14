@@ -56,7 +56,8 @@ extern const std::string SENTINEL_PSK_ID;
 /// @brief Preferred cipher suite: ChaChaPoly (lower CPU cost, no hardware dep).
 static constexpr std::string_view NOISE_SUITE_CHACHAPOLY{"Noise_KKpsk2_25519_ChaChaPoly_SHA256"};
 
-/// @brief Alternative cipher suite: AES-256-GCM (hardware-accelerated on ESP32).
+/// @brief Alternative cipher suite: AES-256-GCM. Host only; unavailable on ESP-IDF
+/// (see the cipher_suite doc in config.h for why).
 static constexpr std::string_view NOISE_SUITE_AESGCM{"Noise_KKpsk2_25519_AESGCM_SHA256"};
 
 // ============================================================================
