@@ -14,15 +14,12 @@
 
 #include "file_persistence_provider.h"
 
-#include "sendspin/config.h"
 #include "sendspin/persistence_codec.h"
 #include <ArduinoJson.h>
 
-#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <ios>
@@ -45,8 +42,8 @@ namespace sendspin {
 
 namespace {
 
-// Base64url encode/decode (RFC 4648 section 5, no `=` padding) now comes from the library's
-// public sendspin/persistence_codec.h instead of being hand-rolled here, so this file stays
+// Base64url encode/decode (RFC 4648 section 5, no `=` padding) comes from the library's public
+// sendspin/persistence_codec.h instead of being hand-rolled here, so this file stays
 // byte-compatible with the encoding used by the library's own src/platform/base64.h.
 
 /// Read the entire file into a string. Returns empty string on error.
@@ -158,16 +155,6 @@ static bool save_doc(const std::string& path, const JsonDocument& doc) {
     return write_file(path, out);
 }
 
-/// Decode a base64url string to a 32-byte array. Returns false on failure.
-static bool b64u_to_32(const std::string& s, std::array<uint8_t, 32>& out) {
-    auto decoded = base64url_decode(s);
-    if (!decoded.has_value() || decoded->size() != 32) {
-        return false;
-    }
-    std::memcpy(out.data(), decoded->data(), 32);
-    return true;
-}
-
 }  // namespace
 
 // ============================================================================
@@ -177,290 +164,39 @@ static bool b64u_to_32(const std::string& s, std::array<uint8_t, 32>& out) {
 FilePersistenceProvider::FilePersistenceProvider(std::string path) : path_(std::move(path)) {}
 
 // ============================================================================
-// Static keypair
+// Blob store
 // ============================================================================
 
-bool FilePersistenceProvider::save_static_keypair(const std::array<uint8_t, 32>& private_key) {
+std::optional<std::vector<uint8_t>> FilePersistenceProvider::load_blob(const std::string& key) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    doc["static_keypair"]["private_key"] = base64url_encode(private_key.data(), private_key.size());
-    return save_doc(path_, doc);
-}
-
-std::optional<std::array<uint8_t, 32>> FilePersistenceProvider::load_static_keypair() {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    if (!doc["static_keypair"]["private_key"].is<const char*>()) {
+    JsonDocument doc = load_doc(this->path_);
+    if (!doc[key].is<const char*>()) {
         return std::nullopt;
     }
-    std::string s = doc["static_keypair"]["private_key"].as<const char*>();
-    std::array<uint8_t, 32> out{};
-    if (!b64u_to_32(s, out)) {
-        std::fprintf(stderr, "[FilePersistenceProvider] bad static_keypair in persistence file\n");
+    auto decoded = base64url_decode(doc[key].as<const char*>());
+    if (!decoded.has_value()) {
+        std::fprintf(stderr, "[FilePersistenceProvider] bad base64url for key '%s'\n",
+                     key.c_str());
         return std::nullopt;
     }
-    return out;
+    return decoded;
 }
 
-// ============================================================================
-// Last-played server_id
-// ============================================================================
-
-bool FilePersistenceProvider::save_last_played_server_id(const std::string& server_id) {
+bool FilePersistenceProvider::save_blob(const std::string& key, const uint8_t* data, size_t len) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    doc["last_played_server_id"] = server_id;
-    return save_doc(path_, doc);
+    JsonDocument doc = load_doc(this->path_);
+    doc[key] = base64url_encode(data, len);
+    return save_doc(this->path_, doc);
 }
 
-std::optional<std::string> FilePersistenceProvider::load_last_played_server_id() {
+bool FilePersistenceProvider::erase_blob(const std::string& key) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    if (!doc["last_played_server_id"].is<const char*>()) {
-        return std::nullopt;
+    JsonDocument doc = load_doc(this->path_);
+    if (!doc[key].is<const char*>()) {
+        return true;  // Nothing stored: the key is already absent.
     }
-    std::string s = doc["last_played_server_id"].as<const char*>();
-    if (s.empty()) {
-        return std::nullopt;
-    }
-    return s;
-}
-
-// ============================================================================
-// Pairing records
-// ============================================================================
-
-std::vector<SendspinPairingRecord> FilePersistenceProvider::load_pairing_records() {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    std::vector<SendspinPairingRecord> out;
-    JsonArray arr = doc["pairing_records"].as<JsonArray>();
-    if (arr.isNull()) {
-        return out;
-    }
-    for (JsonObject obj : arr) {
-        SendspinPairingRecord rec;
-        if (!obj["psk_id"].is<const char*>() || !obj["psk"].is<const char*>()) {
-            continue;
-        }
-        rec.psk_id = obj["psk_id"].as<const char*>();
-        if (!b64u_to_32(obj["psk"].as<const char*>(), rec.psk)) {
-            continue;
-        }
-        if (obj["server_id"].is<const char*>()) {
-            rec.server_id = obj["server_id"].as<const char*>();
-        }
-        if (obj["label"].is<const char*>()) {
-            rec.label = obj["label"].as<const char*>();
-        }
-        // Guarded like the other fields: as<bool>() coerces any non-boolean variant to
-        // true, so a corrupt "used" value would otherwise flip the single-use gate.
-        if (obj["used"].is<bool>()) {
-            rec.used = obj["used"].as<bool>();
-        }
-        out.push_back(std::move(rec));
-    }
-    return out;
-}
-
-bool FilePersistenceProvider::save_pairing_record(const SendspinPairingRecord& record) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    JsonArray arr = doc["pairing_records"].is<JsonArray>() ? doc["pairing_records"].as<JsonArray>()
-                                                           : doc["pairing_records"].to<JsonArray>();
-
-    // Find and replace an existing entry with the same psk_id, or append.
-    for (JsonObject obj : arr) {
-        if (obj["psk_id"].is<const char*>() &&
-            std::string(obj["psk_id"].as<const char*>()) == record.psk_id) {
-            obj["psk"] = base64url_encode(record.psk.data(), record.psk.size());
-            if (record.server_id.has_value()) {
-                obj["server_id"] = record.server_id.value();
-            } else {
-                obj.remove("server_id");
-            }
-            if (record.label.has_value()) {
-                obj["label"] = record.label.value();
-            } else {
-                obj.remove("label");
-            }
-            obj["used"] = record.used;
-            return save_doc(path_, doc);
-        }
-    }
-
-    // Append new.
-    JsonObject new_obj = arr.add<JsonObject>();
-    new_obj["psk_id"] = record.psk_id;
-    new_obj["psk"] = base64url_encode(record.psk.data(), record.psk.size());
-    if (record.server_id.has_value()) {
-        new_obj["server_id"] = record.server_id.value();
-    }
-    if (record.label.has_value()) {
-        new_obj["label"] = record.label.value();
-    }
-    new_obj["used"] = record.used;
-    return save_doc(path_, doc);
-}
-
-bool FilePersistenceProvider::remove_pairing_record(const std::string& psk_id) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    if (!doc["pairing_records"].is<JsonArray>()) {
-        return true;  // Nothing stored: the record is already absent.
-    }
-    JsonArray arr = doc["pairing_records"].as<JsonArray>();
-    // ArduinoJson does not provide a remove-by-index on JsonArray directly; rebuild the array.
-    JsonDocument tmp;
-    JsonArray new_arr = tmp["r"].to<JsonArray>();
-    for (JsonObject obj : arr) {
-        if (!obj["psk_id"].is<const char*>() ||
-            std::string(obj["psk_id"].as<const char*>()) == psk_id) {
-            continue;  // Skip the entry to remove.
-        }
-        new_arr.add(obj);
-    }
-    doc["pairing_records"].set(new_arr);
-    return save_doc(path_, doc);
-}
-
-// ============================================================================
-// Accepted Pairing PSK
-// ============================================================================
-
-std::optional<SendspinPairingPsk> FilePersistenceProvider::load_pairing_psk() {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    if (!doc["pairing_psk"]["psk_id"].is<const char*>() ||
-        !doc["pairing_psk"]["psk"].is<const char*>()) {
-        return std::nullopt;
-    }
-    SendspinPairingPsk p;
-    p.psk_id = doc["pairing_psk"]["psk_id"].as<const char*>();
-    if (!b64u_to_32(doc["pairing_psk"]["psk"].as<const char*>(), p.psk)) {
-        return std::nullopt;
-    }
-    if (doc["pairing_psk"]["label"].is<const char*>()) {
-        p.label = doc["pairing_psk"]["label"].as<const char*>();
-    }
-    return p;
-}
-
-bool FilePersistenceProvider::save_pairing_psk(const SendspinPairingPsk& psk) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    doc["pairing_psk"]["psk_id"] = psk.psk_id;
-    doc["pairing_psk"]["psk"] = base64url_encode(psk.psk.data(), psk.psk.size());
-    if (psk.label.has_value()) {
-        doc["pairing_psk"]["label"] = psk.label.value();
-    } else {
-        // Drop any stale label left over from a previously-saved PSK that had one.
-        doc["pairing_psk"].remove("label");
-    }
-    return save_doc(path_, doc);
-}
-
-bool FilePersistenceProvider::clear_pairing_psk() {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    doc.remove("pairing_psk");
-    return save_doc(path_, doc);
-}
-
-// ============================================================================
-// Static PIN
-// ============================================================================
-
-std::optional<std::string> FilePersistenceProvider::load_static_pin() {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    if (!doc["static_pin"].is<const char*>()) {
-        return std::nullopt;
-    }
-    return std::string(doc["static_pin"].as<const char*>());
-}
-
-bool FilePersistenceProvider::save_static_pin(const std::string& pin) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    doc["static_pin"] = pin;
-    return save_doc(path_, doc);
-}
-
-bool FilePersistenceProvider::clear_static_pin() {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    doc.remove("static_pin");
-    return save_doc(path_, doc);
-}
-
-// ============================================================================
-// Pairing config
-// ============================================================================
-
-std::optional<SendspinPairingConfig> FilePersistenceProvider::load_pairing_config() {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    if (!doc["pairing_config"]["record_mode_psk_id"].is<const char*>()) {
-        return std::nullopt;
-    }
-    SendspinPairingConfig cfg;
-    cfg.record_mode_psk_id = doc["pairing_config"]["record_mode_psk_id"].as<const char*>();
-    if (doc["pairing_config"]["pairing_psk_enabled"].is<bool>()) {
-        cfg.pairing_psk_enabled = doc["pairing_config"]["pairing_psk_enabled"].as<bool>();
-    }
-    if (doc["pairing_config"]["unpaired_access_enabled"].is<bool>()) {
-        cfg.unpaired_access_enabled = doc["pairing_config"]["unpaired_access_enabled"].as<bool>();
-    }
-    if (doc["pairing_config"]["dynamic_pin_enabled"].is<bool>()) {
-        cfg.dynamic_pin_enabled = doc["pairing_config"]["dynamic_pin_enabled"].as<bool>();
-    }
-    if (doc["pairing_config"]["static_pin_enabled"].is<bool>()) {
-        cfg.static_pin_enabled = doc["pairing_config"]["static_pin_enabled"].as<bool>();
-    }
-    if (doc["pairing_config"]["dynamic_pin_min_length"].is<int>()) {
-        cfg.dynamic_pin_min_length = doc["pairing_config"]["dynamic_pin_min_length"].as<int>();
-    }
-    if (doc["pairing_config"]["dynamic_pin_failures"].is<int>()) {
-        cfg.dynamic_pin_failures = doc["pairing_config"]["dynamic_pin_failures"].as<int>();
-    }
-    if (cfg.record_mode_psk_id.empty()) {
-        return std::nullopt;
-    }
-    return cfg;
-}
-
-bool FilePersistenceProvider::save_pairing_config(const SendspinPairingConfig& config) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    doc["pairing_config"]["record_mode_psk_id"] = config.record_mode_psk_id;
-    doc["pairing_config"]["pairing_psk_enabled"] = config.pairing_psk_enabled;
-    doc["pairing_config"]["unpaired_access_enabled"] = config.unpaired_access_enabled;
-    doc["pairing_config"]["dynamic_pin_enabled"] = config.dynamic_pin_enabled;
-    doc["pairing_config"]["static_pin_enabled"] = config.static_pin_enabled;
-    doc["pairing_config"]["dynamic_pin_min_length"] = config.dynamic_pin_min_length;
-    doc["pairing_config"]["dynamic_pin_failures"] = config.dynamic_pin_failures;
-    return save_doc(path_, doc);
-}
-
-// ============================================================================
-// Player static delay
-// ============================================================================
-
-bool FilePersistenceProvider::save_static_delay(uint16_t delay_ms) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    doc["static_delay_ms"] = delay_ms;
-    return save_doc(path_, doc);
-}
-
-std::optional<uint16_t> FilePersistenceProvider::load_static_delay() {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    JsonDocument doc = load_doc(path_);
-    if (!doc["static_delay_ms"].is<uint16_t>()) {
-        return std::nullopt;
-    }
-    return doc["static_delay_ms"].as<uint16_t>();
+    doc.remove(key);
+    return save_doc(this->path_, doc);
 }
 
 }  // namespace sendspin

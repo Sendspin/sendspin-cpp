@@ -434,123 +434,116 @@ struct HostNetworkProvider : SendspinNetworkProvider {
 
 Allows the library to persist state across reboots. Required for stable identity and
 pairing. On host platforms `examples/common/file_persistence_provider.h` provides
-`FilePersistenceProvider`, which persists to a JSON file -- use it directly or as a
-reference implementation.
+`FilePersistenceProvider`, which persists to a single JSON file (one document mapping each
+key below to `base64url(bytes)`) -- use it directly or as a reference implementation.
 
-Most methods are called on the main loop thread. The exception is `save_pairing_record`,
-which is also called on the network thread when a pairing finalizes (the record must be
-stored before the server's immediate re-handshake resolves it). A network-thread
-`save_pairing_record` can therefore overlap a main-loop call to another method, so an
-implementation that shares state across methods (a file, a handle) must serialize its own
-access. `FilePersistenceProvider` guards every method with a mutex.
-
-#### Method contract
-
-**Static keypair** (required for stable identity and pairing):
-
-- `save_static_keypair(key)` -- store the 32-byte raw X25519 private key. Called once on
-  first boot, or after a key reset. Return `true` on success.
-- `load_static_keypair()` -- return the saved private key, or `nullopt` if not yet saved.
-  Returning `nullopt` causes the library to generate a new keypair and call
-  `save_static_keypair` immediately.
-
-**Last-played server** (used for server-preference arbitration):
-
-- `save_last_played_server_id(server_id)` -- store the `server_id` string (base64url
-  public key of the server) whenever a playback connection completes. May be called
-  frequently; implementations should tolerate repeated calls with the same value.
-- `load_last_played_server_id()` -- return the saved `server_id`, or `nullopt` if none.
-
-**Pairing records** (long-term trust, required for paired connections to survive reboots):
-
-- `load_pairing_records()` -- return all stored records (may be empty).
-- `save_pairing_record(record)` -- persist a `SendspinPairingRecord`, adding it or
-  replacing any existing entry with the same `psk_id`. Called on the main loop (management
-  add-record, and provisioning during `start_server`) and on the network thread when a
-  pairing finalizes; must be safe to call from either thread. Return `true` on success. A
-  `false` return fails the pairing closed: the client reports
-  `SendspinPairAbortReason::STORAGE_FAILED` via `on_pairing_failed` and drops the
-  connection rather than complete a pairing that could not survive a reboot.
-- `remove_pairing_record(psk_id)` -- remove the record with the given `psk_id`. Return
-  `true` if the record is gone from the store; an absent record counts as success. Report a
-  failed delete honestly: the client drops the record from RAM either way, so the revocation
-  holds for the current boot, but a store that still holds the record hands it back at the
-  next start and the revoked PSK becomes valid again. A `false` return makes the client log
-  a warning saying exactly that.
-
-**Accepted Pairing PSK** (distributes an out-of-band PSK to admit servers before pairing):
-
-- `load_pairing_psk()` -- return the stored `SendspinPairingPsk`, or `nullopt` if none.
-- `save_pairing_psk(psk)` -- persist a new accepted Pairing PSK. Return `true` on success.
-- `clear_pairing_psk()` -- remove the accepted Pairing PSK. Return `true` on success; same
-  contract as `remove_pairing_record`, since a PSK that survives keeps authenticating
-  pairing attempts.
-
-**Static PIN** (used by the static-PIN pairing method, when enabled):
-
-- `load_static_pin()` -- return the configured static PIN, or `nullopt` if none.
-- `save_static_pin(pin)` -- persist the configured static PIN. Return `true` on success.
-- `clear_static_pin()` -- remove the configured static PIN. Return `true` on success; same
-  contract as `remove_pairing_record`, since a PIN that survives keeps pairing devices.
-
-**Pairing policy** (whether unpaired access or the Pairing PSK method is enabled):
-
-- `load_pairing_config()` -- return the stored `SendspinPairingConfig`, or `nullopt` to
-  use the compile-time defaults.
-- `save_pairing_config(config)` -- persist updated policy. Return `true` on success.
-
-**Player static delay** (optional, unrelated to encryption):
-
-- `save_static_delay(delay_ms)` -- persist the user-adjustable static delay in
-  milliseconds. Return `true` on success.
-- `load_static_delay()` -- return the saved delay, or `nullopt` if none saved. When
-  `nullopt` the `PlayerRoleConfig::initial_static_delay_ms` value is used.
-
-Every method has a default no-op / `nullopt` / empty-vector implementation so you can
-implement only the methods you need. The minimum useful set for a deployed device is
-`save_static_keypair` + `load_static_keypair` (for stable identity) and
-`save_pairing_record` + `load_pairing_records` (for pairing to survive reboots).
+The interface is a plain byte-blob store -- three methods, independent of what is being
+stored:
 
 ```cpp
-struct MyPersistenceProvider : SendspinPersistenceProvider {
-    bool save_static_keypair(const std::array<uint8_t, 32>& key) override {
-        return nvs_write_bytes("static_keypair", key.data(), key.size());
-    }
-    std::optional<std::array<uint8_t, 32>> load_static_keypair() override {
-        std::array<uint8_t, 32> key{};
-        if (nvs_read_bytes("static_keypair", key.data(), key.size())) return key;
-        return std::nullopt;
-    }
-
-    bool save_last_played_server_id(const std::string& server_id) override {
-        return nvs_write_str("last_server", server_id);
-    }
-    std::optional<std::string> load_last_played_server_id() override {
-        std::string id;
-        if (nvs_read_str("last_server", id)) return id;
-        return std::nullopt;
-    }
-
-    // Implement save/load_pairing_record, save/load_static_delay, etc. as needed.
+class SendspinPersistenceProvider {
+public:
+    virtual std::optional<std::vector<uint8_t>> load_blob(const std::string& key);
+    virtual bool save_blob(const std::string& key, const uint8_t* data, size_t len);
+    virtual bool erase_blob(const std::string& key);
 };
 ```
 
-#### Migrating from a Pre-Encryption Release
+The library owns all serialization. It calls these three methods with one of the fixed keys
+below; a provider never needs to parse or interpret the bytes, only store and return them
+byte-for-byte.
 
-If your `SendspinPersistenceProvider` implementation predates mandatory Noise encryption, two
-things changed:
+Most keys are only ever touched from the main loop thread. Two exceptions:
 
-- The interface grew from 4 methods to 17 (see Method contract above). Every new method has a
-  safe no-op / `nullopt` default, so you only need to implement what your deployment actually
-  uses -- at minimum `save_static_keypair` + `load_static_keypair` for a stable identity, and
-  `save_pairing_record` + `load_pairing_records` for pairing to survive reboots.
-- `save_last_server_hash(uint32_t)` / `load_last_server_hash()` were replaced by
-  `save_last_played_server_id(const std::string&)` / `load_last_played_server_id()`. This is a
-  rename and a retype, not just a rename: the old methods stored an FNV1 hash of the server
-  id, the new ones store the raw base64url `server_id` string. An existing `override` of the
-  old methods will fail to compile after upgrading; that is intentional, since a hash-based
-  override left in place would silently stop being called (it no longer overrides anything)
-  rather than failing loudly.
+- `save_blob(persistence_keys::RECORDS, ...)` is also called on the network thread when a
+  pairing finalizes (the record must be durable before the server's immediate re-handshake
+  resolves it). This can therefore overlap a main-loop call to another key, so an
+  implementation that shares state across keys (a file, a handle) must serialize its own
+  access. `FilePersistenceProvider` guards every call with a mutex.
+- `save_blob(persistence_keys::KEYPAIR, ...)` fires once, during `start_server()` (main loop),
+  called out only because it is a startup-time write rather than a response to a runtime event.
+
+#### Keyspace
+
+Every key is a fixed constant from the `persistence_keys` namespace (`sendspin/client.h`), at
+most 12 characters (comfortably under a typical NVS key's 15-character limit). A provider must
+not invent its own keys; it only needs to store and return whatever bytes the library gives it
+for each of these:
+
+| Key | Contents |
+|---|---|
+| `persistence_keys::KEYPAIR` | 32 raw bytes: the static X25519 private key. No codec. |
+| `persistence_keys::RECORDS` | The WHOLE `SendspinPairingRecord` array as one codec blob (`encode_pairing_records()` / `decode_pairing_records()` in `sendspin/persistence_codec.h`). Stays present (possibly as an empty array) once any record has ever existed. |
+| `persistence_keys::PAIRING_PSK` | The accepted `SendspinPairingPsk` as one codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). |
+| `persistence_keys::STATIC_PIN` | Raw UTF-8 bytes: the configured static PIN string. |
+| `persistence_keys::PAIR_CONFIG` | The `SendspinPairingConfig` as one codec blob (`encode_pairing_config()` / `decode_pairing_config()`). |
+| `persistence_keys::LAST_PLAYED` | Raw UTF-8 bytes: the `server_id` (base64url public key) of the last server that played audio. |
+| `persistence_keys::STATIC_DELAY` | ASCII decimal string (e.g. `"150"`): the player's static delay in milliseconds. Chosen over raw `uint16_t` bytes for debuggability and to avoid an endianness dependency. |
+
+`sendspin/persistence_codec.h` is public so a custom provider (or a test) can inspect or seed
+the `RECORDS` / `PAIRING_PSK` / `PAIR_CONFIG` content in exactly the format the library itself
+produces -- it is not something a provider hand-rolls its own version of.
+
+#### Durability contract
+
+- `save_blob()` returning `true` means DURABLY stored. This matters most for
+  `persistence_keys::RECORDS`: the library gates pairing completion on it (a `false` return
+  during pairing fails the exchange closed -- the client reports
+  `SendspinPairAbortReason::STORAGE_FAILED` via `on_pairing_failed` and drops the connection
+  rather than complete a pairing that could not survive a reboot) and gates revocation
+  durability on it for removals (a revoked record is always dropped from RAM regardless of the
+  return value, but a `false` return means the store still holds the old array and will hand
+  the revoked record back at the next boot, silently making the revoked PSK valid again -- the
+  library logs a warning saying exactly that).
+- `erase_blob()` is only ever called for `persistence_keys::PAIRING_PSK` and
+  `persistence_keys::STATIC_PIN` (a removal from `RECORDS` re-saves the shrunken array instead,
+  so that key stays present). Absent counts as success. Same durability contract as a rejected
+  save: the in-memory effect of the clear always happens regardless of the return value, but a
+  `false` return means the cleared PSK/PIN may still be in the store and will resume
+  authenticating pairing attempts / admitting the static PIN after a reboot.
+
+Every method has a default no-op / `nullopt` implementation, so you can implement only the
+keys your deployment actually needs. The minimum useful set for a deployed device is
+`persistence_keys::KEYPAIR` (for stable identity) and `persistence_keys::RECORDS` (for pairing
+to survive reboots).
+
+```cpp
+struct MyPersistenceProvider : SendspinPersistenceProvider {
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        std::vector<uint8_t> bytes;
+        if (nvs_read_bytes(key.c_str(), bytes)) return bytes;
+        return std::nullopt;
+    }
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        return nvs_write_bytes(key.c_str(), data, len);
+    }
+    bool erase_blob(const std::string& key) override {
+        return nvs_erase(key.c_str());  // Return true if the key is already absent, too.
+    }
+};
+```
+
+A provider backed by a single flat NVS namespace (as above) can often implement the whole
+interface generically, since every key is already sized to fit and the library handles
+serialization; a provider that needs different backing per key (e.g. a plaintext-secrets file
+plus separate flash-wear-optimized storage for `STATIC_DELAY`) can switch on `key` instead.
+
+#### Migrating from a Pre-Blob-Store Release
+
+If your `SendspinPersistenceProvider` implementation predates the blob-store interface, it
+implemented up to 17 typed methods (`save_static_keypair`, `load_pairing_records`,
+`save_pairing_psk`, etc.) instead of the three generic ones above. There is no compatibility
+shim: override `load_blob` / `save_blob` / `erase_blob` instead, using the keyspace table above
+to know which key replaces which old method, and `sendspin/persistence_codec.h` to encode/decode
+the struct types the old typed methods took directly. A provider carrying old typed `override`s
+will fail to compile after upgrading (they no longer override anything); that is intentional
+rather than silently no-op-ing.
+
+The on-disk format is not preserved across this migration either: `examples/common/
+file_persistence_provider.h`'s `FilePersistenceProvider` now stores one JSON document mapping
+key to `base64url(bytes)`, replacing the old per-struct JSON layout. A file written by the old
+provider is not read by the new one; delete it and let the device re-provision (a fresh keypair,
+a fresh Pairing PSK) rather than trying to hand-migrate the old format.
 
 ### SendspinClientListener (Optional)
 
@@ -728,8 +721,8 @@ observes pairing via `SendspinClientListener` callbacks:
 #### Pairing PSK
 
 `pairing_psk` is the pairing method every client must implement, so the library provisions a
-random Pairing PSK on first boot and persists it through `save_pairing_psk`. Nothing is
-required of the application to enable the method.
+random Pairing PSK on first boot and persists it as a `persistence_keys::PAIRING_PSK` blob.
+Nothing is required of the application to enable the method.
 
 To pair, the server must learn that PSK out of band. Surface it as a **pairing token** -- one
 `"SP:"`-prefixed string carrying the `client_id` and the PSK together, for the operator to
@@ -743,19 +736,22 @@ The token is stable for the lifetime of the stored PSK, so it can be printed at 
 in a UI, or rendered as a QR code.
 
 To pin a specific PSK instead (for factory provisioning, where the same key is baked into a
-setup tool), write one through the persistence provider before `start_server()`:
+setup tool), write one through the persistence provider before `start_server()`, encoded with
+the codec so it round-trips through the library's own loader:
 
 ```cpp
 SendspinPairingPsk psk;
 // 32 raw bytes distributed out-of-band during provisioning
 psk.psk = { /* ... */ };
 psk.psk_id = "";  // derived from psk by the library; any value here is ignored
-persistence_provider.save_pairing_psk(psk);
+std::string blob = encode_pairing_psk(psk);  // sendspin/persistence_codec.h
+persistence_provider.save_blob(persistence_keys::PAIRING_PSK,
+                                reinterpret_cast<const uint8_t*>(blob.data()), blob.size());
 ```
 
 After pairing completes, `on_pairing_succeeded` fires and the long-term record is stored
-by the library via `save_pairing_record`. Subsequent boots load the record via
-`load_pairing_records`; no further provisioning is needed.
+by the library as a `persistence_keys::RECORDS` blob. Subsequent boots load that same blob;
+no further provisioning is needed.
 
 #### PIN pairing
 
@@ -824,32 +820,43 @@ wins, so a server that turns unpaired access off through `management/set-pairing
 it off across reboots. With no persistence provider there is no stored config, so the seed
 applies on every start.
 
-A config that fails to load is not treated as a first boot. `load_pairing_config()` returns
-`std::nullopt` both when nothing was ever stored and when the stored config could not be read
-back, and the interface gives a provider no way to tell the client which happened. If any
-provisioned material survives -- a pairing record or the Pairing PSK -- the seed is skipped and
-unpaired access stays disabled, so a damaged config on a paired device fails closed rather than
-silently reopening unauthenticated access. A store that lost everything is indistinguishable
-from a factory-fresh device, so the seed does apply there.
+A config that fails to load is not treated as a first boot. The library's internal load of the
+`persistence_keys::PAIR_CONFIG` blob is treated as "nothing stored" both when the key is truly
+absent and when the stored blob fails to decode, and the interface gives a provider no way to
+tell the client which happened. If any provisioned material survives -- a pairing record or the
+Pairing PSK -- the seed is skipped and unpaired access stays disabled, so a damaged config on a
+paired device fails closed rather than silently reopening unauthenticated access. A store that
+lost everything is indistinguishable from a factory-fresh device, so the seed does apply there.
 
 An application that manages the persisted pairing config itself can write the flag directly,
-but it must read-modify-write the stored config rather than save a fresh one:
+but it must read-modify-write the stored blob rather than save a fresh one:
 
 ```cpp
-auto pairing_cfg = persistence_provider.load_pairing_config();
-if (pairing_cfg.has_value()) {
-    pairing_cfg->unpaired_access_enabled = true;
-    persistence_provider.save_pairing_config(*pairing_cfg);
+auto blob = persistence_provider.load_blob(persistence_keys::PAIR_CONFIG);
+if (blob.has_value()) {
+    std::string text(blob->begin(), blob->end());
+    auto cfg = decode_pairing_config(text);  // sendspin/persistence_codec.h
+    if (cfg.has_value()) {
+        cfg->unpaired_access_enabled = true;
+        std::string encoded = encode_pairing_config(*cfg);
+        persistence_provider.save_blob(persistence_keys::PAIR_CONFIG,
+                                        reinterpret_cast<const uint8_t*>(encoded.data()),
+                                        encoded.size());
+    }
 }
 ```
 
-A default-constructed `SendspinPairingConfig` has an empty `record_mode_psk_id`, so saving one
-drops the client's reference to its shared-PSK fallback record. A provider is free to reject
-that config outright, and the bundled `FilePersistenceProvider` does -- it reports an empty
-`record_mode_psk_id` as "nothing stored". Writing a bare config to disable unpaired access is
-therefore doubly wrong: the write is discarded, and the resulting empty store makes the next
-start a first boot, which re-applies `initial_unpaired_access_enabled` and turns the flag back
-on. Before the first `start_server()` there is no stored config to modify, so use the seed.
+This is why the read-modify-write step matters: the provider is a byte store and does not
+validate what it is handed, so saving a bare, default-constructed `SendspinPairingConfig`
+*will* be written and *will* take effect on the next boot -- silently resetting every policy
+field (`pairing_psk_enabled`, `dynamic_pin_enabled`, and in particular the empty
+`record_mode_psk_id`, which drops the client's reference to its shared-PSK fallback record) to
+the struct's compiled-in defaults rather than merely failing to change `unpaired_access_enabled`.
+`RecordStore` does notice the empty `record_mode_psk_id` and re-provisions a fresh shared-PSK
+fallback record for it, but that repair does not restore the OTHER policy fields the bare write
+clobbered, and it does not count as a first boot (the config blob still decoded successfully),
+so `initial_unpaired_access_enabled` is not reapplied either. Before the first `start_server()`
+there is no stored config to modify, so use the seed instead.
 
 Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
 unpaired access after the device is paired is the typical production configuration.
@@ -977,9 +984,9 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 
 `ArtworkRole::frame_done()` must be called from the main loop thread (typically from inside `on_image_display()`/`on_image_clear()` or when a cross-fade animation completes).
 
-`SendspinPersistenceProvider` methods are called on the main loop thread, except
-`save_pairing_record`, which is also called on the network thread when a pairing finalizes
-(see the `SendspinPersistenceProvider` section above).
+`SendspinPersistenceProvider` calls are on the main loop thread for every key except
+`persistence_keys::RECORDS`, whose `save_blob()` is also called on the network thread when a
+pairing finalizes (see the `SendspinPersistenceProvider` section above).
 
 ## Minimal Example
 

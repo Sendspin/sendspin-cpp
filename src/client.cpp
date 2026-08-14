@@ -48,6 +48,7 @@
 #endif
 #include <ArduinoJson.h>
 
+#include <algorithm>
 #include <utility>
 
 static const char* const TAG = "sendspin.client";
@@ -1508,20 +1509,27 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
 
 bool SendspinClient::load_or_generate_identity() {
     if (this->persistence_provider_ != nullptr) {
-        auto saved_priv = this->persistence_provider_->load_static_keypair();
-        if (saved_priv.has_value()) {
-            auto loaded = Identity::from_private_bytes(saved_priv.value());
+        auto saved_priv = this->persistence_provider_->load_blob(persistence_keys::KEYPAIR);
+        // No codec involved: the keypair blob is exactly 32 raw bytes, so the only validation
+        // needed here is the exact-length check -- anything else is corrupt or the wrong key.
+        if (saved_priv.has_value() && saved_priv->size() == 32) {
+            std::array<uint8_t, 32> priv_bytes{};
+            std::copy(saved_priv->begin(), saved_priv->end(), priv_bytes.begin());
+            auto loaded = Identity::from_private_bytes(priv_bytes);
             if (loaded.has_value()) {
                 this->identity_ = std::make_unique<Identity>(loaded.value());
                 this->client_id_ = this->identity_->peer_id();
                 SS_LOGI(TAG, "Loaded static keypair; client_id=%s", this->client_id_.c_str());
                 return true;
             }
-            // Stored key is corrupt/wrong-length, or the underlying DH computation failed --
-            // do not use it and do not treat this as an all-zero identity. Fall through and
-            // generate a fresh identity (the device will need to re-pair) rather than
-            // proceeding with a predictable/zero key.
+            // Stored key is corrupt, or the underlying DH computation failed -- do not use it
+            // and do not treat this as an all-zero identity. Fall through and generate a fresh
+            // identity (the device will need to re-pair) rather than proceeding with a
+            // predictable/zero key.
             SS_LOGW(TAG, "Stored static keypair is invalid; generating a new one");
+        } else if (saved_priv.has_value()) {
+            SS_LOGW(TAG, "Stored static keypair has the wrong size (%zu bytes); regenerating",
+                    saved_priv->size());
         }
     }
 
@@ -1538,7 +1546,9 @@ bool SendspinClient::load_or_generate_identity() {
     this->client_id_ = this->identity_->peer_id();
 
     if (this->persistence_provider_ != nullptr) {
-        if (this->persistence_provider_->save_static_keypair(this->identity_->private_bytes)) {
+        if (this->persistence_provider_->save_blob(persistence_keys::KEYPAIR,
+                                                   this->identity_->private_bytes.data(),
+                                                   this->identity_->private_bytes.size())) {
             SS_LOGI(TAG, "Generated and persisted static keypair; client_id=%s",
                     this->client_id_.c_str());
         } else {
@@ -1557,10 +1567,11 @@ void SendspinClient::load_last_played_server() {
         return;
     }
 
-    auto server_id = this->persistence_provider_->load_last_played_server_id();
-    if (server_id.has_value() && !server_id->empty()) {
-        this->connection_manager_->set_last_played_server_id(server_id.value());
-        SS_LOGI(TAG, "Loaded last played server: %s", server_id->c_str());
+    auto server_id_blob = this->persistence_provider_->load_blob(persistence_keys::LAST_PLAYED);
+    if (server_id_blob.has_value() && !server_id_blob->empty()) {
+        std::string server_id(server_id_blob->begin(), server_id_blob->end());
+        this->connection_manager_->set_last_played_server_id(server_id);
+        SS_LOGI(TAG, "Loaded last played server: %s", server_id.c_str());
     }
 }
 
@@ -1572,7 +1583,9 @@ void SendspinClient::persist_last_played_server(const std::string& server_id) {
     this->connection_manager_->set_last_played_server_id(server_id);
 
     if (this->persistence_provider_) {
-        if (this->persistence_provider_->save_last_played_server_id(server_id)) {
+        if (this->persistence_provider_->save_blob(
+                persistence_keys::LAST_PLAYED, reinterpret_cast<const uint8_t*>(server_id.data()),
+                server_id.size())) {
             SS_LOGD(TAG, "Persisted last played server: %s", server_id.c_str());
         } else {
             SS_LOGW(TAG, "Failed to persist last played server");

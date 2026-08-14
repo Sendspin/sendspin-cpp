@@ -20,7 +20,36 @@
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 
+#include <charconv>
+
 static const char* const TAG = "sendspin.player";
+
+/// @brief Parses the ASCII-decimal static-delay blob (persistence_keys::STATIC_DELAY).
+/// @return The parsed value, or nullopt if the blob is empty, contains anything other than
+///         decimal digits, or does not fit in a uint16_t. Chosen over raw uint16_t bytes for
+///         debuggability and to avoid an endianness dependency; an invalid value is treated as
+///         though nothing were saved rather than as an error.
+static std::optional<uint16_t> parse_static_delay_blob(const std::vector<uint8_t>& blob) {
+    if (blob.empty()) {
+        return std::nullopt;
+    }
+    const char* begin = reinterpret_cast<const char*>(blob.data());
+    const char* end = begin + blob.size();
+    uint16_t value = 0;
+    auto result = std::from_chars(begin, end, value);
+    if (result.ec != std::errc() || result.ptr != end) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+/// @brief Encodes a static-delay value as its ASCII-decimal blob for
+/// persistence_keys::STATIC_DELAY.
+static std::string encode_static_delay_blob(uint16_t delay_ms) {
+    char buf[6];  // "65535" (5 digits) + headroom; std::to_chars never null-terminates.
+    auto result = std::to_chars(buf, buf + sizeof(buf), delay_ms);
+    return std::string(buf, result.ptr);
+}
 
 /// @brief Size of the big-endian 64-bit timestamp at the start of player binary messages.
 static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
@@ -574,7 +603,10 @@ void PlayerRole::Impl::load_static_delay() {
         return;
     }
 
-    auto delay = this->persistence->load_static_delay();
+    std::optional<uint16_t> delay;
+    if (auto blob = this->persistence->load_blob(persistence_keys::STATIC_DELAY)) {
+        delay = parse_static_delay_blob(blob.value());
+    }
     if (delay.has_value()) {
         if (delay.value() <= MAX_STATIC_DELAY_MS) {
             this->static_delay_ms.store(delay.value(), std::memory_order_relaxed);
@@ -599,7 +631,10 @@ uint16_t PlayerRole::Impl::get_effective_static_delay_ms() const {
 void PlayerRole::Impl::persist_static_delay() const {
     if (this->persistence) {
         uint16_t delay = this->static_delay_ms.load(std::memory_order_relaxed);
-        if (this->persistence->save_static_delay(delay)) {
+        std::string encoded = encode_static_delay_blob(delay);
+        if (this->persistence->save_blob(persistence_keys::STATIC_DELAY,
+                                         reinterpret_cast<const uint8_t*>(encoded.data()),
+                                         encoded.size())) {
             SS_LOGD(TAG, "Persisted static delay: %u ms", delay);
         } else {
             SS_LOGW(TAG, "Failed to persist static delay");

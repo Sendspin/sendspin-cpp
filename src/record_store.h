@@ -371,6 +371,16 @@ private:
     /// @brief Persist the current pairing config via the provider.
     void persist_config();
 
+    /// @brief Encode records_ (the WHOLE array) and save it under persistence_keys::RECORDS.
+    ///
+    /// MUST be called with mutex_ already held (the "_locked" suffix), so the encoded snapshot
+    /// is always exactly what is in memory at the moment of the write. Every mutation path that
+    /// touches records_ and needs to persist it goes through this one helper -- see the locking
+    /// discipline comment above its definition in the .cpp for why this is safe and how
+    /// store_record()'s fail-closed contract is preserved despite it.
+    /// @return true on success (or when there is no provider); false on a rejected write.
+    bool persist_records_locked();
+
     std::vector<SendspinPairingRecord> records_;
     std::optional<SendspinPairingPsk> pairing_psk_;
     std::optional<std::string> static_pin_;  ///< Configured static PIN (8 decimal digits).

@@ -19,6 +19,7 @@
 #include "platform/base64.h"
 #include "protocol_messages.h"
 #include "record_store.h"
+#include "sendspin/persistence_codec.h"
 
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
@@ -28,6 +29,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -431,15 +433,24 @@ TEST(DynamicPinEscalation, CanFailAgainAfterReset) {
 // The counter must survive a reboot (spec: "persisted across reboots"): failures recorded in
 // one RecordStore lifetime escalate a store constructed later from the same provider.
 TEST(DynamicPinEscalation, EscalationSurvivesReboot) {
-    /// Minimal provider persisting only the pairing config, as save_pairing_config does.
+    /// Minimal provider persisting only the "pair_config" blob, as RecordStore::persist_config()
+    /// writes it.
     class ConfigOnlyProvider : public SendspinPersistenceProvider {
     public:
-        std::optional<SendspinPairingConfig> load_pairing_config() override {
-            return this->config_;
+        std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+            if (key != persistence_keys::PAIR_CONFIG || !this->config_.has_value()) {
+                return std::nullopt;
+            }
+            std::string encoded = encode_pairing_config(this->config_.value());
+            return std::vector<uint8_t>(encoded.begin(), encoded.end());
         }
-        bool save_pairing_config(const SendspinPairingConfig& config) override {
-            this->config_ = config;
-            return true;
+        bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+            if (key != persistence_keys::PAIR_CONFIG) {
+                return false;
+            }
+            std::string_view text(reinterpret_cast<const char*>(data), len);
+            this->config_ = decode_pairing_config(text);
+            return this->config_.has_value();
         }
 
     private:
@@ -481,16 +492,17 @@ TEST(DynamicPinEscalation, EscalationSurvivesReboot) {
 // guess calls it), so it must not write to flash on every single failure. It persists only at
 // the first failure since a reset and at the failure that crosses the escalation threshold.
 TEST(DynamicPinEscalation, PersistsOnlyAtFirstFailureAndEscalationCrossing) {
-    /// Provider that counts save_pairing_config() calls, so the test can assert exactly which
+    /// Provider that counts "pair_config" blob writes, so the test can assert exactly which
     /// failures triggered a flash write.
     class CountingProvider : public SendspinPersistenceProvider {
     public:
-        std::optional<SendspinPairingConfig> load_pairing_config() override {
-            return std::nullopt;
-        }
-        bool save_pairing_config(const SendspinPairingConfig& config) override {
+        bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+            if (key != persistence_keys::PAIR_CONFIG) {
+                return false;
+            }
             this->save_count++;
-            this->last_saved = config;
+            std::string_view text(reinterpret_cast<const char*>(data), len);
+            this->last_saved = decode_pairing_config(text);
             return true;
         }
 

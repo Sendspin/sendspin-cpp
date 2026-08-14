@@ -19,15 +19,26 @@
 // provisioning. Most tests exercise RecordStore and FilePersistenceProvider
 // standalone; the KeypairPersistsViaClientStartServer test below exercises
 // the full SendspinClient::start_server() -> client_id() path.
+//
+// The persistence provider is a blob store (SendspinPersistenceProvider::load_blob /
+// save_blob / erase_blob); RecordStore and FilePersistenceProvider are pure byte stores for the
+// "records" / "pairing_psk" / "pair_config" keys, so tests that need to inspect or shape what is
+// actually stored go through the codec in sendspin/persistence_codec.h, exactly like production
+// code does. Most fakes here share tests/fake_persistence.h's InMemoryPersistenceProvider;
+// a handful of tests need bespoke behavior (observing removals specifically, serving
+// mismatched/canned codec content) and keep a local fake for that.
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "fake_persistence.h"
 #include "file_persistence_provider.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/persistence_codec.h"
+#include "sendspin/player_role.h"
 
 #include <gtest/gtest.h>
 
@@ -39,6 +50,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -91,6 +103,22 @@ static SendspinPairingPsk make_pairing_psk(const std::optional<std::string>& lab
     return p;
 }
 
+/// Wraps a std::string's bytes as a blob for seed_blob()/save_blob() calls.
+static std::vector<uint8_t> to_bytes(const std::string& s) {
+    return std::vector<uint8_t>(s.begin(), s.end());
+}
+
+/// Decodes a raw blob as a pairing-records array; ASSERT-fails the calling test on decode
+/// failure (helper, not itself a TEST).
+static std::optional<std::vector<SendspinPairingRecord>> decode_records_blob(
+    const std::optional<std::vector<uint8_t>>& blob) {
+    if (!blob.has_value()) {
+        return std::nullopt;
+    }
+    std::string_view text(reinterpret_cast<const char*>(blob->data()), blob->size());
+    return decode_pairing_records(text);
+}
+
 /// A RecordStore subclass that always reports storage exhausted.
 class ExhaustedRecordStore : public RecordStore {
 public:
@@ -102,11 +130,14 @@ public:
     }
 };
 
-/// A persistence provider whose pairing-record writes can be made to fail
-/// (e.g. full or faulty flash).
+/// A persistence provider whose "records" blob writes can be made to fail (e.g. full or faulty
+/// flash). Pairing PSK / pair config writes always succeed; they are not under test here.
 class RejectingPersistenceProvider : public SendspinPersistenceProvider {
 public:
-    bool save_pairing_record(const SendspinPairingRecord& /*record*/) override {
+    bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
+        if (key != persistence_keys::RECORDS) {
+            return true;
+        }
         save_attempts++;
         return !reject;
     }
@@ -150,21 +181,19 @@ TEST(RecordStore, FirstBootProvisioningCreatesPairingPsk) {
     EXPECT_NE(store.pairing_psk()->psk, shared->psk);
 }
 
-/// A persistence provider whose writes for the shared-PSK record, the Pairing PSK, and the
-/// pairing config always fail (e.g. full or read-only NVS), used to verify first-boot
+/// A persistence provider whose writes for the shared-PSK record ("records"), the Pairing PSK,
+/// and the pairing config always fail (e.g. full or read-only NVS), used to verify first-boot
 /// provisioning surfaces a rejected write instead of silently discarding it.
 class AlwaysRejectingProvider : public SendspinPersistenceProvider {
 public:
-    bool save_pairing_record(const SendspinPairingRecord& /*record*/) override {
-        record_save_attempts++;
-        return false;
-    }
-    bool save_pairing_psk(const SendspinPairingPsk& /*psk*/) override {
-        psk_save_attempts++;
-        return false;
-    }
-    bool save_pairing_config(const SendspinPairingConfig& /*config*/) override {
-        config_save_attempts++;
+    bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
+        if (key == persistence_keys::RECORDS) {
+            record_save_attempts++;
+        } else if (key == persistence_keys::PAIRING_PSK) {
+            psk_save_attempts++;
+        } else if (key == persistence_keys::PAIR_CONFIG) {
+            config_save_attempts++;
+        }
         return false;
     }
 
@@ -209,6 +238,68 @@ TEST(RecordStore, FirstBootPskIdIsSentinelPskIdResolvable) {
 }
 
 // =============================================================================
+// New coverage: booting from a blob store seeded purely via the public codec
+// =============================================================================
+
+// A provider seeded entirely through sendspin/persistence_codec.h (no RecordStore involved)
+// must be read back as-is, with no first-boot re-provisioning: the seeded material is complete
+// and valid, so RecordStore has nothing to fill in.
+TEST(RecordStore, BootsFromBlobStoreSeededViaCodec) {
+    InMemoryPersistenceProvider provider;
+
+    SendspinPairingRecord shared = make_shared_record("Fallback");
+    SendspinPairingRecord paired = make_client_record("server-seeded", "Seeded Label");
+    std::string records_blob = encode_pairing_records({shared, paired});
+    provider.seed_blob(persistence_keys::RECORDS, to_bytes(records_blob));
+
+    SendspinPairingPsk psk = make_pairing_psk("Seeded PSK");
+    std::string psk_blob = encode_pairing_psk(psk);
+    provider.seed_blob(persistence_keys::PAIRING_PSK, to_bytes(psk_blob));
+
+    SendspinPairingConfig cfg;
+    cfg.record_mode_psk_id = shared.psk_id;
+    cfg.unpaired_access_enabled = true;
+    std::string cfg_blob = encode_pairing_config(cfg);
+    provider.seed_blob(persistence_keys::PAIR_CONFIG, to_bytes(cfg_blob));
+
+    RecordStore store(&provider);
+
+    EXPECT_EQ(store.record_mode_psk_id(), shared.psk_id);
+    EXPECT_TRUE(store.unpaired_access_enabled());
+    EXPECT_EQ(provider.save_attempts(persistence_keys::RECORDS), 0)
+        << "a fully-seeded store must not trigger first-boot re-provisioning";
+
+    auto resolved_paired = store.resolve_by_psk_id(paired.psk_id);
+    ASSERT_TRUE(resolved_paired.has_value());
+    EXPECT_EQ(resolved_paired->category, PskCategory::LONG_TERM);
+    EXPECT_EQ(resolved_paired->counterparty_id, paired.server_id);
+
+    auto resolved_shared = store.resolve_by_psk_id(shared.psk_id);
+    ASSERT_TRUE(resolved_shared.has_value());
+    EXPECT_EQ(resolved_shared->category, PskCategory::LONG_TERM);
+    EXPECT_FALSE(resolved_shared->counterparty_id.has_value());
+
+    ASSERT_TRUE(store.pairing_psk().has_value());
+    EXPECT_EQ(store.pairing_psk()->psk_id, psk.psk_id);
+    EXPECT_EQ(store.pairing_psk()->psk, psk.psk);
+}
+
+// A "records" blob that fails to decode at all (corrupt bytes, not valid JSON) must not crash or
+// refuse to start: the store falls back to empty and re-provisions from there.
+TEST(RecordStore, CorruptRecordsBlobFallsBackToEmptyStore) {
+    InMemoryPersistenceProvider provider;
+    provider.seed_blob(persistence_keys::RECORDS, to_bytes("not valid json at all {{{"));
+
+    RecordStore store(&provider);
+
+    // First-boot provisioning must have run as if nothing were stored.
+    EXPECT_FALSE(store.record_mode_psk_id().empty());
+    const auto* rec = store.record_by_psk_id(store.record_mode_psk_id());
+    ASSERT_NE(rec, nullptr);
+    EXPECT_FALSE(rec->server_id.has_value());
+}
+
+// =============================================================================
 // Records - reject wrong PSK size
 // =============================================================================
 
@@ -246,6 +337,30 @@ TEST(RecordStore, StoreRecordFailsClosedWhenProviderRejectsWrite) {
     EXPECT_TRUE(!resolved.has_value() || resolved->category != PskCategory::LONG_TERM)
         << "a rejected record must not resolve as long-term";
     EXPECT_EQ(store.record_by_psk_id(rec.psk_id), nullptr);
+}
+
+// New coverage: the same contract, phrased directly against the blob-store interface's
+// "records" key, with the InMemoryPersistenceProvider fake's fail-injection.
+TEST(RecordStore, StoreRecordFailsClosedWhenRecordsBlobSaveIsRejected) {
+    InMemoryPersistenceProvider provider;
+    RecordStore store(&provider);  // First-boot provisioning succeeds normally.
+
+    const int baseline_save_attempts = provider.save_attempts(persistence_keys::RECORDS);
+    provider.reject_save_keys.insert(persistence_keys::RECORDS);
+
+    SendspinPairingRecord rec = make_client_record("server-X");
+    EXPECT_FALSE(store.store_record(rec));
+    EXPECT_EQ(store.record_by_psk_id(rec.psk_id), nullptr);
+    EXPECT_GT(provider.save_attempts(persistence_keys::RECORDS), baseline_save_attempts)
+        << "the rejected write must have been attempted";
+
+    // The persisted blob must still decode to exactly what it held before the rejected write:
+    // the new record must not have leaked into the store despite the rejection.
+    auto decoded = decode_records_blob(provider.blob(persistence_keys::RECORDS));
+    ASSERT_TRUE(decoded.has_value());
+    for (const auto& r : decoded.value()) {
+        EXPECT_NE(r.psk_id, rec.psk_id);
+    }
 }
 
 TEST(RecordStore, StoreRecordReportsSuccessWithoutProvider) {
@@ -501,54 +616,63 @@ TEST(RecordStore, RemoveRecordAndList) {
     store.remove_record("absent-psk-id");
 }
 
-/// A provider that accepts writes but can refuse deletes, standing in for a store whose delete
-/// path fails on its own (full or read-only NVS, a torn write) while saves still work. A refused
-/// delete leaves the entry in `saved`, so a later load_pairing_records() hands it back exactly
-/// as a real store would after a reboot.
+/// A persistence provider that accepts every "records" blob save EXCEPT one that drops a
+/// psk_id which was present in the previously-accepted blob (i.e. a removal), standing in for a
+/// store whose delete path fails on its own (full or read-only NVS, a torn write) while saves
+/// that only add/replace still work. Distinguishes an add from a removal by diffing the
+/// newly-offered array against the last array it accepted -- the store is a pure byte store in
+/// production, but a test fake is free to peek at its own content to model this.
 class RejectingDeleteProvider : public SendspinPersistenceProvider {
 public:
-    bool save_pairing_record(const SendspinPairingRecord& record) override {
-        saved.push_back(record);
-        return true;
-    }
-    std::vector<SendspinPairingRecord> load_pairing_records() override {
-        return saved;
-    }
-    bool remove_pairing_record(const std::string& psk_id) override {
-        remove_attempts.push_back(psk_id);
-        if (refuse_delete) {
-            return false;  // The record stays on "disk".
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        if (key != persistence_keys::RECORDS) {
+            return std::nullopt;
         }
-        saved.erase(std::remove_if(saved.begin(), saved.end(),
-                                   [&](const SendspinPairingRecord& r) {
-                                       return r.psk_id == psk_id;
-                                   }),
-                    saved.end());
+        std::string encoded = encode_pairing_records(this->saved_);
+        return std::vector<uint8_t>(encoded.begin(), encoded.end());
+    }
+
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        if (key != persistence_keys::RECORDS) {
+            return true;  // Pairing PSK / pair config writes are not under test here.
+        }
+        std::string_view text(reinterpret_cast<const char*>(data), len);
+        auto decoded = decode_pairing_records(text).value_or(std::vector<SendspinPairingRecord>{});
+
+        for (const auto& old_rec : this->saved_) {
+            bool still_present = std::any_of(
+                decoded.begin(), decoded.end(),
+                [&](const SendspinPairingRecord& r) { return r.psk_id == old_rec.psk_id; });
+            if (!still_present) {
+                this->remove_attempts.push_back(old_rec.psk_id);
+                if (this->refuse_delete) {
+                    return false;  // Reject the whole write; saved_ stays as it was.
+                }
+            }
+        }
+        this->saved_ = std::move(decoded);
         return true;
     }
-    bool save_pairing_psk(const SendspinPairingPsk& /*psk*/) override {
-        return true;
-    }
-    bool clear_pairing_psk() override {
-        clear_psk_attempts++;
-        return !refuse_delete;
-    }
-    bool save_static_pin(const std::string& /*pin*/) override {
-        return true;
-    }
-    bool clear_static_pin() override {
-        clear_pin_attempts++;
-        return !refuse_delete;
-    }
-    bool save_pairing_config(const SendspinPairingConfig& /*config*/) override {
+
+    bool erase_blob(const std::string& key) override {
+        if (key == persistence_keys::PAIRING_PSK) {
+            this->clear_psk_attempts++;
+            return !this->refuse_delete;
+        }
+        if (key == persistence_keys::STATIC_PIN) {
+            this->clear_pin_attempts++;
+            return !this->refuse_delete;
+        }
         return true;
     }
 
     bool refuse_delete{true};
-    std::vector<SendspinPairingRecord> saved{};
     std::vector<std::string> remove_attempts{};
     int clear_psk_attempts{0};
     int clear_pin_attempts{0};
+
+private:
+    std::vector<SendspinPairingRecord> saved_{};
 };
 
 /// Captures stderr (where the host SS_LOG* macros write) for the duration of its scope, so a
@@ -738,7 +862,7 @@ TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
     auto resolved = rebooted.resolve_by_psk_id(a.psk_id);
     ASSERT_TRUE(resolved.has_value())
         << "the provider kept the record, so it must come back -- this is what the false return "
-           "from remove_pairing_record() warns about";
+           "from a rejected \"records\" save warns about";
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
 }
 
@@ -851,13 +975,21 @@ class MismatchedPairingPskProvider : public SendspinPersistenceProvider {
 public:
     explicit MismatchedPairingPskProvider(SendspinPairingPsk psk) : psk_(std::move(psk)) {}
 
-    std::optional<SendspinPairingPsk> load_pairing_psk() override {
-        return this->psk_;
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        if (key != persistence_keys::PAIRING_PSK) {
+            return std::nullopt;
+        }
+        std::string encoded = encode_pairing_psk(this->psk_);
+        return std::vector<uint8_t>(encoded.begin(), encoded.end());
     }
 
-    bool save_pairing_psk(const SendspinPairingPsk& psk) override {
-        this->saved = psk;
-        return true;
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        if (key != persistence_keys::PAIRING_PSK) {
+            return false;
+        }
+        std::string_view text(reinterpret_cast<const char*>(data), len);
+        this->saved = decode_pairing_psk(text);
+        return this->saved.has_value();
     }
 
     std::optional<SendspinPairingPsk> saved;
@@ -930,11 +1062,12 @@ TEST(FilePersistenceProvider, KeypairPersistsAcrossReboots) {
     // "First boot": generate and persist.
     {
         FilePersistenceProvider provider(tmp.path());
-        auto loaded = provider.load_static_keypair();
+        auto loaded = provider.load_blob(persistence_keys::KEYPAIR);
         EXPECT_FALSE(loaded.has_value()) << "No key yet on first boot";
 
         Identity id = Identity::generate().value();
-        EXPECT_TRUE(provider.save_static_keypair(id.private_bytes));
+        EXPECT_TRUE(provider.save_blob(persistence_keys::KEYPAIR, id.private_bytes.data(),
+                                       id.private_bytes.size()));
         client_id_first = id.peer_id();
         pub_first = id.public_bytes;
     }
@@ -942,10 +1075,13 @@ TEST(FilePersistenceProvider, KeypairPersistsAcrossReboots) {
     // "Reboot": reload and verify same keypair.
     {
         FilePersistenceProvider provider(tmp.path());
-        auto loaded = provider.load_static_keypair();
+        auto loaded = provider.load_blob(persistence_keys::KEYPAIR);
         ASSERT_TRUE(loaded.has_value()) << "Key should be present after first boot";
+        ASSERT_EQ(loaded->size(), 32u);
 
-        Identity rehydrated = Identity::from_private_bytes(loaded.value()).value();
+        std::array<uint8_t, 32> priv_bytes{};
+        std::copy(loaded->begin(), loaded->end(), priv_bytes.begin());
+        Identity rehydrated = Identity::from_private_bytes(priv_bytes).value();
         EXPECT_EQ(rehydrated.public_bytes, pub_first);
         EXPECT_EQ(rehydrated.peer_id(), client_id_first);
     }
@@ -1001,21 +1137,46 @@ TEST(FilePersistenceProvider, StartServerNeverProducesAllZeroClientId) {
     EXPECT_NE(client.client_id(), zero_identity.peer_id());
 }
 
+// New coverage: a persisted "keypair" blob of the wrong length must be rejected outright (not
+// truncated/reinterpreted) and a fresh keypair generated and persisted in its place.
+TEST(SendspinClientIdentity, WrongSizeKeypairBlobIsRejectedAndRegenerated) {
+    InMemoryPersistenceProvider provider;
+    std::vector<uint8_t> wrong_size(16, 0x42);  // valid X25519 private keys are exactly 32 bytes
+    provider.seed_blob(persistence_keys::KEYPAIR, wrong_size);
+
+    SendspinClientConfig config;
+    config.name = "wrong-size-keypair-test";
+    SendspinClient client(std::move(config));
+    client.set_persistence_provider(&provider);
+    ASSERT_TRUE(client.start_server());
+
+    EXPECT_FALSE(client.client_id().empty());
+
+    auto persisted = provider.blob(persistence_keys::KEYPAIR);
+    ASSERT_TRUE(persisted.has_value())
+        << "a freshly generated keypair must have been persisted over the bad blob";
+    EXPECT_EQ(persisted->size(), 32u);
+    EXPECT_NE(*persisted, wrong_size);
+}
+
 TEST(FilePersistenceProvider, PairingRecordRoundTrip) {
     TempFile tmp;
     FilePersistenceProvider provider(tmp.path());
 
     SendspinPairingRecord rec = make_client_record("server-X", "My Label");
+    std::string encoded = encode_pairing_records({rec});
+    EXPECT_TRUE(provider.save_blob(persistence_keys::RECORDS,
+                                   reinterpret_cast<const uint8_t*>(encoded.data()),
+                                   encoded.size()));
 
-    EXPECT_TRUE(provider.save_pairing_record(rec));
-
-    auto loaded = provider.load_pairing_records();
-    ASSERT_EQ(loaded.size(), 1u);
-    EXPECT_EQ(loaded[0].psk_id, rec.psk_id);
-    EXPECT_EQ(loaded[0].psk, rec.psk);
-    EXPECT_EQ(loaded[0].server_id, rec.server_id);
-    EXPECT_EQ(loaded[0].label, rec.label);
-    EXPECT_EQ(loaded[0].used, rec.used);
+    auto decoded = decode_records_blob(provider.load_blob(persistence_keys::RECORDS));
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->size(), 1u);
+    EXPECT_EQ((*decoded)[0].psk_id, rec.psk_id);
+    EXPECT_EQ((*decoded)[0].psk, rec.psk);
+    EXPECT_EQ((*decoded)[0].server_id, rec.server_id);
+    EXPECT_EQ((*decoded)[0].label, rec.label);
+    EXPECT_EQ((*decoded)[0].used, rec.used);
 }
 
 TEST(FilePersistenceProvider, SharedRecordRoundTrip) {
@@ -1023,42 +1184,20 @@ TEST(FilePersistenceProvider, SharedRecordRoundTrip) {
     FilePersistenceProvider provider(tmp.path());
 
     SendspinPairingRecord shared = make_shared_record("Fallback");
-    EXPECT_TRUE(provider.save_pairing_record(shared));
+    std::string encoded = encode_pairing_records({shared});
+    EXPECT_TRUE(provider.save_blob(persistence_keys::RECORDS,
+                                   reinterpret_cast<const uint8_t*>(encoded.data()),
+                                   encoded.size()));
 
-    auto loaded = provider.load_pairing_records();
-    ASSERT_EQ(loaded.size(), 1u);
-    EXPECT_FALSE(loaded[0].server_id.has_value()) << "shared record must have no server_id";
+    auto decoded = decode_records_blob(provider.load_blob(persistence_keys::RECORDS));
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_EQ(decoded->size(), 1u);
+    EXPECT_FALSE((*decoded)[0].server_id.has_value()) << "shared record must have no server_id";
 }
 
-TEST(FilePersistenceProvider, RemovePairingRecord) {
-    TempFile tmp;
-    FilePersistenceProvider provider(tmp.path());
-
-    SendspinPairingRecord a = make_client_record("server-A");
-    SendspinPairingRecord b = make_client_record("server-B");
-    provider.save_pairing_record(a);
-    provider.save_pairing_record(b);
-
-    EXPECT_TRUE(provider.remove_pairing_record(a.psk_id));
-    auto loaded = provider.load_pairing_records();
-    ASSERT_EQ(loaded.size(), 1u);
-    EXPECT_EQ(loaded[0].psk_id, b.psk_id);
-
-    // Removing an absent record leaves the file alone and still reports success.
-    EXPECT_TRUE(provider.remove_pairing_record("absent-psk-id"));
-    EXPECT_EQ(provider.load_pairing_records().size(), 1u);
-}
-
-// Nothing stored at all: there is no record to delete, so the delete succeeded by definition.
-// A false here would make every removal on a fresh device log a spurious durability warning.
-TEST(FilePersistenceProvider, RemovePairingRecordOnEmptyStoreSucceeds) {
-    TempFile tmp;
-    FilePersistenceProvider provider(tmp.path());
-
-    EXPECT_TRUE(provider.remove_pairing_record("never-stored"));
-}
-
-// The clear_* revocations carry the same contract as remove_pairing_record().
+// The clear_* revocations (Pairing PSK / static PIN) carry the same contract via erase_blob():
+// absent-or-erased both report success, so a fresh device never logs a spurious durability
+// warning on first clear.
 TEST(FilePersistenceProvider, ClearPairingPskAndStaticPinReportSuccess) {
     TempFile tmp;
     FilePersistenceProvider provider(tmp.path());
@@ -1066,31 +1205,42 @@ TEST(FilePersistenceProvider, ClearPairingPskAndStaticPinReportSuccess) {
     SendspinPairingPsk psk;
     psk.psk_id = "pairing-psk-id";
     psk.psk.fill(0x42);
-    ASSERT_TRUE(provider.save_pairing_psk(psk));
-    ASSERT_TRUE(provider.load_pairing_psk().has_value());
-    EXPECT_TRUE(provider.clear_pairing_psk());
-    EXPECT_FALSE(provider.load_pairing_psk().has_value());
+    std::string psk_encoded = encode_pairing_psk(psk);
+    ASSERT_TRUE(provider.save_blob(persistence_keys::PAIRING_PSK,
+                                   reinterpret_cast<const uint8_t*>(psk_encoded.data()),
+                                   psk_encoded.size()));
+    ASSERT_TRUE(provider.load_blob(persistence_keys::PAIRING_PSK).has_value());
+    EXPECT_TRUE(provider.erase_blob(persistence_keys::PAIRING_PSK));
+    EXPECT_FALSE(provider.load_blob(persistence_keys::PAIRING_PSK).has_value());
 
-    ASSERT_TRUE(provider.save_static_pin("12345678"));
-    ASSERT_TRUE(provider.load_static_pin().has_value());
-    EXPECT_TRUE(provider.clear_static_pin());
-    EXPECT_FALSE(provider.load_static_pin().has_value());
+    std::string pin = "12345678";
+    ASSERT_TRUE(provider.save_blob(persistence_keys::STATIC_PIN,
+                                   reinterpret_cast<const uint8_t*>(pin.data()), pin.size()));
+    ASSERT_TRUE(provider.load_blob(persistence_keys::STATIC_PIN).has_value());
+    EXPECT_TRUE(provider.erase_blob(persistence_keys::STATIC_PIN));
+    EXPECT_FALSE(provider.load_blob(persistence_keys::STATIC_PIN).has_value());
 
     // Clearing what is already absent is still success.
-    EXPECT_TRUE(provider.clear_pairing_psk());
-    EXPECT_TRUE(provider.clear_static_pin());
+    EXPECT_TRUE(provider.erase_blob(persistence_keys::PAIRING_PSK));
+    EXPECT_TRUE(provider.erase_blob(persistence_keys::STATIC_PIN));
+
+    // And a key that was NEVER touched at all is likewise a no-op success.
+    EXPECT_TRUE(provider.erase_blob("never-used-key"));
 }
 
 TEST(FilePersistenceProvider, LastPlayedServerIdRoundTrip) {
     TempFile tmp;
     FilePersistenceProvider provider(tmp.path());
 
-    EXPECT_FALSE(provider.load_last_played_server_id().has_value());
+    EXPECT_FALSE(provider.load_blob(persistence_keys::LAST_PLAYED).has_value());
 
-    EXPECT_TRUE(provider.save_last_played_server_id("server-id-abc"));
-    auto loaded = provider.load_last_played_server_id();
+    std::string server_id = "server-id-abc";
+    EXPECT_TRUE(provider.save_blob(persistence_keys::LAST_PLAYED,
+                                   reinterpret_cast<const uint8_t*>(server_id.data()),
+                                   server_id.size()));
+    auto loaded = provider.load_blob(persistence_keys::LAST_PLAYED);
     ASSERT_TRUE(loaded.has_value());
-    EXPECT_EQ(loaded.value(), "server-id-abc");
+    EXPECT_EQ(std::string(loaded->begin(), loaded->end()), server_id);
 }
 
 TEST(FilePersistenceProvider, PairingConfigRoundTrip) {
@@ -1102,9 +1252,15 @@ TEST(FilePersistenceProvider, PairingConfigRoundTrip) {
     cfg.unpaired_access_enabled = true;
     cfg.record_mode_psk_id = "some-psk-id";
 
-    EXPECT_TRUE(provider.save_pairing_config(cfg));
+    std::string encoded = encode_pairing_config(cfg);
+    EXPECT_TRUE(provider.save_blob(persistence_keys::PAIR_CONFIG,
+                                   reinterpret_cast<const uint8_t*>(encoded.data()),
+                                   encoded.size()));
 
-    auto loaded = provider.load_pairing_config();
+    auto blob = provider.load_blob(persistence_keys::PAIR_CONFIG);
+    ASSERT_TRUE(blob.has_value());
+    std::string_view text(reinterpret_cast<const char*>(blob->data()), blob->size());
+    auto loaded = decode_pairing_config(text);
     ASSERT_TRUE(loaded.has_value());
     EXPECT_EQ(loaded->pairing_psk_enabled, false);
     EXPECT_EQ(loaded->unpaired_access_enabled, true);
@@ -1119,7 +1275,9 @@ TEST(FilePersistenceProvider, PersistedFileIsOwnerOnly) {
     TempFile tmp;
     FilePersistenceProvider provider(tmp.path());
 
-    EXPECT_TRUE(provider.save_static_pin("1234"));
+    std::string pin = "1234";
+    EXPECT_TRUE(provider.save_blob(persistence_keys::STATIC_PIN,
+                                   reinterpret_cast<const uint8_t*>(pin.data()), pin.size()));
 
     struct stat st{};
     ASSERT_EQ(::stat(tmp.path().c_str(), &st), 0);
@@ -1161,6 +1319,43 @@ TEST(RecordStoreWithFile, FirstBootProvisioningPersists) {
     }
 }
 
+// A removed record must not merely vanish from RAM: the persisted "records" blob itself must
+// shrink, so a reboot does not resurrect it. Ports the old FilePersistenceProvider-level
+// "RemovePairingRecord" test to the level where removal is actually implemented now
+// (RecordStore, not the provider -- the provider is a pure byte store).
+TEST(RecordStoreWithFile, RemoveRecordShrinksThePersistedBlob) {
+    TempFile tmp;
+    std::string a_psk_id;
+    std::string b_psk_id;
+    {
+        FilePersistenceProvider provider(tmp.path());
+        RecordStore store(&provider);
+        SendspinPairingRecord a = make_client_record("server-A");
+        SendspinPairingRecord b = make_client_record("server-B");
+        ASSERT_TRUE(store.store_record(a));
+        ASSERT_TRUE(store.store_record(b));
+        a_psk_id = a.psk_id;
+        b_psk_id = b.psk_id;
+        store.remove_record(a_psk_id);
+    }
+
+    FilePersistenceProvider provider(tmp.path());
+    auto decoded = decode_records_blob(provider.load_blob(persistence_keys::RECORDS));
+    ASSERT_TRUE(decoded.has_value());
+    bool found_a = false;
+    bool found_b = false;
+    for (const auto& r : decoded.value()) {
+        if (r.psk_id == a_psk_id) {
+            found_a = true;
+        }
+        if (r.psk_id == b_psk_id) {
+            found_b = true;
+        }
+    }
+    EXPECT_FALSE(found_a) << "a removed record must not survive in the persisted blob";
+    EXPECT_TRUE(found_b);
+}
+
 // =============================================================================
 // Unpaired-access first-boot seed
 // =============================================================================
@@ -1172,13 +1367,24 @@ class CannedConfigProvider : public SendspinPersistenceProvider {
 public:
     explicit CannedConfigProvider(SendspinPairingConfig config) : config_(std::move(config)) {}
 
-    std::optional<SendspinPairingConfig> load_pairing_config() override {
-        return this->config_;
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        if (key != persistence_keys::PAIR_CONFIG) {
+            return std::nullopt;
+        }
+        std::string encoded = encode_pairing_config(this->config_);
+        return std::vector<uint8_t>(encoded.begin(), encoded.end());
     }
 
-    bool save_pairing_config(const SendspinPairingConfig& config) override {
-        this->config_ = config;
-        return true;
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        if (key != persistence_keys::PAIR_CONFIG) {
+            return false;
+        }
+        std::string_view text(reinterpret_cast<const char*>(data), len);
+        auto decoded = decode_pairing_config(text);
+        if (decoded.has_value()) {
+            this->config_ = decoded.value();
+        }
+        return decoded.has_value();
     }
 
 private:
@@ -1234,16 +1440,24 @@ public:
     explicit RecordsWithoutConfigProvider(std::vector<SendspinPairingRecord> records)
         : records_(std::move(records)) {}
 
-    std::vector<SendspinPairingRecord> load_pairing_records() override {
-        return this->records_;
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        if (key != persistence_keys::RECORDS) {
+            return std::nullopt;  // In particular, no PAIR_CONFIG -- that is the point.
+        }
+        std::string encoded = encode_pairing_records(this->records_);
+        return std::vector<uint8_t>(encoded.begin(), encoded.end());
     }
 
-    std::optional<SendspinPairingConfig> load_pairing_config() override {
-        return std::nullopt;
-    }
-
-    bool save_pairing_record(const SendspinPairingRecord& record) override {
-        this->records_.push_back(record);
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        if (key != persistence_keys::RECORDS) {
+            return false;
+        }
+        std::string_view text(reinterpret_cast<const char*>(data), len);
+        auto decoded = decode_pairing_records(text);
+        if (!decoded.has_value()) {
+            return false;
+        }
+        this->records_ = std::move(decoded.value());
         return true;
     }
 
@@ -1252,7 +1466,7 @@ private:
 };
 
 TEST(RecordStore, UnpairedAccessSeedDoesNotApplyWhenOnlyTheConfigIsLost) {
-    // load_pairing_config() returning nullopt is not proof of a first boot: the interface cannot
+    // A missing/undecodable pair_config blob is not proof of a first boot: the interface cannot
     // distinguish "never stored" from "could not be read back". Surviving records prove the
     // device was provisioned before, so re-seeding unpaired access ON here would silently
     // reopen unauthenticated access on a paired device whose operator had turned it off.
@@ -1456,4 +1670,63 @@ TEST(RecordStore, ResolvePairingOutcomeExhaustedNoStore) {
     // No record was stored (nullopt record -> store nothing).
     const auto* stored = store.record_by_server_id(server_id);
     EXPECT_EQ(stored, nullptr) << "no record should exist for the server after exhausted outcome";
+}
+
+// =============================================================================
+// Player static delay: ASCII-decimal round-trip via persistence_keys::STATIC_DELAY
+// =============================================================================
+
+// update_static_delay() must persist an ASCII decimal string (not raw uint16_t bytes) --
+// debuggable and endian-free, per persistence_keys::STATIC_DELAY's contract.
+TEST(PlayerRoleStaticDelay, PersistsAsAsciiDecimal) {
+    InMemoryPersistenceProvider provider;
+    SendspinClientConfig config;
+    config.name = "static-delay-round-trip-test";
+    SendspinClient client(std::move(config));
+    client.set_persistence_provider(&provider);
+
+    PlayerRoleConfig player_config;
+    auto& player = client.add_player(player_config);
+    ASSERT_TRUE(client.start_server());
+    player.set_static_delay_adjustable(true);
+    player.update_static_delay(1234);
+
+    auto blob = provider.blob(persistence_keys::STATIC_DELAY);
+    ASSERT_TRUE(blob.has_value());
+    EXPECT_EQ(std::string(blob->begin(), blob->end()), "1234")
+        << "static_delay must persist as an ASCII decimal string";
+
+    // And it must load back correctly on a fresh PlayerRole over the same provider.
+    SendspinClientConfig config2;
+    config2.name = "static-delay-round-trip-test-2";
+    SendspinClient client2(std::move(config2));
+    client2.set_persistence_provider(&provider);
+    PlayerRoleConfig player_config2;
+    auto& player2 = client2.add_player(player_config2);
+    ASSERT_TRUE(client2.start_server());
+    player2.set_static_delay_adjustable(true);
+    EXPECT_EQ(player2.get_static_delay_ms(), 1234u);
+}
+
+// An unparseable persisted static_delay blob (corrupt bytes, not decimal digits) must be
+// treated as though nothing were saved, falling back to PlayerRoleConfig::initial_static_delay_ms
+// rather than crashing or reinterpreting garbage as a number.
+TEST(PlayerRoleStaticDelay, InvalidPersistedValueIsTreatedAsAbsent) {
+    InMemoryPersistenceProvider provider;
+    provider.seed_blob(persistence_keys::STATIC_DELAY, to_bytes("not-a-number"));
+
+    SendspinClientConfig config;
+    config.name = "static-delay-invalid-test";
+    SendspinClient client(std::move(config));
+    client.set_persistence_provider(&provider);
+
+    PlayerRoleConfig player_config;
+    player_config.initial_static_delay_ms = 77;
+    auto& player = client.add_player(player_config);
+    ASSERT_TRUE(client.start_server());
+    player.set_static_delay_adjustable(true);
+
+    EXPECT_EQ(player.get_static_delay_ms(), 77u)
+        << "an unparseable static_delay blob must be treated as absent, falling back to "
+           "initial_static_delay_ms";
 }

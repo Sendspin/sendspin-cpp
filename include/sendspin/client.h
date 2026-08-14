@@ -157,157 +157,114 @@ public:
     virtual bool is_network_ready() = 0;
 };
 
-/// @brief Optional persistence provider for saving/loading client state.
+/// @brief Optional persistence provider for saving/loading client state as opaque byte blobs.
 ///
-/// All methods fire on the main loop thread.
+/// The platform (e.g., ESPHome) provides a concrete implementation that stores blobs keyed by
+/// the fixed key constants in `persistence_keys` below, backed by NVS/Preferences (ESP) or a
+/// file (host). The library owns all serialization -- see `persistence_keys` for which keys hold
+/// raw bytes and which hold a codec blob (`sendspin/persistence_codec.h`); a provider is a pure
+/// byte store and must not parse the codec blobs.
 ///
-/// The platform (e.g., ESPHome) provides a concrete implementation that
-/// serializes to NVS/Preferences (ESP) or a file (host). Every method has a
-/// default no-op / nullopt implementation so a platform can opt in
-/// incrementally, matching the existing style.
+/// Every method has a default no-op / nullopt implementation so a platform can opt in
+/// incrementally.
 ///
-/// A provider that stores the pairing structs as byte blobs does not need to hand-roll their
-/// serialization: see sendspin/persistence_codec.h for ready-made encode/decode functions.
+/// Threading: most keys are only ever touched from the main loop thread. Two exceptions:
+///   - `save_blob(persistence_keys::RECORDS, ...)` can also fire on the NETWORK thread, via the
+///     server/pair-finalize commit path (`RecordStore::store_record()`): the record must be
+///     durable before the server's immediate re-handshake resolves it, so this cannot wait for
+///     the main loop. A provider that shares state across keys (a file, a handle) must serialize
+///     its own access, since this can overlap a main-loop call to another key.
+///   - `save_blob(persistence_keys::KEYPAIR, ...)` fires during `start_server()`, which runs on
+///     the main loop, but before any connection exists -- called out here only because it is the
+///     one write that happens exactly once, at startup, rather than in response to a runtime
+///     event.
+///
+/// Re-entrancy: implementations must NOT call back into the library (SendspinClient or any of
+/// its objects) from inside load_blob/save_blob/erase_blob. The library invokes these methods
+/// while holding internal locks (e.g. the record store's mutex around a `RECORDS` save), so a
+/// callback into the library from a provider method can deadlock.
 class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;
 
-    // ========================================
-    // Static X25519 keypair
-    // ========================================
-
-    /// @brief Save the static X25519 private key (32 raw bytes).
-    /// @return true on success, false on failure.
-    virtual bool save_static_keypair(const std::array<uint8_t, 32>& /*private_key*/) {
-        return false;
-    }
-
-    /// @brief Load the static X25519 private key (32 raw bytes).
-    /// @return The 32-byte private key, or nullopt if not yet saved.
-    virtual std::optional<std::array<uint8_t, 32>> load_static_keypair() {
+    /// @brief Load the blob stored under key.
+    /// @return The bytes, or nullopt if absent.
+    virtual std::optional<std::vector<uint8_t>> load_blob(const std::string& /*key*/) {
         return std::nullopt;
     }
 
-    // ========================================
-    // Last-played server_id
-    // ========================================
-
-    /// @brief Save the server_id of the last server that played audio.
-    /// @param server_id base64url-encoded public key of the server.
-    /// @return true on success, false on failure.
-    virtual bool save_last_played_server_id(const std::string& /*server_id*/) {
-        return false;
-    }
-
-    /// @brief Load the last-played server_id.
-    /// @return The saved server_id string, or nullopt if none saved.
-    virtual std::optional<std::string> load_last_played_server_id() {
-        return std::nullopt;
-    }
-
-    // ========================================
-    // Pairing records
-    // ========================================
-
-    /// @brief Load all persisted pairing records.
-    /// @return All stored records (may be empty).
-    virtual std::vector<SendspinPairingRecord> load_pairing_records() {
-        return {};
-    }
-
-    /// @brief Persist (add or replace) a pairing record, keyed by psk_id.
-    /// @return true on success, false on failure.
-    virtual bool save_pairing_record(const SendspinPairingRecord& /*record*/) {
-        return false;
-    }
-
-    /// @brief Remove the pairing record with the given psk_id.
-    /// No-op if absent (which counts as success).
+    /// @brief Persist bytes under key. Returning true means DURABLY stored (the library
+    /// gates pairing completion on this for the "records" key, and revocation durability
+    /// on it for removals).
     ///
-    /// Returning false is not cosmetic: the record is dropped from RAM either way, so the
-    /// revocation takes effect for the current boot, but a store that still holds it will hand
-    /// it back at the next start and the revoked PSK becomes valid again. The client logs a
-    /// warning saying exactly that, so report failure honestly rather than swallowing it.
-    /// @return true if the record is gone from the store, false if it may still be there.
-    virtual bool remove_pairing_record(const std::string& /*psk_id*/) {
+    /// Specifically: a rejected write to `persistence_keys::RECORDS` during pairing fails the
+    /// exchange closed -- the client reports `SendspinPairAbortReason::STORAGE_FAILED` via
+    /// `on_pairing_failed` and drops the connection rather than complete a pairing that could
+    /// not survive a reboot. And a revoked/removed record is always dropped from RAM regardless
+    /// of this return value, so a `false` here does not undo that -- it means the store still
+    /// holds the old array and will hand the revoked record back at the next boot, silently
+    /// making the revoked PSK valid again. The library logs a warning saying exactly that, so
+    /// report failure honestly rather than swallowing it.
+    /// @return true on success, false on failure.
+    virtual bool save_blob(const std::string& /*key*/, const uint8_t* /*data*/, size_t /*len*/) {
         return false;
     }
 
-    // ========================================
-    // Accepted Pairing PSK
-    // ========================================
-
-    /// @brief Load the accepted Pairing PSK, if any.
-    virtual std::optional<SendspinPairingPsk> load_pairing_psk() {
-        return std::nullopt;
-    }
-
-    /// @brief Save the accepted Pairing PSK.
-    virtual bool save_pairing_psk(const SendspinPairingPsk& /*psk*/) {
+    /// @brief Remove key. Absent counts as success. A false return means the value may
+    /// survive a reboot.
+    ///
+    /// Only `persistence_keys::PAIRING_PSK` and `persistence_keys::STATIC_PIN` are ever erased
+    /// this way; `persistence_keys::RECORDS` is never erased (a removal re-saves the shrunken
+    /// array instead, so the key stays present with an empty array). The in-memory effect of a
+    /// clear always takes place regardless of the return value (the PSK/PIN stops working for
+    /// the current boot either way); a `false` return means the value the library just cleared
+    /// may still be sitting in the store and will resume authenticating pairing attempts /
+    /// admitting the static PIN again after a reboot.
+    /// @return true if the key is gone from the store, false if it may still be there.
+    virtual bool erase_blob(const std::string& /*key*/) {
         return false;
-    }
-
-    /// @brief Clear the accepted Pairing PSK.
-    /// Same contract as remove_pairing_record(): a false return means the PSK may survive a
-    /// reboot and keep authenticating pairing attempts.
-    /// @return true if the Pairing PSK is gone from the store, false if it may still be there.
-    virtual bool clear_pairing_psk() {
-        return false;
-    }
-
-    // ========================================
-    // Static PIN
-    // ========================================
-
-    /// @brief Load the configured static PIN, if any.
-    virtual std::optional<std::string> load_static_pin() {
-        return std::nullopt;
-    }
-
-    /// @brief Save the configured static PIN.
-    virtual bool save_static_pin(const std::string& /*pin*/) {
-        return false;
-    }
-
-    /// @brief Clear the configured static PIN.
-    /// Same contract as remove_pairing_record(): a false return means the PIN may survive a
-    /// reboot and keep pairing devices.
-    /// @return true if the static PIN is gone from the store, false if it may still be there.
-    virtual bool clear_static_pin() {
-        return false;
-    }
-
-    // ========================================
-    // Pairing config
-    // ========================================
-
-    /// @brief Load the pairing policy config.
-    virtual std::optional<SendspinPairingConfig> load_pairing_config() {
-        return std::nullopt;
-    }
-
-    /// @brief Save the pairing policy config.
-    virtual bool save_pairing_config(const SendspinPairingConfig& /*config*/) {
-        return false;
-    }
-
-    // ========================================
-    // Player static delay (unrelated to encryption)
-    // ========================================
-
-    /// @brief Saves the player's static delay
-    /// @param delay_ms Static delay in milliseconds
-    /// @return true on success, false on failure
-    virtual bool save_static_delay(uint16_t /*delay_ms*/) {
-        return false;
-    }
-
-    /// @brief Loads the player's persisted static delay
-    /// @return The saved delay in milliseconds, or nullopt if none saved
-    virtual std::optional<uint16_t> load_static_delay() {
-        return std::nullopt;
     }
 };
+
+/// @brief Fixed, library-owned keyspace for SendspinPersistenceProvider.
+///
+/// Every key is at most 12 characters, comfortably under the 15-character NVS key limit.
+/// Providers are pure byte stores: they must not parse or reinterpret these values.
+///
+/// - `RECORDS`, `PAIRING_PSK`, and `PAIR_CONFIG` hold a versioned JSON blob produced by the
+///   codec in `sendspin/persistence_codec.h` (`encode_pairing_records()` /
+///   `decode_pairing_records()`, `encode_pairing_psk()` / `decode_pairing_psk()`,
+///   `encode_pairing_config()` / `decode_pairing_config()` respectively).
+/// - `KEYPAIR`, `STATIC_PIN`, and `LAST_PLAYED` hold raw bytes: see each constant's comment.
+/// - `STATIC_DELAY` holds an ASCII decimal string rather than raw uint16_t bytes, for
+///   debuggability and to avoid an endianness dependency; decode it with a bounds check and
+///   treat an invalid value as absent.
+namespace persistence_keys {
+
+/// 32 raw bytes: the static X25519 private key. No codec, no encoding.
+inline constexpr const char* KEYPAIR = "keypair";
+
+/// Codec blob: the WHOLE `SendspinPairingRecord` array (`encode_pairing_records()` /
+/// `decode_pairing_records()`). Stays present once any record exists, including an empty array
+/// after the last record is removed -- see `persistence_keys` doc above.
+inline constexpr const char* RECORDS = "records";
+
+/// Codec blob: the accepted `SendspinPairingPsk` (`encode_pairing_psk()` / `decode_pairing_psk()`).
+inline constexpr const char* PAIRING_PSK = "pairing_psk";
+
+/// Raw UTF-8 bytes: the configured static PIN string.
+inline constexpr const char* STATIC_PIN = "static_pin";
+
+/// Codec blob: the `SendspinPairingConfig` (`encode_pairing_config()` / `decode_pairing_config()`).
+inline constexpr const char* PAIR_CONFIG = "pair_config";
+
+/// Raw UTF-8 bytes: the server_id (base64url public key) of the last server that played audio.
+inline constexpr const char* LAST_PLAYED = "last_played";
+
+/// ASCII decimal string (e.g. "150"): the player's static delay in milliseconds.
+inline constexpr const char* STATIC_DELAY = "static_delay";
+
+}  // namespace persistence_keys
 
 /// @brief Log severity levels for host builds
 /// Has no effect on ESP-IDF builds

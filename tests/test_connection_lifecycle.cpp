@@ -52,6 +52,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
@@ -118,8 +119,11 @@ class TestPersistenceProvider : public SendspinPersistenceProvider {
 public:
     explicit TestPersistenceProvider(std::string server_id) : server_id_(std::move(server_id)) {}
 
-    std::optional<std::string> load_last_played_server_id() override {
-        return this->server_id_;
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        if (key != persistence_keys::LAST_PLAYED) {
+            return std::nullopt;
+        }
+        return std::vector<uint8_t>(this->server_id_.begin(), this->server_id_.end());
     }
 
 private:

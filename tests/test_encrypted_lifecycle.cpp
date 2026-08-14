@@ -35,6 +35,7 @@
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
+#include "sendspin/persistence_codec.h"
 #include "sendspin/types.h"
 
 #include <gtest/gtest.h>
@@ -65,6 +66,7 @@ extern "C" {
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -109,8 +111,12 @@ public:
     explicit TestPersistenceProvider(SendspinPairingRecord record)
         : record_(std::move(record)) {}
 
-    std::vector<SendspinPairingRecord> load_pairing_records() override {
-        return {this->record_};
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        if (key != persistence_keys::RECORDS) {
+            return std::nullopt;
+        }
+        std::string encoded = encode_pairing_records({this->record_});
+        return std::vector<uint8_t>(encoded.begin(), encoded.end());
     }
 
 private:
@@ -118,15 +124,16 @@ private:
 };
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
-// record store_record() persists via save_pairing_record(), so the pairing-flow test below can
-// assert on the psk_id/server_id/psk that pairing generated and persisted, and hand the same
+// record store_record() persists via save_blob(persistence_keys::RECORDS, ...), so the
+// pairing-flow test below can assert on the psk_id/server_id/psk that pairing generated and
+// persisted, and hand the same
 // psk/psk_id back to the fake server for the follow-up in-band re-handshake. Thread-safe: the
 // server/pair-finalize commit runs on the network thread (see client.cpp's SERVER_PAIR_FINALIZE
 // handler), while the test thread reads captured_record().
 class PairingCapturePersistenceProvider : public SendspinPersistenceProvider {
 public:
-    // load_pairing_records() is not overridden: the base class default (no records) is exactly
-    // "starts with no pairing records" above, so restating it here would be a no-op override.
+    // load_blob(RECORDS) is not overridden beyond the base class's nullopt default: "starts with
+    // no pairing records" above, so restating it here would be a no-op override.
 
     // Optionally pre-seed an accepted Pairing PSK (spec #113/#122/#123: pairing.method
     // MUST be 'pairing_psk' if and only if the matched PSK IS the Pairing PSK, and the client
@@ -138,22 +145,39 @@ public:
         this->configured_pairing_psk_ = std::move(psk);
     }
 
-    std::optional<SendspinPairingPsk> load_pairing_psk() override {
-        return this->configured_pairing_psk_;
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        if (key != persistence_keys::PAIRING_PSK || !this->configured_pairing_psk_.has_value()) {
+            return std::nullopt;
+        }
+        std::string encoded = encode_pairing_psk(this->configured_pairing_psk_.value());
+        return std::vector<uint8_t>(encoded.begin(), encoded.end());
     }
 
-    bool save_pairing_record(const SendspinPairingRecord& record) override {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        // Only capture/reject records with a server_id: the RecordStore also persists a
-        // shared-PSK fallback record (no server_id) on first boot, which is not the pairing
-        // outcome under test and must always succeed so first-boot provisioning is unaffected.
-        if (!record.server_id.has_value()) {
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        if (key != persistence_keys::RECORDS) {
+            return true;  // pair_config etc. are not under test here.
+        }
+        std::string_view text(reinterpret_cast<const char*>(data), len);
+        auto decoded = decode_pairing_records(text).value_or(std::vector<SendspinPairingRecord>{});
+        // Only capture/reject a write that includes a record WITH a server_id: the RecordStore
+        // also persists a shared-PSK fallback record (no server_id) on first boot as part of the
+        // very same whole-array write, and that provisioning write must always succeed
+        // unconditionally so it is unaffected by reject_pairing_records_.
+        const SendspinPairingRecord* with_server_id = nullptr;
+        for (const auto& r : decoded) {
+            if (r.server_id.has_value()) {
+                with_server_id = &r;
+                break;
+            }
+        }
+        if (with_server_id == nullptr) {
             return true;
         }
+        std::lock_guard<std::mutex> lock(this->mutex_);
         if (this->reject_pairing_records_) {
             return false;
         }
-        this->captured_ = record;
+        this->captured_ = *with_server_id;
         return true;
     }
 
@@ -162,11 +186,12 @@ public:
         return this->captured_;
     }
 
-    // When set, save_pairing_record() rejects any record with a server_id (simulating a
-    // persistence-provider failure, e.g. storage full), while still succeeding for the
-    // first-boot shared-PSK fallback record. Used to verify the fail-closed contract: a
-    // rejected persist must not report pairing success (see client.cpp's SERVER_PAIR_FINALIZE
-    // handler, which must check RecordStore::store_record()'s return value).
+    // When set, save_blob(RECORDS, ...) rejects any write that includes a record with a
+    // server_id (simulating a persistence-provider failure, e.g. storage full), while still
+    // succeeding for the first-boot shared-PSK fallback record. Used to verify the fail-closed
+    // contract: a rejected persist must not report pairing success (see client.cpp's
+    // SERVER_PAIR_FINALIZE handler, which must check RecordStore::store_record()'s return
+    // value).
     void set_reject_pairing_records(bool reject) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->reject_pairing_records_ = reject;
@@ -1669,8 +1694,12 @@ TEST(EncryptedLifecycle, RemoveRecordDropsTheRevokedDevicesLiveSession) {
     public:
         TwoRecordProvider(SendspinPairingRecord a, SendspinPairingRecord b)
             : records_{std::move(a), std::move(b)} {}
-        std::vector<SendspinPairingRecord> load_pairing_records() override {
-            return this->records_;
+        std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+            if (key != persistence_keys::RECORDS) {
+                return std::nullopt;
+            }
+            std::string encoded = encode_pairing_records(this->records_);
+            return std::vector<uint8_t>(encoded.begin(), encoded.end());
         }
 
     private:

@@ -15,28 +15,28 @@
 /// @file file_persistence_provider.h
 /// @brief File-backed SendspinPersistenceProvider for host examples.
 ///
-/// Serializes keypair, pairing records, pairing config, last-played server_id,
-/// and the player static delay to a JSON file via ArduinoJson. This is a shared
-/// example/test helper, not part of the library: persistence is the consumer's
-/// responsibility, and this shows one way to implement the provider on host.
-/// It depends only on the public API (sendspin/client.h) plus ArduinoJson, so it
-/// is self-contained and can be copied into a downstream project as a starting
-/// point. On a real device the platform (e.g. ESPHome) implements the provider
-/// against NVS/Preferences instead.
+/// A minimal blob store: the whole file is one JSON document mapping each
+/// persistence_keys::* key to base64url(bytes). This is a shared example/test helper, not part
+/// of the library: persistence is the consumer's responsibility, and this shows one way to
+/// implement the provider on host. It depends only on the public API (sendspin/client.h,
+/// sendspin/persistence_codec.h) plus ArduinoJson, so it is self-contained and can be copied
+/// into a downstream project as a starting point. On a real device the platform (e.g. ESPHome)
+/// implements the provider against NVS/Preferences instead.
 ///
-/// The file holds plaintext secrets (the static private key, long-term PSKs, the
-/// Pairing PSK, and the static PIN), so it is written owner-only (0600) via POSIX
-/// open()/fchmod and fsync'd before the rename that makes it visible, with the
-/// containing directory fsync'd after -- see write_file() in the .cpp. If this is
-/// copied elsewhere, keep that behavior or swap in an equivalent for the target
-/// platform; do not fall back to a bare std::ofstream.
+/// The file holds plaintext secrets (the static private key, long-term PSKs, the Pairing PSK,
+/// and the static PIN), so it is written owner-only (0600) via POSIX open()/fchmod and fsync'd
+/// before the rename that makes it visible, with the containing directory fsync'd after -- see
+/// write_file() in the .cpp. If this is copied elsewhere, keep that behavior or swap in an
+/// equivalent for the target platform; do not fall back to a bare std::ofstream.
+///
+/// NOTE: this is a breaking change from the pre-blob-store on-disk format (the per-struct JSON
+/// layout keyed by "static_keypair", "pairing_records", etc.). A file written by the old
+/// FilePersistenceProvider is not read by this one; delete it and let the device re-provision.
 
 #pragma once
 
 #include "sendspin/client.h"
-#include "sendspin/config.h"
 
-#include <array>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -45,65 +45,24 @@
 
 namespace sendspin {
 
-/// @brief File-backed persistence provider.
+/// @brief File-backed persistence provider: one JSON document mapping key -> base64url(bytes).
 ///
-/// All data is stored in a single JSON file at `path`. The file is
-/// overwritten atomically on every save. Each method re-reads the file on
-/// load and re-serializes on save (small data, infrequent calls).
+/// The file is overwritten atomically on every save. Each method re-reads the file on load and
+/// re-serializes on save (small data, infrequent calls).
 class FilePersistenceProvider : public SendspinPersistenceProvider {
 public:
     /// @brief Construct with the path to the JSON persistence file.
     explicit FilePersistenceProvider(std::string path);
 
-    // ========================================================================
-    // Static keypair
-    // ========================================================================
-    bool save_static_keypair(const std::array<uint8_t, 32>& private_key) override;
-    std::optional<std::array<uint8_t, 32>> load_static_keypair() override;
-
-    // ========================================================================
-    // Last-played server_id
-    // ========================================================================
-    bool save_last_played_server_id(const std::string& server_id) override;
-    std::optional<std::string> load_last_played_server_id() override;
-
-    // ========================================================================
-    // Pairing records
-    // ========================================================================
-    std::vector<SendspinPairingRecord> load_pairing_records() override;
-    bool save_pairing_record(const SendspinPairingRecord& record) override;
-    bool remove_pairing_record(const std::string& psk_id) override;
-
-    // ========================================================================
-    // Accepted Pairing PSK
-    // ========================================================================
-    std::optional<SendspinPairingPsk> load_pairing_psk() override;
-    bool save_pairing_psk(const SendspinPairingPsk& psk) override;
-    bool clear_pairing_psk() override;
-
-    // ========================================================================
-    // Static PIN
-    // ========================================================================
-    std::optional<std::string> load_static_pin() override;
-    bool save_static_pin(const std::string& pin) override;
-    bool clear_static_pin() override;
-
-    // ========================================================================
-    // Pairing config
-    // ========================================================================
-    std::optional<SendspinPairingConfig> load_pairing_config() override;
-    bool save_pairing_config(const SendspinPairingConfig& config) override;
-
-    // ========================================================================
-    // Player static delay
-    // ========================================================================
-    bool save_static_delay(uint16_t delay_ms) override;
-    std::optional<uint16_t> load_static_delay() override;
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override;
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override;
+    bool erase_blob(const std::string& key) override;
 
 private:
-    // save_pairing_record is called on the network thread during pairing finalize, while the
-    // other methods run on the main loop. This mutex serializes the read-modify-write of the
-    // backing file so concurrent calls cannot lose an update.
+    // save_blob(persistence_keys::RECORDS, ...) is called on the network thread during pairing
+    // finalize, while the other keys are only ever touched from the main loop. This mutex
+    // serializes the read-modify-write of the backing file so concurrent calls cannot lose an
+    // update.
     std::mutex mutex_;
     std::string path_;
 };

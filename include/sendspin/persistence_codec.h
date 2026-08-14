@@ -15,16 +15,19 @@
 /// @file persistence_codec.h
 /// @brief Storage-format codec for the persistence structs in sendspin/config.h
 ///
-/// A `SendspinPersistenceProvider` implementer needs to turn `SendspinPairingRecord`,
-/// `SendspinPairingPsk`, and `SendspinPairingConfig` into bytes it can put in a file, an NVS
-/// entry, or any other byte-blob store. This header provides that serialization so providers
-/// stop hand-rolling it: encode a struct to a JSON text blob, decode a blob back to a struct.
+/// `SendspinPersistenceProvider` (sendspin/client.h) is a plain blob store: `load_blob()` /
+/// `save_blob()` / `erase_blob()` move opaque bytes in and out of NVS/Preferences (ESP) or a
+/// file (host), keyed by the fixed constants in `persistence_keys`. The library itself is the
+/// only caller of this codec: for the `persistence_keys::RECORDS`, `PAIRING_PSK`, and
+/// `PAIR_CONFIG` keys, it turns `SendspinPairingRecord` / `SendspinPairingPsk` /
+/// `SendspinPairingConfig` into the JSON text blob a provider actually stores, and back. A
+/// provider implementation never needs to (and must not) parse these blobs -- this header is
+/// exposed publicly so a custom provider (or a test) can inspect or seed that content in the
+/// same format the library itself produces, not so providers hand-roll their own encoding.
 ///
 /// This is a STORAGE codec, intentionally independent of the Sendspin protocol wire format
 /// (see `src/management.h`, which never carries the PSK secret in list-records responses -- the
-/// two formats have different jobs and must not be confused). Providers remain free to use
-/// their own format entirely; nothing in `SendspinPersistenceProvider`'s 17-method interface
-/// changes. This header is purely an opt-in convenience.
+/// two formats have different jobs and must not be confused).
 ///
 /// ## Wire format
 ///
@@ -66,13 +69,20 @@
 /// - `base64url_decode()` follows RFC 4648 section 5: encode never pads, decode tolerates
 ///   padding, and any character outside the base64url alphabet makes it return `std::nullopt`.
 ///
-/// ## Keyspace guidance for NVS-style stores
+/// ## Keyspace
 ///
-/// An encoded record is roughly 250 bytes; an 8-record store (`encode_pairing_records()`) comes
-/// out around 2 KB -- comfortably under a typical NVS entry's ~4 KB limit. But `psk_id` is 43
-/// characters (base64url of a 32-byte key) while NVS keys max out at 15, so do not use `psk_id`
-/// as a storage key. Either key blobs by slot index (e.g. "ss_rec_0" .. "ss_rec_N") or store one
-/// records-array blob under a single fixed key.
+/// The storage key is not a provider's choice: it is one of the fixed constants in
+/// `persistence_keys` (sendspin/client.h) -- `RECORDS`, `PAIRING_PSK`, and `PAIR_CONFIG` for the
+/// three struct types this header encodes, plus `KEYPAIR`, `STATIC_PIN`, `LAST_PLAYED`, and
+/// `STATIC_DELAY` for the raw-byte / ASCII-decimal keys the library also persists. Every key is
+/// at most 12 characters, comfortably under a typical NVS key's 15-character limit; see
+/// `persistence_keys`'s doc comment for the full list and what each one holds.
+///
+/// `RECORDS` always holds the WHOLE records array as one blob (`encode_pairing_records()` /
+/// `decode_pairing_records()`), not one entry per record: an encoded record is roughly 250
+/// bytes, so an 8-record store comes out around 2 KB -- comfortably under a typical NVS entry's
+/// ~4 KB limit. This also sidesteps needing `psk_id` (43 characters, base64url of a 32-byte key)
+/// as a storage key, which would not fit an NVS key at all.
 
 #pragma once
 

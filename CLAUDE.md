@@ -65,7 +65,7 @@ client.start_server();
 The platform (e.g., ESPHome) provides:
 
 - A `PlayerRoleListener` implementation with `on_audio_write()` to receive decoded PCM audio
-- An optional `SendspinPersistenceProvider` for saving/loading preferences
+- An optional `SendspinPersistenceProvider` (a plain byte-blob store: `load_blob`/`save_blob`/`erase_blob`, keyed by the fixed `persistence_keys` constants) for saving/loading preferences
 - A `SendspinNetworkProvider` for network readiness
 - An optional `SendspinClientListener` for high-performance WiFi power management callbacks
 - Playback progress feedback via `notify_audio_played()`
@@ -86,7 +86,7 @@ examples/tui_client/        - Terminal UI host example with PortAudio audio outp
 
 ### Header visibility
 
-- **Public** (`include/sendspin/`): `client.h`, `config.h`, `types.h`, `persistence_codec.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`, `color_role.h`). These are the consumer-facing API. `config.h` contains all configuration structs (`SendspinClientConfig` and role configs). Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles. `persistence_codec.h` provides an optional JSON storage codec for the pairing structs, for `SendspinPersistenceProvider` implementers that store byte blobs.
+- **Public** (`include/sendspin/`): `client.h`, `config.h`, `types.h`, `persistence_codec.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`, `color_role.h`). These are the consumer-facing API. `config.h` contains all configuration structs (`SendspinClientConfig` and role configs). Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles. `persistence_codec.h` provides the JSON storage codec the library itself uses to turn the pairing structs into the blobs it hands to `SendspinPersistenceProvider::save_blob()`; it is public so a custom provider or test can inspect/seed that same content.
 - **Private** (`src/`): All internal headers (decoder, sync_task, time_filter, ring buffers, protocol_messages, etc.). Not exposed to consumers. `protocol_messages.h` contains message envelope structs, internal protocol enums, and protocol function declarations.
 - **Platform-specific** (`src/esp/`, `src/host/`): Networking headers with the same names (`client_connection.h`, `server_connection.h`, `ws_server.h`) but different implementations per platform.
 
