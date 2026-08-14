@@ -35,9 +35,9 @@
 
 namespace sendspin {
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Constants (mirrors cpace.py)
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief DSI string for generator derivation.
 static constexpr char CPACE_DSI[] = "CPace255";
@@ -64,9 +64,9 @@ static constexpr size_t CPACE_TAG_SIZE = 64;
 /// See #117 (PSK Wrapping): ISK feeds K_wrap = SHA-256("sendspin-pair-psk-wrap-v1" || sid || ISK).
 static constexpr size_t CPACE_ISK_SIZE = 64;
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // CPaceRole
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief CPace protocol role.  The Sendspin server is A (INITIATOR).
 enum class CPaceRole : uint8_t {
@@ -74,24 +74,24 @@ enum class CPaceRole : uint8_t {
     RESPONDER = 1,  ///< Role B: sends the second share
 };
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // CPace
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief One side of a CPace-X25519-SHA512 exchange with mutual confirmation.
 ///
 /// Usage:
 /// @code
-///   // Phase 1: start
+///   // Step 1: start
 ///   CPace side;
 ///   std::vector<uint8_t> my_share;
 ///   if (!side.start(CPaceRole::RESPONDER, prs, sid, {}, {}, {})) return false;
 ///   my_share = side.public_share();
 ///
-///   // Phase 2: receive peer share, derive MAC key
+///   // Step 2: receive peer share, derive MAC key
 ///   if (!side.derive(peer_share)) return false;
 ///
-///   // Phase 3: exchange tags
+///   // Step 3: exchange tags
 ///   auto my_tag = side.tag();         // send to peer
 ///   if (!side.verify(peer_tag)) return false;  // verify peer tag
 /// @endcode
@@ -168,9 +168,9 @@ private:
     std::array<uint8_t, CPACE_TAG_SIZE> compute_mac(bool own) const;
 };
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Low-level CPace building blocks (exposed for testing)
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief Encode a length in CPace's variable-length prefix format.
 /// Mirrors cpace.py _prepend_len.

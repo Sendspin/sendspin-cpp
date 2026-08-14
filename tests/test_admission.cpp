@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Phase-4a unit tests for the admission/trust enforcement and arbitration functions.
+// Unit tests for the admission/trust enforcement and arbitration functions.
 // Mirrors the reference decision logic in:
 //   aiosendspin/aiosendspin/client/connection.py:_activities_allowed/_admissible
 //   aiosendspin/aiosendspin/client/client.py:_activity_rank/_should_admit_connection

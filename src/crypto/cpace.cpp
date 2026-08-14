@@ -39,9 +39,9 @@ void secure_zero(void* p, size_t n) {
 
 }  // namespace
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // LV encoding -- mirrors cpace.py _prepend_len / _lv_cat
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 std::vector<uint8_t> cpace_prepend_len(const uint8_t* data, size_t len) {
     std::vector<uint8_t> out;
@@ -68,9 +68,9 @@ std::vector<uint8_t> cpace_lv_cat(std::initializer_list<std::pair<const uint8_t*
     return out;
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Generator string -- mirrors cpace.py _generator_string
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, const uint8_t* ci,
                                             size_t ci_len, const uint8_t* sid, size_t sid_len) {
@@ -99,9 +99,9 @@ std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, 
     });
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // _decode_u -- mirrors cpace.py _decode_u (clear top bit per RFC 7748)
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len) {
     assert(len == 32);  // caller must pass a 32-byte little-endian value
@@ -112,7 +112,7 @@ std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len) {
     return u;
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Elligator2 map -- mirrors cpace.py _elligator2
 //
 // Given r (mod p), computes the Curve25519 x-coordinate:
@@ -121,7 +121,7 @@ std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len) {
 //   x = eps*v - (1 - eps)*A/2 mod p
 //
 // Returns the 32-byte little-endian encoding.
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 std::array<uint8_t, 32> cpace_elligator2(const std::array<uint8_t, 32>& r_le) {
     using namespace field25519;
@@ -207,9 +207,9 @@ std::array<uint8_t, 32> cpace_elligator2(const std::array<uint8_t, 32>& r_le) {
     return fp_to_le(x);
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // _calculate_generator -- mirrors cpace.py _calculate_generator
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs_len,
                                                   const uint8_t* ci, size_t ci_len,
@@ -221,12 +221,12 @@ std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs
     return cpace_elligator2(u);
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // x25519_scalar_mult -- mirrors cpace.py _scalar_mult
 //
 // Uses noise-c's dhstate to perform RFC 7748 X25519 WITH scalar clamping.
 // The clamping is done by the underlying x25519() call in dh-curve25519.c.
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 bool x25519_scalar_mult(const uint8_t scalar[32], const uint8_t point[32], uint8_t out[32]) {
     NoiseDHState* dh_priv = nullptr;
@@ -267,9 +267,9 @@ bool x25519_scalar_mult(const uint8_t scalar[32], const uint8_t point[32], uint8
     return err == NOISE_ERROR_NONE;
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Helper: build lv_cat over two (share, ad) pairs -- used in derive() and tags
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 static std::vector<uint8_t> lv_pair(const uint8_t* share, const std::vector<uint8_t>& ad) {
     return cpace_lv_cat({
@@ -278,9 +278,9 @@ static std::vector<uint8_t> lv_pair(const uint8_t* share, const std::vector<uint
     });
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // CPace::start
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 bool CPace::start(CPaceRole role, const std::vector<uint8_t>& prs, const std::vector<uint8_t>& sid,
                   const std::vector<uint8_t>& ci, const std::vector<uint8_t>& ad,
@@ -308,9 +308,9 @@ bool CPace::start(CPaceRole role, const std::vector<uint8_t>& prs, const std::ve
     return true;
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // CPace::derive
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 bool CPace::derive(const uint8_t* peer_share, size_t peer_share_len) {
     if (!this->started_) {
@@ -395,9 +395,9 @@ bool CPace::derive(const uint8_t* peer_share, size_t peer_share_len) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // CPace::compute_mac
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 std::array<uint8_t, CPACE_TAG_SIZE> CPace::compute_mac(bool own) const {
     // own == true  -> authenticates our own (share, ad)
@@ -420,9 +420,9 @@ CPace::~CPace() {
     secure_zero(this->isk_.data(), this->isk_.size());
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // CPace::tag
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 std::optional<std::array<uint8_t, CPACE_TAG_SIZE>> CPace::tag() const {
     if (!this->derived_) {
@@ -431,9 +431,9 @@ std::optional<std::array<uint8_t, CPACE_TAG_SIZE>> CPace::tag() const {
     return this->compute_mac(true);
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // CPace::verify
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 bool CPace::verify(const uint8_t* peer_tag, size_t peer_tag_len) const {
     if (!this->derived_) {
@@ -446,9 +446,9 @@ bool CPace::verify(const uint8_t* peer_tag, size_t peer_tag_len) const {
     return constant_time_equal(expected.data(), peer_tag, CPACE_TAG_SIZE);
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // CPace::isk
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> CPace::isk() const {
     if (!this->derived_) {

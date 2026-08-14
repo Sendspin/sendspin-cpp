@@ -20,9 +20,9 @@
 
 namespace sendspin {
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // pin_generate_nonce
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 std::array<uint8_t, PIN_NONCE_SIZE> pin_generate_nonce() {
     std::array<uint8_t, PIN_NONCE_SIZE> nonce{};
@@ -30,9 +30,9 @@ std::array<uint8_t, PIN_NONCE_SIZE> pin_generate_nonce() {
     return nonce;
 }
 
-// ---------------------------------------------------------------------------
-// pin_commit: SHA-256(PIN_COMMIT_LABEL || nonce)  (see #118: domain separator)
-// ---------------------------------------------------------------------------
+// ============================================================================
+// pin_commit: SHA-256(PIN_COMMIT_LABEL || nonce), domain-separated via the label
+// ============================================================================
 
 std::array<uint8_t, PIN_COMMIT_SIZE> pin_commit(const uint8_t* nonce, size_t nonce_len) {
     const auto* label = reinterpret_cast<const uint8_t*>(PIN_COMMIT_LABEL);
@@ -40,9 +40,9 @@ std::array<uint8_t, PIN_COMMIT_SIZE> pin_commit(const uint8_t* nonce, size_t non
     return sha256_oneshot(label, label_len, nonce, nonce_len);
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // pin_verify_commit: constant-time compare SHA-256(LABEL || nonce) vs commitment
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 bool pin_verify_commit(const uint8_t* nonce, size_t nonce_len, const uint8_t* commitment,
                        size_t commitment_len) {
@@ -53,13 +53,13 @@ bool pin_verify_commit(const uint8_t* nonce, size_t nonce_len, const uint8_t* co
     return constant_time_equal(computed.data(), commitment, PIN_COMMIT_SIZE);
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // pin_derive
 //
 // digest = SHA-256(PIN_DERIVE_LABEL || handshake_hash || nonce_a || nonce_b)
 // pin_int = big-endian interpret(digest) mod 10^pin_length
 // Returns zero-padded decimal string of pin_length digits.
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 std::optional<std::string> pin_derive(const uint8_t* handshake_hash, size_t hash_len,
                                       const uint8_t* nonce_a, size_t nonce_a_len,

@@ -363,9 +363,8 @@ void ArtworkRole::Impl::enqueue_stream_event(ArtworkEventType event) const {
 void ArtworkRole::Impl::handle_stream_ring_event(ArtworkEventType event) {
     // Called from the ring drain in SendspinClient::loop() before this role's drain_events()
     // runs each tick (see drain_events()), so clearing the holds and display_slot here cancels
-    // any display that would otherwise fire later this same tick -- the same "lifecycle first"
-    // ordering the old queue-drain loop at the top of drain_events() used to guarantee by running
-    // before the display-deadline loop below it.
+    // any display that would otherwise fire later this same tick, keeping lifecycle events
+    // ordered ahead of display delivery for the tick.
     switch (event) {
         case ArtworkEventType::STREAM_END:
         case ArtworkEventType::STREAM_CLEAR:

@@ -100,14 +100,14 @@ SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendComple
 }
 
 // ============================================================================
-// Noise transport (Phase 2)
+// Noise transport
 // ============================================================================
 
 void SendspinConnection::init_noise_handshake(const Identity& identity,
                                               const RecordStore& record_store,
                                               const std::string& suite_name) {
     this->noise_handshake_ = std::make_unique<NoiseHandshake>(identity, record_store, suite_name);
-    // Retain for re-handshake (Phase 4b): these pointers outlive connections (owned by the
+    // Retain for re-handshake: these pointers outlive connections (owned by the
     // SendspinClient that constructed the manager which called this).
     this->noise_identity_ = &identity;
     this->noise_record_store_ = &record_store;
@@ -339,12 +339,10 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
 
     const size_t msg_len = this->websocket_write_offset_;
 
-    // -------------------------------------------------------------------------
     // Pre-handshake: TEXT frames feed the Noise handshake state machine (when one is
     // installed - see init_noise_handshake()). Post-handshake: every frame is BINARY
     // (Noise ciphertext); a connection with no handshake driver installed falls through to
     // the legacy direct-dispatch path unchanged.
-    // -------------------------------------------------------------------------
     const bool noise_active = this->noise_handshake_complete_.load(std::memory_order_acquire);
     const bool noise_pending = !noise_active && this->noise_handshake_;
 
@@ -384,9 +382,7 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
         return;
     }
 
-    // -------------------------------------------------------------------------
     // Binary frame
-    // -------------------------------------------------------------------------
     if (noise_active) {
         // Decrypt in-place; buffer has the full ciphertext (plaintext + 16-byte tag).
         size_t pt_len =
@@ -449,7 +445,7 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
 }
 
 // ============================================================================
-// Phase 5: Pairing finalize watchdog
+// Pairing finalize watchdog
 // ============================================================================
 
 void SendspinConnection::note_pairing_finalize_ack() {

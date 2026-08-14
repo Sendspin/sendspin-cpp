@@ -30,9 +30,9 @@
 #include <string>
 #include <vector>
 
-// Forward declaration of the Phase 8d test fixture (defined in tests/test_pin_state_machine.cpp,
-// global namespace). Declared here, outside namespace sendspin, so the friend declaration below
-// can name it unambiguously with the "::" qualifier.
+// Forward declaration of the PIN state-machine integration test fixture (defined in
+// tests/test_pin_state_machine.cpp, global namespace). Declared here, outside namespace
+// sendspin, so the friend declaration below can name it unambiguously with the "::" qualifier.
 class PinStateMachineTest;
 
 namespace sendspin {
@@ -169,9 +169,9 @@ class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;
 
-    // ========================================================================
+    // ========================================
     // Static X25519 keypair
-    // ========================================================================
+    // ========================================
 
     /// @brief Save the static X25519 private key (32 raw bytes).
     /// @return true on success, false on failure.
@@ -185,9 +185,9 @@ public:
         return std::nullopt;
     }
 
-    // ========================================================================
+    // ========================================
     // Last-played server_id
-    // ========================================================================
+    // ========================================
 
     /// @brief Save the server_id of the last server that played audio.
     /// @param server_id base64url-encoded public key of the server.
@@ -202,9 +202,9 @@ public:
         return std::nullopt;
     }
 
-    // ========================================================================
+    // ========================================
     // Pairing records
-    // ========================================================================
+    // ========================================
 
     /// @brief Load all persisted pairing records.
     /// @return All stored records (may be empty).
@@ -230,9 +230,9 @@ public:
         return false;
     }
 
-    // ========================================================================
+    // ========================================
     // Accepted Pairing PSK
-    // ========================================================================
+    // ========================================
 
     /// @brief Load the accepted Pairing PSK, if any.
     virtual std::optional<SendspinPairingPsk> load_pairing_psk() {
@@ -252,9 +252,9 @@ public:
         return false;
     }
 
-    // ========================================================================
-    // Static PIN (Phase 8c)
-    // ========================================================================
+    // ========================================
+    // Static PIN
+    // ========================================
 
     /// @brief Load the configured static PIN, if any.
     virtual std::optional<std::string> load_static_pin() {
@@ -274,9 +274,9 @@ public:
         return false;
     }
 
-    // ========================================================================
+    // ========================================
     // Pairing config
-    // ========================================================================
+    // ========================================
 
     /// @brief Load the pairing policy config.
     virtual std::optional<SendspinPairingConfig> load_pairing_config() {
@@ -288,9 +288,9 @@ public:
         return false;
     }
 
-    // ========================================================================
-    // Player static delay (unrelated to encryption; kept from pre-Phase-1)
-    // ========================================================================
+    // ========================================
+    // Player static delay (unrelated to encryption)
+    // ========================================
 
     /// @brief Saves the player's static delay
     /// @param delay_ms Static delay in milliseconds
@@ -374,7 +374,7 @@ struct Identity;
  */
 class SendspinClient {
     friend class ConnectionManager;
-    // Test-only: lets the Phase 8d PIN state-machine integration harness reach
+    // Test-only: lets the PIN state-machine integration test harness reach
     // connection_manager_ (private) to inject a fake connection. See the matching
     // friend declaration on ConnectionManager in src/connection_manager.h.
     friend class ::PinStateMachineTest;

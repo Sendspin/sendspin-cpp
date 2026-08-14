@@ -102,9 +102,9 @@ inline bool activities_allowed(PskCategory category,
 /// declaring PLAYBACK is playback-capable exactly when its own `activities` are allowed.
 ///
 /// Used both by admissible() (below) and by the client's re-evaluation of persisted
-/// `active_roles` on every server/activate (spec #122: "if a later activation changes activities
-/// so the connection is no longer playback-capable without explicitly sending active_roles, the
-/// persisted roles are treated as empty rather than the message rejected").
+/// `active_roles` on every server/activate: if a later activation changes activities so the
+/// connection is no longer playback-capable without explicitly sending active_roles, the
+/// persisted roles are treated as empty rather than the message rejected.
 ///
 /// @param category    PSK category matched during the Noise handshake.
 /// @param activities  Activities declared in the server/activate message.

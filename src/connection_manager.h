@@ -34,9 +34,9 @@
 #include <string>
 #include <vector>
 
-// Forward declaration of the Phase 8d test fixture (defined in tests/test_pin_state_machine.cpp,
-// global namespace). Declared here, outside namespace sendspin, so the friend declaration below
-// can name it unambiguously with the "::" qualifier.
+// Forward declaration of the PIN state-machine integration test fixture (defined in
+// tests/test_pin_state_machine.cpp, global namespace). Declared here, outside namespace
+// sendspin, so the friend declaration below can name it unambiguously with the "::" qualifier.
 class PinStateMachineTest;
 
 namespace sendspin {
@@ -261,7 +261,7 @@ struct ServerActivateEvent {
  * @endcode
  */
 class ConnectionManager {
-    // Test-only: lets the Phase 8d PIN state-machine integration harness inject a fake
+    // Test-only: lets the PIN state-machine integration test harness inject a fake
     // current_connection_ directly and drive on_connection_lost, bypassing the real
     // WebSocket transport and Noise handshake. No production code depends on this;
     // it exists solely so tests/test_pin_state_machine.cpp can reach private state.
@@ -652,7 +652,7 @@ private:
     static constexpr size_t NURSERY_CAPACITY = 2;
 
     // ========================================
-    // Phase 5: Pairing main-loop handlers
+    // Pairing main-loop handlers
     // ========================================
 
     /// @brief Enters the pairing exchange for the given connection.
@@ -677,8 +677,46 @@ private:
     /// @param event The storage-failed event (conn + the server_id captured when it was posted).
     void handle_pair_storage_failed(const PairStorageFailedEvent& event);
 
+    /// @brief Fires on_clear_pairing_pin and/or on_open_pairing_window's counterpart for a
+    /// pairing UI element that was left showing. Caller must hold conn_ptr_mutex_.
+    /// @param pin_was_displayed Whether a dynamic-PIN value was on screen; if true, queues
+    ///        on_clear_pairing_pin.
+    /// @param window_was_shown Whether the pairing-window gesture prompt was open; if true,
+    ///        queues on_close_pairing_window.
+    void dismiss_pairing_ui(bool pin_was_displayed, bool window_was_shown);
+
+    /// @brief Shared cleanup for every path that locally ends a pairing attempt on `conn`.
+    ///
+    /// Captures the PIN-display / pairing-window flags before clear_pairing_state() resets
+    /// them, optionally sends a wire pair/abort, clears the pairing state, optionally drops the
+    /// connection, then queues on_pairing_failed and dismisses any pairing UI left showing (via
+    /// dismiss_pairing_ui()). When `should_drop` is true, drop_connection() -> the current-slot
+    /// cleanup runs before the note_* calls, matching the ordering every call site needs (the
+    /// pending-notification vectors it clears must not race the queue pushes below). Caller must
+    /// hold conn_ptr_mutex_; `conn` must be non-null.
+    ///
+    /// @param conn               Connection whose pairing attempt is ending. Must be non-null.
+    /// @param wire_abort_reason  If set, sends pair/abort(wire_abort_reason) to the peer first
+    ///        (best-effort). Leave nullopt when the abort was received from the peer, or when
+    ///        the spec's Protocol Errors handling forbids sending one.
+    /// @param should_drop        If true, the connection is dropped via drop_connection() using
+    ///        drop_goodbye_reason. If false, drop_goodbye_reason is ignored and the connection is
+    ///        left open.
+    /// @param drop_goodbye_reason Goodbye reason passed to drop_connection() when should_drop is
+    ///        true; nullopt closes the transport without sending a client/goodbye.
+    /// @param public_reason      Reason delivered to the application via on_pairing_failed.
+    /// @param server_id_override When set, passed to on_pairing_failed instead of
+    ///        conn->get_server_id(). Only handle_pair_storage_failed() needs this: it fires from
+    ///        an event captured at production time (see its own comment for why), not from the
+    ///        connection's current state.
+    void abort_pairing_attempt(SendspinConnection* conn,
+                               std::optional<PairAbortReason> wire_abort_reason, bool should_drop,
+                               std::optional<SendspinGoodbyeReason> drop_goodbye_reason,
+                               SendspinPairAbortReason public_reason,
+                               std::optional<std::string> server_id_override = std::nullopt);
+
     // ========================================
-    // Phase 8b: Dynamic-PIN pairing main-loop handlers
+    // Dynamic-PIN pairing main-loop handlers
     // ========================================
 
     /// @brief Handle a dynamic-PIN server message on the main loop.
@@ -723,7 +761,7 @@ private:
     void handle_pairing_window_confirmed();
 
     // ========================================
-    // Phase 6: Management main-loop handlers
+    // Management main-loop handlers
     // ========================================
 
     /// @brief Handles a management/* request on the main loop.

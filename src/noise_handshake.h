@@ -29,7 +29,7 @@
 /// After step 6 the connection is in encrypted transport mode.
 /// Any failure aborts silently (caller closes the WebSocket).
 ///
-/// Re-handshake (in-band key rotation, Phase 4b):
+/// Re-handshake (in-band key rotation):
 ///   The server may initiate a new KKpsk2 handshake after transport is active.
 ///   The re-handshake msg1 arrives as a decrypted noise/handshake JSON envelope.
 ///   The prologue is the prior handshake hash `h` rather than init-text concatenation.
@@ -72,7 +72,7 @@ enum class HandshakeFrameResult {
 };
 
 // ============================================================================
-// Re-handshake helper (Phase 4b)
+// Re-handshake helper
 // ============================================================================
 
 /// @brief Run the responder side of an in-band Noise KKpsk2 re-handshake.
@@ -134,9 +134,9 @@ public:
     NoiseHandshake(NoiseHandshake&&) = delete;
     NoiseHandshake& operator=(NoiseHandshake&&) = delete;
 
-    // =========================================================================
+    // ========================================
     // Drive the state machine
-    // =========================================================================
+    // ========================================
 
     /// @brief Serialize and return the client/init TEXT frame.
     /// Call this immediately after the WS connection is open, before reading frames.

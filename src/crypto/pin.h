@@ -27,9 +27,9 @@
 
 namespace sendspin {
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // PIN constants (mirrors pin.py)
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief Size of a PIN nonce in bytes.
 static constexpr size_t PIN_NONCE_SIZE = 32;
@@ -40,8 +40,9 @@ static constexpr size_t PIN_COMMIT_SIZE = 32;
 /// @brief Label prepended to the SHA-256 input in derive_pin.
 static constexpr char PIN_DERIVE_LABEL[] = "sendspin-pin-derive-v1";
 
-/// @brief Domain-separation label prepended to nonce_B in pin_commit (see #118: "Add domain
-/// separator to pair commit"). commit_B = SHA-256(PIN_COMMIT_LABEL || nonce_B).
+/// @brief Domain-separation label prepended to nonce_B in pin_commit, so the commitment hash
+/// cannot be reused across a different protocol context. commit_B = SHA-256(PIN_COMMIT_LABEL
+/// || nonce_B).
 static constexpr char PIN_COMMIT_LABEL[] = "sendspin-pair-commit-v1";
 
 /// @brief Minimum number of PIN digits.
@@ -57,9 +58,9 @@ static constexpr int PIN_DEFAULT_MIN_DIGITS = 6;
 /// Mirrors `_STATIC_PIN_DIGITS` in aiosendspin/client/management.py.
 static constexpr int STATIC_PIN_DIGITS = 8;
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // PIN helpers
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief Return whether `pin` is exactly STATIC_PIN_DIGITS decimal digits.
 /// Mirrors `_valid_static_pin` in aiosendspin/client/management.py.

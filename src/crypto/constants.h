@@ -28,9 +28,9 @@
 
 namespace sendspin {
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // PSK constants
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief Size of a Noise pre-shared key in bytes (Curve25519 key size).
 static constexpr size_t NOISE_PSK_SIZE = 32;
@@ -49,9 +49,9 @@ extern const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK;
 /// Computed once at startup by constants.cpp.
 extern const std::string SENTINEL_PSK_ID;
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Cipher suite names (passed to noise_protocol_name_to_id)
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief Preferred cipher suite: ChaChaPoly (lower CPU cost, no hardware dep).
 static constexpr std::string_view NOISE_SUITE_CHACHAPOLY{"Noise_KKpsk2_25519_ChaChaPoly_SHA256"};
@@ -59,9 +59,9 @@ static constexpr std::string_view NOISE_SUITE_CHACHAPOLY{"Noise_KKpsk2_25519_Cha
 /// @brief Alternative cipher suite: AES-256-GCM (hardware-accelerated on ESP32).
 static constexpr std::string_view NOISE_SUITE_AESGCM{"Noise_KKpsk2_25519_AESGCM_SHA256"};
 
-// -----------------------------------------------------------------------------
-// Transport framing constants (used in Phase 2+)
-// -----------------------------------------------------------------------------
+// ============================================================================
+// Transport framing constants
+// ============================================================================
 
 /// @brief Core protocol version carried in client/init and server/init.
 static constexpr int PROTOCOL_VERSION = 1;
@@ -77,9 +77,9 @@ static constexpr size_t MAX_TRANSPORT_PLAINTEXT = 65535 - 16;  // = 65519
 /// matters on ESP32 targets with only a few MiB of PSRAM.
 static constexpr size_t MAX_REASSEMBLED_MESSAGE_BYTES = 4UL * 1024UL * 1024UL;
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Binary message type bytes (first byte of decrypted plaintext)
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief Type byte: the plaintext is a JSON body (UTF-8, strip the type byte).
 static constexpr uint8_t MSG_TYPE_JSON_BODY = 0;

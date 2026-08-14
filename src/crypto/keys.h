@@ -31,9 +31,9 @@
 
 namespace sendspin {
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // PSK-ID derivation
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief Derive the psk_id for a 32-byte PSK.
 /// @param psk  Exactly NOISE_PSK_SIZE (32) bytes.
@@ -45,9 +45,9 @@ std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk);
 /// Returns std::nullopt if len != NOISE_PSK_SIZE.
 std::optional<std::string> psk_id_for(const uint8_t* psk, size_t len);
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // X25519 Identity (long-term static keypair)
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief Size of an X25519 key (private or public) in bytes.
 static constexpr size_t X25519_KEY_SIZE = 32;
@@ -71,9 +71,9 @@ struct Identity {
     /// @brief The base64url-encoded private key (for persistence).
     [[nodiscard]] std::string private_b64u() const;
 
-    // -------------------------------------------------------------------------
+    // ========================================
     // Factory methods
-    // -------------------------------------------------------------------------
+    // ========================================
 
     /// @brief Generate a new random X25519 identity using the platform CSPRNG.
     /// Returns std::nullopt if the underlying noise-c DH-state allocation or keypair

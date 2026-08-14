@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Phase-2 Noise transport KATs: in-process loopback tests exercising:
+// Noise transport KATs: in-process loopback tests exercising:
 //   - NoiseHandshake state machine (Sendspin client = Noise responder)
 //   - NoiseSession (two-handshake trick for PSK-after-start)
 //   - SendspinConnection transport helpers (encrypt/fragment/dispatch)
@@ -25,6 +25,7 @@
 #include "crypto/keys.h"
 #include "noise_handshake.h"
 #include "noise_session.h"
+#include "noise_test_helpers.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
 #include "platform/types.h"
@@ -188,109 +189,8 @@ static std::optional<std::vector<uint8_t>> extract_noise_bytes(const std::string
     return b64url_decode(data_b64);
 }
 
-/// RAII wrapper for a noise-c handshakestate.
-struct HsGuard {
-    NoiseHandshakeState* hs{nullptr};
-    explicit HsGuard(NoiseHandshakeState* h) : hs(h) {}
-    ~HsGuard() {
-        if (hs) {
-            noise_handshakestate_free(hs);
-        }
-    }
-    HsGuard(const HsGuard&) = delete;
-    HsGuard& operator=(const HsGuard&) = delete;
-};
-
-/// RAII wrapper for a pair of noise-c cipher states.
-struct CipherPair {
-    NoiseCipherState* send_cs{nullptr};
-    NoiseCipherState* recv_cs{nullptr};
-
-    CipherPair() = default;
-
-    ~CipherPair() {
-        if (send_cs) {
-            noise_cipherstate_free(send_cs);
-            send_cs = nullptr;
-        }
-        if (recv_cs) {
-            noise_cipherstate_free(recv_cs);
-            recv_cs = nullptr;
-        }
-    }
-
-    CipherPair(const CipherPair&) = delete;
-    CipherPair& operator=(const CipherPair&) = delete;
-
-    CipherPair(CipherPair&& o) noexcept : send_cs(o.send_cs), recv_cs(o.recv_cs) {
-        o.send_cs = nullptr;
-        o.recv_cs = nullptr;
-    }
-    CipherPair& operator=(CipherPair&& o) noexcept {
-        if (this != &o) {
-            if (send_cs) noise_cipherstate_free(send_cs);
-            if (recv_cs) noise_cipherstate_free(recv_cs);
-            send_cs = o.send_cs;
-            recv_cs = o.recv_cs;
-            o.send_cs = nullptr;
-            o.recv_cs = nullptr;
-        }
-        return *this;
-    }
-};
-
-/// @brief Build a KKpsk2 initiator handshakestate (the "server" role in Sendspin).
-///
-/// @param suite_name   Full Noise suite name.
-/// @param local_priv   Server static private key (32 bytes).
-/// @param local_pub    Server static public key (32 bytes).
-/// @param remote_pub   Client static public key (32 bytes).
-/// @param psk          PSK (32 bytes) - provided to satisfy noise-c before start.
-/// @param prologue     Prologue bytes.
-/// @param prologue_len Prologue length.
-/// @return Raw pointer on success, or nullptr.
-static NoiseHandshakeState* build_initiator_hs(const std::string& suite_name,
-                                               const uint8_t* local_priv, const uint8_t* local_pub,
-                                               const uint8_t* remote_pub, const uint8_t* psk,
-                                               const uint8_t* prologue, size_t prologue_len) {
-    NoiseHandshakeState* hs = nullptr;
-    if (noise_handshakestate_new_by_name(&hs, suite_name.c_str(), NOISE_ROLE_INITIATOR) !=
-        NOISE_ERROR_NONE) {
-        return nullptr;
-    }
-
-    NoiseDHState* local_dh = noise_handshakestate_get_local_keypair_dh(hs);
-    if (noise_dhstate_set_keypair(local_dh, local_priv, X25519_KEY_SIZE, local_pub,
-                                  X25519_KEY_SIZE) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-
-    NoiseDHState* remote_dh = noise_handshakestate_get_remote_public_key_dh(hs);
-    if (noise_dhstate_set_public_key(remote_dh, remote_pub, X25519_KEY_SIZE) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-
-    if (noise_handshakestate_set_pre_shared_key(hs, psk, NOISE_PSK_SIZE) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-
-    if (prologue_len > 0) {
-        if (noise_handshakestate_set_prologue(hs, prologue, prologue_len) != NOISE_ERROR_NONE) {
-            noise_handshakestate_free(hs);
-            return nullptr;
-        }
-    }
-
-    if (noise_handshakestate_start(hs) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-
-    return hs;
-}
+// HsGuard, CipherPair, and build_initiator (the raw noise-c KKpsk2 initiator builder playing
+// the "server" role) come from noise_test_helpers.h.
 
 // =============================================================================
 // Full handshake loopback helper
@@ -381,11 +281,11 @@ static std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     // Msg1 plaintext payload: {"psk_id":"..."}
     // -----------------------------------------------------------------
     NoiseHandshakeState* init_hs_raw =
-        build_initiator_hs(suite_name, server_id.private_bytes.data(),
+        build_initiator(suite_name, server_id.private_bytes.data(),
                            server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
                            prologue, prologue_len);
     if (init_hs_raw == nullptr) {
-        ADD_FAILURE() << "build_initiator_hs failed for suite " << suite_name;
+        ADD_FAILURE() << "build_initiator failed for suite " << suite_name;
         return std::nullopt;
     }
     HsGuard init_hs_guard(init_hs_raw);
@@ -613,8 +513,8 @@ TEST(NoiseTransport, SendEncryptedText_SmallJson_ChaChaPoly) {
 }
 
 // send_app_json routes plaintext before a transport session exists and encrypted afterwards.
-// Regression guard for the Finding-1 fix: the routing decision reads the atomic noise_active_
-// flag (set alongside the session), not the noise_session_ unique_ptr.
+// Regression guard: the routing decision reads the atomic noise_active_ flag (set alongside
+// the session), not the noise_session_ unique_ptr.
 TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
@@ -841,7 +741,7 @@ TEST(NoiseHandshakeDriver, UnknownPskIdAborts) {
 
     // Build initiator (uses same psk - so msg1 auth passes, but psk_id not in store)
     NoiseHandshakeState* init_hs_raw =
-        build_initiator_hs(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
+        build_initiator(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
                            server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
                            prologue, prologue_len);
     ASSERT_NE(init_hs_raw, nullptr);
@@ -898,7 +798,7 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
 
     // Build initiator - uses psk (matching the stored PSK)
     NoiseHandshakeState* init_hs_raw =
-        build_initiator_hs(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
+        build_initiator(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
                            server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
                            prologue, prologue_len);
     ASSERT_NE(init_hs_raw, nullptr);
@@ -958,8 +858,7 @@ TEST(NoiseHandshakeDriver, WrongVersionAborts) {
 TEST(NoiseTransportDispatch, NonFragmentMidReassemblyClosesConnection) {
     // Deliver FRAGMENT_MORE, then a non-fragment (type 0x00) frame while reassembly is in
     // flight. Per spec "Malformed sequences" this is a protocol error: the connection must be
-    // closed, not just have its reassembly state discarded (the old, pre-fix behavior this test
-    // used to assert -- see FINDING 9 in the encryption failure-handling review).
+    // closed, not just have its reassembly state discarded.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
 
@@ -1026,7 +925,7 @@ TEST(NoiseTransportDispatch, NonFragmentMidReassemblyClosesConnection) {
 TEST(NoiseTransportDispatch, FragmentEndWithoutStartClosesConnection) {
     // A fragment-end frame with no fragmented message in flight is a spec "Malformed
     // sequences" protocol error: the connection must be closed, not merely have the stray
-    // frame dropped (the old, pre-fix behavior this test used to assert -- see FINDING 9).
+    // frame dropped.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
 
@@ -1060,7 +959,7 @@ TEST(NoiseTransportDispatch, FragmentEndWithoutStartClosesConnection) {
 }
 
 TEST(NoiseTransportDispatch, BenignMidReassemblyDoesNotClose) {
-    // Regression guard for FINDING 9: a normal, in-progress fragment reassembly (just the
+    // Regression guard: a normal, in-progress fragment reassembly (just the
     // FRAGMENT_MORE start frame, no FRAGMENT_END yet) is the benign "no complete message yet"
     // state and must NOT close the connection -- only the three enumerated malformed
     // sequences (fragment-end with nothing in flight, a non-fragment frame while one is in
@@ -1169,7 +1068,7 @@ TEST(NoiseTransportDispatch, ReassemblyOverCapDropsWithoutClosing) {
 }
 
 TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
-    // FINDING 12: a fatal initial-handshake error (here: an unresolvable psk_id in msg1) must
+    // A fatal initial-handshake error (here: an unresolvable psk_id in msg1) must
     // close the connection. This drives the full chain through dispatch_completed_message() ->
     // handle_noise_handshake_text(), using the same fake-connection pattern (TestConnection,
     // disconnect_calls_) as the other dispatch tests above -- unlike the
@@ -1200,7 +1099,7 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
     std::string psk_id = psk_id_for(psk);
 
     NoiseHandshakeState* init_hs_raw =
-        build_initiator_hs(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
+        build_initiator(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
                            server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
                            prologue, prologue_len);
     ASSERT_NE(init_hs_raw, nullptr);
@@ -1368,7 +1267,7 @@ TEST(NoiseTransport, FragmentReassembleBinaryReceive) {
 // =============================================================================
 
 TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
-    // FINDING 1: an AEAD failure in transport mode must not just drop the frame -- the
+    // An AEAD failure in transport mode must not just drop the frame -- the
     // underlying Noise decrypt never advances the receive-direction nonce counter on an auth
     // failure, so leaving the connection open would desync it permanently (every later frame
     // would also fail forever). Spec Failure Handling also mandates closing silently here.

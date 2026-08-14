@@ -152,7 +152,7 @@ TEST(RecordStore, FirstBootProvisioningCreatesPairingPsk) {
 
 /// A persistence provider whose writes for the shared-PSK record, the Pairing PSK, and the
 /// pairing config always fail (e.g. full or read-only NVS), used to verify first-boot
-/// provisioning surfaces a rejected write instead of silently discarding it (Finding D).
+/// provisioning surfaces a rejected write instead of silently discarding it.
 class AlwaysRejectingProvider : public SendspinPersistenceProvider {
 public:
     bool save_pairing_record(const SendspinPairingRecord& /*record*/) override {
@@ -173,9 +173,9 @@ public:
     int config_save_attempts{0};
 };
 
-// Finding D: a provider that rejects every write during first-boot provisioning must not be
-// silently ignored. The device must still be fully usable for the current boot (RAM-only state),
-// and the provider must actually have been asked to persist each piece of material.
+// A provider that rejects every write during first-boot provisioning must not be silently
+// ignored. The device must still be fully usable for the current boot (RAM-only state), and
+// the provider must actually have been asked to persist each piece of material.
 TEST(RecordStore, FirstBootProvisioningSurvivesPersistenceFailureForThisBoot) {
     AlwaysRejectingProvider provider;
     RecordStore store(&provider);
@@ -278,7 +278,7 @@ TEST(RecordStore, StoreRecordRejectionDoesNotReplaceExistingRecord) {
 }
 
 // =============================================================================
-// store_record: at most one record per server_id (Finding A supersede invariant)
+// store_record_superseding: at most one record per server_id
 // =============================================================================
 
 // Re-pairing the same server_id twice (e.g. after the server was factory-reset and re-paired)
@@ -983,8 +983,8 @@ TEST(FilePersistenceProvider, KeypairPersistsViaClientStartServer) {
     }
 }
 
-// Finding #4 regression: load_or_generate_identity() must never leave client_id_ as the peer_id
-// of an all-zero Identity (the old silent-failure value). This cannot force the underlying
+// Regression: load_or_generate_identity() must never leave client_id_ as the peer_id
+// of an all-zero Identity (a silent-failure value). This cannot force the underlying
 // noise-c DH-state generation to actually fail (no test hook for that), so it instead pins the
 // property that would have caught the original bug: a real client_id must differ from what an
 // all-zero keypair would have produced.
@@ -1312,8 +1312,7 @@ TEST(RecordStoreWithFile, UnpairedAccessSeedDoesNotOverrideStoredConfig) {
 }
 
 // =============================================================================
-// resolve_pairing_outcome: normal and storage-exhausted paths (declared in Phase 2 for
-// completeness; exercised for real once pairing lands in a later phase)
+// resolve_pairing_outcome: normal and storage-exhausted paths
 // =============================================================================
 
 // Normal case: storage is available -> returns {psk, record=set}.

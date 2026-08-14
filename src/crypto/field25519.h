@@ -42,9 +42,9 @@ struct Fp {
     uint64_t limbs[4]{};  // limbs[0] = least significant 64 bits
 };
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Internal helpers
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 // p = 2^255 - 19
 static constexpr Fp FP_P = {{
@@ -95,7 +95,7 @@ inline std::array<uint8_t, 32> fp_to_le(const Fp& a) {
     return out;
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Portable wide-arithmetic helpers.
 //
 // The field arithmetic below works on four 64-bit limbs and needs 64x64->128
@@ -104,7 +104,7 @@ inline std::array<uint8_t, 32> fp_to_le(const Fp& a) {
 // type. These helpers implement the wide operations using only uint64_t, so there
 // is a SINGLE code path on every platform and the host tests validate exactly what
 // runs on the device.
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// @brief 64x64 -> 128 bit unsigned multiply. Sets hi:lo to the full product.
 inline void mul64_wide(uint64_t a, uint64_t b, uint64_t& hi, uint64_t& lo) {
@@ -140,13 +140,13 @@ inline uint64_t sbb64(uint64_t a, uint64_t b, uint64_t borrow_in, uint64_t& borr
     return d2;
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Fully reduce a value that may be in [0, 2p-1] to [0, p-1].
 //
 // Uses a conditional subtraction: try to subtract p; if no borrow, the
 // subtracted result is correct; otherwise keep the original.
 // Called after add, sub, and mul operations.
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 inline Fp fp_reduce(const Fp& a) {
     // Attempt to subtract p: compute r = a - p.
@@ -165,7 +165,7 @@ inline Fp fp_reduce(const Fp& a) {
     return a;
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Fully reduce a value anywhere in [0, 2^256) to [0, p-1].
 //
 // The single conditional subtraction above is only enough for inputs below 2p.
@@ -179,7 +179,7 @@ inline Fp fp_reduce(const Fp& a) {
 // fp_to_le(), which does not reduce.
 //
 // Two passes always suffice because 2^256 < 3p.
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 inline Fp fp_reduce_full(const Fp& a) {
     return fp_reduce(fp_reduce(a));
@@ -192,7 +192,7 @@ inline Fp fp_reduce(const Fp& a, uint64_t /*top_carry_must_be_folded_in*/) {
     return fp_reduce_full(a);
 }
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Montgomery-free 256-bit mod-p multiplication using schoolbook 128-bit math.
 //
 // We compute a * b as a 512-bit product then reduce mod p.
@@ -201,7 +201,7 @@ inline Fp fp_reduce(const Fp& a, uint64_t /*top_carry_must_be_folded_in*/) {
 //   n mod p = n_lo + n_hi * 19   (because 2^255 = p + 19 => 2^255 mod p = 19)
 // The fold leaves a value below 2^256, which is 2p + 38 -- so the final step must be the
 // two-subtraction fp_reduce_full(), not a single conditional subtraction.
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 inline Fp fp_mul(const Fp& a, const Fp& b) {
     // Compute a 512-bit product using 64-bit limbs.

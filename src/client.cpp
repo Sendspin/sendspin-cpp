@@ -85,7 +85,7 @@ struct SendspinClient::EventState {
     // Dynamic-PIN display notifications.
     std::vector<std::string> pending_display_pin;  ///< PINs to display (usually 0 or 1 entry).
     bool pending_clear_pin{false};                 ///< true = fire on_clear_pairing_pin once.
-    // Static-PIN pairing-window notifications (Phase 8c).
+    // Static-PIN pairing-window notifications.
     bool pending_open_pairing_window{false};   ///< true = fire on_open_pairing_window once.
     bool pending_close_pairing_window{false};  ///< true = fire on_close_pairing_window once.
 };
@@ -1051,7 +1051,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             break;
         }
         case SendspinServerToClientMessageType::NOISE_HANDSHAKE: {
-            // In-band re-handshake initiated by the server (Phase 4b). This runs on the
+            // In-band re-handshake initiated by the server. This runs on the
             // network thread (same thread as decrypt), so no lock is needed on this side; the
             // NoiseTransport session mutex is only acquired inside handle_noise_rehandshake for
             // the encrypt + swap.
@@ -1355,7 +1355,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             break;
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_AUTH: {
-            // server/pair-auth: server CPace share (Phase 8b).
+            // server/pair-auth: server CPace share.
             if (conn != nullptr) {
                 ServerPairAuthPayload payload;
                 if (process_server_pair_auth_message(root, &payload)) {
@@ -1375,7 +1375,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             break;
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM: {
-            // server/pair-confirm: server CPace confirmation tag (Phase 8b).
+            // server/pair-confirm: server CPace confirmation tag.
             if (conn != nullptr) {
                 ServerPairConfirmPayload payload;
                 if (process_server_pair_confirm_message(root, &payload)) {

@@ -29,6 +29,7 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "noise_test_helpers.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
 #include "sendspin/client.h"
@@ -243,95 +244,11 @@ void pump_for(SendspinClient& client, int duration_ms) {
 }
 
 // ============================================================================
-// Raw noise-c initiator-side crypto helpers (mirrors test_noise_rehandshake.cpp exactly; the
-// project's own NoiseSession class only implements the Noise RESPONDER role, so the fake
-// server -- playing the Noise INITIATOR -- has to drive noise-c directly).
+// Raw noise-c initiator-side crypto helpers (HsGuard / CipherPair / build_initiator come from
+// noise_test_helpers.h; the project's own NoiseSession class only implements the Noise
+// RESPONDER role, so the fake server -- playing the Noise INITIATOR -- has to drive noise-c
+// directly).
 // ============================================================================
-
-struct HsGuard {
-    NoiseHandshakeState* hs{nullptr};
-    explicit HsGuard(NoiseHandshakeState* h) : hs(h) {}
-    ~HsGuard() {
-        if (this->hs) {
-            noise_handshakestate_free(this->hs);
-        }
-    }
-    HsGuard(const HsGuard&) = delete;
-    HsGuard& operator=(const HsGuard&) = delete;
-};
-
-struct CipherPair {
-    NoiseCipherState* send_cs{nullptr};
-    NoiseCipherState* recv_cs{nullptr};
-
-    CipherPair() = default;
-    ~CipherPair() {
-        this->reset();
-    }
-    CipherPair(const CipherPair&) = delete;
-    CipherPair& operator=(const CipherPair&) = delete;
-    CipherPair(CipherPair&& o) noexcept : send_cs(o.send_cs), recv_cs(o.recv_cs) {
-        o.send_cs = nullptr;
-        o.recv_cs = nullptr;
-    }
-    CipherPair& operator=(CipherPair&& o) noexcept {
-        if (this != &o) {
-            this->reset();
-            this->send_cs = o.send_cs;
-            this->recv_cs = o.recv_cs;
-            o.send_cs = nullptr;
-            o.recv_cs = nullptr;
-        }
-        return *this;
-    }
-    void reset() {
-        if (this->send_cs) {
-            noise_cipherstate_free(this->send_cs);
-            this->send_cs = nullptr;
-        }
-        if (this->recv_cs) {
-            noise_cipherstate_free(this->recv_cs);
-            this->recv_cs = nullptr;
-        }
-    }
-};
-
-NoiseHandshakeState* build_initiator(const std::string& suite_name, const uint8_t* local_priv,
-                                     const uint8_t* local_pub, const uint8_t* remote_pub,
-                                     const uint8_t* psk, const uint8_t* prologue,
-                                     size_t prologue_len) {
-    NoiseHandshakeState* hs = nullptr;
-    if (noise_handshakestate_new_by_name(&hs, suite_name.c_str(), NOISE_ROLE_INITIATOR) !=
-        NOISE_ERROR_NONE) {
-        return nullptr;
-    }
-    NoiseDHState* local_dh = noise_handshakestate_get_local_keypair_dh(hs);
-    if (noise_dhstate_set_keypair(local_dh, local_priv, X25519_KEY_SIZE, local_pub,
-                                  X25519_KEY_SIZE) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-    NoiseDHState* remote_dh = noise_handshakestate_get_remote_public_key_dh(hs);
-    if (noise_dhstate_set_public_key(remote_dh, remote_pub, X25519_KEY_SIZE) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-    if (noise_handshakestate_set_pre_shared_key(hs, psk, NOISE_PSK_SIZE) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-    if (prologue_len > 0) {
-        if (noise_handshakestate_set_prologue(hs, prologue, prologue_len) != NOISE_ERROR_NONE) {
-            noise_handshakestate_free(hs);
-            return nullptr;
-        }
-    }
-    if (noise_handshakestate_start(hs) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-    return hs;
-}
 
 std::vector<uint8_t> write_msg1(NoiseHandshakeState* hs, const std::string& psk_id) {
     std::string psk_id_json = "{\"psk_id\":\"" + psk_id + "\"}";

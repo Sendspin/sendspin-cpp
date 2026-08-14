@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Phase 8b unit tests: dynamic-PIN wire messages, PIN lockout, and CPace
-// round-trip.  Mirrors the test surface described in the Phase 8b spec and
-// validates against the aiosendspin Python reference behaviour.
+// Dynamic-PIN and static-PIN unit tests: wire messages, PIN lockout, and CPace
+// round-trip. Validates against the aiosendspin Python reference behaviour.
 
 #include "crypto/cpace.h"
 #include "platform/base64.h"
@@ -612,7 +611,7 @@ TEST(DynamicPinCPace, MismatchedAssociatedDataFailsVerify) {
 }
 
 // ============================================================================
-// Phase 8b: client/hello dynamic_pin method descriptor fields
+// client/hello dynamic_pin method descriptor fields
 // ============================================================================
 
 TEST(DynamicPin, ClientHelloDynamicPinDescriptorOutChannels) {
@@ -647,7 +646,7 @@ TEST(DynamicPin, ClientHelloDynamicPinDescriptorOutChannels) {
 }
 
 // ============================================================================
-// Phase 8c: static-PIN wire messages
+// Static-PIN wire messages
 // ============================================================================
 
 // format_client_pair_init_message(pairing_index) (single-arg overload): static PIN sends no
@@ -706,7 +705,7 @@ TEST(StaticPin, FormatClientPairConfirmNoNonceWireShape) {
 }
 
 // ============================================================================
-// Phase 8c: client/hello static_pin method descriptor fields
+// client/hello static_pin method descriptor fields
 // ============================================================================
 
 // static_pin carries neither out_channels nor min_pin_length (those are set only for
@@ -757,7 +756,7 @@ TEST(StaticPin, ClientHelloStaticPinLocationsHint) {
 }
 
 // ============================================================================
-// Phase 8c: CPace round-trip using the static-PIN SID construction
+// CPace round-trip using the static-PIN SID construction
 // ============================================================================
 
 // The static-PIN SID construction is identical to dynamic PIN's (see make_test_sid() above);

@@ -188,12 +188,10 @@ inline std::optional<SendspinActivity> activity_from_string(const std::string& s
 }
 
 /// @brief Pairing method on the wire (advertised in client/hello, selected in server/activate).
-/// DYNAMIC_PIN/STATIC_PIN are declared for wire completeness; the pairing flow that uses them
-/// is deferred (Phase 5/8) and never appears in supported_pair_methods yet.
 enum class SendspinPairMethod : uint8_t {
     PAIRING_PSK,  // Out-of-band distributed Pairing PSK
-    DYNAMIC_PIN,  // Dynamic PIN via PAKE (deferred)
-    STATIC_PIN,   // Static PIN via PAKE (deferred)
+    DYNAMIC_PIN,  // Dynamic PIN via PAKE
+    STATIC_PIN,   // Static PIN via PAKE
 };
 
 /// @brief Converts a SendspinPairMethod value to its protocol wire string.
@@ -766,7 +764,7 @@ struct ServerColorStateDelta {
 // ============================================================================
 
 // ============================================================================
-// Phase 6: Management result types
+// Management result types
 // ============================================================================
 
 /// @brief Result code for management/result messages.
@@ -892,7 +890,7 @@ struct ManagementResultPayload {
 };
 
 // ============================================================================
-// Phase 6: Management request message structs (server -> client)
+// Management request message structs (server -> client)
 // ============================================================================
 
 /// @brief Parsed management/add-record payload.
@@ -1017,10 +1015,10 @@ struct PairAbortMessage {
 };
 
 // ============================================================================
-// Phase 8b: Dynamic-PIN pairing message structs (server -> client)
+// Dynamic-PIN pairing message structs (server -> client)
 // ============================================================================
 
-/// @brief Parsed server/pair-init payload (Phase 8b).
+/// @brief Parsed server/pair-init payload.
 /// Carries only nonce_A (32 raw bytes, base64url-encoded on the wire, 43 chars); the session
 /// pin_length arrives earlier, in the activation's pairing object. Sent by the server in
 /// response to client/pair-init (which carried commit_B).
@@ -1028,13 +1026,13 @@ struct ServerPairInitPayload {
     std::array<uint8_t, 32> nonce_a{};  ///< 32-byte server nonce decoded from base64url.
 };
 
-/// @brief Parsed server/pair-auth payload (Phase 8b).
+/// @brief Parsed server/pair-auth payload.
 /// Carries pake_msg_1 (32 raw bytes, base64url-encoded, 43 chars): the server's CPace share.
 struct ServerPairAuthPayload {
     std::array<uint8_t, 32> pake_msg_1{};  ///< Server CPace public share.
 };
 
-/// @brief Parsed server/pair-confirm payload (Phase 8b).
+/// @brief Parsed server/pair-confirm payload.
 /// Carries server_kc (64 raw bytes, base64url-encoded, 86 chars): the server confirmation tag.
 struct ServerPairConfirmPayload {
     std::array<uint8_t, 64> server_kc{};  ///< Server CPace confirmation tag (HMAC-SHA-512).
@@ -1220,7 +1218,7 @@ bool process_server_pair_finalize_message(JsonObject root);
 bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg);
 
 // ============================================================================
-// Phase 8b: Dynamic-PIN pairing protocol functions
+// Dynamic-PIN pairing protocol functions
 // ============================================================================
 
 /// @brief Parses a server/pair-init JSON message into the provided struct.
@@ -1263,7 +1261,7 @@ std::string format_client_pair_pending_message(uint32_t pairing_index);
 std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
                                             uint32_t pairing_index);
 
-/// @brief Formats a client/pair-init message with only pairing_index (static PIN, Phase 8c).
+/// @brief Formats a client/pair-init message with only pairing_index (static PIN).
 /// Static PIN carries no commit_B (mirrors the reference's ClientPairInitPayload with omit_none:
 /// commit_B is unset). Sent after the operator confirms the pairing-window gesture, before
 /// starting CPace RESPONDER.
@@ -1286,14 +1284,14 @@ std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_
 std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
                                                const std::array<uint8_t, 32>& nonce_b);
 
-/// @brief Formats a client/pair-confirm message with no nonce (static PIN, Phase 8c).
+/// @brief Formats a client/pair-confirm message with no nonce (static PIN).
 /// Static PIN carries client_kc only (no nonce_B opening, since there is no commit_B to open).
 /// @param client_kc 64-byte client CPace confirmation tag (base64url-encoded on the wire).
 /// @return JSON string for the client/pair-confirm message with client_kc only.
 std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc);
 
 // ============================================================================
-// Phase 6: Management protocol functions
+// Management protocol functions
 // ============================================================================
 
 /// @brief Parses a management/add-record JSON message payload into the provided struct.

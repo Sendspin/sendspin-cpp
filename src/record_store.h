@@ -103,18 +103,18 @@ public:
 
     virtual ~RecordStore() = default;
 
-    // ========================================================================
-    // PSK resolution (used by the Noise handshake, Phase 2+)
-    // ========================================================================
+    // ========================================
+    // PSK resolution (used by the Noise handshake)
+    // ========================================
 
     /// @brief Resolve a psk_id to its PSK for the handshake.
     /// Order: long-term record -> accepted Pairing PSK -> Sentinel PSK.
     /// Returns nullopt only if psk_id is entirely unknown (not even Sentinel).
     [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id(const std::string& psk_id) const;
 
-    // ========================================================================
+    // ========================================
     // Long-term record management
-    // ========================================================================
+    // ========================================
 
     /// @brief Return the long-term record identified by psk_id, if any.
     [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(const std::string& psk_id) const;
@@ -191,9 +191,9 @@ public:
     /// The record referenced by record_mode_psk_id is protected.
     [[nodiscard]] bool can_remove_record(const std::string& psk_id) const;
 
-    // ========================================================================
+    // ========================================
     // Pairing PSK (the one the client accepts to admit a new server)
-    // ========================================================================
+    // ========================================
 
     /// @brief Set the accepted Pairing PSK, replacing any existing one.
     /// psk_id is re-derived from the supplied secret; any id in `psk` is ignored.
@@ -207,9 +207,9 @@ public:
         return this->pairing_psk_;
     }
 
-    // ========================================================================
+    // ========================================
     // Pairing config
-    // ========================================================================
+    // ========================================
 
     /// @brief Return whether Pairing-PSK pairing is enabled.
     [[nodiscard]] bool pairing_psk_enabled() const {
@@ -231,9 +231,9 @@ public:
         return this->dynamic_pin_min_length_;
     }
 
-    // ========================================================================
+    // ========================================
     // Dynamic-PIN failure counter (escalation, persisted)
-    // ========================================================================
+    // ========================================
 
     /// @brief Failure count at which dynamic_pin becomes escalated (gesture-gated).
     static constexpr int DYNAMIC_PIN_ESCALATION_THRESHOLD = 10;
@@ -258,9 +258,9 @@ public:
     /// client's own verification of server_kc succeeds, whether or not the attempt finalizes.
     void reset_dynamic_pin_failures();
 
-    // ========================================================================
-    // Static PIN (Phase 8c)
-    // ========================================================================
+    // ========================================
+    // Static PIN
+    // ========================================
 
     /// @brief Return the configured static PIN, if any.
     [[nodiscard]] const std::optional<std::string>& static_pin() const {
@@ -281,15 +281,6 @@ public:
     /// @brief Set the static-PIN-enabled flag and persist the config.
     void set_static_pin_enabled(bool enabled);
 
-    /// @brief Return the psk_id of the shared-PSK fallback record.
-    [[nodiscard]] const std::string& record_mode_psk_id() const {
-        return this->record_mode_psk_id_;
-    }
-
-    /// @brief Set the shared-PSK fallback record.
-    /// @return false if psk_id does not reference an existing shared-PSK record.
-    bool set_record_mode_psk_id(const std::string& psk_id);
-
     /// @brief Set the pairing-PSK-enabled flag and persist the config.
     void set_pairing_psk_enabled(bool enabled);
 
@@ -302,9 +293,26 @@ public:
     /// @brief Set the minimum PIN length and persist the config.
     void set_dynamic_pin_min_length(int length);
 
-    // ========================================================================
-    // Pairing outcome (Phase 5+, declared now for completeness)
-    // ========================================================================
+    /// @brief Return the psk_id of the shared-PSK fallback record.
+    [[nodiscard]] const std::string& record_mode_psk_id() const {
+        return this->record_mode_psk_id_;
+    }
+
+    /// @brief Set the shared-PSK fallback record.
+    /// @return false if psk_id does not reference an existing shared-PSK record.
+    bool set_record_mode_psk_id(const std::string& psk_id);
+
+    // ========================================
+    // Pairing outcome
+    // ========================================
+
+    /// @brief Result of resolve_pairing_outcome(): either a fresh per-server PSK/record pair,
+    /// or the shared-PSK fallback when storage is exhausted.
+    struct PairingOutcome {
+        std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+        /// nullopt = storage exhausted, use the shared-PSK fallback record.
+        std::optional<SendspinPairingRecord> record;
+    };
 
     /// @brief Decide a pairing outcome.
     ///
@@ -312,11 +320,6 @@ public:
     /// fresh PSK bound to server_id and returns {psk, record}.
     /// When storage is exhausted, returns the shared fallback PSK and record=nullopt.
     /// Returns nullopt on error (missing shared fallback).
-    struct PairingOutcome {
-        std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-        /// nullopt = storage exhausted, use the shared-PSK fallback record.
-        std::optional<SendspinPairingRecord> record;
-    };
     [[nodiscard]] std::optional<PairingOutcome> resolve_pairing_outcome(
         const std::string& server_id, const std::optional<std::string>& label = std::nullopt);
 
@@ -325,9 +328,9 @@ public:
         return true;
     }
 
-    // ========================================================================
-    // Storage accounting (Phase 6)
-    // ========================================================================
+    // ========================================
+    // Storage accounting
+    // ========================================
 
     /// @brief Storage accounting report returned by storage_accounting().
     struct StorageReport {

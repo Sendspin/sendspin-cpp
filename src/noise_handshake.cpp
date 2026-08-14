@@ -153,9 +153,7 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
         return std::nullopt;
     }
 
-    // -------------------------------------------------------------------------
     // Two-handshake trick: Step 1 - probe session with placeholder PSK
-    // -------------------------------------------------------------------------
     // We need psk_id from msg1's plaintext, but noise-c requires PSK before start.
     // Use a zero placeholder; since psk2 mixes PSK only in msg2, msg1 is
     // authenticated with static keys only.
@@ -192,9 +190,7 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
 
     SS_LOGD(TAG, "%s: psk_id='%s'", log_prefix, psk_id);
 
-    // -------------------------------------------------------------------------
     // Resolve psk_id via RecordStore
-    // -------------------------------------------------------------------------
     auto resolved = record_store.resolve_by_psk_id(std::string(psk_id));
     if (!resolved.has_value()) {
         SS_LOGW(TAG, "%s: unknown psk_id='%s', aborting", log_prefix, psk_id);
@@ -209,9 +205,7 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
         return std::nullopt;
     }
 
-    // -------------------------------------------------------------------------
     // Two-handshake trick: Step 2 - real session with the resolved PSK
-    // -------------------------------------------------------------------------
     // Discard the probe; build a fresh handshakestate with the real PSK and
     // re-process the exact same msg1 bytes.
     auto real_session =
@@ -228,9 +222,7 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
         return std::nullopt;
     }
 
-    // -------------------------------------------------------------------------
     // Write msg2 (payload: `{}`) and split to transport mode
-    // -------------------------------------------------------------------------
     std::vector<uint8_t> msg2_bytes;
     if (!real_session->write_msg2_and_split(msg2_bytes)) {
         SS_LOGE(TAG, "%s: write_msg2_and_split failed", log_prefix);
@@ -375,7 +367,7 @@ bool NoiseHandshake::handle_msg1(const std::string& text,
 }
 
 // ============================================================================
-// Re-handshake helper (Phase 4b)
+// Re-handshake helper
 // ============================================================================
 
 std::optional<NoiseHandshakeResult> run_rehandshake_msg1(const std::string& msg1_json,

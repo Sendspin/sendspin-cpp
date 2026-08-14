@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Phase 6 unit tests covering:
+// Management-protocol unit tests covering:
 //   - Protocol round-trips: parse each server->client management request + server/unpair;
 //     format management/result for each result code and each data shape; verify omit-when-absent.
 //   - Handler unit tests against a RecordStore + fake persistence provider.
@@ -630,9 +630,6 @@ TEST(ManagementHandler, AddRecordAlreadyExists) {
     EXPECT_EQ(result.result, ManagementResult::ALREADY_EXISTS);
 }
 
-// Finding C: add-record twice with the same server_id but different PSKs supersedes the prior
-// record rather than accumulating two records for one server (consistent with the re-pairing
-// supersede semantics in RecordStore::store_record, see Finding A).
 // management/add-record deliberately does NOT supersede: the spec's only stated add-record
 // collision rule is keyed on psk_id ("A psk whose psk_id is already known ... is rejected as
 // already_exists") and it defines no outcome for a server_id collision, so silently deleting a
@@ -740,10 +737,8 @@ TEST(ManagementHandler, RemoveRecordProtectedRecordMode) {
     EXPECT_EQ(effect, ManagementEffect::NONE);
 }
 
-// Regression (Finding B): own-record detection compares psk_id -- the credential that actually
-// authenticated the connection -- not server_id. This test previously passed the record's
-// server_id as the third argument; that encoded the old (buggy) server_id-based comparison.
-// Updated to pass the record's psk_id, which is what a real connection presents now.
+// Regression: own-record detection compares psk_id -- the credential that actually
+// authenticated the connection -- not server_id.
 TEST(ManagementHandler, RemoveOwnRecordGivesGoodbyeUnauthorized) {
     RecordStore store(nullptr);
     SendspinPairingRecord rec = make_client_record("srv-self");
@@ -783,9 +778,9 @@ TEST(ManagementHandler, RemoveRecordDifferentRequesterPskIdNoEffect) {
     EXPECT_EQ(effect, ManagementEffect::NONE);
 }
 
-// Finding B (b1): a connection authenticated via a non-record-mode SHARED record removing that
-// record must still get GOODBYE_UNAUTHORIZED. Shared records have no server_id at all, so the
-// old server_id-based comparison could never fire here -- this is the "missed teardown" case.
+// Regression: a connection authenticated via a non-record-mode SHARED record removing that
+// record must still get GOODBYE_UNAUTHORIZED. Shared records have no server_id at all, so a
+// server_id-based comparison could never fire here -- this is the "missed teardown" case.
 TEST(ManagementHandler, RemoveOwnSharedRecordGivesGoodbyeUnauthorized) {
     RecordStore store(nullptr);
     // A second shared-PSK record, distinct from the auto-provisioned record_mode fallback, so

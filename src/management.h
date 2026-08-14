@@ -20,8 +20,8 @@
 /// ManagementEffect. Deliberately transport-free so handlers are unit-testable against
 /// a bare RecordStore without any network layer.
 ///
-/// pairing_psk, static_pin, and dynamic_pin are all implemented (Phase 8c added the PIN
-/// branches). See handle_get_pairing_config / handle_set_pairing_config below.
+/// pairing_psk, static_pin, and dynamic_pin are all implemented.
+/// See handle_get_pairing_config / handle_set_pairing_config below.
 
 #pragma once
 

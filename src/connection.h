@@ -186,12 +186,12 @@ public:
     }
 
     // ========================================
-    // Noise transport (Phase 2)
+    // Noise transport
     // ========================================
 
     /// @brief Initialize the Noise handshake driver for this connection.
     /// Must be called before the WS connection is open. Also retains identity/record_store/
-    /// suite_name pointers so a later in-band re-handshake (Phase 4b) can be driven after this
+    /// suite_name pointers so a later in-band re-handshake can be driven after this
     /// initial NoiseHandshake object is destroyed.
     /// @param identity     Client static X25519 identity.
     /// @param record_store Record store for psk_id resolution.
@@ -227,7 +227,7 @@ public:
     /// Must be called after the WebSocket connection is open (from on_connected_cb).
     void send_noise_client_init();  // implemented in connection.cpp
 
-    /// @brief Handle an in-band re-handshake initiated by the server (Phase 4b).
+    /// @brief Handle an in-band re-handshake initiated by the server.
     ///
     /// Called on the NETWORK thread when a decrypted noise/handshake JSON message arrives
     /// after transport is already active (routed here from the SERVER_ACTIVATE-adjacent
@@ -252,6 +252,10 @@ public:
     SsErr send_encrypted_text(const char* json, size_t len) {
         return this->noise_transport_.send_json(json, len);
     }
+
+    /// @brief Encrypt and send a JSON string as a Noise transport binary frame.
+    /// Thin delegate to NoiseTransport::send_json().
+    /// @return SsErr::OK on success.
     SsErr send_encrypted_text(const std::string& json) {
         return this->noise_transport_.send_json(json);
     }
@@ -263,11 +267,11 @@ public:
     ///   frame is encrypted.
     /// - If not yet encrypted (pre-handshake), routes through send_text_message().
     ///
-    /// All role senders (client/hello, client/state, client/command, client/goodbye,
-    /// client/time) should use this method once Noise is wired up by the connection manager
-    /// (Phase 4); today they still call send_text_message() directly, so this choke point is
-    /// exercised only by send_goodbye_reason() and the two send_time_message() overrides that
-    /// already avoid std::string materialization on the hot path.
+    /// All role senders (client/hello, client/state, client/command, client/goodbye) use this
+    /// method. client/time is the one exception: its two send_time_message() overrides capture
+    /// the transmit timestamp as close to the wire send as possible and avoid std::string
+    /// materialization on the hot path, so they encrypt and send directly instead of routing
+    /// through here.
     /// @param json    JSON string to send.
     /// @param cb      Optional send-complete callback (best-effort; see send_text_message).
     /// @param allow_before_hello  Passed through to send_text_message on the pre-noise path.
@@ -903,17 +907,14 @@ protected:
     }
 
     // ========================================
-    // Noise transport state (Phase 2 + 4b)
+    // Noise transport state
     // ========================================
 
-    /// Noise handshake driver (active from connection open until handshake complete).
-    std::unique_ptr<NoiseHandshake> noise_handshake_;
+    // Struct fields
 
     /// Encrypted transport: owns the cipher session, its mutex, outbound fragmentation,
     /// and inbound reassembly. See noise_transport.h for the threading contract.
     NoiseTransport noise_transport_;
-
-    // Struct fields
 
     /// Message buffering (for websocket frame assembly).
     PlatformBuffer websocket_payload_;
@@ -926,6 +927,9 @@ protected:
 
     /// Time synchronization filter (Kalman-based).
     std::unique_ptr<SendspinTimeFilter> time_filter_;
+
+    /// Noise handshake driver (active from connection open until handshake complete).
+    std::unique_ptr<NoiseHandshake> noise_handshake_;
 
     /// Retained for re-handshake: pointer to the client identity supplied at
     /// init_noise_handshake(). Lifetime is owned by SendspinClient (outlives connections).
@@ -980,7 +984,7 @@ protected:
     std::vector<std::string> active_roles_{};
 
     /// Pairing method from the pairing object of the last pairing server/activate; nullopt
-    /// outside a pairing activation. Read by the Phase 5 pairing flow. Written and read on
+    /// outside a pairing activation. Read by the pairing flow. Written and read on
     /// the main loop (apply_server_activate runs in ConnectionManager::loop()).
     std::optional<SendspinPairMethod> pairing_method_{};
 
@@ -989,7 +993,7 @@ protected:
     std::optional<int> pairing_pin_length_{};
 
     // ========================================
-    // Phase 5 / 8b: Pairing state members
+    // Pairing state members
     // ========================================
 
     /// Dynamic-PIN PAKE session (all fields are main-loop-only; no lock needed).

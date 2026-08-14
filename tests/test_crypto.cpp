@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Phase-0 Known-Answer Tests (KATs) for the Sendspin crypto foundation.
+// Known-Answer Tests (KATs) for the Sendspin crypto foundation.
 //
 // These tests mirror the vectors from:
 //   aiosendspin/tests/noise/test_constants.py
@@ -137,9 +137,9 @@ TEST(Sha256, KatAbc) {
 }
 
 TEST(Sha256, ClassOkAfterConstructionAndFinalize) {
-    // Documents the ok() contract added for finding #3: ok() must stay true through a normal
-    // update()/finalize() cycle so callers that check it after finalize() (e.g. psk_id_for,
-    // derive_psk_wrap_key, the SENTINEL_PSK static initializer) accept the digest.
+    // Documents the ok() contract: ok() must stay true through a normal update()/finalize()
+    // cycle so callers that check it after finalize() (e.g. psk_id_for, derive_psk_wrap_key,
+    // the SENTINEL_PSK static initializer) accept the digest.
     Sha256 h;
     ASSERT_TRUE(h.ok());
     const char* m = "abc";
@@ -285,7 +285,7 @@ TEST(Identity, PrivateB64uRoundTripsViaDecode) {
 }
 
 // -----------------------------------------------------------------------------
-// Failure-propagation contract (finding #4): generate()/from_private_bytes() must return
+// Failure-propagation contract: generate()/from_private_bytes() must return
 // std::optional and must never let a caller observe a default-constructed (all-zero) Identity
 // as if it were a real keypair. noise-c's DHState has no test hook to force the underlying
 // allocation/keypair-generation failure deterministically, so the actual failure branch cannot

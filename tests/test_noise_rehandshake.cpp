@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Phase 4b: in-band Noise re-handshake tests.
+// In-band Noise re-handshake tests.
 //
 // These tests exercise the server-initiated re-handshake path where:
 //   1. An initial KKpsk2 handshake completes (initiator + responder sessions).
@@ -30,6 +30,7 @@
 #include "crypto/keys.h"
 #include "noise_handshake.h"
 #include "noise_session.h"
+#include "noise_test_helpers.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
 #include "record_store.h"
@@ -64,92 +65,14 @@ using namespace sendspin;  // NOLINT(google-build-using-namespace) - test-local 
 // Helpers
 // =============================================================================
 
-/// RAII wrapper for a noise-c handshakestate.
-struct RhsHsGuard {
-    NoiseHandshakeState* hs{nullptr};
-    explicit RhsHsGuard(NoiseHandshakeState* h) : hs(h) {}
-    ~RhsHsGuard() {
-        if (this->hs) {
-            noise_handshakestate_free(this->hs);
-        }
-    }
-    RhsHsGuard(const RhsHsGuard&) = delete;
-    RhsHsGuard& operator=(const RhsHsGuard&) = delete;
-};
-
-/// RAII pair of noise-c cipher states.
-struct RhsCipherPair {
-    NoiseCipherState* send_cs{nullptr};
-    NoiseCipherState* recv_cs{nullptr};
-
-    RhsCipherPair() = default;
-    ~RhsCipherPair() {
-        if (this->send_cs) { noise_cipherstate_free(this->send_cs); }
-        if (this->recv_cs) { noise_cipherstate_free(this->recv_cs); }
-    }
-    RhsCipherPair(const RhsCipherPair&) = delete;
-    RhsCipherPair& operator=(const RhsCipherPair&) = delete;
-    RhsCipherPair(RhsCipherPair&& o) noexcept
-        : send_cs(o.send_cs), recv_cs(o.recv_cs) {
-        o.send_cs = nullptr;
-        o.recv_cs = nullptr;
-    }
-    RhsCipherPair& operator=(RhsCipherPair&& o) noexcept {
-        if (this != &o) {
-            if (this->send_cs) { noise_cipherstate_free(this->send_cs); }
-            if (this->recv_cs) { noise_cipherstate_free(this->recv_cs); }
-            this->send_cs = o.send_cs;
-            this->recv_cs = o.recv_cs;
-            o.send_cs = nullptr;
-            o.recv_cs = nullptr;
-        }
-        return *this;
-    }
-};
-
-/// @brief Build a KKpsk2 initiator handshakestate (the "server" role).
-static NoiseHandshakeState* build_initiator(const std::string& suite_name,
-                                            const uint8_t* local_priv, const uint8_t* local_pub,
-                                            const uint8_t* remote_pub, const uint8_t* psk,
-                                            const uint8_t* prologue, size_t prologue_len) {
-    NoiseHandshakeState* hs = nullptr;
-    if (noise_handshakestate_new_by_name(&hs, suite_name.c_str(), NOISE_ROLE_INITIATOR) !=
-        NOISE_ERROR_NONE) {
-        return nullptr;
-    }
-    NoiseDHState* local_dh = noise_handshakestate_get_local_keypair_dh(hs);
-    if (noise_dhstate_set_keypair(local_dh, local_priv, X25519_KEY_SIZE, local_pub,
-                                  X25519_KEY_SIZE) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-    NoiseDHState* remote_dh = noise_handshakestate_get_remote_public_key_dh(hs);
-    if (noise_dhstate_set_public_key(remote_dh, remote_pub, X25519_KEY_SIZE) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-    if (noise_handshakestate_set_pre_shared_key(hs, psk, NOISE_PSK_SIZE) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-    if (prologue_len > 0) {
-        if (noise_handshakestate_set_prologue(hs, prologue, prologue_len) != NOISE_ERROR_NONE) {
-            noise_handshakestate_free(hs);
-            return nullptr;
-        }
-    }
-    if (noise_handshakestate_start(hs) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(hs);
-        return nullptr;
-    }
-    return hs;
-}
+// HsGuard, CipherPair, and build_initiator (the raw noise-c KKpsk2 initiator builder playing
+// the "server" role) come from noise_test_helpers.h.
 
 /// @brief Run one complete initial KKpsk2 loopback handshake (initiator + responder).
 ///
 /// Returns: initiator cipher pair, responder NoiseSession, and server_id (public key).
 struct InitialHandshakeResult {
-    RhsCipherPair initiator;
+    CipherPair initiator;
     std::unique_ptr<NoiseSession> responder_session;
     std::array<uint8_t, 32> responder_h{};  // handshake hash from the responder side
     std::array<uint8_t, 32> psk{};
@@ -201,7 +124,7 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
                         r.server_id.public_bytes.data(), r.client_id.public_bytes.data(),
                         r.psk.data(), prologue, prologue_len);
     if (!init_hs_raw) { return std::nullopt; }
-    RhsHsGuard init_hs_guard(init_hs_raw);
+    HsGuard init_hs_guard(init_hs_raw);
 
     std::string psk_id_json = "{\"psk_id\":\"" + r.psk_id + "\"}";
     std::vector<uint8_t> msg1_raw(4096);
@@ -297,7 +220,7 @@ static std::vector<uint8_t> raw_decrypt(NoiseCipherState* cs, std::vector<uint8_
 /// @param rehs_psk_id  psk_id for the re-handshake.
 /// @return New initiator cipher pair + new responder session on success, or nullopt.
 struct RehandshakeResult {
-    RhsCipherPair initiator;
+    CipherPair initiator;
     std::unique_ptr<NoiseSession> responder_session;
     std::array<uint8_t, 32> new_h{};  // new handshake hash
 };
@@ -317,7 +240,7 @@ static std::optional<RehandshakeResult> run_rehandshake(
         ADD_FAILURE() << "build_initiator for re-handshake failed";
         return std::nullopt;
     }
-    RhsHsGuard init_hs_guard(init_hs_raw);
+    HsGuard init_hs_guard(init_hs_raw);
 
     // Initiator writes msg1 with psk_id payload
     std::string psk_id_json = "{\"psk_id\":\"" + rehs_psk_id + "\"}";
@@ -401,7 +324,7 @@ static std::optional<RehandshakeResult> run_rehandshake(
 // =============================================================================
 
 /// @brief Verify a round-trip through a session: initiator->responder and responder->initiator.
-static void check_session_roundtrip(RhsCipherPair& init_pair, NoiseSession& responder_session,
+static void check_session_roundtrip(CipherPair& init_pair, NoiseSession& responder_session,
                                     const std::vector<uint8_t>& plaintext) {
     // Initiator -> Responder (initiator.send_cs, responder.decrypt)
     {
@@ -536,7 +459,7 @@ TEST(NoiseRehandshake, UnknownPskIdAborts) {
                         init.server_id.public_bytes.data(), init.client_id.public_bytes.data(),
                         unknown_psk.data(), prior_h.data(), prior_h.size());
     ASSERT_NE(init_hs_raw, nullptr);
-    RhsHsGuard guard(init_hs_raw);
+    HsGuard guard(init_hs_raw);
 
     std::string psk_id_json = "{\"psk_id\":\"" + unknown_psk_id + "\"}";
     std::vector<uint8_t> msg1_raw(4096);

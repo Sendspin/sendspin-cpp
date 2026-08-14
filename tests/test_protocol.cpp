@@ -811,7 +811,7 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
 }
 
 // ============================================================================
-// Phase 3: client/hello new shape (no client_id/version, new fields)
+// client/hello new shape (no client_id/version, new fields)
 // ============================================================================
 
 // Under encryption, client/hello must NOT contain client_id or version (they move to client/init).
@@ -902,7 +902,7 @@ TEST(Protocol, ClientHelloNoSupportedPairMethods) {
 }
 
 // ============================================================================
-// Phase 3: server/hello slim parse (only name)
+// server/hello slim parse (only name)
 // ============================================================================
 
 TEST(Protocol, ServerHelloSlimParse) {
@@ -938,7 +938,7 @@ TEST(Protocol, ServerHelloMissingNameFails) {
 }
 
 // ============================================================================
-// Phase 3: server/activate parse
+// server/activate parse
 // ============================================================================
 
 TEST(Protocol, ServerActivateActivitiesOnly) {
@@ -1082,7 +1082,7 @@ TEST(Protocol, ServerActivateMissingActivitiesFails) {
 }
 
 // ============================================================================
-// Phase 3: Activity enum round-trips
+// Activity enum round-trips
 // ============================================================================
 
 TEST(Protocol, ActivityToString) {
@@ -1099,7 +1099,7 @@ TEST(Protocol, ActivityFromString) {
 }
 
 // ============================================================================
-// Phase 3: PairMethod enum round-trips
+// PairMethod enum round-trips
 // ============================================================================
 
 TEST(Protocol, PairMethodToString) {
@@ -1116,7 +1116,7 @@ TEST(Protocol, PairMethodFromString) {
 }
 
 // ============================================================================
-// Phase 3: New SendspinGoodbyeReason values
+// New SendspinGoodbyeReason values
 // ============================================================================
 
 TEST(Protocol, GoodbyeReasonNewValues) {
@@ -1135,7 +1135,7 @@ TEST(Protocol, GoodbyeReasonExistingValues) {
 }
 
 // ============================================================================
-// Phase 5: Pairing-PSK protocol messages
+// Pairing-PSK protocol messages
 // ============================================================================
 
 // Determine message type recognizes the two new pairing types.

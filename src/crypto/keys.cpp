@@ -29,9 +29,9 @@ extern "C" {
 
 namespace sendspin {
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // PSK-ID derivation
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 std::optional<std::string> psk_id_for(const uint8_t* psk, size_t len) {
     if (len != NOISE_PSK_SIZE) {
@@ -67,16 +67,16 @@ std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
     return result.value();
 }
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Identity
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 std::string Identity::peer_id() const {
-    return b64url_encode(public_bytes.data(), public_bytes.size());
+    return b64url_encode(this->public_bytes.data(), this->public_bytes.size());
 }
 
 std::string Identity::private_b64u() const {
-    return b64url_encode(private_bytes.data(), private_bytes.size());
+    return b64url_encode(this->private_bytes.data(), this->private_bytes.size());
 }
 
 std::optional<Identity> Identity::generate() {

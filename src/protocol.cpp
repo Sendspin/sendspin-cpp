@@ -1256,7 +1256,7 @@ std::string format_client_command_message(const ClientCommandControllerObject& c
 }
 
 // ============================================================================
-// Phase 5: Pairing-PSK protocol messages
+// Pairing-PSK protocol messages
 // ============================================================================
 
 std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk) {
@@ -1333,7 +1333,7 @@ bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
 }
 
 // ============================================================================
-// Phase 8b: Dynamic-PIN pairing protocol functions
+// Dynamic-PIN pairing protocol functions
 // ============================================================================
 
 bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* payload) {
@@ -1478,7 +1478,7 @@ std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& cl
 }
 
 // ============================================================================
-// Phase 6: Management protocol functions
+// Management protocol functions
 // ============================================================================
 
 bool process_management_add_record_message(JsonObject root, ManagementAddRecordPayload* payload) {

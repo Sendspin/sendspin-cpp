@@ -81,6 +81,10 @@ public:
     /// the transport active. Called on the network thread at handshake COMPLETE.
     void activate(std::unique_ptr<NoiseSession> session);
 
+    /// @brief Returns the current session's 32-byte Noise handshake hash, or nullopt if no
+    /// session is active. Takes session_mutex_, so it is safe from any thread.
+    std::optional<std::array<uint8_t, 32>> handshake_hash() const;
+
     /// @brief Returns true once a transport session exists (stays true across re-handshake
     /// swaps). Atomic; safe from any thread. This is the check send paths use to decide
     /// encrypted-vs-cleartext without racing a session swap.
@@ -88,13 +92,9 @@ public:
         return this->active_.load(std::memory_order_acquire);
     }
 
-    /// @brief Returns the current session's 32-byte Noise handshake hash, or nullopt if no
-    /// session is active. Takes session_mutex_, so it is safe from any thread.
-    std::optional<std::array<uint8_t, 32>> handshake_hash() const;
-
-    // =========================================================================
+    // ========================================
     // Outbound (encrypt + send); any thread, serialized by session_mutex_
-    // =========================================================================
+    // ========================================
 
     /// @brief Encrypt and send a JSON string as a Noise transport frame.
     /// Encodes as [MSG_TYPE_JSON_BODY | utf8(json)] -> encrypt -> frame sink.
@@ -122,9 +122,9 @@ public:
     SsErr send_msg2_and_swap(const std::string& msg2_text,
                              std::unique_ptr<NoiseSession> next_session);
 
-    // =========================================================================
+    // ========================================
     // Inbound (decrypt + reassemble); NETWORK THREAD ONLY
-    // =========================================================================
+    // ========================================
 
     /// @brief Decrypts one transport frame in-place. Unlocked by design: see the file comment
     /// (decrypt is sequential with the session swap on the same thread).

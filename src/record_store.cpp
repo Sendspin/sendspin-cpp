@@ -36,44 +36,44 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
     : provider_(provider) {
     // Try loading persisted records and config first.
     bool loaded_config = false;
-    if (provider_ != nullptr) {
-        auto stored_records = provider_->load_pairing_records();
+    if (this->provider_ != nullptr) {
+        auto stored_records = this->provider_->load_pairing_records();
         for (auto& rec : stored_records) {
-            records_.push_back(std::move(rec));
+            this->records_.push_back(std::move(rec));
         }
 
-        auto pairing_psk = provider_->load_pairing_psk();
+        auto pairing_psk = this->provider_->load_pairing_psk();
         if (pairing_psk.has_value()) {
-            pairing_psk_ = std::move(pairing_psk);
+            this->pairing_psk_ = std::move(pairing_psk);
             // psk_id is a pure function of the PSK, and the server derives it the same way to
             // reference the key in its handshake. A stored id that disagrees with the secret
             // (hand-provisioned by an application, or corrupted) would never resolve, so correct
             // it here rather than advertising a method that cannot complete.
-            std::string derived = psk_id_for(pairing_psk_->psk);
-            if (pairing_psk_->psk_id != derived) {
+            std::string derived = psk_id_for(this->pairing_psk_->psk);
+            if (this->pairing_psk_->psk_id != derived) {
                 SS_LOGW(TAG, "Stored Pairing PSK id %s does not match the PSK; using %s",
-                        pairing_psk_->psk_id.c_str(), derived.c_str());
-                pairing_psk_->psk_id = std::move(derived);
+                        this->pairing_psk_->psk_id.c_str(), derived.c_str());
+                this->pairing_psk_->psk_id = std::move(derived);
             }
         }
 
-        auto static_pin = provider_->load_static_pin();
+        auto static_pin = this->provider_->load_static_pin();
         if (static_pin.has_value()) {
-            static_pin_ = std::move(static_pin);
+            this->static_pin_ = std::move(static_pin);
         }
 
-        auto config = provider_->load_pairing_config();
+        auto config = this->provider_->load_pairing_config();
         if (config.has_value()) {
-            pairing_psk_enabled_ = config->pairing_psk_enabled;
-            unpaired_access_enabled_ = config->unpaired_access_enabled;
-            dynamic_pin_enabled_ = config->dynamic_pin_enabled;
-            static_pin_enabled_ = config->static_pin_enabled;
-            dynamic_pin_min_length_ = config->dynamic_pin_min_length;
-            dynamic_pin_failures_ = config->dynamic_pin_failures;
-            record_mode_psk_id_ = config->record_mode_psk_id;
+            this->pairing_psk_enabled_ = config->pairing_psk_enabled;
+            this->unpaired_access_enabled_ = config->unpaired_access_enabled;
+            this->dynamic_pin_enabled_ = config->dynamic_pin_enabled;
+            this->static_pin_enabled_ = config->static_pin_enabled;
+            this->dynamic_pin_min_length_ = config->dynamic_pin_min_length;
+            this->dynamic_pin_failures_ = config->dynamic_pin_failures;
+            this->record_mode_psk_id_ = config->record_mode_psk_id;
             loaded_config = true;
             SS_LOGD(TAG, "Loaded pairing config: record_mode_psk_id=%s",
-                    record_mode_psk_id_.c_str());
+                    this->record_mode_psk_id_.c_str());
         }
     }
 
@@ -95,14 +95,14 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
     //
     // A store that lost EVERYTHING is indistinguishable from a factory-fresh device by
     // construction, so the seed does apply there -- as it does when there is no provider at all.
-    const bool previously_provisioned = !records_.empty() || pairing_psk_.has_value();
+    const bool previously_provisioned = !this->records_.empty() || this->pairing_psk_.has_value();
     if (!loaded_config && !previously_provisioned) {
-        unpaired_access_enabled_ = initial_unpaired_access_enabled;
+        this->unpaired_access_enabled_ = initial_unpaired_access_enabled;
     } else if (!loaded_config) {
         SS_LOGW(TAG,
                 "No pairing config loaded but %zu record(s) survived; ignoring the unpaired-"
                 "access seed and leaving unpaired access disabled",
-                records_.size());
+                this->records_.size());
     }
     // Scope note: only unpaired_access_enabled_ is protected this way, and deliberately so. It
     // defaults to false, so declining to seed it can only ever withhold a permission -- it
@@ -118,8 +118,8 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
 
     // First-boot provisioning: if no config was loaded (or the referenced shared
     // record is missing), generate a fresh shared-PSK fallback record.
-    if (!loaded_config || record_mode_psk_id_.empty() ||
-        record_by_psk_id(record_mode_psk_id_) == nullptr) {
+    if (!loaded_config || this->record_mode_psk_id_.empty() ||
+        record_by_psk_id(this->record_mode_psk_id_) == nullptr) {
         SS_LOGD(TAG, "First-boot provisioning: generating shared-PSK fallback record");
 
         std::array<uint8_t, NOISE_PSK_SIZE> shared_psk{};
@@ -131,8 +131,8 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
         shared_record.psk = shared_psk;
         // server_id absent = shared record
 
-        records_.push_back(shared_record);
-        record_mode_psk_id_ = shared_psk_id;
+        this->records_.push_back(shared_record);
+        this->record_mode_psk_id_ = shared_psk_id;
 
         // Persist the new record and config. A rejected write leaves the record RAM-only for
         // this boot: the device stays usable (pairing_token() etc. still work against the
@@ -140,9 +140,9 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
         // token printed before persistence is fixed would silently stop working. Surface that
         // instead of logging success unconditionally.
         bool record_persisted = true;
-        if (provider_ != nullptr) {
-            record_persisted = provider_->save_pairing_record(shared_record);
-            persist_config();
+        if (this->provider_ != nullptr) {
+            record_persisted = this->provider_->save_pairing_record(shared_record);
+            this->persist_config();
         }
 
         if (record_persisted) {
@@ -162,7 +162,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
     // server as a pairing token (SendspinClient::pairing_token()). The key is stable across
     // reboots once persisted; if persistence fails it is RAM-only for this boot, so a token
     // printed then will not survive a reboot (a warning is logged when this happens).
-    if (!pairing_psk_.has_value()) {
+    if (!this->pairing_psk_.has_value()) {
         std::array<uint8_t, NOISE_PSK_SIZE> psk{};
         platform_random_bytes(psk.data(), psk.size());
 
@@ -171,8 +171,8 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
         provisioned.psk = psk;
 
         bool psk_persisted = true;
-        if (provider_ != nullptr) {
-            psk_persisted = provider_->save_pairing_psk(provisioned);
+        if (this->provider_ != nullptr) {
+            psk_persisted = this->provider_->save_pairing_psk(provisioned);
         }
         if (psk_persisted) {
             SS_LOGI(TAG, "Provisioned Sendspin Pairing PSK: %s", provisioned.psk_id.c_str());
@@ -182,7 +182,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                     "token printed now will not survive a reboot",
                     provisioned.psk_id.c_str());
         }
-        pairing_psk_ = std::move(provisioned);
+        this->pairing_psk_ = std::move(provisioned);
     }
 }
 
@@ -196,7 +196,7 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
     std::lock_guard<std::mutex> lock(this->mutex_);
 
     // 1. Long-term records (highest priority).
-    const SendspinPairingRecord* rec = record_by_psk_id(psk_id);
+    const SendspinPairingRecord* rec = this->record_by_psk_id(psk_id);
     if (rec != nullptr) {
         ResolvedPsk r;
         r.psk_id = rec->psk_id;
@@ -209,10 +209,11 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
     // 2. Accepted Pairing PSK. Excluded from the candidate set when pairing_psk is disabled in
     // the live pairing config (spec #116/#122): a handshake referencing it then fails as a
     // lookup miss, exactly as if no Pairing PSK were configured at all.
-    if (pairing_psk_.has_value() && pairing_psk_->psk_id == psk_id && pairing_psk_enabled_) {
+    if (this->pairing_psk_.has_value() && this->pairing_psk_->psk_id == psk_id &&
+        this->pairing_psk_enabled_) {
         ResolvedPsk r;
-        r.psk_id = pairing_psk_->psk_id;
-        r.psk = pairing_psk_->psk;
+        r.psk_id = this->pairing_psk_->psk_id;
+        r.psk = this->pairing_psk_->psk;
         r.category = PskCategory::PAIRING;
         return r;
     }
@@ -234,8 +235,8 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
 // ============================================================================
 
 size_t RecordStore::find_index(const std::string& psk_id) const {
-    for (size_t i = 0; i < records_.size(); ++i) {
-        if (records_[i].psk_id == psk_id) {
+    for (size_t i = 0; i < this->records_.size(); ++i) {
+        if (this->records_[i].psk_id == psk_id) {
             return i;
         }
     }
@@ -243,15 +244,15 @@ size_t RecordStore::find_index(const std::string& psk_id) const {
 }
 
 const SendspinPairingRecord* RecordStore::record_by_psk_id(const std::string& psk_id) const {
-    size_t idx = find_index(psk_id);
+    size_t idx = this->find_index(psk_id);
     if (idx == static_cast<size_t>(-1)) {
         return nullptr;
     }
-    return &records_[idx];
+    return &this->records_[idx];
 }
 
 const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string& server_id) const {
-    for (const auto& rec : records_) {
+    for (const auto& rec : this->records_) {
         if (rec.server_id.has_value() && rec.server_id.value() == server_id) {
             return &rec;
         }
@@ -272,17 +273,17 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
     // untouched so the pairing fails closed (see the header contract). A deferred
     // provider (e.g. one that queues the flash write) reports success here and owns
     // the durability of the queued data.
-    if (provider_ != nullptr && !provider_->save_pairing_record(record)) {
+    if (this->provider_ != nullptr && !this->provider_->save_pairing_record(record)) {
         SS_LOGW(TAG, "Provider rejected pairing record %s; not storing", record.psk_id.c_str());
         return false;
     }
     std::lock_guard<std::mutex> lock(this->mutex_);
-    size_t idx = find_index(record.psk_id);
+    size_t idx = this->find_index(record.psk_id);
     if (idx != static_cast<size_t>(-1)) {
-        records_[idx] = std::move(record);
+        this->records_[idx] = std::move(record);
     } else {
-        records_.push_back(std::move(record));
-        idx = records_.size() - 1;
+        this->records_.push_back(std::move(record));
+        idx = this->records_.size() - 1;
     }
 
     // Pairing mints a fresh per-server PSK that REPLACES whatever that server held before, so
@@ -294,26 +295,27 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
     // already_exists) and it defines no outcome for a server_id collision -- silently deleting
     // a record the caller never named would be unattested by any result code. Shared-PSK
     // records (server_id absent) never match here.
-    if (supersede_server_id && records_[idx].server_id.has_value()) {
-        const std::string superseded_server_id = records_[idx].server_id.value();
-        for (size_t i = 0; i < records_.size();) {
-            if (i != idx && records_[i].server_id.has_value() &&
-                records_[i].server_id.value() == superseded_server_id) {
+    if (supersede_server_id && this->records_[idx].server_id.has_value()) {
+        const std::string superseded_server_id = this->records_[idx].server_id.value();
+        for (size_t i = 0; i < this->records_.size();) {
+            if (i != idx && this->records_[i].server_id.has_value() &&
+                this->records_[i].server_id.value() == superseded_server_id) {
                 SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
-                        records_[i].psk_id.c_str(), superseded_server_id.c_str());
+                        this->records_[i].psk_id.c_str(), superseded_server_id.c_str());
                 // The in-memory erase below is unconditional: the operator (or the pairing
                 // exchange) asked for this credential to stop working, and keeping it in RAM
                 // because the store could not be written would leave it usable right now, which
                 // is strictly worse. But a delete that did not reach the store means the record
                 // comes back at the next start, so say so loudly instead of reporting a
                 // revocation that silently half-happened.
-                if (provider_ != nullptr && !provider_->remove_pairing_record(records_[i].psk_id)) {
+                if (this->provider_ != nullptr &&
+                    !this->provider_->remove_pairing_record(this->records_[i].psk_id)) {
                     SS_LOGW(TAG,
                             "Superseded record %s but the provider did not delete it; it is gone "
                             "for this boot only and will be valid again after a reboot",
-                            records_[i].psk_id.c_str());
+                            this->records_[i].psk_id.c_str());
                 }
-                records_.erase(records_.begin() + static_cast<ptrdiff_t>(i));
+                this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(i));
                 if (i < idx) {
                     --idx;
                 }
@@ -327,14 +329,14 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
 
 void RecordStore::remove_record(const std::string& psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    size_t idx = find_index(psk_id);
+    size_t idx = this->find_index(psk_id);
     if (idx == static_cast<size_t>(-1)) {
         return;  // No-op if absent.
     }
-    records_.erase(records_.begin() + static_cast<ptrdiff_t>(idx));
+    this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(idx));
     // Erased from RAM regardless of the store's answer, and warned about when the store did not
     // take it -- see the same reasoning in store_record_impl()'s supersede loop.
-    if (provider_ != nullptr && !provider_->remove_pairing_record(psk_id)) {
+    if (this->provider_ != nullptr && !this->provider_->remove_pairing_record(psk_id)) {
         SS_LOGW(TAG,
                 "Removed record %s but the provider did not delete it; it is gone for this boot "
                 "only and will be valid again after a reboot",
@@ -344,18 +346,18 @@ void RecordStore::remove_record(const std::string& psk_id) {
 
 void RecordStore::mark_record_used(const std::string& psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    size_t idx = find_index(psk_id);
-    if (idx == static_cast<size_t>(-1) || records_[idx].used) {
+    size_t idx = this->find_index(psk_id);
+    if (idx == static_cast<size_t>(-1) || this->records_[idx].used) {
         return;
     }
-    records_[idx].used = true;
-    if (provider_ != nullptr) {
-        provider_->save_pairing_record(records_[idx]);
+    this->records_[idx].used = true;
+    if (this->provider_ != nullptr) {
+        this->provider_->save_pairing_record(this->records_[idx]);
     }
 }
 
 bool RecordStore::can_remove_record(const std::string& psk_id) const {
-    return psk_id != record_mode_psk_id_;
+    return psk_id != this->record_mode_psk_id_;
 }
 
 // ============================================================================
@@ -367,16 +369,16 @@ void RecordStore::set_pairing_psk(SendspinPairingPsk psk) {
     // Derive psk_id from the secret rather than trusting the caller's: it is the id the server
     // will reference in its handshake, so a supplied mismatch would make the key unresolvable.
     psk.psk_id = psk_id_for(psk.psk);
-    pairing_psk_ = std::move(psk);
-    if (provider_ != nullptr) {
-        provider_->save_pairing_psk(pairing_psk_.value());
+    this->pairing_psk_ = std::move(psk);
+    if (this->provider_ != nullptr) {
+        this->provider_->save_pairing_psk(this->pairing_psk_.value());
     }
 }
 
 void RecordStore::clear_pairing_psk() {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    pairing_psk_.reset();
-    if (provider_ != nullptr && !provider_->clear_pairing_psk()) {
+    this->pairing_psk_.reset();
+    if (this->provider_ != nullptr && !this->provider_->clear_pairing_psk()) {
         SS_LOGW(TAG,
                 "Cleared the Pairing PSK but the provider did not delete it; it is gone for this "
                 "boot only and will authenticate pairing again after a reboot");
@@ -392,38 +394,38 @@ bool RecordStore::is_shared_record(const ResolvedPsk& r) {
 }
 
 bool RecordStore::set_record_mode_psk_id(const std::string& psk_id) {
-    auto resolved = resolve_by_psk_id(psk_id);
+    auto resolved = this->resolve_by_psk_id(psk_id);
     if (!resolved.has_value()) {
         SS_LOGE(TAG, "record_mode psk_id '%s' references no record", psk_id.c_str());
         return false;
     }
-    if (!is_shared_record(resolved.value())) {
+    if (!this->is_shared_record(resolved.value())) {
         SS_LOGE(TAG, "record_mode psk_id '%s' must reference a shared-PSK record", psk_id.c_str());
         return false;
     }
-    record_mode_psk_id_ = psk_id;
-    persist_config();
+    this->record_mode_psk_id_ = psk_id;
+    this->persist_config();
     return true;
 }
 
 void RecordStore::set_pairing_psk_enabled(bool enabled) {
-    pairing_psk_enabled_ = enabled;
-    persist_config();
+    this->pairing_psk_enabled_ = enabled;
+    this->persist_config();
 }
 
 void RecordStore::set_unpaired_access_enabled(bool enabled) {
-    unpaired_access_enabled_ = enabled;
-    persist_config();
+    this->unpaired_access_enabled_ = enabled;
+    this->persist_config();
 }
 
 void RecordStore::set_dynamic_pin_enabled(bool enabled) {
-    dynamic_pin_enabled_ = enabled;
-    persist_config();
+    this->dynamic_pin_enabled_ = enabled;
+    this->persist_config();
 }
 
 void RecordStore::set_dynamic_pin_min_length(int length) {
-    dynamic_pin_min_length_ = length;
-    persist_config();
+    this->dynamic_pin_min_length_ = length;
+    this->persist_config();
 }
 
 // ============================================================================
@@ -431,34 +433,34 @@ void RecordStore::set_dynamic_pin_min_length(int length) {
 // ============================================================================
 
 void RecordStore::record_dynamic_pin_failure() {
-    dynamic_pin_failures_++;
+    this->dynamic_pin_failures_++;
     SS_LOGW(TAG, "Dynamic-PIN failure recorded (count=%d, escalation threshold=%d)",
-            dynamic_pin_failures_, DYNAMIC_PIN_ESCALATION_THRESHOLD);
-    persist_config();
+            this->dynamic_pin_failures_, DYNAMIC_PIN_ESCALATION_THRESHOLD);
+    this->persist_config();
 }
 
 void RecordStore::reset_dynamic_pin_failures() {
-    if (dynamic_pin_failures_ == 0) {
+    if (this->dynamic_pin_failures_ == 0) {
         return;  // Nothing to reset; skip the persistence write.
     }
-    dynamic_pin_failures_ = 0;
-    persist_config();
+    this->dynamic_pin_failures_ = 0;
+    this->persist_config();
 }
 
 // ============================================================================
-// Static PIN (Phase 8c)
+// Static PIN
 // ============================================================================
 
 void RecordStore::set_static_pin(const std::string& pin) {
-    static_pin_ = pin;
-    if (provider_ != nullptr) {
-        provider_->save_static_pin(pin);
+    this->static_pin_ = pin;
+    if (this->provider_ != nullptr) {
+        this->provider_->save_static_pin(pin);
     }
 }
 
 void RecordStore::clear_static_pin() {
-    static_pin_.reset();
-    if (provider_ != nullptr && !provider_->clear_static_pin()) {
+    this->static_pin_.reset();
+    if (this->provider_ != nullptr && !this->provider_->clear_static_pin()) {
         SS_LOGW(TAG,
                 "Cleared the static PIN but the provider did not delete it; it is gone for this "
                 "boot only and will pair devices again after a reboot");
@@ -466,8 +468,8 @@ void RecordStore::clear_static_pin() {
 }
 
 void RecordStore::set_static_pin_enabled(bool enabled) {
-    static_pin_enabled_ = enabled;
-    persist_config();
+    this->static_pin_enabled_ = enabled;
+    this->persist_config();
 }
 
 // ============================================================================
@@ -476,7 +478,7 @@ void RecordStore::set_static_pin_enabled(bool enabled) {
 
 std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
     const std::string& server_id, const std::optional<std::string>& label) {
-    if (can_store_record()) {
+    if (this->can_store_record()) {
         std::array<uint8_t, NOISE_PSK_SIZE> psk{};
         platform_random_bytes(psk.data(), psk.size());
         std::string pid = psk_id_for(psk);
@@ -494,10 +496,10 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
     }
 
     // Storage exhausted: fall back to the shared-PSK record.
-    auto resolved = resolve_by_psk_id(record_mode_psk_id_);
-    if (!resolved.has_value() || !is_shared_record(resolved.value())) {
+    auto resolved = this->resolve_by_psk_id(this->record_mode_psk_id_);
+    if (!resolved.has_value() || !this->is_shared_record(resolved.value())) {
         SS_LOGE(TAG, "shared-PSK fallback record '%s' is missing or not shared",
-                record_mode_psk_id_.c_str());
+                this->record_mode_psk_id_.c_str());
         return std::nullopt;
     }
 
@@ -512,18 +514,18 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
 // ============================================================================
 
 void RecordStore::persist_config() {
-    if (provider_ == nullptr) {
+    if (this->provider_ == nullptr) {
         return;
     }
     SendspinPairingConfig config;
-    config.pairing_psk_enabled = pairing_psk_enabled_;
-    config.unpaired_access_enabled = unpaired_access_enabled_;
-    config.dynamic_pin_enabled = dynamic_pin_enabled_;
-    config.static_pin_enabled = static_pin_enabled_;
-    config.dynamic_pin_min_length = dynamic_pin_min_length_;
-    config.dynamic_pin_failures = dynamic_pin_failures_;
-    config.record_mode_psk_id = record_mode_psk_id_;
-    if (!provider_->save_pairing_config(config)) {
+    config.pairing_psk_enabled = this->pairing_psk_enabled_;
+    config.unpaired_access_enabled = this->unpaired_access_enabled_;
+    config.dynamic_pin_enabled = this->dynamic_pin_enabled_;
+    config.static_pin_enabled = this->static_pin_enabled_;
+    config.dynamic_pin_min_length = this->dynamic_pin_min_length_;
+    config.dynamic_pin_failures = this->dynamic_pin_failures_;
+    config.record_mode_psk_id = this->record_mode_psk_id_;
+    if (!this->provider_->save_pairing_config(config)) {
         SS_LOGW(TAG,
                 "Provider rejected pairing config write (record_mode_psk_id=%s); the change is "
                 "RAM-only for this boot and will not survive a reboot",

@@ -63,9 +63,9 @@ public:
     NoiseSession(NoiseSession&&) noexcept;
     NoiseSession& operator=(NoiseSession&&) noexcept;
 
-    // =========================================================================
+    // ========================================
     // Factory
-    // =========================================================================
+    // ========================================
 
     /// @brief Build a KKpsk2 responder session (the Sendspin client role).
     ///
@@ -89,9 +89,9 @@ public:
                                                     const uint8_t* prologue, size_t prologue_len,
                                                     const uint8_t* psk);
 
-    // =========================================================================
+    // ========================================
     // Handshake
-    // =========================================================================
+    // ========================================
 
     /// @brief Decrypt Noise message 1 and return its plaintext payload.
     /// @param msg1_bytes   Raw bytes received in the noise/handshake frame.
@@ -115,9 +115,9 @@ public:
         return this->handshake_hash_;
     }
 
-    // =========================================================================
+    // ========================================
     // Transport
-    // =========================================================================
+    // ========================================
 
     /// @brief Encrypt plaintext for transport.
     /// @param plaintext  Input bytes (modified in-place; caller must supply

@@ -128,7 +128,7 @@ inline int platform_base64_decode(uint8_t* dst, size_t dlen, size_t* olen, const
 
 #endif  // ESP_PLATFORM
 
-// =============================================================================
+// ============================================================================
 // Base64url helpers - portable, identical on both ESP and host.
 //
 // These implement the URL-safe base64 alphabet (RFC 4648 §5) with no `=` padding:
@@ -138,7 +138,7 @@ inline int platform_base64_decode(uint8_t* dst, size_t dlen, size_t* olen, const
 //
 // The functions live outside the ESP/host split because they are pure
 // computation with no OS or platform dependency.
-// =============================================================================
+// ============================================================================
 
 namespace sendspin {
 

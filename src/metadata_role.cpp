@@ -155,10 +155,9 @@ void MetadataRole::Impl::handle_server_state(ServerMetadataStateDelta&& delta) c
 
 void MetadataRole::Impl::drain_events() {
     // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex --
-    // see inbox.h), so the server-clock deadline gate that used to live inside the shadow slot's
-    // take_if predicate is split in two: take() unconditionally moves any pending slot value into
-    // held_delta (folding it in if a delta is already held), then the deadline is evaluated below
-    // with no lock held at all.
+    // see inbox.h), so the server-clock deadline gate is split in two: take() unconditionally
+    // moves any pending slot value into held_delta (folding it in if a delta is already held),
+    // then the deadline is evaluated below with no lock held at all.
     //
     // Caveat: merged deltas carry only the newest timestamp, so a past-valid field merged under a
     // later future-valid update gets held back until the later deadline. Accepted since

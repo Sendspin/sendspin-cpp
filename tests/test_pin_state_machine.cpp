@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Phase 8d integration harness: drives ConnectionManager's PIN pairing state machine
-// end-to-end for both dynamic PIN and static PIN, including the abort / cleanup /
-// connection-loss paths that the Phase 8b/8c unit tests could not reach (they only covered
-// wire parse/format, the lockout counter, CPace round-trips, and the client/hello descriptor).
+// Integration harness: drives ConnectionManager's PIN pairing state machine end-to-end for
+// both dynamic PIN and static PIN, including the abort / cleanup / connection-loss paths that
+// the dynamic/static PIN unit tests (test_dynamic_pin.cpp) do not reach -- those cover wire
+// parse/format, the lockout counter, CPace round-trips, and the client/hello descriptor.
 //
 // The device under test is the CPace RESPONDER; the "server" side is simulated in-test with
 // a CPace INITIATOR (see cpace.h). A FakeConnection (adapted from TestConnection in
@@ -224,6 +224,15 @@ public:
         for (auto it = this->events_.rbegin(); it != this->events_.rend(); ++it) {
             if (it->kind == PairingEventKind::FAILED) {
                 return it->reason;
+            }
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<std::string> last_failed_server_id() const {
+        for (auto it = this->events_.rbegin(); it != this->events_.rend(); ++it) {
+            if (it->kind == PairingEventKind::FAILED) {
+                return it->server_id;
             }
         }
         return std::nullopt;
@@ -453,7 +462,7 @@ protected:
     }
 
     /// Simulate the connection being lost (network thread reporting a close/disconnect),
-    /// exercising ConnectionManager::on_connection_lost() -- the Phase 8c regression path.
+    /// exercising ConnectionManager::on_connection_lost() with a pairing attempt in flight.
     void simulate_connection_lost(SendspinConnection* conn) {
         this->client_->connection_manager_->on_connection_lost(conn);
     }
@@ -492,6 +501,13 @@ protected:
     /// Schedule a pair/abort event for deferred processing, without pumping loop().
     void schedule_abort(PairAbortEvent event) {
         this->client_->connection_manager_->schedule_pair_abort(std::move(event));
+    }
+
+    /// Schedule a pairing storage-failure event for deferred processing, without pumping
+    /// loop(). Mirrors what SendspinClient::process_json_message() does on the network thread
+    /// when RecordStore::store_record() rejects the long-term record at server/pair-finalize.
+    void schedule_storage_failed(PairStorageFailedEvent event) {
+        this->client_->connection_manager_->schedule_pair_storage_failed(std::move(event));
     }
 
     /// Schedule a management/* request event for deferred processing, without pumping loop().
@@ -662,6 +678,90 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_FALSE(this->record_store().dynamic_pin_escalated());
     EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 0);
+}
+
+// Regression: a PIN attempt that reaches PAIR_CONFIRM success already dismisses the displayed
+// PIN there (see the PAIR_CONFIRM handler in connection_manager.cpp). If the server then acks
+// server/pair-finalize but the persistence provider rejects the record, handle_pair_storage_
+// failed() ends the same attempt a second time via abort_pairing_attempt(); on_clear_pairing_pin
+// must NOT fire again for the PIN this attempt already stopped showing.
+TEST_F(PinStateMachineTest, StorageFailureAfterConfirmDoesNotReclearAlreadyDismissedPin) {
+    FakeConnection* conn =
+        this->inject_current_connection("server-dyn-storage-fail", SendspinPairMethod::DYNAMIC_PIN);
+
+    this->enter_pairing(conn);
+    this->client_->loop();
+
+    const std::array<uint8_t, 32> nonce_b = conn->pin_session().nonce_b;
+    const std::array<uint8_t, 32> handshake_hash = conn->pin_session().handshake_hash;
+
+    std::array<uint8_t, 32> nonce_a{};
+    for (size_t i = 0; i < nonce_a.size(); ++i) {
+        nonce_a[i] = static_cast<uint8_t>(i + 1);
+    }
+    const int pin_length = 6;
+    auto pin_opt = pin_derive(handshake_hash.data(), handshake_hash.size(), nonce_a.data(),
+                              nonce_a.size(), nonce_b.data(), nonce_b.size(), pin_length);
+    ASSERT_TRUE(pin_opt.has_value());
+
+    auto conn_sp = this->current_connection_sp();
+
+    ServerPairingMessageEvent pair_init_event;
+    pair_init_event.conn = conn_sp;
+    pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
+    pair_init_event.nonce_a = nonce_a;
+    this->schedule_pin_message(std::move(pair_init_event));
+    this->client_->loop();
+    ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
+
+    ServerStandIn server;
+    ASSERT_TRUE(server.start(pin_opt.value(), handshake_hash));
+
+    ServerPairingMessageEvent pair_auth_event;
+    pair_auth_event.conn = conn_sp;
+    pair_auth_event.kind = PinPairingMessageKind::PAIR_AUTH;
+    pair_auth_event.pake_msg_1 = server.initiator.public_share();
+    this->schedule_pin_message(std::move(pair_auth_event));
+    this->client_->loop();
+
+    JsonDocument auth_doc;
+    JsonObject auth_root;
+    ASSERT_TRUE(parse_json(conn->sent_text_.back(), auth_doc, auth_root));
+    auto pake_msg_2_b64 = std::string(auth_root["payload"]["pake_msg_2"] | "");
+    auto pake_msg_2 = b64url_decode(pake_msg_2_b64);
+    ASSERT_TRUE(pake_msg_2.has_value());
+    ASSERT_TRUE(server.initiator.derive(pake_msg_2->data(), pake_msg_2->size()));
+    auto server_kc = server.initiator.tag();
+    ASSERT_TRUE(server_kc.has_value());
+
+    ServerPairingMessageEvent pair_confirm_event;
+    pair_confirm_event.conn = conn_sp;
+    pair_confirm_event.kind = PinPairingMessageKind::PAIR_CONFIRM;
+    pair_confirm_event.server_kc = server_kc.value();
+    this->schedule_pin_message(std::move(pair_confirm_event));
+    this->client_->loop();
+
+    // PAIR_CONFIRM succeeded: client/pair-finalize was sent, and the PIN was already dismissed
+    // exactly once.
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
+    ASSERT_EQ(this->listener_.count(PairingEventKind::CLEAR_PIN), 1);
+    ASSERT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
+
+    // The persistence provider now rejects the record at server/pair-finalize ack (network
+    // thread, in production); simulate the resulting deferred event directly.
+    PairStorageFailedEvent storage_failed_event;
+    storage_failed_event.conn = conn_sp;
+    storage_failed_event.server_id = "server-dyn-storage-fail";
+    this->schedule_storage_failed(std::move(storage_failed_event));
+    this->client_->loop();
+
+    // The attempt now fails and the connection is dropped, but on_clear_pairing_pin must NOT
+    // fire a second time: pin_displayed was already reset to false at PAIR_CONFIRM.
+    EXPECT_EQ(this->listener_.count(PairingEventKind::CLEAR_PIN), 1)
+        << "on_clear_pairing_pin must not fire twice for one pairing attempt";
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
+    EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::STORAGE_FAILED);
+    EXPECT_EQ(this->listener_.last_failed_server_id(), "server-dyn-storage-fail");
 }
 
 // =============================================================================
@@ -1425,7 +1525,7 @@ TEST_F(PinStateMachineTest, GestureWaitHasNoClientTimeout) {
 }
 
 // =============================================================================
-// Regression: connection loss mid-pairing (Phase 8c MAJOR)
+// Regression: connection loss mid-pairing
 // =============================================================================
 
 TEST_F(PinStateMachineTest, ConnectionLossDuringStaticPairingWindowClosesWindow) {
@@ -1444,7 +1544,7 @@ TEST_F(PinStateMachineTest, ConnectionLossDuringStaticPairingWindowClosesWindow)
     this->client_->loop();
 
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW))
-        << "on_connection_lost must dismiss a stranded pairing-window prompt (Phase 8c MAJOR)";
+        << "on_connection_lost must dismiss a stranded pairing-window prompt";
     EXPECT_LT(this->listener_.first_index_of(PairingEventKind::OPEN_WINDOW),
              this->listener_.first_index_of(PairingEventKind::CLOSE_WINDOW));
 }
@@ -1488,7 +1588,7 @@ TEST_F(PinStateMachineTest, ConnectionLossWithPinDisplayedClearsPin) {
 }
 
 // =============================================================================
-// Regression: abort ordering survives cleanup_connection_state() (Phase 8b BLOCKER)
+// Regression: abort ordering survives cleanup_connection_state()
 // =============================================================================
 
 TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
@@ -1530,10 +1630,10 @@ TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
     this->client_->loop();
 
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED))
-        << "on_pairing_failed must survive cleanup_connection_state() (Phase 8b BLOCKER)";
+        << "on_pairing_failed must survive cleanup_connection_state()";
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_PIN))
-        << "on_clear_pairing_pin must survive cleanup_connection_state() (Phase 8b BLOCKER)";
+        << "on_clear_pairing_pin must survive cleanup_connection_state()";
     // Spec #120/#123: only reason concurrent_attempt closes the connection; user_cancelled
     // leaves it open (pairing state is still cleared above).
     EXPECT_EQ(conn->disconnect_count_, 0);

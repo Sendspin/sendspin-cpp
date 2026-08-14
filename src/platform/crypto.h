@@ -52,17 +52,17 @@ static constexpr size_t SHA256_DIGEST_SIZE = 32;
 class Sha256 {
 public:
     Sha256() {
-        int err = noise_hashstate_new_by_name(&state_, "SHA256");
+        int err = noise_hashstate_new_by_name(&this->state_, "SHA256");
         if (err != NOISE_ERROR_NONE) {
-            state_ = nullptr;
+            this->state_ = nullptr;
         } else {
-            noise_hashstate_reset(state_);
+            noise_hashstate_reset(this->state_);
         }
     }
 
     ~Sha256() {
-        if (state_ != nullptr) {
-            noise_hashstate_free(state_);
+        if (this->state_ != nullptr) {
+            noise_hashstate_free(this->state_);
         }
     }
 
@@ -72,12 +72,12 @@ public:
 
     /// @brief Feed bytes into the hash.
     void update(const uint8_t* data, size_t len) {
-        if (state_ == nullptr) {
+        if (this->state_ == nullptr) {
             return;
         }
-        int err = noise_hashstate_update(state_, data, len);
+        int err = noise_hashstate_update(this->state_, data, len);
         if (err != NOISE_ERROR_NONE) {
-            failed_ = true;
+            this->failed_ = true;
         }
     }
 
@@ -88,10 +88,10 @@ public:
     /// rather than silently trusting it.
     std::array<uint8_t, SHA256_DIGEST_SIZE> finalize() {
         std::array<uint8_t, SHA256_DIGEST_SIZE> digest{};
-        if (state_ != nullptr && !failed_) {
-            int err = noise_hashstate_finalize(state_, digest.data(), SHA256_DIGEST_SIZE);
+        if (this->state_ != nullptr && !this->failed_) {
+            int err = noise_hashstate_finalize(this->state_, digest.data(), SHA256_DIGEST_SIZE);
             if (err != NOISE_ERROR_NONE) {
-                failed_ = true;
+                this->failed_ = true;
                 digest.fill(0);
             }
         }
@@ -101,7 +101,7 @@ public:
     /// @brief Return true if the hashstate was successfully initialized and no update()/
     /// finalize() call has failed so far.
     [[nodiscard]] bool ok() const {
-        return state_ != nullptr && !failed_;
+        return this->state_ != nullptr && !this->failed_;
     }
 
 private:
@@ -128,9 +128,9 @@ inline std::array<uint8_t, SHA256_DIGEST_SIZE> sha256_oneshot(const uint8_t* pre
     return h.finalize();
 }
 
-// =============================================================================
+// ============================================================================
 // SHA-512
-// =============================================================================
+// ============================================================================
 
 /// @brief Number of bytes in a SHA-512 digest.
 static constexpr size_t SHA512_DIGEST_SIZE = 64;
@@ -320,9 +320,9 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> sha512_oneshot(const uint8_t* pre
     return h.finalize();
 }
 
-// =============================================================================
+// ============================================================================
 // HMAC-SHA-512
-// =============================================================================
+// ============================================================================
 
 /// @brief Compute HMAC-SHA-512(key, data) via the standard ipad/opad construction.
 ///
@@ -369,9 +369,9 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
     return outer.finalize();
 }
 
-// =============================================================================
+// ============================================================================
 // CSPRNG
-// =============================================================================
+// ============================================================================
 
 /// @brief Fill a buffer with cryptographically secure random bytes.
 /// Routes through noise-c's `noise_randstate_*` abstraction which uses the OS
@@ -396,9 +396,9 @@ inline std::vector<uint8_t> platform_random_bytes(size_t len) {
     return out;
 }
 
-// =============================================================================
+// ============================================================================
 // AEAD (one-shot, explicit key + nonce)
-// =============================================================================
+// ============================================================================
 //
 // Used for PSK Wrapping (spec #117): the client seals the new PSK under a key derived from the
 // CPace output using the AEAD of the connection's negotiated cipher suite, a 12-byte all-zero
@@ -507,9 +507,9 @@ inline std::optional<std::vector<uint8_t>> aead_oneshot_decrypt(const char* ciph
     return buf;
 }
 
-// =============================================================================
+// ============================================================================
 // Constant-time comparison
-// =============================================================================
+// ============================================================================
 
 /// @brief Compare two equal-length byte buffers in constant time (XOR-accumulate, no
 /// early exit), for authentication tags, commitments, and other secret-dependent
