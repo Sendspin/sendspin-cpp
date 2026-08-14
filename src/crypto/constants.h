@@ -71,12 +71,13 @@ static constexpr int PROTOCOL_VERSION = 1;
 /// Plaintext includes the leading type byte, so usable payload is one byte less.
 static constexpr size_t MAX_TRANSPORT_PLAINTEXT = 65535 - 16;  // = 65519
 
-/// @brief Per-connection reassembly buffer cap: 4 MiB.
+/// @brief Per-connection reassembly buffer cap: 1 MiB.
 /// The largest legitimate fragmented message is album artwork (a single JPEG/PNG image);
-/// typical artwork payloads are well under 1 MiB, so this leaves generous headroom while still
-/// bounding how much heap an authenticated peer can force this connection to reserve, which
-/// matters on ESP32 targets with only a few MiB of PSRAM.
-static constexpr size_t MAX_REASSEMBLED_MESSAGE_BYTES = 4UL * 1024UL * 1024UL;
+/// typical artwork payloads for embedded display targets are well under 1 MiB. The cap bounds
+/// how much heap an authenticated peer can force this connection to reserve; capacity is
+/// retained at the high-water mark for the connection's life, so the cap is also the
+/// worst-case steady-state pin.
+static constexpr size_t MAX_REASSEMBLED_MESSAGE_BYTES = 1UL * 1024UL * 1024UL;
 
 // ============================================================================
 // Binary message type bytes (first byte of decrypted plaintext)
