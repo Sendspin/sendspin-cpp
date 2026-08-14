@@ -72,6 +72,7 @@ struct TuiSnapshot {
     std::string client_id;
     ConnectionTrust trust{ConnectionTrust::NONE};
     std::string pairing_status;
+    std::string pairing_token;
 
     // Server selector
     bool server_selector_active{false};
@@ -122,6 +123,7 @@ static TuiSnapshot take_snapshot(TuiState& state) {
     snap.client_id = state.client_id;
     snap.trust = state.trust;
     snap.pairing_status = state.pairing_status;
+    snap.pairing_token = state.pairing_token;
     snap.server_selector_active = state.server_selector_active;
     snap.server_selector_index = state.server_selector_index;
     snap.discovered_servers = state.discovered_servers;
@@ -640,6 +642,20 @@ static Element render_server_selector(const TuiSnapshot& snap) {
     });
 }
 
+// Shown until the client is paired: the Pairing PSK token an operator pastes into a server
+// that only offers the mandatory pairing_psk method (dynamic_pin needs nothing shown here --
+// the PIN itself appears in the Server panel's pairing status row instead). Wrapped across
+// the full terminal width since the token (107 chars) does not fit any of the three info
+// panels above.
+static Element render_pairing_token(const TuiSnapshot& snap) {
+    return window(text(" Pairing Token ") | bold,
+                  vbox({
+                      paragraph(snap.pairing_token) | color(Color::White),
+                      text("  Paste into a server pairing via pairing_psk") | color(Color::White) | dim,
+                  })) |
+          color(Color::Yellow);
+}
+
 static Element render_footer(const TuiSnapshot& snap) {
     // Show truncated client_id (first 12 chars) on the left; shortcuts on the right.
     std::string id_display = snap.client_id.empty()
@@ -681,13 +697,20 @@ static Element render_tui(TuiState& state) {
         });
     }
 
-    return vbox({
+    Elements sections{
         top_section,
         render_progress(snap),
         render_info_panels(snap, width),
-        filler(),
-        render_footer(snap),
-    });
+    };
+    // Show the Pairing PSK token only until this connection is paired -- once trust is USER,
+    // the token has already served its purpose and the vertical space goes back to filler().
+    if (!snap.pairing_token.empty() && snap.trust != ConnectionTrust::USER) {
+        sections.push_back(render_pairing_token(snap));
+    }
+    sections.push_back(filler());
+    sections.push_back(render_footer(snap));
+
+    return vbox(std::move(sections));
 }
 
 static bool handle_selector_key(const Event& event, SendspinClient& client, TuiState& state) {

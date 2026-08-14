@@ -250,8 +250,11 @@ public:
         return this->dynamic_pin_failures_;
     }
 
-    /// @brief Increment the dynamic-PIN failure counter and persist it. Called only when the
-    /// client's own verification of server_kc fails; no other event increments it.
+    /// @brief Increment the dynamic-PIN failure counter. Called only when the client's own
+    /// verification of server_kc fails; no other event increments it. Persists only at the
+    /// first failure since a reset and at the failure that crosses
+    /// DYNAMIC_PIN_ESCALATION_THRESHOLD (see the .cpp for the durability invariant this
+    /// preserves), not on every call, to bound flash writes on this network-reachable path.
     void record_dynamic_pin_failure();
 
     /// @brief Reset the dynamic-PIN failure counter to zero and persist it. Called when the

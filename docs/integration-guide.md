@@ -535,6 +535,23 @@ struct MyPersistenceProvider : SendspinPersistenceProvider {
 };
 ```
 
+#### Migrating from a Pre-Encryption Release
+
+If your `SendspinPersistenceProvider` implementation predates mandatory Noise encryption, two
+things changed:
+
+- The interface grew from 4 methods to 17 (see Method contract above). Every new method has a
+  safe no-op / `nullopt` default, so you only need to implement what your deployment actually
+  uses -- at minimum `save_static_keypair` + `load_static_keypair` for a stable identity, and
+  `save_pairing_record` + `load_pairing_records` for pairing to survive reboots.
+- `save_last_server_hash(uint32_t)` / `load_last_server_hash()` were replaced by
+  `save_last_played_server_id(const std::string&)` / `load_last_played_server_id()`. This is a
+  rename and a retype, not just a rename: the old methods stored an FNV1 hash of the server
+  id, the new ones store the raw base64url `server_id` string. An existing `override` of the
+  old methods will fail to compile after upgrading; that is intentional, since a hash-based
+  override left in place would silently stop being called (it no longer overrides anything)
+  rather than failing loudly.
+
 ### SendspinClientListener (Optional)
 
 Receives client-level events. All callbacks fire on the main loop thread.

@@ -23,6 +23,7 @@
 #include "noise_handshake.h"
 #include "noise_transport.h"
 #include "platform/memory.h"
+#include "platform/shadow_slot.h"
 #include "platform/types.h"
 #include "protocol_messages.h"
 #include "record_store.h"
@@ -573,27 +574,27 @@ public:
     /// shared PSK but store nothing on ack. Written on the main loop when entering pairing; taken
     /// on the network thread in the server/pair-finalize handler (the commit must happen there,
     /// before the server's re-handshake msg1 - next message on the same thread - resolves the new
-    /// PSK against the RecordStore). pending_pairing_mutex_ guards the cross-thread access.
+    /// PSK against the RecordStore). Thin wrapper around pending_pairing_slot_ (ShadowSlot);
+    /// latest-wins overwrite, matching write()'s semantics.
     void set_pending_pairing_record(std::optional<SendspinPairingRecord> record) {
-        std::lock_guard<std::mutex> lock(this->pending_pairing_mutex_);
-        this->pending_pairing_record_ = std::move(record);
+        this->pending_pairing_slot_.write(std::move(record));
     }
 
     /// @brief Atomically returns and clears the pending pairing record. A returned value is a
-    /// record to store; nullopt means store nothing (shared-PSK case or no pending pairing).
-    /// Called on the network thread when the server/pair-finalize ack arrives.
+    /// record to store; nullopt means store nothing (shared-PSK case or no pending pairing --
+    /// take() leaves the out-param at its default-constructed nullopt when the slot is clean, so
+    /// both cases collapse to the same observable result, matching the prior std::exchange
+    /// behavior). Called on the network thread when the server/pair-finalize ack arrives.
     std::optional<SendspinPairingRecord> take_pending_pairing_record() {
-        std::lock_guard<std::mutex> lock(this->pending_pairing_mutex_);
-        return std::exchange(this->pending_pairing_record_, std::nullopt);
+        std::optional<SendspinPairingRecord> out;
+        this->pending_pairing_slot_.take(out);
+        return out;
     }
 
     /// @brief Clears all pairing state on this connection. Called on abort or leftover-activate.
     void clear_pairing_state() {
         this->pairing_in_progress_.store(false, std::memory_order_release);
-        {
-            std::lock_guard<std::mutex> lock(this->pending_pairing_mutex_);
-            this->pending_pairing_record_ = std::nullopt;
-        }
+        this->pending_pairing_slot_.reset();
         // Reset the dynamic-PIN session (main-loop-only fields; no lock needed).
         this->pin_session_ = PinSession{};
     }
@@ -1008,12 +1009,9 @@ protected:
 
     /// Pending pairing record to be committed when the server/pair-finalize ack arrives (nullopt
     /// = shared-PSK / nothing to store). Written on the main loop (enter pairing), taken on the
-    /// network thread (server/pair-finalize handler), cleared on the main loop (abort/leftover);
-    /// guarded by pending_pairing_mutex_.
-    std::optional<SendspinPairingRecord> pending_pairing_record_{};
-
-    /// Guards pending_pairing_record_ across the main-loop writer and the network-thread taker.
-    std::mutex pending_pairing_mutex_{};
+    /// network thread (server/pair-finalize handler), cleared on the main loop (abort/leftover).
+    /// A ShadowSlot: latest-wins write, take-and-clear read, single mutex internal to the slot.
+    ShadowSlot<std::optional<SendspinPairingRecord>> pending_pairing_slot_{};
 
     /// Count of pairing server/activate messages received since the last Noise handshake (or
     /// re-handshake) (spec #120). Feeds both the wire `pairing_index` field on

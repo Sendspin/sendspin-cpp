@@ -143,13 +143,24 @@ SsErr NoiseTransport::send_json(const char* json, size_t len) {
     const size_t plaintext_len = 1 + len;
 
     if (plaintext_len <= MAX_TRANSPORT_PLAINTEXT) {
-        std::vector<uint8_t> buf(plaintext_len + 16);
-        buf[0] = MSG_TYPE_JSON_BODY;
-        std::memcpy(buf.data() + 1, json, len);
-        return this->encrypt_and_send_frame(buf.data(), buf.size(), plaintext_len);
+        // Locked for fill + encrypt + send, not just encrypt + send: send_buf_ is a shared
+        // member, so the whole read/write window over it must stay inside the critical
+        // section (see send_buf_'s doc comment).
+        std::lock_guard<std::mutex> lock(this->session_mutex_);
+        if (!this->ensure_send_buf()) {
+            return SsErr::FAIL;
+        }
+        this->send_buf_.data()[0] = MSG_TYPE_JSON_BODY;
+        std::memcpy(this->send_buf_.data() + 1, json, len);
+        return this->encrypt_and_send_frame_locked(this->send_buf_.data(), this->send_buf_.size(),
+                                                   plaintext_len);
     }
 
-    // Need fragmentation
+    // Need fragmentation. Rare (large messages only) and unbounded in size (up to
+    // MAX_REASSEMBLED_MESSAGE_BYTES), so it is not a candidate for the fixed-size reused
+    // send_buf_: fragment_and_send releases session_mutex_ between frames (each frame is its
+    // own encrypt_and_send_frame() call), so a buffer read across that whole loop cannot be a
+    // shared member without holding the lock for the entire multi-frame send.
     std::vector<uint8_t> plaintext(plaintext_len);
     plaintext[0] = MSG_TYPE_JSON_BODY;
     std::memcpy(plaintext.data() + 1, json, len);
@@ -165,9 +176,13 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
     }
 
     if (len <= MAX_TRANSPORT_PLAINTEXT) {
-        std::vector<uint8_t> buf(len + 16);
-        std::memcpy(buf.data(), data, len);
-        return this->encrypt_and_send_frame(buf.data(), buf.size(), len);
+        std::lock_guard<std::mutex> lock(this->session_mutex_);
+        if (!this->ensure_send_buf()) {
+            return SsErr::FAIL;
+        }
+        std::memcpy(this->send_buf_.data(), data, len);
+        return this->encrypt_and_send_frame_locked(this->send_buf_.data(), this->send_buf_.size(),
+                                                   len);
     }
 
     return this->fragment_and_send(data, len);
@@ -176,16 +191,26 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
 SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
                                          std::unique_ptr<NoiseSession> next_session) {
     // One locked region for "send msg2 under the OLD session, then swap to the new session"
-    // so a concurrent encrypt on another thread cannot interleave between the two.
+    // so a concurrent encrypt on another thread cannot interleave between the two. This also
+    // covers the send_buf_ fill (see send_buf_'s doc comment).
     std::lock_guard<std::mutex> lock(this->session_mutex_);
 
     const size_t plaintext_len = 1 + msg2_text.size();
-    std::vector<uint8_t> frame_buf(plaintext_len + 16);
-    frame_buf[0] = MSG_TYPE_JSON_BODY;
-    std::memcpy(frame_buf.data() + 1, msg2_text.data(), msg2_text.size());
+    if (plaintext_len > MAX_TRANSPORT_PLAINTEXT) {
+        // The handshake msg2 JSON is never expected to approach this size; reject rather than
+        // overflow the fixed-size send_buf_ (mirrors wire.py, which never fragments handshake
+        // control messages).
+        SS_LOGE(TAG, "send_msg2_and_swap: msg2 plaintext too large (%zu bytes)", plaintext_len);
+        return SsErr::FAIL;
+    }
+    if (!this->ensure_send_buf()) {
+        return SsErr::FAIL;
+    }
+    this->send_buf_.data()[0] = MSG_TYPE_JSON_BODY;
+    std::memcpy(this->send_buf_.data() + 1, msg2_text.data(), msg2_text.size());
 
-    SsErr err =
-        this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), plaintext_len);
+    SsErr err = this->encrypt_and_send_frame_locked(this->send_buf_.data(), this->send_buf_.size(),
+                                                    plaintext_len);
     if (err != SsErr::OK) {
         SS_LOGE(TAG, "send_msg2_and_swap: failed to send encrypted msg2 (err=%d)",
                 static_cast<int>(err));
@@ -327,6 +352,17 @@ bool NoiseTransport::reasm_reserve(size_t needed) {
         SS_LOGE(TAG, "reassembly buffer allocation failed (%zu bytes); dropping message", new_size);
     }
     return ok;
+}
+
+bool NoiseTransport::ensure_send_buf() {
+    if (this->send_buf_.data() != nullptr) {
+        return true;
+    }
+    if (!this->send_buf_.allocate(MAX_TRANSPORT_PLAINTEXT + 16, this->buffer_location_)) {
+        SS_LOGE(TAG, "send buffer allocation failed");
+        return false;
+    }
+    return true;
 }
 
 }  // namespace sendspin

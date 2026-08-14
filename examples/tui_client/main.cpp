@@ -840,9 +840,19 @@ int main(int argc, char* argv[]) {
 
     // Expose client_id in the TUI state for display.
     // client_id is base64url(static X25519 public key), 43 chars.
+    //
+    // Also expose the formatted Pairing PSK token: a server that only offers the mandatory
+    // pairing_psk method (dynamic_pin is optional) needs this pasted in by the operator, so
+    // without showing it here a user could not pair against such a server at all. Mirrors
+    // basic_client's startup banner, just routed into TUI state instead of stderr since the
+    // TUI owns the terminal.
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         state.client_id = client.client_id();
+        auto token = client.pairing_token();
+        if (token.has_value()) {
+            state.pairing_token = std::move(*token);
+        }
     }
 
     // Advertise via mDNS and browse for other servers (when compiled in)

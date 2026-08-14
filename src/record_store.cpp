@@ -433,10 +433,37 @@ void RecordStore::set_dynamic_pin_min_length(int length) {
 // ============================================================================
 
 void RecordStore::record_dynamic_pin_failure() {
+    // Failures arrive network-reachable and unthrottled (every rejected PIN guess calls this),
+    // so persisting on every increment would put an attacker-driven write rate directly on
+    // flash. Persist only at the two points where losing the in-memory update to an untimely
+    // reboot would change observable behavior:
+    //  - the first failure after a reset (0 -> 1), so a power-cycle cannot silently erase the
+    //    fact that a failed attempt happened at all;
+    //  - the failure that crosses DYNAMIC_PIN_ESCALATION_THRESHOLD, so a power-cycle cannot
+    //    un-escalate dynamic_pin.
+    // Invariant this guarantees: dynamic_pin_escalated() is durable -- if it is true before a
+    // reboot, it is true after (escalation only clears via reset_dynamic_pin_failures(), which
+    // always persists), and it cannot be un-escalated by power-cycling. Non-escalating counts
+    // strictly between 1 and DYNAMIC_PIN_ESCALATION_THRESHOLD may be lost to an untimely
+    // reboot; that only costs the attacker's own progress toward escalation, not the escalation
+    // guarantee itself, in exchange for not touching flash on every guess.
+    //
+    // This is a considered tradeoff, not just an optimistic one: an attacker who can force a
+    // reboot or crash by unrelated means (a bug, a power blip, physical access) gets at most
+    // DYNAMIC_PIN_ESCALATION_THRESHOLD - 1 fresh online guesses per forced cycle. Each of those
+    // guesses still costs a full CPace PAKE handshake (see crypto/cpace.h) -- there is no
+    // faster offline path -- so the reboot-assisted budget only multiplies an already-expensive
+    // per-guess cost by a small bounded factor; it does not turn the PIN into a cheap oracle.
+    const bool was_escalated = this->dynamic_pin_escalated();
+    const bool first_failure_since_reset = (this->dynamic_pin_failures_ == 0);
     this->dynamic_pin_failures_++;
     SS_LOGW(TAG, "Dynamic-PIN failure recorded (count=%d, escalation threshold=%d)",
             this->dynamic_pin_failures_, DYNAMIC_PIN_ESCALATION_THRESHOLD);
-    this->persist_config();
+
+    const bool now_escalated = this->dynamic_pin_escalated();
+    if (first_failure_since_reset || (now_escalated && !was_escalated)) {
+        this->persist_config();
+    }
 }
 
 void RecordStore::reset_dynamic_pin_failures() {

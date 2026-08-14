@@ -225,6 +225,16 @@ TEST(B64Url, DecodeRejectsInvalidCharacter) {
     EXPECT_FALSE(b64url_decode("Zm9v/g").has_value());
 }
 
+TEST(B64Url, DecodeRejectsEmbeddedWhitespace) {
+    // platform_base64_decode's host implementation silently skips '\n'/'\r'/' ' rather than
+    // rejecting them; b64url_decode must reject regardless of that platform-decoder laxity, so
+    // accepted input does not silently diverge between host and ESP (mbedTLS rejects these
+    // outright).
+    EXPECT_FALSE(b64url_decode("Zm9v\nYg").has_value());
+    EXPECT_FALSE(b64url_decode("Zm9v\rYg").has_value());
+    EXPECT_FALSE(b64url_decode("Zm9v Yg").has_value());
+}
+
 // =============================================================================
 // PSK-ID derivation KATs  (mirrors test_keys.py)
 // =============================================================================

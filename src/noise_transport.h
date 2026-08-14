@@ -19,7 +19,10 @@
 /// This class isolates every piece of state that the "decrypt runs unlocked on the network
 /// thread" invariant applies to. Its threading contract:
 ///
-///   - ENCRYPT / send (send_json, send_binary): any thread; serialized by session_mutex_.
+///   - ENCRYPT / send (send_json, send_binary): any thread; serialized by session_mutex_. The
+///     non-fragmented path also fills and encrypts the reused send_buf_ member under the same
+///     lock, so that reuse is safe precisely because this path is fully serialized (see
+///     send_buf_'s doc comment).
 ///   - DECRYPT (decrypt_in_place) and reassembly (accept_plaintext): NETWORK THREAD ONLY.
 ///     The decrypt path is deliberately unlocked: the only writer that can replace the session
 ///     mid-connection (send_msg2_and_swap, driven by an inbound re-handshake frame) runs on the
@@ -166,6 +169,11 @@ private:
     /// preserved, capacity retained across messages). Returns false on allocation failure.
     bool reasm_reserve(size_t needed);
 
+    /// @brief Lazily allocates send_buf_ to MAX_TRANSPORT_PLAINTEXT + 16 bytes (plaintext +
+    /// AEAD tag room) on first use, then reuses the allocation for the life of the transport.
+    /// Caller must hold session_mutex_ (see send_buf_). Returns false on allocation failure.
+    bool ensure_send_buf();
+
     /// @brief Discards any in-flight reassembly state (keeps the allocation).
     void reasm_reset() {
         this->reasm_len_ = 0;
@@ -185,6 +193,15 @@ private:
 
     /// Emits one encrypted frame as a binary WS frame.
     FrameSink frame_sink_;
+
+    /// Reused scratch buffer for the non-fragmented send path (send_json, send_binary,
+    /// send_msg2_and_swap). Fixed at MAX_TRANSPORT_PLAINTEXT + 16 bytes (largest plaintext
+    /// that path ever handles, plus AEAD tag room) once allocated by ensure_send_buf().
+    /// Guarded by session_mutex_: every caller fills and encrypts it while holding the lock,
+    /// so concurrent send_json/send_binary/send_msg2_and_swap calls from different threads
+    /// (any thread may call these; see the file comment) never touch it at the same time.
+    /// Placed per buffer_location_ like reasm_buf_ (PSRAM-preferring by default on ESP).
+    PlatformBuffer send_buf_;
 
     // Fragment reassembly state (network thread only).
 

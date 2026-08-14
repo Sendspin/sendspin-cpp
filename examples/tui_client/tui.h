@@ -85,6 +85,7 @@ struct TuiState {
     std::string client_id;
     ConnectionTrust trust{ConnectionTrust::NONE};
     std::string pairing_status;  // brief human-readable pairing event description
+    std::string pairing_token;   // formatted Pairing PSK token (SP:...); empty if unavailable
 
     // Server selector
     bool server_selector_active{false};

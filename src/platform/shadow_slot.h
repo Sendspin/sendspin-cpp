@@ -23,15 +23,18 @@
 
 namespace sendspin {
 
-/// @brief Thread-safe shadow slot for passing state between a producer and a consumer thread,
-/// neither of which is the main loop
+/// @brief Thread-safe shadow slot for passing the latest value of T between any two threads: one
+/// writer, one reader, latest-value-wins.
 ///
 /// The writer thread locks briefly to write or merge a value; the reader thread locks briefly to
-/// move the value out if dirty. Remains the right primitive for producer/consumer pairs outside
-/// the main loop -- its one user today is the sync task's playback-progress slot (audio callback
-/// thread to sync task thread). State bound for the main loop instead goes through Inbox /
-/// InboxSlot (see inbox.h), which consolidates many such producers onto one shared mutex and a
-/// single lock-free poll() read per tick.
+/// move the value out if dirty. General contract: safe between any single-writer/single-reader
+/// thread pair, not just producer/consumer pairs outside the main loop -- e.g. the sync task's
+/// playback-progress slot (audio callback thread to sync task thread) and a connection's pending
+/// pairing record (main loop writer to network-thread reader). State bound for the main loop's
+/// own read side instead goes through Inbox / InboxSlot (see inbox.h) when there are many such
+/// producers to consolidate onto one shared mutex and a single lock-free poll() read per tick;
+/// ShadowSlot remains the right primitive for a single producer/single consumer pair regardless
+/// of which (if either) side is the main loop.
 template <typename T>
 class ShadowSlot {
 public:

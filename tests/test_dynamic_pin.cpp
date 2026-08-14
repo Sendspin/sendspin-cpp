@@ -477,6 +477,61 @@ TEST(DynamicPinEscalation, EscalationSurvivesReboot) {
     }
 }
 
+// record_dynamic_pin_failure() is a network-reachable, unthrottled path (every rejected PIN
+// guess calls it), so it must not write to flash on every single failure. It persists only at
+// the first failure since a reset and at the failure that crosses the escalation threshold.
+TEST(DynamicPinEscalation, PersistsOnlyAtFirstFailureAndEscalationCrossing) {
+    /// Provider that counts save_pairing_config() calls, so the test can assert exactly which
+    /// failures triggered a flash write.
+    class CountingProvider : public SendspinPersistenceProvider {
+    public:
+        std::optional<SendspinPairingConfig> load_pairing_config() override {
+            return std::nullopt;
+        }
+        bool save_pairing_config(const SendspinPairingConfig& config) override {
+            this->save_count++;
+            this->last_saved = config;
+            return true;
+        }
+
+        int save_count{0};
+        std::optional<SendspinPairingConfig> last_saved;
+    };
+
+    CountingProvider provider;
+    RecordStore store(&provider);
+    // The constructor itself may provision and persist a first-boot shared-PSK fallback record
+    // and Pairing PSK; baseline against the count after construction rather than assuming 0.
+    const int baseline = provider.save_count;
+
+    // Failure 1 (first since construction/reset): persists.
+    store.record_dynamic_pin_failure();
+    EXPECT_EQ(provider.save_count, baseline + 1);
+    ASSERT_TRUE(provider.last_saved.has_value());
+    EXPECT_EQ(provider.last_saved->dynamic_pin_failures, 1);
+
+    // Failures 2 .. threshold-1: below threshold, no new write.
+    for (int i = 2; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
+        store.record_dynamic_pin_failure();
+        EXPECT_EQ(provider.save_count, baseline + 1) << "failure " << i << " should not persist";
+    }
+
+    // The threshold-th failure crosses the escalation threshold: persists.
+    store.record_dynamic_pin_failure();
+    EXPECT_EQ(provider.save_count, baseline + 2);
+    ASSERT_TRUE(provider.last_saved.has_value());
+    EXPECT_EQ(provider.last_saved->dynamic_pin_failures,
+              RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD);
+    EXPECT_TRUE(store.dynamic_pin_escalated());
+
+    // Further failures past the threshold: already escalated, no new write.
+    for (int i = 0; i < 5; ++i) {
+        store.record_dynamic_pin_failure();
+        EXPECT_EQ(provider.save_count, baseline + 2)
+            << "post-escalation failure " << i << " should not persist";
+    }
+}
+
 // ============================================================================
 // CPace INITIATOR + RESPONDER round-trip with shared password
 // ============================================================================
