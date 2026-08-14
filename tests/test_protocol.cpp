@@ -371,17 +371,6 @@ TEST(Protocol, ServerHelloRequiresName) {
     ServerHelloMessage ok;
     ASSERT_TRUE(process_server_hello_message(root_ok, &ok));
     EXPECT_EQ(ok.name, "srv");
-    EXPECT_FALSE(ok.server_id.has_value());  // fallback field, absent on the real wire
-
-    // The server_id fallback field parses when present (test/no-encryption fixtures only).
-    JsonDocument doc_legacy;
-    JsonObject root_legacy;
-    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"srv","server_id":"s1"}})",
-                      doc_legacy, root_legacy));
-    ServerHelloMessage legacy;
-    ASSERT_TRUE(process_server_hello_message(root_legacy, &legacy));
-    ASSERT_TRUE(legacy.server_id.has_value());
-    EXPECT_EQ(legacy.server_id.value(), "s1");
 }
 
 // server/activate declares the activity set (and, sticky, active_roles); activities is required.

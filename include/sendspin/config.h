@@ -105,19 +105,6 @@ struct SendspinClientConfig {
     /// @brief Noise cipher suite preference. Defaults to ChaChaPoly (lower CPU on bare-metal).
     NoiseCipherSuitePreference cipher_suite{NoiseCipherSuitePreference::CHACHAPOLY};
 
-    /// @brief Whether every connection must complete a Noise KKpsk2 handshake before the hello
-    /// exchange (spec "Encryption"'s always-on encryption model).
-    ///
-    /// Internal/testing knob, not part of the supported public surface: the Sendspin spec
-    /// requires encryption to be always-on, and every shipping deployment must leave this at
-    /// its default of true. The client is always the Noise responder, and admission/trust
-    /// enforcement (see admission.h) key off the PSK category resolved by that handshake.
-    /// Setting this to false skips the crypto layer entirely and runs the connection nursery
-    /// (accept/reap/admission-arbitration) in plaintext; it exists only for test fixtures that
-    /// exercise nursery structure independently of Noise (already covered separately by the
-    /// Noise handshake/re-handshake/admission unit tests).
-    bool encryption_required{true};
-
     std::optional<std::string> product_name{};  ///< Device product name (optional)
     std::optional<std::string> manufacturer{};  ///< Manufacturer name, e.g., "ESPHome" (optional)
     std::optional<std::string> software_version{};  ///< Software version string (optional)

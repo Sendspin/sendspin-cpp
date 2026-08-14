@@ -387,9 +387,6 @@ bool process_server_hello_message(JsonObject root, ServerHelloMessage* hello_msg
 
     if (hello_msg != nullptr) {
         hello_msg->name = root["payload"]["name"].as<std::string>();
-        if (root["payload"]["server_id"].is<const char*>()) {
-            hello_msg->server_id = root["payload"]["server_id"].as<std::string>();
-        }
     }
 
     return true;

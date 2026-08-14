@@ -955,11 +955,6 @@ struct ClientStateMessage {
 /// active_roles come from the server/activate message that follows.
 struct ServerHelloMessage {
     std::string name{};
-    /// Test-only fallback: not part of server/hello on the wire, but parsed if present so
-    /// no-encryption test fixtures can populate server_id. The client only ever adopts it when
-    /// the connection has no Noise handshake result to source server_id from
-    /// (encryption_required == false); see SendspinClient's SERVER_HELLO handling.
-    std::optional<std::string> server_id{};
 };
 
 /// @brief Parsed server/activate message that follows server/hello.

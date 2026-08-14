@@ -70,8 +70,6 @@ constexpr uint16_t PREHANDSHAKE_BINARY_TEST_PORT = 19000;
 constexpr uint16_t PREADMISSION_ROLE_TEST_PORT = 19001;
 constexpr uint16_t REVOCATION_SWEEP_TEST_PORT = 19002;
 
-
-
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record store_record() persists via save_blob(persistence_keys::RECORDS, ...), so the
 // pairing-flow test below can assert on the psk_id/server_id/psk that pairing generated and
@@ -229,7 +227,6 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     SendspinClientConfig config;
     config.name = "Encrypted Lifecycle Test Client";
     config.server_port = RESUME_TEST_PORT;
-    ASSERT_TRUE(config.encryption_required);  // this suite exercises the encrypted path
 
     SendspinClient client(config);
     client.set_network_provider(&network);
@@ -310,7 +307,6 @@ TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
     SendspinClientConfig config;
     config.name = "AEAD Failure Outbound Test Client";
     config.server_port = AEAD_FAILURE_TEST_PORT;  // unused: this test never accepts inbound
-    ASSERT_TRUE(config.encryption_required);
 
     SendspinClient client(config);
     client.set_network_provider(&network);
@@ -738,18 +734,15 @@ TEST(EncryptedLifecycle, ManagementListRecordsRoundTripOverEncryptedTransport) {
 // A binary WebSocket frame that arrives while the Noise handshake is still pending must close the
 // connection, not be dispatched.
 //
-// The binary branch of dispatch_completed_message() must distinguish "handshake installed but not
-// finished" from "no handshake at all" (encryption_required == false).
-// Collapsing the two into the same fall-through would let a peer skip client/init entirely, send a
-// raw binary frame, and have it handed straight to the role binary handlers with the whole
-// Noise/PSK/admission chain bypassed. The TEXT branch already routes pre-handshake text into the
-// handshake driver, so it does not share this gap.
+// The binary branch of dispatch_completed_message() closes rather than dispatching: letting a peer
+// skip client/init entirely, send a raw binary frame, and have it handed to the role binary
+// handlers would bypass the whole Noise/PSK/admission chain. The TEXT branch routes pre-handshake
+// text into the handshake driver instead, so it does not share this gap.
 TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
     TestNetworkProvider network;
     SendspinClientConfig config;
     config.name = "Pre-Handshake Binary Test Client";
     config.server_port = PREHANDSHAKE_BINARY_TEST_PORT;
-    ASSERT_TRUE(config.encryption_required);
 
     SendspinClient client(config);
     client.set_network_provider(&network);
@@ -813,7 +806,6 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     SendspinClientConfig config;
     config.name = "Pre-Admission Role Traffic Test Client";
     config.server_port = PREADMISSION_ROLE_TEST_PORT;
-    ASSERT_TRUE(config.encryption_required);
 
     SendspinClient client(config);
     client.set_network_provider(&network);
@@ -894,7 +886,6 @@ TEST(EncryptedLifecycle, RemoveRecordDropsTheRevokedDevicesLiveSession) {
     SendspinClientConfig config;
     config.name = "Revocation Sweep Test Client";
     config.server_port = REVOCATION_SWEEP_TEST_PORT;
-    ASSERT_TRUE(config.encryption_required);
 
     SendspinClient client(config);
     client.set_network_provider(&network);

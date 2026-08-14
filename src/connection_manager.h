@@ -226,9 +226,8 @@ struct ServerActivateEvent {
  * Connections prove themselves before they are trusted: every new connection enters a bounded
  * nursery and leaves it only by completing the hello handshake AND being admitted by its first
  * server/activate (promotion, or a fair arbitration against the incumbent) or by missing the
- * establish deadline (reaped). When encryption is required (SendspinClientConfig::
- * encryption_required, the default), the prove stage additionally starts with the Noise
- * handshake: accept/connect -> Noise handshake complete -> hello handshake complete -> first
+ * establish deadline (reaped). The prove stage starts with the Noise handshake:
+ * accept/connect -> Noise handshake complete -> hello handshake complete -> first
  * server/activate admitted. The platform ws_server delivers inbound connections only after
  * observing their WebSocket upgrade, so the manager never reasons about raw sockets that might
  * not speak WebSocket; those are closed inside the platform layer. Invariant:

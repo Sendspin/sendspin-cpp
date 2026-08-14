@@ -338,10 +338,16 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
 
     const size_t msg_len = this->websocket_write_offset_;
 
-    // Two ways in, one dispatch. Under Noise every frame is BINARY ciphertext: decrypt,
-    // reassemble, and read the message type from the leading plaintext byte. With no
-    // handshake driver installed the WebSocket frame type is the message type (TEXT is
-    // JSON, BINARY is a role message), and both dispatch as-is.
+    // Every application frame is BINARY ciphertext: decrypt, reassemble, and read the message
+    // type from the leading plaintext byte. Cleartext TEXT frames carry only the pre-transport
+    // handshake exchange (server/init, noise/handshake), which the handshake driver consumes.
+    //
+    // A third state exists briefly: WS-upgraded with no handshake driver yet. An outbound
+    // connection sits there between its transport connected callback and the main loop calling
+    // init_noise_handshake() (see ConnectionManager::drain_lifecycle_events), and a connection
+    // rejected at nursery capacity never gets a driver at all. Nothing legitimate arrives in
+    // either case (a server speaks only after client/init), so any frame there is
+    // unauthenticated and is dropped.
     const bool noise_active = this->noise_handshake_complete_.load(std::memory_order_acquire);
     const bool noise_pending = !noise_active && this->noise_handshake_;
 
@@ -362,21 +368,7 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
             return;
         }
 
-        // No handshake driver installed: the frame is already plaintext JSON.
-        // Hand the JSON callback a pointer straight into the reassembly buffer instead of
-        // copying it into a std::string. The callback parses synchronously;
-        // reset_websocket_payload() below makes the buffer reusable as soon as it returns, so
-        // the callback must not retain the pointer. Not null-terminated; the length is
-        // authoritative.
-        if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
-            this->reset_websocket_payload();
-            return;
-        }
-        if (this->on_json_message_cb) {
-            this->on_json_message_cb(this,
-                                     reinterpret_cast<const char*>(this->websocket_payload_.data()),
-                                     msg_len, receive_time);
-        }
+        SS_LOGW(TAG, "TEXT frame before the Noise handshake started; dropping");
         this->reset_websocket_payload();
         return;
     }
@@ -431,15 +423,7 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
         return;
     }
 
-    // No handshake driver installed (encryption_required == false): the frame is already a
-    // plaintext role message (connection retains buffer ownership, callback reads in-place).
-    if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
-        this->reset_websocket_payload();
-        return;
-    }
-    if (this->on_binary_message_cb) {
-        this->on_binary_message_cb(this, this->websocket_payload_.data(), msg_len);
-    }
+    SS_LOGW(TAG, "Binary frame before the Noise handshake started; dropping");
     this->reset_websocket_payload();
 }
 

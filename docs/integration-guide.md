@@ -1117,12 +1117,6 @@ X25519 keypair and read back via `client.client_id()` after `start_server()`.
 | `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `websocket_payload_location` (which covers the raw WebSocket frame buffer). ESP-IDF only; ignored on host. |
 | `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer used to parse incoming JSON protocol messages, instead of the default PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the network task on every message. Messages too large for the budget fall back to PSRAM; the default covers steady-state traffic (including the FLAC stream-start header), while large track-metadata messages may spill over (but those arrive only once per song). Set to `0` to disable and keep PSRAM-only behaviour. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer for the parse (still used, harmless). |
 
-`encryption_required` is intentionally not documented here: it is an internal/testing knob
-(default `true`) that skips the Noise layer entirely when set to `false`, for test fixtures
-that exercise the connection-nursery structure independently of Noise. The Sendspin spec
-requires encryption to be always-on; every shipping deployment must leave this at its
-default and it is not part of the supported public configuration surface.
-
 ---
 
 ### PlayerRoleConfig

@@ -411,7 +411,7 @@ The filter is protected by `state_mutex_` so that `compute_client_time()` can be
 
 ## Noise Encryption
 
-Every connection is encrypted with Noise KKpsk2 when `SendspinClientConfig::encryption_required` is set (the default). The C++ library is always the Noise responder; the Python server is always the initiator.
+Every connection is encrypted with Noise KKpsk2. The C++ library is always the Noise responder; the Python server is always the initiator.
 
 ### Transport Stack (`src/noise_transport.h`, `src/noise_transport.cpp`)
 
@@ -517,7 +517,7 @@ The `server/activate` handler in `ConnectionManager::loop()` evaluates each acti
 
 `unpaired_access_enabled` is persisted in `SendspinPairingConfig` and is normally written by the server through `management/set-pairing-config`. Its value on a device that has never persisted a pairing config comes from `SendspinClientConfig::initial_unpaired_access_enabled`, which `RecordStore`'s constructor applies only on the `!loaded_config` path (a loaded config always outranks the seed) and which the first-boot provisioning branch then persists.
 
-A rejected activate closes the connection with `SendspinGoodbyeReason::PAIRING_REQUIRED` when it would have been admissible had unpaired access been enabled (a Sentinel connection requesting `{playback}` while unpaired access is off), and `SendspinGoodbyeReason::UNAUTHORIZED` otherwise. Trust enforcement is skipped entirely when `encryption_required` is false (no PSK category was ever resolved), matching pre-encryption behavior for the plaintext nursery-structure test fixtures that use it.
+A rejected activate closes the connection with `SendspinGoodbyeReason::PAIRING_REQUIRED` when it would have been admissible had unpaired access been enabled (a Sentinel connection requesting `{playback}` while unpaired access is off), and `SendspinGoodbyeReason::UNAUTHORIZED` otherwise.
 
 Multi-server admission arbitration (deciding whether an incoming connection displaces the current one) ranks each side by its highest activity (`activity_rank()` in `admission.h`: management=3, playback=2, pairing=1, none=0) and applies `should_admit_connection()`'s rules, described in [Handshake and Handoff](#handshake-and-handoff) above.
 
@@ -537,7 +537,7 @@ All are `std::shared_ptr<SendspinConnection>`, and on the ESP server path they a
 ### Handshake and Handoff
 
 1. A new connection (outbound or inbound) enters the nursery. Inbound connections are delivered by the platform ws_server only after their WebSocket upgrade is observed.
-2. When `SendspinClientConfig::encryption_required` is set (the default), the connection first runs the cleartext Noise handshake (`client/init` / `server/init` / `noise/handshake` msg1 / msg2) on the network thread before any application message is processed; see [Noise Encryption](#noise-encryption) below. No `client/hello` is sent until Noise transport is active.
+2. The connection first runs the cleartext Noise handshake (`client/init` / `server/init` / `noise/handshake` msg1 / msg2) on the network thread before any application message is processed; see [Noise Encryption](#noise-encryption) below. No `client/hello` is sent until Noise transport is active.
 3. The connection sends `client/hello` (over the encrypted transport, once Noise is active). Retry with exponential backoff (100 ms base, 3 attempts). Each managed connection has its own retry entry in `ConnectionManager::hello_retries_`, so a handoff candidate arriving mid-handshake cannot clobber another connection's pending hello.
 4. The handshake state lives on the connection as two atomic flags: `client_hello_sent_` (set by the hello send-completion callback) and `server_hello_received_` (set when `server/hello` is processed on the network thread, after the server info fields it publishes). `is_handshake_complete()` (`client_hello_sent_ && server_hello_received_`) therefore already implies the Noise handshake completed, since `client/hello` cannot be sent before transport is active.
 5. Establishment is level-triggered: each `loop()` tick, the promotion scan promotes any nursery connection whose `is_operational()` (`is_handshake_complete() && first_activate_received()`) is true, so it does not matter whether the hello handshake or the first `server/activate` completes first. `server/activate` trust enforcement (admissibility against the connection's PSK category) runs as soon as the activate event is processed, independent of promotion timing; a rejected activate closes the connection immediately. Admission arbitration against an incumbent (rank by highest activity: management > playback > pairing > none; equal non-zero rank admits the incoming connection; an in-flight pairing is not displaced by an incoming pairing or playback connection) happens inside the promotion scan itself. See [PSK Admission (trust gating)](#psk-admission-trust-gating) below.

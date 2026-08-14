@@ -448,25 +448,20 @@ void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
     }
 
     // Transport connected events: an outbound connection's WebSocket upgrade completed.
-    // When encryption is required, this is where the outbound side starts the Noise
-    // handshake (client_init is sent proactively; the client is always the Noise
-    // responder regardless of who opened the socket, but it still sends client/init
-    // first as the Sendspin protocol client). The hello is armed later, once the Noise
-    // handshake completes (see the noise-completion scan in scan_hello_and_nursery()).
-    // Otherwise, arm the hello right away. (Inbound connections arrive already
-    // upgraded and are handled the same way in on_new_connection().) Guarded by nursery
-    // membership: a connection promoted or released by an earlier event is skipped.
+    // This is where the outbound side starts the Noise handshake (client_init is sent
+    // proactively; the client is always the Noise responder regardless of who opened the
+    // socket, but it still sends client/init first as the Sendspin protocol client). The
+    // hello is armed later, once the Noise handshake completes (see the noise-completion
+    // scan in scan_hello_and_nursery()). (Inbound connections arrive already upgraded and
+    // are handled the same way in on_new_connection().) Guarded by nursery membership: a
+    // connection promoted or released by an earlier event is skipped.
     for (auto& conn : ev.connected) {
         if (this->find_in_nursery(conn.get()) == this->nursery_.end()) {
             continue;
         }
-        if (this->client_->config_.encryption_required) {
-            conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
-                                       suite_name_for(this->client_->config_.cipher_suite));
-            conn->send_noise_client_init();
-        } else {
-            this->initiate_hello(conn.get());
-        }
+        conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
+                                   suite_name_for(this->client_->config_.cipher_suite));
+        conn->send_noise_client_init();
     }
 
     // In-band re-handshake completions: handle_noise_rehandshake() already swapped the
@@ -517,11 +512,10 @@ void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
                 : (playback_capable ? event.conn->get_active_roles() : EMPTY_ROLES);
         const bool has_roles = !effective_roles.empty();
 
-        // Trust enforcement only applies when a handshake resolved a PSK category for this
-        // connection. With encryption_required == false no handshake runs, so there is no
-        // PSK category to enforce against and every admitted connection is trusted.
-        const bool trust_ok = !this->client_->config_.encryption_required ||
-                              admissible(event.conn->get_psk_category(), event.activities,
+        // Trust enforcement against the PSK category the Noise handshake resolved for this
+        // connection. Every connection has one: no server/activate can arrive before the
+        // handshake completes.
+        const bool trust_ok = admissible(event.conn->get_psk_category(), event.activities,
                                          has_roles, unpaired_access);
 
         if (!trust_ok) {
@@ -662,8 +656,7 @@ void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
         // re-handshake (see the comment below), and a server may start the next
         // re-handshake while this activate is still queued, so a second read here could
         // straddle a network-thread rewrite and disagree with the first.
-        if (is_first && this->client_->config_.encryption_required &&
-            event.conn->get_psk_category() == PskCategory::LONG_TERM &&
+        if (is_first && event.conn->get_psk_category() == PskCategory::LONG_TERM &&
             this->client_->record_store_ != nullptr) {
             const std::string psk_id = event.conn->get_psk_id();
             if (!psk_id.empty()) {
@@ -869,15 +862,13 @@ void ConnectionManager::scan_hello_and_nursery() {
         // the network thread (inside dispatch_completed_message/handle_noise_handshake_text)
         // with no corresponding queued event, unlike the connected-events edge above. Skips
         // connections whose hello is already sent or already has a pending retry, so a
-        // connection is armed exactly once. When encryption is not required this scan never
-        // finds anything to arm (on_new_connection/the connected-events block above already
-        // armed the hello immediately in that mode).
+        // connection is armed exactly once.
         for (const auto& entry : this->nursery_) {
             SendspinConnection* c = entry.conn.get();
             if (c->has_client_hello_sent() || this->has_hello_retry(c)) {
                 continue;
             }
-            if (this->client_->config_.encryption_required && !c->is_noise_handshake_complete()) {
+            if (!c->is_noise_handshake_complete()) {
                 continue;
             }
             this->initiate_hello(c);
@@ -1204,20 +1195,12 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
         } else {
             SS_LOGD(TAG, "Admitting new connection into the nursery");
-            if (this->client_->config_.encryption_required) {
-                // The connection arrives WS-upgraded, so client/init can be sent right away
-                // (there is no earlier signal to wait for). The hello is armed later, once the
-                // Noise handshake completes (see the noise-completion scan in
-                // scan_hello_and_nursery()).
-                conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
-                                           suite_name_for(this->client_->config_.cipher_suite));
-                conn->send_noise_client_init();
-            } else {
-                // Arm the hello right away: the connection arrives WS-upgraded, so there is no
-                // earlier signal to wait for. (Outbound connections instead arm theirs when the
-                // transport's connected event is processed in drain_lifecycle_events().)
-                this->initiate_hello(conn.get());
-            }
+            // The connection arrives WS-upgraded, so client/init can be sent right away (there
+            // is no earlier signal to wait for). The hello is armed later, once the Noise
+            // handshake completes (see the noise-completion scan in scan_hello_and_nursery()).
+            conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
+                                       suite_name_for(this->client_->config_.cipher_suite));
+            conn->send_noise_client_init();
             this->push_nursery_entry(NurseryEntry{std::move(conn), /*inbound=*/true});
         }
     }
@@ -1297,10 +1280,9 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
 
     std::string hello_message = this->client_->build_hello_message(conn);
 
-    // send_app_json (not send_text_message): once the Noise transport is active, client/hello
-    // must be encrypted like every other post-handshake message; send_app_json routes to the
-    // encrypted path automatically and falls back to plain text when there is no active
-    // transport (encryption_required == false).
+    // send_app_json (not send_text_message): client/hello is encrypted like every other
+    // post-handshake message. The hello is only ever armed once the Noise handshake completes,
+    // so the transport send_app_json routes to is always active here.
     SsErr err = conn->send_app_json(
         hello_message,
         [conn](bool success) {

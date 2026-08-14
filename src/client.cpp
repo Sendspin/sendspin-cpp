@@ -209,9 +209,9 @@ void SendspinClient::connect_to(const std::string& url) {
     // Refuse to build an outbound connection before start_server() has fully succeeded.
     // identity_ and record_store_ are populated only there, and the lifecycle drain hands both
     // to init_noise_handshake() by reference once the WebSocket upgrade completes (see
-    // ConnectionManager::drain_lifecycle_events), with encryption_required defaulting to true,
-    // a connection started now would dereference null there. Checking the pointers rather than
-    // started_ alone also covers a consumer that ignored a false return from start_server().
+    // ConnectionManager::drain_lifecycle_events), so a connection started now would dereference
+    // null there. Checking the pointers rather than started_ alone also covers a consumer that
+    // ignored a false return from start_server().
     if (this->identity_ == nullptr || this->record_store_ == nullptr) {
         SS_LOGE(TAG,
                 "connect_to(%s) ignored: start_server() has not completed successfully, so there "
@@ -1030,15 +1030,10 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             ServerHelloMessage hello_msg;
             if (process_server_hello_message(root, &hello_msg)) {
                 // server_id comes from the Noise handshake result (already set on the
-                // connection when one ran); server/hello only carries the display name. The
-                // server_id field on server/hello is a test-only fallback, adopted only
-                // when the Noise handshake never set one (encryption_required == false).
+                // connection); server/hello only carries the display name.
                 if (conn != nullptr) {
                     ServerInformationObject info = conn->get_server_information();
                     info.name = hello_msg.name;
-                    if (info.server_id.empty() && hello_msg.server_id.has_value()) {
-                        info.server_id = hello_msg.server_id.value();
-                    }
                     conn->set_server_information(std::move(info));
                     // Set last: this atomic store publishes the field above to the manager's
                     // promotion scan on the main loop, which observes is_handshake_complete()
