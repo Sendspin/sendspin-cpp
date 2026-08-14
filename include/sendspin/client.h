@@ -165,6 +165,9 @@ public:
 /// serializes to NVS/Preferences (ESP) or a file (host). Every method has a
 /// default no-op / nullopt implementation so a platform can opt in
 /// incrementally, matching the existing style.
+///
+/// A provider that stores the pairing structs as byte blobs does not need to hand-roll their
+/// serialization: see sendspin/persistence_codec.h for ready-made encode/decode functions.
 class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;

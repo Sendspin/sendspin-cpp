@@ -15,6 +15,7 @@
 #include "file_persistence_provider.h"
 
 #include "sendspin/config.h"
+#include "sendspin/persistence_codec.h"
 #include <ArduinoJson.h>
 
 #include <array>
@@ -44,77 +45,9 @@ namespace sendspin {
 
 namespace {
 
-// ----------------------------------------------------------------------------
-// Base64url (RFC 4648 section 5, no `=` padding). Inlined here so this example helper
-// depends only on the public API + ArduinoJson, not on the library's internal
-// platform/ headers. Matches the library's src/platform/base64.h encoding so
-// files written by either remain compatible.
-// ----------------------------------------------------------------------------
-
-// clang-format off
-static constexpr char B64URL_ENCODE_TABLE[65] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-static constexpr unsigned char B64URL_DECODE_TABLE[128] = {
-    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,  //   0-15
-    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,  //  16-31
-    255,255,255,255,255,255,255,255,255,255,255,255,255, 62,255,255,  //  32-47  (-, no +, no /)
-     52, 53, 54, 55, 56, 57, 58, 59, 60, 61,255,255,255,255,255,255,  //  48-63  (0-9)
-    255,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,  //  64-79  (A-O)
-     15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,255,255,255,255, 63,  //  80-95  (P-Z, _)
-    255, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,  //  96-111 (a-o)
-     41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,255,255,255,255,255,  // 112-127 (p-z)
-};
-// clang-format on
-
-/// Encode bytes to base64url, no `=` padding.
-static std::string b64url_encode(const uint8_t* data, size_t len) {
-    std::string out;
-    out.reserve(((len + 2) / 3) * 4);
-    for (size_t i = 0; i < len; i += 3) {
-        uint32_t b = static_cast<uint32_t>(data[i]) << 16;
-        if (i + 1 < len) {
-            b |= static_cast<uint32_t>(data[i + 1]) << 8;
-        }
-        if (i + 2 < len) {
-            b |= static_cast<uint32_t>(data[i + 2]);
-        }
-        out += B64URL_ENCODE_TABLE[(b >> 18) & 0x3F];
-        out += B64URL_ENCODE_TABLE[(b >> 12) & 0x3F];
-        if (i + 1 < len) {
-            out += B64URL_ENCODE_TABLE[(b >> 6) & 0x3F];
-        }
-        if (i + 2 < len) {
-            out += B64URL_ENCODE_TABLE[b & 0x3F];
-        }
-    }
-    return out;
-}
-
-/// Decode base64url, tolerating missing `=` padding. Returns nullopt on invalid input.
-static std::optional<std::vector<uint8_t>> b64url_decode(const std::string& s) {
-    size_t slen = s.size();
-    while (slen > 0 && s[slen - 1] == '=') {
-        --slen;
-    }
-    std::vector<uint8_t> out;
-    out.reserve((slen * 3) / 4);
-    uint32_t acc = 0;
-    int bits = 0;
-    for (size_t i = 0; i < slen; ++i) {
-        auto c = static_cast<unsigned char>(s[i]);
-        if (c >= 128 || B64URL_DECODE_TABLE[c] == 255) {
-            return std::nullopt;  // Invalid character.
-        }
-        acc = (acc << 6) | B64URL_DECODE_TABLE[c];
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFF));
-        }
-    }
-    return out;
-}
+// Base64url encode/decode (RFC 4648 section 5, no `=` padding) now comes from the library's
+// public sendspin/persistence_codec.h instead of being hand-rolled here, so this file stays
+// byte-compatible with the encoding used by the library's own src/platform/base64.h.
 
 /// Read the entire file into a string. Returns empty string on error.
 static std::string read_file(const std::string& path) {
@@ -227,7 +160,7 @@ static bool save_doc(const std::string& path, const JsonDocument& doc) {
 
 /// Decode a base64url string to a 32-byte array. Returns false on failure.
 static bool b64u_to_32(const std::string& s, std::array<uint8_t, 32>& out) {
-    auto decoded = b64url_decode(s);
+    auto decoded = base64url_decode(s);
     if (!decoded.has_value() || decoded->size() != 32) {
         return false;
     }
@@ -250,7 +183,7 @@ FilePersistenceProvider::FilePersistenceProvider(std::string path) : path_(std::
 bool FilePersistenceProvider::save_static_keypair(const std::array<uint8_t, 32>& private_key) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
-    doc["static_keypair"]["private_key"] = b64url_encode(private_key.data(), private_key.size());
+    doc["static_keypair"]["private_key"] = base64url_encode(private_key.data(), private_key.size());
     return save_doc(path_, doc);
 }
 
@@ -320,7 +253,11 @@ std::vector<SendspinPairingRecord> FilePersistenceProvider::load_pairing_records
         if (obj["label"].is<const char*>()) {
             rec.label = obj["label"].as<const char*>();
         }
-        rec.used = obj["used"].as<bool>();
+        // Guarded like the other fields: as<bool>() coerces any non-boolean variant to
+        // true, so a corrupt "used" value would otherwise flip the single-use gate.
+        if (obj["used"].is<bool>()) {
+            rec.used = obj["used"].as<bool>();
+        }
         out.push_back(std::move(rec));
     }
     return out;
@@ -336,7 +273,7 @@ bool FilePersistenceProvider::save_pairing_record(const SendspinPairingRecord& r
     for (JsonObject obj : arr) {
         if (obj["psk_id"].is<const char*>() &&
             std::string(obj["psk_id"].as<const char*>()) == record.psk_id) {
-            obj["psk"] = b64url_encode(record.psk.data(), record.psk.size());
+            obj["psk"] = base64url_encode(record.psk.data(), record.psk.size());
             if (record.server_id.has_value()) {
                 obj["server_id"] = record.server_id.value();
             } else {
@@ -355,7 +292,7 @@ bool FilePersistenceProvider::save_pairing_record(const SendspinPairingRecord& r
     // Append new.
     JsonObject new_obj = arr.add<JsonObject>();
     new_obj["psk_id"] = record.psk_id;
-    new_obj["psk"] = b64url_encode(record.psk.data(), record.psk.size());
+    new_obj["psk"] = base64url_encode(record.psk.data(), record.psk.size());
     if (record.server_id.has_value()) {
         new_obj["server_id"] = record.server_id.value();
     }
@@ -413,7 +350,7 @@ bool FilePersistenceProvider::save_pairing_psk(const SendspinPairingPsk& psk) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(path_);
     doc["pairing_psk"]["psk_id"] = psk.psk_id;
-    doc["pairing_psk"]["psk"] = b64url_encode(psk.psk.data(), psk.psk.size());
+    doc["pairing_psk"]["psk"] = base64url_encode(psk.psk.data(), psk.psk.size());
     if (psk.label.has_value()) {
         doc["pairing_psk"]["label"] = psk.label.value();
     } else {
