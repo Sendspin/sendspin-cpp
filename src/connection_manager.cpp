@@ -393,7 +393,15 @@ void ConnectionManager::init_server(SendspinClient* client) {
         });
 }
 
-void ConnectionManager::loop() {
+bool ConnectionManager::DrainedEvents::any() const {
+    return !this->connected.empty() || !this->disconnected.empty() || !this->activates.empty() ||
+           !this->rehandshake.empty() || !this->pair_aborts.empty() ||
+           !this->management_requests.empty() || !this->server_unpairs.empty() ||
+           !this->pin_messages.empty() || !this->pairing_succeeded.empty() ||
+           !this->pair_storage_failed.empty() || this->pairing_window_confirm;
+}
+
+void ConnectionManager::maybe_start_ws_server() {
     // Start WS server when network becomes ready. A persistent failure (e.g. the server port is
     // already in use) is retried with backoff instead of on every tick, which would spam the log.
     if (this->ws_server_ != nullptr && !this->ws_server_->is_started()) {
@@ -407,450 +415,421 @@ void ConnectionManager::loop() {
             }
         }
     }
+}
 
-    // Process deferred connection lifecycle events
-    {
-        std::vector<std::shared_ptr<SendspinConnection>> connected_events;
-        std::vector<std::shared_ptr<SendspinConnection>> disconnect_events;
-        std::vector<ServerActivateEvent> activate_events;
-        std::vector<std::shared_ptr<SendspinConnection>> rehandshake_events;
-        std::vector<PairAbortEvent> pair_abort_events;
-        std::vector<ManagementRequestEvent> management_request_events;
-        std::vector<ServerUnpairEvent> server_unpair_events;
-        std::vector<ServerPairingMessageEvent> pin_pairing_events;
-        std::vector<std::string> pairing_succeeded_events;
-        std::vector<PairStorageFailedEvent> pair_storage_failed_events;
-        bool pairing_window_confirm_event = false;
-        // Skip the conn_mutex_ acquisition entirely when the hint says all queues are
-        // empty. Sound because every push site sets has_pending_events_ = true under
-        // conn_mutex_ before releasing it (see the field's doc comment in connection_manager.h).
-        if (this->has_pending_events_.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> lock(this->conn_mutex_);
-            connected_events.swap(this->pending_connected_events_);
-            disconnect_events.swap(this->pending_disconnect_events_);
-            activate_events.swap(this->pending_activate_events_);
-            rehandshake_events.swap(this->pending_rehandshake_events_);
-            pair_abort_events.swap(this->pending_pair_abort_events_);
-            management_request_events.swap(this->pending_management_request_events_);
-            server_unpair_events.swap(this->pending_server_unpair_events_);
-            pin_pairing_events.swap(this->pending_pin_pairing_events_);
-            pairing_succeeded_events.swap(this->pending_pairing_succeeded_events_);
-            pair_storage_failed_events.swap(this->pending_pair_storage_failed_events_);
-            pairing_window_confirm_event =
-                std::exchange(this->pending_pairing_window_confirm_, false);
-            this->has_pending_events_.store(false, std::memory_order_release);
-        }
+ConnectionManager::DrainedEvents ConnectionManager::swap_out_pending_events() {
+    DrainedEvents ev;
+    // Skip the conn_mutex_ acquisition entirely when the hint says all queues are
+    // empty. Sound because every push site sets has_pending_events_ = true under
+    // conn_mutex_ before releasing it (see the field's doc comment in connection_manager.h).
+    if (this->has_pending_events_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(this->conn_mutex_);
+        ev.connected.swap(this->pending_connected_events_);
+        ev.disconnected.swap(this->pending_disconnect_events_);
+        ev.activates.swap(this->pending_activate_events_);
+        ev.rehandshake.swap(this->pending_rehandshake_events_);
+        ev.pair_aborts.swap(this->pending_pair_abort_events_);
+        ev.management_requests.swap(this->pending_management_request_events_);
+        ev.server_unpairs.swap(this->pending_server_unpair_events_);
+        ev.pin_messages.swap(this->pending_pin_pairing_events_);
+        ev.pairing_succeeded.swap(this->pending_pairing_succeeded_events_);
+        ev.pair_storage_failed.swap(this->pending_pair_storage_failed_events_);
+        ev.pairing_window_confirm = std::exchange(this->pending_pairing_window_confirm_, false);
+        this->has_pending_events_.store(false, std::memory_order_release);
+    }
+    return ev;
+}
 
-        // Also runs whenever the nursery is non-empty even with no swapped-out events: the
-        // noise-completion scan below (see the nursery_size_ block further down) is
-        // level-triggered on handshake flags set by network threads with no corresponding event
-        // push, so loop() must keep running every tick a nursery connection exists.
-        if (!connected_events.empty() || !disconnect_events.empty() || !activate_events.empty() ||
-            !rehandshake_events.empty() || !pair_abort_events.empty() ||
-            !management_request_events.empty() || !server_unpair_events.empty() ||
-            !pin_pairing_events.empty() || !pairing_succeeded_events.empty() ||
-            !pair_storage_failed_events.empty() || pairing_window_confirm_event ||
-            this->nursery_size_.load(std::memory_order_acquire) > 0) {
-            std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-
-            // Connection close/disconnect events (inbound ws_server closes on both platforms,
-            // outbound host IXWebSocket disconnects). Keyed on connection identity, never on
-            // sockfd: the OS recycles fds, so an fd-keyed event could outlive its connection and
-            // mis-route to a newcomer admitted onto the recycled fd. A connection already
-            // released by an earlier event is a no-op inside drop_connection.
-            for (auto& conn : disconnect_events) {
-                this->on_connection_lost(conn.get());
-            }
-
-            // Transport connected events: an outbound connection's WebSocket upgrade completed.
-            // When encryption is required, this is where the outbound side starts the Noise
-            // handshake (client_init is sent proactively; the client is always the Noise
-            // responder regardless of who opened the socket, but it still sends client/init
-            // first as the Sendspin protocol client). The hello is armed later, once the Noise
-            // handshake completes (see the noise-completion scan below). Otherwise, arm the
-            // hello right away, as before. (Inbound connections arrive already upgraded and are
-            // handled the same way in on_new_connection().) Guarded by nursery membership: a
-            // connection promoted or released by an earlier event is skipped.
-            for (auto& conn : connected_events) {
-                if (this->find_in_nursery(conn.get()) == this->nursery_.end()) {
-                    continue;
-                }
-                if (this->client_->config_.encryption_required) {
-                    conn->init_noise_handshake(*this->client_->identity_,
-                                               *this->client_->record_store_,
-                                               suite_name_for(this->client_->config_.cipher_suite));
-                    conn->send_noise_client_init();
-                } else {
-                    this->initiate_hello(conn.get());
-                }
-            }
-
-            // In-band re-handshake completions: handle_noise_rehandshake() already swapped the
-            // Noise session synchronously on the network thread and reset
-            // server_hello_received_/client_hello_sent_/first_activate_received_ on the
-            // connection; re-arm its hello here so the post-swap server/hello -> client/hello ->
-            // server/activate cycle actually runs. Only meaningful for the current (already-
-            // admitted) connection -- a re-handshake never targets a nursery member (they have not
-            // completed even their first hello yet) -- but is guarded defensively in case a stale
-            // event outlives a race with drop_connection.
-            for (auto& conn : rehandshake_events) {
-                if (!conn || conn.get() != this->current_connection_.get()) {
-                    continue;
-                }
-                SS_LOGI(TAG, "Re-arming hello after in-band re-handshake");
-                this->initiate_hello(conn.get());
-            }
-
-            // server/activate events: trust enforcement, operational gating, and admission
-            // arbitration. ALL decisions (admissibility, arbitration, RecordStore mutations)
-            // happen here on the main loop thread, never on the network thread.
-            for (auto& event : activate_events) {
-                if (!event.conn) {
-                    continue;
-                }
-                const bool in_nursery =
-                    this->find_in_nursery(event.conn.get()) != this->nursery_.end();
-                const bool is_current = event.conn.get() == this->current_connection_.get();
-                if (!in_nursery && !is_current) {
-                    // Already released by an earlier event in the same loop() pass.
-                    continue;
-                }
-
-                // ==== Trust enforcement (admissibility check) ====
-                const bool unpaired_access =
-                    this->client_->record_store_ != nullptr &&
-                    this->client_->record_store_->unpaired_access_enabled();
-
-                // Compute the effective active_roles (sticky: nullopt keeps the prior set) --
-                // EXCEPT when this activate omits active_roles and its activities are no longer
-                // playback-capable: spec #122 says the client treats the persisted roles as empty
-                // in that case rather than rejecting the message (a later activate can legally
-                // narrow activities without re-sending an empty active_roles).
-                const bool playback_capable = is_playback_capable(
-                    event.conn->get_psk_category(), event.activities, unpaired_access);
-                static const std::vector<std::string> EMPTY_ROLES{};
-                const std::vector<std::string>& effective_roles =
-                    event.active_roles.has_value()
-                        ? event.active_roles.value()
-                        : (playback_capable ? event.conn->get_active_roles() : EMPTY_ROLES);
-                const bool has_roles = !effective_roles.empty();
-
-                // Trust enforcement only applies when encryption resolved a PSK category for
-                // this connection; without it (encryption_required == false) there is no trust
-                // model at all, matching pre-encryption behavior.
-                const bool trust_ok = !this->client_->config_.encryption_required ||
-                                      admissible(event.conn->get_psk_category(), event.activities,
-                                                 has_roles, unpaired_access);
-
-                if (!trust_ok) {
-                    SendspinGoodbyeReason reject_reason = SendspinGoodbyeReason::UNAUTHORIZED;
-                    if (event.conn->get_psk_category() == PskCategory::SENTINEL &&
-                        !unpaired_access &&
-                        admissible(event.conn->get_psk_category(), event.activities, has_roles,
-                                   /*unpaired_access=*/true)) {
-                        reject_reason = SendspinGoodbyeReason::PAIRING_REQUIRED;
-                    }
-                    SS_LOGW(TAG, "server/activate inadmissible (psk_category=%d): closing with %s",
-                            static_cast<int>(event.conn->get_psk_category()),
-                            reject_reason == SendspinGoodbyeReason::PAIRING_REQUIRED
-                                ? "pairing_required"
-                                : "unauthorized");
-                    this->drop_connection(event.conn.get(), reject_reason);
-                    continue;
-                }
-
-                // ==== pairing_index counter (spec #120) ====
-                // "the number of pairing server/activate messages received since the last Noise
-                // handshake" is a RAW MESSAGE COUNT, not an accepted-attempt count: the server
-                // counts every pairing activate it sends, including ones the client goes on to
-                // reject (e.g. method_not_supported below). Bump here, at the single point every
-                // pairing server/activate is received (structurally admissible activates only --
-                // one rejected by the trust-enforcement block above is about to close the
-                // connection and a fresh handshake will reset the counter anyway), so that a
-                // rejected activate does not leave the client permanently behind the server's own
-                // count. handle_enter_pairing() reads this value; it must not bump again.
-                const bool is_pairing_activate = event.activities.size() == 1 &&
-                                                 event.activities[0] == SendspinActivity::PAIRING;
-                if (is_pairing_activate) {
-                    event.conn->bump_pairing_index();
-                }
-
-                // ==== Pairing-method admissibility (spec #120/#123) ====
-                // Structurally admissible ('pairing' alone is always an allowed activity set),
-                // but a pairing activate additionally carries a pairing object whose method must
-                // (a) match the matched PSK's category (pairing_psk iff the matched PSK IS the
-                // Pairing PSK) and (b) currently be offered per the LIVE pairing config, which
-                // may have drifted from the supported_pair_methods advertised at hello time. When
-                // it is not, reply pair/abort(method_not_supported) and leave the connection open
-                // (unlike the reasons above, this does not close the connection).
-                // A pairing activate that names NO usable method (pairing object absent, or a
-                // method string this client does not recognize --
-                // process_server_activate_message logs the raw value) cannot start any flow.
-                // Answering pair/abort here rather than ignoring the activate matters: a server
-                // that never hears back sits waiting for the device forever, with nothing on
-                // either side to explain the stall.
-                if (is_pairing_activate && !event.pairing_method.has_value()) {
-                    SS_LOGW(TAG,
-                            "server/activate declares pairing with no usable pairing.method "
-                            "for server_id=%s; replying pair/abort(method_not_supported), "
-                            "connection stays open",
-                            event.conn->get_server_id().c_str());
-                    event.conn->send_app_json(
-                        format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
-                    continue;
-                }
-
-                if (is_pairing_activate && event.pairing_method.has_value()) {
-                    const SendspinPairMethod method = event.pairing_method.value();
-                    const bool category_ok =
-                        (method == SendspinPairMethod::PAIRING_PSK) ==
-                        (event.conn->get_psk_category() == PskCategory::PAIRING);
-                    // "Currently offered" mirrors exactly what build_hello_message() advertises
-                    // in supported_pair_methods (client.cpp): the RecordStore's live enabled
-                    // flags AND the platform-capability flags (a device with no PIN display
-                    // never offers dynamic_pin, regardless of the enabled flag).
-                    bool offered = true;
-                    if (this->client_->record_store_ != nullptr) {
-                        const RecordStore& rs = *this->client_->record_store_;
-                        const auto& cfg = this->client_->config_;
-                        switch (method) {
-                            case SendspinPairMethod::PAIRING_PSK:
-                                offered = rs.pairing_psk_enabled() && rs.pairing_psk().has_value();
-                                break;
-                            case SendspinPairMethod::DYNAMIC_PIN:
-                                offered = cfg.pin_display_supported && rs.dynamic_pin_enabled();
-                                break;
-                            case SendspinPairMethod::STATIC_PIN:
-                                offered = cfg.pairing_window_supported && rs.static_pin_enabled() &&
-                                          rs.static_pin().has_value();
-                                break;
-                        }
-                    }
-                    if (!category_ok || !offered) {
-                        SS_LOGW(TAG,
-                                "server/activate selects unsupported pairing method (%s) for "
-                                "server_id=%s; replying pair/abort(method_not_supported), "
-                                "connection stays open",
-                                to_cstr(method), event.conn->get_server_id().c_str());
-                        event.conn->send_app_json(
-                            format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED),
-                            nullptr);
-                        continue;
-                    }
-
-                    // ==== pin_length validation (dynamic_pin only) ====
-                    // The server computes L = max(client_min, server_min) clamped to 4-12 and
-                    // sends it in the activation's pairing object; the client validates it HERE,
-                    // on receipt of the activation (server/pair-init carries only nonce_A).
-                    // Absent, below the configured minimum, or outside the protocol's 4-12
-                    // range -> pair/abort(pin_length_unacceptable), connection stays open.
-                    if (method == SendspinPairMethod::DYNAMIC_PIN) {
-                        const int min_len =
-                            this->client_->record_store_ != nullptr
-                                ? this->client_->record_store_->dynamic_pin_min_length()
-                                : PIN_MIN_DIGITS;
-                        const int pin_len = event.pairing_pin_length.value_or(0);
-                        if (pin_len < min_len || pin_len < PIN_MIN_DIGITS ||
-                            pin_len > PIN_MAX_DIGITS) {
-                            SS_LOGW(TAG,
-                                    "server/activate pairing.pin_length=%d unacceptable (min=%d "
-                                    "floor=%d max=%d) for server_id=%s; replying "
-                                    "pair/abort(pin_length_unacceptable), connection stays open",
-                                    pin_len, min_len, PIN_MIN_DIGITS, PIN_MAX_DIGITS,
-                                    event.conn->get_server_id().c_str());
-                            event.conn->send_app_json(
-                                format_pair_abort_message(PairAbortReason::PIN_LENGTH_UNACCEPTABLE),
-                                nullptr);
-                            continue;
-                        }
-                    }
-                }
-
-                // ==== Admissible: apply the activate's state on the main loop ====
-                const bool is_first = !event.conn->first_activate_received();
-                // Pass the same active_roles the admissibility check above used: when the message
-                // omitted active_roles but the connection is no longer playback-capable, that is
-                // effective_roles == EMPTY_ROLES, and it must be applied (not left sticky) so the
-                // persisted active_roles_ is actually cleared (spec #122).
-                const std::optional<std::vector<std::string>> active_roles_to_apply =
-                    event.active_roles.has_value()
-                        ? event.active_roles
-                        : (!playback_capable ? std::make_optional(EMPTY_ROLES) : std::nullopt);
-                event.conn->apply_server_activate(event.activities, active_roles_to_apply,
-                                                  event.pairing_method, event.pairing_pin_length);
-
-                // First activate on a long-term PSK: mark the record used (reference parity).
-                // Safe here because RecordStore mutations stay on the main loop.
-                //
-                // Read the psk_id ONCE into a local. is_first is true again after every in-band
-                // re-handshake (see the comment below), and a server may start the next
-                // re-handshake while this activate is still queued, so a second read here could
-                // straddle a network-thread rewrite and disagree with the first.
-                if (is_first && this->client_->config_.encryption_required &&
-                    event.conn->get_psk_category() == PskCategory::LONG_TERM &&
-                    this->client_->record_store_ != nullptr) {
-                    const std::string psk_id = event.conn->get_psk_id();
-                    if (!psk_id.empty()) {
-                        this->client_->record_store_->mark_record_used(psk_id);
-                    }
-                }
-
-                if (event.conn.get() == this->current_connection_.get()) {
-                    // Already admitted: no arbitration needed. is_first can still be true here
-                    // after an in-band re-handshake reset first_activate_received_; re-publish
-                    // state in that case, but only once the post-swap hello has also completed
-                    // (is_handshake_complete()) -- otherwise this is a stale pre-completion
-                    // activate and there is nothing to (re-)publish yet.
-                    this->note_playback_activity(event.conn.get());
-                    if (!is_first && event.conn->is_pairing_in_progress()) {
-                        // ==== Pairing leftover activate ====
-                        // Pairing was in progress and the server sent another server/activate
-                        // instead of server/pair-finalize: it abandoned pairing without
-                        // finalizing. Mirrors the reference's leftover branch: the activate was
-                        // already applied normally above; going operational discards any pending
-                        // record and resets the PIN session structurally (see the comment on
-                        // SendspinClient::on_handshake_complete()).
-                        SS_LOGI(TAG,
-                                "Subsequent activate during pairing (leftover): clearing pairing "
-                                "state and going operational for server_id=%s",
-                                event.conn->get_server_id().c_str());
-                        this->client_->on_handshake_complete(event.conn.get());
-                    } else if (is_first && event.conn->is_handshake_complete()) {
-                        this->client_->on_handshake_complete(event.conn.get());
-                    } else if (!is_first) {
-                        // ==== Subsequent activate transitions into pairing ====
-                        // The operator can initiate pairing on an already-operational connection,
-                        // not only on the very first activate: the server re-activates the
-                        // connection with the PAIRING activity and a pairing object.
-                        // Mirrors the reference's _handle_server_activate, which runs _pair()
-                        // whenever the applied activate is a pairing activate, not only on the
-                        // first one. Only reached when pairing is not already in progress (the
-                        // leftover-activate branch above handles that case).
-                        const auto& activities = event.conn->get_activities();
-                        const auto& pairing_method = event.conn->get_pairing_method();
-                        const bool is_pairing_activity_only =
-                            activities.size() == 1 && activities[0] == SendspinActivity::PAIRING &&
-                            pairing_method.has_value();
-                        const bool is_supported_pair_method =
-                            is_pairing_activity_only &&
-                            (pairing_method.value() == SendspinPairMethod::PAIRING_PSK ||
-                             pairing_method.value() == SendspinPairMethod::DYNAMIC_PIN ||
-                             pairing_method.value() == SendspinPairMethod::STATIC_PIN);
-                        if (is_supported_pair_method) {
-                            SS_LOGI(TAG,
-                                    "Subsequent activate selects pairing (%s): entering pairing "
-                                    "for server_id=%s",
-                                    to_cstr(pairing_method.value()),
-                                    event.conn->get_server_id().c_str());
-                            this->handle_enter_pairing(event.conn.get());
-                        }
-                    }
-                    continue;
-                }
-
-                // A nursery entry's first activate always eventually resolves it (promoted or
-                // rejected), so a nursery entry can never see a genuinely "subsequent" activate.
-                // is_first is therefore always true here; the promotion itself is handled by the
-                // level-triggered scan just below (not here), because this event only proves the
-                // activate arrived -- the hello handshake may still be in flight (e.g. a
-                // nonconforming peer whose server/hello + server/activate race ahead of our own
-                // client/hello). The scan promotes/arbitrates once BOTH are true, in whichever
-                // order they complete. A pairing-flavored activate is not special-cased here: the
-                // scan promotes the entry into current_connection_ exactly like any other
-                // operational candidate (so admission.h's "in-flight pairing is not displaced"
-                // arbitration rule applies to it), and only then branches into
-                // handle_enter_pairing() instead of on_handshake_complete() -- see
-                // promote_or_arbitrate_nursery_entry().
-            }
-
-            // Promotion/arbitration scan: handles every nursery entry that has proven itself
-            // (is_operational(): hello handshake complete AND first server/activate applied and
-            // admissible -- trust was already checked above, for every activate event, including
-            // ones that arrived before the hello completed). Level-triggered rather than
-            // edge-triggered on the activate events just processed, because hello completion is
-            // itself level-triggered (see the establishment invariant note on
-            // is_handshake_complete() elsewhere in this file): the two conditions can become true
-            // in either order.
-            for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
-                if (!it->conn->is_operational()) {
-                    ++it;
-                    continue;
-                }
-                it = this->promote_or_arbitrate_nursery_entry(it);
-            }
-
-            // ==== Pairing deferred events ====
-            // pair/abort: clean up pairing state and close the connection. (The
-            // server/pair-finalize ack is committed synchronously on the network thread, and the
-            // leftover-activate case is handled inline in the subsequent-activate branch above, so
-            // neither needs a deferred event here.)
-            for (auto& event : pair_abort_events) {
-                if (!event.conn || event.conn.get() != this->current_connection_.get()) {
-                    continue;
-                }
-                this->handle_pair_abort(event.conn.get(), event.reason);
-            }
-
-            // ==== Dynamic-PIN pairing deferred events ====
-            // Only ever targets the current connection: a PIN session only exists on a
-            // connection that already won promotion into current_connection_ (see the pairing
-            // branch in promote_or_arbitrate_nursery_entry()).
-            for (auto& event : pin_pairing_events) {
-                if (!event.conn || event.conn.get() != this->current_connection_.get()) {
-                    continue;
-                }
-                this->handle_pin_pairing_message(event.conn.get(), event);
-            }
-
-            // ==== on_pairing_succeeded deferred events ====
-            // Triggered by the network-thread server/pair-finalize ack handler
-            // (SendspinClient::schedule_pairing_succeeded); only ever targets the current
-            // connection for the same reason as pin_pairing_events above.
-            for (const auto& server_id : pairing_succeeded_events) {
-                this->client_->note_pairing_succeeded(server_id);
-            }
-
-            // ==== Pairing storage-failure deferred events ====
-            // Only ever targets the current connection, for the same reason as
-            // pairing_succeeded_events above: pairing only exists on a connection that already
-            // won promotion. A connection that already left current_connection_ (e.g. raced by a
-            // disconnect event earlier in this same pass) still gets the listener notification --
-            // handle_pair_storage_failed() reports it unconditionally -- but skips the redundant
-            // drop_connection()/pair-abort send.
-            for (const auto& event : pair_storage_failed_events) {
-                this->handle_pair_storage_failed(event);
-            }
-
-            // ==== Static-PIN pairing-window confirm deferred event ====
-            if (pairing_window_confirm_event) {
-                this->handle_pairing_window_confirmed();
-            }
-
-            // ==== server/unpair deferred events ====
-            // Only ever targets the current connection: server/unpair is only admissible post-
-            // promotion (LONG_TERM trust with an active session), never a still-unproven nursery
-            // entry.
-            for (auto& event : server_unpair_events) {
-                if (!event.conn || event.conn.get() != this->current_connection_.get()) {
-                    continue;
-                }
-                this->handle_server_unpair(event.conn.get(), event);
-            }
-
-            // ==== Management request deferred events ====
-            // At-most-one-in-flight (server waits for result); FIFO processing is correct.
-            for (auto& event : management_request_events) {
-                if (!event.conn || event.conn.get() != this->current_connection_.get()) {
-                    continue;
-                }
-                this->handle_management_request(event.conn.get(), event);
-            }
-        }
-
-        // Send the goodbyes and release the connections dropped above, outside the lock.
-        this->flush_deferred_releases();
+void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
+    // Connection close/disconnect events (inbound ws_server closes on both platforms,
+    // outbound host IXWebSocket disconnects). Keyed on connection identity, never on
+    // sockfd: the OS recycles fds, so an fd-keyed event could outlive its connection and
+    // mis-route to a newcomer admitted onto the recycled fd. A connection already
+    // released by an earlier event is a no-op inside drop_connection.
+    for (auto& conn : ev.disconnected) {
+        this->on_connection_lost(conn.get());
     }
 
+    // Transport connected events: an outbound connection's WebSocket upgrade completed.
+    // When encryption is required, this is where the outbound side starts the Noise
+    // handshake (client_init is sent proactively; the client is always the Noise
+    // responder regardless of who opened the socket, but it still sends client/init
+    // first as the Sendspin protocol client). The hello is armed later, once the Noise
+    // handshake completes (see the noise-completion scan in scan_hello_and_nursery()).
+    // Otherwise, arm the hello right away, as before. (Inbound connections arrive already
+    // upgraded and are handled the same way in on_new_connection().) Guarded by nursery
+    // membership: a connection promoted or released by an earlier event is skipped.
+    for (auto& conn : ev.connected) {
+        if (this->find_in_nursery(conn.get()) == this->nursery_.end()) {
+            continue;
+        }
+        if (this->client_->config_.encryption_required) {
+            conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
+                                       suite_name_for(this->client_->config_.cipher_suite));
+            conn->send_noise_client_init();
+        } else {
+            this->initiate_hello(conn.get());
+        }
+    }
+
+    // In-band re-handshake completions: handle_noise_rehandshake() already swapped the
+    // Noise session synchronously on the network thread and reset
+    // server_hello_received_/client_hello_sent_/first_activate_received_ on the
+    // connection; re-arm its hello here so the post-swap server/hello -> client/hello ->
+    // server/activate cycle actually runs. Only meaningful for the current (already-
+    // admitted) connection -- a re-handshake never targets a nursery member (they have not
+    // completed even their first hello yet) -- but is guarded defensively in case a stale
+    // event outlives a race with drop_connection.
+    for (auto& conn : ev.rehandshake) {
+        if (!conn || conn.get() != this->current_connection_.get()) {
+            continue;
+        }
+        SS_LOGI(TAG, "Re-arming hello after in-band re-handshake");
+        this->initiate_hello(conn.get());
+    }
+
+    // server/activate events: trust enforcement, operational gating, and admission
+    // arbitration. ALL decisions (admissibility, arbitration, RecordStore mutations)
+    // happen here on the main loop thread, never on the network thread.
+    for (auto& event : ev.activates) {
+        if (!event.conn) {
+            continue;
+        }
+        const bool in_nursery = this->find_in_nursery(event.conn.get()) != this->nursery_.end();
+        const bool is_current = event.conn.get() == this->current_connection_.get();
+        if (!in_nursery && !is_current) {
+            // Already released by an earlier event in the same loop() pass.
+            continue;
+        }
+
+        // ==== Trust enforcement (admissibility check) ====
+        const bool unpaired_access = this->client_->record_store_ != nullptr &&
+                                     this->client_->record_store_->unpaired_access_enabled();
+
+        // Compute the effective active_roles (sticky: nullopt keeps the prior set) --
+        // EXCEPT when this activate omits active_roles and its activities are no longer
+        // playback-capable: spec #122 says the client treats the persisted roles as empty
+        // in that case rather than rejecting the message (a later activate can legally
+        // narrow activities without re-sending an empty active_roles).
+        const bool playback_capable =
+            is_playback_capable(event.conn->get_psk_category(), event.activities, unpaired_access);
+        static const std::vector<std::string> EMPTY_ROLES{};
+        const std::vector<std::string>& effective_roles =
+            event.active_roles.has_value()
+                ? event.active_roles.value()
+                : (playback_capable ? event.conn->get_active_roles() : EMPTY_ROLES);
+        const bool has_roles = !effective_roles.empty();
+
+        // Trust enforcement only applies when encryption resolved a PSK category for
+        // this connection; without it (encryption_required == false) there is no trust
+        // model at all, matching pre-encryption behavior.
+        const bool trust_ok = !this->client_->config_.encryption_required ||
+                              admissible(event.conn->get_psk_category(), event.activities,
+                                         has_roles, unpaired_access);
+
+        if (!trust_ok) {
+            SendspinGoodbyeReason reject_reason = SendspinGoodbyeReason::UNAUTHORIZED;
+            if (event.conn->get_psk_category() == PskCategory::SENTINEL && !unpaired_access &&
+                admissible(event.conn->get_psk_category(), event.activities, has_roles,
+                           /*unpaired_access=*/true)) {
+                reject_reason = SendspinGoodbyeReason::PAIRING_REQUIRED;
+            }
+            SS_LOGW(TAG, "server/activate inadmissible (psk_category=%d): closing with %s",
+                    static_cast<int>(event.conn->get_psk_category()),
+                    reject_reason == SendspinGoodbyeReason::PAIRING_REQUIRED ? "pairing_required"
+                                                                             : "unauthorized");
+            this->drop_connection(event.conn.get(), reject_reason);
+            continue;
+        }
+
+        // ==== pairing_index counter (spec #120) ====
+        // "the number of pairing server/activate messages received since the last Noise
+        // handshake" is a RAW MESSAGE COUNT, not an accepted-attempt count: the server
+        // counts every pairing activate it sends, including ones the client goes on to
+        // reject (e.g. method_not_supported below). Bump here, at the single point every
+        // pairing server/activate is received (structurally admissible activates only --
+        // one rejected by the trust-enforcement block above is about to close the
+        // connection and a fresh handshake will reset the counter anyway), so that a
+        // rejected activate does not leave the client permanently behind the server's own
+        // count. handle_enter_pairing() reads this value; it must not bump again.
+        const bool is_pairing_activate =
+            event.activities.size() == 1 && event.activities[0] == SendspinActivity::PAIRING;
+        if (is_pairing_activate) {
+            event.conn->bump_pairing_index();
+        }
+
+        // ==== Pairing-method admissibility (spec #120/#123) ====
+        // Structurally admissible ('pairing' alone is always an allowed activity set),
+        // but a pairing activate additionally carries a pairing object whose method must
+        // (a) match the matched PSK's category (pairing_psk iff the matched PSK IS the
+        // Pairing PSK) and (b) currently be offered per the LIVE pairing config, which
+        // may have drifted from the supported_pair_methods advertised at hello time. When
+        // it is not, reply pair/abort(method_not_supported) and leave the connection open
+        // (unlike the reasons above, this does not close the connection).
+        // A pairing activate that names NO usable method (pairing object absent, or a
+        // method string this client does not recognize --
+        // process_server_activate_message logs the raw value) cannot start any flow.
+        // Answering pair/abort here rather than ignoring the activate matters: a server
+        // that never hears back sits waiting for the device forever, with nothing on
+        // either side to explain the stall.
+        if (is_pairing_activate && !event.pairing_method.has_value()) {
+            SS_LOGW(TAG,
+                    "server/activate declares pairing with no usable pairing.method "
+                    "for server_id=%s; replying pair/abort(method_not_supported), "
+                    "connection stays open",
+                    event.conn->get_server_id().c_str());
+            event.conn->send_app_json(
+                format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
+            continue;
+        }
+
+        if (is_pairing_activate && event.pairing_method.has_value()) {
+            const SendspinPairMethod method = event.pairing_method.value();
+            const bool category_ok = (method == SendspinPairMethod::PAIRING_PSK) ==
+                                     (event.conn->get_psk_category() == PskCategory::PAIRING);
+            // "Currently offered" mirrors exactly what build_hello_message() advertises
+            // in supported_pair_methods (client.cpp): the RecordStore's live enabled
+            // flags AND the platform-capability flags (a device with no PIN display
+            // never offers dynamic_pin, regardless of the enabled flag).
+            bool offered = true;
+            if (this->client_->record_store_ != nullptr) {
+                const RecordStore& rs = *this->client_->record_store_;
+                const auto& cfg = this->client_->config_;
+                switch (method) {
+                    case SendspinPairMethod::PAIRING_PSK:
+                        offered = rs.pairing_psk_enabled() && rs.pairing_psk().has_value();
+                        break;
+                    case SendspinPairMethod::DYNAMIC_PIN:
+                        offered = cfg.pin_display_supported && rs.dynamic_pin_enabled();
+                        break;
+                    case SendspinPairMethod::STATIC_PIN:
+                        offered = cfg.pairing_window_supported && rs.static_pin_enabled() &&
+                                  rs.static_pin().has_value();
+                        break;
+                }
+            }
+            if (!category_ok || !offered) {
+                SS_LOGW(TAG,
+                        "server/activate selects unsupported pairing method (%s) for "
+                        "server_id=%s; replying pair/abort(method_not_supported), "
+                        "connection stays open",
+                        to_cstr(method), event.conn->get_server_id().c_str());
+                event.conn->send_app_json(
+                    format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
+                continue;
+            }
+
+            // ==== pin_length validation (dynamic_pin only) ====
+            // The server computes L = max(client_min, server_min) clamped to 4-12 and
+            // sends it in the activation's pairing object; the client validates it HERE,
+            // on receipt of the activation (server/pair-init carries only nonce_A).
+            // Absent, below the configured minimum, or outside the protocol's 4-12
+            // range -> pair/abort(pin_length_unacceptable), connection stays open.
+            if (method == SendspinPairMethod::DYNAMIC_PIN) {
+                const int min_len = this->client_->record_store_ != nullptr
+                                        ? this->client_->record_store_->dynamic_pin_min_length()
+                                        : PIN_MIN_DIGITS;
+                const int pin_len = event.pairing_pin_length.value_or(0);
+                if (pin_len < min_len || pin_len < PIN_MIN_DIGITS || pin_len > PIN_MAX_DIGITS) {
+                    SS_LOGW(TAG,
+                            "server/activate pairing.pin_length=%d unacceptable (min=%d "
+                            "floor=%d max=%d) for server_id=%s; replying "
+                            "pair/abort(pin_length_unacceptable), connection stays open",
+                            pin_len, min_len, PIN_MIN_DIGITS, PIN_MAX_DIGITS,
+                            event.conn->get_server_id().c_str());
+                    event.conn->send_app_json(
+                        format_pair_abort_message(PairAbortReason::PIN_LENGTH_UNACCEPTABLE),
+                        nullptr);
+                    continue;
+                }
+            }
+        }
+
+        // ==== Admissible: apply the activate's state on the main loop ====
+        const bool is_first = !event.conn->first_activate_received();
+        // Pass the same active_roles the admissibility check above used: when the message
+        // omitted active_roles but the connection is no longer playback-capable, that is
+        // effective_roles == EMPTY_ROLES, and it must be applied (not left sticky) so the
+        // persisted active_roles_ is actually cleared (spec #122).
+        const std::optional<std::vector<std::string>> active_roles_to_apply =
+            event.active_roles.has_value()
+                ? event.active_roles
+                : (!playback_capable ? std::make_optional(EMPTY_ROLES) : std::nullopt);
+        event.conn->apply_server_activate(event.activities, active_roles_to_apply,
+                                          event.pairing_method, event.pairing_pin_length);
+
+        // First activate on a long-term PSK: mark the record used (reference parity).
+        // Safe here because RecordStore mutations stay on the main loop.
+        //
+        // Read the psk_id ONCE into a local. is_first is true again after every in-band
+        // re-handshake (see the comment below), and a server may start the next
+        // re-handshake while this activate is still queued, so a second read here could
+        // straddle a network-thread rewrite and disagree with the first.
+        if (is_first && this->client_->config_.encryption_required &&
+            event.conn->get_psk_category() == PskCategory::LONG_TERM &&
+            this->client_->record_store_ != nullptr) {
+            const std::string psk_id = event.conn->get_psk_id();
+            if (!psk_id.empty()) {
+                this->client_->record_store_->mark_record_used(psk_id);
+            }
+        }
+
+        if (event.conn.get() == this->current_connection_.get()) {
+            // Already admitted: no arbitration needed. is_first can still be true here
+            // after an in-band re-handshake reset first_activate_received_; re-publish
+            // state in that case, but only once the post-swap hello has also completed
+            // (is_handshake_complete()) -- otherwise this is a stale pre-completion
+            // activate and there is nothing to (re-)publish yet.
+            this->note_playback_activity(event.conn.get());
+            if (!is_first && event.conn->is_pairing_in_progress()) {
+                // ==== Pairing leftover activate ====
+                // Pairing was in progress and the server sent another server/activate
+                // instead of server/pair-finalize: it abandoned pairing without
+                // finalizing. Mirrors the reference's leftover branch: the activate was
+                // already applied normally above; going operational discards any pending
+                // record and resets the PIN session structurally (see the comment on
+                // SendspinClient::on_handshake_complete()).
+                SS_LOGI(TAG,
+                        "Subsequent activate during pairing (leftover): clearing pairing "
+                        "state and going operational for server_id=%s",
+                        event.conn->get_server_id().c_str());
+                this->client_->on_handshake_complete(event.conn.get());
+            } else if (is_first && event.conn->is_handshake_complete()) {
+                this->client_->on_handshake_complete(event.conn.get());
+            } else if (!is_first) {
+                // ==== Subsequent activate transitions into pairing ====
+                // The operator can initiate pairing on an already-operational connection,
+                // not only on the very first activate: the server re-activates the
+                // connection with the PAIRING activity and a pairing object.
+                // Mirrors the reference's _handle_server_activate, which runs _pair()
+                // whenever the applied activate is a pairing activate, not only on the
+                // first one. Only reached when pairing is not already in progress (the
+                // leftover-activate branch above handles that case).
+                const auto& activities = event.conn->get_activities();
+                const auto& pairing_method = event.conn->get_pairing_method();
+                const bool is_pairing_activity_only = activities.size() == 1 &&
+                                                      activities[0] == SendspinActivity::PAIRING &&
+                                                      pairing_method.has_value();
+                const bool is_supported_pair_method =
+                    is_pairing_activity_only &&
+                    (pairing_method.value() == SendspinPairMethod::PAIRING_PSK ||
+                     pairing_method.value() == SendspinPairMethod::DYNAMIC_PIN ||
+                     pairing_method.value() == SendspinPairMethod::STATIC_PIN);
+                if (is_supported_pair_method) {
+                    SS_LOGI(TAG,
+                            "Subsequent activate selects pairing (%s): entering pairing "
+                            "for server_id=%s",
+                            to_cstr(pairing_method.value()), event.conn->get_server_id().c_str());
+                    this->handle_enter_pairing(event.conn.get());
+                }
+            }
+            continue;
+        }
+
+        // A nursery entry's first activate always eventually resolves it (promoted or
+        // rejected), so a nursery entry can never see a genuinely "subsequent" activate.
+        // is_first is therefore always true here; the promotion itself is handled by the
+        // level-triggered scan just below (not here), because this event only proves the
+        // activate arrived -- the hello handshake may still be in flight (e.g. a
+        // nonconforming peer whose server/hello + server/activate race ahead of our own
+        // client/hello). The scan promotes/arbitrates once BOTH are true, in whichever
+        // order they complete. A pairing-flavored activate is not special-cased here: the
+        // scan promotes the entry into current_connection_ exactly like any other
+        // operational candidate (so admission.h's "in-flight pairing is not displaced"
+        // arbitration rule applies to it), and only then branches into
+        // handle_enter_pairing() instead of on_handshake_complete() -- see
+        // promote_or_arbitrate_nursery_entry().
+    }
+
+    // Promotion/arbitration scan: handles every nursery entry that has proven itself
+    // (is_operational(): hello handshake complete AND first server/activate applied and
+    // admissible -- trust was already checked above, for every activate event, including
+    // ones that arrived before the hello completed). Level-triggered rather than
+    // edge-triggered on the activate events just processed, because hello completion is
+    // itself level-triggered (see the establishment invariant note on
+    // is_handshake_complete() elsewhere in this file): the two conditions can become true
+    // in either order.
+    for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
+        if (!it->conn->is_operational()) {
+            ++it;
+            continue;
+        }
+        it = this->promote_or_arbitrate_nursery_entry(it);
+    }
+}
+
+void ConnectionManager::drain_pairing_events(DrainedEvents& ev) {
+    // ==== Pairing deferred events ====
+    // pair/abort: clean up pairing state and close the connection. (The
+    // server/pair-finalize ack is committed synchronously on the network thread, and the
+    // leftover-activate case is handled inline in the subsequent-activate branch of
+    // drain_lifecycle_events(), so neither needs a deferred event here.)
+    for (auto& event : ev.pair_aborts) {
+        if (!event.conn || event.conn.get() != this->current_connection_.get()) {
+            continue;
+        }
+        this->handle_pair_abort(event.conn.get(), event.reason);
+    }
+
+    // ==== Dynamic-PIN pairing deferred events ====
+    // Only ever targets the current connection: a PIN session only exists on a
+    // connection that already won promotion into current_connection_ (see the pairing
+    // branch in promote_or_arbitrate_nursery_entry()).
+    for (auto& event : ev.pin_messages) {
+        if (!event.conn || event.conn.get() != this->current_connection_.get()) {
+            continue;
+        }
+        this->handle_pin_pairing_message(event.conn.get(), event);
+    }
+
+    // ==== on_pairing_succeeded deferred events ====
+    // Triggered by the network-thread server/pair-finalize ack handler
+    // (SendspinClient::schedule_pairing_succeeded); only ever targets the current
+    // connection for the same reason as ev.pin_messages above.
+    for (const auto& server_id : ev.pairing_succeeded) {
+        this->client_->note_pairing_succeeded(server_id);
+    }
+
+    // ==== Pairing storage-failure deferred events ====
+    // Only ever targets the current connection, for the same reason as
+    // ev.pairing_succeeded above: pairing only exists on a connection that already
+    // won promotion. A connection that already left current_connection_ (e.g. raced by a
+    // disconnect event earlier in this same pass) still gets the listener notification --
+    // handle_pair_storage_failed() reports it unconditionally -- but skips the redundant
+    // drop_connection()/pair-abort send.
+    for (const auto& event : ev.pair_storage_failed) {
+        this->handle_pair_storage_failed(event);
+    }
+
+    // ==== Static-PIN pairing-window confirm deferred event ====
+    if (ev.pairing_window_confirm) {
+        this->handle_pairing_window_confirmed();
+    }
+}
+
+void ConnectionManager::drain_management_events(DrainedEvents& ev) {
+    // ==== server/unpair deferred events ====
+    // Only ever targets the current connection: server/unpair is only admissible post-
+    // promotion (LONG_TERM trust with an active session), never a still-unproven nursery
+    // entry.
+    for (auto& event : ev.server_unpairs) {
+        if (!event.conn || event.conn.get() != this->current_connection_.get()) {
+            continue;
+        }
+        this->handle_server_unpair(event.conn.get(), event);
+    }
+
+    // ==== Management request deferred events ====
+    // At-most-one-in-flight (server waits for result); FIFO processing is correct.
+    for (auto& event : ev.management_requests) {
+        if (!event.conn || event.conn.get() != this->current_connection_.get()) {
+            continue;
+        }
+        this->handle_management_request(event.conn.get(), event);
+    }
+}
+
+void ConnectionManager::loop_managed_connections() {
     // Call loop on active connections using shared_ptr copies to avoid holding the lock. The
     // nursery is bounded (NURSERY_CAPACITY inbound + 1 outbound), so a fixed array avoids a
     // per-tick heap allocation while connections are being set up.
@@ -873,7 +852,9 @@ void ConnectionManager::loop() {
     for (size_t i = 0; i < nursery_count; ++i) {
         nursery_copies[i]->loop();
     }
+}
 
+void ConnectionManager::scan_hello_and_nursery() {
     // The nursery establish-deadline reap operates purely on nursery membership, so it is skipped
     // whenever the nursery is empty. Hello retry timers are not confined to nursery membership,
     // though: schedule_rehandshake_rearm() also arms one for the current (already-admitted)
@@ -978,41 +959,31 @@ void ConnectionManager::loop() {
             }
         }
     }
+}
 
-    // Send the goodbyes and release the connections reaped by the nursery tick, outside the lock.
-    this->flush_deferred_releases();
-
-    // Drive the platform ws_server's pending-upgrade reap (ESP: close sessions that never
-    // complete their upgrade; host: no-op, IXWebSocket times them out itself). Called with no
-    // manager lock held.
-    if (this->ws_server_ != nullptr) {
-        this->ws_server_->tick();
-    }
-
+void ConnectionManager::scan_pin_attempt_timeout() {
     // ==== Dynamic-PIN attempt timeout ====
     // Abort a dynamic-PIN exchange that has stalled past PIN_ATTEMPT_TIMEOUT_US (mirrors the
     // reference's per-attempt timeout). local_abort_pin_pairing also clears the displayed PIN.
     // Only the current connection can host a PIN session (see the pairing branch in
     // promote_or_arbitrate_nursery_entry()).
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        if (this->current_connection_ != nullptr) {
-            const auto& ps = this->current_connection_->pin_session();
-            const int64_t now_us = platform_time_us();
-            const bool pin_attempt_expired = ps.step != SendspinConnection::PinStep::IDLE &&
-                                             ps.attempt_deadline_us != 0 &&
-                                             now_us >= ps.attempt_deadline_us;
-            if (pin_attempt_expired) {
-                SS_LOGW(TAG, "Dynamic-PIN attempt timed out for server_id=%s; aborting",
-                        this->current_connection_->get_server_id().c_str());
-                this->local_abort_pin_pairing(this->current_connection_.get(),
-                                              PairAbortReason::ATTEMPT_TIMEOUT);
-            }
+    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+    if (this->current_connection_ != nullptr) {
+        const auto& ps = this->current_connection_->pin_session();
+        const int64_t now_us = platform_time_us();
+        const bool pin_attempt_expired = ps.step != SendspinConnection::PinStep::IDLE &&
+                                         ps.attempt_deadline_us != 0 &&
+                                         now_us >= ps.attempt_deadline_us;
+        if (pin_attempt_expired) {
+            SS_LOGW(TAG, "Dynamic-PIN attempt timed out for server_id=%s; aborting",
+                    this->current_connection_->get_server_id().c_str());
+            this->local_abort_pin_pairing(this->current_connection_.get(),
+                                          PairAbortReason::ATTEMPT_TIMEOUT);
         }
     }
-    // Send the goodbye and release the connection if the PIN-timeout check above aborted one.
-    this->flush_deferred_releases();
+}
 
+void ConnectionManager::scan_reprove_watchdog() {
     // ==== Re-proving watchdog ====
     // current_connection_ is briefly non-operational while it re-proves itself: after a
     // successful in-band re-handshake (SendspinConnection::handle_noise_rehandshake(), re-armed
@@ -1030,22 +1001,68 @@ void ConnectionManager::loop() {
     // genuinely promoted connection -- both admission paths stamp it before the connection can
     // even reach the nursery -- but keeps this check inert for anything that reaches
     // current_connection_ by a route that skips that stamp).
-    {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        if (this->current_connection_ != nullptr && !this->current_connection_->is_operational()) {
-            const int64_t provisional_us = this->current_connection_->get_provisional_time_us();
-            const int64_t now_us = platform_time_us();
-            if (provisional_us != 0 && now_us - provisional_us >= REPROVE_TIMEOUT_US) {
-                SS_LOGW(TAG,
-                        "Current connection failed to re-prove itself within %d s "
-                        "(server_id=%s); dropping",
-                        static_cast<int>(REPROVE_TIMEOUT_US / US_PER_SECOND),
-                        this->current_connection_->get_server_id().c_str());
-                this->drop_connection(this->current_connection_.get(),
-                                      SendspinGoodbyeReason::ANOTHER_SERVER);
-            }
+    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+    if (this->current_connection_ != nullptr && !this->current_connection_->is_operational()) {
+        const int64_t provisional_us = this->current_connection_->get_provisional_time_us();
+        const int64_t now_us = platform_time_us();
+        if (provisional_us != 0 && now_us - provisional_us >= REPROVE_TIMEOUT_US) {
+            SS_LOGW(TAG,
+                    "Current connection failed to re-prove itself within %d s "
+                    "(server_id=%s); dropping",
+                    static_cast<int>(REPROVE_TIMEOUT_US / US_PER_SECOND),
+                    this->current_connection_->get_server_id().c_str());
+            this->drop_connection(this->current_connection_.get(),
+                                  SendspinGoodbyeReason::ANOTHER_SERVER);
         }
     }
+}
+
+void ConnectionManager::loop() {
+    this->maybe_start_ws_server();
+
+    // Process deferred connection lifecycle events: one conn_mutex_ swap, then (when there is
+    // something to do) one conn_ptr_mutex_ section applying lifecycle, pairing, and management
+    // events in order.
+    DrainedEvents ev = this->swap_out_pending_events();
+
+    // Also runs whenever the nursery is non-empty even with no swapped-out events: the
+    // noise-completion scan in scan_hello_and_nursery() (called further down) is
+    // level-triggered on handshake flags set by network threads with no corresponding event
+    // push, so loop() must keep running every tick a nursery connection exists.
+    if (ev.any() || this->nursery_size_.load(std::memory_order_acquire) > 0) {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        this->drain_lifecycle_events(ev);
+        this->drain_pairing_events(ev);
+        this->drain_management_events(ev);
+    }
+
+    // Send the goodbyes and release the connections dropped above, outside the lock.
+    this->flush_deferred_releases();
+
+    // Call loop() on active connections using shared_ptr copies to avoid holding the lock.
+    this->loop_managed_connections();
+
+    // Noise-completion scan, hello retry timers, and the nursery establish-deadline reap.
+    this->scan_hello_and_nursery();
+
+    // Send the goodbyes and release the connections reaped by the nursery tick, outside the lock.
+    this->flush_deferred_releases();
+
+    // Drive the platform ws_server's pending-upgrade reap (ESP: close sessions that never
+    // complete their upgrade; host: no-op, IXWebSocket times them out itself). Called with no
+    // manager lock held.
+    if (this->ws_server_ != nullptr) {
+        this->ws_server_->tick();
+    }
+
+    // Abort a dynamic-PIN exchange that has stalled past its attempt timeout.
+    this->scan_pin_attempt_timeout();
+    // Send the goodbye and release the connection if the PIN-timeout check above aborted one.
+    this->flush_deferred_releases();
+
+    // Drop the current connection if it failed to re-prove itself after an in-band re-handshake
+    // or a pairing-finalize rekey.
+    this->scan_reprove_watchdog();
     // Send the goodbye and release the connection if the re-proving watchdog above dropped one.
     this->flush_deferred_releases();
 }
@@ -1195,14 +1212,15 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             if (this->client_->config_.encryption_required) {
                 // The connection arrives WS-upgraded, so client/init can be sent right away
                 // (there is no earlier signal to wait for). The hello is armed later, once the
-                // Noise handshake completes (see the noise-completion scan in loop()).
+                // Noise handshake completes (see the noise-completion scan in
+                // scan_hello_and_nursery()).
                 conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
                                            suite_name_for(this->client_->config_.cipher_suite));
                 conn->send_noise_client_init();
             } else {
                 // Arm the hello right away: the connection arrives WS-upgraded, so there is no
                 // earlier signal to wait for. (Outbound connections instead arm theirs when the
-                // transport's connected event is processed in loop().)
+                // transport's connected event is processed in drain_lifecycle_events().)
                 this->initiate_hello(conn.get());
             }
             this->push_nursery_entry(NurseryEntry{std::move(conn), /*inbound=*/true});
@@ -1294,8 +1312,8 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
             // Runs on the transport's send-completion context (httpd worker on ESP, inline on
             // host); conn is kept alive for the duration by the transport (see AsyncRespArg).
             // Setting the flag is all that is needed: establishment is level-triggered, so
-            // loop()'s promotion scan observes is_handshake_complete() on its next tick even
-            // when the peer's server/hello raced ahead of this send.
+            // drain_lifecycle_events()'s promotion scan observes is_handshake_complete() on its
+            // next tick even when the peer's server/hello raced ahead of this send.
             if (!success) {
                 SS_LOGW(TAG, "Hello message send failed");
                 return;
@@ -1707,9 +1725,10 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     conn->set_pairing_in_progress(true);
 
     // The pairing server/activate counter (spec #120) was already bumped by the caller at the
-    // point this activate was received (see the activate_events loop in loop() -- every pairing
-    // server/activate counts there, whether or not it turns out to be admissible, so a
-    // method_not_supported rejection does not desync the count from the server's). Do NOT bump
+    // point this activate was received (see the activate-events loop in drain_lifecycle_events()
+    // -- every pairing server/activate counts there, whether or not it turns out to be
+    // admissible, so a method_not_supported rejection does not desync the count from the
+    // server's). Do NOT bump
     // again here: this handler can also be reached well after reception (the "subsequent activate
     // transitions into pairing" branch applies the activate first, then calls this), so bumping
     // here would double-count or use a stale value. The current value is captured into the PIN

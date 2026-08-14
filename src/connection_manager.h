@@ -68,7 +68,8 @@ static constexpr int64_t NURSERY_ESTABLISH_TIMEOUT_US = seconds_to_us(NURSERY_ES
 /// after SendspinConnection::handle_noise_rehandshake() or ::note_pairing_finalize_ack() resets
 /// its operational state.
 ///
-/// Read by the re-proving watchdog in ConnectionManager::loop(), which is gated on
+/// Read by the re-proving watchdog in ConnectionManager::scan_reprove_watchdog() (called every
+/// tick from loop()), which is gated on
 /// !current_connection_->is_operational(). current_connection_ is never non-operational for any
 /// other reason: a nursery entry is only ever promoted once it is already operational (see
 /// promote_or_arbitrate_nursery_entry()), and an in-progress PIN-pairing PAKE exchange keeps
@@ -239,7 +240,8 @@ struct ServerActivateEvent {
  * (SendspinConnection::note_pairing_finalize_ack()). The invariant is restored once the cycle
  * completes; if it does not -- the hello send keeps failing until retries are exhausted, or the
  * server simply goes silent -- the connection is dropped rather than left wedged. See the
- * hello-retry-timer scan and the re-proving-deadline check (REPROVE_TIMEOUT_US) in loop(). For why
+ * hello-retry-timer scan in scan_hello_and_nursery() and the re-proving-deadline check
+ * (REPROVE_TIMEOUT_US) in scan_reprove_watchdog(), both called every tick from loop(). For why
  * this state is tracked as independent flags rather than a single phase enum, see the
  * lifecycle-flag axes note above SendspinConnection's atomic flag members in connection.h.
  *
@@ -302,8 +304,11 @@ public:
     /// @brief Drives connection state: starts server when network ready, processes lifecycle
     /// events, retries hello, calls loop() on active connections.
     ///
-    /// Tick cost: every section below the ws_server start-retry check is gated on one of the
-    /// atomic hints in "Atomic fields" below (has_pending_events_, nursery_size_, has_current_,
+    /// Implemented as a short driver over the named private steps in the "loop() decomposition"
+    /// section below (pure code-motion; each step keeps its original locking).
+    ///
+    /// Tick cost: every step after the ws_server start-retry check is gated on one of the atomic
+    /// hints in "Atomic fields" below (has_pending_events_, nursery_size_, has_current_,
     /// deferred_size_), so an idle tick only pays for the atomic loads it needs to decide there
     /// is nothing to do. Steady state: connected and idle (no pending events, empty nursery)
     /// costs exactly one conn_ptr_mutex_ acquisition (the current/nursery copy ahead of the
@@ -410,6 +415,84 @@ public:
 
 private:
     // ========================================
+    // loop() decomposition
+    // ========================================
+    // loop() is a short driver over the named steps below (pure code-motion out of what used to
+    // be one long function body); behavior, locking shape, and processing order are exactly as
+    // documented on loop() and on ConnectionManager above. Each method's doc comment states its
+    // lock contract; see loop()'s definition in connection_manager.cpp for the exact call
+    // sequence and the flush_deferred_releases() calls between steps.
+
+    /// @brief Stack-local snapshot of every deferred queue, filled by one swap under conn_mutex_
+    /// in swap_out_pending_events(). Private to ConnectionManager; never exposed outside it.
+    struct DrainedEvents {
+        std::vector<std::shared_ptr<SendspinConnection>> connected, disconnected, rehandshake;
+        std::vector<ServerActivateEvent> activates;
+        std::vector<PairAbortEvent> pair_aborts;
+        std::vector<ManagementRequestEvent> management_requests;
+        std::vector<ServerUnpairEvent> server_unpairs;
+        std::vector<ServerPairingMessageEvent> pin_messages;
+        std::vector<std::string> pairing_succeeded;
+        std::vector<PairStorageFailedEvent> pair_storage_failed;
+        bool pairing_window_confirm{false};
+
+        /// @brief True if any queue above has an entry, or pairing_window_confirm is set.
+        bool any() const;
+    };
+
+    /// @brief Starts the WS server once the network becomes ready. A persistent failure (e.g. the
+    /// server port is already in use) is retried with backoff instead of on every tick, which
+    /// would spam the log. Main-loop-only; acquires no manager mutex.
+    void maybe_start_ws_server();
+
+    /// @brief Swaps every pending_*_events_ queue and the pairing-window confirm flag out into a
+    /// freshly returned DrainedEvents. Acquires conn_mutex_ internally, and only when the
+    /// has_pending_events_ acquire-load hint says there is something to swap; clears
+    /// has_pending_events_ under that same lock. Returns a default-constructed (empty)
+    /// DrainedEvents when the hint was false.
+    /// @return The drained events.
+    DrainedEvents swap_out_pending_events();
+
+    /// @brief Applies disconnect events, then connected events, then in-band re-handshake
+    /// re-arms, then server/activate events (trust enforcement, pairing-method admissibility,
+    /// apply), then runs the promotion/arbitration scan over the nursery, in that order. Caller
+    /// must hold conn_ptr_mutex_.
+    /// @param ev Drained events from swap_out_pending_events(); consumed in place.
+    void drain_lifecycle_events(DrainedEvents& ev);
+
+    /// @brief Applies pair/abort events, then dynamic-PIN pairing events, then
+    /// pairing-succeeded events, then pairing storage-failure events, then a pairing-window
+    /// confirm, in that order. Caller must hold conn_ptr_mutex_.
+    /// @param ev Drained events from swap_out_pending_events(); consumed in place.
+    void drain_pairing_events(DrainedEvents& ev);
+
+    /// @brief Applies server/unpair events, then management request events (unpair first,
+    /// management last). Caller must hold conn_ptr_mutex_.
+    /// @param ev Drained events from swap_out_pending_events(); consumed in place.
+    void drain_management_events(DrainedEvents& ev);
+
+    /// @brief Copies current_connection_ and every nursery entry under a brief conn_ptr_mutex_
+    /// lock, then calls loop() on each copy outside the lock. Acquires conn_ptr_mutex_
+    /// internally, and only when the nursery_size_/has_current_ hints say there is something to
+    /// copy.
+    void loop_managed_connections();
+
+    /// @brief Arms hellos for nursery connections whose Noise handshake just completed (level-
+    /// triggered noise-completion scan), checks hello retry timers, and reaps nursery connections
+    /// that miss the establish deadline. Acquires conn_ptr_mutex_ internally, and only when the
+    /// nursery_size_/hello_retries_size_ hints say there is something to scan.
+    void scan_hello_and_nursery();
+
+    /// @brief Aborts a dynamic-PIN exchange on the current connection that has stalled past
+    /// PIN_ATTEMPT_TIMEOUT_US. Acquires conn_ptr_mutex_ internally.
+    void scan_pin_attempt_timeout();
+
+    /// @brief Drops the current connection if it has failed to re-prove itself (after an in-band
+    /// re-handshake or a pairing-finalize rekey) within REPROVE_TIMEOUT_US. Acquires
+    /// conn_ptr_mutex_ internally.
+    void scan_reprove_watchdog();
+
+    // ========================================
     // Connection setup
     // ========================================
     /// @brief Attaches message and lifecycle callbacks to a connection.
@@ -424,7 +507,8 @@ private:
     /// When encryption is required, this installs the Noise handshake driver and sends
     /// client/init immediately (the connection is already WS-upgraded, so there is no earlier
     /// signal to wait for); the hello is armed later, once the Noise handshake completes (see
-    /// the noise-completion scan in loop()). Otherwise the hello is armed right away, as before.
+    /// the noise-completion scan in scan_hello_and_nursery()). Otherwise the hello is armed right
+    /// away, as before.
     /// @param conn The newly delivered server connection. The session slot keeps a parallel
     ///             refcount, so this observer can be reset at any time without freeing the conn
     ///             out from under in-flight httpd workers.
@@ -557,8 +641,9 @@ private:
     /// @param conn The connection whose retry state should be dropped.
     void remove_hello_retry(const SendspinConnection* conn);
     /// @brief Returns true if conn already has a pending hello-retry entry. Caller must hold
-    /// conn_ptr_mutex_. Used by the noise-completion scan in loop() to arm a connection's hello
-    /// exactly once (idempotent re-arming would otherwise reset the backoff every tick).
+    /// conn_ptr_mutex_. Used by the noise-completion scan in scan_hello_and_nursery() to arm a
+    /// connection's hello exactly once (idempotent re-arming would otherwise reset the backoff
+    /// every tick).
     /// @param conn The connection to check.
     bool has_hello_retry(const SendspinConnection* conn) const;
 
