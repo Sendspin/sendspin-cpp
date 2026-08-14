@@ -42,6 +42,14 @@ static const char* const TAG = "sendspin.server_connection";
 /// The worker resolves it with `conn.lock()`: a recycled sockfd can therefore never redirect the
 /// frame onto a different connection, and a destroyed connection yields a null lock (a clean
 /// no-op) rather than a use-after-free.
+///
+/// Allocation layout: callers allocate a single block sized `sizeof(AsyncRespArg) + len`,
+/// placement-new the struct at the block start, and point `payload` at the byte immediately
+/// following it (`reinterpret_cast<uint8_t*>(this) + sizeof(AsyncRespArg)`). The struct is not
+/// POD (it holds a weak_ptr and a std::function), so the tail cannot be a flexible array member;
+/// `payload` stays a plain pointer into that same block instead. Freeing requires calling the
+/// destructor explicitly, then a single platform_free() of the block - never free(payload)
+/// separately.
 struct AsyncRespArg {
     std::weak_ptr<SendspinServerConnection> conn;
     uint8_t* payload{nullptr};
@@ -139,9 +147,9 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
         return SsErr::INVALID_STATE;
     }
 
-    struct AsyncRespArg* resp_arg =
-        static_cast<AsyncRespArg*>(platform_malloc(sizeof(AsyncRespArg)));
-    if (resp_arg == nullptr) {
+    // Single allocation: the AsyncRespArg header immediately followed by the payload bytes.
+    void* block = platform_malloc(sizeof(AsyncRespArg) + message.size());
+    if (block == nullptr) {
         SS_LOGE(TAG, "Failed to allocate AsyncRespArg for message send");
         if (on_complete) {
             on_complete(false);
@@ -150,20 +158,11 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
     }
 
     // Use placement new to properly construct the struct with the callback
-    new (resp_arg) AsyncRespArg();
+    auto* resp_arg = new (block) AsyncRespArg();
 
     resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
     resp_arg->allow_before_hello = allow_before_hello;
-    resp_arg->payload = static_cast<uint8_t*>(platform_malloc(message.size()));
-    if (resp_arg->payload == nullptr) {
-        SS_LOGE(TAG, "Failed to allocate %zu bytes for message payload", message.size());
-        resp_arg->~AsyncRespArg();
-        platform_free(resp_arg);
-        if (on_complete) {
-            on_complete(false);
-        }
-        return SsErr::NO_MEM;
-    }
+    resp_arg->payload = reinterpret_cast<uint8_t*>(block) + sizeof(AsyncRespArg);
     resp_arg->len = message.size();
 
     // Move the callback into the struct if provided
@@ -177,13 +176,12 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
 
     if (httpd_queue_work(this->server_, async_send_text, resp_arg) != ESP_OK) {
         SS_LOGE(TAG, "httpd_queue_work failed!");
-        platform_free(resp_arg->payload);
         // Need to invoke callback with failure before destroying it
         if (resp_arg->has_callback) {
             resp_arg->on_complete(false);
         }
         resp_arg->~AsyncRespArg();
-        platform_free(resp_arg);
+        platform_free(block);
         return SsErr::FAIL;
     }
     return SsErr::OK;
@@ -199,9 +197,9 @@ SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t 
         return SsErr::INVALID_STATE;
     }
 
-    struct AsyncRespArg* resp_arg =
-        static_cast<AsyncRespArg*>(platform_malloc(sizeof(AsyncRespArg)));
-    if (resp_arg == nullptr) {
+    // Single allocation: the AsyncRespArg header immediately followed by the payload bytes.
+    void* block = platform_malloc(sizeof(AsyncRespArg) + len);
+    if (block == nullptr) {
         SS_LOGE(TAG, "Failed to allocate AsyncRespArg for binary send");
         if (on_complete) {
             on_complete(false);
@@ -209,19 +207,10 @@ SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t 
         return SsErr::NO_MEM;
     }
 
-    new (resp_arg) AsyncRespArg();
+    auto* resp_arg = new (block) AsyncRespArg();
     resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
     resp_arg->allow_before_hello = allow_before_hello;
-    resp_arg->payload = static_cast<uint8_t*>(platform_malloc(len));
-    if (resp_arg->payload == nullptr) {
-        SS_LOGE(TAG, "Failed to allocate %zu bytes for binary payload", len);
-        resp_arg->~AsyncRespArg();
-        platform_free(resp_arg);
-        if (on_complete) {
-            on_complete(false);
-        }
-        return SsErr::NO_MEM;
-    }
+    resp_arg->payload = reinterpret_cast<uint8_t*>(block) + sizeof(AsyncRespArg);
     resp_arg->len = len;
 
     if (on_complete) {
@@ -233,12 +222,11 @@ SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t 
 
     if (httpd_queue_work(this->server_, async_send_binary, resp_arg) != ESP_OK) {
         SS_LOGE(TAG, "httpd_queue_work failed for binary send!");
-        platform_free(resp_arg->payload);
         if (resp_arg->has_callback) {
             resp_arg->on_complete(false);
         }
         resp_arg->~AsyncRespArg();
-        platform_free(resp_arg);
+        platform_free(block);
         return SsErr::FAIL;
     }
     return SsErr::OK;
@@ -407,7 +395,8 @@ void SendspinServerConnection::async_send_binary(void* arg) {
         }
     }
 
-    platform_free(ws_pkt.payload);
+    // payload lives inline in the same allocation as resp_arg (see AsyncRespArg), so freeing
+    // resp_arg below also releases the payload bytes; there is no separate payload free.
     resp_arg->~AsyncRespArg();
     platform_free(resp_arg);
 }
@@ -438,9 +427,9 @@ void SendspinServerConnection::async_send_text(void* arg) {
         }
     }
 
-    platform_free(ws_pkt.payload);
-
-    // Properly destruct the AsyncRespArg (which includes the std::function)
+    // payload lives inline in the same allocation as resp_arg (see AsyncRespArg), so freeing
+    // resp_arg below also releases the payload bytes; there is no separate payload free.
+    // Properly destruct the AsyncRespArg (which includes the std::function) before freeing.
     resp_arg->~AsyncRespArg();
     platform_free(resp_arg);
 }
