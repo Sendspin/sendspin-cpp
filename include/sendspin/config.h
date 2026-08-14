@@ -173,6 +173,21 @@ struct SendspinClientConfig {
     unsigned websocket_priority{5};  ///< FreeRTOS priority for the WebSocket client task
                                      ///< (ESP-IDF only)
 
+    /// @brief Default esp_websocket_client task stack size in bytes (ESP-IDF only). Larger than
+    /// the esp_websocket_client 4096-byte default because the Noise handshake runs inline on
+    /// this task for outbound connections: the initial handshake fits in 4096, but the in-band
+    /// re-handshake (server-initiated after pairing finalize) runs the full KKpsk2 X25519
+    /// handshake twice (the two-handshake psk_id probe) nested under the transport
+    /// decrypt/encrypt layers, which overflows 4096. Same rationale as
+    /// DEFAULT_HTTPD_STACK_SIZE above.
+    static constexpr size_t DEFAULT_WEBSOCKET_STACK_SIZE = 8192U;
+
+    size_t websocket_stack_size{
+        DEFAULT_WEBSOCKET_STACK_SIZE};  ///< esp_websocket_client task stack size in bytes
+                                        ///< (ESP-IDF only). Values below
+                                        ///< DEFAULT_WEBSOCKET_STACK_SIZE are clamped up to it;
+                                        ///< raising it is allowed.
+
     static constexpr uint16_t DEFAULT_SERVER_PORT = 8928U;  ///< Default WebSocket server port
 
     uint16_t httpd_ctrl_port{0};  ///< ESP-IDF httpd control port; 0 = ESP_HTTPD_DEF_CTRL_PORT

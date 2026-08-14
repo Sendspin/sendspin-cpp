@@ -66,6 +66,18 @@ void SendspinClientConnection::start() {
     config.uri = this->url_.c_str();
     config.disable_auto_reconnect = true;  // We handle reconnection ourselves
     config.task_prio = static_cast<int>(this->task_priority_);
+    // The Noise handshake (and especially the in-band re-handshake) runs its X25519 crypto on
+    // this task; the esp_websocket_client 4096-byte default overflows during the post-pairing
+    // re-handshake. Clamp to the documented minimum so a lowered config value cannot reintroduce
+    // that overflow.
+    size_t task_stack_size = this->task_stack_size_;
+    if (task_stack_size < SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE) {
+        SS_LOGW(TAG, "websocket_stack_size %u below minimum %u; clamping",
+                static_cast<unsigned>(task_stack_size),
+                static_cast<unsigned>(SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE));
+        task_stack_size = SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE;
+    }
+    config.task_stack = static_cast<int>(task_stack_size);
 
     // Create the client
     this->client_ = esp_websocket_client_init(&config);

@@ -1107,6 +1107,7 @@ X25519 keypair and read back via `client.client_id()` after `start_server()`.
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `httpd_stack_size` | `size_t` | `8192` | HTTP server task stack size in bytes (ESP-IDF only). The Noise handshake (and especially the in-band re-handshake after pairing) runs its X25519 crypto on this task; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
 | `websocket_priority` | `unsigned` | `5` | FreeRTOS priority for the WebSocket client task (ESP-IDF only) |
+| `websocket_stack_size` | `size_t` | `8192` | esp_websocket_client task stack size in bytes (ESP-IDF only). The Noise handshake (and especially the in-band re-handshake after pairing) runs its X25519 crypto on this task for outbound connections; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
 | `server_port` | `uint16_t` | `8928` | WebSocket server port |
 | `server_max_connections` | `uint8_t` | `4` | Maximum simultaneous WebSocket connections (one established, two unproven, and one spare so a surplus peer can be rejected with a goodbye) |
 | `httpd_ctrl_port` | `uint16_t` | `0` | ESP-IDF httpd control port; `0` uses `ESP_HTTPD_DEF_CTRL_PORT + 1` to avoid conflict with the web_server component |

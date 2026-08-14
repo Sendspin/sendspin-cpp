@@ -19,6 +19,7 @@
 
 #include "connection.h"
 #include "platform/types.h"
+#include "sendspin/config.h"
 #include "sendspin/types.h"
 #include <esp_websocket_client.h>
 
@@ -126,8 +127,13 @@ public:
 
     /// @brief Configures the internal esp_websocket_client task
     /// @param priority FreeRTOS task priority for the WebSocket client task.
-    void set_task_config(unsigned priority) {
+    /// @param stack_size Task stack size in bytes. Values below
+    ///     SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE are clamped up to it in start()
+    ///     (see the rationale on that constant: the Noise handshake, including the in-band
+    ///     re-handshake, runs inline on this task).
+    void set_task_config(unsigned priority, size_t stack_size) {
         this->task_priority_ = priority;
+        this->task_stack_size_ = stack_size;
     }
 
 protected:
@@ -177,6 +183,9 @@ protected:
 
     /// @brief FreeRTOS task priority for the internal esp_websocket_client task
     unsigned task_priority_{5};
+
+    /// @brief Stack size in bytes for the internal esp_websocket_client task
+    size_t task_stack_size_{SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE};
 
     // 8-bit fields
 

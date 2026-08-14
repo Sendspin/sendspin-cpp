@@ -242,7 +242,8 @@ void ConnectionManager::connect_to(const std::string& url) {
 
     auto client_conn = std::make_shared<SendspinClientConnection>(url);
     client_conn->set_auto_reconnect(false);
-    client_conn->set_task_config(this->client_->config_.websocket_priority);
+    client_conn->set_task_config(this->client_->config_.websocket_priority,
+                                 this->client_->config_.websocket_stack_size);
     client_conn->set_websocket_payload_location(this->client_->config_.websocket_payload_location);
     client_conn->set_noise_buffer_location(this->client_->config_.noise_buffer_location);
 

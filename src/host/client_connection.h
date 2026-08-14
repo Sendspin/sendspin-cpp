@@ -102,14 +102,16 @@ public:
         this->auto_reconnect_ = enabled;
     }
 
-    /// @brief No-op on host builds; task configuration is an ESP-IDF concept
+    /// @brief No-op on host builds; task configuration is an ESP-IDF concept. Both parameters are
+    /// accepted and ignored: the host build has no analogue of a FreeRTOS task priority or stack
+    /// size, since IXWebSocket's worker thread uses the OS default stack.
     // cppcheck-suppress functionStatic
     // Instance method by API design, matching the ESP build's set_task_config() (see
     // src/esp/client_connection.h): both platforms expose the same shape so callers do not need
     // to special-case one over the other. (The "missing override" half of cppcheck's message is
     // also a false positive: the host and ESP SendspinClientConnection classes are separate,
     // platform-selected-at-build-time types, not runtime polymorphic siblings.)
-    void set_task_config(unsigned /*priority*/) {}
+    void set_task_config(unsigned /*priority*/, size_t /*stack_size*/) {}
 
     /// @brief Returns true if the WebSocket connection is currently open
     /// @return true if connected, false otherwise.
