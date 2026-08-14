@@ -239,7 +239,9 @@ struct ServerActivateEvent {
  * (SendspinConnection::note_pairing_finalize_ack()). The invariant is restored once the cycle
  * completes; if it does not -- the hello send keeps failing until retries are exhausted, or the
  * server simply goes silent -- the connection is dropped rather than left wedged. See the
- * hello-retry-timer scan and the re-proving-deadline check (REPROVE_TIMEOUT_US) in loop().
+ * hello-retry-timer scan and the re-proving-deadline check (REPROVE_TIMEOUT_US) in loop(). For why
+ * this state is tracked as independent flags rather than a single phase enum, see the
+ * lifecycle-flag axes note above SendspinConnection's atomic flag members in connection.h.
  *
  * Typical usage:
  *  1. Construct with a `SendspinClient*`.

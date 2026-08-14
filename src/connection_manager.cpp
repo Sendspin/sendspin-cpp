@@ -52,6 +52,10 @@ static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * U
 /// Derived on demand from the connection's proven flags rather than stored, so it can never go
 /// stale. Inbound entries are WS_UP or later by construction (delivered only after their upgrade);
 /// only an outbound connect_to() still awaiting DNS/TCP resolve can be TCP_OPEN.
+///
+/// This is the derive-on-demand pattern referenced by the lifecycle-flag axes note above
+/// SendspinConnection's atomic flag members in connection.h: a readable single "phase" computed
+/// from the underlying flags, never stored as one itself.
 enum class SetupStage : uint8_t {
     TCP_OPEN,
     WS_UP,

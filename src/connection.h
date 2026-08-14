@@ -1024,6 +1024,58 @@ protected:
 
     // 8-bit fields
 
+    /// Lifecycle-flag axes (documentation-only note; a design review considered and rejected
+    /// collapsing the flags below into a single phase enum -- read this before re-proposing it).
+    ///
+    /// The six atomic flags in this section are not one linear lifecycle. They form three
+    /// independent axes:
+    ///
+    ///  - Transport axis: ws_upgraded_. Set once by the platform ws_server / outbound connected
+    ///    callback (network thread); read for reap diagnostics (see SetupStage in
+    ///    connection_manager.cpp).
+    ///  - Proving axis: noise_handshake_complete_ is set ONCE on the network thread at handshake
+    ///    COMPLETE and never cleared -- not even by an in-band re-handshake, because the transport
+    ///    stays active across it. Alongside it, the RESETTABLE trio client_hello_sent_ /
+    ///    server_hello_received_ / first_activate_received_ tracks the hello + first-activate
+    ///    cycle, which does re-run on re-handshake.
+    ///  - Admission axis: admitted_ -- whether this connection occupies the manager's current
+    ///    slot. Written only by ConnectionManager::set_current_connection() / drop_connection() on
+    ///    the main loop; read by the network thread's role-dispatch gate. Orthogonal to proving:
+    ///    an operational nursery loser is never admitted, and after a re-handshake the current
+    ///    connection is admitted but temporarily NOT operational.
+    ///
+    /// Writer/thread map (verified 2026-08-14):
+    ///  - client_hello_sent_: set by the hello send-completion callback in
+    ///    ConnectionManager::send_hello_message (httpd worker thread on ESP, inline on host);
+    ///    cleared by handle_noise_rehandshake (network thread) at the start of a key rotation
+    ///    and by the outbound transports' disconnect handlers (esp/host client_connection.cpp,
+    ///    transport thread). Inbound connections are never reset on disconnect: a dropped
+    ///    server connection is torn down, not reused.
+    ///  - server_hello_received_: set by SendspinClient::process_json_message on server/hello
+    ///    (network thread); cleared by the same two paths as client_hello_sent_.
+    ///  - first_activate_received_: set by apply_server_activate (main loop only); cleared by
+    ///    handle_noise_rehandshake and note_pairing_finalize_ack (both network thread).
+    ///  - noise_handshake_complete_: set once in handle_noise_handshake_text at COMPLETE (network
+    ///    thread); never cleared.
+    ///  - admitted_: main loop only (ConnectionManager).
+    ///  - ws_upgraded_: network threads (platform ws_server / connect_to connected callback).
+    ///
+    /// Why not a single phase enum:
+    ///  - The order is not total: client_hello_sent_ and server_hello_received_ flip
+    ///    independently on different threads and can complete in either order (a nonconforming
+    ///    peer's server/hello can race ahead of our client/hello send completion). That is exactly
+    ///    why the manager's promotion scan is level-triggered rather than edge-triggered. A single
+    ///    enum would force an ordering that does not exist.
+    ///  - Transitions are non-monotonic by design: handle_noise_rehandshake rewinds the hello +
+    ///    activate flags from the network thread while the main loop reads them;
+    ///    note_pairing_finalize_ack rewinds first_activate_received_ alone. Monotonic-transition
+    ///    assertions would fire on legitimate operation.
+    ///  - The axes are orthogonal (see above), so one scalar cannot represent, e.g., "admitted but
+    ///    not operational" during re-proving.
+    ///  - The sanctioned way to get a readable single "phase" is to DERIVE it on demand from these
+    ///    flags, as SetupStage in connection_manager.cpp does for reap diagnostics -- derived,
+    ///    never stored, so it cannot go stale.
+
     /// PSK category resolved by the Noise handshake (set at COMPLETE, or re-handshake).
     /// Atomic because get_psk_category() is read on the main loop (build_hello_message via the
     /// hello-retry path) while the network thread writes it at COMPLETE / re-handshake.
