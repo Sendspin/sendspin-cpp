@@ -247,6 +247,9 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
             psk_persisted = this->provider_->save_blob(
                 persistence_keys::PAIRING_PSK, reinterpret_cast<const uint8_t*>(encoded.data()),
                 encoded.size());
+            // The encoded blob is base64 PSK text; wipe it now that save_blob() has its own copy
+            // (or has failed), rather than leaving it for the string's destructor to free unwiped.
+            secure_zero(encoded.data(), encoded.size());
         }
         if (psk_persisted) {
             SS_LOGI(TAG, "Provisioned Sendspin Pairing PSK: %s", provisioned.psk_id.c_str());
@@ -345,15 +348,6 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
 bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede_server_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
 
-    // Phase 1: insert/replace the new record. Fails closed: the record must not survive in
-    // records_ when the provider rejects the write (see the class doc). Snapshot the
-    // pre-mutation state so it can be restored on failure; this is safe because the whole
-    // sequence below runs under mutex_, so no reader (in particular resolve_by_psk_id() on the
-    // network thread) can observe the tentative mutation before it either commits or rolls
-    // back. See the locking-discipline comment on persist_records_locked() for the general rule
-    // this is the one exception to.
-    std::vector<SendspinPairingRecord> rollback = this->records_;
-
     size_t idx = this->find_index(record.psk_id);
     const std::string incoming_psk_id = record.psk_id;
     const bool is_insert = (idx == static_cast<size_t>(-1));
@@ -376,17 +370,34 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
         }
     }
 
+    // Phase 1: insert/replace the new record. Fails closed: the record must not survive in
+    // records_ when the provider rejects the write (see the class doc). This is safe under
+    // mutex_ (held for the whole sequence, so no reader - in particular resolve_by_psk_id() on
+    // the network thread - can observe the tentative mutation before it commits or rolls back;
+    // see the locking-discipline comment on persist_records_locked() for the general rule this
+    // is the one exception to), and each branch below only ever needs to undo the single element
+    // it just touched, not the whole vector: a replace snapshots just the record it is about to
+    // overwrite, and an insert only needs to pop the one it just pushed.
     if (!is_insert) {
+        SendspinPairingRecord replaced = std::move(this->records_[idx]);
         this->records_[idx] = std::move(record);
+
+        if (!this->persist_records_locked()) {
+            SS_LOGW(TAG, "Provider rejected pairing record %s; not storing",
+                    incoming_psk_id.c_str());
+            this->records_[idx] = std::move(replaced);
+            return false;
+        }
     } else {
         this->records_.push_back(std::move(record));
         idx = this->records_.size() - 1;
-    }
 
-    if (!this->persist_records_locked()) {
-        SS_LOGW(TAG, "Provider rejected pairing record %s; not storing", incoming_psk_id.c_str());
-        this->records_ = std::move(rollback);
-        return false;
+        if (!this->persist_records_locked()) {
+            SS_LOGW(TAG, "Provider rejected pairing record %s; not storing",
+                    incoming_psk_id.c_str());
+            this->records_.pop_back();
+            return false;
+        }
     }
 
     // Phase 2 (pairing path only, and only a SEPARATE write from phase 1): pairing mints a fresh
@@ -493,6 +504,9 @@ void RecordStore::set_pairing_psk(SendspinPairingPsk psk) {
         this->provider_->save_blob(persistence_keys::PAIRING_PSK,
                                    reinterpret_cast<const uint8_t*>(encoded.data()),
                                    encoded.size());
+        // See the constructor's provisioning branch for why this is wiped rather than left for
+        // the string's destructor to free unwiped: it is base64 PSK text.
+        secure_zero(encoded.data(), encoded.size());
     }
 }
 
@@ -764,9 +778,15 @@ bool RecordStore::persist_records_locked() {
         return true;
     }
     std::string encoded = encode_pairing_records(this->records_);
-    return this->provider_->save_blob(persistence_keys::RECORDS,
-                                      reinterpret_cast<const uint8_t*>(encoded.data()),
-                                      encoded.size());
+    const bool ok = this->provider_->save_blob(persistence_keys::RECORDS,
+                                               reinterpret_cast<const uint8_t*>(encoded.data()),
+                                               encoded.size());
+    // The encoded blob is base64 PSK text for every stored record; wipe it now that save_blob()
+    // has its own copy (or has rejected it), rather than leaving it for the string's destructor
+    // to free unwiped. This is the one blob write on every records_ mutation path (see the
+    // locking-discipline comment above), so it covers store/remove/mark-used/supersede alike.
+    secure_zero(encoded.data(), encoded.size());
+    return ok;
 }
 
 }  // namespace sendspin

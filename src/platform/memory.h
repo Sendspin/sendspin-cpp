@@ -18,11 +18,13 @@
 
 #pragma once
 
+#include "platform/crypto.h"
 #include "sendspin/types.h"
 #include <ArduinoJson.h>
 
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 
 #ifdef ESP_PLATFORM
 
@@ -313,6 +315,86 @@ public:
 /// @return A JsonDocument configured to use the platform's PSRAM-preferring allocator
 inline JsonDocument make_json_document() {
     return JsonDocument(PsramJsonAllocator::instance());
+}
+
+/// @brief ArduinoJson allocator that wipes each block's contents before freeing it, for documents
+/// that may hold key material (PSKs) in their string pool. `ArduinoJson::Allocator::deallocate()`
+/// receives only a pointer, not a size, so a correct wipe needs the size back: this allocator
+/// stashes it in a small header placed just before the block it hands to ArduinoJson.
+///
+/// Not for the protocol hot path (use PsramJsonAllocator there): every allocate()/deallocate()
+/// pays for an extra max_align_t-sized header, and reallocate() always copies into a fresh block
+/// rather than growing in place, so the old block can be wiped via this class's own deallocate()
+/// before it is freed - a plain platform_realloc() that relocates would otherwise free the old
+/// (PSK-containing) block through the underlying allocator directly, bypassing the wipe. This is
+/// for the PSK-carrying persistence-codec documents only (see persistence_codec.cpp).
+class ZeroizingJsonAllocator : public ArduinoJson::Allocator {
+public:
+    /// @brief Allocates `size` bytes, plus a hidden header recording that size for deallocate().
+    /// @param size Number of bytes to allocate.
+    /// @return Pointer to the allocated memory, or nullptr on failure.
+    void* allocate(size_t size) override {
+        void* raw = platform_malloc(kHeaderSize + size);
+        if (raw == nullptr) {
+            return nullptr;
+        }
+        *static_cast<size_t*>(raw) = size;
+        return static_cast<uint8_t*>(raw) + kHeaderSize;
+    }
+
+    /// @brief Wipes the block (recovering its size from the header allocate()/reallocate() wrote)
+    /// and frees it via platform_free.
+    /// @param ptr Pointer previously returned by allocate() or reallocate(); null is a no-op.
+    void deallocate(void* ptr) override {
+        if (ptr == nullptr) {
+            return;
+        }
+        uint8_t* raw = static_cast<uint8_t*>(ptr) - kHeaderSize;
+        const size_t size = *reinterpret_cast<size_t*>(raw);
+        secure_zero(raw, kHeaderSize + size);
+        platform_free(raw);
+    }
+
+    /// @brief Reallocates a block to `new_size` via a fresh allocate() + copy + deallocate() of
+    /// the old block, rather than delegating to platform_realloc(); see the class doc for why.
+    /// @param ptr Pointer previously returned by allocate() or reallocate(), or nullptr.
+    /// @param new_size New size in bytes.
+    /// @return Pointer to the new block, or nullptr on failure (the old block is left intact).
+    void* reallocate(void* ptr, size_t new_size) override {
+        if (ptr == nullptr) {
+            return this->allocate(new_size);
+        }
+        uint8_t* raw = static_cast<uint8_t*>(ptr) - kHeaderSize;
+        const size_t old_size = *reinterpret_cast<size_t*>(raw);
+
+        void* new_ptr = this->allocate(new_size);
+        if (new_ptr == nullptr) {
+            return nullptr;
+        }
+        std::memcpy(new_ptr, ptr, old_size < new_size ? old_size : new_size);
+        this->deallocate(ptr);
+        return new_ptr;
+    }
+
+    /// @brief Returns the singleton allocator instance
+    /// @return Pointer to the shared ZeroizingJsonAllocator instance.
+    static ZeroizingJsonAllocator* instance() {
+        static ZeroizingJsonAllocator instance;
+        return &instance;
+    }
+
+private:
+    /// Header size: rounded up to alignof(std::max_align_t) so the pointer handed back to
+    /// ArduinoJson (raw + kHeaderSize) keeps whatever alignment platform_malloc() guarantees.
+    static constexpr size_t kHeaderSize =
+        alignof(std::max_align_t) >= sizeof(size_t) ? alignof(std::max_align_t) : sizeof(size_t);
+};
+
+/// @brief Creates a JsonDocument whose pool is wiped block-by-block as it frees memory, for
+/// parsing/serializing documents that may hold PSK material (see ZeroizingJsonAllocator).
+/// @return A JsonDocument configured to use the zeroizing allocator.
+inline JsonDocument make_zeroizing_json_document() {
+    return JsonDocument(ZeroizingJsonAllocator::instance());
 }
 
 }  // namespace sendspin

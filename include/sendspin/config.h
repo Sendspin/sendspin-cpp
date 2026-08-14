@@ -28,6 +28,25 @@
 
 namespace sendspin {
 
+namespace detail {
+
+/// @brief Overwrite a 32-byte PSK with zeroes through a volatile pointer, so the write survives
+/// dead-store elimination on a buffer that is about to go out of scope (a plain assignment to a
+/// value never read again is legal for the compiler to delete outright).
+///
+/// This is a public-header-safe duplicate of `secure_zero()` in the private `platform/crypto.h`
+/// (the same primitive `Identity::~Identity()` in `crypto/keys.cpp` and `psk_wrap.cpp` use for
+/// their own secrets): `config.h` is a public header and must not include a `src/`-private one,
+/// so the three-line loop is repeated here rather than shared. Keep the two in sync.
+inline void secure_zero_psk(std::array<uint8_t, 32>& psk) {
+    volatile uint8_t* vp = psk.data();
+    for (size_t i = 0; i < psk.size(); ++i) {
+        vp[i] = 0;
+    }
+}
+
+}  // namespace detail
+
 // ============================================================================
 // Persistence types (used by SendspinPersistenceProvider)
 // ============================================================================
@@ -41,6 +60,25 @@ struct SendspinPairingRecord {
     std::optional<std::string> server_id;  ///< Absent = shared-PSK record.
     std::optional<std::string> label;
     bool used{false};
+
+    SendspinPairingRecord() = default;
+    SendspinPairingRecord(const SendspinPairingRecord&) = default;
+    SendspinPairingRecord(SendspinPairingRecord&&) = default;
+    SendspinPairingRecord& operator=(const SendspinPairingRecord&) = default;
+    SendspinPairingRecord& operator=(SendspinPairingRecord&&) = default;
+
+    /// @brief Wipes `psk` on destruction: defense in depth against a stale copy (a rollback
+    /// snapshot, a superseded/moved-from element, a temporary) outliving its use. It does NOT
+    /// protect the live record: the PSK is durably plaintext in `RecordStore::records_` and in
+    /// the persisted blob for as long as the record is paired, by design (see persist_records_
+    /// locked() in record_store.cpp). The copy/move members are defaulted explicitly (rather than
+    /// left to go through this destructor's precedent of suppressing them, as `Identity` does):
+    /// records move through `std::vector`/`std::optional` on real paths (store_record_impl's
+    /// insert/replace, decode_pairing_records' push_back, resolve_pairing_outcome's
+    /// PairingOutcome), so keeping those moves real (not copies) matters here.
+    ~SendspinPairingRecord() {
+        detail::secure_zero_psk(this->psk);
+    }
 };
 
 /// @brief An accepted Pairing PSK the client stores for admitting a server.
@@ -49,6 +87,18 @@ struct SendspinPairingPsk {
     std::string psk_id;
     std::array<uint8_t, 32> psk{};
     std::optional<std::string> label;
+
+    SendspinPairingPsk() = default;
+    SendspinPairingPsk(const SendspinPairingPsk&) = default;
+    SendspinPairingPsk(SendspinPairingPsk&&) = default;
+    SendspinPairingPsk& operator=(const SendspinPairingPsk&) = default;
+    SendspinPairingPsk& operator=(SendspinPairingPsk&&) = default;
+
+    /// @brief Wipes `psk` on destruction; see SendspinPairingRecord::~SendspinPairingRecord()
+    /// above for the full rationale (same discipline, same public/private header constraint).
+    ~SendspinPairingPsk() {
+        detail::secure_zero_psk(this->psk);
+    }
 };
 
 /// @brief Pairing policy persisted by the client.

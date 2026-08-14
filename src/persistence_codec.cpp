@@ -15,6 +15,7 @@
 #include "sendspin/persistence_codec.h"
 
 #include "platform/base64.h"
+#include "platform/crypto.h"
 #include "platform/memory.h"
 #include <ArduinoJson.h>
 
@@ -34,6 +35,13 @@ namespace {
 struct PskIdAndBytes {
     std::string psk_id;
     std::array<uint8_t, 32> psk{};
+
+    /// @brief Wipes `psk` on destruction. This is a decode-side scratch copy distinct from the
+    /// SendspinPairingRecord/SendspinPairingPsk it flows into (those wipe themselves
+    /// independently; see config.h), so it needs the same discipline on its own account.
+    ~PskIdAndBytes() {
+        secure_zero(this->psk.data(), this->psk.size());
+    }
 };
 
 /// @brief Parses and validates the "psk_id"/"psk" fields common to a record and a Pairing PSK.
@@ -50,13 +58,17 @@ std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj) {
     if (!obj["psk"].is<const char*>()) {
         return std::nullopt;
     }
-    auto decoded = b64url_decode(std::string(obj["psk"].as<const char*>()));
+    // Decode straight from the JSON pool's char*, not a std::string copy of it: that copy would
+    // be base64 PSK text living outside the document's (zeroizing) allocator, with nothing to
+    // wipe it on the way out.
+    auto decoded = b64url_decode(obj["psk"].as<const char*>());
     if (!decoded.has_value() || decoded->size() != 32) {
         return std::nullopt;
     }
     PskIdAndBytes out;
     out.psk_id = std::move(psk_id);
     std::memcpy(out.psk.data(), decoded->data(), 32);
+    secure_zero(decoded->data(), decoded->size());
     return out;
 }
 
@@ -120,10 +132,14 @@ JsonObjectConst parse_root_object(std::string_view bytes, JsonDocument& doc) {
 // ============================================================================
 
 std::string encode_pairing_record(const SendspinPairingRecord& r) {
-    JsonDocument doc = make_json_document();
+    // Every JsonDocument here uses the zeroizing allocator (not make_json_document()'s plain
+    // PsramJsonAllocator): the pool holds base64 PSK text and must not be freed unwiped.
+    JsonDocument doc = make_zeroizing_json_document();
     doc["v"] = RECORD_CODEC_VERSION;
     doc["psk_id"] = r.psk_id;
-    doc["psk"] = base64url_encode(r.psk.data(), r.psk.size());
+    std::string psk_b64 = base64url_encode(r.psk.data(), r.psk.size());
+    doc["psk"] = psk_b64;
+    secure_zero(psk_b64.data(), psk_b64.size());
     if (r.server_id.has_value()) {
         doc["server_id"] = r.server_id.value();
     }
@@ -137,7 +153,7 @@ std::string encode_pairing_record(const SendspinPairingRecord& r) {
 }
 
 std::optional<SendspinPairingRecord> decode_pairing_record(std::string_view bytes) {
-    JsonDocument doc = make_json_document();
+    JsonDocument doc = make_zeroizing_json_document();
     JsonObjectConst obj = parse_root_object(bytes, doc);
     if (obj.isNull()) {
         return std::nullopt;
@@ -146,13 +162,15 @@ std::optional<SendspinPairingRecord> decode_pairing_record(std::string_view byte
 }
 
 std::string encode_pairing_records(const std::vector<SendspinPairingRecord>& v) {
-    JsonDocument doc = make_json_document();
+    JsonDocument doc = make_zeroizing_json_document();
     doc["v"] = RECORD_CODEC_VERSION;
     JsonArray arr = doc["records"].to<JsonArray>();
     for (const auto& r : v) {
         JsonObject obj = arr.add<JsonObject>();
         obj["psk_id"] = r.psk_id;
-        obj["psk"] = base64url_encode(r.psk.data(), r.psk.size());
+        std::string psk_b64 = base64url_encode(r.psk.data(), r.psk.size());
+        obj["psk"] = psk_b64;
+        secure_zero(psk_b64.data(), psk_b64.size());
         if (r.server_id.has_value()) {
             obj["server_id"] = r.server_id.value();
         }
@@ -167,7 +185,7 @@ std::string encode_pairing_records(const std::vector<SendspinPairingRecord>& v) 
 }
 
 std::optional<std::vector<SendspinPairingRecord>> decode_pairing_records(std::string_view bytes) {
-    JsonDocument doc = make_json_document();
+    JsonDocument doc = make_zeroizing_json_document();
     JsonObjectConst root = parse_root_object(bytes, doc);
     if (root.isNull() || !root["records"].is<JsonArrayConst>()) {
         return std::nullopt;
@@ -187,10 +205,12 @@ std::optional<std::vector<SendspinPairingRecord>> decode_pairing_records(std::st
 // ============================================================================
 
 std::string encode_pairing_psk(const SendspinPairingPsk& p) {
-    JsonDocument doc = make_json_document();
+    JsonDocument doc = make_zeroizing_json_document();
     doc["v"] = RECORD_CODEC_VERSION;
     doc["psk_id"] = p.psk_id;
-    doc["psk"] = base64url_encode(p.psk.data(), p.psk.size());
+    std::string psk_b64 = base64url_encode(p.psk.data(), p.psk.size());
+    doc["psk"] = psk_b64;
+    secure_zero(psk_b64.data(), psk_b64.size());
     if (p.label.has_value()) {
         doc["label"] = p.label.value();
     }
@@ -200,7 +220,7 @@ std::string encode_pairing_psk(const SendspinPairingPsk& p) {
 }
 
 std::optional<SendspinPairingPsk> decode_pairing_psk(std::string_view bytes) {
-    JsonDocument doc = make_json_document();
+    JsonDocument doc = make_zeroizing_json_document();
     JsonObjectConst obj = parse_root_object(bytes, doc);
     if (obj.isNull()) {
         return std::nullopt;
