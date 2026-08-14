@@ -455,6 +455,10 @@ void SendspinConnection::note_pairing_finalize_ack() {
     // !current_connection_->is_operational()) will drop the connection if the server acks but
     // never re-handshakes.
     this->first_activate_received_.store(false, std::memory_order_release);
+    // Mark the activities snapshot stale: the exchange is protocol-complete (the record is
+    // stored) but activities_ still reads [PAIRING] until the post-rekey activate lands, and
+    // admission must not keep shielding this connection as an in-flight pairing meanwhile.
+    this->pairing_finalized_.store(true, std::memory_order_release);
     this->set_provisional_time_us(platform_time_us());
 }
 

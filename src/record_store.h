@@ -84,9 +84,18 @@ struct ResolvedPsk {
 ///     `records`) are for internal-locked or single-threaded (main-loop-only) use ONLY;
 ///     callers must not retain a returned pointer or reference across any mutation, and must
 ///     never call them from the network thread.
-///   - The config fields (`pairing_psk_enabled_`, `unpaired_access_enabled_`,
-///     `record_mode_psk_id_`) are main-loop-only; they are never written from the network
-///     thread, so no lock is needed for reads on the main loop.
+///   - Most config fields (`unpaired_access_enabled_`, `dynamic_pin_enabled_`,
+///     `static_pin_enabled_`, `dynamic_pin_min_length_`, `dynamic_pin_failures_`,
+///     `record_mode_psk_id_`) are main-loop-only: written only on the main loop and read only
+///     on the main loop, so no lock is needed.
+///   - `pairing_psk_enabled_` is the ONE exception and IS guarded by `mutex_`. It is written on
+///     the main loop like its neighbours, but it is also READ on the network thread, inside
+///     `resolve_by_psk_id`'s locked section, because a disabled Pairing PSK must drop out of the
+///     handshake candidate set. Its setter therefore takes `mutex_` -- exactly as
+///     `set_pairing_psk()` does for the value half of that same condition. Do not "simplify" the
+///     lock away to match the other config setters: without it the network-thread read is an
+///     unsynchronized race and an operator-disabled Pairing PSK can keep authenticating
+///     handshakes for a window after the toggle.
 ///   - `resolve_by_psk_id` runs on the network thread (Noise handshake and re-handshake)
 ///     under `mutex_` so a network-thread resolve cannot race a main-loop mutation of
 ///     `records_` / `pairing_psk_`.
@@ -369,7 +378,12 @@ private:
     bool store_record_impl(SendspinPairingRecord record, bool supersede_server_id);
 
     /// @brief Persist the current pairing config via the provider.
-    void persist_config();
+    /// @return True if the config was stored (or there is no provider, so there is nothing to
+    ///         store); false only when a provider actively rejected the write. Nearly every
+    ///         caller ignores this -- a rejected config write is warned about and the change
+    ///         stays RAM-only for the boot. First-boot provisioning is the exception: it must
+    ///         not go on to persist a record the config cannot reference.
+    bool persist_config();
 
     /// @brief Encode records_ (the WHOLE array) and save it under persistence_keys::RECORDS.
     ///

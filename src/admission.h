@@ -227,13 +227,19 @@ inline int activity_rank(const std::vector<SendspinActivity>& activities) {
 /// @param has_admitted           Whether there is an admitted connection at all.
 /// @param last_playback_server_id  The last-playback server_id (empty if unset).
 /// @param has_last_playback      Whether last_playback_server_id has been set.
+/// @param admitted_pairing_in_flight  Whether the admitted connection's pairing exchange is still
+///        in flight. Defaults to true, which is the plain reading of rule 2 and preserves the
+///        reference behavior. Pass false only when the admitted side declares PAIRING but has
+///        already been acked with server/pair-finalize, so rule 2 stops shielding a pairing that
+///        has finished. Affects rule 2 alone; the rank comparisons are untouched.
 /// @return true if the incoming connection should become the admitted one.
 inline bool should_admit_connection(const std::vector<SendspinActivity>& incoming_activities,
                                     const std::string& incoming_server_id,
                                     const std::vector<SendspinActivity>& admitted_activities,
                                     const std::string& admitted_server_id, bool has_admitted,
                                     const std::string& last_playback_server_id,
-                                    bool has_last_playback) {
+                                    bool has_last_playback,
+                                    bool admitted_pairing_in_flight = true) {
     if (!has_admitted) {
         return true;
     }
@@ -242,7 +248,15 @@ inline bool should_admit_connection(const std::vector<SendspinActivity>& incomin
     const int admitted_rank = activity_rank(admitted_activities);
 
     // An in-flight pairing is not displaced by incoming rank 1 (pairing) or rank 2 (playback).
-    if (admitted_rank == 1 && (incoming_rank == 1 || incoming_rank == 2)) {
+    // "In-flight" is the operative word: once the server has acked server/pair-finalize the
+    // exchange is complete, and the admitted connection keeps declaring PAIRING only because its
+    // activities snapshot is not rewritten until the post-rekey activate arrives. The caller
+    // passes admitted_pairing_in_flight=false for that window so this shield stops applying,
+    // while the rank comparisons below still use the real (stale but rank-correct) activities --
+    // substituting an empty set here instead would drop the admitted side to rank 0 and hand a
+    // rank-0 newcomer the last_playback tiebreak below, which it could never have won before.
+    if (admitted_pairing_in_flight && admitted_rank == 1 &&
+        (incoming_rank == 1 || incoming_rank == 2)) {
         return false;
     }
 

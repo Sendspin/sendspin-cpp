@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
+#include <string>
 #include <vector>
 
 // noise-c is a C library; wrap the includes in extern "C" to avoid C++
@@ -505,6 +507,33 @@ inline std::optional<std::vector<uint8_t>> aead_oneshot_decrypt(const char* ciph
     }
     buf.resize(nbuf.size);
     return buf;
+}
+
+// ============================================================================
+// Secret erasure
+// ============================================================================
+
+/// @brief Overwrite a buffer with zeroes through a volatile pointer, so the write survives
+/// dead-store elimination (a plain memset on a buffer that is never read again is legal for the
+/// compiler to delete outright).
+///
+/// Use on every scope-exit path that leaves key material behind: PSKs, AEAD keys, X25519 private
+/// keys, PAKE scalars. It is a defence-in-depth measure, not a substitute for the fact that
+/// long-lived secrets necessarily sit in RAM for as long as they are needed.
+inline void secure_zero(void* p, size_t n) {
+    volatile uint8_t* vp = static_cast<volatile uint8_t*>(p);
+    for (size_t i = 0; i < n; ++i) {
+        vp[i] = 0;
+    }
+}
+
+/// @brief secure_zero() over a contiguous container (std::array, std::vector) of bytes.
+/// No-op for an empty container: data() may legally be null and n is 0.
+template <typename Container>
+inline void secure_zero_container(Container& c) {
+    if (!c.empty()) {
+        secure_zero(c.data(), c.size() * sizeof(typename Container::value_type));
+    }
 }
 
 // ============================================================================

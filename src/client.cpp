@@ -20,6 +20,7 @@
 #include "crypto/pairing_token.h"
 #include "inbox.h"
 #include "platform/compiler.h"
+#include "platform/crypto.h"
 #include "platform/json_arena.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
@@ -152,12 +153,16 @@ LogLevel SendspinClient::get_log_level() {
 // ============================================================================
 
 bool SendspinClient::start_server() {
-    this->started_ = true;
-
+    // started_ is deliberately NOT set here: it is set only once every step below has succeeded.
+    // Setting it up front would mark the client started even when this function returns false
+    // (e.g. identity generation failed and identity_ is left null), which is precisely the state
+    // connect_to() must refuse to build a connection in.
+    //
     // Create the record store (needs the persistence provider, so done here rather than at
     // construction) and load or generate the static X25519 identity. Both must exist before
     // the connection manager can hand them out to any connection (init_server() below starts
-    // the ws_server, and connect_to() may be called any time after start_server()).
+    // the ws_server, and connect_to() may be called any time after start_server() RETURNS TRUE
+    // -- connect_to() enforces that itself rather than trusting the caller's ordering).
     this->record_store_ = std::make_unique<RecordStore>(
         this->persistence_provider_, this->config_.initial_unpaired_access_enabled);
     if (!this->load_or_generate_identity()) {
@@ -196,10 +201,24 @@ bool SendspinClient::start_server() {
     // Create and configure the WebSocket server (started later when network is ready)
     this->connection_manager_->init_server(this);
 
+    this->started_ = true;
     return true;
 }
 
 void SendspinClient::connect_to(const std::string& url) {
+    // Refuse to build an outbound connection before start_server() has fully succeeded.
+    // identity_ and record_store_ are populated only there, and the lifecycle drain hands both
+    // to init_noise_handshake() by reference once the WebSocket upgrade completes (see
+    // ConnectionManager::drain_lifecycle_events) -- with encryption_required defaulting to true,
+    // a connection started now would dereference null there. Checking the pointers rather than
+    // started_ alone also covers a consumer that ignored a false return from start_server().
+    if (this->identity_ == nullptr || this->record_store_ == nullptr) {
+        SS_LOGE(TAG,
+                "connect_to(%s) ignored: start_server() has not completed successfully, so there "
+                "is no identity to hand the Noise handshake",
+                url.c_str());
+        return;
+    }
     this->connection_manager_->connect_to(url);
 }
 
@@ -1516,6 +1535,12 @@ bool SendspinClient::load_or_generate_identity() {
             std::array<uint8_t, 32> priv_bytes{};
             std::copy(saved_priv->begin(), saved_priv->end(), priv_bytes.begin());
             auto loaded = Identity::from_private_bytes(priv_bytes);
+            // The raw private key has been consumed, so wipe the two transient copies of it now
+            // instead of leaving them on the stack/heap until their frames are reused. Every
+            // Identity-shaped copy (`loaded`, and the one make_unique takes below) wipes itself
+            // via ~Identity(); these two are the plain byte buffers that cannot.
+            secure_zero_container(priv_bytes);
+            secure_zero_container(saved_priv.value());
             if (loaded.has_value()) {
                 this->identity_ = std::make_unique<Identity>(loaded.value());
                 this->client_id_ = this->identity_->peer_id();

@@ -563,6 +563,13 @@ public:
         return this->pairing_in_progress_.load(std::memory_order_acquire);
     }
 
+    /// @brief Returns true if the server has acked server/pair-finalize but no fresh
+    /// server/activate has arrived yet, i.e. get_activities() still reports the stale
+    /// pre-finalize [PAIRING] set for an exchange that is already complete.
+    bool is_pairing_finalized() const {
+        return this->pairing_finalized_.load(std::memory_order_acquire);
+    }
+
     /// @brief Sets the pairing-in-progress flag.
     /// Call on the main loop when entering the pairing exchange.
     void set_pairing_in_progress(bool value) {
@@ -594,6 +601,7 @@ public:
     /// @brief Clears all pairing state on this connection. Called on abort or leftover-activate.
     void clear_pairing_state() {
         this->pairing_in_progress_.store(false, std::memory_order_release);
+        this->pairing_finalized_.store(false, std::memory_order_release);
         this->pending_pairing_slot_.reset();
         // Reset the dynamic-PIN session (main-loop-only fields; no lock needed).
         this->pin_session_ = PinSession{};
@@ -665,6 +673,8 @@ public:
         this->pairing_method_ = has_pairing ? pairing_method : std::nullopt;
         this->pairing_pin_length_ = has_pairing ? pairing_pin_length : std::nullopt;
         this->first_activate_received_.store(true, std::memory_order_release);
+        // activities_ is fresh again, so the post-finalize staleness window is over.
+        this->pairing_finalized_.store(false, std::memory_order_release);
     }
 
     // ========================================
@@ -1006,6 +1016,16 @@ protected:
     /// Read on the main loop (time-burst and publish_client_state quiesce gates).
     /// Atomic because of the network-thread write in handle_noise_rehandshake.
     std::atomic<bool> pairing_in_progress_{false};
+
+    /// True from the moment the server acks server/pair-finalize until fresh activities arrive
+    /// (or pairing state is cleared). In that window the exchange is protocol-complete -- the
+    /// record is already stored -- but `activities_` still holds the pre-finalize [PAIRING] set,
+    /// because only apply_server_activate() ever rewrites it and the post-finalize activate has
+    /// not arrived yet. Admission consults this so the "in-flight pairing is not displaced" rule
+    /// stops protecting a pairing that has already finished (see should_switch_to_new_server).
+    /// Written on the network thread (note_pairing_finalize_ack) and the main loop
+    /// (apply_server_activate / clear_pairing_state); read on the main loop. Hence atomic.
+    std::atomic<bool> pairing_finalized_{false};
 
     /// Pending pairing record to be committed when the server/pair-finalize ack arrives (nullopt
     /// = shared-PSK / nothing to store). Written on the main loop (enter pairing), taken on the

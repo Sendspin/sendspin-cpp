@@ -27,17 +27,8 @@ extern "C" {
 
 namespace sendspin {
 
-namespace {
-
-// Overwrite a buffer through a volatile pointer so the clear is not optimized away.
-void secure_zero(void* p, size_t n) {
-    volatile uint8_t* vp = static_cast<volatile uint8_t*>(p);
-    for (size_t i = 0; i < n; ++i) {
-        vp[i] = 0;
-    }
-}
-
-}  // namespace
+// secure_zero() now lives in platform/crypto.h so the other holders of key material (Identity,
+// psk_wrap) can share the one implementation instead of each rolling their own.
 
 // ============================================================================
 // LV encoding -- mirrors cpace.py _prepend_len / _lv_cat

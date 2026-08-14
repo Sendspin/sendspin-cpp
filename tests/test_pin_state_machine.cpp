@@ -467,6 +467,19 @@ protected:
         this->client_->connection_manager_->on_connection_lost(conn);
     }
 
+    /// Seam for arbitration checks: should_switch_to_new_server() and the last-playback fields
+    /// are private to ConnectionManager, and the friend declaration names this fixture, not the
+    /// class TEST_F derives from it -- so the call has to route through here.
+    /// @param last_playback_server_id Sets last_played_server_id_; empty clears the has-value
+    ///        flag, so rule 5's tiebreak is only armed when a non-empty id is passed.
+    bool would_switch_to(SendspinConnection* current, SendspinConnection* incoming,
+                         const std::string& last_playback_server_id) {
+        auto& mgr = *this->client_->connection_manager_;
+        mgr.last_played_server_id_ = last_playback_server_id;
+        mgr.has_last_played_server_ = !last_playback_server_id.empty();
+        return mgr.should_switch_to_new_server(current, incoming);
+    }
+
     /// Returns the shared_ptr backing the injected current connection, for building
     /// ServerPairingMessageEvent / PairAbortEvent conn fields (which require a shared_ptr).
     /// Backed by the fixture's own owning reference (see inject_current_connection), not
@@ -1968,4 +1981,44 @@ TEST_F(PinStateMachineTest, DropClearsTheAdmittedFlag) {
     EXPECT_EQ(this->current_connection(), nullptr) << "the slot must be empty after the drop";
     EXPECT_FALSE(conn->is_admitted())
         << "a dropped connection must not keep claiming the admitted slot";
+}
+
+// ============================================================================
+// Arbitration against a finalized-but-not-yet-re-proven incumbent
+// ============================================================================
+
+// Companion to test_admission.cpp's pure-function tests: those pin what
+// should_admit_connection() does with a given admitted_pairing_in_flight, while this pins that
+// should_switch_to_new_server() WIRES it correctly -- passing the incumbent's real activities and
+// signalling the finished pairing through the flag. An earlier version of the fix instead
+// substituted an empty activity set here, which silently dropped the incumbent to rank 0 and let
+// rule 5's last_playback tiebreak evict a connection that had just finished pairing.
+TEST_F(PinStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlaybackPeer) {
+    FakeConnection* current =
+        this->inject_current_connection("paired-server", SendspinPairMethod::DYNAMIC_PIN);
+    // The server has acked pair-finalize: pairing is complete, but no post-rekey activate has
+    // landed, so get_activities() still reports [PAIRING].
+    current->note_pairing_finalize_ack();
+    ASSERT_TRUE(current->is_pairing_finalized());
+    ASSERT_EQ(current->get_activities().size(), 1u);
+
+    // A rank-0 peer (no activities) whose server_id is the last playback server -- exactly the
+    // inputs admission rule 5 keys on.
+    auto newcomer = std::make_shared<FakeConnection>();
+    newcomer->set_noise_handshake_result("old-playback-server", PskCategory::SENTINEL,
+                                         /*psk_id=*/"");
+    newcomer->apply_server_activate({}, std::nullopt, std::nullopt, std::nullopt);
+
+    EXPECT_FALSE(this->would_switch_to(current, newcomer.get(), "old-playback-server"))
+        << "a rank-0 peer must not displace a just-paired rank-1 connection; suppressing the "
+           "in-flight-pairing shield must not also drop the incumbent's rank";
+
+    // The shield really is suppressed though: a rank-2 playback peer now wins, which is the
+    // whole point of the fix.
+    auto playback = std::make_shared<FakeConnection>();
+    playback->set_noise_handshake_result("playback-server", PskCategory::SENTINEL, /*psk_id=*/"");
+    playback->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
+                                    std::nullopt);
+    EXPECT_TRUE(this->would_switch_to(current, playback.get(), "old-playback-server"))
+        << "a finalized pairing must stop blocking a higher-ranked incoming connection";
 }

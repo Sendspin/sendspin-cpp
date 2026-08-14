@@ -1603,6 +1603,15 @@ bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* cu
     // Ports admission.h::should_admit_connection (activity-priority arbitration). `current` may
     // be null (nothing admitted yet); the pure function's has_admitted=false path always admits.
     const bool has_current = current != nullptr;
+    // An incumbent whose pair-finalize has already been acked still reports the pre-finalize
+    // [PAIRING] activities (only apply_server_activate rewrites them, and the post-rekey activate
+    // has not arrived), so admission.h rule 2 -- "an in-flight pairing is NOT displaced" -- would
+    // keep shielding a pairing that already completed. Tell the rule the pairing is no longer in
+    // flight instead of rewriting the activities: the rank comparisons must keep seeing rank 1,
+    // because dropping the incumbent to rank 0 would expose it to rule 5's last_playback
+    // tiebreak, letting a rank-0 newcomer evict a just-paired connection mid-rekey -- an outcome
+    // that was impossible before and is not one this fix intends.
+    const bool pairing_in_flight = !has_current || !current->is_pairing_finalized();
     return should_admit_connection(
         /*incoming_activities=*/new_conn->get_activities(),
         /*incoming_server_id=*/new_conn->get_server_id(),
@@ -1611,7 +1620,8 @@ bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* cu
         /*admitted_server_id=*/has_current ? current->get_server_id() : std::string{},
         /*has_admitted=*/has_current,
         /*last_playback_server_id=*/this->last_played_server_id_,
-        /*has_last_playback=*/this->has_last_played_server_);
+        /*has_last_playback=*/this->has_last_played_server_,
+        /*admitted_pairing_in_flight=*/pairing_in_flight);
 }
 
 void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {

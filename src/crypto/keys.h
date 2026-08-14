@@ -65,6 +65,23 @@ struct Identity {
     std::array<uint8_t, X25519_KEY_SIZE> private_bytes{};
     std::array<uint8_t, X25519_KEY_SIZE> public_bytes{};
 
+    /// @brief Wipes `private_bytes` on destruction (see secure_zero in platform/crypto.h).
+    ///
+    /// This is the same discipline ~CPace() applies to its ephemeral secrets. It bounds how long
+    /// a *stale* copy of the long-term key outlives its use -- the temporaries that
+    /// load_or_generate_identity() creates while rehydrating the key, and any copy taken by a
+    /// future caller. It does NOT protect the live key: the `identity_` the client owns must stay
+    /// readable for the whole process lifetime because every Noise handshake dereferences it, and
+    /// the same 32 bytes are persisted unencrypted under persistence_keys::KEYPAIR. An attacker
+    /// who can already read RAM or flash is not shut out by this; it only removes the needless
+    /// extra copies.
+    ///
+    /// Only the destructor is user-declared, deliberately: declaring any constructor would make
+    /// Identity a non-aggregate under C++20 and break `Identity{}` value-init at its call sites.
+    /// The cost is that the implicit move operations are suppressed, so moves degrade to copies
+    /// -- harmless for a 64-byte struct, and every such copy now wipes itself.
+    ~Identity();
+
     /// @brief The base64url-encoded public key (Sendspin client_id / server_id).
     [[nodiscard]] std::string peer_id() const;
 

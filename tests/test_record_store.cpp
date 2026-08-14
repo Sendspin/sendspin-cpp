@@ -48,6 +48,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -209,8 +211,9 @@ TEST(RecordStore, FirstBootProvisioningSurvivesPersistenceFailureForThisBoot) {
     AlwaysRejectingProvider provider;
     RecordStore store(&provider);
 
-    EXPECT_GE(provider.record_save_attempts, 1)
-        << "the shared-PSK fallback record write must have been attempted";
+    EXPECT_EQ(provider.record_save_attempts, 0)
+        << "provisioning writes the config first and skips the record write when that is "
+           "refused: a persisted record the config cannot reference is the orphan case";
     EXPECT_GE(provider.psk_save_attempts, 1) << "the Pairing PSK write must have been attempted";
 
     // Despite every write being rejected, the device remains usable for this boot: both the
@@ -1729,4 +1732,201 @@ TEST(PlayerRoleStaticDelay, InvalidPersistedValueIsTreatedAsAbsent) {
     EXPECT_EQ(player.get_static_delay_ms(), 77u)
         << "an unparseable static_delay blob must be treated as absent, falling back to "
            "initial_static_delay_ms";
+}
+
+// ============================================================================
+// Regression tests for the 2026-08-14 review fixes
+// ============================================================================
+
+namespace {
+
+/// @brief Blob store that records the ORDER in which keys were written, which
+/// InMemoryPersistenceProvider (a count-only fake) cannot express. Only the provisioning-order
+/// test needs this, so it stays local per the file's bespoke-fake convention above.
+class OrderRecordingProvider : public SendspinPersistenceProvider {
+public:
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        auto it = this->blobs_.find(key);
+        if (it == this->blobs_.end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        this->save_order.push_back(key);
+        this->blobs_[key] = std::vector<uint8_t>(data, data + len);
+        return true;
+    }
+
+    bool erase_blob(const std::string& key) override {
+        this->blobs_.erase(key);
+        return true;
+    }
+
+    /// @return Index of the first save of `key` in save_order, or -1 if never saved.
+    [[nodiscard]] int first_save_index(const std::string& key) const {
+        for (size_t i = 0; i < this->save_order.size(); ++i) {
+            if (this->save_order[i] == key) {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    std::vector<std::string> save_order;
+
+private:
+    std::map<std::string, std::vector<uint8_t>> blobs_;
+};
+
+}  // namespace
+
+// First-boot provisioning writes PAIR_CONFIG and RECORDS as two separate, non-atomic provider
+// calls. The order decides what an interrupted provisioning leaves behind, so pin it: config
+// first means the survivable state is "config names a record RECORDS never got", which the
+// constructor's third guard clause detects and regenerates from. The reverse order would leave a
+// stored record no config references, which re-provisioning APPENDS to rather than reusing.
+TEST(RecordStore, FirstBootProvisioningWritesConfigBeforeRecords) {
+    OrderRecordingProvider provider;
+    RecordStore store(&provider);
+
+    const int config_idx = provider.first_save_index(persistence_keys::PAIR_CONFIG);
+    const int records_idx = provider.first_save_index(persistence_keys::RECORDS);
+    ASSERT_GE(config_idx, 0) << "provisioning must persist the pairing config";
+    ASSERT_GE(records_idx, 0) << "provisioning must persist the records";
+    EXPECT_LT(config_idx, records_idx)
+        << "pair_config must be written before records so an interrupted provisioning is "
+           "self-healing rather than orphan-producing";
+}
+
+// The crash-between-writes state under the fixed order is "PAIR_CONFIG durable, RECORDS not".
+// Rejecting the RECORDS key reproduces exactly that persisted state. A second store built on it
+// must regenerate a single fallback record, never accumulate a second one alongside an orphan.
+TEST(RecordStore, InterruptedProvisioningDoesNotAccumulateOrphanRecords) {
+    InMemoryPersistenceProvider provider;
+    provider.reject_save_keys.insert(persistence_keys::RECORDS);
+
+    std::string first_psk_id;
+    {
+        RecordStore interrupted(&provider);
+        first_psk_id = interrupted.record_mode_psk_id();
+        ASSERT_FALSE(first_psk_id.empty());
+    }
+    ASSERT_FALSE(provider.blob(persistence_keys::RECORDS).has_value())
+        << "the RECORDS write was supposed to be rejected";
+    ASSERT_TRUE(provider.blob(persistence_keys::PAIR_CONFIG).has_value())
+        << "the PAIR_CONFIG write should have landed before it";
+
+    // Reboot with a healthy provider.
+    provider.reject_save_keys.clear();
+    RecordStore rebooted(&provider);
+
+    EXPECT_EQ(rebooted.records_snapshot().size(), 1u)
+        << "the interrupted boot must not leave an unreferenced record behind";
+    const auto* rec = rebooted.record_by_psk_id(rebooted.record_mode_psk_id());
+    ASSERT_NE(rec, nullptr) << "the surviving record must be the one record_mode points at";
+    EXPECT_FALSE(rec->server_id.has_value());
+}
+
+// A STATIC_PIN blob that is not 8 decimal digits is rejected at load, exactly as RECORDS and
+// PAIRING_PSK are rejected by their decoders. Accepting it would leave the device advertising
+// static_pin while feeding garbage PRS bytes to the PAKE.
+TEST(RecordStore, RejectsMalformedStoredStaticPin) {
+    for (const std::string& bad : {std::string("abcdefgh"), std::string("1234"),
+                                   std::string("123456789"), std::string("1234567x")}) {
+        InMemoryPersistenceProvider provider;
+        provider.seed_blob(persistence_keys::STATIC_PIN, to_bytes(bad));
+        RecordStore store(&provider);
+        EXPECT_FALSE(store.static_pin().has_value())
+            << "stored static PIN '" << bad << "' should have been rejected at load";
+    }
+}
+
+TEST(RecordStore, AcceptsValidStoredStaticPin) {
+    InMemoryPersistenceProvider provider;
+    provider.seed_blob(persistence_keys::STATIC_PIN, to_bytes("12345678"));
+    RecordStore store(&provider);
+    ASSERT_TRUE(store.static_pin().has_value());
+    EXPECT_EQ(store.static_pin().value(), "12345678");
+}
+
+// A corrupt PAIR_CONFIG could otherwise seed the failure counter at INT_MAX, where the next
+// increment is signed overflow (UB). Clamped on load and saturating on increment, neither the
+// stored value nor any number of failures can push it out of range.
+TEST(RecordStore, ClampsCorruptDynamicPinFailureCounter) {
+    InMemoryPersistenceProvider provider;
+    SendspinPairingConfig cfg;
+    cfg.dynamic_pin_failures = std::numeric_limits<int>::max();
+    provider.seed_blob(persistence_keys::PAIR_CONFIG, to_bytes(encode_pairing_config(cfg)));
+
+    RecordStore store(&provider);
+    EXPECT_TRUE(store.dynamic_pin_escalated())
+        << "a stored count above the threshold still means escalated";
+
+    // The increment must not overflow: it saturates instead.
+    for (int i = 0; i < 5; ++i) {
+        store.record_dynamic_pin_failure();
+    }
+    EXPECT_TRUE(store.dynamic_pin_escalated());
+
+    store.reset_dynamic_pin_failures();
+    EXPECT_FALSE(store.dynamic_pin_escalated()) << "reset must still clear escalation";
+}
+
+// A negative stored count would read as "not escalated" and silently undo the durability
+// guarantee record_dynamic_pin_failure() documents. Clamp it up to zero.
+TEST(RecordStore, ClampsNegativeStoredDynamicPinFailureCounter) {
+    InMemoryPersistenceProvider provider;
+    SendspinPairingConfig cfg;
+    cfg.dynamic_pin_failures = -5;
+    provider.seed_blob(persistence_keys::PAIR_CONFIG, to_bytes(encode_pairing_config(cfg)));
+
+    RecordStore store(&provider);
+    EXPECT_FALSE(store.dynamic_pin_escalated());
+
+    // From a clamped 0, exactly threshold failures must escalate -- a negative start would have
+    // required far more.
+    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
+        store.record_dynamic_pin_failure();
+    }
+    EXPECT_TRUE(store.dynamic_pin_escalated());
+}
+
+// connect_to() before a successful start_server() must be refused, not allowed to build a
+// connection that dereferences the null identity_ once its WebSocket upgrade completes.
+TEST(SendspinClientIdentity, ConnectToBeforeStartServerIsRefused) {
+    SendspinClientConfig config;
+    config.name = "connect-before-start";
+    SendspinClient client(std::move(config));
+
+    EXPECT_TRUE(client.client_id().empty()) << "no identity exists before start_server()";
+    client.connect_to("ws://192.0.2.1:8927/sendspin");
+    client.loop();  // must not fault on a null identity_
+
+    EXPECT_FALSE(client.is_connected())
+        << "connect_to() before start_server() must not produce a live connection";
+}
+
+// Ordering makes a crash between the two provisioning writes self-healing, but a provider that
+// rejects PAIR_CONFIG while accepting RECORDS would reach the same orphaned state by another
+// route. The record write is skipped when the config write is refused, so the next boot is a
+// clean first boot rather than a re-provisioning one that appends alongside an orphan.
+TEST(RecordStore, ProvisioningSkipsTheRecordWriteWhenTheConfigWriteIsRejected) {
+    InMemoryPersistenceProvider provider;
+    provider.reject_save_keys.insert(persistence_keys::PAIR_CONFIG);
+
+    {
+        RecordStore refused(&provider);
+        EXPECT_FALSE(refused.record_mode_psk_id().empty())
+            << "the store still works in RAM for this boot";
+    }
+    EXPECT_FALSE(provider.blob(persistence_keys::RECORDS).has_value())
+        << "no record may be persisted that the config cannot reference";
+
+    // Reboot with a healthy provider: a clean first boot, exactly one record.
+    provider.reject_save_keys.clear();
+    RecordStore rebooted(&provider);
+    EXPECT_EQ(rebooted.records_snapshot().size(), 1u);
+    EXPECT_NE(rebooted.record_by_psk_id(rebooted.record_mode_psk_id()), nullptr);
 }

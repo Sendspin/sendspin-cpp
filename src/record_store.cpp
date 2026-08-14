@@ -16,12 +16,15 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "crypto/pin.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
 #include "sendspin/persistence_codec.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -80,8 +83,22 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
         }
 
         if (auto pin_blob = this->provider_->load_blob(persistence_keys::STATIC_PIN)) {
-            this->static_pin_ =
-                std::string(reinterpret_cast<const char*>(pin_blob->data()), pin_blob->size());
+            std::string loaded_pin(reinterpret_cast<const char*>(pin_blob->data()),
+                                   pin_blob->size());
+            // Validate on load, the same way RECORDS and PAIRING_PSK are validated by their
+            // decoders. The write path (management/set-pairing-config) already checks this, so a
+            // value that fails here came from provider corruption or out-of-band provisioning.
+            // Accepting it would leave the device advertising static_pin while feeding malformed
+            // PRS bytes to the PAKE, which can only ever produce pin_mismatch -- a pairing that
+            // deterministically fails with nothing in the logs pointing at storage.
+            if (is_valid_static_pin(loaded_pin)) {
+                this->static_pin_ = std::move(loaded_pin);
+            } else {
+                SS_LOGW(TAG,
+                        "Stored \"%s\" blob is not a valid static PIN (%zu bytes); ignoring it, "
+                        "so static_pin pairing stays unavailable until one is set again",
+                        persistence_keys::STATIC_PIN, loaded_pin.size());
+            }
         }
 
         if (auto config_blob = this->provider_->load_blob(persistence_keys::PAIR_CONFIG)) {
@@ -94,7 +111,15 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                 this->dynamic_pin_enabled_ = config->dynamic_pin_enabled;
                 this->static_pin_enabled_ = config->static_pin_enabled;
                 this->dynamic_pin_min_length_ = config->dynamic_pin_min_length;
-                this->dynamic_pin_failures_ = config->dynamic_pin_failures;
+                // Clamp the failure counter into its meaningful range instead of trusting the
+                // blob. Only the >= threshold predicate consumes this value, so saturating at
+                // the threshold is lossless, and it makes record_dynamic_pin_failure()'s
+                // increment unable to overflow (signed overflow is UB) no matter what a corrupt
+                // or hand-edited blob supplies -- including a negative value, which would
+                // otherwise read as "not escalated" and undo the durability guarantee that
+                // function documents.
+                this->dynamic_pin_failures_ =
+                    std::clamp(config->dynamic_pin_failures, 0, DYNAMIC_PIN_ESCALATION_THRESHOLD);
                 this->record_mode_psk_id_ = config->record_mode_psk_id;
                 loaded_config = true;
                 SS_LOGD(TAG, "Loaded pairing config: record_mode_psk_id=%s",
@@ -164,16 +189,32 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
         this->records_.push_back(shared_record);
         this->record_mode_psk_id_ = shared_psk_id;
 
-        // Persist the new record and config. A rejected write leaves the record RAM-only for
-        // this boot: the device stays usable (pairing_token() etc. still work against the
-        // in-memory record), but the record will be regenerated on the next reboot, so any
-        // token printed before persistence is fixed would silently stop working. Surface that
-        // instead of logging success unconditionally. No lock needed here: the constructor runs
-        // before this object is reachable by any other thread.
-        bool record_persisted = this->persist_records_locked();
-        if (this->provider_ != nullptr) {
-            this->persist_config();
-        }
+        // Persist the config BEFORE the record, not after. These are two independent provider
+        // writes (PAIR_CONFIG and RECORDS) with no atomicity between them -- the in-tree
+        // reference provider does a full fsync+rename per save_blob() -- so a power loss can
+        // land between them, and the ORDER decides whether that is self-healing:
+        //
+        //   config first (this order): the interrupted state is a config naming a record that
+        //     RECORDS never received. Next boot takes the third clause of the guard above
+        //     (record_by_psk_id(record_mode_psk_id_) == nullptr), regenerates, and overwrites
+        //     both keys. Nothing is left behind.
+        //   record first (the reverse): the interrupted state is a stored record that no config
+        //     references. Next boot sees !loaded_config, re-enters, and APPENDS a second record
+        //     while the first stays in records_ -- still resolvable by resolve_by_psk_id() but
+        //     unreferenced. Every repeat of that crash window adds another orphan.
+        //
+        // Ordering alone only covers a crash. A provider that REJECTS the config write while
+        // accepting the record write would reach the same orphaned state by a different route,
+        // so skip the record write when the config write was refused: leaving neither key
+        // written keeps the next boot a clean first boot instead of a re-provisioning one.
+        //
+        // A rejected write leaves the record RAM-only for this boot: the device stays usable
+        // (pairing_token() etc. still work against the in-memory record), but the record will be
+        // regenerated on the next reboot, so any token printed before persistence is fixed would
+        // silently stop working. Surface that instead of logging success unconditionally. No lock
+        // needed here: the constructor runs before this object is reachable by any other thread.
+        const bool config_persisted = this->persist_config();
+        const bool record_persisted = config_persisted && this->persist_records_locked();
 
         if (record_persisted) {
             SS_LOGI(TAG, "Provisioned shared-PSK fallback record: %s", shared_psk_id.c_str());
@@ -470,6 +511,14 @@ bool RecordStore::set_record_mode_psk_id(const std::string& psk_id) {
 }
 
 void RecordStore::set_pairing_psk_enabled(bool enabled) {
+    // Locked, unlike the other config setters: resolve_by_psk_id() reads this field on the
+    // NETWORK thread inside its own mutex_ section (see the thread-safety note on the class).
+    // Holding mutex_ across persist_config() is safe on both counts that matter: it does not
+    // take mutex_ itself, so there is no recursive acquisition inside this class; and it reaches
+    // the consumer's provider, which SendspinPersistenceProvider's documented re-entrancy
+    // contract forbids from calling back into the library (that contract cites this exact
+    // pattern -- set_pairing_psk() has always held mutex_ across its own save_blob()).
+    std::lock_guard<std::mutex> lock(this->mutex_);
     this->pairing_psk_enabled_ = enabled;
     this->persist_config();
 }
@@ -517,7 +566,12 @@ void RecordStore::record_dynamic_pin_failure() {
     // per-guess cost by a small bounded factor; it does not turn the PIN into a cheap oracle.
     const bool was_escalated = this->dynamic_pin_escalated();
     const bool first_failure_since_reset = (this->dynamic_pin_failures_ == 0);
-    this->dynamic_pin_failures_++;
+    // Saturate at the threshold rather than incrementing without bound: nothing reads the count
+    // above it (dynamic_pin_escalated() is the only consumer, plus the log line below), and an
+    // unbounded ++ on a signed int is UB once it reaches INT_MAX.
+    if (this->dynamic_pin_failures_ < DYNAMIC_PIN_ESCALATION_THRESHOLD) {
+        this->dynamic_pin_failures_++;
+    }
     SS_LOGW(TAG, "Dynamic-PIN failure recorded (count=%d, escalation threshold=%d)",
             this->dynamic_pin_failures_, DYNAMIC_PIN_ESCALATION_THRESHOLD);
 
@@ -602,9 +656,9 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
 // Private helpers
 // ============================================================================
 
-void RecordStore::persist_config() {
+bool RecordStore::persist_config() {
     if (this->provider_ == nullptr) {
-        return;
+        return true;
     }
     SendspinPairingConfig config;
     config.pairing_psk_enabled = this->pairing_psk_enabled_;
@@ -622,7 +676,9 @@ void RecordStore::persist_config() {
                 "Provider rejected pairing config write (record_mode_psk_id=%s); the change is "
                 "RAM-only for this boot and will not survive a reboot",
                 config.record_mode_psk_id.c_str());
+        return false;
     }
+    return true;
 }
 
 // ============================================================================

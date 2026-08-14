@@ -678,8 +678,14 @@ private:
     /// rejects it with concurrent_attempt if arbitration favors the incumbent.
     ///
     /// Erases the entry from the nursery unconditionally (it never returns to the nursery).
-    /// Calls should_switch_to_new_server() when a current connection already exists; both sides
-    /// of that comparison are always operational, so arbitration never runs on partial data.
+    /// Calls should_switch_to_new_server() when a current connection already exists. The incoming
+    /// side is always operational. The incumbent normally is too, with one documented exception:
+    /// the re-proving window (see the class-level note above), during which it has been rewound
+    /// by an in-band re-handshake or a pair-finalize ack. Its activities stay valid across a
+    /// routine rekey, so arbitration on them is still correct there; the pair-finalize case is
+    /// the one where they go stale, and should_switch_to_new_server() answers it by telling
+    /// admission.h that the pairing is no longer in flight (suppressing its not-displaced rule)
+    /// while leaving the activities themselves, and therefore every rank comparison, intact.
     /// On the winning outcome (promotion, whether or not it displaced an incumbent), notifies the
     /// client, publishes state, and records playback activity. Caller must hold conn_ptr_mutex_.
     /// @param it Valid iterator into nursery_ whose connection satisfies is_operational().

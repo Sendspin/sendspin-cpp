@@ -55,6 +55,9 @@ std::optional<std::array<uint8_t, WRAPPED_PSK_SIZE>> wrap_psk(
     }
     auto ct =
         aead_oneshot_encrypt(cipher_name, k_wrap->data(), k_wrap->size(), psk.data(), psk.size());
+    // K_wrap has done its job. Wiped here, before the branches, so every exit path below is
+    // covered by the one call. The ciphertext it produced is not secret.
+    secure_zero_container(k_wrap.value());
     if (!ct.has_value() || ct->size() != WRAPPED_PSK_SIZE) {
         return std::nullopt;
     }
@@ -76,11 +79,15 @@ std::optional<std::array<uint8_t, 32>> unwrap_psk(
     }
     auto pt = aead_oneshot_decrypt(cipher_name, k_wrap->data(), k_wrap->size(), wrapped.data(),
                                    wrapped.size());
+    secure_zero_container(k_wrap.value());
     if (!pt.has_value() || pt->size() != 32) {
         return std::nullopt;
     }
     std::array<uint8_t, 32> out{};
     std::memcpy(out.data(), pt->data(), 32);
+    // `pt` holds the recovered PSK; the caller gets its own copy in `out`, so wipe this one.
+    // The caller owns wiping `out` once it has stored the PSK.
+    secure_zero_container(pt.value());
     return out;
 }
 

@@ -408,3 +408,38 @@ TEST(ShouldAdmit, ManagementDisplacesPlayback) {
     // incoming=management(3), admitted=playback(2) -> admit
     EXPECT_TRUE(admit(acts(MG), "new", acts(PB), "old", true));
 }
+
+// ============================================================================
+// Post-finalize pairing: rule 2 stops shielding, ranks stay intact
+// ============================================================================
+
+// Once server/pair-finalize is acked the pairing is complete, but the admitted connection keeps
+// declaring PAIRING until its post-rekey activate lands. Rule 2 must stop protecting it then, or
+// a legitimate higher-ranked reconnect is rejected for the whole re-proving window.
+TEST(ShouldAdmitConnection, FinalizedPairingNoLongerBlocksHigherRankedIncoming) {
+    const std::vector<SendspinActivity> incoming{SendspinActivity::PLAYBACK};  // rank 2
+    const std::vector<SendspinActivity> admitted{SendspinActivity::PAIRING};   // rank 1
+
+    EXPECT_FALSE(should_admit_connection(incoming, "server-new", admitted, "server-pairing", true,
+                                         "", false, /*admitted_pairing_in_flight=*/true))
+        << "a pairing still in flight must not be displaced";
+    EXPECT_TRUE(should_admit_connection(incoming, "server-new", admitted, "server-pairing", true,
+                                        "", false, /*admitted_pairing_in_flight=*/false))
+        << "a pairing that already finalized must not keep blocking a rank-2 incoming";
+}
+
+// Regression guard: suppressing rule 2 must NOT drop the admitted side to rank 0. An earlier
+// version of this fix substituted an empty activity set, which let rule 5's last_playback
+// tiebreak admit a rank-0 newcomer over a just-paired connection -- an eviction that was
+// impossible before the fix and is not one it intends.
+TEST(ShouldAdmitConnection, FinalizedPairingIsNotEvictedByRankZeroLastPlaybackPeer) {
+    const std::vector<SendspinActivity> incoming{};                           // rank 0
+    const std::vector<SendspinActivity> admitted{SendspinActivity::PAIRING};  // rank 1
+
+    // "server-old" is the last playback server, which is exactly the input rule 5 keys on.
+    EXPECT_FALSE(should_admit_connection(incoming, "server-old", admitted, "server-paired", true,
+                                         "server-old", true,
+                                         /*admitted_pairing_in_flight=*/false))
+        << "a rank-0 peer must not displace a rank-1 connection, finalized or not: rank still "
+           "decides, and rule 5 applies only when BOTH sides are rank 0";
+}

@@ -71,6 +71,11 @@ std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
 // Identity
 // ============================================================================
 
+Identity::~Identity() {
+    // public_bytes is not secret and is deliberately left alone.
+    secure_zero(this->private_bytes.data(), this->private_bytes.size());
+}
+
 std::string Identity::peer_id() const {
     return b64url_encode(this->public_bytes.data(), this->public_bytes.size());
 }
