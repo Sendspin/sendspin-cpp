@@ -1206,7 +1206,6 @@ Reported via `SendspinClientListener::on_trust_changed` once per admitted connec
 |---|---|
 | `ATTEMPT_TIMEOUT` | Pairing timed out waiting for the next step |
 | `CONCURRENT_ATTEMPT` | The server rejected pairing because another pairing is in progress |
-| `LOCKED_OUT` | Too many failed pairing attempts |
 | `METHOD_NOT_SUPPORTED` | The proposed pairing method is not supported by the client |
 | `PIN_LENGTH_UNACCEPTABLE` | The PIN length requirement is out of the accepted range |
 | `PIN_MISMATCH` | The PIN entered does not match |

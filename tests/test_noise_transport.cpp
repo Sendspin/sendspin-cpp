@@ -1094,6 +1094,80 @@ TEST(NoiseTransportDispatch, BenignMidReassemblyDoesNotClose) {
         << "a benign mid-reassembly frame must not close the connection";
 }
 
+TEST(NoiseTransportDispatch, ReassemblyOverCapDropsWithoutClosing) {
+    // A fragmented message whose reassembled size would exceed MAX_REASSEMBLED_MESSAGE_BYTES
+    // must be dropped (reassembly reset) without closing the connection: exceeding the cap is
+    // not itself a malformed sequence (a legitimate peer could simply be sending an oversized
+    // image), so accept_plaintext() leaves msg.malformed false and the connection stays open.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+
+    TestConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    int dispatched = 0;
+    conn.on_json_message_cb = [&dispatched](SendspinConnection* /*c*/, const char* /*d*/,
+                                             size_t /*l*/, int64_t /*t*/) { ++dispatched; };
+
+    // Encrypts one fragment frame ([type_byte][body]) with the initiator send cipher and
+    // injects it into the connection as if it had just arrived off the wire.
+    auto send_fragment = [&](uint8_t type_byte, const std::vector<uint8_t>& body) {
+        std::vector<uint8_t> plaintext;
+        plaintext.reserve(1 + body.size());
+        plaintext.push_back(type_byte);
+        plaintext.insert(plaintext.end(), body.begin(), body.end());
+        std::vector<uint8_t> ct(plaintext.size() + 16);
+        std::copy(plaintext.begin(), plaintext.end(), ct.begin());
+        NoiseBuffer buf;
+        noise_buffer_set_inout(buf, ct.data(), plaintext.size(), ct.size());
+        ASSERT_EQ(noise_cipherstate_encrypt(r->initiator.send_cs, &buf), NOISE_ERROR_NONE);
+        ct.resize(buf.size);
+        conn.inject_binary_payload(ct.data(), ct.size());
+    };
+
+    // Fills a fresh reassembly to just under the cap: a FRAGMENT_MORE start frame, then
+    // continuation frames at the largest size a single Noise frame allows
+    // (MAX_TRANSPORT_PLAINTEXT bytes of plaintext, one of which is the type byte) while the
+    // next one still fits under the cap.
+    const size_t chunk = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) - 1;
+    auto fill_to_just_under_cap = [&] {
+        // FRAGMENT_MORE start: [orig_type=0x00, 1 data byte] -> reasm_len_ starts at 2.
+        send_fragment(MSG_TYPE_FRAGMENT_MORE, {MSG_TYPE_JSON_BODY, 0xAA});
+        size_t reasm_len = 2;
+        while (reasm_len - 1 + chunk <= MAX_REASSEMBLED_MESSAGE_BYTES) {
+            send_fragment(MSG_TYPE_FRAGMENT_MORE, std::vector<uint8_t>(chunk, 'X'));
+            reasm_len += chunk;
+        }
+    };
+
+    // A FRAGMENT_MORE continuation frame pushes the total past the cap.
+    fill_to_just_under_cap();
+    send_fragment(MSG_TYPE_FRAGMENT_MORE, std::vector<uint8_t>(chunk, 'X'));
+
+    EXPECT_EQ(dispatched, 0) << "over-cap reassembly must not dispatch a complete message";
+    EXPECT_EQ(conn.close_transport_now_calls_, 0)
+        << "exceeding the reassembly cap drops the message but must not close the connection";
+    EXPECT_TRUE(conn.disconnect_calls_.empty());
+
+    // The dropped reassembly must not wedge the connection: a fresh, ordinary message still
+    // dispatches normally afterward.
+    send_fragment(MSG_TYPE_JSON_BODY, {'{', '}'});
+    EXPECT_EQ(dispatched, 1) << "connection must still be usable after the drop";
+
+    // The FRAGMENT_END branch carries its own copy of the over-cap check: a final frame that
+    // pushes the total past the cap must also drop without closing.
+    fill_to_just_under_cap();
+    send_fragment(MSG_TYPE_FRAGMENT_END, std::vector<uint8_t>(chunk, 'X'));
+
+    EXPECT_EQ(dispatched, 1) << "over-cap fragment-end must not dispatch a complete message";
+    EXPECT_EQ(conn.close_transport_now_calls_, 0)
+        << "exceeding the reassembly cap on fragment-end must not close the connection";
+    EXPECT_TRUE(conn.disconnect_calls_.empty());
+
+    send_fragment(MSG_TYPE_JSON_BODY, {'{', '}'});
+    EXPECT_EQ(dispatched, 2) << "connection must still be usable after the fragment-end drop";
+}
+
 TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
     // FINDING 12: a fatal initial-handshake error (here: an unresolvable psk_id in msg1) must
     // close the connection. This drives the full chain through dispatch_completed_message() ->

@@ -29,6 +29,7 @@ files:
     - ".markdownlint.yaml"
     - ".pre-commit-config.yaml"
     - "examples/**"
-    - "test/**"
+    - "tests/**"
     - "script/**"
     - "CLAUDE.md"
+    - "docs/encryption-plan.md"
