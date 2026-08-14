@@ -460,21 +460,21 @@ The Noise KKpsk2 handshake requires a pre-shared key (PSK). The server embeds a 
 
 The resolved `PskCategory` is stored on the connection and determines the trust level reported in `client/hello` (`trust_level="user"` for `LONG_TERM`, `"none"` otherwise) and the `ConnectionTrust` value delivered to `SendspinClientListener::on_trust_changed`.
 
-### Two-Handshake PSK Trick (`src/noise_handshake.cpp`)
+### Deferred PSK Binding (`src/noise_handshake.cpp`)
 
-In KKpsk2 the PSK is mixed only into msg2, so msg1 can be read with the static keys alone. But noise-c requires a PSK to be set before the handshake starts, and the client does not know which PSK applies until it reads the `psk_id` carried in msg1. The library resolves this with a two-step read:
+In KKpsk2 the PSK is mixed only into msg2, so msg1 can be read with the static keys alone (KK's `es`/`ss` tokens). The client does not know which PSK applies until it reads the `psk_id` carried in msg1's payload, so it cannot supply the real PSK up front. noise-c allows `noise_handshakestate_set_pre_shared_key()` to be called at any point before the "psk" token is processed, so a single responder session handles the whole exchange:
 
-1. Build a probe responder with a zero placeholder PSK and read msg1. msg1 is PSK-independent, so this succeeds and exposes the `psk_id` in its payload.
-2. Discard the probe. Resolve the `psk_id` to the real PSK via `RecordStore`, build a fresh responder with that PSK, and re-read the same msg1 bytes.
+1. Build a responder with no PSK bound and read msg1 through it. This succeeds and exposes the `psk_id` in the decrypted payload.
+2. Resolve the `psk_id` to the real PSK via `RecordStore` and bind it onto the SAME responder (`NoiseSession::set_psk`).
 3. Write msg2 and split into transport keys.
 
-The in-band re-handshake below uses the same probe-then-real sequence.
+The in-band re-handshake below uses the same deferred-binding sequence.
 
 ### In-Band Re-Handshake (Key Rotation)
 
 After transport is active, the server may initiate a new KKpsk2 handshake to rotate session keys or move an admitted connection onto a different PSK (e.g. the post-pairing rekey below). The server sends a `noise/handshake` JSON envelope (decrypted through the active transport). `SendspinConnection::handle_noise_rehandshake()`:
 
-1. Runs the probe-then-real msg1 read with the re-handshake PSK.
+1. Runs the deferred-PSK-binding msg1 read with the re-handshake PSK.
 2. Builds msg2 and encrypts it under the old session.
 3. Atomically swaps the active `NoiseSession` under a per-connection mutex (`session_mutex_` in `NoiseTransport`).
 4. Resets `first_activate_received_` / `server_hello_received_` / `client_hello_sent_`, so the connection goes momentarily non-operational and `ConnectionManager::schedule_rehandshake_rearm()` re-arms `client/hello` for it on the main loop -- without that re-arm the connection would stay non-operational forever after the swap (see the hello re-arm scan in `loop()`).

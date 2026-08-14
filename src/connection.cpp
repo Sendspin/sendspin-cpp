@@ -211,7 +211,7 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     // server/hello -> client/hello -> server/activate cycle does not complete in time.
     this->set_provisional_time_us(platform_time_us());
 
-    // Run the two-handshake PSK trick with prologue = the prior handshake hash h.
+    // Run the deferred-PSK-binding msg1 read with prologue = the prior handshake hash h.
     auto prior_h = this->noise_transport_.handshake_hash();
     if (!prior_h.has_value()) {
         SS_LOGE(TAG, "handle_noise_rehandshake: no handshake hash available");

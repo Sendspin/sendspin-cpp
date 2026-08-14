@@ -14,7 +14,7 @@
 
 // Noise transport KATs: in-process loopback tests exercising:
 //   - NoiseHandshake state machine (Sendspin client = Noise responder)
-//   - NoiseSession (two-handshake trick for PSK-after-start)
+//   - NoiseSession (deferred PSK binding: msg1 read before the PSK is known)
 //   - SendspinConnection transport helpers (encrypt/fragment/dispatch)
 //
 // The "server" side uses raw noise-c as the Noise initiator.

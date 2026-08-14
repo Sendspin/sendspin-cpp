@@ -17,19 +17,18 @@
 ///
 /// Mirrors `aiosendspin/noise/session.py` (`NoiseSession`).
 ///
-/// Key design choice: the two-handshake trick for PSK-after-start.
+/// Key design choice: deferred PSK binding.
 /// In KKpsk2 the PSK is mixed only during msg2, so msg1 (which carries
-/// the encrypted psk_id) is decryptable with static keys alone.  However,
-/// noise-c requires the PSK to be supplied before `noise_handshakestate_start`.
-/// We handle this with a throwaway handshake:
-///   1. Build a "probe" handshakestate with a zero placeholder PSK.
-///   2. Read msg1 through the probe to extract the psk_id.
-///   3. Discard the probe.
-///   4. Build the real handshakestate with the resolved PSK.
-///   5. Read the SAME msg1 bytes through the real handshakestate.
-///   6. Write msg2 and call split().
+/// the encrypted psk_id) is decryptable with static keys alone, and the "psk"
+/// token is not processed until msg2 is written. noise-c allows
+/// `noise_handshakestate_set_pre_shared_key` to be called at any point before
+/// that token is reached, including after `noise_handshakestate_start` and
+/// after reading msg1. A single responder session is therefore built without
+/// (or with a not-yet-final) PSK, reads msg1 to expose the psk_id, and only
+/// then binds the real PSK via `set_psk` before writing msg2.
 ///
-/// See `NoiseSession::read_msg1` and `NoiseSession::write_msg2_and_split`.
+/// See `NoiseSession::read_msg1`, `NoiseSession::set_psk`, and
+/// `NoiseSession::write_msg2_and_split`.
 
 #pragma once
 
@@ -51,7 +50,8 @@ namespace sendspin {
 /// @brief Noise KKpsk2 session: handshake and transport state.
 ///
 /// Construct via the factory `NoiseSession::as_responder()`.
-/// Call `read_msg1()` then `write_msg2_and_split()` to complete the handshake.
+/// Call `read_msg1()`, then `set_psk()` (if the PSK was not supplied at
+/// construction), then `write_msg2_and_split()` to complete the handshake.
 /// After split(), use `encrypt()` / `decrypt()` for transport traffic.
 class NoiseSession {
 public:
@@ -69,19 +69,20 @@ public:
 
     /// @brief Build a KKpsk2 responder session (the Sendspin client role).
     ///
-    /// noise-c requires the PSK before `noise_handshakestate_start`, but the real PSK is
-    /// only known after `read_msg1` reveals the psk_id. The handshake driver
-    /// (noise_handshake.cpp run_msg1_core) therefore uses the two-session trick: a probe
-    /// session built with a zero placeholder PSK decrypts msg1 (psk2 mixes the PSK only
-    /// into msg2, so msg1 authenticates under static keys alone), then a second session
-    /// built with the resolved real PSK re-processes the same msg1 bytes and continues to
-    /// `write_msg2_and_split`.
+    /// The real PSK is only known after `read_msg1` reveals the psk_id carried in its
+    /// payload, so `psk` may be null here: noise-c permits
+    /// `noise_handshakestate_set_pre_shared_key` to be called at any point before the "psk"
+    /// token is processed, which for KKpsk2 happens in msg2. The handshake driver
+    /// (noise_handshake.cpp run_msg1_core) builds the session with `psk = nullptr`, calls
+    /// `read_msg1` to expose the psk_id (KK's "es"/"ss" msg1 tokens authenticate against the
+    /// static keys and do not involve the PSK), resolves the real PSK via the record store,
+    /// binds it with `set_psk`, and only then calls `write_msg2_and_split`.
     ///
     /// @param suite_name  Full Noise suite name (e.g. NOISE_SUITE_CHACHAPOLY).
     /// @param local_priv  32-byte X25519 private key.
     /// @param remote_pub  32-byte X25519 public key of the remote (server).
     /// @param prologue    Exact prologue bytes (init messages, or prior hash on re-handshake).
-    /// @param psk         32-byte PSK (zero placeholder for a probe session, or the real PSK).
+    /// @param psk         32-byte PSK, or nullptr to bind it later via `set_psk`.
     /// @return Session ready for `read_msg1`, or nullopt on error.
     static std::optional<NoiseSession> as_responder(const std::string& suite_name,
                                                     const uint8_t* local_priv,
@@ -98,6 +99,19 @@ public:
     /// @param msg1_len     Length of msg1_bytes.
     /// @return Decrypted payload, or empty vector on auth failure.
     std::vector<uint8_t> read_msg1(const uint8_t* msg1_bytes, size_t msg1_len);
+
+    /// @brief Bind (or rebind) the pre-shared key on this handshake state.
+    ///
+    /// Responder-only. Must be called before `write_msg2_and_split`, i.e. before the
+    /// "psk" token is processed -- for KKpsk2 that token is in msg2, so this may be
+    /// called any time after construction and up through immediately before
+    /// `write_msg2_and_split`, including after `read_msg1`. Calling it more than once
+    /// simply replaces the previously bound key.
+    ///
+    /// @param psk  32-byte PSK.
+    /// @return true on success, false if the handshake state is null/consumed or noise-c
+    ///         rejects the key.
+    bool set_psk(const uint8_t* psk);
 
     /// @brief Encrypt Noise message 2 (payload = `{}` UTF-8) and split into
     /// transport cipher states.

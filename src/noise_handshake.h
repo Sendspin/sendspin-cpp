@@ -21,19 +21,21 @@
 /// Protocol sequence (all pre-transport frames are WS TEXT):
 ///   1. Send  `client/init` (TEXT)
 ///   2. Recv  `server/init` (TEXT): prologue = bytes(client/init) || bytes(server/init)
-///   3. Recv  `noise/handshake` msg1 (TEXT): decrypt; extract psk_id
-///   4. Resolve psk_id via RecordStore
-///   5. Build real KKpsk2 responder with resolved PSK; re-read msg1
-///   6. Send  `noise/handshake` msg2 (TEXT): write msg2, split -> transport
+///   3. Recv  `noise/handshake` msg1 (TEXT): build a KKpsk2 responder with no PSK bound yet,
+///      read msg1 through it, extract psk_id from the decrypted payload
+///   4. Resolve psk_id via RecordStore; bind the resolved PSK onto the SAME responder
+///      (NoiseSession::set_psk) -- valid because KKpsk2 processes the "psk" token in msg2,
+///      not msg1
+///   5. Send  `noise/handshake` msg2 (TEXT): write msg2, split -> transport
 ///
-/// After step 6 the connection is in encrypted transport mode.
+/// After step 5 the connection is in encrypted transport mode.
 /// Any failure aborts silently (caller closes the WebSocket).
 ///
 /// Re-handshake (in-band key rotation):
 ///   The server may initiate a new KKpsk2 handshake after transport is active.
 ///   The re-handshake msg1 arrives as a decrypted noise/handshake JSON envelope.
 ///   The prologue is the prior handshake hash `h` rather than init-text concatenation.
-///   Use run_rehandshake_msg1() which applies the same two-handshake PSK trick.
+///   Use run_rehandshake_msg1() which applies the same deferred-PSK-binding sequence.
 
 #pragma once
 
@@ -81,11 +83,11 @@ enum class HandshakeFrameResult {
 /// after transport mode is already active.  The prologue for the re-handshake
 /// is the 32-byte handshake hash `h` from the PRIOR handshake.
 ///
-/// The two-handshake PSK trick is applied identically to the initial handshake:
-///   1. Build a probe session with a zero placeholder PSK.
-///   2. Read msg1 through the probe to extract psk_id.
+/// The same deferred-PSK-binding sequence used by the initial handshake applies here:
+///   1. Build a session with no PSK bound.
+///   2. Read msg1 through it to extract psk_id.
 ///   3. Resolve psk_id via record_store.
-///   4. Build a real session with the resolved PSK and re-read msg1.
+///   4. Bind the resolved PSK onto the SAME session (NoiseSession::set_psk).
 ///   5. Write msg2 and split -> new session.
 ///
 /// @param msg1_json      Decrypted noise/handshake JSON string (the re-handshake msg1 envelope).

@@ -227,8 +227,8 @@ struct SendspinClientConfig {
     /// @brief Default HTTP server task stack size in bytes (ESP-IDF only). Larger than the
     /// esp_http_server 4096-byte default because the Noise handshake runs on this task: the
     /// initial handshake fits in 4096, but the in-band re-handshake (server-initiated after
-    /// pairing finalize) runs the full KKpsk2 X25519 handshake twice (the two-handshake psk_id
-    /// probe) nested under the transport decrypt/encrypt layers, which overflows 4096.
+    /// pairing finalize) runs the full KKpsk2 X25519 handshake nested under the transport
+    /// decrypt/encrypt layers, which overflows 4096.
     static constexpr size_t DEFAULT_HTTPD_STACK_SIZE = 8192U;
 
     size_t httpd_stack_size{DEFAULT_HTTPD_STACK_SIZE};  ///< HTTP server task stack size in bytes
@@ -242,9 +242,8 @@ struct SendspinClientConfig {
     /// the esp_websocket_client 4096-byte default because the Noise handshake runs inline on
     /// this task for outbound connections: the initial handshake fits in 4096, but the in-band
     /// re-handshake (server-initiated after pairing finalize) runs the full KKpsk2 X25519
-    /// handshake twice (the two-handshake psk_id probe) nested under the transport
-    /// decrypt/encrypt layers, which overflows 4096. Same rationale as
-    /// DEFAULT_HTTPD_STACK_SIZE above.
+    /// handshake nested under the transport decrypt/encrypt layers, which overflows 4096. Same
+    /// rationale as DEFAULT_HTTPD_STACK_SIZE above.
     static constexpr size_t DEFAULT_WEBSOCKET_STACK_SIZE = 8192U;
 
     size_t websocket_stack_size{

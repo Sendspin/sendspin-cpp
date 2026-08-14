@@ -79,11 +79,11 @@ static std::string serialize_noise_handshake(const std::vector<uint8_t>& noise_b
 
 namespace {
 
-/// @brief Outcome of the shared probe/psk-resolve/real-session/write-msg2 core.
+/// @brief Outcome of the shared read-msg1/resolve-psk/set-psk/write-msg2 core.
 /// Carries everything both `NoiseHandshake::handle_msg1` and `run_rehandshake_msg1`
 /// need to build their own `NoiseHandshakeResult` and deliver msg2 in their own way.
 struct Msg1CoreResult {
-    /// The real (post-PSK-resolution) session, split into transport cipher states.
+    /// The session, split into transport cipher states, with the resolved PSK bound.
     NoiseSession session;
     /// The PSK record that admitted the connection.
     ResolvedPsk resolved_psk;
@@ -91,9 +91,9 @@ struct Msg1CoreResult {
     std::vector<uint8_t> msg2_bytes;
 };
 
-/// @brief Run the shared core of Noise msg1 processing: decode msg1 + server_id,
-/// probe for psk_id, resolve the PSK via the record store, verify any stored-pubkey
-/// binding, build the real session, and write msg2.
+/// @brief Run the shared core of Noise msg1 processing: decode msg1 + server_id, read msg1
+/// to expose psk_id, resolve the PSK via the record store, verify any stored-pubkey
+/// binding, bind the resolved PSK onto the same session, and write msg2.
 ///
 /// Used identically by the initial handshake (`NoiseHandshake::handle_msg1`) and the
 /// in-band re-handshake (`run_rehandshake_msg1`); the only differences between the two
@@ -145,23 +145,20 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
         return std::nullopt;
     }
 
-    // Two-handshake trick, step 1: probe session with placeholder PSK
-    // We need psk_id from msg1's plaintext, but noise-c requires PSK before start.
-    // Use a zero placeholder; since psk2 mixes PSK only in msg2, msg1 is
-    // authenticated with static keys only.
-    static const std::array<uint8_t, NOISE_PSK_SIZE> placeholder_psk{};
-
-    auto probe_session =
-        NoiseSession::as_responder(suite_name, identity.private_bytes.data(), server_pub->data(),
-                                   prologue, prologue_len, placeholder_psk.data());
-    if (!probe_session.has_value()) {
-        SS_LOGE(TAG, "%s: failed to build probe session", log_prefix);
+    // psk_id lives inside msg1's encrypted payload, so the PSK is not known yet when the
+    // session is built. KKpsk2 mixes the PSK only into msg2, so msg1 authenticates under the
+    // static keys alone (KK's "es"/"ss" tokens); build the responder with no PSK bound and
+    // defer that until it is resolved below (see NoiseSession::set_psk).
+    auto session = NoiseSession::as_responder(suite_name, identity.private_bytes.data(),
+                                              server_pub->data(), prologue, prologue_len, nullptr);
+    if (!session.has_value()) {
+        SS_LOGE(TAG, "%s: failed to build session", log_prefix);
         return std::nullopt;
     }
 
-    auto msg1_payload = probe_session->read_msg1(msg1_bytes->data(), msg1_bytes->size());
+    auto msg1_payload = session->read_msg1(msg1_bytes->data(), msg1_bytes->size());
     if (msg1_payload.empty()) {
-        SS_LOGE(TAG, "%s: probe read_msg1 failed (auth error in msg1 static DH)", log_prefix);
+        SS_LOGE(TAG, "%s: read_msg1 failed (auth error in msg1 static DH)", log_prefix);
         return std::nullopt;
     }
 
@@ -196,31 +193,21 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
         return std::nullopt;
     }
 
-    // Two-handshake trick, step 2: real session with the resolved PSK
-    // Discard the probe; build a fresh handshakestate with the real PSK and
-    // re-process the exact same msg1 bytes.
-    auto real_session =
-        NoiseSession::as_responder(suite_name, identity.private_bytes.data(), server_pub->data(),
-                                   prologue, prologue_len, resolved->psk.data());
-    if (!real_session.has_value()) {
-        SS_LOGE(TAG, "%s: failed to build real session", log_prefix);
-        return std::nullopt;
-    }
-
-    auto real_msg1_payload = real_session->read_msg1(msg1_bytes->data(), msg1_bytes->size());
-    if (real_msg1_payload.empty()) {
-        SS_LOGE(TAG, "%s: real read_msg1 failed", log_prefix);
+    // Bind the resolved PSK onto the SAME handshake state that already read msg1, then
+    // proceed to msg2. This is legal because the "psk" token is not processed until msg2.
+    if (!session->set_psk(resolved->psk.data())) {
+        SS_LOGE(TAG, "%s: failed to bind resolved PSK", log_prefix);
         return std::nullopt;
     }
 
     // Write msg2 (payload: `{}`) and split to transport mode
     std::vector<uint8_t> msg2_bytes;
-    if (!real_session->write_msg2_and_split(msg2_bytes)) {
+    if (!session->write_msg2_and_split(msg2_bytes)) {
         SS_LOGE(TAG, "%s: write_msg2_and_split failed", log_prefix);
         return std::nullopt;
     }
 
-    return Msg1CoreResult{std::move(real_session.value()), std::move(resolved.value()),
+    return Msg1CoreResult{std::move(session.value()), std::move(resolved.value()),
                           std::move(msg2_bytes)};
 }
 

@@ -127,11 +127,15 @@ static NoiseHandshakeState* build_responder_hs(const std::string& suite_name,
         }
     }
 
-    // PSK
-    if (noise_handshakestate_set_pre_shared_key(hs, psk, NOISE_PSK_SIZE) != NOISE_ERROR_NONE) {
-        SS_LOGE(TAG, "noise_handshakestate_set_pre_shared_key failed");
-        noise_handshakestate_free(hs);
-        return nullptr;
+    // PSK: optional at this point. noise-c allows the PSK to be set any time before the
+    // "psk" token is processed (KKpsk2 mixes it only in msg2), so a null psk here just
+    // defers binding to a later NoiseSession::set_psk call.
+    if (psk) {
+        if (noise_handshakestate_set_pre_shared_key(hs, psk, NOISE_PSK_SIZE) != NOISE_ERROR_NONE) {
+            SS_LOGE(TAG, "noise_handshakestate_set_pre_shared_key failed");
+            noise_handshakestate_free(hs);
+            return nullptr;
+        }
     }
 
     if (noise_handshakestate_start(hs) != NOISE_ERROR_NONE) {
@@ -198,6 +202,21 @@ std::vector<uint8_t> NoiseSession::read_msg1(const uint8_t* msg1_bytes, size_t m
 
     payload_buf.resize(payload_out.size);
     return payload_buf;
+}
+
+bool NoiseSession::set_psk(const uint8_t* psk) {
+    if (!this->hs_) {
+        SS_LOGE(TAG, "set_psk: handshake state is null");
+        return false;
+    }
+
+    if (noise_handshakestate_set_pre_shared_key(this->hs_, psk, NOISE_PSK_SIZE) !=
+        NOISE_ERROR_NONE) {
+        SS_LOGE(TAG, "set_psk: noise_handshakestate_set_pre_shared_key failed");
+        return false;
+    }
+
+    return true;
 }
 
 bool NoiseSession::write_msg2_and_split(std::vector<uint8_t>& msg2_out) {

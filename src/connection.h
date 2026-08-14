@@ -232,8 +232,8 @@ public:
     ///
     /// Called on the NETWORK thread when a decrypted noise/handshake JSON message arrives
     /// after transport is already active (routed here from the SERVER_ACTIVATE-adjacent
-    /// dispatch for the "noise/handshake" message type). Runs the two-handshake trick with
-    /// prologue = the current NoiseTransport's handshake_hash(), then commits the new
+    /// dispatch for the "noise/handshake" message type). Runs the deferred-PSK-binding msg1
+    /// read with prologue = the current NoiseTransport's handshake_hash(), then commits the new
     /// session via NoiseTransport::send_msg2_and_swap() (msg2 sent under the OLD session,
     /// swap happens under the same lock so a concurrent main-loop encrypt cannot interleave).
     ///
