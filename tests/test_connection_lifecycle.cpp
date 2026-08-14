@@ -14,20 +14,25 @@
 
 // Integration tests for the connection nursery (prove-then-admit lifecycle). The manager is only
 // reachable through SendspinClient, so these drive a real client on loopback ports: raw TCP
-// sockets play the junk probes, IXWebSocket endpoints play the Sendspin servers, and the test
-// thread pumps client.loop() like a platform main loop. Each scenario guards one lifecycle
-// property or the delivery-at-upgrade contract (connections reach the manager only after their
-// WebSocket upgrade; raw-TCP junk is closed inside the transport layer and never occupies a slot).
+// sockets play the junk probes, the fake servers from lifecycle_test_fixtures.h play the Sendspin
+// peers over real Noise KKpsk2, and the test thread pumps client.loop() like a platform main loop.
+// Each scenario guards one lifecycle property or the delivery-at-upgrade contract (connections
+// reach the manager only after their WebSocket upgrade; raw-TCP junk is closed inside the
+// transport layer and never occupies a slot).
+//
+// test_encrypted_lifecycle.cpp covers the protocol layer riding on that lifecycle (hello/activate,
+// pairing, management, in-band re-handshake) against the same fixtures.
 
+#include "crypto/constants.h"
+#include "crypto/keys.h"
+#include "lifecycle_test_fixtures.h"
+#include "platform/crypto.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/types.h"
+
 #include <gtest/gtest.h>
-#include <ixwebsocket/IXConnectionState.h>
 #include <ixwebsocket/IXWebSocket.h>
-#include <ixwebsocket/IXWebSocketMessage.h>
-#include <ixwebsocket/IXWebSocketMessageType.h>
-#include <ixwebsocket/IXWebSocketServer.h>
 
 // IWYU pragma: begin_keep
 // The include-what-you-use checker misattributes arpa/inet.h's htons/ntohs/htonl/ntohl to
@@ -41,14 +46,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <memory>
-#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -64,88 +67,50 @@ constexpr uint16_t OUTBOUND_TEST_PORT = 18942;
 constexpr uint16_t PROXY_LISTEN_PORT = 18951;
 constexpr uint16_t PROXY_BACKEND_PORT = 18952;
 constexpr uint16_t RACE_TEST_PORT = 18961;
-constexpr uint16_t EARLY_HELLO_TEST_PORT = 18971;
 constexpr uint16_t EVICT_TEST_PORT = 18972;
 constexpr uint16_t REJECT_TEST_PORT = 18973;
 constexpr uint16_t STALL_LISTEN_PORT = 18981;
 constexpr uint16_t ADMIT_TEST_PORT = 18982;
 
-std::string server_url(uint16_t port) {
-    return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
-}
-
-// Under the encrypted protocol, server_id comes from the Noise handshake result rather than
-// server/hello, and server/activate carries an activities/active_roles model rather than a
-// connection_reason field. This suite runs with encryption_required = false (see make_config())
-// so its fake servers can stay plaintext WS peers and exercise the nursery's structural
-// admission/reaping/arbitration mechanics independently of the Noise crypto layer (which has its
-// own dedicated coverage in test_noise_transport.cpp / test_noise_rehandshake.cpp /
-// test_admission.cpp). server/hello's server_id field is accepted here as a test-only
-// fallback: the connection adopts it only when the Noise handshake never set one (see client.cpp's
-// SERVER_HELLO handling).
-std::string server_hello_json(const std::string& server_id) {
-    return std::string(R"({"type":"server/hello","payload":{"server_id":")") + server_id +
-           R"(","name":"Fake Server"}})";
-}
-
-// `reason` is "discovery" (empty activities; used by every fixture here, including the
-// last-played-server_id tiebreak race) or "playback" (activities: ["playback"]).
-std::string server_activate_json(const std::string& reason) {
-    const std::string activities = (reason == "playback") ? R"(["playback"])" : R"([])";
-    return std::string(R"({"type":"server/activate","payload":{"activities":)") + activities +
-           R"(,"active_roles":["player@v1"]}})";
-}
-
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
     config.name = "Lifecycle Test Client";
     config.server_port = port;
-    // This suite exercises the nursery's structural lifecycle (accept/prove/admit, reaping,
-    // arbitration) over plaintext WS, independent of the Noise crypto layer; see the comment
-    // on server_hello_json() above.
-    config.encryption_required = false;
     return config;
 }
 
-class TestNetworkProvider : public SendspinNetworkProvider {
-public:
-    bool is_network_ready() override {
-        return true;
-    }
+/// A fresh long-term pairing record plus the PSK behind it, so a test can seed the client's
+/// RecordStore and hand the same PSK to a fake server. The resulting connection resolves to
+/// PskCategory::LONG_TERM, which admits any subset of {playback, management} plus the empty set.
+struct PairedPeer {
+    SendspinPairingRecord record;
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
 };
 
-class TestPersistenceProvider : public SendspinPersistenceProvider {
-public:
-    explicit TestPersistenceProvider(std::string server_id) : server_id_(std::move(server_id)) {}
-
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        if (key != persistence_keys::LAST_PLAYED) {
-            return std::nullopt;
-        }
-        return std::vector<uint8_t>(this->server_id_.begin(), this->server_id_.end());
-    }
-
-private:
-    std::string server_id_;
-};
-
-/// Pumps client.loop() (like a platform main loop would) until the predicate returns true or the
-/// timeout elapses. Returns true if the predicate was satisfied.
-bool pump_until(SendspinClient& client, const std::function<bool()>& pred, int timeout_ms) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        client.loop();
-        if (pred()) {
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    }
-    return false;
+PairedPeer make_paired_peer() {
+    PairedPeer peer;
+    platform_random_bytes(peer.psk.data(), peer.psk.size());
+    peer.record.psk_id = psk_id_for(peer.psk);
+    peer.record.psk = peer.psk;
+    return peer;
 }
 
-void pump_for(SendspinClient& client, int duration_ms) {
-    pump_until(
-        client, [] { return false; }, duration_ms);
+/// Options for a peer that completes the Noise handshake and the hello exchange but never sends
+/// server/activate, so it proves it speaks the protocol yet never becomes operational and stays
+/// in the nursery for the whole establish window.
+FakeEncryptedServerOptions unactivated_peer_options() {
+    FakeEncryptedServerOptions options;
+    options.suppress_activate = true;
+    return options;
+}
+
+/// Options for a peer that activates with no activities and no roles: rank 0 for admission
+/// arbitration, which is what drives the last-played tiebreak (admission.h rule 5).
+FakeEncryptedServerOptions rank_zero_peer_options() {
+    FakeEncryptedServerOptions options;
+    options.first_activities_json = R"([])";
+    options.first_roles_json = R"([])";
+    return options;
 }
 
 int connect_loopback(uint16_t port) {
@@ -179,71 +144,6 @@ bool socket_closed(int fd) {
         // n > 0: bytes to discard; loop and look again
     }
 }
-
-/// Behavior knobs for FakeServer.
-struct FakeServerOptions {
-    bool hello_on_open{false};  ///< Send server/hello immediately on Open, before any
-                                ///< client/hello arrives (a nonconforming peer)
-    bool answer_hello{true};    ///< Reply to client/hello with server/hello (false: mute peer
-                                ///< that upgrades and then never establishes)
-};
-
-/// A minimal Sendspin "server": an IXWebSocket client that connects to the SendspinClient's WS
-/// server (the server-initiated discovery direction) and answers client/hello with server/hello,
-/// per the given options.
-class FakeServer {
-public:
-    FakeServer(const std::string& url, std::string server_id, FakeServerOptions options = {})
-        : server_id_(std::move(server_id)) {
-        this->ws_.setUrl(url);
-        this->ws_.disableAutomaticReconnection();
-        this->ws_.setOnMessageCallback([this, options](const ix::WebSocketMessagePtr& msg) {
-            if (msg->type == ix::WebSocketMessageType::Open) {
-                if (options.hello_on_open) {
-                    this->ws_.send(server_hello_json(this->server_id_));
-                    this->ws_.send(server_activate_json("discovery"));
-                }
-            } else if (msg->type == ix::WebSocketMessageType::Message &&
-                       msg->str.find("client/hello") != std::string::npos) {
-                this->got_client_hello_.store(true);
-                if (options.answer_hello) {
-                    this->ws_.send(server_hello_json(this->server_id_));
-                    this->ws_.send(server_activate_json("discovery"));
-                }
-            } else if (msg->type == ix::WebSocketMessageType::Message &&
-                       msg->str.find("client/goodbye") != std::string::npos) {
-                this->got_goodbye_.store(true);
-            } else if (msg->type == ix::WebSocketMessageType::Close ||
-                       msg->type == ix::WebSocketMessageType::Error) {
-                this->closed_.store(true);
-            }
-        });
-        this->ws_.start();
-    }
-
-    ~FakeServer() {
-        this->ws_.stop();
-    }
-
-    bool closed() const {
-        return this->closed_.load();
-    }
-
-    bool got_client_hello() const {
-        return this->got_client_hello_.load();
-    }
-
-    bool got_goodbye() const {
-        return this->got_goodbye_.load();
-    }
-
-private:
-    ix::WebSocket ws_;
-    std::string server_id_;
-    std::atomic<bool> closed_{false};
-    std::atomic<bool> got_client_hello_{false};
-    std::atomic<bool> got_goodbye_{false};
-};
 
 /// TCP relay that accepts one connection, sits on it without reading for delay_ms (the peer's
 /// WebSocket upgrade request waits in the kernel buffer), then connects to the backend and pumps
@@ -380,9 +280,13 @@ private:
 // keep a real server from connecting and establishing immediately, and the probe socket must be
 // closed within roughly the nursery upgrade deadline.
 TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
+    PairedPeer peer = make_paired_peer();
+
     TestNetworkProvider network;
+    TestPersistenceProvider persistence(peer.record);
     SendspinClient client(make_config(PROBE_TEST_PORT));
     client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start_server());
     // The WS server starts synchronously on the first loop() once the network reports ready.
     pump_for(client, 50);
@@ -396,12 +300,15 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
 
     // A real server connects while the probe is held: it must establish promptly, not after the
     // probe's deadline.
-    FakeServer real_server(server_url(PROBE_TEST_PORT), "server-a");
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServer real_server(server_url(PROBE_TEST_PORT),
+                                    std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                                    peer.record.psk_id, peer.psk);
     EXPECT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000));
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, "server-a");
+    EXPECT_EQ(info->server_id, server_identity.peer_id());
 
     // The probe never completes a WebSocket handshake, so the transport layer closes it without
     // it ever reaching the manager (host: IXWebSocket's 3 s server-side handshake timeout; on
@@ -420,33 +327,23 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
 // handshake timeout); an outbound connect's clock predates DNS/TCP resolve and must never be cut
 // short by them.
 TEST(ConnectionLifecycle, SlowOutboundSurvivesUpgradeTier) {
+    PairedPeer peer = make_paired_peer();
+
     // Real Sendspin-speaking endpoint the proxy forwards to.
-    ix::WebSocketServer backend(PROXY_BACKEND_PORT, "127.0.0.1");
-    backend.setOnConnectionCallback([](const std::weak_ptr<ix::WebSocket>& weak_ws,
-                                       const std::shared_ptr<ix::ConnectionState>& /*state*/) {
-        auto ws = weak_ws.lock();
-        if (!ws) {
-            return;
-        }
-        ws->setOnMessageCallback([weak_ws](const ix::WebSocketMessagePtr& msg) {
-            if (msg->type == ix::WebSocketMessageType::Message &&
-                msg->str.find("client/hello") != std::string::npos) {
-                if (auto locked = weak_ws.lock()) {
-                    locked->send(server_hello_json("server-slow"));
-                    locked->send(server_activate_json("discovery"));
-                }
-            }
-        });
-    });
-    ASSERT_TRUE(backend.listen().first);
+    Identity server_identity = Identity::generate().value();
+    FakeOutboundEncryptedServer backend(PROXY_BACKEND_PORT, std::string(NOISE_SUITE_CHACHAPOLY),
+                                        server_identity, peer.record.psk_id, peer.psk);
+    ASSERT_TRUE(backend.listen());
     backend.start();
 
     DelayProxy proxy(PROXY_LISTEN_PORT, PROXY_BACKEND_PORT, 8000);
     ASSERT_TRUE(proxy.ok());
 
     TestNetworkProvider network;
+    TestPersistenceProvider persistence(peer.record);
     SendspinClient client(make_config(OUTBOUND_TEST_PORT));
     client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
@@ -457,19 +354,20 @@ TEST(ConnectionLifecycle, SlowOutboundSurvivesUpgradeTier) {
     EXPECT_FALSE(pump_until(
         client, [&] { return client.is_connected(); }, 6500));
 
+    // Past the stall the whole remaining sequence (Noise handshake, hello, activate) still has to
+    // fit inside the 30 s establish budget that started before the DNS/TCP resolve.
     EXPECT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 7500));
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, "server-slow");
+    EXPECT_EQ(info->server_id, server_identity.peer_id());
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
-    backend.stop();
 }
 
 // An in-flight outbound connect_to() must not count against the inbound nursery capacity: with
-// one mute inbound peer holding a slot and an outbound attempt stalled mid-upgrade, a real server
+// one inbound peer holding a slot and an outbound attempt stalled mid-upgrade, a real server
 // connecting inbound must still be admitted and establish, not be rejected with ANOTHER_SERVER
 // for up to the outbound's 30 s establish budget.
 TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
@@ -487,26 +385,38 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
     ASSERT_EQ(::bind(stall_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     ASSERT_EQ(::listen(stall_fd, 1), 0);
 
+    PairedPeer peer = make_paired_peer();
+
     TestNetworkProvider network;
+    TestPersistenceProvider persistence(peer.record);
     SendspinClient client(make_config(ADMIT_TEST_PORT));
     client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
     client.connect_to(server_url(STALL_LISTEN_PORT));
 
-    // A mute inbound peer occupies one inbound slot past TCP_OPEN.
-    FakeServer mute(server_url(ADMIT_TEST_PORT), "mute", {.answer_hello = false});
+    // A peer that handshakes and answers the hello but never activates occupies one inbound slot.
+    // It runs on the Sentinel PSK, which RecordStore resolves unconditionally, so it needs no
+    // record of its own.
+    Identity mute_identity = Identity::generate().value();
+    FakeEncryptedServer mute(server_url(ADMIT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                             mute_identity, std::string(SENTINEL_PSK_ID), SENTINEL_PSK,
+                             unactivated_peer_options());
     ASSERT_TRUE(pump_until(
-        client, [&] { return mute.got_client_hello(); }, 3000));
+        client, [&] { return mute.client_hello_count() > 0; }, 4000));
 
     // The real server takes the second inbound slot; the stalled outbound must not consume it.
-    FakeServer real_server(server_url(ADMIT_TEST_PORT), "server-real");
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServer real_server(server_url(ADMIT_TEST_PORT),
+                                    std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                                    peer.record.psk_id, peer.psk);
     EXPECT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000));
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, "server-real");
+    EXPECT_EQ(info->server_id, server_identity.peer_id());
     EXPECT_FALSE(real_server.closed());
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -514,64 +424,59 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
     ::close(stall_fd);
 }
 
-// A peer that sends server/hello immediately on connect, before our client/hello has gone out,
-// must not be promoted with an incomplete handshake (that would wedge the current slot forever:
-// out of the nursery, no deadline, is_connected() false, hello retry cancelled). Establishment
-// must instead complete once the client/hello send lands.
-TEST(ConnectionLifecycle, EarlyServerHelloDoesNotWedge) {
-    TestNetworkProvider network;
-    SendspinClient client(make_config(EARLY_HELLO_TEST_PORT));
-    client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
-
-    FakeServer eager(server_url(EARLY_HELLO_TEST_PORT), "server-eager", {.hello_on_open = true});
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
-    auto info = client.get_server_information();
-    ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, "server-eager");
-    EXPECT_FALSE(eager.closed());
-}
-
 // Two real servers connecting back to back resolve by the fair comparison, not by handshake
-// timing. Sequenced deterministically (not a timed race): server-a is asserted to be current
-// before server-b connects, so the second establishment provably exercises the handoff comparison
-// rather than the empty-slot promotion.
+// timing. Sequenced deterministically (not a timed race): server A is asserted to be current
+// before server B connects, so the second establishment provably exercises the handoff comparison
+// rather than the empty-slot promotion. Both activate at rank 0 (no activities, no roles), which
+// is what routes the decision to admission.h rule 5's last-played tiebreak.
 TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
+    PairedPeer peer_a = make_paired_peer();
+    PairedPeer peer_b = make_paired_peer();
+    Identity identity_a = Identity::generate().value();
+    Identity identity_b = Identity::generate().value();
+
     TestNetworkProvider network;
-    TestPersistenceProvider persistence("server-b");
+    TestPersistenceProvider persistence(
+        std::vector<SendspinPairingRecord>{peer_a.record, peer_b.record});
+    // Seeded before start_server(), which is where the client loads it into the manager.
+    persistence.set_last_played_server_id(identity_b.peer_id());
+
     SendspinClient client(make_config(RACE_TEST_PORT));
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
-    // server-a establishes and is promoted into the empty slot first...
-    FakeServer server_a(server_url(RACE_TEST_PORT), "server-a");
+    // Server A establishes and is promoted into the empty slot first...
+    FakeEncryptedServer server_a(server_url(RACE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                                 identity_a, peer_a.record.psk_id, peer_a.psk,
+                                 rank_zero_peer_options());
     ASSERT_TRUE(pump_until(
         client,
         [&] {
             auto info = client.get_server_information();
-            return info.has_value() && info->server_id == "server-a";
+            return info.has_value() && info->server_id == identity_a.peer_id();
         },
-        3000));
+        4000));
 
-    // ...then server-b establishes against the incumbent. Both sides of the comparison are
-    // established; the last-played preference (server-b) must win the handoff, and the later
+    // ...then server B establishes against the incumbent. Both sides of the comparison are
+    // established; the last-played preference (server B) must win the handoff, and the later
     // arrival must not be evicted for finishing second.
-    FakeServer server_b(server_url(RACE_TEST_PORT), "server-b");
+    FakeEncryptedServer server_b(server_url(RACE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                                 identity_b, peer_b.record.psk_id, peer_b.psk,
+                                 rank_zero_peer_options());
     EXPECT_TRUE(pump_until(
         client,
         [&] {
             auto info = client.get_server_information();
-            return info.has_value() && info->server_id == "server-b";
+            return info.has_value() && info->server_id == identity_b.peer_id();
         },
-        3000));
+        4000));
 
     // The displaced incumbent is released with a goodbye, not left dangling.
     EXPECT_TRUE(pump_until(
-        client, [&] { return server_a.closed(); }, 3000));
+        client, [&] { return server_a.closed(); }, 4000));
+    EXPECT_EQ(server_a.goodbye_reason().value_or(""), "another_server");
     EXPECT_FALSE(server_b.closed());
     EXPECT_TRUE(client.is_connected());
 }
@@ -579,9 +484,13 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
 // Delivery-at-upgrade contract: raw TCP probes never reach the manager, so even enough of them to
 // fill the nursery capacity cannot occupy a slot or delay a real server.
 TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
+    PairedPeer peer = make_paired_peer();
+
     TestNetworkProvider network;
+    TestPersistenceProvider persistence(peer.record);
     SendspinClient client(make_config(EVICT_TEST_PORT));
     client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
@@ -595,12 +504,15 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
 
     // The real server must establish promptly: the probes hold no nursery slots, so nothing
     // needs evicting and nothing is rejected.
-    FakeServer real_server(server_url(EVICT_TEST_PORT), "server-real");
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServer real_server(server_url(EVICT_TEST_PORT),
+                                    std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                                    peer.record.psk_id, peer.psk);
     EXPECT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000));
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, "server-real");
+    EXPECT_EQ(info->server_id, server_identity.peer_id());
 
     // The transport layer closes the probes on its own (host: IX 3 s handshake timeout).
     EXPECT_TRUE(pump_until(
@@ -611,27 +523,41 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
     ::close(probe2);
 }
 
-// Rejection path: with the nursery full of peers that have proven they speak WebSocket (they
-// received client/hello but never establish), a newcomer is rejected. Because rejection happens on
-// an already-upgraded session, the goodbye must reach the peer before the close.
+// Rejection path: with the nursery full of peers that have proven they speak the protocol (they
+// complete the Noise handshake and the hello exchange but never activate), a newcomer is rejected.
+// Rejection happens at accept, before the newcomer gets a Noise handshake driver, so its goodbye
+// travels as a cleartext text frame and must reach the peer before the close.
 TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
+    PairedPeer peer = make_paired_peer();
+
     TestNetworkProvider network;
+    TestPersistenceProvider persistence(peer.record);
     SendspinClient client(make_config(REJECT_TEST_PORT));
     client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start_server());
     pump_for(client, 50);
 
-    // Two mute peers: they upgrade and receive client/hello but never answer it, occupying both
-    // nursery slots past TCP_OPEN until the establish deadline.
-    FakeServer mute_a(server_url(REJECT_TEST_PORT), "mute-a", {.answer_hello = false});
-    FakeServer mute_b(server_url(REJECT_TEST_PORT), "mute-b", {.answer_hello = false});
+    // Two peers on the Sentinel PSK that handshake and answer the hello but never activate,
+    // occupying both nursery slots until the establish deadline.
+    Identity identity_a = Identity::generate().value();
+    Identity identity_b = Identity::generate().value();
+    FakeEncryptedServer mute_a(server_url(REJECT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                               identity_a, std::string(SENTINEL_PSK_ID), SENTINEL_PSK,
+                               unactivated_peer_options());
+    FakeEncryptedServer mute_b(server_url(REJECT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                               identity_b, std::string(SENTINEL_PSK_ID), SENTINEL_PSK,
+                               unactivated_peer_options());
     ASSERT_TRUE(pump_until(
-        client, [&] { return mute_a.got_client_hello() && mute_b.got_client_hello(); }, 3000));
+        client,
+        [&] { return mute_a.client_hello_count() > 0 && mute_b.client_hello_count() > 0; }, 4000));
 
-    FakeServer late(server_url(REJECT_TEST_PORT), "server-late");
+    Identity late_identity = Identity::generate().value();
+    FakeEncryptedServer late(server_url(REJECT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                             late_identity, peer.record.psk_id, peer.psk);
     EXPECT_TRUE(pump_until(
-        client, [&] { return late.closed(); }, 3000));
-    EXPECT_TRUE(late.got_goodbye());
+        client, [&] { return late.closed(); }, 4000));
+    EXPECT_EQ(late.goodbye_reason().value_or(""), "another_server");
     EXPECT_FALSE(client.is_connected());
     EXPECT_FALSE(mute_a.closed());
     EXPECT_FALSE(mute_b.closed());
