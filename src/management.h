@@ -93,14 +93,7 @@ inline void handle_list_records(const RecordStore& store, ManagementResultPayloa
                                 ManagementEffect& effect) {
     result.result = ManagementResult::OK;
     result.data = ManagementResultData{};
-    result.data->records = std::vector<RecordSummary>{};
-    for (const auto& r : store.records_snapshot()) {
-        RecordSummary summary;
-        summary.psk_id = r.psk_id;
-        summary.server_id = r.server_id;
-        summary.used = r.used;
-        result.data->records->push_back(std::move(summary));
-    }
+    result.data->records = store.records_summary_snapshot();
     effect = ManagementEffect::NONE;
 }
 

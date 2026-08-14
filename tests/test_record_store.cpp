@@ -34,6 +34,7 @@
 #include "file_persistence_provider.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
+#include "protocol_messages.h"
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
@@ -1710,6 +1711,40 @@ TEST(RecordStore, RecordsSnapshotReturnsAllRecords) {
     for (const auto& r : snap) {
         if (r.psk_id == a.psk_id) found_a = true;
         if (r.psk_id == b.psk_id) found_b = true;
+    }
+    EXPECT_TRUE(found_a);
+    EXPECT_TRUE(found_b);
+}
+
+// records_summary_snapshot() carries psk_id/server_id/used for every record (including the
+// shared fallback, which has no server_id) without exposing the PSK bytes at all.
+TEST(RecordStore, RecordsSummarySnapshotMatchesRecordsWithoutPsk) {
+    RecordStore store(nullptr);
+    // Auto-provisioned shared fallback is already present (1 record, no server_id).
+    ASSERT_EQ(store.records_snapshot().size(), 1u);
+
+    SendspinPairingRecord a = make_client_record("server-A");
+    SendspinPairingRecord b = make_shared_record();
+    store.store_record(a);
+    store.store_record(b);
+    store.mark_record_used(a.psk_id);
+
+    auto summaries = store.records_summary_snapshot();
+    EXPECT_EQ(summaries.size(), 3u);
+
+    bool found_a = false;
+    bool found_b = false;
+    for (const auto& summary : summaries) {
+        if (summary.psk_id == a.psk_id) {
+            found_a = true;
+            ASSERT_TRUE(summary.server_id.has_value());
+            EXPECT_EQ(summary.server_id.value(), "server-A");
+            EXPECT_TRUE(summary.used);
+        } else if (summary.psk_id == b.psk_id) {
+            found_b = true;
+            EXPECT_FALSE(summary.server_id.has_value());
+            EXPECT_FALSE(summary.used);
+        }
     }
     EXPECT_TRUE(found_a);
     EXPECT_TRUE(found_b);

@@ -19,6 +19,7 @@
 #include "crypto/pin.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
+#include "protocol_messages.h"
 #include "sendspin/persistence_codec.h"
 
 #include <algorithm>
@@ -335,6 +336,20 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
         }
     }
     return nullptr;
+}
+
+std::vector<RecordSummary> RecordStore::records_summary_snapshot() const {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    std::vector<RecordSummary> summaries;
+    summaries.reserve(this->records_.size());
+    for (const auto& rec : this->records_) {
+        RecordSummary summary;
+        summary.psk_id = rec.psk_id;
+        summary.server_id = rec.server_id;
+        summary.used = rec.used;
+        summaries.push_back(std::move(summary));
+    }
+    return summaries;
 }
 
 bool RecordStore::store_record(SendspinPairingRecord record) {

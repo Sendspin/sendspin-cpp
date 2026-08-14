@@ -45,6 +45,13 @@
 
 namespace sendspin {
 
+/// Forward-declared rather than pulled in via protocol_messages.h: that header drags in every
+/// role header (color_role.h, controller_role.h, ...) plus ArduinoJson, and record_store.h is
+/// itself included by low-level files (connection.h, admission.h) that have no business seeing
+/// any of that. records_summary_snapshot() is declared here and defined in record_store.cpp,
+/// which already sits at the leaf of the include graph and can afford the real include.
+struct RecordSummary;
+
 // ============================================================================
 // PSK category
 // ============================================================================
@@ -157,6 +164,13 @@ public:
         std::lock_guard<std::mutex> lock(this->mutex_);
         return this->records_;
     }
+
+    /// @brief Return a locked snapshot of psk_id/server_id/used for every long-term record
+    /// (thread-safe), without materializing any PSK bytes. The only production caller is
+    /// management/list-records (see handle_list_records() in management.h), which never needs
+    /// the PSK; use records_snapshot() instead when the full record (including the PSK) is
+    /// actually required.
+    [[nodiscard]] std::vector<RecordSummary> records_summary_snapshot() const;
 
     /// @brief Return a locked copy of the record identified by psk_id, if any (thread-safe).
     /// Calls the unlocked record_by_psk_id helper while holding mutex_; no recursion since
