@@ -57,7 +57,7 @@ void SendspinConnection::init_time_filter() {
 
 SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
                                               SendCompleteCallback on_complete) {
-    // Goodbye must be sent even when Noise transport is active - route through send_app_json
+    // Goodbye must be sent even when Noise transport is active; route through send_app_json
     // so it is encrypted. allow_before_hello=true because goodbye can precede the hello (e.g.,
     // when rejecting an excess connection before the handshake finishes).
     return this->send_app_json(format_client_goodbye_message(reason), std::move(on_complete),
@@ -161,8 +161,8 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
         // which cannot be true before the Noise transport is active) see these values.
         this->set_noise_handshake_result(outcome->server_id, outcome->resolved_psk.category,
                                          outcome->resolved_psk.psk_id);
-        // Reset the pairing server/activate counter (spec #120): a fresh handshake starts a
-        // fresh count for the pairing_index / CPace-sid counter.
+        // Reset the pairing server/activate counter (spec "Pairing index"): a fresh handshake
+        // starts a fresh count for the pairing_index / CPace-sid counter.
         this->reset_pairing_index();
         // Install the cipher session; send_app_json() routes encrypted from here on.
         this->noise_transport_.activate(std::move(outcome->session));
@@ -179,14 +179,14 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
 bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) {
     // Runs on the NETWORK thread (dispatched from the JSON callback for a decrypted
     // "noise/handshake" message, itself only reachable post-COMPLETE, so this always runs on
-    // the same network thread as the decrypt path -- sequential with it, never concurrent).
+    // the same network thread as the decrypt path, sequential with it and never concurrent).
     if (!this->noise_transport_.is_active()) {
         SS_LOGE(TAG, "handle_noise_rehandshake: no active Noise transport");
         return false;
     }
     if (this->noise_identity_ == nullptr || this->noise_record_store_ == nullptr ||
         this->noise_suite_name_.empty()) {
-        SS_LOGE(TAG, "handle_noise_rehandshake: missing identity/record_store/suite -- "
+        SS_LOGE(TAG, "handle_noise_rehandshake: missing identity/record_store/suite; "
                      "init_noise_handshake() was not called");
         return false;
     }
@@ -201,7 +201,7 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     // pairing finalized and it is rekeying onto the new long-term PSK.  The quiesce gate
     // (pairing_in_progress) must be cleared here (network thread) before the new
     // server/activate arrives, so the main loop can resume time sync and state publishing.
-    // Atomic store - written on network thread, read on main loop.
+    // Atomic store: written on network thread, read on main loop.
     this->pairing_in_progress_.store(false, std::memory_order_release);
 
     // Restart the re-proving watchdog: the connection is once again "awaiting its first
@@ -246,8 +246,8 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
         this->psk_id_ = result->resolved_psk.psk_id;
     }
 
-    // Reset the pairing server/activate counter (spec #120): a re-handshake starts a fresh
-    // count for the pairing_index / CPace-sid counter, same as an initial handshake.
+    // Reset the pairing server/activate counter (spec "Pairing index"): a re-handshake starts a
+    // fresh count for the pairing_index / CPace-sid counter, same as an initial handshake.
     this->reset_pairing_index();
 
     // Reset hello handshake state so the post-swap server/hello -> client/hello ->
@@ -309,7 +309,6 @@ void SendspinConnection::reset_websocket_payload() {
 
 uint8_t* SendspinConnection::prepare_receive_buffer(size_t data_len) {
     if (!this->websocket_payload_) {
-        // First fragment - allocate new buffer
         if (!this->websocket_payload_.allocate(data_len, this->websocket_payload_location_)) {
             SS_LOGE(TAG, "Failed to allocate %zu bytes for websocket payload", data_len);
             return nullptr;
@@ -339,10 +338,10 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
 
     const size_t msg_len = this->websocket_write_offset_;
 
-    // Pre-handshake: TEXT frames feed the Noise handshake state machine (when one is
-    // installed - see init_noise_handshake()). Post-handshake: every frame is BINARY
-    // (Noise ciphertext); a connection with no handshake driver installed falls through to
-    // the legacy direct-dispatch path unchanged.
+    // Two ways in, one dispatch. Under Noise every frame is BINARY ciphertext: decrypt,
+    // reassemble, and read the message type from the leading plaintext byte. With no
+    // handshake driver installed the WebSocket frame type is the message type (TEXT is
+    // JSON, BINARY is a role message), and both dispatch as-is.
     const bool noise_active = this->noise_handshake_complete_.load(std::memory_order_acquire);
     const bool noise_pending = !noise_active && this->noise_handshake_;
 
@@ -363,7 +362,7 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
             return;
         }
 
-        // No Noise handshake installed on this connection: legacy path (direct JSON dispatch).
+        // No handshake driver installed: the frame is already plaintext JSON.
         // Hand the JSON callback a pointer straight into the reassembly buffer instead of
         // copying it into a std::string. The callback parses synchronously;
         // reset_websocket_payload() below makes the buffer reusable as soon as it returns, so
@@ -418,7 +417,7 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
 
     if (noise_pending) {
         // A handshake driver is installed but the transport is not up yet, so this frame is
-        // unauthenticated application data. It must NOT reach the legacy dispatch below: that
+        // unauthenticated application data. It must NOT reach the unencrypted dispatch below: that
         // path hands the bytes straight to the role binary handlers, which would let any peer
         // that merely completed the WebSocket upgrade inject audio/artwork/visualizer data with
         // the whole Noise/PSK/admission chain bypassed. The TEXT branch above already refuses
@@ -432,8 +431,8 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
         return;
     }
 
-    // No Noise handshake installed (encryption_required == false): legacy binary dispatch
-    // (connection retains buffer ownership, callback reads in-place).
+    // No handshake driver installed (encryption_required == false): the frame is already a
+    // plaintext role message (connection retains buffer ownership, callback reads in-place).
     if (!this->message_dispatch_enabled_.load(std::memory_order_acquire)) {
         this->reset_websocket_payload();
         return;

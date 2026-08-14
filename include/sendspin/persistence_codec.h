@@ -21,12 +21,12 @@
 /// only caller of this codec: for the `persistence_keys::RECORDS`, `PAIRING_PSK`, and
 /// `PAIR_CONFIG` keys, it turns `SendspinPairingRecord` / `SendspinPairingPsk` /
 /// `SendspinPairingConfig` into the JSON text blob a provider actually stores, and back. A
-/// provider implementation never needs to (and must not) parse these blobs -- this header is
+/// provider implementation never needs to (and must not) parse these blobs. This header is
 /// exposed publicly so a custom provider (or a test) can inspect or seed that content in the
 /// same format the library itself produces, not so providers hand-roll their own encoding.
 ///
 /// This is a STORAGE codec, intentionally independent of the Sendspin protocol wire format
-/// (see `src/management.h`, which never carries the PSK secret in list-records responses -- the
+/// (see `src/management.h`, which never carries the PSK secret in list-records responses: the
 /// two formats have different jobs and must not be confused).
 ///
 /// ## Wire format
@@ -35,7 +35,7 @@
 ///
 /// - Record: `{"v":1,"psk_id":"...","psk":"<base64url>","server_id":"...","label":"...",
 ///   "used":bool}`, with "server_id"/"label" omitted when absent.
-/// - Records array: `{"v":1,"records":[<record objects, without their own "v">]}` -- the array
+/// - Records array: `{"v":1,"records":[<record objects, without their own "v">]}`. The array
 ///   wrapper carries "v" once; each entry has the same fields as a record minus "v".
 ///   `decode_pairing_record()` still accepts an entry that has its own "v" (it is ignored like
 ///   any other unknown field), so a single record object round-trips whether it came from
@@ -52,7 +52,7 @@
 /// ## Decode semantics
 ///
 /// - A missing "v" is treated as version 1 (every blob written before "v" existed still
-///   decodes). A "v" greater than `RECORD_CODEC_VERSION` still decodes on a best-effort basis --
+///   decodes). A "v" greater than `RECORD_CODEC_VERSION` still decodes on a best-effort basis:
 ///   unknown fields are ignored, so a blob written by a newer library version round-trips
 ///   through an older one instead of being rejected outright.
 /// - Unknown/extra fields are ignored everywhere. Missing optional fields take the struct's
@@ -62,7 +62,7 @@
 ///   base64url-decode to exactly 32 bytes.
 /// - `decode_pairing_records()` returns `std::nullopt` only when the JSON fails to parse or the
 ///   root has no array "records" field. An individual entry that fails record validation is
-///   SKIPPED rather than failing the whole decode -- a provider should not lose its entire store
+///   SKIPPED rather than failing the whole decode: a provider should not lose its entire store
 ///   to one corrupt entry.
 /// - `decode_pairing_config()` returns `std::nullopt` only when the JSON fails to parse or the
 ///   root is not an object. Missing fields take the `SendspinPairingConfig` struct's defaults.
@@ -72,7 +72,7 @@
 /// ## Keyspace
 ///
 /// The storage key is not a provider's choice: it is one of the fixed constants in
-/// `persistence_keys` (sendspin/client.h) -- `RECORDS`, `PAIRING_PSK`, and `PAIR_CONFIG` for the
+/// `persistence_keys` (sendspin/client.h): `RECORDS`, `PAIRING_PSK`, and `PAIR_CONFIG` for the
 /// three struct types this header encodes, plus `KEYPAIR`, `STATIC_PIN`, `LAST_PLAYED`, and
 /// `STATIC_DELAY` for the raw-byte / ASCII-decimal keys the library also persists. Every key is
 /// at most 12 characters, comfortably under a typical NVS key's 15-character limit; see
@@ -80,7 +80,7 @@
 ///
 /// `RECORDS` always holds the WHOLE records array as one blob (`encode_pairing_records()` /
 /// `decode_pairing_records()`), not one entry per record: an encoded record is roughly 250
-/// bytes, so an 8-record store comes out around 2 KB -- comfortably under a typical NVS entry's
+/// bytes, so an 8-record store comes out around 2 KB, comfortably under a typical NVS entry's
 /// ~4 KB limit. This also sidesteps needing `psk_id` (43 characters, base64url of a 32-byte key)
 /// as a storage key, which would not fit an NVS key at all.
 

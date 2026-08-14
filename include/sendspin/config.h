@@ -96,7 +96,7 @@ enum class NoiseCipherSuitePreference : uint8_t {
 /// @brief Configuration for a SendspinClient instance
 /// Filled in by the platform (e.g., ESPHome) before calling start_server()
 struct SendspinClientConfig {
-    // NOTE: client_id is not a field here. The library derives it from the static X25519
+    // client_id is derived, not configured: the library computes it from the static X25519
     // keypair (client_id = base64url(public_key)), generated on first boot and persisted via
     // SendspinPersistenceProvider. Read it back via SendspinClient::client_id() after
     // start_server().
@@ -106,7 +106,7 @@ struct SendspinClientConfig {
     NoiseCipherSuitePreference cipher_suite{NoiseCipherSuitePreference::CHACHAPOLY};
 
     /// @brief Whether every connection must complete a Noise KKpsk2 handshake before the hello
-    /// exchange (spec PR #84's always-on encryption model).
+    /// exchange (spec "Encryption"'s always-on encryption model).
     ///
     /// Internal/testing knob, not part of the supported public surface: the Sendspin spec
     /// requires encryption to be always-on, and every shipping deployment must leave this at
@@ -115,8 +115,7 @@ struct SendspinClientConfig {
     /// Setting this to false skips the crypto layer entirely and runs the connection nursery
     /// (accept/reap/admission-arbitration) in plaintext; it exists only for test fixtures that
     /// exercise nursery structure independently of Noise (already covered separately by the
-    /// Noise handshake/re-handshake/admission unit tests). May be removed once every fixture
-    /// speaks Noise.
+    /// Noise handshake/re-handshake/admission unit tests).
     bool encryption_required{true};
 
     std::optional<std::string> product_name{};  ///< Device product name (optional)

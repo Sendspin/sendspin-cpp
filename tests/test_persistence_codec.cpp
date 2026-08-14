@@ -28,7 +28,7 @@
 #include <string>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 namespace {
 
@@ -139,9 +139,9 @@ TEST(PersistenceCodec, RecordDecodeRejectsBadBase64) {
 }
 
 TEST(PersistenceCodec, RecordDecodeWrongTypedUsedFallsBackToFalse) {
-    // Regression: ArduinoJson's as<bool>() coerces any non-boolean variant to true, so an
-    // unguarded read would turn a corrupt "used":"false" STRING into used == true and flip
-    // the single-use admission gate. A wrong-typed field must keep the struct default.
+    // ArduinoJson's as<bool>() coerces any non-boolean variant to true, so an unguarded read
+    // would turn a corrupt "used":"false" STRING into used == true and flip the single-use
+    // admission gate. A wrong-typed field must keep the struct default.
     for (const char* corrupt_used : {R"("false")", R"("yes")", R"("")", "[1,2]", "{}"}) {
         std::string blob = R"({"v":1,"psk_id":"rec-u","psk":")" +
                            base64url_encode(make_psk(0x62).data(), 32) + R"(","used":)" +

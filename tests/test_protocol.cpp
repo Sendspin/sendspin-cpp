@@ -38,7 +38,7 @@
 #include <utility>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 namespace {
 
@@ -371,9 +371,9 @@ TEST(Protocol, ServerHelloRequiresName) {
     ServerHelloMessage ok;
     ASSERT_TRUE(process_server_hello_message(root_ok, &ok));
     EXPECT_EQ(ok.name, "srv");
-    EXPECT_FALSE(ok.server_id.has_value());  // legacy fallback field, absent on the real wire
+    EXPECT_FALSE(ok.server_id.has_value());  // fallback field, absent on the real wire
 
-    // The legacy server_id fallback field parses when present (test/no-encryption fixtures only).
+    // The server_id fallback field parses when present (test/no-encryption fixtures only).
     JsonDocument doc_legacy;
     JsonObject root_legacy;
     ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"srv","server_id":"s1"}})",
@@ -408,7 +408,6 @@ TEST(Protocol, ServerActivateParsesActivitiesAndStickyRoles) {
     ASSERT_TRUE(process_server_activate_message(root2, &msg2));
     EXPECT_FALSE(msg2.active_roles.has_value());
 
-    // Missing activities array rejects the message.
     JsonDocument doc3;
     JsonObject root3;
     ASSERT_TRUE(parse(R"({"type":"server/activate","payload":{}})", doc3, root3));
@@ -416,9 +415,9 @@ TEST(Protocol, ServerActivateParsesActivitiesAndStickyRoles) {
     EXPECT_FALSE(process_server_activate_message(root3, &msg3));
 }
 
-// If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a non-zero
-// bin count must be present. Otherwise the expected size of binary spectrum messages would be
-// indeterminate, so the visualizer object is dropped -- but only the visualizer object: the message
+// If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a
+// non-zero bin count must be present. Otherwise the expected size of binary spectrum messages
+// would be indeterminate, so the visualizer object is dropped, but only that object: the message
 // itself still parses so a well-formed player/artwork start alongside it is not lost.
 TEST(Protocol, StreamStartDropsSpectrumWithoutValidConfig) {
     // (a) SPECTRUM advertised but no spectrum object at all.
@@ -693,9 +692,9 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsPresent) {
 }
 
 // client/hello's trust_level/unpaired_access/supported_pair_methods fields: supported_pair_
-// methods is now a REQUIRED field on the wire (spec #113/#122: every client implements at least
-// pairing_psk, so the field can never be legitimately absent) -- always emitted as an array, even
-// an empty one in a degenerate all-disabled configuration.
+// methods is a REQUIRED field on the wire (spec's "client/hello" section: every client
+// implements at least pairing_psk, so the field can never be legitimately absent), always
+// emitted as an array, even an empty one in a degenerate all-disabled configuration.
 TEST(Protocol, FormatClientHelloTrustAndPairMethods) {
     ClientHelloMessage msg;
     msg.name = "Speaker";
@@ -811,7 +810,7 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
 }
 
 // ============================================================================
-// client/hello new shape (no client_id/version, new fields)
+// client/hello field set
 // ============================================================================
 
 // Under encryption, client/hello must NOT contain client_id or version (they move to client/init).
@@ -886,9 +885,8 @@ TEST(Protocol, ClientHelloPairingPskMethodDescriptor) {
 }
 
 // supported_pair_methods: the field itself is REQUIRED on the wire even when there are no
-// methods to advertise (spec #113/#122) -- emitted as an empty array, not omitted. Superseded
-// requirement; the field used to be omitted entirely in this case (see git history), which is
-// no longer spec-conformant now that every client is expected to implement at least pairing_psk.
+// methods to advertise (spec's "client/hello" section): it must be emitted as an empty array,
+// not omitted, since every client is expected to implement at least pairing_psk.
 TEST(Protocol, ClientHelloNoSupportedPairMethods) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
@@ -896,7 +894,6 @@ TEST(Protocol, ClientHelloNoSupportedPairMethods) {
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
-    // Field must be present as an empty array, not absent.
     ASSERT_TRUE(doc["payload"]["supported_pair_methods"].is<JsonArrayConst>());
     EXPECT_EQ(doc["payload"]["supported_pair_methods"].as<JsonArrayConst>().size(), 0u);
 }
@@ -915,11 +912,11 @@ TEST(Protocol, ServerHelloSlimParse) {
     EXPECT_EQ(msg.name, "MySpeaker");
 }
 
-// server/hello must ignore (not fail on) absence of the old fields.
-TEST(Protocol, ServerHelloIgnoresOldFields) {
+// server/hello parses successfully when only name is present; the optional fields may be absent.
+TEST(Protocol, ServerHelloParsesWithOnlyName) {
     JsonDocument doc;
     JsonObject root;
-    // Old-style fields (connection_reason, active_roles, version, server_id) are absent.
+    // Optional fields (connection_reason, active_roles, version, server_id) are absent.
     ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"X"}})", doc, root));
 
     ServerHelloMessage msg;
@@ -927,7 +924,6 @@ TEST(Protocol, ServerHelloIgnoresOldFields) {
     EXPECT_EQ(msg.name, "X");
 }
 
-// server/hello with missing name must fail.
 TEST(Protocol, ServerHelloMissingNameFails) {
     JsonDocument doc;
     JsonObject root;
@@ -1009,9 +1005,9 @@ TEST(Protocol, ServerActivateActiveRolesAbsentIsNullopt) {
         << "absent active_roles must be nullopt (sticky)";
 }
 
-// The current spec nests the pairing parameters: payload.pairing = {method, pin_length?,
-// languages?}. Regression guard for the resync away from the removed flat
-// payload.selected_pair_method field.
+// The spec nests the pairing parameters: payload.pairing = {method, pin_length?, languages?}.
+// The parser must accept this nested form; the flat payload.selected_pair_method field is not
+// part of the current wire format.
 TEST(Protocol, ServerActivateWithPairingObject) {
     JsonDocument doc;
     JsonObject root;
@@ -1044,8 +1040,8 @@ TEST(Protocol, ServerActivatePairingObjectCarriesPinLength) {
     EXPECT_EQ(msg.pairing_pin_length.value(), 6);
 }
 
-// The pre-resync flat field must no longer be honored: a server sending only the removed
-// payload.selected_pair_method yields no usable method.
+// payload.selected_pair_method is not part of the current wire format: a server sending only
+// that flat field yields no usable method.
 TEST(Protocol, ServerActivateLegacyFlatSelectedPairMethodIgnored) {
     JsonDocument doc;
     JsonObject root;
@@ -1116,18 +1112,17 @@ TEST(Protocol, PairMethodFromString) {
 }
 
 // ============================================================================
-// New SendspinGoodbyeReason values
+// SendspinGoodbyeReason
 // ============================================================================
 
-TEST(Protocol, GoodbyeReasonNewValues) {
+TEST(Protocol, GoodbyeReasonPairingValues) {
     EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::UNAUTHORIZED), "unauthorized");
     EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::PAIRING_REQUIRED), "pairing_required");
     EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::CONCURRENT_ATTEMPT), "concurrent_attempt");
     EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::UNPAIRED), "unpaired");
 }
 
-// All pre-existing GoodbyeReason values must still work.
-TEST(Protocol, GoodbyeReasonExistingValues) {
+TEST(Protocol, GoodbyeReasonLifecycleValues) {
     EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::ANOTHER_SERVER), "another_server");
     EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::SHUTDOWN), "shutdown");
     EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::RESTART), "restart");
@@ -1177,11 +1172,9 @@ TEST(Protocol, FormatClientPairFinalizeWireShape) {
     std::array<uint8_t, 32> psk{};
     const std::string out = format_client_pair_finalize_message(psk);
 
-    // Must be valid JSON.
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_finalize produced invalid JSON";
 
-    // type field.
     EXPECT_STREQ(doc["type"], "client/pair-finalize");
 
     // long_term_psk must be a 43-character base64url string (no padding).
@@ -1200,7 +1193,6 @@ TEST(Protocol, FormatClientPairFinalizeWireShape) {
     }
 }
 
-// format_client_pair_finalize_message: non-zero PSK encodes correctly.
 TEST(Protocol, FormatClientPairFinalizeNonZeroPsk) {
     std::array<uint8_t, 32> psk{};
     for (size_t i = 0; i < 32; ++i) {
@@ -1266,7 +1258,6 @@ TEST(Protocol, PairAbortMessageParseRoundTrip) {
         PairAbortReason::USER_CANCELLED,
     };
     for (const auto reason : reasons) {
-        // Serialize with the format function, then parse back.
         const std::string out = format_pair_abort_message(reason);
         JsonDocument doc;
         JsonObject root;

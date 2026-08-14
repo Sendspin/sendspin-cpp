@@ -6,7 +6,7 @@
 
 include(FetchContent)
 
-# GoogleTest — fetched the same way as the library's other dependencies.
+# GoogleTest, fetched the same way as the library's other dependencies.
 FetchContent_Declare(
     googletest
     GIT_REPOSITORY https://github.com/google/googletest.git

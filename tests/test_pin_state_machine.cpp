@@ -14,7 +14,7 @@
 
 // Integration harness: drives ConnectionManager's PIN pairing state machine end-to-end for
 // both dynamic PIN and static PIN, including the abort / cleanup / connection-loss paths that
-// the dynamic/static PIN unit tests (test_dynamic_pin.cpp) do not reach -- those cover wire
+// the dynamic/static PIN unit tests (test_dynamic_pin.cpp) do not reach. Those cover wire
 // parse/format, the lockout counter, CPace round-trips, and the client/hello descriptor.
 //
 // The device under test is the CPace RESPONDER; the "server" side is simulated in-test with
@@ -25,8 +25,8 @@
 //
 // Server-to-client pairing messages are injected via ConnectionManager's public
 // schedule_pin_pairing_message() / schedule_pair_abort() / schedule_pairing_window_confirm()
-// APIs followed by SendspinClient::loop() -- the same entry points process_json_message() uses
-// on the network thread -- so these tests exercise the real deferred-event + main-loop path.
+// APIs followed by SendspinClient::loop() (the same entry points process_json_message() uses
+// on the network thread), so these tests exercise the real deferred-event + main-loop path.
 // Listener callbacks are NOT fired directly by ConnectionManager; they are queued into
 // SendspinClient::EventState and drained by SendspinClient::loop() after
 // connection_manager_->loop() returns, so every scenario below calls client.loop() and asserts
@@ -60,24 +60,24 @@
 #include <utility>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 namespace {
 
 // =============================================================================
-// FakeConnection: minimal SendspinConnection stand-in (D2)
+// FakeConnection: minimal SendspinConnection stand-in
 // =============================================================================
 
 /// @brief Concrete SendspinConnection that captures outbound frames and reports a canned
 /// Noise handshake hash without ever installing a real Noise session. Adapted from
-/// TestConnection in tests/test_noise_transport.cpp; kept as a separate copy per the brief
-/// (that file's copy is not to be disturbed).
+/// TestConnection in tests/test_noise_transport.cpp; kept as a deliberately separate copy
+/// so this harness's needs can diverge without disturbing that file's fixture.
 class FakeConnection : public SendspinConnection {
 public:
     FakeConnection() = default;
     ~FakeConnection() override = default;
 
-    // -- Interface stubs --
+    // Interface stubs
 
     void start() override {}
     void loop() override {}
@@ -113,23 +113,23 @@ public:
 
     bool send_time_message() override { return true; }
 
-    // -- Test-only seam: canned handshake hash without a Noise session (D1, seam #1) --
+    // Test-only seam: canned handshake hash without a Noise session
 
     /// Report a fixed 32-byte handshake hash while leaving noise_session_ (and therefore
     /// noise_active_) unset, so send_app_json() routes through send_text_message() as raw
-    /// JSON. Overrides the now-virtual base implementation (see connection.h).
+    /// JSON. Overrides the virtual base implementation (see connection.h).
     std::optional<std::array<uint8_t, 32>> get_noise_handshake_hash() const override {
         return this->canned_hash_;
     }
 
     /// Report a canned Noise suite name without an active Noise session, so PSK Wrapping
-    /// (spec #117) can resolve an AEAD cipher during the PAIR_CONFIRM step. Overrides the
-    /// now-virtual base implementation (see connection.h).
+    /// (spec "PSK Wrapping") can resolve an AEAD cipher during the PAIR_CONFIRM step. Overrides the
+    /// virtual base implementation (see connection.h).
     const std::string& get_noise_suite_name() const override {
         return this->canned_suite_name_;
     }
 
-    // -- Accumulated outgoing messages / disconnect bookkeeping --
+    // Accumulated outgoing messages / disconnect bookkeeping
 
     std::vector<std::string> sent_text_;
     std::vector<std::vector<uint8_t>> sent_binary_;
@@ -144,7 +144,7 @@ private:
 };
 
 // =============================================================================
-// RecordingListener: captures every pairing-related callback, in order (D2)
+// RecordingListener: captures every pairing-related callback, in order
 // =============================================================================
 
 enum class PairingEventKind {
@@ -242,11 +242,11 @@ public:
 };
 
 // =============================================================================
-// Minimal fake providers (D2)
+// Minimal fake providers
 // =============================================================================
 
 /// Network provider that always reports "not ready", so ConnectionManager::loop() never
-/// starts the real WebSocket server -- these tests inject connections directly and never
+/// starts the real WebSocket server: these tests inject connections directly and never
 /// exercise the transport or accept path.
 class FakeNetworkProvider : public SendspinNetworkProvider {
 public:
@@ -313,9 +313,9 @@ std::string last_pair_abort_reason(const std::vector<std::string>& sent_text) {
 // =============================================================================
 
 /// Build the SID CPace expects: "sendspin-pair-pake-v1" (21 bytes, no NUL) || 32-byte hash ||
-/// 4-byte big-endian pairing_index counter (spec #120). `counter` must equal the pairing_index
+/// 4-byte big-endian pairing_index counter (spec "PAKE"). `counter` must equal the pairing_index
 /// the client captured for this attempt (SendspinConnection::bump_pairing_index(), which returns
-/// 1 for the first pairing server/activate on a fresh connection -- the value every single-
+/// 1 for the first pairing server/activate on a fresh connection, the value every single-
 /// enter_pairing() test in this file uses).
 std::vector<uint8_t> make_sid(const std::array<uint8_t, 32>& handshake_hash, uint32_t counter = 1) {
     static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
@@ -333,8 +333,8 @@ std::vector<uint8_t> ascii_bytes(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
-/// ADa = "server" (the (stand-in) server's own AD), ADb = "client" (the device's own AD) --
-/// spec #117.
+/// ADa = "server" (the (stand-in) server's own AD), ADb = "client" (the device's own AD);
+/// spec "PAKE".
 std::vector<uint8_t> ad_server() {
     return ascii_bytes("server");
 }
@@ -364,7 +364,7 @@ struct ServerStandIn {
 }  // namespace
 
 // =============================================================================
-// Test fixture (D2): builds a SendspinClient, injects a FakeConnection as
+// Test fixture: builds a SendspinClient, injects a FakeConnection as
 // current_connection_, and provides helpers to drive the PIN state machine.
 // =============================================================================
 
@@ -373,7 +373,7 @@ protected:
     void SetUp() override {
         // This harness exercises both dynamic-PIN and static-PIN device flows, so the platform
         // capability flags gating their advertisement/admissibility default to both set (spec
-        // #120/#123's pairing-method admissibility check in ConnectionManager::loop() mirrors
+        // "PAKE"'s pairing-method admissibility check in ConnectionManager::loop() mirrors
         // build_hello_message()'s gating exactly, including these). Tests that need a different
         // capability shape call init_client() again with other flags.
         this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/true);
@@ -392,9 +392,8 @@ protected:
         ASSERT_TRUE(this->client_->start_server());
         // A device that implements static_pin enables it in its live pairing config (the flag a
         // real client would flip once, independent of whether a PIN is currently configured).
-        // Needed since spec #120/#123's pairing-method admissibility check (see
-        // ConnectionManager::loop()) now gates entry on RecordStore::static_pin_enabled(), not
-        // just on a PIN being configured.
+        // Needed since spec "server/activate"'s pairing-method admissibility check (see
+        // ConnectionManager::loop()) gates entry on RecordStore::static_pin_enabled().
         this->record_store().set_static_pin_enabled(true);
     }
 
@@ -446,16 +445,16 @@ protected:
 
     /// Drive handle_enter_pairing() for the injected current connection via the same call
     /// ConnectionManager::loop() makes for a first pairing activate. Called directly (through
-    /// the friend seam) rather than replaying the full activate-arbitration path, per the
-    /// brief's "if intractable" fallback -- arbitration itself is exercised by test_admission.cpp
-    /// and is not the subject of this harness.
+    /// the friend seam) rather than replaying the full activate-arbitration path, since
+    /// arbitration itself is exercised by test_admission.cpp and is not the subject of this
+    /// harness.
     ///
     /// Production bumps pairing_index at the point a pairing server/activate is RECEIVED (the
     /// activate_events loop in ConnectionManager::loop(), before the admissibility gate), not
-    /// inside handle_enter_pairing() itself -- see the fix for the pairing_index undercount bug.
-    /// This seam skips that loop entirely, so it must bump here to stand in for "a pairing
-    /// server/activate was just received for this connection", matching what every real caller
-    /// of handle_enter_pairing() already observes.
+    /// inside handle_enter_pairing() itself: pairing_index must reflect every received activate,
+    /// not only ones that reach this seam. This seam skips that loop entirely, so it must bump
+    /// here to stand in for "a pairing server/activate was just received for this connection",
+    /// matching what every real caller of handle_enter_pairing() already observes.
     void enter_pairing(SendspinConnection* conn) {
         conn->bump_pairing_index();
         this->client_->connection_manager_->handle_enter_pairing(conn);
@@ -469,7 +468,7 @@ protected:
 
     /// Seam for arbitration checks: should_switch_to_new_server() and the last-playback fields
     /// are private to ConnectionManager, and the friend declaration names this fixture, not the
-    /// class TEST_F derives from it -- so the call has to route through here.
+    /// class TEST_F derives from it, so the call has to route through here.
     /// @param last_playback_server_id Sets last_played_server_id_; empty clears the has-value
     ///        flag, so rule 5's tiebreak is only armed when a non-empty id is passed.
     bool would_switch_to(SendspinConnection* current, SendspinConnection* incoming,
@@ -488,7 +487,7 @@ protected:
     std::shared_ptr<SendspinConnection> current_connection_sp() { return this->injected_conn_; }
 
     /// Returns ConnectionManager::current_connection_ (nullptr once dropped), through the
-    /// friend seam -- unlike current_connection_sp() above, this reflects whether the
+    /// friend seam. Unlike current_connection_sp() above, this reflects whether the
     /// connection is still actually managed, not just whether the fixture's own reference is
     /// still alive.
     SendspinConnection* current_connection() {
@@ -531,7 +530,7 @@ protected:
     /// Schedule a server/activate event on the injected current connection for deferred
     /// processing, without pumping loop(). Drives the real activate-arbitration path in
     /// ConnectionManager::loop() (trust check, apply_server_activate, then either the
-    /// already-admitted branch's leftover-activate handling or on_handshake_complete()) --
+    /// already-admitted branch's leftover-activate handling or on_handshake_complete()):
     /// the same entry point process_json_message() uses on the network thread.
     void post_activate(std::vector<SendspinActivity> activities,
                        std::optional<std::vector<std::string>> active_roles,
@@ -589,7 +588,7 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
     const std::array<uint8_t, 32> nonce_b = conn->pin_session().nonce_b;
     const std::array<uint8_t, 32> handshake_hash = conn->pin_session().handshake_hash;
 
-    // ---- server/pair-init: nonce_A only; pin_length (6) came from the activation ----
+    // server/pair-init: nonce_A only; pin_length (6) came from the activation.
     std::array<uint8_t, 32> nonce_a{};
     for (size_t i = 0; i < nonce_a.size(); ++i) {
         nonce_a[i] = static_cast<uint8_t>(i + 1);
@@ -612,11 +611,11 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
     EXPECT_EQ(this->listener_.last_displayed_pin(), pin_opt.value());
 
-    // ---- Simulated server (INITIATOR) starts CPace with the same derived PIN ----
+    // Simulated server (INITIATOR) starts CPace with the same derived PIN.
     ServerStandIn server;
     ASSERT_TRUE(server.start(pin_opt.value(), handshake_hash));
 
-    // ---- server/pair-auth: server's public share (pake_msg_1) ----
+    // server/pair-auth: server's public share (pake_msg_1).
     ServerPairingMessageEvent pair_auth_event;
     pair_auth_event.conn = conn_sp;
     pair_auth_event.kind = PinPairingMessageKind::PAIR_AUTH;
@@ -639,7 +638,7 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
     auto server_kc = server.initiator.tag();
     ASSERT_TRUE(server_kc.has_value());
 
-    // ---- server/pair-confirm: server_kc ----
+    // server/pair-confirm: server_kc.
     ServerPairingMessageEvent pair_confirm_event;
     pair_confirm_event.conn = conn_sp;
     pair_confirm_event.kind = PinPairingMessageKind::PAIR_CONFIRM;
@@ -659,9 +658,10 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
         << "dynamic PIN pair-confirm must open nonce_B";
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
 
-    // PSK Wrapping round-trip (spec #117): client/pair-finalize must carry wrapped_psk (NOT
-    // long_term_psk) in a PIN flow, and the server-side ServerStandIn -- using its own
-    // independently-derived ISK/sid, exactly as a real server would -- must be able to unwrap it.
+    // PSK Wrapping round-trip (spec "PSK Wrapping"): client/pair-finalize must carry
+    // wrapped_psk (NOT long_term_psk) in a PIN flow, and the server-side ServerStandIn (using its
+    // own
+    // independently-derived ISK/sid, exactly as a real server would) must be able to unwrap it.
     // A successful AEAD decrypt here proves the client used the same K_wrap the server derives.
     JsonDocument finalize_doc;
     JsonObject finalize_root;
@@ -693,8 +693,8 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
     EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 0);
 }
 
-// Regression: a PIN attempt that reaches PAIR_CONFIRM success already dismisses the displayed
-// PIN there (see the PAIR_CONFIRM handler in connection_manager.cpp). If the server then acks
+// A PIN attempt that reaches PAIR_CONFIRM success already dismisses the displayed PIN there (see
+// the PAIR_CONFIRM handler in connection_manager.cpp). If the server then acks
 // server/pair-finalize but the persistence provider rejects the record, handle_pair_storage_
 // failed() ends the same attempt a second time via abort_pairing_attempt(); on_clear_pairing_pin
 // must NOT fire again for the PIN this attempt already stopped showing.
@@ -834,8 +834,8 @@ TEST_F(PinStateMachineTest, DynamicPinMismatchRecordsFailureAndAborts) {
     this->client_->loop();
 
     // Device must abort with pin_mismatch, record a DYNAMIC_PIN failure, and fire the failure
-    // callbacks (abort-ordering regression: on_pairing_failed AND on_clear_pairing_pin both
-    // survive cleanup_connection_state()).
+    // callbacks: on_pairing_failed AND on_clear_pairing_pin both survive
+    // cleanup_connection_state().
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pin_mismatch");
     EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 1);
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
@@ -871,11 +871,10 @@ TEST_F(PinStateMachineTest, DynamicPinAttemptTimeout) {
 // Dynamic PIN: malformed server frame
 // =============================================================================
 
-// Spec "Protocol Errors" (line 999): "a malformed or missing field ... is a protocol error: the
-// detecting side closes the WebSocket without sending any application-level error message, and
-// persists nothing." Previously this path sent pair/abort(method_not_supported) and left the
-// connection open, deviating from the spec (see ConnectionManager::handle_pin_pairing_message's
-// MALFORMED case); this test now pins the corrected silent-close behavior.
+// Spec "Protocol Errors": "a malformed or missing field ... is a protocol error: the detecting
+// side closes the WebSocket without sending any application-level error message, and persists
+// nothing." This pins that behavior for the MALFORMED case in
+// ConnectionManager::handle_pin_pairing_message: no pair/abort, and the connection closes.
 TEST_F(PinStateMachineTest, DynamicPinMalformedFrameDuringSessionClosesSilently) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-4", SendspinPairMethod::DYNAMIC_PIN);
@@ -895,7 +894,7 @@ TEST_F(PinStateMachineTest, DynamicPinMalformedFrameDuringSessionClosesSilently)
     ASSERT_EQ(conn->sent_text_.size(), 1u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
     // The close goes through drop_connection() with goodbye=std::nullopt (no client/goodbye
-    // either), so disconnect_count_ stays 0 -- unlike
+    // either), so disconnect_count_ stays 0, unlike
     // PairAbortConcurrentAttemptStillClosesConnection, which does send a goodbye.
     EXPECT_EQ(conn->disconnect_count_, 0);
     EXPECT_EQ(this->current_connection(), nullptr)
@@ -929,14 +928,14 @@ TEST_F(PinStateMachineTest, DynamicPinMalformedFrameWithNoActiveSessionIsIgnored
 // Dynamic PIN: CPace derive() failure on server/pair-auth (low-order/malformed share)
 // =============================================================================
 
-// Spec Protocol Errors (line 999): "a CPace share with the wrong length or encoding a
-// low-order point" is a protocol error, not a pin_mismatch: the detecting side closes the
-// WebSocket without sending any application-level error message, and persists nothing. A
-// derive() failure happens on the peer's raw share BEFORE the PIN-derived generator can even
-// be compared, so it can never be produced by an operator simply mistyping the PIN (that
-// produces a well-formed shared secret that only fails the confirm-tag check exercised by
-// DynamicPinMismatchRecordsFailureAndAborts above) -- it must not count toward the dynamic-PIN
-// failure counter or escalate the method, which is the security-relevant half of this test.
+// Spec "Protocol Errors": "a CPace share with the wrong length or encoding a low-order point" is
+// a protocol error, not a pin_mismatch: the detecting side closes the WebSocket without sending
+// any application-level error message, and persists nothing. A derive() failure happens on the
+// peer's raw share BEFORE the PIN-derived generator can even be compared, so it can never be
+// produced by an operator simply mistyping the PIN (that produces a well-formed shared secret
+// that only fails the confirm-tag check exercised by DynamicPinMismatchRecordsFailureAndAborts
+// above); it must not count toward the dynamic-PIN failure counter or escalate the method, which
+// is the security-relevant half of this test.
 TEST_F(PinStateMachineTest, DynamicPinDeriveFailureOnPairAuthClosesSilentlyWithoutFailureCount) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-7", SendspinPairMethod::DYNAMIC_PIN);
@@ -994,7 +993,7 @@ TEST_F(PinStateMachineTest, DynamicPinDeriveFailureOnPairAuthClosesSilentlyWitho
 }
 
 // =============================================================================
-// Dynamic PIN: escalation (gesture gating, replaces the old lockout)
+// Dynamic PIN: escalation (gesture gating, not a lockout)
 // =============================================================================
 
 // At the failure threshold the method is escalated, NOT locked out: the attempt is not
@@ -1239,7 +1238,7 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
     const std::array<uint8_t, 32> handshake_hash = conn->pin_session().handshake_hash;
 
     // Operator confirms the pairing-window gesture: this must send client/pair-init with no
-    // commit_B, but WITH the required pairing_index (spec #120).
+    // commit_B, but WITH the required pairing_index (spec "Pairing index").
     this->client_->confirm_pairing_window();
     this->client_->loop();
 
@@ -1295,7 +1294,7 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
         << "static PIN pair-confirm must NOT carry nonce_B";
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
 
-    // PSK Wrapping round-trip (spec #117), static-PIN flavor: see the identical block in
+    // PSK Wrapping round-trip (spec "PSK Wrapping"), static-PIN flavor: see the identical block in
     // DynamicPinHappyPath above for the full rationale.
     JsonDocument finalize_doc;
     JsonObject finalize_root;
@@ -1324,15 +1323,15 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
 }
 
 // =============================================================================
-// Entered from a SUBSEQUENT activate (regression)
+// Entered from a SUBSEQUENT activate
 // =============================================================================
 
 // A device that first goes operational on an empty server/activate must still enter static-PIN
-// pairing when the operator later triggers a SUBSEQUENT activate declaring [pairing]. Before the
-// fix, ConnectionManager::loop() only entered pairing on the FIRST activate on an already-admitted
-// connection and silently dropped a later one as an ordinary "subsequent activate", so the pairing
-// window never opened. Mirrors the reference's _handle_server_activate, which runs pairing on any
-// pairing activate, not only the first.
+// pairing when the operator later triggers a SUBSEQUENT activate declaring [pairing].
+// ConnectionManager::loop() must enter pairing on ANY pairing activate on an already-admitted
+// connection, not only the first, or a later one is silently dropped as an ordinary "subsequent
+// activate" and the pairing window never opens. Mirrors the reference's _handle_server_activate,
+// which runs pairing on any pairing activate, not only the first.
 TEST_F(PinStateMachineTest, SubsequentActivateEntersStaticPinPairing) {
     this->record_store().set_static_pin("13572468");
 
@@ -1365,8 +1364,8 @@ TEST_F(PinStateMachineTest, SubsequentActivateEntersStaticPinPairing) {
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 }
 
-// Same regression, dynamic-PIN flavor: a subsequent activate declaring [pairing] + dynamic_pin on
-// an already-operational connection must enter pairing and send client/pair-init (commit_B)
+// Dynamic-PIN flavor: a subsequent activate declaring [pairing] + dynamic_pin on an
+// already-operational connection must enter pairing and send client/pair-init (commit_B)
 // immediately (dynamic PIN has no operator pairing-window gesture, unlike static PIN above).
 TEST_F(PinStateMachineTest, SubsequentActivateEntersDynamicPinPairing) {
     FakeConnection* conn = this->inject_provisional_current_connection("server-dyn-sub");
@@ -1391,7 +1390,7 @@ TEST_F(PinStateMachineTest, SubsequentActivateEntersDynamicPinPairing) {
 }
 
 // The client validates pin_length on receipt of the ACTIVATION (not at server/pair-init,
-// which now carries only nonce_A): a value below min_pin_length or outside 4-12 is rejected
+// which carries only nonce_A): a value below min_pin_length or outside 4-12 is rejected
 // with pair/abort(pin_length_unacceptable), leaving the connection open.
 TEST_F(PinStateMachineTest, OutOfRangePinLengthOnActivationIsRejected) {
     FakeConnection* conn = this->inject_provisional_current_connection("server-badlen");
@@ -1538,7 +1537,7 @@ TEST_F(PinStateMachineTest, GestureWaitHasNoClientTimeout) {
 }
 
 // =============================================================================
-// Regression: connection loss mid-pairing
+// Connection loss mid-pairing
 // =============================================================================
 
 TEST_F(PinStateMachineTest, ConnectionLossDuringStaticPairingWindowClosesWindow) {
@@ -1601,13 +1600,13 @@ TEST_F(PinStateMachineTest, ConnectionLossWithPinDisplayedClearsPin) {
 }
 
 // =============================================================================
-// Regression: abort ordering survives cleanup_connection_state()
+// Abort ordering survives cleanup_connection_state()
 // =============================================================================
 
 TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
     // A current-connection abort (pair/abort from the server) must still deliver
     // on_pairing_failed AND on_clear_pairing_pin even though cleanup_connection_state() wipes
-    // the EventState pending-notification vectors -- the note_* calls in
+    // the EventState pending-notification vectors: the note_* calls in
     // ConnectionManager::handle_pair_abort() must run strictly AFTER that wipe.
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-8", SendspinPairMethod::DYNAMIC_PIN);
@@ -1647,15 +1646,15 @@ TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_PIN))
         << "on_clear_pairing_pin must survive cleanup_connection_state()";
-    // Spec #120/#123: only reason concurrent_attempt closes the connection; user_cancelled
+    // Spec "pair/abort": only reason concurrent_attempt closes the connection; user_cancelled
     // leaves it open (pairing state is still cleared above).
     EXPECT_EQ(conn->disconnect_count_, 0);
     EXPECT_FALSE(conn->is_pairing_in_progress());
 }
 
 TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupStaticWindow) {
-    // Same regression, static-PIN flavor: abort while AWAIT_PAIRING_WINDOW (before any PIN
-    // exchange even starts) must still fire on_pairing_failed + on_close_pairing_window.
+    // Static-PIN flavor: abort while AWAIT_PAIRING_WINDOW (before any PIN exchange even starts)
+    // must still fire on_pairing_failed + on_close_pairing_window.
     this->record_store().set_static_pin("13572468");
     FakeConnection* conn =
         this->inject_current_connection("server-static-6", SendspinPairMethod::STATIC_PIN);
@@ -1673,7 +1672,7 @@ TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupStaticW
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
-    // Spec #120/#123: only reason concurrent_attempt closes the connection.
+    // Spec "pair/abort": only reason concurrent_attempt closes the connection.
     EXPECT_EQ(conn->disconnect_count_, 0);
 }
 
@@ -1683,8 +1682,8 @@ TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupStaticW
 
 // A server/activate in place of server/pair-finalize ends the pairing attempt without
 // finalizing; the spec requires persisting nothing and discarding any pending long_term_psk.
-// The clear is folded into SendspinClient::on_handshake_complete() -- the one place every
-// "connection is now operational" path converges -- so no operational-entry path can leave a
+// The clear is folded into SendspinClient::on_handshake_complete(), the one place every
+// "connection is now operational" path converges, so no operational-entry path can leave a
 // stale PIN session or pending record behind.
 TEST_F(PinStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPinSession) {
     this->record_store().set_static_pin("13572468");
@@ -1705,8 +1704,8 @@ TEST_F(PinStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPinSession) 
     this->client_->loop();
 
     // Going operational must have discarded the pending record and reset the PIN session.
-    // (is_operational() also requires is_handshake_complete(), which FakeConnection never sets --
-    // no real hello handshake runs in this harness -- so it is not asserted here.)
+    // (is_operational() also requires is_handshake_complete(), which FakeConnection never sets,
+    // since no real hello handshake runs in this harness, so it is not asserted here.)
     EXPECT_FALSE(conn->take_pending_pairing_record().has_value())
         << "leftover activate must discard the received long_term_psk";
     EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::IDLE);
@@ -1714,10 +1713,10 @@ TEST_F(PinStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPinSession) 
 }
 
 // =============================================================================
-// pairing_index counter (spec #120)
+// pairing_index counter (spec "Pairing index")
 // =============================================================================
 
-// The pairing_index counter -- sent on every client/pair-init and folded into the CPace sid --
+// The pairing_index counter (sent on every client/pair-init and folded into the CPace sid)
 // must keep incrementing across repeated pairing server/activate messages on the SAME
 // connection (e.g. the operator retries after a stalled attempt), not reset with each attempt.
 // It only resets on a fresh Noise handshake (initial or re-handshake).
@@ -1771,8 +1770,8 @@ TEST_F(PinStateMachineTest, PairingIndexIncrementsAcrossRepeatedPairingActivates
 // still count. Unlike PairingIndexIncrementsAcrossRepeatedPairingActivates above (which drives
 // handle_enter_pairing() directly via the enter_pairing() test seam, bypassing the gate
 // entirely), this test goes through the REAL ConnectionManager::loop() admissibility gate via
-// post_activate()/schedule_activate() -- the same code path a stray or drifted server activate
-// takes in production -- to prove the bump in the activate_events loop (connection_manager.cpp,
+// post_activate()/schedule_activate(), the same code path a stray or drifted server activate
+// takes in production, to prove the bump in the activate_events loop (connection_manager.cpp,
 // before the pairing-method admissibility check) fires for a rejected activate too, so a second,
 // admissible activate on the same connection is not left one behind the server's own count.
 TEST_F(PinStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
@@ -1787,7 +1786,7 @@ TEST_F(PinStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
     EXPECT_TRUE(conn->sent_text_.empty());
 
     // Second activate: [pairing] + pairing_psk, but this connection resolved via the Sentinel PSK
-    // (PskCategory::SENTINEL, not PAIRING) -- category_ok fails, so the admissibility gate rejects
+    // (PskCategory::SENTINEL, not PAIRING), so category_ok fails and the admissibility gate rejects
     // it with pair/abort(method_not_supported) and leaves the connection open, WITHOUT ever
     // reaching handle_enter_pairing(). The counter must still have advanced to 1.
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
@@ -1803,7 +1802,7 @@ TEST_F(PinStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
     // Third activate: [pairing] + dynamic_pin, admissible this time (category_ok: dynamic_pin
     // does not require a Pairing-category PSK; offered: pin_display_supported=true and
     // dynamic_pin_enabled_ defaults true). Must proceed into pairing and its client/pair-init
-    // must carry pairing_index == 2 -- BOTH the rejected and the accepted activate counted.
+    // must carry pairing_index == 2: BOTH the rejected and the accepted activate counted.
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::DYNAMIC_PIN, /*pairing_pin_length=*/6);
     this->client_->loop();
@@ -1826,7 +1825,7 @@ TEST_F(PinStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
 }
 
 // =============================================================================
-// pair/abort close-vs-stay-open semantics (spec #120/#123)
+// pair/abort close-vs-stay-open semantics (spec "pair/abort")
 // =============================================================================
 
 // Reason concurrent_attempt is the ONE pair/abort reason whose sender (and, symmetrically, this
@@ -1850,7 +1849,7 @@ TEST_F(PinStateMachineTest, PairAbortConcurrentAttemptStillClosesConnection) {
 }
 
 // A pair/abort that arrives after the receiver has already ended the attempt (here: a local
-// attempt-timeout abort) has no effect -- it must not fire a second on_pairing_failed, and must
+// attempt-timeout abort) has no effect: it must not fire a second on_pairing_failed, and must
 // not touch the connection.
 TEST_F(PinStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
     FakeConnection* conn =
@@ -1888,11 +1887,10 @@ TEST_F(PinStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
 // SendspinConnection::note_pairing_finalize_ack() resets first_activate_received_ (so
 // is_operational() goes false) and re-arms provisional_time_us_, anticipating the server's
 // follow-up in-band re-handshake. If the server goes silent instead, ConnectionManager::loop()
-// must eventually drop the connection rather than leave it wedged non-operational forever (the
-// bug: the only reaper that read provisional_time_us_ scanned the nursery, and this connection
-// is never a nursery member). Forces the deadline into the past instead of sleeping
-// REPROVE_TIMEOUT_US (30 s) in a unit test, matching the existing attempt_deadline_us pattern
-// (e.g. DynamicPinAttemptTimeout above).
+// must eventually drop the connection rather than leave it wedged non-operational forever. The
+// nursery reaper cannot cover this: the connection is current_connection_, never a nursery member.
+// Forces the deadline into the past instead of sleeping REPROVE_TIMEOUT_US (30 s) in a unit test,
+// matching the attempt_deadline_us pattern (e.g. DynamicPinAttemptTimeout above).
 TEST_F(PinStateMachineTest, ReproveWatchdogDropsConnectionAfterFinalizeAckGoesSilent) {
     FakeConnection* conn =
         this->inject_current_connection("server-reprove-silent", SendspinPairMethod::DYNAMIC_PIN);
@@ -1914,7 +1912,7 @@ TEST_F(PinStateMachineTest, ReproveWatchdogDropsConnectionAfterFinalizeAckGoesSi
 
 // Companion to the test above, proving the watchdog does NOT over-reap: a connection that is
 // operational (is_operational() == true, as a real promoted current_connection_ always is
-// outside the two re-proving windows -- see promote_or_arbitrate_nursery_entry()) and legitimately
+// outside the two re-proving windows; see promote_or_arbitrate_nursery_entry()) and legitimately
 // mid-PIN-pairing, awaiting a human to press a physical gesture with no fixed deadline of its
 // own, must survive even though its provisional_time_us_ is stale by far more than
 // REPROVE_TIMEOUT_US.
@@ -1924,8 +1922,8 @@ TEST_F(PinStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingHumanPin
         this->inject_current_connection("server-reprove-pin-wait", SendspinPairMethod::STATIC_PIN);
 
     // inject_current_connection() does not run a real hello handshake (see the comment on
-    // LeftoverActivateDiscardsPendingRecordAndPinSession above), so is_handshake_complete() --
-    // and therefore is_operational() -- would otherwise stay false regardless of pairing state.
+    // LeftoverActivateDiscardsPendingRecordAndPinSession above), so is_handshake_complete(),
+    // and therefore is_operational(), would otherwise stay false regardless of pairing state.
     // Set it explicitly so this test exercises the same !is_operational() gate a real connection
     // would, and so a false pass (the watchdog skipping this connection only because
     // is_operational() can never be true in this harness) cannot hide a real over-reap bug.
@@ -1942,7 +1940,7 @@ TEST_F(PinStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingHumanPin
     ASSERT_TRUE(conn->is_operational())
         << "entering pairing must not itself clear first_activate_received_";
 
-    // A long time passes -- far beyond REPROVE_TIMEOUT_US -- while the human has not yet acted.
+    // A long time passes, far beyond REPROVE_TIMEOUT_US, while the human has not yet acted.
     conn->set_provisional_time_us(platform_time_us() - REPROVE_TIMEOUT_US - 1);
     this->client_->loop();
 
@@ -1959,7 +1957,7 @@ TEST_F(PinStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingHumanPin
 // whether a connection may drive the roles (see requires_admitted_connection() in client.cpp).
 // drop_connection() moves the connection out of current_connection_ BEFORE calling
 // set_current_connection(nullptr), so the setter sees an already-null slot and cannot clear the
-// outgoing occupant -- drop_connection() has to do it itself. The dropped connection outlives the
+// outgoing occupant; drop_connection() has to do it itself. The dropped connection outlives the
 // call (queue_deferred_release keeps it alive through the goodbye window), so a missed clear
 // leaves an object that still claims admission.
 //
@@ -1989,10 +1987,10 @@ TEST_F(PinStateMachineTest, DropClearsTheAdmittedFlag) {
 
 // Companion to test_admission.cpp's pure-function tests: those pin what
 // should_admit_connection() does with a given admitted_pairing_in_flight, while this pins that
-// should_switch_to_new_server() WIRES it correctly -- passing the incumbent's real activities and
-// signalling the finished pairing through the flag. An earlier version of the fix instead
-// substituted an empty activity set here, which silently dropped the incumbent to rank 0 and let
-// rule 5's last_playback tiebreak evict a connection that had just finished pairing.
+// should_switch_to_new_server() WIRES it correctly: passing the incumbent's real activities and
+// signalling the finished pairing through the flag, rather than substituting an empty activity
+// set (which would silently drop the incumbent to rank 0 and let rule 5's last_playback tiebreak
+// evict a connection that had just finished pairing).
 TEST_F(PinStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlaybackPeer) {
     FakeConnection* current =
         this->inject_current_connection("paired-server", SendspinPairMethod::DYNAMIC_PIN);
@@ -2002,7 +2000,7 @@ TEST_F(PinStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlaybackPe
     ASSERT_TRUE(current->is_pairing_finalized());
     ASSERT_EQ(current->get_activities().size(), 1u);
 
-    // A rank-0 peer (no activities) whose server_id is the last playback server -- exactly the
+    // A rank-0 peer (no activities) whose server_id is the last playback server: exactly the
     // inputs admission rule 5 keys on.
     auto newcomer = std::make_shared<FakeConnection>();
     newcomer->set_noise_handshake_result("old-playback-server", PskCategory::SENTINEL,
@@ -2013,8 +2011,7 @@ TEST_F(PinStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlaybackPe
         << "a rank-0 peer must not displace a just-paired rank-1 connection; suppressing the "
            "in-flight-pairing shield must not also drop the incumbent's rank";
 
-    // The shield really is suppressed though: a rank-2 playback peer now wins, which is the
-    // whole point of the fix.
+    // The shield really is suppressed though: a rank-2 playback peer wins.
     auto playback = std::make_shared<FakeConnection>();
     playback->set_noise_handshake_result("playback-server", PskCategory::SENTINEL, /*psk_id=*/"");
     playback->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,

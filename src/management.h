@@ -15,12 +15,12 @@
 /// @file management.h
 /// @brief Pure handler logic for management/* requests and server/unpair.
 ///
-/// Ports client/management.py from the aiosendspin reference. Each handler takes a
+/// Mirrors client/management.py from the aiosendspin reference. Each handler takes a
 /// RecordStore and parsed request data, returns a ManagementResultPayload and a
 /// ManagementEffect. Deliberately transport-free so handlers are unit-testable against
 /// a bare RecordStore without any network layer.
 ///
-/// pairing_psk, static_pin, and dynamic_pin are all implemented.
+/// Supports the pairing_psk, static_pin, and dynamic_pin pairing methods.
 /// See handle_get_pairing_config / handle_set_pairing_config below.
 
 #pragma once
@@ -47,7 +47,7 @@ namespace sendspin {
 inline constexpr const char* MGMT_TAG = "sendspin.management";
 
 // ============================================================================
-// ManagementEffect - what the connection does after sending the result
+// ManagementEffect: what the connection does after sending the result
 // ============================================================================
 
 /// @brief Action the connection takes after sending management/result.
@@ -141,7 +141,6 @@ inline void handle_add_record(RecordStore& store, const ManagementAddRecordPaylo
         }
     }
 
-    // Decode the base64url PSK.
     auto psk_decoded = b64url_decode(payload.psk);
     if (!psk_decoded.has_value() || psk_decoded->size() != NOISE_PSK_SIZE) {
         SS_LOGW(MGMT_TAG, "add-record: invalid psk (decode failed or wrong size)");
@@ -192,8 +191,8 @@ inline void handle_add_record(RecordStore& store, const ManagementAddRecordPaylo
 /// @brief Handle management/remove-record.
 /// Finds the record, checks protections, removes it, and detects own-record removal.
 ///
-/// Own-record detection compares psk_id -- the credential that actually authenticated the
-/// requesting connection -- rather than server_id. server_id is absent for shared-PSK records
+/// Own-record detection compares psk_id, the credential that actually authenticated the
+/// requesting connection, rather than server_id. server_id is absent for shared-PSK records
 /// (so a server_id-based check would silently miss a connection removing the shared record it
 /// authenticated with), and it is not a unique key across records (so it would also fire for a
 /// different record that merely shares the requester's server_id).
@@ -228,7 +227,6 @@ inline void handle_remove_record(RecordStore& store, const ManagementRemoveRecor
         return;
     }
 
-    // Check if the requester is removing the record that authenticated its own connection.
     const bool is_self = requester_psk_id.has_value() && requester_psk_id.value() == payload.psk_id;
     if (is_self) {
         effect = ManagementEffect::GOODBYE_UNAUTHORIZED;
@@ -261,12 +259,12 @@ inline void handle_get_pairing_config(RecordStore& store, bool dynamic_pin_imple
     result.result = ManagementResult::OK;
     result.data = ManagementResultData{};
 
-    // pairing_psk: report enabled flag only (no secrets).
+    // No secrets in pairing_psk.
     PairingMethodConfig pairing_psk_cfg;
     pairing_psk_cfg.enabled = store.pairing_psk_enabled();
     result.data->pairing_psk = pairing_psk_cfg;
 
-    // static_pin: enabled only (no min_pin_length, no escalated -- the method has no failure
+    // static_pin: enabled only (no min_pin_length, no escalated: the method has no failure
     // counter; it is gesture-gated on every attempt).
     if (static_pin_implemented) {
         PairingMethodConfig static_pin_cfg;
@@ -284,12 +282,10 @@ inline void handle_get_pairing_config(RecordStore& store, bool dynamic_pin_imple
         result.data->dynamic_pin = dynamic_pin_cfg;
     }
 
-    // record_mode: psk_id of the shared-PSK fallback record.
     RecordModeConfig record_mode_cfg;
     record_mode_cfg.psk_id = store.record_mode_psk_id();
     result.data->record_mode = record_mode_cfg;
 
-    // unpaired_access: enabled flag.
     UnpairedAccessConfig unpaired_cfg;
     unpaired_cfg.enabled = store.unpaired_access_enabled();
     result.data->unpaired_access = unpaired_cfg;

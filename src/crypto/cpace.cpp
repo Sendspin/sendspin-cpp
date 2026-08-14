@@ -27,11 +27,11 @@ extern "C" {
 
 namespace sendspin {
 
-// secure_zero() now lives in platform/crypto.h so the other holders of key material (Identity,
-// psk_wrap) can share the one implementation instead of each rolling their own.
+// secure_zero() lives in platform/crypto.h so the other holders of key material (Identity,
+// psk_wrap) can share one implementation.
 
 // ============================================================================
-// LV encoding -- mirrors cpace.py _prepend_len / _lv_cat
+// LV encoding: mirrors cpace.py _prepend_len / _lv_cat
 // ============================================================================
 
 std::vector<uint8_t> cpace_prepend_len(const uint8_t* data, size_t len) {
@@ -60,7 +60,7 @@ std::vector<uint8_t> cpace_lv_cat(std::initializer_list<std::pair<const uint8_t*
 }
 
 // ============================================================================
-// Generator string -- mirrors cpace.py _generator_string
+// Generator string: mirrors cpace.py _generator_string
 // ============================================================================
 
 std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, const uint8_t* ci,
@@ -91,7 +91,7 @@ std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, 
 }
 
 // ============================================================================
-// _decode_u -- mirrors cpace.py _decode_u (clear top bit per RFC 7748)
+// _decode_u: mirrors cpace.py _decode_u (clear top bit per RFC 7748)
 // ============================================================================
 
 std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len) {
@@ -104,7 +104,7 @@ std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len) {
 }
 
 // ============================================================================
-// Elligator2 map -- mirrors cpace.py _elligator2
+// Elligator2 map: mirrors cpace.py _elligator2
 //
 // Given r (mod p), computes the Curve25519 x-coordinate:
 //   v = -A * (1 + Z*r^2)^(-1) mod p       (A=486662, Z=2)
@@ -155,25 +155,16 @@ std::array<uint8_t, 32> cpace_elligator2(const std::array<uint8_t, 32>& r_le) {
     // v^3 + A*v^2 + v
     Fp poly = fp_add(fp_add(v3, Av2), v);
 
-    // eps = poly^((p-1)/2) mod p -- Legendre symbol
+    // eps = poly^((p-1)/2) mod p (Legendre symbol)
     Fp eps = fp_legendre_pow(poly);
 
     // eps is 0, 1, or p-1.
-    // Python: x = (eps * v - (1 - eps) * A * INV2) % Q
-    // = eps*v - (1-eps) * A/2
-    // = eps*v - A/2 + eps*A/2
-    // = eps*(v + A/2) - A/2
-    // But let's compute it directly as the Python does:
-    //   x = (eps * v + (eps - 1) * A * INV2) % Q
-    //   ... or: x = (eps * v - (1 - eps) * A_half) where A_half = A * INV2
+    // Python: x = (eps * v - (1 - eps) * A * INV2) % Q, i.e. x = eps*v - (1-eps)*A_half
+    // where A_half = A * INV2 = A/2 mod p.
 
     // A * INV2 (= A/2 mod p)
     static constexpr Fp A_HALF = {{
-        // A/2 mod p = 486662 * ((p+1)/2) mod p
-        // = 486662 * 0x3FF...F7 mod p
-        // Computed: 486662/2 = 243331 (A is even, so A/2 is exact over integers, no modular inverse
-        // needed for integer division)
-        // Actually A = 486662 is even, so A/2 = 243331 exactly.
+        // A is even, so A/2 = 243331 exactly (no modular inverse needed).
         243331ULL,
         0,
         0,
@@ -199,7 +190,7 @@ std::array<uint8_t, 32> cpace_elligator2(const std::array<uint8_t, 32>& r_le) {
 }
 
 // ============================================================================
-// _calculate_generator -- mirrors cpace.py _calculate_generator
+// _calculate_generator: mirrors cpace.py _calculate_generator
 // ============================================================================
 
 std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs_len,
@@ -213,7 +204,7 @@ std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs
 }
 
 // ============================================================================
-// x25519_scalar_mult -- mirrors cpace.py _scalar_mult
+// x25519_scalar_mult: mirrors cpace.py _scalar_mult
 //
 // Uses noise-c's dhstate to perform RFC 7748 X25519 WITH scalar clamping.
 // The clamping is done by the underlying x25519() call in dh-curve25519.c.
@@ -241,7 +232,6 @@ bool x25519_scalar_mult(const uint8_t scalar[32], const uint8_t point[32], uint8
         return false;
     }
 
-    // Set the public point.
     err = noise_dhstate_set_public_key(dh_pub, point, 32);
     if (err != NOISE_ERROR_NONE) {
         noise_dhstate_free(dh_priv);
@@ -249,7 +239,6 @@ bool x25519_scalar_mult(const uint8_t scalar[32], const uint8_t point[32], uint8
         return false;
     }
 
-    // Perform the multiplication; result goes into out.
     err = noise_dhstate_calculate(dh_priv, dh_pub, out, 32);
 
     noise_dhstate_free(dh_priv);
@@ -259,7 +248,7 @@ bool x25519_scalar_mult(const uint8_t scalar[32], const uint8_t point[32], uint8
 }
 
 // ============================================================================
-// Helper: build lv_cat over two (share, ad) pairs -- used in derive() and tags
+// Helper: build lv_cat over two (share, ad) pairs; used in derive() and tags
 // ============================================================================
 
 static std::vector<uint8_t> lv_pair(const uint8_t* share, const std::vector<uint8_t>& ad) {
@@ -365,7 +354,7 @@ bool CPace::derive(const uint8_t* peer_share, size_t peer_share_len) {
     h_isk.update(lv_prefix.data(), lv_prefix.size());
     h_isk.update(t_init.data(), t_init.size());
     h_isk.update(t_resp.data(), t_resp.size());
-    // ISK is retained (not wiped) on this->isk_: PSK Wrapping (#117) derives K_wrap from it
+    // ISK is retained (not wiped) on this->isk_: PSK Wrapping derives K_wrap from it
     // after key confirmation succeeds. Zeroized in the destructor along with mac_key_.
     this->isk_ = h_isk.finalize();
 
@@ -395,7 +384,6 @@ std::array<uint8_t, CPACE_TAG_SIZE> CPace::compute_mac(bool own) const {
     // own == false -> authenticates peer's (share, ad)
     //
     // Ta authenticates (Ya, ADa); Tb authenticates (Yb, ADb).
-    // If own == (role == INITIATOR): use initiator's data.
     bool use_initiator = (own == (this->role_ == CPaceRole::INITIATOR));
     const uint8_t* share =
         use_initiator ? this->initiator_share_.data() : this->responder_share_.data();

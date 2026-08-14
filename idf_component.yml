@@ -32,4 +32,3 @@ files:
     - "tests/**"
     - "script/**"
     - "CLAUDE.md"
-    - "docs/encryption-plan.md"

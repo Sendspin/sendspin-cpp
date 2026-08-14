@@ -30,7 +30,7 @@ std::optional<std::array<uint8_t, 32>> derive_psk_wrap_key(
         // noise_hashstate_new_by_name() failed (allocation failure or missing algorithm); h is
         // a no-op in this state and finalize() would silently yield an all-zero digest. Returning
         // that as K_wrap would let wrap_psk() seal the freshly minted PSK under a publicly
-        // derivable key, defeating PSK Wrapping (spec #117) -- fail loudly instead.
+        // derivable key, defeating PSK Wrapping (spec "PSK Wrapping"), so fail loudly instead.
         return std::nullopt;
     }
     h.update(label, label_len);

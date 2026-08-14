@@ -39,7 +39,7 @@
 #include <string>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 namespace {
 
@@ -293,7 +293,7 @@ TEST(ManagementProtocol, ParseSetPairingConfigFull) {
 }
 
 // ===========================================================================
-// Protocol: format management/result - result codes + omit-when-absent
+// Protocol: format management/result result codes and omit-when-absent
 // ===========================================================================
 
 TEST(ManagementProtocol, FormatResultPermissionDenied) {
@@ -418,7 +418,7 @@ TEST(ManagementProtocol, FormatResultGetPairingConfigStaticAndDynamicPin) {
     EXPECT_TRUE(doc["payload"]["data"]["static_pin"]["min_pin_length"].isUnbound())
         << "static_pin must never carry min_pin_length";
     EXPECT_TRUE(doc["payload"]["data"]["static_pin"]["locked_out"].isUnbound())
-        << "locked_out is gone from the wire";
+        << "locked_out is never emitted";
     EXPECT_TRUE(doc["payload"]["data"]["static_pin"]["escalated"].isUnbound())
         << "static_pin has no failure counter, so no escalated flag";
 
@@ -426,7 +426,7 @@ TEST(ManagementProtocol, FormatResultGetPairingConfigStaticAndDynamicPin) {
     EXPECT_EQ(doc["payload"]["data"]["dynamic_pin"]["min_pin_length"].as<int>(), 6);
     EXPECT_EQ(doc["payload"]["data"]["dynamic_pin"]["escalated"].as<bool>(), true);
     EXPECT_TRUE(doc["payload"]["data"]["dynamic_pin"]["locked_out"].isUnbound())
-        << "locked_out is gone from the wire";
+        << "locked_out is never emitted";
 }
 
 TEST(ManagementProtocol, FormatResultStorageAbsent) {
@@ -549,7 +549,6 @@ TEST(ManagementHandler, AddRecordOk) {
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_EQ(effect, ManagementEffect::NONE);
 
-    // Record must be stored.
     const auto* stored = store.record_by_psk_id(expected_psk_id);
     ASSERT_NE(stored, nullptr);
     EXPECT_EQ(stored->server_id, server_id);
@@ -706,7 +705,6 @@ TEST(ManagementHandler, RemoveRecordOk) {
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_EQ(effect, ManagementEffect::NONE);
 
-    // Record must be gone.
     EXPECT_EQ(store.record_by_psk_id(rec.psk_id), nullptr);
 }
 
@@ -737,8 +735,8 @@ TEST(ManagementHandler, RemoveRecordProtectedRecordMode) {
     EXPECT_EQ(effect, ManagementEffect::NONE);
 }
 
-// Regression: own-record detection compares psk_id -- the credential that actually
-// authenticated the connection -- not server_id.
+// Own-record detection compares psk_id, the credential that actually authenticated the
+// connection, not server_id.
 TEST(ManagementHandler, RemoveOwnRecordGivesGoodbyeUnauthorized) {
     RecordStore store(nullptr);
     SendspinPairingRecord rec = make_client_record("srv-self");
@@ -754,14 +752,12 @@ TEST(ManagementHandler, RemoveOwnRecordGivesGoodbyeUnauthorized) {
     EXPECT_EQ(result.result, ManagementResult::OK);
     EXPECT_EQ(effect, ManagementEffect::GOODBYE_UNAUTHORIZED);
 
-    // Record must still be removed.
     EXPECT_EQ(store.record_by_psk_id(rec.psk_id), nullptr);
 }
 
-// Renamed from RemoveDifferentServerRecordNoEffect: the discriminator is now psk_id, not
-// server_id, so the "different requester" case is a different psk_id, not a different server_id
-// string. Previously this test passed an arbitrary server_id string as the third argument; now
-// it passes an arbitrary psk_id string that does not match the removed record's psk_id.
+// The requester discriminator is psk_id, not server_id, so the "different requester" case is a
+// different psk_id. This passes an arbitrary psk_id string that does not match the removed
+// record's psk_id.
 TEST(ManagementHandler, RemoveRecordDifferentRequesterPskIdNoEffect) {
     RecordStore store(nullptr);
     SendspinPairingRecord rec = make_client_record("srv-other");
@@ -778,9 +774,9 @@ TEST(ManagementHandler, RemoveRecordDifferentRequesterPskIdNoEffect) {
     EXPECT_EQ(effect, ManagementEffect::NONE);
 }
 
-// Regression: a connection authenticated via a non-record-mode SHARED record removing that
-// record must still get GOODBYE_UNAUTHORIZED. Shared records have no server_id at all, so a
-// server_id-based comparison could never fire here -- this is the "missed teardown" case.
+// A connection authenticated via a non-record-mode SHARED record removing that record must still
+// get GOODBYE_UNAUTHORIZED. Shared records have no server_id at all, so a server_id-based
+// comparison could never fire here.
 TEST(ManagementHandler, RemoveOwnSharedRecordGivesGoodbyeUnauthorized) {
     RecordStore store(nullptr);
     // A second shared-PSK record, distinct from the auto-provisioned record_mode fallback, so
@@ -800,10 +796,9 @@ TEST(ManagementHandler, RemoveOwnSharedRecordGivesGoodbyeUnauthorized) {
 }
 
 // Removing a different record that merely happens to share the requester's server_id must NOT
-// tear down the connection -- only an exact psk_id match does. Two records CAN coexist under one
+// tear down the connection; only an exact psk_id match does. Two records CAN coexist under one
 // server_id (management/add-record stores plainly; see AddRecordSameServerIdKeepsBothRecords), so
-// this is reachable in practice, and it is exactly what the old server_id-based comparison
-// mishandled.
+// this is reachable in practice.
 TEST(ManagementHandler, RemoveRecordDifferentPskIdSameServerIdNoEffect) {
     RecordStore store(nullptr);
     SendspinPairingRecord rec = make_client_record("srv-shared");
@@ -1246,8 +1241,6 @@ TEST(ManagementHandler, SetPairingConfigAppliesRecordMode) {
     SendspinPairingRecord shared = make_shared_record();
     store.store_record(shared);
     ASSERT_TRUE(store.set_record_mode_psk_id(shared.psk_id));  // Verify it works directly.
-    // Reset to original.
-    // (Use the auto-provisioned record for initial state.)
 
     // Now use the handler to set it.
     ManagementSetPairingConfigPayload payload;
@@ -1292,7 +1285,6 @@ TEST(ManagementHandler, UnpairLongTermStoredPubkeyRemovesRecord) {
 
     handle_unpair(store, rec.psk_id);
 
-    // Record must be removed.
     EXPECT_EQ(store.record_by_psk_id(rec.psk_id), nullptr);
 }
 
@@ -1304,7 +1296,6 @@ TEST(ManagementHandler, UnpairSharedPskRecordNotRemoved) {
     // server/unpair with a shared-PSK record psk_id: shared records are never removed.
     handle_unpair(store, shared_psk_id);
 
-    // Record must still exist.
     EXPECT_NE(store.record_by_psk_id(shared_psk_id), nullptr);
 }
 
@@ -1336,7 +1327,7 @@ TEST(ManagementHandler, PermissionDeniedResultShape) {
 }
 
 // ===========================================================================
-// Fix 4 regression: format_management_result_message always emits
+// format_management_result_message always emits
 // unpaired_access.enabled for a get-pairing-config result (true and false).
 // ===========================================================================
 
@@ -1368,7 +1359,7 @@ TEST(ManagementProtocol, FormatResultUnpairedAccessEnabledFalse) {
     std::string json = format_management_result_message(payload);
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, json));
-    // enabled must be present and false (the former double-guard dropped this case).
+    // enabled must be present and false.
     ASSERT_FALSE(doc["payload"]["data"]["unpaired_access"]["enabled"].isUnbound())
         << "unpaired_access.enabled must always be emitted even when false";
     EXPECT_EQ(doc["payload"]["data"]["unpaired_access"]["enabled"].as<bool>(), false);

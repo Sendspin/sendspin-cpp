@@ -89,7 +89,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
             // decoders. The write path (management/set-pairing-config) already checks this, so a
             // value that fails here came from provider corruption or out-of-band provisioning.
             // Accepting it would leave the device advertising static_pin while feeding malformed
-            // PRS bytes to the PAKE, which can only ever produce pin_mismatch -- a pairing that
+            // PRS bytes to the PAKE, which can only ever produce pin_mismatch, a pairing that
             // deterministically fails with nothing in the logs pointing at storage.
             if (is_valid_static_pin(loaded_pin)) {
                 this->static_pin_ = std::move(loaded_pin);
@@ -115,7 +115,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                 // blob. Only the >= threshold predicate consumes this value, so saturating at
                 // the threshold is lossless, and it makes record_dynamic_pin_failure()'s
                 // increment unable to overflow (signed overflow is UB) no matter what a corrupt
-                // or hand-edited blob supplies -- including a negative value, which would
+                // or hand-edited blob supplies, including a negative value, which would
                 // otherwise read as "not escalated" and undo the durability guarantee that
                 // function documents.
                 this->dynamic_pin_failures_ =
@@ -139,7 +139,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
     //
     // !loaded_config alone is NOT sufficient evidence of a first boot, and getting that wrong
     // fails open. loaded_config stays false both when the persistence_keys::PAIR_CONFIG blob was
-    // never stored and when it was stored but failed to decode -- the provider interface gives no
+    // never stored and when it was stored but failed to decode: the provider interface gives no
     // way to distinguish "absent" from "present but unreadable" (load_blob() returns nullopt for
     // the former; a decode failure on a non-nullopt blob is treated the same way here, see the
     // constructor's load loop above). Records and config are separate keys, so a provider that
@@ -149,7 +149,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
     // damaged config, not a first boot, and the safe default is the restrictive one.
     //
     // A store that lost EVERYTHING is indistinguishable from a factory-fresh device by
-    // construction, so the seed does apply there -- as it does when there is no provider at all.
+    // construction, so the seed does apply there, as it does when there is no provider at all.
     const bool previously_provisioned = !this->records_.empty() || this->pairing_psk_.has_value();
     if (!loaded_config && !previously_provisioned) {
         this->unpaired_access_enabled_ = initial_unpaired_access_enabled;
@@ -160,7 +160,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                 this->records_.size());
     }
     // Scope note: only unpaired_access_enabled_ is protected this way, and deliberately so. It
-    // defaults to false, so declining to seed it can only ever withhold a permission -- it
+    // defaults to false, so declining to seed it can only ever withhold a permission; it
     // cannot break a working device. The sibling flags (pairing_psk_enabled_,
     // dynamic_pin_enabled_) default to TRUE, so a config that fails to load does resurrect a
     // pairing method an operator had turned off, and the provisioning branch below persists
@@ -168,7 +168,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
     // Pairing PSK without implementing config persistence at all returns nullopt for exactly the
     // same reason a damaged one does, and disabling pairing for it would break a legitimate
     // integration. Closing that hole properly needs the provider interface to distinguish
-    // "never stored" from "could not be read" -- a tri-state load result -- rather than more
+    // "never stored" from "could not be read" (a tri-state load result) rather than more
     // guessing here.
 
     // First-boot provisioning: if no config was loaded (or the referenced shared
@@ -190,8 +190,8 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
         this->record_mode_psk_id_ = shared_psk_id;
 
         // Persist the config BEFORE the record, not after. These are two independent provider
-        // writes (PAIR_CONFIG and RECORDS) with no atomicity between them -- the in-tree
-        // reference provider does a full fsync+rename per save_blob() -- so a power loss can
+        // writes (PAIR_CONFIG and RECORDS) with no atomicity between them (the in-tree
+        // reference provider does a full fsync+rename per save_blob()), so a power loss can
         // land between them, and the ORDER decides whether that is self-healing:
         //
         //   config first (this order): the interrupted state is a config naming a record that
@@ -200,7 +200,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
         //     both keys. Nothing is left behind.
         //   record first (the reverse): the interrupted state is a stored record that no config
         //     references. Next boot sees !loaded_config, re-enters, and APPENDS a second record
-        //     while the first stays in records_ -- still resolvable by resolve_by_psk_id() but
+        //     while the first stays in records_, still resolvable by resolve_by_psk_id() but
         //     unreferenced. Every repeat of that crash window adds another orphan.
         //
         // Ordering alone only covers a crash. A provider that REJECTS the config write while
@@ -228,7 +228,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
     }
 
     // Pairing PSK provisioning: pairing_psk is the one pairing method every client must
-    // implement (spec #113/#122), so a client with no Pairing PSK would advertise a method it
+    // implement (spec "client/hello"), so a client with no Pairing PSK would advertise a method it
     // cannot complete. Generate one when absent and persist it; the operator transfers it to a
     // server as a pairing token (SendspinClient::pairing_token()). The key is stable across
     // reboots once persisted; if persistence fails it is RAM-only for this boot, so a token
@@ -281,7 +281,7 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
     }
 
     // 2. Accepted Pairing PSK. Excluded from the candidate set when pairing_psk is disabled in
-    // the live pairing config (spec #116/#122): a handshake referencing it then fails as a
+    // the live pairing config (spec "Pre-Shared Key"): a handshake referencing it then fails as a
     // lookup miss, exactly as if no Pairing PSK were configured at all.
     if (this->pairing_psk_.has_value() && this->pairing_psk_->psk_id == psk_id &&
         this->pairing_psk_enabled_) {
@@ -345,13 +345,13 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
 bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede_server_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
 
-    // Phase 1: insert/replace the new record. Fails closed -- the record must not survive in
+    // Phase 1: insert/replace the new record. Fails closed: the record must not survive in
     // records_ when the provider rejects the write (see the class doc). Snapshot the
-    // pre-mutation state so it can be restored on failure -- safe because the whole sequence
-    // below runs under mutex_, so no reader (in particular resolve_by_psk_id() on the network
-    // thread) can observe the tentative mutation before it either commits or rolls back. See the
-    // locking-discipline comment on persist_records_locked() for the general rule this is the
-    // one exception to.
+    // pre-mutation state so it can be restored on failure; this is safe because the whole
+    // sequence below runs under mutex_, so no reader (in particular resolve_by_psk_id() on the
+    // network thread) can observe the tentative mutation before it either commits or rolls
+    // back. See the locking-discipline comment on persist_records_locked() for the general rule
+    // this is the one exception to.
     std::vector<SendspinPairingRecord> rollback = this->records_;
 
     size_t idx = this->find_index(record.psk_id);
@@ -370,21 +370,21 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
     }
 
     // Phase 2 (pairing path only, and only a SEPARATE write from phase 1): pairing mints a fresh
-    // per-server PSK that REPLACES whatever that server held before, so the new record -- already
-    // safely persisted above -- supersedes any OTHER record still bound to this server_id. Drop
+    // per-server PSK that REPLACES whatever that server held before, so the new record (already
+    // safely persisted above) supersedes any OTHER record still bound to this server_id. Drop
     // it, otherwise re-pairing accumulates a second working PSK for the same server and
     // "rotation" never revokes anything. Only the pairing path asks for this: management/add-
     // record stores plainly, because the spec's only stated add-record collision rule is keyed on
     // psk_id (a psk whose psk_id is already known is already_exists) and it defines no outcome
-    // for a server_id collision -- silently deleting a record the caller never named would be
+    // for a server_id collision: silently deleting a record the caller never named would be
     // unattested by any result code. Shared-PSK records (server_id absent) never match here.
     //
     // Deliberately NOT folded into a single write with phase 1: the new record must be safely
     // persisted BEFORE the old one is dropped, so a provider that can add but not delete (a
     // legitimate, independent failure mode on real storage) never turns a successful pairing
     // into a failed one. A rejected phase-2 write behaves like remove_record(): the retired
-    // record is erased from RAM unconditionally and a rejected persist only logs a warning,
-    // exactly mirroring the durability contract the old typed remove_pairing_record() carried.
+    // record is erased from RAM unconditionally, and a rejected persist is only logged as a
+    // warning rather than treated as a failure.
     if (supersede_server_id && this->records_[idx].server_id.has_value()) {
         const std::string superseded_server_id = this->records_[idx].server_id.value();
         std::vector<std::string> superseded_psk_ids;
@@ -426,7 +426,7 @@ void RecordStore::remove_record(const std::string& psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     size_t idx = this->find_index(psk_id);
     if (idx == static_cast<size_t>(-1)) {
-        return;  // No-op if absent.
+        return;
     }
     this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(idx));
     // Erased from RAM regardless of the store's answer: the operator (or the pairing exchange)
@@ -449,9 +449,8 @@ void RecordStore::mark_record_used(const std::string& psk_id) {
         return;
     }
     this->records_[idx].used = true;
-    // Best-effort like the pre-blob-store code: a rejected write here is not reported, since
-    // "used" is advisory bookkeeping rather than a revocation whose durability the caller
-    // depends on.
+    // Best-effort: a rejected write here is not reported, since "used" is advisory bookkeeping
+    // rather than a revocation whose durability the caller depends on.
     this->persist_records_locked();
 }
 
@@ -517,7 +516,7 @@ void RecordStore::set_pairing_psk_enabled(bool enabled) {
     // take mutex_ itself, so there is no recursive acquisition inside this class; and it reaches
     // the consumer's provider, which SendspinPersistenceProvider's documented re-entrancy
     // contract forbids from calling back into the library (that contract cites this exact
-    // pattern -- set_pairing_psk() has always held mutex_ across its own save_blob()).
+    // pattern: set_pairing_psk() has always held mutex_ across its own save_blob()).
     std::lock_guard<std::mutex> lock(this->mutex_);
     this->pairing_psk_enabled_ = enabled;
     this->persist_config();
@@ -551,7 +550,7 @@ void RecordStore::record_dynamic_pin_failure() {
     //    fact that a failed attempt happened at all;
     //  - the failure that crosses DYNAMIC_PIN_ESCALATION_THRESHOLD, so a power-cycle cannot
     //    un-escalate dynamic_pin.
-    // Invariant this guarantees: dynamic_pin_escalated() is durable -- if it is true before a
+    // Invariant this guarantees: dynamic_pin_escalated() is durable; if it is true before a
     // reboot, it is true after (escalation only clears via reset_dynamic_pin_failures(), which
     // always persists), and it cannot be un-escalated by power-cycling. Non-escalating counts
     // strictly between 1 and DYNAMIC_PIN_ESCALATION_THRESHOLD may be lost to an untimely
@@ -561,8 +560,8 @@ void RecordStore::record_dynamic_pin_failure() {
     // This is a considered tradeoff, not just an optimistic one: an attacker who can force a
     // reboot or crash by unrelated means (a bug, a power blip, physical access) gets at most
     // DYNAMIC_PIN_ESCALATION_THRESHOLD - 1 fresh online guesses per forced cycle. Each of those
-    // guesses still costs a full CPace PAKE handshake (see crypto/cpace.h) -- there is no
-    // faster offline path -- so the reboot-assisted budget only multiplies an already-expensive
+    // guesses still costs a full CPace PAKE handshake (see crypto/cpace.h); there is no faster
+    // offline path, so the reboot-assisted budget only multiplies an already-expensive
     // per-guess cost by a small bounded factor; it does not turn the PIN into a cheap oracle.
     const bool was_escalated = this->dynamic_pin_escalated();
     const bool first_failure_since_reset = (this->dynamic_pin_failures_ == 0);
@@ -648,7 +647,7 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
 
     PairingOutcome outcome;
     outcome.psk = resolved->psk;
-    // outcome.record is nullopt - caller should not store a new record.
+    // outcome.record is nullopt: caller should not store a new record.
     return outcome;
 }
 
@@ -708,7 +707,7 @@ bool RecordStore::persist_config() {
 // discipline instead: erase from records_ unconditionally, persist, and only warn (not fail) if
 // the provider rejects it. See store_record_impl() for the full reasoning.
 //
-// Precondition: the caller holds mutex_ -- with one exception, the constructor's first-boot
+// Precondition: the caller holds mutex_, with one exception: the constructor's first-boot
 // provisioning path, which calls this before the object is reachable by any other thread and
 // therefore needs (and takes) no lock. Every post-construction caller must hold mutex_.
 bool RecordStore::persist_records_locked() {

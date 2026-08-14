@@ -58,7 +58,7 @@ extern "C" {
 #include <utility>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) - test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 // =============================================================================
 // Minimal in-process SendspinConnection for testing transport helpers
@@ -71,7 +71,7 @@ public:
     TestConnection() = default;
     ~TestConnection() override = default;
 
-    // -- Interface stubs --
+    // --- Interface stubs ---
 
     void start() override {}
     void loop() override {}
@@ -106,7 +106,7 @@ public:
 
     bool send_time_message() override { return true; }
 
-    // -- Test helpers --
+    // --- Test helpers ---
 
     /// Inject a fully assembled binary frame (plaintext simulation after WS reassembly)
     /// into the dispatch path, bypassing the WS layer.
@@ -214,11 +214,9 @@ struct LoopbackResult {
 };
 
 static std::optional<LoopbackResult> run_loopback_handshake(const std::string& suite_name) {
-    // Generate identities
     Identity client_id = Identity::generate().value();  // Noise responder
     Identity server_id = Identity::generate().value();  // Noise initiator
 
-    // Generate a PSK
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     platform_random_bytes(psk.data(), psk.size());
     std::string psk_id = psk_id_for(psk);
@@ -226,7 +224,6 @@ static std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     // Build a RecordStore with the PSK (no counterparty_id constraint).
     // RecordStore(nullptr) provisions the sentinel shared-PSK fallback on construction.
     RecordStore rs(nullptr);
-    // Add our custom PSK
     SendspinPairingRecord rec;
     rec.psk_id = psk_id;
     rec.psk = psk;
@@ -309,7 +306,6 @@ static std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
               NOISE_ERROR_NONE);
     msg1_raw.resize(msg1_out.size);
 
-    // Wrap msg1 in the noise/handshake JSON envelope
     std::string msg1_text = make_noise_handshake_envelope(msg1_raw);
 
     // -----------------------------------------------------------------
@@ -357,7 +353,6 @@ static std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
               NOISE_ERROR_NONE);
     // noise_handshakestate_split does not free the hs; the guard destructor will free it.
 
-    // Retrieve responder session
     auto outcome = nh.take_result();
     EXPECT_TRUE(outcome.has_value());
     if (!outcome.has_value()) {
@@ -499,7 +494,6 @@ TEST(NoiseTransport, SendEncryptedText_SmallJson_ChaChaPoly) {
     std::string json = "{\"type\":\"test\",\"value\":123}";
     EXPECT_EQ(conn.send_encrypted_text(json), SsErr::OK);
 
-    // Should have sent exactly one binary frame
     ASSERT_EQ(conn.sent_binary_.size(), 1u);
     const auto& ct = conn.sent_binary_[0];
 
@@ -512,9 +506,9 @@ TEST(NoiseTransport, SendEncryptedText_SmallJson_ChaChaPoly) {
     EXPECT_EQ(recovered, json);
 }
 
-// send_app_json routes plaintext before a transport session exists and encrypted afterwards.
-// Regression guard: the routing decision reads the atomic noise_active_ flag (set alongside
-// the session), not the noise_session_ unique_ptr.
+// send_app_json routes plaintext before a transport session exists and encrypted afterwards. The
+// routing decision reads the atomic noise_active_ flag (set alongside the session), not the
+// noise_session_ unique_ptr.
 TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
@@ -552,7 +546,6 @@ TEST(NoiseTransport, ReceiveEncryptedBinary_JsonDispatch) {
     TestConnection conn;
     // The responder (client) recv cipher was not exposed in LoopbackResult;
     // we'll use send_encrypted_text to produce a ciphertext and inject it back.
-    // Alternatively: use the initiator side to produce a frame.
 
     // Build a JSON frame: [0x00 | utf8(json)]
     std::string json = "{\"type\":\"server/play\"}";
@@ -607,21 +600,12 @@ TEST(NoiseTransport, FragmentOverMaxTransportPlaintext) {
     std::string large_json(65520, 'A');  // 65520 'A' chars
     EXPECT_EQ(conn.send_encrypted_text(large_json), SsErr::OK);
 
-    // Should have produced >= 2 encrypted binary frames (fragmented)
     EXPECT_GE(conn.sent_binary_.size(), 2u);
 
-    // Decrypt and inject each frame back in order (simulates receiving the frames)
-    // We need a fresh connection with a fresh responder session to receive.
-    // Actually: we can use the TestConnection itself as both sender and receiver
-    // by re-running a fresh handshake and feeding the encrypted frames from conn
-    // back into a new conn wired up with the correct decryption keys.
-
-    // For simplicity: run a second handshake to get fresh initiator keys, then
-    // verify the fragment structure (frame types). Transport correctness is covered
-    // by ReceiveEncryptedBinary_JsonDispatch.
-    // Check that the first frame starts with an encrypted FRAGMENT_MORE frame.
-    // We can't easily decrypt without the paired keys at this point (session was moved),
-    // so just check the count and sizes.
+    // The responder session was moved into conn, so decrypting the captured frames here would
+    // need a second handshake to recover matching keys. That full decrypt-and-reassemble path is
+    // already covered by ReceiveEncryptedBinary_JsonDispatch; this test only checks the structural
+    // shape of the fragmented output: at least two frames, each within the AEAD-tagged size cap.
     EXPECT_GE(conn.sent_binary_.size(), 2u);
     for (const auto& frame : conn.sent_binary_) {
         // Each encrypted frame = plaintext + 16-byte AEAD tag
@@ -634,8 +618,8 @@ TEST(NoiseTransport, FragmentOverMaxTransportPlaintext) {
 // =============================================================================
 
 TEST(NoiseTransport, FragmentReassembleEndToEnd) {
-    // Use a fresh handshake for an end-to-end fragment+reassemble test.
-    // The responder encrypts and sends; we inject frames back using the initiator cipher.
+    // The responder session is a move-only resource consumed by set_noise_session(), so each
+    // TestConnection below that needs its own session draws from a fresh loopback handshake.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
 
@@ -654,14 +638,9 @@ TEST(NoiseTransport, FragmentReassembleEndToEnd) {
     ASSERT_EQ(sender.send_encrypted_text(large_json), SsErr::OK);
     ASSERT_GE(sender.sent_binary_.size(), 2u);
 
-    // Re-run a new loopback to get fresh cipher states for decryption.
-    // This is the cleanest way since we moved the responder session into sender.
-    // Decryption side: we use the initiator recv_cs to simulate receiving frames.
-    // Build a second fresh handshake to get a second full session pair.
     auto r2 = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r2.has_value());
 
-    // Create a receiver connection with the NEW responder session
     TestConnection receiver;
     receiver.set_noise_session(std::move(r2->responder_session));
 
@@ -671,27 +650,19 @@ TEST(NoiseTransport, FragmentReassembleEndToEnd) {
         received_json = std::string(data, len);
     };
 
-    // Encrypt the large payload with the NEW responder session and inject into receiver.
-    // Use the new session to encrypt (sender was already moved).
-    // Build the frames by directly calling encrypt on the second responder session:
-    // Actually use a fresh conn to produce frames encrypted for r2's initiator decryption.
     TestConnection sender2;
-    sender2.set_noise_session(std::move(r2->responder_session));  // moved already above
-    // r2->responder_session is null now - use a separate approach.
+    sender2.set_noise_session(std::move(r2->responder_session));  // already moved above; no-op
 
-    // Simplest: run a third fresh handshake
+    // A TestConnection cannot have individual cipher states installed directly, only a whole
+    // NoiseSession, so decrypting requires the matching initiator recv_cs from its own handshake.
+    // A third handshake supplies that matched pair for a small, single-frame round-trip: the
+    // fragmented case above already verified the send-side frame structure, so this only needs to
+    // confirm the encrypt/decrypt path itself is correct end to end.
     auto r3 = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r3.has_value());
 
     TestConnection sender3;
     sender3.set_noise_session(std::move(r3->responder_session));
-
-    // We need to receive with the initiator decrypt perspective.
-    // Create a pseudo-receiver that uses the initiator recv cipher.
-    // Since we cannot install individual ciphers into a TestConnection directly,
-    // instead send small frames that fit in one fragment to verify the full path works.
-    // The fragmentation logic is already verified structurally above.
-    // For an actual decrypt: use a simple loop.
 
     std::string medium_json = "{\"data\":\"";
     medium_json.append(100, 'Z');
@@ -739,7 +710,7 @@ TEST(NoiseHandshakeDriver, UnknownPskIdAborts) {
     auto r1 = nh.on_text_frame(server_init_text, [](const std::string&) { return true; });
     EXPECT_EQ(r1, HandshakeFrameResult::NEED_MORE);
 
-    // Build initiator (uses same psk - so msg1 auth passes, but psk_id not in store)
+    // Build initiator (uses same psk, so msg1 auth passes, but psk_id not in store)
     NoiseHandshakeState* init_hs_raw =
         build_initiator(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
                            server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
@@ -796,7 +767,7 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     auto r1 = nh.on_text_frame(server_init_text, [](const std::string&) { return true; });
     EXPECT_EQ(r1, HandshakeFrameResult::NEED_MORE);
 
-    // Build initiator - uses psk (matching the stored PSK)
+    // Build initiator, using psk (matching the stored PSK)
     NoiseHandshakeState* init_hs_raw =
         build_initiator(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
                            server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
@@ -864,17 +835,11 @@ TEST(NoiseTransportDispatch, NonFragmentMidReassemblyClosesConnection) {
 
     TestConnection conn;
 
-    // We need to inject DECRYPTED plaintext since dispatch_noise_plaintext operates post-decrypt.
-    // Use the responder session for encryption so the receiver can decrypt.
-    // But since we are using the same session for both directions in these unit tests,
-    // the cleanest approach is to use NoiseSession directly to encrypt the test frames.
-
-    // Re-use responder_session for encrypt direction; inject results via inject_binary_payload.
-    // Note: inject_binary_payload -> dispatch_completed_message -> decrypt -> dispatch_noise_plaintext
-
-    // We need the responder's send cipher AND a way to decrypt in TestConnection.
-    // Install a freshly-constructed session into TestConnection and use the matched
-    // initiator cipher to create the ciphertext.
+    // inject_binary_payload() decrypts before dispatch_noise_plaintext() runs (via
+    // dispatch_completed_message()), so this test drives that state machine by injecting frames
+    // pre-encrypted for the NoiseSession installed below. conn holds the responder session, so
+    // frames must be encrypted with the matching initiator cipher (r->initiator.send_cs) for
+    // conn's decrypt to succeed.
 
     // Create a "fragment-more" frame: [0x02, orig_type=0x00, data...]
     // We'll encrypt it manually using the initiator send_cs.
@@ -912,8 +877,8 @@ TEST(NoiseTransportDispatch, NonFragmentMidReassemblyClosesConnection) {
 
     // The JSON dispatch should NOT have fired (the non-fragment frame is dropped, not
     // dispatched), and the connection must have been closed silently: torn down via
-    // close_transport_now() (not disconnect() -- see close_silently()'s doc comment: the
-    // network thread cannot safely call disconnect() on host/ESP outbound transports), with no
+    // close_transport_now(), not disconnect() (see close_silently()'s doc comment: the network
+    // thread cannot safely call disconnect() on host/ESP outbound transports), with no
     // application-level message sent as part of the close itself.
     EXPECT_EQ(json_dispatched, 0);
     EXPECT_EQ(conn.close_transport_now_calls_, 1);
@@ -959,11 +924,10 @@ TEST(NoiseTransportDispatch, FragmentEndWithoutStartClosesConnection) {
 }
 
 TEST(NoiseTransportDispatch, BenignMidReassemblyDoesNotClose) {
-    // Regression guard: a normal, in-progress fragment reassembly (just the
-    // FRAGMENT_MORE start frame, no FRAGMENT_END yet) is the benign "no complete message yet"
-    // state and must NOT close the connection -- only the three enumerated malformed
-    // sequences (fragment-end with nothing in flight, a non-fragment frame while one is in
-    // flight, and orig_type 2/3) do.
+    // A normal, in-progress fragment reassembly (just the FRAGMENT_MORE start frame, no
+    // FRAGMENT_END yet) is the benign "no complete message yet" state and must NOT close the
+    // connection; only the three enumerated malformed sequences (fragment-end with nothing in
+    // flight, a non-fragment frame while one is in flight, and orig_type 2/3) do.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
 
@@ -974,7 +938,7 @@ TEST(NoiseTransportDispatch, BenignMidReassemblyDoesNotClose) {
     conn.on_json_message_cb = [&dispatched](SendspinConnection* /*c*/, const char* /*d*/,
                                              size_t /*l*/, int64_t /*t*/) { ++dispatched; };
 
-    // FRAGMENT_MORE start: [0x02, orig_type=0x00, data...] -- valid start of a fragmented
+    // FRAGMENT_MORE start: [0x02, orig_type=0x00, data...]. A valid start of a fragmented
     // JSON message, no FRAGMENT_END yet.
     std::vector<uint8_t> plaintext_frag_more{0x02, 0x00, 0xAA, 0xBB, 0xCC};
     std::vector<uint8_t> ct(plaintext_frag_more.size() + 16);
@@ -1071,7 +1035,7 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
     // A fatal initial-handshake error (here: an unresolvable psk_id in msg1) must
     // close the connection. This drives the full chain through dispatch_completed_message() ->
     // handle_noise_handshake_text(), using the same fake-connection pattern (TestConnection,
-    // disconnect_calls_) as the other dispatch tests above -- unlike the
+    // disconnect_calls_) as the other dispatch tests above. This differs from the
     // NoiseHandshakeDriver.*Aborts tests, which call NoiseHandshake::on_text_frame() directly
     // and only prove the state machine returns ABORT, not that the connection actually closes.
     Identity client_id = Identity::generate().value();
@@ -1267,7 +1231,7 @@ TEST(NoiseTransport, FragmentReassembleBinaryReceive) {
 // =============================================================================
 
 TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
-    // An AEAD failure in transport mode must not just drop the frame -- the
+    // An AEAD failure in transport mode must not just drop the frame: the
     // underlying Noise decrypt never advances the receive-direction nonce counter on an auth
     // failure, so leaving the connection open would desync it permanently (every later frame
     // would also fail forever). Spec Failure Handling also mandates closing silently here.
@@ -1291,7 +1255,7 @@ TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
     auto ct = server_encrypt_frame(server_send, pt);
 
     // Flip a byte; the AEAD tag check must fail, the frame must be dropped, and the
-    // connection must be closed -- silently, with no application-level message sent.
+    // connection must be closed silently, with no application-level message sent.
     ASSERT_GT(ct.size(), 0u);
     ct[ct.size() / 2] ^= 0xFF;
     conn.inject_binary_payload(ct.data(), ct.size());

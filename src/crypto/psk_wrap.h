@@ -13,13 +13,13 @@
 // limitations under the License.
 
 /// @file psk_wrap.h
-/// @brief PSK Wrapping (spec #117): seals the new Sendspin PSK under a key derived from the
-/// CPace output so `client/pair-finalize` in the PIN flows carries `wrapped_psk` instead of the
+/// @brief PSK Wrapping (spec "PSK Wrapping"): seals the new Sendspin PSK under a key derived from
+/// the CPace output so `client/pair-finalize` in the PIN flows carries `wrapped_psk` instead of the
 /// PSK in the clear.
 ///
 /// K_wrap = SHA-256("sendspin-pair-psk-wrap-v1" || sid || ISK)
 ///
-/// where `sid` is the CPace session id (see cpace.h CPace::sid(), spec #120) and `ISK` is the
+/// where `sid` is the CPace session id (see cpace.h CPace::sid(), spec "PAKE") and `ISK` is the
 /// 64-byte CPace intermediate session key (see cpace.h CPace::isk()). The 32-byte PSK is then
 /// sealed with the AEAD of the connection's negotiated cipher suite, a 12-byte all-zero nonce,
 /// and empty associated data: wrapped_psk is the 48-byte ciphertext-plus-tag.
@@ -61,7 +61,7 @@ std::optional<std::array<uint8_t, WRAPPED_PSK_SIZE>> wrap_psk(
 
 /// @brief Open a wrapped_psk sealed by wrap_psk(), recovering the 32-byte PSK.
 /// @return The 32-byte PSK, or nullopt if the cipher is unrecognized or AEAD authentication
-/// fails (wrong key, corrupted input -- a protocol error per the spec).
+/// fails (wrong key or corrupted input, which the spec treats as a protocol error).
 std::optional<std::array<uint8_t, 32>> unwrap_psk(
     const char* cipher_name, const std::vector<uint8_t>& sid,
     const std::array<uint8_t, CPACE_ISK_SIZE>& isk,

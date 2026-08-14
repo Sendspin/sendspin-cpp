@@ -246,7 +246,7 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
     const uint8_t type_byte = plaintext[0];
 
     if (type_byte == MSG_TYPE_FRAGMENT_MORE) {
-        // Fragment frame - begin or continue reassembly. reasm_buf_ accumulates the final
+        // Fragment frame: begin or continue reassembly. reasm_buf_ accumulates the final
         // message shape directly ([orig_type][data...]), so completion needs no staging copy.
         if (!this->reasm_in_progress_) {
             // Start of a new fragmented message: pt[1] = orig_type, pt[2..] = data
@@ -340,7 +340,7 @@ bool NoiseTransport::reasm_reserve(size_t needed) {
         return true;
     }
     // Geometric growth amortizes realloc cost across ~64 KB fragments; capacity is retained
-    // between messages (same as the previous std::vector behavior).
+    // between messages.
     size_t new_size = this->reasm_buf_.size() * 2;
     if (new_size < needed) {
         new_size = needed;

@@ -38,15 +38,9 @@ namespace sendspin {
 /// Format: {"type":"client/init","payload":{"client_id":"...","version":1,"suite":"..."}}
 static std::string serialize_client_init(const std::string& client_id,
                                          const std::string& suite_name) {
-    // suite_name from NOISE_SUITE_CHACHAPOLY is "Noise_KKpsk2_25519_ChaChaPoly_SHA256";
-    // the wire value is the suffix after "Noise_KKpsk2_" (see NoiseCipherSuite in session.py).
-    // However, the spec says the full suite name goes on the wire for client/init.
-    // Looking at models.py ClientInitPayload.suite, and session.py NoiseCipherSuite.value
-    // which is "25519_ChaChaPoly_SHA256" - just the suffix.  But constants.py is the
-    // source of truth and says NOISE_SUITE_CHACHAPOLY = "Noise_KKpsk2_25519_ChaChaPoly_SHA256"
-    // while NoiseCipherSuite.CHACHAPOLY.value = "25519_ChaChaPoly_SHA256".
-    // The wire suite string is NoiseCipherSuite.value = "25519_ChaChaPoly_SHA256".
-    // Strip "Noise_KKpsk2_" prefix to produce the wire suite string.
+    // suite_name is the full name (e.g. NOISE_SUITE_CHACHAPOLY = "Noise_KKpsk2_25519_..."); the
+    // wire value is the suffix after "Noise_KKpsk2_" (session.py NoiseCipherSuite.value). Strip
+    // that prefix to produce the wire suite string.
     static constexpr const char* PREFIX = "Noise_KKpsk2_";
     const size_t PREFIX_LEN = 13;
     std::string wire_suite = suite_name;
@@ -103,7 +97,7 @@ struct Msg1CoreResult {
 ///
 /// Used identically by the initial handshake (`NoiseHandshake::handle_msg1`) and the
 /// in-band re-handshake (`run_rehandshake_msg1`); the only differences between the two
-/// callers are the prologue bytes and how msg2 is delivered to the peer -- both handled
+/// callers are the prologue bytes and how msg2 is delivered to the peer, both handled
 /// by the caller after this returns.
 ///
 /// @param log_prefix    Prefix used for all log lines (mirrors the caller's function name).
@@ -120,7 +114,6 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
                                             const std::string& suite_name,
                                             const std::string& server_id, const uint8_t* prologue,
                                             size_t prologue_len, const std::string& msg1_json) {
-    // Parse the JSON envelope
     JsonDocument doc = make_json_document();
     DeserializationError err = deserializeJson(doc, msg1_json);
     if (err || doc.isNull()) {
@@ -146,14 +139,13 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
         return std::nullopt;
     }
 
-    // Decode the server static public key from server_id
     auto server_pub = b64url_decode(server_id);
     if (!server_pub.has_value() || server_pub->size() != X25519_KEY_SIZE) {
         SS_LOGE(TAG, "%s: invalid server_id (cannot decode public key)", log_prefix);
         return std::nullopt;
     }
 
-    // Two-handshake trick: Step 1 - probe session with placeholder PSK
+    // Two-handshake trick, step 1: probe session with placeholder PSK
     // We need psk_id from msg1's plaintext, but noise-c requires PSK before start.
     // Use a zero placeholder; since psk2 mixes PSK only in msg2, msg1 is
     // authenticated with static keys only.
@@ -190,7 +182,6 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
 
     SS_LOGD(TAG, "%s: psk_id='%s'", log_prefix, psk_id);
 
-    // Resolve psk_id via RecordStore
     auto resolved = record_store.resolve_by_psk_id(std::string(psk_id));
     if (!resolved.has_value()) {
         SS_LOGW(TAG, "%s: unknown psk_id='%s', aborting", log_prefix, psk_id);
@@ -205,7 +196,7 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
         return std::nullopt;
     }
 
-    // Two-handshake trick: Step 2 - real session with the resolved PSK
+    // Two-handshake trick, step 2: real session with the resolved PSK
     // Discard the probe; build a fresh handshakestate with the real PSK and
     // re-process the exact same msg1 bytes.
     auto real_session =
@@ -356,7 +347,6 @@ bool NoiseHandshake::handle_msg1(const std::string& text,
     SS_LOGI(TAG, "Noise handshake complete: server_id=%s psk_category=%d", this->server_id_.c_str(),
             static_cast<int>(core->resolved_psk.category));
 
-    // Store result
     NoiseHandshakeResult result;
     result.session = std::make_unique<NoiseSession>(std::move(core->session));
     result.server_id = this->server_id_;

@@ -58,13 +58,12 @@
 
 #include <sys/stat.h>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 // =============================================================================
 // Test helpers
 // =============================================================================
 
-/// Generate a random 32-byte PSK.
 static std::array<uint8_t, NOISE_PSK_SIZE> make_random_psk() {
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     platform_random_bytes(psk.data(), psk.size());
@@ -83,7 +82,7 @@ static SendspinPairingRecord make_client_record(const std::string& server_id,
     return rec;
 }
 
-/// Build a shared-PSK (fallback) record - no server_id.
+/// Build a shared-PSK (fallback) record: no server_id.
 static SendspinPairingRecord make_shared_record(
     const std::optional<std::string>& label = {}) {
     auto psk = make_random_psk();
@@ -241,7 +240,7 @@ TEST(RecordStore, FirstBootPskIdIsSentinelPskIdResolvable) {
 }
 
 // =============================================================================
-// New coverage: booting from a blob store seeded purely via the public codec
+// Booting from a blob store seeded purely via the public codec
 // =============================================================================
 
 // A provider seeded entirely through sendspin/persistence_codec.h (no RecordStore involved)
@@ -303,7 +302,7 @@ TEST(RecordStore, CorruptRecordsBlobFallsBackToEmptyStore) {
 }
 
 // =============================================================================
-// Records - reject wrong PSK size
+// Records: reject wrong PSK size
 // =============================================================================
 
 TEST(RecordStore, RecordsRejectWrongPskSize) {
@@ -342,7 +341,7 @@ TEST(RecordStore, StoreRecordFailsClosedWhenProviderRejectsWrite) {
     EXPECT_EQ(store.record_by_psk_id(rec.psk_id), nullptr);
 }
 
-// New coverage: the same contract, phrased directly against the blob-store interface's
+// The same contract, phrased directly against the blob-store interface's
 // "records" key, with the InMemoryPersistenceProvider fake's fail-injection.
 TEST(RecordStore, StoreRecordFailsClosedWhenRecordsBlobSaveIsRejected) {
     InMemoryPersistenceProvider provider;
@@ -623,7 +622,7 @@ TEST(RecordStore, RemoveRecordAndList) {
 /// psk_id which was present in the previously-accepted blob (i.e. a removal), standing in for a
 /// store whose delete path fails on its own (full or read-only NVS, a torn write) while saves
 /// that only add/replace still work. Distinguishes an add from a removal by diffing the
-/// newly-offered array against the last array it accepted -- the store is a pure byte store in
+/// newly-offered array against the last array it accepted. The store is a pure byte store in
 /// production, but a test fake is free to peek at its own content to model this.
 class RejectingDeleteProvider : public SendspinPersistenceProvider {
 public:
@@ -864,7 +863,7 @@ TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
     RecordStore rebooted(&provider);
     auto resolved = rebooted.resolve_by_psk_id(a.psk_id);
     ASSERT_TRUE(resolved.has_value())
-        << "the provider kept the record, so it must come back -- this is what the false return "
+        << "the provider kept the record, so it must come back: this is what the false return "
            "from a rejected \"records\" save warns about";
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
 }
@@ -1093,7 +1092,7 @@ TEST(FilePersistenceProvider, KeypairPersistsAcrossReboots) {
 // Exercises the full public path: SendspinClient::start_server() loads or generates the
 // identity via load_or_generate_identity() and exposes it through client_id(). Two separate
 // SendspinClient instances sharing the same FilePersistenceProvider file must derive the same
-// client_id -- the second instance is the "reboot" case.
+// client_id: the second instance is the "reboot" case.
 TEST(FilePersistenceProvider, KeypairPersistsViaClientStartServer) {
     TempFile tmp;
 
@@ -1122,11 +1121,10 @@ TEST(FilePersistenceProvider, KeypairPersistsViaClientStartServer) {
     }
 }
 
-// Regression: load_or_generate_identity() must never leave client_id_ as the peer_id
-// of an all-zero Identity (a silent-failure value). This cannot force the underlying
-// noise-c DH-state generation to actually fail (no test hook for that), so it instead pins the
-// property that would have caught the original bug: a real client_id must differ from what an
-// all-zero keypair would have produced.
+// load_or_generate_identity() must never leave client_id_ as the peer_id of an all-zero
+// Identity (a silent-failure value). This cannot force the underlying noise-c DH-state
+// generation to actually fail (no test hook for that), so instead it pins the invariant:
+// a real client_id must differ from what an all-zero keypair would produce.
 TEST(FilePersistenceProvider, StartServerNeverProducesAllZeroClientId) {
     TempFile tmp;
     FilePersistenceProvider provider(tmp.path());
@@ -1140,7 +1138,7 @@ TEST(FilePersistenceProvider, StartServerNeverProducesAllZeroClientId) {
     EXPECT_NE(client.client_id(), zero_identity.peer_id());
 }
 
-// New coverage: a persisted "keypair" blob of the wrong length must be rejected outright (not
+// A persisted "keypair" blob of the wrong length must be rejected outright (not
 // truncated/reinterpreted) and a fresh keypair generated and persisted in its place.
 TEST(SendspinClientIdentity, WrongSizeKeypairBlobIsRejectedAndRegenerated) {
     InMemoryPersistenceProvider provider;
@@ -1323,9 +1321,8 @@ TEST(RecordStoreWithFile, FirstBootProvisioningPersists) {
 }
 
 // A removed record must not merely vanish from RAM: the persisted "records" blob itself must
-// shrink, so a reboot does not resurrect it. Ports the old FilePersistenceProvider-level
-// "RemovePairingRecord" test to the level where removal is actually implemented now
-// (RecordStore, not the provider -- the provider is a pure byte store).
+// shrink, so a reboot does not resurrect it. Exercised at the RecordStore level, where removal
+// is actually implemented, rather than against the provider, which is a pure byte store.
 TEST(RecordStoreWithFile, RemoveRecordShrinksThePersistedBlob) {
     TempFile tmp;
     std::string a_psk_id;
@@ -1364,7 +1361,7 @@ TEST(RecordStoreWithFile, RemoveRecordShrinksThePersistedBlob) {
 // =============================================================================
 
 /// A persistence provider that hands back a canned pairing config. Lets a test present a
-/// loaded config whose record_mode_psk_id is empty or dangling - states FilePersistenceProvider
+/// loaded config whose record_mode_psk_id is empty or dangling: states FilePersistenceProvider
 /// collapses into "nothing stored", so they are unreachable through it.
 class CannedConfigProvider : public SendspinPersistenceProvider {
 public:
@@ -1434,7 +1431,7 @@ TEST(RecordStore, UnpairedAccessSeedYieldsToConfigWithEmptyRecordModeId) {
         << "an empty record_mode_psk_id still means a config was loaded";
 }
 
-/// A provider whose records survive but whose pairing config does not come back - the shape of
+/// A provider whose records survive but whose pairing config does not come back: the shape of
 /// a config blob lost or corrupted independently of the records (separate NVS keys, a torn
 /// write, or any provider whose parse failure collapses into "nothing stored", which is exactly
 /// what the bundled FilePersistenceProvider does).
@@ -1445,7 +1442,7 @@ public:
 
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
         if (key != persistence_keys::RECORDS) {
-            return std::nullopt;  // In particular, no PAIR_CONFIG -- that is the point.
+            return std::nullopt;  // In particular, no PAIR_CONFIG: that is the point.
         }
         std::string encoded = encode_pairing_records(this->records_);
         return std::vector<uint8_t>(encoded.begin(), encoded.end());
@@ -1483,7 +1480,7 @@ TEST(RecordStore, UnpairedAccessSeedDoesNotApplyWhenOnlyTheConfigIsLost) {
 
 TEST(RecordStore, UnpairedAccessSeedStillAppliesWhenNothingSurvived) {
     // A store that lost everything is indistinguishable from a factory-fresh device, so the
-    // seed does apply - same as the no-provider case.
+    // seed does apply, same as the no-provider case.
     RecordsWithoutConfigProvider provider({});
 
     RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true);
@@ -1551,7 +1548,6 @@ TEST(RecordStore, ResolvePairingOutcomeNormal) {
     }
     EXPECT_FALSE(all_zero) << "generated PSK should not be all-zero";
 
-    // A record must have been generated (storage not exhausted).
     ASSERT_TRUE(outcome->record.has_value())
         << "storage available: record must be present in outcome";
 
@@ -1561,7 +1557,6 @@ TEST(RecordStore, ResolvePairingOutcomeNormal) {
 
     // psk_id must be set and match the PSK.
     EXPECT_FALSE(outcome->record->psk_id.empty());
-    // The PSK in the record must match the outcome PSK.
     EXPECT_EQ(outcome->record->psk, outcome->psk);
 }
 
@@ -1603,13 +1598,11 @@ TEST(RecordStore, ResolvePairingOutcomeThenStore) {
     // Simulate the ack path: store the pending record.
     store.store_record(outcome->record.value());
 
-    // The record must now be findable by server_id.
     const auto* stored = store.record_by_server_id(server_id);
     ASSERT_NE(stored, nullptr) << "record must be retrievable by server_id after store";
     EXPECT_EQ(stored->psk_id, outcome->record->psk_id);
     EXPECT_EQ(stored->psk, outcome->psk);
 
-    // And resolvable by psk_id with LONG_TERM category.
     auto resolved = store.resolve_by_psk_id(stored->psk_id);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
@@ -1679,7 +1672,7 @@ TEST(RecordStore, ResolvePairingOutcomeExhaustedNoStore) {
 // Player static delay: ASCII-decimal round-trip via persistence_keys::STATIC_DELAY
 // =============================================================================
 
-// update_static_delay() must persist an ASCII decimal string (not raw uint16_t bytes) --
+// update_static_delay() must persist an ASCII decimal string (not raw uint16_t bytes):
 // debuggable and endian-free, per persistence_keys::STATIC_DELAY's contract.
 TEST(PlayerRoleStaticDelay, PersistsAsAsciiDecimal) {
     InMemoryPersistenceProvider provider;
@@ -1735,7 +1728,7 @@ TEST(PlayerRoleStaticDelay, InvalidPersistedValueIsTreatedAsAbsent) {
 }
 
 // ============================================================================
-// Regression tests for the 2026-08-14 review fixes
+// Provisioning write ordering, load-time validation, and counter clamping
 // ============================================================================
 
 namespace {
@@ -1885,7 +1878,7 @@ TEST(RecordStore, ClampsNegativeStoredDynamicPinFailureCounter) {
     RecordStore store(&provider);
     EXPECT_FALSE(store.dynamic_pin_escalated());
 
-    // From a clamped 0, exactly threshold failures must escalate -- a negative start would have
+    // From a clamped 0, exactly threshold failures must escalate; a negative start would have
     // required far more.
     for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
         store.record_dynamic_pin_failure();

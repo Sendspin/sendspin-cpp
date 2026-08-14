@@ -33,7 +33,7 @@
 #include <utility>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 namespace {
 
@@ -275,7 +275,6 @@ TEST(DynamicPin, FormatClientPairInitWireShape) {
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_init produced invalid JSON";
 
-    // type field
     EXPECT_STREQ(doc["type"], "client/pair-init");
 
     // commit_B must be a 43-char unpadded base64url string (32 bytes -> 43 chars).
@@ -291,7 +290,7 @@ TEST(DynamicPin, FormatClientPairInitWireShape) {
         EXPECT_EQ((*decoded)[i], commit_b[i]) << "decoded byte mismatch at index " << i;
     }
 
-    // pairing_index is required on every client/pair-init (spec #120).
+    // pairing_index is required on every client/pair-init (spec "Pairing index").
     ASSERT_TRUE(doc["payload"]["pairing_index"].is<uint32_t>());
     EXPECT_EQ(doc["payload"]["pairing_index"].as<uint32_t>(), 3u);
 }
@@ -369,10 +368,10 @@ TEST(DynamicPin, FormatClientPairConfirmWireShape) {
 // Dynamic-PIN failure counter (escalation, RecordStore)
 // ============================================================================
 
-// Escalation replaces the old lockout model (spec: Failure counter): a single dynamic_pin
-// counter, persisted across reboots, that gesture-gates the method at the threshold. The
-// method STAYS OFFERED while escalated; there is no refusal state and static_pin has no
-// counter at all (it is gesture-gated on every attempt).
+// The escalation model (spec: Failure counter) tracks a single dynamic_pin counter, persisted
+// across reboots, that gesture-gates the method at the threshold. The method STAYS OFFERED while
+// escalated; there is no refusal state and static_pin has no counter at all (it is gesture-gated
+// on every attempt).
 
 TEST(DynamicPinEscalation, NotEscalatedInitially) {
     RecordStore store(nullptr);
@@ -551,7 +550,7 @@ TEST(DynamicPinEscalation, PersistsOnlyAtFirstFailureAndEscalationCrossing) {
 namespace {
 
 // Build a SID = "sendspin-pair-pake-v1" (21 bytes) || 32 zero bytes || 4-byte BE counter
-// (spec #120: the sid now includes the pairing_index counter).
+// (spec "PAKE": the sid includes the pairing_index counter).
 static std::vector<uint8_t> make_test_sid(uint32_t counter = 0) {
     const char* prefix = "sendspin-pair-pake-v1";
     const size_t prefix_len = 21;
@@ -571,7 +570,7 @@ static std::vector<uint8_t> to_bytes(const char* s) {
                                 reinterpret_cast<const uint8_t*>(s) + len);
 }
 
-// ADa = "server" (initiator's own AD), ADb = "client" (responder's own AD) -- spec #117.
+// ADa = "server" (initiator's own AD), ADb = "client" (responder's own AD); per spec "PAKE".
 static std::vector<uint8_t> ad_server() {
     return to_bytes("server");
 }
@@ -608,12 +607,10 @@ TEST(DynamicPinCPace, RoundTripWithMatchingPassword) {
     ASSERT_TRUE(tag_a.has_value());
     ASSERT_TRUE(tag_b.has_value());
 
-    // Initiator verifies responder tag.
     EXPECT_TRUE(initiator.verify(tag_b->data(), tag_b->size()));
-    // Responder verifies initiator tag.
     EXPECT_TRUE(responder.verify(tag_a->data(), tag_a->size()));
 
-    // Both sides agree on ISK and sid -- needed for PSK Wrapping (spec #117).
+    // Both sides agree on ISK and sid, needed for PSK Wrapping (spec "PSK Wrapping").
     ASSERT_TRUE(initiator.isk().has_value());
     ASSERT_TRUE(responder.isk().has_value());
     EXPECT_EQ(initiator.isk().value(), responder.isk().value());
@@ -649,9 +646,9 @@ TEST(DynamicPinCPace, RoundTripMismatchedPasswordFails) {
 }
 
 TEST(DynamicPinCPace, MismatchedAssociatedDataFailsVerify) {
-    // Regression test for spec #117 (distinct ADa/ADb fixes a reflected-MAC issue): if a side
-    // uses the WRONG associated data (e.g. swapped, or both sides use the same AD instead of
-    // distinct "server"/"client" values), confirmation must fail even with a matching password.
+    // Distinct ADa/ADb values prevent a reflected-MAC issue (spec "PAKE"): if a side uses the
+    // WRONG associated data (e.g. swapped, or both sides use the same AD instead of distinct
+    // "server"/"client" values), confirmation must fail even with a matching password.
     const auto sid = make_test_sid();
     const auto prs = to_bytes("123456");
     const std::vector<uint8_t> empty;
@@ -673,7 +670,7 @@ TEST(DynamicPinCPace, MismatchedAssociatedDataFailsVerify) {
     ASSERT_TRUE(tag_a.has_value());
 
     // The responder expects the initiator's tag to authenticate (Ya, ADa="server"), but the
-    // initiator signed (Ya, ADa="client") instead -- verification must fail.
+    // initiator signed (Ya, ADa="client") instead, so verification must fail.
     EXPECT_FALSE(responder.verify(tag_a->data(), tag_a->size()));
 }
 
@@ -698,16 +695,14 @@ TEST(DynamicPin, ClientHelloDynamicPinDescriptorOutChannels) {
     ASSERT_EQ(methods.size(), 1u);
     EXPECT_STREQ(methods[0]["method"], "dynamic_pin");
 
-    // out_channels
     JsonArrayConst ch = methods[0]["out_channels"].as<JsonArrayConst>();
     ASSERT_EQ(ch.size(), 1u);
     EXPECT_STREQ(ch[0], "display");
 
-    // min_pin_length
     EXPECT_EQ(methods[0]["min_pin_length"].as<int>(), 6);
 
-    // locked_out is gone from the wire (escalation replaced lockout); it must never be
-    // emitted. locations is a static_pin/pairing_psk hint, absent for dynamic_pin.
+    // locked_out is not part of the wire format; it must never be emitted. locations is a
+    // static_pin/pairing_psk hint, absent for dynamic_pin.
     EXPECT_TRUE(methods[0]["locked_out"].isUnbound());
     EXPECT_TRUE(methods[0]["locations"].isUnbound());
 }
@@ -717,11 +712,11 @@ TEST(DynamicPin, ClientHelloDynamicPinDescriptorOutChannels) {
 // ============================================================================
 
 // format_client_pair_init_message(pairing_index) (single-arg overload): static PIN sends no
-// commit_B, but pairing_index is required on every client/pair-init since spec #120. Mirrors
-// ClientPairInitPayload() with omit_none in the reference (aiosendspin/noise/models.py
-// ClientPairInitPayload, ~lines 138-147) and run_static_pin_client's
-// `ClientPairInitMessage(payload=ClientPairInitPayload())` (aiosendspin/noise/pairing.py,
-// ~line 285), extended with the new required pairing_index field.
+// commit_B, but pairing_index is required on every client/pair-init (spec "Pairing index"). Mirrors
+// ClientPairInitPayload() with omit_none in the reference (aiosendspin/noise/models.py,
+// ClientPairInitPayload) and run_static_pin_client's
+// `ClientPairInitMessage(payload=ClientPairInitPayload())` (aiosendspin/noise/pairing.py),
+// extended with the required pairing_index field.
 TEST(StaticPin, FormatClientPairInitEmptyWireShape) {
     const std::string out = format_client_pair_init_message(/*pairing_index=*/1);
 
@@ -741,10 +736,10 @@ TEST(StaticPin, FormatClientPairInitEmptyWireShape) {
 }
 
 // format_client_pair_confirm_message() (client_kc-only overload): static PIN carries client_kc
-// but NO nonce_B. Mirrors ClientPairConfirmPayload with nonce_B omitted (aiosendspin/noise/models.py
-// ClientPairConfirmPayload, ~lines 225-236) and run_static_pin_client's
+// but NO nonce_B. Mirrors ClientPairConfirmPayload with nonce_B omitted
+// (aiosendspin/noise/models.py, ClientPairConfirmPayload) and run_static_pin_client's
 // `ClientPairConfirmMessage(payload=ClientPairConfirmPayload(client_kc=...))`
-// (aiosendspin/noise/pairing.py, ~line 298).
+// (aiosendspin/noise/pairing.py).
 TEST(StaticPin, FormatClientPairConfirmNoNonceWireShape) {
     std::array<uint8_t, 64> client_kc{};
     for (int i = 0; i < 64; ++i) client_kc[i] = static_cast<uint8_t>(i + 5);
@@ -776,7 +771,7 @@ TEST(StaticPin, FormatClientPairConfirmNoNonceWireShape) {
 // ============================================================================
 
 // static_pin carries neither out_channels nor min_pin_length (those are set only for
-// DYNAMIC_PIN); its only optional hint is locations. locked_out is gone from the wire.
+// DYNAMIC_PIN); its only optional hint is locations. locked_out is never emitted.
 TEST(StaticPin, ClientHelloStaticPinDescriptorShape) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";

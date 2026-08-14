@@ -18,7 +18,7 @@
 //   1. An initial KKpsk2 handshake completes (initiator + responder sessions).
 //   2. The initiator (server) begins a re-handshake using prior_h as prologue.
 //   3. The responder (run_rehandshake_msg1) processes msg1, emits msg2.
-//   4. The initiator reads msg2, splits -- new sessions.
+//   4. The initiator reads msg2 and splits, producing new sessions.
 //   5. Verifies: new sessions work, new h != old h, old session cannot decrypt new traffic.
 //
 // Also covers the negative path: unknown psk_id in re-handshake msg1 aborts cleanly.
@@ -59,7 +59,7 @@ extern "C" {
 #include <utility>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) - test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 // =============================================================================
 // Helpers
@@ -169,13 +169,11 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
         return std::nullopt;
     }
 
-    // Initiator splits
     if (noise_handshakestate_split(init_hs_raw, &r.initiator.send_cs, &r.initiator.recv_cs) !=
         NOISE_ERROR_NONE) {
         return std::nullopt;
     }
 
-    // Responder takes result
     auto outcome = nh.take_result();
     if (!outcome.has_value() || !outcome->session) { return std::nullopt; }
     r.responder_h = outcome->session->handshake_hash();
@@ -267,7 +265,6 @@ static std::optional<RehandshakeResult> run_rehandshake(
     std::string msg1_json;
     serializeJson(env_doc, msg1_json);
 
-    // Responder runs run_rehandshake_msg1()
     auto result = run_rehandshake_msg1(msg1_json, init.server_id.peer_id(), init.client_id, rs,
                                        suite_name, prior_h);
     if (!result.has_value()) {
@@ -275,7 +272,7 @@ static std::optional<RehandshakeResult> run_rehandshake(
         return std::nullopt;
     }
 
-    // msg2_text is already in the result -- it is a noise/handshake JSON envelope wrapping msg2.
+    // msg2_text is already in the result: a noise/handshake JSON envelope wrapping msg2.
     // The initiator reads msg2 from it.
     JsonDocument msg2_doc;
     if (deserializeJson(msg2_doc, result->msg2_text)) {
@@ -301,12 +298,10 @@ static std::optional<RehandshakeResult> run_rehandshake(
         return std::nullopt;
     }
 
-    // msg2 payload must be "{}"
     std::string msg2_payload_str(reinterpret_cast<char*>(msg2_payload_buf.data()),
                                  msg2_payload_out.size);
     EXPECT_EQ(msg2_payload_str, "{}");
 
-    // Initiator splits
     RehandshakeResult rr;
     if (noise_handshakestate_split(init_hs_raw, &rr.initiator.send_cs,
                                    &rr.initiator.recv_cs) != NOISE_ERROR_NONE) {
@@ -432,7 +427,6 @@ TEST(NoiseRehandshake, RehandshakeWithDifferentPsk_ChaChaPoly) {
     const std::vector<uint8_t> pt = {0x00, 't', 'e', 's', 't'};
     check_session_roundtrip(rr_opt->initiator, *rr_opt->responder_session, pt);
 
-    // New h must differ from the old h.
     EXPECT_NE(rr_opt->new_h, init.responder_h);
 }
 

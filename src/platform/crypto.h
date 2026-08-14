@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /// @file crypto.h
-/// @brief Portable cryptographic primitives - SHA-256, SHA-512, HMAC-SHA-512, and CSPRNG -
+/// @brief Portable cryptographic primitives (SHA-256, SHA-512, HMAC-SHA-512, and CSPRNG),
 /// routed through noise-c on both host and ESP so both platforms use identical code
 /// paths with no extra dependencies.
 
@@ -343,7 +343,7 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
     } else {
         // key_len <= BLOCK here (the `if` above handles key_len > BLOCK); key+key_len is the
         // standard one-past-the-end pointer for the caller-supplied (key, key_len) buffer, valid
-        // as long as the caller's buffer is at least key_len bytes -- the same (ptr, len) contract
+        // as long as the caller's buffer is at least key_len bytes: the same (ptr, len) contract
         // every function in this file relies on. cppcheck's range check can't see the caller's
         // actual buffer size and flags the key_len == BLOCK case as if it might overrun.
         // cppcheck-suppress pointerOutOfBoundsCond
@@ -402,10 +402,10 @@ inline std::vector<uint8_t> platform_random_bytes(size_t len) {
 // AEAD (one-shot, explicit key + nonce)
 // ============================================================================
 //
-// Used for PSK Wrapping (spec #117): the client seals the new PSK under a key derived from the
+// Used for spec "PSK Wrapping": the client seals the new PSK under a key derived from the
 // CPace output using the AEAD of the connection's negotiated cipher suite, a 12-byte all-zero
 // nonce, and empty associated data. This is independent of the Noise transport's own
-// monotonic-counter nonces (see noise_transport.h) -- it is a single-shot construction with a
+// monotonic-counter nonces (see noise_transport.h); it is a single-shot construction with a
 // fixed nonce, safe here only because K_wrap is used to encrypt exactly one message.
 
 /// @brief Number of bytes of authentication-tag overhead added by every Sendspin AEAD cipher

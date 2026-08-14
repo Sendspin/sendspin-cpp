@@ -84,7 +84,7 @@ void SendspinServerConnection::loop() {
 void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
                                           std::function<void()> on_complete) {
     if (!this->is_connected()) {
-        // Not connected - invoke completion callback immediately if provided
+        // Not connected: invoke completion callback immediately if provided
         if (on_complete) {
             on_complete();
         }
@@ -118,7 +118,7 @@ void SendspinServerConnection::close_transport_now() {
     // primitive disconnect() uses in its completion callback and handle_data() uses via the
     // ESP_ERR_NO_MEM return path below), so it is safe to call directly here. on_disconnected_cb
     // is intentionally not fired here: for inbound connections it is wired as a no-op
-    // (ConnectionManager::on_new_connection() -- cleanup happens via the ws_server's own close
+    // (ConnectionManager::on_new_connection(); cleanup happens via the ws_server's own close
     // notification instead, see close_callback() in ws_server.cpp), so the resulting close
     // notification is what reports the loss.
     this->trigger_close();
@@ -132,7 +132,7 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback on_complete,
                                                   bool allow_before_hello) {
     if (!this->is_connected()) {
-        // No client connected - invoke callback with failure if provided
+        // No client connected: invoke callback with failure if provided
         if (on_complete) {
             on_complete(false);
         }
@@ -274,7 +274,7 @@ SS_HOT esp_err_t SendspinServerConnection::handle_data(httpd_req_t* req, int64_t
     if (ws_pkt.type == HTTPD_WS_TYPE_TEXT || ws_pkt.type == HTTPD_WS_TYPE_BINARY) {
         this->is_text_frame_ = (ws_pkt.type == HTTPD_WS_TYPE_TEXT);
     } else if (ws_pkt.type != HTTPD_WS_TYPE_CONTINUE) {
-        // Control frames (ping, pong, close) - not handled here
+        // Control frames (ping, pong, close): not handled here
         return ESP_OK;
     }
 

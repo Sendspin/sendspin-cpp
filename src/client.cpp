@@ -74,8 +74,8 @@ struct SendspinClient::EventState {
     // call returns (unlocked, so a listener may safely call back into the client). No lock is
     // needed here: single-writer/single-reader, both on the main loop.
     //
-    // The one genuinely cross-thread notification -- on_pairing_succeeded, triggered by the
-    // network-thread server/pair-finalize ack handler -- does NOT queue here directly; it goes
+    // The one genuinely cross-thread notification, on_pairing_succeeded (triggered by the
+    // network-thread server/pair-finalize ack handler), does NOT queue here directly; it goes
     // through ConnectionManager's existing pending_*_events_ / has_pending_events_ idiom (see
     // schedule_pairing_succeeded()) and is only turned into a note_pairing_succeeded() call (and
     // thus pushed into pending_pairing_succeeded_ below) once that idiom's drain has moved it to
@@ -161,8 +161,8 @@ bool SendspinClient::start_server() {
     // Create the record store (needs the persistence provider, so done here rather than at
     // construction) and load or generate the static X25519 identity. Both must exist before
     // the connection manager can hand them out to any connection (init_server() below starts
-    // the ws_server, and connect_to() may be called any time after start_server() RETURNS TRUE
-    // -- connect_to() enforces that itself rather than trusting the caller's ordering).
+    // the ws_server, and connect_to() may be called any time after start_server() RETURNS TRUE;
+    // connect_to() enforces that itself rather than trusting the caller's ordering).
     this->record_store_ = std::make_unique<RecordStore>(
         this->persistence_provider_, this->config_.initial_unpaired_access_enabled);
     if (!this->load_or_generate_identity()) {
@@ -209,7 +209,7 @@ void SendspinClient::connect_to(const std::string& url) {
     // Refuse to build an outbound connection before start_server() has fully succeeded.
     // identity_ and record_store_ are populated only there, and the lifecycle drain hands both
     // to init_noise_handshake() by reference once the WebSocket upgrade completes (see
-    // ConnectionManager::drain_lifecycle_events) -- with encryption_required defaulting to true,
+    // ConnectionManager::drain_lifecycle_events), with encryption_required defaulting to true,
     // a connection started now would dereference null there. Checking the pointers rather than
     // started_ alone also covers a consumer that ignored a false return from start_server().
     if (this->identity_ == nullptr || this->record_store_ == nullptr) {
@@ -262,7 +262,7 @@ void SendspinClient::loop() {
     // since a role's InboxSlot can be written by a producer between this snapshot and that one.
     // Both are lock-free atomic loads, so a tick with nothing pending performs zero inbox mutex
     // acquisitions in this section. A bit either snapshot races and misses is picked up by the
-    // next tick's poll() -- bounded staleness, already documented on Inbox::poll().
+    // next tick's poll(): bounded staleness, already documented on Inbox::poll().
     const uint32_t inbox_bits = this->event_state_->inbox.poll();
 
     // --- Time sync events ---
@@ -327,7 +327,7 @@ void SendspinClient::loop() {
                     // (wiping the whole ring) before any role re-pushes its CLEARED, and that path
                     // runs only under conn_ptr_mutex_ (ConnectionManager::drop_connection), so it
                     // cannot interleave with itself. So even a back-to-back disconnect/reconnect
-                    // coalesces to a single CLEARED -- the reset_events() ordering is what
+                    // coalesces to a single CLEARED; the reset_events() ordering is what
                     // guarantees it, not clear-callback idempotency. (Callbacks are idempotent by
                     // contract anyway; see on_controller_state_clear() / on_metadata_clear() /
                     // on_color_clear().)
@@ -357,7 +357,7 @@ void SendspinClient::loop() {
                     }
                     // ARTWORK_STREAM / VISUALIZER_STREAM: stream lifecycle sub-events (code =
                     // the role-local ArtworkEventType/VisualizerEventType) from the artwork and
-                    // visualizer roles, dispatched the same way as PLAYER_STREAM above -- straight
+                    // visualizer roles, dispatched the same way as PLAYER_STREAM above: straight
                     // to a main-thread-only Impl method keyed on the role-local enum.
                     case InboxEventType::ARTWORK_STREAM: {
 #ifdef SENDSPIN_ENABLE_ARTWORK
@@ -687,7 +687,7 @@ void SendspinClient::cleanup_connection_state() {
     // in one manager pass) wipes the first teardown's just-pushed CLEARED/STREAM_END events
     // here before they are ever drained. That is safe only because every role's cleanup() below
     // pushes its full event set unconditionally, so this call re-creates exactly what it wiped
-    // and the drain still fires each (payload-free, idempotent) callback once -- the same
+    // and the drain still fires each (payload-free, idempotent) callback once, the same
     // coalescing the old per-role pending_clear booleans provided. Keep role cleanups
     // unconditional or this reset starts losing clear signals.
     this->event_state_->drain_generation++;
@@ -697,7 +697,7 @@ void SendspinClient::cleanup_connection_state() {
     // Also wipes any not-yet-dispatched pairing/PIN listener notifications. Callers that need a
     // notification to survive teardown (e.g. handle_pair_abort's on_pairing_failed /
     // on_clear_pairing_pin) must call the corresponding note_*() AFTER cleanup_connection_state()
-    // returns, never before -- see the ConnectionManager pairing/PIN handlers.
+    // returns, never before; see the ConnectionManager pairing/PIN handlers.
     this->event_state_->pending_pairing_started.clear();
     this->event_state_->pending_pairing_succeeded.clear();
     this->event_state_->pending_pairing_failed.clear();
@@ -856,7 +856,7 @@ namespace {
 /// RecordStore::resolve_by_psk_id() accepts unconditionally, so any peer on the network can
 /// finish a handshake and sit in the nursery. Whether its PSK category actually permits the
 /// PLAYBACK activity is decided by admission (see admission.h), which runs on the main loop when
-/// server/activate arrives -- so until this connection holds the admitted slot, none of these
+/// server/activate arrives, so until this connection holds the admitted slot, none of these
 /// messages may touch a role.
 ///
 /// False for the establishment and trust-negotiation traffic a connection must be able to send
@@ -1031,7 +1031,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             if (process_server_hello_message(root, &hello_msg)) {
                 // server_id comes from the Noise handshake result (already set on the
                 // connection when one ran); server/hello only carries the display name. The
-                // legacy server_id field on server/hello is a test-only fallback, adopted only
+                // server_id field on server/hello is a test-only fallback, adopted only
                 // when the Noise handshake never set one (encryption_required == false).
                 if (conn != nullptr) {
                     ServerInformationObject info = conn->get_server_information();
@@ -1093,7 +1093,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                     // close without any application-level message). This handler runs on the
                     // network thread, so disconnect() here would be the same
                     // join-the-calling-thread deadlock/std::terminate() hazard close_silently()
-                    // was added to avoid -- see close_transport_now()'s doc comment in
+                    // was added to avoid; see close_transport_now()'s doc comment in
                     // connection.h.
                     conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
                 }
@@ -1427,7 +1427,7 @@ SS_HOT void SendspinClient::process_binary_message(const SendspinConnection* con
     }
 
     // Every binary message feeds a role, so the same admission gate as the role-bound JSON
-    // messages applies -- see requires_admitted_connection().
+    // messages applies; see requires_admitted_connection().
     if (conn == nullptr || !conn->is_admitted()) {
         SS_LOGW(TAG, "Ignoring binary message from a connection that is not admitted");
         return;
@@ -1512,7 +1512,6 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     state_msg.state = this->state_;
 
 #ifdef SENDSPIN_ENABLE_PLAYER
-    // Only include player state when the "player" role is active on this connection.
     if (this->player_ && conn->is_role_active("player")) {
         this->player_->impl_->build_state_fields(state_msg);
     }
@@ -1530,7 +1529,7 @@ bool SendspinClient::load_or_generate_identity() {
     if (this->persistence_provider_ != nullptr) {
         auto saved_priv = this->persistence_provider_->load_blob(persistence_keys::KEYPAIR);
         // No codec involved: the keypair blob is exactly 32 raw bytes, so the only validation
-        // needed here is the exact-length check -- anything else is corrupt or the wrong key.
+        // needed here is the exact-length check: anything else is corrupt or the wrong key.
         if (saved_priv.has_value() && saved_priv->size() == 32) {
             std::array<uint8_t, 32> priv_bytes{};
             std::copy(saved_priv->begin(), saved_priv->end(), priv_bytes.begin());
@@ -1547,7 +1546,7 @@ bool SendspinClient::load_or_generate_identity() {
                 SS_LOGI(TAG, "Loaded static keypair; client_id=%s", this->client_id_.c_str());
                 return true;
             }
-            // Stored key is corrupt, or the underlying DH computation failed -- do not use it
+            // Stored key is corrupt, or the underlying DH computation failed; do not use it
             // and do not treat this as an all-zero identity. Fall through and generate a fresh
             // identity (the device will need to re-pair) rather than proceeding with a
             // predictable/zero key.
@@ -1558,7 +1557,7 @@ bool SendspinClient::load_or_generate_identity() {
         }
     }
 
-    // No saved key (or the saved key was invalid) -- generate a new one.
+    // No saved key, or the saved key was invalid: generate a new one.
     auto generated = Identity::generate();
     if (!generated.has_value()) {
         // No safe fallback: identity_ must never be set to a default-constructed (all-zero)
@@ -1625,13 +1624,12 @@ void SendspinClient::persist_last_played_server(const std::string& server_id) {
 void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     // Entering the operational state structurally ends any pairing exchange: discard the pending
     // pairing record and reset the PIN session so a stale attempt timeout can never fire a stray
-    // pair/abort on an operational connection (the class of bug that produced one ~120 s after a
-    // successful pairing). Folding this in here -- the one place every "connection is now
-    // operational" path converges (normal activate, leftover activate, and winning promotion) --
-    // makes it impossible for a future PAIRING/REKEYING transition to leave a stale PIN session
-    // behind. Safe because on_handshake_complete() only ever runs on the main loop, where the
-    // main-loop-only pin_session_ may be touched. Idempotent no-op for a connection that never
-    // paired.
+    // pair/abort on an operational connection. Folding this in here, the one place every
+    // "connection is now operational" path converges (normal activate, leftover activate, and
+    // winning promotion), makes it impossible for a future PAIRING/REKEYING transition to leave a
+    // stale PIN session behind. Safe because on_handshake_complete() only ever runs on the main
+    // loop, where the main-loop-only pin_session_ may be touched. Idempotent no-op for a
+    // connection that never paired.
     if (conn != nullptr) {
         conn->clear_pairing_state();
     }

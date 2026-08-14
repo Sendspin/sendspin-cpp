@@ -61,14 +61,14 @@ static std::string read_file(const std::string& path) {
 ///
 /// This file can hold the device's static private key, long-term PSKs, the Pairing
 /// PSK, and the static PIN, so the temp file is created owner-only (0600) from the
-/// moment it exists rather than chmod'd afterward -- a post-write chmod would leave
+/// moment it exists rather than chmod'd afterward: a post-write chmod would leave
 /// the secret readable by other local accounts for the duration of the write.
 /// std::ofstream has no portable way to specify a creation mode, so the temp file is
 /// opened with POSIX open()/O_CREAT and an explicit mode instead, and written via
 /// that descriptor. Because rename() replaces the destination's directory entry
 /// wholesale, the renamed-over file always ends up with the temp file's (0600)
-/// permissions, which also tightens the mode of a pre-existing file that an older,
-/// less careful version of this helper (or another tool) left group/world readable.
+/// permissions, which also tightens the mode of a pre-existing file that another
+/// tool left group/world readable.
 ///
 /// The temp file's contents are fsync'd before the rename, and the containing
 /// directory is fsync'd after the rename, so a crash cannot report success for data
@@ -136,7 +136,7 @@ static JsonDocument load_doc(const std::string& path) {
     JsonDocument doc;
     std::string raw = read_file(path);
     if (raw.empty()) {
-        doc.to<JsonObject>();  // Start as empty object.
+        doc.to<JsonObject>();
         return doc;
     }
     DeserializationError err = deserializeJson(doc, raw);

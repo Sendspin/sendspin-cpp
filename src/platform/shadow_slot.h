@@ -28,7 +28,7 @@ namespace sendspin {
 ///
 /// The writer thread locks briefly to write or merge a value; the reader thread locks briefly to
 /// move the value out if dirty. General contract: safe between any single-writer/single-reader
-/// thread pair, not just producer/consumer pairs outside the main loop -- e.g. the sync task's
+/// thread pair, not just producer/consumer pairs outside the main loop: e.g. the sync task's
 /// playback-progress slot (audio callback thread to sync task thread) and a connection's pending
 /// pairing record (main loop writer to network-thread reader). State bound for the main loop's
 /// own read side instead goes through Inbox / InboxSlot (see inbox.h) when there are many such

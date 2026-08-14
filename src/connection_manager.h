@@ -73,11 +73,10 @@ static constexpr int64_t NURSERY_ESTABLISH_TIMEOUT_US = seconds_to_us(NURSERY_ES
 /// !current_connection_->is_operational(). current_connection_ is never non-operational for any
 /// other reason: a nursery entry is only ever promoted once it is already operational (see
 /// promote_or_arbitrate_nursery_entry()), and an in-progress PIN-pairing PAKE exchange keeps
-/// is_operational() true throughout (that flow has its own timeouts -- PIN_ATTEMPT_TIMEOUT_US
-/// and pairing_window_open() -- see connection_manager.cpp). Shares
-/// NURSERY_ESTABLISH_TIMEOUT_S's value by design (same "reach the next protocol milestone
-/// within a bounded window" semantics) but is named separately because it applies to the
-/// current slot, not the nursery.
+/// is_operational() true throughout (that flow has its own timeouts, PIN_ATTEMPT_TIMEOUT_US and
+/// pairing_window_open(); see connection_manager.cpp). Shares NURSERY_ESTABLISH_TIMEOUT_S's value
+/// by design (same "reach the next protocol milestone within a bounded window" semantics) but is
+/// named separately because it applies to the current slot, not the nursery.
 static constexpr double REPROVE_TIMEOUT_S = NURSERY_ESTABLISH_TIMEOUT_S;
 
 /// @brief Timeout in microseconds (derived from REPROVE_TIMEOUT_S).
@@ -120,8 +119,8 @@ struct PairAbortEvent {
 /// (RecordStore::store_record fails closed) and the pairing must fail closed. Processed on
 /// the main loop: sends a best-effort pair/abort, drops the connection, and reports
 /// SendspinPairAbortReason::STORAGE_FAILED to the listener. server_id is captured at
-/// production time for the same reason as PairingSucceededEvent's server_id (the connection
-/// may already be torn down by the time this drains).
+/// production time for the same reason schedule_pairing_succeeded() captures its server_id
+/// argument: the connection may already be torn down by the time this drains.
 struct PairStorageFailedEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection whose pairing failed to persist
     std::string server_id;                     ///< server_id captured when the event was posted
@@ -238,8 +237,8 @@ struct ServerActivateEvent {
  * in-band re-handshake (schedule_rehandshake_rearm(): the hello cycle re-arms and re-runs) or
  * after the server acks client/pair-finalize and is expected to rekey via one
  * (SendspinConnection::note_pairing_finalize_ack()). The invariant is restored once the cycle
- * completes; if it does not -- the hello send keeps failing until retries are exhausted, or the
- * server simply goes silent -- the connection is dropped rather than left wedged. See the
+ * completes. If it does not (the hello send keeps failing until retries are exhausted, or the
+ * server simply goes silent), the connection is dropped rather than left wedged. See the
  * hello-retry-timer scan in scan_hello_and_nursery() and the re-proving-deadline check
  * (REPROVE_TIMEOUT_US) in scan_reprove_watchdog(), both called every tick from loop(). For why
  * this state is tracked as independent flags rather than a single phase enum, see the
@@ -305,7 +304,7 @@ public:
     /// events, retries hello, calls loop() on active connections.
     ///
     /// Implemented as a short driver over the named private steps in the "loop() decomposition"
-    /// section below (pure code-motion; each step keeps its original locking).
+    /// section below; each step keeps its own locking.
     ///
     /// Tick cost: every step after the ws_server start-retry check is gated on one of the atomic
     /// hints in "Atomic fields" below (has_pending_events_, nursery_size_, has_current_,
@@ -417,9 +416,9 @@ private:
     // ========================================
     // loop() decomposition
     // ========================================
-    // loop() is a short driver over the named steps below (pure code-motion out of what used to
-    // be one long function body); behavior, locking shape, and processing order are exactly as
-    // documented on loop() and on ConnectionManager above. Each method's doc comment states its
+    // loop() is a short driver over the named steps below. Behavior, locking shape, and
+    // processing order are exactly as documented on loop() and on ConnectionManager above. Each
+    // method's doc comment states its
     // lock contract; see loop()'s definition in connection_manager.cpp for the exact call
     // sequence and the flush_deferred_releases() calls between steps.
 
@@ -508,7 +507,7 @@ private:
     /// client/init immediately (the connection is already WS-upgraded, so there is no earlier
     /// signal to wait for); the hello is armed later, once the Noise handshake completes (see
     /// the noise-completion scan in scan_hello_and_nursery()). Otherwise the hello is armed right
-    /// away, as before.
+    /// away.
     /// @param conn The newly delivered server connection. The session slot keeps a parallel
     ///             refcount, so this observer can be reset at any time without freeing the conn
     ///             out from under in-flight httpd workers.
@@ -616,7 +615,7 @@ private:
     /// a queued release is performed exactly once. Called after every locked section that can
     /// queue a release; loop() also calls it as a backstop.
     ///
-    /// Early-returns without locking when deferred_size_ reads 0 -- see the definition for the
+    /// Early-returns without locking when deferred_size_ reads 0; see the definition for the
     /// soundness argument.
     void flush_deferred_releases();
 
@@ -627,7 +626,7 @@ private:
     ///
     /// Usually called for a nursery member, but also for the current (already-admitted)
     /// connection to re-arm its hello after a successful in-band re-handshake (see
-    /// schedule_rehandshake_rearm()) -- hello_retries_ is not exclusively a nursery-membership
+    /// schedule_rehandshake_rearm()): hello_retries_ is not exclusively a nursery-membership
     /// concept, see the field's doc comment.
     /// @param conn The connection to send the hello to.
     void initiate_hello(SendspinConnection* conn);
@@ -718,8 +717,8 @@ private:
     /// Removing a record from the RecordStore does not by itself end a session that is already
     /// running on it: a connection caches its resolved psk_id and PSK category at Noise-handshake
     /// completion (see SendspinConnection::get_psk_category()) and never re-resolves them against
-    /// the store. Without this sweep a revoked device would keep its LONG_TERM trust -- and with
-    /// it management authority and playback -- until it happened to disconnect, so revocation
+    /// the store. Without this sweep a revoked device would keep its LONG_TERM trust (and with
+    /// it management authority and playback) until it happened to disconnect, so revocation
     /// would not take effect until the peer's next connection.
     ///
     /// Covers the current slot and the nursery. Caller must hold conn_ptr_mutex_ and call
@@ -755,7 +754,7 @@ private:
     void handle_enter_pairing(SendspinConnection* conn);
 
     /// @brief Handles a pair/abort event on the main loop.
-    /// Cleans up pairing state. Per spec #120/#123, only closes the connection for reason
+    /// Cleans up pairing state. Per spec "pair/abort", only closes the connection for reason
     /// concurrent_attempt; every other reason leaves it open. A pair/abort that arrives after the
     /// attempt has already ended (is_pairing_in_progress() false) is silently ignored (stale).
     /// @param conn The connection on which the abort arrived.
@@ -820,7 +819,7 @@ private:
                                     const ServerPairingMessageEvent& event);
 
     /// @brief Abort the current PIN-pairing session: send pair/abort, notify, and close the
-    /// connection only for reason concurrent_attempt (spec #120/#123; every other reason leaves
+    /// connection only for reason concurrent_attempt (spec "pair/abort"; every other reason leaves
     /// the connection open).
     /// @param conn The connection to abort.
     /// @param reason The abort reason to send.
@@ -916,7 +915,7 @@ private:
     bool has_last_played_server_{false};
 
     // Atomic fields (lock-free hints for loop() tick gating; ground truth remains the
-    // mutex-protected containers/pointer above -- see the "Tick cost" note on loop())
+    // mutex-protected containers/pointer above; see the "Tick cost" note on loop())
 
     /// True while pending_connected_events_ or pending_disconnect_events_ holds an unswapped
     /// entry. Set under conn_mutex_ at every push into either queue; cleared under conn_mutex_
@@ -941,7 +940,7 @@ private:
     /// hello_retries_ mutation (initiate_hello(), remove_hello_retry(), and the retry-timer scan's
     /// erases in loop()). Lets loop() run the hello-retry-timer scan even when the nursery is
     /// empty, which happens whenever the only pending retry belongs to the current (already-
-    /// admitted) connection re-arming its hello after an in-band re-handshake -- that connection
+    /// admitted) connection re-arming its hello after an in-band re-handshake. That connection
     /// is never a nursery member, so nursery_size_ alone would miss it.
     std::atomic<size_t> hello_retries_size_{0};
 

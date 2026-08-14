@@ -16,11 +16,11 @@
 /// @brief Self-contained 256-bit modular arithmetic over GF(2^255-19).
 ///
 /// Provides only what CPace-X25519-SHA512 needs:
-///   - fp_mul(a, b)   -- modular multiplication
-///   - fp_pow(base, exp) -- modular exponentiation (used for inv and Legendre)
-///   - fp_inv(a)      -- modular inverse via Fermat: a^(p-2) mod p
-///   - fp_from_le(bytes) -- decode 32 little-endian bytes to a Fp value
-///   - fp_to_le(v)    -- encode a Fp value to 32 little-endian bytes
+///   - fp_mul(a, b): modular multiplication
+///   - fp_pow(base, exp): modular exponentiation (used for inv and Legendre)
+///   - fp_inv(a): modular inverse via Fermat: a^(p-2) mod p
+///   - fp_from_le(bytes): decode 32 little-endian bytes to a Fp value
+///   - fp_to_le(v): encode a Fp value to 32 little-endian bytes
 ///
 /// No external dependencies; compiles on both host (x86/arm) and ESP32.
 
@@ -172,7 +172,7 @@ inline Fp fp_reduce(const Fp& a) {
 // The 38-fold in fp_mul/fp_scale leaves a value that is merely below 2^256, and
 // 2^256 = 2p + 38, so an input in [2p, 2^256) needs a SECOND subtraction: one
 // pass would leave it in [p, p+38), i.e. still non-canonical. That band is not
-// exotic -- it is reachable whenever the true result is congruent to a value
+// exotic: it is reachable whenever the true result is congruent to a value
 // below 38, which is exactly what an inverse or a Legendre exponentiation
 // produces (fp_mul(x, fp_inv(x)) hit it for ~25% of random x, returning p+1
 // instead of 1). A non-canonical Fp then encodes to the wrong 32 bytes through
@@ -199,7 +199,7 @@ inline Fp fp_reduce(const Fp& a, uint64_t /*top_carry_must_be_folded_in*/) {
 // Reduction of a 512-bit number n mod (2^255-19):
 //   n = n_lo + n_hi * 2^255
 //   n mod p = n_lo + n_hi * 19   (because 2^255 = p + 19 => 2^255 mod p = 19)
-// The fold leaves a value below 2^256, which is 2p + 38 -- so the final step must be the
+// The fold leaves a value below 2^256, which is 2p + 38, so the final step must be the
 // two-subtraction fp_reduce_full(), not a single conditional subtraction.
 // ============================================================================
 
@@ -247,8 +247,8 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
         // `carry` here is the carry out of limb 3 from the loop above, i.e. the true
         // overflow past 2^256 (bounded by ~38): its positional value is 2^256, and
         // 2^256 mod p = 38, so folding it back in as carry*38 (added into limb 0) is
-        // correct. But that addition can itself carry out of limb 0 -- a carry with
-        // positional value 2^64, NOT 2^256 -- so it must be propagated limb-by-limb
+        // correct. That addition can itself carry out of limb 0, though (a carry with
+        // positional value 2^64, not 2^256), so it must be propagated limb-by-limb
         // (0 -> 1 -> 2 -> 3), not folded by 38 again. Only a carry that makes it all
         // the way out of limb 3 a second time has positional value 2^256 and is
         // legitimately foldable by 38.
@@ -267,7 +267,7 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
     }
 
     // Pass 2: fully reduce. The folded value is only bounded by 2^256 (= 2p + 38), not by
-    // 2p, so this needs the two-subtraction reduce -- see fp_reduce_full().
+    // 2p, so this needs the two-subtraction reduce; see fp_reduce_full().
     return fp_reduce(r, 0);
 }
 
@@ -324,7 +324,7 @@ inline Fp fp_legendre_pow(const Fp& a) {
     return fp_pow(a, FP_LEGENDRE);
 }
 
-/// @brief Scale a Fp by a small integer constant (< 2^63) without full multiplication.
+/// @brief Scale a Fp by a small integer constant (< 2^26) without full multiplication.
 inline Fp fp_scale(const Fp& a, uint64_t s) {
     // The single-step carry fold below is only exact for small scalars: the loop carry can
     // reach ~s, and it is folded back with multiplier 38 assuming it fits alongside limb 0.
@@ -343,8 +343,8 @@ inline Fp fp_scale(const Fp& a, uint64_t s) {
     // `carry` here is the carry out of limb 3 from the loop above, i.e. the true
     // overflow past 2^256 (bounded by s < 2^26): its positional value is 2^256, and
     // 2^256 mod p = 38, so folding it back in as carry*38 (added into limb 0) is
-    // correct. But that addition can itself carry out of limb 0 -- a carry with
-    // positional value 2^64, NOT 2^256 -- so it must be propagated limb-by-limb
+    // correct. That addition can itself carry out of limb 0, though (a carry with
+    // positional value 2^64, not 2^256), so it must be propagated limb-by-limb
     // (0 -> 1 -> 2 -> 3), not folded by 38 again. Only a carry that makes it all the
     // way out of limb 3 a second time has positional value 2^256 and is legitimately
     // foldable by 38.

@@ -224,7 +224,7 @@ void SendspinClientConnection::setup_callbacks() {
                         SS_LOGE(TAG, "Allocation failed, dropping connection");
                         // Stop processing further frames and initiate a real transport close via
                         // close_transport_now() (stop() would join IX's thread and deadlock here;
-                        // close() is async and safe -- see its doc comment).
+                        // close() is async and safe; see its doc comment).
                         this->disable_message_dispatch();
                         this->close_transport_now();
                         return;

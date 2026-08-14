@@ -491,28 +491,28 @@ bool process_group_update_message(JsonObject root, GroupUpdateMessage* group_msg
     // Parse optional playback_state
     JsonVariantConst playback_state_var = root["payload"]["playback_state"];
     if (!playback_state_var.isUnbound() && playback_state_var.isNull()) {
-        // Field set to null - clear from state
+        // Field set to null: clear from state
         group_msg->group.playback_state = std::nullopt;
     } else if (auto state = read_enum_field(playback_state_var, "playback_state",
                                             playback_state_from_string)) {
         group_msg->group.playback_state = state;
     }
 
-    // Parse optional group_id - use empty string to signal clearing
+    // Parse optional group_id; use empty string to signal clearing
     JsonVariantConst group_id_var = root["payload"]["group_id"];
     if (group_id_var.is<const char*>()) {
         group_msg->group.group_id = group_id_var.as<std::string>();
     } else if (!group_id_var.isUnbound() && group_id_var.isNull()) {
-        // Field set to null - use empty string to clear
+        // Field set to null: use empty string to clear
         group_msg->group.group_id = "";
     }
 
-    // Parse optional group_name - use empty string to signal clearing
+    // Parse optional group_name; use empty string to signal clearing
     JsonVariantConst group_name_var = root["payload"]["group_name"];
     if (group_name_var.is<const char*>()) {
         group_msg->group.group_name = group_name_var.as<std::string>();
     } else if (!group_name_var.isUnbound() && group_name_var.isNull()) {
-        // Field set to null - use empty string to clear
+        // Field set to null: use empty string to clear
         group_msg->group.group_name = "";
     }
 
@@ -584,7 +584,7 @@ bool process_server_state_metadata(JsonObject root, ServerMetadataStateDelta* me
     parse_metadata_uint16_field(metadata_object["year"], "year", &metadata_delta->year);
     parse_metadata_uint16_field(metadata_object["track"], "track", &metadata_delta->track);
 
-    // Parse progress object - present object engages inner; explicit null clears; absent leaves
+    // Parse progress object: a present object engages inner, explicit null clears, absent leaves
     // outer nullopt.
     if (metadata_object["progress"].is<JsonObject>()) {
         JsonObject progress_object = metadata_object["progress"];
@@ -928,8 +928,8 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         }
     }
     root["payload"]["trust_level"] = msg->trust_level;
-    // supported_pair_methods is REQUIRED on the wire (spec #113/#122: every client implements at
-    // least pairing_psk, so the field can never be legitimately absent) -- always emit the array,
+    // supported_pair_methods is REQUIRED on the wire (spec "client/hello": every client implements
+    // at least pairing_psk, so the field can never be legitimately absent). Always emit the array,
     // even if empty in a degenerate configuration with every method disabled.
     {
         JsonArray methods_list = root["payload"]["supported_pair_methods"].to<JsonArray>();
@@ -1279,7 +1279,7 @@ std::string format_client_pair_finalize_wrapped_message(
 
     root["type"] = "client/pair-finalize";
     // Encode the 48-byte wrapped PSK as 64-char base64url (no padding). PIN flows only (spec
-    // #117: PSK Wrapping); exactly one of long_term_psk/wrapped_psk is present per message.
+    // "PSK Wrapping"); exactly one of long_term_psk/wrapped_psk is present per message.
     root["payload"]["wrapped_psk"] = b64url_encode(wrapped_psk.data(), wrapped_psk.size());
 
     std::string output;
@@ -1300,14 +1300,10 @@ std::string format_pair_abort_message(PairAbortReason reason) {
 }
 
 bool process_server_pair_finalize_message(JsonObject root) {
-    // server/pair-finalize carries an empty payload object.
-    // Validate that the type field is correct (already checked by determine_message_type).
-    // We accept any valid JSON object as the payload (including an empty one).
     if (!root["type"].is<const char*>()) {
         SS_LOGE(TAG, "process_server_pair_finalize_message: missing type field");
         return false;
     }
-    // payload is allowed to be absent or empty
     return true;
 }
 
@@ -1430,7 +1426,8 @@ std::string format_client_pair_init_message(uint32_t pairing_index) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
-    // Static PIN: no commit_B, but pairing_index is required on every client/pair-init (#120).
+    // Static PIN: no commit_B, but pairing_index is required on every client/pair-init (spec
+    // "PAKE").
     root["payload"]["pairing_index"] = pairing_index;
 
     std::string output;
@@ -1525,7 +1522,6 @@ bool process_management_set_pairing_config_message(JsonObject root,
         return true;
     }
 
-    // Parse pairing_psk (optional sub-object).
     if (root["payload"]["pairing_psk"].is<JsonObject>()) {
         SetPairingPskConfig psk_cfg;
         JsonObject psk_obj = root["payload"]["pairing_psk"].as<JsonObject>();
@@ -1538,7 +1534,6 @@ bool process_management_set_pairing_config_message(JsonObject root,
         payload->pairing_psk = std::move(psk_cfg);
     }
 
-    // Parse static_pin (optional sub-object).
     if (root["payload"]["static_pin"].is<JsonObject>()) {
         SetStaticPinConfig static_cfg;
         JsonObject static_obj = root["payload"]["static_pin"].as<JsonObject>();
@@ -1551,7 +1546,6 @@ bool process_management_set_pairing_config_message(JsonObject root,
         payload->static_pin = std::move(static_cfg);
     }
 
-    // Parse dynamic_pin (optional sub-object).
     if (root["payload"]["dynamic_pin"].is<JsonObject>()) {
         SetDynamicPinConfig dynamic_cfg;
         JsonObject dynamic_obj = root["payload"]["dynamic_pin"].as<JsonObject>();
@@ -1564,7 +1558,6 @@ bool process_management_set_pairing_config_message(JsonObject root,
         payload->dynamic_pin = dynamic_cfg;
     }
 
-    // Parse record_mode (optional sub-object).
     if (root["payload"]["record_mode"].is<JsonObject>()) {
         JsonObject rm_obj = root["payload"]["record_mode"].as<JsonObject>();
         if (rm_obj["psk_id"].is<const char*>()) {
@@ -1574,7 +1567,6 @@ bool process_management_set_pairing_config_message(JsonObject root,
         }
     }
 
-    // Parse unpaired_access (optional sub-object).
     if (root["payload"]["unpaired_access"].is<JsonObject>()) {
         JsonObject ua_obj = root["payload"]["unpaired_access"].as<JsonObject>();
         UnpairedAccessConfig ua;
@@ -1646,7 +1638,7 @@ std::string format_management_result_message(const ManagementResultPayload& payl
         }
 
         // unpaired_access (get-pairing-config result): always emit enabled when the object is
-        // present -- the spec requires unpaired_access:{enabled:<bool>} in every get-config result.
+        // present. The spec requires unpaired_access:{enabled:<bool>} in every get-config result.
         if (data.unpaired_access.has_value()) {
             root["payload"]["data"]["unpaired_access"]["enabled"] =
                 data.unpaired_access->enabled.value_or(false);

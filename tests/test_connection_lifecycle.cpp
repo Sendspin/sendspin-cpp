@@ -74,15 +74,14 @@ std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
 }
 
-// Under the encrypted protocol, server/hello no longer carries server_id (it comes from the
-// Noise handshake result instead) and server/activate replaces the old discovery/playback
-// connection_reason with an activities/active_roles model. This suite runs with
-// encryption_required = false (see make_config()) so its fake servers can stay plaintext WS
-// peers and exercise the nursery's structural admission/reaping/arbitration mechanics
-// independently of the Noise crypto layer (which has its own dedicated coverage in
-// test_noise_transport.cpp / test_noise_rehandshake.cpp / test_admission.cpp). server/hello's
-// server_id field is therefore still accepted here as a legacy/test-only fallback: the
-// connection adopts it only when the Noise handshake never set one (see client.cpp's
+// Under the encrypted protocol, server_id comes from the Noise handshake result rather than
+// server/hello, and server/activate carries an activities/active_roles model rather than a
+// connection_reason field. This suite runs with encryption_required = false (see make_config())
+// so its fake servers can stay plaintext WS peers and exercise the nursery's structural
+// admission/reaping/arbitration mechanics independently of the Noise crypto layer (which has its
+// own dedicated coverage in test_noise_transport.cpp / test_noise_rehandshake.cpp /
+// test_admission.cpp). server/hello's server_id field is accepted here as a test-only
+// fallback: the connection adopts it only when the Noise handshake never set one (see client.cpp's
 // SERVER_HELLO handling).
 std::string server_hello_json(const std::string& server_id) {
     return std::string(R"({"type":"server/hello","payload":{"server_id":")") + server_id +
@@ -102,7 +101,7 @@ SendspinClientConfig make_config(uint16_t port) {
     config.name = "Lifecycle Test Client";
     config.server_port = port;
     // This suite exercises the nursery's structural lifecycle (accept/prove/admit, reaping,
-    // arbitration) over plaintext WS, independent of the Noise crypto layer -- see the comment
+    // arbitration) over plaintext WS, independent of the Noise crypto layer; see the comment
     // on server_hello_json() above.
     config.encryption_required = false;
     return config;

@@ -18,8 +18,8 @@
 // real loopback WebSocket, exactly like test_connection_lifecycle.cpp does for the plaintext
 // nursery mechanics. That suite intentionally runs with encryption_required = false and defers all
 // Noise coverage to the crypto-primitive-level tests (test_noise_transport.cpp,
-// test_noise_rehandshake.cpp, test_admission.cpp); this file closes the remaining gap: nothing
-// previously exercised the full encrypted lifecycle end to end through ConnectionManager.
+// test_noise_rehandshake.cpp, test_admission.cpp); this file exercises the full encrypted
+// lifecycle end to end through ConnectionManager.
 //
 // The fake server (FakeEncryptedServer below) plays the Noise INITIATOR role using raw noise-c
 // (the project's own NoiseSession class only implements the responder side, matching the
@@ -135,9 +135,9 @@ public:
     // load_blob(RECORDS) is not overridden beyond the base class's nullopt default: "starts with
     // no pairing records" above, so restating it here would be a no-op override.
 
-    // Optionally pre-seed an accepted Pairing PSK (spec #113/#122/#123: pairing.method
-    // MUST be 'pairing_psk' if and only if the matched PSK IS the Pairing PSK, and the client
-    // now enforces this -- see ConnectionManager::loop()'s pairing-method admissibility check).
+    // Optionally pre-seed an accepted Pairing PSK (spec's "server/activate" section: pairing.method
+    // MUST be 'pairing_psk' if and only if the matched PSK IS the Pairing PSK; the client
+    // enforces this via ConnectionManager::loop()'s pairing-method admissibility check).
     // The Pairing PSK Flow test below needs the fake server to connect using this PSK directly
     // (matching PskCategory::PAIRING immediately), not the Sentinel PSK, so this must be set
     // before start_server() reads it into the RecordStore.
@@ -271,7 +271,7 @@ void pump_for(SendspinClient& client, int duration_ms) {
 // ============================================================================
 // Raw noise-c initiator-side crypto helpers (HsGuard / CipherPair / build_initiator come from
 // noise_test_helpers.h; the project's own NoiseSession class only implements the Noise
-// RESPONDER role, so the fake server -- playing the Noise INITIATOR -- has to drive noise-c
+// RESPONDER role, so the fake server, playing the Noise INITIATOR, has to drive noise-c
 // directly).
 // ============================================================================
 
@@ -342,7 +342,7 @@ struct FakeEncryptedServerOptions {
     std::string second_activities_json{R"(["playback"])"};
     std::string second_roles_json{R"(["player@v1"])"};
     // When set, this raw JSON message is sent (encrypted) immediately BEFORE the first
-    // server/activate -- i.e. while the connection has finished the Noise handshake but has not
+    // server/activate: while the connection has finished the Noise handshake but has not
     // yet been admitted. Used to prove role-bound traffic is refused until admission.
     std::optional<std::string> pre_activate_message;
     // When true, no server/activate is ever sent. The connection completes the Noise handshake
@@ -676,7 +676,7 @@ private:
 
         if (std::strcmp(type, "noise/handshake") == 0 && this->rehandshake_hs_ != nullptr) {
             // The client's msg2 for the in-band re-handshake, still encrypted under the OLD
-            // (currently active) session -- decrypted above like any other frame.
+            // (currently active) session, decrypted above like any other frame.
             const char* data_b64 = doc["payload"]["data"] | "";
             auto msg2_bytes = b64url_decode(data_b64);
             if (!msg2_bytes.has_value()) {
@@ -764,13 +764,13 @@ private:
 //
 // This exists only for the AeadFailureOnOutboundConnectionDoesNotCrash regression test below.
 // Every other test in this file drives client.start_server() and connects FakeEncryptedServer to
-// it as a WS client, which exercises SendspinServerConnection (host/server_connection.cpp) --
-// that class's disconnect() only ever calls the already-async trigger_close(), so it was never
-// susceptible to the network-thread deadlock/crash close_transport_now() (connection.h) guards
-// against. That bug lived specifically in SendspinClientConnection::disconnect()
-// (host/client_connection.cpp), reached only when the SendspinClient itself calls connect_to()
-// and dispatch_completed_message() runs synchronously on IXWebSocket's own outbound worker
-// thread. This class lets the DUT be the outbound connector so the test exercises that code path.
+// it as a WS client, which exercises SendspinServerConnection (host/server_connection.cpp); that
+// class's disconnect() only ever calls the already-async trigger_close(), so it never needs the
+// network-thread deadlock/crash guard close_transport_now() (connection.h) provides.
+// SendspinClientConnection::disconnect() (host/client_connection.cpp) does need that guard: it is
+// reached when the SendspinClient itself calls connect_to() and dispatch_completed_message() runs
+// synchronously on IXWebSocket's own outbound worker thread. This class lets the DUT be the
+// outbound connector so the test exercises that code path.
 class FakeOutboundEncryptedServer {
 public:
     FakeOutboundEncryptedServer(uint16_t port, std::string suite_name, Identity server_identity,
@@ -1019,9 +1019,8 @@ private:
 // Full encrypted lifecycle: accept -> Noise handshake -> hello -> server/activate -> operational,
 // then a server-initiated in-band re-handshake on the ADMITTED connection -> the connection must
 // come back operational via a fresh hello/activate cycle under the new session keys, without ever
-// being dropped or re-entering nursery arbitration (the MUST-FIX under test: before the fix,
-// nothing ever re-armed client/hello for a connection outside the nursery, so the connection
-// stayed permanently non-operational after the swap).
+// being dropped or re-entering nursery arbitration. client/hello must be re-armed for a connection
+// outside the nursery so it does not stay permanently non-operational after the swap.
 TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     platform_random_bytes(psk.data(), psk.size());
@@ -1061,15 +1060,15 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     // resumption from trust change, which is covered separately below).
     ASSERT_TRUE(server.trigger_rehandshake(psk_id, psk));
 
-    // Immediately after the swap the connection must go non-operational (first_activate_received_
-    // /server_hello_received_/client_hello_sent_ were reset) -- this is the expected transient
-    // dip described in connection_manager.h's invariant comment, not a failure.
+    // Immediately after the swap the connection must go non-operational: first_activate_received_,
+    // server_hello_received_, and client_hello_sent_ are reset. This is the expected transient dip
+    // described in connection_manager.h's invariant comment, not a failure.
     EXPECT_TRUE(pump_until(
         client, [&] { return !client.is_connected(); }, 2000))
         << "Connection should go non-operational immediately after the re-handshake swap";
 
-    // The MUST-FIX: without schedule_rehandshake_rearm()/the hello-retry re-arm, the connection
-    // would stay non-operational forever. It must instead come back within a few ticks.
+    // schedule_rehandshake_rearm() must re-arm the hello retry so the connection comes back within
+    // a few ticks; without it, the connection would stay non-operational forever.
     EXPECT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000))
         << "Connection did not resume operational status after the in-band re-handshake";
@@ -1084,12 +1083,12 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     pump_for(client, 100);
 }
 
-// Regression test for a network-thread deadlock/crash: close_silently() (spec Failure Handling --
-// no application-level message on an AEAD failure/malformed fragment/handshake abort) used to call
-// disconnect(), which on a host OUTBOUND connection ends up calling ix::WebSocket::stop() from
-// inside dispatch_completed_message() -- itself invoked synchronously from IXWebSocket's own
-// worker thread callback. Joining the current thread from itself throws std::system_error, which
-// escapes WebSocket::run() uncaught and calls std::terminate(), crashing the whole test process.
+// close_silently() (spec Failure Handling: no application-level message on an AEAD
+// failure/malformed fragment/handshake abort) must never call disconnect(). On a host OUTBOUND
+// connection, disconnect() ends up calling ix::WebSocket::stop() from inside
+// dispatch_completed_message(), itself invoked synchronously from IXWebSocket's own worker thread
+// callback. Joining the current thread from itself throws std::system_error, which escapes
+// WebSocket::run() uncaught and calls std::terminate(), crashing the whole test process.
 //
 // This must be driven through a real client.connect_to() (SendspinClientConnection): plugging a
 // fake peer into client.start_server() instead (as every other test in this file does) exercises
@@ -1099,9 +1098,9 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
 // SendspinClientConnection::disconnect().
 //
 // This test drives a real Noise AEAD decrypt failure on that real outbound host connection (the
-// simplest of the three close_silently() triggers to produce from a fake peer) against the fix
-// (close_silently() -> close_transport_now(), which never blocks/joins): merely completing this
-// test without the process aborting is the primary assertion. It also checks that the connection
+// simplest of the three close_silently() triggers to produce from a fake peer): close_silently()
+// must use close_transport_now(), which never blocks or joins, so merely completing this test
+// without the process aborting is the primary assertion. It also checks that the connection
 // is reported lost exactly once and that no client/goodbye is sent (the close is silent, per spec).
 TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
@@ -1232,7 +1231,7 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
     Identity server_identity = Identity::generate().value();
     // After the re-handshake, the fake server switches to declaring ["management"], which the
     // SENTINEL-category PSK it re-handshakes to cannot satisfy (management requires a long-term
-    // PSK match) -- see admission.h::activities_allowed.
+    // PSK match; see admission.h::activities_allowed).
     FakeEncryptedServerOptions options;
     options.second_activities_json = R"(["management"])";
     options.second_roles_json = R"([])";
@@ -1244,7 +1243,7 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
         << "Initial encrypted handshake/hello/activate did not complete";
 
     // Re-handshake down to the Sentinel PSK (unpaired access is disabled by default, so even
-    // ["playback"] would be inadmissible for it -- ["management"] is doubly so).
+    // ["playback"] would be inadmissible for it, and ["management"] is doubly so).
     ASSERT_TRUE(server.trigger_rehandshake(std::string(SENTINEL_PSK_ID), SENTINEL_PSK));
 
     // The connection must be dropped (never come back operational) once the inadmissible
@@ -1312,14 +1311,14 @@ TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
 // Full pairing-PSK flow end to end: the operator has already transferred a Pairing PSK to the
 // server out of band (a pairing token; see crypto/pairing_token.h), so the server's initial
 // handshake resolves it directly to PskCategory::PAIRING (spec: "pairing.method MUST be
-// 'pairing_psk' if and only if the matched PSK IS the Pairing PSK" -- the client now enforces
-// this, see ConnectionManager::loop()'s pairing-method admissibility check, so a fake server that
-// selected pairing_psk over a Sentinel-matched connection would now be correctly rejected as
-// method_not_supported). The client generates a fresh long-term PSK client-side (CSPRNG) and
-// sends it via client/pair-finalize, the server acks, the client persists the record, and then --
-// exactly like a real server immediately rekeying onto the new PSK -- the fake server triggers an
-// in-band re-handshake with the learned psk_id/psk. The connection must resume operational under
-// the new session with trust upgraded from PAIRING to USER (LONG_TERM).
+// 'pairing_psk' if and only if the matched PSK IS the Pairing PSK". The client enforces this via
+// ConnectionManager::loop()'s pairing-method admissibility check, so a fake server that selected
+// pairing_psk over a Sentinel-matched connection is correctly rejected as method_not_supported).
+// The client generates a fresh long-term PSK client-side (CSPRNG) and sends it via
+// client/pair-finalize, the server acks, the client persists the record, and then, exactly like a
+// real server immediately rekeying onto the new PSK, the fake server triggers an in-band
+// re-handshake with the learned psk_id/psk. The connection must resume operational under the new
+// session with trust upgraded from PAIRING to USER (LONG_TERM).
 TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
@@ -1410,9 +1409,8 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 // storage exhausted, write error), the client must NOT report pairing success, must instead
 // report on_pairing_failed with the client-local SendspinPairAbortReason::STORAGE_FAILED reason,
 // and must close the connection (schedule_pair_storage_failed -> handle_pair_storage_failed).
-// Pins both halves of the fix to client.cpp's SERVER_PAIR_FINALIZE handler: RecordStore::
-// store_record()'s return value gates on_pairing_succeeded, and a rejection now drives an
-// explicit local abort instead of silently leaving the connection to the 30 s watchdog.
+// In client.cpp's SERVER_PAIR_FINALIZE handler, RecordStore::store_record()'s return value gates
+// on_pairing_succeeded, and a rejection drives an explicit local abort.
 TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
@@ -1546,12 +1544,12 @@ TEST(EncryptedLifecycle, ManagementListRecordsRoundTripOverEncryptedTransport) {
 // A binary WebSocket frame that arrives while the Noise handshake is still pending must close the
 // connection, not be dispatched.
 //
-// Regression test: dispatch_completed_message()'s binary branch only checked "is the transport
-// active", collapsing "handshake installed but not finished" into the same fall-through as "no
-// handshake at all" (encryption_required == false). The TEXT branch never had that gap -- it
-// routes pre-handshake text into the handshake driver -- so a peer that merely completed the
-// WebSocket upgrade could skip client/init entirely, send a raw binary frame, and have it handed
-// straight to the role binary handlers with the whole Noise/PSK/admission chain bypassed.
+// The binary branch of dispatch_completed_message() must distinguish "handshake installed but not
+// finished" from "no handshake at all" (encryption_required == false).
+// Collapsing the two into the same fall-through would let a peer skip client/init entirely, send a
+// raw binary frame, and have it handed straight to the role binary handlers with the whole
+// Noise/PSK/admission chain bypassed. The TEXT branch already routes pre-handshake text into the
+// handshake driver, so it does not share this gap.
 TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
     TestNetworkProvider network;
     SendspinClientConfig config;
@@ -1583,7 +1581,7 @@ TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
         client, [&] { return opened.load(); }, 4000))
         << "Raw peer never completed the WebSocket upgrade";
 
-    // No client/init, no handshake -- straight to a player-shaped binary frame (type byte 4 =
+    // No client/init, no handshake: straight to a player-shaped binary frame (type byte 4 =
     // player role, slot 0, followed by what would be an 8-byte timestamp and a payload).
     const std::string binary_frame(
         "\x04\x00\x00\x00\x00\x00\x00\x00\x00\xde\xad\xbe\xef", 13);
@@ -1676,11 +1674,11 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
 // Revoking a record via management/remove-record must also end the revoked device's live session.
 //
 // A connection resolves its psk_id and PSK category once, at Noise-handshake completion, and never
-// re-checks them against the RecordStore. Deleting the record therefore did not, on its own, stop
-// the revoked peer: handle_remove_record only ever disconnected the REQUESTER (the is_self path),
-// so a different live connection running on the removed record kept its LONG_TERM trust -- and
-// with it management authority and playback -- until it happened to disconnect. Revocation would
-// not take effect until the peer's next connection.
+// re-checks them against the RecordStore, so deleting the record alone does not stop the revoked
+// peer: handle_remove_record must disconnect both the REQUESTER (the is_self path) and any other
+// live connection running on the removed record. Otherwise that connection would keep its
+// LONG_TERM trust, and with it management authority and playback, until it happened to disconnect
+// on its own, leaving revocation ineffective until the peer's next connection.
 TEST(EncryptedLifecycle, RemoveRecordDropsTheRevokedDevicesLiveSession) {
     // Two distinct paired records: the admitted management session (A) and the peer it revokes (B).
     std::array<uint8_t, NOISE_PSK_SIZE> psk_a{};

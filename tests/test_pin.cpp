@@ -28,7 +28,7 @@
 #include <cstdint>
 #include <string>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local
 
 // =============================================================================
 // pin_commit / pin_verify_commit round-trip
@@ -63,8 +63,7 @@ TEST(PinCommit, WrongCommitmentSizeFailsVerify) {
 
 TEST(PinCommit, Kat) {
     // commit(nonce=bytes(range(32))) = SHA-256("sendspin-pair-commit-v1" || 0x00..0x1f)
-    // (spec #118: domain separator added to pair commit; this invalidates the old
-    // SHA-256(nonce)-only KAT below.)
+    // (spec's "Dynamic PIN Pairing Flow" section: domain separator added to pair commit.)
     // Independently re-derived via: python3 -c "
     //   import hashlib
     //   print(hashlib.sha256(b'sendspin-pair-commit-v1' + bytes(range(32))).hexdigest())"
@@ -198,7 +197,7 @@ TEST(PinConstants, Values) {
 }
 
 // =============================================================================
-// pin_generate_nonce - basic shape
+// pin_generate_nonce: basic shape
 // =============================================================================
 
 TEST(PinNonce, GenerateProduce32Bytes) {

@@ -47,8 +47,7 @@
 #ifdef SENDSPIN_HAS_MDNS
 // IWYU pragma: begin_keep
 // The include-what-you-use checker misattributes arpa/inet.h's htons/ntohs/htonl/ntohl to
-// macOS libc++'s private headers when analyzed on a macOS host toolchain (a known
-// include-checker false-positive class for macOS private headers like _abort.h/_endian.h); arpa/inet.h is
+// macOS libc++'s private headers when analyzed on a macOS host toolchain; arpa/inet.h is
 // still the correct, portable header on both macOS and Linux CI.
 #include <arpa/inet.h>
 // IWYU pragma: end_keep

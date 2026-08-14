@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Pairing Token (spec #125) tests.
+// Pairing Token (spec "Pairing Token") tests.
 //
 // The reference vector below is taken verbatim from the spec's README.md "Pairing Token"
 // section (client_key = 0x00..0x1f, pairing_psk = 0xe0..0xff), not independently re-derived by
-// us -- it is the spec's own worked example, so reproducing it exactly is the correctness bar.
+// us: it is the spec's own worked example, so reproducing it exactly is the correctness bar.
 
 #include "crypto/pairing_token.h"
 
@@ -26,7 +26,7 @@
 #include <cstdint>
 #include <string>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local
 
 namespace {
 
@@ -93,7 +93,8 @@ TEST(PairingToken, UsesOnlyQrAlphanumericAlphabet) {
     }
 }
 
-// The body must never contain the digit '2' (transliterated to '9' per spec #125).
+// The body must never contain the digit '2' (transliterated to '9' per the spec's
+// "Pairing Token" section).
 TEST(PairingToken, BodyNeverContainsDigitTwo) {
     const auto client_key = make_client_key();
     const auto pairing_psk = make_pairing_psk();

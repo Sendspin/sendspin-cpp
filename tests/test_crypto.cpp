@@ -44,7 +44,7 @@ extern "C" {
 #include <string_view>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 // =============================================================================
 // SHA-512 / HMAC-SHA-512 KATs
@@ -117,16 +117,12 @@ TEST(HmacSha512, Rfc4231Case2) {
 // SHA-256 (Sha256 class / sha256_oneshot) KATs and failure-propagation contract
 //
 // noise-c's SHA256 backend has no test hook to force an allocation/finalize failure, so the
-// actual "hash primitive fails" branch inside Sha256::ok() (crypto.h) cannot be exercised
-// directly from a unit test. What *is* testable, and what these cover, is the contract that
-// depends on it: every security-critical caller (psk_id_for, derive_psk_wrap_key/wrap_psk/
-// unwrap_psk, SENTINEL_PSK) must surface failure through std::optional (or abort(), for the
-// two call sites -- psk_id_for(array) and the SENTINEL_PSK static initializer -- whose
-// established non-optional signatures are depended on elsewhere in the tree) rather than ever
-// returning a zero-derived value as if it were valid. The tests below pin the normal
-// (succeeding) path so a regression that silently drops one of these checks -- e.g. reverting
-// to computing a digest without consulting ok() -- would still be caught by a KAT mismatch or
-// a has_value()/ok() assertion failing to hold for the property it documents.
+// failure branch inside Sha256::ok() cannot be exercised directly here. Instead, these tests pin
+// the succeeding path for every security-critical caller (psk_id_for, derive_psk_wrap_key/
+// wrap_psk/unwrap_psk, SENTINEL_PSK), which must surface failure via std::optional, or abort()
+// at the two call sites whose established non-optional signatures the rest of the tree depends
+// on, rather than ever returning a zero-derived value as valid; a KAT mismatch or failing
+// has_value()/ok() assertion would catch a regression that silently drops one of these checks.
 // =============================================================================
 
 TEST(Sha256, KatAbc) {
@@ -299,9 +295,8 @@ TEST(Identity, PrivateB64uRoundTripsViaDecode) {
 // std::optional and must never let a caller observe a default-constructed (all-zero) Identity
 // as if it were a real keypair. noise-c's DHState has no test hook to force the underlying
 // allocation/keypair-generation failure deterministically, so the actual failure branch cannot
-// be exercised here; what these pin is the contract surface -- optional-returning signatures,
-// and that a successfully generated/reconstructed Identity is never the zero value a silent
-// failure used to produce.
+// be exercised here. What these pin is the contract surface: optional-returning signatures, and
+// that a successfully generated/reconstructed Identity is never the zero value.
 // -----------------------------------------------------------------------------
 
 TEST(Identity, GenerateSucceedsUnderNormalConditionsAndIsNeverAllZero) {
@@ -313,10 +308,9 @@ TEST(Identity, GenerateSucceedsUnderNormalConditionsAndIsNeverAllZero) {
 }
 
 TEST(Identity, FromPrivateBytesArrayOverloadReturnsEngagedOptional) {
-    // The array overload used to return a bare Identity (with an internal .value() that could
-    // never legitimately fail per its own comment); it now forwards the pointer/length
-    // overload's std::optional so a real DH-state failure would propagate instead of being
-    // masked. Confirm the normal path still succeeds and reproduces the same keypair.
+    // The array overload forwards to the pointer/length overload's std::optional, so a real
+    // DH-state failure would propagate instead of being masked by an unconditional .value().
+    // Confirm the normal path still succeeds and reproduces the same keypair.
     auto original = Identity::generate();
     ASSERT_TRUE(original.has_value());
     auto rehydrated = Identity::from_private_bytes(original->private_bytes);
@@ -385,7 +379,7 @@ bool run_kkpsk2_handshake(const char* suite_name) {
     }
 
     // -------------------------------------------------------------------------
-    // Set remote static public keys (KK pattern - both sides know each other's key)
+    // Set remote static public keys (KK pattern: both sides know each other's key)
     // -------------------------------------------------------------------------
     NoiseDHState* init_remote = noise_handshakestate_get_remote_public_key_dh(initiator);
     NoiseDHState* resp_remote = noise_handshakestate_get_remote_public_key_dh(responder);
@@ -444,7 +438,7 @@ bool run_kkpsk2_handshake(const char* suite_name) {
         return false;
     }
     noise_buffer_set_output(msg, msg_buf.data(), msg_buf.size());
-    // Pass nullptr for payload - these handshake messages carry no application payload.
+    // Pass nullptr for payload: these handshake messages carry no application payload.
     if (noise_handshakestate_write_message(initiator, &msg, nullptr) != NOISE_ERROR_NONE) {
         noise_handshakestate_free(initiator);
         noise_handshakestate_free(responder);

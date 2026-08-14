@@ -67,7 +67,7 @@ void SendspinServerConnection::close_transport_now() {
     // trigger_close() -> ws_->close() is already async/non-blocking (the same primitive
     // disconnect() uses in its completion callback), so it is safe to call directly from the
     // network thread here. on_disconnected_cb is intentionally not fired here: for inbound
-    // connections it is wired as a no-op (ConnectionManager::on_new_connection() -- cleanup
+    // connections it is wired as a no-op (ConnectionManager::on_new_connection(); cleanup
     // happens via the ws_server's own close notification instead), so the resulting Close event
     // is what reports the loss.
     this->trigger_close();

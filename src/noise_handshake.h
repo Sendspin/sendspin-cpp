@@ -20,11 +20,11 @@
 ///
 /// Protocol sequence (all pre-transport frames are WS TEXT):
 ///   1. Send  `client/init` (TEXT)
-///   2. Recv  `server/init` (TEXT)  -- prologue = bytes(client/init) || bytes(server/init)
-///   3. Recv  `noise/handshake` msg1 (TEXT) -- decrypt; extract psk_id
+///   2. Recv  `server/init` (TEXT): prologue = bytes(client/init) || bytes(server/init)
+///   3. Recv  `noise/handshake` msg1 (TEXT): decrypt; extract psk_id
 ///   4. Resolve psk_id via RecordStore
 ///   5. Build real KKpsk2 responder with resolved PSK; re-read msg1
-///   6. Send  `noise/handshake` msg2 (TEXT) -- write msg2, split -> transport
+///   6. Send  `noise/handshake` msg2 (TEXT): write msg2, split -> transport
 ///
 /// After step 6 the connection is in encrypted transport mode.
 /// Any failure aborts silently (caller closes the WebSocket).
@@ -89,7 +89,7 @@ enum class HandshakeFrameResult {
 ///   5. Write msg2 and split -> new session.
 ///
 /// @param msg1_json      Decrypted noise/handshake JSON string (the re-handshake msg1 envelope).
-/// @param server_id      Known server peer_id (43-char base64url) -- from the prior handshake.
+/// @param server_id      Known server peer_id (43-char base64url) from the prior handshake.
 /// @param identity       Our static X25519 identity.
 /// @param record_store   Record store for psk_id resolution (read-only on network thread).
 /// @param suite_name     Noise suite name (NOISE_SUITE_CHACHAPOLY or NOISE_SUITE_AESGCM).

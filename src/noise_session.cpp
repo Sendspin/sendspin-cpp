@@ -182,7 +182,7 @@ std::vector<uint8_t> NoiseSession::read_msg1(const uint8_t* msg1_bytes, size_t m
     constexpr size_t MAX_PAYLOAD = 4096;
     std::vector<uint8_t> payload_buf(MAX_PAYLOAD);
 
-    // Input buffer - noise-c needs a mutable copy
+    // Input buffer: noise-c needs a mutable copy
     std::vector<uint8_t> in_buf(msg1_bytes, msg1_bytes + msg1_len);
 
     NoiseBuffer msg_in;
@@ -249,7 +249,7 @@ bool NoiseSession::write_msg2_and_split(std::vector<uint8_t>& msg2_out) {
         return false;
     }
 
-    // Free the handshakestate - transport mode is now active
+    // Free the handshakestate. Transport mode is now active.
     noise_handshakestate_free(this->hs_);
     this->hs_ = nullptr;
 

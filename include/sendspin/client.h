@@ -112,8 +112,8 @@ public:
     /// Fires on the main loop when the active connection's trust level becomes known: on the
     /// initial handshake and after each successful re-handshake (for example, after pairing).
     /// trust reflects the PSK category matched during the Noise handshake:
-    ///   ConnectionTrust::USER    -- long-term record (paired server)
-    ///   ConnectionTrust::NONE    -- Sentinel or Pairing PSK (unpaired access)
+    ///   ConnectionTrust::USER:  long-term record (paired server)
+    ///   ConnectionTrust::NONE:  Sentinel or Pairing PSK (unpaired access)
     virtual void on_trust_changed(ConnectionTrust /*trust*/) {}
 
     /// @brief Called when a dynamic-PIN should be displayed to the user.
@@ -161,7 +161,7 @@ public:
 ///
 /// The platform (e.g., ESPHome) provides a concrete implementation that stores blobs keyed by
 /// the fixed key constants in `persistence_keys` below, backed by NVS/Preferences (ESP) or a
-/// file (host). The library owns all serialization -- see `persistence_keys` for which keys hold
+/// file (host). The library owns all serialization; see `persistence_keys` for which keys hold
 /// raw bytes and which hold a codec blob (`sendspin/persistence_codec.h`); a provider is a pure
 /// byte store and must not parse the codec blobs.
 ///
@@ -175,8 +175,8 @@ public:
 ///     the main loop. A provider that shares state across keys (a file, a handle) must serialize
 ///     its own access, since this can overlap a main-loop call to another key.
 ///   - `save_blob(persistence_keys::KEYPAIR, ...)` fires during `start_server()`, which runs on
-///     the main loop, but before any connection exists -- called out here only because it is the
-///     one write that happens exactly once, at startup, rather than in response to a runtime
+///     the main loop, but before any connection exists. It is called out here only because it is
+///     the one write that happens exactly once, at startup, rather than in response to a runtime
 ///     event.
 ///
 /// Re-entrancy: implementations must NOT call back into the library (SendspinClient or any of
@@ -198,10 +198,10 @@ public:
     /// on it for removals).
     ///
     /// Specifically: a rejected write to `persistence_keys::RECORDS` during pairing fails the
-    /// exchange closed -- the client reports `SendspinPairAbortReason::STORAGE_FAILED` via
+    /// exchange closed: the client reports `SendspinPairAbortReason::STORAGE_FAILED` via
     /// `on_pairing_failed` and drops the connection rather than complete a pairing that could
     /// not survive a reboot. And a revoked/removed record is always dropped from RAM regardless
-    /// of this return value, so a `false` here does not undo that -- it means the store still
+    /// of this return value, so a `false` here does not undo that: it means the store still
     /// holds the old array and will hand the revoked record back at the next boot, silently
     /// making the revoked PSK valid again. The library logs a warning saying exactly that, so
     /// report failure honestly rather than swallowing it.
@@ -246,7 +246,7 @@ inline constexpr const char* KEYPAIR = "keypair";
 
 /// Codec blob: the WHOLE `SendspinPairingRecord` array (`encode_pairing_records()` /
 /// `decode_pairing_records()`). Stays present once any record exists, including an empty array
-/// after the last record is removed -- see `persistence_keys` doc above.
+/// after the last record is removed; see `persistence_keys` doc above.
 inline constexpr const char* RECORDS = "records";
 
 /// Codec blob: the accepted `SendspinPairingPsk` (`encode_pairing_psk()` / `decode_pairing_psk()`).
@@ -503,18 +503,18 @@ public:
     // ========================================
 
     /// @brief Returns the client's cryptographic identity string.
-    /// This is base64url(X25519 public key), 43 chars - the Sendspin client_id.
+    /// This is base64url(X25519 public key), 43 chars: the Sendspin client_id.
     /// Generated on first boot and persisted via the persistence provider.
     /// Empty until start_server() is called.
     [[nodiscard]] const std::string& client_id() const {
         return this->client_id_;
     }
 
-    /// @brief Builds the pairing token (spec #125) for a Sendspin Pairing PSK: the single
-    /// "SP:"-prefixed, base32 string that carries this client's static public key alongside
-    /// `pairing_psk`, for an operator to transfer into a server via copy/paste or QR code to
-    /// begin the Pairing PSK flow. Clients offering `pairing_psk` SHOULD surface this token
-    /// rather than the bare PSK.
+    /// @brief Builds the pairing token (spec's "Pairing Token" section) for a Sendspin Pairing
+    /// PSK: the single "SP:"-prefixed, base32 string that carries this client's static public key
+    /// alongside `pairing_psk`, for an operator to transfer into a server via copy/paste or QR
+    /// code to begin the Pairing PSK flow. Clients offering `pairing_psk` SHOULD surface this
+    /// token rather than the bare PSK.
     /// @param pairing_psk The 32-byte Sendspin Pairing PSK to encode alongside this client's
     ///                    identity.
     /// @return The 107-character token string, or nullopt if no identity has been initialized
@@ -633,7 +633,7 @@ private:
 
     /// @brief Processes a binary message from a connection
     /// Every binary message is role-bound, so this is dropped unless `conn` holds the admitted
-    /// slot -- see the admission gate in process_json_message() for why finishing the Noise
+    /// slot; see the admission gate in process_json_message() for why finishing the Noise
     /// handshake is not enough on its own.
     /// @param conn The connection the message arrived on
     /// @param payload Pointer to the raw binary data

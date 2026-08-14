@@ -5,9 +5,9 @@ include(FetchContent)
 function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     # =========================================================================
     # Include paths:
-    #   - src/host    — host networking headers (client_connection.h, etc.)
-    #   - include     — public library headers
-    #   - src         — private implementation headers
+    #   - src/host: host networking headers (client_connection.h, etc.)
+    #   - include: public library headers
+    #   - src: private implementation headers
     # ESP networking headers live in src/esp/ (only added to ESP builds).
     # =========================================================================
     target_include_directories(${TARGET_LIB} PUBLIC ${SOURCE_DIR}/src/host)
@@ -15,7 +15,7 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     target_include_directories(${TARGET_LIB} PRIVATE ${SOURCE_DIR}/src)
 
     # =========================================================================
-    # Platform abstraction layer — all host platform code is header-only
+    # Platform abstraction layer: all host platform code is header-only
     # =========================================================================
 
     # =========================================================================
@@ -110,11 +110,11 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     #      plus the ghash sources from upstream.
     #
     # Compile definitions:
-    #   NOISE_USE_REFERENCE_BACKEND=1  - use the pure-C reference backend
-    #   NOISE_USE_AES=1                - enable AES-GCM (needs ghash)
-    #   NOISE_USE_REFERENCE_AES=1      - route AES-GCM through the ref backend
-    #   NOISE_USE_LIBSODIUM=0          - disable sodium backend on host
-    #   NOISE_USE_CUSTOM_RAND=0        - use the OS RNG (rand_os.c)
+    #   NOISE_USE_REFERENCE_BACKEND=1: use the pure-C reference backend
+    #   NOISE_USE_AES=1:               enable AES-GCM (needs ghash)
+    #   NOISE_USE_REFERENCE_AES=1:     route AES-GCM through the ref backend
+    #   NOISE_USE_LIBSODIUM=0:         disable sodium backend on host
+    #   NOISE_USE_CUSTOM_RAND=0:       use the OS RNG (rand_os.c)
     # =========================================================================
     # CMake 3.30+ deprecates calling FetchContent_Populate() directly (CMP0169).
     # We must use it here because the esphome-libs fork ships only an IDF
@@ -180,7 +180,7 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         ${noise_c_SOURCE_DIR}/src/crypto/aes/rijndael-alg-fst.c
         ${noise_c_SOURCE_DIR}/src/crypto/x25519/x25519.c
 
-        # ghash (GF(2^128) multiply for AES-GCM) - from rweather/noise-c upstream
+        # ghash (GF(2^128) multiply for AES-GCM), from rweather/noise-c upstream
         # (the esphome-libs fork omits this file)
         ${noise_c_upstream_SOURCE_DIR}/src/crypto/ghash/ghash.c
     )

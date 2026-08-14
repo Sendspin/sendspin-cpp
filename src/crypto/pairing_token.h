@@ -13,16 +13,17 @@
 // limitations under the License.
 
 /// @file pairing_token.h
-/// @brief Pairing Token encoder (spec #125): the single "SP:"-prefixed, versioned, base32
-/// string that distributes a client's static public key and its Sendspin Pairing PSK together
-/// for the Pairing PSK flow, so an operator can transfer both by copy/paste or QR scan.
+/// @brief Pairing Token encoder (spec's "Pairing Token" section): the single "SP:"-prefixed,
+/// versioned, base32 string that distributes a client's static public key and its Sendspin Pairing
+/// PSK together for the Pairing PSK flow, so an operator can transfer both by copy/paste or QR
+/// scan.
 ///
 /// token   = "SP:" || version || body
 /// payload = client_key (32 bytes) || pairing_psk (32 bytes)
 /// body    = RFC 4648 base32(payload), '=' padding stripped, then every '2' -> '9'
 ///
 /// This client only ever generates tokens (the server decodes them), so no decoder is provided
-/// here -- see the spec's "Pairing Token" section for the (server-side) decode algorithm.
+/// here; see the spec's "Pairing Token" section for the (server-side) decode algorithm.
 
 #pragma once
 

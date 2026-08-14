@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /// @file keys.h
-/// @brief Sendspin key helpers - PSK-ID derivation and X25519 Identity.
+/// @brief Sendspin key helpers: PSK-ID derivation and X25519 Identity.
 ///
 /// Mirrors `aiosendspin/noise/keys.py` exactly:
 ///   - `psk_id_for(psk)` = base64url(SHA-256(PSK_ID_LABEL || psk))
@@ -38,7 +38,8 @@ namespace sendspin {
 /// @brief Derive the psk_id for a 32-byte PSK.
 /// @param psk  Exactly NOISE_PSK_SIZE (32) bytes.
 /// @return base64url(SHA-256(PSK_ID_LABEL || psk)), a 43-char string with no `=`.
-/// @throws std::invalid_argument if psk.size() != NOISE_PSK_SIZE
+/// Never throws; calls abort() if the underlying SHA-256 computation fails (e.g. a noise-c
+/// allocation failure), which is not expected to happen in practice.
 std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk);
 
 /// @brief Derive the psk_id for an arbitrary-length PSK buffer.
@@ -56,7 +57,7 @@ static constexpr size_t X25519_KEY_SIZE = 32;
 /// A 32-byte value encodes to ceil(32*8/6)=43 base64url characters.
 static constexpr size_t PEER_ID_SIZE = 43;
 
-/// @brief Sendspin static X25519 identity - a long-term keypair.
+/// @brief Sendspin static X25519 identity: a long-term keypair.
 ///
 /// Mirrors Python `Identity` in `aiosendspin/noise/keys.py`.
 /// The `peer_id` property returns `base64url(public_bytes)`, which is the
@@ -68,7 +69,7 @@ struct Identity {
     /// @brief Wipes `private_bytes` on destruction (see secure_zero in platform/crypto.h).
     ///
     /// This is the same discipline ~CPace() applies to its ephemeral secrets. It bounds how long
-    /// a *stale* copy of the long-term key outlives its use -- the temporaries that
+    /// a *stale* copy of the long-term key outlives its use: the temporaries that
     /// load_or_generate_identity() creates while rehydrating the key, and any copy taken by a
     /// future caller. It does NOT protect the live key: the `identity_` the client owns must stay
     /// readable for the whole process lifetime because every Noise handshake dereferences it, and
@@ -78,8 +79,8 @@ struct Identity {
     ///
     /// Only the destructor is user-declared, deliberately: declaring any constructor would make
     /// Identity a non-aggregate under C++20 and break `Identity{}` value-init at its call sites.
-    /// The cost is that the implicit move operations are suppressed, so moves degrade to copies
-    /// -- harmless for a 64-byte struct, and every such copy now wipes itself.
+    /// The cost is that the implicit move operations are suppressed, so moves degrade to copies;
+    /// that is harmless for a 64-byte struct, and every such copy now wipes itself.
     ~Identity();
 
     /// @brief The base64url-encoded public key (Sendspin client_id / server_id).

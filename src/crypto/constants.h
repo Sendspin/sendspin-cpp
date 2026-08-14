@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /// @file constants.h
-/// @brief Sendspin Noise-protocol constants - Sentinel PSK, PSK-ID label, suite names.
+/// @brief Sendspin Noise-protocol constants: Sentinel PSK, PSK-ID label, suite names.
 ///
 /// These mirror `aiosendspin/noise/constants.py` exactly.  Any change to these
 /// values is a breaking wire-protocol change.
@@ -40,7 +40,7 @@ static constexpr size_t NOISE_PSK_SIZE = 32;
 static constexpr std::string_view PSK_ID_LABEL{"sendspin-psk-id-v1"};
 
 /// @brief The Sentinel PSK: SHA-256("sendspin-sentinel-psk-v1").
-/// This is a public constant - it authenticates nothing on its own.
+/// This is a public constant; it authenticates nothing on its own.
 /// Expected hex: 1b5e24dbc1aed95fc2a5a338a90c05df44bd10f5ec1f4cd66cbf86272767b9d3
 extern const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK;
 
@@ -84,10 +84,10 @@ static constexpr size_t MAX_REASSEMBLED_MESSAGE_BYTES = 4UL * 1024UL * 1024UL;
 /// @brief Type byte: the plaintext is a JSON body (UTF-8, strip the type byte).
 static constexpr uint8_t MSG_TYPE_JSON_BODY = 0;
 
-/// @brief Type byte: fragment-more - a non-final fragment of a larger message.
+/// @brief Type byte: fragment-more, a non-final fragment of a larger message.
 static constexpr uint8_t MSG_TYPE_FRAGMENT_MORE = 2;
 
-/// @brief Type byte: fragment-end - the final fragment of a larger message.
+/// @brief Type byte: fragment-end, the final fragment of a larger message.
 static constexpr uint8_t MSG_TYPE_FRAGMENT_END = 3;
 
 }  // namespace sendspin

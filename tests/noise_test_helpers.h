@@ -93,7 +93,7 @@ struct CipherPair {
 /// @param local_priv   Server static private key (32 bytes).
 /// @param local_pub    Server static public key (32 bytes).
 /// @param remote_pub   Client static public key (32 bytes).
-/// @param psk          PSK (32 bytes) - provided to satisfy noise-c before start.
+/// @param psk          PSK (32 bytes), provided to satisfy noise-c before start.
 /// @param prologue     Prologue bytes.
 /// @param prologue_len Prologue length.
 /// @return Raw pointer on success (caller takes ownership via HsGuard), or nullptr.

@@ -27,9 +27,8 @@
 #include <string>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
-// Helper to build an activity vector
 static std::vector<SendspinActivity> acts() {
     return {};
 }
@@ -44,13 +43,12 @@ static std::vector<SendspinActivity> acts(SendspinActivity a, SendspinActivity b
     return {a, b, c};
 }
 
-// Aliases for readability
 static const auto PB = SendspinActivity::PLAYBACK;
 static const auto MG = SendspinActivity::MANAGEMENT;
 static const auto PR = SendspinActivity::PAIRING;
 
 // ============================================================================
-// activities_allowed tests - exhaustive over PskCategory x activity_set x unpaired_access
+// activities_allowed tests: exhaustive over PskCategory x activity_set x unpaired_access
 // ============================================================================
 
 // SENTINEL category
@@ -81,7 +79,7 @@ TEST(ActivitiesAllowed, SentinelPairing_OnlyExactlyPairing) {
 }
 
 TEST(ActivitiesAllowed, SentinelPairingPlayback_NotAllowed) {
-    // {PAIRING, PLAYBACK} is not ok - pairing must be alone
+    // {PAIRING, PLAYBACK} is not ok: pairing must be alone
     EXPECT_FALSE(activities_allowed(PskCategory::SENTINEL, acts(PR, PB), false));
     EXPECT_FALSE(activities_allowed(PskCategory::SENTINEL, acts(PR, PB), true));
 }
@@ -146,11 +144,10 @@ TEST(ActivitiesAllowed, PairingCatPairingPlayback_NotAllowed) {
 }
 
 // ============================================================================
-// admissible tests - checks the has_roles interaction
+// admissible tests: checks the has_roles interaction
 // ============================================================================
 
 TEST(Admissible, SentinelEmptyNoRoles_Admissible) {
-    // {} + no roles -> allowed
     EXPECT_TRUE(admissible(PskCategory::SENTINEL, acts(), false, false));
 }
 
@@ -200,7 +197,7 @@ TEST(Admissible, LongTermPlaybackManagement_Admissible) {
 }
 
 TEST(Admissible, LongTermPairing_AdmissibleOnlyWithoutRoles) {
-    // {PAIRING} allowed; {PAIRING} | {PB} = {PB, PAIRING} - not allowed (pairing must be alone)
+    // {PAIRING} allowed; {PAIRING} | {PB} = {PB, PAIRING} not allowed (pairing must be alone)
     EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(PR), false, false));
     EXPECT_FALSE(admissible(PskCategory::LONG_TERM, acts(PR), true, false));
 }
@@ -238,20 +235,18 @@ static SendspinGoodbyeReason reject_reason_for(PskCategory cat,
 }
 
 TEST(RejectReason, SentinelPlaybackNoUnpaired_PairingRequired) {
-    // SENTINEL + {PLAYBACK} + !unpaired_access -> pairing_required
-    // (because admissible(SENTINEL, {PB}, false, true) = true)
+    // Because admissible(SENTINEL, {PB}, false, true) = true.
     EXPECT_EQ(reject_reason_for(PskCategory::SENTINEL, acts(PB), false, false),
               SendspinGoodbyeReason::PAIRING_REQUIRED);
 }
 
 TEST(RejectReason, SentinelPlaybackRolesNoUnpaired_PairingRequired) {
-    // SENTINEL + {PLAYBACK} + has_roles + !unpaired_access -> pairing_required
     EXPECT_EQ(reject_reason_for(PskCategory::SENTINEL, acts(PB), true, false),
               SendspinGoodbyeReason::PAIRING_REQUIRED);
 }
 
 TEST(RejectReason, SentinelManagement_Unauthorized) {
-    // SENTINEL + {MANAGEMENT} -> unauthorized (admissible with unpaired_access=true? No)
+    // Still unauthorized even with unpaired_access=true, unlike the PLAYBACK cases above.
     EXPECT_EQ(reject_reason_for(PskCategory::SENTINEL, acts(MG), false, false),
               SendspinGoodbyeReason::UNAUTHORIZED);
 }
@@ -264,13 +259,12 @@ TEST(RejectReason, SentinelEmptyHasRolesNoUnpaired_PairingRequired) {
 }
 
 TEST(RejectReason, LongTermPairingPlayback_Unauthorized) {
-    // LONG_TERM + {PAIRING, PLAYBACK} - not allowed at all -> unauthorized
+    // {PAIRING, PLAYBACK} is not allowed at all for LONG_TERM, not just with unpaired_access.
     EXPECT_EQ(reject_reason_for(PskCategory::LONG_TERM, acts(PR, PB), false, false),
               SendspinGoodbyeReason::UNAUTHORIZED);
 }
 
 TEST(RejectReason, PairingCatPlayback_Unauthorized) {
-    // PAIRING category + {PLAYBACK} -> unauthorized
     EXPECT_EQ(reject_reason_for(PskCategory::PAIRING, acts(PB), false, false),
               SendspinGoodbyeReason::UNAUTHORIZED);
 }
@@ -318,7 +312,6 @@ TEST(ActivityRank, Ordering) {
 // should_admit_connection tests
 // ============================================================================
 
-// Helper wrapper
 static bool admit(const std::vector<SendspinActivity>& incoming_acts,
                   const std::string& incoming_id,
                   const std::vector<SendspinActivity>& admitted_acts,
@@ -335,7 +328,7 @@ TEST(ShouldAdmit, NoCurrent_AlwaysAdmit) {
 }
 
 TEST(ShouldAdmit, HigherRankDisplaces) {
-    // incoming=playback(2), admitted=pairing(1) -- but pairing is not displaced by rank 2
+    // incoming=playback(2), admitted=pairing(1), but pairing is not displaced by rank 2
     // (the in-flight-pairing rule blocks it)
     EXPECT_FALSE(admit(acts(PB), "new", acts(PR), "old", true));
 
@@ -394,7 +387,7 @@ TEST(ShouldAdmit, BothEmpty_NoLastPlayback_KeepAdmitted) {
 }
 
 TEST(ShouldAdmit, BothEmpty_BothMatchLastPlayback) {
-    // Both match - admitted already has last_playback; incoming also matches but admitted is not
+    // Both match: admitted already has last_playback; incoming also matches but admitted is not
     // != last_playback, so condition fails -> keep admitted
     EXPECT_FALSE(admit(acts(), "server_a", acts(), "server_a", true, "server_a", true));
 }
@@ -428,10 +421,10 @@ TEST(ShouldAdmitConnection, FinalizedPairingNoLongerBlocksHigherRankedIncoming) 
         << "a pairing that already finalized must not keep blocking a rank-2 incoming";
 }
 
-// Regression guard: suppressing rule 2 must NOT drop the admitted side to rank 0. An earlier
-// version of this fix substituted an empty activity set, which let rule 5's last_playback
-// tiebreak admit a rank-0 newcomer over a just-paired connection -- an eviction that was
-// impossible before the fix and is not one it intends.
+// Suppressing rule 2 must NOT drop the admitted side to rank 0. Passing an empty activity set
+// instead of the incumbent's real [PAIRING] would let rule 5's last_playback tiebreak admit a
+// rank-0 newcomer over a just-paired connection, which must never happen: rank still governs, and
+// rule 5 applies only when BOTH sides are rank 0.
 TEST(ShouldAdmitConnection, FinalizedPairingIsNotEvictedByRankZeroLastPlaybackPeer) {
     const std::vector<SendspinActivity> incoming{};                           // rank 0
     const std::vector<SendspinActivity> admitted{SendspinActivity::PAIRING};  // rank 1

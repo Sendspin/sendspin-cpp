@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// PSK Wrapping (spec #117) tests: K_wrap derivation and wrap_psk/unwrap_psk round-trips.
+// PSK Wrapping (spec "PSK Wrapping") tests: K_wrap derivation and wrap_psk/unwrap_psk round-trips.
 //
 // The K_wrap KAT below is independently re-derived via a small Python script (see the comment
 // on PskWrap.KWrapKat) rather than taken from aiosendspin, since aiosendspin predates this
@@ -31,7 +31,7 @@
 #include <cstring>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local
 
 namespace {
 
@@ -44,7 +44,7 @@ std::array<uint8_t, CPACE_ISK_SIZE> make_fixed_isk() {
 }
 
 std::vector<uint8_t> make_fixed_sid() {
-    // A representative sid: LABEL || 32-byte handshake hash || 4-byte BE counter (spec #120).
+    // A representative sid: LABEL || 32-byte handshake hash || 4-byte BE counter (spec "PAKE").
     std::vector<uint8_t> sid;
     const char* label = "sendspin-pair-pake-v1";
     sid.insert(sid.end(), label, label + std::strlen(label));
@@ -75,7 +75,7 @@ std::vector<uint8_t> make_fixed_sid() {
 // SHA-256 computation must not silently produce an all-zero K_wrap, since wrap_psk() would then
 // seal the freshly minted PSK under a publicly derivable key. noise-c has no hook to force that
 // failure deterministically, so this KAT (and the has_value() check it starts with) is the
-// regression coverage available -- it pins the success path and the optional-returning contract.
+// regression coverage available: it pins the success path and the optional-returning contract.
 TEST(PskWrap, KWrapKat) {
     const auto sid = make_fixed_sid();
     const auto isk = make_fixed_isk();

@@ -21,7 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 
-// noise-c headers - include as extern "C" to silence pedantic warnings about C headers.
+// noise-c headers: included as extern "C" to silence pedantic warnings about C headers.
 extern "C" {
 #include <noise/protocol/constants.h>
 #include <noise/protocol/dhstate.h>
@@ -58,7 +58,7 @@ std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
     // pointer/length overload can fail here is if the underlying SHA-256 computation itself
     // failed. This overload's non-optional return type is depended on throughout the tree
     // (record store, management, tests) as a plain std::string, so there is no safe value to
-    // return on failure -- fail loudly rather than silently deriving a psk_id from a
+    // return on failure; fail loudly rather than silently deriving a psk_id from a
     // zero digest (matching the CSPRNG-failure precedent in platform_random_bytes()).
     auto result = psk_id_for(psk.data(), psk.size());
     if (!result.has_value()) {

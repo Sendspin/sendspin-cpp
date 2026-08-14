@@ -34,7 +34,7 @@
 #include <cstring>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace) -- test-local
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local
 
 // =============================================================================
 // Building-block KATs
@@ -127,9 +127,7 @@ TEST(CPacePrimitives, DecodeUClearsTopBit) {
 // Expected values from Python: _elligator2(r_int)
 
 TEST(CPacePrimitives, Elligator2ZeroInput) {
-    // _elligator2(0) = b'\x00' * 32  (v = 0 when 1+Z*0=1, so -A/1=-A -> v = p-A)
-    // But actually: v = -A * inv(1+0) = -A mod p; eps = legendre(-A^3 + A*A^2 - A + ...) ...
-    // Reference says _elligator2(0) = b'\x00' * 32.
+    // _elligator2(0) = b'\x00' * 32, per the Python reference.
     std::array<uint8_t, 32> r{};  // r = 0
     auto result = cpace_elligator2(r);
     EXPECT_EQ(to_hex(result), "0000000000000000000000000000000000000000000000000000000000000000");
@@ -177,11 +175,11 @@ TEST(CPacePrimitives, Elligator2FieldArithmeticStress) {
     }
 }
 
-// --- field25519 fp_mul / fp_scale carry-chain regression ---
+// --- field25519 fp_mul / fp_scale carry chain ---
 //
 // fp_mul and fp_scale fold a carry that overflows past the top limb (limb 3) back into
 // limb 0 by multiplying it by 38 (since 2^256 mod p = 38). That fold-back addition can
-// itself carry out of limb 0 -- a carry with positional value 2^64, not 2^256 -- which
+// itself carry out of limb 0 (a carry with positional value 2^64, not 2^256), which
 // must ripple into limbs 1..3, not be folded by 38 a second time. The vectors below were
 // constructed (via a scratch Python/C++ cross-check against exact arbitrary-precision
 // (a*b) mod p) specifically to drive limb 0 to the edge of overflow after the main fold
@@ -220,18 +218,17 @@ TEST(FieldArithmetic, ScaleByCurveConstantForcesCarryPropagation) {
               "5d178d0000000000a9e7f9ffffffffffffffffffffffffffffffffffffffff7f");
 }
 
-// --- field25519 final-reduction regression ---
+// --- field25519 final reduction ---
 //
 // The 38-fold in fp_mul/fp_scale leaves a value bounded only by 2^256, and 2^256 = 2p + 38, so
 // the final reduction needs TWO conditional subtractions of p. A single subtraction leaves an
-// input in [2p, 2^256) sitting in [p, p+38) -- still non-canonical -- and fp_to_le() does not
+// input in [2p, 2^256) sitting in [p, p+38) (still non-canonical), and fp_to_le() does not
 // reduce, so the element then encodes to the wrong 32 bytes. The band is reachable exactly when
 // the true result is congruent to something below 38, which is what an inverse or a Legendre
 // exponentiation produces.
 
 TEST(FieldArithmetic, MulOfInverseIsCanonicalOne) {
-    // b is the modular inverse of a, so (a*b) mod p is exactly 1. With a single-subtraction
-    // final reduce this returned p+1 (LE "eeff..ff7f") instead.
+    // b is the modular inverse of a, so (a*b) mod p is exactly 1.
     auto a_le = from_hex_arr<32>("5171d8daf80eb7e4b7c102a6f8c63218d0bb218db264c644bfd6fd97c75f6312");
     auto b_le = from_hex_arr<32>("a5aa1eb682b5de7c2d01e7936be026ea2db1f101dd883d3724f04d2461516960");
     auto result = field25519::fp_mul(field25519::fp_from_le(a_le.data()),
@@ -329,7 +326,7 @@ TEST(CPacePrimitives, HmacSha512Kat) {
 }
 
 // =============================================================================
-// Full round-trip test - role A and role B with same PRS/sid
+// Full round-trip test: role A and role B with same PRS/sid
 // =============================================================================
 
 // Helper: run a complete A-B exchange with FIXED scalars by invoking the
@@ -494,7 +491,6 @@ TEST(CPaceRoundTrip, DeriveIsRejectedTwice) {
     ASSERT_TRUE(side_b.start(CPaceRole::RESPONDER, prs, sid, ci, ad, ad));
 
     ASSERT_TRUE(side_a.derive(side_b.public_share().data(), CPACE_SHARE_SIZE));
-    // Second call must be rejected.
     EXPECT_FALSE(side_a.derive(side_b.public_share().data(), CPACE_SHARE_SIZE));
 }
 
@@ -537,9 +533,7 @@ TEST(CPaceDeriveRejects, TagBeforeDeriveReturnsNullopt) {
     CPace side;
     ASSERT_TRUE(side.start(CPaceRole::RESPONDER, prs, sid, ci, ad, ad));
 
-    // tag() before derive() must return nullopt.
     EXPECT_FALSE(side.tag().has_value());
-    // verify() before derive() must return false.
     std::array<uint8_t, CPACE_TAG_SIZE> dummy{};
     EXPECT_FALSE(side.verify(dummy.data(), CPACE_TAG_SIZE));
 }

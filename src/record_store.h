@@ -54,7 +54,7 @@ namespace sendspin {
 enum class PskCategory : uint8_t {
     LONG_TERM,  ///< Per-pair long-term PSK from a successful pairing.
     PAIRING,    ///< Pairing PSK distributed out-of-band to admit a new server.
-    SENTINEL,   ///< Published Sentinel PSK - authenticates nothing on its own.
+    SENTINEL,   ///< Published Sentinel PSK: authenticates nothing on its own.
 };
 
 // ============================================================================
@@ -91,7 +91,7 @@ struct ResolvedPsk {
 ///   - `pairing_psk_enabled_` is the ONE exception and IS guarded by `mutex_`. It is written on
 ///     the main loop like its neighbours, but it is also READ on the network thread, inside
 ///     `resolve_by_psk_id`'s locked section, because a disabled Pairing PSK must drop out of the
-///     handshake candidate set. Its setter therefore takes `mutex_` -- exactly as
+///     handshake candidate set. Its setter therefore takes `mutex_`, exactly as
 ///     `set_pairing_psk()` does for the value half of that same condition. Do not "simplify" the
 ///     lock away to match the other config setters: without it the network-thread read is an
 ///     unsynchronized race and an operator-disabled Pairing PSK can keep authenticating
@@ -151,7 +151,7 @@ public:
     }
 
     /// @brief Return a locked copy of the record identified by psk_id, if any (thread-safe).
-    /// Calls the unlocked record_by_psk_id helper while holding mutex_ -- no recursion since
+    /// Calls the unlocked record_by_psk_id helper while holding mutex_; no recursion since
     /// record_by_psk_id does not lock. Returns nullopt when the psk_id is not found.
     [[nodiscard]] std::optional<SendspinPairingRecord> record_by_psk_id_copy(
         const std::string& psk_id) const {
@@ -248,7 +248,7 @@ public:
     static constexpr int DYNAMIC_PIN_ESCALATION_THRESHOLD = 10;
 
     /// @brief Return true if dynamic_pin is escalated: every attempt is gesture-gated until a
-    /// successful server_kc verification de-escalates it. Escalation is not an error state --
+    /// successful server_kc verification de-escalates it. Escalation is not an error state:
     /// the method stays offered.
     [[nodiscard]] bool dynamic_pin_escalated() const {
         return this->dynamic_pin_failures_ >= DYNAMIC_PIN_ESCALATION_THRESHOLD;
@@ -380,7 +380,7 @@ private:
     /// @brief Persist the current pairing config via the provider.
     /// @return True if the config was stored (or there is no provider, so there is nothing to
     ///         store); false only when a provider actively rejected the write. Nearly every
-    ///         caller ignores this -- a rejected config write is warned about and the change
+    ///         caller ignores this: a rejected config write is warned about and the change
     ///         stays RAM-only for the boot. First-boot provisioning is the exception: it must
     ///         not go on to persist a record the config cannot reference.
     bool persist_config();
@@ -389,7 +389,7 @@ private:
     ///
     /// MUST be called with mutex_ already held (the "_locked" suffix), so the encoded snapshot
     /// is always exactly what is in memory at the moment of the write. Every mutation path that
-    /// touches records_ and needs to persist it goes through this one helper -- see the locking
+    /// touches records_ and needs to persist it goes through this one helper; see the locking
     /// discipline comment above its definition in the .cpp for why this is safe and how
     /// store_record()'s fail-closed contract is preserved despite it.
     /// @return true on success (or when there is no provider); false on a rejected write.

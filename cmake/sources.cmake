@@ -1,9 +1,9 @@
 # Source file definitions for sendspin-cpp
 
 function(sendspin_get_sources BASE_DIR)
-    # Core sources — always compiled on both ESP-IDF and host
+    # Core sources: always compiled on both ESP-IDF and host
     set(SENDSPIN_CORE_SOURCES
-        # Crypto primitives and Noise-protocol constants/keys (always on - encryption
+        # Crypto primitives and Noise-protocol constants/keys (always on: encryption
         # is not role-gated; see CLAUDE.md #ifdef discipline)
         ${BASE_DIR}/src/crypto/constants.cpp
         ${BASE_DIR}/src/crypto/keys.cpp
@@ -46,7 +46,7 @@ function(sendspin_get_sources BASE_DIR)
         PARENT_SCOPE
     )
 
-    # Per-role source sets — conditionally compiled based on SENDSPIN_ENABLE_* options
+    # Per-role source sets: conditionally compiled based on SENDSPIN_ENABLE_* options
     set(SENDSPIN_PLAYER_SOURCES
         ${BASE_DIR}/src/player_role.cpp
         ${BASE_DIR}/src/audio_ring_buffer.cpp
@@ -86,7 +86,7 @@ function(sendspin_get_sources BASE_DIR)
         PARENT_SCOPE
     )
 
-    # ESP-IDF only sources — networking layer deeply coupled to ESP-IDF APIs
+    # ESP-IDF only sources: networking layer deeply coupled to ESP-IDF APIs
     set(SENDSPIN_ESP_SOURCES
         ${BASE_DIR}/src/esp/server_connection.cpp
         ${BASE_DIR}/src/esp/client_connection.cpp
@@ -99,7 +99,7 @@ function(sendspin_get_sources BASE_DIR)
         PARENT_SCOPE
     )
 
-    # Host only sources — IXWebSocket-based networking
+    # Host only sources: IXWebSocket-based networking
     set(SENDSPIN_HOST_SOURCES
         ${BASE_DIR}/src/host/ws_server.cpp
         ${BASE_DIR}/src/host/server_connection.cpp

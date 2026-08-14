@@ -109,7 +109,7 @@ void SendspinClientConnection::loop() {
 void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
                                           std::function<void()> on_complete) {
     if (!this->is_connected()) {
-        // Not connected - invoke completion callback immediately if provided
+        // Not connected: invoke completion callback immediately if provided
         if (on_complete) {
             on_complete();
         }
@@ -184,7 +184,6 @@ SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t 
         return SsErr::INVALID_STATE;
     }
 
-    // esp_websocket_client_send_bin sends a binary-opcode WebSocket frame.
     int sent = esp_websocket_client_send_bin(this->client_, reinterpret_cast<const char*>(data),
                                              static_cast<int>(len),
                                              pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
@@ -296,10 +295,10 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
 
     // Determine frame type: text (0x01), binary (0x02), or continuation (0x00)
     if (data->op_code == WS_OP_TEXT || data->op_code == WS_OP_BINARY) {
-        // First frame of a new message - remember the type for continuation frames
+        // First frame of a new message: remember the type for continuation frames
         this->is_text_frame_ = (data->op_code == WS_OP_TEXT);
     } else if (data->op_code != WS_OP_CONTINUATION) {
-        // Control frames (ping, pong, close) - ignore
+        // Control frames (ping, pong, close): ignore
         return;
     }
 
@@ -313,7 +312,7 @@ void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* dat
             SS_LOGE(TAG, "Allocation failed, dropping connection");
             // Stop processing frames that keep arriving on the still-open transport via
             // close_transport_now() (esp_websocket_client_stop cannot be called from the
-            // websocket task's own event handler -- see its doc comment).
+            // websocket task's own event handler; see its doc comment).
             this->disable_message_dispatch();
             this->close_transport_now();
             return;

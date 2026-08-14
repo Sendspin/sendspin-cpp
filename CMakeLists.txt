@@ -78,7 +78,7 @@ if(ESP_IDF_BUILD)
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_VISUALIZER)
     endif()
 
-    # Register the component — uses assembled source list
+    # Register the component using the assembled source list
     # WHOLE_ARCHIVE: this component defines noise_rand_bytes() (src/esp/noise_rand.cpp), which the
     # esphome__noise-c component references but does not define (it is built with
     # NOISE_USE_CUSTOM_RAND=1). Because noise-c depends on sendspin-cpp and sendspin-cpp depends on
@@ -145,7 +145,7 @@ else()
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_VISUALIZER_SOURCES})
     endif()
 
-    # Create the library — core sources + enabled role sources + host networking (added via host.cmake)
+    # Create the library: core sources, enabled role sources, host networking (via host.cmake)
     add_library(sendspin STATIC ${SENDSPIN_ALL_SOURCES})
 
     # Add compile definitions for enabled roles

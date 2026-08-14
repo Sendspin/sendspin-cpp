@@ -90,13 +90,12 @@ std::optional<std::string> pin_derive(const uint8_t* handshake_hash, size_t hash
     auto digest = h.finalize();
     if (!h.ok()) {
         // A mid-stream update()/finalize() failure after a successful construction; same
-        // rationale as the ok() check above -- do not derive a PIN from a zero digest.
+        // rationale as the ok() check above: do not derive a PIN from a zero digest.
         return std::nullopt;
     }
 
     // Interpret as a big-endian 256-bit unsigned integer mod 10^pin_length.
-    // We compute the modulus using 128-bit arithmetic to avoid overflow:
-    // 10^12 = 1_000_000_000_000 < 2^40, fits in uint64_t.
+    // The modulus fits in uint64_t: 10^12 = 1_000_000_000_000 < 2^40.
     // 256-bit big-endian mod uint64_t: process bytes from most to least significant.
     uint64_t modulus = 1;
     for (int i = 0; i < pin_length; ++i) {

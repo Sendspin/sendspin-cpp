@@ -20,7 +20,7 @@
 /// 1. **Standard base64 encode/decode** (`platform_base64_encode` / `platform_base64_decode`):
 ///    wrap mbedTLS on ESP and a built-in implementation on host.  Handle the `+`/`/` alphabet
 ///    with `=` padding (decode also tolerates missing padding on host; ESP's mbedTLS backend
-///    requires exact padding -- see the b64url wrappers below for how that is bridged).
+///    requires exact padding; see the b64url wrappers below for how that is bridged).
 ///
 /// 2. **URL-safe base64url** (`b64url_encode` / `b64url_decode`): thin wrappers around
 ///    platform_base64_encode/decode that transliterate the `-`/`_` alphabet to `+`/`/` (and
@@ -208,7 +208,7 @@ inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const
 #endif  // ESP_PLATFORM
 
 // ============================================================================
-// Base64url helpers - portable, identical on both ESP and host.
+// Base64url helpers: portable, identical on both ESP and host.
 //
 // Implement the URL-safe base64 alphabet (RFC 4648 SS5) with no `=` padding:
 //   - encode uses `-` and `_` instead of `+` and `/`
@@ -264,7 +264,6 @@ inline std::string b64url_encode(const uint8_t* data, size_t len) {
 inline std::optional<std::vector<uint8_t>> b64url_decode(const char* s) {
     size_t slen = std::strlen(s);
 
-    // Strip any trailing `=` padding the caller may have included.
     while (slen > 0 && s[slen - 1] == '=') {
         --slen;
     }

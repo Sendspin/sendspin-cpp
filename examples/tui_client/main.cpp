@@ -46,8 +46,7 @@
 // IWYU pragma: begin_keep
 // The include-what-you-use checker misattributes arpa/inet.h's htons/ntohs/htonl/ntohl and
 // sys/select.h's select()/fd_set to macOS libc++'s private headers when analyzed on a macOS
-// host toolchain (a known include-checker false-positive class for
-// macOS private headers like _abort.h/_endian.h); both are still the correct, portable headers on macOS and Linux CI.
+// host toolchain; both are still the correct, portable headers on macOS and Linux CI.
 #include <arpa/inet.h>
 #include <sys/select.h>
 // IWYU pragma: end_keep
@@ -908,7 +907,7 @@ int main(int argc, char* argv[]) {
                 vis_showing = state.show_visualizer;
             }
 
-            // Smooth visualizer display values every tick (10ms) — only when visible
+            // Smooth visualizer display values every tick (10ms), only when visible
             if (vis_showing) {
                 int64_t current_us = now_us();
                 std::lock_guard<std::mutex> lock(state.mutex);

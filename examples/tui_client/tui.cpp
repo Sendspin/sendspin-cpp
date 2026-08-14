@@ -405,7 +405,7 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
     auto host_display = snap.connected_host.empty() ? "\u2014" : snap.connected_host;
     auto port_display = snap.connected_port > 0 ? std::to_string(snap.connected_port) : "\u2014";
 
-    // Build server info rows -- group, trust, and identity shown when applicable
+    // Build server info rows: group, trust, and identity shown when applicable
     Elements server_rows;
     server_rows.push_back(hbox({text("  Status: ") | color(Color::White) | dim, text(connection_str) | bold | color(connection_color)}));
     server_rows.push_back(info_row("Host:    ", host_display, !snap.connected_host.empty()));
@@ -415,7 +415,6 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
     if (!snap.group_name.empty()) {
         server_rows.push_back(info_row("Group:   ", snap.group_name, true));
     }
-    // Trust level: show when connected
     if (snap.connected) {
         std::string trust_str = (snap.trust == ConnectionTrust::USER) ? "user (paired)" : "none";
         Color trust_color = (snap.trust == ConnectionTrust::USER) ? Color::Green : Color::GrayDark;
@@ -424,7 +423,6 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
             text(trust_str) | color(trust_color),
         }));
     }
-    // Pairing status: show when non-empty
     if (!snap.pairing_status.empty()) {
         server_rows.push_back(info_row("Pair:    ", snap.pairing_status, true));
     }
@@ -643,7 +641,7 @@ static Element render_server_selector(const TuiSnapshot& snap) {
 }
 
 // Shown until the client is paired: the Pairing PSK token an operator pastes into a server
-// that only offers the mandatory pairing_psk method (dynamic_pin needs nothing shown here --
+// that only offers the mandatory pairing_psk method (dynamic_pin needs nothing shown here;
 // the PIN itself appears in the Server panel's pairing status row instead). Wrapped across
 // the full terminal width since the token (107 chars) does not fit any of the three info
 // panels above.
@@ -702,7 +700,7 @@ static Element render_tui(TuiState& state) {
         render_progress(snap),
         render_info_panels(snap, width),
     };
-    // Show the Pairing PSK token only until this connection is paired -- once trust is USER,
+    // Show the Pairing PSK token only until this connection is paired: once trust is USER,
     // the token has already served its purpose and the vertical space goes back to filler().
     if (!snap.pairing_token.empty() && snap.trust != ConnectionTrust::USER) {
         sections.push_back(render_pairing_token(snap));

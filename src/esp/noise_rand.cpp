@@ -20,7 +20,7 @@
 /// and expects the consuming application to supply it. randstate.c (reseed) and the DH
 /// backend (keypair generation) both call it. We back it with the ESP32 hardware RNG via
 /// esp_fill_random(), which is a cryptographically secure entropy source while the RF
-/// subsystem (Wi-Fi/Bluetooth) is enabled -- always the case for a running Sendspin client.
+/// subsystem (Wi-Fi/Bluetooth) is enabled: always the case for a running Sendspin client.
 ///
 /// The host build instead compiles noise-c's rand_os.c with NOISE_USE_CUSTOM_RAND=0, so
 /// this translation unit is ESP-only (see cmake/sources.cmake SENDSPIN_ESP_SOURCES).
@@ -31,7 +31,7 @@
 /// symbol link error. Making ours weak lets ESPHome's strong definition take precedence when
 /// present, while ours still satisfies noise-c on any build that lacks one. (The sendspin-cpp
 /// component is linked WHOLE_ARCHIVE so this object is pulled in even though nothing in
-/// sendspin-cpp references the symbol directly - see the top-level CMakeLists.txt.)
+/// sendspin-cpp references the symbol directly; see the top-level CMakeLists.txt.)
 
 #include "esp_random.h"
 
@@ -41,16 +41,9 @@
 // esphome/noise-c component, not vendored in this repo). -Wmissing-prototypes /
 // -Wmissing-declarations require a declared prototype for any non-static, non-anonymous-
 // namespace function; noise_rand_bytes must stay external linkage (see the WEAK rationale
-// below), so the prototype is restated here rather than making the definition static.
+// above), so the prototype is restated here rather than making the definition static.
 extern "C" void noise_rand_bytes(void* bytes, size_t size);
 
-// The definition is WEAK on purpose: ESPHome's own API component defines a strong
-// noise_rand_bytes() when the encrypted native API is enabled (USE_API_NOISE). On a device
-// that uses both Sendspin and the encrypted API, two strong definitions would be a duplicate-
-// symbol link error. Making ours weak lets ESPHome's strong definition take precedence when
-// present, while ours still satisfies noise-c on any build that lacks one. (The sendspin-cpp
-// component is linked WHOLE_ARCHIVE so this object is pulled in even though nothing in
-// sendspin-cpp references the symbol directly - see the top-level CMakeLists.txt.)
 extern "C" __attribute__((weak)) void noise_rand_bytes(void* bytes, size_t size) {
     esp_fill_random(bytes, size);
 }

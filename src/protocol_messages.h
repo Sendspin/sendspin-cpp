@@ -101,12 +101,12 @@ enum class SendspinServerToClientMessageType : uint8_t {
     SERVER_PAIR_FINALIZE,            // server/pair-finalize empty ack from server
     PAIR_ABORT,                      // pair/abort pairing failure from either side
     SERVER_UNPAIR,                   // server/unpair request to drop pairing record
-    MANAGEMENT_LIST_RECORDS,         // management/list-records
-    MANAGEMENT_ADD_RECORD,           // management/add-record
-    MANAGEMENT_REMOVE_RECORD,        // management/remove-record
-    MANAGEMENT_GET_PAIRING_CONFIG,   // management/get-pairing-config
-    MANAGEMENT_SET_PAIRING_CONFIG,   // management/set-pairing-config
-    MANAGEMENT_OPEN_PAIRING_WINDOW,  // management/open-pairing-window
+    MANAGEMENT_LIST_RECORDS,         // management/list-records stored record summaries
+    MANAGEMENT_ADD_RECORD,           // management/add-record store a new pairing PSK
+    MANAGEMENT_REMOVE_RECORD,        // management/remove-record delete a stored record
+    MANAGEMENT_GET_PAIRING_CONFIG,   // management/get-pairing-config read pairing method config
+    MANAGEMENT_SET_PAIRING_CONFIG,   // management/set-pairing-config update pairing method config
+    MANAGEMENT_OPEN_PAIRING_WINDOW,  // management/open-pairing-window remote operator gesture
     SERVER_PAIR_INIT,                // server/pair-init: nonce_A
     SERVER_PAIR_AUTH,                // server/pair-auth: pake_msg_1
     SERVER_PAIR_CONFIRM,             // server/pair-confirm: server_kc
@@ -146,8 +146,7 @@ inline const char* to_cstr(SendspinRole role) {
 }
 
 /// @brief Activity declared in a server/activate message.
-/// Replaces the old discovery/playback SendspinConnectionReason model (spec PR #84): a
-/// connection now declares a SET of activities rather than a single reason.
+/// A connection declares a SET of activities rather than a single reason (spec "server/activate").
 /// Mirrors Activity in aiosendspin/models/types.py.
 enum class SendspinActivity : uint8_t {
     PLAYBACK,    // Active or upcoming playback
@@ -310,7 +309,7 @@ inline std::optional<PairAbortReason> pair_abort_reason_from_string(const std::s
 }
 
 // ============================================================================
-// Conversion helpers (moved from public headers — internal use only)
+// Conversion helpers (internal use only)
 // ============================================================================
 
 // --- types.h ---
@@ -956,23 +955,23 @@ struct ClientStateMessage {
 /// active_roles come from the server/activate message that follows.
 struct ServerHelloMessage {
     std::string name{};
-    /// Legacy/test-only fallback: a server_id field on server/hello itself, parsed if present
-    /// but never required. The client only ever adopts it when the connection has no Noise
-    /// handshake result to source server_id from (encryption_required == false); see
-    /// SendspinClient's SERVER_HELLO handling. Real (encrypted) peers should not send this.
+    /// Test-only fallback: not part of server/hello on the wire, but parsed if present so
+    /// no-encryption test fixtures can populate server_id. The client only ever adopts it when
+    /// the connection has no Noise handshake result to source server_id from
+    /// (encryption_required == false); see SendspinClient's SERVER_HELLO handling.
     std::optional<std::string> server_id{};
 };
 
 /// @brief Parsed server/activate message that follows server/hello.
-/// Declares the server's current activity set and active roles for this connection.
-/// Replaces the old connection_reason field of server/hello (spec PR #84).
+/// Declares the server's current activity set and active roles for this connection
+/// (spec "server/activate").
 struct ServerActivateMessage {
     std::vector<SendspinActivity> activities{};
     std::optional<std::vector<std::string>> active_roles;  // sticky: nullopt = keep prior set
-    /// From payload.pairing.method -- the pairing method the server picked. nullopt when the
+    /// From payload.pairing.method: the pairing method the server picked. nullopt when the
     /// message carries no pairing object or names an unrecognized method string.
     std::optional<SendspinPairMethod> pairing_method;
-    /// From payload.pairing.pin_length -- the session PIN digit count. Required on the wire
+    /// From payload.pairing.pin_length: the session PIN digit count. Required on the wire
     /// when pairing_method is dynamic_pin; validated against [min_pin_length, 12] on receipt
     /// of the activation (not at server/pair-init, which carries only nonce_A).
     std::optional<int> pairing_pin_length;
@@ -1009,7 +1008,6 @@ struct StreamClearMessage {
 };
 
 /// @brief Parsed pair/abort message (received or sent during a pairing exchange)
-/// The reason field identifies why the pairing attempt was aborted.
 struct PairAbortMessage {
     PairAbortReason reason{PairAbortReason::METHOD_NOT_SUPPORTED};
 };
@@ -1193,7 +1191,7 @@ std::string format_client_command_message(const ClientCommandControllerObject& c
 std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk);
 
 /// @brief Formats a client/pair-finalize message carrying wrapped_psk (PIN flows only; see
-/// PSK Wrapping, spec #117). wrapped_psk is 48 raw bytes, base64url-encoded (no padding, 64
+/// spec "PSK Wrapping"). wrapped_psk is 48 raw bytes, base64url-encoded (no padding, 64
 /// chars).
 /// @param wrapped_psk 48-byte wrapped PSK (ciphertext || tag) to embed in the message.
 /// @return JSON string for the client/pair-finalize message.
@@ -1253,7 +1251,7 @@ std::string format_client_pair_pending_message(uint32_t pairing_index);
 
 /// @brief Formats a client/pair-init message as a JSON string.
 /// Starts the dynamic-PIN attempt; carries commit_B = SHA-256(LABEL || nonce_B) and the
-/// required pairing_index counter (spec #120).
+/// required pairing_index counter (spec "Pairing index").
 /// @param commit_b 32-byte commit_B value to embed (base64url-encoded on the wire).
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
 ///                      handshake (see SendspinConnection::get_pairing_index()).

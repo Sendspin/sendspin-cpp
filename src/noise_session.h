@@ -48,7 +48,7 @@ typedef struct NoiseCipherState_s NoiseCipherState;
 
 namespace sendspin {
 
-/// @brief Noise KKpsk2 session - handshake and transport state.
+/// @brief Noise KKpsk2 session: handshake and transport state.
 ///
 /// Construct via the factory `NoiseSession::as_responder()`.
 /// Call `read_msg1()` then `write_msg2_and_split()` to complete the handshake.

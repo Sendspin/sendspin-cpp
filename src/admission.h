@@ -58,7 +58,6 @@ namespace sendspin {
 inline bool activities_allowed(PskCategory category,
                                const std::vector<SendspinActivity>& activities,
                                bool unpaired_access) {
-    // Check whether PAIRING is in the set.
     bool has_pairing = false;
     for (const auto& a : activities) {
         if (a == SendspinActivity::PAIRING) {
@@ -133,8 +132,8 @@ inline bool is_playback_capable(PskCategory category,
 /// Ports `_admissible` from
 /// aiosendspin/aiosendspin/client/connection.py (line ~154).
 ///
-/// A non-empty active_roles set requires that the connection be "playback-capable" -
-/// i.e., activities | {PLAYBACK} must also be allowed. This catches e.g. a Sentinel
+/// A non-empty active_roles set requires that the connection be "playback-capable": activities |
+/// {PLAYBACK} must also be allowed. This catches e.g. a Sentinel
 /// connection with has_roles=true and activities={} (empty), which would attempt to
 /// use role protocol without being allowed playback.
 ///
@@ -252,8 +251,8 @@ inline bool should_admit_connection(const std::vector<SendspinActivity>& incomin
     // exchange is complete, and the admitted connection keeps declaring PAIRING only because its
     // activities snapshot is not rewritten until the post-rekey activate arrives. The caller
     // passes admitted_pairing_in_flight=false for that window so this shield stops applying,
-    // while the rank comparisons below still use the real (stale but rank-correct) activities --
-    // substituting an empty set here instead would drop the admitted side to rank 0 and hand a
+    // while the rank comparisons below still use the real (stale but rank-correct) activities.
+    // Substituting an empty set here instead would drop the admitted side to rank 0 and hand a
     // rank-0 newcomer the last_playback tiebreak below, which it could never have won before.
     if (admitted_pairing_in_flight && admitted_rank == 1 &&
         (incoming_rank == 1 || incoming_rank == 2)) {

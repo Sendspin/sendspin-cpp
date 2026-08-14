@@ -192,9 +192,7 @@ public:
     /// @brief Gets the httpd handle (for use by connections)
     /// @return The httpd server handle, or nullptr if not started.
     // cppcheck-suppress unusedFunction
-    // Public accessor for ESP-side connection code; not currently exercised by this repo's own
-    // sources but part of the class's intended API surface (mirrors the connection.h
-    // unusedFunction rationale for encryption-work API built ahead of its caller).
+    // Public accessor for ESP-side connection code; currently unused in-tree.
     httpd_handle_t get_server() const {
         return this->server_;
     }

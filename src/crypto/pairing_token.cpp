@@ -76,14 +76,13 @@ std::string format_pairing_token(const std::array<uint8_t, 32>& client_key,
 
     std::string body = base32_encode(payload.data(), payload.size());
 
-    // Strip '=' padding.
     size_t pad_start = body.find('=');
     if (pad_start != std::string::npos) {
         body.resize(pad_start);
     }
 
     // Transliterate every '2' to '9' (the two characters that could otherwise be confused when
-    // handwritten or misread; see spec #125).
+    // handwritten or misread; see the spec's "Pairing Token" section).
     for (char& c : body) {
         if (c == '2') {
             c = '9';

@@ -170,7 +170,7 @@ public:
     /// Noise handshake and the hello cycle and still lose arbitration, and every peer that knows
     /// the Sentinel PSK (a spec constant, so effectively any peer on the network) can reach that
     /// state. Admission is where the PSK category is actually checked against the requested
-    /// activities (see admission.h), so anything that drives shared client state -- the roles --
+    /// activities (see admission.h), so anything that drives shared client state (the roles)
     /// must gate on THIS, not on the handshake having succeeded.
     ///
     /// Set/cleared only by ConnectionManager::set_current_connection() on the main loop; atomic
@@ -212,7 +212,7 @@ public:
 
     /// @brief Return the full Noise suite name supplied at init_noise_handshake() (e.g.
     /// "Noise_KKpsk2_25519_ChaChaPoly_SHA256"), or an empty string if none was set.
-    /// Used to select the AEAD cipher for PSK Wrapping (spec #117; see
+    /// Used to select the AEAD cipher for spec "PSK Wrapping" (see
     /// platform/crypto.h aead_cipher_name_from_noise_suite()).
     ///
     /// Virtual so tests can inject a fake connection that reports a canned suite name without an
@@ -240,7 +240,7 @@ public:
     /// Resets first_activate_received_/server_hello_received_/client_hello_sent_ so the
     /// post-swap server/hello -> client/hello -> server/activate flow re-runs under the new
     /// session keys; the manager's nursery is not involved (the connection stays current/
-    /// established throughout -- no drop/reconnect).
+    /// established throughout, with no drop/reconnect).
     ///
     /// @param msg1_json  The decrypted noise/handshake JSON string (msg1 envelope).
     /// @return true on success (session swapped; a post-swap server/hello is expected next).
@@ -292,8 +292,7 @@ public:
     /// @param data  Pointer to type-prefixed binary bytes (first byte is the role type byte).
     /// @param len   Total length including the type byte.
     /// @return SsErr::OK on success.
-    // No client-to-server binary message exists yet, so nothing calls this today; kept as the
-    // entry point for the first such feature rather than removed and re-added later.
+    // No client-to-server binary message exists yet, so nothing calls this today.
     // cppcheck-suppress unusedFunction
     SsErr send_encrypted_binary(const uint8_t* data, size_t len) {
         return this->noise_transport_.send_binary(data, len);
@@ -377,7 +376,7 @@ public:
     /// client/goodbye (or any other application-level message). Every call site is reached from
     /// dispatch_completed_message() on the network thread, so this routes to
     /// close_transport_now() (non-blocking on every platform) instead of disconnect() (which is
-    /// not network-thread-safe on host/ESP outbound -- see close_transport_now()'s doc comment).
+    /// not network-thread-safe on host/ESP outbound; see close_transport_now()'s doc comment).
     /// Also disables further message dispatch first, matching the existing allocation-failure
     /// precedent in the platform .cpp files, so a stale frame cannot reach role queues while the
     /// close is in flight.
@@ -443,9 +442,9 @@ public:
     /// any thread at any time. It deliberately does NOT return a reference: psk_id_ is rewritten
     /// on the network thread at handshake COMPLETE and at every in-band re-handshake, and a
     /// server may start a re-handshake at any point after admission, so a reader has no way to
-    /// exclude a later write by argument. Reference-returning versions of this accessor were
-    /// misread as safe twice (the activate handler's mark_record_used() and the
-    /// management/remove-record requester lookup), which is why only the locking form exists.
+    /// exclude a later write by argument, so only the locking form exists: a reference-returning
+    /// accessor would let a caller retain a pointer into psk_id_ that a concurrent re-handshake
+    /// could rewrite out from under it.
     ///
     /// Every call site is cold (first activate per handshake, remove-record, unpair), so the
     /// copy is not on any hot path. Callers that need the value more than once must read it once
@@ -580,7 +579,7 @@ public:
     /// server/pair-finalize. A nullopt record = storage-exhausted / shared-PSK case: send the
     /// shared PSK but store nothing on ack. Written on the main loop when entering pairing; taken
     /// on the network thread in the server/pair-finalize handler (the commit must happen there,
-    /// before the server's re-handshake msg1 - next message on the same thread - resolves the new
+    /// before the server's re-handshake msg1 (the next message on the same thread) resolves the new
     /// PSK against the RecordStore). Thin wrapper around pending_pairing_slot_ (ShadowSlot);
     /// latest-wins overwrite, matching write()'s semantics.
     void set_pending_pairing_record(std::optional<SendspinPairingRecord> record) {
@@ -588,10 +587,10 @@ public:
     }
 
     /// @brief Atomically returns and clears the pending pairing record. A returned value is a
-    /// record to store; nullopt means store nothing (shared-PSK case or no pending pairing --
+    /// record to store; nullopt means store nothing (shared-PSK case or no pending pairing:
     /// take() leaves the out-param at its default-constructed nullopt when the slot is clean, so
-    /// both cases collapse to the same observable result, matching the prior std::exchange
-    /// behavior). Called on the network thread when the server/pair-finalize ack arrives.
+    /// both cases collapse to the same observable result). Called on the network thread when the
+    /// server/pair-finalize ack arrives.
     std::optional<SendspinPairingRecord> take_pending_pairing_record() {
         std::optional<SendspinPairingRecord> out;
         this->pending_pairing_slot_.take(out);
@@ -745,8 +744,7 @@ public:
     /// stats for diagnostics. Atomic so the httpd worker (ESP server) can update it while the
     /// hub thread reads it.
     // cppcheck-suppress unusedFunction
-    // Diagnostics API surface built ahead of the feature that will call it; not currently read
-    // by this repo's own sources.
+    // Not currently called by this repo's own sources.
     int64_t get_serialize_ema_us() const {
         return this->serialize_ema_us_.load(std::memory_order_relaxed);
     }
@@ -1018,8 +1016,8 @@ protected:
     std::atomic<bool> pairing_in_progress_{false};
 
     /// True from the moment the server acks server/pair-finalize until fresh activities arrive
-    /// (or pairing state is cleared). In that window the exchange is protocol-complete -- the
-    /// record is already stored -- but `activities_` still holds the pre-finalize [PAIRING] set,
+    /// (or pairing state is cleared). In that window the exchange is protocol-complete (the
+    /// record is already stored), but `activities_` still holds the pre-finalize [PAIRING] set,
     /// because only apply_server_activate() ever rewrites it and the post-finalize activate has
     /// not arrived yet. Admission consults this so the "in-flight pairing is not displaced" rule
     /// stops protecting a pairing that has already finished (see should_switch_to_new_server).
@@ -1034,7 +1032,7 @@ protected:
     ShadowSlot<std::optional<SendspinPairingRecord>> pending_pairing_slot_{};
 
     /// Count of pairing server/activate messages received since the last Noise handshake (or
-    /// re-handshake) (spec #120). Feeds both the wire `pairing_index` field on
+    /// re-handshake) (spec "Pairing index"). Feeds both the wire `pairing_index` field on
     /// client/pair-init and the CPace `sid` counter (see PinSession::pairing_index, captured at
     /// handle_enter_pairing() so a later PAKE step reuses the exact value client/pair-init sent).
     /// Written on the main loop (bump_pairing_index(), each pairing server/activate) and on the
@@ -1044,8 +1042,7 @@ protected:
 
     // 8-bit fields
 
-    /// Lifecycle-flag axes (documentation-only note; a design review considered and rejected
-    /// collapsing the flags below into a single phase enum -- read this before re-proposing it).
+    /// Lifecycle-flag axes.
     ///
     /// The six atomic flags in this section are not one linear lifecycle. They form three
     /// independent axes:
@@ -1054,17 +1051,17 @@ protected:
     ///    callback (network thread); read for reap diagnostics (see SetupStage in
     ///    connection_manager.cpp).
     ///  - Proving axis: noise_handshake_complete_ is set ONCE on the network thread at handshake
-    ///    COMPLETE and never cleared -- not even by an in-band re-handshake, because the transport
+    ///    COMPLETE and never cleared: not even by an in-band re-handshake, because the transport
     ///    stays active across it. Alongside it, the RESETTABLE trio client_hello_sent_ /
     ///    server_hello_received_ / first_activate_received_ tracks the hello + first-activate
     ///    cycle, which does re-run on re-handshake.
-    ///  - Admission axis: admitted_ -- whether this connection occupies the manager's current
-    ///    slot. Written only by ConnectionManager::set_current_connection() / drop_connection() on
+    ///  - Admission axis: admitted_ (whether this connection occupies the manager's current
+    ///    slot). Written only by ConnectionManager::set_current_connection() / drop_connection() on
     ///    the main loop; read by the network thread's role-dispatch gate. Orthogonal to proving:
     ///    an operational nursery loser is never admitted, and after a re-handshake the current
     ///    connection is admitted but temporarily NOT operational.
     ///
-    /// Writer/thread map (verified 2026-08-14):
+    /// Writer/thread map:
     ///  - client_hello_sent_: set by the hello send-completion callback in
     ///    ConnectionManager::send_hello_message (httpd worker thread on ESP, inline on host);
     ///    cleared by handle_noise_rehandshake (network thread) at the start of a key rotation
@@ -1093,7 +1090,7 @@ protected:
     ///  - The axes are orthogonal (see above), so one scalar cannot represent, e.g., "admitted but
     ///    not operational" during re-proving.
     ///  - The sanctioned way to get a readable single "phase" is to DERIVE it on demand from these
-    ///    flags, as SetupStage in connection_manager.cpp does for reap diagnostics -- derived,
+    ///    flags, as SetupStage in connection_manager.cpp does for reap diagnostics: derived,
     ///    never stored, so it cannot go stale.
 
     /// PSK category resolved by the Noise handshake (set at COMPLETE, or re-handshake).
