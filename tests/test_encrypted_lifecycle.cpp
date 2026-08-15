@@ -160,6 +160,10 @@ public:
         this->trust_history_.push_back(trust);
     }
 
+    void on_pairing_started(const std::string& server_id) override {
+        this->pairing_started_server_id_ = server_id;
+    }
+
     void on_pairing_succeeded(const std::string& server_id) override {
         this->pairing_succeeded_server_id_ = server_id;
     }
@@ -178,6 +182,10 @@ public:
         return false;
     }
 
+    const std::optional<std::string>& pairing_started_server_id() const {
+        return this->pairing_started_server_id_;
+    }
+
     const std::optional<std::string>& pairing_succeeded_server_id() const {
         return this->pairing_succeeded_server_id_;
     }
@@ -192,6 +200,7 @@ public:
 
 private:
     std::vector<ConnectionTrust> trust_history_;
+    std::optional<std::string> pairing_started_server_id_;
     std::optional<std::string> pairing_succeeded_server_id_;
     std::optional<std::string> pairing_failed_server_id_;
     std::optional<SendspinPairAbortReason> pairing_failed_reason_;
@@ -509,6 +518,12 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     ASSERT_TRUE(pump_until(
         client, [&] { return server.learned_psk_id().has_value(); }, 4000))
         << "client/pair-finalize (with a freshly generated long_term_psk) was never observed";
+
+    // handle_enter_pairing's Pairing-PSK branch must fire on_pairing_started, exactly like the
+    // PIN branches do, so the started/succeeded/failed callback trio stays method-agnostic.
+    ASSERT_TRUE(listener.pairing_started_server_id().has_value())
+        << "on_pairing_started was never fired for the pairing-token (Pairing-PSK) flow";
+    EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());
 
     // The server's ack must have made the client persist the record before this returns (see
     // client.cpp's SERVER_PAIR_FINALIZE handler: the commit happens synchronously on the network

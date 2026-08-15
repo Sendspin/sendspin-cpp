@@ -78,11 +78,11 @@ public:
     // Encryption / pairing callbacks
     // ========================================
 
-    /// @brief Called when a server begins a Pairing-PSK pairing exchange
+    /// @brief Called when a server begins a pairing exchange
     ///
-    /// server_id is the base64url public key of the server entering pairing.
-    /// At this point client/pair-finalize has been sent; the exchange completes
-    /// when on_pairing_succeeded or on_pairing_failed fires.
+    /// server_id is the base64url public key of the server entering pairing. Fires once per
+    /// attempt regardless of the selected method (Pairing-PSK, dynamic PIN, or static PIN);
+    /// the exchange completes when on_pairing_succeeded or on_pairing_failed fires.
     /// Fires on the main loop.
     virtual void on_pairing_started(const std::string& /*server_id*/) {}
 

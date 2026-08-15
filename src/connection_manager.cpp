@@ -1833,6 +1833,8 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     // Hold the pending record: committed to the RecordStore by the network-thread
     // server/pair-finalize handler on ack. nullopt record = storage-exhausted case: store nothing.
     conn->set_pending_pairing_record(std::move(outcome->record));
+
+    this->client_->note_pairing_started(server_id);
 }
 
 void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortReason reason) {
