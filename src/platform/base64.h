@@ -27,7 +27,7 @@
 ///    back) and add/strip `=` padding, so the URL-safe helpers are *identical* on host and ESP
 ///    and both route through the platform's real base64 implementation instead of
 ///    reimplementing the bit-accumulator loop a second time. Output has no `=` padding
-///    (RFC 4648 SS5). These are required for Noise-protocol key identifiers (PSK IDs, peer
+///    (RFC 4648 section 5). These are required for Noise-protocol key identifiers (PSK IDs, peer
 ///    IDs).
 
 #pragma once
@@ -145,7 +145,7 @@ inline int platform_base64_decode(uint8_t* dst, size_t dlen, size_t* olen, const
 }
 
 // clang-format off
-/// Encoding alphabet: standard base64 (RFC 4648 SS4).
+/// Encoding alphabet: standard base64 (RFC 4648 section 4).
 static constexpr char BASE64_ENCODE_TABLE[65] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 // clang-format on
@@ -210,7 +210,7 @@ inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const
 // ============================================================================
 // Base64url helpers: portable, identical on both ESP and host.
 //
-// Implement the URL-safe base64 alphabet (RFC 4648 SS5) with no `=` padding:
+// Implement the URL-safe base64 alphabet (RFC 4648 section 5) with no `=` padding:
 //   - encode uses `-` and `_` instead of `+` and `/`
 //   - encode strips trailing `=` padding
 //   - decode tolerates missing `=` padding
@@ -227,7 +227,7 @@ inline int platform_base64_encode(uint8_t* dst, size_t dlen, size_t* olen, const
 
 namespace sendspin {
 
-/// @brief Encode bytes to base64url, no `=` padding (RFC 4648 SS5).
+/// @brief Encode bytes to base64url, no `=` padding (RFC 4648 section 5).
 /// @param data  Input bytes.
 /// @param len   Number of bytes.
 /// @return ASCII string using only `A-Z a-z 0-9 - _`.
@@ -258,7 +258,7 @@ inline std::string b64url_encode(const uint8_t* data, size_t len) {
     return out;
 }
 
-/// @brief Decode base64url, tolerating missing `=` padding (RFC 4648 SS5).
+/// @brief Decode base64url, tolerating missing `=` padding (RFC 4648 section 5).
 /// @param s  Null-terminated base64url string.
 /// @return Decoded bytes, or std::nullopt on invalid input.
 inline std::optional<std::vector<uint8_t>> b64url_decode(const char* s) {
