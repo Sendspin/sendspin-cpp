@@ -414,6 +414,39 @@ public:
     [[nodiscard]] virtual std::optional<StorageReport> storage_accounting() const;
 
 private:
+    // ========================================
+    // Construction helpers
+    // ========================================
+    // Called in this order from the constructor; see the constructor definition in the .cpp for
+    // the full first-boot / damaged-config reasoning that ties the load and provisioning steps
+    // together.
+
+    /// @brief Load records_ from the provider's RECORDS blob, if present.
+    void load_records_from_provider();
+
+    /// @brief Load pairing_psk_ from the provider's PAIRING_PSK blob, if present, correcting its
+    /// psk_id if it disagrees with the loaded secret.
+    void load_pairing_psk_from_provider();
+
+    /// @brief Load static_pin_ from the provider's STATIC_PIN blob, if present and valid.
+    void load_static_pin_from_provider();
+
+    /// @brief Load the pairing config fields from the provider's PAIR_CONFIG blob, if present.
+    /// @return True if a valid config was loaded; the provisioning helpers below use this (the
+    ///         "loaded_config" signal) to decide first-boot vs. damaged-config behavior.
+    bool load_pairing_config_from_provider();
+
+    /// @brief First-boot handling for the unpaired-access default and the shared-PSK fallback
+    /// record: seeds unpaired_access_enabled_ only on a genuine first boot, then generates and
+    /// persists the fallback record when the loaded config did not already reference one.
+    /// @param loaded_config Whether load_pairing_config_from_provider() found a usable config.
+    /// @param initial_unpaired_access_enabled First-boot default for unpaired access.
+    void provision_shared_record_if_needed(bool loaded_config,
+                                           bool initial_unpaired_access_enabled);
+
+    /// @brief Generate and persist the Pairing PSK if the store has none.
+    void provision_pairing_psk_if_needed();
+
     /// @brief Return true if a resolved PSK is a shared-PSK record (long-term, no counterparty).
     static bool is_shared_record(const ResolvedPsk& r);
 

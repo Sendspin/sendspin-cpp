@@ -98,6 +98,25 @@ std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj) {
     return rec;
 }
 
+/// @brief Writes the "psk_id"/"psk"/"server_id"/"label"/"used" fields shared by
+/// encode_pairing_record() and encode_pairing_records() into a JSON object or document root.
+/// @param target A JsonDocument (top-level record) or JsonObject (one array entry); both support
+///        the same operator[] assignment used here.
+template <typename TTarget>
+void write_record_fields(TTarget& target, const SendspinPairingRecord& r) {
+    target["psk_id"] = r.psk_id;
+    std::string psk_b64 = base64url_encode(r.psk.data(), r.psk.size());
+    target["psk"] = psk_b64;
+    secure_zero(psk_b64.data(), psk_b64.size());
+    if (r.server_id.has_value()) {
+        target["server_id"] = r.server_id.value();
+    }
+    if (r.label.has_value()) {
+        target["label"] = r.label.value();
+    }
+    target["used"] = r.used;
+}
+
 /// @brief Parses an accepted Pairing PSK from a JSON object.
 std::optional<SendspinPairingPsk> psk_from_object(JsonObjectConst obj) {
     auto core = parse_psk_id_and_psk(obj);
@@ -136,17 +155,7 @@ std::string encode_pairing_record(const SendspinPairingRecord& r) {
     // PsramJsonAllocator): the pool holds base64 PSK text and must not be freed unwiped.
     JsonDocument doc = make_zeroizing_json_document();
     doc["v"] = RECORD_CODEC_VERSION;
-    doc["psk_id"] = r.psk_id;
-    std::string psk_b64 = base64url_encode(r.psk.data(), r.psk.size());
-    doc["psk"] = psk_b64;
-    secure_zero(psk_b64.data(), psk_b64.size());
-    if (r.server_id.has_value()) {
-        doc["server_id"] = r.server_id.value();
-    }
-    if (r.label.has_value()) {
-        doc["label"] = r.label.value();
-    }
-    doc["used"] = r.used;
+    write_record_fields(doc, r);
     std::string out;
     serializeJson(doc, out);
     return out;
@@ -167,17 +176,7 @@ std::string encode_pairing_records(const std::vector<SendspinPairingRecord>& v) 
     JsonArray arr = doc["records"].to<JsonArray>();
     for (const auto& r : v) {
         JsonObject obj = arr.add<JsonObject>();
-        obj["psk_id"] = r.psk_id;
-        std::string psk_b64 = base64url_encode(r.psk.data(), r.psk.size());
-        obj["psk"] = psk_b64;
-        secure_zero(psk_b64.data(), psk_b64.size());
-        if (r.server_id.has_value()) {
-            obj["server_id"] = r.server_id.value();
-        }
-        if (r.label.has_value()) {
-            obj["label"] = r.label.value();
-        }
-        obj["used"] = r.used;
+        write_record_fields(obj, r);
     }
     std::string out;
     serializeJson(doc, out);

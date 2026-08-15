@@ -33,6 +33,34 @@ static const char* const TAG = "sendspin.record_store";
 
 namespace sendspin {
 
+namespace {
+
+/// @brief Shared load -> string_view -> decode -> warn-on-failure -> secure_zero(blob) shape used
+/// by the RECORDS and PAIRING_PSK loaders below. STATIC_PIN (no decoder, no PSK bytes) and
+/// PAIR_CONFIG (no PSK bytes) differ enough to stay direct.
+/// @param decode_fail_suffix Appended to the "Stored "%s" blob failed to decode; " warning, so
+///        each caller keeps its own original message verbatim.
+/// @return The decoded value, or nullopt if the blob was absent or failed to decode. The raw
+///         blob is wiped before returning on BOTH the success and decode-failure paths.
+template <typename T>
+std::optional<T> load_decode_wipe(SendspinPersistenceProvider& provider, const char* key,
+                                  std::optional<T> (*decode)(std::string_view),
+                                  const char* decode_fail_suffix) {
+    auto blob = provider.load_blob(key);
+    if (!blob.has_value()) {
+        return std::nullopt;
+    }
+    std::string_view text(reinterpret_cast<const char*>(blob->data()), blob->size());
+    auto decoded = decode(text);
+    if (!decoded.has_value()) {
+        SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; %s", key, decode_fail_suffix);
+    }
+    secure_zero(blob->data(), blob->size());
+    return decoded;
+}
+
+}  // namespace
+
 // ============================================================================
 // Constructor
 // ============================================================================
@@ -45,99 +73,107 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
     // decoding happens entirely on this side of the interface.
     bool loaded_config = false;
     if (this->provider_ != nullptr) {
-        if (auto records_blob = this->provider_->load_blob(persistence_keys::RECORDS)) {
-            std::string_view text(reinterpret_cast<const char*>(records_blob->data()),
-                                  records_blob->size());
-            auto decoded = decode_pairing_records(text);
-            if (decoded.has_value()) {
-                this->records_ = std::move(decoded.value());
-            } else {
-                // Whole-blob decode failure (corrupt bytes, not JSON at all): the codec already
-                // skips individually corrupt entries within an otherwise-valid blob, so this only
-                // fires when the blob itself could not be parsed. Continue with an empty store
-                // rather than refusing to start.
-                SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; starting with an empty store",
-                        persistence_keys::RECORDS);
-            }
-            // The loaded blob is base64 PSK text (even when it failed to decode); wipe it
-            // before the vector's destructor frees it, mirroring the save-path wipes in
-            // persist_records_locked() and set_pairing_psk().
-            secure_zero(records_blob->data(), records_blob->size());
-        }
-
-        if (auto psk_blob = this->provider_->load_blob(persistence_keys::PAIRING_PSK)) {
-            std::string_view text(reinterpret_cast<const char*>(psk_blob->data()),
-                                  psk_blob->size());
-            auto decoded = decode_pairing_psk(text);
-            if (decoded.has_value()) {
-                this->pairing_psk_ = std::move(decoded);
-                // psk_id is a pure function of the PSK, and the server derives it the same way to
-                // reference the key in its handshake. A stored id that disagrees with the secret
-                // (hand-provisioned by an application, or corrupted) would never resolve, so
-                // correct it here rather than advertising a method that cannot complete.
-                std::string derived = psk_id_for(this->pairing_psk_->psk);
-                if (this->pairing_psk_->psk_id != derived) {
-                    SS_LOGW(TAG, "Stored Pairing PSK id %s does not match the PSK; using %s",
-                            this->pairing_psk_->psk_id.c_str(), derived.c_str());
-                    this->pairing_psk_->psk_id = std::move(derived);
-                }
-            } else {
-                SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; ignoring",
-                        persistence_keys::PAIRING_PSK);
-            }
-            // Base64 PSK text like the RECORDS blob above; wipe before the vector frees it.
-            secure_zero(psk_blob->data(), psk_blob->size());
-        }
-
-        if (auto pin_blob = this->provider_->load_blob(persistence_keys::STATIC_PIN)) {
-            std::string loaded_pin(reinterpret_cast<const char*>(pin_blob->data()),
-                                   pin_blob->size());
-            // Validate on load, the same way RECORDS and PAIRING_PSK are validated by their
-            // decoders. The write path (management/set-pairing-config) already checks this, so a
-            // value that fails here came from provider corruption or out-of-band provisioning.
-            // Accepting it would leave the device advertising static_pin while feeding malformed
-            // PRS bytes to the PAKE, which can only ever produce pin_mismatch, a pairing that
-            // deterministically fails with nothing in the logs pointing at storage.
-            if (is_valid_static_pin(loaded_pin)) {
-                this->static_pin_ = std::move(loaded_pin);
-            } else {
-                SS_LOGW(TAG,
-                        "Stored \"%s\" blob is not a valid static PIN (%zu bytes); ignoring it, "
-                        "so static_pin pairing stays unavailable until one is set again",
-                        persistence_keys::STATIC_PIN, loaded_pin.size());
-            }
-        }
-
-        if (auto config_blob = this->provider_->load_blob(persistence_keys::PAIR_CONFIG)) {
-            std::string_view text(reinterpret_cast<const char*>(config_blob->data()),
-                                  config_blob->size());
-            auto config = decode_pairing_config(text);
-            if (config.has_value()) {
-                this->pairing_psk_enabled_ = config->pairing_psk_enabled;
-                this->unpaired_access_enabled_ = config->unpaired_access_enabled;
-                this->dynamic_pin_enabled_ = config->dynamic_pin_enabled;
-                this->static_pin_enabled_ = config->static_pin_enabled;
-                this->dynamic_pin_min_length_ = config->dynamic_pin_min_length;
-                // Clamp the failure counter into its meaningful range instead of trusting the
-                // blob. Only the >= threshold predicate consumes this value, so saturating at
-                // the threshold is lossless, and it makes record_dynamic_pin_failure()'s
-                // increment unable to overflow (signed overflow is UB) no matter what a corrupt
-                // or hand-edited blob supplies, including a negative value, which would
-                // otherwise read as "not escalated" and undo the durability guarantee that
-                // function documents.
-                this->dynamic_pin_failures_ =
-                    std::clamp(config->dynamic_pin_failures, 0, DYNAMIC_PIN_ESCALATION_THRESHOLD);
-                this->record_mode_psk_id_ = config->record_mode_psk_id;
-                loaded_config = true;
-                SS_LOGD(TAG, "Loaded pairing config: record_mode_psk_id=%s",
-                        this->record_mode_psk_id_.c_str());
-            } else {
-                SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; ignoring",
-                        persistence_keys::PAIR_CONFIG);
-            }
-        }
+        this->load_records_from_provider();
+        this->load_pairing_psk_from_provider();
+        this->load_static_pin_from_provider();
+        loaded_config = this->load_pairing_config_from_provider();
     }
 
+    this->provision_shared_record_if_needed(loaded_config, initial_unpaired_access_enabled);
+    this->provision_pairing_psk_if_needed();
+}
+
+// ============================================================================
+// Construction helpers
+// ============================================================================
+
+void RecordStore::load_records_from_provider() {
+    // Whole-blob decode failure (corrupt bytes, not JSON at all): the codec already skips
+    // individually corrupt entries within an otherwise-valid blob, so this only fires when the
+    // blob itself could not be parsed. Continue with an empty store rather than refusing to
+    // start. load_decode_wipe() logs the warning and wipes the raw blob on both paths; the raw
+    // blob is base64 PSK text (even when it failed to decode), mirroring the save-path wipes in
+    // persist_records_locked() and set_pairing_psk().
+    auto decoded = load_decode_wipe<std::vector<SendspinPairingRecord>>(
+        *this->provider_, persistence_keys::RECORDS, decode_pairing_records,
+        "starting with an empty store");
+    if (decoded.has_value()) {
+        this->records_ = std::move(decoded.value());
+    }
+}
+
+void RecordStore::load_pairing_psk_from_provider() {
+    // Base64 PSK text like the RECORDS blob above; load_decode_wipe() wipes it on both paths.
+    auto decoded = load_decode_wipe<SendspinPairingPsk>(
+        *this->provider_, persistence_keys::PAIRING_PSK, decode_pairing_psk, "ignoring");
+    if (decoded.has_value()) {
+        this->pairing_psk_ = std::move(decoded);
+        // psk_id is a pure function of the PSK, and the server derives it the same way to
+        // reference the key in its handshake. A stored id that disagrees with the secret
+        // (hand-provisioned by an application, or corrupted) would never resolve, so
+        // correct it here rather than advertising a method that cannot complete.
+        std::string derived = psk_id_for(this->pairing_psk_->psk);
+        if (this->pairing_psk_->psk_id != derived) {
+            SS_LOGW(TAG, "Stored Pairing PSK id %s does not match the PSK; using %s",
+                    this->pairing_psk_->psk_id.c_str(), derived.c_str());
+            this->pairing_psk_->psk_id = std::move(derived);
+        }
+    }
+}
+
+void RecordStore::load_static_pin_from_provider() {
+    if (auto pin_blob = this->provider_->load_blob(persistence_keys::STATIC_PIN)) {
+        std::string loaded_pin(reinterpret_cast<const char*>(pin_blob->data()), pin_blob->size());
+        // Validate on load, the same way RECORDS and PAIRING_PSK are validated by their
+        // decoders. The write path (management/set-pairing-config) already checks this, so a
+        // value that fails here came from provider corruption or out-of-band provisioning.
+        // Accepting it would leave the device advertising static_pin while feeding malformed
+        // PRS bytes to the PAKE, which can only ever produce pin_mismatch, a pairing that
+        // deterministically fails with nothing in the logs pointing at storage.
+        if (is_valid_static_pin(loaded_pin)) {
+            this->static_pin_ = std::move(loaded_pin);
+        } else {
+            SS_LOGW(TAG,
+                    "Stored \"%s\" blob is not a valid static PIN (%zu bytes); ignoring it, "
+                    "so static_pin pairing stays unavailable until one is set again",
+                    persistence_keys::STATIC_PIN, loaded_pin.size());
+        }
+    }
+}
+
+bool RecordStore::load_pairing_config_from_provider() {
+    if (auto config_blob = this->provider_->load_blob(persistence_keys::PAIR_CONFIG)) {
+        std::string_view text(reinterpret_cast<const char*>(config_blob->data()),
+                              config_blob->size());
+        auto config = decode_pairing_config(text);
+        if (config.has_value()) {
+            this->pairing_psk_enabled_ = config->pairing_psk_enabled;
+            this->unpaired_access_enabled_ = config->unpaired_access_enabled;
+            this->dynamic_pin_enabled_ = config->dynamic_pin_enabled;
+            this->static_pin_enabled_ = config->static_pin_enabled;
+            this->dynamic_pin_min_length_ = config->dynamic_pin_min_length;
+            // Clamp the failure counter into its meaningful range instead of trusting the
+            // blob. Only the >= threshold predicate consumes this value, so saturating at
+            // the threshold is lossless, and it makes record_dynamic_pin_failure()'s
+            // increment unable to overflow (signed overflow is UB) no matter what a corrupt
+            // or hand-edited blob supplies, including a negative value, which would
+            // otherwise read as "not escalated" and undo the durability guarantee that
+            // function documents.
+            this->dynamic_pin_failures_ =
+                std::clamp(config->dynamic_pin_failures, 0, DYNAMIC_PIN_ESCALATION_THRESHOLD);
+            this->record_mode_psk_id_ = config->record_mode_psk_id;
+            SS_LOGD(TAG, "Loaded pairing config: record_mode_psk_id=%s",
+                    this->record_mode_psk_id_.c_str());
+            return true;
+        }
+        SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; ignoring",
+                persistence_keys::PAIR_CONFIG);
+    }
+    return false;
+}
+
+void RecordStore::provision_shared_record_if_needed(bool loaded_config,
+                                                    bool initial_unpaired_access_enabled) {
     // First-boot seed: the application's configured default for unpaired access applies only on
     // a genuine first boot. A loaded config always wins, so a server that turned unpaired access
     // off through management/set-pairing-config keeps it off across reboots. The value is
@@ -148,9 +184,9 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
     // fails open. loaded_config stays false both when the persistence_keys::PAIR_CONFIG blob was
     // never stored and when it was stored but failed to decode: the provider interface gives no
     // way to distinguish "absent" from "present but unreadable" (load_blob() returns nullopt for
-    // the former; a decode failure on a non-nullopt blob is treated the same way here, see the
-    // constructor's load loop above). Records and config are separate keys, so a provider that
-    // loses only the config blob (independent NVS keys, a torn write) would otherwise re-seed
+    // the former; a decode failure on a non-nullopt blob is treated the same way, see
+    // load_pairing_config_from_provider()). Records and config are separate keys, so a provider
+    // that loses only the config blob (independent NVS keys, a torn write) would otherwise re-seed
     // unpaired access ON for a device that is still paired and had it deliberately turned off.
     // Any surviving provisioned material therefore vetoes the seed: this is a reboot with a
     // damaged config, not a first boot, and the safe default is the restrictive one.
@@ -181,7 +217,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
     // First-boot provisioning: if no config was loaded (or the referenced shared
     // record is missing), generate a fresh shared-PSK fallback record.
     if (!loaded_config || this->record_mode_psk_id_.empty() ||
-        record_by_psk_id(this->record_mode_psk_id_) == nullptr) {
+        this->record_by_psk_id(this->record_mode_psk_id_) == nullptr) {
         SS_LOGD(TAG, "First-boot provisioning: generating shared-PSK fallback record");
 
         std::array<uint8_t, NOISE_PSK_SIZE> shared_psk{};
@@ -233,7 +269,9 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                     shared_psk_id.c_str());
         }
     }
+}
 
+void RecordStore::provision_pairing_psk_if_needed() {
     // Pairing PSK provisioning: pairing_psk is the one pairing method every client must
     // implement (spec "client/hello"), so a client with no Pairing PSK would advertise a method it
     // cannot complete. Generate one when absent and persist it; the operator transfers it to a

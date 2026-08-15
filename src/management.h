@@ -58,6 +58,27 @@ enum class ManagementEffect : uint8_t {
 };
 
 // ============================================================================
+// PSK decode/validate helper
+// ============================================================================
+
+/// @brief Decode a base64url-encoded PSK and validate its length.
+/// Shared by handle_add_record() and handle_set_pairing_config(), which each own their own
+/// context-specific warning log and INVALID handling on failure.
+/// @param b64 The base64url-encoded PSK text.
+/// @return The decoded PSK, or nullopt if decoding failed or the result is not NOISE_PSK_SIZE
+///         bytes.
+inline std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> decode_and_validate_psk(
+    const std::string& b64) {
+    auto decoded = b64url_decode(b64);
+    if (!decoded.has_value() || decoded->size() != NOISE_PSK_SIZE) {
+        return std::nullopt;
+    }
+    std::array<uint8_t, NOISE_PSK_SIZE> arr;
+    std::copy(decoded->begin(), decoded->end(), arr.begin());
+    return arr;
+}
+
+// ============================================================================
 // Handler: server/unpair
 // ============================================================================
 
@@ -134,18 +155,15 @@ inline void handle_add_record(RecordStore& store, const ManagementAddRecordPaylo
         }
     }
 
-    auto psk_decoded = b64url_decode(payload.psk);
-    if (!psk_decoded.has_value() || psk_decoded->size() != NOISE_PSK_SIZE) {
+    auto psk_arr = decode_and_validate_psk(payload.psk);
+    if (!psk_arr.has_value()) {
         SS_LOGW(MGMT_TAG, "add-record: invalid psk (decode failed or wrong size)");
         result.result = ManagementResult::INVALID;
         return;
     }
-    const std::vector<uint8_t>& psk_bytes = psk_decoded.value();
 
     // Compute psk_id and check for duplicates.
-    std::array<uint8_t, NOISE_PSK_SIZE> psk_arr;
-    std::copy(psk_bytes.begin(), psk_bytes.end(), psk_arr.begin());
-    auto psk_id_opt = psk_id_for(psk_arr.data(), psk_arr.size());
+    auto psk_id_opt = psk_id_for(psk_arr->data(), psk_arr->size());
     if (!psk_id_opt.has_value()) {
         result.result = ManagementResult::INVALID;
         return;
@@ -170,7 +188,7 @@ inline void handle_add_record(RecordStore& store, const ManagementAddRecordPaylo
 
     SendspinPairingRecord rec;
     rec.psk_id = psk_id;
-    rec.psk = psk_arr;
+    rec.psk = psk_arr.value();
     rec.server_id = payload.server_id;
     store.store_record(std::move(rec));
 
@@ -334,18 +352,16 @@ inline void handle_set_pairing_config(RecordStore& store,
     // 2. Validate pairing_psk.psk if present.
     std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> new_psk;
     if (payload.pairing_psk.has_value() && payload.pairing_psk->psk.has_value()) {
-        auto decoded_opt = b64url_decode(payload.pairing_psk->psk.value());
-        if (!decoded_opt.has_value() || decoded_opt->size() != NOISE_PSK_SIZE) {
+        auto decoded_arr = decode_and_validate_psk(payload.pairing_psk->psk.value());
+        if (!decoded_arr.has_value()) {
             SS_LOGW(MGMT_TAG, "set-pairing-config: invalid pairing_psk.psk");
             result.result = ManagementResult::INVALID;
             return;
         }
-        std::array<uint8_t, NOISE_PSK_SIZE> arr;
-        std::copy(decoded_opt->begin(), decoded_opt->end(), arr.begin());
         // A psk_id collision with a candidate PSK in a different category (Sentinel or a stored
         // record) would shadow that key at handshake time; reject as already_exists. A collision
         // with the CURRENT Pairing PSK is a no-op rotation and passes.
-        auto psk_id_opt = psk_id_for(arr.data(), arr.size());
+        auto psk_id_opt = psk_id_for(decoded_arr->data(), decoded_arr->size());
         if (psk_id_opt.has_value()) {
             auto resolved = store.resolve_by_psk_id(psk_id_opt.value());
             if (resolved.has_value() && resolved->category != PskCategory::PAIRING) {
@@ -356,7 +372,7 @@ inline void handle_set_pairing_config(RecordStore& store,
                 return;
             }
         }
-        new_psk = arr;
+        new_psk = decoded_arr;
     }
 
     // 3. Validate static_pin.pin if present: exactly 8 decimal digits.
