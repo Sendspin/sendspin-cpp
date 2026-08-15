@@ -1814,15 +1814,14 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
                 server_id.c_str());
         // Send pair/abort(method_not_supported): closest reason for "cannot proceed".
         // method_not_supported is used as the error path here because there is no distinct
-        // "store unavailable" reason in the protocol.
-        conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED),
-                            nullptr);
-        conn->clear_pairing_state();
-        // Close the connection: pairing cannot proceed. drop_connection() handles both the
-        // current-slot cleanup (cleanup_connection_state, which also resets the time burst) and
-        // the deferred goodbye+release; flush_deferred_releases() runs at the end of the caller's
-        // locked block.
-        this->drop_connection(conn, SendspinGoodbyeReason::UNAUTHORIZED);
+        // "store unavailable" reason in the protocol. abort_pairing_attempt() also queues
+        // note_pairing_failed() and drops the connection (drop_connection() handles both the
+        // current-slot cleanup, which also resets the time burst, and the deferred
+        // goodbye+release; flush_deferred_releases() runs at the end of the caller's locked
+        // block), matching every other pairing-failure path in this file.
+        this->abort_pairing_attempt(conn, PairAbortReason::METHOD_NOT_SUPPORTED,
+                                    /*should_drop=*/true, SendspinGoodbyeReason::UNAUTHORIZED,
+                                    SendspinPairAbortReason::METHOD_NOT_SUPPORTED);
         return;
     }
 
