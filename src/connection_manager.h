@@ -448,6 +448,16 @@ private:
     /// @param ev Drained events from swap_out_pending_events(); consumed in place.
     void drain_lifecycle_events(DrainedEvents& ev);
 
+    /// @brief Applies one server/activate event: trust enforcement, pairing_index bump,
+    /// pairing-method admissibility, pin_length validation, then applies the activate's state
+    /// and dispatches (arbitration for a nursery entry, or the already-admitted-connection
+    /// branches: leftover-pairing cleanup, first-activate handshake completion, or entering
+    /// pairing on a subsequent activate). No-op if event.conn is null, or if the connection is
+    /// neither in the nursery nor the current connection (already released by an earlier event
+    /// in the same loop() pass). Caller must hold conn_ptr_mutex_.
+    /// @param event The server/activate event to process.
+    void process_activate_event(ServerActivateEvent& event);
+
     /// @brief Applies pair/abort events, then dynamic-PIN pairing events, then
     /// pairing-succeeded events, then pairing storage-failure events, then a pairing-window
     /// confirm, in that order. Caller must hold conn_ptr_mutex_.
@@ -712,6 +722,22 @@ private:
     /// @param conn The connection entering pairing.
     void handle_enter_pairing(SendspinConnection* conn);
 
+    /// @brief Runs the dynamic-PIN or static-PIN branch of handle_enter_pairing(): populates the
+    /// PinSession, applies gesture gating (spec "Pairing Window"), and either sends
+    /// client/pair-pending and waits for a window, or starts the attempt immediately.
+    /// @param conn The connection entering pairing.
+    /// @param pairing_index Current pairing_index counter, captured by handle_enter_pairing().
+    /// @param server_id conn->get_server_id(), captured by handle_enter_pairing().
+    /// @param selected_method The selected method; DYNAMIC_PIN or STATIC_PIN.
+    void handle_enter_pairing_pin(SendspinConnection* conn, uint32_t pairing_index,
+                                  const std::string& server_id, SendspinPairMethod selected_method);
+
+    /// @brief Runs the Pairing-PSK branch of handle_enter_pairing(): resolves the pairing outcome
+    /// and sends client/pair-finalize with the long-term PSK in the clear.
+    /// @param conn The connection entering pairing.
+    /// @param server_id conn->get_server_id(), captured by handle_enter_pairing().
+    void handle_enter_pairing_psk(SendspinConnection* conn, const std::string& server_id);
+
     /// @brief Handles a pair/abort event on the main loop.
     /// Cleans up pairing state. Per spec "pair/abort", only closes the connection for reason
     /// concurrent_attempt; every other reason leaves it open. A pair/abort that arrives after the
@@ -776,6 +802,27 @@ private:
     /// @param event The parsed server PIN pairing message.
     void handle_pin_pairing_message(SendspinConnection* conn,
                                     const ServerPairingMessageEvent& event);
+
+    /// @brief Handles PinPairingMessageKind::PAIR_INIT: derives the PIN, displays it, and starts
+    /// CPace as RESPONDER. Dynamic-PIN only; a PAIR_INIT while ps.method == STATIC_PIN is a
+    /// wrong-step protocol violation.
+    /// @param conn The connection that received the message.
+    /// @param event The parsed server PIN pairing message; nonce_a is used here.
+    void handle_pair_init(SendspinConnection* conn, const ServerPairingMessageEvent& event);
+
+    /// @brief Handles PinPairingMessageKind::PAIR_AUTH: sends client/pair-auth (pake_msg_2), then
+    /// derives the MAC key from the server's share (pake_msg_1). A derive failure is a spec
+    /// Protocol Errors close (no pair/abort, no failure-counter increment), not a PIN mismatch.
+    /// @param conn The connection that received the message.
+    /// @param event The parsed server PIN pairing message; pake_msg_1 is used here.
+    void handle_pair_auth(SendspinConnection* conn, const ServerPairingMessageEvent& event);
+
+    /// @brief Handles PinPairingMessageKind::PAIR_CONFIRM: verifies server_kc (updating the
+    /// dynamic-PIN failure counter), sends client/pair-confirm, resolves the pairing outcome, and
+    /// sends the CPace-wrapped client/pair-finalize.
+    /// @param conn The connection that received the message.
+    /// @param event The parsed server PIN pairing message; server_kc is used here.
+    void handle_pair_confirm(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
     /// @brief Abort the current PIN-pairing session: send pair/abort, notify, and close the
     /// connection only for reason concurrent_attempt (spec "pair/abort"; every other reason leaves
