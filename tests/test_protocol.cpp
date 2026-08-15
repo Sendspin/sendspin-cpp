@@ -763,7 +763,7 @@ TEST(Protocol, ClientHelloNoClientIdOrVersion) {
 TEST(Protocol, ClientHelloTrustLevelNone) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
-    msg.trust_level = "none";
+    msg.trust_level = ConnectionTrust::NONE;
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
@@ -773,7 +773,7 @@ TEST(Protocol, ClientHelloTrustLevelNone) {
 TEST(Protocol, ClientHelloTrustLevelUser) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
-    msg.trust_level = "user";
+    msg.trust_level = ConnectionTrust::USER;
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));

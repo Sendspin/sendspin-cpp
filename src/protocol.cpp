@@ -924,7 +924,7 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             root["payload"]["device_info"]["mac_address"] = info.mac_address.value();
         }
     }
-    root["payload"]["trust_level"] = msg->trust_level;
+    root["payload"]["trust_level"] = to_cstr(msg->trust_level);
     // supported_pair_methods is REQUIRED on the wire (spec "client/hello": every client implements
     // at least pairing_psk, so the field can never be legitimately absent). Always emit the array,
     // even if empty in a degenerate configuration with every method disabled.

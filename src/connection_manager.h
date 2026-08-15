@@ -101,6 +101,13 @@ struct DeferredRelease {
     std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: transport gone, just release
 };
 
+/// @brief Disposition for the connection once abort_pairing_attempt() ends a pairing attempt.
+enum class PairingDropAction : uint8_t {
+    KEEP_OPEN,           ///< Leave the connection open.
+    CLOSE_SILENTLY,      ///< Drop the connection; no client/goodbye is sent.
+    CLOSE_WITH_GOODBYE,  ///< Drop the connection, sending client/goodbye first.
+};
+
 /// @brief Deferred pair/abort event: the server (or wire) sent pair/abort during pairing.
 /// Processed on the main loop in ConnectionManager::loop().
 /// (The server/pair-finalize ack is committed synchronously on the network thread, and the
@@ -767,30 +774,30 @@ private:
     /// Captures the PIN-display / pairing-window flags before clear_pairing_state() resets
     /// them, optionally sends a wire pair/abort, clears the pairing state, optionally drops the
     /// connection, then queues on_pairing_failed and dismisses any pairing UI left showing (via
-    /// dismiss_pairing_ui()). When `should_drop` is true, drop_connection() -> the current-slot
-    /// cleanup runs before the note_* calls, matching the ordering every call site needs (the
-    /// pending-notification vectors it clears must not race the queue pushes below). Caller must
-    /// hold conn_ptr_mutex_; `conn` must be non-null.
+    /// dismiss_pairing_ui()). When `drop_action` is not KEEP_OPEN, drop_connection() -> the
+    /// current-slot cleanup runs before the note_* calls, matching the ordering every call site
+    /// needs (the pending-notification vectors it clears must not race the queue pushes below).
+    /// Caller must hold conn_ptr_mutex_; `conn` must be non-null.
     ///
     /// @param conn               Connection whose pairing attempt is ending. Must be non-null.
     /// @param wire_abort_reason  If set, sends pair/abort(wire_abort_reason) to the peer first
     ///        (best-effort). Leave nullopt when the abort was received from the peer, or when
     ///        the spec's Protocol Errors handling forbids sending one.
-    /// @param should_drop        If true, the connection is dropped via drop_connection() using
-    ///        drop_goodbye_reason. If false, drop_goodbye_reason is ignored and the connection is
-    ///        left open.
-    /// @param drop_goodbye_reason Goodbye reason passed to drop_connection() when should_drop is
-    ///        true; nullopt closes the transport without sending a client/goodbye.
+    /// @param drop_action        Whether/how the connection is closed. KEEP_OPEN leaves it open.
+    ///        CLOSE_SILENTLY drops it via drop_connection() without a client/goodbye.
+    ///        CLOSE_WITH_GOODBYE drops it via drop_connection() using goodbye_reason.
     /// @param public_reason      Reason delivered to the application via on_pairing_failed.
+    /// @param goodbye_reason     Goodbye reason passed to drop_connection() when drop_action is
+    ///        CLOSE_WITH_GOODBYE; read only then, so callers for the other actions omit it.
     /// @param server_id_override When set, passed to on_pairing_failed instead of
     ///        conn->get_server_id(). Only handle_pair_storage_failed() needs this: it fires from
     ///        an event captured at production time (see its own comment for why), not from the
     ///        connection's current state.
-    void abort_pairing_attempt(SendspinConnection* conn,
-                               std::optional<PairAbortReason> wire_abort_reason, bool should_drop,
-                               std::optional<SendspinGoodbyeReason> drop_goodbye_reason,
-                               SendspinPairAbortReason public_reason,
-                               std::optional<std::string> server_id_override = std::nullopt);
+    void abort_pairing_attempt(
+        SendspinConnection* conn, std::optional<PairAbortReason> wire_abort_reason,
+        PairingDropAction drop_action, SendspinPairAbortReason public_reason,
+        SendspinGoodbyeReason goodbye_reason = SendspinGoodbyeReason::UNAUTHORIZED,
+        std::optional<std::string> server_id_override = std::nullopt);
 
     // ========================================
     // Dynamic-PIN pairing main-loop handlers

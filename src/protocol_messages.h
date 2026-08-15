@@ -370,6 +370,16 @@ inline std::optional<SendspinPlaybackState> playback_state_from_string(const std
     return std::nullopt;
 }
 
+inline const char* to_cstr(ConnectionTrust trust) {
+    switch (trust) {
+        case ConnectionTrust::USER:
+            return "user";
+        case ConnectionTrust::NONE:
+        default:
+            return "none";
+    }
+}
+
 /// @brief Optional hardware and software identity fields sent in client/hello messages
 struct DeviceInfoObject {
     std::optional<std::string> product_name{};
@@ -938,7 +948,7 @@ struct ClientHelloMessage {
     std::optional<PlayerSupportObject> player_v1_support{};
     std::optional<ArtworkSupportObject> artwork_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
-    std::string trust_level{"none"};  // "none" or "user"
+    ConnectionTrust trust_level{ConnectionTrust::NONE};
     bool unpaired_access_enabled{false};
     std::vector<PairMethodDescriptor> supported_pair_methods{};
 };

@@ -1809,9 +1809,9 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn,
         // current-slot cleanup, which also resets the time burst, and the deferred
         // goodbye+release; flush_deferred_releases() runs at the end of the caller's locked
         // block), matching every other pairing-failure path in this file.
-        this->abort_pairing_attempt(conn, PairAbortReason::METHOD_NOT_SUPPORTED,
-                                    /*should_drop=*/true, SendspinGoodbyeReason::UNAUTHORIZED,
-                                    SendspinPairAbortReason::METHOD_NOT_SUPPORTED);
+        this->abort_pairing_attempt(
+            conn, PairAbortReason::METHOD_NOT_SUPPORTED, PairingDropAction::CLOSE_WITH_GOODBYE,
+            SendspinPairAbortReason::METHOD_NOT_SUPPORTED, SendspinGoodbyeReason::UNAUTHORIZED);
         return;
     }
 
@@ -1856,10 +1856,11 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
     // mirror that here: only concurrent_attempt drops the connection on our side too (the server,
     // as sender, is closing its side regardless; closing here just avoids waiting on the TCP
     // teardown). No wire pair/abort is sent: this one already arrived from the server.
-    this->abort_pairing_attempt(conn, /*wire_abort_reason=*/std::nullopt,
-                                /*should_drop=*/reason == PairAbortReason::CONCURRENT_ATTEMPT,
-                                SendspinGoodbyeReason::CONCURRENT_ATTEMPT,
-                                to_public_abort_reason(reason));
+    this->abort_pairing_attempt(
+        conn, /*wire_abort_reason=*/std::nullopt,
+        reason == PairAbortReason::CONCURRENT_ATTEMPT ? PairingDropAction::CLOSE_WITH_GOODBYE
+                                                      : PairingDropAction::KEEP_OPEN,
+        to_public_abort_reason(reason), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
 }
 
 void ConnectionManager::handle_pair_storage_failed(const PairStorageFailedEvent& event) {
@@ -1888,8 +1889,9 @@ void ConnectionManager::handle_pair_storage_failed(const PairStorageFailedEvent&
         // production-time server_id used below on the no-match path, so the listener sees the
         // same value regardless of which branch handled the event.
         this->abort_pairing_attempt(event.conn.get(), PairAbortReason::USER_CANCELLED,
-                                    /*should_drop=*/true, SendspinGoodbyeReason::UNAUTHORIZED,
-                                    SendspinPairAbortReason::STORAGE_FAILED, event.server_id);
+                                    PairingDropAction::CLOSE_WITH_GOODBYE,
+                                    SendspinPairAbortReason::STORAGE_FAILED,
+                                    SendspinGoodbyeReason::UNAUTHORIZED, event.server_id);
         return;
     }
 
@@ -1911,10 +1913,12 @@ void ConnectionManager::dismiss_pairing_ui(bool pin_was_displayed, bool window_w
     }
 }
 
-void ConnectionManager::abort_pairing_attempt(
-    SendspinConnection* conn, std::optional<PairAbortReason> wire_abort_reason, bool should_drop,
-    std::optional<SendspinGoodbyeReason> drop_goodbye_reason, SendspinPairAbortReason public_reason,
-    std::optional<std::string> server_id_override) {
+void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
+                                              std::optional<PairAbortReason> wire_abort_reason,
+                                              PairingDropAction drop_action,
+                                              SendspinPairAbortReason public_reason,
+                                              SendspinGoodbyeReason goodbye_reason,
+                                              std::optional<std::string> server_id_override) {
     // Runs on the main loop (caller holds conn_ptr_mutex_).
     //
     // Capture the deferred-notification inputs BEFORE clear_pairing_state() resets the PIN
@@ -1933,7 +1937,11 @@ void ConnectionManager::abort_pairing_attempt(
     // On the current-slot path drop_connection() -> cleanup_connection_state() clears the
     // pending pairing-note queue, so the note_* calls below MUST come after it.
     conn->clear_pairing_state();
-    if (should_drop) {
+    if (drop_action != PairingDropAction::KEEP_OPEN) {
+        const std::optional<SendspinGoodbyeReason> drop_goodbye_reason =
+            drop_action == PairingDropAction::CLOSE_WITH_GOODBYE
+                ? std::optional<SendspinGoodbyeReason>(goodbye_reason)
+                : std::nullopt;
         this->drop_connection(conn, drop_goodbye_reason);
     }
 
@@ -1966,10 +1974,11 @@ void ConnectionManager::local_abort_pin_pairing(SendspinConnection* conn, PairAb
             to_cstr(reason));
 
     // Best-effort pair/abort to the server (the connection is still live here).
-    this->abort_pairing_attempt(conn, reason,
-                                /*should_drop=*/reason == PairAbortReason::CONCURRENT_ATTEMPT,
-                                SendspinGoodbyeReason::CONCURRENT_ATTEMPT,
-                                to_public_abort_reason(reason));
+    this->abort_pairing_attempt(
+        conn, reason,
+        reason == PairAbortReason::CONCURRENT_ATTEMPT ? PairingDropAction::CLOSE_WITH_GOODBYE
+                                                      : PairingDropAction::KEEP_OPEN,
+        to_public_abort_reason(reason), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
 }
 
 // ============================================================================
@@ -2126,7 +2135,7 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
             // send pair/abort and must close unconditionally, so it cannot route through
             // local_abort_pin_pairing() (which always sends pair/abort and only closes for
             // concurrent_attempt); it calls abort_pairing_attempt() directly instead, with no
-            // wire_abort_reason and should_drop forced true.
+            // wire_abort_reason and drop_action forced CLOSE_SILENTLY.
             SS_LOGW(TAG,
                     "handle_pin_pairing_message: malformed pairing frame during PIN pairing for "
                     "server_id=%s; closing per spec Protocol Errors (no pair/abort sent)",
@@ -2139,7 +2148,7 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
             // here as the closest available local-only fit, mirroring how STORAGE_FAILED is
             // reused for the other client-local abort (see handle_pair_storage_failed()).
             this->abort_pairing_attempt(conn, /*wire_abort_reason=*/std::nullopt,
-                                        /*should_drop=*/true, /*drop_goodbye_reason=*/std::nullopt,
+                                        PairingDropAction::CLOSE_SILENTLY,
                                         SendspinPairAbortReason::UNKNOWN);
             break;
         }
@@ -2249,8 +2258,7 @@ void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
         // reused here as the closest available local-only fit, matching the MALFORMED
         // case below.
         this->abort_pairing_attempt(conn, /*wire_abort_reason=*/std::nullopt,
-                                    /*should_drop=*/true,
-                                    /*drop_goodbye_reason=*/std::nullopt,
+                                    PairingDropAction::CLOSE_SILENTLY,
                                     SendspinPairAbortReason::UNKNOWN);
         return;
     }
