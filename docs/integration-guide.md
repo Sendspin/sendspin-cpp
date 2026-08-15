@@ -95,7 +95,9 @@ The stream parameters negotiated by the server are available via `get_current_st
 | `bit_depth` | `std::optional<uint8_t>` | Bits per sample |
 | `codec_header` | `std::optional<std::string>` | Codec-specific header data |
 
-Call `is_complete()` on the object to check if all fields have values.
+Call `is_complete()` on the object to check that `codec`, `sample_rate`, `channels`, and
+`bit_depth` all have values. `codec_header` is not part of that check, so it can still be
+`nullopt` when `is_complete()` returns true.
 
 ### Controller Role (Playback Commands)
 
@@ -165,7 +167,8 @@ auto& color = client.add_color();
 
 ### PlayerRoleListener (Required if Using Player Role)
 
-The `on_audio_write` method is the only pure virtual (required) method in the entire library.
+The `on_audio_write` method is one of only two pure virtual (required) methods in the library;
+the other is `SendspinNetworkProvider::is_network_ready()`.
 
 ```cpp
 struct MyPlayerListener : PlayerRoleListener {
@@ -586,13 +589,15 @@ struct MyClientListener : SendspinClientListener {
         printf("Pairing succeeded with server %s\n", server_id.c_str());
     }
 
-    // Called when a pairing exchange is aborted. The connection is closed immediately
-    // after this callback.
+    // Called when a pairing exchange is aborted. The connection usually stays open so the
+    // server can retry or resume normal operation; only CONCURRENT_ATTEMPT and the
+    // client-local STORAGE_FAILED close it.
     void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
         printf("Pairing failed with server %s\n", server_id.c_str());
     }
 
-    // Called once per admitted connection after the Noise handshake completes.
+    // Called after the Noise handshake completes, and again after each successful
+    // re-handshake (notably the post-pairing rekey).
     // trust reflects the PSK category used:
     //   ConnectionTrust::USER  -- long-term pairing record (paired server)
     //   ConnectionTrust::NONE  -- Sentinel or Pairing PSK (unpaired access)
@@ -702,9 +707,14 @@ observes pairing via `SendspinClientListener` callbacks:
 1. `on_pairing_started(server_id)` -- the exchange has begun.
 2. `on_pairing_succeeded(server_id)` -- the record is stored; the server will
    re-handshake immediately on the new long-term PSK.
-3. `on_pairing_failed(server_id, reason)` -- the exchange failed; connection closed. See
+3. `on_pairing_failed(server_id, reason)` -- the exchange failed. See
    `SendspinPairAbortReason` below for the possible reasons, including the client-local
    `STORAGE_FAILED` case (the persistence provider rejected the record).
+
+   Most failures leave the connection open, so the server can re-activate pairing or resume
+   normal operation on it. Only `CONCURRENT_ATTEMPT` and the client-local `STORAGE_FAILED`
+   close the connection, so do not treat this callback as a disconnect notification;
+   poll `is_connected()` if the application needs to track that.
 
 #### Pairing PSK
 
@@ -731,7 +741,11 @@ the codec so it round-trips through the library's own loader:
 SendspinPairingPsk psk;
 // 32 raw bytes distributed out-of-band during provisioning
 psk.psk = { /* ... */ };
-psk.psk_id = "";  // derived from psk by the library; any value here is ignored
+// psk_id must be non-empty: the codec writes it verbatim and the loader rejects a blob whose
+// psk_id is empty, discarding the pinned key and provisioning a random one in its place. The
+// value need not be correct (the library recomputes it from the PSK and logs a warning on a
+// mismatch), but a placeholder must be present.
+psk.psk_id = "provisioned";
 std::string blob = encode_pairing_psk(psk);  // sendspin/persistence_codec.h
 persistence_provider.save_blob(persistence_keys::PAIRING_PSK,
                                 reinterpret_cast<const uint8_t*>(blob.data()), blob.size());
@@ -780,12 +794,31 @@ counter.
 
 | Value | PSK used | Meaning |
 |-------|---------|---------|
-| `ConnectionTrust::USER` | Long-term pairing record | Server has been paired with this client |
+| `ConnectionTrust::USER` | Long-term record | Server holds a stored record (see Record Mode below) |
 | `ConnectionTrust::NONE` | Sentinel or Pairing PSK | Unpaired access |
 
-`on_trust_changed` fires once per admitted connection, after `server/activate` is
-processed and the connection is promoted to current. Connections that are rejected
-(e.g., missing record when unpaired access is disabled) do not fire this callback.
+`on_trust_changed` fires after `server/activate` is processed and the connection is promoted
+to current, and again after each successful in-band re-handshake on that same connection.
+Pairing an already-connected server therefore delivers the callback twice: once with
+`ConnectionTrust::NONE` at admission, then again with `ConnectionTrust::USER` once the
+post-pairing rekey completes. Connections that are rejected (e.g., missing record when
+unpaired access is disabled) do not fire this callback.
+
+#### Record Mode
+
+`ConnectionTrust::USER` means the server presented a PSK matching a stored record. That is
+usually a record minted for it during pairing, but it is not always a per-server record.
+
+The client provisions one **shared-PSK fallback record** on first boot, before any pairing has
+happened. When the record store is full (`max_pairing_records`, default 12) and a new server
+pairs, the client hands that server the shared record's PSK instead of minting a new record.
+The protocol models this deliberately: `management/get-pairing-config` reports it as
+`record_mode`, and storage accounting distinguishes `cost_individual` from `cost_shared`.
+
+Servers holding the shared record are therefore indistinguishable from each other, and each
+gets `ConnectionTrust::USER` with the same `{playback, management}` rights as a
+per-server-paired server. Raise `max_pairing_records` if a deployment needs every server to
+have its own record.
 
 ### Unpaired Access
 
@@ -937,7 +970,7 @@ The client and roles expose query methods for polling state in your main loop or
 bool connected = client.is_connected();       // Active connection with completed handshake
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
 const GroupUpdateObject& group = client.get_group_state();   // Group id, name, playback state (all optional)
-ConnectionTrust trust = client.get_current_trust();          // Active connection's trust; NONE when disconnected
+ConnectionTrust trust = client.get_current_trust();          // Active connection's trust; NONE when no connection is active or the handshake has not completed
 
 // Player state
 uint8_t vol = player.get_volume();
@@ -1195,9 +1228,11 @@ Configuration passed to `client.add_visualizer()`.
 | Value | Description |
 |---|---|
 | `NONE` | Sentinel or Pairing PSK was used; this server has not been paired |
-| `USER` | Long-term pairing record matched; this server is paired |
+| `USER` | Long-term record matched; the server is paired, or holds the shared-PSK record |
 
-Reported via `SendspinClientListener::on_trust_changed` once per admitted connection.
+Reported via `SendspinClientListener::on_trust_changed` on admission and again after each
+successful in-band re-handshake. See [Trust Levels](#trust-levels) and
+[Record Mode](#record-mode).
 
 ### SendspinPairAbortReason
 
