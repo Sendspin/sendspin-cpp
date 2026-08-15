@@ -589,9 +589,10 @@ struct MyClientListener : SendspinClientListener {
         printf("Pairing succeeded with server %s\n", server_id.c_str());
     }
 
-    // Called when a pairing exchange is aborted. The connection usually stays open so the
-    // server can retry or resume normal operation; only CONCURRENT_ATTEMPT and the
-    // client-local STORAGE_FAILED close it.
+    // Called when a pairing exchange is aborted. Most server-sent abort reasons leave the
+    // connection open so the server can retry or resume normal operation; CONCURRENT_ATTEMPT
+    // and the client-local aborts (STORAGE_FAILED, and protocol errors reported as UNKNOWN)
+    // close it.
     void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
         printf("Pairing failed with server %s\n", server_id.c_str());
     }
@@ -712,10 +713,14 @@ observes pairing via `SendspinClientListener` callbacks:
    `SendspinPairAbortReason` below for the possible reasons, including the client-local
    `STORAGE_FAILED` case (the persistence provider rejected the record).
 
-   Most failures leave the connection open, so the server can re-activate pairing or resume
-   normal operation on it. Only `CONCURRENT_ATTEMPT` and the client-local `STORAGE_FAILED`
-   close the connection, so do not treat this callback as a disconnect notification;
-   poll `is_connected()` if the application needs to track that.
+   Whether the connection survives depends on the reason. Most reasons the server sends in a
+   `pair/abort` leave it open, so the server can re-activate pairing or resume normal operation
+   on it. `CONCURRENT_ATTEMPT` closes it, as do the client-local aborts: `STORAGE_FAILED`, and
+   protocol errors (a malformed pairing frame or a bad CPace share), which are reported as
+   `UNKNOWN` and close the transport without sending a `client/goodbye`.
+
+   Either way, do not treat this callback as a disconnect notification; poll `is_connected()`
+   if the application needs to track that.
 
 #### Pairing PSK
 
