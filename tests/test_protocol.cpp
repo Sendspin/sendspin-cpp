@@ -1220,22 +1220,6 @@ TEST(Protocol, FormatPairAbortWireShape) {
     }
 }
 
-// process_server_pair_finalize_message: accepts the empty payload ack.
-TEST(Protocol, ServerPairFinalizeAck) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"server/pair-finalize","payload":{}})", doc, root));
-    EXPECT_TRUE(process_server_pair_finalize_message(root));
-}
-
-// process_server_pair_finalize_message: accepts minimal envelope (no payload key).
-TEST(Protocol, ServerPairFinalizeMinimalEnvelope) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"server/pair-finalize"})", doc, root));
-    EXPECT_TRUE(process_server_pair_finalize_message(root));
-}
-
 // process_pair_abort_message: round-trips every PairAbortReason.
 TEST(Protocol, PairAbortMessageParseRoundTrip) {
     const PairAbortReason reasons[] = {

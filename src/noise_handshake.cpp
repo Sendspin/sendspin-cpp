@@ -42,7 +42,7 @@ static std::string serialize_client_init(const std::string& client_id,
     // wire value is the suffix after "Noise_KKpsk2_" (session.py NoiseCipherSuite.value). Strip
     // that prefix to produce the wire suite string.
     static constexpr const char* PREFIX = "Noise_KKpsk2_";
-    const size_t PREFIX_LEN = 13;
+    constexpr size_t PREFIX_LEN = std::char_traits<char>::length(PREFIX);
     std::string wire_suite = suite_name;
     if (wire_suite.size() > PREFIX_LEN && wire_suite.substr(0, PREFIX_LEN) == PREFIX) {
         wire_suite = wire_suite.substr(PREFIX_LEN);

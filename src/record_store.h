@@ -32,6 +32,7 @@
 #pragma once
 
 #include "crypto/constants.h"
+#include "crypto/pin.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 
@@ -160,16 +161,6 @@ public:
     /// Shared-PSK records (server_id absent) are never returned here.
     [[nodiscard]] const SendspinPairingRecord* record_by_server_id(
         const std::string& server_id) const;
-
-    /// @brief Return all long-term records (includes the shared fallback).
-    /// Main-loop-only: the reference is invalidated by any concurrent mutation.
-    // cppcheck-suppress unusedFunction
-    // Public accessor, not currently called by this repo's own sources or tests; kept for
-    // consumers that need main-loop-thread, zero-copy record access (records_snapshot() below
-    // is the thread-safe copying alternative already used internally).
-    [[nodiscard]] const std::vector<SendspinPairingRecord>& records() const {
-        return this->records_;
-    }
 
     /// @brief Return a locked copy of all long-term records (thread-safe).
     /// Safe to call from any thread; iterates under mutex_ so the copy is consistent.
@@ -483,7 +474,13 @@ private:
     /// Dynamic-PIN failure counter (persisted through SendspinPairingConfig so escalation
     /// survives reboots). static_pin has no counter: it is gesture-gated on every attempt.
     int dynamic_pin_failures_{0};
-    int dynamic_pin_min_length_{6};
+    int dynamic_pin_min_length_{PIN_DEFAULT_MIN_DIGITS};
+    // include/sendspin/config.h's SendspinPairingConfig::dynamic_pin_min_length hardcodes this
+    // same default as a literal (a public header cannot include this private one); keep the two
+    // in sync manually and let this assert catch drift.
+    static_assert(PIN_DEFAULT_MIN_DIGITS == 6,
+                  "update SendspinPairingConfig::dynamic_pin_min_length's default in "
+                  "include/sendspin/config.h to match");
 
     // 8-bit fields
     bool dynamic_pin_enabled_{true};

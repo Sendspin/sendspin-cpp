@@ -1296,14 +1296,6 @@ std::string format_pair_abort_message(PairAbortReason reason) {
     return output;
 }
 
-bool process_server_pair_finalize_message(JsonObject root) {
-    if (!root["type"].is<const char*>()) {
-        SS_LOGE(TAG, "process_server_pair_finalize_message: missing type field");
-        return false;
-    }
-    return true;
-}
-
 bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
     if (!root["payload"]["reason"].is<const char*>()) {
         SS_LOGE(TAG, "Invalid pair/abort message: missing reason");

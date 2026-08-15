@@ -185,13 +185,6 @@ inline Fp fp_reduce_full(const Fp& a) {
     return fp_reduce(fp_reduce(a));
 }
 
-// Overload accepting an explicit carry argument for the fp_mul/fp_scale call sites; the
-// carry must already be folded in there, leaving a value in [0, 2^256) that needs the
-// two-pass reduction.
-inline Fp fp_reduce(const Fp& a, uint64_t /*top_carry_must_be_folded_in*/) {
-    return fp_reduce_full(a);
-}
-
 // ============================================================================
 // Montgomery-free 256-bit mod-p multiplication using schoolbook 128-bit math.
 //
@@ -267,8 +260,8 @@ inline Fp fp_mul(const Fp& a, const Fp& b) {
     }
 
     // Pass 2: fully reduce. The folded value is only bounded by 2^256 (= 2p + 38), not by
-    // 2p, so this needs the two-subtraction reduce; see fp_reduce_full().
-    return fp_reduce(r, 0);
+    // 2p, so this needs the two-subtraction reduce.
+    return fp_reduce_full(r);
 }
 
 /// @brief Modular addition: (a + b) mod p.
@@ -362,7 +355,7 @@ inline Fp fp_scale(const Fp& a, uint64_t s) {
             r.limbs[0] = r.limbs[0] + 38ULL;
         }
     }
-    return fp_reduce(r, 0);
+    return fp_reduce_full(r);
 }
 
 }  // namespace field25519

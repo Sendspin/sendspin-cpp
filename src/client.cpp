@@ -1245,69 +1245,66 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
             // that PSK against the RecordStore. The record must therefore be stored before this
             // handler returns, else the re-handshake sees an unknown psk_id and aborts.
             // RecordStore is thread-safe (its mutators lock).
+            // The payload is spec'd as empty; the message-type dispatch above is the only
+            // validation this message needs.
             if (conn != nullptr) {
-                if (process_server_pair_finalize_message(root)) {
-                    auto record = conn->take_pending_pairing_record();
-                    bool stored_record = false;
-                    bool persist_failed = false;
-                    if (record.has_value() && this->record_store_ != nullptr) {
-                        const std::string psk_id = record->psk_id;
-                        // store_record_superseding() persists to the provider before mutating
-                        // in-memory state and fails closed: a provider rejection (full storage,
-                        // write error) must not be reported as a successful pairing, else
-                        // on_pairing_succeeded fires and the re-handshake watchdog re-arms for a
-                        // PSK the client never actually retained. The server will rekey onto
-                        // this PSK regardless (it already acked pair-finalize); since the client
-                        // does not have it, the follow-up re-handshake will fail to resolve the
-                        // psk_id and the connection would otherwise dangle waiting for a
-                        // watchdog. schedule_pair_storage_failed() below aborts it explicitly
-                        // instead.
-                        //
-                        // The superseding form is correct here and only here: this PSK replaces
-                        // whatever this server held before, so the prior record for the same
-                        // server_id must be retired or the old PSK stays valid forever.
-                        // management/add-record deliberately uses the plain store_record().
-                        if (this->record_store_->store_record_superseding(
-                                std::move(record.value()))) {
-                            SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
-                                    psk_id.c_str());
-                            stored_record = true;
-                        } else {
-                            SS_LOGW(TAG,
-                                    "server/pair-finalize: failed to persist pairing record "
-                                    "(psk_id=%s); aborting pairing",
-                                    psk_id.c_str());
-                            persist_failed = true;
-                        }
+                auto record = conn->take_pending_pairing_record();
+                bool stored_record = false;
+                bool persist_failed = false;
+                if (record.has_value() && this->record_store_ != nullptr) {
+                    const std::string psk_id = record->psk_id;
+                    // store_record_superseding() persists to the provider before mutating
+                    // in-memory state and fails closed: a provider rejection (full storage,
+                    // write error) must not be reported as a successful pairing, else
+                    // on_pairing_succeeded fires and the re-handshake watchdog re-arms for a
+                    // PSK the client never actually retained. The server will rekey onto
+                    // this PSK regardless (it already acked pair-finalize); since the client
+                    // does not have it, the follow-up re-handshake will fail to resolve the
+                    // psk_id and the connection would otherwise dangle waiting for a
+                    // watchdog. schedule_pair_storage_failed() below aborts it explicitly
+                    // instead.
+                    //
+                    // The superseding form is correct here and only here: this PSK replaces
+                    // whatever this server held before, so the prior record for the same
+                    // server_id must be retired or the old PSK stays valid forever.
+                    // management/add-record deliberately uses the plain store_record().
+                    if (this->record_store_->store_record_superseding(std::move(record.value()))) {
+                        SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
+                                psk_id.c_str());
+                        stored_record = true;
                     } else {
-                        SS_LOGI(TAG, "server/pair-finalize: no record to store "
-                                     "(shared-PSK fallback or no pending pairing)");
-                    }
-                    if (persist_failed) {
-                        // The persistence provider rejected the record, so it was never stored
-                        // (store_record fails closed) and this pairing could not survive a
-                        // reboot. Defer the local abort (pair/abort + drop + on_pairing_failed
-                        // with STORAGE_FAILED) to the main loop via the same pending_*_events_ /
-                        // has_pending_events_ idiom every other cross-thread connection-state
-                        // mutation in ConnectionManager uses. No note_pairing_finalize_ack() here:
-                        // the connection is being aborted, not kept alive to await a re-handshake.
-                        this->connection_manager_->schedule_pair_storage_failed(
-                            {conn->shared_from_this(), conn->get_server_id()});
-                    } else {
-                        // Defer on_pairing_succeeded to the main loop via the same
-                        // pending_*_events_ / has_pending_events_ idiom every other cross-thread
-                        // connection-state mutation in ConnectionManager uses. Only fire when an
-                        // actual long-term record was stored (not the shared-PSK fallback case).
-                        if (stored_record) {
-                            this->connection_manager_->schedule_pairing_succeeded(
-                                conn->get_server_id());
-                        }
-                        // Re-arm the provisional timeout so the 30 s watchdog fires if the server
-                        // acks but never sends the in-band re-handshake that follows pair-finalize.
-                        conn->note_pairing_finalize_ack();
+                        SS_LOGW(TAG,
+                                "server/pair-finalize: failed to persist pairing record "
+                                "(psk_id=%s); aborting pairing",
+                                psk_id.c_str());
+                        persist_failed = true;
                     }
                 } else {
-                    SS_LOGW(TAG, "Malformed server/pair-finalize; ignoring");
+                    SS_LOGI(TAG, "server/pair-finalize: no record to store "
+                                 "(shared-PSK fallback or no pending pairing)");
+                }
+                if (persist_failed) {
+                    // The persistence provider rejected the record, so it was never stored
+                    // (store_record fails closed) and this pairing could not survive a
+                    // reboot. Defer the local abort (pair/abort + drop + on_pairing_failed
+                    // with STORAGE_FAILED) to the main loop via the same pending_*_events_ /
+                    // has_pending_events_ idiom every other cross-thread connection-state
+                    // mutation in ConnectionManager uses. No note_pairing_finalize_ack() here:
+                    // the connection is being aborted, not kept alive to await a re-handshake.
+                    this->connection_manager_->schedule_pair_storage_failed(
+                        {conn->shared_from_this(), conn->get_server_id()});
+                } else {
+                    // Defer on_pairing_succeeded to the main loop via the same
+                    // pending_*_events_ / has_pending_events_ idiom every other cross-thread
+                    // connection-state mutation in ConnectionManager uses. Only fire when an
+                    // actual long-term record was stored (not the shared-PSK fallback case).
+                    if (stored_record) {
+                        this->connection_manager_->schedule_pairing_succeeded(
+                            conn->get_server_id());
+                    }
+                    // Re-arm the provisional timeout so the 30 s watchdog fires if the server
+                    // acks but never sends the in-band re-handshake that follows pair-finalize.
+                    conn->note_pairing_finalize_ack();
                 }
             }
             break;

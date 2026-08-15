@@ -336,17 +336,6 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> sha512_oneshot(const uint8_t* dat
     return h.finalize();
 }
 
-/// @brief Compute SHA-512(prefix || suffix).
-inline std::array<uint8_t, SHA512_DIGEST_SIZE> sha512_oneshot(const uint8_t* prefix,
-                                                              size_t prefix_len,
-                                                              const uint8_t* suffix,
-                                                              size_t suffix_len) {
-    Sha512 h;
-    h.update(prefix, prefix_len);
-    h.update(suffix, suffix_len);
-    return h.finalize();
-}
-
 // ============================================================================
 // HMAC-SHA-512
 // ============================================================================

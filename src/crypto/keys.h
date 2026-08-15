@@ -87,6 +87,7 @@ struct Identity {
     [[nodiscard]] std::string peer_id() const;
 
     /// @brief The base64url-encoded private key (for persistence).
+    /// Kept for parity with aiosendspin's reference Python implementation; used by tests.
     [[nodiscard]] std::string private_b64u() const;
 
     // ========================================

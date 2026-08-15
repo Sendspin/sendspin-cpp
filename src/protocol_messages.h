@@ -1198,12 +1198,6 @@ std::string format_client_pair_finalize_wrapped_message(const std::array<uint8_t
 /// @return JSON string for the pair/abort message.
 std::string format_pair_abort_message(PairAbortReason reason);
 
-/// @brief Parses a server/pair-finalize JSON message.
-/// The payload is an empty object ({}); this merely validates the message shape.
-/// @param root Parsed JSON object from the message.
-/// @return true if the message is a valid server/pair-finalize ack, false otherwise.
-bool process_server_pair_finalize_message(JsonObject root);
-
 /// @brief Parses a pair/abort JSON message into the provided struct.
 /// @param root Parsed JSON object from the message.
 /// @param abort_msg [out] Struct to populate with the parsed abort reason.

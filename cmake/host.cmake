@@ -184,7 +184,6 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         NOISE_USE_AES=0
         NOISE_USE_LIBSODIUM=0
         NOISE_USE_CUSTOM_RAND=0
-        NOISE_USE_REFERENCE_SHA512=1
     )
 
     # noise-c is a C library; don't apply sendspin's -Werror or pedantic flags.

@@ -120,6 +120,7 @@ public:
     bool write_msg2_and_split(std::vector<uint8_t>& msg2_out);
 
     /// @brief Return true once split() has been called successfully.
+    /// Test-observability accessor only; production code tracks handshake completion elsewhere.
     bool handshake_complete() const {
         return this->send_cipher_ != nullptr && this->recv_cipher_ != nullptr;
     }

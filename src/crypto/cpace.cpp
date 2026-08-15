@@ -123,8 +123,7 @@ std::array<uint8_t, 32> cpace_elligator2(const std::array<uint8_t, 32>& r_le) {
     // Decode r as a field element, reducing mod p.
     Fp r = fp_from_le(r_le.data());
     // Reduce r mod p (top bit may be set from raw bytes, though decode_u clears it).
-    // fp_reduce handles this if we add 0.
-    r = fp_reduce(r, 0);
+    r = fp_reduce_full(r);
 
     // r^2
     Fp r2 = fp_mul(r, r);

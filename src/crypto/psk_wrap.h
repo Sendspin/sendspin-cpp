@@ -60,6 +60,7 @@ std::optional<std::array<uint8_t, WRAPPED_PSK_SIZE>> wrap_psk(
     const std::array<uint8_t, CPACE_ISK_SIZE>& isk, const std::array<uint8_t, 32>& psk);
 
 /// @brief Open a wrapped_psk sealed by wrap_psk(), recovering the 32-byte PSK.
+/// Kept for parity with aiosendspin's reference Python implementation; used by tests.
 /// @return The 32-byte PSK, or nullopt if the cipher is unrecognized or AEAD authentication
 /// fails (wrong key or corrupted input, which the spec treats as a protocol error).
 std::optional<std::array<uint8_t, 32>> unwrap_psk(
