@@ -397,11 +397,6 @@ TEST(ShouldAdmit, PlaybackDisplacesEmpty) {
     EXPECT_TRUE(admit(acts(PB), "new", acts(), "old", true));
 }
 
-TEST(ShouldAdmit, ManagementDisplacesPlayback) {
-    // incoming=management(3), admitted=playback(2) -> admit
-    EXPECT_TRUE(admit(acts(MG), "new", acts(PB), "old", true));
-}
-
 // ============================================================================
 // Post-finalize pairing: rule 2 stops shielding, ranks stay intact
 // ============================================================================

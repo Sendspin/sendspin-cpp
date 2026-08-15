@@ -325,14 +325,16 @@ TEST(Identity, FromPrivateBytesArrayOverloadReturnsEngagedOptional) {
 // and responder.  After split(), verify that:
 //   - initiator→responder traffic decrypts correctly
 //   - responder→initiator traffic decrypts correctly
-// Both cipher suites must pass.
 // =============================================================================
 
 namespace {
 
-/// Run a complete in-process KKpsk2 handshake for the given suite name.
+/// Run a complete in-process KKpsk2 handshake for NOISE_SUITE_CHACHAPOLY.
 /// Returns true if the handshake completes and both transport directions work.
-bool run_kkpsk2_handshake(const char* suite_name) {
+bool run_kkpsk2_handshake() {
+    const std::string suite_name_str = std::string(NOISE_SUITE_CHACHAPOLY);
+    const char* suite_name = suite_name_str.c_str();
+
     // Generate static keypairs for initiator and responder.
     Identity init_id = Identity::generate().value();
     Identity resp_id = Identity::generate().value();
@@ -576,5 +578,5 @@ bool run_kkpsk2_handshake(const char* suite_name) {
 }  // namespace
 
 TEST(NoiseHandshake, KKpsk2ChaChaPoly) {
-    EXPECT_TRUE(run_kkpsk2_handshake(std::string(NOISE_SUITE_CHACHAPOLY).c_str()));
+    EXPECT_TRUE(run_kkpsk2_handshake());
 }

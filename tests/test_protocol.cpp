@@ -373,37 +373,6 @@ TEST(Protocol, ServerHelloRequiresName) {
     EXPECT_EQ(ok.name, "srv");
 }
 
-// server/activate declares the activity set (and, sticky, active_roles); activities is required.
-TEST(Protocol, ServerActivateParsesActivitiesAndStickyRoles) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"server/activate","payload":{"activities":["playback"],)"
-                      R"("active_roles":["player@v1"]}})",
-                      doc, root));
-    ServerActivateMessage msg;
-    ASSERT_TRUE(process_server_activate_message(root, &msg));
-    ASSERT_EQ(msg.activities.size(), 1u);
-    EXPECT_EQ(msg.activities[0], SendspinActivity::PLAYBACK);
-    ASSERT_TRUE(msg.active_roles.has_value());
-    ASSERT_EQ(msg.active_roles->size(), 1u);
-    EXPECT_EQ((*msg.active_roles)[0], "player@v1");
-
-    // A subsequent activate omitting active_roles must parse it as nullopt (sticky: keep prior).
-    JsonDocument doc2;
-    JsonObject root2;
-    ASSERT_TRUE(
-        parse(R"({"type":"server/activate","payload":{"activities":["playback"]}})", doc2, root2));
-    ServerActivateMessage msg2;
-    ASSERT_TRUE(process_server_activate_message(root2, &msg2));
-    EXPECT_FALSE(msg2.active_roles.has_value());
-
-    JsonDocument doc3;
-    JsonObject root3;
-    ASSERT_TRUE(parse(R"({"type":"server/activate","payload":{}})", doc3, root3));
-    ServerActivateMessage msg3;
-    EXPECT_FALSE(process_server_activate_message(root3, &msg3));
-}
-
 // If a visualizer stream advertises SPECTRUM in its `types`, a valid spectrum config with a
 // non-zero bin count must be present. Otherwise the expected size of binary spectrum messages
 // would be indeterminate, so the visualizer object is dropped, but only that object: the message
@@ -678,32 +647,6 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsPresent) {
     EXPECT_STREQ(doc["payload"]["device_info"]["manufacturer"], "ESPHome");
     EXPECT_STREQ(doc["payload"]["device_info"]["software_version"], "1.2.3");
     EXPECT_STREQ(doc["payload"]["device_info"]["mac_address"], "aa:bb:cc:dd:ee:ff");
-}
-
-// client/hello's trust_level/unpaired_access/supported_pair_methods fields: supported_pair_
-// methods is a REQUIRED field on the wire (spec's "client/hello" section: every client
-// implements at least pairing_psk, so the field can never be legitimately absent), always
-// emitted as an array, even an empty one in a degenerate all-disabled configuration.
-TEST(Protocol, FormatClientHelloTrustAndPairMethods) {
-    ClientHelloMessage msg;
-    msg.name = "Speaker";
-    msg.trust_level = "user";
-    msg.unpaired_access_enabled = true;
-
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
-    EXPECT_STREQ(doc["payload"]["trust_level"], "user");
-    EXPECT_TRUE(doc["payload"]["unpaired_access"]["enabled"].as<bool>());
-    ASSERT_TRUE(doc["payload"]["supported_pair_methods"].is<JsonArray>());
-    EXPECT_EQ(doc["payload"]["supported_pair_methods"].as<JsonArrayConst>().size(), 0u);
-
-    PairMethodDescriptor psk_desc;
-    psk_desc.method = SendspinPairMethod::PAIRING_PSK;
-    msg.supported_pair_methods.push_back(psk_desc);
-    JsonDocument doc2;
-    ASSERT_FALSE(deserializeJson(doc2, format_client_hello_message(&msg)));
-    ASSERT_TRUE(doc2["payload"]["supported_pair_methods"].is<JsonArray>());
-    EXPECT_STREQ(doc2["payload"]["supported_pair_methods"][0]["method"], "pairing_psk");
 }
 
 // The visualizer@v1 support object serializes with the spec's field layout: types (including

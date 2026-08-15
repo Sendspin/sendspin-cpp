@@ -300,30 +300,7 @@ TEST(CPacePrimitives, X25519ScalarMultGenerator) {
     EXPECT_EQ(to_hex(out, 32), "57551a92c995ea9b792f4e89a18c34459491c1484deddbb1498c29b499286c0f");
 }
 
-// --- SHA-512 KAT ---
-
-TEST(CPacePrimitives, Sha512OneshotKat) {
-    // hashlib.sha512(b'').hexdigest()
-    // = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
-    auto digest = sha512_oneshot(nullptr, 0);
-    EXPECT_EQ(to_hex(digest),
-        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
-        "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e");
-}
-
-TEST(CPacePrimitives, HmacSha512Kat) {
-    // hmac.new(b'\x0b' * 20, b'Hi There', hashlib.sha512).hexdigest()
-    // RFC 4231 Test Case 1 adapted for SHA-512.
-    // Expected from Python: hmac.new(key, data, hashlib.sha512).digest()
-    std::array<uint8_t, 20> key{};
-    std::fill(key.begin(), key.end(), 0x0Bu);
-    const uint8_t* data = reinterpret_cast<const uint8_t*>("Hi There");
-    auto mac = hmac_sha512(key.data(), key.size(), data, 8);
-    // RFC 4231 test vector for HMAC-SHA-512, test case 1:
-    EXPECT_EQ(to_hex(mac),
-        "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cd"
-        "edaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854");
-}
+// SHA-512/HMAC primitives are covered in test_crypto.cpp.
 
 // =============================================================================
 // Full round-trip test: role A and role B with same PRS/sid
@@ -549,20 +526,5 @@ TEST(CPaceDeriveRejects, TagBeforeDeriveReturnsNullopt) {
 // the fixed-scalar KAT through the CPace object.  The FixedExchange test above
 // covers the ISK+mac_key derivation path directly.
 
-// =============================================================================
-// SHA-512 streaming multi-part test
-// =============================================================================
-
-TEST(Sha512Streaming, MultiPartMatchesOneshot) {
-    const uint8_t part1[] = {0x01, 0x02, 0x03};
-    const uint8_t part2[] = {0x04, 0x05, 0x06};
-    const uint8_t all[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
-
-    Sha512 h;
-    h.update(part1, 3);
-    h.update(part2, 3);
-    auto streaming = h.finalize();
-
-    auto oneshot = sha512_oneshot(all, 6);
-    EXPECT_EQ(streaming, oneshot);
-}
+// SHA-512 streaming coverage (multi-part matches one-shot) lives in test_crypto.cpp
+// (Sha512.StreamingByteByByteMatchesOneShot).

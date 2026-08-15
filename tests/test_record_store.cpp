@@ -962,38 +962,8 @@ TEST(RecordStore, CanRemoveRecordProtectsRecordModeFallback) {
     EXPECT_TRUE(store.can_remove_record(other.psk_id));
 }
 
-// =============================================================================
-// resolve_pairing_outcome: normal and fallback paths
-// =============================================================================
-
-TEST(RecordStore, ResolveOutcomeMintsFreshRecord) {
-    RecordStore store(nullptr);
-
-    auto outcome = store.resolve_pairing_outcome("server-X", "My Hub");
-    ASSERT_TRUE(outcome.has_value());
-    ASSERT_TRUE(outcome->record.has_value());
-
-    EXPECT_EQ(outcome->record->server_id, "server-X");
-    EXPECT_EQ(outcome->record->label, "My Hub");
-    EXPECT_EQ(outcome->psk, outcome->record->psk);
-    EXPECT_EQ(outcome->record->psk_id, psk_id_for(outcome->psk));
-}
-
-TEST(RecordStore, ResolveOutcomeFallsBackToSharedOnExhaustion) {
-    ExhaustedRecordStore store(nullptr);
-
-    // Pre-provision and set a shared record (the auto-provisioned one works fine).
-    const std::string& shared_psk_id = store.record_mode_psk_id();
-
-    auto outcome = store.resolve_pairing_outcome("server-X");
-    ASSERT_TRUE(outcome.has_value()) << "fallback must succeed when shared record exists";
-    EXPECT_FALSE(outcome->record.has_value()) << "storage exhausted: no new record";
-
-    // The returned PSK must match the shared record's PSK.
-    const auto* shared = store.record_by_psk_id(shared_psk_id);
-    ASSERT_NE(shared, nullptr);
-    EXPECT_EQ(outcome->psk, shared->psk);
-}
+// resolve_pairing_outcome coverage (normal mint and storage-exhausted fallback) lives further
+// below, next to ResolvePairingOutcomeThenStore / ResolvePairingOutcomeExhaustedNoStore.
 
 // =============================================================================
 // Pairing PSK lifecycle
@@ -1583,12 +1553,12 @@ TEST(RecordStoreWithFile, UnpairedAccessSeedDoesNotOverrideStoredConfig) {
 // =============================================================================
 
 // Normal case: storage is available -> returns {psk, record=set}.
-// The record must be bound to the given server_id and have a valid psk_id.
+// The record must be bound to the given server_id/label and carry a psk_id matching the PSK.
 TEST(RecordStore, ResolvePairingOutcomeNormal) {
     RecordStore store(nullptr);
 
     const std::string server_id = "server-pair-test";
-    auto outcome = store.resolve_pairing_outcome(server_id);
+    auto outcome = store.resolve_pairing_outcome(server_id, "My Hub");
 
     ASSERT_TRUE(outcome.has_value()) << "resolve_pairing_outcome must succeed when storage available";
     // PSK must be non-zero (randomly generated).
@@ -1604,18 +1574,23 @@ TEST(RecordStore, ResolvePairingOutcomeNormal) {
     ASSERT_TRUE(outcome->record.has_value())
         << "storage available: record must be present in outcome";
 
-    // The record's server_id must match what was passed in.
+    // The record's server_id and label must match what was passed in.
     ASSERT_TRUE(outcome->record->server_id.has_value());
     EXPECT_EQ(outcome->record->server_id.value(), server_id);
+    EXPECT_EQ(outcome->record->label, "My Hub");
 
     // psk_id must be set and match the PSK.
-    EXPECT_FALSE(outcome->record->psk_id.empty());
-    EXPECT_EQ(outcome->record->psk, outcome->psk);
+    EXPECT_EQ(outcome->psk, outcome->record->psk);
+    EXPECT_EQ(outcome->record->psk_id, psk_id_for(outcome->psk));
 }
 
-// Storage-exhausted case: ExhaustedRecordStore returns {psk, record=nullopt}.
+// Storage-exhausted case: ExhaustedRecordStore returns {psk, record=nullopt}, falling back to
+// the pre-provisioned shared record's PSK.
 TEST(RecordStore, ResolvePairingOutcomeExhausted) {
     ExhaustedRecordStore store(nullptr);
+
+    // Pre-provision and capture the shared record's psk_id (the auto-provisioned one works fine).
+    const std::string& shared_psk_id = store.record_mode_psk_id();
 
     const std::string server_id = "server-exhausted";
     auto outcome = store.resolve_pairing_outcome(server_id);
@@ -1636,6 +1611,11 @@ TEST(RecordStore, ResolvePairingOutcomeExhausted) {
         }
     }
     EXPECT_FALSE(all_zero) << "shared fallback PSK should not be all-zero";
+
+    // The returned PSK must match the shared record's PSK.
+    const auto* shared = store.record_by_psk_id(shared_psk_id);
+    ASSERT_NE(shared, nullptr);
+    EXPECT_EQ(outcome->psk, shared->psk);
 }
 
 // store_record after resolve_pairing_outcome (simulates the server/pair-finalize ack path).
