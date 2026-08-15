@@ -546,28 +546,6 @@ interface generically, since every key is already sized to fit and the library h
 serialization; a provider that needs different backing per key (e.g. a plaintext-secrets file
 plus separate flash-wear-optimized storage for `STATIC_DELAY`) can switch on `key` instead.
 
-#### Migrating from a Pre-Blob-Store Release
-
-This section applies only to consumers who integrated against a pre-release snapshot of this
-branch that still had the 17-method interface; it was never part of a tagged release, so anyone
-starting from a tagged release or from main has only ever had the three generic methods above and
-can skip this section.
-
-If your `SendspinPersistenceProvider` implementation predates the blob-store interface, it
-implemented up to 17 typed methods (`save_static_keypair`, `load_pairing_records`,
-`save_pairing_psk`, etc.) instead of the three generic ones above. There is no compatibility
-shim: override `load_blob` / `save_blob` / `erase_blob` instead, using the keyspace table above
-to know which key replaces which old method, and `sendspin/persistence_codec.h` to encode/decode
-the struct types the old typed methods took directly. A provider carrying old typed `override`s
-will fail to compile after upgrading (they no longer override anything); that is intentional
-rather than silently no-op-ing.
-
-The on-disk format is not preserved across this migration either: `examples/common/
-file_persistence_provider.h`'s `FilePersistenceProvider` now stores one JSON document mapping
-key to `base64url(bytes)`, replacing the old per-struct JSON layout. A file written by the old
-provider is not read by the new one; delete it and let the device re-provision (a fresh keypair,
-a fresh Pairing PSK) rather than trying to hand-migrate the old format.
-
 ### SendspinClientListener (Optional)
 
 Receives client-level events. All callbacks fire on the main loop thread.
