@@ -577,7 +577,8 @@ struct MyClientListener : SendspinClientListener {
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     }
 
-    // Called when a server starts a Pairing-PSK pairing exchange.
+    // Called when a server begins a pairing exchange, once per attempt and whatever
+    // the method (Pairing-PSK, dynamic PIN, or static PIN).
     // server_id is the base64url public key of the server initiating pairing.
     void on_pairing_started(const std::string& server_id) override {
         printf("Pairing started with server %s\n", server_id.c_str());
