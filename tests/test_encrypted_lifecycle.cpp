@@ -162,10 +162,12 @@ public:
 
     void on_pairing_started(const std::string& server_id) override {
         this->pairing_started_server_id_ = server_id;
+        this->pairing_started_seq_ = this->next_seq_++;
     }
 
     void on_pairing_succeeded(const std::string& server_id) override {
         this->pairing_succeeded_server_id_ = server_id;
+        this->pairing_succeeded_seq_ = this->next_seq_++;
     }
 
     void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
@@ -198,8 +200,21 @@ public:
         return this->pairing_failed_reason_;
     }
 
+    /// Dispatch order of the pairing callbacks, for asserting that started precedes its
+    /// terminal event. nullopt until the corresponding callback fires.
+    const std::optional<size_t>& pairing_started_seq() const {
+        return this->pairing_started_seq_;
+    }
+
+    const std::optional<size_t>& pairing_succeeded_seq() const {
+        return this->pairing_succeeded_seq_;
+    }
+
 private:
     std::vector<ConnectionTrust> trust_history_;
+    size_t next_seq_{0};
+    std::optional<size_t> pairing_started_seq_;
+    std::optional<size_t> pairing_succeeded_seq_;
     std::optional<std::string> pairing_started_server_id_;
     std::optional<std::string> pairing_succeeded_server_id_;
     std::optional<std::string> pairing_failed_server_id_;
@@ -540,6 +555,15 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
         client, [&] { return listener.pairing_succeeded_server_id().has_value(); }, 4000))
         << "on_pairing_succeeded was never fired";
     EXPECT_EQ(listener.pairing_succeeded_server_id().value(), server_identity.peer_id());
+
+    // The application must see the exchange begin before it sees it end. The ordering is
+    // structural (ConnectionManager::loop() swaps pending events out before draining lifecycle
+    // events, and SendspinClient::loop() drains the whole note batch each tick), so pin it here
+    // to catch a future reordering of either drain.
+    ASSERT_TRUE(listener.pairing_started_seq().has_value());
+    ASSERT_TRUE(listener.pairing_succeeded_seq().has_value());
+    EXPECT_LT(listener.pairing_started_seq().value(), listener.pairing_succeeded_seq().value())
+        << "on_pairing_succeeded was delivered before on_pairing_started";
 
     // Rekey onto the newly paired PSK, exactly like the real server does immediately after
     // acking pair-finalize (see connection.h's note_pairing_finalize_ack()/provisional-timeout
