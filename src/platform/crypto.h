@@ -140,9 +140,26 @@ static constexpr size_t SHA512_DIGEST_SIZE = 64;
 /// @brief Self-contained streaming SHA-512 (FIPS 180-4).
 ///
 /// Implemented here rather than through noise-c so both host and ESP use one code
-/// path with no external dependency: the noise-c raw sha512 primitive is not exposed
-/// consistently across the host FetchContent build and the ESP component, and the
-/// hashstate-registry SHA-512 backend has an include-layout conflict in the fork.
+/// path with no external dependency. Two noise-c paths were considered and both are
+/// closed on the esphome-libs fork (checked at the pinned tag v0.1.13 and at the
+/// newer v0.1.14/v0.1.15):
+///   - The hashstate registry has no SHA-512 backend at all: no
+///     src/backend/ref/hash-sha512.c or src/backend/sodium/hash-sha512.c file exists
+///     in the fork, so noise_hashstate_new_by_name("SHA512") cannot succeed.
+///   - The raw src/crypto/sha2/sha512.c/.h primitive is compiled into the ESP-IDF
+///     component's source list and its header is exported from the component's
+///     include dirs, but the entire body of both files is gated behind
+///     #if NOISE_USE_REFERENCE_SHA512. That macro has no default in
+///     include/noise/defines.h (unlike NOISE_USE_REFERENCE_SHA256 and
+///     NOISE_USE_LIBSODIUM, which do), and the fork's ESP-IDF CMakeLists.txt never
+///     defines it and ships no Kconfig option to do so. On ESP the primitive
+///     therefore compiles to an empty translation unit with no callable functions.
+///     The host build avoids this only because cmake/host.cmake builds its own
+///     noise_c CMake target from the fetched source and can freely set
+///     NOISE_USE_REFERENCE_SHA512=1 on it; a REQUIRES'd ESP-IDF component gives no
+///     equivalent hook to set a definition on someone else's compilation.
+/// This class can move onto the raw noise-c primitive once the fork defines
+/// NOISE_USE_REFERENCE_SHA512 for its ESP-IDF component (one line plus a release).
 /// Uses only uint64_t arithmetic, so it builds on 32-bit targets (Xtensa/ESP32).
 /// Validated against FIPS/RFC 4231 known-answer tests in tests/test_crypto.cpp.
 class Sha512 {
