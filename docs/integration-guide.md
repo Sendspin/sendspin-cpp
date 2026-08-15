@@ -1312,7 +1312,7 @@ These represent commands the server can send to the player. The player advertise
 | `USER_REQUEST` | User requested disconnect |
 | `UNAUTHORIZED` | Server requested an activity its trust level does not permit |
 | `PAIRING_REQUIRED` | Server requested playback but the client requires pairing first |
-| `CONCURRENT_ATTEMPT` | A second pairing attempt arrived while one was in progress |
+| `CONCURRENT_ATTEMPT` | Incoming connection rejected because another is already admitted. Distinct from the same-named `SendspinPairAbortReason`, which is specific to pairing |
 | `UNPAIRED` | Server unpaired this device via `management/server-unpair` |
 
 ### SendspinPlaybackState
