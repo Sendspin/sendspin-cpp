@@ -30,11 +30,6 @@
 #include <string>
 #include <vector>
 
-// Forward declaration of the PIN state-machine integration test fixture (defined in
-// tests/test_pin_state_machine.cpp, global namespace). Declared here, outside namespace
-// sendspin, so the friend declaration below can name it unambiguously with the "::" qualifier.
-class PinStateMachineTest;
-
 namespace sendspin {
 
 // Forward declarations for enabled roles
@@ -334,10 +329,6 @@ struct Identity;
  */
 class SendspinClient {
     friend class ConnectionManager;
-    // Test-only: lets the PIN state-machine integration test harness reach
-    // connection_manager_ (private) to inject a fake connection. See the matching
-    // friend declaration on ConnectionManager in src/connection_manager.h.
-    friend class ::PinStateMachineTest;
 
 public:
     explicit SendspinClient(SendspinClientConfig config);

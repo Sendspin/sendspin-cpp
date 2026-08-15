@@ -366,6 +366,14 @@ struct ServerStandIn {
 // =============================================================================
 // Test fixture: builds a SendspinClient, injects a FakeConnection as
 // current_connection_, and provides helpers to drive the PIN state machine.
+//
+// This file reaches ConnectionManager's and SendspinClient's private state
+// directly: tests/CMakeLists.txt compiles this one translation unit with
+// -fno-access-control so the production headers need no test friend
+// declarations. Route every such access through a fixture helper below (each
+// documents why the seam exists) rather than touching privates inline in
+// tests, so the private surface this harness depends on stays auditable in
+// one place.
 // =============================================================================
 
 class PinStateMachineTest : public ::testing::Test {
@@ -430,7 +438,7 @@ protected:
     /// inject_current_connection, this lets a test drive the real ServerActivateEvent
     /// arbitration path via post_activate() + loop(), so the first-vs-subsequent activate
     /// handling in ConnectionManager::loop() is exercised end to end (not bypassed through the
-    /// handle_enter_pairing() friend seam).
+    /// handle_enter_pairing() seam).
     FakeConnection* inject_provisional_current_connection(const std::string& server_id) {
         auto conn = std::make_shared<FakeConnection>();
         conn->set_noise_handshake_result(server_id, PskCategory::SENTINEL, /*psk_id=*/"");
@@ -445,7 +453,7 @@ protected:
 
     /// Drive handle_enter_pairing() for the injected current connection via the same call
     /// ConnectionManager::loop() makes for a first pairing activate. Called directly (through
-    /// the friend seam) rather than replaying the full activate-arbitration path, since
+    /// the private-access seam) rather than replaying the full activate-arbitration path, since
     /// arbitration itself is exercised by test_admission.cpp and is not the subject of this
     /// harness.
     ///
@@ -467,8 +475,8 @@ protected:
     }
 
     /// Seam for arbitration checks: should_switch_to_new_server() and the last-playback fields
-    /// are private to ConnectionManager, and the friend declaration names this fixture, not the
-    /// class TEST_F derives from it, so the call has to route through here.
+    /// are private to ConnectionManager; per this file's access policy (see the fixture header
+    /// comment) the call routes through here.
     /// @param last_playback_server_id Sets last_played_server_id_; empty clears the has-value
     ///        flag, so rule 5's tiebreak is only armed when a non-empty id is passed.
     bool would_switch_to(SendspinConnection* current, SendspinConnection* incoming,
@@ -487,14 +495,14 @@ protected:
     std::shared_ptr<SendspinConnection> current_connection_sp() { return this->injected_conn_; }
 
     /// Returns ConnectionManager::current_connection_ (nullptr once dropped), through the
-    /// friend seam. Unlike current_connection_sp() above, this reflects whether the
+    /// private-access seam. Unlike current_connection_sp() above, this reflects whether the
     /// connection is still actually managed, not just whether the fixture's own reference is
     /// still alive.
     SendspinConnection* current_connection() {
         return this->client_->connection_manager_->current();
     }
 
-    /// Drive ConnectionManager's real teardown path for `conn`, through the friend seam, taking
+    /// Drive ConnectionManager's real teardown path for `conn`, through the private-access seam, taking
     /// the same lock and running the same deferred-release flush loop() would.
     void drop_connection(SendspinConnection* conn, SendspinGoodbyeReason goodbye) {
         {
@@ -545,7 +553,7 @@ protected:
         this->client_->connection_manager_->schedule_activate(std::move(event));
     }
 
-    /// Read the standing pairing-window deadline (0 = closed) through the friend seam.
+    /// Read the standing pairing-window deadline (0 = closed) through the private-access seam.
     int64_t window_deadline() {
         return this->client_->connection_manager_->pairing_window_open_until_us_;
     }

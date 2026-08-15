@@ -34,11 +34,6 @@
 #include <string>
 #include <vector>
 
-// Forward declaration of the PIN state-machine integration test fixture (defined in
-// tests/test_pin_state_machine.cpp, global namespace). Declared here, outside namespace
-// sendspin, so the friend declaration below can name it unambiguously with the "::" qualifier.
-class PinStateMachineTest;
-
 namespace sendspin {
 
 // Forward declarations
@@ -263,12 +258,6 @@ struct ServerActivateEvent {
  * @endcode
  */
 class ConnectionManager {
-    // Test-only: lets the PIN state-machine integration test harness inject a fake
-    // current_connection_ directly and drive on_connection_lost, bypassing the real
-    // WebSocket transport and Noise handshake. No production code depends on this;
-    // it exists solely so tests/test_pin_state_machine.cpp can reach private state.
-    friend class ::PinStateMachineTest;
-
 public:
     explicit ConnectionManager(SendspinClient* client);
     ~ConnectionManager();

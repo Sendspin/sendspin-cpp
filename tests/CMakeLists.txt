@@ -65,6 +65,15 @@ target_link_libraries(sendspin_tests PRIVATE sendspin GTest::gtest_main)
 target_compile_features(sendspin_tests PRIVATE cxx_std_20)
 target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
 
+# test_pin_state_machine.cpp is a white-box integration harness: its fixture injects fake
+# connections into ConnectionManager's private state and drives private lifecycle methods
+# directly. Disabling access checking for that one translation unit keeps every test seam
+# out of the production headers (no friend declarations); access control is a compile-time
+# check only, so this has no ABI effect. GCC and Clang both support the flag, and the test
+# suite is host-only. The fixture's accessor methods document each seam and why it exists.
+set_source_files_properties(test_pin_state_machine.cpp PROPERTIES
+    COMPILE_OPTIONS "-fno-access-control")
+
 # Match the library's sanitizer configuration so the test binary is instrumented too.
 if(ENABLE_SANITIZERS)
     target_compile_options(sendspin_tests PRIVATE

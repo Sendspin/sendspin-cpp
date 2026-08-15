@@ -215,10 +215,9 @@ public:
     /// Used to select the AEAD cipher for spec "PSK Wrapping" (see
     /// platform/crypto.h aead_cipher_name_from_noise_suite()).
     ///
-    /// Virtual so tests can inject a fake connection that reports a canned suite name without an
-    /// active Noise session (see PinStateMachineTest's FakeConnection, mirroring
-    /// get_noise_handshake_hash() below); production connections keep the same implementation
-    /// via dynamic dispatch.
+    /// Virtual so a fake connection can report a canned suite name without an active Noise
+    /// session (mirroring get_noise_handshake_hash() below); production connections keep the
+    /// same implementation via dynamic dispatch.
     virtual const std::string& get_noise_suite_name() const {
         return this->noise_suite_name_;
     }
@@ -543,9 +542,8 @@ public:
     /// that can trigger pairing) or at re-handshake swap. During a DYNAMIC_PIN pairing activation
     /// the transport session is stable and active.
     ///
-    /// Virtual so tests can inject a fake connection that reports a canned hash without an
-    /// active Noise session (see PinStateMachineTest's FakeConnection); production connections
-    /// keep the same implementation via dynamic dispatch.
+    /// Virtual so a fake connection can report a canned hash without an active Noise session;
+    /// production connections keep the same implementation via dynamic dispatch.
     virtual std::optional<std::array<uint8_t, 32>> get_noise_handshake_hash() const {
         return this->noise_transport_.handshake_hash();
     }
