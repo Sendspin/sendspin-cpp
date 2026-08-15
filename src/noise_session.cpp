@@ -53,10 +53,10 @@ NoiseSession::~NoiseSession() {
 }
 
 NoiseSession::NoiseSession(NoiseSession&& other) noexcept
-    : hs_(other.hs_),
-      send_cipher_(other.send_cipher_),
+    : handshake_hash_(other.handshake_hash_),
+      hs_(other.hs_),
       recv_cipher_(other.recv_cipher_),
-      handshake_hash_(other.handshake_hash_) {
+      send_cipher_(other.send_cipher_) {
     other.hs_ = nullptr;
     other.send_cipher_ = nullptr;
     other.recv_cipher_ = nullptr;

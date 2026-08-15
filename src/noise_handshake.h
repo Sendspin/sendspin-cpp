@@ -175,23 +175,29 @@ private:
     bool handle_msg1(const std::string& text,
                      const std::function<bool(const std::string&)>& send_fn);
 
-    const Identity& identity_;
-    const RecordStore& record_store_;
-    std::string suite_name_;
-
-    State state_{State::INIT};
-
+    // Struct fields
     /// Exact bytes of the client/init frame we sent (retained for prologue).
     std::string client_init_text_;
 
-    /// Exact bytes of the server/init frame we received (retained for prologue).
-    std::string server_init_text_;
+    /// Result available after COMPLETE.
+    std::optional<NoiseHandshakeResult> result_;
 
     /// server_id decoded from server/init (43-char base64url).
     std::string server_id_;
 
-    /// Result available after COMPLETE.
-    std::optional<NoiseHandshakeResult> result_;
+    /// Exact bytes of the server/init frame we received (retained for prologue).
+    std::string server_init_text_;
+
+    std::string suite_name_;
+
+    // Pointer fields
+    // Reference members, grouped with pointers: both are non-owning indirections to
+    // another object.
+    const Identity& identity_;
+    const RecordStore& record_store_;
+
+    // 32-bit fields
+    State state_{State::INIT};
 };
 
 }  // namespace sendspin

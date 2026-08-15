@@ -145,22 +145,23 @@ public:
     }
 
 private:
-    CPaceRole role_{CPaceRole::RESPONDER};
-    std::array<uint8_t, CPACE_FIELD_BYTES> scalar_{};
-    std::vector<uint8_t> sid_{};
+    // Struct fields
     std::vector<uint8_t> ad_{};
+    std::vector<uint8_t> initiator_ad_{};                      // Set by derive()
+    std::array<uint8_t, CPACE_SHARE_SIZE> initiator_share_{};  // Set by derive()
+    std::array<uint8_t, CPACE_ISK_SIZE> isk_{};                // Set by derive()
+    std::array<uint8_t, CPACE_TAG_SIZE> mac_key_{};            // Set by derive()
     std::vector<uint8_t> peer_ad_{};
     std::array<uint8_t, CPACE_SHARE_SIZE> public_share_{};
-    bool started_{false};
+    std::vector<uint8_t> responder_ad_{};                      // Set by derive()
+    std::array<uint8_t, CPACE_SHARE_SIZE> responder_share_{};  // Set by derive()
+    std::array<uint8_t, CPACE_FIELD_BYTES> scalar_{};
+    std::vector<uint8_t> sid_{};
 
-    // Set by derive()
-    std::array<uint8_t, CPACE_TAG_SIZE> mac_key_{};
-    std::array<uint8_t, CPACE_ISK_SIZE> isk_{};
-    std::array<uint8_t, CPACE_SHARE_SIZE> initiator_share_{};
-    std::vector<uint8_t> initiator_ad_{};
-    std::array<uint8_t, CPACE_SHARE_SIZE> responder_share_{};
-    std::vector<uint8_t> responder_ad_{};
-    bool derived_{false};
+    // 8-bit fields
+    bool derived_{false};  // Set by derive()
+    CPaceRole role_{CPaceRole::RESPONDER};
+    bool started_{false};
 
     /// @brief Compute an LV-encoded (variable-length-prefix) HMAC-SHA-512 tag
     /// over (share, ad) with mac_key_.  If own is true, uses our share/ad;

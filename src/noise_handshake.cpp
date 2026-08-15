@@ -219,7 +219,7 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
 
 NoiseHandshake::NoiseHandshake(const Identity& identity, const RecordStore& record_store,
                                const std::string& suite_name)
-    : identity_(identity), record_store_(record_store), suite_name_(suite_name) {}
+    : suite_name_(suite_name), identity_(identity), record_store_(record_store) {}
 
 // ============================================================================
 // Public API

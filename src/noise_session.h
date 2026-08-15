@@ -150,17 +150,19 @@ public:
 private:
     NoiseSession() = default;
 
+    // Struct fields
+    /// @brief Noise handshake hash `h` (populated by write_msg2_and_split).
+    std::array<uint8_t, 32> handshake_hash_{};
+
+    // Pointer fields
     /// @brief The active handshakestate (null after split).
     NoiseHandshakeState* hs_{nullptr};
-
-    /// @brief Transport cipher: send direction (null until split).
-    NoiseCipherState* send_cipher_{nullptr};
 
     /// @brief Transport cipher: receive direction (null until split).
     NoiseCipherState* recv_cipher_{nullptr};
 
-    /// @brief Noise handshake hash `h` (populated by write_msg2_and_split).
-    std::array<uint8_t, 32> handshake_hash_{};
+    /// @brief Transport cipher: send direction (null until split).
+    NoiseCipherState* send_cipher_{nullptr};
 };
 
 }  // namespace sendspin

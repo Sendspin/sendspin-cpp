@@ -458,29 +458,38 @@ private:
     /// @return true on success (or when there is no provider); false on a rejected write.
     bool persist_records_locked();
 
-    std::vector<SendspinPairingRecord> records_;
-    /// Cap on records_.size() enforced by has_capacity_locked() / can_store_record() / the base
-    /// storage_accounting(); see DEFAULT_MAX_RECORDS. Set once at construction, then read-only.
-    size_t max_records_{DEFAULT_MAX_RECORDS};
-    std::optional<SendspinPairingPsk> pairing_psk_;
-    std::optional<std::string> static_pin_;  ///< Configured static PIN (8 decimal digits).
-
-    // Pairing config
-    bool pairing_psk_enabled_{true};
-    bool unpaired_access_enabled_{false};
-    bool dynamic_pin_enabled_{true};
-    bool static_pin_enabled_{false};
-    int dynamic_pin_min_length_{6};
-    /// Dynamic-PIN failure counter (persisted through SendspinPairingConfig so escalation
-    /// survives reboots). static_pin has no counter: it is gesture-gated on every attempt.
-    int dynamic_pin_failures_{0};
-    std::string record_mode_psk_id_;
-
-    SendspinPersistenceProvider* provider_{nullptr};
-
+    // Struct fields
     /// Guards `records_` and `pairing_psk_` against a network-thread `resolve_by_psk_id`
     /// racing a main-loop mutation. Mutable so the const `resolve_by_psk_id` can lock it.
     mutable std::mutex mutex_;
+
+    std::optional<SendspinPairingPsk> pairing_psk_;
+
+    std::string record_mode_psk_id_;
+
+    std::vector<SendspinPairingRecord> records_;
+
+    std::optional<std::string> static_pin_;  ///< Configured static PIN (8 decimal digits).
+
+    // Pointer fields
+    SendspinPersistenceProvider* provider_{nullptr};
+
+    // size_t fields
+    /// Cap on records_.size() enforced by has_capacity_locked() / can_store_record() / the base
+    /// storage_accounting(); see DEFAULT_MAX_RECORDS. Set once at construction, then read-only.
+    size_t max_records_{DEFAULT_MAX_RECORDS};
+
+    // 32-bit fields
+    /// Dynamic-PIN failure counter (persisted through SendspinPairingConfig so escalation
+    /// survives reboots). static_pin has no counter: it is gesture-gated on every attempt.
+    int dynamic_pin_failures_{0};
+    int dynamic_pin_min_length_{6};
+
+    // 8-bit fields
+    bool dynamic_pin_enabled_{true};
+    bool pairing_psk_enabled_{true};
+    bool static_pin_enabled_{false};
+    bool unpaired_access_enabled_{false};
 };
 
 }  // namespace sendspin

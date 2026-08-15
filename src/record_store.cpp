@@ -39,7 +39,7 @@ namespace sendspin {
 
 RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                          bool initial_unpaired_access_enabled, size_t max_records)
-    : max_records_(max_records), provider_(provider) {
+    : provider_(provider), max_records_(max_records) {
     // Try loading persisted records and config first. Every blob here (except static_pin, which
     // is raw UTF-8 bytes) is a codec-encoded blob; the provider itself is a pure byte store, so
     // decoding happens entirely on this side of the interface.

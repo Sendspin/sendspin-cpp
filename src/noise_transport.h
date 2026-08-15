@@ -181,19 +181,19 @@ private:
         this->reasm_in_progress_ = false;
     }
 
-    /// Noise cipher session (set at handshake COMPLETE, replaced on re-handshake swap).
-    /// Guarded by session_mutex_ for the ENCRYPT (send) path and the swap; the DECRYPT
-    /// (receive) path reads it unlocked (same-thread sequential with the swap).
-    std::unique_ptr<NoiseSession> session_;
-
-    /// Guards the send-side encrypt path against the re-handshake session swap.
-    mutable std::mutex session_mutex_;
-
+    // Struct fields
     /// True once a transport session exists. See is_active().
     std::atomic<bool> active_{false};
 
     /// Emits one encrypted frame as a binary WS frame.
     FrameSink frame_sink_;
+
+    /// Accumulates the reassembled message as [orig_type][data...] while a fragmented
+    /// message is in flight; on completion accept_plaintext() returns a pointer into this
+    /// buffer, valid until the next accept_plaintext() call. Grows with the largest
+    /// fragmented message received (e.g. album artwork) and retains its capacity, so it is
+    /// placed per buffer_location_ (PSRAM-preferring by default on ESP). Network thread only.
+    PlatformBuffer reasm_buf_;
 
     /// Reused scratch buffer for the non-fragmented send path (send_json, send_binary,
     /// send_msg2_and_swap). Grown on demand by ensure_send_buf() to fit each frame (geometric
@@ -207,23 +207,25 @@ private:
     /// buffer_location_ like reasm_buf_ (PSRAM-preferring by default on ESP).
     PlatformBuffer send_buf_;
 
-    // Fragment reassembly state (network thread only).
+    /// Guards the send-side encrypt path against the re-handshake session swap.
+    mutable std::mutex session_mutex_;
 
-    /// Accumulates the reassembled message as [orig_type][data...] while a fragmented
-    /// message is in flight; on completion accept_plaintext() returns a pointer into this
-    /// buffer, valid until the next accept_plaintext() call. Grows with the largest
-    /// fragmented message received (e.g. album artwork) and retains its capacity, so it is
-    /// placed per buffer_location_ (PSRAM-preferring by default on ESP).
-    PlatformBuffer reasm_buf_;
+    // Pointer fields
+    /// Noise cipher session (set at handshake COMPLETE, replaced on re-handshake swap).
+    /// Guarded by session_mutex_ for the ENCRYPT (send) path and the swap; the DECRYPT
+    /// (receive) path reads it unlocked (same-thread sequential with the swap).
+    std::unique_ptr<NoiseSession> session_;
 
-    /// Bytes used in reasm_buf_ (including the leading orig_type byte).
+    // size_t fields
+    /// Bytes used in reasm_buf_ (including the leading orig_type byte). Network thread only.
     size_t reasm_len_{0};
 
-    /// True when a fragmented message is being reassembled.
-    bool reasm_in_progress_{false};
-
+    // 8-bit fields
     /// Memory placement for reasm_buf_ and the fragmentation frame buffer.
     MemoryLocation buffer_location_{MemoryLocation::PREFER_EXTERNAL};
+
+    /// True when a fragmented message is being reassembled. Network thread only.
+    bool reasm_in_progress_{false};
 };
 
 }  // namespace sendspin

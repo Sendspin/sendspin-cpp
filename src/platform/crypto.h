@@ -107,7 +107,10 @@ public:
     }
 
 private:
+    // Pointer fields
     NoiseHashState* state_{nullptr};
+
+    // 8-bit fields
     bool failed_{false};
 };
 
@@ -315,10 +318,15 @@ private:
         this->h_[7] += h;
     }
 
+    // 64-bit fields
     uint64_t h_[8]{};
     uint64_t total_len_{0};  ///< Total message bytes fed so far.
-    uint8_t buf_[BLOCK]{};   ///< Partial-block buffer.
-    size_t buf_len_{0};      ///< Bytes currently in buf_.
+
+    // size_t fields
+    size_t buf_len_{0};  ///< Bytes currently in buf_.
+
+    // 8-bit fields
+    uint8_t buf_[BLOCK]{};  ///< Partial-block buffer.
 };
 
 /// @brief Compute SHA-512(data, len).
