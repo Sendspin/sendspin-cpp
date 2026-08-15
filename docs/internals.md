@@ -34,7 +34,7 @@ The library uses a small number of long-lived threads. All state mutations and u
 | Thread | Name | Created by | Stack (ESP) | Priority (ESP) | Purpose |
 |--------|------|-----------|-------------|-----------------|---------|
 | **Main loop** | (caller's) | User code | - | - | Drives `SendspinClient::loop()`. All role event processing and listener callbacks run here. |
-| **Sync task** | `Sendspin` | `PlayerRole::Impl::start()` → `SyncTask::start()` | 6192 B | 2 | Decodes audio, synchronizes to server timestamps, writes PCM to the audio sink via `on_audio_write`. |
+| **Sync task** | `Sendspin` | `PlayerRole::Impl::start()` → `SyncTask::start()` | 6192 B | 6 | Decodes audio, synchronizes to server timestamps, writes PCM to the audio sink via `on_audio_write`. |
 | **Visualizer drain** | `SsVis` | `VisualizerRole::Impl::start()` | 4096 B | 2 | Reads visualization frames from a ring buffer and delivers them to the listener at the correct playback time. |
 | **Artwork decode** | `SsArt` | `ArtworkRole::Impl::start()` | 4096 B | 2 | Receives image notifications and calls the decode callback. Hands the server display timestamp off to the main loop, which fires the display callback at the correct time. |
 | **Network** | (library-internal) | IXWebSocket (host) or esp_http_server (ESP) | - | - | WebSocket I/O. Callbacks fire on these threads and must defer work to the main loop. |
@@ -43,7 +43,7 @@ On host builds, `platform_configure_thread()` is a no-op; threads use OS default
 
 ### Thread Lifecycle
 
-**Sync task** (`src/sync_task.cpp:620`):
+**Sync task** (`SyncTask::start()` at `src/sync_task.cpp:113`, `stop()` at `:787`, `thread_entry()` at `:800`):
 
 1. `SyncTask::start()` configures the thread and spawns it.
 2. The caller blocks until the thread reaches IDLE state (`TASK_IDLE` event flag) or exits early due to an allocation failure (`TASK_STOPPED`).
@@ -92,7 +92,7 @@ Fixed-depth FIFO queue with timed send/receive. Used to defer events from networ
 
 | Queue | Depth | Data | Producer | Consumer |
 |-------|-------|------|----------|----------|
-| `ArtworkRole::Impl::notify_queue` | 8 | `ArtworkNotification` | Network thread | Artwork decode thread |
+| `ArtworkRole::Impl::DrainTask::notify_queue` | 8 | `ArtworkNotification` | Network thread | Artwork decode thread |
 
 ### ShadowSlot (`src/platform/shadow_slot.h`)
 
@@ -278,7 +278,7 @@ The Inbox drain steps gate the same way, off two lock-free `poll()` snapshots of
 
 Most roles implement `drain_events()` to process their deferred state on the main loop thread; stream lifecycle events instead ride the shared inbox ring and are dispatched from the ring drain (step 3 above) via each role's `handle_stream_ring_event()` / `on_stream_ring_event()` / `handle_cleared_event()`. Together these convert cross-thread inbox writes into sequential, single-threaded callback delivery. (The visualizer role has no `drain_events()` - all its delivery is ring-driven.)
 
-### PlayerRole::Impl::drain_events() (`src/player_role.cpp:363`)
+### PlayerRole::Impl::drain_events() (`src/player_role.cpp:396`)
 
 Three stages, processed in order:
 
@@ -531,7 +531,7 @@ PIN specifics, per the current spec: the session `pin_length` arrives in the act
 
 ### PSK Admission (trust gating)
 
-The `server/activate` handler in `ConnectionManager::loop()` evaluates each activate against `RecordStore::unpaired_access_enabled()` and the connection's resolved `PskCategory`, via the pure functions in `src/admission.h`:
+The `server/activate` handler in `ConnectionManager::drain_lifecycle_events()` (called from `loop()`) evaluates each activate against `RecordStore::unpaired_access_enabled()` and the connection's resolved `PskCategory`, via the pure functions in `src/admission.h`:
 
 - Any activity set that contains `pairing` is admitted only when it is exactly `{pairing}`.
 - `LONG_TERM`: any subset of `{playback, management}`.

@@ -1018,6 +1018,9 @@ A minimal integration that receives and discards audio:
 #include "sendspin/client.h"
 #include "sendspin/player_role.h"
 
+#include <chrono>
+#include <thread>
+
 using namespace sendspin;
 
 struct MinimalPlayer : PlayerRoleListener {
@@ -1138,6 +1141,9 @@ X25519 keypair and read back via `client.client_id()` after `start_server()`.
 | `time_burst_response_timeout_ms` | `int64_t` | `10000` | Milliseconds before a burst message times out |
 | `websocket_payload_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the per-connection WebSocket payload reassembly buffer (sized to the largest incoming frame, holds raw audio chunks delivered by httpd). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
 | `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `websocket_payload_location` (which covers the raw WebSocket frame buffer). ESP-IDF only; ignored on host. |
+| `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint. |
+| `static_pin_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static PIN, same values as above. Advertised on the `static_pin` descriptor in `client/hello`; empty omits the hint. |
+| `initial_unpaired_access_enabled` | `bool` | `false` | First-boot default for unpaired (Sentinel) access. Applies only on a genuine first boot; see [Unpaired Access](#unpaired-access). |
 | `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer used to parse incoming JSON protocol messages, instead of the default PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the network task on every message. Messages too large for the budget fall back to PSRAM; the default covers steady-state traffic (including the FLAC stream-start header), while large track-metadata messages may spill over (but those arrive only once per song). Set to `0` to disable and keep PSRAM-only behaviour. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer for the parse (still used, harmless). |
 
 ---
@@ -1304,6 +1310,10 @@ These represent commands the server can send to the player. The player advertise
 | `SHUTDOWN` | Device is shutting down |
 | `RESTART` | Device is restarting |
 | `USER_REQUEST` | User requested disconnect |
+| `UNAUTHORIZED` | Server requested an activity its trust level does not permit |
+| `PAIRING_REQUIRED` | Server requested playback but the client requires pairing first |
+| `CONCURRENT_ATTEMPT` | A second pairing attempt arrived while one was in progress |
+| `UNPAIRED` | Server unpaired this device via `management/server-unpair` |
 
 ### SendspinPlaybackState
 
@@ -1344,6 +1354,7 @@ These represent commands the server can send to the player. The player advertise
 | `LOUDNESS` | Loudness level |
 | `F_PEAK` | Peak frequency |
 | `SPECTRUM` | Frequency spectrum bins |
+| `PEAK` | Energy onset (transient) events |
 
 ### VisualizerSpectrumScale
 
