@@ -599,7 +599,8 @@ struct MyClientListener : SendspinClientListener {
     // Called after the Noise handshake completes, and again after each successful
     // re-handshake (notably the post-pairing rekey).
     // trust reflects the PSK category used:
-    //   ConnectionTrust::USER  -- long-term pairing record (paired server)
+    //   ConnectionTrust::USER  -- long-term record: a paired server, or one holding
+    //                             the shared-PSK fallback record (see Record Mode)
     //   ConnectionTrust::NONE  -- Sentinel or Pairing PSK (unpaired access)
     void on_trust_changed(ConnectionTrust trust) override {
         bool paired = (trust == ConnectionTrust::USER);
