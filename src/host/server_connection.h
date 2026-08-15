@@ -115,6 +115,15 @@ public:
     void handle_message(const std::string& data, bool is_binary, int64_t receive_time);
 
 protected:
+    /// @brief Shared implementation for send_text_message() and send_binary_message()
+    /// @param is_binary Sends as an IX binary frame when true, text frame when false.
+    /// @param data      Payload bytes to send.
+    /// @param len       Number of bytes in `data`.
+    /// @param on_complete Callback invoked after send completes.
+    /// @return SsErr::OK if sent successfully, error code otherwise.
+    SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
+                        SendCompleteCallback on_complete);
+
     // Pointer fields
 
     /// @brief The IXWebSocket instance for this connection (shared with the server)

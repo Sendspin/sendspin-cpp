@@ -119,31 +119,18 @@ void SendspinClientConnection::close_transport_now() {
 SsErr SendspinClientConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback cb,
                                                   bool /*allow_before_hello*/) {
-    if (!this->is_connected()) {
-        if (cb) {
-            cb(false);
-        }
-        return SsErr::INVALID_STATE;
-    }
-
-    auto info = this->ws_->send(message);
-    bool success = info.success;
-
-    if (cb) {
-        cb(success);
-    }
-
-    if (!success) {
-        SS_LOGE(TAG, "Failed to send text message");
-        return SsErr::FAIL;
-    }
-
-    return SsErr::OK;
+    return this->send_ws_frame(false, reinterpret_cast<const uint8_t*>(message.data()),
+                               message.size(), std::move(cb));
 }
 
 SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len,
                                                     SendCompleteCallback cb,
                                                     bool /*allow_before_hello*/) {
+    return this->send_ws_frame(true, data, len, std::move(cb));
+}
+
+SsErr SendspinClientConnection::send_ws_frame(bool is_binary, const uint8_t* data, size_t len,
+                                              SendCompleteCallback cb) {
     if (!this->is_connected()) {
         if (cb) {
             cb(false);
@@ -152,7 +139,7 @@ SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t 
     }
 
     std::string buf(reinterpret_cast<const char*>(data), len);
-    auto info = this->ws_->sendBinary(buf);
+    auto info = is_binary ? this->ws_->sendBinary(buf) : this->ws_->send(buf);
     bool success = info.success;
 
     if (cb) {
@@ -160,7 +147,13 @@ SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t 
     }
 
     if (!success) {
-        SS_LOGE(TAG, "Failed to send binary message");
+        // SS_LOGE requires a compile-time literal format string (it is concatenated with the log
+        // prefix at compile time), so the differing wording is an if/else rather than a ternary.
+        if (is_binary) {
+            SS_LOGE(TAG, "Failed to send binary message");
+        } else {
+            SS_LOGE(TAG, "Failed to send text message");
+        }
         return SsErr::FAIL;
     }
 

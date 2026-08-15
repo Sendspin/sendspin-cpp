@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <ios>
@@ -162,6 +163,11 @@ static bool save_doc(const std::string& path, const JsonDocument& doc) {
 // ============================================================================
 
 FilePersistenceProvider::FilePersistenceProvider(std::string path) : path_(std::move(path)) {}
+
+std::string FilePersistenceProvider::default_path(const std::string& filename) {
+    const char* home_dir = getenv("HOME");
+    return std::string(home_dir != nullptr ? home_dir : ".") + "/" + filename;
+}
 
 // ============================================================================
 // Blob store

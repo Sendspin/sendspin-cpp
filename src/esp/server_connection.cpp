@@ -54,6 +54,8 @@ struct AsyncRespArg {
     std::weak_ptr<SendspinServerConnection> conn;
     uint8_t* payload{nullptr};
     size_t len{0};
+    /// Frame type (HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY) the worker sends this as.
+    httpd_ws_type_t type{HTTPD_WS_TYPE_TEXT};
     bool has_callback{false};
     /// When true the frame may be sent before client/hello (the hello itself and goodbye); when
     /// false the worker drops it unless the hello has already been sent on this connection.
@@ -113,7 +115,7 @@ void SendspinServerConnection::disconnect(SendspinGoodbyeReason reason,
         }
 
         // Invoke user-provided completion callback if provided.
-        // Already running in httpd worker thread context (async_send_text),
+        // Already running in httpd worker thread context (async_send_frame),
         // so caller should use defer() if they need main loop context
         if (on_complete) {
             on_complete();
@@ -139,6 +141,23 @@ bool SendspinServerConnection::is_connected() const {
 SsErr SendspinServerConnection::send_text_message(const std::string& message,
                                                   SendCompleteCallback on_complete,
                                                   bool allow_before_hello) {
+    return this->queue_async_send(reinterpret_cast<const uint8_t*>(message.data()), message.size(),
+                                  HTTPD_WS_TYPE_TEXT, std::move(on_complete), allow_before_hello);
+}
+
+SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
+                                                    SendCompleteCallback on_complete,
+                                                    bool allow_before_hello) {
+    return this->queue_async_send(data, len, HTTPD_WS_TYPE_BINARY, std::move(on_complete),
+                                  allow_before_hello);
+}
+
+SsErr SendspinServerConnection::queue_async_send(const uint8_t* data, size_t len,
+                                                 httpd_ws_type_t type,
+                                                 SendCompleteCallback on_complete,
+                                                 bool allow_before_hello) {
+    const bool is_text = (type == HTTPD_WS_TYPE_TEXT);
+
     if (!this->is_connected()) {
         // No client connected: invoke callback with failure if provided
         if (on_complete) {
@@ -148,9 +167,15 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
     }
 
     // Single allocation: the AsyncRespArg header immediately followed by the payload bytes.
-    void* block = platform_malloc(sizeof(AsyncRespArg) + message.size());
+    void* block = platform_malloc(sizeof(AsyncRespArg) + len);
     if (block == nullptr) {
-        SS_LOGE(TAG, "Failed to allocate AsyncRespArg for message send");
+        // SS_LOGE requires a compile-time literal format string (it is concatenated with the log
+        // prefix at compile time), so the differing wording is an if/else rather than a ternary.
+        if (is_text) {
+            SS_LOGE(TAG, "Failed to allocate AsyncRespArg for message send");
+        } else {
+            SS_LOGE(TAG, "Failed to allocate AsyncRespArg for binary send");
+        }
         if (on_complete) {
             on_complete(false);
         }
@@ -163,7 +188,8 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
     resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
     resp_arg->allow_before_hello = allow_before_hello;
     resp_arg->payload = reinterpret_cast<uint8_t*>(block) + sizeof(AsyncRespArg);
-    resp_arg->len = message.size();
+    resp_arg->len = len;
+    resp_arg->type = type;
 
     // Move the callback into the struct if provided
     if (on_complete) {
@@ -171,57 +197,15 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
         resp_arg->on_complete = std::move(on_complete);
     }
 
-    std::memcpy(static_cast<void*>(resp_arg->payload), static_cast<const void*>(message.data()),
-                message.size());
-
-    if (httpd_queue_work(this->server_, async_send_text, resp_arg) != ESP_OK) {
-        SS_LOGE(TAG, "httpd_queue_work failed!");
-        // Need to invoke callback with failure before destroying it
-        if (resp_arg->has_callback) {
-            resp_arg->on_complete(false);
-        }
-        resp_arg->~AsyncRespArg();
-        platform_free(block);
-        return SsErr::FAIL;
-    }
-    return SsErr::OK;
-}
-
-SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
-                                                    SendCompleteCallback on_complete,
-                                                    bool allow_before_hello) {
-    if (!this->is_connected()) {
-        if (on_complete) {
-            on_complete(false);
-        }
-        return SsErr::INVALID_STATE;
-    }
-
-    // Single allocation: the AsyncRespArg header immediately followed by the payload bytes.
-    void* block = platform_malloc(sizeof(AsyncRespArg) + len);
-    if (block == nullptr) {
-        SS_LOGE(TAG, "Failed to allocate AsyncRespArg for binary send");
-        if (on_complete) {
-            on_complete(false);
-        }
-        return SsErr::NO_MEM;
-    }
-
-    auto* resp_arg = new (block) AsyncRespArg();
-    resp_arg->conn = std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
-    resp_arg->allow_before_hello = allow_before_hello;
-    resp_arg->payload = reinterpret_cast<uint8_t*>(block) + sizeof(AsyncRespArg);
-    resp_arg->len = len;
-
-    if (on_complete) {
-        resp_arg->has_callback = true;
-        resp_arg->on_complete = std::move(on_complete);
-    }
-
     std::memcpy(static_cast<void*>(resp_arg->payload), static_cast<const void*>(data), len);
 
-    if (httpd_queue_work(this->server_, async_send_binary, resp_arg) != ESP_OK) {
-        SS_LOGE(TAG, "httpd_queue_work failed for binary send!");
+    if (httpd_queue_work(this->server_, async_send_frame, resp_arg) != ESP_OK) {
+        if (is_text) {
+            SS_LOGE(TAG, "httpd_queue_work failed!");
+        } else {
+            SS_LOGE(TAG, "httpd_queue_work failed for binary send!");
+        }
+        // Need to invoke callback with failure before destroying it
         if (resp_arg->has_callback) {
             resp_arg->on_complete(false);
         }
@@ -377,38 +361,14 @@ void SendspinServerConnection::async_send_time_text(void* arg) {
     httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt);
 }
 
-void SendspinServerConnection::async_send_binary(void* arg) {
+void SendspinServerConnection::async_send_frame(void* arg) {
     auto* resp_arg = static_cast<AsyncRespArg*>(arg);
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
 
     ws_pkt.payload = resp_arg->payload;
     ws_pkt.len = resp_arg->len;
-    ws_pkt.type = HTTPD_WS_TYPE_BINARY;
-
-    auto conn = resp_arg->conn.lock();
-    if (conn && conn->is_connected() &&
-        (resp_arg->allow_before_hello || conn->client_hello_sent_)) {
-        esp_err_t err = httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt);
-        if (resp_arg->has_callback) {
-            resp_arg->on_complete(err == ESP_OK);
-        }
-    }
-
-    // payload lives inline in the same allocation as resp_arg (see AsyncRespArg), so freeing
-    // resp_arg below also releases the payload bytes; there is no separate payload free.
-    resp_arg->~AsyncRespArg();
-    platform_free(resp_arg);
-}
-
-void SendspinServerConnection::async_send_text(void* arg) {
-    struct AsyncRespArg* resp_arg = static_cast<AsyncRespArg*>(arg);
-    httpd_ws_frame_t ws_pkt;
-    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
-
-    ws_pkt.payload = resp_arg->payload;
-    ws_pkt.len = resp_arg->len;
-    ws_pkt.type = HTTPD_WS_TYPE_TEXT;
+    ws_pkt.type = resp_arg->type;
 
     // Resolve the originating connection. weak_ptr.lock() yields the exact conn that queued this
     // work (or null if it has been destroyed), so a recycled sockfd can never redirect the frame

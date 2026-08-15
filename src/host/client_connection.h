@@ -124,6 +124,14 @@ protected:
     /// events
     void setup_callbacks();
 
+    /// @brief Shared implementation for send_text_message() and send_binary_message()
+    /// @param is_binary Sends as an IX binary frame when true, text frame when false.
+    /// @param data      Payload bytes to send.
+    /// @param len       Number of bytes in `data`.
+    /// @param cb        Callback invoked after send completes.
+    /// @return SsErr::OK if sent successfully, error code otherwise.
+    SsErr send_ws_frame(bool is_binary, const uint8_t* data, size_t len, SendCompleteCallback cb);
+
     // ========================================
     // Member variables
     // ========================================

@@ -157,13 +157,24 @@ public:
     esp_err_t handle_data(httpd_req_t* req, int64_t receive_time);
 
 protected:
-    /// @brief httpd_queue_work callback that sends a queued text frame over the WebSocket
-    /// @param arg Pointer to the AsyncRespArg context allocated by send_text_message().
-    static void async_send_text(void* arg);
+    /// @brief Allocates an AsyncRespArg, copies the payload into it, and queues it on the httpd
+    /// worker to be sent as a text or binary frame by async_send_frame()
+    ///
+    /// Shared by send_text_message() and send_binary_message(); `type` selects the WebSocket
+    /// frame type and which of their (identical apart from wording) log messages is used.
+    /// @param data              Payload bytes to copy and send.
+    /// @param len               Number of bytes in `data`.
+    /// @param type              HTTPD_WS_TYPE_TEXT or HTTPD_WS_TYPE_BINARY.
+    /// @param on_complete       Completion callback, if any.
+    /// @param allow_before_hello If true, bypasses the pre-hello send gate.
+    /// @return SsErr::OK if queued successfully, error code otherwise.
+    SsErr queue_async_send(const uint8_t* data, size_t len, httpd_ws_type_t type,
+                           SendCompleteCallback on_complete, bool allow_before_hello);
 
-    /// @brief httpd_queue_work callback that sends a queued binary frame over the WebSocket
-    /// @param arg Pointer to the AsyncRespArg context allocated by send_binary_message().
-    static void async_send_binary(void* arg);
+    /// @brief httpd_queue_work callback that sends a queued text or binary frame over the
+    /// WebSocket
+    /// @param arg Pointer to the AsyncRespArg context allocated by queue_async_send().
+    static void async_send_frame(void* arg);
 
     /// @brief httpd_queue_work callback that builds and sends a client/time frame
     ///

@@ -54,6 +54,11 @@ public:
     /// @brief Construct with the path to the JSON persistence file.
     explicit FilePersistenceProvider(std::string path);
 
+    /// @brief Builds a default persistence file path under the user's home directory
+    /// @param filename The bare file name to place under $HOME (e.g. ".sendspin.json").
+    /// @return "$HOME/<filename>", or "./<filename>" if the HOME environment variable is unset.
+    static std::string default_path(const std::string& filename);
+
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override;
     bool save_blob(const std::string& key, const uint8_t* data, size_t len) override;
     bool erase_blob(const std::string& key) override;

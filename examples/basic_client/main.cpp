@@ -234,9 +234,7 @@ int main(int argc, char* argv[]) {
 
     // Persist the static keypair (and pairing state) so client_id and pairing records survive
     // restarts. Path: $HOME/.sendspin.json (regenerated if the file is absent).
-    const char* home_dir = getenv("HOME");
-    const std::string persistence_path =
-        std::string(home_dir != nullptr ? home_dir : ".") + "/.sendspin.json";
+    const std::string persistence_path = FilePersistenceProvider::default_path(".sendspin.json");
     FilePersistenceProvider persistence_provider(persistence_path);
 
     SendspinClient client(std::move(config));

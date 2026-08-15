@@ -538,9 +538,8 @@ int main(int argc, char* argv[]) {
     // restarts. Path: $HOME/.sendspin_tui.json (distinct from basic_client's
     // .sendspin.json so the two examples do not share an identity/pairing file;
     // regenerated if the file is absent).
-    const char* home_dir = getenv("HOME");
     const std::string persistence_path =
-        std::string(home_dir != nullptr ? home_dir : ".") + "/.sendspin_tui.json";
+        FilePersistenceProvider::default_path(".sendspin_tui.json");
     FilePersistenceProvider persistence_provider(persistence_path);
 
     SendspinClient client(std::move(config));
