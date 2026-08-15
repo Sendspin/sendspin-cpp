@@ -79,22 +79,6 @@ SendspinClientConfig make_config(uint16_t port) {
     return config;
 }
 
-/// A fresh long-term pairing record plus the PSK behind it, so a test can seed the client's
-/// RecordStore and hand the same PSK to a fake server. The resulting connection resolves to
-/// PskCategory::LONG_TERM, which admits any subset of {playback, management} plus the empty set.
-struct PairedPeer {
-    SendspinPairingRecord record;
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-};
-
-PairedPeer make_paired_peer() {
-    PairedPeer peer;
-    platform_random_bytes(peer.psk.data(), peer.psk.size());
-    peer.record.psk_id = psk_id_for(peer.psk);
-    peer.record.psk = peer.psk;
-    return peer;
-}
-
 /// Options for a peer that completes the Noise handshake and the hello exchange but never sends
 /// server/activate, so it proves it speaks the protocol yet never becomes operational and stays
 /// in the nursery for the whole establish window.
@@ -280,16 +264,10 @@ private:
 // keep a real server from connecting and establishing immediately, and the probe socket must be
 // closed within roughly the nursery upgrade deadline.
 TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
-    PairedPeer peer = make_paired_peer();
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(peer.record);
-    SendspinClient client(make_config(PROBE_TEST_PORT));
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
+    PairedClientBundle bundle(make_config(PROBE_TEST_PORT));
+    SendspinClient& client = bundle.client();
     // The WS server starts synchronously on the first loop() once the network reports ready.
-    pump_for(client, 50);
+    ASSERT_TRUE(bundle.start());
 
     // Hold a raw TCP connection open without ever speaking WebSocket.
     int probe_fd = connect_loopback(PROBE_TEST_PORT);
@@ -303,7 +281,7 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServer real_server(server_url(PROBE_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
-                                    peer.record.psk_id, peer.psk);
+                                    bundle.peer.record.psk_id, bundle.peer.psk);
     EXPECT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000));
     auto info = client.get_server_information();
@@ -327,25 +305,21 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
 // handshake timeout); an outbound connect's clock predates DNS/TCP resolve and must never be cut
 // short by them.
 TEST(ConnectionLifecycle, SlowOutboundSurvivesUpgradeTier) {
-    PairedPeer peer = make_paired_peer();
+    PairedClientBundle bundle(make_config(OUTBOUND_TEST_PORT));
+    SendspinClient& client = bundle.client();
 
     // Real Sendspin-speaking endpoint the proxy forwards to.
     Identity server_identity = Identity::generate().value();
     FakeOutboundEncryptedServer backend(PROXY_BACKEND_PORT, std::string(NOISE_SUITE_CHACHAPOLY),
-                                        server_identity, peer.record.psk_id, peer.psk);
+                                        server_identity, bundle.peer.record.psk_id,
+                                        bundle.peer.psk);
     ASSERT_TRUE(backend.listen());
     backend.start();
 
     DelayProxy proxy(PROXY_LISTEN_PORT, PROXY_BACKEND_PORT, 8000);
     ASSERT_TRUE(proxy.ok());
 
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(peer.record);
-    SendspinClient client(make_config(OUTBOUND_TEST_PORT));
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    ASSERT_TRUE(bundle.start());
 
     client.connect_to(server_url(PROXY_LISTEN_PORT));
 
@@ -385,15 +359,9 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
     ASSERT_EQ(::bind(stall_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     ASSERT_EQ(::listen(stall_fd, 1), 0);
 
-    PairedPeer peer = make_paired_peer();
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(peer.record);
-    SendspinClient client(make_config(ADMIT_TEST_PORT));
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    PairedClientBundle bundle(make_config(ADMIT_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
 
     client.connect_to(server_url(STALL_LISTEN_PORT));
 
@@ -411,7 +379,7 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServer real_server(server_url(ADMIT_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
-                                    peer.record.psk_id, peer.psk);
+                                    bundle.peer.record.psk_id, bundle.peer.psk);
     EXPECT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000));
     auto info = client.get_server_information();
@@ -484,15 +452,9 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
 // Delivery-at-upgrade contract: raw TCP probes never reach the manager, so even enough of them to
 // fill the nursery capacity cannot occupy a slot or delay a real server.
 TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
-    PairedPeer peer = make_paired_peer();
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(peer.record);
-    SendspinClient client(make_config(EVICT_TEST_PORT));
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    PairedClientBundle bundle(make_config(EVICT_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
 
     // Two held raw probes, enough to fill every nursery slot if they were admitted at accept.
     int probe1 = connect_loopback(EVICT_TEST_PORT);
@@ -507,7 +469,7 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServer real_server(server_url(EVICT_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
-                                    peer.record.psk_id, peer.psk);
+                                    bundle.peer.record.psk_id, bundle.peer.psk);
     EXPECT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000));
     auto info = client.get_server_information();
@@ -528,15 +490,9 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
 // Rejection happens at accept, before the newcomer gets a Noise handshake driver, so its goodbye
 // travels as a cleartext text frame and must reach the peer before the close.
 TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
-    PairedPeer peer = make_paired_peer();
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(peer.record);
-    SendspinClient client(make_config(REJECT_TEST_PORT));
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    PairedClientBundle bundle(make_config(REJECT_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
 
     // Two peers on the Sentinel PSK that handshake and answer the hello but never activate,
     // occupying both nursery slots until the establish deadline.
@@ -554,7 +510,7 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
 
     Identity late_identity = Identity::generate().value();
     FakeEncryptedServer late(server_url(REJECT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-                             late_identity, peer.record.psk_id, peer.psk);
+                             late_identity, bundle.peer.record.psk_id, bundle.peer.psk);
     EXPECT_TRUE(pump_until(
         client, [&] { return late.closed(); }, 4000));
     EXPECT_EQ(late.goodbye_reason().value_or(""), "another_server");

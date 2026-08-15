@@ -50,6 +50,18 @@ bool parse(const std::string& json, JsonDocument& doc, JsonObject& root) {
     return true;
 }
 
+/// Parses `json` and asserts that `parse_fn` rejects it. Collapses the malformed-payload
+/// rejection tests below to their JSON literal.
+template <typename Payload>
+void expect_parse_rejects(bool (*parse_fn)(JsonObject, Payload*), const std::string& json) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(json, doc, root));
+
+    Payload payload;
+    EXPECT_FALSE(parse_fn(root, &payload));
+}
+
 /// base64url-encode a fixed-size array for building test JSON strings.
 template <size_t N>
 static std::string b64url(const std::array<uint8_t, N>& a) {
@@ -98,14 +110,8 @@ TEST(DynamicPin, ParseServerPairInitValid) {
 }
 
 TEST(DynamicPin, ParseServerPairInitMissingNonce) {
-    const std::string json = R"({"type":"server/pair-init","payload":{}})";
-
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
-    ServerPairInitPayload payload;
-    EXPECT_FALSE(process_server_pair_init_message(root, &payload));
+    expect_parse_rejects<ServerPairInitPayload>(process_server_pair_init_message,
+                                                 R"({"type":"server/pair-init","payload":{}})");
 }
 
 // A pre-resync server that still sends pin_length alongside nonce_A parses fine: the extra
@@ -128,26 +134,14 @@ TEST(DynamicPin, ParseServerPairInitWrongNonceLength) {
     // Encode only 16 bytes (wrong size).
     std::array<uint8_t, 16> short_nonce{};
     const std::string nonce_b64 = b64url_encode(short_nonce.data(), short_nonce.size());
-    const std::string json = make_pair_init_json(nonce_b64);
-
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
-    ServerPairInitPayload payload;
-    EXPECT_FALSE(process_server_pair_init_message(root, &payload));
+    expect_parse_rejects<ServerPairInitPayload>(process_server_pair_init_message,
+                                                 make_pair_init_json(nonce_b64));
 }
 
 TEST(DynamicPin, ParseServerPairInitInvalidBase64) {
-    const std::string json =
-        R"({"type":"server/pair-init","payload":{"nonce_A":"!!!not_base64!!!"}})";
-
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
-    ServerPairInitPayload payload;
-    EXPECT_FALSE(process_server_pair_init_message(root, &payload));
+    expect_parse_rejects<ServerPairInitPayload>(
+        process_server_pair_init_message,
+        R"({"type":"server/pair-init","payload":{"nonce_A":"!!!not_base64!!!"}})");
 }
 
 // ============================================================================
@@ -170,40 +164,22 @@ TEST(DynamicPin, ParseServerPairAuthValid) {
 }
 
 TEST(DynamicPin, ParseServerPairAuthMissingField) {
-    const std::string json = R"({"type":"server/pair-auth","payload":{}})";
-
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
-    ServerPairAuthPayload payload;
-    EXPECT_FALSE(process_server_pair_auth_message(root, &payload));
+    expect_parse_rejects<ServerPairAuthPayload>(process_server_pair_auth_message,
+                                                 R"({"type":"server/pair-auth","payload":{}})");
 }
 
 TEST(DynamicPin, ParseServerPairAuthWrongFieldLength) {
     // 16 bytes instead of 32.
     std::array<uint8_t, 16> short_share{};
     const std::string b64 = b64url_encode(short_share.data(), short_share.size());
-    const std::string json = make_pair_auth_json(b64);
-
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
-    ServerPairAuthPayload payload;
-    EXPECT_FALSE(process_server_pair_auth_message(root, &payload));
+    expect_parse_rejects<ServerPairAuthPayload>(process_server_pair_auth_message,
+                                                 make_pair_auth_json(b64));
 }
 
 TEST(DynamicPin, ParseServerPairAuthInvalidBase64) {
-    const std::string json =
-        R"({"type":"server/pair-auth","payload":{"pake_msg_1":"!!!not_valid!!!"}})";
-
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
-    ServerPairAuthPayload payload;
-    EXPECT_FALSE(process_server_pair_auth_message(root, &payload));
+    expect_parse_rejects<ServerPairAuthPayload>(
+        process_server_pair_auth_message,
+        R"({"type":"server/pair-auth","payload":{"pake_msg_1":"!!!not_valid!!!"}})");
 }
 
 // ============================================================================
@@ -226,40 +202,22 @@ TEST(DynamicPin, ParseServerPairConfirmValid) {
 }
 
 TEST(DynamicPin, ParseServerPairConfirmMissingField) {
-    const std::string json = R"({"type":"server/pair-confirm","payload":{}})";
-
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
-    ServerPairConfirmPayload payload;
-    EXPECT_FALSE(process_server_pair_confirm_message(root, &payload));
+    expect_parse_rejects<ServerPairConfirmPayload>(
+        process_server_pair_confirm_message, R"({"type":"server/pair-confirm","payload":{}})");
 }
 
 TEST(DynamicPin, ParseServerPairConfirmWrongFieldLength) {
     // 32 bytes instead of 64.
     std::array<uint8_t, 32> short_kc{};
     const std::string b64 = b64url_encode(short_kc.data(), short_kc.size());
-    const std::string json = make_pair_confirm_json(b64);
-
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
-    ServerPairConfirmPayload payload;
-    EXPECT_FALSE(process_server_pair_confirm_message(root, &payload));
+    expect_parse_rejects<ServerPairConfirmPayload>(process_server_pair_confirm_message,
+                                                    make_pair_confirm_json(b64));
 }
 
 TEST(DynamicPin, ParseServerPairConfirmInvalidBase64) {
-    const std::string json =
-        R"({"type":"server/pair-confirm","payload":{"server_kc":"!!!not_valid!!!"}})";
-
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
-    ServerPairConfirmPayload payload;
-    EXPECT_FALSE(process_server_pair_confirm_message(root, &payload));
+    expect_parse_rejects<ServerPairConfirmPayload>(
+        process_server_pair_confirm_message,
+        R"({"type":"server/pair-confirm","payload":{"server_kc":"!!!not_valid!!!"}})");
 }
 
 // ============================================================================
@@ -578,71 +536,85 @@ static std::vector<uint8_t> ad_client() {
     return to_bytes("client");
 }
 
+/// What the round-trip pairs below need from a CPace(INITIATOR)/CPace(RESPONDER) exchange, with
+/// the correct ADa="server"/ADb="client" association: whether each side's confirmation tag
+/// verifies against the other's, plus the derived ISK/sid (only the matching-password tests
+/// check these, per PSK Wrapping).
+struct CPaceRoundTripResult {
+    bool verify_ab{false};  // initiator.verify(tag_b)
+    bool verify_ba{false};  // responder.verify(tag_a)
+    std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk_a;
+    std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk_b;
+    std::vector<uint8_t> initiator_sid;
+};
+
+// Runs a full CPace INITIATOR/RESPONDER exchange (start, cross-derive, tag, verify) with the
+// standard ADa="server"/ADb="client" association, differing only in the PRS each side uses and
+// the shared sid. The matching-vs-mismatched distinction under test lives entirely in the
+// returned verify_ab/verify_ba, which callers assert on themselves.
+static CPaceRoundTripResult run_cpace_round_trip(const std::vector<uint8_t>& prs_a,
+                                                  const std::vector<uint8_t>& prs_b,
+                                                  const std::vector<uint8_t>& sid) {
+    const std::vector<uint8_t> empty;
+
+    CPace initiator;
+    EXPECT_TRUE(initiator.start(CPaceRole::INITIATOR, prs_a, sid, empty, ad_server(), ad_client()));
+    const auto& share_a = initiator.public_share();
+
+    CPace responder;
+    EXPECT_TRUE(responder.start(CPaceRole::RESPONDER, prs_b, sid, empty, ad_client(), ad_server()));
+    const auto& share_b = responder.public_share();
+
+    EXPECT_TRUE(initiator.derive(share_b.data(), share_b.size()));
+    EXPECT_TRUE(responder.derive(share_a.data(), share_a.size()));
+
+    auto tag_a = initiator.tag();
+    auto tag_b = responder.tag();
+    EXPECT_TRUE(tag_a.has_value());
+    EXPECT_TRUE(tag_b.has_value());
+
+    CPaceRoundTripResult result;
+    if (tag_a.has_value() && tag_b.has_value()) {
+        result.verify_ab = initiator.verify(tag_b->data(), tag_b->size());
+        result.verify_ba = responder.verify(tag_a->data(), tag_a->size());
+    }
+    result.isk_a = initiator.isk();
+    result.isk_b = responder.isk();
+    result.initiator_sid = initiator.sid();
+    return result;
+}
+
 }  // namespace
 
 TEST(DynamicPinCPace, RoundTripWithMatchingPassword) {
     const auto sid = make_test_sid(/*counter=*/1);
     const auto prs = to_bytes("123456");
-    const std::vector<uint8_t> empty;
 
-    // Initiator (A = server role in the protocol; we test the library regardless).
-    // Own AD = ADa = "server"; peer AD = ADb = "client".
-    CPace initiator;
-    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs, sid, empty, ad_server(), ad_client()));
-    const auto& share_a = initiator.public_share();
-
-    // Responder (B = client role in the protocol). Own AD = ADb = "client"; peer AD = ADa =
-    // "server".
-    CPace responder;
-    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs, sid, empty, ad_client(), ad_server()));
-    const auto& share_b = responder.public_share();
-
-    // Cross-derive.
-    ASSERT_TRUE(initiator.derive(share_b.data(), share_b.size()));
-    ASSERT_TRUE(responder.derive(share_a.data(), share_a.size()));
+    // Initiator (A = server role in the protocol) and responder (B = client role in the
+    // protocol) share the same password.
+    auto result = run_cpace_round_trip(prs, prs, sid);
 
     // Both sides produce a tag; each side can verify the other's.
-    auto tag_a = initiator.tag();
-    auto tag_b = responder.tag();
-    ASSERT_TRUE(tag_a.has_value());
-    ASSERT_TRUE(tag_b.has_value());
-
-    EXPECT_TRUE(initiator.verify(tag_b->data(), tag_b->size()));
-    EXPECT_TRUE(responder.verify(tag_a->data(), tag_a->size()));
+    EXPECT_TRUE(result.verify_ab);
+    EXPECT_TRUE(result.verify_ba);
 
     // Both sides agree on ISK and sid, needed for PSK Wrapping (spec "PSK Wrapping").
-    ASSERT_TRUE(initiator.isk().has_value());
-    ASSERT_TRUE(responder.isk().has_value());
-    EXPECT_EQ(initiator.isk().value(), responder.isk().value());
-    EXPECT_EQ(initiator.sid(), sid);
+    ASSERT_TRUE(result.isk_a.has_value());
+    ASSERT_TRUE(result.isk_b.has_value());
+    EXPECT_EQ(result.isk_a.value(), result.isk_b.value());
+    EXPECT_EQ(result.initiator_sid, sid);
 }
 
 TEST(DynamicPinCPace, RoundTripMismatchedPasswordFails) {
     const auto sid = make_test_sid();
     const auto prs_a = to_bytes("123456");
     const auto prs_b = to_bytes("999999");
-    const std::vector<uint8_t> empty;
 
-    CPace initiator;
-    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs_a, sid, empty, ad_server(), ad_client()));
-
-    CPace responder;
-    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs_b, sid, empty, ad_client(), ad_server()));
-
-    const auto& share_a = initiator.public_share();
-    const auto& share_b = responder.public_share();
-
-    ASSERT_TRUE(initiator.derive(share_b.data(), share_b.size()));
-    ASSERT_TRUE(responder.derive(share_a.data(), share_a.size()));
-
-    auto tag_a = initiator.tag();
-    auto tag_b = responder.tag();
-    ASSERT_TRUE(tag_a.has_value());
-    ASSERT_TRUE(tag_b.has_value());
+    auto result = run_cpace_round_trip(prs_a, prs_b, sid);
 
     // With mismatched passwords, verification must fail.
-    EXPECT_FALSE(initiator.verify(tag_b->data(), tag_b->size()));
-    EXPECT_FALSE(responder.verify(tag_a->data(), tag_a->size()));
+    EXPECT_FALSE(result.verify_ab);
+    EXPECT_FALSE(result.verify_ba);
 }
 
 TEST(DynamicPinCPace, MismatchedAssociatedDataFailsVerify) {
@@ -827,51 +799,22 @@ TEST(StaticPin, ClientHelloStaticPinLocationsHint) {
 TEST(StaticPinCPace, RoundTripWithMatchingStaticPin) {
     const auto sid = make_test_sid();
     const auto prs = to_bytes("13572468");  // 8 decimal digits, per STATIC_PIN_DIGITS.
-    const std::vector<uint8_t> empty;
 
-    CPace initiator;  // Stand-in for the server.
-    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs, sid, empty, ad_server(), ad_client()));
-    const auto& share_a = initiator.public_share();
+    // Initiator stands in for the server; responder is the client, per
+    // handle_pairing_window_confirmed().
+    auto result = run_cpace_round_trip(prs, prs, sid);
 
-    CPace responder;  // The client, per handle_pairing_window_confirmed().
-    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs, sid, empty, ad_client(), ad_server()));
-    const auto& share_b = responder.public_share();
-
-    ASSERT_TRUE(initiator.derive(share_b.data(), share_b.size()));
-    ASSERT_TRUE(responder.derive(share_a.data(), share_a.size()));
-
-    auto tag_a = initiator.tag();
-    auto tag_b = responder.tag();
-    ASSERT_TRUE(tag_a.has_value());
-    ASSERT_TRUE(tag_b.has_value());
-
-    EXPECT_TRUE(initiator.verify(tag_b->data(), tag_b->size()));
-    EXPECT_TRUE(responder.verify(tag_a->data(), tag_a->size()));
+    EXPECT_TRUE(result.verify_ab);
+    EXPECT_TRUE(result.verify_ba);
 }
 
 TEST(StaticPinCPace, RoundTripMismatchedStaticPinFails) {
     const auto sid = make_test_sid();
     const auto prs_a = to_bytes("13572468");
     const auto prs_b = to_bytes("99999999");
-    const std::vector<uint8_t> empty;
 
-    CPace initiator;
-    ASSERT_TRUE(initiator.start(CPaceRole::INITIATOR, prs_a, sid, empty, ad_server(), ad_client()));
+    auto result = run_cpace_round_trip(prs_a, prs_b, sid);
 
-    CPace responder;
-    ASSERT_TRUE(responder.start(CPaceRole::RESPONDER, prs_b, sid, empty, ad_client(), ad_server()));
-
-    const auto& share_a = initiator.public_share();
-    const auto& share_b = responder.public_share();
-
-    ASSERT_TRUE(initiator.derive(share_b.data(), share_b.size()));
-    ASSERT_TRUE(responder.derive(share_a.data(), share_a.size()));
-
-    auto tag_a = initiator.tag();
-    auto tag_b = responder.tag();
-    ASSERT_TRUE(tag_a.has_value());
-    ASSERT_TRUE(tag_b.has_value());
-
-    EXPECT_FALSE(initiator.verify(tag_b->data(), tag_b->size()));
-    EXPECT_FALSE(responder.verify(tag_a->data(), tag_a->size()));
+    EXPECT_FALSE(result.verify_ab);
+    EXPECT_FALSE(result.verify_ba);
 }

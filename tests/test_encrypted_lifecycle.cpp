@@ -237,29 +237,17 @@ private:
 // being dropped or re-entering nursery arbitration. client/hello must be re-armed for a connection
 // outside the nursery so it does not stay permanently non-operational after the swap.
 TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-    std::string psk_id = psk_id_for(psk);
-
-    SendspinPairingRecord record;
-    record.psk_id = psk_id;
-    record.psk = psk;
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(record);
     SendspinClientConfig config;
     config.name = "Encrypted Lifecycle Test Client";
     config.server_port = RESUME_TEST_PORT;
 
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServer server(server_url(RESUME_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-                               server_identity, psk_id, psk);
+                               server_identity, bundle.peer.record.psk_id, bundle.peer.psk);
 
     // Initial handshake + hello + activate must bring the connection operational.
     ASSERT_TRUE(pump_until(
@@ -272,7 +260,7 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
 
     // Trigger the in-band re-handshake on the ADMITTED connection (same PSK: this test isolates
     // resumption from trust change, which is covered separately below).
-    ASSERT_TRUE(server.trigger_rehandshake(psk_id, psk));
+    ASSERT_TRUE(server.trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
 
     // Immediately after the swap the connection must go non-operational: first_activate_received_,
     // server_hello_received_, and client_hello_sent_ are reset. This is the expected transient dip
@@ -317,30 +305,18 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
 // without the process aborting is the primary assertion. It also checks that the connection
 // is reported lost exactly once and that no client/goodbye is sent (the close is silent, per spec).
 TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-    std::string psk_id = psk_id_for(psk);
-
-    SendspinPairingRecord record;
-    record.psk_id = psk_id;
-    record.psk = psk;
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(record);
     SendspinClientConfig config;
     config.name = "AEAD Failure Outbound Test Client";
     config.server_port = AEAD_FAILURE_TEST_PORT;  // unused: this test never accepts inbound
 
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
 
     Identity server_identity = Identity::generate().value();
     FakeOutboundEncryptedServer server(AEAD_FAILURE_OUTBOUND_PORT,
                                        std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
-                                       psk_id, psk);
+                                       bundle.peer.record.psk_id, bundle.peer.psk);
     ASSERT_TRUE(server.listen());
     server.start();
 
@@ -377,25 +353,13 @@ TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
 // identically whether the activate follows the initial handshake or a re-handshake), closing with
 // the correct client/goodbye reason.
 TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-    std::string psk_id = psk_id_for(psk);
-
-    SendspinPairingRecord record;
-    record.psk_id = psk_id;
-    record.psk = psk;
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(record);
     SendspinClientConfig config;
     config.name = "Encrypted Lifecycle Downgrade Test Client";
     config.server_port = DOWNGRADE_TEST_PORT;
 
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
 
     Identity server_identity = Identity::generate().value();
     // After the re-handshake, the fake server switches to declaring ["management"], which the
@@ -405,7 +369,8 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
     options.second_activities_json = R"(["management"])";
     options.second_roles_json = R"([])";
     FakeEncryptedServer server(server_url(DOWNGRADE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-                               server_identity, psk_id, psk, options);
+                               server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+                               options);
 
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000))
@@ -435,30 +400,19 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
 // declares pin_display_supported. A client that advertises neither leaves a server (and its
 // operator) with no way into pairing at all.
 TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-    std::string psk_id = psk_id_for(psk);
-
-    SendspinPairingRecord record;
-    record.psk_id = psk_id;
-    record.psk = psk;
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(record);
     SendspinClientConfig config;
     config.name = "Pair Methods Test Client";
     config.server_port = PAIR_METHODS_TEST_PORT;
     config.pin_display_supported = true;
 
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServer server(server_url(PAIR_METHODS_TEST_PORT),
-                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity, psk_id, psk);
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               bundle.peer.record.psk_id, bundle.peer.psk);
 
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000))
@@ -669,25 +623,13 @@ TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
 // path (trust gating -> handle_management_request -> format_management_result_message) works
 // end to end over the real Noise transport, not just at the unit level (test_management.cpp).
 TEST(EncryptedLifecycle, ManagementListRecordsRoundTripOverEncryptedTransport) {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-    std::string psk_id = psk_id_for(psk);
-
-    SendspinPairingRecord record;
-    record.psk_id = psk_id;
-    record.psk = psk;
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(record);
     SendspinClientConfig config;
     config.name = "Management Round-Trip Test Client";
     config.server_port = MANAGEMENT_TEST_PORT;
 
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
 
     // A LONG_TERM PSK activated with the MANAGEMENT activity (no roles): admissible per
     // admission.h::activities_allowed (LONG_TERM allows any subset of {PLAYBACK, MANAGEMENT}),
@@ -697,7 +639,8 @@ TEST(EncryptedLifecycle, ManagementListRecordsRoundTripOverEncryptedTransport) {
     options.first_activities_json = R"(["management"])";
     options.first_roles_json = R"([])";
     FakeEncryptedServer server(server_url(MANAGEMENT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-                               server_identity, psk_id, psk, options);
+                               server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+                               options);
 
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000))
@@ -718,7 +661,7 @@ TEST(EncryptedLifecycle, ManagementListRecordsRoundTripOverEncryptedTransport) {
     ASSERT_FALSE(records.isNull());
     bool found_seeded_record = false;
     for (JsonObject rec : records) {
-        if (std::string(rec["psk_id"] | "") == psk_id) {
+        if (std::string(rec["psk_id"] | "") == bundle.peer.record.psk_id) {
             found_seeded_record = true;
             break;
         }
@@ -791,23 +734,12 @@ TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
 // stream/state traffic ahead of server/activate (or never send one) and drive the roles anyway for
 // the whole nursery establish window.
 TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-    std::string psk_id = psk_id_for(psk);
-
-    SendspinPairingRecord record;
-    record.psk_id = psk_id;
-    record.psk = psk;
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(record);
     SendspinClientConfig config;
     config.name = "Pre-Admission Role Traffic Test Client";
     config.server_port = PREADMISSION_ROLE_TEST_PORT;
 
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
 
     struct RecordingMetadataListener : MetadataRoleListener {
         std::atomic<int> updates{0};
@@ -820,8 +752,7 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     RecordingMetadataListener metadata_listener;
     client.add_metadata().set_listener(&metadata_listener);
 
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    ASSERT_TRUE(bundle.start());
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
@@ -830,8 +761,8 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     options.pre_activate_message =
         R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Pre-Admission Leak"}}})";
     FakeEncryptedServer server(server_url(PREADMISSION_ROLE_TEST_PORT),
-                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity, psk_id, psk,
-                               options);
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               bundle.peer.record.psk_id, bundle.peer.psk, options);
 
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000))

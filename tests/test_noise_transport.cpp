@@ -306,23 +306,8 @@ static std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     EXPECT_EQ(noise_handshakestate_get_action(init_hs_raw), NOISE_ACTION_WRITE_MESSAGE);
 
     // Build msg1 payload: {"psk_id":"..."}
-    std::string psk_id_json = "{\"psk_id\":\"" + psk_id + "\"}";
-    const uint8_t* psk_id_payload = reinterpret_cast<const uint8_t*>(psk_id_json.data());
-    size_t psk_id_payload_len = psk_id_json.size();
-
-    constexpr size_t MSG_BUF_SIZE = 4096;
-    std::vector<uint8_t> msg1_raw(MSG_BUF_SIZE);
-    NoiseBuffer msg1_out;
-    noise_buffer_set_output(msg1_out, msg1_raw.data(), msg1_raw.size());
-
-    NoiseBuffer payload_in;
-    noise_buffer_set_input(payload_in, const_cast<uint8_t*>(psk_id_payload), psk_id_payload_len);
-
-    EXPECT_EQ(noise_handshakestate_write_message(init_hs_raw, &msg1_out, &payload_in),
-              NOISE_ERROR_NONE);
-    msg1_raw.resize(msg1_out.size);
-
-    std::string msg1_text = make_noise_handshake_envelope(msg1_raw);
+    std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id);
+    EXPECT_FALSE(msg1_text.empty());
 
     // -----------------------------------------------------------------
     // Step 4: our driver processes msg1
@@ -469,17 +454,7 @@ TEST(NoiseTransport, BinaryNonZeroTypeRoundTrip) {
 // Fragment and reassemble (TestConnection dispatch loop)
 // =============================================================================
 
-/// Decrypt one frame using the initiator recv cipher.
-static std::vector<uint8_t> init_decrypt(NoiseCipherState* recv_cs,
-                                         std::vector<uint8_t> ciphertext) {
-    NoiseBuffer buf;
-    noise_buffer_set_inout(buf, ciphertext.data(), ciphertext.size(), ciphertext.size());
-    if (noise_cipherstate_decrypt(recv_cs, &buf) != NOISE_ERROR_NONE) {
-        return {};
-    }
-    ciphertext.resize(buf.size);
-    return ciphertext;
-}
+// raw_decrypt() (from noise_test_helpers.h) decrypts one frame using the initiator recv cipher.
 
 TEST(NoiseTransport, SendEncryptedText_SmallJson_ChaChaPoly) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
@@ -496,7 +471,7 @@ TEST(NoiseTransport, SendEncryptedText_SmallJson_ChaChaPoly) {
     const auto& ct = conn.sent_binary_[0];
 
     // Decrypt with initiator recv cipher
-    auto pt = init_decrypt(r->initiator.recv_cs, ct);
+    auto pt = raw_decrypt(r->initiator.recv_cs, ct);
     ASSERT_FALSE(pt.empty());
     ASSERT_GE(pt.size(), 1u);
     EXPECT_EQ(pt[0], 0x00u);  // MSG_TYPE_JSON_BODY
@@ -528,7 +503,7 @@ TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
     ASSERT_EQ(conn.sent_binary_.size(), 1u);
 
     // The encrypted frame decrypts to the JSON body via the initiator's recv cipher.
-    auto pt = init_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
+    auto pt = raw_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
     ASSERT_GE(pt.size(), 1u);
     EXPECT_EQ(pt[0], 0x00u);  // MSG_TYPE_JSON_BODY
     std::string recovered(reinterpret_cast<char*>(pt.data() + 1), pt.size() - 1);
@@ -649,20 +624,8 @@ TEST(NoiseHandshakeDriver, UnknownPskIdAborts) {
     ASSERT_NE(init_hs_raw, nullptr);
     HsGuard guard(init_hs_raw);
 
-    std::string psk_id_json = "{\"psk_id\":\"" + psk_id + "\"}";
-    std::vector<uint8_t> msg1_raw(4096);
-    NoiseBuffer msg1_out;
-    noise_buffer_set_output(msg1_out, msg1_raw.data(), msg1_raw.size());
-    NoiseBuffer payload_in;
-    noise_buffer_set_input(payload_in,
-                           const_cast<uint8_t*>(
-                               reinterpret_cast<const uint8_t*>(psk_id_json.data())),
-                           psk_id_json.size());
-    ASSERT_EQ(noise_handshakestate_write_message(init_hs_raw, &msg1_out, &payload_in),
-              NOISE_ERROR_NONE);
-    msg1_raw.resize(msg1_out.size);
-
-    std::string msg1_text = make_noise_handshake_envelope(msg1_raw);
+    std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id);
+    ASSERT_FALSE(msg1_text.empty());
 
     // Should abort because psk_id not found
     auto r2 = nh.on_text_frame(msg1_text, [](const std::string&) { return true; });
@@ -706,22 +669,11 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     ASSERT_NE(init_hs_raw, nullptr);
     HsGuard guard(init_hs_raw);
 
-    std::string psk_id_json = "{\"psk_id\":\"" + psk_id_val + "\"}";
-    std::vector<uint8_t> msg1_raw(4096);
-    NoiseBuffer msg1_out;
-    noise_buffer_set_output(msg1_out, msg1_raw.data(), msg1_raw.size());
-    NoiseBuffer payload_in;
-    noise_buffer_set_input(payload_in,
-                           const_cast<uint8_t*>(
-                               reinterpret_cast<const uint8_t*>(psk_id_json.data())),
-                           psk_id_json.size());
-    ASSERT_EQ(noise_handshakestate_write_message(init_hs_raw, &msg1_out, &payload_in),
-              NOISE_ERROR_NONE);
-    msg1_raw.resize(msg1_out.size);
+    std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id_val);
+    ASSERT_FALSE(msg1_text.empty());
 
     // Should abort because PSK is bound to other_server, not server_id
-    auto r2 = nh.on_text_frame(make_noise_handshake_envelope(msg1_raw),
-                                [](const std::string&) { return true; });
+    auto r2 = nh.on_text_frame(msg1_text, [](const std::string&) { return true; });
     EXPECT_EQ(r2, HandshakeFrameResult::ABORT);
 }
 
@@ -773,16 +725,10 @@ TEST(NoiseTransportDispatch, NonFragmentMidReassemblyClosesConnection) {
     // conn's decrypt to succeed.
 
     // Create a "fragment-more" frame: [0x02, orig_type=0x00, data...]
-    // We'll encrypt it manually using the initiator send_cs.
     auto plaintext_frag_more =
         std::vector<uint8_t>{0x02, 0x00, 0xAA, 0xBB, 0xCC};  // FRAGMENT_MORE, orig=JSON, 3 bytes
-
-    std::vector<uint8_t> ct1(plaintext_frag_more.size() + 16);
-    std::copy(plaintext_frag_more.begin(), plaintext_frag_more.end(), ct1.begin());
-    NoiseBuffer buf;
-    noise_buffer_set_inout(buf, ct1.data(), plaintext_frag_more.size(), ct1.size());
-    ASSERT_EQ(noise_cipherstate_encrypt(r->initiator.send_cs, &buf), NOISE_ERROR_NONE);
-    ct1.resize(buf.size);
+    std::vector<uint8_t> ct1 = raw_encrypt(r->initiator.send_cs, plaintext_frag_more);
+    ASSERT_FALSE(ct1.empty());
 
     conn.set_noise_session(std::move(r->responder_session));
 
@@ -796,13 +742,9 @@ TEST(NoiseTransportDispatch, NonFragmentMidReassemblyClosesConnection) {
     conn.inject_binary_payload(ct1.data(), ct1.size());
 
     // Now inject a non-fragment frame (type=0x00 = JSON). This should abort reassembly.
-    // We need to encrypt this too with the initiator send_cs (already advanced one nonce)
     std::vector<uint8_t> plaintext_json = {0x00, 'H', 'i'};  // JSON body type
-    std::vector<uint8_t> ct2(plaintext_json.size() + 16);
-    std::copy(plaintext_json.begin(), plaintext_json.end(), ct2.begin());
-    noise_buffer_set_inout(buf, ct2.data(), plaintext_json.size(), ct2.size());
-    ASSERT_EQ(noise_cipherstate_encrypt(r->initiator.send_cs, &buf), NOISE_ERROR_NONE);
-    ct2.resize(buf.size);
+    std::vector<uint8_t> ct2 = raw_encrypt(r->initiator.send_cs, plaintext_json);
+    ASSERT_FALSE(ct2.empty());
 
     conn.inject_binary_payload(ct2.data(), ct2.size());
 
@@ -829,13 +771,8 @@ TEST(NoiseTransportDispatch, FragmentEndWithoutStartClosesConnection) {
 
     // Send FRAGMENT_END without a preceding FRAGMENT_MORE
     std::vector<uint8_t> plaintext_frag_end = {0x03, 'A', 'B'};  // FRAGMENT_END + data
-
-    std::vector<uint8_t> ct(plaintext_frag_end.size() + 16);
-    std::copy(plaintext_frag_end.begin(), plaintext_frag_end.end(), ct.begin());
-    NoiseBuffer buf;
-    noise_buffer_set_inout(buf, ct.data(), plaintext_frag_end.size(), ct.size());
-    ASSERT_EQ(noise_cipherstate_encrypt(r->initiator.send_cs, &buf), NOISE_ERROR_NONE);
-    ct.resize(buf.size);
+    std::vector<uint8_t> ct = raw_encrypt(r->initiator.send_cs, plaintext_frag_end);
+    ASSERT_FALSE(ct.empty());
 
     conn.set_noise_session(std::move(r->responder_session));
 
@@ -872,12 +809,8 @@ TEST(NoiseTransportDispatch, BenignMidReassemblyDoesNotClose) {
     // FRAGMENT_MORE start: [0x02, orig_type=0x00, data...]. A valid start of a fragmented
     // JSON message, no FRAGMENT_END yet.
     std::vector<uint8_t> plaintext_frag_more{0x02, 0x00, 0xAA, 0xBB, 0xCC};
-    std::vector<uint8_t> ct(plaintext_frag_more.size() + 16);
-    std::copy(plaintext_frag_more.begin(), plaintext_frag_more.end(), ct.begin());
-    NoiseBuffer buf;
-    noise_buffer_set_inout(buf, ct.data(), plaintext_frag_more.size(), ct.size());
-    ASSERT_EQ(noise_cipherstate_encrypt(r->initiator.send_cs, &buf), NOISE_ERROR_NONE);
-    ct.resize(buf.size);
+    std::vector<uint8_t> ct = raw_encrypt(r->initiator.send_cs, plaintext_frag_more);
+    ASSERT_FALSE(ct.empty());
 
     conn.inject_binary_payload(ct.data(), ct.size());
 
@@ -910,12 +843,8 @@ TEST(NoiseTransportDispatch, ReassemblyOverCapDropsWithoutClosing) {
         plaintext.reserve(1 + body.size());
         plaintext.push_back(type_byte);
         plaintext.insert(plaintext.end(), body.begin(), body.end());
-        std::vector<uint8_t> ct(plaintext.size() + 16);
-        std::copy(plaintext.begin(), plaintext.end(), ct.begin());
-        NoiseBuffer buf;
-        noise_buffer_set_inout(buf, ct.data(), plaintext.size(), ct.size());
-        ASSERT_EQ(noise_cipherstate_encrypt(r->initiator.send_cs, &buf), NOISE_ERROR_NONE);
-        ct.resize(buf.size);
+        std::vector<uint8_t> ct = raw_encrypt(r->initiator.send_cs, plaintext);
+        ASSERT_FALSE(ct.empty());
         conn.inject_binary_payload(ct.data(), ct.size());
     };
 
@@ -1048,19 +977,10 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
     ASSERT_NE(init_hs_raw, nullptr);
     HsGuard guard(init_hs_raw);
 
-    std::string psk_id_json = "{\"psk_id\":\"" + psk_id + "\"}";
-    std::vector<uint8_t> msg1_raw(4096);
-    NoiseBuffer msg1_out;
-    noise_buffer_set_output(msg1_out, msg1_raw.data(), msg1_raw.size());
-    NoiseBuffer payload_in;
-    noise_buffer_set_input(
-        payload_in, const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(psk_id_json.data())),
-        psk_id_json.size());
-    ASSERT_EQ(noise_handshakestate_write_message(init_hs_raw, &msg1_out, &payload_in),
-              NOISE_ERROR_NONE);
-    msg1_raw.resize(msg1_out.size);
+    std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id);
+    ASSERT_FALSE(msg1_text.empty());
 
-    conn.inject_text_payload(make_noise_handshake_envelope(msg1_raw));
+    conn.inject_text_payload(msg1_text);
 
     // The handshake must have aborted and the connection must have been closed silently: torn
     // down via close_transport_now() (not disconnect()), with no goodbye (only the earlier
@@ -1076,17 +996,8 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
 // End-to-end fragment + reassembly through the receive (decrypt) path
 // =============================================================================
 
-/// Encrypt one plaintext frame with the "server" send cipher (advances its nonce).
-static std::vector<uint8_t> server_encrypt_frame(NoiseCipherState* send_cs,
-                                                 const std::vector<uint8_t>& frame_pt) {
-    std::vector<uint8_t> ct(frame_pt.size() + 16);
-    std::copy(frame_pt.begin(), frame_pt.end(), ct.begin());
-    NoiseBuffer buf;
-    noise_buffer_set_inout(buf, ct.data(), frame_pt.size(), ct.size());
-    EXPECT_EQ(noise_cipherstate_encrypt(send_cs, &buf), NOISE_ERROR_NONE);
-    ct.resize(buf.size);
-    return ct;
-}
+// raw_encrypt() (from noise_test_helpers.h) encrypts one plaintext frame with the "server" send
+// cipher (advances its nonce).
 
 /// Split a type-prefixed plaintext into wire fragment frames, matching wire.py _fragment()
 /// and SendspinConnection::fragment_and_send().
@@ -1154,7 +1065,8 @@ static void run_fragment_reassemble_receive(const std::string& suite) {
     const auto frames = server_fragment_frames(plaintext);
     ASSERT_GE(frames.size(), 3u);
     for (const auto& f : frames) {
-        const auto ct = server_encrypt_frame(server_send, f);
+        const auto ct = raw_encrypt(server_send, f);
+        EXPECT_FALSE(ct.empty());
         conn.inject_binary_payload(ct.data(), ct.size());
     }
 
@@ -1192,7 +1104,8 @@ TEST(NoiseTransport, FragmentReassembleBinaryReceive) {
     const auto frames = server_fragment_frames(plaintext);
     ASSERT_GE(frames.size(), 2u);
     for (const auto& f : frames) {
-        const auto ct = server_encrypt_frame(server_send, f);
+        const auto ct = raw_encrypt(server_send, f);
+        EXPECT_FALSE(ct.empty());
         conn.inject_binary_payload(ct.data(), ct.size());
     }
 
@@ -1227,7 +1140,7 @@ TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
     std::vector<uint8_t> pt;
     pt.push_back(MSG_TYPE_JSON_BODY);
     pt.insert(pt.end(), json.begin(), json.end());
-    auto ct = server_encrypt_frame(server_send, pt);
+    auto ct = raw_encrypt(server_send, pt);
 
     // Flip a byte; the AEAD tag check must fail, the frame must be dropped, and the
     // connection must be closed silently, with no application-level message sent.
@@ -1300,7 +1213,7 @@ TEST(NoiseTransport, SendJson_GrowingSizesRoundTrip) {
         ASSERT_EQ(conn.send_encrypted_text(json), SsErr::OK) << "json_len=" << json_len;
         ASSERT_EQ(conn.sent_binary_.size(), 1u) << "json_len=" << json_len;
 
-        auto pt = init_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
+        auto pt = raw_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
         ASSERT_FALSE(pt.empty()) << "json_len=" << json_len;
         EXPECT_EQ(pt[0], 0x00u);  // MSG_TYPE_JSON_BODY
         std::string recovered(reinterpret_cast<char*>(pt.data() + 1), pt.size() - 1);
@@ -1331,7 +1244,7 @@ TEST(NoiseTransport, SendBinary_GrowingSizesUpToMaxTransportPlaintextRoundTrip) 
         ASSERT_EQ(conn.test_send_binary(data.data(), data.size()), SsErr::OK) << "len=" << len;
         ASSERT_EQ(conn.sent_binary_.size(), 1u) << "len=" << len;
 
-        auto pt = init_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
+        auto pt = raw_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);
         ASSERT_EQ(pt.size(), len) << "len=" << len;
         EXPECT_EQ(pt, data) << "len=" << len;
     }

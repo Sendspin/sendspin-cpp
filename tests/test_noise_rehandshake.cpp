@@ -126,27 +126,10 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
     if (!init_hs_raw) { return std::nullopt; }
     HsGuard init_hs_guard(init_hs_raw);
 
-    std::string psk_id_json = "{\"psk_id\":\"" + r.psk_id + "\"}";
-    std::vector<uint8_t> msg1_raw(4096);
-    NoiseBuffer msg1_out;
-    noise_buffer_set_output(msg1_out, msg1_raw.data(), msg1_raw.size());
-    NoiseBuffer payload_in;
-    noise_buffer_set_input(payload_in,
-                           const_cast<uint8_t*>(
-                               reinterpret_cast<const uint8_t*>(psk_id_json.data())),
-                           psk_id_json.size());
-    if (noise_handshakestate_write_message(init_hs_raw, &msg1_out, &payload_in) != NOISE_ERROR_NONE) {
+    std::string msg1_text = build_msg1_envelope(init_hs_raw, r.psk_id);
+    if (msg1_text.empty()) {
         return std::nullopt;
     }
-    msg1_raw.resize(msg1_out.size);
-
-    // Build noise/handshake JSON envelope for msg1
-    std::string msg1_b64 = b64url_encode(msg1_raw.data(), msg1_raw.size());
-    JsonDocument env_doc;
-    env_doc["type"] = "noise/handshake";
-    env_doc["payload"]["data"] = msg1_b64;
-    std::string msg1_text;
-    serializeJson(env_doc, msg1_text);
 
     EXPECT_EQ(nh.on_text_frame(msg1_text, send_fn), HandshakeFrameResult::COMPLETE);
     if (captured_msg2.empty()) { return std::nullopt; }
@@ -182,25 +165,8 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
     return r;
 }
 
-/// Encrypt one frame with a raw noise-c cipher state.
-static std::vector<uint8_t> raw_encrypt(NoiseCipherState* cs, const std::vector<uint8_t>& pt) {
-    std::vector<uint8_t> ct(pt.size() + 16);
-    std::copy(pt.begin(), pt.end(), ct.begin());
-    NoiseBuffer buf;
-    noise_buffer_set_inout(buf, ct.data(), pt.size(), ct.size());
-    EXPECT_EQ(noise_cipherstate_encrypt(cs, &buf), NOISE_ERROR_NONE);
-    ct.resize(buf.size);
-    return ct;
-}
-
-/// Decrypt one frame with a raw noise-c cipher state.
-static std::vector<uint8_t> raw_decrypt(NoiseCipherState* cs, std::vector<uint8_t> ct) {
-    NoiseBuffer buf;
-    noise_buffer_set_inout(buf, ct.data(), ct.size(), ct.size());
-    if (noise_cipherstate_decrypt(cs, &buf) != NOISE_ERROR_NONE) { return {}; }
-    ct.resize(buf.size);
-    return ct;
-}
+// raw_encrypt() / raw_decrypt() (from noise_test_helpers.h) encrypt/decrypt one frame with a raw
+// noise-c cipher state.
 
 // =============================================================================
 // Re-handshake loopback helper
@@ -240,30 +206,13 @@ static std::optional<RehandshakeResult> run_rehandshake(
     }
     HsGuard init_hs_guard(init_hs_raw);
 
-    // Initiator writes msg1 with psk_id payload
-    std::string psk_id_json = "{\"psk_id\":\"" + rehs_psk_id + "\"}";
-    std::vector<uint8_t> msg1_raw(4096);
-    NoiseBuffer msg1_out;
-    noise_buffer_set_output(msg1_out, msg1_raw.data(), msg1_raw.size());
-    NoiseBuffer payload_in;
-    noise_buffer_set_input(payload_in,
-                           const_cast<uint8_t*>(
-                               reinterpret_cast<const uint8_t*>(psk_id_json.data())),
-                           psk_id_json.size());
-    if (noise_handshakestate_write_message(init_hs_raw, &msg1_out, &payload_in) !=
-        NOISE_ERROR_NONE) {
+    // Initiator writes msg1 with psk_id payload, wrapped in a noise/handshake JSON envelope (as
+    // decrypted by the transport layer).
+    std::string msg1_json = build_msg1_envelope(init_hs_raw, rehs_psk_id);
+    if (msg1_json.empty()) {
         ADD_FAILURE() << "initiator write_message (msg1) failed";
         return std::nullopt;
     }
-    msg1_raw.resize(msg1_out.size);
-
-    // Wrap msg1 in a noise/handshake JSON envelope (as decrypted by the transport layer)
-    std::string msg1_b64 = b64url_encode(msg1_raw.data(), msg1_raw.size());
-    JsonDocument env_doc;
-    env_doc["type"] = "noise/handshake";
-    env_doc["payload"]["data"] = msg1_b64;
-    std::string msg1_json;
-    serializeJson(env_doc, msg1_json);
 
     auto result = run_rehandshake_msg1(msg1_json, init.server_id.peer_id(), init.client_id, rs,
                                        suite_name, prior_h);
@@ -451,25 +400,8 @@ TEST(NoiseRehandshake, UnknownPskIdAborts) {
     ASSERT_NE(init_hs_raw, nullptr);
     HsGuard guard(init_hs_raw);
 
-    std::string psk_id_json = "{\"psk_id\":\"" + unknown_psk_id + "\"}";
-    std::vector<uint8_t> msg1_raw(4096);
-    NoiseBuffer msg1_out;
-    noise_buffer_set_output(msg1_out, msg1_raw.data(), msg1_raw.size());
-    NoiseBuffer payload_in;
-    noise_buffer_set_input(
-        payload_in,
-        const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(psk_id_json.data())),
-        psk_id_json.size());
-    ASSERT_EQ(noise_handshakestate_write_message(init_hs_raw, &msg1_out, &payload_in),
-              NOISE_ERROR_NONE);
-    msg1_raw.resize(msg1_out.size);
-
-    std::string msg1_b64 = b64url_encode(msg1_raw.data(), msg1_raw.size());
-    JsonDocument env_doc;
-    env_doc["type"] = "noise/handshake";
-    env_doc["payload"]["data"] = msg1_b64;
-    std::string msg1_json;
-    serializeJson(env_doc, msg1_json);
+    std::string msg1_json = build_msg1_envelope(init_hs_raw, unknown_psk_id);
+    ASSERT_FALSE(msg1_json.empty());
 
     // run_rehandshake_msg1 must return nullopt (unknown psk_id).
     auto result = run_rehandshake_msg1(msg1_json, init.server_id.peer_id(), init.client_id,

@@ -28,6 +28,7 @@
 #include "crypto/keys.h"
 #include "noise_test_helpers.h"
 #include "platform/base64.h"
+#include "platform/crypto.h"
 #include "sendspin/client.h"
 #include "sendspin/persistence_codec.h"
 #include "sendspin/types.h"
@@ -133,6 +134,59 @@ inline void pump_for(SendspinClient& client, int duration_ms) {
         client, [] { return false; }, duration_ms);
 }
 
+/// A fresh long-term pairing record plus the PSK behind it, so a test can seed the client's
+/// RecordStore and hand the same PSK to a fake server. The resulting connection resolves to
+/// PskCategory::LONG_TERM, which admits any subset of {playback, management} plus the empty set.
+struct PairedPeer {
+    SendspinPairingRecord record;
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+};
+
+inline PairedPeer make_paired_peer() {
+    PairedPeer peer;
+    platform_random_bytes(peer.psk.data(), peer.psk.size());
+    peer.record.psk_id = psk_id_for(peer.psk);
+    peer.record.psk = peer.psk;
+    return peer;
+}
+
+/// A SendspinClient wired to a fresh PairedPeer's TestNetworkProvider/TestPersistenceProvider,
+/// ready for the test to finish any per-scenario setup (extra roles, extra config fields) before
+/// calling start(). SendspinClient is not movable (it owns a std::mutex), so it is heap-allocated
+/// and this bundle is meant to be constructed once, in place, at the call site, mirroring the
+/// peer + network + persistence + client + start_server + pump bundle every lifecycle test needs.
+class PairedClientBundle {
+public:
+    explicit PairedClientBundle(SendspinClientConfig config)
+        : peer(make_paired_peer()),
+          persistence(this->peer.record),
+          client_(std::make_unique<SendspinClient>(std::move(config))) {
+        this->client_->set_network_provider(&this->network);
+        this->client_->set_persistence_provider(&this->persistence);
+    }
+
+    SendspinClient& client() {
+        return *this->client_;
+    }
+
+    /// Starts the server and pumps for the 50 ms bring-up window every call site uses before its
+    /// first fake-server connection.
+    bool start() {
+        if (!this->client_->start_server()) {
+            return false;
+        }
+        pump_for(*this->client_, 50);
+        return true;
+    }
+
+    PairedPeer peer;
+    TestNetworkProvider network;
+    TestPersistenceProvider persistence;
+
+private:
+    std::unique_ptr<SendspinClient> client_;
+};
+
 inline std::vector<uint8_t> write_msg1(NoiseHandshakeState* hs, const std::string& psk_id) {
     std::string psk_id_json = "{\"psk_id\":\"" + psk_id + "\"}";
     std::vector<uint8_t> msg1_raw(4096);
@@ -147,28 +201,6 @@ inline std::vector<uint8_t> write_msg1(NoiseHandshakeState* hs, const std::strin
     }
     msg1_raw.resize(msg1_out.size);
     return msg1_raw;
-}
-
-inline std::vector<uint8_t> raw_encrypt(NoiseCipherState* cs, const std::vector<uint8_t>& pt) {
-    std::vector<uint8_t> ct(pt.size() + 16);
-    std::copy(pt.begin(), pt.end(), ct.begin());
-    NoiseBuffer buf;
-    noise_buffer_set_inout(buf, ct.data(), pt.size(), ct.size());
-    if (noise_cipherstate_encrypt(cs, &buf) != NOISE_ERROR_NONE) {
-        return {};
-    }
-    ct.resize(buf.size);
-    return ct;
-}
-
-inline std::vector<uint8_t> raw_decrypt(NoiseCipherState* cs, std::vector<uint8_t> ct) {
-    NoiseBuffer buf;
-    noise_buffer_set_inout(buf, ct.data(), ct.size(), ct.size());
-    if (noise_cipherstate_decrypt(cs, &buf) != NOISE_ERROR_NONE) {
-        return {};
-    }
-    ct.resize(buf.size);
-    return ct;
 }
 
 inline std::string noise_handshake_envelope(const std::vector<uint8_t>& noise_bytes) {
