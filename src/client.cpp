@@ -122,6 +122,15 @@ struct SendspinClient::EventState {
     // schedule_pairing_succeeded()) and is only turned into a note_pairing_succeeded() call (and
     // thus a PairingNote here) once that idiom's drain has moved it to the main loop.
     std::vector<PairingNote> pairing_notes;
+
+    /// @brief Appends `note` to pairing_notes. Every SendspinClient::note_*() method funnels
+    /// through this so the push_back shape lives once. PairingNote is anonymous-namespace-private
+    /// to this file, so this lives on EventState (itself private to SendspinClient) rather than as
+    /// a SendspinClient member declared in the public header.
+    /// @param note The note to append (moved).
+    void push_pairing_note(PairingNote&& note) {
+        this->pairing_notes.push_back(std::move(note));
+    }
 };
 
 // ============================================================================
@@ -1709,36 +1718,35 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
 }
 
 void SendspinClient::note_pairing_started(const std::string& server_id) {
-    this->event_state_->pairing_notes.push_back(
+    this->event_state_->push_pairing_note(
         {.type = PairingNoteType::PAIRING_STARTED, .text = server_id});
 }
 
 void SendspinClient::note_pairing_succeeded(const std::string& server_id) {
-    this->event_state_->pairing_notes.push_back(
+    this->event_state_->push_pairing_note(
         {.type = PairingNoteType::PAIRING_SUCCEEDED, .text = server_id});
 }
 
 void SendspinClient::note_pairing_failed(const std::string& server_id,
                                          SendspinPairAbortReason reason) {
-    this->event_state_->pairing_notes.push_back(
+    this->event_state_->push_pairing_note(
         {.type = PairingNoteType::PAIRING_FAILED, .text = server_id, .reason = reason});
 }
 
 void SendspinClient::note_display_pin(const std::string& pin) {
-    this->event_state_->pairing_notes.push_back(
-        {.type = PairingNoteType::DISPLAY_PIN, .text = pin});
+    this->event_state_->push_pairing_note({.type = PairingNoteType::DISPLAY_PIN, .text = pin});
 }
 
 void SendspinClient::note_clear_pin() {
-    this->event_state_->pairing_notes.push_back({.type = PairingNoteType::CLEAR_PIN});
+    this->event_state_->push_pairing_note({.type = PairingNoteType::CLEAR_PIN});
 }
 
 void SendspinClient::note_open_pairing_window() {
-    this->event_state_->pairing_notes.push_back({.type = PairingNoteType::OPEN_PAIRING_WINDOW});
+    this->event_state_->push_pairing_note({.type = PairingNoteType::OPEN_PAIRING_WINDOW});
 }
 
 void SendspinClient::note_close_pairing_window() {
-    this->event_state_->pairing_notes.push_back({.type = PairingNoteType::CLOSE_PAIRING_WINDOW});
+    this->event_state_->push_pairing_note({.type = PairingNoteType::CLOSE_PAIRING_WINDOW});
 }
 
 void SendspinClient::confirm_pairing_window() {

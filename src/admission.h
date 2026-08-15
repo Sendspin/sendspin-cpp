@@ -39,6 +39,21 @@ namespace sendspin {
 // Trust enforcement (PSK category -> allowed activities)
 // ============================================================================
 
+/// @brief Whether `activities` contains `target`. Activity lists are always tiny, so a linear
+/// scan is used everywhere in this file instead of a set.
+/// @param activities Activities to scan.
+/// @param target     Activity to look for.
+/// @return true if `target` appears in `activities`.
+inline bool contains_activity(const std::vector<SendspinActivity>& activities,
+                              SendspinActivity target) {
+    for (const auto& a : activities) {
+        if (a == target) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// @brief Whether `activities` is an allowed set for the matched PSK category.
 ///
 /// Ports `_activities_allowed` from
@@ -58,15 +73,7 @@ namespace sendspin {
 inline bool activities_allowed(PskCategory category,
                                const std::vector<SendspinActivity>& activities,
                                bool unpaired_access) {
-    bool has_pairing = false;
-    for (const auto& a : activities) {
-        if (a == SendspinActivity::PAIRING) {
-            has_pairing = true;
-            break;
-        }
-    }
-
-    if (has_pairing) {
+    if (contains_activity(activities, SendspinActivity::PAIRING)) {
         // Only {PAIRING} is valid when PAIRING is present.
         return activities.size() == 1;
     }
@@ -112,14 +119,7 @@ inline bool activities_allowed(PskCategory category,
 inline bool is_playback_capable(PskCategory category,
                                 const std::vector<SendspinActivity>& activities,
                                 bool unpaired_access) {
-    bool already_has_playback = false;
-    for (const auto& a : activities) {
-        if (a == SendspinActivity::PLAYBACK) {
-            already_has_playback = true;
-            break;
-        }
-    }
-    if (already_has_playback) {
+    if (contains_activity(activities, SendspinActivity::PLAYBACK)) {
         return activities_allowed(category, activities, unpaired_access);
     }
     std::vector<SendspinActivity> with_playback = activities;
@@ -152,14 +152,7 @@ inline bool admissible(PskCategory category, const std::vector<SendspinActivity>
     }
     // Non-empty active_roles requires playback-capable activities.
     // Build activities | {PLAYBACK}.
-    bool already_has_playback = false;
-    for (const auto& a : activities) {
-        if (a == SendspinActivity::PLAYBACK) {
-            already_has_playback = true;
-            break;
-        }
-    }
-    if (already_has_playback) {
+    if (contains_activity(activities, SendspinActivity::PLAYBACK)) {
         // activities already includes PLAYBACK -> same check.
         return true;
     }

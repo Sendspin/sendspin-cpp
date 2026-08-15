@@ -105,6 +105,27 @@ static const char* to_cstr(SetupStage stage) {
     return "UNKNOWN";
 }
 
+/// @brief Pairing-UI display flags snapshotted from a connection's PinSession.
+///
+/// conn->pin_session().pin_displayed / .window_shown are the sole record of whether a PIN or
+/// pairing-window prompt is still showing, and every path that ends a pairing attempt clears that
+/// state (cleanup_connection_state() on the current-slot drop path, clear_pairing_state())
+/// before it gets a chance to dismiss the prompt. Capture the flags with snapshot_pairing_ui()
+/// BEFORE that cleanup runs, then pass them to ConnectionManager::dismiss_pairing_ui() afterward
+/// so the dismissal still happens even though the flags it would have read are already gone.
+struct PairingUiSnapshot {
+    bool pin_was_displayed;
+    bool window_was_shown;
+};
+
+/// @brief Captures conn's pairing-UI display flags. See PairingUiSnapshot for why the capture
+/// must happen before any pairing-state cleanup.
+/// @param conn Connection to snapshot. Must be non-null.
+/// @return The captured flags.
+static PairingUiSnapshot snapshot_pairing_ui(SendspinConnection* conn) {
+    return {conn->pin_session().pin_displayed, conn->pin_session().window_shown};
+}
+
 /// @brief Overall deadline for a dynamic-PIN pairing attempt (mirrors the reference's 120 s
 /// asyncio.timeout). If the server stalls mid-exchange the attempt is aborted and the PIN is
 /// cleared from the display, rather than hanging until the transport eventually drops.
@@ -206,11 +227,12 @@ ConnectionManager::~ConnectionManager() {
         // Keep the hint atomics in sync with the now-empty containers (has_pending_events_ was
         // handled above under its own mutex). Nothing reads them again after destruction, but
         // this keeps the "atomic mirrors container" invariant unconditional rather than carving
-        // out an exception for teardown.
+        // out an exception for teardown. The containers were just moved-from (empty), so the
+        // refresh helpers store 0.
         this->has_current_.store(false, std::memory_order_release);
-        this->nursery_size_.store(0, std::memory_order_release);
-        this->deferred_size_.store(0, std::memory_order_release);
-        this->hello_retries_size_.store(0, std::memory_order_release);
+        this->refresh_nursery_size_hint();
+        this->refresh_deferred_size_hint();
+        this->refresh_hello_retries_size_hint();
     }
     // Locals release here. Queued goodbyes are skipped on destruction; shutdown drops slots
     // without a send.
@@ -238,12 +260,12 @@ void ConnectionManager::connect_to(const std::string& url) {
         // Inbound connections arrive already upgraded and arm their hello at admission.
         c->mark_ws_upgraded();
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->queue_pending_connected(c->shared_from_this());
+        this->queue_pending(this->pending_connected_events_, c->shared_from_this());
     };
     client_conn->on_disconnected_cb = [this](SendspinConnection* conn) {
         // Defer to loop(); this callback runs on IXWebSocket's internal thread
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        this->queue_pending_disconnect(conn->shared_from_this());
+        this->queue_pending(this->pending_disconnect_events_, conn->shared_from_this());
     };
 
     client_conn->init_time_filter();
@@ -352,7 +374,7 @@ void ConnectionManager::init_server(SendspinClient* client) {
             // queue: both carry the connection itself, so a stale event can never be mis-routed to
             // a new connection (drop_connection no-ops on connections it does not manage).
             std::lock_guard<std::mutex> lock(this->conn_mutex_);
-            this->queue_pending_disconnect(std::move(conn));
+            this->queue_pending(this->pending_disconnect_events_, std::move(conn));
         });
 
     // Connection lookup-by-sockfd. Used by the host build's ws_server to route IXWebSocket
@@ -907,7 +929,7 @@ void ConnectionManager::scan_hello_and_nursery() {
                     this->drop_connection(rc, std::nullopt);
                 }
             }
-            this->hello_retries_size_.store(this->hello_retries_.size(), std::memory_order_release);
+            this->refresh_hello_retries_size_hint();
         }
 
         // Nursery tick: reap connections that miss the establish deadline. This is the only
@@ -1063,56 +1085,56 @@ void ConnectionManager::set_last_played_server_id(const std::string& server_id) 
 void ConnectionManager::schedule_activate(ServerActivateEvent event) {
     // Called from SendspinClient::process_json_message() on the network thread.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending_activate(std::move(event));
+    this->queue_pending(this->pending_activate_events_, std::move(event));
 }
 
 void ConnectionManager::schedule_rehandshake_rearm(std::shared_ptr<SendspinConnection> conn) {
     // Called from SendspinClient::process_json_message() on the network thread, right after
     // SendspinConnection::handle_noise_rehandshake() returns success.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending_rehandshake(std::move(conn));
+    this->queue_pending(this->pending_rehandshake_events_, std::move(conn));
 }
 
 void ConnectionManager::schedule_pair_abort(PairAbortEvent event) {
     // Called from SendspinClient::process_json_message() on the network thread when a pair/abort
     // message arrives (or a malformed pairing frame forces one).
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending_pair_abort(std::move(event));
+    this->queue_pending(this->pending_pair_abort_events_, std::move(event));
 }
 
 void ConnectionManager::schedule_management_request(ManagementRequestEvent&& event) {
     // Called from SendspinClient::process_json_message() on the network thread when a
     // management/* request arrives.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending_management_request(std::move(event));
+    this->queue_pending(this->pending_management_request_events_, std::move(event));
 }
 
 void ConnectionManager::schedule_server_unpair(ServerUnpairEvent&& event) {
     // Called from SendspinClient::process_json_message() on the network thread when
     // server/unpair arrives.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending_server_unpair(std::move(event));
+    this->queue_pending(this->pending_server_unpair_events_, std::move(event));
 }
 
 void ConnectionManager::schedule_pin_pairing_message(ServerPairingMessageEvent&& event) {
     // Called from SendspinClient::process_json_message() on the network thread when a dynamic-PIN
     // pairing message arrives (or a malformed pairing frame forces a MALFORMED event).
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending_pin_pairing_message(std::move(event));
+    this->queue_pending(this->pending_pin_pairing_events_, std::move(event));
 }
 
 void ConnectionManager::schedule_pairing_succeeded(std::string server_id) {
     // Called from SendspinClient::process_json_message() on the network thread when the
     // server/pair-finalize ack handler stores a long-term record.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending_pairing_succeeded(std::move(server_id));
+    this->queue_pending(this->pending_pairing_succeeded_events_, std::move(server_id));
 }
 
 void ConnectionManager::schedule_pair_storage_failed(PairStorageFailedEvent event) {
     // Called from SendspinClient::process_json_message() on the network thread when
     // RecordStore::store_record() reports that the persistence provider rejected the record.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending_pair_storage_failed(std::move(event));
+    this->queue_pending(this->pending_pair_storage_failed_events_, std::move(event));
 }
 
 void ConnectionManager::schedule_pairing_window_confirm() {
@@ -1219,7 +1241,7 @@ void ConnectionManager::initiate_hello(SendspinConnection* conn) {
     retry.attempts = 3;
     retry.retry_time_us = retry_time_us;
     this->hello_retries_.push_back(std::move(retry));
-    this->hello_retries_size_.store(this->hello_retries_.size(), std::memory_order_release);
+    this->refresh_hello_retries_size_hint();
 }
 
 void ConnectionManager::remove_hello_retry(const SendspinConnection* conn) {
@@ -1233,7 +1255,7 @@ void ConnectionManager::remove_hello_retry(const SendspinConnection* conn) {
             ++it;
         }
     }
-    this->hello_retries_size_.store(this->hello_retries_.size(), std::memory_order_release);
+    this->refresh_hello_retries_size_hint();
 }
 
 bool ConnectionManager::has_hello_retry(const SendspinConnection* conn) const {
@@ -1312,10 +1334,25 @@ std::vector<NurseryEntry>::iterator ConnectionManager::find_in_nursery(
     return this->nursery_.end();
 }
 
+void ConnectionManager::refresh_nursery_size_hint() {
+    // Note: caller must hold conn_ptr_mutex_
+    this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
+}
+
+void ConnectionManager::refresh_hello_retries_size_hint() {
+    // Note: caller must hold conn_ptr_mutex_
+    this->hello_retries_size_.store(this->hello_retries_.size(), std::memory_order_release);
+}
+
+void ConnectionManager::refresh_deferred_size_hint() {
+    // Note: caller must hold conn_ptr_mutex_
+    this->deferred_size_.store(this->deferred_releases_.size(), std::memory_order_release);
+}
+
 void ConnectionManager::push_nursery_entry(NurseryEntry entry) {
     // Note: caller must hold conn_ptr_mutex_
     this->nursery_.push_back(std::move(entry));
-    this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
+    this->refresh_nursery_size_hint();
 }
 
 void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnection> conn) {
@@ -1339,72 +1376,12 @@ void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnectio
     this->current_connection_ = std::move(conn);
 }
 
-void ConnectionManager::queue_pending_connected(std::shared_ptr<SendspinConnection> conn) {
-    // Note: caller must hold conn_mutex_
-    this->pending_connected_events_.push_back(std::move(conn));
-    this->has_pending_events_.store(true, std::memory_order_release);
-}
-
-void ConnectionManager::queue_pending_disconnect(std::shared_ptr<SendspinConnection> conn) {
-    // Note: caller must hold conn_mutex_
-    this->pending_disconnect_events_.push_back(std::move(conn));
-    this->has_pending_events_.store(true, std::memory_order_release);
-}
-
-void ConnectionManager::queue_pending_activate(ServerActivateEvent event) {
-    // Note: caller must hold conn_mutex_
-    this->pending_activate_events_.push_back(std::move(event));
-    this->has_pending_events_.store(true, std::memory_order_release);
-}
-
-void ConnectionManager::queue_pending_rehandshake(std::shared_ptr<SendspinConnection> conn) {
-    // Note: caller must hold conn_mutex_
-    this->pending_rehandshake_events_.push_back(std::move(conn));
-    this->has_pending_events_.store(true, std::memory_order_release);
-}
-
-void ConnectionManager::queue_pending_pair_abort(PairAbortEvent event) {
-    // Note: caller must hold conn_mutex_
-    this->pending_pair_abort_events_.push_back(std::move(event));
-    this->has_pending_events_.store(true, std::memory_order_release);
-}
-
-void ConnectionManager::queue_pending_management_request(ManagementRequestEvent&& event) {
-    // Note: caller must hold conn_mutex_
-    this->pending_management_request_events_.push_back(std::move(event));
-    this->has_pending_events_.store(true, std::memory_order_release);
-}
-
-void ConnectionManager::queue_pending_server_unpair(ServerUnpairEvent&& event) {
-    // Note: caller must hold conn_mutex_
-    this->pending_server_unpair_events_.push_back(std::move(event));
-    this->has_pending_events_.store(true, std::memory_order_release);
-}
-
-void ConnectionManager::queue_pending_pin_pairing_message(ServerPairingMessageEvent&& event) {
-    // Note: caller must hold conn_mutex_
-    this->pending_pin_pairing_events_.push_back(std::move(event));
-    this->has_pending_events_.store(true, std::memory_order_release);
-}
-
-void ConnectionManager::queue_pending_pairing_succeeded(std::string server_id) {
-    // Note: caller must hold conn_mutex_
-    this->pending_pairing_succeeded_events_.push_back(std::move(server_id));
-    this->has_pending_events_.store(true, std::memory_order_release);
-}
-
-void ConnectionManager::queue_pending_pair_storage_failed(PairStorageFailedEvent event) {
-    // Note: caller must hold conn_mutex_
-    this->pending_pair_storage_failed_events_.push_back(std::move(event));
-    this->has_pending_events_.store(true, std::memory_order_release);
-}
-
 std::vector<NurseryEntry>::iterator ConnectionManager::release_nursery_entry(
     std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason) {
     // Note: caller must hold conn_ptr_mutex_ and flush_deferred_releases() after dropping it
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
-    this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
+    this->refresh_nursery_size_hint();
     // Leaving management: block stale network-thread dispatch into role/state queues during the
     // goodbye window. Outgoing sends, including the goodbye itself, are unaffected.
     conn->disable_message_dispatch();
@@ -1448,7 +1425,7 @@ void ConnectionManager::queue_deferred_release(std::shared_ptr<SendspinConnectio
                                                std::optional<SendspinGoodbyeReason> reason) {
     // Note: caller must hold conn_ptr_mutex_ and call flush_deferred_releases() after dropping it
     this->deferred_releases_.push_back({std::move(conn), reason});
-    this->deferred_size_.store(this->deferred_releases_.size(), std::memory_order_release);
+    this->refresh_deferred_size_hint();
 }
 
 void ConnectionManager::flush_deferred_releases() {
@@ -1478,7 +1455,7 @@ void ConnectionManager::flush_deferred_releases() {
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         releases.swap(this->deferred_releases_);
-        this->deferred_size_.store(this->deferred_releases_.size(), std::memory_order_release);
+        this->refresh_deferred_size_hint();
     }
     for (auto& release : releases) {
         if (release.goodbye.has_value()) {
@@ -1522,11 +1499,11 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         // deferred (see DeferredRelease).
         //
         // If a PIN pairing was mid-flight, its display / pairing-window prompt must be dismissed.
-        // Capture the flags before cleanup_connection_state() clears the pending notification
-        // state in EventState, then queue the note_* calls after cleanup so they survive to be
-        // dispatched from SendspinClient::loop() (same ordering rule as the abort handlers).
-        const bool pin_was_displayed = conn->pin_session().pin_displayed;
-        const bool window_was_shown = conn->pin_session().window_shown;
+        // Snapshot before cleanup_connection_state() clears the pending notification state in
+        // EventState (see PairingUiSnapshot), then queue the note_* calls after cleanup so they
+        // survive to be dispatched from SendspinClient::loop() (same ordering rule as the abort
+        // handlers).
+        const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
         conn->disable_message_dispatch();
         // Vacate the admitted slot explicitly. set_current_connection(nullptr) below cannot do
         // it: the outgoing connection is moved out of current_connection_ first, so the setter
@@ -1541,7 +1518,7 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         auto dropped = std::move(this->current_connection_);
         this->set_current_connection(nullptr);
         this->queue_deferred_release(std::move(dropped), goodbye);
-        this->dismiss_pairing_ui(pin_was_displayed, window_was_shown);
+        this->dismiss_pairing_ui(ui.pin_was_displayed, ui.window_was_shown);
         return;
     }
 
@@ -1549,11 +1526,11 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         // Dropping an unproven connection: no client-state cleanup (it was never admitted). PIN
         // sessions only ever exist on the current connection (see the pairing-events comment
         // above, in loop()), but dismiss any prompt defensively for symmetry with the other
-        // drop paths in case that invariant is ever relaxed.
-        const bool pin_was_displayed = conn->pin_session().pin_displayed;
-        const bool window_was_shown = conn->pin_session().window_shown;
+        // drop paths in case that invariant is ever relaxed. Snapshot before release for the same
+        // reason as the current-slot path above (see PairingUiSnapshot).
+        const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
         this->release_nursery_entry(it, goodbye);
-        this->dismiss_pairing_ui(pin_was_displayed, window_was_shown);
+        this->dismiss_pairing_ui(ui.pin_was_displayed, ui.window_was_shown);
     }
     // Not a managed connection: nothing to do (already released by an earlier event this tick).
 }
@@ -1609,7 +1586,7 @@ std::vector<NurseryEntry>::iterator ConnectionManager::promote_or_arbitrate_nurs
     // Note: caller must hold conn_ptr_mutex_
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
-    this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
+    this->refresh_nursery_size_hint();
     this->remove_hello_retry(conn.get());
 
     if (this->current_connection_ == nullptr) {
@@ -1933,8 +1910,8 @@ void ConnectionManager::abort_pairing_attempt(
     // (see handle_pair_storage_failed()) instead of reading the connection's current state.
     const std::string server_id =
         server_id_override.has_value() ? server_id_override.value() : conn->get_server_id();
-    const bool pin_was_displayed = conn->pin_session().pin_displayed;
-    const bool window_was_shown = conn->pin_session().window_shown;
+    // Snapshot before clear_pairing_state()/drop_connection() clear it (see PairingUiSnapshot).
+    const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
 
     if (wire_abort_reason.has_value()) {
         conn->send_app_json(format_pair_abort_message(wire_abort_reason.value()), nullptr);
@@ -1951,7 +1928,7 @@ void ConnectionManager::abort_pairing_attempt(
     // from SendspinClient::loop() after conn_ptr_mutex_ is released. Only the queue push happens
     // while the lock is held.
     this->client_->note_pairing_failed(server_id, public_reason);
-    this->dismiss_pairing_ui(pin_was_displayed, window_was_shown);
+    this->dismiss_pairing_ui(ui.pin_was_displayed, ui.window_was_shown);
 }
 
 // ============================================================================

@@ -32,6 +32,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sendspin {
@@ -507,9 +508,24 @@ private:
     /// @return Iterator into nursery_, or nursery_.end() if the connection is not in the nursery.
     std::vector<NurseryEntry>::iterator find_in_nursery(const SendspinConnection* conn);
 
-    /// @brief Appends an entry to the nursery and refreshes nursery_size_ in the same critical
-    /// section, so the hint atomic can never drift from nursery_.size(). Caller must hold
-    /// conn_ptr_mutex_.
+    /// @brief Refreshes nursery_size_ from nursery_.size(). Every nursery_ mutation site calls
+    /// this immediately afterward, in the same critical section, so the hint atomic can never
+    /// drift from the container. Caller must hold conn_ptr_mutex_.
+    void refresh_nursery_size_hint();
+
+    /// @brief Refreshes hello_retries_size_ from hello_retries_.size(). Every hello_retries_
+    /// mutation site calls this immediately afterward, in the same critical section, so the hint
+    /// atomic can never drift from the container. Caller must hold conn_ptr_mutex_.
+    void refresh_hello_retries_size_hint();
+
+    /// @brief Refreshes deferred_size_ from deferred_releases_.size(). Every deferred_releases_
+    /// mutation site calls this immediately afterward, in the same critical section, so the hint
+    /// atomic can never drift from the container. Caller must hold conn_ptr_mutex_.
+    void refresh_deferred_size_hint();
+
+    /// @brief Appends an entry to the nursery and refreshes nursery_size_ (via
+    /// refresh_nursery_size_hint()) in the same critical section, so the hint atomic can never
+    /// drift from nursery_.size(). Caller must hold conn_ptr_mutex_.
     /// @param entry The nursery entry to add.
     void push_nursery_entry(NurseryEntry entry);
 
@@ -519,65 +535,19 @@ private:
     /// @param conn The connection to install as current, or nullptr to clear; moved from.
     void set_current_connection(std::shared_ptr<SendspinConnection> conn);
 
-    /// @brief Appends a connection to pending_connected_events_ and sets has_pending_events_ in
-    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
-    /// Caller must hold conn_mutex_.
-    /// @param conn The freshly connected connection to defer to loop().
-    void queue_pending_connected(std::shared_ptr<SendspinConnection> conn);
-
-    /// @brief Appends a connection to pending_disconnect_events_ and sets has_pending_events_ in
-    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
-    /// Caller must hold conn_mutex_.
-    /// @param conn The disconnected connection to defer to loop().
-    void queue_pending_disconnect(std::shared_ptr<SendspinConnection> conn);
-
-    /// @brief Appends an event to pending_activate_events_ and sets has_pending_events_ in the
-    /// same critical section, so loop()'s lock-free gate can never miss a pushed event. Caller
-    /// must hold conn_mutex_.
-    /// @param event The server/activate event to defer to loop() (moved).
-    void queue_pending_activate(ServerActivateEvent event);
-
-    /// @brief Appends a connection to pending_rehandshake_events_ and sets has_pending_events_ in
-    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
-    /// Caller must hold conn_mutex_.
-    /// @param conn The re-handshaked connection to defer to loop() (moved).
-    void queue_pending_rehandshake(std::shared_ptr<SendspinConnection> conn);
-
-    /// @brief Appends an event to pending_pair_abort_events_ and sets has_pending_events_ in the
-    /// same critical section, so loop()'s lock-free gate can never miss a pushed event. Caller
-    /// must hold conn_mutex_.
-    /// @param event The pair/abort event to defer to loop() (moved).
-    void queue_pending_pair_abort(PairAbortEvent event);
-
-    /// @brief Appends an event to pending_management_request_events_ and sets has_pending_events_
-    /// in the same critical section, so loop()'s lock-free gate can never miss a pushed event.
-    /// Caller must hold conn_mutex_.
-    /// @param event The management/* request event to defer to loop() (moved).
-    void queue_pending_management_request(ManagementRequestEvent&& event);
-
-    /// @brief Appends an event to pending_server_unpair_events_ and sets has_pending_events_ in
-    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
-    /// Caller must hold conn_mutex_.
-    /// @param event The server/unpair event to defer to loop() (moved).
-    void queue_pending_server_unpair(ServerUnpairEvent&& event);
-
-    /// @brief Appends an event to pending_pin_pairing_events_ and sets has_pending_events_ in
-    /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
-    /// Caller must hold conn_mutex_.
-    /// @param event The dynamic-PIN pairing message event to defer to loop() (moved).
-    void queue_pending_pin_pairing_message(ServerPairingMessageEvent&& event);
-
-    /// @brief Appends a server_id to pending_pairing_succeeded_events_ and sets
-    /// has_pending_events_ in the same critical section, so loop()'s lock-free gate can never
-    /// miss a pushed event. Caller must hold conn_mutex_.
-    /// @param server_id The newly paired server's base64url public key (moved).
-    void queue_pending_pairing_succeeded(std::string server_id);
-
-    /// @brief Appends an event to pending_pair_storage_failed_events_ and sets
-    /// has_pending_events_ in the same critical section, so loop()'s lock-free gate can never
-    /// miss a pushed event. Caller must hold conn_mutex_.
-    /// @param event The storage-failed event to defer to loop() (moved).
-    void queue_pending_pair_storage_failed(PairStorageFailedEvent event);
+    /// @brief Appends `item` to a pending_*_events_ queue and sets has_pending_events_ in the
+    /// same critical section, so loop()'s lock-free gate can never miss a pushed event. Every
+    /// pending_*_events_ push in this class goes through this one template instead of a per-queue
+    /// single-use method. Caller must hold conn_mutex_.
+    /// @tparam Container Type of a pending_*_events_ member (deduced).
+    /// @tparam T Type of the item being pushed (deduced; forwarded into push_back).
+    /// @param container The pending_*_events_ queue to append to.
+    /// @param item The event to append (forwarded).
+    template <typename Container, typename T>
+    void queue_pending(Container& container, T&& item) {
+        container.push_back(std::forward<T>(item));
+        this->has_pending_events_.store(true, std::memory_order_release);
+    }
 
     /// @brief Releases a nursery entry: erases it, prunes its hello retry, and queues the
     /// goodbye+release on deferred_releases_. Caller must hold conn_ptr_mutex_ and call
@@ -589,9 +559,10 @@ private:
     std::vector<NurseryEntry>::iterator release_nursery_entry(
         std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason);
 
-    /// @brief Appends a release to deferred_releases_ and refreshes deferred_size_ in the same
-    /// critical section, so the hint atomic can never drift from deferred_releases_.size().
-    /// Caller must hold conn_ptr_mutex_ and call flush_deferred_releases() after dropping it.
+    /// @brief Appends a release to deferred_releases_ and refreshes deferred_size_ (via
+    /// refresh_deferred_size_hint()) in the same critical section, so the hint atomic can never
+    /// drift from deferred_releases_.size(). Caller must hold conn_ptr_mutex_ and call
+    /// flush_deferred_releases() after dropping it.
     /// @param conn The connection to release; empty on return (moved from).
     /// @param reason The goodbye reason to send before closing, or nullopt when the transport is
     ///        already gone so no goodbye should be attempted.
@@ -916,7 +887,8 @@ private:
     /// cannot drift). Lets loop() skip the copies/loop() block, the hello-retry scan, and the
     /// nursery reap scan when the nursery is empty, and keeps the lifecycle block running while
     /// any nursery connection exists even with no swapped-out events (its promotion scan is
-    /// level-triggered on connection flags, not edge-triggered on events).
+    /// level-triggered on connection flags, not edge-triggered on events). Every refresh goes
+    /// through refresh_nursery_size_hint().
     std::atomic<size_t> nursery_size_{0};
 
     /// True whenever current_connection_ is non-null. Refreshed under conn_ptr_mutex_ at every
@@ -929,12 +901,14 @@ private:
     /// erases in loop()). Lets loop() run the hello-retry-timer scan even when the nursery is
     /// empty, which happens whenever the only pending retry belongs to the current (already-
     /// admitted) connection re-arming its hello after an in-band re-handshake. That connection
-    /// is never a nursery member, so nursery_size_ alone would miss it.
+    /// is never a nursery member, so nursery_size_ alone would miss it. Every refresh goes through
+    /// refresh_hello_retries_size_hint().
     std::atomic<size_t> hello_retries_size_{0};
 
     /// deferred_releases_.size(), refreshed under conn_ptr_mutex_ after every push (see
     /// queue_deferred_release()) and after the drain swap in flush_deferred_releases(). Lets
-    /// flush_deferred_releases() early-return without locking when nothing is queued.
+    /// flush_deferred_releases() early-return without locking when nothing is queued. Every
+    /// refresh goes through refresh_deferred_size_hint().
     std::atomic<size_t> deferred_size_{0};
 };
 
