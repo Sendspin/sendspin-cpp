@@ -541,6 +541,8 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
         << "Connection did not resume operational after the post-pairing re-handshake";
     EXPECT_TRUE(listener.trust_ever_reached(ConnectionTrust::USER))
         << "Trust was never upgraded to USER after pairing completed";
+    EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER)
+        << "get_current_trust() must report the rekeyed connection's trust";
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
@@ -548,6 +550,8 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+    EXPECT_EQ(client.get_current_trust(), ConnectionTrust::NONE)
+        << "get_current_trust() must reset to NONE once the connection is torn down";
 }
 
 // Fail-closed persistence: when the persistence provider rejects the pair-finalize record (e.g.

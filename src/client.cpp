@@ -770,6 +770,10 @@ void SendspinClient::cleanup_connection_state() {
     // returns, never before; see the ConnectionManager pairing/PIN handlers.
     this->event_state_->pairing_notes.clear();
 
+    // The trust level is per-connection state: with no active connection there is nothing to
+    // trust, so the getter reports NONE until the next handshake completes.
+    this->current_trust_ = ConnectionTrust::NONE;
+
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         this->player_->impl_->cleanup();
@@ -1701,6 +1705,7 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
         ConnectionTrust trust = (conn->get_psk_category() == PskCategory::LONG_TERM)
                                     ? ConnectionTrust::USER
                                     : ConnectionTrust::NONE;
+        this->current_trust_ = trust;
         this->event_state_->pairing_notes.push_back(
             {.type = PairingNoteType::TRUST_CHANGED, .trust = trust});
     }

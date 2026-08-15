@@ -954,6 +954,7 @@ The client and roles expose query methods for polling state in your main loop or
 bool connected = client.is_connected();       // Active connection with completed handshake
 bool synced = client.is_time_synced();         // Time filter has received at least one measurement
 const GroupUpdateObject& group = client.get_group_state();   // Group id, name, playback state (all optional)
+ConnectionTrust trust = client.get_current_trust();          // Active connection's trust; NONE when disconnected
 
 // Player state
 uint8_t vol = player.get_volume();

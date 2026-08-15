@@ -553,6 +553,15 @@ public:
         return this->group_state_;
     }
 
+    /// @brief Returns the trust level of the active connection. Main loop only.
+    /// The same value SendspinClientListener::on_trust_changed reports, queryable at any
+    /// time (e.g. for redrawing a UI without caching the callback's argument).
+    /// @return The active connection's ConnectionTrust; ConnectionTrust::NONE when no
+    ///         connection is active or the handshake has not completed
+    ConnectionTrust get_current_trust() const {
+        return this->current_trust_;
+    }
+
     // ========================================
     // State updates
     // ========================================
@@ -757,6 +766,9 @@ private:
     SendspinClientState state_{SendspinClientState::SYNCHRONIZED};
 
     // 8-bit fields
+    /// Trust level of the active connection; written by on_handshake_complete() and reset by
+    /// cleanup_connection_state(), both main loop only, so get_current_trust() needs no lock.
+    ConnectionTrust current_trust_{ConnectionTrust::NONE};
     bool high_performance_held_for_time_{false};
     std::atomic<uint8_t> high_performance_ref_count_{0};
     bool started_{false};
