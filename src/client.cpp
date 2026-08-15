@@ -56,6 +56,46 @@ static const char* const TAG = "sendspin.client";
 
 namespace sendspin {
 
+namespace {
+
+/// @brief Discriminates PairingNote entries. Enumerator order is the dispatch precedence: the
+/// loop() dispatch fires all notes of one type before any note of the next, regardless of queue
+/// order, preserving the delivery contract of the former per-type pending fields (e.g.
+/// on_pairing_started before the on_open_pairing_window prompt it gated). The dispatch walks this
+/// enum by value, so adding an enumerator here places it in the order automatically and the
+/// exhaustive switch (no default, built with -Werror) forces it to be given a case.
+enum class PairingNoteType : uint8_t {
+    PAIRING_STARTED,
+    PAIRING_SUCCEEDED,
+    TRUST_CHANGED,
+    PAIRING_FAILED,
+    DISPLAY_PIN,
+    CLEAR_PIN,
+    OPEN_PAIRING_WINDOW,
+    CLOSE_PAIRING_WINDOW,
+    COUNT,  ///< Not a note type; bounds the dispatch walk. Keep last.
+};
+
+/// @brief One deferred pairing/trust listener notification, queued by the note_*() methods and
+/// dispatched from loop()
+struct PairingNote {
+    PairingNoteType type{};
+    /// server_id for PAIRING_STARTED/SUCCEEDED/FAILED; PIN text for DISPLAY_PIN; empty otherwise.
+    std::string text;
+    SendspinPairAbortReason reason{};  ///< Valid only for PAIRING_FAILED.
+    ConnectionTrust trust{};           ///< Valid only for TRUST_CHANGED.
+};
+
+/// @brief True for note types that coalesce to at most one callback per tick, keeping the
+/// single-flag semantics of the window/PIN-clear notifications (two note_clear_pin() calls in one
+/// tick still fire on_clear_pairing_pin once)
+constexpr bool is_coalesced_note(PairingNoteType type) {
+    return type == PairingNoteType::CLEAR_PIN || type == PairingNoteType::OPEN_PAIRING_WINDOW ||
+           type == PairingNoteType::CLOSE_PAIRING_WINDOW;
+}
+
+}  // namespace
+
 /// @brief Deferred event state for time responses and group updates on the main thread
 struct SendspinClient::EventState {
     Inbox inbox;
@@ -72,24 +112,16 @@ struct SendspinClient::EventState {
     // (by ConnectionManager, itself driven from connection_manager_->loop() called from
     // SendspinClient::loop()) while conn_ptr_mutex_ is held, and fired from loop() after that
     // call returns (unlocked, so a listener may safely call back into the client). No lock is
-    // needed here: single-writer/single-reader, both on the main loop.
+    // needed here: single-writer/single-reader, both on the main loop. Deliberately NOT on the
+    // Inbox: the payloads carry strings (the ring is POD-only) and nothing crosses a thread, so
+    // the shared mutex and a topic bit would buy nothing.
     //
     // The one genuinely cross-thread notification, on_pairing_succeeded (triggered by the
     // network-thread server/pair-finalize ack handler), does NOT queue here directly; it goes
     // through ConnectionManager's existing pending_*_events_ / has_pending_events_ idiom (see
     // schedule_pairing_succeeded()) and is only turned into a note_pairing_succeeded() call (and
-    // thus pushed into pending_pairing_succeeded_ below) once that idiom's drain has moved it to
-    // the main loop.
-    std::vector<std::string> pending_pairing_started;
-    std::vector<std::string> pending_pairing_succeeded;
-    std::vector<std::pair<std::string, SendspinPairAbortReason>> pending_pairing_failed;
-    std::vector<ConnectionTrust> pending_trust_changed;
-    // Dynamic-PIN display notifications.
-    std::vector<std::string> pending_display_pin;  ///< PINs to display (usually 0 or 1 entry).
-    bool pending_clear_pin{false};                 ///< true = fire on_clear_pairing_pin once.
-    // Static-PIN pairing-window notifications.
-    bool pending_open_pairing_window{false};   ///< true = fire on_open_pairing_window once.
-    bool pending_close_pairing_window{false};  ///< true = fire on_close_pairing_window once.
+    // thus a PairingNote here) once that idiom's drain has moved it to the main loop.
+    std::vector<PairingNote> pairing_notes;
 };
 
 // ============================================================================
@@ -409,40 +441,77 @@ void SendspinClient::loop() {
     //     the client). Main loop only. ---
     {
         auto& es = *this->event_state_;
-        if (this->listener_) {
-            for (const auto& server_id : es.pending_pairing_started) {
-                this->listener_->on_pairing_started(server_id);
-            }
-            for (const auto& server_id : es.pending_pairing_succeeded) {
-                this->listener_->on_pairing_succeeded(server_id);
-            }
-            for (const auto& trust : es.pending_trust_changed) {
-                this->listener_->on_trust_changed(trust);
-            }
-            for (const auto& failed : es.pending_pairing_failed) {
-                this->listener_->on_pairing_failed(failed.first, failed.second);
-            }
-            for (const auto& pin : es.pending_display_pin) {
-                this->listener_->on_display_pairing_pin(pin);
-            }
-            if (es.pending_clear_pin) {
-                this->listener_->on_clear_pairing_pin();
-            }
-            if (es.pending_open_pairing_window) {
-                this->listener_->on_open_pairing_window();
-            }
-            if (es.pending_close_pairing_window) {
-                this->listener_->on_close_pairing_window();
+        if (!es.pairing_notes.empty()) {
+            // Move the queue out before dispatching: a callback below may re-enter the client
+            // (e.g. connect_to() from a listener runs cleanup_connection_state(), which clears
+            // the live queue), and iterating the member vector across that would invalidate this
+            // dispatch's iterators. Notes are consumed (or discarded, when no listener is set)
+            // exactly once per tick either way.
+            std::vector<PairingNote> notes = std::move(es.pairing_notes);
+            es.pairing_notes.clear();
+            // Same staleness rule as the ring drain above: a teardown re-entered from a callback
+            // bumps drain_generation to wipe undelivered notifications, which must cover the
+            // ones already moved into this local batch.
+            const uint32_t note_generation = es.drain_generation;
+            // Set when a re-entrant teardown bumps the generation, abandoning the rest of the
+            // batch.
+            bool notes_aborted = false;
+            // Checked once for the whole batch: the listener is set before start_server() and must
+            // outlive the client (see set_listener), so it cannot become null mid-dispatch.
+            if (this->listener_ != nullptr) {
+                // Dispatch grouped by type in PairingNoteType declaration order (not queue order),
+                // firing coalesced types at most once; see the enum and is_coalesced_note().
+                // Walking the enum rather than a hand-written order list leaves nothing to fall out
+                // of sync: a new note type joins the order where it is declared.
+                for (uint8_t i = 0;
+                     i < static_cast<uint8_t>(PairingNoteType::COUNT) && !notes_aborted; ++i) {
+                    const auto type = static_cast<PairingNoteType>(i);
+                    for (const PairingNote& note : notes) {
+                        if (note.type != type) {
+                            continue;
+                        }
+                        switch (type) {
+                            case PairingNoteType::PAIRING_STARTED:
+                                this->listener_->on_pairing_started(note.text);
+                                break;
+                            case PairingNoteType::PAIRING_SUCCEEDED:
+                                this->listener_->on_pairing_succeeded(note.text);
+                                break;
+                            case PairingNoteType::TRUST_CHANGED:
+                                this->listener_->on_trust_changed(note.trust);
+                                break;
+                            case PairingNoteType::PAIRING_FAILED:
+                                this->listener_->on_pairing_failed(note.text, note.reason);
+                                break;
+                            case PairingNoteType::DISPLAY_PIN:
+                                this->listener_->on_display_pairing_pin(note.text);
+                                break;
+                            case PairingNoteType::CLEAR_PIN:
+                                this->listener_->on_clear_pairing_pin();
+                                break;
+                            case PairingNoteType::OPEN_PAIRING_WINDOW:
+                                this->listener_->on_open_pairing_window();
+                                break;
+                            case PairingNoteType::CLOSE_PAIRING_WINDOW:
+                                this->listener_->on_close_pairing_window();
+                                break;
+                            case PairingNoteType::COUNT:
+                                // Unreachable: the walk above stops before COUNT. Listed so the
+                                // switch stays exhaustive without a default, which is what forces a
+                                // new note type to be handled here.
+                                break;
+                        }
+                        if (es.drain_generation != note_generation) {
+                            notes_aborted = true;
+                            break;
+                        }
+                        if (is_coalesced_note(type)) {
+                            break;
+                        }
+                    }
+                }
             }
         }
-        es.pending_pairing_started.clear();
-        es.pending_pairing_succeeded.clear();
-        es.pending_trust_changed.clear();
-        es.pending_pairing_failed.clear();
-        es.pending_display_pin.clear();
-        es.pending_clear_pin = false;
-        es.pending_open_pairing_window = false;
-        es.pending_close_pairing_window = false;
     }
 
     // --- Role events: bit-gated so an idle tick performs zero inbox mutex acquisitions here ---
@@ -699,14 +768,7 @@ void SendspinClient::cleanup_connection_state() {
     // notification to survive teardown (e.g. handle_pair_abort's on_pairing_failed /
     // on_clear_pairing_pin) must call the corresponding note_*() AFTER cleanup_connection_state()
     // returns, never before; see the ConnectionManager pairing/PIN handlers.
-    this->event_state_->pending_pairing_started.clear();
-    this->event_state_->pending_pairing_succeeded.clear();
-    this->event_state_->pending_pairing_failed.clear();
-    this->event_state_->pending_trust_changed.clear();
-    this->event_state_->pending_display_pin.clear();
-    this->event_state_->pending_clear_pin = false;
-    this->event_state_->pending_open_pairing_window = false;
-    this->event_state_->pending_close_pairing_window = false;
+    this->event_state_->pairing_notes.clear();
 
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
@@ -1639,37 +1701,42 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
         ConnectionTrust trust = (conn->get_psk_category() == PskCategory::LONG_TERM)
                                     ? ConnectionTrust::USER
                                     : ConnectionTrust::NONE;
-        this->event_state_->pending_trust_changed.push_back(trust);
+        this->event_state_->pairing_notes.push_back(
+            {.type = PairingNoteType::TRUST_CHANGED, .trust = trust});
     }
 }
 
 void SendspinClient::note_pairing_started(const std::string& server_id) {
-    this->event_state_->pending_pairing_started.push_back(server_id);
+    this->event_state_->pairing_notes.push_back(
+        {.type = PairingNoteType::PAIRING_STARTED, .text = server_id});
 }
 
 void SendspinClient::note_pairing_succeeded(const std::string& server_id) {
-    this->event_state_->pending_pairing_succeeded.push_back(server_id);
+    this->event_state_->pairing_notes.push_back(
+        {.type = PairingNoteType::PAIRING_SUCCEEDED, .text = server_id});
 }
 
 void SendspinClient::note_pairing_failed(const std::string& server_id,
                                          SendspinPairAbortReason reason) {
-    this->event_state_->pending_pairing_failed.push_back({server_id, reason});
+    this->event_state_->pairing_notes.push_back(
+        {.type = PairingNoteType::PAIRING_FAILED, .text = server_id, .reason = reason});
 }
 
 void SendspinClient::note_display_pin(const std::string& pin) {
-    this->event_state_->pending_display_pin.push_back(pin);
+    this->event_state_->pairing_notes.push_back(
+        {.type = PairingNoteType::DISPLAY_PIN, .text = pin});
 }
 
 void SendspinClient::note_clear_pin() {
-    this->event_state_->pending_clear_pin = true;
+    this->event_state_->pairing_notes.push_back({.type = PairingNoteType::CLEAR_PIN});
 }
 
 void SendspinClient::note_open_pairing_window() {
-    this->event_state_->pending_open_pairing_window = true;
+    this->event_state_->pairing_notes.push_back({.type = PairingNoteType::OPEN_PAIRING_WINDOW});
 }
 
 void SendspinClient::note_close_pairing_window() {
-    this->event_state_->pending_close_pairing_window = true;
+    this->event_state_->pairing_notes.push_back({.type = PairingNoteType::CLOSE_PAIRING_WINDOW});
 }
 
 void SendspinClient::confirm_pairing_window() {

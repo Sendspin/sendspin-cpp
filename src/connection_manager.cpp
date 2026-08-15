@@ -1957,7 +1957,7 @@ void ConnectionManager::abort_pairing_attempt(
     }
 
     // On the current-slot path drop_connection() -> cleanup_connection_state() clears the
-    // pending notification vectors, so the note_* calls below MUST come after it.
+    // pending pairing-note queue, so the note_* calls below MUST come after it.
     conn->clear_pairing_state();
     if (should_drop) {
         this->drop_connection(conn, drop_goodbye_reason);

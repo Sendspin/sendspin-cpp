@@ -128,6 +128,8 @@ State currently on the Inbox:
 | `VisualizerRole::Impl::EventState::config_slot` | `INBOX_TOPIC_VISUALIZER_CONFIG` | `ServerVisualizerStreamObject` (latest wins) | Network thread |
 | `ArtworkRole::Impl::EventState::display_slot` | `INBOX_TOPIC_ARTWORK_DISPLAY` | `ArtworkDisplayUpdate` (per-slot display timestamp + epoch, merged) | Artwork decode thread |
 
+One family of main-loop-bound notifications deliberately stays off the Inbox: the pairing/trust listener notifications (`on_pairing_started`, `on_pairing_succeeded`, `on_pairing_failed`, `on_trust_changed`, and the PIN/pairing-window prompts). They are queued as tagged `PairingNote` entries in `SendspinClient::EventState::pairing_notes` by the `note_*()` methods, produced only on the main loop (by `ConnectionManager` while `conn_ptr_mutex_` is held) and dispatched later in the same `SendspinClient::loop()` tick after that lock is released. The deferral exists to fire the callbacks unlocked, not to cross threads, and the payloads carry strings the POD-only ring cannot, so no mutex or topic bit is involved. Dispatch moves the queue out first (so a callback that re-enters connection teardown cannot invalidate the iteration), then fires grouped by note type in a fixed precedence order (started, succeeded, trust, failed, display-PIN, clear-PIN, open-window, close-window) rather than queue order; the window/PIN-clear types coalesce to at most one callback per tick. `cleanup_connection_state()` clears the queue and bumps the same drain generation the ring drain uses, so a teardown re-entered from a dispatch callback also abandons the rest of that tick's already-moved batch.
+
 All roles have been migrated onto the Inbox. The controller/metadata/color roles write or merge server state into their `InboxSlot` from `handle_server_state()`, and their disconnect clear arrives as a `*_CLEARED` lifecycle event on the shared ring rather than a per-role flag. The player role owns three `InboxSlot`s (stream params, command, and client state, on its `EventState`) plus `PLAYER_STREAM` lifecycle events on the shared ring; its disconnect clear is the synthetic STREAM_END that `cleanup()` pushes onto the ring. The visualizer role writes its stream config to `config_slot` and delivers STREAM_START/END/CLEAR as `VISUALIZER_STREAM` ring events (no per-tick `drain_events()`; the config is taken when the START event is dispatched). The artwork role merges per-slot display timestamps (tagged with the decode `stream_epoch`) into `display_slot`, delivers STREAM_END/CLEAR as `ARTWORK_STREAM` ring events, and keeps a per-tick `drain_events()` for its server-clock display-deadline sweep. Both roles' disconnect clears are synthetic stream events that `cleanup()` pushes onto the ring.
 
 ### SpscRingBuffer (`src/platform/spsc_ring_buffer.h`)
@@ -227,14 +229,18 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    ├─ Dispatch ARTWORK_STREAM via artwork_->impl_->handle_stream_ring_event()
    └─ Dispatch VISUALIZER_STREAM via visualizer_->impl_->handle_stream_ring_event()
 
-4. Role event draining (each role's impl_->drain_events(), gated on impl_->needs_drain(slot_bits))
+4. Dispatch deferred pairing/trust notes (when EventState::pairing_notes is non-empty)
+   └─ Fire on_pairing_started/succeeded/failed, on_trust_changed, and the PIN/window
+      prompts, unlocked, grouped by note type in precedence order
+
+5. Role event draining (each role's impl_->drain_events(), gated on impl_->needs_drain(slot_bits))
    ├─ player_->impl_->drain_events()
    ├─ controller_->impl_->drain_events()
    ├─ metadata_->impl_->drain_events()
    ├─ color_->impl_->drain_events()
    └─ artwork_->impl_->drain_events()   (display-deadline sweep; visualizer has no drain_events())
 
-5. Drain group_slot (when INBOX_TOPIC_GROUP is set in slot_bits)
+6. Drain group_slot (when INBOX_TOPIC_GROUP is set in slot_bits)
    └─ Apply group deltas, fire on_group_update, persist last played server
 ```
 
@@ -249,7 +255,7 @@ Each `loop()` section that would otherwise take a mutex first consults a lock-fr
 
 Steady state is therefore cheap: connected-and-idle costs one `conn_ptr_mutex_` acquisition (the current/nursery copy ahead of the `conn->loop()` calls) plus a handful of atomic loads; disconnected-and-idle costs zero mutex acquisitions. The mutex-protected containers and pointers remain the ground truth in every case; the hints only decide whether it is worth locking to look.
 
-The Inbox drain steps gate the same way, off two lock-free `poll()` snapshots of the topic bitmask. `inbox_bits` is taken first and gates only the event-ring drain (step 3). `slot_bits` is taken *after* that drain completes and gates the role drains (step 4) and the group drain (step 5); the second snapshot catches topic bits a producer set while the ring drain was running (including a ring event's own side effects re-entering the inbox). A bit either snapshot races and misses is not lost - it stays set and the next tick's `poll()` observes it (bounded staleness, per `Inbox::poll()`). Each role's `needs_drain(slot_bits)` decides whether its drain runs: mostly a simple `slot_bits & INBOX_TOPIC_*` test, but the player, metadata, and artwork roles OR in a main-thread-only carry-over term (the player's `awaiting_sync_idle_events`, the metadata role's future-dated `held_delta`, the artwork role's nonzero `held_display_mask`) so that work waiting out a deadline no inbox bit tracks still gets a drain every tick until it fires.
+The Inbox drain steps gate the same way, off two lock-free `poll()` snapshots of the topic bitmask. `inbox_bits` is taken first and gates only the event-ring drain (step 3). `slot_bits` is taken *after* that drain completes and gates the role drains (step 5) and the group drain (step 6); the second snapshot catches topic bits a producer set while the ring drain was running (including a ring event's own side effects re-entering the inbox). A bit either snapshot races and misses is not lost - it stays set and the next tick's `poll()` observes it (bounded staleness, per `Inbox::poll()`). Each role's `needs_drain(slot_bits)` decides whether its drain runs: mostly a simple `slot_bits & INBOX_TOPIC_*` test, but the player, metadata, and artwork roles OR in a main-thread-only carry-over term (the player's `awaiting_sync_idle_events`, the metadata role's future-dated `held_delta`, the artwork role's nonzero `held_display_mask`) so that work waiting out a deadline no inbox bit tracks still gets a drain every tick until it fires.
 
 ## Role Event Draining
 
