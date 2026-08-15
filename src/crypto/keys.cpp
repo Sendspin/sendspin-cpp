@@ -87,27 +87,23 @@ std::string Identity::private_b64u() const {
 std::optional<Identity> Identity::generate() {
     // Use noise-c's DHState to generate a fresh Curve25519 keypair.
     // This routes through noise-c's reference backend on both platforms.
-    NoiseDHState* dh = nullptr;
-    int err = noise_dhstate_new_by_name(&dh, "25519");
-    if (err != NOISE_ERROR_NONE || dh == nullptr) {
+    DhState dh;
+    if (!dh.valid()) {
         return std::nullopt;
     }
-    err = noise_dhstate_generate_keypair(dh);
+    int err = noise_dhstate_generate_keypair(dh.get());
     if (err != NOISE_ERROR_NONE) {
-        noise_dhstate_free(dh);
         return std::nullopt;
     }
-    size_t priv_len = noise_dhstate_get_private_key_length(dh);
-    size_t pub_len = noise_dhstate_get_public_key_length(dh);
+    size_t priv_len = noise_dhstate_get_private_key_length(dh.get());
+    size_t pub_len = noise_dhstate_get_public_key_length(dh.get());
     if (priv_len != X25519_KEY_SIZE || pub_len != X25519_KEY_SIZE) {
-        noise_dhstate_free(dh);
         return std::nullopt;
     }
 
     Identity id{};
-    err = noise_dhstate_get_keypair(dh, id.private_bytes.data(), priv_len, id.public_bytes.data(),
-                                    pub_len);
-    noise_dhstate_free(dh);
+    err = noise_dhstate_get_keypair(dh.get(), id.private_bytes.data(), priv_len,
+                                    id.public_bytes.data(), pub_len);
     if (err != NOISE_ERROR_NONE) {
         return std::nullopt;
     }
@@ -119,28 +115,24 @@ std::optional<Identity> Identity::from_private_bytes(const uint8_t* priv, size_t
         return std::nullopt;
     }
 
-    NoiseDHState* dh = nullptr;
-    int err = noise_dhstate_new_by_name(&dh, "25519");
-    if (err != NOISE_ERROR_NONE || dh == nullptr) {
+    DhState dh;
+    if (!dh.valid()) {
         return std::nullopt;
     }
 
-    err = noise_dhstate_set_keypair_private(dh, priv, len);
+    int err = noise_dhstate_set_keypair_private(dh.get(), priv, len);
     if (err != NOISE_ERROR_NONE) {
-        noise_dhstate_free(dh);
         return std::nullopt;
     }
 
-    size_t pub_len = noise_dhstate_get_public_key_length(dh);
+    size_t pub_len = noise_dhstate_get_public_key_length(dh.get());
     if (pub_len != X25519_KEY_SIZE) {
-        noise_dhstate_free(dh);
         return std::nullopt;
     }
 
     Identity id{};
     std::memcpy(id.private_bytes.data(), priv, X25519_KEY_SIZE);
-    err = noise_dhstate_get_public_key(dh, id.public_bytes.data(), pub_len);
-    noise_dhstate_free(dh);
+    err = noise_dhstate_get_public_key(dh.get(), id.public_bytes.data(), pub_len);
     if (err != NOISE_ERROR_NONE) {
         return std::nullopt;
     }

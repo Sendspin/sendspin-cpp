@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace sendspin {
@@ -40,7 +41,7 @@ namespace sendspin {
 static constexpr size_t WRAPPED_PSK_SIZE = 32 + 16;
 
 /// @brief Domain-separation label for K_wrap. See PSK Wrapping in the spec's Pairing section.
-static constexpr char PSK_WRAP_LABEL[] = "sendspin-pair-psk-wrap-v1";
+static constexpr std::string_view PSK_WRAP_LABEL{"sendspin-pair-psk-wrap-v1"};
 
 /// @brief Derive K_wrap = SHA-256(PSK_WRAP_LABEL || sid || isk).
 /// Returns std::nullopt if the underlying SHA-256 computation fails (e.g. noise-c allocation

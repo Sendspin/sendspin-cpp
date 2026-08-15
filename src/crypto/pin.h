@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace sendspin {
 
@@ -38,12 +39,12 @@ static constexpr size_t PIN_NONCE_SIZE = 32;
 static constexpr size_t PIN_COMMIT_SIZE = 32;
 
 /// @brief Label prepended to the SHA-256 input in derive_pin.
-static constexpr char PIN_DERIVE_LABEL[] = "sendspin-pin-derive-v1";
+static constexpr std::string_view PIN_DERIVE_LABEL{"sendspin-pin-derive-v1"};
 
 /// @brief Domain-separation label prepended to nonce_B in pin_commit, so the commitment hash
 /// cannot be reused across a different protocol context. commit_B = SHA-256(PIN_COMMIT_LABEL
 /// || nonce_B).
-static constexpr char PIN_COMMIT_LABEL[] = "sendspin-pair-commit-v1";
+static constexpr std::string_view PIN_COMMIT_LABEL{"sendspin-pair-commit-v1"};
 
 /// @brief Minimum number of PIN digits.
 static constexpr int PIN_MIN_DIGITS = 4;

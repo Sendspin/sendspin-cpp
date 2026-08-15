@@ -13,9 +13,9 @@
 // limitations under the License.
 
 /// @file crypto.h
-/// @brief Portable cryptographic primitives (SHA-256, SHA-512, HMAC-SHA-512, and CSPRNG),
-/// routed through noise-c on both host and ESP so both platforms use identical code
-/// paths with no extra dependencies.
+/// @brief Portable cryptographic primitives (SHA-256, SHA-512, HMAC-SHA-512, CSPRNG, and an
+/// X25519 DH-state RAII wrapper), routed through noise-c on both host and ESP so both platforms
+/// use identical code paths with no extra dependencies.
 
 #pragma once
 
@@ -34,6 +34,7 @@
 extern "C" {
 #include <noise/protocol/cipherstate.h>
 #include <noise/protocol/constants.h>
+#include <noise/protocol/dhstate.h>
 #include <noise/protocol/hashstate.h>
 #include <noise/protocol/randstate.h>
 }
@@ -411,6 +412,51 @@ inline std::vector<uint8_t> platform_random_bytes(size_t len) {
     platform_random_bytes(out.data(), len);
     return out;
 }
+
+// ============================================================================
+// Diffie-Hellman state (X25519)
+// ============================================================================
+
+/// @brief RAII wrapper around noise-c's NoiseDHState, so X25519 keypair generation/loading and
+/// scalar multiplication do not hand-roll a noise_dhstate_new_by_name()/noise_dhstate_free()
+/// pair across every error-return branch.
+///
+/// The wrapper only owns the state's lifetime; keypair setup (noise_dhstate_set_keypair_private,
+/// noise_dhstate_generate_keypair, ...) and DH computation (noise_dhstate_calculate,
+/// noise_dhstate_get_public_key, ...) remain the caller's responsibility via get().
+class DhState {
+public:
+    /// @brief Allocate a DH state for the named curve ("25519" for every current call site).
+    explicit DhState(const char* dh_name = "25519") {
+        int err = noise_dhstate_new_by_name(&this->state_, dh_name);
+        if (err != NOISE_ERROR_NONE) {
+            this->state_ = nullptr;
+        }
+    }
+
+    ~DhState() {
+        if (this->state_ != nullptr) {
+            noise_dhstate_free(this->state_);
+        }
+    }
+
+    // Non-copyable
+    DhState(const DhState&) = delete;
+    DhState& operator=(const DhState&) = delete;
+
+    /// @brief Return true if the underlying NoiseDHState was successfully allocated.
+    [[nodiscard]] bool valid() const {
+        return this->state_ != nullptr;
+    }
+
+    /// @brief Access the underlying NoiseDHState. Only meaningful when valid() is true.
+    [[nodiscard]] NoiseDHState* get() const {
+        return this->state_;
+    }
+
+private:
+    NoiseDHState* state_{nullptr};
+};
 
 // ============================================================================
 // AEAD (one-shot, explicit key + nonce)

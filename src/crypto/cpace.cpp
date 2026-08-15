@@ -65,8 +65,8 @@ std::vector<uint8_t> cpace_lv_cat(std::initializer_list<std::pair<const uint8_t*
 
 std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, const uint8_t* ci,
                                             size_t ci_len, const uint8_t* sid, size_t sid_len) {
-    const auto* dsi = reinterpret_cast<const uint8_t*>(CPACE_DSI);
-    size_t dsi_len = sizeof(CPACE_DSI) - 1;  // exclude NUL
+    const auto* dsi = reinterpret_cast<const uint8_t*>(CPACE_DSI.data());
+    size_t dsi_len = CPACE_DSI.size();
 
     auto lv_dsi = cpace_prepend_len(dsi, dsi_len);
     auto lv_prs = cpace_prepend_len(prs, prs_len);
@@ -210,38 +210,27 @@ std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs
 // ============================================================================
 
 bool x25519_scalar_mult(const uint8_t scalar[32], const uint8_t point[32], uint8_t out[32]) {
-    NoiseDHState* dh_priv = nullptr;
-    NoiseDHState* dh_pub = nullptr;
-
-    int err = noise_dhstate_new_by_name(&dh_priv, "25519");
-    if (err != NOISE_ERROR_NONE || dh_priv == nullptr) {
+    DhState dh_priv;
+    if (!dh_priv.valid()) {
         return false;
     }
-    err = noise_dhstate_new_by_name(&dh_pub, "25519");
-    if (err != NOISE_ERROR_NONE || dh_pub == nullptr) {
-        noise_dhstate_free(dh_priv);
+    DhState dh_pub;
+    if (!dh_pub.valid()) {
         return false;
     }
 
     // Set private scalar (noise-c stores it as-is; clamping happens in calculate()).
-    err = noise_dhstate_set_keypair_private(dh_priv, scalar, 32);
+    int err = noise_dhstate_set_keypair_private(dh_priv.get(), scalar, 32);
     if (err != NOISE_ERROR_NONE) {
-        noise_dhstate_free(dh_priv);
-        noise_dhstate_free(dh_pub);
         return false;
     }
 
-    err = noise_dhstate_set_public_key(dh_pub, point, 32);
+    err = noise_dhstate_set_public_key(dh_pub.get(), point, 32);
     if (err != NOISE_ERROR_NONE) {
-        noise_dhstate_free(dh_priv);
-        noise_dhstate_free(dh_pub);
         return false;
     }
 
-    err = noise_dhstate_calculate(dh_priv, dh_pub, out, 32);
-
-    noise_dhstate_free(dh_priv);
-    noise_dhstate_free(dh_pub);
+    err = noise_dhstate_calculate(dh_priv.get(), dh_pub.get(), out, 32);
 
     return err == NOISE_ERROR_NONE;
 }
@@ -339,8 +328,8 @@ bool CPace::derive(const uint8_t* peer_share, size_t peer_share_len) {
     auto t_resp = lv_pair(this->responder_share_.data(), this->responder_ad_);
 
     // ISK input: lv_cat(DSI_ISK, sid, shared) + transcript
-    const auto* dsi_isk = reinterpret_cast<const uint8_t*>(CPACE_DSI_ISK);
-    size_t dsi_isk_len = sizeof(CPACE_DSI_ISK) - 1;
+    const auto* dsi_isk = reinterpret_cast<const uint8_t*>(CPACE_DSI_ISK.data());
+    size_t dsi_isk_len = CPACE_DSI_ISK.size();
 
     auto lv_prefix = cpace_lv_cat({
         {dsi_isk, dsi_isk_len},
@@ -358,8 +347,8 @@ bool CPace::derive(const uint8_t* peer_share, size_t peer_share_len) {
     this->isk_ = h_isk.finalize();
 
     // mac_key = SHA512(MAC_LABEL + sid + ISK)
-    const auto* mac_label = reinterpret_cast<const uint8_t*>(CPACE_MAC_LABEL);
-    size_t mac_label_len = sizeof(CPACE_MAC_LABEL) - 1;
+    const auto* mac_label = reinterpret_cast<const uint8_t*>(CPACE_MAC_LABEL.data());
+    size_t mac_label_len = CPACE_MAC_LABEL.size();
 
     Sha512 h_mac;
     h_mac.update(mac_label, mac_label_len);

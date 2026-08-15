@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -40,13 +41,13 @@ namespace sendspin {
 // ============================================================================
 
 /// @brief DSI string for generator derivation.
-static constexpr char CPACE_DSI[] = "CPace255";
+static constexpr std::string_view CPACE_DSI{"CPace255"};
 
 /// @brief DSI string for ISK derivation.
-static constexpr char CPACE_DSI_ISK[] = "CPace255_ISK";
+static constexpr std::string_view CPACE_DSI_ISK{"CPace255_ISK"};
 
 /// @brief Label for MAC key derivation.
-static constexpr char CPACE_MAC_LABEL[] = "CPaceMac";
+static constexpr std::string_view CPACE_MAC_LABEL{"CPaceMac"};
 
 /// @brief SHA-512 block size in bytes.
 static constexpr size_t CPACE_SHA512_BLOCK = 128;

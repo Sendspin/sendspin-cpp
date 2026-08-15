@@ -26,7 +26,7 @@ namespace sendspin {
 // bytes; the test KAT verifies the hex matches the spec constant.
 // NOLINTNEXTLINE(cert-err58-cpp)
 const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK = []() {
-    static constexpr char label[] = "sendspin-sentinel-psk-v1";
+    static constexpr std::string_view label{"sendspin-sentinel-psk-v1"};
     Sha256 h;
     if (!h.ok()) {
         // SHA-256 is unavailable at process startup (noise-c allocation failure). There is no
@@ -36,7 +36,7 @@ const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK = []() {
         // the CSPRNG-failure abort() in platform_random_bytes()).
         abort();
     }
-    h.update(reinterpret_cast<const uint8_t*>(label), sizeof(label) - 1);
+    h.update(reinterpret_cast<const uint8_t*>(label.data()), label.size());
     auto digest = h.finalize();
     if (!h.ok()) {
         abort();

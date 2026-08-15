@@ -351,8 +351,8 @@ struct FixedExchange {
         auto t_b = cpace_lv_cat({{Yb.data(), 32}, {nullptr, 0}});
 
         // ISK = SHA512(lv_cat(DSI_ISK, sid, shared) + transcript)
-        const auto* dsi_isk = reinterpret_cast<const uint8_t*>(CPACE_DSI_ISK);
-        size_t dsi_isk_len = sizeof(CPACE_DSI_ISK) - 1;
+        const auto* dsi_isk = reinterpret_cast<const uint8_t*>(CPACE_DSI_ISK.data());
+        size_t dsi_isk_len = CPACE_DSI_ISK.size();
         auto lv_prefix = cpace_lv_cat({
             {dsi_isk, dsi_isk_len},
             {sid, sid_len},
@@ -365,8 +365,8 @@ struct FixedExchange {
         auto isk = h_isk.finalize();
 
         // mac_key = SHA512(MAC_LABEL + sid + ISK)
-        const auto* mac_label = reinterpret_cast<const uint8_t*>(CPACE_MAC_LABEL);
-        size_t mac_label_len = sizeof(CPACE_MAC_LABEL) - 1;
+        const auto* mac_label = reinterpret_cast<const uint8_t*>(CPACE_MAC_LABEL.data());
+        size_t mac_label_len = CPACE_MAC_LABEL.size();
         Sha512 h_mac;
         h_mac.update(mac_label, mac_label_len);
         h_mac.update(sid, sid_len);

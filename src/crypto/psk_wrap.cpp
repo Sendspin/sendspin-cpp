@@ -22,8 +22,8 @@ namespace sendspin {
 
 std::optional<std::array<uint8_t, 32>> derive_psk_wrap_key(
     const std::vector<uint8_t>& sid, const std::array<uint8_t, CPACE_ISK_SIZE>& isk) {
-    const auto* label = reinterpret_cast<const uint8_t*>(PSK_WRAP_LABEL);
-    size_t label_len = sizeof(PSK_WRAP_LABEL) - 1;  // exclude NUL
+    const auto* label = reinterpret_cast<const uint8_t*>(PSK_WRAP_LABEL.data());
+    size_t label_len = PSK_WRAP_LABEL.size();
 
     Sha256 h;
     if (!h.ok()) {

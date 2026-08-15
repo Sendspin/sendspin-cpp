@@ -35,8 +35,8 @@ std::array<uint8_t, PIN_NONCE_SIZE> pin_generate_nonce() {
 // ============================================================================
 
 std::array<uint8_t, PIN_COMMIT_SIZE> pin_commit(const uint8_t* nonce, size_t nonce_len) {
-    const auto* label = reinterpret_cast<const uint8_t*>(PIN_COMMIT_LABEL);
-    size_t label_len = sizeof(PIN_COMMIT_LABEL) - 1;  // exclude NUL
+    const auto* label = reinterpret_cast<const uint8_t*>(PIN_COMMIT_LABEL.data());
+    size_t label_len = PIN_COMMIT_LABEL.size();
     return sha256_oneshot(label, label_len, nonce, nonce_len);
 }
 
@@ -73,8 +73,8 @@ std::optional<std::string> pin_derive(const uint8_t* handshake_hash, size_t hash
     }
 
     // SHA-256(label || hash || nonce_a || nonce_b)
-    const auto* label = reinterpret_cast<const uint8_t*>(PIN_DERIVE_LABEL);
-    size_t label_len = sizeof(PIN_DERIVE_LABEL) - 1;  // exclude NUL
+    const auto* label = reinterpret_cast<const uint8_t*>(PIN_DERIVE_LABEL.data());
+    size_t label_len = PIN_DERIVE_LABEL.size();
 
     Sha256 h;
     if (!h.ok()) {
