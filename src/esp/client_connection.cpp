@@ -24,6 +24,7 @@
 #include <freertos/task.h>
 
 #include <cstring>
+#include <limits>
 #include <utility>
 
 namespace sendspin {
@@ -76,6 +77,11 @@ void SendspinClientConnection::start() {
                 static_cast<unsigned>(task_stack_size),
                 static_cast<unsigned>(SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE));
         task_stack_size = SendspinClientConfig::DEFAULT_WEBSOCKET_STACK_SIZE;
+    }
+    // esp_websocket_client's task_stack field is int; bound the size_t config value so an
+    // absurd setting cannot wrap negative instead of just failing task creation.
+    if (task_stack_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        task_stack_size = static_cast<size_t>(std::numeric_limits<int>::max());
     }
     config.task_stack = static_cast<int>(task_stack_size);
 

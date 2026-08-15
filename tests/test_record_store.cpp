@@ -2039,3 +2039,47 @@ TEST(RecordStore, ProvisioningSkipsTheRecordWriteWhenTheConfigWriteIsRejected) {
     EXPECT_EQ(rebooted.records_snapshot().size(), 1u);
     EXPECT_NE(rebooted.record_by_psk_id(rebooted.record_mode_psk_id()), nullptr);
 }
+
+// ============================================================================
+// PSK zeroization on destruction
+// ============================================================================
+
+// The pairing structs promise to wipe their psk array when destroyed (see config.h and
+// record_store.h). These tests pin that behavior: each constructs the object in caller-owned
+// storage via placement new, fills the psk with a sentinel pattern, destroys the object
+// explicitly, and then inspects the storage bytes where the psk lived. The storage itself
+// stays alive for the whole test, so reading it after the object's lifetime ends is
+// well-defined; only the object is gone.
+
+namespace {
+
+template <typename T> void expect_psk_wiped_on_destruction() {
+    alignas(T) unsigned char storage[sizeof(T)];
+    T* obj = new (storage) T();
+    obj->psk.fill(0xA5u);
+    // Take the address before destruction; afterwards only the raw bytes may be read.
+    const unsigned char* psk_bytes = reinterpret_cast<const unsigned char*>(obj->psk.data());
+    const size_t psk_len = obj->psk.size();
+    obj->~T();
+    for (size_t i = 0; i < psk_len; ++i) {
+        ASSERT_EQ(psk_bytes[i], 0u) << "psk byte " << i << " survived destruction";
+    }
+}
+
+}  // namespace
+
+TEST(PskZeroization, PairingRecordDestructorWipesPsk) {
+    expect_psk_wiped_on_destruction<SendspinPairingRecord>();
+}
+
+TEST(PskZeroization, PairingPskDestructorWipesPsk) {
+    expect_psk_wiped_on_destruction<SendspinPairingPsk>();
+}
+
+TEST(PskZeroization, ResolvedPskDestructorWipesPsk) {
+    expect_psk_wiped_on_destruction<ResolvedPsk>();
+}
+
+TEST(PskZeroization, PairingOutcomeDestructorWipesPsk) {
+    expect_psk_wiped_on_destruction<RecordStore::PairingOutcome>();
+}

@@ -76,6 +76,19 @@ struct ResolvedPsk {
     PskCategory category{PskCategory::SENTINEL};
     /// Peer server_id for stored-pubkey records; empty optional = shared / sentinel / pairing.
     std::optional<std::string> counterparty_id;
+
+    ResolvedPsk() = default;
+    ResolvedPsk(const ResolvedPsk&) = default;
+    ResolvedPsk(ResolvedPsk&&) = default;
+    ResolvedPsk& operator=(const ResolvedPsk&) = default;
+    ResolvedPsk& operator=(ResolvedPsk&&) = default;
+
+    /// @brief Wipes `psk` on destruction; same discipline as SendspinPairingRecord (see
+    /// config.h): copies of this struct travel through every handshake and must not leave
+    /// key bytes behind in freed heap or dead stack frames.
+    ~ResolvedPsk() {
+        detail::secure_zero_psk(this->psk);
+    }
 };
 
 // ============================================================================
@@ -346,6 +359,18 @@ public:
         std::array<uint8_t, NOISE_PSK_SIZE> psk{};
         /// nullopt = storage exhausted, use the shared-PSK fallback record.
         std::optional<SendspinPairingRecord> record;
+
+        PairingOutcome() = default;
+        PairingOutcome(const PairingOutcome&) = default;
+        PairingOutcome(PairingOutcome&&) = default;
+        PairingOutcome& operator=(const PairingOutcome&) = default;
+        PairingOutcome& operator=(PairingOutcome&&) = default;
+
+        /// @brief Wipes `psk` on destruction; same discipline as SendspinPairingRecord (see
+        /// config.h). The contained record wipes its own copy independently.
+        ~PairingOutcome() {
+            detail::secure_zero_psk(this->psk);
+        }
     };
 
     /// @brief Decide a pairing outcome.

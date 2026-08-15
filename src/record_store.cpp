@@ -59,6 +59,10 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                 SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; starting with an empty store",
                         persistence_keys::RECORDS);
             }
+            // The loaded blob is base64 PSK text (even when it failed to decode); wipe it
+            // before the vector's destructor frees it, mirroring the save-path wipes in
+            // persist_records_locked() and set_pairing_psk().
+            secure_zero(records_blob->data(), records_blob->size());
         }
 
         if (auto psk_blob = this->provider_->load_blob(persistence_keys::PAIRING_PSK)) {
@@ -81,6 +85,8 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                 SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; ignoring",
                         persistence_keys::PAIRING_PSK);
             }
+            // Base64 PSK text like the RECORDS blob above; wipe before the vector frees it.
+            secure_zero(psk_blob->data(), psk_blob->size());
         }
 
         if (auto pin_blob = this->provider_->load_blob(persistence_keys::STATIC_PIN)) {
