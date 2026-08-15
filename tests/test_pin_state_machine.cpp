@@ -361,6 +361,14 @@ struct ServerStandIn {
     }
 };
 
+/// Result of PinStateMachineTest::drive_to_pin_displayed(): the derived PIN (matches
+/// on_display_pairing_pin's argument) plus the handshake hash a later ServerStandIn needs to
+/// start CPace with the same PRS/SID.
+struct PinDisplayResult {
+    std::string pin;
+    std::array<uint8_t, 32> handshake_hash{};
+};
+
 }  // namespace
 
 // =============================================================================
@@ -565,6 +573,153 @@ protected:
 
     RecordStore& record_store() { return *this->client_->record_store_; }
 
+    // =========================================================================
+    // CPace pair-init/auth/confirm drive helpers
+    //
+    // These stage the choreography shared by the dynamic-PIN and static-PIN happy paths (and
+    // the connection-loss / abort-ordering tests that ride the front half of it): inject +
+    // enter pairing, drive server/pair-init to a displayed PIN, drive server/pair-auth to a
+    // genuine server_kc, then send server/pair-confirm. Each stage asserts its own
+    // preconditions internally (ASSERT_TRUE/ASSERT_EQ), so callers wrap the call in
+    // ASSERT_NO_FATAL_FAILURE to propagate a failure out of the TEST_F body the way an inline
+    // ASSERT_* would (gtest's fatal-assertion `return` only unwinds the helper itself).
+    // =========================================================================
+
+    /// Inject a fresh dynamic-PIN FakeConnection for `server_id` and drive
+    /// handle_enter_pairing(): emits client/pair-init(commit_B), but the PIN is not yet
+    /// displayed (server/pair-init has not arrived from the "server" yet). Returns the
+    /// injected connection.
+    FakeConnection* enter_dynamic_pin_pairing(const std::string& server_id, int pin_length = 6) {
+        FakeConnection* conn = this->inject_current_connection(
+            server_id, SendspinPairMethod::DYNAMIC_PIN, pin_length);
+        this->enter_pairing(conn);
+        this->client_->loop();
+        return conn;
+    }
+
+    /// Complete the server/pair-init leg of a dynamic-PIN attempt already at
+    /// handle_enter_pairing(): captures nonce_B from the session, builds nonce_A (each byte
+    /// i + nonce_a_seed, matching this file's per-test constants that keep pin_derive()
+    /// outputs distinct across tests), derives the PIN the way the device does, then
+    /// schedules+pumps server/pair-init and asserts on_display_pairing_pin fired (spec "PAKE":
+    /// display only happens once server/pair-init supplies pin_length).
+    void drive_to_pin_displayed(FakeConnection* conn, uint8_t nonce_a_seed, PinDisplayResult& out,
+                                int pin_length = 6) {
+        const std::array<uint8_t, 32> nonce_b = conn->pin_session().nonce_b;
+        out.handshake_hash = conn->pin_session().handshake_hash;
+
+        std::array<uint8_t, 32> nonce_a{};
+        for (size_t i = 0; i < nonce_a.size(); ++i) {
+            nonce_a[i] = static_cast<uint8_t>(i + nonce_a_seed);
+        }
+        auto pin_opt = pin_derive(out.handshake_hash.data(), out.handshake_hash.size(),
+                                  nonce_a.data(), nonce_a.size(), nonce_b.data(), nonce_b.size(),
+                                  pin_length);
+        ASSERT_TRUE(pin_opt.has_value());
+        out.pin = pin_opt.value();
+
+        ServerPairingMessageEvent pair_init_event;
+        pair_init_event.conn = this->current_connection_sp();
+        pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
+        pair_init_event.nonce_a = nonce_a;
+        this->schedule_pin_message(std::move(pair_init_event));
+        this->client_->loop();
+
+        ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
+    }
+
+    /// Complete the server/pair-auth leg of a PIN attempt already at PAIR_INIT: schedules+pumps
+    /// server/pair-auth carrying `server`'s public share, asserts the device answered with
+    /// client/pair-auth(pake_msg_2), then feeds that share into `server`'s CPace and returns the
+    /// resulting server_kc via `server_kc_out` (spec "PAKE"). Callers that need a genuine
+    /// server_kc for a successful PAIR_CONFIRM use this; the PIN-mismatch test fabricates its
+    /// own bogus server_kc instead and drives PAIR_AUTH inline (it never calls derive()/tag()).
+    void drive_pair_auth(FakeConnection* conn, ServerStandIn& server,
+                         std::array<uint8_t, CPACE_TAG_SIZE>& server_kc_out) {
+        ServerPairingMessageEvent pair_auth_event;
+        pair_auth_event.conn = this->current_connection_sp();
+        pair_auth_event.kind = PinPairingMessageKind::PAIR_AUTH;
+        pair_auth_event.pake_msg_1 = server.initiator.public_share();
+        this->schedule_pin_message(std::move(pair_auth_event));
+        this->client_->loop();
+
+        ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
+        JsonDocument auth_doc;
+        JsonObject auth_root;
+        ASSERT_TRUE(parse_json(conn->sent_text_.back(), auth_doc, auth_root));
+        auto pake_msg_2_b64 = std::string(auth_root["payload"]["pake_msg_2"] | "");
+        auto pake_msg_2 = b64url_decode(pake_msg_2_b64);
+        ASSERT_TRUE(pake_msg_2.has_value());
+        ASSERT_EQ(pake_msg_2->size(), 32u);
+
+        ASSERT_TRUE(server.initiator.derive(pake_msg_2->data(), pake_msg_2->size()));
+        auto server_kc = server.initiator.tag();
+        ASSERT_TRUE(server_kc.has_value());
+        server_kc_out = server_kc.value();
+    }
+
+    /// Schedule a server/pair-confirm(server_kc) event for the injected connection and pump
+    /// loop(). Shared by every PAIR_CONFIRM step regardless of whether server_kc is genuine
+    /// (from drive_pair_auth) or deliberately wrong (a PIN-mismatch test's fabricated tag): the
+    /// dispatch is identical either way.
+    void schedule_pair_confirm(const std::array<uint8_t, CPACE_TAG_SIZE>& server_kc) {
+        ServerPairingMessageEvent pair_confirm_event;
+        pair_confirm_event.conn = this->current_connection_sp();
+        pair_confirm_event.kind = PinPairingMessageKind::PAIR_CONFIRM;
+        pair_confirm_event.server_kc = server_kc;
+        this->schedule_pin_message(std::move(pair_confirm_event));
+        this->client_->loop();
+    }
+
+    /// Verify the client/pair-confirm frame (second-to-last: client/pair-finalize follows
+    /// immediately) carries client_kc and, only for dynamic PIN, nonce_B; then verify the last
+    /// frame is client/pair-finalize. `expect_nonce_b` distinguishes the dynamic-PIN flow
+    /// (which opens nonce_B alongside the confirm) from static-PIN (which never opens a nonce).
+    /// Callers assert the frame count first, since the required minimum differs by flow.
+    void verify_pair_confirm_frame(const std::vector<std::string>& sent_text, bool expect_nonce_b) {
+        JsonDocument confirm_doc;
+        JsonObject confirm_root;
+        const std::string& confirm_frame = sent_text[sent_text.size() - 2];
+        ASSERT_TRUE(parse_json(confirm_frame, confirm_doc, confirm_root));
+        EXPECT_STREQ(confirm_root["type"], "client/pair-confirm");
+        EXPECT_TRUE(confirm_root["payload"]["client_kc"].is<const char*>());
+        if (expect_nonce_b) {
+            EXPECT_TRUE(confirm_root["payload"]["nonce_B"].is<const char*>())
+                << "dynamic PIN pair-confirm must open nonce_B";
+        } else {
+            EXPECT_TRUE(confirm_root["payload"]["nonce_B"].isUnbound())
+                << "static PIN pair-confirm must NOT carry nonce_B";
+        }
+        EXPECT_EQ(last_frame_type(sent_text), "client/pair-finalize");
+    }
+
+    /// Verify PSK Wrapping (spec "PSK Wrapping"): the last captured frame must be
+    /// client/pair-finalize carrying wrapped_psk (never long_term_psk in a PIN flow), and
+    /// `server` (using its own independently-derived ISK/sid, exactly as a real server would)
+    /// must be able to unwrap it. A successful AEAD decrypt here proves the client used the
+    /// same K_wrap the server derives.
+    void verify_wrapped_psk_finalize(const std::vector<std::string>& sent_text,
+                                     const ServerStandIn& server) {
+        JsonDocument finalize_doc;
+        JsonObject finalize_root;
+        ASSERT_TRUE(parse_json(sent_text.back(), finalize_doc, finalize_root));
+        EXPECT_TRUE(finalize_root["payload"]["long_term_psk"].isUnbound())
+            << "PIN flows must not send long_term_psk in the clear";
+        ASSERT_TRUE(finalize_root["payload"]["wrapped_psk"].is<const char*>());
+        auto wrapped_bytes =
+            b64url_decode(std::string(finalize_root["payload"]["wrapped_psk"] | ""));
+        ASSERT_TRUE(wrapped_bytes.has_value());
+        ASSERT_EQ(wrapped_bytes->size(), WRAPPED_PSK_SIZE);
+        std::array<uint8_t, WRAPPED_PSK_SIZE> wrapped_psk{};
+        std::memcpy(wrapped_psk.data(), wrapped_bytes->data(), WRAPPED_PSK_SIZE);
+
+        ASSERT_TRUE(server.initiator.isk().has_value());
+        auto unwrapped = unwrap_psk("ChaChaPoly", server.initiator.sid(),
+                                    server.initiator.isk().value(), wrapped_psk);
+        ASSERT_TRUE(unwrapped.has_value()) << "server-side unwrap_psk failed";
+        EXPECT_EQ(unwrapped->size(), 32u);
+    }
+
     std::unique_ptr<SendspinClient> client_;
     RecordingListener listener_;
     FakeNetworkProvider network_provider_;
@@ -579,10 +734,7 @@ protected:
 // =============================================================================
 
 TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
-    FakeConnection* conn = this->inject_current_connection("server-dyn-1", SendspinPairMethod::DYNAMIC_PIN);
-
-    this->enter_pairing(conn);
-    this->client_->loop();
+    FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-1");
 
     // client/pair-init(commit_B) was emitted, and on_pairing_started + on_display_pairing_pin
     // have NOT fired yet (display only happens after server/pair-init supplies pin_length).
@@ -592,103 +744,27 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
     EXPECT_EQ(this->listener_.events_.front().server_id, "server-dyn-1");
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
 
-    // Capture nonce_B via the test seam (pin_session() is public on SendspinConnection).
-    const std::array<uint8_t, 32> nonce_b = conn->pin_session().nonce_b;
-    const std::array<uint8_t, 32> handshake_hash = conn->pin_session().handshake_hash;
-
-    // server/pair-init: nonce_A only; pin_length (6) came from the activation.
-    std::array<uint8_t, 32> nonce_a{};
-    for (size_t i = 0; i < nonce_a.size(); ++i) {
-        nonce_a[i] = static_cast<uint8_t>(i + 1);
-    }
-    const int pin_length = 6;
-    auto pin_opt = pin_derive(handshake_hash.data(), handshake_hash.size(), nonce_a.data(),
-                              nonce_a.size(), nonce_b.data(), nonce_b.size(), pin_length);
-    ASSERT_TRUE(pin_opt.has_value());
-
-    auto conn_sp = this->current_connection_sp();
-
-    ServerPairingMessageEvent pair_init_event;
-    pair_init_event.conn = conn_sp;
-    pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
-    pair_init_event.nonce_a = nonce_a;
-    this->schedule_pin_message(std::move(pair_init_event));
-    this->client_->loop();
-
-    // The derived PIN must now be displayed.
-    ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
-    EXPECT_EQ(this->listener_.last_displayed_pin(), pin_opt.value());
+    PinDisplayResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_pin_displayed(conn, /*nonce_a_seed=*/1, display));
+    EXPECT_EQ(this->listener_.last_displayed_pin(), display.pin);
 
     // Simulated server (INITIATOR) starts CPace with the same derived PIN.
     ServerStandIn server;
-    ASSERT_TRUE(server.start(pin_opt.value(), handshake_hash));
+    ASSERT_TRUE(server.start(display.pin, display.handshake_hash));
 
-    // server/pair-auth: server's public share (pake_msg_1).
-    ServerPairingMessageEvent pair_auth_event;
-    pair_auth_event.conn = conn_sp;
-    pair_auth_event.kind = PinPairingMessageKind::PAIR_AUTH;
-    pair_auth_event.pake_msg_1 = server.initiator.public_share();
-    this->schedule_pin_message(std::move(pair_auth_event));
-    this->client_->loop();
+    std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
+    ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
 
-    // Device must have emitted client/pair-auth (pake_msg_2).
-    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
-    JsonDocument auth_doc;
-    JsonObject auth_root;
-    ASSERT_TRUE(parse_json(conn->sent_text_.back(), auth_doc, auth_root));
-    auto pake_msg_2_b64 = std::string(auth_root["payload"]["pake_msg_2"] | "");
-    auto pake_msg_2 = b64url_decode(pake_msg_2_b64);
-    ASSERT_TRUE(pake_msg_2.has_value());
-    ASSERT_EQ(pake_msg_2->size(), 32u);
-
-    // Server derives against the device's share, then computes server_kc.
-    ASSERT_TRUE(server.initiator.derive(pake_msg_2->data(), pake_msg_2->size()));
-    auto server_kc = server.initiator.tag();
-    ASSERT_TRUE(server_kc.has_value());
-
-    // server/pair-confirm: server_kc.
-    ServerPairingMessageEvent pair_confirm_event;
-    pair_confirm_event.conn = conn_sp;
-    pair_confirm_event.kind = PinPairingMessageKind::PAIR_CONFIRM;
-    pair_confirm_event.server_kc = server_kc.value();
-    this->schedule_pin_message(std::move(pair_confirm_event));
-    this->client_->loop();
+    this->schedule_pair_confirm(server_kc);
 
     // Device must emit client/pair-confirm (with client_kc + nonce_B) then client/pair-finalize.
     ASSERT_GE(conn->sent_text_.size(), 4u);
-    JsonDocument confirm_doc;
-    JsonObject confirm_root;
-    const std::string& confirm_frame = conn->sent_text_[conn->sent_text_.size() - 2];
-    ASSERT_TRUE(parse_json(confirm_frame, confirm_doc, confirm_root));
-    EXPECT_STREQ(confirm_root["type"], "client/pair-confirm");
-    EXPECT_TRUE(confirm_root["payload"]["client_kc"].is<const char*>());
-    EXPECT_TRUE(confirm_root["payload"]["nonce_B"].is<const char*>())
-        << "dynamic PIN pair-confirm must open nonce_B";
-    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
+    ASSERT_NO_FATAL_FAILURE(
+        this->verify_pair_confirm_frame(conn->sent_text_, /*expect_nonce_b=*/true));
 
-    // PSK Wrapping round-trip (spec "PSK Wrapping"): client/pair-finalize must carry
-    // wrapped_psk (NOT long_term_psk) in a PIN flow, and the server-side ServerStandIn (using its
-    // own
-    // independently-derived ISK/sid, exactly as a real server would) must be able to unwrap it.
-    // A successful AEAD decrypt here proves the client used the same K_wrap the server derives.
-    JsonDocument finalize_doc;
-    JsonObject finalize_root;
-    ASSERT_TRUE(parse_json(conn->sent_text_.back(), finalize_doc, finalize_root));
-    EXPECT_TRUE(finalize_root["payload"]["long_term_psk"].isUnbound())
-        << "PIN flows must not send long_term_psk in the clear";
-    ASSERT_TRUE(finalize_root["payload"]["wrapped_psk"].is<const char*>());
-    auto wrapped_bytes =
-        b64url_decode(std::string(finalize_root["payload"]["wrapped_psk"] | ""));
-    ASSERT_TRUE(wrapped_bytes.has_value());
-    ASSERT_EQ(wrapped_bytes->size(), WRAPPED_PSK_SIZE);
-    std::array<uint8_t, WRAPPED_PSK_SIZE> wrapped_psk{};
-    std::memcpy(wrapped_psk.data(), wrapped_bytes->data(), WRAPPED_PSK_SIZE);
-
-    ASSERT_TRUE(server.initiator.isk().has_value());
-    auto unwrapped =
-        unwrap_psk("ChaChaPoly", server.initiator.sid(), server.initiator.isk().value(), wrapped_psk);
-    ASSERT_TRUE(unwrapped.has_value()) << "server-side unwrap_psk failed";
-    EXPECT_EQ(unwrapped->size(), 32u);
+    // PSK Wrapping round-trip (spec "PSK Wrapping"): see verify_wrapped_psk_finalize()'s doc
+    // comment for the rationale.
+    ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_psk_finalize(conn->sent_text_, server));
 
     // Success callbacks: on_clear_pairing_pin fires (display -> clear ordering), and the
     // dynamic-PIN failure counter is reset (was already 0, but exercise the call path by
@@ -707,60 +783,18 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
 // failed() ends the same attempt a second time via abort_pairing_attempt(); on_clear_pairing_pin
 // must NOT fire again for the PIN this attempt already stopped showing.
 TEST_F(PinStateMachineTest, StorageFailureAfterConfirmDoesNotReclearAlreadyDismissedPin) {
-    FakeConnection* conn =
-        this->inject_current_connection("server-dyn-storage-fail", SendspinPairMethod::DYNAMIC_PIN);
+    FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-storage-fail");
 
-    this->enter_pairing(conn);
-    this->client_->loop();
-
-    const std::array<uint8_t, 32> nonce_b = conn->pin_session().nonce_b;
-    const std::array<uint8_t, 32> handshake_hash = conn->pin_session().handshake_hash;
-
-    std::array<uint8_t, 32> nonce_a{};
-    for (size_t i = 0; i < nonce_a.size(); ++i) {
-        nonce_a[i] = static_cast<uint8_t>(i + 1);
-    }
-    const int pin_length = 6;
-    auto pin_opt = pin_derive(handshake_hash.data(), handshake_hash.size(), nonce_a.data(),
-                              nonce_a.size(), nonce_b.data(), nonce_b.size(), pin_length);
-    ASSERT_TRUE(pin_opt.has_value());
-
-    auto conn_sp = this->current_connection_sp();
-
-    ServerPairingMessageEvent pair_init_event;
-    pair_init_event.conn = conn_sp;
-    pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
-    pair_init_event.nonce_a = nonce_a;
-    this->schedule_pin_message(std::move(pair_init_event));
-    this->client_->loop();
-    ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
+    PinDisplayResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_pin_displayed(conn, /*nonce_a_seed=*/1, display));
 
     ServerStandIn server;
-    ASSERT_TRUE(server.start(pin_opt.value(), handshake_hash));
+    ASSERT_TRUE(server.start(display.pin, display.handshake_hash));
 
-    ServerPairingMessageEvent pair_auth_event;
-    pair_auth_event.conn = conn_sp;
-    pair_auth_event.kind = PinPairingMessageKind::PAIR_AUTH;
-    pair_auth_event.pake_msg_1 = server.initiator.public_share();
-    this->schedule_pin_message(std::move(pair_auth_event));
-    this->client_->loop();
+    std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
+    ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
 
-    JsonDocument auth_doc;
-    JsonObject auth_root;
-    ASSERT_TRUE(parse_json(conn->sent_text_.back(), auth_doc, auth_root));
-    auto pake_msg_2_b64 = std::string(auth_root["payload"]["pake_msg_2"] | "");
-    auto pake_msg_2 = b64url_decode(pake_msg_2_b64);
-    ASSERT_TRUE(pake_msg_2.has_value());
-    ASSERT_TRUE(server.initiator.derive(pake_msg_2->data(), pake_msg_2->size()));
-    auto server_kc = server.initiator.tag();
-    ASSERT_TRUE(server_kc.has_value());
-
-    ServerPairingMessageEvent pair_confirm_event;
-    pair_confirm_event.conn = conn_sp;
-    pair_confirm_event.kind = PinPairingMessageKind::PAIR_CONFIRM;
-    pair_confirm_event.server_kc = server_kc.value();
-    this->schedule_pin_message(std::move(pair_confirm_event));
-    this->client_->loop();
+    this->schedule_pair_confirm(server_kc);
 
     // PAIR_CONFIRM succeeded: client/pair-finalize was sent, and the PIN was already dismissed
     // exactly once.
@@ -771,7 +805,7 @@ TEST_F(PinStateMachineTest, StorageFailureAfterConfirmDoesNotReclearAlreadyDismi
     // The persistence provider now rejects the record at server/pair-finalize ack (network
     // thread, in production); simulate the resulting deferred event directly.
     PairStorageFailedEvent storage_failed_event;
-    storage_failed_event.conn = conn_sp;
+    storage_failed_event.conn = this->current_connection_sp();
     storage_failed_event.server_id = "server-dyn-storage-fail";
     this->schedule_storage_failed(std::move(storage_failed_event));
     this->client_->loop();
@@ -790,56 +824,30 @@ TEST_F(PinStateMachineTest, StorageFailureAfterConfirmDoesNotReclearAlreadyDismi
 // =============================================================================
 
 TEST_F(PinStateMachineTest, DynamicPinMismatchRecordsFailureAndAborts) {
-    FakeConnection* conn =
-        this->inject_current_connection("server-dyn-2", SendspinPairMethod::DYNAMIC_PIN);
-    this->enter_pairing(conn);
-    this->client_->loop();
+    FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-2");
 
-    const std::array<uint8_t, 32> nonce_b = conn->pin_session().nonce_b;
-    const std::array<uint8_t, 32> handshake_hash = conn->pin_session().handshake_hash;
-
-    std::array<uint8_t, 32> nonce_a{};
-    for (size_t i = 0; i < nonce_a.size(); ++i) {
-        nonce_a[i] = static_cast<uint8_t>(i + 2);
-    }
-    const int pin_length = 6;
-    auto pin_opt = pin_derive(handshake_hash.data(), handshake_hash.size(), nonce_a.data(),
-                              nonce_a.size(), nonce_b.data(), nonce_b.size(), pin_length);
-    ASSERT_TRUE(pin_opt.has_value());
-
-    auto current_conn_sp = this->current_connection_sp();
-
-    ServerPairingMessageEvent pair_init_event;
-    pair_init_event.conn = current_conn_sp;
-    pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
-    pair_init_event.nonce_a = nonce_a;
-    this->schedule_pin_message(std::move(pair_init_event));
-    this->client_->loop();
-    ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
+    PinDisplayResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_pin_displayed(conn, /*nonce_a_seed=*/2, display));
 
     // Simulated server uses the CORRECT pin to complete the CPace handshake (so derive()
     // succeeds), but then sends a bogus server_kc so verify() fails (a genuine PIN mismatch,
-    // as opposed to a low-order-point derive() failure).
+    // as opposed to a low-order-point derive() failure). This diverges from drive_pair_auth()'s
+    // happy path (which calls derive()+tag() to get a real server_kc), so PAIR_AUTH is driven
+    // inline here rather than through that helper.
     ServerStandIn server;
-    ASSERT_TRUE(server.start(pin_opt.value(), handshake_hash));
+    ASSERT_TRUE(server.start(display.pin, display.handshake_hash));
 
     ServerPairingMessageEvent pair_auth_event;
-    pair_auth_event.conn = current_conn_sp;
+    pair_auth_event.conn = this->current_connection_sp();
     pair_auth_event.kind = PinPairingMessageKind::PAIR_AUTH;
     pair_auth_event.pake_msg_1 = server.initiator.public_share();
     this->schedule_pin_message(std::move(pair_auth_event));
     this->client_->loop();
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
 
-    std::array<uint8_t, 64> bogus_server_kc{};
+    std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
     bogus_server_kc.fill(0xAB);
-
-    ServerPairingMessageEvent pair_confirm_event;
-    pair_confirm_event.conn = current_conn_sp;
-    pair_confirm_event.kind = PinPairingMessageKind::PAIR_CONFIRM;
-    pair_confirm_event.server_kc = bogus_server_kc;
-    this->schedule_pin_message(std::move(pair_confirm_event));
-    this->client_->loop();
+    this->schedule_pair_confirm(bogus_server_kc);
 
     // Device must abort with pin_mismatch, record a DYNAMIC_PIN failure, and fire the failure
     // callbacks: on_pairing_failed AND on_clear_pairing_pin both survive
@@ -1264,63 +1272,19 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
     ServerStandIn server;
     ASSERT_TRUE(server.start("13572468", handshake_hash));
 
-    auto current_conn_sp = this->current_connection_sp();
-    ServerPairingMessageEvent pair_auth_event;
-    pair_auth_event.conn = current_conn_sp;
-    pair_auth_event.kind = PinPairingMessageKind::PAIR_AUTH;
-    pair_auth_event.pake_msg_1 = server.initiator.public_share();
-    this->schedule_pin_message(std::move(pair_auth_event));
-    this->client_->loop();
+    std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
+    ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
 
-    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
-    JsonDocument auth_doc;
-    JsonObject auth_root;
-    ASSERT_TRUE(parse_json(conn->sent_text_.back(), auth_doc, auth_root));
-    auto pake_msg_2 = b64url_decode(std::string(auth_root["payload"]["pake_msg_2"] | ""));
-    ASSERT_TRUE(pake_msg_2.has_value());
-
-    ASSERT_TRUE(server.initiator.derive(pake_msg_2->data(), pake_msg_2->size()));
-    auto server_kc = server.initiator.tag();
-    ASSERT_TRUE(server_kc.has_value());
-
-    ServerPairingMessageEvent pair_confirm_event;
-    pair_confirm_event.conn = current_conn_sp;
-    pair_confirm_event.kind = PinPairingMessageKind::PAIR_CONFIRM;
-    pair_confirm_event.server_kc = server_kc.value();
-    this->schedule_pin_message(std::move(pair_confirm_event));
-    this->client_->loop();
+    this->schedule_pair_confirm(server_kc);
 
     // client/pair-confirm must carry client_kc and NO nonce_B (static PIN never opens a nonce).
     ASSERT_GE(conn->sent_text_.size(), 2u);
-    JsonDocument confirm_doc;
-    JsonObject confirm_root;
-    const std::string& confirm_frame = conn->sent_text_[conn->sent_text_.size() - 2];
-    ASSERT_TRUE(parse_json(confirm_frame, confirm_doc, confirm_root));
-    EXPECT_STREQ(confirm_root["type"], "client/pair-confirm");
-    EXPECT_TRUE(confirm_root["payload"]["client_kc"].is<const char*>());
-    EXPECT_TRUE(confirm_root["payload"]["nonce_B"].isUnbound())
-        << "static PIN pair-confirm must NOT carry nonce_B";
-    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
+    ASSERT_NO_FATAL_FAILURE(
+        this->verify_pair_confirm_frame(conn->sent_text_, /*expect_nonce_b=*/false));
 
-    // PSK Wrapping round-trip (spec "PSK Wrapping"), static-PIN flavor: see the identical block in
-    // DynamicPinHappyPath above for the full rationale.
-    JsonDocument finalize_doc;
-    JsonObject finalize_root;
-    ASSERT_TRUE(parse_json(conn->sent_text_.back(), finalize_doc, finalize_root));
-    EXPECT_TRUE(finalize_root["payload"]["long_term_psk"].isUnbound())
-        << "PIN flows must not send long_term_psk in the clear";
-    ASSERT_TRUE(finalize_root["payload"]["wrapped_psk"].is<const char*>());
-    auto wrapped_bytes =
-        b64url_decode(std::string(finalize_root["payload"]["wrapped_psk"] | ""));
-    ASSERT_TRUE(wrapped_bytes.has_value());
-    ASSERT_EQ(wrapped_bytes->size(), WRAPPED_PSK_SIZE);
-    std::array<uint8_t, WRAPPED_PSK_SIZE> wrapped_psk{};
-    std::memcpy(wrapped_psk.data(), wrapped_bytes->data(), WRAPPED_PSK_SIZE);
-
-    ASSERT_TRUE(server.initiator.isk().has_value());
-    auto unwrapped =
-        unwrap_psk("ChaChaPoly", server.initiator.sid(), server.initiator.isk().value(), wrapped_psk);
-    ASSERT_TRUE(unwrapped.has_value()) << "server-side unwrap_psk failed";
+    // PSK Wrapping round-trip (spec "PSK Wrapping"), static-PIN flavor: see
+    // verify_wrapped_psk_finalize()'s doc comment for the rationale.
+    ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_psk_finalize(conn->sent_text_, server));
 
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
     EXPECT_LT(this->listener_.first_index_of(PairingEventKind::OPEN_WINDOW),
@@ -1570,30 +1534,11 @@ TEST_F(PinStateMachineTest, ConnectionLossDuringStaticPairingWindowClosesWindow)
 }
 
 TEST_F(PinStateMachineTest, ConnectionLossWithPinDisplayedClearsPin) {
-    FakeConnection* conn =
-        this->inject_current_connection("server-dyn-7", SendspinPairMethod::DYNAMIC_PIN);
-    this->enter_pairing(conn);
-    this->client_->loop();
+    FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-7");
 
-    const std::array<uint8_t, 32> nonce_b = conn->pin_session().nonce_b;
-    const std::array<uint8_t, 32> handshake_hash = conn->pin_session().handshake_hash;
-    std::array<uint8_t, 32> nonce_a{};
-    for (size_t i = 0; i < nonce_a.size(); ++i) {
-        nonce_a[i] = static_cast<uint8_t>(i + 3);
-    }
-    auto pin_opt = pin_derive(handshake_hash.data(), handshake_hash.size(), nonce_a.data(),
-                              nonce_a.size(), nonce_b.data(), nonce_b.size(), 6);
-    ASSERT_TRUE(pin_opt.has_value());
+    PinDisplayResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_pin_displayed(conn, /*nonce_a_seed=*/3, display));
 
-    auto current_conn_sp = this->current_connection_sp();
-    ServerPairingMessageEvent pair_init_event;
-    pair_init_event.conn = current_conn_sp;
-    pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
-    pair_init_event.nonce_a = nonce_a;
-    this->schedule_pin_message(std::move(pair_init_event));
-    this->client_->loop();
-
-    ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
     ASSERT_FALSE(this->listener_.fired(PairingEventKind::CLEAR_PIN));
     ASSERT_TRUE(conn->pin_session().pin_displayed);
 
@@ -1616,35 +1561,16 @@ TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
     // on_pairing_failed AND on_clear_pairing_pin even though cleanup_connection_state() wipes
     // the EventState pending-notification vectors: the note_* calls in
     // ConnectionManager::handle_pair_abort() must run strictly AFTER that wipe.
-    FakeConnection* conn =
-        this->inject_current_connection("server-dyn-8", SendspinPairMethod::DYNAMIC_PIN);
-    this->enter_pairing(conn);
-    this->client_->loop();
+    FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-8");
 
-    const std::array<uint8_t, 32> nonce_b = conn->pin_session().nonce_b;
-    const std::array<uint8_t, 32> handshake_hash = conn->pin_session().handshake_hash;
-    std::array<uint8_t, 32> nonce_a{};
-    for (size_t i = 0; i < nonce_a.size(); ++i) {
-        nonce_a[i] = static_cast<uint8_t>(i + 4);
-    }
-    auto pin_opt = pin_derive(handshake_hash.data(), handshake_hash.size(), nonce_a.data(),
-                              nonce_a.size(), nonce_b.data(), nonce_b.size(), 6);
-    ASSERT_TRUE(pin_opt.has_value());
-
-    auto current_conn_sp = this->current_connection_sp();
-    ServerPairingMessageEvent pair_init_event;
-    pair_init_event.conn = current_conn_sp;
-    pair_init_event.kind = PinPairingMessageKind::PAIR_INIT;
-    pair_init_event.nonce_a = nonce_a;
-    this->schedule_pin_message(std::move(pair_init_event));
-    this->client_->loop();
-    ASSERT_TRUE(this->listener_.fired(PairingEventKind::DISPLAY_PIN));
+    PinDisplayResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_pin_displayed(conn, /*nonce_a_seed=*/4, display));
     ASSERT_TRUE(conn->pin_session().pin_displayed);
 
     // The server aborts the exchange directly (pair/abort), which drives
     // ConnectionManager::handle_pair_abort() -> cleanup_connection_state() -> deferred note_*.
     PairAbortEvent abort_event;
-    abort_event.conn = current_conn_sp;
+    abort_event.conn = this->current_connection_sp();
     abort_event.reason = PairAbortReason::USER_CANCELLED;
     this->schedule_abort(std::move(abort_event));
     this->client_->loop();

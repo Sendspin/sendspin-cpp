@@ -103,6 +103,22 @@ public:
     }
 };
 
+/// Invoke handle_set_pairing_config() and return just the result code: no SetPairingConfig*
+/// test inspects ManagementResultPayload::data, only result.result, so the payload struct stays
+/// local to this wrapper. `effect` is an out-param because exactly one caller
+/// (SetPairingConfigEnablePairingPsk) asserts on it; other call sites pass a throwaway local.
+/// dynamic_pin_implemented/static_pin_implemented default to true: every SetPairingConfig* site
+/// but SetPairingConfigRejectsUnimplementedMethodFields uses both true.
+static ManagementResult invoke_set_pairing_config(
+    RecordStore& store, const ManagementSetPairingConfigPayload& payload,
+    ManagementEffect& effect, bool dynamic_pin_implemented = true,
+    bool static_pin_implemented = true) {
+    ManagementResultPayload result;
+    handle_set_pairing_config(store, payload, dynamic_pin_implemented, static_pin_implemented,
+                              result, effect);
+    return result.result;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -927,11 +943,11 @@ TEST(ManagementHandler, SetPairingConfigRejectsUnimplementedMethodFields) {
     dyn_cfg.enabled = false;
     payload.dynamic_pin = dyn_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/false,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect,
+                                                        /*dynamic_pin_implemented=*/false,
+                                                        /*static_pin_implemented=*/true);
+    EXPECT_EQ(result, ManagementResult::INVALID);
     EXPECT_TRUE(store.dynamic_pin_enabled()) << "a rejected patch must not be applied";
 }
 
@@ -945,19 +961,16 @@ TEST(ManagementHandler, SetPairingConfigRejectsEnablingStaticPinWithoutPin) {
     static_cfg.enabled = true;
     payload.static_pin = static_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::INVALID);
     EXPECT_FALSE(store.static_pin_enabled());
 
     // Supplying the PIN in the same request passes.
     static_cfg.pin = "12345678";
     payload.static_pin = static_cfg;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
+    result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::OK);
     EXPECT_TRUE(store.static_pin_enabled());
 }
 
@@ -974,11 +987,9 @@ TEST(ManagementHandler, SetPairingConfigEnablePairingPsk) {
     ppsk_patch.enabled = true;
     payload.pairing_psk = ppsk_patch;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::OK);
     EXPECT_EQ(effect, ManagementEffect::NONE);
     EXPECT_TRUE(store.pairing_psk_enabled());
 }
@@ -993,11 +1004,9 @@ TEST(ManagementHandler, SetPairingConfigSetNewPsk) {
     ppsk_patch.psk = new_psk_b64;
     payload.pairing_psk = ppsk_patch;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::OK);
 
     // The pairing PSK must be set.
     ASSERT_TRUE(store.pairing_psk().has_value());
@@ -1011,11 +1020,9 @@ TEST(ManagementHandler, SetPairingConfigStaticPinValidPinAccepted) {
     static_cfg.pin = "12345678";
     payload.static_pin = static_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::OK);
     ASSERT_TRUE(store.static_pin().has_value());
     EXPECT_EQ(store.static_pin().value(), "12345678");
 }
@@ -1027,11 +1034,9 @@ TEST(ManagementHandler, SetPairingConfigInvalidStaticPinWrongLength) {
     static_cfg.pin = "1234567";  // 7 digits, must be exactly 8.
     payload.static_pin = static_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::INVALID);
     EXPECT_FALSE(store.static_pin().has_value());
 }
 
@@ -1042,11 +1047,9 @@ TEST(ManagementHandler, SetPairingConfigInvalidStaticPinNonDigit) {
     static_cfg.pin = "1234abcd";  // Non-digit characters.
     payload.static_pin = static_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::INVALID);
     EXPECT_FALSE(store.static_pin().has_value());
 }
 
@@ -1062,11 +1065,9 @@ TEST(ManagementHandler, SetPairingConfigStaticPinEnabledToggle) {
     static_cfg.enabled = true;
     payload.static_pin = static_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::OK);
     EXPECT_TRUE(store.static_pin_enabled());
 }
 
@@ -1079,11 +1080,9 @@ TEST(ManagementHandler, SetPairingConfigDynamicPinEnabledToggle) {
     dynamic_cfg.enabled = false;
     payload.dynamic_pin = dynamic_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::OK);
     EXPECT_FALSE(store.dynamic_pin_enabled());
 }
 
@@ -1094,11 +1093,9 @@ TEST(ManagementHandler, SetPairingConfigDynamicPinMinLengthOutOfRangeTooLow) {
     dynamic_cfg.min_pin_length = 3;  // Below PIN_MIN_DIGITS (4).
     payload.dynamic_pin = dynamic_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::INVALID);
 }
 
 TEST(ManagementHandler, SetPairingConfigDynamicPinMinLengthOutOfRangeTooHigh) {
@@ -1108,11 +1105,9 @@ TEST(ManagementHandler, SetPairingConfigDynamicPinMinLengthOutOfRangeTooHigh) {
     dynamic_cfg.min_pin_length = 13;  // Above PIN_MAX_DIGITS (12).
     payload.dynamic_pin = dynamic_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::INVALID);
 }
 
 TEST(ManagementHandler, SetPairingConfigDynamicPinMinLengthAppliesWhenValid) {
@@ -1122,11 +1117,9 @@ TEST(ManagementHandler, SetPairingConfigDynamicPinMinLengthAppliesWhenValid) {
     dynamic_cfg.min_pin_length = 8;
     payload.dynamic_pin = dynamic_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::OK);
     EXPECT_EQ(store.dynamic_pin_min_length(), 8);
 }
 
@@ -1146,11 +1139,9 @@ TEST(ManagementHandler, SetPairingConfigCannotTouchEscalation) {
     dynamic_cfg.enabled = true;
     payload.dynamic_pin = dynamic_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::OK);
     EXPECT_TRUE(store.dynamic_pin_escalated())
         << "management must not be able to de-escalate the failure counter";
 }
@@ -1174,11 +1165,9 @@ TEST(ManagementHandler, SetPairingConfigPskCollidingWithRecordRejected) {
     psk_cfg.psk = psk_to_b64url(psk);
     payload.pairing_psk = psk_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::ALREADY_EXISTS);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::ALREADY_EXISTS);
 }
 
 // A patch mixing a valid field (pairing_psk enabled toggle) and an invalid field (bad static PIN)
@@ -1197,11 +1186,9 @@ TEST(ManagementHandler, SetPairingConfigMixedValidAndInvalidMutatesNothing) {
     static_cfg.pin = "bad";  // Invalid: wrong length and non-digit.
     payload.static_pin = static_cfg;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::INVALID);
 
     // Nothing must have been mutated.
     EXPECT_TRUE(store.pairing_psk_enabled());
@@ -1218,11 +1205,9 @@ TEST(ManagementHandler, SetPairingConfigInvalidBadPskBytes) {
     ppsk_patch.psk = b64url_encode(short_psk.data(), short_psk.size());
     payload.pairing_psk = ppsk_patch;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::INVALID);
 }
 
 TEST(ManagementHandler, SetPairingConfigInvalidRecordMode) {
@@ -1236,11 +1221,9 @@ TEST(ManagementHandler, SetPairingConfigInvalidRecordMode) {
     rm.psk_id = pubkey_rec.psk_id;
     payload.record_mode = rm;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::INVALID);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::INVALID);
 }
 
 TEST(ManagementHandler, SetPairingConfigAppliesRecordMode) {
@@ -1256,11 +1239,9 @@ TEST(ManagementHandler, SetPairingConfigAppliesRecordMode) {
     rm.psk_id = shared.psk_id;
     payload.record_mode = rm;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::OK);
     EXPECT_EQ(store.record_mode_psk_id(), shared.psk_id);
 }
 
@@ -1273,11 +1254,9 @@ TEST(ManagementHandler, SetPairingConfigUnpairedAccess) {
     ua.enabled = true;
     payload.unpaired_access = ua;
 
-    ManagementResultPayload result;
     ManagementEffect effect;
-    handle_set_pairing_config(store, payload, /*dynamic_pin_implemented=*/true,
-                              /*static_pin_implemented=*/true, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::OK);
+    ManagementResult result = invoke_set_pairing_config(store, payload, effect);
+    EXPECT_EQ(result, ManagementResult::OK);
     EXPECT_TRUE(store.unpaired_access_enabled());
 }
 
