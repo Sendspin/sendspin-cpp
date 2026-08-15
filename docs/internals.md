@@ -441,10 +441,10 @@ Types 2 and 3 implement app-level fragmentation for payloads too large for a sin
 
 ### Cleartext Handshake (Initial Exchange)
 
-Before Noise transport is active, a short cleartext exchange establishes the prologue and negotiates cipher suite. All frames in this phase are WebSocket text (JSON).
+Before Noise transport is active, a short cleartext exchange establishes the prologue and carries the cipher suite. All frames in this phase are WebSocket text (JSON).
 
 ```api
-Client -> Server: client/init   (client_id, version, cipher suite preference)
+Client -> Server: client/init   (client_id, version, cipher suite)
 Server -> Client: server/init   (server_id, cipher suite selection)
 Server -> Client: noise/handshake msg1 (Noise KKpsk2 initiator message)
 Client -> Server: noise/handshake msg2 (Noise KKpsk2 responder message)
@@ -454,7 +454,7 @@ Client -> Server: client/hello  (encrypted, device info, trust_level, pair_metho
 Server -> Client: server/activate (encrypted, activities, active_roles)
 ```
 
-The prologue fed into the Noise handshake is `bytes(client/init) || bytes(server/init)`. `ConnectionManager` sends `client/init` as soon as the WebSocket upgrade completes (`init_noise_handshake()` followed by `send_noise_client_init()`), for both inbound (`on_new_connection`) and outbound (`connect_to()`/the connected-event scan in `loop()`) connections. The cipher suite sent is `suite_name_for(config_.cipher_suite)`: `SendspinClientConfig::cipher_suite` selects a preference (`NoiseCipherSuitePreference::CHACHAPOLY` or `AESGCM`); on ESP-IDF, `AESGCM` is unusable (the `esphome__noise-c` libsodium backend stubs AES-GCM on Xtensa) and `suite_name_for()` silently falls back to ChaChaPoly with a warning.
+The prologue fed into the Noise handshake is `bytes(client/init) || bytes(server/init)`. `ConnectionManager` sends `client/init` as soon as the WebSocket upgrade completes (`init_noise_handshake()` followed by `send_noise_client_init()`), for both inbound (`on_new_connection`) and outbound (`connect_to()`/the connected-event scan in `loop()`) connections. The client always proposes `NOISE_SUITE_CHACHAPOLY` (`Noise_KKpsk2_25519_ChaChaPoly_SHA256`, see `src/crypto/constants.h`); it builds its Noise session from that same proposal and never reads `server/init`'s suite field back, so there is nothing to select between.
 
 ### PSK Resolution (`src/record_store.cpp`)
 

@@ -94,7 +94,7 @@ enum class HandshakeFrameResult {
 /// @param server_id      Known server peer_id (43-char base64url) from the prior handshake.
 /// @param identity       Our static X25519 identity.
 /// @param record_store   Record store for psk_id resolution (read-only on network thread).
-/// @param suite_name     Noise suite name (NOISE_SUITE_CHACHAPOLY or NOISE_SUITE_AESGCM).
+/// @param suite_name     Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
 /// @param prior_h        32-byte handshake hash from the prior session (used as prologue).
 /// @return Populated NoiseHandshakeResult (session + msg2_text to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
@@ -124,7 +124,7 @@ public:
     /// @brief Construct the handshake driver.
     /// @param identity     Our static X25519 identity.
     /// @param record_store Record store for psk_id resolution (read-only on network thread).
-    /// @param suite_name   Noise suite name (NOISE_SUITE_CHACHAPOLY or NOISE_SUITE_AESGCM).
+    /// @param suite_name   Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
     NoiseHandshake(const Identity& identity, const RecordStore& record_store,
                    const std::string& suite_name);
 

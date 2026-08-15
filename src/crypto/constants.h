@@ -50,15 +50,14 @@ extern const std::array<uint8_t, NOISE_PSK_SIZE> SENTINEL_PSK;
 extern const std::string SENTINEL_PSK_ID;
 
 // ============================================================================
-// Cipher suite names (passed to noise_protocol_name_to_id)
+// Cipher suite name (passed to noise_protocol_name_to_id)
 // ============================================================================
 
-/// @brief Preferred cipher suite: ChaChaPoly (lower CPU cost, no hardware dep).
+/// @brief The only cipher suite the client proposes: ChaChaPoly20-Poly1305 (constant-time on
+/// every target, no AES hardware dependency). The Sendspin client builds its Noise session from
+/// its own client/init proposal and never reads server/init's suite field back, so a single
+/// suite is sufficient; there is nothing to negotiate.
 static constexpr std::string_view NOISE_SUITE_CHACHAPOLY{"Noise_KKpsk2_25519_ChaChaPoly_SHA256"};
-
-/// @brief Alternative cipher suite: AES-256-GCM. Host only; unavailable on ESP-IDF
-/// (see the cipher_suite doc in config.h for why).
-static constexpr std::string_view NOISE_SUITE_AESGCM{"Noise_KKpsk2_25519_AESGCM_SHA256"};
 
 // ============================================================================
 // Transport framing constants

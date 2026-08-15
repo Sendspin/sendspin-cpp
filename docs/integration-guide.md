@@ -688,7 +688,7 @@ client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
 
 ## Encryption and Pairing
 
-All connections are encrypted with Noise KKpsk2 (X25519 + ChaChaPoly or AES-GCM). This
+All connections are encrypted with Noise KKpsk2 (X25519 + ChaChaPoly). This
 requires no application-level configuration beyond providing a `SendspinPersistenceProvider`
 (so the static keypair survives reboots). Encryption is mandatory; there is no cleartext
 fallback.
@@ -706,19 +706,6 @@ and server preferences will not survive reboots in that case.
 client.start_server();
 printf("client_id: %s\n", client.client_id().c_str());
 ```
-
-### Cipher Suite
-
-The default cipher suite is `ChaChaPoly` (lower CPU on bare-metal). On host targets AES-GCM
-may be faster; set the preference in `SendspinClientConfig`:
-
-```cpp
-config.cipher_suite = NoiseCipherSuitePreference::AESGCM;
-```
-
-Both suites are always supported on host; this field only sets the preference sent to the
-server. On ESP-IDF, `AESGCM` is not usable (see the `NoiseCipherSuitePreference` reference
-below) and the library falls back to `ChaChaPoly` regardless of this setting.
 
 ### Pairing
 
@@ -1114,7 +1101,6 @@ X25519 keypair and read back via `client.client_id()` after `start_server()`.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | `std::string` | — | Friendly display name shown in the Sendspin UI |
-| `cipher_suite` | `NoiseCipherSuitePreference` | `CHACHAPOLY` | Preferred Noise cipher suite advertised to the server. `CHACHAPOLY` (default) is lower CPU on bare-metal; `AESGCM` is host-only (see the enum reference below). Both suites are always supported; the server selects the actual cipher used. |
 | `product_name` | `std::optional<std::string>` | unset | Device product name; sent in `client/hello` only when set |
 | `manufacturer` | `std::optional<std::string>` | unset | Manufacturer name (e.g., `"ESPHome"`); sent in `client/hello` only when set |
 | `software_version` | `std::optional<std::string>` | unset | Software version string; sent in `client/hello` only when set |
@@ -1219,15 +1205,6 @@ Configuration passed to `client.add_visualizer()`.
 ---
 
 ## Enums Reference
-
-### NoiseCipherSuitePreference
-
-| Value | Description |
-|---|---|
-| `CHACHAPOLY` | Prefer Noise_KKpsk2_25519_ChaChaPoly_SHA256 (default; lower CPU on bare-metal) |
-| `AESGCM` | Prefer Noise_KKpsk2_25519_AESGCM_SHA256 (host only; on ESP-IDF the library ignores this preference and falls back to ChaChaPoly, since ESP-IDF's libsodium AES-GCM backend is a stub) |
-
-Set in `SendspinClientConfig::cipher_suite`. The server selects the actual cipher; this is a preference only.
 
 ### ConnectionTrust
 

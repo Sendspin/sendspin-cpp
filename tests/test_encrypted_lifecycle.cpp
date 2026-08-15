@@ -62,7 +62,6 @@ constexpr uint16_t DOWNGRADE_TEST_PORT = 18992;
 constexpr uint16_t PAIRING_TEST_PORT = 18993;
 constexpr uint16_t MANAGEMENT_TEST_PORT = 18994;
 constexpr uint16_t PAIRING_PERSIST_FAILURE_TEST_PORT = 18995;
-constexpr uint16_t CIPHER_SUITE_AESGCM_TEST_PORT = 18996;
 constexpr uint16_t PAIR_METHODS_TEST_PORT = 18997;
 constexpr uint16_t AEAD_FAILURE_TEST_PORT = 18998;
 constexpr uint16_t AEAD_FAILURE_OUTBOUND_PORT = 18999;
@@ -344,50 +343,6 @@ TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
 
     // Spec Failure Handling: no client/goodbye is sent for a silent close.
     EXPECT_FALSE(server.goodbye_reason().has_value());
-
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
-    pump_for(client, 100);
-}
-
-// SendspinClientConfig::cipher_suite must actually reach the Noise handshake: setting it to
-// AESGCM should make init_noise_handshake() (via connection_manager.cpp's suite_name_for())
-// build the client's side of the handshake with Noise_KKpsk2_25519_AESGCM_SHA256 rather than
-// the ChaChaPoly default. The Noise protocol name is mixed into the handshake hash on both
-// sides, so a mismatched suite string would fail the handshake outright; a fake server built
-// with the matching AESGCM suite name completing the full handshake/hello/activate cycle is
-// therefore proof the preference was threaded through, not just accepted and ignored.
-TEST(EncryptedLifecycle, CipherSuitePreferenceAesgcmCompletesHandshake) {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-    std::string psk_id = psk_id_for(psk);
-
-    SendspinPairingRecord record;
-    record.psk_id = psk_id;
-    record.psk = psk;
-
-    TestNetworkProvider network;
-    TestPersistenceProvider persistence(record);
-    SendspinClientConfig config;
-    config.name = "Cipher Suite AESGCM Test Client";
-    config.server_port = CIPHER_SUITE_AESGCM_TEST_PORT;
-    config.cipher_suite = NoiseCipherSuitePreference::AESGCM;
-
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
-
-    Identity server_identity = Identity::generate().value();
-    FakeEncryptedServer server(server_url(CIPHER_SUITE_AESGCM_TEST_PORT),
-                               std::string(NOISE_SUITE_AESGCM), server_identity, psk_id, psk);
-
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "AESGCM-suite handshake/hello/activate did not complete";
-    auto info = client.get_server_information();
-    ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, server_identity.peer_id());
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

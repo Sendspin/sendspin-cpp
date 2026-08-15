@@ -389,10 +389,6 @@ TEST(NoiseRehandshake, BasicRehandshake_ChaChaPoly) {
     run_rehandshake_test(std::string(NOISE_SUITE_CHACHAPOLY));
 }
 
-TEST(NoiseRehandshake, BasicRehandshake_AesGcm) {
-    run_rehandshake_test(std::string(NOISE_SUITE_AESGCM));
-}
-
 // Test: re-handshake with a DIFFERENT PSK (key rotation to a new long-term key).
 TEST(NoiseRehandshake, RehandshakeWithDifferentPsk_ChaChaPoly) {
     const std::string suite = std::string(NOISE_SUITE_CHACHAPOLY);

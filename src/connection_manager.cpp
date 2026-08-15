@@ -153,23 +153,6 @@ static std::vector<uint8_t> pake_ad_server() {
     return std::vector<uint8_t>(PAKE_AD_SERVER, PAKE_AD_SERVER + sizeof(PAKE_AD_SERVER) - 1);
 }
 
-/// @brief Map NoiseCipherSuitePreference to the full Noise protocol suite name string.
-/// On ESP-IDF, AESGCM is unusable: the esphome__noise-c ESP-IDF component builds with
-/// NOISE_USE_AES=0 by default, so the "AESGCM" cipher name is never registered and
-/// session creation by that suite name fails outright. Fall back to ChaChaPoly and warn.
-static std::string suite_name_for(NoiseCipherSuitePreference pref) {
-    if (pref == NoiseCipherSuitePreference::AESGCM) {
-#ifdef ESP_PLATFORM
-        SS_LOGW(TAG, "AESGCM cipher suite is not supported on ESP-IDF (not compiled into the "
-                     "noise-c component); falling back to ChaChaPoly");
-        return std::string(NOISE_SUITE_CHACHAPOLY);
-#else
-        return std::string(NOISE_SUITE_AESGCM);
-#endif
-    }
-    return std::string(NOISE_SUITE_CHACHAPOLY);
-}
-
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
@@ -461,7 +444,7 @@ void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
             continue;
         }
         conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
-                                   suite_name_for(this->client_->config_.cipher_suite));
+                                   std::string(NOISE_SUITE_CHACHAPOLY));
         conn->send_noise_client_init();
     }
 
@@ -1200,7 +1183,7 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             // is no earlier signal to wait for). The hello is armed later, once the Noise
             // handshake completes (see the noise-completion scan in scan_hello_and_nursery()).
             conn->init_noise_handshake(*this->client_->identity_, *this->client_->record_store_,
-                                       suite_name_for(this->client_->config_.cipher_suite));
+                                       std::string(NOISE_SUITE_CHACHAPOLY));
             conn->send_noise_client_init();
             this->push_nursery_entry(NurseryEntry{std::move(conn), /*inbound=*/true});
         }

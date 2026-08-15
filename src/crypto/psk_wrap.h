@@ -48,8 +48,8 @@ static constexpr char PSK_WRAP_LABEL[] = "sendspin-pair-psk-wrap-v1";
 std::optional<std::array<uint8_t, 32>> derive_psk_wrap_key(
     const std::vector<uint8_t>& sid, const std::array<uint8_t, CPACE_ISK_SIZE>& isk);
 
-/// @brief Seal a 32-byte PSK under K_wrap using the named AEAD cipher ("ChaChaPoly" or
-/// "AESGCM"), a 12-byte all-zero nonce, and empty associated data.
+/// @brief Seal a 32-byte PSK under K_wrap using the named AEAD cipher ("ChaChaPoly"), a
+/// 12-byte all-zero nonce, and empty associated data.
 /// @param cipher_name Noise-c cipher name for the connection's negotiated suite.
 /// @param sid         CPace session id (see CPace::sid()).
 /// @param isk         CPace intermediate session key (see CPace::isk()).

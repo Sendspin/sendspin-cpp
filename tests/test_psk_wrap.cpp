@@ -107,22 +107,6 @@ TEST(PskWrap, RoundTripChaChaPoly) {
     EXPECT_EQ(unwrapped.value(), psk);
 }
 
-TEST(PskWrap, RoundTripAesGcm) {
-    const auto sid = make_fixed_sid();
-    const auto isk = make_fixed_isk();
-    std::array<uint8_t, 32> psk{};
-    for (size_t i = 0; i < psk.size(); ++i) {
-        psk[i] = static_cast<uint8_t>(0x55 + i);
-    }
-
-    auto wrapped = wrap_psk("AESGCM", sid, isk, psk);
-    ASSERT_TRUE(wrapped.has_value());
-
-    auto unwrapped = unwrap_psk("AESGCM", sid, isk, wrapped.value());
-    ASSERT_TRUE(unwrapped.has_value());
-    EXPECT_EQ(unwrapped.value(), psk);
-}
-
 TEST(PskWrap, DifferentSidsProduceDifferentWrappedPsk) {
     const auto isk = make_fixed_isk();
     std::array<uint8_t, 32> psk{};
@@ -178,7 +162,6 @@ TEST(PskWrap, UnknownCipherNameFails) {
 TEST(PskWrap, CipherNameFromNoiseSuite) {
     EXPECT_STREQ(aead_cipher_name_from_noise_suite("Noise_KKpsk2_25519_ChaChaPoly_SHA256"),
                 "ChaChaPoly");
-    EXPECT_STREQ(aead_cipher_name_from_noise_suite("Noise_KKpsk2_25519_AESGCM_SHA256"), "AESGCM");
     EXPECT_EQ(aead_cipher_name_from_noise_suite(""), nullptr);
     EXPECT_EQ(aead_cipher_name_from_noise_suite("garbage"), nullptr);
 }

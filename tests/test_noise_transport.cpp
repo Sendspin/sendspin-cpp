@@ -18,7 +18,8 @@
 //   - SendspinConnection transport helpers (encrypt/fragment/dispatch)
 //
 // The "server" side uses raw noise-c as the Noise initiator.
-// Both Noise_KKpsk2_25519_ChaChaPoly_SHA256 and ...AESGCM_SHA256 are tested.
+// The client proposes only Noise_KKpsk2_25519_ChaChaPoly_SHA256 (see NOISE_SUITE_CHACHAPOLY
+// in crypto/constants.h), so that is the only suite exercised here.
 
 #include "connection.h"
 #include "crypto/constants.h"
@@ -386,14 +387,6 @@ TEST(NoiseHandshakeLoopback, KKpsk2ChaChaPoly_FullHandshake) {
     EXPECT_NE(r->initiator.recv_cs, nullptr);
 }
 
-TEST(NoiseHandshakeLoopback, KKpsk2AesGcm_FullHandshake) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_AESGCM));
-    ASSERT_TRUE(r.has_value()) << "AESGCM loopback handshake failed";
-    EXPECT_TRUE(r->responder_session->handshake_complete());
-    EXPECT_NE(r->initiator.send_cs, nullptr);
-    EXPECT_NE(r->initiator.recv_cs, nullptr);
-}
-
 // =============================================================================
 // Handshake hash is available and non-zero after split
 // =============================================================================
@@ -453,16 +446,6 @@ TEST(NoiseTransport, JsonRoundTrip_ChaChaPoly) {
     std::string json_text = "{\"hello\":\"world\"}";
     std::vector<uint8_t> plaintext;
     plaintext.push_back(0x00);  // MSG_TYPE_JSON_BODY
-    plaintext.insert(plaintext.end(), json_text.begin(), json_text.end());
-    check_transport_roundtrip(*r, plaintext);
-}
-
-TEST(NoiseTransport, JsonRoundTrip_AesGcm) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_AESGCM));
-    ASSERT_TRUE(r.has_value());
-    std::string json_text = "{\"test\":42}";
-    std::vector<uint8_t> plaintext;
-    plaintext.push_back(0x00);
     plaintext.insert(plaintext.end(), json_text.begin(), json_text.end());
     check_transport_roundtrip(*r, plaintext);
 }
@@ -1241,10 +1224,6 @@ static void run_fragment_reassemble_receive(const std::string& suite) {
 
 TEST(NoiseTransport, FragmentReassembleReceive_ChaChaPoly) {
     run_fragment_reassemble_receive(std::string(NOISE_SUITE_CHACHAPOLY));
-}
-
-TEST(NoiseTransport, FragmentReassembleReceive_AesGcm) {
-    run_fragment_reassemble_receive(std::string(NOISE_SUITE_AESGCM));
 }
 
 TEST(NoiseTransport, FragmentReassembleBinaryReceive) {

@@ -103,7 +103,7 @@ struct Msg1CoreResult {
 /// @param log_prefix    Prefix used for all log lines (mirrors the caller's function name).
 /// @param identity      Our static X25519 identity.
 /// @param record_store  Record store for psk_id resolution (read-only on network thread).
-/// @param suite_name    Noise suite name (NOISE_SUITE_CHACHAPOLY or NOISE_SUITE_AESGCM).
+/// @param suite_name    Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
 /// @param server_id     Known/claimed server peer_id (43-char base64url).
 /// @param prologue      Exact prologue bytes for this handshake (caller-specific).
 /// @param prologue_len  Length of `prologue`.

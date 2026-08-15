@@ -102,23 +102,25 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     # The esphome-libs fork only ships an IDF CMakeLists.txt (idf_component_register),
     # so we cannot use FetchContent_MakeAvailable directly.  Instead we:
     #   1. Populate the esphome-libs fork into _deps/noise_c-src.
-    #   2. Populate the rweather/noise-c upstream into _deps/noise_c_upstream-src
-    #      to obtain the ghash (GCM authentication) source that the esphome-libs
-    #      fork omits but that the reference AESGCM backend requires.
-    #   3. Build a `noise_c` STATIC target manually with the reference backend only
-    #      (no libsodium, no OpenSSL), plus the ghash sources from upstream. This is
-    #      a deliberate choice for a self-contained host build, not a mirror of the
-    #      ESP-IDF component's active backend: the esphome-libs ESP-IDF component
-    #      compiles both the ref and sodium backends and defaults to
-    #      NOISE_USE_LIBSODIUM=1, so ESP-IDF runs the libsodium DH/cipher backend
-    #      while host runs ref. Host and ESP-IDF therefore exercise different
-    #      crypto backends, and crypto performance measured on host does not
-    #      transfer to ESP-IDF.
+    #   2. Build a `noise_c` STATIC target manually with the reference backend
+    #      (no libsodium, no OpenSSL). This is a deliberate choice for a
+    #      self-contained host build, not a mirror of the ESP-IDF component's
+    #      active backend: the esphome-libs ESP-IDF component compiles both the
+    #      ref and sodium backends and defaults to NOISE_USE_LIBSODIUM=1, so
+    #      ESP-IDF runs the libsodium DH/cipher backend while host runs ref.
+    #      Host and ESP-IDF therefore exercise different crypto backends, and
+    #      crypto performance measured on host does not transfer to ESP-IDF.
+    #
+    # The client proposes exactly one Noise suite, ChaChaPoly20-Poly1305 (see
+    # NOISE_SUITE_CHACHAPOLY in src/crypto/constants.h), and builds its session from
+    # that same proposal; it never reads server/init's suite selection back. AES-GCM
+    # support is therefore not built: NOISE_USE_AES=0 keeps noise-c from registering
+    # the AESGCM suite name, which also drops its ghash (GF(2^128)) and rijndael
+    # dependencies from the source list below.
     #
     # Compile definitions:
     #   NOISE_USE_REFERENCE_BACKEND=1: use the pure-C reference backend
-    #   NOISE_USE_AES=1:               enable AES-GCM (needs ghash)
-    #   NOISE_USE_REFERENCE_AES=1:     route AES-GCM through the ref backend
+    #   NOISE_USE_AES=0:               AES-GCM is not built (ChaChaPoly only)
     #   NOISE_USE_LIBSODIUM=0:         disable sodium backend on host
     #   NOISE_USE_CUSTOM_RAND=0:       use the OS RNG (rand_os.c)
     # =========================================================================
@@ -141,20 +143,7 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         FetchContent_Populate(noise_c)
     endif()
 
-    # Obtain ghash sources from the rweather/noise-c upstream (not in the esphome-libs fork).
-    # Pinned to a fixed commit (not master) for reproducible builds. A full SHA cannot be
-    # fetched shallowly from GitHub, so GIT_SHALLOW is intentionally omitted here.
-    FetchContent_Declare(
-        noise_c_upstream
-        GIT_REPOSITORY https://github.com/rweather/noise-c.git
-        GIT_TAG        cfe25410979a87391bb9ac8d4d4bef64e9f268c6
-    )
-    FetchContent_GetProperties(noise_c_upstream)
-    if(NOT noise_c_upstream_POPULATED)
-        FetchContent_Populate(noise_c_upstream)
-    endif()
-
-    # Build the noise_c static library with the reference backend + ref AESGCM.
+    # Build the noise_c static library with the reference backend.
     # noise-c is a C library; suppress any pedantic/extra warnings so our own
     # -Wall -Wextra -Wpedantic flags don't bleed into it (it's a separate target).
     add_library(noise_c STATIC
@@ -173,9 +162,8 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         ${noise_c_SOURCE_DIR}/src/protocol/symmetricstate.c
         ${noise_c_SOURCE_DIR}/src/protocol/util.c
 
-        # Reference backend: ChaChaPoly + AES-GCM + Curve25519 + SHA-256
+        # Reference backend: ChaChaPoly + Curve25519 + SHA-256
         ${noise_c_SOURCE_DIR}/src/backend/ref/cipher-chachapoly.c
-        ${noise_c_SOURCE_DIR}/src/backend/ref/cipher-aesgcm.c
         ${noise_c_SOURCE_DIR}/src/backend/ref/dh-curve25519.c
         ${noise_c_SOURCE_DIR}/src/backend/ref/hash-sha256.c
 
@@ -183,29 +171,17 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         ${noise_c_SOURCE_DIR}/src/crypto/chacha/chacha.c
         ${noise_c_SOURCE_DIR}/src/crypto/donna/poly1305-donna.c
         ${noise_c_SOURCE_DIR}/src/crypto/sha2/sha256.c
-        ${noise_c_SOURCE_DIR}/src/crypto/aes/rijndael-alg-fst.c
         ${noise_c_SOURCE_DIR}/src/crypto/x25519/x25519.c
-
-        # ghash (GF(2^128) multiply for AES-GCM), from rweather/noise-c upstream
-        # (the esphome-libs fork omits this file)
-        ${noise_c_upstream_SOURCE_DIR}/src/crypto/ghash/ghash.c
     )
 
     target_include_directories(noise_c PUBLIC
         ${noise_c_SOURCE_DIR}/include
         ${noise_c_SOURCE_DIR}/src
     )
-    # Teach noise_c where to find the upstream ghash header.
-    # cipher-aesgcm.c includes "crypto/ghash/ghash.h", so we add the upstream
-    # src/ directory to the include path so that relative reference resolves.
-    target_include_directories(noise_c PRIVATE
-        ${noise_c_upstream_SOURCE_DIR}/src
-    )
 
     target_compile_definitions(noise_c PUBLIC
         NOISE_USE_REFERENCE_BACKEND=1
-        NOISE_USE_AES=1
-        NOISE_USE_REFERENCE_AES=1
+        NOISE_USE_AES=0
         NOISE_USE_LIBSODIUM=0
         NOISE_USE_CUSTOM_RAND=0
         NOISE_USE_REFERENCE_SHA512=1

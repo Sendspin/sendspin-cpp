@@ -403,40 +403,38 @@ inline std::vector<uint8_t> platform_random_bytes(size_t len) {
 // ============================================================================
 //
 // Used for spec "PSK Wrapping": the client seals the new PSK under a key derived from the
-// CPace output using the AEAD of the connection's negotiated cipher suite, a 12-byte all-zero
-// nonce, and empty associated data. This is independent of the Noise transport's own
-// monotonic-counter nonces (see noise_transport.h); it is a single-shot construction with a
-// fixed nonce, safe here only because K_wrap is used to encrypt exactly one message.
+// CPace output using the AEAD of the connection's negotiated cipher suite (always ChaChaPoly;
+// see NOISE_SUITE_CHACHAPOLY in crypto/constants.h), a 12-byte all-zero nonce, and empty
+// associated data. This is independent of the Noise transport's own monotonic-counter nonces
+// (see noise_transport.h); it is a single-shot construction with a fixed nonce, safe here only
+// because K_wrap is used to encrypt exactly one message.
 
-/// @brief Number of bytes of authentication-tag overhead added by every Sendspin AEAD cipher
-/// (ChaChaPoly and AESGCM both use a 16-byte tag).
+/// @brief Number of bytes of authentication-tag overhead added by the Sendspin AEAD cipher
+/// (ChaChaPoly uses a 16-byte tag).
 static constexpr size_t AEAD_TAG_SIZE = 16;
 
 /// @brief Number of bytes in the fixed nonce used by aead_oneshot_encrypt/decrypt.
 static constexpr size_t AEAD_ONESHOT_NONCE_SIZE = 12;
 
 /// @brief Map a full Noise suite name (e.g. "Noise_KKpsk2_25519_ChaChaPoly_SHA256") to the
-/// noise-c cipher name ("ChaChaPoly" or "AESGCM") for use with aead_oneshot_encrypt/decrypt.
-/// Returns nullptr if the suite name does not contain a recognized cipher component.
+/// noise-c cipher name ("ChaChaPoly") for use with aead_oneshot_encrypt/decrypt. The client only
+/// ever negotiates ChaChaPoly, so this validates the suite string rather than selecting between
+/// alternatives. Returns nullptr if the suite name does not contain the expected cipher
+/// component.
 inline const char* aead_cipher_name_from_noise_suite(const std::string& noise_suite_name) {
     if (noise_suite_name.find("ChaChaPoly") != std::string::npos) {
         return "ChaChaPoly";
     }
-    if (noise_suite_name.find("AESGCM") != std::string::npos) {
-        return "AESGCM";
-    }
     return nullptr;
 }
 
-/// @brief Encrypt `plaintext` with the named AEAD cipher ("ChaChaPoly" or "AESGCM"), key `key`,
-/// an all-zero 12-byte nonce, and empty associated data. Returns ciphertext || tag
-/// (plaintext_len + AEAD_TAG_SIZE bytes), or nullopt on any cipher-allocation or key-length
-/// failure.
+/// @brief Encrypt `plaintext` with the named AEAD cipher ("ChaChaPoly"), key `key`, an all-zero
+/// 12-byte nonce, and empty associated data. Returns ciphertext || tag (plaintext_len +
+/// AEAD_TAG_SIZE bytes), or nullopt on any cipher-allocation or key-length failure.
 ///
 /// The all-zero nonce is safe here because the Noise per-message counter n=0 encodes to an
-/// all-zero 96-bit nonce regardless of the cipher's internal byte-order convention (ChaChaPoly
-/// packs the counter little-endian, AESGCM big-endian; zero is representation-independent), and
-/// K_wrap is a single-use key (see PSK Wrapping above).
+/// all-zero 96-bit nonce regardless of ChaChaPoly's internal counter byte-order, and K_wrap is
+/// a single-use key (see PSK Wrapping above).
 inline std::optional<std::vector<uint8_t>> aead_oneshot_encrypt(const char* cipher_name,
                                                                 const uint8_t* key, size_t key_len,
                                                                 const uint8_t* plaintext,

@@ -578,7 +578,3 @@ bool run_kkpsk2_handshake(const char* suite_name) {
 TEST(NoiseHandshake, KKpsk2ChaChaPoly) {
     EXPECT_TRUE(run_kkpsk2_handshake(std::string(NOISE_SUITE_CHACHAPOLY).c_str()));
 }
-
-TEST(NoiseHandshake, KKpsk2AesGcm) {
-    EXPECT_TRUE(run_kkpsk2_handshake(std::string(NOISE_SUITE_AESGCM).c_str()));
-}
