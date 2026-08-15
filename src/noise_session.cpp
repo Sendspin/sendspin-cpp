@@ -182,9 +182,9 @@ std::vector<uint8_t> NoiseSession::read_msg1(const uint8_t* msg1_bytes, size_t m
         return {};
     }
 
-    // Payload buffer large enough for any handshake payload (spec max ~256 bytes).
-    constexpr size_t MAX_PAYLOAD = 4096;
-    std::vector<uint8_t> payload_buf(MAX_PAYLOAD);
+    // Payload buffer large enough for any handshake payload; see
+    // MAX_HANDSHAKE_MESSAGE_BYTES in crypto/constants.h.
+    std::vector<uint8_t> payload_buf(MAX_HANDSHAKE_MESSAGE_BYTES);
 
     // Input buffer: noise-c needs a mutable copy
     std::vector<uint8_t> in_buf(msg1_bytes, msg1_bytes + msg1_len);
@@ -235,9 +235,9 @@ bool NoiseSession::write_msg2_and_split(std::vector<uint8_t>& msg2_out) {
     NoiseBuffer payload_in;
     noise_buffer_set_input(payload_in, const_cast<uint8_t*>(msg2_payload), sizeof(msg2_payload));
 
-    // Output buffer: handshake message 2 is small (< 256 bytes)
-    constexpr size_t MSG2_BUF_SIZE = 512;
-    msg2_out.resize(MSG2_BUF_SIZE);
+    // Output buffer: handshake message 2 is small; see MAX_HANDSHAKE_MESSAGE_BYTES in
+    // crypto/constants.h.
+    msg2_out.resize(MAX_HANDSHAKE_MESSAGE_BYTES);
 
     NoiseBuffer msg_out;
     noise_buffer_set_output(msg_out, msg2_out.data(), msg2_out.size());

@@ -66,29 +66,22 @@ SsErr SendspinConnection::send_goodbye_reason(SendspinGoodbyeReason reason,
 
 SsErr SendspinConnection::send_app_json(const std::string& json, SendCompleteCallback cb,
                                         bool allow_before_hello) {
-    // is_active() is an atomic read; NoiseTransport owns its own session mutex, so this
-    // main-loop check cannot race the network-thread re-handshake swap: send_encrypted_text
-    // re-checks the session under NoiseTransport's own lock.
-    if (this->noise_transport_.is_active()) {
-        // Post-handshake: all application JSON must be encrypted.
-        // The callback is not forwarded through the encrypted path (the transport's send
-        // methods call send_binary_message with a null cb). Best-effort: fire it as success
-        // if encryption succeeds, fire it as failure otherwise.
-        SsErr err = this->send_encrypted_text(json);
-        if (cb) {
-            cb(err == SsErr::OK);
-        }
-        return err;
-    }
-    // Pre-handshake: send as plain text.
-    return this->send_text_message(json, std::move(cb), allow_before_hello);
+    // Delegate to the pointer/length overload: same routing, same is_active() race-freedom
+    // reasoning (see that overload).
+    return this->send_app_json(json.data(), json.size(), std::move(cb), allow_before_hello);
 }
 
 SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendCompleteCallback cb,
                                         bool allow_before_hello) {
-    // Same routing as the std::string overload, but the encrypted hot path consumes the
-    // caller's buffer directly (no std::string materialization).
+    // is_active() is an atomic read; NoiseTransport owns its own session mutex, so this
+    // main-loop check cannot race the network-thread re-handshake swap: send_encrypted_text
+    // re-checks the session under NoiseTransport's own lock.
     if (this->noise_transport_.is_active()) {
+        // Post-handshake: all application JSON must be encrypted. The encrypted hot path
+        // consumes the caller's buffer directly (no std::string materialization).
+        // The callback is not forwarded through the encrypted path (the transport's send
+        // methods call send_binary_message with a null cb). Best-effort: fire it as success
+        // if encryption succeeds, fire it as failure otherwise.
         SsErr err = this->send_encrypted_text(json, len);
         if (cb) {
             cb(err == SsErr::OK);

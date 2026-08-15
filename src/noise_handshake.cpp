@@ -79,6 +79,32 @@ static std::string serialize_noise_handshake(const std::vector<uint8_t>& noise_b
 
 namespace {
 
+/// @brief Parse a JSON envelope and verify its "type" field, logging and returning nullopt on
+/// any failure (parse error or type mismatch). Shared by handle_server_init (server/init) and
+/// run_msg1_core (noise/handshake msg1): both deserialize an envelope, check its "type" against
+/// what they expect, and log+fail identically otherwise.
+/// @param text           Raw JSON envelope text.
+/// @param expected_type  Required value of the envelope's "type" field.
+/// @param log_context    Prefix used for the failure log line (caller's function name).
+/// @return The parsed document on success, or nullopt.
+std::optional<JsonDocument> parse_json_envelope(const std::string& text, const char* expected_type,
+                                                const char* log_context) {
+    JsonDocument doc = make_json_document();
+    DeserializationError err = deserializeJson(doc, text);
+    if (err || doc.isNull()) {
+        SS_LOGE(TAG, "%s: JSON parse failed", log_context);
+        return std::nullopt;
+    }
+
+    const char* type = doc["type"] | "";
+    if (std::strcmp(type, expected_type) != 0) {
+        SS_LOGE(TAG, "%s: unexpected type '%s'", log_context, type);
+        return std::nullopt;
+    }
+
+    return doc;
+}
+
 /// @brief Outcome of the shared read-msg1/resolve-psk/set-psk/write-msg2 core.
 /// Carries everything both `NoiseHandshake::handle_msg1` and `run_rehandshake_msg1`
 /// need to build their own `NoiseHandshakeResult` and deliver msg2 in their own way.
@@ -114,18 +140,11 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
                                             const std::string& suite_name,
                                             const std::string& server_id, const uint8_t* prologue,
                                             size_t prologue_len, const std::string& msg1_json) {
-    JsonDocument doc = make_json_document();
-    DeserializationError err = deserializeJson(doc, msg1_json);
-    if (err || doc.isNull()) {
-        SS_LOGE(TAG, "%s: JSON parse failed", log_prefix);
+    auto doc_opt = parse_json_envelope(msg1_json, "noise/handshake", log_prefix);
+    if (!doc_opt.has_value()) {
         return std::nullopt;
     }
-
-    const char* type = doc["type"] | "";
-    if (std::strcmp(type, "noise/handshake") != 0) {
-        SS_LOGE(TAG, "%s: unexpected type '%s'", log_prefix, type);
-        return std::nullopt;
-    }
+    JsonDocument doc = std::move(doc_opt.value());
 
     const char* data_b64 = doc["payload"]["data"] | "";
     if (data_b64[0] == '\0') {
@@ -211,6 +230,20 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
                           std::move(msg2_bytes)};
 }
 
+/// @brief Build a NoiseHandshakeResult from a completed Msg1CoreResult. Shared by
+/// NoiseHandshake::handle_msg1 (initial handshake) and run_rehandshake_msg1: both assemble the
+/// result identically from the core's session and resolved_psk; only msg2_text differs, so the
+/// caller sets it afterward.
+/// @param core       Completed core result (session and resolved_psk are moved out of it).
+/// @param server_id  Server peer_id to record on the result.
+NoiseHandshakeResult make_handshake_result(Msg1CoreResult&& core, std::string server_id) {
+    NoiseHandshakeResult result;
+    result.session = std::make_unique<NoiseSession>(std::move(core.session));
+    result.server_id = std::move(server_id);
+    result.resolved_psk = std::move(core.resolved_psk);
+    return result;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -274,18 +307,11 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
 // ============================================================================
 
 bool NoiseHandshake::handle_server_init(const std::string& text) {
-    JsonDocument doc = make_json_document();
-    DeserializationError err = deserializeJson(doc, text);
-    if (err || doc.isNull()) {
-        SS_LOGE(TAG, "handle_server_init: JSON parse failed");
+    auto doc_opt = parse_json_envelope(text, "server/init", "handle_server_init");
+    if (!doc_opt.has_value()) {
         return false;
     }
-
-    const char* type = doc["type"] | "";
-    if (std::strcmp(type, "server/init") != 0) {
-        SS_LOGE(TAG, "handle_server_init: unexpected type '%s'", type);
-        return false;
-    }
+    JsonDocument doc = std::move(doc_opt.value());
 
     int version = doc["payload"]["version"] | 0;
     if (version != PROTOCOL_VERSION) {
@@ -334,11 +360,7 @@ bool NoiseHandshake::handle_msg1(const std::string& text,
     SS_LOGI(TAG, "Noise handshake complete: server_id=%s psk_category=%d", this->server_id_.c_str(),
             static_cast<int>(core->resolved_psk.category));
 
-    NoiseHandshakeResult result;
-    result.session = std::make_unique<NoiseSession>(std::move(core->session));
-    result.server_id = this->server_id_;
-    result.resolved_psk = std::move(core->resolved_psk);
-    this->result_ = std::move(result);
+    this->result_ = make_handshake_result(std::move(core.value()), this->server_id_);
 
     return true;
 }
@@ -369,10 +391,7 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(const std::string& msg1
     SS_LOGI(TAG, "Re-handshake complete: server_id=%s psk_category=%d", server_id.c_str(),
             static_cast<int>(core->resolved_psk.category));
 
-    NoiseHandshakeResult result;
-    result.session = std::make_unique<NoiseSession>(std::move(core->session));
-    result.server_id = server_id;
-    result.resolved_psk = std::move(core->resolved_psk);
+    NoiseHandshakeResult result = make_handshake_result(std::move(core.value()), server_id);
     result.msg2_text = std::move(msg2_text);
     return result;
 }

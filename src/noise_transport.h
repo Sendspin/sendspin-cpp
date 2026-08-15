@@ -165,14 +165,32 @@ private:
     /// encrypt+send each one. Matches wire.py `_fragment` exactly.
     SsErr fragment_and_send(const uint8_t* plaintext, size_t plaintext_len);
 
-    /// @brief Grows reasm_buf_ to at least `needed` bytes (geometric growth, contents
-    /// preserved, capacity retained across messages). Returns false on allocation failure.
+    /// @brief Fills send_buf_ with an optional prefix followed by data, then encrypts and
+    /// sends it. Caller must hold session_mutex_ for the whole call: this fills send_buf_ and
+    /// calls encrypt_and_send_frame_locked() inside one critical section, as send_buf_'s doc
+    /// comment requires.
+    /// @param prefix      Bytes written to the start of send_buf_, or nullptr for none.
+    /// @param prefix_len  Length of prefix (0 if prefix is nullptr).
+    /// @param data        Payload bytes written after prefix.
+    /// @param data_len    Length of data.
+    SsErr fill_and_encrypt_locked(const uint8_t* prefix, size_t prefix_len, const uint8_t* data,
+                                  size_t data_len);
+
+    /// @brief Grows a PlatformBuffer to at least `needed` bytes (geometric growth, contents
+    /// preserved, capacity retained across calls), optionally capped.
+    /// @param buf     Buffer to grow.
+    /// @param needed  Minimum required size.
+    /// @param cap     Upper bound on the grown size, or 0 for uncapped.
+    /// @param what    Noun describing the buffer, used in the allocation-failure log line.
+    /// @return false on allocation failure.
+    bool grow_buffer(PlatformBuffer& buf, size_t needed, size_t cap, const char* what);
+
+    /// @brief Grows reasm_buf_ to at least `needed` bytes. See grow_buffer().
     bool reasm_reserve(size_t needed);
 
-    /// @brief Grows send_buf_ to at least `needed` bytes (geometric growth, capacity retained
-    /// across sends), capped at MAX_TRANSPORT_PLAINTEXT + 16 (the largest plaintext + AEAD tag
-    /// room the non-fragmented path ever handles). Caller must hold session_mutex_ (see
-    /// send_buf_). Returns false on allocation failure.
+    /// @brief Grows send_buf_ to at least `needed` bytes, capped at MAX_TRANSPORT_PLAINTEXT + 16
+    /// (the largest plaintext + AEAD tag room the non-fragmented path ever handles). Caller
+    /// must hold session_mutex_ (see send_buf_). See grow_buffer().
     bool ensure_send_buf(size_t needed);
 
     /// @brief Discards any in-flight reassembly state (keeps the allocation).

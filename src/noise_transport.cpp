@@ -134,6 +134,20 @@ SsErr NoiseTransport::fragment_and_send(const uint8_t* plaintext, size_t plainte
     return SsErr::OK;
 }
 
+SsErr NoiseTransport::fill_and_encrypt_locked(const uint8_t* prefix, size_t prefix_len,
+                                              const uint8_t* data, size_t data_len) {
+    const size_t plaintext_len = prefix_len + data_len;
+    if (!this->ensure_send_buf(plaintext_len + 16)) {
+        return SsErr::FAIL;
+    }
+    if (prefix_len > 0) {
+        std::memcpy(this->send_buf_.data(), prefix, prefix_len);
+    }
+    std::memcpy(this->send_buf_.data() + prefix_len, data, data_len);
+    return this->encrypt_and_send_frame_locked(this->send_buf_.data(), this->send_buf_.size(),
+                                               plaintext_len);
+}
+
 SsErr NoiseTransport::send_json(const char* json, size_t len) {
     if (!this->is_active()) {
         return SsErr::INVALID_STATE;
@@ -147,13 +161,9 @@ SsErr NoiseTransport::send_json(const char* json, size_t len) {
         // member, so the whole read/write window over it must stay inside the critical
         // section (see send_buf_'s doc comment).
         std::lock_guard<std::mutex> lock(this->session_mutex_);
-        if (!this->ensure_send_buf(plaintext_len + 16)) {
-            return SsErr::FAIL;
-        }
-        this->send_buf_.data()[0] = MSG_TYPE_JSON_BODY;
-        std::memcpy(this->send_buf_.data() + 1, json, len);
-        return this->encrypt_and_send_frame_locked(this->send_buf_.data(), this->send_buf_.size(),
-                                                   plaintext_len);
+        const uint8_t prefix = MSG_TYPE_JSON_BODY;
+        return this->fill_and_encrypt_locked(&prefix, 1, reinterpret_cast<const uint8_t*>(json),
+                                             len);
     }
 
     // Need fragmentation. Rare (large messages only) and unbounded in size (up to
@@ -177,12 +187,7 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
 
     if (len <= MAX_TRANSPORT_PLAINTEXT) {
         std::lock_guard<std::mutex> lock(this->session_mutex_);
-        if (!this->ensure_send_buf(len + 16)) {
-            return SsErr::FAIL;
-        }
-        std::memcpy(this->send_buf_.data(), data, len);
-        return this->encrypt_and_send_frame_locked(this->send_buf_.data(), this->send_buf_.size(),
-                                                   len);
+        return this->fill_and_encrypt_locked(nullptr, 0, data, len);
     }
 
     return this->fragment_and_send(data, len);
@@ -203,14 +208,10 @@ SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
         SS_LOGE(TAG, "send_msg2_and_swap: msg2 plaintext too large (%zu bytes)", plaintext_len);
         return SsErr::FAIL;
     }
-    if (!this->ensure_send_buf(plaintext_len + 16)) {
-        return SsErr::FAIL;
-    }
-    this->send_buf_.data()[0] = MSG_TYPE_JSON_BODY;
-    std::memcpy(this->send_buf_.data() + 1, msg2_text.data(), msg2_text.size());
 
-    SsErr err = this->encrypt_and_send_frame_locked(this->send_buf_.data(), this->send_buf_.size(),
-                                                    plaintext_len);
+    const uint8_t prefix = MSG_TYPE_JSON_BODY;
+    SsErr err = this->fill_and_encrypt_locked(
+        &prefix, 1, reinterpret_cast<const uint8_t*>(msg2_text.data()), msg2_text.size());
     if (err != SsErr::OK) {
         SS_LOGE(TAG, "send_msg2_and_swap: failed to send encrypted msg2 (err=%d)",
                 static_cast<int>(err));
@@ -335,48 +336,38 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
     return {plaintext, len};
 }
 
-bool NoiseTransport::reasm_reserve(size_t needed) {
-    if (this->reasm_buf_.size() >= needed) {
+bool NoiseTransport::grow_buffer(PlatformBuffer& buf, size_t needed, size_t cap, const char* what) {
+    if (buf.size() >= needed) {
         return true;
     }
-    // Geometric growth amortizes realloc cost across ~64 KB fragments; capacity is retained
-    // between messages.
-    size_t new_size = this->reasm_buf_.size() * 2;
+    // Geometric growth amortizes realloc cost across repeated growth; capacity is retained
+    // between calls instead of shrinking back down.
+    size_t new_size = buf.size() * 2;
     if (new_size < needed) {
         new_size = needed;
     }
-    const bool ok = (this->reasm_buf_.data() == nullptr)
-                        ? this->reasm_buf_.allocate(new_size, this->buffer_location_)
-                        : this->reasm_buf_.realloc(new_size);
+    if (cap != 0 && new_size > cap) {
+        new_size = cap;
+    }
+    const bool ok = (buf.data() == nullptr) ? buf.allocate(new_size, this->buffer_location_)
+                                            : buf.realloc(new_size);
     if (!ok) {
-        SS_LOGE(TAG, "reassembly buffer allocation failed (%zu bytes); dropping message", new_size);
+        SS_LOGE(TAG, "%s buffer allocation failed (%zu bytes)", what, new_size);
     }
     return ok;
 }
 
+bool NoiseTransport::reasm_reserve(size_t needed) {
+    // Uncapped: fragmented messages are already size-limited by MAX_REASSEMBLED_MESSAGE_BYTES
+    // at the caller (accept_plaintext), before this is reached.
+    return this->grow_buffer(this->reasm_buf_, needed, 0, "reassembly");
+}
+
 bool NoiseTransport::ensure_send_buf(size_t needed) {
-    if (this->send_buf_.size() >= needed) {
-        return true;
-    }
-    // Geometric growth, same idiom as reasm_reserve(): capacity is retained across sends, so
-    // steady-state traffic (client/time, client/state) settles at its working-set size instead
-    // of paying the MAX_TRANSPORT_PLAINTEXT + 16 ceiling on every connection.
-    size_t new_size = this->send_buf_.size() * 2;
-    if (new_size < needed) {
-        new_size = needed;
-    }
-    // Callers never request more than MAX_TRANSPORT_PLAINTEXT + 16 (the non-fragmented path's
-    // own size check enforces this), so the doubling never needs to grow past that ceiling.
-    if (new_size > MAX_TRANSPORT_PLAINTEXT + 16) {
-        new_size = MAX_TRANSPORT_PLAINTEXT + 16;
-    }
-    const bool ok = (this->send_buf_.data() == nullptr)
-                        ? this->send_buf_.allocate(new_size, this->buffer_location_)
-                        : this->send_buf_.realloc(new_size);
-    if (!ok) {
-        SS_LOGE(TAG, "send buffer allocation failed (%zu bytes)", new_size);
-    }
-    return ok;
+    // Capped at MAX_TRANSPORT_PLAINTEXT + 16 (the largest plaintext + AEAD tag room the
+    // non-fragmented path ever handles); callers never request more (the non-fragmented path's
+    // own size check enforces this), so the cap never actually clamps.
+    return this->grow_buffer(this->send_buf_, needed, MAX_TRANSPORT_PLAINTEXT + 16, "send");
 }
 
 }  // namespace sendspin
