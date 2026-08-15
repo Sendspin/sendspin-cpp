@@ -181,6 +181,181 @@ inline std::string noise_handshake_envelope(const std::vector<uint8_t>& noise_by
     return out;
 }
 
+/// @brief Shared Noise KKpsk2-INITIATOR simulation logic for FakeEncryptedServer and
+/// FakeOutboundEncryptedServer: driving the client/init -> server/init -> noise/handshake
+/// msg1/msg2 exchange for the initial handshake, encrypting/sending application frames, and
+/// decrypting inbound ones. Two concrete fixtures sit on top of this shared base (rather than
+/// one) because they exercise different DUT connection-establishment and
+/// disconnect()/close_transport_now() code paths: see FakeOutboundEncryptedServer's class comment
+/// for why. Each subclass implements send_text_frame_locked()/send_binary_frame_locked() over its
+/// own transport handle and keeps its own type-specific dispatch (client/hello, client/goodbye,
+/// management, in-band re-handshake, etc.).
+class NoiseInitiatorFixtureBase {
+public:
+    virtual ~NoiseInitiatorFixtureBase() {
+        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+        if (this->init_hs_ != nullptr) {
+            noise_handshakestate_free(this->init_hs_);
+        }
+    }
+
+    std::optional<std::string> goodbye_reason() const {
+        std::lock_guard<std::mutex> lock(this->goodbye_mutex_);
+        return this->goodbye_reason_;
+    }
+
+protected:
+    NoiseInitiatorFixtureBase(std::string suite_name, Identity server_identity, std::string psk_id,
+                              std::array<uint8_t, NOISE_PSK_SIZE> psk, std::string server_hello_name)
+        : suite_name_(std::move(suite_name)),
+          server_identity_(server_identity),
+          psk_id_(std::move(psk_id)),
+          psk_(psk),
+          server_hello_name_(std::move(server_hello_name)) {}
+
+    // Sends `frame` as a WebSocket TEXT/BINARY frame over the concrete transport. Caller must
+    // hold crypto_mutex_. A dead/absent socket is silently swallowed, matching every call site's
+    // pre-refactor behavior of never checking the underlying send's result.
+    virtual void send_text_frame_locked(const std::string& frame) = 0;
+    virtual void send_binary_frame_locked(const std::string& frame) = 0;
+
+    /// Sends `json` as one Noise transport binary frame: [MSG_TYPE_JSON_BODY | utf8(json)],
+    /// encrypted under the currently active send cipher. Caller must hold crypto_mutex_.
+    void send_encrypted_locked(const std::string& json) {
+        std::vector<uint8_t> plaintext(1 + json.size());
+        plaintext[0] = MSG_TYPE_JSON_BODY;
+        std::memcpy(plaintext.data() + 1, json.data(), json.size());
+        auto ct = raw_encrypt(this->active_.send_cs, plaintext);
+        if (ct.empty()) {
+            return;
+        }
+        this->send_binary_frame_locked(std::string(ct.begin(), ct.end()));
+    }
+
+    // Drives the client/init leg of the initial handshake: records the client's ephemeral
+    // pubkey (client_id_b64), replies with server/init, then builds the Noise INITIATOR state
+    // and sends msg1. client_init_text is the raw incoming message, kept verbatim as the first
+    // half of the handshake prologue. Caller must hold crypto_mutex_.
+    void handle_client_init_locked(const std::string& client_init_text,
+                                   const char* client_id_b64) {
+        auto client_pub = b64url_decode(client_id_b64);
+        if (!client_pub.has_value() || client_pub->size() != X25519_KEY_SIZE) {
+            return;
+        }
+        std::copy(client_pub->begin(), client_pub->end(), this->client_pubkey_.begin());
+        this->client_init_text_ = client_init_text;
+
+        JsonDocument sdoc;
+        sdoc["type"] = "server/init";
+        sdoc["payload"]["server_id"] = this->server_identity_.peer_id();
+        sdoc["payload"]["version"] = PROTOCOL_VERSION;
+        std::string server_init_text;
+        serializeJson(sdoc, server_init_text);
+        this->server_init_text_ = server_init_text;
+        this->send_text_frame_locked(server_init_text);
+
+        std::string prologue_str = this->client_init_text_ + this->server_init_text_;
+        this->init_hs_ = build_initiator(
+            this->suite_name_, this->server_identity_.private_bytes.data(),
+            this->server_identity_.public_bytes.data(), this->client_pubkey_.data(),
+            this->psk_.data(), reinterpret_cast<const uint8_t*>(prologue_str.data()),
+            prologue_str.size());
+        if (this->init_hs_ == nullptr) {
+            return;
+        }
+        auto msg1_bytes = write_msg1(this->init_hs_, this->psk_id_);
+        if (msg1_bytes.empty()) {
+            noise_handshakestate_free(this->init_hs_);
+            this->init_hs_ = nullptr;
+            return;
+        }
+        this->send_text_frame_locked(noise_handshake_envelope(msg1_bytes));
+    }
+
+    // Completes the initial handshake from the client's msg2 (data_b64 = payload.data): reads it
+    // into init_hs_, splits into the active cipher pair, records the handshake hash (a subclass
+    // may need it as the prologue for a later in-band re-handshake), and sends the post-handshake
+    // server/hello. Caller must hold crypto_mutex_ and must have already checked
+    // init_hs_ != nullptr.
+    void handle_initial_msg2_locked(const char* data_b64) {
+        auto msg2_bytes = b64url_decode(data_b64);
+        if (!msg2_bytes.has_value()) {
+            return;
+        }
+        std::vector<uint8_t> payload_buf(512);
+        NoiseBuffer msg2_in;
+        noise_buffer_set_input(msg2_in, msg2_bytes->data(), msg2_bytes->size());
+        NoiseBuffer payload_out;
+        noise_buffer_set_output(payload_out, payload_buf.data(), payload_buf.size());
+        if (noise_handshakestate_read_message(this->init_hs_, &msg2_in, &payload_out) !=
+            NOISE_ERROR_NONE) {
+            noise_handshakestate_free(this->init_hs_);
+            this->init_hs_ = nullptr;
+            return;
+        }
+        std::array<uint8_t, 32> h{};
+        noise_handshakestate_get_handshake_hash(this->init_hs_, h.data(), h.size());
+        NoiseCipherState* send_cs = nullptr;
+        NoiseCipherState* recv_cs = nullptr;
+        if (noise_handshakestate_split(this->init_hs_, &send_cs, &recv_cs) != NOISE_ERROR_NONE) {
+            noise_handshakestate_free(this->init_hs_);
+            this->init_hs_ = nullptr;
+            return;
+        }
+        noise_handshakestate_free(this->init_hs_);
+        this->init_hs_ = nullptr;
+
+        this->active_.reset();
+        this->active_.send_cs = send_cs;
+        this->active_.recv_cs = recv_cs;
+        this->prior_h_ = h;
+
+        JsonDocument hdoc;
+        hdoc["type"] = "server/hello";
+        hdoc["payload"]["name"] = this->server_hello_name_;
+        std::string hello_text;
+        serializeJson(hdoc, hello_text);
+        this->send_encrypted_locked(hello_text);
+    }
+
+    // Decrypts an inbound binary frame and returns its JSON text, or nullopt if no session is
+    // active yet, decrypt fails, or the leading type byte is not MSG_TYPE_JSON_BODY. Does not
+    // itself parse the JSON: callers deserialize it into their own JsonDocument. Caller must hold
+    // crypto_mutex_.
+    std::optional<std::string> decrypt_json_locked(const std::string& bytes) {
+        if (this->active_.send_cs == nullptr) {
+            return std::nullopt;
+        }
+        std::vector<uint8_t> ct(bytes.begin(), bytes.end());
+        auto pt = raw_decrypt(this->active_.recv_cs, std::move(ct));
+        if (pt.empty() || pt[0] != MSG_TYPE_JSON_BODY) {
+            return std::nullopt;
+        }
+        return std::string(reinterpret_cast<char*>(pt.data() + 1), pt.size() - 1);
+    }
+
+    std::string suite_name_;
+    Identity server_identity_;
+    std::string psk_id_;
+    std::array<uint8_t, NOISE_PSK_SIZE> psk_;
+    std::string server_hello_name_;
+
+    // Guards every field below: the concrete subclass's message handlers run on IXWebSocket's own
+    // thread(s), while the test thread may call into subclass methods (trigger_rehandshake,
+    // send_tampered_frame, etc.) concurrently. Mirrors NoiseTransport::session_mutex_'s role in
+    // the production responder.
+    mutable std::mutex crypto_mutex_;
+    std::array<uint8_t, X25519_KEY_SIZE> client_pubkey_{};
+    std::string client_init_text_;
+    std::string server_init_text_;
+    NoiseHandshakeState* init_hs_{nullptr};  // pending initial handshake
+    CipherPair active_;
+    std::array<uint8_t, 32> prior_h_{};
+
+    mutable std::mutex goodbye_mutex_;
+    std::optional<std::string> goodbye_reason_;
+};
+
 struct FakeEncryptedServerOptions {
     // Sent in server/activate after the FIRST client/hello.
     std::string first_activities_json{R"(["playback"])"};
@@ -203,15 +378,13 @@ struct FakeEncryptedServerOptions {
     bool suppress_activate{false};
 };
 
-class FakeEncryptedServer {
+class FakeEncryptedServer : public NoiseInitiatorFixtureBase {
 public:
     FakeEncryptedServer(const std::string& url, std::string suite_name, Identity server_identity,
                         std::string psk_id, std::array<uint8_t, NOISE_PSK_SIZE> psk,
                         FakeEncryptedServerOptions options = {})
-        : suite_name_(std::move(suite_name)),
-          server_identity_(server_identity),
-          init_psk_id_(std::move(psk_id)),
-          init_psk_(psk),
+        : NoiseInitiatorFixtureBase(std::move(suite_name), server_identity, std::move(psk_id), psk,
+                                    "Fake Encrypted Server"),
           options_(std::move(options)) {
         this->ws_.setUrl(url);
         this->ws_.disableAutomaticReconnection();
@@ -220,12 +393,9 @@ public:
         this->ws_.start();
     }
 
-    ~FakeEncryptedServer() {
+    ~FakeEncryptedServer() override {
         this->ws_.stop();
         std::lock_guard<std::mutex> lock(this->crypto_mutex_);
-        if (this->init_hs_ != nullptr) {
-            noise_handshakestate_free(this->init_hs_);
-        }
         if (this->rehandshake_hs_ != nullptr) {
             noise_handshakestate_free(this->rehandshake_hs_);
         }
@@ -270,11 +440,6 @@ public:
 
     bool closed() const {
         return this->closed_.load();
-    }
-
-    std::optional<std::string> goodbye_reason() const {
-        std::lock_guard<std::mutex> lock(this->goodbye_mutex_);
-        return this->goodbye_reason_;
     }
 
     // The PSK (and its derived psk_id) the client generated and sent via client/pair-finalize,
@@ -334,17 +499,12 @@ private:
         }
     }
 
-    // Sends `json` as one Noise transport binary frame: [MSG_TYPE_JSON_BODY | utf8(json)],
-    // encrypted under the currently active send cipher. Caller must hold crypto_mutex_.
-    void send_encrypted_locked(const std::string& json) {
-        std::vector<uint8_t> plaintext(1 + json.size());
-        plaintext[0] = MSG_TYPE_JSON_BODY;
-        std::memcpy(plaintext.data() + 1, json.data(), json.size());
-        auto ct = raw_encrypt(this->active_.send_cs, plaintext);
-        if (ct.empty()) {
-            return;
-        }
-        this->ws_.sendBinary(std::string(ct.begin(), ct.end()));
+    void send_text_frame_locked(const std::string& frame) override {
+        this->ws_.send(frame);
+    }
+
+    void send_binary_frame_locked(const std::string& frame) override {
+        this->ws_.sendBinary(frame);
     }
 
     void handle_text(const std::string& text) {
@@ -368,38 +528,7 @@ private:
 
         if (std::strcmp(type, "client/init") == 0) {
             const char* client_id_b64 = doc["payload"]["client_id"] | "";
-            auto client_pub = b64url_decode(client_id_b64);
-            if (!client_pub.has_value() || client_pub->size() != X25519_KEY_SIZE) {
-                return;
-            }
-            std::copy(client_pub->begin(), client_pub->end(), this->client_pubkey_.begin());
-            this->client_init_text_ = text;
-
-            JsonDocument sdoc;
-            sdoc["type"] = "server/init";
-            sdoc["payload"]["server_id"] = this->server_identity_.peer_id();
-            sdoc["payload"]["version"] = PROTOCOL_VERSION;
-            std::string server_init_text;
-            serializeJson(sdoc, server_init_text);
-            this->server_init_text_ = server_init_text;
-            this->ws_.send(server_init_text);
-
-            std::string prologue_str = this->client_init_text_ + this->server_init_text_;
-            this->init_hs_ = build_initiator(
-                this->suite_name_, this->server_identity_.private_bytes.data(),
-                this->server_identity_.public_bytes.data(), this->client_pubkey_.data(),
-                this->init_psk_.data(),
-                reinterpret_cast<const uint8_t*>(prologue_str.data()), prologue_str.size());
-            if (this->init_hs_ == nullptr) {
-                return;
-            }
-            auto msg1_bytes = write_msg1(this->init_hs_, this->init_psk_id_);
-            if (msg1_bytes.empty()) {
-                noise_handshakestate_free(this->init_hs_);
-                this->init_hs_ = nullptr;
-                return;
-            }
-            this->ws_.send(noise_handshake_envelope(msg1_bytes));
+            this->handle_client_init_locked(text, client_id_b64);
             return;
         }
 
@@ -407,60 +536,17 @@ private:
             // The client's msg2 for the INITIAL handshake (still cleartext TEXT per the
             // pre-transport exchange).
             const char* data_b64 = doc["payload"]["data"] | "";
-            auto msg2_bytes = b64url_decode(data_b64);
-            if (!msg2_bytes.has_value()) {
-                return;
-            }
-            std::vector<uint8_t> payload_buf(512);
-            NoiseBuffer msg2_in;
-            noise_buffer_set_input(msg2_in, msg2_bytes->data(), msg2_bytes->size());
-            NoiseBuffer payload_out;
-            noise_buffer_set_output(payload_out, payload_buf.data(), payload_buf.size());
-            if (noise_handshakestate_read_message(this->init_hs_, &msg2_in, &payload_out) !=
-                NOISE_ERROR_NONE) {
-                noise_handshakestate_free(this->init_hs_);
-                this->init_hs_ = nullptr;
-                return;
-            }
-            std::array<uint8_t, 32> h{};
-            noise_handshakestate_get_handshake_hash(this->init_hs_, h.data(), h.size());
-            NoiseCipherState* send_cs = nullptr;
-            NoiseCipherState* recv_cs = nullptr;
-            if (noise_handshakestate_split(this->init_hs_, &send_cs, &recv_cs) !=
-                NOISE_ERROR_NONE) {
-                noise_handshakestate_free(this->init_hs_);
-                this->init_hs_ = nullptr;
-                return;
-            }
-            noise_handshakestate_free(this->init_hs_);
-            this->init_hs_ = nullptr;
-
-            this->active_.reset();
-            this->active_.send_cs = send_cs;
-            this->active_.recv_cs = recv_cs;
-            this->prior_h_ = h;
-
-            // Kick off the post-handshake protocol flow: server/hello, encrypted.
-            JsonDocument hdoc;
-            hdoc["type"] = "server/hello";
-            hdoc["payload"]["name"] = "Fake Encrypted Server";
-            std::string hello_text;
-            serializeJson(hdoc, hello_text);
-            this->send_encrypted_locked(hello_text);
+            this->handle_initial_msg2_locked(data_b64);
         }
     }
 
     void handle_binary(const std::string& bytes) {
         std::lock_guard<std::mutex> lock(this->crypto_mutex_);
-        if (this->active_.send_cs == nullptr) {
+        auto json_opt = this->decrypt_json_locked(bytes);
+        if (!json_opt.has_value()) {
             return;
         }
-        std::vector<uint8_t> ct(bytes.begin(), bytes.end());
-        auto pt = raw_decrypt(this->active_.recv_cs, std::move(ct));
-        if (pt.empty() || pt[0] != MSG_TYPE_JSON_BODY) {
-            return;
-        }
-        std::string json(reinterpret_cast<char*>(pt.data() + 1), pt.size() - 1);
+        const std::string& json = *json_opt;
         JsonDocument doc;
         if (deserializeJson(doc, json)) {
             return;
@@ -586,30 +672,15 @@ private:
     }
 
     ix::WebSocket ws_;
-    std::string suite_name_;
-    Identity server_identity_;
-    std::string init_psk_id_;
-    std::array<uint8_t, NOISE_PSK_SIZE> init_psk_;
     FakeEncryptedServerOptions options_;
 
-    // Guards every field below: handle_text/handle_binary run on IXWebSocket's callback thread;
-    // trigger_rehandshake() is called from the test thread. Mirrors NoiseTransport::
-    // session_mutex_'s role in the production responder.
-    mutable std::mutex crypto_mutex_;
-    std::array<uint8_t, X25519_KEY_SIZE> client_pubkey_{};
-    std::string client_init_text_;
-    std::string server_init_text_;
-    NoiseHandshakeState* init_hs_{nullptr};        // pending initial handshake
-    NoiseHandshakeState* rehandshake_hs_{nullptr};  // pending in-band re-handshake
-    CipherPair active_;
-    std::array<uint8_t, 32> prior_h_{};
+    // pending in-band re-handshake; guarded by crypto_mutex_ (declared on the base class).
+    NoiseHandshakeState* rehandshake_hs_{nullptr};
 
     std::atomic<int> client_hello_count_{0};
     mutable std::mutex pair_methods_mutex_;
     std::vector<std::string> hello_pair_methods_;
     std::atomic<bool> closed_{false};
-    mutable std::mutex goodbye_mutex_;
-    std::optional<std::string> goodbye_reason_;
 
     mutable std::mutex pair_mutex_;
     std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> learned_psk_;
@@ -631,15 +702,13 @@ private:
 // reached when the SendspinClient itself calls connect_to() and dispatch_completed_message() runs
 // synchronously on IXWebSocket's own outbound worker thread. This class lets the client under
 // test be the outbound connector, so a test can reach that code path.
-class FakeOutboundEncryptedServer {
+class FakeOutboundEncryptedServer : public NoiseInitiatorFixtureBase {
 public:
     FakeOutboundEncryptedServer(uint16_t port, std::string suite_name, Identity server_identity,
                                 std::string psk_id, std::array<uint8_t, NOISE_PSK_SIZE> psk)
-        : server_(port, "127.0.0.1"),
-          suite_name_(std::move(suite_name)),
-          server_identity_(server_identity),
-          psk_id_(std::move(psk_id)),
-          psk_(psk) {
+        : NoiseInitiatorFixtureBase(std::move(suite_name), server_identity, std::move(psk_id), psk,
+                                    "Fake Outbound Encrypted Server"),
+          server_(port, "127.0.0.1") {
         this->server_.setOnConnectionCallback(
             [this](const std::weak_ptr<ix::WebSocket>& weak_ws,
                    const std::shared_ptr<ix::ConnectionState>& /*state*/) {
@@ -656,12 +725,8 @@ public:
             });
     }
 
-    ~FakeOutboundEncryptedServer() {
+    ~FakeOutboundEncryptedServer() override {
         this->server_.stop();
-        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
-        if (this->init_hs_ != nullptr) {
-            noise_handshakestate_free(this->init_hs_);
-        }
     }
 
     bool listen() {
@@ -691,11 +756,6 @@ public:
         return true;
     }
 
-    std::optional<std::string> goodbye_reason() const {
-        std::lock_guard<std::mutex> lock(this->goodbye_mutex_);
-        return this->goodbye_reason_;
-    }
-
 private:
     void on_message(const ix::WebSocketMessagePtr& msg) {
         if (msg->type != ix::WebSocketMessageType::Message) {
@@ -708,21 +768,20 @@ private:
         }
     }
 
-    // Sends `json` as one Noise transport binary frame, encrypted under the active send cipher.
-    // Caller must hold crypto_mutex_.
-    void send_encrypted_locked(const std::string& json) {
+    void send_text_frame_locked(const std::string& frame) override {
         auto ws = this->ws_.lock();
         if (!ws) {
             return;
         }
-        std::vector<uint8_t> plaintext(1 + json.size());
-        plaintext[0] = MSG_TYPE_JSON_BODY;
-        std::memcpy(plaintext.data() + 1, json.data(), json.size());
-        auto ct = raw_encrypt(this->active_.send_cs, plaintext);
-        if (ct.empty()) {
+        ws->send(frame);
+    }
+
+    void send_binary_frame_locked(const std::string& frame) override {
+        auto ws = this->ws_.lock();
+        if (!ws) {
             return;
         }
-        ws->sendBinary(std::string(ct.begin(), ct.end()));
+        ws->sendBinary(frame);
     }
 
     void handle_text(const std::string& text) {
@@ -733,104 +792,31 @@ private:
         const char* type = doc["type"] | "";
 
         std::lock_guard<std::mutex> lock(this->crypto_mutex_);
-        auto ws = this->ws_.lock();
-        if (!ws) {
+        if (!this->ws_.lock()) {
             return;
         }
 
         if (std::strcmp(type, "client/init") == 0) {
             const char* client_id_b64 = doc["payload"]["client_id"] | "";
-            auto client_pub = b64url_decode(client_id_b64);
-            if (!client_pub.has_value() || client_pub->size() != X25519_KEY_SIZE) {
-                return;
-            }
-            std::copy(client_pub->begin(), client_pub->end(), this->client_pubkey_.begin());
-            this->client_init_text_ = text;
-
-            JsonDocument sdoc;
-            sdoc["type"] = "server/init";
-            sdoc["payload"]["server_id"] = this->server_identity_.peer_id();
-            sdoc["payload"]["version"] = PROTOCOL_VERSION;
-            std::string server_init_text;
-            serializeJson(sdoc, server_init_text);
-            this->server_init_text_ = server_init_text;
-            ws->send(server_init_text);
-
-            std::string prologue_str = this->client_init_text_ + this->server_init_text_;
-            this->init_hs_ = build_initiator(
-                this->suite_name_, this->server_identity_.private_bytes.data(),
-                this->server_identity_.public_bytes.data(), this->client_pubkey_.data(),
-                this->psk_.data(), reinterpret_cast<const uint8_t*>(prologue_str.data()),
-                prologue_str.size());
-            if (this->init_hs_ == nullptr) {
-                return;
-            }
-            auto msg1_bytes = write_msg1(this->init_hs_, this->psk_id_);
-            if (msg1_bytes.empty()) {
-                noise_handshakestate_free(this->init_hs_);
-                this->init_hs_ = nullptr;
-                return;
-            }
-            ws->send(noise_handshake_envelope(msg1_bytes));
+            this->handle_client_init_locked(text, client_id_b64);
             return;
         }
 
         if (std::strcmp(type, "noise/handshake") == 0 && this->init_hs_ != nullptr) {
             // The client's msg2, still cleartext TEXT per the pre-transport exchange.
             const char* data_b64 = doc["payload"]["data"] | "";
-            auto msg2_bytes = b64url_decode(data_b64);
-            if (!msg2_bytes.has_value()) {
-                return;
-            }
-            std::vector<uint8_t> payload_buf(512);
-            NoiseBuffer msg2_in;
-            noise_buffer_set_input(msg2_in, msg2_bytes->data(), msg2_bytes->size());
-            NoiseBuffer payload_out;
-            noise_buffer_set_output(payload_out, payload_buf.data(), payload_buf.size());
-            if (noise_handshakestate_read_message(this->init_hs_, &msg2_in, &payload_out) !=
-                NOISE_ERROR_NONE) {
-                noise_handshakestate_free(this->init_hs_);
-                this->init_hs_ = nullptr;
-                return;
-            }
-            NoiseCipherState* send_cs = nullptr;
-            NoiseCipherState* recv_cs = nullptr;
-            if (noise_handshakestate_split(this->init_hs_, &send_cs, &recv_cs) !=
-                NOISE_ERROR_NONE) {
-                noise_handshakestate_free(this->init_hs_);
-                this->init_hs_ = nullptr;
-                return;
-            }
-            noise_handshakestate_free(this->init_hs_);
-            this->init_hs_ = nullptr;
-
-            this->active_.reset();
-            this->active_.send_cs = send_cs;
-            this->active_.recv_cs = recv_cs;
-
-            // Kick off the post-handshake protocol flow: server/hello, encrypted.
-            JsonDocument hdoc;
-            hdoc["type"] = "server/hello";
-            hdoc["payload"]["name"] = "Fake Outbound Encrypted Server";
-            std::string hello_text;
-            serializeJson(hdoc, hello_text);
-            this->send_encrypted_locked(hello_text);
+            this->handle_initial_msg2_locked(data_b64);
         }
     }
 
     void handle_binary(const std::string& bytes) {
         std::lock_guard<std::mutex> lock(this->crypto_mutex_);
-        if (this->active_.send_cs == nullptr) {
+        auto json_opt = this->decrypt_json_locked(bytes);
+        if (!json_opt.has_value()) {
             return;
         }
-        std::vector<uint8_t> ct(bytes.begin(), bytes.end());
-        auto pt = raw_decrypt(this->active_.recv_cs, std::move(ct));
-        if (pt.empty() || pt[0] != MSG_TYPE_JSON_BODY) {
-            return;
-        }
-        std::string json(reinterpret_cast<char*>(pt.data() + 1), pt.size() - 1);
         JsonDocument doc;
-        if (deserializeJson(doc, json)) {
+        if (deserializeJson(doc, *json_opt)) {
             return;
         }
         const char* type = doc["type"] | "";
@@ -851,23 +837,11 @@ private:
     }
 
     ix::WebSocketServer server_;
-    std::string suite_name_;
-    Identity server_identity_;
-    std::string psk_id_;
-    std::array<uint8_t, NOISE_PSK_SIZE> psk_;
 
-    // Guards every field below: on_message()/handle_text()/handle_binary() run on the WS server's
-    // own connection thread; the test thread calls send_tampered_frame().
-    mutable std::mutex crypto_mutex_;
+    // ws_ itself is guarded by crypto_mutex_ (declared on the base class): on_message() /
+    // handle_text() / handle_binary() run on the WS server's own connection thread, while the
+    // test thread calls send_tampered_frame().
     std::weak_ptr<ix::WebSocket> ws_;
-    std::array<uint8_t, X25519_KEY_SIZE> client_pubkey_{};
-    std::string client_init_text_;
-    std::string server_init_text_;
-    NoiseHandshakeState* init_hs_{nullptr};
-    CipherPair active_;
-
-    mutable std::mutex goodbye_mutex_;
-    std::optional<std::string> goodbye_reason_;
 };
 
 }  // namespace sendspin

@@ -27,6 +27,7 @@
 #include "platform/crypto.h"
 #include "protocol_messages.h"
 #include "record_store.h"
+#include "record_test_helpers.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include <ArduinoJson.h>
@@ -47,12 +48,6 @@ namespace {
 // Test helpers
 // ===========================================================================
 
-static std::array<uint8_t, NOISE_PSK_SIZE> make_random_psk() {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-    return psk;
-}
-
 static std::string psk_to_b64url(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
     return b64url_encode(psk.data(), psk.size());
 }
@@ -62,24 +57,6 @@ static std::string make_test_server_id() {
     std::array<uint8_t, 32> key{};
     platform_random_bytes(key.data(), key.size());
     return b64url_encode(key.data(), key.size());
-}
-
-static SendspinPairingRecord make_client_record(const std::string& server_id) {
-    auto psk = make_random_psk();
-    SendspinPairingRecord rec;
-    rec.psk_id = psk_id_for(psk);
-    rec.psk = psk;
-    rec.server_id = server_id;
-    return rec;
-}
-
-static SendspinPairingRecord make_shared_record() {
-    auto psk = make_random_psk();
-    SendspinPairingRecord rec;
-    rec.psk_id = psk_id_for(psk);
-    rec.psk = psk;
-    // server_id absent = shared-PSK record
-    return rec;
 }
 
 /// Parse a JSON string into a root object; keeps the document alive via out-params.

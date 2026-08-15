@@ -548,6 +548,11 @@ plus separate flash-wear-optimized storage for `STATIC_DELAY`) can switch on `ke
 
 #### Migrating from a Pre-Blob-Store Release
 
+This section applies only to consumers who integrated against a pre-release snapshot of this
+branch that still had the 17-method interface; it was never part of a tagged release, so anyone
+starting from a tagged release or from main has only ever had the three generic methods above and
+can skip this section.
+
 If your `SendspinPersistenceProvider` implementation predates the blob-store interface, it
 implemented up to 17 typed methods (`save_static_keypair`, `load_pairing_records`,
 `save_pairing_psk`, etc.) instead of the three generic ones above. There is no compatibility

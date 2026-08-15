@@ -36,6 +36,7 @@
 #include "platform/logging.h"
 #include "protocol_messages.h"
 #include "record_store.h"
+#include "record_test_helpers.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/persistence_codec.h"
@@ -64,36 +65,6 @@ using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local c
 // =============================================================================
 // Test helpers
 // =============================================================================
-
-static std::array<uint8_t, NOISE_PSK_SIZE> make_random_psk() {
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-    return psk;
-}
-
-/// Build a stored-pubkey client record bound to server_id.
-static SendspinPairingRecord make_client_record(const std::string& server_id,
-                                                const std::optional<std::string>& label = {}) {
-    auto psk = make_random_psk();
-    SendspinPairingRecord rec;
-    rec.psk_id = psk_id_for(psk);
-    rec.psk = psk;
-    rec.server_id = server_id;
-    rec.label = label;
-    return rec;
-}
-
-/// Build a shared-PSK (fallback) record: no server_id.
-static SendspinPairingRecord make_shared_record(
-    const std::optional<std::string>& label = {}) {
-    auto psk = make_random_psk();
-    SendspinPairingRecord rec;
-    rec.psk_id = psk_id_for(psk);
-    rec.psk = psk;
-    // server_id absent = shared record
-    rec.label = label;
-    return rec;
-}
 
 /// Build an accepted Pairing PSK.
 static SendspinPairingPsk make_pairing_psk(const std::optional<std::string>& label = {}) {

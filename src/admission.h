@@ -42,7 +42,7 @@ namespace sendspin {
 /// @brief Whether `activities` is an allowed set for the matched PSK category.
 ///
 /// Ports `_activities_allowed` from
-/// aiosendspin/aiosendspin/client/connection.py (line ~139).
+/// aiosendspin/aiosendspin/client/connection.py.
 ///
 /// Rules (mirroring the reference exactly):
 ///   - If PAIRING in activities -> only {PAIRING} is valid.
@@ -130,7 +130,7 @@ inline bool is_playback_capable(PskCategory category,
 /// @brief Whether `activities`/`active_roles` satisfy the matched PSK's structural constraints.
 ///
 /// Ports `_admissible` from
-/// aiosendspin/aiosendspin/client/connection.py (line ~154).
+/// aiosendspin/aiosendspin/client/connection.py.
 ///
 /// A non-empty active_roles set requires that the connection be "playback-capable": activities |
 /// {PLAYBACK} must also be allowed. This catches e.g. a Sentinel
@@ -175,7 +175,7 @@ inline bool admissible(PskCategory category, const std::vector<SendspinActivity>
 /// @brief Rank a connection by its highest activity.
 ///
 /// Ports `_activity_rank` from
-/// aiosendspin/aiosendspin/client/client.py (line ~504).
+/// aiosendspin/aiosendspin/client/client.py.
 ///
 /// management=3 > playback=2 > pairing=1 > none=0.
 ///
@@ -209,7 +209,7 @@ inline int activity_rank(const std::vector<SendspinActivity>& activities) {
 /// @brief Whether the incoming connection should displace the currently admitted one.
 ///
 /// Ports `_should_admit_connection` from
-/// aiosendspin/aiosendspin/client/client.py (line ~515).
+/// aiosendspin/aiosendspin/client/client.py.
 ///
 /// Rules (from the reference):
 ///   1. If no currently admitted connection -> admit.

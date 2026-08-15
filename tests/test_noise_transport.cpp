@@ -138,6 +138,13 @@ public:
         this->noise_handshake_complete_.store(true, std::memory_order_release);
     }
 
+    /// Direct access to NoiseTransport::send_binary() for tests exercising the binary send
+    /// path (there is no connection-level wrapper; production code has no client-to-server
+    /// binary message today).
+    SsErr test_send_binary(const uint8_t* data, size_t len) {
+        return this->noise_transport_.send_binary(data, len);
+    }
+
     // --- Direct access to the receive-buffer cap, bypassing WS/dispatch ---
 
     uint8_t* test_prepare_receive_buffer(size_t data_len) {
@@ -1388,7 +1395,7 @@ TEST(NoiseTransport, SendBinary_GrowingSizesUpToMaxTransportPlaintextRoundTrip) 
         }
 
         conn.sent_binary_.clear();
-        ASSERT_EQ(conn.send_encrypted_binary(data.data(), data.size()), SsErr::OK) << "len=" << len;
+        ASSERT_EQ(conn.test_send_binary(data.data(), data.size()), SsErr::OK) << "len=" << len;
         ASSERT_EQ(conn.sent_binary_.size(), 1u) << "len=" << len;
 
         auto pt = init_decrypt(r->initiator.recv_cs, conn.sent_binary_[0]);

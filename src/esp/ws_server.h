@@ -189,14 +189,6 @@ public:
         return this->server_ != nullptr;
     }
 
-    /// @brief Gets the httpd handle (for use by connections)
-    /// @return The httpd server handle, or nullptr if not started.
-    // cppcheck-suppress unusedFunction
-    // Public accessor for ESP-side connection code; currently unused in-tree.
-    httpd_handle_t get_server() const {
-        return this->server_;
-    }
-
 protected:
     /// @brief Callback invoked when a new client opens a connection
     /// Creates a SendspinServerConnection and notifies the client.

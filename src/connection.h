@@ -286,17 +286,6 @@ public:
     SsErr send_app_json(const char* json, size_t len, SendCompleteCallback cb = nullptr,
                         bool allow_before_hello = false);
 
-    /// @brief Encrypt and send pre-typed binary data as a Noise transport binary frame.
-    /// Thin delegate to NoiseTransport::send_binary().
-    /// @param data  Pointer to type-prefixed binary bytes (first byte is the role type byte).
-    /// @param len   Total length including the type byte.
-    /// @return SsErr::OK on success.
-    // No client-to-server binary message exists yet, so nothing calls this today.
-    // cppcheck-suppress unusedFunction
-    SsErr send_encrypted_binary(const uint8_t* data, size_t len) {
-        return this->noise_transport_.send_binary(data, len);
-    }
-
     /// @brief Gets the socket file descriptor for this connection
     /// @return Socket fd for server connections, -1 for client connections.
     /// @note Used by the hub to identify which connection closed when notified by the server.
