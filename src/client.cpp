@@ -1673,6 +1673,13 @@ void SendspinClient::persist_last_played_server(const std::string& server_id) {
         return;
     }
 
+    // Skip the setter and the write when the server_id is unchanged (including the boot-time
+    // value seeded by load_last_played_server()), bounding flash writes to one per actual
+    // handoff instead of one per PLAYING transition.
+    if (server_id == this->connection_manager_->last_played_server_id()) {
+        return;
+    }
+
     this->connection_manager_->set_last_played_server_id(server_id);
 
     if (this->persistence_provider_) {

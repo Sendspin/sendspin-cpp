@@ -385,6 +385,12 @@ public:
     /// @param server_id The server_id string of the last-played server.
     void set_last_played_server_id(const std::string& server_id);
 
+    /// @brief Returns the current last-played server_id. Main loop only.
+    /// @return The server_id string of the last-played server, or empty if unset.
+    const std::string& last_played_server_id() const {
+        return this->last_played_server_id_;
+    }
+
     // ========================================
     // Event queuing (thread-safe)
     // ========================================

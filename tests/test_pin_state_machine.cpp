@@ -53,6 +53,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -254,8 +255,25 @@ public:
 };
 
 /// Persistence provider that does nothing (in-memory RecordStore defaults are sufficient for
-/// these tests: shared-PSK fallback record is generated fresh, no config restrictions).
-class FakePersistenceProvider : public SendspinPersistenceProvider {};
+/// these tests: shared-PSK fallback record is generated fresh, no config restrictions). Counts
+/// save_blob() calls per key, still returning false like the base class default, so tests can
+/// assert on write counts (e.g. the persist_last_played_server() dedup guard) without disturbing
+/// the always-fails behavior the RECORDS-storage-failure tests rely on.
+class FakePersistenceProvider : public SendspinPersistenceProvider {
+public:
+    bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
+        this->save_attempts_[key]++;
+        return false;
+    }
+
+    [[nodiscard]] int save_attempts(const std::string& key) const {
+        auto it = this->save_attempts_.find(key);
+        return it == this->save_attempts_.end() ? 0 : it->second;
+    }
+
+private:
+    std::map<std::string, int> save_attempts_;
+};
 
 // =============================================================================
 // JSON helpers for asserting on captured outbound frames
@@ -493,6 +511,12 @@ protected:
         mgr.last_played_server_id_ = last_playback_server_id;
         mgr.has_last_played_server_ = !last_playback_server_id.empty();
         return mgr.should_switch_to_new_server(current, incoming);
+    }
+
+    /// Drives SendspinClient::persist_last_played_server(), private to SendspinClient; per this
+    /// file's access policy the call routes through here.
+    void persist_last_played_server(const std::string& server_id) {
+        this->client_->persist_last_played_server(server_id);
     }
 
     /// Returns the shared_ptr backing the injected current connection, for building
@@ -1952,4 +1976,30 @@ TEST_F(PinStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlaybackPe
                                     std::nullopt);
     EXPECT_TRUE(this->would_switch_to(current, playback.get(), "old-playback-server"))
         << "a finalized pairing must stop blocking a higher-ranked incoming connection";
+}
+
+// ============================================================================
+// persist_last_played_server() same-value dedup guard
+// ============================================================================
+
+// A single-server deployment repeats the same server_id on every PLAYING transition, so the
+// guard must skip the write (not just rely on the storage backend to dedup) once the id already
+// matches ConnectionManager's last-played state; a genuine handoff to a different server_id must
+// still go through.
+TEST_F(PinStateMachineTest, PersistLastPlayedServerSkipsDuplicateWrite) {
+    EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 0);
+
+    this->persist_last_played_server("server-a");
+    EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 1);
+    EXPECT_EQ(this->client_->connection_manager_->last_played_server_id(), "server-a");
+
+    // Same server_id again (also covers the post-reboot case, where load_last_played_server()
+    // already seeded this value via the same setter): no second write.
+    this->persist_last_played_server("server-a");
+    EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 1);
+
+    // A different server_id must still go through.
+    this->persist_last_played_server("server-b");
+    EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
+    EXPECT_EQ(this->client_->connection_manager_->last_played_server_id(), "server-b");
 }

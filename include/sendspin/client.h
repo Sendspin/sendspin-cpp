@@ -178,6 +178,13 @@ public:
 /// its objects) from inside load_blob/save_blob/erase_blob. The library invokes these methods
 /// while holding internal locks (e.g. the record store's mutex around a `RECORDS` save), so a
 /// callback into the library from a provider method can deadlock.
+///
+/// Blocking: for the same reason, an implementation must perform one bounded storage operation
+/// and return, not add blocking of its own (a synchronous retry loop, a multi-second fsync
+/// chain). Held locks and, for `RECORDS`, the NETWORK thread mid-pairing-exchange are on the
+/// call stack for the duration. A failed write should be reported by returning false rather
+/// than retried inline; the library already handles that (fail-closed pairing, revocation
+/// warnings) as described below on save_blob/erase_blob.
 class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;
