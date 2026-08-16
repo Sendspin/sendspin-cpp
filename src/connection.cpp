@@ -184,6 +184,21 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
         return false;
     }
 
+    // Restart the re-proving watchdog: the connection is once again "awaiting its first
+    // server/activate" (under the new keys). ConnectionManager::loop()'s re-proving-deadline
+    // check reads this timestamp for current_connection_ (gated on !is_operational()) and
+    // drops the connection after REPROVE_TIMEOUT_US (see connection_manager.h) if the post-swap
+    // server/hello -> client/hello -> server/activate cycle does not complete in time.
+    //
+    // This must precede the first_activate_received_ store below. The watchdog reads
+    // is_operational() and then get_provisional_time_us() while holding nothing that excludes
+    // this thread, so clearing the flag first would let it pair "not operational" with this
+    // connection's previous stamp, which for a long-admitted connection is far older than
+    // REPROVE_TIMEOUT_US, and drop a healthy connection mid-rekey. In this order the relaxed
+    // stamp is sequenced before the release store, so any reader whose acquire load observes
+    // the cleared flag is guaranteed to see the fresh stamp with it.
+    this->set_provisional_time_us(platform_time_us());
+
     // Suppress app-level sends (client/state, client/time) for the duration of the
     // re-handshake. The main loop gates on first_activate_received(), so clearing it here
     // cleanly stops publish_client_state()/the time burst until the new server/activate
@@ -196,13 +211,6 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     // server/activate arrives, so the main loop can resume time sync and state publishing.
     // Atomic store: written on network thread, read on main loop.
     this->pairing_in_progress_.store(false, std::memory_order_release);
-
-    // Restart the re-proving watchdog: the connection is once again "awaiting its first
-    // server/activate" (under the new keys). ConnectionManager::loop()'s re-proving-deadline
-    // check reads this timestamp for current_connection_ (gated on !is_operational()) and
-    // drops the connection after REPROVE_TIMEOUT_US (see connection_manager.h) if the post-swap
-    // server/hello -> client/hello -> server/activate cycle does not complete in time.
-    this->set_provisional_time_us(platform_time_us());
 
     // Run the deferred-PSK-binding msg1 read with prologue = the prior handshake hash h.
     auto prior_h = this->noise_transport_.handshake_hash();
@@ -446,12 +454,17 @@ void SendspinConnection::note_pairing_finalize_ack() {
     // ConnectionManager::loop()'s re-proving-deadline check (REPROVE_TIMEOUT_US, gated on
     // !current_connection_->is_operational()) will drop the connection if the server acks but
     // never re-handshakes.
+    //
+    // Stamp the provisional timer before clearing first_activate_received_, for the reason given
+    // in handle_noise_rehandshake(): the watchdog reads is_operational() and then
+    // get_provisional_time_us() unsynchronized, so the reverse order lets it pair "not
+    // operational" with this connection's previous, arbitrarily old stamp and drop it.
+    this->set_provisional_time_us(platform_time_us());
     this->first_activate_received_.store(false, std::memory_order_release);
     // Mark the activities snapshot stale: the exchange is protocol-complete (the record is
     // stored) but activities_ still reads [PAIRING] until the post-rekey activate lands, and
     // admission must not keep shielding this connection as an in-flight pairing meanwhile.
     this->pairing_finalized_.store(true, std::memory_order_release);
-    this->set_provisional_time_us(platform_time_us());
 }
 
 }  // namespace sendspin

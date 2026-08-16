@@ -22,6 +22,7 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "fake_persistence.h"
 #include "management.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
@@ -709,6 +710,33 @@ TEST(ManagementHandler, AddRecordStorageExhaustedAtDefaultCap) {
     ManagementEffect effect;
     handle_add_record(store, payload, result, effect);
     EXPECT_EQ(result.result, ManagementResult::STORAGE_EXHAUSTED);
+}
+
+// Capacity is not the only way an add can fail: a provider that refuses the RECORDS write makes
+// store_record() fail closed and roll the insert back, so answering ok would promise a credential
+// the device does not hold, and the caller would only discover that at the next handshake.
+TEST(ManagementHandler, AddRecordReportsPersistenceWriteFailure) {
+    InMemoryPersistenceProvider provider;
+    provider.reject_save_keys.insert(persistence_keys::RECORDS);
+    RecordStore store(&provider);
+    ASSERT_TRUE(store.can_store_record())
+        << "capacity must be available so the write is what fails";
+
+    auto psk = make_random_psk();
+    ManagementAddRecordPayload payload;
+    payload.psk = psk_to_b64url(psk);
+
+    ManagementResultPayload result;
+    ManagementEffect effect;
+    handle_add_record(store, payload, result, effect);
+
+    EXPECT_EQ(result.result, ManagementResult::STORAGE_EXHAUSTED);
+    EXPECT_EQ(effect, ManagementEffect::NONE);
+
+    auto psk_id = psk_id_for(psk.data(), psk.size());
+    ASSERT_TRUE(psk_id.has_value());
+    EXPECT_EQ(store.record_by_psk_id(psk_id.value()), nullptr)
+        << "a record the provider refused must not stay resolvable in memory";
 }
 
 // ===========================================================================
