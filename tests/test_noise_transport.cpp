@@ -1169,16 +1169,67 @@ TEST(NoiseTransport, FragmentBoundaryExactLimit) {
 
     // plaintext = [0x00] + json, and MAX_TRANSPORT_PLAINTEXT (65519) counts the type byte.
     const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
+    constexpr size_t TAG = 16;  // AEAD tag appended to every frame's plaintext
 
     // json of (maxp - 1) bytes -> plaintext exactly maxp -> a single (unfragmented) frame.
     EXPECT_EQ(conn.send_encrypted_text(std::string(maxp - 1, 'A')), SsErr::OK);
-    EXPECT_EQ(conn.sent_binary_.size(), 1u);
+    ASSERT_EQ(conn.sent_binary_.size(), 1u);
+    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG);
 
     conn.sent_binary_.clear();
 
     // json of maxp bytes -> plaintext (maxp + 1) -> exactly two frames.
+    //
+    // Assert each frame's exact size, not just the frame count: the split point is wire format
+    // (wire.py _fragment()), so an off-by-one in fragment_and_send's first_cap/cont_cap would
+    // still emit two frames that this transport happily reassembles, while a peer running the
+    // reference implementation would disagree about where the boundary falls.
+    //
+    // First frame is [FRAGMENT_MORE, orig_type, data[:first_cap]], so its plaintext fills the cap
+    // exactly at 2 + (maxp - 2) == maxp. That leaves data_len - (maxp - 2) == 2 bytes for the
+    // continuation frame, whose plaintext is [FRAGMENT_END, those 2 bytes] == 3 bytes.
     EXPECT_EQ(conn.send_encrypted_text(std::string(maxp, 'A')), SsErr::OK);
-    EXPECT_EQ(conn.sent_binary_.size(), 2u);
+    ASSERT_EQ(conn.sent_binary_.size(), 2u);
+    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG)
+        << "first fragment must fill MAX_TRANSPORT_PLAINTEXT exactly";
+    EXPECT_EQ(conn.sent_binary_[1].size(), 3u + TAG)
+        << "continuation must carry exactly the bytes the first frame's cap left over";
+
+    conn.sent_binary_.clear();
+
+    // One byte further: the continuation grows by exactly one, confirming the leftover tracks
+    // data_len rather than the frame count staying coincidentally right.
+    EXPECT_EQ(conn.send_encrypted_text(std::string(maxp + 1, 'A')), SsErr::OK);
+    ASSERT_EQ(conn.sent_binary_.size(), 2u);
+    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG);
+    EXPECT_EQ(conn.sent_binary_[1].size(), 4u + TAG);
+}
+
+// The first and continuation frames have different caps: the first spends two plaintext bytes on
+// [FRAGMENT_MORE, orig_type] while continuations spend one on the fragment type alone. A two-frame
+// message never fills a continuation, so cont_cap is only observable once a third frame is needed.
+TEST(NoiseTransport, FragmentContinuationCapAtThreeFrames) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+
+    TestConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
+    constexpr size_t TAG = 16;
+    const size_t first_cap = maxp - 2;  // first frame: [FRAGMENT_MORE, orig_type, data...]
+    const size_t cont_cap = maxp - 1;   // continuation: [FRAGMENT_MORE|END, data...]
+
+    // json length == data_len, since plaintext is [0x00] + json. One byte past what two frames
+    // can carry, so the run is first_cap + cont_cap + 1 and the tail lands in a third frame.
+    const size_t json_len = first_cap + cont_cap + 1;
+    EXPECT_EQ(conn.send_encrypted_text(std::string(json_len, 'A')), SsErr::OK);
+
+    ASSERT_EQ(conn.sent_binary_.size(), 3u);
+    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG) << "first frame fills first_cap";
+    EXPECT_EQ(conn.sent_binary_[1].size(), maxp + TAG) << "middle frame fills cont_cap";
+    EXPECT_EQ(conn.sent_binary_[2].size(), 2u + TAG)
+        << "tail carries the single leftover byte plus its fragment type";
 }
 
 // =============================================================================
