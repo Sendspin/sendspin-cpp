@@ -307,6 +307,16 @@ void SendspinClientConnection::handle_disconnected() {
 
 void SendspinClientConnection::handle_data(const esp_websocket_event_data_t* data,
                                            int64_t receive_time) {
+    // connected_ is written only by handle_connected() and handle_disconnected(), both reached
+    // exclusively through this same websocket task's event handler, so this same-task read races
+    // with nothing. close_transport_now() reports the disconnect via handle_disconnected()
+    // without stopping the transport, so already-buffered frames keep arriving as further DATA
+    // events until the manager drops the connection off this task; drop them here instead of
+    // reprocessing a cap trip or re-firing the disconnect callback.
+    if (!this->connected_) {
+        return;
+    }
+
     if (data == nullptr) {
         return;
     }
