@@ -117,18 +117,6 @@ struct PairAbortEvent {
     PairAbortReason reason{};                  ///< Parsed abort reason
 };
 
-/// @brief Deferred local pairing abort: the persistence provider rejected the long-term
-/// record at server/pair-finalize (network thread), so the record was never stored
-/// (RecordStore::store_record fails closed) and the pairing must fail closed. Processed on
-/// the main loop: sends a best-effort pair/abort, drops the connection, and reports
-/// SendspinPairAbortReason::STORAGE_FAILED to the listener. server_id is captured at
-/// production time for the same reason schedule_pairing_succeeded() captures its server_id
-/// argument: the connection may already be torn down by the time this drains.
-struct PairStorageFailedEvent {
-    std::shared_ptr<SendspinConnection> conn;  ///< Connection whose pairing failed to persist
-    std::string server_id;                     ///< server_id captured when the event was posted
-};
-
 // ============================================================================
 // Management deferred events
 // ============================================================================
@@ -364,15 +352,6 @@ public:
     /// @param server_id The base64url public key of the newly paired server (moved).
     void schedule_pairing_succeeded(std::string server_id);
 
-    /// @brief Schedules a pairing storage-failure abort for deferred processing in loop().
-    ///
-    /// Called from SendspinClient::process_json_message() on the NETWORK thread when
-    /// RecordStore::store_record() reports that the persistence provider rejected the
-    /// long-term record at server/pair-finalize. Rides the same pending_*_events_ /
-    /// has_pending_events_ idiom as schedule_pairing_succeeded above.
-    /// @param event The storage-failed event to schedule (moved).
-    void schedule_pair_storage_failed(PairStorageFailedEvent event);
-
     /// @brief Schedules a static-PIN pairing-window confirmation for deferred processing in
     /// loop(). Thread-safe; called from SendspinClient::confirm_pairing_window().
     void schedule_pairing_window_confirm();
@@ -434,7 +413,6 @@ private:
         std::vector<ServerUnpairEvent> server_unpairs;
         std::vector<ServerPairingMessageEvent> pin_messages;
         std::vector<std::string> pairing_succeeded;
-        std::vector<PairStorageFailedEvent> pair_storage_failed;
         bool pairing_window_confirm{false};
 
         /// @brief True if any queue above has an entry, or pairing_window_confirm is set.
@@ -759,14 +737,6 @@ private:
     /// @param reason The abort reason.
     void handle_pair_abort(SendspinConnection* conn, PairAbortReason reason);
 
-    /// @brief Handles a pairing storage-failure event on the main loop.
-    /// The persistence provider rejected the long-term record at server/pair-finalize, so the
-    /// record was never stored (RecordStore::store_record fails closed) and the pairing cannot
-    /// survive a reboot. Sends a best-effort pair/abort, drops the connection, and reports
-    /// SendspinPairAbortReason::STORAGE_FAILED to the listener.
-    /// @param event The storage-failed event (conn + the server_id captured when it was posted).
-    void handle_pair_storage_failed(const PairStorageFailedEvent& event);
-
     /// @brief Fires on_clear_pairing_pin and/or on_open_pairing_window's counterpart for a
     /// pairing UI element that was left showing. Caller must hold conn_ptr_mutex_.
     /// @param pin_was_displayed Whether a dynamic-PIN value was on screen; if true, queues
@@ -796,9 +766,8 @@ private:
     /// @param goodbye_reason     Goodbye reason passed to drop_connection() when drop_action is
     ///        CLOSE_WITH_GOODBYE; read only then, so callers for the other actions omit it.
     /// @param server_id_override When set, passed to on_pairing_failed instead of
-    ///        conn->get_server_id(). Only handle_pair_storage_failed() needs this: it fires from
-    ///        an event captured at production time (see its own comment for why), not from the
-    ///        connection's current state.
+    ///        conn->get_server_id(), for callers whose server_id was captured before the
+    ///        connection's current state could change.
     void abort_pairing_attempt(
         SendspinConnection* conn, std::optional<PairAbortReason> wire_abort_reason,
         PairingDropAction drop_action, SendspinPairAbortReason public_reason,
@@ -910,9 +879,7 @@ private:
     std::vector<ServerUnpairEvent> pending_server_unpair_events_;
     std::vector<ServerPairingMessageEvent> pending_pin_pairing_events_;
     std::vector<std::string> pending_pairing_succeeded_events_;  // server_ids to notify
-    // Deferred storage-failure aborts (persist rejected the record at server/pair-finalize)
-    std::vector<PairStorageFailedEvent> pending_pair_storage_failed_events_;
-    bool pending_pairing_window_confirm_{false};  // Pairing-window gesture confirm
+    bool pending_pairing_window_confirm_{false};                 // Pairing-window gesture confirm
     // Standing pairing window: platform_time_us() deadline until which the window admits one
     // pairing attempt; 0 = closed. Opened by the operator gesture or
     // management/open-pairing-window, consumed when client/pair-init is sent. Main-loop-only.

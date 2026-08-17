@@ -401,7 +401,7 @@ bool ConnectionManager::DrainedEvents::any() const {
            !this->rehandshake.empty() || !this->pair_aborts.empty() ||
            !this->management_requests.empty() || !this->server_unpairs.empty() ||
            !this->pin_messages.empty() || !this->pairing_succeeded.empty() ||
-           !this->pair_storage_failed.empty() || this->pairing_window_confirm;
+           this->pairing_window_confirm;
 }
 
 void ConnectionManager::maybe_start_ws_server() {
@@ -436,7 +436,6 @@ ConnectionManager::DrainedEvents ConnectionManager::swap_out_pending_events() {
         ev.server_unpairs.swap(this->pending_server_unpair_events_);
         ev.pin_messages.swap(this->pending_pin_pairing_events_);
         ev.pairing_succeeded.swap(this->pending_pairing_succeeded_events_);
-        ev.pair_storage_failed.swap(this->pending_pair_storage_failed_events_);
         ev.pairing_window_confirm = std::exchange(this->pending_pairing_window_confirm_, false);
         this->has_pending_events_.store(false, std::memory_order_release);
     }
@@ -789,17 +788,6 @@ void ConnectionManager::drain_pairing_events(DrainedEvents& ev) {
         this->client_->note_pairing_succeeded(server_id);
     }
 
-    // ==== Pairing storage-failure deferred events ====
-    // Only ever targets the current connection, for the same reason as
-    // ev.pairing_succeeded above: pairing only exists on a connection that already
-    // won promotion. A connection that already left current_connection_ (e.g. raced by a
-    // disconnect event earlier in this same pass) still gets the listener notification
-    // (handle_pair_storage_failed() reports it unconditionally) but skips the redundant
-    // drop_connection()/pair-abort send.
-    for (const auto& event : ev.pair_storage_failed) {
-        this->handle_pair_storage_failed(event);
-    }
-
     // ==== Static-PIN pairing-window confirm deferred event ====
     if (ev.pairing_window_confirm) {
         this->handle_pairing_window_confirmed();
@@ -1131,13 +1119,6 @@ void ConnectionManager::schedule_pairing_succeeded(std::string server_id) {
     // server/pair-finalize ack handler stores a long-term record.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->queue_pending(this->pending_pairing_succeeded_events_, std::move(server_id));
-}
-
-void ConnectionManager::schedule_pair_storage_failed(PairStorageFailedEvent event) {
-    // Called from SendspinClient::process_json_message() on the network thread when
-    // RecordStore::store_record() reports that the persistence provider rejected the record.
-    std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending(this->pending_pair_storage_failed_events_, std::move(event));
 }
 
 void ConnectionManager::schedule_pairing_window_confirm() {
@@ -1863,45 +1844,6 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
         to_public_abort_reason(reason), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
 }
 
-void ConnectionManager::handle_pair_storage_failed(const PairStorageFailedEvent& event) {
-    // Runs on the main loop (caller holds conn_ptr_mutex_). The persistence provider rejected
-    // the long-term record when server/pair-finalize was acked on the network thread
-    // (RecordStore::store_record fails closed, see SendspinClient::process_json_message), so the
-    // record was never stored and this pairing cannot survive a reboot. The server has already
-    // persisted its side (server/pair-finalize acks its own store), so it is left holding a
-    // record this client never had; aborting loudly here makes that visible immediately rather
-    // than at the next reconnect. Note: the server's follow-up re-handshake msg1 may race this
-    // event and fail on the unresolvable psk_id first. Both paths drop the connection, and the
-    // listener notification below does not depend on the connection still being managed.
-    if (event.conn && event.conn.get() == this->current_connection_.get()) {
-        SS_LOGE(TAG, "Pairing record persist failed for server_id=%s; aborting pairing",
-                event.server_id.c_str());
-        // Best-effort pair/abort. The wire enum has no storage-failure value (candidate spec
-        // addition); user_cancelled is the closest fit: the application cancelled the exchange.
-        // Per spec "pair/abort", a pair/abort sender only closes the connection for reason
-        // concurrent_attempt, but this is not an ordinary protocol-level pairing abort: the
-        // server has already persisted its side (it acked server/pair-finalize) and is about to
-        // re-handshake to a PSK this client never stored, which is guaranteed to fail anyway. We
-        // close proactively here (an independent local decision, not the wire pair/abort
-        // semantics) so the client gets a clean reconnect instead of a doomed re-handshake.
-        //
-        // server_id_override=event.server_id (not conn->get_server_id()): matches the
-        // production-time server_id used below on the no-match path, so the listener sees the
-        // same value regardless of which branch handled the event.
-        this->abort_pairing_attempt(event.conn.get(), PairAbortReason::USER_CANCELLED,
-                                    PairingDropAction::CLOSE_WITH_GOODBYE,
-                                    SendspinPairAbortReason::STORAGE_FAILED,
-                                    SendspinGoodbyeReason::UNAUTHORIZED, event.server_id);
-        return;
-    }
-
-    // conn is no longer managed (e.g. already dropped by a race with the re-handshake failure
-    // path noted above): nothing to clean up on it, but the listener still needs to hear about
-    // the failure. Uses the production-time server_id, since there is no connection to read it
-    // from here.
-    this->client_->note_pairing_failed(event.server_id, SendspinPairAbortReason::STORAGE_FAILED);
-}
-
 /// @brief Fires on_clear_pairing_pin and/or on_open_pairing_window's counterpart for a pairing UI
 /// element that was left showing. Caller must hold conn_ptr_mutex_.
 void ConnectionManager::dismiss_pairing_ui(bool pin_was_displayed, bool window_was_shown) {
@@ -1924,7 +1866,7 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
     // Capture the deferred-notification inputs BEFORE clear_pairing_state() resets the PIN
     // session and before the connection is possibly released (server_id is copied so it survives
     // any tear-down). server_id_override lets a caller substitute a value captured earlier
-    // (see handle_pair_storage_failed()) instead of reading the connection's current state.
+    // instead of reading the connection's current state.
     const std::string server_id =
         server_id_override.has_value() ? server_id_override.value() : conn->get_server_id();
     // Snapshot before clear_pairing_state()/drop_connection() clear it (see PairingUiSnapshot).
@@ -2144,9 +2086,8 @@ void ConnectionManager::handle_pin_pairing_message(SendspinConnection* conn,
             // drop_connection() with goodbye=std::nullopt closes the transport without sending a
             // client/goodbye (or any other application-level message).
             // SendspinPairAbortReason has no dedicated "protocol error" value and none of the
-            // wire-facing reasons fit (no pair/abort was received or sent); UNKNOWN is reused
-            // here as the closest available local-only fit, mirroring how STORAGE_FAILED is
-            // reused for the other client-local abort (see handle_pair_storage_failed()).
+            // wire-facing reasons fit (no pair/abort was received or sent); UNKNOWN is the
+            // closest available local-only fit.
             this->abort_pairing_attempt(conn, /*wire_abort_reason=*/std::nullopt,
                                         PairingDropAction::CLOSE_SILENTLY,
                                         SendspinPairAbortReason::UNKNOWN);
@@ -2328,10 +2269,9 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     // pin_displayed / window_shown above). Reset both flags immediately after: they are
     // the sole record of "does a prompt still need dismissing", and clear_pairing_state()
     // does NOT run on this success path (only on abort), so anything that inspects them
-    // later (e.g. handle_pair_storage_failed()/abort_pairing_attempt() if server/pair-
-    // finalize is acked but persistence then fails) must see that the UI was already
-    // dismissed here, not fire on_clear_pairing_pin/on_close_pairing_window a second time
-    // for the same attempt.
+    // later (e.g. abort_pairing_attempt()) must see that the UI was already dismissed here,
+    // not fire on_clear_pairing_pin/on_close_pairing_window a second time for the same
+    // attempt.
     this->dismiss_pairing_ui(ps.pin_displayed, ps.window_shown);
     ps.pin_displayed = false;
     ps.window_shown = false;

@@ -200,9 +200,12 @@ public:
     /// on it for removals).
     ///
     /// Specifically: a rejected write to `persistence_keys::RECORDS` during pairing fails the
-    /// exchange closed: the client reports `SendspinPairAbortReason::STORAGE_FAILED` via
-    /// `on_pairing_failed` and drops the connection rather than complete a pairing that could
-    /// not survive a reboot. And a revoked/removed record is always dropped from RAM regardless
+    /// exchange closed: the record is not retained, `on_pairing_succeeded` does not fire, and
+    /// the pairing does not complete. The connection then drops on its own, because the server
+    /// rekeys onto a PSK this client never stored and that re-handshake cannot resolve.
+    /// A provider that cannot report durability synchronously (one that queues the write) should
+    /// return true and surface its own write failures; the library's guarantee is only as strong
+    /// as this return value. And a revoked/removed record is always dropped from RAM regardless
     /// of this return value, so a `false` here does not undo that: it means the store still
     /// holds the old array and will hand the revoked record back at the next boot, silently
     /// making the revoked PSK valid again. The library logs a warning saying exactly that, so

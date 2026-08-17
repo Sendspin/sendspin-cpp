@@ -548,11 +548,11 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 }
 
 // Fail-closed persistence: when the persistence provider rejects the pair-finalize record (e.g.
-// storage exhausted, write error), the client must NOT report pairing success, must instead
-// report on_pairing_failed with the client-local SendspinPairAbortReason::STORAGE_FAILED reason,
-// and must close the connection (schedule_pair_storage_failed -> handle_pair_storage_failed).
-// In client.cpp's SERVER_PAIR_FINALIZE handler, RecordStore::store_record()'s return value gates
-// on_pairing_succeeded, and a rejection drives an explicit local abort.
+// storage exhausted, write error), the client must NOT report pairing success. The record is
+// never stored (RecordStore::store_record fails closed), so nothing further is needed to unwind
+// the connection: the server rekeys onto that PSK regardless (it already acked pair-finalize),
+// and the client cannot resolve the psk_id, so the re-handshake drops the connection. This test
+// drives that rekey explicitly, since the fake server only re-handshakes on request.
 TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
@@ -594,24 +594,24 @@ TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
         client, [&] { return server.learned_psk_id().has_value(); }, 4000))
         << "client/pair-finalize was never observed";
 
-    // The rejection must drive an explicit local abort (schedule_pair_storage_failed ->
-    // handle_pair_storage_failed), not just a silent no-op left to the watchdog.
-    ASSERT_TRUE(pump_until(
-        client, [&] { return listener.pairing_failed_server_id().has_value(); }, 4000))
-        << "on_pairing_failed was never fired after the persistence provider rejected the record";
+    pump_for(client, 200);
 
     EXPECT_FALSE(persistence.captured_record().has_value())
         << "A rejected record must not be captured (provider returned false)";
     EXPECT_FALSE(listener.pairing_succeeded_server_id().has_value())
         << "on_pairing_succeeded must not fire when the persistence provider rejects the record";
-    EXPECT_EQ(listener.pairing_failed_server_id().value(), server_identity.peer_id());
-    ASSERT_TRUE(listener.pairing_failed_reason().has_value());
-    EXPECT_EQ(listener.pairing_failed_reason().value(), SendspinPairAbortReason::STORAGE_FAILED);
 
-    // The connection must be closed rather than left dangling for the 30 s watchdog.
+    // Rekey onto the PSK the client was handed but never stored, exactly like the real server
+    // does immediately after acking pair-finalize. The client cannot resolve the psk_id, so the
+    // re-handshake fails and the connection is dropped without any special storage-failure path.
+    auto learned_psk = server.learned_psk();
+    auto learned_psk_id = server.learned_psk_id();
+    ASSERT_TRUE(learned_psk.has_value() && learned_psk_id.has_value());
+    ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
+
     EXPECT_TRUE(pump_until(
         client, [&] { return !client.is_connected(); }, 4000))
-        << "Connection must be dropped after a storage-failure abort";
+        << "Connection must drop when the server rekeys onto a PSK the client never stored";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

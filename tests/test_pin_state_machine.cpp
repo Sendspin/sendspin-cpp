@@ -555,13 +555,6 @@ protected:
         this->client_->connection_manager_->schedule_pair_abort(std::move(event));
     }
 
-    /// Schedule a pairing storage-failure event for deferred processing, without pumping
-    /// loop(). Mirrors what SendspinClient::process_json_message() does on the network thread
-    /// when RecordStore::store_record() rejects the long-term record at server/pair-finalize.
-    void schedule_storage_failed(PairStorageFailedEvent event) {
-        this->client_->connection_manager_->schedule_pair_storage_failed(std::move(event));
-    }
-
     /// Schedule a management/* request event for deferred processing, without pumping loop().
     void schedule_management(ManagementRequestEvent event) {
         this->client_->connection_manager_->schedule_management_request(std::move(event));
@@ -802,12 +795,11 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
 }
 
 // A PIN attempt that reaches PAIR_CONFIRM success already dismisses the displayed PIN there (see
-// the PAIR_CONFIRM handler in connection_manager.cpp). If the server then acks
-// server/pair-finalize but the persistence provider rejects the record, handle_pair_storage_
-// failed() ends the same attempt a second time via abort_pairing_attempt(); on_clear_pairing_pin
-// must NOT fire again for the PIN this attempt already stopped showing.
-TEST_F(PinStateMachineTest, StorageFailureAfterConfirmDoesNotReclearAlreadyDismissedPin) {
-    FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-storage-fail");
+// the PAIR_CONFIRM handler in connection_manager.cpp). If a pair/abort then ends the same attempt
+// a second time via abort_pairing_attempt(), on_clear_pairing_pin must NOT fire again for the PIN
+// this attempt already stopped showing.
+TEST_F(PinStateMachineTest, AbortAfterConfirmDoesNotReclearAlreadyDismissedPin) {
+    FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-abort-after-confirm");
 
     PinDisplayResult display;
     ASSERT_NO_FATAL_FAILURE(this->drive_to_pin_displayed(conn, /*nonce_a_seed=*/1, display));
@@ -826,21 +818,20 @@ TEST_F(PinStateMachineTest, StorageFailureAfterConfirmDoesNotReclearAlreadyDismi
     ASSERT_EQ(this->listener_.count(PairingEventKind::CLEAR_PIN), 1);
     ASSERT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 
-    // The persistence provider now rejects the record at server/pair-finalize ack (network
-    // thread, in production); simulate the resulting deferred event directly.
-    PairStorageFailedEvent storage_failed_event;
-    storage_failed_event.conn = this->current_connection_sp();
-    storage_failed_event.server_id = "server-dyn-storage-fail";
-    this->schedule_storage_failed(std::move(storage_failed_event));
+    // The server now aborts the exchange after the PIN was already dismissed (it can do this
+    // any time before the attempt concludes, e.g. the operator cancelled on its side).
+    PairAbortEvent abort_event;
+    abort_event.conn = this->current_connection_sp();
+    abort_event.reason = PairAbortReason::USER_CANCELLED;
+    this->schedule_abort(std::move(abort_event));
     this->client_->loop();
 
-    // The attempt now fails and the connection is dropped, but on_clear_pairing_pin must NOT
-    // fire a second time: pin_displayed was already reset to false at PAIR_CONFIRM.
+    // The attempt now fails, but on_clear_pairing_pin must NOT fire a second time:
+    // pin_displayed was already reset to false at PAIR_CONFIRM.
     EXPECT_EQ(this->listener_.count(PairingEventKind::CLEAR_PIN), 1)
         << "on_clear_pairing_pin must not fire twice for one pairing attempt";
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
-    EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::STORAGE_FAILED);
-    EXPECT_EQ(this->listener_.last_failed_server_id(), "server-dyn-storage-fail");
+    EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
 }
 
 // =============================================================================

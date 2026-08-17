@@ -16,7 +16,7 @@
 /// @brief Shared in-memory SendspinPersistenceProvider fake for tests.
 ///
 /// A std::map<key, blob> plus fail-injection switches for save_blob()/erase_blob(), since
-/// several tests exercise persist-failure paths (pairing STORAGE_FAILED aborts,
+/// several tests exercise persist-failure paths (a rejected pairing record,
 /// revocation-durability warnings). Prefer this over a bespoke per-file provider when a test
 /// only needs a generic blob store with optional failure injection; keep a bespoke fake when a
 /// test needs to observe or shape a specific call in a way this one does not (e.g. distinguishing

@@ -491,9 +491,8 @@ produces -- it is not something a provider hand-rolls its own version of.
 
 - `save_blob()` returning `true` means DURABLY stored. This matters most for
   `persistence_keys::RECORDS`: the library gates pairing completion on it (a `false` return
-  during pairing fails the exchange closed -- the client reports
-  `SendspinPairAbortReason::STORAGE_FAILED` via `on_pairing_failed` and drops the connection
-  rather than complete a pairing that could not survive a reboot) and gates revocation
+  during pairing fails the exchange closed -- the record is not retained and
+  `on_pairing_succeeded` does not fire, so the pairing does not complete) and gates revocation
   durability on it for removals (a revoked record is always dropped from RAM regardless of the
   return value, but a `false` return means the store still holds the old array and will hand
   the revoked record back at the next boot, silently making the revoked PSK valid again -- the
@@ -592,8 +591,7 @@ struct MyClientListener : SendspinClientListener {
 
     // Called when a pairing exchange is aborted. Most server-sent abort reasons leave the
     // connection open so the server can retry or resume normal operation; CONCURRENT_ATTEMPT
-    // and the client-local aborts (STORAGE_FAILED, and protocol errors reported as UNKNOWN)
-    // close it.
+    // and protocol errors (reported as UNKNOWN) close it.
     void on_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason) override {
         printf("Pairing failed with server %s\n", server_id.c_str());
     }
@@ -711,14 +709,18 @@ observes pairing via `SendspinClientListener` callbacks:
 2. `on_pairing_succeeded(server_id)` -- the record is stored; the server will
    re-handshake immediately on the new long-term PSK.
 3. `on_pairing_failed(server_id, reason)` -- the exchange failed. See
-   `SendspinPairAbortReason` below for the possible reasons, including the client-local
-   `STORAGE_FAILED` case (the persistence provider rejected the record).
+   `SendspinPairAbortReason` below for the possible reasons.
 
    Whether the connection survives depends on the reason. Most reasons the server sends in a
    `pair/abort` leave it open, so the server can re-activate pairing or resume normal operation
-   on it. `CONCURRENT_ATTEMPT` closes it, as do the client-local aborts: `STORAGE_FAILED`, and
-   protocol errors (a malformed pairing frame or a bad CPace share), which are reported as
-   `UNKNOWN` and close the transport without sending a `client/goodbye`.
+   on it. `CONCURRENT_ATTEMPT` closes it, as do protocol errors (a malformed pairing frame or a
+   bad CPace share), which are reported as `UNKNOWN` and close the transport without sending a
+   `client/goodbye`.
+
+   A persistence provider that rejects the long-term record is NOT reported through this
+   callback: neither `on_pairing_succeeded` nor `on_pairing_failed` fires, the record is not
+   retained, and the connection drops when the server rekeys onto the PSK the client never
+   stored. Surface that failure from the provider itself.
 
    Either way, do not treat this callback as a disconnect notification; poll `is_connected()`
    if the application needs to track that.
@@ -1257,7 +1259,6 @@ successful in-band re-handshake. See [Trust Levels](#trust-levels) and
 | `PIN_LENGTH_UNACCEPTABLE` | The PIN length requirement is out of the accepted range |
 | `PIN_MISMATCH` | The PIN entered does not match |
 | `USER_CANCELLED` | The pairing was cancelled by the user (on the server side) |
-| `STORAGE_FAILED` | This device could not persist the pairing record (client-local; the wire carries `user_cancelled`) |
 | `UNKNOWN` | Unrecognized abort reason from the server |
 
 Delivered via `SendspinClientListener::on_pairing_failed`.
