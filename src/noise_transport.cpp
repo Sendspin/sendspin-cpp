@@ -49,16 +49,6 @@ std::optional<std::array<uint8_t, 32>> NoiseTransport::handshake_hash() const {
 // Outbound (encrypt + send)
 // ============================================================================
 
-SsErr NoiseTransport::encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity,
-                                             size_t plaintext_len) {
-    // Hold the session mutex across the null-check, encrypt, and frame-sink send. This
-    // excludes a concurrent re-handshake session swap (network thread) from racing a
-    // main-loop encrypt. The critical section is intentionally small: frame construction
-    // happens outside the lock.
-    std::lock_guard<std::mutex> lock(this->session_mutex_);
-    return this->encrypt_and_send_frame_locked(buf, buf_capacity, plaintext_len);
-}
-
 SsErr NoiseTransport::encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity,
                                                     size_t plaintext_len) {
     if (!this->session_) {
@@ -84,7 +74,7 @@ SsErr NoiseTransport::encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_cap
     return this->frame_sink_(buf, ct_len);
 }
 
-SsErr NoiseTransport::fragment_and_send(const uint8_t* plaintext, size_t plaintext_len) {
+SsErr NoiseTransport::fragment_and_send_locked(const uint8_t* plaintext, size_t plaintext_len) {
     // Matches wire.py _fragment() exactly.
     // plaintext[0] = orig_type; plaintext[1..] = data.
     const uint8_t orig_type = plaintext[0];
@@ -109,7 +99,8 @@ SsErr NoiseTransport::fragment_and_send(const uint8_t* plaintext, size_t plainte
     std::memcpy(frame_buf.data() + 2, data, first_chunk);
     size_t first_frame_len = 2 + first_chunk;
 
-    SsErr err = this->encrypt_and_send_frame(frame_buf.data(), frame_buf.size(), first_frame_len);
+    SsErr err =
+        this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), first_frame_len);
     if (err != SsErr::OK) {
         return err;
     }
@@ -124,7 +115,8 @@ SsErr NoiseTransport::fragment_and_send(const uint8_t* plaintext, size_t plainte
         std::memcpy(frame_buf.data() + 1, data + offset, chunk);
         size_t cont_frame_len = 1 + chunk;
 
-        err = this->encrypt_and_send_frame(frame_buf.data(), frame_buf.size(), cont_frame_len);
+        err =
+            this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), cont_frame_len);
         if (err != SsErr::OK) {
             return err;
         }
@@ -168,13 +160,13 @@ SsErr NoiseTransport::send_json(const char* json, size_t len) {
 
     // Need fragmentation. Rare (large messages only) and unbounded in size (up to
     // MAX_REASSEMBLED_MESSAGE_BYTES), so it is not a candidate for the fixed-size reused
-    // send_buf_: fragment_and_send releases session_mutex_ between frames (each frame is its
-    // own encrypt_and_send_frame() call), so a buffer read across that whole loop cannot be a
-    // shared member without holding the lock for the entire multi-frame send.
+    // send_buf_; fragment_and_send_locked() allocates its own frame buffer instead. The
+    // plaintext is staged before taking the lock so only the encrypt+send loop is serialized.
     std::vector<uint8_t> plaintext(plaintext_len);
     plaintext[0] = MSG_TYPE_JSON_BODY;
     std::memcpy(plaintext.data() + 1, json, len);
-    return this->fragment_and_send(plaintext.data(), plaintext_len);
+    std::lock_guard<std::mutex> lock(this->session_mutex_);
+    return this->fragment_and_send_locked(plaintext.data(), plaintext_len);
 }
 
 SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
@@ -190,7 +182,8 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
         return this->fill_and_encrypt_locked(nullptr, 0, data, len);
     }
 
-    return this->fragment_and_send(data, len);
+    std::lock_guard<std::mutex> lock(this->session_mutex_);
+    return this->fragment_and_send_locked(data, len);
 }
 
 SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,

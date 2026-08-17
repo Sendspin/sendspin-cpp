@@ -54,8 +54,10 @@ extern "C" {
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -145,6 +147,13 @@ public:
         return this->noise_transport_.send_binary(data, len);
     }
 
+    /// Direct access to NoiseTransport::accept_plaintext() for feeding already-decrypted frames
+    /// through the reassembly state machine, independent of decrypt_in_place. Lets a test judge
+    /// an emitted frame sequence the way a peer would without standing up a second live session.
+    NoiseTransport::CompleteMessage test_accept_plaintext(uint8_t* pt, size_t len) {
+        return this->noise_transport_.accept_plaintext(pt, len);
+    }
+
     // --- Direct access to the receive-buffer cap, bypassing WS/dispatch ---
 
     uint8_t* test_prepare_receive_buffer(size_t data_len) {
@@ -164,6 +173,24 @@ public:
     // close_silently(), which calls this instead of disconnect() so it never blocks/joins the
     // network thread it runs on).
     int close_transport_now_calls_{0};
+};
+
+/// TestConnection whose send_binary_message() capture is serialized by its own mutex, so
+/// concurrent test threads can push into sent_binary_ without racing the vector itself. This
+/// mutex guards only the capture; it deliberately does not serialize the encrypt, which is
+/// NoiseTransport::session_mutex_'s job and is what ConcurrentSendsDoNotInterleaveFragments
+/// exercises. Frames land in sent_binary_ in the order they reached the sink, which is the
+/// order they would reach the wire.
+class ConcurrentCaptureConnection : public TestConnection {
+public:
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
+                              bool allow_before_hello) override {
+        std::lock_guard<std::mutex> lock(this->capture_mutex_);
+        return TestConnection::send_binary_message(data, len, cb, allow_before_hello);
+    }
+
+private:
+    std::mutex capture_mutex_;
 };
 
 // =============================================================================
@@ -1336,4 +1363,81 @@ TEST(NoiseHandshakeDriver, MalformedMsg1GarbageAborts) {
     std::vector<uint8_t> garbage(64, 0xAB);
     EXPECT_EQ(nh.on_text_frame(make_noise_handshake_envelope(garbage), send_fn),
               HandshakeFrameResult::ABORT);
+}
+
+// =============================================================================
+// Concurrent sends
+// =============================================================================
+
+// The fragments of one logical message must reach the wire consecutively. A peer that sees a
+// non-fragment frame while a fragmented message is in flight treats it as a spec
+// "Malformed sequences" protocol error and closes the connection (accept_plaintext() sets
+// malformed, and connection.cpp turns that into close_silently()).
+//
+// Sends come from more than one thread in production: on ESP the periodic client/time message
+// is built and encrypted on the httpd worker task (async_send_time_text in
+// esp/server_connection.cpp), while management and pairing sends encrypt on the main loop.
+// fragment_and_send_locked() therefore has to hold session_mutex_ across every frame, not
+// re-acquire it per frame; otherwise a small concurrent send lands a complete frame in the gap.
+//
+// This test races a fragmenting send against a stream of small sends on one transport, then
+// replays the captured frames, in emission order, through an independent reassembly state
+// machine and requires it to find no protocol violation. It detects a regression
+// probabilistically (the interleave needs the two threads to collide in the gap), so it runs
+// several rounds; it never fails spuriously, because correct locking cannot produce a malformed
+// sequence at all.
+TEST(NoiseTransport, ConcurrentSendsDoNotInterleaveFragments) {
+    constexpr int ROUNDS = 4;
+    // Fragments into roughly 14 frames at MAX_TRANSPORT_PLAINTEXT, giving many gaps to hit.
+    constexpr size_t LARGE_JSON_BYTES = 900000;
+    // Overlap margin so the small sender is still running as the large send starts.
+    constexpr int MIN_SMALL_SENDS = 50;
+
+    for (int round = 0; round < ROUNDS; ++round) {
+        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+        ASSERT_TRUE(r.has_value());
+
+        ConcurrentCaptureConnection conn;
+        conn.set_noise_session(std::move(r->responder_session));
+
+        std::string large_json(LARGE_JSON_BYTES, 'A');
+        std::atomic<bool> stop{false};
+
+        std::thread big_sender([&]() {
+            EXPECT_EQ(conn.send_encrypted_text(large_json), SsErr::OK);
+            stop.store(true, std::memory_order_release);
+        });
+
+        std::thread small_sender([&]() {
+            int i = 0;
+            while (!stop.load(std::memory_order_acquire) || i < MIN_SMALL_SENDS) {
+                conn.send_encrypted_text("{\"i\":" + std::to_string(i) + "}");
+                ++i;
+            }
+        });
+
+        big_sender.join();
+        small_sender.join();
+
+        ASSERT_GE(conn.sent_binary_.size(), 2u);
+
+        // Decrypt in emission order with the peer's matching cipher. conn encrypted with the
+        // responder session, so the initiator's recv cipher is its counterpart; the std::move
+        // of responder_session above leaves r->initiator untouched.
+        TestConnection receiver;
+        size_t frame_index = 0;
+        for (auto& frame : conn.sent_binary_) {
+            std::vector<uint8_t> pt = raw_decrypt(r->initiator.recv_cs, frame);
+            ASSERT_FALSE(pt.empty()) << "round " << round << " frame " << frame_index
+                                     << " failed to decrypt";
+            NoiseTransport::CompleteMessage msg =
+                receiver.test_accept_plaintext(pt.data(), pt.size());
+            ASSERT_FALSE(msg.malformed)
+                << "round " << round << ": frame " << frame_index << " of "
+                << conn.sent_binary_.size()
+                << " broke the fragment sequence, so a concurrent send interleaved with a "
+                   "fragmented one";
+            ++frame_index;
+        }
+    }
 }

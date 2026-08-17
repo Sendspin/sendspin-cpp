@@ -152,18 +152,23 @@ public:
     }
 
 private:
-    /// @brief Encrypt one frame and emit it via the frame sink. Acquires session_mutex_.
+    /// @brief Encrypt one frame and emit it via the frame sink. Caller must hold session_mutex_,
+    /// which excludes a concurrent re-handshake session swap from racing the encrypt.
     /// @param buf           Frame buffer holding the plaintext; encrypted in-place.
     /// @param buf_capacity  Total capacity of buf; must be >= plaintext_len + 16 (AEAD tag).
     /// @param plaintext_len Plaintext byte count at the start of buf.
-    SsErr encrypt_and_send_frame(uint8_t* buf, size_t buf_capacity, size_t plaintext_len);
-
-    /// @brief Same as encrypt_and_send_frame, but the caller already holds session_mutex_.
     SsErr encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity, size_t plaintext_len);
 
     /// @brief Fragment a plaintext > MAX_TRANSPORT_PLAINTEXT into multiple frames and
     /// encrypt+send each one. Matches wire.py `_fragment` exactly.
-    SsErr fragment_and_send(const uint8_t* plaintext, size_t plaintext_len);
+    ///
+    /// Caller must hold session_mutex_ for the WHOLE call, and it stays held across every
+    /// frame. The fragments of one logical message must reach the wire consecutively: a peer
+    /// that sees a non-fragment frame between them treats it as a spec "Malformed sequences"
+    /// protocol error and closes the connection (see accept_plaintext()). Releasing the lock
+    /// between frames would let a concurrent send_json()/send_binary() on another thread
+    /// interleave exactly such a frame.
+    SsErr fragment_and_send_locked(const uint8_t* plaintext, size_t plaintext_len);
 
     /// @brief Fills send_buf_ with an optional prefix followed by data, then encrypts and
     /// sends it. Caller must hold session_mutex_ for the whole call: this fills send_buf_ and
