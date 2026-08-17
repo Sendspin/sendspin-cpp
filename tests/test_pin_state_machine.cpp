@@ -1939,6 +1939,46 @@ TEST_F(PinStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingHumanPin
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 }
 
+// The finalize-ack window above also has to defuse scan_pin_attempt_timeout(): pin_session_ is
+// only reset by clear_pairing_state(), which runs once the post-rekey server/activate lands, not
+// by note_pairing_finalize_ack() itself. So pin_session_.step and its attempt_deadline_us are
+// still exactly what PAIR_CONFIRM left them while the rekey is in flight, and a slow rekey can
+// let that deadline elapse for an exchange that already succeeded.
+TEST_F(PinStateMachineTest, PinAttemptTimeoutScanSuppressedDuringFinalizeAckWindow) {
+    FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-finalize-window");
+
+    PinDisplayResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_pin_displayed(conn, /*nonce_a_seed=*/3, display));
+
+    ServerStandIn server;
+    ASSERT_TRUE(server.start(display.pin, display.handshake_hash));
+
+    std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
+    ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
+
+    this->schedule_pair_confirm(server_kc);
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
+    ASSERT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_SERVER_PAIR_FINALIZE);
+
+    // Simulate: the server acked client/pair-finalize (the SERVER_PAIR_FINALIZE handler in
+    // client.cpp calls this on success) and is now expected to rekey via an in-band
+    // re-handshake. pin_session_ is untouched by this call.
+    conn->note_pairing_finalize_ack();
+    ASSERT_TRUE(conn->is_pairing_finalized());
+    ASSERT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_SERVER_PAIR_FINALIZE);
+
+    // The rekey takes long enough that the original attempt deadline elapses.
+    conn->pin_session().attempt_deadline_us = platform_time_us() - 1;
+    this->client_->loop();
+
+    EXPECT_EQ(this->current_connection(), conn)
+        << "a pairing that already finalized must not be dropped by the PIN attempt-timeout scan";
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED))
+        << "the attempt-timeout scan must not abort a pairing that already finalized";
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_SERVER_PAIR_FINALIZE)
+        << "the PIN session must survive untouched until the post-rekey activate clears it";
+}
+
 // The admitted flag must be cleared when the admitted connection is dropped.
 //
 // SendspinConnection::is_admitted() is what the network-thread dispatch gate reads to decide

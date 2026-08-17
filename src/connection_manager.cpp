@@ -950,6 +950,13 @@ void ConnectionManager::scan_pin_attempt_timeout() {
     // promote_or_arbitrate_nursery_entry()).
     std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
     if (this->current_connection_ != nullptr) {
+        // Between the server's pair-finalize ack and the post-rekey activate that reaches
+        // clear_pairing_state(), pin_session_ still reports its last pre-ack step (non-IDLE) and
+        // attempt_deadline_us keeps counting down against an exchange that has already succeeded.
+        // Skip the scan for that window so a slow rekey cannot abort a completed pairing.
+        if (this->current_connection_->is_pairing_finalized()) {
+            return;
+        }
         const auto& ps = this->current_connection_->pin_session();
         const int64_t now_us = platform_time_us();
         const bool pin_attempt_expired = ps.step != SendspinConnection::PinStep::IDLE &&
