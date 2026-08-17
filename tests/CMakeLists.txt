@@ -74,6 +74,13 @@ target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
 set_source_files_properties(test_pin_state_machine.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
+# test_cpace.cpp needs the same treatment for one reason: pinning CPace::derive()/tag()/isk()
+# against the reference vectors requires a known scalar, and start() always samples a fresh one
+# from the CSPRNG. The fixed-scalar KAT overwrites the private scalar_/public_share_ instead of
+# production growing a test-only injection hook. See force_fixed_scalar() in that file.
+set_source_files_properties(test_cpace.cpp PROPERTIES
+    COMPILE_OPTIONS "-fno-access-control")
+
 # Match the library's sanitizer configuration so the test binary is instrumented too.
 if(ENABLE_SANITIZERS)
     target_compile_options(sendspin_tests PRIVATE

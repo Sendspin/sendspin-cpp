@@ -381,28 +381,119 @@ struct FixedExchange {
     }
 };
 
+// The reference values below are shared by FixedScalarIsKnownAnswers (which recomputes the chain
+// from the primitives) and FixedScalarDrivesProductionDeriveAndTag (which drives CPace itself).
+// Re-derived independently of this implementation from the spec's construction, using hashlib
+// plus a from-scratch RFC 7748 Montgomery ladder.
+namespace {
+
+constexpr const char* KAT_YA =
+    "57551a92c995ea9b792f4e89a18c34459491c1484deddbb1498c29b499286c0f";
+constexpr const char* KAT_YB =
+    "a057a00be47920856f4ae0574971590e9fb0b5d97b89dba12237957dd8ec577f";
+constexpr const char* KAT_ISK =
+    "fab2965a5e084943c7d286b66a998daf6af5e370040aec16f544f3e8dbc9ba0f"
+    "87149a1a88bc73f0f5c3f9a8fa2cfc78ee88a53941614c69b68c827665f53d3b";
+constexpr const char* KAT_MAC_KEY =
+    "a1fd9e5cc9cbf898a9ebcd2d69b7fb9ed84c3524de3b6047c5dc06fb8cc81aae"
+    "0d0db10ae8d6d231fd2cae0783a60175a875f7cf294a2460278fce192742c8d1";
+constexpr const char* KAT_TA =
+    "fe47abf1649b3f91ce6e3b38870ac3947a209a1dc1dab2c88db77791e9432426"
+    "111e9555562a6f7a41a14079de95617f1396d82c8066f19c8aa486e7f70b8ef0";
+constexpr const char* KAT_TB =
+    "806b304d1cc3f232ed45afd6d2dc7e08ffd69aeb57ca3c78de75c5d280024a6c"
+    "263ec2c6da7414899a91d085b826d63ca320bf50f7b49d985a3db00c8c891e45";
+
+}  // namespace
+
 TEST(CPaceRoundTrip, FixedScalarIsKnownAnswers) {
     FixedExchange fx;
     ASSERT_TRUE(fx.run());
 
     // Ya, Yb (public shares)
-    EXPECT_EQ(to_hex(fx.Ya), "57551a92c995ea9b792f4e89a18c34459491c1484deddbb1498c29b499286c0f");
-    EXPECT_EQ(to_hex(fx.Yb), "a057a00be47920856f4ae0574971590e9fb0b5d97b89dba12237957dd8ec577f");
+    EXPECT_EQ(to_hex(fx.Ya), KAT_YA);
+    EXPECT_EQ(to_hex(fx.Yb), KAT_YB);
+    EXPECT_EQ(to_hex(fx.mac_key), KAT_MAC_KEY);
+    EXPECT_EQ(to_hex(fx.Ta), KAT_TA);
+    EXPECT_EQ(to_hex(fx.Tb), KAT_TB);
+}
 
-    // mac_key
-    EXPECT_EQ(to_hex(fx.mac_key),
-        "a1fd9e5cc9cbf898a9ebcd2d69b7fb9ed84c3524de3b6047c5dc06fb8cc81aa"
-        "e0d0db10ae8d6d231fd2cae0783a60175a875f7cf294a2460278fce192742c8d1");
+// -----------------------------------------------------------------------------
+// The same vectors, but driven through CPace itself.
+//
+// FixedScalarIsKnownAnswers above recomputes the ISK/mac_key/tag chain from the primitives, so it
+// pins the construction but not CPace::derive()/tag(). Every other CPace test here runs our
+// responder against our initiator, which agrees with itself under any consistent change. Between
+// them, a wire-visible edit to derive()'s hash inputs would pass the whole file. This test closes
+// that: it drives the real derive()/isk()/tag() and compares against the reference vectors, so a
+// change that would desync us from a peer running the reference implementation fails here.
+//
+// start() always samples a fresh scalar from the CSPRNG, so reaching a known answer means
+// overwriting the private scalar_/public_share_ (see the -fno-access-control note in
+// tests/CMakeLists.txt) rather than adding an injection hook to production.
+// -----------------------------------------------------------------------------
 
-    // Ta
-    EXPECT_EQ(to_hex(fx.Ta),
-        "fe47abf1649b3f91ce6e3b38870ac3947a209a1dc1dab2c88db77791e9432426"
-        "111e9555562a6f7a41a14079de95617f1396d82c8066f19c8aa486e7f70b8ef0");
+namespace {
 
-    // Tb
-    EXPECT_EQ(to_hex(fx.Tb),
-        "806b304d1cc3f232ed45afd6d2dc7e08ffd69aeb57ca3c78de75c5d280024a6c"
-        "263ec2c6da7414899a91d085b826d63ca320bf50f7b49d985a3db00c8c891e45");
+/// Replace a started CPace's sampled scalar with a fixed one, recomputing its public share so the
+/// object is left exactly as if start() had sampled that scalar. `gen` must be the generator for
+/// the same (prs, ci, sid) the side was started with.
+bool force_fixed_scalar(CPace& side, const uint8_t (&scalar)[32],
+                        const std::array<uint8_t, 32>& gen) {
+    std::memcpy(side.scalar_.data(), scalar, side.scalar_.size());
+    return x25519_scalar_mult(side.scalar_.data(), gen.data(), side.public_share_.data());
+}
+
+}  // namespace
+
+TEST(CPaceRoundTrip, FixedScalarDrivesProductionDeriveAndTag) {
+    const std::vector<uint8_t> prs(reinterpret_cast<const uint8_t*>("1234"),
+                                   reinterpret_cast<const uint8_t*>("1234") + 4);
+    const char* sid_chars = "test-session-id-1234567890123456";
+    const std::vector<uint8_t> sid(reinterpret_cast<const uint8_t*>(sid_chars),
+                                   reinterpret_cast<const uint8_t*>(sid_chars) + 32);
+    const std::vector<uint8_t> ci, ad;
+
+    CPace side_a, side_b;
+    ASSERT_TRUE(side_a.start(CPaceRole::INITIATOR, prs, sid, ci, ad, ad));
+    ASSERT_TRUE(side_b.start(CPaceRole::RESPONDER, prs, sid, ci, ad, ad));
+
+    const auto gen = cpace_calculate_generator(prs.data(), prs.size(), nullptr, 0, sid.data(),
+                                               sid.size());
+    ASSERT_TRUE(force_fixed_scalar(side_a, FixedExchange::SCALAR_A, gen));
+    ASSERT_TRUE(force_fixed_scalar(side_b, FixedExchange::SCALAR_B, gen));
+
+    EXPECT_EQ(to_hex(side_a.public_share()), KAT_YA);
+    EXPECT_EQ(to_hex(side_b.public_share()), KAT_YB);
+
+    ASSERT_TRUE(side_a.derive(side_b.public_share().data(), CPACE_SHARE_SIZE));
+    ASSERT_TRUE(side_b.derive(side_a.public_share().data(), CPACE_SHARE_SIZE));
+
+    // ISK feeds K_wrap for PSK Wrapping, so a drift here silently breaks the wrapped_psk exchange
+    // rather than the tag comparison.
+    auto isk_a = side_a.isk();
+    auto isk_b = side_b.isk();
+    ASSERT_TRUE(isk_a.has_value());
+    ASSERT_TRUE(isk_b.has_value());
+    EXPECT_EQ(to_hex(*isk_a), KAT_ISK);
+    EXPECT_EQ(to_hex(*isk_b), KAT_ISK);
+
+    // Ta authenticates (Ya, ADa) and is produced by the INITIATOR; Tb by the RESPONDER.
+    auto tag_a = side_a.tag();
+    auto tag_b = side_b.tag();
+    ASSERT_TRUE(tag_a.has_value());
+    ASSERT_TRUE(tag_b.has_value());
+    EXPECT_EQ(to_hex(*tag_a), KAT_TA);
+    EXPECT_EQ(to_hex(*tag_b), KAT_TB);
+
+    // Each side must also accept the reference bytes for its peer's tag, not merely reproduce
+    // them: verify() recomputes the peer MAC over a different (share, ad) pair than tag() does.
+    const auto ref_ta = from_hex(KAT_TA);
+    const auto ref_tb = from_hex(KAT_TB);
+    ASSERT_EQ(ref_ta.size(), CPACE_TAG_SIZE);
+    ASSERT_EQ(ref_tb.size(), CPACE_TAG_SIZE);
+    EXPECT_TRUE(side_b.verify(ref_ta.data(), ref_ta.size()));
+    EXPECT_TRUE(side_a.verify(ref_tb.data(), ref_tb.size()));
 }
 
 // --- Full CPace object round-trip (CSPRNG scalars) ---
@@ -514,17 +605,6 @@ TEST(CPaceDeriveRejects, TagBeforeDeriveReturnsNullopt) {
     std::array<uint8_t, CPACE_TAG_SIZE> dummy{};
     EXPECT_FALSE(side.verify(dummy.data(), CPACE_TAG_SIZE));
 }
-
-// =============================================================================
-// ISK KAT via CPace object (verifies derive() produces the known ISK inputs)
-// =============================================================================
-
-// Note: the CPace class does not expose ISK or mac_key directly (internal).
-// We verify them indirectly: the Tags produced by the CPace object must match
-// the manually-computed Ta/Tb from the FixedExchange helper above.
-// Since CPace.start() samples a fresh random scalar, we cannot directly reproduce
-// the fixed-scalar KAT through the CPace object.  The FixedExchange test above
-// covers the ISK+mac_key derivation path directly.
 
 // SHA-512 streaming coverage (multi-part matches one-shot) lives in test_crypto.cpp
 // (Sha512.StreamingByteByByteMatchesOneShot).
