@@ -171,6 +171,12 @@ else()
     # Host build options
     option(ENABLE_WERROR "Treat warnings as errors" OFF)
     option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+    # ThreadSanitizer is a separate option because it cannot be combined with ASan/UBSan. The
+    # concurrency tests (e.g. RecordStoreConcurrency) only detect a data race when built this way.
+    option(ENABLE_TSAN "Enable ThreadSanitizer (mutually exclusive with ENABLE_SANITIZERS)" OFF)
+    if(ENABLE_TSAN AND ENABLE_SANITIZERS)
+        message(FATAL_ERROR "ENABLE_TSAN and ENABLE_SANITIZERS are mutually exclusive")
+    endif()
 
     # Examples build by default for standalone development, but not when sendspin is pulled into
     # a larger project via add_subdirectory (where the consumer doesn't want the example deps,

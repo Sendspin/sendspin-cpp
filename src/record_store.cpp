@@ -318,7 +318,10 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk
     // Runs on the network thread; lock against main-loop mutations of records_/pairing_psk_.
     // Calls the unlocked record_by_psk_id() helper, so no recursive acquisition occurs.
     std::lock_guard<std::mutex> lock(this->mutex_);
+    return this->resolve_by_psk_id_locked(psk_id);
+}
 
+std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id_locked(const std::string& psk_id) const {
     // 1. Long-term records (highest priority).
     const SendspinPairingRecord* rec = this->record_by_psk_id(psk_id);
     if (rec != nullptr) {
@@ -735,14 +738,23 @@ void RecordStore::set_static_pin_enabled(bool enabled) {
 
 std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
     const std::string& server_id, const std::optional<std::string>& label) {
+    // Hold mutex_ for the whole body rather than letting each step lock on its own. The
+    // capacity probe, the server_id probe, and the shared-PSK fallback lookup must all see one
+    // consistent view of records_, and record_by_server_id() iterates records_ directly: without
+    // this lock a network-thread store_record_superseding() (client.cpp's server/pair-finalize
+    // handler commits synchronously on that thread) can reallocate the vector mid-iteration.
+    // Every helper called below is therefore the _locked variant; calling the public
+    // can_store_record()/resolve_by_psk_id() here would self-deadlock on this non-recursive mutex.
+    std::lock_guard<std::mutex> lock(this->mutex_);
+
     // A re-pair for a server_id that already holds a long-term record supersedes it in place
     // (store_record_superseding() retires the old record only once the new one is safely
     // persisted; see store_record_impl()), so it does not grow the store and must not be
-    // blocked by can_store_record() even when the store reports itself full. Without this, a
+    // blocked by the capacity check even when the store reports itself full. Without this, a
     // device that already occupies the store's last slot could never re-pair once other
     // servers filled the rest of it.
     const bool replaces_existing = this->record_by_server_id(server_id) != nullptr;
-    if (replaces_existing || this->can_store_record()) {
+    if (replaces_existing || this->has_capacity_locked()) {
         std::array<uint8_t, NOISE_PSK_SIZE> psk{};
         platform_random_bytes(psk.data(), psk.size());
         std::string pid = psk_id_for(psk);
@@ -760,7 +772,7 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
     }
 
     // Storage exhausted: fall back to the shared-PSK record.
-    auto resolved = this->resolve_by_psk_id(this->record_mode_psk_id_);
+    auto resolved = this->resolve_by_psk_id_locked(this->record_mode_psk_id_);
     if (!resolved.has_value() || !this->is_shared_record(resolved.value())) {
         SS_LOGE(TAG, "shared-PSK fallback record '%s' is missing or not shared",
                 this->record_mode_psk_id_.c_str());

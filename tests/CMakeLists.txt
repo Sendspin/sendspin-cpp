@@ -88,5 +88,13 @@ if(ENABLE_SANITIZERS)
     target_link_options(sendspin_tests PRIVATE -fsanitize=address,undefined)
 endif()
 
+# ThreadSanitizer, configured separately from ASan/UBSan (the two cannot be combined). The
+# concurrency tests only report a data race when the binary is built this way; see
+# RecordStoreConcurrency in test_record_store.cpp.
+if(ENABLE_TSAN)
+    target_compile_options(sendspin_tests PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+    target_link_options(sendspin_tests PRIVATE -fsanitize=thread)
+endif()
+
 include(GoogleTest)
 gtest_discover_tests(sendspin_tests)

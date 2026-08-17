@@ -39,6 +39,10 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         target_compile_options(${TARGET_LIB} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
         target_link_options(${TARGET_LIB} PUBLIC -fsanitize=address,undefined)
     endif()
+    if(ENABLE_TSAN)
+        target_compile_options(${TARGET_LIB} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(${TARGET_LIB} PUBLIC -fsanitize=thread)
+    endif()
 
     # =========================================================================
     # External dependencies

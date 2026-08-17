@@ -80,9 +80,35 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build-tests --output-on-failure
 
+  test-tsan:
+    name: Unit tests (ThreadSanitizer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libavahi-compat-libdnssd-dev
+
+      - name: Configure CMake
+        # ENABLE_TSAN instead of ENABLE_SANITIZERS: TSan cannot be combined with ASan/UBSan, and
+        # the concurrency tests only report a data race when built this way.
+        run: cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .
+
+      - name: Build tests
+        run: cmake --build build-tsan --target sendspin_tests
+
+      - name: Run tests
+        # halt_on_error makes a detected race fail the job deterministically rather than relying
+        # on the process happening to abort afterwards.
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build-tsan --output-on-failure
+
   ci:
     name: CI
-    needs: [pre-commit, lint, build, test]
+    needs: [pre-commit, lint, build, test, test-tsan]
     runs-on: ubuntu-latest
     if: always()
     steps:

@@ -472,6 +472,12 @@ private:
         return this->records_.size() < this->max_records_;
     }
 
+    /// @brief Body of resolve_by_psk_id(). MUST be called with mutex_ already held.
+    /// Exists so resolve_pairing_outcome(), which holds mutex_ across its whole body, can run
+    /// the same resolution without re-entering this non-recursive mutex.
+    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id_locked(
+        const std::string& psk_id) const;
+
     /// @brief Find the index of a record by psk_id, or npos if absent.
     [[nodiscard]] size_t find_index(const std::string& psk_id) const;
 

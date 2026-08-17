@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -55,6 +56,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2116,4 +2118,58 @@ TEST(PskZeroization, ResolvedPskDestructorWipesPsk) {
 
 TEST(PskZeroization, PairingOutcomeDestructorWipesPsk) {
     expect_psk_wiped_on_destruction<RecordStore::PairingOutcome>();
+}
+
+// Reproduces the two-thread access pattern production actually runs:
+//
+//   main loop     -> ConnectionManager::handle_enter_pairing_psk()
+//                      -> RecordStore::resolve_pairing_outcome()   [reads records_]
+//   network thread-> SendspinClient::process_json_message(), server/pair-finalize
+//                      -> RecordStore::store_record_superseding()  [push_back/erase records_]
+//
+// Both threads are real in production: server/pair-finalize commits synchronously on the
+// network thread (deliberately, so the server's follow-up re-handshake can resolve the new
+// psk_id), while the main loop enters pairing for a different connection. The two sides guard
+// different mutexes at the ConnectionManager level, so nothing above RecordStore serializes
+// them.
+//
+// resolve_pairing_outcome() must therefore hold mutex_ across its whole body: probing records_
+// through the unlocked record_by_server_id() helper races store_record_impl()'s push_back
+// reallocation. Under ThreadSanitizer (-DENABLE_TSAN=ON) such a race is reported against
+// records_ and fails this test. Without TSan the test still carries weight: it would hang if
+// the locking ever re-entered the non-recursive mutex_.
+TEST(RecordStoreConcurrency, ResolvePairingOutcomeDoesNotRaceRecordStores) {
+    InMemoryPersistenceProvider provider;
+    RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true, /*max_records=*/64);
+
+    // Both threads work over an overlapping server_id space so the reader's scan and the
+    // writer's supersede-erase touch the same entries.
+    constexpr int SERVER_ID_SPACE = 8;
+    constexpr int ITERATIONS = 2000;
+
+    std::atomic<bool> writer_ready{false};
+
+    std::thread writer([&] {
+        writer_ready.store(true, std::memory_order_release);
+        for (int i = 0; i < ITERATIONS; ++i) {
+            SendspinPairingRecord record;
+            record.psk_id = "psk-" + std::to_string(i);
+            record.psk.fill(static_cast<uint8_t>(i));
+            record.server_id = "server-" + std::to_string(i % SERVER_ID_SPACE);
+            store.store_record_superseding(std::move(record));
+        }
+    });
+
+    while (!writer_ready.load(std::memory_order_acquire)) {
+    }
+
+    for (int i = 0; i < ITERATIONS; ++i) {
+        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i %
+                                                                                SERVER_ID_SPACE));
+        // Every resolve must yield a usable PSK: either a freshly minted long-term one or the
+        // shared-PSK fallback. A torn read of records_ would surface here as a miss.
+        ASSERT_TRUE(outcome.has_value());
+    }
+
+    writer.join();
 }
