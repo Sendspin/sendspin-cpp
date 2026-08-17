@@ -500,7 +500,7 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
             if (this->persist_records_locked()) {
                 for (const auto& superseded_psk_id : superseded_psk_ids) {
                     SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
-                            superseded_psk_id.c_str(), incoming_psk_id.c_str());
+                            superseded_psk_id.c_str(), superseded_server_id.c_str());
                 }
             } else {
                 for (const auto& superseded_psk_id : superseded_psk_ids) {
