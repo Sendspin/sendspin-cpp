@@ -65,49 +65,44 @@ TEST(PairingToken, SpecReferenceVector) {
     EXPECT_EQ(token, expected);
 }
 
-TEST(PairingToken, IsExactly107Characters) {
-    const auto client_key = make_client_key();
-    const auto pairing_psk = make_pairing_psk();
-    const std::string token = format_pairing_token(client_key, pairing_psk);
+// =============================================================================
+// Structural invariants, over inputs the reference vector above does not cover
+//
+// Length / "SP:0" prefix / alphabet / absence of the digit '2' are already pinned byte-for-byte
+// by SpecReferenceVector for its own input, so asserting them again on that same token proves
+// nothing. They are checked here against other inputs, where they are not implied.
+// =============================================================================
+
+namespace {
+
+void expect_well_formed_token(const std::string& token) {
     EXPECT_EQ(token.size(), PAIRING_TOKEN_LENGTH);
     EXPECT_EQ(token.size(), 107u);
-}
-
-TEST(PairingToken, HasSpPrefixAndVersionZero) {
-    const auto client_key = make_client_key();
-    const auto pairing_psk = make_pairing_psk();
-    const std::string token = format_pairing_token(client_key, pairing_psk);
     ASSERT_GE(token.size(), 4u);
-    EXPECT_EQ(token.substr(0, 3), "SP:");
-    EXPECT_EQ(token[3], '0');
-}
-
-// A version-0 token is drawn only from the QR code alphanumeric set (0-9, A-Z, ':').
-TEST(PairingToken, UsesOnlyQrAlphanumericAlphabet) {
-    const auto client_key = make_client_key();
-    const auto pairing_psk = make_pairing_psk();
-    const std::string token = format_pairing_token(client_key, pairing_psk);
+    EXPECT_EQ(token.substr(0, 4), "SP:0");
+    // A version-0 token is drawn only from the QR code alphanumeric set (0-9, A-Z, ':')...
     for (char c : token) {
         const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || c == ':';
         EXPECT_TRUE(ok) << "unexpected character '" << c << "' in token";
     }
-}
-
-// The body must never contain the digit '2' (transliterated to '9' per the spec's
-// "Pairing Token" section).
-TEST(PairingToken, BodyNeverContainsDigitTwo) {
-    const auto client_key = make_client_key();
-    const auto pairing_psk = make_pairing_psk();
-    const std::string token = format_pairing_token(client_key, pairing_psk);
-    // Body starts after "SP:0".
+    // ...and the body never contains the digit '2' (transliterated to '9' per the spec's
+    // "Pairing Token" section).
     for (size_t i = 4; i < token.size(); ++i) {
         EXPECT_NE(token[i], '2') << "position " << i;
     }
 }
 
-// =============================================================================
-// Differing inputs produce differing tokens (sanity, not a security proof)
-// =============================================================================
+}  // namespace
+
+TEST(PairingToken, WellFormedAcrossVariedInputs) {
+    std::array<uint8_t, 32> zero{};
+    std::array<uint8_t, 32> ones{};
+    ones.fill(0xFF);
+    expect_well_formed_token(format_pairing_token(zero, zero));
+    expect_well_formed_token(format_pairing_token(ones, ones));
+    expect_well_formed_token(format_pairing_token(zero, ones));
+    expect_well_formed_token(format_pairing_token(make_client_key(), ones));
+}
 
 TEST(PairingToken, DifferentKeysProduceDifferentTokens) {
     auto client_key_a = make_client_key();
@@ -118,12 +113,4 @@ TEST(PairingToken, DifferentKeysProduceDifferentTokens) {
     const std::string token_a = format_pairing_token(client_key_a, pairing_psk);
     const std::string token_b = format_pairing_token(client_key_b, pairing_psk);
     EXPECT_NE(token_a, token_b);
-}
-
-TEST(PairingToken, AllZeroInputsProduceValidLengthToken) {
-    std::array<uint8_t, 32> zero_key{};
-    std::array<uint8_t, 32> zero_psk{};
-    const std::string token = format_pairing_token(zero_key, zero_psk);
-    EXPECT_EQ(token.size(), PAIRING_TOKEN_LENGTH);
-    EXPECT_EQ(token.substr(0, 4), "SP:0");
 }

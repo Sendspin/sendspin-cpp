@@ -184,17 +184,9 @@ TEST(PinDeriveValidation, WrongNonceSizeReturnsNullopt) {
         pin_derive(h.data(), 32, short_na.data(), 16, nb.data(), 32, 6).has_value());
 }
 
-// =============================================================================
-// Constants
-// =============================================================================
-
-TEST(PinConstants, Values) {
-    EXPECT_EQ(PIN_NONCE_SIZE, 32u);
-    EXPECT_EQ(PIN_COMMIT_SIZE, 32u);
-    EXPECT_EQ(PIN_MIN_DIGITS, 4);
-    EXPECT_EQ(PIN_MAX_DIGITS, 12);
-    EXPECT_EQ(PIN_DEFAULT_MIN_DIGITS, 6);
-}
+// The PIN_* constants are not pinned by a test of their own: changing PIN_NONCE_SIZE,
+// PIN_COMMIT_SIZE or PIN_DEFAULT_MIN_DIGITS is a compile error, and the digit-count bounds are
+// covered by PinDeriveValidation's boundary tests above.
 
 // =============================================================================
 // pin_generate_nonce: basic shape

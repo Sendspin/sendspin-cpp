@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -58,11 +59,13 @@ inline std::vector<uint8_t> from_hex(const char* s) {
     return out;
 }
 
-/// Decode a lowercase hex string into a fixed-size byte array.
+/// Decode a lowercase hex string into a fixed-size byte array. A string shorter than N bytes
+/// leaves the tail zeroed rather than reading past the decoded buffer, so a typo'd KAT vector
+/// fails its comparison instead of tripping the sanitizers on unrelated memory.
 template <size_t N>
 inline std::array<uint8_t, N> from_hex_arr(const char* s) {
     auto v = from_hex(s);
     std::array<uint8_t, N> a{};
-    std::memcpy(a.data(), v.data(), N);
+    std::memcpy(a.data(), v.data(), std::min(v.size(), N));
     return a;
 }

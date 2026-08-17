@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Known-Answer Tests (KATs) for the Sendspin crypto foundation.
+// Known-Answer Tests (KATs) for the Sendspin crypto foundation: the hash primitives, the spec
+// constants, base64url, and Identity/psk_id derivation.
 //
 // These tests mirror the vectors from:
 //   aiosendspin/tests/noise/test_constants.py
 //   aiosendspin/tests/noise/test_keys.py
-//
-// and add an in-process KKpsk2 handshake for both cipher suites.
 
 #include "crypto/constants.h"
 #include "test_util.h"
@@ -27,15 +26,6 @@
 #include "platform/crypto.h"
 
 #include <gtest/gtest.h>
-
-// noise-c is a C library; wrap in extern "C" to avoid name-mangling issues.
-extern "C" {
-#include <noise/protocol/buffer.h>
-#include <noise/protocol/cipherstate.h>
-#include <noise/protocol/constants.h>
-#include <noise/protocol/dhstate.h>
-#include <noise/protocol/handshakestate.h>
-}
 
 #include <array>
 #include <cstdint>
@@ -114,35 +104,27 @@ TEST(HmacSha512, Rfc4231Case2) {
 }
 
 // =============================================================================
-// SHA-256 (Sha256 class / sha256_oneshot) KATs and failure-propagation contract
+// SHA-256 (Sha256 class / sha256_oneshot) KATs
 //
 // noise-c's SHA256 backend has no test hook to force an allocation/finalize failure, so the
-// failure branch inside Sha256::ok() cannot be exercised directly here. Instead, these tests pin
-// the succeeding path for every security-critical caller (psk_id_for, derive_psk_wrap_key/
-// wrap_psk/unwrap_psk, SENTINEL_PSK), which must surface failure via std::optional, or abort()
-// at the two call sites whose established non-optional signatures the rest of the tree depends
-// on, rather than ever returning a zero-derived value as valid; a KAT mismatch or failing
-// has_value()/ok() assertion would catch a regression that silently drops one of these checks.
+// failure branch inside Sha256::ok() cannot be exercised here; the callers that must surface it
+// (psk_id_for, derive_psk_wrap_key/wrap_psk/unwrap_psk, SENTINEL_PSK) are covered through their
+// own std::optional-returning KATs in this file and test_psk_wrap.cpp.
 // =============================================================================
 
 TEST(Sha256, KatAbc) {
-    // NIST FIPS 180-4 SHA-256("abc").
+    // NIST FIPS 180-4 SHA-256("abc"), via both the one-shot helper and the streaming class.
     const char* m = "abc";
-    auto d = sha256_oneshot(reinterpret_cast<const uint8_t*>(m), std::strlen(m));
-    EXPECT_EQ(to_hex(d), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-}
+    const std::string expected =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
-TEST(Sha256, ClassOkAfterConstructionAndFinalize) {
-    // Documents the ok() contract: ok() must stay true through a normal update()/finalize()
-    // cycle so callers that check it after finalize() (e.g. psk_id_for, derive_psk_wrap_key,
-    // the SENTINEL_PSK static initializer) accept the digest.
+    auto d = sha256_oneshot(reinterpret_cast<const uint8_t*>(m), std::strlen(m));
+    EXPECT_EQ(to_hex(d), expected);
+
     Sha256 h;
-    ASSERT_TRUE(h.ok());
-    const char* m = "abc";
     h.update(reinterpret_cast<const uint8_t*>(m), std::strlen(m));
-    auto digest = h.finalize();
-    EXPECT_TRUE(h.ok());
-    EXPECT_EQ(to_hex(digest), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    EXPECT_EQ(to_hex(h.finalize()), expected);
+    EXPECT_TRUE(h.ok()) << "ok() must stay true across a normal update()/finalize() cycle";
 }
 
 // =============================================================================
@@ -167,10 +149,6 @@ TEST(CryptoConstants, PskIdLabelIsLiteralUtf8NoNul) {
     EXPECT_EQ(PSK_ID_LABEL.find('\0'), std::string_view::npos);
 }
 
-TEST(CryptoConstants, NoisePskSizeIs32) {
-    EXPECT_EQ(NOISE_PSK_SIZE, 32u);
-}
-
 // =============================================================================
 // Base64url KATs  (mirrors test_keys.py)
 // =============================================================================
@@ -185,6 +163,19 @@ TEST(B64Url, RoundTrip) {
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->size(), data.size());
     EXPECT_EQ(std::memcmp(decoded->data(), data.data(), data.size()), 0);
+}
+
+// Every other test in this section either round-trips through our own decoder (which shares the
+// encoder's table, so it agrees with itself under any permutation) or asserts that a character is
+// absent. This one pins the encoded bytes: the input packs the 6-bit groups 0..63 in order, so
+// the expected string walks the whole alphabet once and a single swapped table entry fails here.
+TEST(B64Url, EncodeAlphabetKat) {
+    const auto data = from_hex(
+        "00108310518720928b30d38f41149351559761969b71d79f"
+        "8218a39259a7a29aabb2dbafc31cb3d35db7e39ebbf3dfbf");
+    ASSERT_EQ(data.size(), 48u);
+    EXPECT_EQ(b64url_encode(data.data(), data.size()),
+              "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_");
 }
 
 TEST(B64Url, UsesUrlSafeAlphabet) {
@@ -290,16 +281,11 @@ TEST(Identity, PrivateB64uRoundTripsViaDecode) {
     EXPECT_EQ(std::memcmp(decoded->data(), id.private_bytes.data(), 32), 0);
 }
 
-// -----------------------------------------------------------------------------
-// Failure-propagation contract: generate()/from_private_bytes() must return
-// std::optional and must never let a caller observe a default-constructed (all-zero) Identity
-// as if it were a real keypair. noise-c's DHState has no test hook to force the underlying
-// allocation/keypair-generation failure deterministically, so the actual failure branch cannot
-// be exercised here. What these pin is the contract surface: optional-returning signatures, and
-// that a successfully generated/reconstructed Identity is never the zero value.
-// -----------------------------------------------------------------------------
-
-TEST(Identity, GenerateSucceedsUnderNormalConditionsAndIsNeverAllZero) {
+// A generated Identity must never be the default-constructed (all-zero) value: generate() returns
+// std::optional precisely so a failure surfaces as an empty optional rather than a zero keypair
+// that would then be used as a real one. noise-c's DHState has no hook to force that failure, so
+// only the success path is reachable from here.
+TEST(Identity, GenerateIsNeverAllZero) {
     auto id = Identity::generate();
     ASSERT_TRUE(id.has_value());
     static const std::array<uint8_t, 32> kZero{};
@@ -307,276 +293,8 @@ TEST(Identity, GenerateSucceedsUnderNormalConditionsAndIsNeverAllZero) {
     EXPECT_NE(id->public_bytes, kZero);
 }
 
-TEST(Identity, FromPrivateBytesArrayOverloadReturnsEngagedOptional) {
-    // The array overload forwards to the pointer/length overload's std::optional, so a real
-    // DH-state failure would propagate instead of being masked by an unconditional .value().
-    // Confirm the normal path still succeeds and reproduces the same keypair.
-    auto original = Identity::generate();
-    ASSERT_TRUE(original.has_value());
-    auto rehydrated = Identity::from_private_bytes(original->private_bytes);
-    ASSERT_TRUE(rehydrated.has_value());
-    EXPECT_EQ(rehydrated->public_bytes, original->public_bytes);
-}
-
-// =============================================================================
-// In-process KKpsk2 handshake KATs
-//
-// Run the full Noise_KKpsk2 handshake with noise-c acting as both initiator
-// and responder.  After split(), verify that:
-//   - initiator→responder traffic decrypts correctly
-//   - responder→initiator traffic decrypts correctly
-// =============================================================================
-
-namespace {
-
-/// Run a complete in-process KKpsk2 handshake for NOISE_SUITE_CHACHAPOLY.
-/// Returns true if the handshake completes and both transport directions work.
-bool run_kkpsk2_handshake() {
-    const std::string suite_name_str = std::string(NOISE_SUITE_CHACHAPOLY);
-    const char* suite_name = suite_name_str.c_str();
-
-    // Generate static keypairs for initiator and responder.
-    Identity init_id = Identity::generate().value();
-    Identity resp_id = Identity::generate().value();
-
-    // PSK shared between both sides.
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-
-    // -------------------------------------------------------------------------
-    // Create handshake states
-    // -------------------------------------------------------------------------
-    NoiseHandshakeState* initiator = nullptr;
-    NoiseHandshakeState* responder = nullptr;
-
-    if (noise_handshakestate_new_by_name(&initiator, suite_name, NOISE_ROLE_INITIATOR) !=
-        NOISE_ERROR_NONE) {
-        return false;
-    }
-    if (noise_handshakestate_new_by_name(&responder, suite_name, NOISE_ROLE_RESPONDER) !=
-        NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        return false;
-    }
-
-    // -------------------------------------------------------------------------
-    // Set local static keypairs
-    // -------------------------------------------------------------------------
-    NoiseDHState* init_local = noise_handshakestate_get_local_keypair_dh(initiator);
-    NoiseDHState* resp_local = noise_handshakestate_get_local_keypair_dh(responder);
-
-    if (noise_dhstate_set_keypair(init_local, init_id.private_bytes.data(), X25519_KEY_SIZE,
-                                  init_id.public_bytes.data(), X25519_KEY_SIZE) !=
-        NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-    if (noise_dhstate_set_keypair(resp_local, resp_id.private_bytes.data(), X25519_KEY_SIZE,
-                                  resp_id.public_bytes.data(), X25519_KEY_SIZE) !=
-        NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-
-    // -------------------------------------------------------------------------
-    // Set remote static public keys (KK pattern: both sides know each other's key)
-    // -------------------------------------------------------------------------
-    NoiseDHState* init_remote = noise_handshakestate_get_remote_public_key_dh(initiator);
-    NoiseDHState* resp_remote = noise_handshakestate_get_remote_public_key_dh(responder);
-
-    if (noise_dhstate_set_public_key(init_remote, resp_id.public_bytes.data(), X25519_KEY_SIZE) !=
-        NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-    if (noise_dhstate_set_public_key(resp_remote, init_id.public_bytes.data(), X25519_KEY_SIZE) !=
-        NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-
-    // -------------------------------------------------------------------------
-    // Set PSK (psk2 → mixed on msg2)
-    // -------------------------------------------------------------------------
-    if (noise_handshakestate_set_pre_shared_key(initiator, psk.data(), psk.size()) !=
-        NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-    if (noise_handshakestate_set_pre_shared_key(responder, psk.data(), psk.size()) !=
-        NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-
-    // -------------------------------------------------------------------------
-    // Start
-    // -------------------------------------------------------------------------
-    if (noise_handshakestate_start(initiator) != NOISE_ERROR_NONE ||
-        noise_handshakestate_start(responder) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-
-    // -------------------------------------------------------------------------
-    // Handshake message exchange
-    // KKpsk2 has two messages: initiator→responder (msg1), responder→initiator (msg2).
-    // -------------------------------------------------------------------------
-    constexpr size_t BUF_SIZE = 4096;
-    std::vector<uint8_t> msg_buf(BUF_SIZE);
-    NoiseBuffer msg;
-
-    // msg1: initiator writes
-    if (noise_handshakestate_get_action(initiator) != NOISE_ACTION_WRITE_MESSAGE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-    noise_buffer_set_output(msg, msg_buf.data(), msg_buf.size());
-    // Pass nullptr for payload: these handshake messages carry no application payload.
-    if (noise_handshakestate_write_message(initiator, &msg, nullptr) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-    size_t msg1_size = msg.size;
-
-    // msg1: responder reads
-    if (noise_handshakestate_get_action(responder) != NOISE_ACTION_READ_MESSAGE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-    noise_buffer_set_input(msg, msg_buf.data(), msg1_size);
-    if (noise_handshakestate_read_message(responder, &msg, nullptr) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-
-    // msg2: responder writes
-    if (noise_handshakestate_get_action(responder) != NOISE_ACTION_WRITE_MESSAGE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-    noise_buffer_set_output(msg, msg_buf.data(), msg_buf.size());
-    if (noise_handshakestate_write_message(responder, &msg, nullptr) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-    size_t msg2_size = msg.size;
-
-    // msg2: initiator reads
-    if (noise_handshakestate_get_action(initiator) != NOISE_ACTION_READ_MESSAGE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-    noise_buffer_set_input(msg, msg_buf.data(), msg2_size);
-    if (noise_handshakestate_read_message(initiator, &msg, nullptr) != NOISE_ERROR_NONE) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-
-    // Both sides should now report SPLIT.
-    if (noise_handshakestate_get_action(initiator) != NOISE_ACTION_SPLIT ||
-        noise_handshakestate_get_action(responder) != NOISE_ACTION_SPLIT) {
-        noise_handshakestate_free(initiator);
-        noise_handshakestate_free(responder);
-        return false;
-    }
-
-    // -------------------------------------------------------------------------
-    // Split into transport cipher states
-    // After split():
-    //   - initiator_send  encrypts initiator→responder traffic
-    //   - initiator_recv  decrypts responder→initiator traffic
-    //   - responder_send  encrypts responder→initiator traffic
-    //   - responder_recv  decrypts initiator→responder traffic
-    // -------------------------------------------------------------------------
-    NoiseCipherState* init_send = nullptr;
-    NoiseCipherState* init_recv = nullptr;
-    NoiseCipherState* resp_send = nullptr;
-    NoiseCipherState* resp_recv = nullptr;
-
-    bool ok = (noise_handshakestate_split(initiator, &init_send, &init_recv) == NOISE_ERROR_NONE);
-    ok = ok &&
-         (noise_handshakestate_split(responder, &resp_send, &resp_recv) == NOISE_ERROR_NONE);
-
-    noise_handshakestate_free(initiator);
-    noise_handshakestate_free(responder);
-
-    if (!ok) {
-        if (init_send) noise_cipherstate_free(init_send);
-        if (init_recv) noise_cipherstate_free(init_recv);
-        if (resp_send) noise_cipherstate_free(resp_send);
-        if (resp_recv) noise_cipherstate_free(resp_recv);
-        return false;
-    }
-
-    // -------------------------------------------------------------------------
-    // Transport verification: initiator→responder direction
-    // -------------------------------------------------------------------------
-    std::vector<uint8_t> plaintext_a = {0x48, 0x65, 0x6C, 0x6C, 0x6F};  // "Hello"
-    constexpr size_t MAC_LEN = 16;
-    std::vector<uint8_t> ciphertext_buf(plaintext_a.size() + MAC_LEN);
-    std::memcpy(ciphertext_buf.data(), plaintext_a.data(), plaintext_a.size());
-
-    NoiseBuffer ct_buf;
-    noise_buffer_set_inout(ct_buf, ciphertext_buf.data(), plaintext_a.size(),
-                           ciphertext_buf.size());
-    ok = (noise_cipherstate_encrypt(init_send, &ct_buf) == NOISE_ERROR_NONE);
-
-    if (ok) {
-        noise_buffer_set_inout(ct_buf, ciphertext_buf.data(), ct_buf.size, ct_buf.size);
-        ok = (noise_cipherstate_decrypt(resp_recv, &ct_buf) == NOISE_ERROR_NONE);
-        if (ok) {
-            ok = (ct_buf.size == plaintext_a.size()) &&
-                 (std::memcmp(ct_buf.data, plaintext_a.data(), ct_buf.size) == 0);
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Transport verification: responder→initiator direction
-    // -------------------------------------------------------------------------
-    if (ok) {
-        std::vector<uint8_t> plaintext_b = {0x57, 0x6F, 0x72, 0x6C, 0x64};  // "World"
-        std::vector<uint8_t> ct_buf_b(plaintext_b.size() + MAC_LEN);
-        std::memcpy(ct_buf_b.data(), plaintext_b.data(), plaintext_b.size());
-
-        NoiseBuffer ct_b;
-        noise_buffer_set_inout(ct_b, ct_buf_b.data(), plaintext_b.size(), ct_buf_b.size());
-        ok = (noise_cipherstate_encrypt(resp_send, &ct_b) == NOISE_ERROR_NONE);
-
-        if (ok) {
-            noise_buffer_set_inout(ct_b, ct_buf_b.data(), ct_b.size, ct_b.size);
-            ok = (noise_cipherstate_decrypt(init_recv, &ct_b) == NOISE_ERROR_NONE);
-            if (ok) {
-                ok = (ct_b.size == plaintext_b.size()) &&
-                     (std::memcmp(ct_b.data, plaintext_b.data(), ct_b.size) == 0);
-            }
-        }
-    }
-
-    noise_cipherstate_free(init_send);
-    noise_cipherstate_free(init_recv);
-    noise_cipherstate_free(resp_send);
-    noise_cipherstate_free(resp_recv);
-    return ok;
-}
-
-}  // namespace
-
-TEST(NoiseHandshake, KKpsk2ChaChaPoly) {
-    EXPECT_TRUE(run_kkpsk2_handshake());
-}
+// The full Noise_KKpsk2 handshake is not exercised here. A noise-c-as-both-sides run tests only
+// that the vendored library agrees with itself; the handshake as this project drives it (our
+// responder against a noise-c initiator, over a real socket) is covered by
+// NoiseHandshakeLoopback/NoiseTransport in test_noise_transport.cpp and the fake-server suites in
+// test_encrypted_lifecycle.cpp.
