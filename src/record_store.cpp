@@ -161,6 +161,8 @@ bool RecordStore::load_pairing_config_from_provider() {
             // function documents.
             this->dynamic_pin_failures_ =
                 std::clamp(config->dynamic_pin_failures, 0, DYNAMIC_PIN_ESCALATION_THRESHOLD);
+            this->pairing_psk_rotated_ = config->pairing_psk_rotated;
+            this->static_pin_rotated_ = config->static_pin_rotated;
             this->record_mode_psk_id_ = config->record_mode_psk_id;
             SS_LOGD(TAG, "Loaded pairing config: record_mode_psk_id=%s",
                     this->record_mode_psk_id_.c_str());
@@ -558,6 +560,20 @@ void RecordStore::set_pairing_psk(SendspinPairingPsk psk) {
     // will reference in its handshake, so a supplied mismatch would make the key unresolvable.
     psk.psk_id = psk_id_for(psk.psk);
     this->pairing_psk_ = std::move(psk);
+    // The secret the device shipped with is now dead, so whatever the application published it
+    // in (device label, leaflet) no longer opens this client and the locations hint has to stop
+    // pointing there. Persisting under mutex_ is the pattern set_pairing_psk_enabled() documents;
+    // skip the write once the flag is already set so a re-rotation costs no extra flash.
+    //
+    // Ordered before the secret's own write, since the two blobs are separate keys and a provider
+    // can take one and reject the other. Losing the secret's write after this one leaves a device
+    // whose shipped secret still works pointing an operator at the server that set the
+    // replacement, which merely wastes a lookup; the reverse order would leave a rotated device
+    // pointing at a label that no longer opens it.
+    if (!this->pairing_psk_rotated_) {
+        this->pairing_psk_rotated_ = true;
+        this->persist_config();
+    }
     if (this->provider_ != nullptr) {
         std::string encoded = encode_pairing_psk(this->pairing_psk_.value());
         this->provider_->save_blob(persistence_keys::PAIRING_PSK,
@@ -687,6 +703,12 @@ void RecordStore::reset_dynamic_pin_failures() {
 
 void RecordStore::set_static_pin(const std::string& pin) {
     this->static_pin_ = pin;
+    // Retires the configured locations hint, and ordered ahead of the PIN's own write for the
+    // reason set_pairing_psk() spells out.
+    if (!this->static_pin_rotated_) {
+        this->static_pin_rotated_ = true;
+        this->persist_config();
+    }
     if (this->provider_ != nullptr) {
         this->provider_->save_blob(persistence_keys::STATIC_PIN,
                                    reinterpret_cast<const uint8_t*>(pin.data()), pin.size());
@@ -788,6 +810,8 @@ bool RecordStore::persist_config() {
     config.static_pin_enabled = this->static_pin_enabled_;
     config.dynamic_pin_min_length = this->dynamic_pin_min_length_;
     config.dynamic_pin_failures = this->dynamic_pin_failures_;
+    config.pairing_psk_rotated = this->pairing_psk_rotated_;
+    config.static_pin_rotated = this->static_pin_rotated_;
     config.record_mode_psk_id = this->record_mode_psk_id_;
     std::string encoded = encode_pairing_config(config);
     if (!this->provider_->save_blob(persistence_keys::PAIR_CONFIG,

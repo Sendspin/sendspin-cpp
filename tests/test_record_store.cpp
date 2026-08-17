@@ -1911,6 +1911,95 @@ TEST(RecordStore, AcceptsValidStoredStaticPin) {
     EXPECT_EQ(store.static_pin().value(), "12345678");
 }
 
+// ============================================================================
+// Secret-rotation flags (retire the client/hello locations hint)
+// ============================================================================
+
+// Installing the shipped secrets is not a rotation: first-boot provisioning generates the
+// Pairing PSK, and a provider load restores whatever the factory wrote. Both must leave the
+// flags clear so a device keeps advertising the locations its label or leaflet really carries.
+TEST(RecordStore, ShippedSecretsAreNotRotations) {
+    InMemoryPersistenceProvider provider;
+    provider.seed_blob(persistence_keys::STATIC_PIN, to_bytes("12345678"));
+
+    RecordStore store(&provider);
+
+    ASSERT_TRUE(store.pairing_psk().has_value()) << "first boot provisions a Pairing PSK";
+    ASSERT_TRUE(store.static_pin().has_value());
+    EXPECT_FALSE(store.pairing_psk_rotated());
+    EXPECT_FALSE(store.static_pin_rotated());
+}
+
+TEST(RecordStore, RotationFlagsAreSetIndependently) {
+    RecordStore store(nullptr);
+    ASSERT_FALSE(store.pairing_psk_rotated());
+    ASSERT_FALSE(store.static_pin_rotated());
+
+    store.set_pairing_psk(make_pairing_psk());
+    EXPECT_TRUE(store.pairing_psk_rotated());
+    EXPECT_FALSE(store.static_pin_rotated()) << "the PIN's own hint is untouched";
+
+    store.set_static_pin("87654321");
+    EXPECT_TRUE(store.static_pin_rotated());
+}
+
+// The rotated secret survives a reboot, so the retired hint has to as well: reloading a factory
+// hint next to a server-set secret would send every server back to a label that no longer opens
+// the device.
+TEST(RecordStore, RotationFlagsSurviveAReboot) {
+    InMemoryPersistenceProvider provider;
+    provider.seed_blob(persistence_keys::STATIC_PIN, to_bytes("12345678"));
+    {
+        RecordStore store(&provider);
+        store.set_pairing_psk(make_pairing_psk());
+        store.set_static_pin("87654321");
+    }
+
+    RecordStore reloaded(&provider);
+    EXPECT_TRUE(reloaded.pairing_psk_rotated());
+    EXPECT_TRUE(reloaded.static_pin_rotated());
+}
+
+// The rotated secret and the flag retiring its locations hint live under separate provider keys,
+// so a provider that takes one write and rejects the other leaves them disagreeing. The order
+// decides which way: config first means the survivable state is "hint retired while the shipped
+// secret still works", costing an operator one wasted lookup, where the reverse would leave a
+// rotated device pointing at a label that no longer opens it.
+TEST(RecordStore, RotationWritesTheRetiredHintBeforeTheSecret) {
+    OrderRecordingProvider provider;
+    RecordStore store(&provider);
+
+    provider.save_order.clear();  // Drop first-boot provisioning's own writes.
+    store.set_pairing_psk(make_pairing_psk());
+    const int psk_config_idx = provider.first_save_index(persistence_keys::PAIR_CONFIG);
+    const int psk_idx = provider.first_save_index(persistence_keys::PAIRING_PSK);
+    ASSERT_GE(psk_config_idx, 0) << "the first rotation must persist the retired hint";
+    ASSERT_GE(psk_idx, 0);
+    EXPECT_LT(psk_config_idx, psk_idx);
+
+    provider.save_order.clear();
+    store.set_static_pin("87654321");
+    const int pin_config_idx = provider.first_save_index(persistence_keys::PAIR_CONFIG);
+    const int pin_idx = provider.first_save_index(persistence_keys::STATIC_PIN);
+    ASSERT_GE(pin_config_idx, 0);
+    ASSERT_GE(pin_idx, 0);
+    EXPECT_LT(pin_config_idx, pin_idx);
+}
+
+// Only the first rotation of each secret pays for a config write; the flag is already true
+// afterwards, and this path is reachable from the network (management/set-pairing-config).
+TEST(RecordStore, RepeatedRotationSkipsTheRedundantConfigWrite) {
+    InMemoryPersistenceProvider provider;
+    RecordStore store(&provider);
+    const int writes_before = provider.save_attempts(persistence_keys::PAIR_CONFIG);
+
+    store.set_pairing_psk(make_pairing_psk());
+    EXPECT_EQ(provider.save_attempts(persistence_keys::PAIR_CONFIG), writes_before + 1);
+
+    store.set_pairing_psk(make_pairing_psk());
+    EXPECT_EQ(provider.save_attempts(persistence_keys::PAIR_CONFIG), writes_before + 1);
+}
+
 // A corrupt PAIR_CONFIG could otherwise seed the failure counter at INT_MAX, where the next
 // increment is signed overflow (UB). Clamped on load and saturating on increment, neither the
 // stored value nor any number of failures can push it out of range.

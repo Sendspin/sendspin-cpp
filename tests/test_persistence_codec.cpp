@@ -298,6 +298,8 @@ TEST(PersistenceCodec, ConfigRoundTrip) {
     c.static_pin_enabled = true;
     c.dynamic_pin_min_length = 8;
     c.dynamic_pin_failures = 3;
+    c.pairing_psk_rotated = true;
+    c.static_pin_rotated = true;
     c.record_mode_psk_id = "fallback-id";
 
     std::string blob = encode_pairing_config(c);
@@ -309,6 +311,8 @@ TEST(PersistenceCodec, ConfigRoundTrip) {
     EXPECT_EQ(decoded->static_pin_enabled, c.static_pin_enabled);
     EXPECT_EQ(decoded->dynamic_pin_min_length, c.dynamic_pin_min_length);
     EXPECT_EQ(decoded->dynamic_pin_failures, c.dynamic_pin_failures);
+    EXPECT_EQ(decoded->pairing_psk_rotated, c.pairing_psk_rotated);
+    EXPECT_EQ(decoded->static_pin_rotated, c.static_pin_rotated);
     EXPECT_EQ(decoded->record_mode_psk_id, c.record_mode_psk_id);
 }
 
@@ -322,6 +326,10 @@ TEST(PersistenceCodec, ConfigDecodeMissingFieldsTakeDefaults) {
     EXPECT_EQ(decoded->static_pin_enabled, defaults.static_pin_enabled);
     EXPECT_EQ(decoded->dynamic_pin_min_length, defaults.dynamic_pin_min_length);
     EXPECT_EQ(decoded->dynamic_pin_failures, defaults.dynamic_pin_failures);
+    // A blob written before the rotation flags existed must read back as "never rotated", so an
+    // upgrade keeps advertising the factory locations hint rather than inventing a rotation.
+    EXPECT_FALSE(decoded->pairing_psk_rotated);
+    EXPECT_FALSE(decoded->static_pin_rotated);
     EXPECT_EQ(decoded->record_mode_psk_id, defaults.record_mode_psk_id);
 }
 

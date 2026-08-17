@@ -94,6 +94,28 @@ constexpr bool is_coalesced_note(PairingNoteType type) {
            type == PairingNoteType::CLOSE_PAIRING_WINDOW;
 }
 
+/// @brief Resolve the `locations` hint for a pair-method descriptor in client/hello.
+/// @param configured Where the application published the secret the device shipped with.
+/// @param rotated True once that secret has been replaced (see RecordStore::pairing_psk_rotated()).
+/// @return The hint to advertise, or nullopt to omit the field.
+///
+/// A rotation invalidates every copy of the shipped secret, so the configured answer becomes a
+/// lie the moment it happens: the replacement exists only wherever the operator who set it keeps
+/// it. The spec has the client update the hint on rotation ("client/hello pair-method
+/// descriptor"), and 'operator' is the value that stays true afterwards no matter what the device
+/// was labeled with. It is advertised even when the application configured nothing, because the
+/// provenance is then known where before it was not.
+std::optional<std::vector<std::string>> locations_hint(const std::vector<std::string>& configured,
+                                                       bool rotated) {
+    if (rotated) {
+        return std::vector<std::string>{"operator"};
+    }
+    if (configured.empty()) {
+        return std::nullopt;
+    }
+    return configured;
+}
+
 }  // namespace
 
 /// @brief Deferred event state for time responses and group updates on the main thread
@@ -851,9 +873,8 @@ std::string SendspinClient::build_hello_message(const SendspinConnection* conn) 
         this->record_store_->pairing_psk().has_value()) {
         PairMethodDescriptor psk_desc;
         psk_desc.method = SendspinPairMethod::PAIRING_PSK;
-        if (!this->config_.pairing_psk_locations.empty()) {
-            psk_desc.locations = this->config_.pairing_psk_locations;
-        }
+        psk_desc.locations = locations_hint(this->config_.pairing_psk_locations,
+                                            this->record_store_->pairing_psk_rotated());
         msg.supported_pair_methods.push_back(std::move(psk_desc));
     }
     // Advertise dynamic_pin when enabled and the platform can display a PIN. An escalated
@@ -875,9 +896,8 @@ std::string SendspinClient::build_hello_message(const SendspinConnection* conn) 
         this->record_store_->static_pin().has_value()) {
         PairMethodDescriptor static_pin_desc;
         static_pin_desc.method = SendspinPairMethod::STATIC_PIN;
-        if (!this->config_.static_pin_locations.empty()) {
-            static_pin_desc.locations = this->config_.static_pin_locations;
-        }
+        static_pin_desc.locations = locations_hint(this->config_.static_pin_locations,
+                                                   this->record_store_->static_pin_rotated());
         msg.supported_pair_methods.push_back(std::move(static_pin_desc));
     }
 

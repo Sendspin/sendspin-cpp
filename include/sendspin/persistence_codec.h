@@ -44,7 +44,8 @@
 ///   omitted when absent.
 /// - Pairing config: `{"v":1,"record_mode_psk_id":"...","pairing_psk_enabled":bool,
 ///   "unpaired_access_enabled":bool,"dynamic_pin_enabled":bool,"static_pin_enabled":bool,
-///   "dynamic_pin_min_length":int,"dynamic_pin_failures":int}`.
+///   "dynamic_pin_min_length":int,"dynamic_pin_failures":int,"pairing_psk_rotated":bool,
+///   "static_pin_rotated":bool}`.
 ///
 /// `psk` is base64url (RFC 4648 section 5, no `=` padding) and always decodes to exactly 32
 /// bytes.

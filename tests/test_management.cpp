@@ -1039,6 +1039,10 @@ TEST(ManagementHandler, SetPairingConfigSetNewPsk) {
     // The pairing PSK must be set.
     ASSERT_TRUE(store.pairing_psk().has_value());
     EXPECT_EQ(store.pairing_psk()->psk, new_psk);
+    // A server-set PSK retires the client/hello locations hint for the shipped one; the static
+    // PIN this request did not touch keeps its own.
+    EXPECT_TRUE(store.pairing_psk_rotated());
+    EXPECT_FALSE(store.static_pin_rotated());
 }
 
 TEST(ManagementHandler, SetPairingConfigStaticPinValidPinAccepted) {
@@ -1053,6 +1057,8 @@ TEST(ManagementHandler, SetPairingConfigStaticPinValidPinAccepted) {
     EXPECT_EQ(result, ManagementResult::OK);
     ASSERT_TRUE(store.static_pin().has_value());
     EXPECT_EQ(store.static_pin().value(), "12345678");
+    EXPECT_TRUE(store.static_pin_rotated());
+    EXPECT_FALSE(store.pairing_psk_rotated());
 }
 
 TEST(ManagementHandler, SetPairingConfigInvalidStaticPinWrongLength) {
@@ -1066,6 +1072,8 @@ TEST(ManagementHandler, SetPairingConfigInvalidStaticPinWrongLength) {
     ManagementResult result = invoke_set_pairing_config(store, payload, effect);
     EXPECT_EQ(result, ManagementResult::INVALID);
     EXPECT_FALSE(store.static_pin().has_value());
+    // A rejected request rotates nothing, so the shipped PIN's locations hint stands.
+    EXPECT_FALSE(store.static_pin_rotated());
 }
 
 TEST(ManagementHandler, SetPairingConfigInvalidStaticPinNonDigit) {

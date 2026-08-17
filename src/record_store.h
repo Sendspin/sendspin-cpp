@@ -232,6 +232,9 @@ public:
 
     /// @brief Set the accepted Pairing PSK, replacing any existing one.
     /// psk_id is re-derived from the supplied secret; any id in `psk` is ignored.
+    /// Marks the Pairing PSK rotated (see pairing_psk_rotated()): this is the rotation entry
+    /// point, distinct from the constructor's first-boot provisioning and provider load, which
+    /// install the shipped secret and leave the flag alone.
     void set_pairing_psk(SendspinPairingPsk psk);
 
     /// @brief Clear the accepted Pairing PSK. No-op if absent.
@@ -264,6 +267,22 @@ public:
     /// @brief Return the minimum PIN length the client will accept.
     [[nodiscard]] int dynamic_pin_min_length() const {
         return this->dynamic_pin_min_length_;
+    }
+
+    /// @brief Return whether the Pairing PSK has been rotated away from the shipped secret.
+    /// True retires SendspinClientConfig::pairing_psk_locations, which described where the
+    /// shipped secret was published: the current one exists only wherever the operator who
+    /// rotated it keeps it, so client/hello advertises `["operator"]` instead. Persisted through
+    /// SendspinPairingConfig so it survives reboots alongside the rotated secret.
+    [[nodiscard]] bool pairing_psk_rotated() const {
+        return this->pairing_psk_rotated_;
+    }
+
+    /// @brief Return whether the static PIN has been rotated away from the shipped secret.
+    /// Retires SendspinClientConfig::static_pin_locations the same way pairing_psk_rotated()
+    /// retires its own hint.
+    [[nodiscard]] bool static_pin_rotated() const {
+        return this->static_pin_rotated_;
     }
 
     // ========================================
@@ -311,6 +330,8 @@ public:
     }
 
     /// @brief Set the configured static PIN (8 decimal digits), replacing any existing one.
+    /// Marks the static PIN rotated (see static_pin_rotated()); the provider load that restores
+    /// a shipped PIN at construction does not.
     void set_static_pin(const std::string& pin);
 
     /// @brief Clear the configured static PIN. No-op if absent.
@@ -518,7 +539,13 @@ private:
     // 8-bit fields
     bool dynamic_pin_enabled_{true};
     bool pairing_psk_enabled_{true};
+    /// Set by set_pairing_psk() and persisted through SendspinPairingConfig; see
+    /// pairing_psk_rotated(). Main-loop-only like the other config flags: written from the
+    /// management handler and read by build_hello_message().
+    bool pairing_psk_rotated_{false};
     bool static_pin_enabled_{false};
+    /// Set by set_static_pin(); see static_pin_rotated().
+    bool static_pin_rotated_{false};
     bool unpaired_access_enabled_{false};
 };
 

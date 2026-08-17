@@ -413,12 +413,17 @@ protected:
         this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/true);
     }
 
-    /// (Re)build the SendspinClient under test with the given platform capability flags.
-    void init_client(bool pin_display_supported, bool pairing_window_supported) {
+    /// (Re)build the SendspinClient under test with the given platform capability flags, and
+    /// optionally the factory locations hints the client/hello descriptors advertise.
+    void init_client(bool pin_display_supported, bool pairing_window_supported,
+                     std::vector<std::string> pairing_psk_locations = {},
+                     std::vector<std::string> static_pin_locations = {}) {
         SendspinClientConfig config;
         config.name = "PinStateMachineTestDevice";
         config.pin_display_supported = pin_display_supported;
         config.pairing_window_supported = pairing_window_supported;
+        config.pairing_psk_locations = std::move(pairing_psk_locations);
+        config.static_pin_locations = std::move(static_pin_locations);
         this->client_ = std::make_unique<SendspinClient>(config);
         this->client_->set_listener(&this->listener_);
         this->client_->set_network_provider(&this->network_provider_);
@@ -589,6 +594,40 @@ protected:
     }
 
     RecordStore& record_store() { return *this->client_->record_store_; }
+
+    /// Install a static PIN the way a factory-provisioned one arrives: straight into the store's
+    /// value, as RecordStore's constructor does from the persistence provider's STATIC_PIN blob.
+    /// The public setter cannot stand in here, because it is the rotation entry point and marks
+    /// the PIN rotated (see RecordStore::static_pin_rotated()), which is exactly the distinction
+    /// the locations-hint tests below are about.
+    void seed_shipped_static_pin(const std::string& pin) {
+        this->record_store().static_pin_ = pin;
+    }
+
+    /// Return the `locations` array on the client/hello descriptor for `method`, or nullopt when
+    /// the descriptor omits the hint. Fails the calling test if the method is not advertised at
+    /// all. build_hello_message() is private; this is the -fno-access-control seam for it.
+    std::optional<std::vector<std::string>> hello_locations(const char* method) {
+        JsonDocument doc;
+        JsonObject root;
+        EXPECT_TRUE(parse_json(this->client_->build_hello_message(nullptr), doc, root));
+        for (JsonObjectConst desc :
+             root["payload"]["supported_pair_methods"].as<JsonArrayConst>()) {
+            if (std::string(desc["method"].as<const char*>()) != method) {
+                continue;
+            }
+            if (desc["locations"].isUnbound()) {
+                return std::nullopt;
+            }
+            std::vector<std::string> out;
+            for (JsonVariantConst loc : desc["locations"].as<JsonArrayConst>()) {
+                out.emplace_back(loc.as<const char*>());
+            }
+            return out;
+        }
+        ADD_FAILURE() << "client/hello does not advertise " << method;
+        return std::nullopt;
+    }
 
     // =========================================================================
     // CPace pair-init/auth/confirm drive helpers
@@ -1993,4 +2032,63 @@ TEST_F(PinStateMachineTest, PersistLastPlayedServerSkipsDuplicateWrite) {
     this->persist_last_played_server("server-b");
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
     EXPECT_EQ(this->client_->connection_manager_->last_played_server_id(), "server-b");
+}
+
+// ============================================================================
+// client/hello locations hint across a secret rotation
+// ============================================================================
+
+// The configured hints describe where the shipped secrets were published, and ride every
+// client/hello until something rotates them (spec "client/hello pair-method descriptor").
+TEST_F(PinStateMachineTest, HelloAdvertisesConfiguredLocationsForShippedSecrets) {
+    this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/true,
+                      /*pairing_psk_locations=*/{"device"},
+                      /*static_pin_locations=*/{"leaflet", "operator"});
+    this->seed_shipped_static_pin("13572468");
+
+    EXPECT_EQ(this->hello_locations("pairing_psk"), (std::vector<std::string>{"device"}));
+    EXPECT_EQ(this->hello_locations("static_pin"),
+              (std::vector<std::string>{"leaflet", "operator"}));
+}
+
+// Rotating the Pairing PSK (management/set-pairing-config) kills every distributed copy of the
+// shipped one, so the descriptor must stop pointing at the device label. The static PIN was not
+// touched, so its own hint stands.
+TEST_F(PinStateMachineTest, HelloLocationsFollowThePairingPskRotation) {
+    this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/true,
+                      /*pairing_psk_locations=*/{"device"},
+                      /*static_pin_locations=*/{"leaflet"});
+    this->seed_shipped_static_pin("13572468");
+
+    SendspinPairingPsk rotated;
+    rotated.psk.fill(0x5a);
+    this->record_store().set_pairing_psk(rotated);
+
+    EXPECT_EQ(this->hello_locations("pairing_psk"), (std::vector<std::string>{"operator"}));
+    EXPECT_EQ(this->hello_locations("static_pin"), (std::vector<std::string>{"leaflet"}));
+}
+
+TEST_F(PinStateMachineTest, HelloLocationsFollowTheStaticPinRotation) {
+    this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/true,
+                      /*pairing_psk_locations=*/{"device"},
+                      /*static_pin_locations=*/{"device", "leaflet"});
+
+    this->record_store().set_static_pin("13572468");
+
+    EXPECT_EQ(this->hello_locations("static_pin"), (std::vector<std::string>{"operator"}));
+    EXPECT_EQ(this->hello_locations("pairing_psk"), (std::vector<std::string>{"device"}));
+}
+
+// With nothing configured the hint is omitted, since the library has no idea where the shipped
+// secret was published. A rotation is the point where it does know: the operator who sent it is
+// the only place the new secret exists, so the hint appears even though none was configured.
+TEST_F(PinStateMachineTest, HelloLocationsAppearOnRotationWithoutConfiguredHints) {
+    this->seed_shipped_static_pin("13572468");
+    EXPECT_FALSE(this->hello_locations("pairing_psk").has_value());
+    EXPECT_FALSE(this->hello_locations("static_pin").has_value());
+
+    this->record_store().set_static_pin("87654321");
+
+    EXPECT_EQ(this->hello_locations("static_pin"), (std::vector<std::string>{"operator"}));
+    EXPECT_FALSE(this->hello_locations("pairing_psk").has_value());
 }
