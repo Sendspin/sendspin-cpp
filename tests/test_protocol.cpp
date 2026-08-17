@@ -742,6 +742,48 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
 }
 
 // ============================================================================
+// client/state field set
+// ============================================================================
+
+// spec "client/state": the client-level field is the boolean `available`, not a multi-valued
+// state string. SYNCHRONIZED must serialize to available:true, and no legacy top-level "state"
+// key may appear (a strict-mode server hard-rejects client/state carrying an unknown field).
+TEST(Protocol, FormatClientStateSynchronizedIsAvailableTrue) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    EXPECT_TRUE(doc["payload"]["available"].as<bool>());
+    EXPECT_FALSE(doc["payload"]["state"].is<const char*>())
+        << "client/state must not carry the legacy top-level 'state' field";
+}
+
+// ERROR and EXTERNAL_SOURCE both report available:false: the current spec's client/state has no
+// separate error signal, only the available boolean (see "External Source Handling").
+TEST(Protocol, FormatClientStateErrorIsAvailableFalse) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::ERROR;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    EXPECT_FALSE(doc["payload"]["available"].as<bool>());
+    EXPECT_FALSE(doc["payload"]["state"].is<const char*>())
+        << "client/state must not carry the legacy top-level 'state' field";
+}
+
+TEST(Protocol, FormatClientStateExternalSourceIsAvailableFalse) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::EXTERNAL_SOURCE;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    EXPECT_FALSE(doc["payload"]["available"].as<bool>());
+    EXPECT_FALSE(doc["payload"]["state"].is<const char*>())
+        << "client/state must not carry the legacy top-level 'state' field";
+}
+
+// ============================================================================
 // client/hello field set
 // ============================================================================
 
