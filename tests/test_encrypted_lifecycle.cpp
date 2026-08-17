@@ -70,12 +70,13 @@ constexpr uint16_t PREADMISSION_ROLE_TEST_PORT = 19001;
 constexpr uint16_t REVOCATION_SWEEP_TEST_PORT = 19002;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
-// record store_record() persists via save_blob(persistence_keys::RECORDS, ...), so the
-// pairing-flow test below can assert on the psk_id/server_id/psk that pairing generated and
-// persisted, and hand the same
-// psk/psk_id back to the fake server for the follow-up in-band re-handshake. Thread-safe: the
-// server/pair-finalize commit runs on the network thread (see client.cpp's SERVER_PAIR_FINALIZE
-// handler), while the test thread reads captured_record().
+// record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
+// can assert on the psk_id/server_id/psk that pairing generated and persisted, and hand the same
+// psk/psk_id back to the fake server for the follow-up in-band re-handshake. The
+// server/pair-finalize commit is RAM-only on the network thread; the save_blob call this
+// captures is the deferred flush from the next loop() tick (RecordStore::persist_records()).
+// Locked anyway, per the general rule that a test provider should not assume the library's
+// threading beyond its documented contract.
 class PairingCapturePersistenceProvider : public SendspinPersistenceProvider {
 public:
     // load_blob(RECORDS) is not overridden beyond the base class's nullopt default: "starts with
@@ -121,6 +122,7 @@ public:
         }
         std::lock_guard<std::mutex> lock(this->mutex_);
         if (this->reject_pairing_records_) {
+            this->rejected_record_saves_++;
             return false;
         }
         this->captured_ = *with_server_id;
@@ -134,18 +136,25 @@ public:
 
     // When set, save_blob(RECORDS, ...) rejects any write that includes a record with a
     // server_id (simulating a persistence-provider failure, e.g. storage full), while still
-    // succeeding for the first-boot shared-PSK fallback record. Used to verify the fail-closed
-    // contract: a rejected persist must not report pairing success (see client.cpp's
-    // SERVER_PAIR_FINALIZE handler, which must check RecordStore::store_record()'s return
-    // value).
+    // succeeding for the first-boot shared-PSK fallback record. Used to verify the deferred
+    // fail-open contract: the pairing still completes on the RAM commit, and the rejected flush
+    // (counted below) is only a durability warning.
     void set_reject_pairing_records(bool reject) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->reject_pairing_records_ = reject;
     }
 
+    // Number of RECORDS writes (with a server_id record) rejected because of the flag above:
+    // proves the deferred flush was actually attempted, since a rejected write captures nothing.
+    int rejected_record_saves() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->rejected_record_saves_;
+    }
+
 private:
     mutable std::mutex mutex_;
     std::optional<SendspinPairingRecord> captured_;
+    int rejected_record_saves_{0};
     bool reject_pairing_records_{false};
     std::optional<SendspinPairingPsk> configured_pairing_psk_;
 };
@@ -494,9 +503,9 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
         << "on_pairing_started was never fired for the pairing-token (Pairing-PSK) flow";
     EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());
 
-    // The server's ack must have made the client persist the record before this returns (see
-    // client.cpp's SERVER_PAIR_FINALIZE handler: the commit happens synchronously on the network
-    // thread, not deferred to the main loop).
+    // The server's ack commits the record to RAM synchronously on the network thread (see
+    // client.cpp's SERVER_PAIR_FINALIZE handler); the durable save_blob(RECORDS) this waits for
+    // is the deferred flush from the next loop() tick (RecordStore::persist_records()).
     ASSERT_TRUE(pump_until(
         client, [&] { return persistence.captured_record().has_value(); }, 4000))
         << "Pairing record was never persisted";
@@ -547,13 +556,16 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
         << "get_current_trust() must reset to NONE once the connection is torn down";
 }
 
-// Fail-closed persistence: when the persistence provider rejects the pair-finalize record (e.g.
-// storage exhausted, write error), the client must NOT report pairing success. The record is
-// never stored (RecordStore::store_record fails closed), so nothing further is needed to unwind
-// the connection: the server rekeys onto that PSK regardless (it already acked pair-finalize),
-// and the client cannot resolve the psk_id, so the re-handshake drops the connection. This test
-// drives that rekey explicitly, since the fake server only re-handshakes on request.
-TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
+// Fail-open persistence: when the persistence provider rejects the pair-finalize record write
+// (e.g. storage full, write error), the pairing still completes for this boot. The RAM commit on
+// the network thread is what the server's follow-up re-handshake resolves, so the connection
+// rekeys and upgrades trust exactly like the happy path; the rejected write happens later, at
+// the deferred flush from loop() (where the provider is main-loop-only), and costs only a logged
+// durability warning: the record is lost at the next reboot. This is deliberate: a provider that
+// cannot write will not be fixed by aborting the pairing, so the device stays usable until
+// reboot instead of dropping the connection. This test drives the rekey explicitly, since the
+// fake server only re-handshakes on request.
+TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
     persistence.set_reject_pairing_records(true);
@@ -594,24 +606,35 @@ TEST(EncryptedLifecycle, PairingPskFlowFailedPersistDoesNotReportSuccess) {
         client, [&] { return server.learned_psk_id().has_value(); }, 4000))
         << "client/pair-finalize was never observed";
 
-    pump_for(client, 200);
-
+    // The pairing must be reported successful on the RAM commit alone.
+    ASSERT_TRUE(pump_until(
+        client, [&] { return listener.pairing_succeeded_server_id().has_value(); }, 4000))
+        << "on_pairing_succeeded must fire even though the persistence provider rejects the "
+           "record";
+    EXPECT_EQ(listener.pairing_succeeded_server_id().value(), server_identity.peer_id());
     EXPECT_FALSE(persistence.captured_record().has_value())
         << "A rejected record must not be captured (provider returned false)";
-    EXPECT_FALSE(listener.pairing_succeeded_server_id().has_value())
-        << "on_pairing_succeeded must not fire when the persistence provider rejects the record";
+    // (Checked after the succeeded callback, so this proves the flush was attempted and
+    // rejected, not the flush-before-callback ordering within the tick; that ordering is a
+    // structural property of loop(), documented there.)
+    EXPECT_GE(persistence.rejected_record_saves(), 1)
+        << "The deferred flush must have been attempted (and rejected)";
 
-    // Rekey onto the PSK the client was handed but never stored, exactly like the real server
-    // does immediately after acking pair-finalize. The client cannot resolve the psk_id, so the
-    // re-handshake fails and the connection is dropped without any special storage-failure path.
+    // Rekey onto the new PSK, exactly like the real server does immediately after acking
+    // pair-finalize. Unlike the retired fail-closed contract, the client CAN resolve the psk_id
+    // (the record is in RAM), so the re-handshake succeeds and trust upgrades to USER; only a
+    // reboot loses the pairing.
     auto learned_psk = server.learned_psk();
     auto learned_psk_id = server.learned_psk_id();
     ASSERT_TRUE(learned_psk.has_value() && learned_psk_id.has_value());
     ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
 
-    EXPECT_TRUE(pump_until(
-        client, [&] { return !client.is_connected(); }, 4000))
-        << "Connection must drop when the server rekeys onto a PSK the client never stored";
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "Connection must resume operational: the RAM-committed record resolves the rekey "
+           "even though the durable write was rejected";
+    EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER)
+        << "Trust must upgrade to USER on the RAM-committed record";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

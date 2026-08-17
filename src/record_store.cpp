@@ -402,14 +402,6 @@ std::vector<RecordSummary> RecordStore::records_summary_snapshot() const {
 }
 
 bool RecordStore::store_record(SendspinPairingRecord record) {
-    return this->store_record_impl(std::move(record), /*supersede_server_id=*/false);
-}
-
-bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
-    return this->store_record_impl(std::move(record), /*supersede_server_id=*/true);
-}
-
-bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede_server_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
 
     size_t idx = this->find_index(record.psk_id);
@@ -418,30 +410,22 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
 
     // Capacity: a genuine insert grows records_ by one and is subject to max_records_. A
     // replace by psk_id (idx already found, handled below) never grows it, so it is exempt.
-    // The pairing-supersede case is also exempt even though it inserts here first: phase 2
-    // below retires whatever record already holds this server_id right after this insert
-    // commits, so the net occupancy does not change. Without this exemption a device that
-    // already holds the store's last free slot could never re-pair once the rest of the store
-    // filled up with other servers' records.
-    if (is_insert) {
-        const bool will_supersede_existing =
-            supersede_server_id && record.server_id.has_value() &&
-            this->record_by_server_id(record.server_id.value()) != nullptr;
-        if (!will_supersede_existing && !this->has_capacity_locked()) {
-            SS_LOGW(TAG, "Storage full (%zu/%zu); rejecting new pairing record %s",
-                    this->records_.size(), this->max_records_, incoming_psk_id.c_str());
-            return false;
-        }
+    if (is_insert && !this->has_capacity_locked()) {
+        SS_LOGW(TAG, "Storage full (%zu/%zu); rejecting new pairing record %s",
+                this->records_.size(), this->max_records_, incoming_psk_id.c_str());
+        return false;
     }
 
-    // Phase 1: insert/replace the new record. Fails closed: the record must not survive in
-    // records_ when the provider rejects the write (see the class doc). This is safe under
-    // mutex_ (held for the whole sequence, so no reader - in particular resolve_by_psk_id() on
-    // the network thread - can observe the tentative mutation before it commits or rolls back;
-    // see the locking-discipline comment on persist_records_locked() for the general rule this
-    // is the one exception to), and each branch below only ever needs to undo the single element
-    // it just touched, not the whole vector: a replace snapshots just the record it is about to
-    // overwrite, and an insert only needs to pop the one it just pushed.
+    // Insert/replace the new record. Fails closed: the record must not survive in records_
+    // when the provider rejects the write (see the class doc; the caller, management/add-record,
+    // reports the result over the wire, so the return value must be honest about durability).
+    // This is safe under mutex_ (held for the whole sequence, so no reader - in particular
+    // resolve_by_psk_id() on the network thread - can observe the tentative mutation before it
+    // commits or rolls back; see the locking-discipline comment on persist_records_locked() for
+    // the general rule this is the one exception to), and each branch below only ever needs to
+    // undo the single element it just touched, not the whole vector: a replace snapshots just
+    // the record it is about to overwrite, and an insert only needs to pop the one it just
+    // pushed.
     if (!is_insert) {
         SendspinPairingRecord replaced = std::move(this->records_[idx]);
         this->records_[idx] = std::move(record);
@@ -454,7 +438,6 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
         }
     } else {
         this->records_.push_back(std::move(record));
-        idx = this->records_.size() - 1;
 
         if (!this->persist_records_locked()) {
             SS_LOGW(TAG, "Provider rejected pairing record %s; not storing",
@@ -464,29 +447,61 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
         }
     }
 
-    // Phase 2 (pairing path only, and only a SEPARATE write from phase 1): pairing mints a fresh
-    // per-server PSK that REPLACES whatever that server held before, so the new record (already
-    // safely persisted above) supersedes any OTHER record still bound to this server_id. Drop
-    // it, otherwise re-pairing accumulates a second working PSK for the same server and
-    // "rotation" never revokes anything. Only the pairing path asks for this: management/add-
-    // record stores plainly, because the spec's only stated add-record collision rule is keyed on
-    // psk_id (a psk whose psk_id is already known is already_exists) and it defines no outcome
-    // for a server_id collision: silently deleting a record the caller never named would be
-    // unattested by any result code. Shared-PSK records (server_id absent) never match here.
-    //
-    // Deliberately NOT folded into a single write with phase 1: the new record must be safely
-    // persisted BEFORE the old one is dropped, so a provider that can add but not delete (a
-    // legitimate, independent failure mode on real storage) never turns a successful pairing
-    // into a failed one. A rejected phase-2 write behaves like remove_record(): the retired
-    // record is erased from RAM unconditionally, and a rejected persist is only logged as a
-    // warning rather than treated as a failure.
-    if (supersede_server_id && this->records_[idx].server_id.has_value()) {
+    return true;
+}
+
+bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
+    // RAM-only, unlike store_record(): this runs on the NETWORK thread (the server/pair-finalize
+    // ack handler), where the record must become resolvable before the handler returns (the
+    // server's follow-up re-handshake is the next message on that thread) but the provider may
+    // not be called (its contract is main-loop-only). The caller schedules persist_records() on
+    // the main loop; see the class doc.
+    std::lock_guard<std::mutex> lock(this->mutex_);
+
+    size_t idx = this->find_index(record.psk_id);
+    const std::string incoming_psk_id = record.psk_id;
+    const bool is_insert = (idx == static_cast<size_t>(-1));
+
+    // Capacity: exempt a replace by psk_id (never grows the store), and exempt an insert that
+    // supersedes an existing record for the same server_id, because the retire below drops that
+    // record in the same locked section, so the net occupancy does not change. Without this
+    // exemption a device that already holds the store's last free slot could never re-pair once
+    // the rest of the store filled up with other servers' records. This RAM-side rejection is
+    // the one way this function fails, and it fails closed: an unresolvable record drops the
+    // connection when the server rekeys onto it.
+    if (is_insert) {
+        const bool will_supersede_existing =
+            record.server_id.has_value() &&
+            this->record_by_server_id(record.server_id.value()) != nullptr;
+        if (!will_supersede_existing && !this->has_capacity_locked()) {
+            SS_LOGW(TAG, "Storage full (%zu/%zu); rejecting new pairing record %s",
+                    this->records_.size(), this->max_records_, incoming_psk_id.c_str());
+            return false;
+        }
+    }
+
+    if (!is_insert) {
+        this->records_[idx] = std::move(record);
+    } else {
+        this->records_.push_back(std::move(record));
+        idx = this->records_.size() - 1;
+    }
+
+    // Retire any OTHER record still bound to this server_id: pairing mints a fresh per-server
+    // PSK that REPLACES whatever that server held before, and leaving the prior record in place
+    // would let re-pairing accumulate a second working PSK for the same server, so "rotation"
+    // never revokes anything. Only the pairing path asks for this: management/add-record stores
+    // plainly, because the spec's only stated add-record collision rule is keyed on psk_id (a
+    // psk whose psk_id is already known is already_exists) and it defines no outcome for a
+    // server_id collision: silently deleting a record the caller never named would be unattested
+    // by any result code. Shared-PSK records (server_id absent) never match here.
+    if (this->records_[idx].server_id.has_value()) {
         const std::string superseded_server_id = this->records_[idx].server_id.value();
-        std::vector<std::string> superseded_psk_ids;
         for (size_t i = 0; i < this->records_.size();) {
             if (i != idx && this->records_[i].server_id.has_value() &&
                 this->records_[i].server_id.value() == superseded_server_id) {
-                superseded_psk_ids.push_back(this->records_[i].psk_id);
+                SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
+                        this->records_[i].psk_id.c_str(), superseded_server_id.c_str());
                 this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(i));
                 if (i < idx) {
                     --idx;
@@ -495,26 +510,26 @@ bool RecordStore::store_record_impl(SendspinPairingRecord record, bool supersede
             }
             ++i;
         }
-
-        if (!superseded_psk_ids.empty()) {
-            if (this->persist_records_locked()) {
-                for (const auto& superseded_psk_id : superseded_psk_ids) {
-                    SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
-                            superseded_psk_id.c_str(), superseded_server_id.c_str());
-                }
-            } else {
-                for (const auto& superseded_psk_id : superseded_psk_ids) {
-                    SS_LOGW(TAG,
-                            "Superseded record %s but the provider did not persist the updated "
-                            "store; it is gone for this boot only and will be valid again after "
-                            "a reboot",
-                            superseded_psk_id.c_str());
-                }
-            }
-        }
     }
 
     return true;
+}
+
+bool RecordStore::persist_records() {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    if (this->persist_records_locked()) {
+        return true;
+    }
+    // One warning covers both halves of a deferred supersede: the freshly paired record is
+    // RAM-only (the pairing dies at the next reboot), and any record it retired is only gone
+    // from RAM (the store still holds the old array, so the retired PSK is valid again after a
+    // reboot). Nothing is retried: a provider that cannot write will not start writing because
+    // it is asked again, and the RAM state stays authoritative for this boot either way.
+    SS_LOGW(TAG,
+            "Provider rejected the pairing-record write; the store's contents are RAM-only for "
+            "this boot: a just-paired record will not survive a reboot, and any record it "
+            "superseded will be valid again after a reboot");
+    return false;
 }
 
 void RecordStore::remove_record(const std::string& psk_id) {
@@ -748,11 +763,11 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
     std::lock_guard<std::mutex> lock(this->mutex_);
 
     // A re-pair for a server_id that already holds a long-term record supersedes it in place
-    // (store_record_superseding() retires the old record only once the new one is safely
-    // persisted; see store_record_impl()), so it does not grow the store and must not be
-    // blocked by the capacity check even when the store reports itself full. Without this, a
-    // device that already occupies the store's last slot could never re-pair once other
-    // servers filled the rest of it.
+    // (store_record_superseding() retires the old record in the same locked section that
+    // inserts the new one), so it does not grow the store and must not be blocked by the
+    // capacity check even when the store reports itself full. Without this, a device that
+    // already occupies the store's last slot could never re-pair once other servers filled
+    // the rest of it.
     const bool replaces_existing = this->record_by_server_id(server_id) != nullptr;
     if (replaces_existing || this->has_capacity_locked()) {
         std::array<uint8_t, NOISE_PSK_SIZE> psk{};
@@ -850,20 +865,18 @@ bool RecordStore::persist_config() {
 // under mutex_ at several call sites in this file (mark_record_used, set_pairing_psk), and no
 // provider implementation calls back into RecordStore.
 //
-// store_record()/store_record_superseding() are the one exception for their own insert/replace
-// half, because that half must fail closed: the new record must not survive in records_ when the
-// provider rejects the write. store_record_impl() snapshots records_ before mutating, applies
-// the insert/replace in place, persists via this same helper, and rolls records_ back to the
-// snapshot on failure. That is safe under the same reasoning: the whole sequence runs under
+// store_record() is the one exception, because it must fail closed: the new record must not
+// survive in records_ when the provider rejects the write. It snapshots the element it is about
+// to touch, applies the insert/replace in place, persists via this same helper, and rolls
+// records_ back on failure. That is safe under the same reasoning: the whole sequence runs under
 // mutex_, so no reader (in particular resolve_by_psk_id() on the network thread) can observe the
 // tentative state before it commits or rolls back.
 //
-// The superseding form's retire-old-records half is deliberately a SEPARATE, later write (not
-// folded into the same persist_records_locked() call as the insert): the new record must be
-// safely persisted before the old one is dropped, so a provider that can add but cannot delete
-// never turns a successful pairing into a failed one. That second write follows remove_record()'s
-// discipline instead: erase from records_ unconditionally, persist, and only warn (not fail) if
-// the provider rejects it. See store_record_impl() for the full reasoning.
+// store_record_superseding() is the other exception, in the other direction: it mutates records_
+// WITHOUT persisting at all, because it runs on the network thread where the provider may not be
+// called. Its deferred flush is persist_records() (the public wrapper below), scheduled onto the
+// main loop by the client via INBOX_TOPIC_RECORDS; one flush write covers the insert and the
+// retire together.
 //
 // Precondition: the caller holds mutex_, with one exception: the constructor's first-boot
 // provisioning path, which calls this before the object is reachable by any other thread and

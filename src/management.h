@@ -201,8 +201,10 @@ inline void handle_add_record(RecordStore& store, const ManagementAddRecordPaylo
     // it was, so reporting ok would promise a credential the device does not hold and would only
     // surface later as an unexplained handshake failure. STORAGE_EXHAUSTED is the honest code
     // here even when the cause is a write error rather than a full store: both mean the record
-    // was not kept, which is the part the requester can act on. The pairing path draws the same
-    // line (see the server/pair-finalize handler, which aborts pairing on this return).
+    // was not kept, which is the part the requester can act on. This is deliberately stricter
+    // than the pairing path (store_record_superseding(), RAM-only with a deferred flush): this
+    // handler runs on the main loop where the provider may be consulted synchronously, and its
+    // result code is protocol-visible, so durability can and should be reported honestly.
     if (!store.store_record(std::move(rec))) {
         SS_LOGW(MGMT_TAG, "add-record: failed to persist record (psk_id=%s)", psk_id.c_str());
         result.result = ManagementResult::STORAGE_EXHAUSTED;

@@ -122,6 +122,14 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
 struct SendspinClient::EventState {
     Inbox inbox;
     InboxSlot<GroupUpdateObject> group_slot{inbox, INBOX_TOPIC_GROUP};
+    /// Pure wakeup (the bool payload carries no information): set by the network-thread
+    /// server/pair-finalize handler after RecordStore::store_record_superseding() mutates the
+    /// store RAM-only, drained by loop() into RecordStore::persist_records(). Exists because the
+    /// persistence provider is main-loop-only, so the durable write cannot happen where the RAM
+    /// commit must (see that handler). Deliberately its own slot rather than a deferred
+    /// connection event: cleanup_connection_state() wipes those, and a staged write must not be
+    /// lost just because the connection died before the next tick.
+    InboxSlot<bool> records_dirty_slot{inbox, INBOX_TOPIC_RECORDS};
     /// Bumped by cleanup_connection_state() so an in-progress ring drain abandons the rest of
     /// its already-copied batch. Main-thread only: the ring drain copies events out before
     /// dispatching, so a listener callback that re-enters connection teardown (e.g. connect_to()
@@ -196,6 +204,15 @@ SendspinClient::~SendspinClient() {
     this->color_.reset();
 #endif
     this->connection_manager_.reset();
+    // The network thread is gone with the connection manager, so no new pairing-record write can
+    // be staged; flush one still sitting in the slot (a pair-finalize that landed after the last
+    // loop() tick) before the store goes away, so an orderly shutdown does not lose the pairing.
+    {
+        bool dirty = false;
+        if (this->event_state_->records_dirty_slot.take(dirty) && this->record_store_ != nullptr) {
+            this->record_store_->persist_records();
+        }
+    }
     // Destroyed after the connection manager: every connection holds raw pointers into
     // identity_/record_store_ (see SendspinConnection::init_noise_handshake), so both must
     // outlive every connection the manager could still be tearing down.
@@ -328,6 +345,21 @@ void SendspinClient::loop() {
     // acquisitions in this section. A bit either snapshot races and misses is picked up by the
     // next tick's poll(): bounded staleness, already documented on Inbox::poll().
     const uint32_t inbox_bits = this->event_state_->inbox.poll();
+
+    // --- Deferred pairing-record persist ---
+    // Staged by the network-thread server/pair-finalize handler (see records_dirty_slot): the
+    // persistence provider is main-loop-only, so the durable write happens here. Runs before the
+    // pairing-note dispatch below so the write has been attempted by the time
+    // on_pairing_succeeded fires: the handler writes the slot before scheduling the note, so any
+    // tick whose connection_manager_->loop() collected the note took this poll() snapshot after
+    // the slot write was visible. persist_records() logs the durability warning itself on a
+    // rejected write, so the return value is deliberately ignored.
+    if (inbox_bits & INBOX_TOPIC_RECORDS) {
+        bool dirty = false;
+        if (this->event_state_->records_dirty_slot.take(dirty) && this->record_store_ != nullptr) {
+            this->record_store_->persist_records();
+        }
+    }
 
     // --- Time sync events ---
     if (inbox_bits & INBOX_TOPIC_EVENTS) {
@@ -1269,12 +1301,14 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE: {
             // server/pair-finalize: server acked our client/pair-finalize.
-            // Commit the pending pairing record synchronously HERE (network thread), NOT deferred
-            // to the main loop: the server rekeys onto the new long-term PSK immediately after
-            // this ack, and its re-handshake msg1 (the next message on this same thread) resolves
-            // that PSK against the RecordStore. The record must therefore be stored before this
-            // handler returns, else the re-handshake sees an unknown psk_id and aborts.
-            // RecordStore is thread-safe (its mutators lock).
+            // Commit the pending pairing record to RAM synchronously HERE (network thread), NOT
+            // deferred to the main loop: the server rekeys onto the new long-term PSK immediately
+            // after this ack, and its re-handshake msg1 (the next message on this same thread)
+            // resolves that PSK against the RecordStore. The record must therefore be resolvable
+            // before this handler returns, else the re-handshake sees an unknown psk_id and
+            // aborts. RecordStore is thread-safe (its mutators lock). Only the RAM commit is
+            // synchronous: the provider write is deferred to the main loop via the records-dirty
+            // slot below, because the persistence provider is main-loop-only.
             // The payload is spec'd as empty; the message-type dispatch above is the only
             // validation this message needs.
             if (conn != nullptr) {
@@ -1282,15 +1316,15 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                 bool stored_record = false;
                 if (record.has_value() && this->record_store_ != nullptr) {
                     const std::string psk_id = record->psk_id;
-                    // store_record_superseding() persists to the provider before mutating
-                    // in-memory state and fails closed, so a provider rejection (full storage,
-                    // write error) leaves the record unstored and is never reported as a
-                    // successful pairing. Nothing further is needed to unwind the connection:
-                    // the server rekeys onto this PSK regardless (it already acked
-                    // pair-finalize), and since the client does not hold it, the follow-up
-                    // re-handshake fails to resolve the psk_id and drops the connection
-                    // (noise_handshake.cpp) -- or, if the server never sends it, the re-prove
-                    // watchdog re-armed below does.
+                    // store_record_superseding() mutates RAM only; it fails only when the store
+                    // is at capacity, which fails the pairing closed: the server rekeys onto
+                    // this PSK regardless (it already acked pair-finalize), and since the client
+                    // does not hold it, the follow-up re-handshake fails to resolve the psk_id
+                    // and drops the connection (noise_handshake.cpp) -- or, if the server never
+                    // sends it, the re-prove watchdog re-armed below does. A provider that later
+                    // rejects the deferred write no longer fails the pairing: the record works
+                    // for this boot and persist_records() warns that it will not survive a
+                    // reboot.
                     //
                     // The superseding form is correct here and only here: this PSK replaces
                     // whatever this server held before, so the prior record for the same
@@ -1300,23 +1334,23 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                         SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
                                 psk_id.c_str());
                         stored_record = true;
-                    } else {
-                        SS_LOGW(TAG,
-                                "server/pair-finalize: failed to persist pairing record "
-                                "(psk_id=%s); the pairing cannot survive a reboot and the "
-                                "server's re-handshake onto it will fail",
-                                psk_id.c_str());
                     }
                 } else {
                     SS_LOGI(TAG, "server/pair-finalize: no record to store "
                                  "(shared-PSK fallback or no pending pairing)");
                 }
-                // Defer on_pairing_succeeded to the main loop via the same
-                // pending_*_events_ / has_pending_events_ idiom every other cross-thread
-                // connection-state mutation in ConnectionManager uses. Only fire when an
-                // actual long-term record was stored (not the shared-PSK fallback case, and
-                // not when the provider rejected the record).
                 if (stored_record) {
+                    // Stage the durable write for the main loop. Written BEFORE
+                    // schedule_pairing_succeeded so the tick that fires on_pairing_succeeded has
+                    // already observed the dirty bit in its inbox poll (loop() takes that
+                    // snapshot after ConnectionManager's event drain collects the note), meaning
+                    // the write is attempted before the application hears the pairing succeeded.
+                    this->event_state_->records_dirty_slot.write(true);
+                    // Defer on_pairing_succeeded to the main loop via the same
+                    // pending_*_events_ / has_pending_events_ idiom every other cross-thread
+                    // connection-state mutation in ConnectionManager uses. Only fire when an
+                    // actual long-term record was stored (not the shared-PSK fallback case, and
+                    // not the capacity-rejection case).
                     this->connection_manager_->schedule_pairing_succeeded(conn->get_server_id());
                 }
                 // Re-arm the provisional timeout so the 30 s watchdog fires if the server

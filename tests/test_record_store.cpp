@@ -413,30 +413,48 @@ TEST(RecordStore, StoreRecordSupersedesPriorRecordForSameServerId) {
     EXPECT_EQ(count, 1);
 }
 
-// The supersede must not happen before the new record is safely persisted: a rejected write
-// leaves the OLD (still-working) record in place rather than destroying it for nothing.
-TEST(RecordStore, StoreRecordSupersedeRejectedWriteKeepsOldRecord) {
-    RejectingPersistenceProvider provider;
-    provider.reject = false;
+// The supersede itself never calls the provider: in production it runs on the NETWORK thread
+// (the server/pair-finalize ack handler), where the provider contract forbids calls, so the
+// durable write is deferred to persist_records() on the main loop. The RAM mutation commits
+// immediately either way; a provider that then rejects the flush leaves the replacement
+// authoritative for this boot while the provider keeps its last accepted blob, so the ORIGINAL
+// record comes back at the next boot.
+TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
+    InMemoryPersistenceProvider provider;
     RecordStore store(&provider);
 
     SendspinPairingRecord original = make_client_record("server-X", "original");
     ASSERT_TRUE(store.store_record_superseding(original));
+    ASSERT_TRUE(store.persist_records());
 
-    provider.reject = true;
+    provider.reject_save_keys.insert(persistence_keys::RECORDS);
+    const int attempts_before = provider.save_attempts(persistence_keys::RECORDS);
+
     SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
-    EXPECT_FALSE(store.store_record_superseding(replacement))
-        << "a rejected write must not supersede the working credential";
+    EXPECT_TRUE(store.store_record_superseding(replacement))
+        << "the RAM-only supersede must not fail on a provider that would reject the write";
+    EXPECT_EQ(provider.save_attempts(persistence_keys::RECORDS), attempts_before)
+        << "store_record_superseding must not call the provider";
 
-    // The old record must still resolve and be the only one for this server_id.
-    auto resolved = store.resolve_by_psk_id(original.psk_id);
+    // RAM state is authoritative for this boot: the replacement resolves, the original is gone.
+    auto resolved = store.resolve_by_psk_id(replacement.psk_id);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
-    EXPECT_EQ(store.record_by_psk_id(replacement.psk_id), nullptr);
-
+    EXPECT_EQ(store.record_by_psk_id(original.psk_id), nullptr);
     const auto* found = store.record_by_server_id("server-X");
     ASSERT_NE(found, nullptr);
-    EXPECT_EQ(found->psk_id, original.psk_id);
+    EXPECT_EQ(found->psk_id, replacement.psk_id);
+
+    // The deferred flush is where the rejection surfaces.
+    EXPECT_FALSE(store.persist_records());
+    EXPECT_GT(provider.save_attempts(persistence_keys::RECORDS), attempts_before)
+        << "the rejected flush must have been attempted";
+
+    // "Reboot": the provider still holds the last accepted blob, so the original record
+    // resurfaces and the replacement is lost.
+    RecordStore rebooted(&provider);
+    EXPECT_TRUE(rebooted.resolve_by_psk_id(original.psk_id).has_value());
+    EXPECT_FALSE(rebooted.resolve_by_psk_id(replacement.psk_id).has_value());
 }
 
 // =============================================================================
@@ -813,52 +831,62 @@ TEST(RecordStore, RemoveRecordIsSilentWhenTheProviderAcceptsTheDelete) {
         << "a delete the store accepted is durable and must not warn; got: " << logs;
 }
 
-// Same contract on the pairing/supersede path: the prior record goes even though the provider
-// refused to delete it, and the refusal is reported.
-TEST(RecordStore, SupersedeErasesFromMemoryAndWarnsWhenTheProviderRefusesTheDelete) {
+// Same contract on the pairing/supersede path, which persists through the deferred
+// persist_records() flush rather than inside the supersede itself: the prior record leaves RAM
+// immediately (revoked for this boot no matter what the provider later says), and a flush the
+// provider refuses is reported at flush time.
+TEST(RecordStore, SupersedeErasesFromMemoryAndFlushWarnsWhenTheProviderRefusesTheDelete) {
     RejectingDeleteProvider provider;
     RecordStore store(&provider);
 
     SendspinPairingRecord original = make_client_record("server-X", "original");
     ASSERT_TRUE(store.store_record_superseding(original));
+    ASSERT_TRUE(store.persist_records());
 
     SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
-    std::string logs;
-    {
-        StderrCapture capture;
-        ASSERT_TRUE(store.store_record_superseding(replacement));
-        logs = capture.release();
-    }
+    ASSERT_TRUE(store.store_record_superseding(replacement));
 
+    // The RAM effect precedes any provider traffic: the supersede itself asked for nothing.
     EXPECT_EQ(store.record_by_psk_id(original.psk_id), nullptr);
     EXPECT_FALSE(store.resolve_by_psk_id(original.psk_id).has_value());
     EXPECT_NE(store.record_by_psk_id(replacement.psk_id), nullptr);
+    EXPECT_TRUE(provider.remove_attempts.empty())
+        << "store_record_superseding must not call the provider";
+
+    std::string logs;
+    {
+        StderrCapture capture;
+        EXPECT_FALSE(store.persist_records());
+        logs = capture.release();
+    }
     ASSERT_EQ(provider.remove_attempts.size(), 1u);
     EXPECT_EQ(provider.remove_attempts[0], original.psk_id);
     EXPECT_NE(logs.find(REBOOT_WARNING), std::string::npos)
-        << "a refused supersede-delete must be reported; got: " << logs;
+        << "a refused supersede flush must be reported; got: " << logs;
 }
 
-// A supersede whose delete the store accepted is durable: no warning, and the prior record is
+// A supersede whose flush the store accepted is durable: no warning, and the prior record is
 // really gone from the provider (so it does not come back on the next start).
-TEST(RecordStore, SupersedeIsSilentWhenTheProviderAcceptsTheDelete) {
+TEST(RecordStore, SupersedeIsSilentWhenTheProviderAcceptsTheFlush) {
     RejectingDeleteProvider provider;
     provider.refuse_delete = false;
     RecordStore store(&provider);
 
     SendspinPairingRecord original = make_client_record("server-X", "original");
     ASSERT_TRUE(store.store_record_superseding(original));
+    ASSERT_TRUE(store.persist_records());
 
     SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
     std::string logs;
     {
         StderrCapture capture;
         ASSERT_TRUE(store.store_record_superseding(replacement));
+        ASSERT_TRUE(store.persist_records());
         logs = capture.release();
     }
 
     EXPECT_EQ(logs.find(REBOOT_WARNING), std::string::npos)
-        << "an accepted supersede-delete must not warn; got: " << logs;
+        << "an accepted supersede flush must not warn; got: " << logs;
 
     RecordStore rebooted(&provider);
     EXPECT_FALSE(rebooted.resolve_by_psk_id(original.psk_id).has_value());
@@ -2134,8 +2162,8 @@ TEST(PskZeroization, PairingOutcomeDestructorWipesPsk) {
 // them.
 //
 // resolve_pairing_outcome() must therefore hold mutex_ across its whole body: probing records_
-// through the unlocked record_by_server_id() helper races store_record_impl()'s push_back
-// reallocation. Under ThreadSanitizer (-DENABLE_TSAN=ON) such a race is reported against
+// through the unlocked record_by_server_id() helper races store_record_superseding()'s
+// push_back reallocation. Under ThreadSanitizer (-DENABLE_TSAN=ON) such a race is reported against
 // records_ and fails this test. Without TSan the test still carries weight: it would hang if
 // the locking ever re-entered the non-recursive mutex_.
 TEST(RecordStoreConcurrency, ResolvePairingOutcomeDoesNotRaceRecordStores) {

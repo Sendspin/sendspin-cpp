@@ -163,16 +163,12 @@ public:
 /// Every method has a default no-op / nullopt implementation so a platform can opt in
 /// incrementally.
 ///
-/// Threading: most keys are only ever touched from the main loop thread. Two exceptions:
-///   - `save_blob(persistence_keys::RECORDS, ...)` can also fire on the NETWORK thread, via the
-///     server/pair-finalize commit path (`RecordStore::store_record()`): the record must be
-///     durable before the server's immediate re-handshake resolves it, so this cannot wait for
-///     the main loop. A provider that shares state across keys (a file, a handle) must serialize
-///     its own access, since this can overlap a main-loop call to another key.
-///   - `save_blob(persistence_keys::KEYPAIR, ...)` fires during `start_server()`, which runs on
-///     the main loop, but before any connection exists. It is called out here only because it is
-///     the one write that happens exactly once, at startup, rather than in response to a runtime
-///     event.
+/// Threading: every method is invoked on the main loop thread, for every key. A provider
+/// therefore needs no locking of its own. (The one library write that originates on the network
+/// thread, the pairing record committed at server/pair-finalize, is staged internally and
+/// flushed to `save_blob(persistence_keys::RECORDS, ...)` from the next `loop()` tick.)
+/// `save_blob(persistence_keys::KEYPAIR, ...)` is the one write that happens exactly once, at
+/// startup during `start_server()`, rather than in response to a runtime event.
 ///
 /// Re-entrancy: implementations must NOT call back into the library (SendspinClient or any of
 /// its objects) from inside load_blob/save_blob/erase_blob. The library invokes these methods
@@ -181,10 +177,9 @@ public:
 ///
 /// Blocking: for the same reason, an implementation must perform one bounded storage operation
 /// and return, not add blocking of its own (a synchronous retry loop, a multi-second fsync
-/// chain). Held locks and, for `RECORDS`, the NETWORK thread mid-pairing-exchange are on the
-/// call stack for the duration. A failed write should be reported by returning false rather
-/// than retried inline; the library already handles that (fail-closed pairing, revocation
-/// warnings) as described below on save_blob/erase_blob.
+/// chain). Held locks are on the call stack for the duration. A failed write should be reported
+/// by returning false rather than retried inline; the library already handles that (durability
+/// warnings, fail-closed management add-record) as described below on save_blob/erase_blob.
 class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;
@@ -196,20 +191,23 @@ public:
     }
 
     /// @brief Persist bytes under key. Returning true means DURABLY stored (the library
-    /// gates pairing completion on this for the "records" key, and revocation durability
-    /// on it for removals).
+    /// gates management/add-record results on this for the "records" key, and revocation
+    /// durability on it for removals).
     ///
-    /// Specifically: a rejected write to `persistence_keys::RECORDS` during pairing fails the
-    /// exchange closed: the record is not retained, `on_pairing_succeeded` does not fire, and
-    /// the pairing does not complete. The connection then drops on its own, because the server
-    /// rekeys onto a PSK this client never stored and that re-handshake cannot resolve.
+    /// A rejected write is reported, not retried: the in-memory state it was meant to capture
+    /// stays authoritative for the current boot, and the library logs a warning naming what will
+    /// be lost (or come back) at the next reboot. Specifically, for
+    /// `persistence_keys::RECORDS`: a rejected write of a just-paired record leaves the pairing
+    /// working for this boot only (`on_pairing_succeeded` still fires); a rejected write of a
+    /// removal means the store still holds the old array and will hand the revoked record back
+    /// at the next boot, silently making the revoked PSK valid again (the revoked record is
+    /// always dropped from RAM regardless of this return value, so a `false` does not undo
+    /// that). The one fail-closed consumer is `management/add-record`, which reports a rejected
+    /// write to the requesting server as storage_exhausted rather than promising a credential
+    /// the device does not durably hold.
     /// A provider that cannot report durability synchronously (one that queues the write) should
-    /// return true and surface its own write failures; the library's guarantee is only as strong
-    /// as this return value. And a revoked/removed record is always dropped from RAM regardless
-    /// of this return value, so a `false` here does not undo that: it means the store still
-    /// holds the old array and will hand the revoked record back at the next boot, silently
-    /// making the revoked PSK valid again. The library logs a warning saying exactly that, so
-    /// report failure honestly rather than swallowing it.
+    /// return true and surface its own write failures; the library's warnings are only as
+    /// accurate as this return value, so report failure honestly rather than swallowing it.
     /// @return true on success, false on failure.
     virtual bool save_blob(const std::string& /*key*/, const uint8_t* /*data*/, size_t /*len*/) {
         return false;

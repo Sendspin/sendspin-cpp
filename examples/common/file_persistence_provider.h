@@ -38,7 +38,6 @@
 #include "sendspin/client.h"
 
 #include <cstdint>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -64,11 +63,8 @@ public:
     bool erase_blob(const std::string& key) override;
 
 private:
-    // save_blob(persistence_keys::RECORDS, ...) is called on the network thread during pairing
-    // finalize, while the other keys are only ever touched from the main loop. This mutex
-    // serializes the read-modify-write of the backing file so concurrent calls cannot lose an
-    // update.
-    std::mutex mutex_;
+    // No locking: the provider contract guarantees every method is invoked on the main loop
+    // thread, for every key (see SendspinPersistenceProvider in sendspin/client.h).
     std::string path_;
 };
 

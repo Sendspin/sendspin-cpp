@@ -100,7 +100,9 @@ struct ResolvedPsk {
 ///
 /// Thread-safety:
 ///   - `records_` and `pairing_psk_` are guarded by `mutex_`. ALL cross-thread access
-///     must go through `resolve_by_psk_id` or the `*_snapshot` / `*_copy` variants.
+///     must go through `resolve_by_psk_id`, the `*_snapshot` / `*_copy` variants, or the one
+///     network-thread mutator, `store_record_superseding` (RAM-only there; its deferred
+///     provider flush, `persist_records`, is main-loop-only).
 ///   - The pointer/reference-returning getters (`record_by_psk_id`, `record_by_server_id`,
 ///     `records`) are for internal-locked or single-threaded (main-loop-only) use ONLY;
 ///     callers must not retain a returned pointer or reference across any mutation, and must
@@ -199,19 +201,29 @@ public:
     /// false when the persistence provider rejected the write.
     bool store_record(SendspinPairingRecord record);
 
-    /// @brief Like store_record(), but additionally retires any OTHER record bound to the
-    /// same server_id once the new record is safely persisted.
+    /// @brief Like store_record(), but RAM-only and additionally retires any OTHER record
+    /// bound to the same server_id.
     ///
     /// This is the pairing-completion form: pairing mints a fresh per-server PSK that
     /// REPLACES whatever that server held before, so leaving the prior record in place
     /// would keep the old PSK valid forever and let repeated re-pairs exhaust storage.
-    /// Ordering matters: the new record is persisted BEFORE the old one is dropped, so a
-    /// rejected write never destroys the working credential. Shared-PSK records (server_id
-    /// absent) are never subject to this supersede, which is what keeps the record-mode
-    /// fallback record safe.
-    /// @return true when the record is stored (and persisted, when a provider is set);
-    /// false when the persistence provider rejected the write (nothing is retired then).
+    /// Shared-PSK records (server_id absent) are never subject to this supersede, which is
+    /// what keeps the record-mode fallback record safe.
+    ///
+    /// Unlike store_record(), this NEVER calls the provider: it runs on the NETWORK thread
+    /// (the server/pair-finalize ack handler), where the record must become resolvable before
+    /// the handler returns but the provider contract only permits main-loop calls. The caller
+    /// must arrange for persist_records() to run on the main loop afterwards (the client does
+    /// this via INBOX_TOPIC_RECORDS); until that flush lands, the mutation is RAM-only.
+    /// @return true when the record is stored in RAM; false only when the store is at
+    /// capacity (nothing is retired then).
     bool store_record_superseding(SendspinPairingRecord record);
+
+    /// @brief Encode records_ and save it under persistence_keys::RECORDS. MAIN LOOP ONLY
+    /// (calls the provider). The deferred flush half of store_record_superseding(); logs the
+    /// durability warning itself on a rejected write, so callers may ignore the return value.
+    /// @return true on success (or when there is no provider); false on a rejected write.
+    bool persist_records();
 
     /// @brief Remove the long-term record identified by psk_id.
     /// No-op if absent.
@@ -398,8 +410,8 @@ public:
     ///
     /// This is an advisory pre-check consulted by callers (resolve_pairing_outcome(),
     /// management/add-record) before attempting to store a record; it takes mutex_ and releases
-    /// it before returning, so the actual insert still goes through store_record_impl(), which
-    /// re-checks max_records_ under its own hold of mutex_. An insert that lands in that gap
+    /// it before returning, so the actual insert (store_record() or store_record_superseding())
+    /// still re-checks max_records_ under its own hold of mutex_. An insert that lands in that gap
     /// therefore cannot grow the in-memory array past the cap. A record replacement (matching
     /// psk_id, or a pairing supersede of the record already held for the target server_id) is
     /// exempt from the cap in both places: it does not grow the store.
@@ -480,11 +492,6 @@ private:
 
     /// @brief Find the index of a record by psk_id, or npos if absent.
     [[nodiscard]] size_t find_index(const std::string& psk_id) const;
-
-    /// @brief Shared body of store_record() and store_record_superseding().
-    /// @param supersede_server_id When true, retire any other record bound to the stored
-    ///        record's server_id after the new record is persisted.
-    bool store_record_impl(SendspinPairingRecord record, bool supersede_server_id);
 
     /// @brief Persist the current pairing config via the provider.
     /// @return True if the config was stored (or there is no provider, so there is nothing to

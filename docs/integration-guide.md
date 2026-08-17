@@ -456,15 +456,12 @@ The library owns all serialization. It calls these three methods with one of the
 below; a provider never needs to parse or interpret the bytes, only store and return them
 byte-for-byte.
 
-Most keys are only ever touched from the main loop thread. Two exceptions:
-
-- `save_blob(persistence_keys::RECORDS, ...)` is also called on the network thread when a
-  pairing finalizes (the record must be durable before the server's immediate re-handshake
-  resolves it). This can therefore overlap a main-loop call to another key, so an
-  implementation that shares state across keys (a file, a handle) must serialize its own
-  access. `FilePersistenceProvider` guards every call with a mutex.
-- `save_blob(persistence_keys::KEYPAIR, ...)` fires once, during `start_server()` (main loop),
-  called out only because it is a startup-time write rather than a response to a runtime event.
+Every method is invoked on the main loop thread, for every key, so a provider needs no locking
+of its own. (The one library write that originates on the network thread -- the pairing record
+committed when a pairing finalizes -- is staged internally and flushed to
+`save_blob(persistence_keys::RECORDS, ...)` from the next `loop()` tick.)
+`save_blob(persistence_keys::KEYPAIR, ...)` is the one startup-time write: it fires once,
+during `start_server()`, rather than in response to a runtime event.
 
 #### Keyspace
 
@@ -489,14 +486,17 @@ produces -- it is not something a provider hand-rolls its own version of.
 
 #### Durability contract
 
-- `save_blob()` returning `true` means DURABLY stored. This matters most for
-  `persistence_keys::RECORDS`: the library gates pairing completion on it (a `false` return
-  during pairing fails the exchange closed -- the record is not retained and
-  `on_pairing_succeeded` does not fire, so the pairing does not complete) and gates revocation
-  durability on it for removals (a revoked record is always dropped from RAM regardless of the
-  return value, but a `false` return means the store still holds the old array and will hand
-  the revoked record back at the next boot, silently making the revoked PSK valid again -- the
-  library logs a warning saying exactly that).
+- `save_blob()` returning `true` means DURABLY stored. A `false` return is reported, not
+  retried: the in-memory state stays authoritative for the current boot, and the library logs a
+  warning naming what will be lost (or come back) at the next reboot. For
+  `persistence_keys::RECORDS` specifically: a rejected write of a just-paired record leaves the
+  pairing working for this boot only (`on_pairing_succeeded` still fires; the record is gone
+  after a reboot), and a rejected write of a removal means the store still holds the old array
+  and will hand the revoked record back at the next boot, silently making the revoked PSK valid
+  again (the revoked record is always dropped from RAM regardless of the return value). The one
+  fail-closed consumer is `management/add-record`, which reports a rejected write to the
+  requesting server as `storage_exhausted` rather than promising a credential the device does
+  not durably hold.
 - `erase_blob()` is only ever called for `persistence_keys::PAIRING_PSK` and
   `persistence_keys::STATIC_PIN` (a removal from `RECORDS` re-saves the shrunken array instead,
   so that key stays present). Absent counts as success. Same durability contract as a rejected
@@ -511,7 +511,7 @@ shared-PSK fallback record counts against the cap too) at
 `SendspinClientConfig::max_pairing_records`, which defaults to
 `SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS` (12). An encoded record is roughly 250
 bytes, so the default keeps the serialized `RECORDS` blob comfortably under a typical NVS
-entry's ~4 KB limit even while a pairing supersede transiently persists one extra record.
+entry's ~4 KB limit.
 Once the cap is reached, a new pairing falls back to the shared-PSK record instead of minting
 a per-server one, and `management/add-record` returns `storage_exhausted`; replacing a record
 already held for a given `psk_id` or `server_id` is unaffected, since that never grows the
@@ -1037,9 +1037,8 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 
 `ArtworkRole::frame_done()` must be called from the main loop thread (typically from inside `on_image_display()`/`on_image_clear()` or when a cross-fade animation completes).
 
-`SendspinPersistenceProvider` calls are on the main loop thread for every key except
-`persistence_keys::RECORDS`, whose `save_blob()` is also called on the network thread when a
-pairing finalizes (see the `SendspinPersistenceProvider` section above).
+`SendspinPersistenceProvider` calls are on the main loop thread for every key (see the
+`SendspinPersistenceProvider` section above).
 
 ## Minimal Example
 

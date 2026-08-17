@@ -24,7 +24,6 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
-#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -174,7 +173,6 @@ std::string FilePersistenceProvider::default_path(const std::string& filename) {
 // ============================================================================
 
 std::optional<std::vector<uint8_t>> FilePersistenceProvider::load_blob(const std::string& key) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(this->path_);
     if (!doc[key].is<const char*>()) {
         return std::nullopt;
@@ -189,14 +187,12 @@ std::optional<std::vector<uint8_t>> FilePersistenceProvider::load_blob(const std
 }
 
 bool FilePersistenceProvider::save_blob(const std::string& key, const uint8_t* data, size_t len) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(this->path_);
     doc[key] = base64url_encode(data, len);
     return save_doc(this->path_, doc);
 }
 
 bool FilePersistenceProvider::erase_blob(const std::string& key) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
     JsonDocument doc = load_doc(this->path_);
     if (!doc[key].is<const char*>()) {
         return true;  // Nothing stored: the key is already absent.

@@ -73,9 +73,10 @@ struct SendspinPairingRecord {
     /// the persisted blob for as long as the record is paired, by design (see persist_records_
     /// locked() in record_store.cpp). The copy/move members are defaulted explicitly (rather than
     /// left to go through this destructor's precedent of suppressing them, as `Identity` does):
-    /// records move through `std::vector`/`std::optional` on real paths (store_record_impl's
-    /// insert/replace, decode_pairing_records' push_back, resolve_pairing_outcome's
-    /// PairingOutcome), so keeping those moves real (not copies) matters here.
+    /// records move through `std::vector`/`std::optional` on real paths (store_record's and
+    /// store_record_superseding's insert/replace, decode_pairing_records' push_back,
+    /// resolve_pairing_outcome's PairingOutcome), so keeping those moves real (not copies)
+    /// matters here.
     ~SendspinPairingRecord() {
         detail::secure_zero_psk(this->psk);
     }
