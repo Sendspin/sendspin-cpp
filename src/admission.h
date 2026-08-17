@@ -161,6 +161,31 @@ inline bool admissible(PskCategory category, const std::vector<SendspinActivity>
     return activities_allowed(category, with_playback, unpaired_access);
 }
 
+/// @brief Goodbye reason to close an inadmissible server/activate with.
+///
+/// Separates "you are not paired yet" from "you may never do this". The activate would have
+/// been admissible had unpaired access been enabled, so the server is told pairing is what is
+/// missing; anything else is a permanent refusal. Only the Sentinel PSK can reach the
+/// pairing_required case, since unpaired_access gates that category alone.
+///
+/// Callers must only use this for an activate that admissible() already rejected: for an
+/// admissible one the return value is meaningless.
+///
+/// @param category        PSK category matched during the Noise handshake.
+/// @param activities      Activities declared in the server/activate message.
+/// @param has_roles       Whether the effective active_roles set is non-empty.
+/// @param unpaired_access Whether unpaired (Sentinel) access is enabled.
+/// @return PAIRING_REQUIRED if enabling unpaired access would have admitted it, else UNAUTHORIZED.
+inline SendspinGoodbyeReason inadmissible_reject_reason(
+    PskCategory category, const std::vector<SendspinActivity>& activities, bool has_roles,
+    bool unpaired_access) {
+    if (category == PskCategory::SENTINEL && !unpaired_access &&
+        admissible(category, activities, has_roles, /*unpaired_access=*/true)) {
+        return SendspinGoodbyeReason::PAIRING_REQUIRED;
+    }
+    return SendspinGoodbyeReason::UNAUTHORIZED;
+}
+
 // ============================================================================
 // Multi-server admission arbitration
 // ============================================================================

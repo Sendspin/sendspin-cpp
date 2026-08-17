@@ -221,17 +221,14 @@ TEST(Admissible, PairingCatPlayback_NotAdmissible) {
 // pairing_required vs unauthorized selection (admissibility-based reject reason)
 // ============================================================================
 
-// Helper: returns the goodbye reason for an inadmissible activate (mirrors the activate handler).
-// pairing_required when SENTINEL+!unpaired_access+would-be-admissible-with-unpaired-access=true.
-// unauthorized otherwise.
+// Thin alias for inadmissible_reject_reason(), the same function ConnectionManager's activate
+// handler calls to pick the goodbye reason. It must stay a call rather than a local
+// reimplementation of the same condition: a copy here would keep these tests green no matter what
+// the handler does.
 static SendspinGoodbyeReason reject_reason_for(PskCategory cat,
                                                const std::vector<SendspinActivity>& activities,
                                                bool has_roles, bool unpaired_access) {
-    if (cat == PskCategory::SENTINEL && !unpaired_access &&
-        admissible(cat, activities, has_roles, /*unpaired_access=*/true)) {
-        return SendspinGoodbyeReason::PAIRING_REQUIRED;
-    }
-    return SendspinGoodbyeReason::UNAUTHORIZED;
+    return inadmissible_reject_reason(cat, activities, has_roles, unpaired_access);
 }
 
 TEST(RejectReason, SentinelPlaybackNoUnpaired_PairingRequired) {

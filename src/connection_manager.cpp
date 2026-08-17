@@ -545,12 +545,8 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         admissible(event.conn->get_psk_category(), event.activities, has_roles, unpaired_access);
 
     if (!trust_ok) {
-        SendspinGoodbyeReason reject_reason = SendspinGoodbyeReason::UNAUTHORIZED;
-        if (event.conn->get_psk_category() == PskCategory::SENTINEL && !unpaired_access &&
-            admissible(event.conn->get_psk_category(), event.activities, has_roles,
-                       /*unpaired_access=*/true)) {
-            reject_reason = SendspinGoodbyeReason::PAIRING_REQUIRED;
-        }
+        const SendspinGoodbyeReason reject_reason = inadmissible_reject_reason(
+            event.conn->get_psk_category(), event.activities, has_roles, unpaired_access);
         SS_LOGW(TAG, "server/activate inadmissible (psk_category=%d): closing with %s",
                 static_cast<int>(event.conn->get_psk_category()),
                 reject_reason == SendspinGoodbyeReason::PAIRING_REQUIRED ? "pairing_required"
