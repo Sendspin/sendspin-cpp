@@ -68,6 +68,7 @@ constexpr uint16_t AEAD_FAILURE_OUTBOUND_PORT = 18999;
 constexpr uint16_t PREHANDSHAKE_BINARY_TEST_PORT = 19000;
 constexpr uint16_t PREADMISSION_ROLE_TEST_PORT = 19001;
 constexpr uint16_t REVOCATION_SWEEP_TEST_PORT = 19002;
+constexpr uint16_t REACTIVATE_PAIRING_TEST_PORT = 19003;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -92,12 +93,25 @@ public:
         this->configured_pairing_psk_ = std::move(psk);
     }
 
+    // Optionally pre-seed a LONG_TERM record so the fake server can connect to it directly
+    // (bypassing pairing) before a test drives an in-band re-handshake onto the pairing PSK
+    // above, on an already-admitted connection. Must be set before start_server() reads it into
+    // the RecordStore, like set_configured_pairing_psk() above.
+    void set_seeded_long_term_record(SendspinPairingRecord record) {
+        this->seeded_long_term_record_ = std::move(record);
+    }
+
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        if (key != persistence_keys::PAIRING_PSK || !this->configured_pairing_psk_.has_value()) {
-            return std::nullopt;
+        if (key == persistence_keys::PAIRING_PSK && this->configured_pairing_psk_.has_value()) {
+            std::string encoded = encode_pairing_psk(this->configured_pairing_psk_.value());
+            return std::vector<uint8_t>(encoded.begin(), encoded.end());
         }
-        std::string encoded = encode_pairing_psk(this->configured_pairing_psk_.value());
-        return std::vector<uint8_t>(encoded.begin(), encoded.end());
+        if (key == persistence_keys::RECORDS && this->seeded_long_term_record_.has_value()) {
+            std::string encoded =
+                encode_pairing_records({this->seeded_long_term_record_.value()});
+            return std::vector<uint8_t>(encoded.begin(), encoded.end());
+        }
+        return std::nullopt;
     }
 
     bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
@@ -157,6 +171,7 @@ private:
     int rejected_record_saves_{0};
     bool reject_pairing_records_{false};
     std::optional<SendspinPairingPsk> configured_pairing_psk_;
+    std::optional<SendspinPairingRecord> seeded_long_term_record_;
 };
 
 // Records on_trust_changed / on_pairing_succeeded notifications so the pairing-flow test can
@@ -554,6 +569,121 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     pump_for(client, 100);
     EXPECT_EQ(client.get_current_trust(), ConnectionTrust::NONE)
         << "get_current_trust() must reset to NONE once the connection is torn down";
+}
+
+// Regression test for the "re-pair an already-connected client" bug: Music Assistant can
+// token-pair a client that is already admitted and operational (LONG_TERM trust). The server
+// does this by in-band re-handshaking the LIVE connection onto the Pairing PSK, which resets
+// first_activate_received_ exactly like any other re-handshake, then sends a fresh
+// server/activate declaring ["pairing"] with pairing.method=pairing_psk. Because that activate
+// looks like a FIRST activate (is_first true), it used to fall into the operational branch of
+// ConnectionManager::drain_lifecycle_events() instead of handle_enter_pairing(): the client
+// resumed time sync and sent client/state, which a real server awaiting client/pair-finalize
+// treats as a protocol error and hard-drops the connection for. The fix makes the
+// pairing-selection check run on every activate (first or not) and take priority over the
+// operational branch, mirroring the reference client's _handle_server_activate.
+TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFinalize) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+
+    // The server identity is generated up front: the LONG_TERM record below is bound to it
+    // (record_store.cpp's handle_msg1 rejects a record whose server_id does not match the peer
+    // that presents it), and the fake server later needs the same identity for both handshakes.
+    Identity server_identity = Identity::generate().value();
+
+    // The LONG_TERM record the client is already connected and admitted with, before pairing is
+    // reopened on the same connection.
+    PairedPeer long_term_peer = make_paired_peer();
+    long_term_peer.record.server_id = server_identity.peer_id();
+    persistence.set_seeded_long_term_record(long_term_peer.record);
+
+    // The Pairing PSK the operator hands to the server out of band (e.g. a fresh pairing token),
+    // known ahead of time here so the fake server can re-handshake onto it directly.
+    std::array<uint8_t, 32> pairing_psk_bytes{};
+    for (size_t i = 0; i < pairing_psk_bytes.size(); ++i) {
+        pairing_psk_bytes[i] = static_cast<uint8_t>(0xC0 + i);
+    }
+    SendspinPairingPsk configured_pairing_psk;
+    configured_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
+    configured_pairing_psk.psk = pairing_psk_bytes;
+    persistence.set_configured_pairing_psk(configured_pairing_psk);
+
+    SendspinClientConfig config;
+    config.name = "Reactivate Pairing Test Client";
+    config.server_port = REACTIVATE_PAIRING_TEST_PORT;
+
+    RecordingClientListener listener;
+    SendspinClient client(config);
+    client.set_listener(&listener);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start_server());
+    pump_for(client, 50);
+
+    // The FIRST server/activate (default options) is a normal playback activate that brings the
+    // connection operational exactly like InBandRehandshakeResumesOperational. The SECOND (sent
+    // after the re-handshake below and its resulting fresh client/hello) is the pairing activate
+    // that reproduces the bug: it declares ["pairing"]/pairing_psk on what looks like a FIRST
+    // activate from the connection's point of view.
+    FakeEncryptedServerOptions options;
+    options.second_activities_json = R"(["pairing"])";
+    options.second_roles_json = R"([])";
+    options.second_pairing_method = "pairing_psk";
+
+    FakeEncryptedServer server(server_url(REACTIVATE_PAIRING_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               long_term_peer.record.psk_id, long_term_peer.psk, options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "Initial LONG_TERM handshake/hello/activate did not complete";
+    EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER);
+
+    // Becoming operational the first time legitimately sends one client/state; only traffic
+    // AFTER this point is what the regression check below cares about. Pump a little longer to
+    // let that legitimate message actually arrive (is_connected() flips as soon as the activate
+    // is applied, slightly before the resulting client/state is sent and received).
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.client_state_count() > 0; }, 2000))
+        << "Sanity check: the initial admission must publish client/state";
+    const int state_count_before_repair = server.client_state_count();
+
+    // Re-handshake the LIVE, admitted connection onto the pairing PSK, exactly like the server
+    // re-pairing an already-connected client (e.g. Music Assistant token-pairing a device that
+    // is already streaming).
+    ASSERT_TRUE(server.trigger_rehandshake(configured_pairing_psk.psk_id, pairing_psk_bytes))
+        << "Failed to start the in-band re-handshake onto the pairing PSK";
+
+    // The fixed client must reply with client/pair-finalize instead of hard-stalling; the
+    // pre-fix client never sends it (it sends client/state instead, which a real server treats
+    // as a protocol violation).
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.learned_psk_id().has_value(); }, 4000))
+        << "client/pair-finalize was never sent for the post-rehandshake pairing activate";
+
+    // The primary regression check: no client/state must have reached the server before (or
+    // instead of) client/pair-finalize. handle_enter_pairing() never publishes client/state;
+    // only the operational branch (on_handshake_complete) does, so any non-zero count here means
+    // the activate was misrouted into the operational path.
+    EXPECT_EQ(server.client_state_count(), state_count_before_repair)
+        << "client/state must not be sent while the server awaits client/pair-finalize";
+
+    // Confirms the fix routed through handle_enter_pairing() (not just that some message with
+    // this shape happened to be sent): the started/succeeded pairing callbacks must fire, exactly
+    // like a fresh pairing-PSK flow.
+    ASSERT_TRUE(listener.pairing_started_server_id().has_value())
+        << "on_pairing_started was never fired for the re-pairing activate";
+    EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return listener.pairing_succeeded_server_id().has_value(); }, 4000))
+        << "on_pairing_succeeded was never fired";
+    EXPECT_EQ(server.client_state_count(), state_count_before_repair)
+        << "client/state must still not have been sent once pairing succeeded (the connection "
+           "goes operational only after the follow-up re-handshake completes)";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
 }
 
 // Fail-open persistence: when the persistence provider rejects the pair-finalize record write

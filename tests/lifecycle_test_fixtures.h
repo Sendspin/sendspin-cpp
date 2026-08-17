@@ -400,6 +400,9 @@ struct FakeEncryptedServerOptions {
     // trigger_rehandshake() call and its resulting fresh hello cycle).
     std::string second_activities_json{R"(["playback"])"};
     std::string second_roles_json{R"(["player@v1"])"};
+    // Mirrors first_pairing_method for the SECOND server/activate: present only when it should
+    // select a pairing method too (an in-band re-handshake onto a pairing PSK, mid-connection).
+    std::optional<std::string> second_pairing_method;
     // When set, this raw JSON message is sent (encrypted) immediately BEFORE the first
     // server/activate: while the connection has finished the Noise handshake but has not
     // yet been admitted. Used to prove role-bound traffic is refused until admission.
@@ -514,6 +517,14 @@ public:
         return this->last_management_result_;
     }
 
+    // Number of client/state messages received so far. Used to prove a client/state was, or was
+    // not, sent before some later event (e.g. client/pair-finalize): a real server awaiting
+    // pair-finalize treats an intervening client/state as a protocol error and hard-drops the
+    // connection, so a test asserting the fix must observe this staying at 0 across that window.
+    int client_state_count() const {
+        return this->client_state_count_.load();
+    }
+
 private:
     void on_message(const ix::WebSocketMessagePtr& msg) {
         if (msg->type == ix::WebSocketMessageType::Close ||
@@ -602,9 +613,11 @@ private:
                 count <= 1 ? this->options_.first_roles_json : this->options_.second_roles_json;
             std::string activate = std::string(R"({"type":"server/activate","payload":{)") +
                                    R"("activities":)" + activities + R"(,"active_roles":)" + roles;
-            if (count <= 1 && this->options_.first_pairing_method.has_value()) {
-                activate += R"(,"pairing":{"method":")" +
-                           this->options_.first_pairing_method.value() + "\"}";
+            const std::optional<std::string>& pairing_method =
+                count <= 1 ? this->options_.first_pairing_method
+                          : this->options_.second_pairing_method;
+            if (pairing_method.has_value()) {
+                activate += R"(,"pairing":{"method":")" + pairing_method.value() + "\"}";
             }
             activate += "}}";
             if (this->options_.suppress_activate) {
@@ -651,6 +664,11 @@ private:
         if (std::strcmp(type, "management/result") == 0) {
             std::lock_guard<std::mutex> mlock(this->management_mutex_);
             this->last_management_result_ = json;
+            return;
+        }
+
+        if (std::strcmp(type, "client/state") == 0) {
+            this->client_state_count_.fetch_add(1);
             return;
         }
 
@@ -720,6 +738,8 @@ private:
 
     mutable std::mutex management_mutex_;
     std::optional<std::string> last_management_result_;
+
+    std::atomic<int> client_state_count_{0};
 };
 
 // A fake Sendspin "server" that LISTENS for a real Sendspin client's OUTBOUND connection (backed

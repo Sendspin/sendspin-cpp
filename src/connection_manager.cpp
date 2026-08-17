@@ -174,6 +174,21 @@ static std::vector<uint8_t> pake_ad_server() {
     return std::vector<uint8_t>(PAKE_AD_SERVER, PAKE_AD_SERVER + sizeof(PAKE_AD_SERVER) - 1);
 }
 
+/// @brief Whether an applied server/activate selects the pairing flow: exactly one activity
+/// (PAIRING) together with a pairing.method the client recognizes. Shared by every site that
+/// must route such an activate into ConnectionManager::handle_enter_pairing() instead of the
+/// operational path (SendspinClient::on_handshake_complete()).
+static bool is_pairing_selection_activate(const std::vector<SendspinActivity>& activities,
+                                          const std::optional<SendspinPairMethod>& pairing_method) {
+    if (activities.size() != 1 || activities[0] != SendspinActivity::PAIRING ||
+        !pairing_method.has_value()) {
+        return false;
+    }
+    return pairing_method.value() == SendspinPairMethod::PAIRING_PSK ||
+           pairing_method.value() == SendspinPairMethod::DYNAMIC_PIN ||
+           pairing_method.value() == SendspinPairMethod::STATIC_PIN;
+}
+
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
@@ -687,52 +702,67 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
 
     if (event.conn.get() == this->current_connection_.get()) {
         // Already admitted: no arbitration needed. is_first can still be true here
-        // after an in-band re-handshake reset first_activate_received_; re-publish
-        // state in that case, but only once the post-swap hello has also completed
-        // (is_handshake_complete()); otherwise this is a stale pre-completion
-        // activate and there is nothing to (re-)publish yet.
+        // after an in-band re-handshake reset first_activate_received_; both branches
+        // below that act on an is_first activate wait for the post-swap hello to have
+        // also completed (is_handshake_complete()) before doing so, otherwise this is
+        // a stale pre-completion activate and there is nothing to (re-)act on yet.
         this->note_playback_activity(event.conn.get());
-        if (!is_first && event.conn->is_pairing_in_progress()) {
+
+        const auto& activities = event.conn->get_activities();
+        const auto& pairing_method = event.conn->get_pairing_method();
+        const bool selects_pairing = is_pairing_selection_activate(activities, pairing_method);
+
+        // The pairing-selection check runs on every activate, first or not, and takes
+        // priority over the operational branch: mirrors the reference's
+        // _handle_server_activate, which checks self.is_pairing before resuming time
+        // sync or sending client/state, on every activate. This matters because a
+        // server rehandshaking an already-admitted connection onto the pairing PSK
+        // resets first_activate_received_, so the resulting pairing activate arrives
+        // looking like a first activate; routing it into the operational branch would
+        // publish client/state while the server is instead waiting for
+        // client/pair-finalize. handle_enter_pairing() never publishes client/state
+        // (only on_handshake_complete() does), so entering pairing here is always
+        // safe on that front regardless of is_first.
+        if (event.conn->is_pairing_in_progress()) {
             // ==== Pairing leftover activate ====
             // Pairing was in progress and the server sent another server/activate
             // instead of server/pair-finalize: it abandoned pairing without
-            // finalizing. Mirrors the reference's leftover branch: the activate was
-            // already applied normally above; going operational discards any pending
-            // record and resets the PIN session structurally (see the comment on
-            // SendspinClient::on_handshake_complete()).
+            // finalizing. This fires even when the new activate itself selects pairing
+            // again: that combination is not special-cased and takes this same branch,
+            // matching prior behavior. Mirrors the reference's leftover branch: the
+            // activate was already applied normally above; going operational discards
+            // any pending record and resets the PIN session structurally (see the
+            // comment on SendspinClient::on_handshake_complete()).
+            // Two paths reset first_activate_received_ on an already-admitted
+            // connection: an in-band re-handshake (handle_noise_rehandshake(), which
+            // also clears pairing_in_progress_, so that path always reaches here with
+            // is_pairing_in_progress() false) and the pair-finalize ack
+            // (note_pairing_finalize_ack(), which leaves pairing_in_progress_ set).
+            // An activate arriving in the ack-to-rekey window therefore lands in this
+            // branch with is_first true; that is the desired outcome for it too (the
+            // server abandoned the finalize choreography, so clear pairing and go
+            // operational), and matches the pre-restructure behavior of that window.
             SS_LOGI(TAG,
                     "Subsequent activate during pairing (leftover): clearing pairing "
                     "state and going operational for server_id=%s",
                     event.conn->get_server_id().c_str());
             this->client_->on_handshake_complete(event.conn.get());
-        } else if (is_first && event.conn->is_handshake_complete()) {
-            this->client_->on_handshake_complete(event.conn.get());
-        } else if (!is_first) {
-            // ==== Subsequent activate transitions into pairing ====
-            // The operator can initiate pairing on an already-operational connection,
-            // not only on the very first activate: the server re-activates the
-            // connection with the PAIRING activity and a pairing object.
-            // Mirrors the reference's _handle_server_activate, which runs _pair()
-            // whenever the applied activate is a pairing activate, not only on the
-            // first one. Only reached when pairing is not already in progress (the
-            // leftover-activate branch above handles that case).
-            const auto& activities = event.conn->get_activities();
-            const auto& pairing_method = event.conn->get_pairing_method();
-            const bool is_pairing_activity_only = activities.size() == 1 &&
-                                                  activities[0] == SendspinActivity::PAIRING &&
-                                                  pairing_method.has_value();
-            const bool is_supported_pair_method =
-                is_pairing_activity_only &&
-                (pairing_method.value() == SendspinPairMethod::PAIRING_PSK ||
-                 pairing_method.value() == SendspinPairMethod::DYNAMIC_PIN ||
-                 pairing_method.value() == SendspinPairMethod::STATIC_PIN);
-            if (is_supported_pair_method) {
+        } else if (selects_pairing) {
+            // ==== Activate selects pairing ====
+            // Reached both when the operator initiates pairing on an already-
+            // operational connection (is_first false: the server re-activates the
+            // connection with the PAIRING activity and a pairing object directly) and
+            // when the server first rehandshakes the connection onto the pairing PSK
+            // (is_first true: see the priority comment above).
+            if (!is_first || event.conn->is_handshake_complete()) {
                 SS_LOGI(TAG,
-                        "Subsequent activate selects pairing (%s): entering pairing "
-                        "for server_id=%s",
+                        "Activate selects pairing (%s): entering pairing for "
+                        "server_id=%s",
                         to_cstr(pairing_method.value()), event.conn->get_server_id().c_str());
                 this->handle_enter_pairing(event.conn.get());
             }
+        } else if (is_first && event.conn->is_handshake_complete()) {
+            this->client_->on_handshake_complete(event.conn.get());
         }
         return;
     }
@@ -1613,11 +1643,8 @@ std::vector<NurseryEntry>::iterator ConnectionManager::promote_or_arbitrate_nurs
     // finishes and the post-finalize re-handshake completes.
     const auto& activities = this->current_connection_->get_activities();
     const auto& pairing_method = this->current_connection_->get_pairing_method();
-    const bool is_pairing_activity_only = activities.size() == 1 &&
-                                          activities[0] == SendspinActivity::PAIRING &&
-                                          pairing_method.has_value();
 
-    if (is_pairing_activity_only) {
+    if (is_pairing_selection_activate(activities, pairing_method)) {
         SS_LOGI(TAG, "Pairing activate received (%s): entering pairing for server_id=%s",
                 to_cstr(pairing_method.value()),
                 this->current_connection_->get_server_id().c_str());
