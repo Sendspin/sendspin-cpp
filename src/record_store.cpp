@@ -782,7 +782,7 @@ bool RecordStore::can_store_record() const {
 // Storage accounting
 // ============================================================================
 
-std::optional<RecordStore::StorageReport> RecordStore::storage_accounting() const {
+RecordStore::StorageReport RecordStore::storage_accounting() const {
     std::lock_guard<std::mutex> lock(this->mutex_);
     StorageReport report;
     report.capacity = static_cast<int>(this->max_records_);

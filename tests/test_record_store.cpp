@@ -92,16 +92,11 @@ static std::optional<std::vector<SendspinPairingRecord>> decode_records_blob(
     return decode_pairing_records(text);
 }
 
-/// A RecordStore subclass that always reports storage exhausted.
-class ExhaustedRecordStore : public RecordStore {
-public:
-    explicit ExhaustedRecordStore(SendspinPersistenceProvider* provider)
-        : RecordStore(provider) {}
-
-    bool can_store_record() const override {
-        return false;
-    }
-};
+/// Build an in-memory store whose only slot is taken by the shared-PSK fallback record the
+/// constructor provisions, so it reports storage exhausted for any genuine net-new record.
+static RecordStore make_exhausted_store() {
+    return RecordStore(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/1);
+}
 
 /// A persistence provider whose "records" blob writes can be made to fail (e.g. full or faulty
 /// flash). Pairing PSK / pair config writes always succeed; they are not under test here.
@@ -517,10 +512,9 @@ TEST(RecordStore, CapacityCustomCapIsRespected) {
     EXPECT_FALSE(store.store_record(overflow));
     EXPECT_EQ(store.records_snapshot().size(), 2u);
 
-    auto report = store.storage_accounting();
-    ASSERT_TRUE(report.has_value());
-    EXPECT_EQ(report->capacity, 2);
-    EXPECT_EQ(report->free, 0);
+    const auto report = store.storage_accounting();
+    EXPECT_EQ(report.capacity, 2);
+    EXPECT_EQ(report.free, 0);
 }
 
 // =============================================================================
@@ -1584,10 +1578,10 @@ TEST(RecordStore, ResolvePairingOutcomeNormal) {
     EXPECT_EQ(outcome->record->psk_id, psk_id_for(outcome->psk));
 }
 
-// Storage-exhausted case: ExhaustedRecordStore returns {psk, record=nullopt}, falling back to
+// Storage-exhausted case: resolve_pairing_outcome returns {psk, record=nullopt}, falling back to
 // the pre-provisioned shared record's PSK.
 TEST(RecordStore, ResolvePairingOutcomeExhausted) {
-    ExhaustedRecordStore store(nullptr);
+    RecordStore store = make_exhausted_store();
 
     // Pre-provision and capture the shared record's psk_id (the auto-provisioned one works fine).
     const std::string& shared_psk_id = store.record_mode_psk_id();
@@ -1723,7 +1717,7 @@ TEST(RecordStore, RecordByPskIdCopyReturnsNulloptForAbsent) {
 // Exhausted case: resolve_pairing_outcome with nullopt inner record -> store nothing.
 // After the "pairing", the server_id must not appear as a long-term record.
 TEST(RecordStore, ResolvePairingOutcomeExhaustedNoStore) {
-    ExhaustedRecordStore store(nullptr);
+    RecordStore store = make_exhausted_store();
 
     const std::string server_id = "server-no-store";
     auto outcome = store.resolve_pairing_outcome(server_id);

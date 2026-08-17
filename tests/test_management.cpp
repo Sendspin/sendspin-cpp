@@ -69,40 +69,14 @@ static bool parse(const std::string& json, JsonDocument& doc, JsonObject& root) 
     return true;
 }
 
-/// A RecordStore subclass that always reports storage exhausted.
-class ExhaustedRecordStore : public RecordStore {
-public:
-    explicit ExhaustedRecordStore(SendspinPersistenceProvider* provider) : RecordStore(provider) {}
-    bool can_store_record() const override {
-        return false;
+/// Store records until `store` holds `occupied` slots in total, so storage accounting reports a
+/// known free count. The shared-PSK fallback record the constructor provisions already occupies
+/// the first slot, so `occupied` must be at least 1.
+static void occupy_slots(RecordStore& store, size_t occupied) {
+    for (size_t i = store.records_snapshot().size(); i < occupied; ++i) {
+        ASSERT_TRUE(store.store_record(make_client_record("srv-" + std::to_string(i))));
     }
-};
-
-/// A RecordStore subclass that returns a bounded storage accounting report.
-class BoundedRecordStore : public RecordStore {
-public:
-    explicit BoundedRecordStore(SendspinPersistenceProvider* provider) : RecordStore(provider) {}
-
-    std::optional<StorageReport> storage_accounting() const override {
-        StorageReport r;
-        r.free = 3;
-        r.capacity = 5;
-        r.cost_individual = 1;
-        r.cost_shared = 1;
-        return r;
-    }
-};
-
-/// A RecordStore subclass whose underlying storage is genuinely unbounded (e.g. a host
-/// provider backed by unlimited disk), overriding the base's bounded default with nullopt.
-class UnboundedRecordStore : public RecordStore {
-public:
-    explicit UnboundedRecordStore(SendspinPersistenceProvider* provider) : RecordStore(provider) {}
-
-    std::optional<StorageReport> storage_accounting() const override {
-        return std::nullopt;
-    }
-};
+}
 
 /// Invoke handle_set_pairing_config() and return just the result code: no SetPairingConfig*
 /// test inspects ManagementResultPayload::data, only result.result, so the payload struct stays
@@ -679,21 +653,8 @@ TEST(ManagementHandler, AddRecordSameServerIdKeepsBothRecords) {
     EXPECT_EQ(count, 2);
 }
 
-TEST(ManagementHandler, AddRecordStorageExhausted) {
-    ExhaustedRecordStore store(nullptr);
-    auto psk = make_random_psk();
-
-    ManagementAddRecordPayload payload;
-    payload.psk = psk_to_b64url(psk);
-
-    ManagementResultPayload result;
-    ManagementEffect effect;
-    handle_add_record(store, payload, result, effect);
-    EXPECT_EQ(result.result, ManagementResult::STORAGE_EXHAUSTED);
-}
-
-// The base RecordStore's default cap (no ExhaustedRecordStore subclass involved) must also
-// produce STORAGE_EXHAUSTED once management/add-record fills every slot.
+// Once management/add-record has filled every slot, a further add must report
+// STORAGE_EXHAUSTED rather than growing the store past its cap.
 TEST(ManagementHandler, AddRecordStorageExhaustedAtDefaultCap) {
     RecordStore store(nullptr);  // 1 slot already used by the shared fallback record.
     for (size_t i = 1; i < SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS; ++i) {
@@ -1409,19 +1370,9 @@ TEST(ManagementProtocol, FormatResultUnpairedAccessEnabledNulloptDefaultsFalse) 
 // Storage accounting: attach_storage_accounting
 // ===========================================================================
 
-TEST(ManagementHandler, StorageAccountingNulloptDoesNotAttach) {
-    // An override reporting genuinely unbounded storage (nullopt) must still omit "storage".
-    UnboundedRecordStore store(nullptr);
-    ManagementResultPayload result;
-    result.result = ManagementResult::OK;
-
-    attach_storage_accounting(store, result, true);
-    EXPECT_FALSE(result.storage.has_value());
-}
-
-// The base RecordStore is capacity-bounded (see SendspinClientConfig::max_pairing_records), so
-// its default storage_accounting() must report real numbers rather than nullopt: a managing
-// server needs to see the actual cap to avoid flooding it via management/add-record.
+// The RecordStore is capacity-bounded (see SendspinClientConfig::max_pairing_records), so
+// storage_accounting() must report the real numbers: a managing server needs to see the actual
+// cap to avoid flooding it via management/add-record.
 TEST(ManagementHandler, StorageAccountingDefaultIsBounded) {
     RecordStore store(nullptr);  // record_mode_psk_id's shared fallback already occupies 1 slot.
     ManagementResultPayload result;
@@ -1437,7 +1388,8 @@ TEST(ManagementHandler, StorageAccountingDefaultIsBounded) {
 }
 
 TEST(ManagementHandler, StorageAccountingBoundedFreeOnly) {
-    BoundedRecordStore store(nullptr);
+    RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/5);
+    occupy_slots(store, 2);  // shared fallback + 1 stored record: 3 of 5 slots free.
     ManagementResultPayload result;
     result.result = ManagementResult::OK;
 
@@ -1451,7 +1403,8 @@ TEST(ManagementHandler, StorageAccountingBoundedFreeOnly) {
 }
 
 TEST(ManagementHandler, StorageAccountingBoundedWithStatic) {
-    BoundedRecordStore store(nullptr);
+    RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/5);
+    occupy_slots(store, 2);  // shared fallback + 1 stored record: 3 of 5 slots free.
     ManagementResultPayload result;
     result.result = ManagementResult::OK;
 

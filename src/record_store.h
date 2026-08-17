@@ -139,8 +139,6 @@ public:
                          bool initial_unpaired_access_enabled = false,
                          size_t max_records = DEFAULT_MAX_RECORDS);
 
-    virtual ~RecordStore() = default;
-
     // ========================================
     // PSK resolution (used by the Noise handshake)
     // ========================================
@@ -396,18 +394,16 @@ public:
 
     /// @brief Return true if a new record can be stored.
     ///
-    /// The default implementation reports free capacity against max_records_ (see
-    /// DEFAULT_MAX_RECORDS). A provider with its own notion of available storage (for example
-    /// one that tracks actual bytes free in flash) may override this with different logic.
+    /// Reports free capacity against max_records_ (see DEFAULT_MAX_RECORDS).
     ///
     /// This is an advisory pre-check consulted by callers (resolve_pairing_outcome(),
-    /// management/add-record) before attempting to store a record; the actual insert still goes
-    /// through store_record_impl() under mutex_, which enforces max_records_ directly against
-    /// genuine inserts regardless of what an override reports, so the in-memory array can never
-    /// grow past it. A record replacement (matching psk_id, or a pairing supersede of the
-    /// record already held for the target server_id) is exempt from the cap in both places: it
-    /// does not grow the store.
-    [[nodiscard]] virtual bool can_store_record() const;
+    /// management/add-record) before attempting to store a record; it takes mutex_ and releases
+    /// it before returning, so the actual insert still goes through store_record_impl(), which
+    /// re-checks max_records_ under its own hold of mutex_. An insert that lands in that gap
+    /// therefore cannot grow the in-memory array past the cap. A record replacement (matching
+    /// psk_id, or a pairing supersede of the record already held for the target server_id) is
+    /// exempt from the cap in both places: it does not grow the store.
+    [[nodiscard]] bool can_store_record() const;
 
     // ========================================
     // Storage accounting
@@ -421,18 +417,17 @@ public:
         int cost_shared{1};      ///< Slots consumed by a shared-PSK record.
     };
 
-    /// @brief Return storage accounting info, or nullopt for unbounded/unknown storage.
+    /// @brief Return storage accounting info for a management result.
     ///
-    /// The default implementation reports against max_records_ (free = max_records_ minus the
-    /// current record count, capacity = max_records_, both costs 1 slot), since the base store
-    /// is capacity-bounded. A provider whose underlying storage is genuinely unbounded, or that
-    /// tracks capacity some other way (e.g. bytes free in flash), may override this; returning
-    /// nullopt from an override means the management/result omits the "storage" key entirely.
+    /// The store is always capacity-bounded, so this always reports real numbers: free =
+    /// max_records_ minus the current record count, capacity = max_records_, both costs 1 slot.
+    /// A managing server needs to see the actual cap to avoid flooding the store via
+    /// management/add-record.
     ///
-    /// include_static semantics (attachment point in management.h with_storage):
+    /// include_static semantics (attachment point in management.h attach_storage_accounting):
     ///   - list-records and get-pairing-config: include capacity/costs.
     ///   - all other results: free only.
-    [[nodiscard]] virtual std::optional<StorageReport> storage_accounting() const;
+    [[nodiscard]] StorageReport storage_accounting() const;
 
 private:
     // ========================================
@@ -520,8 +515,9 @@ private:
     SendspinPersistenceProvider* provider_{nullptr};
 
     // size_t fields
-    /// Cap on records_.size() enforced by has_capacity_locked() / can_store_record() / the base
-    /// storage_accounting(); see DEFAULT_MAX_RECORDS. Set once at construction, then read-only.
+    /// Cap on records_.size() enforced by has_capacity_locked() / can_store_record(), and
+    /// reported by storage_accounting(); see DEFAULT_MAX_RECORDS. Set once at construction,
+    /// then read-only.
     size_t max_records_{DEFAULT_MAX_RECORDS};
 
     // 32-bit fields

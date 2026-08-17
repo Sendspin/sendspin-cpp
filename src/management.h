@@ -468,29 +468,25 @@ inline void handle_set_pairing_config(RecordStore& store,
 // Storage accounting attachment
 // ============================================================================
 
-/// @brief Attach storage accounting to a result payload if the store provides it.
+/// @brief Attach storage accounting to a result payload.
 ///
 /// Mirrors with_storage from aiosendspin/client/management.py.
 /// free is always included; capacity and per-kind costs are added only when include_static=true
-/// (list-records and get-pairing-config). If the store reports no accounting (nullopt), the
-/// payload is left unchanged.
+/// (list-records and get-pairing-config).
 ///
 /// @param store The RecordStore whose storage_accounting() to consult.
 /// @param[in,out] result The result payload to attach storage to.
 /// @param include_static True for list-records and get-pairing-config (add capacity + costs).
 inline void attach_storage_accounting(const RecordStore& store, ManagementResultPayload& result,
                                       bool include_static) {
-    auto report = store.storage_accounting();
-    if (!report.has_value()) {
-        return;  // Unbounded/unknown storage: omit entirely.
-    }
+    const RecordStore::StorageReport report = store.storage_accounting();
 
     StorageAccountingPayload storage;
-    storage.free = report->free;
+    storage.free = report.free;
     if (include_static) {
-        storage.capacity = report->capacity;
-        storage.cost_individual = report->cost_individual;
-        storage.cost_shared = report->cost_shared;
+        storage.capacity = report.capacity;
+        storage.cost_individual = report.cost_individual;
+        storage.cost_shared = report.cost_shared;
     }
     result.storage = std::move(storage);
 }
