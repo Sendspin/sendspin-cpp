@@ -1795,7 +1795,11 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn,
     // Send client/pair-finalize with the long-term PSK (base64url-encoded, 43 chars).
     SS_LOGI(TAG, "Sending client/pair-finalize for server_id=%s (record=%s)", server_id.c_str(),
             outcome->record.has_value() ? "stored" : "shared-psk-fallback");
-    conn->send_app_json(format_client_pair_finalize_message(outcome->psk), nullptr);
+    // Named local rather than a temporary so the serialized message, which carries the raw
+    // base64 long-term PSK, can be wiped once it has been handed to the transport.
+    std::string finalize_msg = format_client_pair_finalize_message(outcome->psk);
+    conn->send_app_json(finalize_msg, nullptr);
+    secure_zero(finalize_msg.data(), finalize_msg.size());
 
     // Hold the pending record: committed to the RecordStore by the network-thread
     // server/pair-finalize handler on ack. nullopt record = storage-exhausted case: store nothing.
@@ -2310,7 +2314,12 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     SS_LOGI(TAG, "Sending client/pair-finalize (%s) for server_id=%s (record=%s)",
             to_cstr(ps.method), server_id.c_str(),
             outcome->record.has_value() ? "stored" : "shared-psk-fallback");
-    conn->send_app_json(format_client_pair_finalize_wrapped_message(wrapped.value()), nullptr);
+    // Wiped after the send for the same reason as the unwrapped form above. The payload here is
+    // the AEAD-wrapped PSK rather than raw key bytes, so this is the weaker of the two cases,
+    // but the two finalize paths are kept identical so neither drifts.
+    std::string finalize_msg = format_client_pair_finalize_wrapped_message(wrapped.value());
+    conn->send_app_json(finalize_msg, nullptr);
+    secure_zero(finalize_msg.data(), finalize_msg.size());
     conn->set_pending_pairing_record(std::move(outcome->record));
 
     ps.step = SendspinConnection::PinStep::AWAIT_SERVER_PAIR_FINALIZE;

@@ -29,6 +29,7 @@
 #include "crypto/keys.h"
 #include "crypto/pin.h"
 #include "platform/base64.h"
+#include "platform/crypto.h"
 #include "platform/logging.h"
 #include "protocol_messages.h"
 #include "record_store.h"
@@ -75,6 +76,11 @@ inline std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> decode_and_validate_ps
     }
     std::array<uint8_t, NOISE_PSK_SIZE> arr;
     std::copy(decoded->begin(), decoded->end(), arr.begin());
+    // b64url_decode returns a plain vector, so the raw PSK would otherwise reach the heap's
+    // free list intact. Same wipe as parse_psk_id_and_psk() does for the identical
+    // decode-then-copy in the persistence codec; see secure_zero()'s contract in
+    // platform/crypto.h.
+    secure_zero(decoded->data(), decoded->size());
     return arr;
 }
 
@@ -455,6 +461,9 @@ inline void handle_set_pairing_config(RecordStore& store,
             p.psk = new_psk.value();
             store.set_pairing_psk(std::move(p));
         }
+        // The staged copy has served its purpose; SendspinPairingPsk wipes itself on
+        // destruction, but this local is a plain array and would not.
+        secure_zero_container(new_psk.value());
     }
 
     if (payload.static_pin.has_value() && payload.static_pin->pin.has_value()) {

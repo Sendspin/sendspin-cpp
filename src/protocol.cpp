@@ -1257,12 +1257,17 @@ std::string format_client_command_message(const ClientCommandControllerObject& c
 // ============================================================================
 
 std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk) {
-    JsonDocument doc = make_json_document();
+    // Zeroizing document: the JSON pool holds the base64 long-term PSK, which admits a server
+    // permanently. The caller wipes the returned string once it has been sent (see
+    // handle_enter_pairing_psk()); everything staged on the way there is wiped here.
+    JsonDocument doc = make_zeroizing_json_document();
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
     // Encode the 32-byte PSK as 43-char base64url (no padding).
-    root["payload"]["long_term_psk"] = b64url_encode(psk.data(), psk.size());
+    std::string psk_b64 = b64url_encode(psk.data(), psk.size());
+    root["payload"]["long_term_psk"] = psk_b64;
+    secure_zero(psk_b64.data(), psk_b64.size());
 
     std::string output;
     serializeJson(doc, output);
@@ -1271,7 +1276,8 @@ std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& p
 
 std::string format_client_pair_finalize_wrapped_message(
     const std::array<uint8_t, 48>& wrapped_psk) {
-    JsonDocument doc = make_json_document();
+    // Zeroizing document to match format_client_pair_finalize_message(); see the note there.
+    JsonDocument doc = make_zeroizing_json_document();
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
