@@ -112,7 +112,13 @@ public:
         return SsErr::OK;
     }
 
-    bool send_time_message() override { return true; }
+    // Records every call instead of just reporting success, so a test can assert that the
+    // time-burst gate in SendspinClient::loop() (see client.cpp) never reached this connection
+    // at all, not merely that no client/time frame text happens to appear in sent_text_.
+    bool send_time_message() override {
+        this->time_message_send_count_++;
+        return true;
+    }
 
     // Test-only seam: canned handshake hash without a Noise session
 
@@ -136,6 +142,7 @@ public:
     std::vector<std::vector<uint8_t>> sent_binary_;
     int disconnect_count_{0};
     int close_transport_now_count_{0};
+    int time_message_send_count_{0};
     std::optional<SendspinGoodbyeReason> last_disconnect_reason_;
 
 private:
@@ -912,6 +919,84 @@ TEST_F(PinStateMachineTest, DynamicPinMismatchRecordsFailureAndAborts) {
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::PIN_MISMATCH);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_PIN));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::SUCCEEDED));
+}
+
+// =============================================================================
+// Regression: non-pairing traffic must stay suppressed in the retry window between a local
+// abort and the server's next server/activate (the connection stays open on pin_mismatch, so
+// the server still has it parked in its pairing state; see client.cpp's has_activity(PAIRING)
+// gates and pairing.md "Entering and leaving pairing").
+// =============================================================================
+
+TEST_F(PinStateMachineTest, TrafficSuppressedAfterLocalAbortUntilNextActivate) {
+    FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-suppress");
+
+    PinDisplayResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_pin_displayed(conn, /*nonce_a_seed=*/9, display));
+
+    ServerStandIn server;
+    ASSERT_TRUE(server.start(display.pin, display.handshake_hash));
+
+    ServerPairingMessageEvent pair_auth_event;
+    pair_auth_event.conn = this->current_connection_sp();
+    pair_auth_event.kind = PinPairingMessageKind::PAIR_AUTH;
+    pair_auth_event.pake_msg_1 = server.initiator.public_share();
+    this->schedule_pin_message(std::move(pair_auth_event));
+    this->client_->loop();
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
+
+    // Wrong server_kc: a genuine PIN mismatch (not concurrent_attempt), so
+    // local_abort_pin_pairing keeps the connection open (PairingDropAction::KEEP_OPEN) instead
+    // of closing it.
+    std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
+    bogus_server_kc.fill(0xCD);
+    this->schedule_pair_confirm(bogus_server_kc);
+
+    ASSERT_EQ(last_pair_abort_reason(conn->sent_text_), "pin_mismatch");
+    ASSERT_EQ(conn->disconnect_count_, 0) << "pin_mismatch must leave the connection open";
+    ASSERT_FALSE(conn->is_pairing_in_progress())
+        << "clear_pairing_state() must clear the local attempt flag on abort";
+    ASSERT_TRUE(conn->has_activity(SendspinActivity::PAIRING))
+        << "activities_ is untouched by a local abort: only the next server/activate updates it";
+
+    // Complete the hello preconditions is_operational() also requires. A real connection would
+    // already have these true long before any server/activate (this one included); the fixture's
+    // inject/enter-pairing helpers never touch them, so they are set explicitly here purely to
+    // exercise SendspinClient::loop()'s time-burst gate, which is otherwise unreachable through
+    // this harness.
+    conn->set_client_hello_sent(true);
+    conn->set_server_hello_received(true);
+    ASSERT_TRUE(conn->is_operational());
+
+    // A fresh SendspinTimeBurst starts its first burst immediately (last_burst_complete_time_
+    // defaults to 0, so the inter-burst wait is trivially satisfied), so any tick that reaches
+    // time_burst_->loop() sends. is_pairing_in_progress() is already false after the local
+    // abort above, so only the declared-PAIRING-activity gate in client.cpp's loop() keeps
+    // these ticks from calling conn->send_time_message() while the server still has the
+    // connection parked in its pairing state.
+    for (int i = 0; i < 5; ++i) {
+        this->client_->loop();
+    }
+    EXPECT_EQ(conn->time_message_send_count_, 0)
+        << "client/time must stay suppressed while activities still declare PAIRING";
+
+    // client/state must likewise stay suppressed (publish_client_state carries the identical
+    // has_activity(PAIRING) gate).
+    this->client_->update_state(SendspinClientState::SYNCHRONIZED);
+    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/state"));
+
+    // The server sends its next activate, leaving pairing (empty activities/active_roles, the
+    // same shape SubsequentActivateEntersDynamicPinPairing uses to go operational). Traffic must
+    // resume immediately: apply_server_activate() runs synchronously inside this same loop()
+    // call, before the time-burst gate re-checks has_activity(PAIRING).
+    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+    this->client_->loop();
+    ASSERT_FALSE(conn->has_activity(SendspinActivity::PAIRING));
+    EXPECT_GT(conn->time_message_send_count_, 0)
+        << "time sync must resume once the connection leaves pairing";
+
+    this->client_->update_state(SendspinClientState::SYNCHRONIZED);
+    EXPECT_TRUE(any_frame_of_type(conn->sent_text_, "client/state"));
 }
 
 // =============================================================================

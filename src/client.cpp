@@ -316,10 +316,22 @@ void SendspinClient::loop() {
     // re-handshake resets first_activate_received_ (and the hello flags) on the still-current
     // connection, and a stale pre-re-handshake time exchange must not resume mid-rotation.
     auto* conn = this->connection_manager_->current();
-    // Suppress time sync while a pairing exchange is in progress (mirrors _pause_time_sync in
-    // the reference). pairing_in_progress_ is written by the main loop (enter/abort) and by the
-    // network thread (handle_noise_rehandshake clears it), so it is atomic.
-    if (conn != nullptr && conn->is_operational() && !conn->is_pairing_in_progress()) {
+    // Suppress time sync while the connection's last-applied server/activate declares PAIRING
+    // (mirrors the reference's _pause_time_sync/_resume_time_sync, gated on `self.is_pairing`,
+    // i.e. `Activity.PAIRING in self._activities`: the SERVER-DECLARED activity set, not a local
+    // attempt flag). pairing.md "Entering and leaving pairing" only obliges the server to resume
+    // normal handling once it sends the leave server/activate; a client that locally aborts an
+    // attempt (pair/abort, connection kept open) has not received that leave activate yet, so the
+    // server still has this connection parked in its pairing state until the next server/activate
+    // arrives. Sending client/time here in that window is traffic the server does not expect on a
+    // still-pairing connection. has_activity() is main-loop-only (see get_activities()), so this
+    // check alone is race-free without touching is_pairing_in_progress(): that flag is a strict
+    // subset of "activities include PAIRING" (it is only ever set after apply_server_activate has
+    // already applied a pairing activate, and cleared by clear_pairing_state() without restoring
+    // the prior activities), so a local abort that clears it leaves this activity check as the
+    // sole, correct gate for the retry window.
+    if (conn != nullptr && conn->is_operational() &&
+        !conn->has_activity(SendspinActivity::PAIRING)) {
         auto result = this->time_burst_->loop(conn);
 
         if (result.sent && !this->high_performance_held_for_time_) {
@@ -776,8 +788,16 @@ void SendspinClient::publish_state() {
 }
 
 void SendspinClient::send_text(const std::string& text) {
+    // Single choke point for every role-originated send that is not a protocol-internal pairing
+    // message (controller commands, visualizer stream/request-format): pairing messages are sent
+    // directly via SendspinConnection::send_app_json() from connection_manager.cpp and never
+    // route through here, so gating unconditionally on has_activity(PAIRING) cannot suppress
+    // them. Active roles are always cleared to empty on a pairing server/activate (admission.h
+    // is_playback_capable() is structurally false whenever activities == {PAIRING}), so a
+    // well-behaved consumer would not be issuing role commands here anyway; this gate defends the
+    // wire even if it does. See the loop() has_activity(PAIRING) gate for the spec rationale.
     auto* conn = this->connection_manager_->current();
-    if (conn != nullptr && conn->is_connected()) {
+    if (conn != nullptr && conn->is_connected() && !conn->has_activity(SendspinActivity::PAIRING)) {
         conn->send_app_json(text, nullptr);
     }
 }
@@ -1612,8 +1632,11 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
         return;
     }
 
-    // Suppress client/state while a pairing exchange is in progress (mirrors _pause_time_sync).
-    if (conn->is_pairing_in_progress()) {
+    // Suppress client/state while the connection's last-applied server/activate declares
+    // PAIRING; see the identical has_activity(PAIRING) gate in loop() for the full rationale
+    // (spec pairing.md "Entering and leaving pairing"; is_pairing_in_progress() is a strict
+    // subset of this condition, so it adds nothing here).
+    if (conn->has_activity(SendspinActivity::PAIRING)) {
         return;
     }
 
