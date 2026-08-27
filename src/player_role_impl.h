@@ -64,6 +64,9 @@ struct PlayerRole::Impl {
 
     void attach_inbox(Inbox& inbox);
     bool start();
+    void stop() const;
+    void request_stop() const;
+    bool has_stopped() const;
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
     void handle_binary(const uint8_t* data, size_t len) const;

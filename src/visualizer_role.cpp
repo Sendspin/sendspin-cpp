@@ -173,6 +173,11 @@ bool VisualizerRole::Impl::start() {
         return false;
     }
 
+    // The flag object survives a stop()/start() cycle, so clear the stale COMMAND_STOP left by
+    // stop() (and any unconsumed flush/clear command) before spawning; otherwise the new
+    // thread's first wait() sees COMMAND_STOP and exits immediately.
+    this->drain_task->event_flags.clear(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR);
+
     platform_configure_thread("SsVis", 4096, static_cast<int>(this->config.priority),
                               this->config.psram_stack);
     this->drain_task->drain_thread = std::thread(drain_thread_func, this);
@@ -185,6 +190,13 @@ void VisualizerRole::Impl::stop() const {
     }
     this->drain_task->event_flags.set(COMMAND_STOP);
     this->drain_task->drain_thread.join();
+}
+
+void VisualizerRole::Impl::request_stop() const {
+    if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
+        return;
+    }
+    this->drain_task->event_flags.set(COMMAND_STOP);
 }
 
 void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {

@@ -54,6 +54,15 @@ class VisualizerRole;
 // Forward declarations for listener types
 struct GroupUpdateObject;
 
+/// @brief Lifecycle state of a SendspinClient
+/// STOPPED before the first start() and after a stop completes; RUNNING after a successful
+/// start(); STOPPING between request_stop() and the completion of its deferred teardown.
+enum class SendspinRunState : uint8_t {
+    STOPPED = 0,
+    RUNNING = 1,
+    STOPPING = 2,
+};
+
 /// @brief Listener for SendspinClient events
 /// All methods fire on the main loop thread
 class SendspinClientListener {
@@ -62,6 +71,14 @@ public:
 
     /// @brief Called when the group state is updated by the server
     virtual void on_group_update(const GroupUpdateObject& /*group*/) {}
+
+    /// @brief Called when a request_stop() teardown completes
+    /// Fires once per request_stop(), from loop() (or from inside a stop() call that finished
+    /// the teardown synchronously). When it fires, every connection is closed, the WebSocket
+    /// server and role threads are stopped, and it is safe to call start() again or destroy the
+    /// client. A synchronous stop() from the RUNNING state does not fire it; that call's return
+    /// is the completion signal.
+    virtual void on_stopped() {}
 
     /// @brief Called after a time sync burst completes with the Kalman filter error
     virtual void on_time_sync_updated(float /*error*/) {}
@@ -75,7 +92,7 @@ public:
 };
 
 /// @brief Platform hook for network readiness
-/// Must be set before start_server()
+/// Must be set before start()
 class SendspinNetworkProvider {
 public:
     virtual ~SendspinNetworkProvider() = default;
@@ -147,8 +164,11 @@ class SendspinTimeBurst;
  * 2. Construct a SendspinClient with that config
  * 3. Add roles via add_player(), add_controller(), add_metadata(), etc.
  * 4. Set listeners on each role and set the network provider on the client
- * 5. Call start_server() to start the WebSocket server and background tasks
+ * 5. Call start() to start the WebSocket server and background tasks
  * 6. Call loop() periodically from the platform main loop
+ * 7. Call stop() to disconnect and shut everything down, or request_stop() for a non-blocking
+ *    teardown that completes over loop() ticks (observe on_stopped() / get_run_state());
+ *    start() again to restart
  *
  * @code
  * struct MyPlayerListener : PlayerRoleListener {
@@ -175,11 +195,13 @@ class SendspinTimeBurst;
  * player.set_listener(&player_listener);
  * client.add_controller();
  * client.set_network_provider(&network_provider);
- * client.start_server();
+ * client.start();
  *
- * while (true) {
+ * while (running) {
  *     client.loop();
  * }
+ *
+ * client.stop();
  * @endcode
  */
 class SendspinClient {
@@ -201,15 +223,57 @@ public:
     // Lifecycle
     // ========================================
 
-    /// @brief Starts the WebSocket server and initializes the sync task (if audio is configured)
+    /// @brief Starts the client: role background threads and the WebSocket server
+    ///
+    /// Must be called from the main loop thread (see stop()). The server socket itself opens on
+    /// a later loop() tick, once the network provider reports ready. Add roles and set providers
+    /// before the first start(). Safe to call again after a stop completes; a no-op if already
+    /// running, and refused (returns false with a warning) while a request_stop() teardown is
+    /// still in progress. On failure every thread that did start is stopped again, so a
+    /// corrected retry begins clean.
+    /// @return true on success (or if already running), false on failure or while stopping
+    bool start();
+
+    /// @brief Stops the client: sends a goodbye, closes every connection, and stops the
+    /// WebSocket server and role background threads
+    ///
+    /// Must be called from the main loop thread (see disconnect()). Blocks until the role
+    /// background threads join (bounded by the sync task's 500 ms idle poll plus any in-flight
+    /// decode work). The goodbye is best-effort: on ESP-IDF the send is queued to an httpd
+    /// worker and the server stop can close the session first; request_stop() avoids that by
+    /// keeping the server up through a grace window. loop() remains safe to call while stopped,
+    /// and the next loop() delivers the roles' clear callbacks queued by the connection
+    /// teardown. Called while a request_stop() is in progress, it finishes that teardown
+    /// synchronously and fires on_stopped() before returning. Call start() to restart. No-op if
+    /// already stopped.
+    void stop();
+
+    /// @brief Requests an asynchronous stop: goodbyes are sent and role threads are signaled
+    /// immediately, and the teardown completes over subsequent loop() ticks
+    ///
+    /// Must be called from the main loop thread (see disconnect()) and does not block: keep
+    /// calling loop() and the teardown finishes once every connection has closed and the role
+    /// threads have wound down, or after a fixed grace deadline (STOP_GRACE_MS in client.cpp),
+    /// whichever comes first. Unlike stop(), the WebSocket server stays up through the grace
+    /// window, so on ESP-IDF the queued goodbye sends actually flush before the server is torn
+    /// down. Completion is signaled by SendspinClientListener::on_stopped() and observable via
+    /// run_state() == STOPPED, after which start() may be called again. No-op unless running.
+    void request_stop();
+
+    /// @brief Legacy name for start(), kept for source compatibility
+    /// Unlike the pre-stop() start_server(), a repeat call while started is a no-op instead of
+    /// re-initializing the WebSocket server.
     /// @return true on success, false on failure
-    bool start_server();
+    bool start_server() {
+        return this->start();
+    }
 
     /// @brief Initiates a client connection to a Sendspin server at the given URL
     ///
     /// Must be called from the main loop thread: it tears down and replaces connection state
     /// (time filter, dispatch, client state) directly rather than deferring to loop(), so calling
-    /// it concurrently with loop() would race those mutations.
+    /// it concurrently with loop() would race those mutations. Ignored (with a warning) unless
+    /// the client is started.
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
@@ -225,7 +289,7 @@ public:
     void loop();
 
     // ========================================
-    // Role registration (call before start_server)
+    // Role registration (call before start())
     // ========================================
 
 #ifdef SENDSPIN_ENABLE_PLAYER
@@ -339,28 +403,43 @@ public:
     // Queries
     // ========================================
 
-    /// @brief Returns true if there is an active connection with completed handshake
-    /// @return true if connected with a completed handshake, false otherwise
-    bool is_connected() const;
-
-    /// @brief Returns the server information from the active connection's hello handshake
-    /// @return ServerInformationObject if connected with a completed handshake, nullopt otherwise
-    std::optional<ServerInformationObject> get_server_information() const;
-
-    /// @brief Returns true if the time filter has received at least one measurement
-    /// @return true if time synchronization has been established, false otherwise
-    bool is_time_synced() const;
-
     /// @brief Converts a server timestamp to the equivalent client timestamp
     /// @param server_time Server-side timestamp in microseconds
     /// @return Equivalent client-side timestamp in microseconds
     int64_t get_client_time(int64_t server_time) const;
+
+    /// @brief Returns true if there is an active connection with completed handshake
+    /// @return true if connected with a completed handshake, false otherwise
+    bool is_connected() const;
 
     /// @brief Returns the current group state
     /// @return The current GroupUpdateObject (fields are optional and may be unset)
     const GroupUpdateObject& get_group_state() const {
         return this->group_state_;
     }
+
+    /// @brief Returns the client lifecycle state. Main-thread only
+    /// STOPPING appears only between request_stop() and its completion; a synchronous stop()
+    /// moves straight to STOPPED.
+    /// @return The current SendspinRunState
+    SendspinRunState get_run_state() const {
+        return this->run_state_;
+    }
+
+    /// @brief Returns the server information from the active connection's hello handshake
+    /// @return ServerInformationObject if connected with a completed handshake, nullopt otherwise
+    std::optional<ServerInformationObject> get_server_information() const;
+
+    /// @brief Returns true if the client is running. Main-thread only
+    /// Equivalent to get_run_state() == RUNNING; false while a request_stop() is in progress.
+    /// @return true if start() succeeded and no stop has begun since
+    bool is_started() const {
+        return this->run_state_ == SendspinRunState::RUNNING;
+    }
+
+    /// @brief Returns true if the time filter has received at least one measurement
+    /// @return true if time synchronization has been established, false otherwise
+    bool is_time_synced() const;
 
     // ========================================
     // State updates
@@ -379,7 +458,7 @@ public:
         this->listener_ = listener;
     }
 
-    /// @brief Sets the network provider (required before start_server())
+    /// @brief Sets the network provider (required before start())
     /// The provider must outlive this client
     void set_network_provider(SendspinNetworkProvider* provider) {
         this->network_provider_ = provider;
@@ -410,6 +489,16 @@ public:
 private:
     /// @brief Cleans up playback state when the active streaming connection is removed
     void cleanup_connection_state();
+
+    /// @brief Stops (joins) every role background thread; roles restart them on the next start()
+    void stop_role_threads();
+
+    /// @brief Performs the full teardown shared by stop() and a completing request_stop()
+    /// @param notify Whether to fire the listener's on_stopped() once torn down
+    void finish_stop(bool notify);
+
+    /// @brief Signals every role background thread to stop without joining it
+    void request_stop_role_threads();
 
     /// @brief Builds the formatted client hello message from config
     std::string build_hello_message();
@@ -496,13 +585,18 @@ private:
     std::unique_ptr<VisualizerRole> visualizer_;
 #endif
 
+    // 64-bit fields
+    /// Deadline (us) for a request_stop() teardown; loop() force-finishes past it. Main-thread
+    /// only, meaningful only while run_state_ == STOPPING.
+    int64_t stop_deadline_us_{0};
+
     // 32-bit fields
     SendspinClientState state_{SendspinClientState::SYNCHRONIZED};
 
     // 8-bit fields
     bool high_performance_held_for_time_{false};
     std::atomic<uint8_t> high_performance_ref_count_{0};
-    bool started_{false};
+    SendspinRunState run_state_{SendspinRunState::STOPPED};
 };
 
 }  // namespace sendspin

@@ -22,6 +22,7 @@
 #include "platform/logging.h"
 #include "platform/memory.h"
 #include "platform/network_info.h"
+#include "platform/time.h"
 #ifdef SENDSPIN_ENABLE_ARTWORK
 #include "artwork_role_impl.h"
 #endif
@@ -47,6 +48,12 @@
 static const char* const TAG = "sendspin.client";
 
 namespace sendspin {
+
+/// Grace deadline for a request_stop() teardown: covers the sync task's 500 ms idle poll plus
+/// margin for goodbye sends to flush and close events to arrive. loop() force-finishes the stop
+/// once it expires, so a peer that ignores its goodbye cannot hold the teardown open.
+static constexpr int64_t STOP_GRACE_MS = 750;
+static constexpr int64_t STOP_GRACE_US = STOP_GRACE_MS * 1000;
 
 /// @brief Deferred event state for time responses and group updates on the main thread
 struct SendspinClient::EventState {
@@ -116,43 +123,82 @@ LogLevel SendspinClient::get_log_level() {
 // Lifecycle
 // ============================================================================
 
-bool SendspinClient::start_server() {
-    this->started_ = true;
+bool SendspinClient::start() {
+    if (this->run_state_ == SendspinRunState::RUNNING) {
+        return true;
+    }
+    if (this->run_state_ == SendspinRunState::STOPPING) {
+        SS_LOGW(TAG, "start() refused; a request_stop() teardown is still in progress");
+        return false;
+    }
 
     // Load persisted state
     this->load_last_played_server();
 
+    // Start role background threads. A failure part-way stops the threads that did start, so
+    // the client is back in the stopped state and a corrected retry begins clean.
+    bool roles_started = true;
 #ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
-        if (!this->player_->impl_->start()) {
-            return false;
-        }
+    if (roles_started && this->player_) {
+        roles_started = this->player_->impl_->start();
     }
 #endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_) {
-        if (!this->visualizer_->impl_->start()) {
-            return false;
-        }
+    if (roles_started && this->visualizer_) {
+        roles_started = this->visualizer_->impl_->start();
     }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_) {
-        if (!this->artwork_->impl_->start()) {
-            return false;
-        }
+    if (roles_started && this->artwork_) {
+        roles_started = this->artwork_->impl_->start();
     }
 #endif
+
+    if (!roles_started) {
+        this->stop_role_threads();
+        return false;
+    }
 
     // Create and configure the WebSocket server (started later when network is ready)
     this->connection_manager_->init_server(this);
 
+    this->run_state_ = SendspinRunState::RUNNING;
     return true;
 }
 
+void SendspinClient::stop() {
+    if (this->run_state_ == SendspinRunState::STOPPED) {
+        return;
+    }
+    // Finishing a pending request_stop() synchronously still announces its completion; a stop
+    // straight from RUNNING signals completion by returning instead.
+    this->finish_stop(/*notify=*/this->run_state_ == SendspinRunState::STOPPING);
+}
+
+void SendspinClient::request_stop() {
+    if (this->run_state_ != SendspinRunState::RUNNING) {
+        return;
+    }
+    this->run_state_ = SendspinRunState::STOPPING;
+    this->stop_deadline_us_ = platform_time_us() + STOP_GRACE_US;
+
+    // Goodbyes go out now (queued to httpd workers on ESP), with the server left up so they can
+    // flush; role threads start winding down concurrently. loop() finishes the teardown once
+    // every connection has closed and the sync task has exited, or at the deadline.
+    this->connection_manager_->begin_stop(SendspinGoodbyeReason::SHUTDOWN);
+    this->request_stop_role_threads();
+}
+
 void SendspinClient::connect_to(const std::string& url) {
+    // Gated on the run state so a stopped (or stopping) client stays fully quiescent: an
+    // outbound connection created here would otherwise re-establish with no server or role
+    // threads running.
+    if (this->run_state_ != SendspinRunState::RUNNING) {
+        SS_LOGW(TAG, "connect_to() ignored; client is not running");
+        return;
+    }
     this->connection_manager_->connect_to(url);
 }
 
@@ -388,16 +434,35 @@ void SendspinClient::loop() {
                     this->group_state_.group_name.value_or("").c_str());
         }
     }
+
+    // Drive a pending request_stop() to completion. Runs after the manager loop above so this
+    // tick's close events are already reflected in has_connections(). The sync task is the only
+    // role thread polled for exit: its idle poll can take up to 500 ms to observe the stop
+    // signal, while the artwork/visualizer drain threads exit within one 50 ms receive timeout,
+    // so their joins in finish_stop() are effectively instant by then. The deadline caps the
+    // wait when a peer never delivers its close.
+    if (this->run_state_ == SendspinRunState::STOPPING) {
+        bool player_done = true;
+#ifdef SENDSPIN_ENABLE_PLAYER
+        if (this->player_) {
+            player_done = this->player_->impl_->has_stopped();
+        }
+#endif
+        if ((player_done && !this->connection_manager_->has_connections()) ||
+            platform_time_us() >= this->stop_deadline_us_) {
+            this->finish_stop(/*notify=*/true);
+        }
+    }
 }
 
 // ============================================================================
-// Role registration (call before start_server)
+// Role registration (call before start())
 // ============================================================================
 
 #ifdef SENDSPIN_ENABLE_PLAYER
 PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
-    if (this->started_) {
-        SS_LOGW(TAG, "add_player() called after start_server(); role may not initialize correctly");
+    if (this->run_state_ != SendspinRunState::STOPPED) {
+        SS_LOGW(TAG, "add_player() called after start(); role may not initialize correctly");
     }
     this->player_ =
         std::make_unique<PlayerRole>(std::move(config), this, this->persistence_provider_);
@@ -408,8 +473,8 @@ PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
 
 #ifdef SENDSPIN_ENABLE_CONTROLLER
 ControllerRole& SendspinClient::add_controller() {
-    if (this->started_) {
-        SS_LOGW(TAG, "add_controller() called after start_server()");
+    if (this->run_state_ != SendspinRunState::STOPPED) {
+        SS_LOGW(TAG, "add_controller() called after start()");
     }
     this->controller_ = std::make_unique<ControllerRole>(this);
     this->controller_->impl_->attach_inbox(this->event_state_->inbox);
@@ -419,8 +484,8 @@ ControllerRole& SendspinClient::add_controller() {
 
 #ifdef SENDSPIN_ENABLE_METADATA
 MetadataRole& SendspinClient::add_metadata() {
-    if (this->started_) {
-        SS_LOGW(TAG, "add_metadata() called after start_server()");
+    if (this->run_state_ != SendspinRunState::STOPPED) {
+        SS_LOGW(TAG, "add_metadata() called after start()");
     }
     this->metadata_ = std::make_unique<MetadataRole>(this);
     this->metadata_->impl_->attach_inbox(this->event_state_->inbox);
@@ -430,8 +495,8 @@ MetadataRole& SendspinClient::add_metadata() {
 
 #ifdef SENDSPIN_ENABLE_COLOR
 ColorRole& SendspinClient::add_color() {
-    if (this->started_) {
-        SS_LOGW(TAG, "add_color() called after start_server()");
+    if (this->run_state_ != SendspinRunState::STOPPED) {
+        SS_LOGW(TAG, "add_color() called after start()");
     }
     this->color_ = std::make_unique<ColorRole>(this);
     this->color_->impl_->attach_inbox(this->event_state_->inbox);
@@ -441,8 +506,8 @@ ColorRole& SendspinClient::add_color() {
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
 ArtworkRole& SendspinClient::add_artwork(ArtworkRoleConfig config) {
-    if (this->started_) {
-        SS_LOGW(TAG, "add_artwork() called after start_server()");
+    if (this->run_state_ != SendspinRunState::STOPPED) {
+        SS_LOGW(TAG, "add_artwork() called after start()");
     }
     this->artwork_ = std::make_unique<ArtworkRole>(std::move(config), this);
     this->artwork_->impl_->attach_inbox(this->event_state_->inbox);
@@ -452,8 +517,8 @@ ArtworkRole& SendspinClient::add_artwork(ArtworkRoleConfig config) {
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
 VisualizerRole& SendspinClient::add_visualizer(VisualizerRoleConfig config) {
-    if (this->started_) {
-        SS_LOGW(TAG, "add_visualizer() called after start_server()");
+    if (this->run_state_ != SendspinRunState::STOPPED) {
+        SS_LOGW(TAG, "add_visualizer() called after start()");
     }
     this->visualizer_ = std::make_unique<VisualizerRole>(std::move(config), this);
     this->visualizer_->impl_->attach_inbox(this->event_state_->inbox);
@@ -465,21 +530,14 @@ VisualizerRole& SendspinClient::add_visualizer(VisualizerRoleConfig config) {
 // Queries
 // ============================================================================
 
-bool SendspinClient::is_connected() const {
-    return this->connection_manager_->is_connected();
-}
-
-bool SendspinClient::is_time_synced() const {
-    // current_shared(): called from role threads (sync task, drain threads), so the shared_ptr
-    // must keep the connection alive while it is dereferenced.
-    auto conn = this->connection_manager_->current_shared();
-    return conn != nullptr && conn->is_time_synced();
-}
-
 int64_t SendspinClient::get_client_time(int64_t server_time) const {
     // current_shared(): called from role threads; see is_time_synced().
     auto conn = this->connection_manager_->current_shared();
     return conn != nullptr ? conn->get_client_time(server_time) : 0;
+}
+
+bool SendspinClient::is_connected() const {
+    return this->connection_manager_->is_connected();
 }
 
 std::optional<ServerInformationObject> SendspinClient::get_server_information() const {
@@ -489,6 +547,13 @@ std::optional<ServerInformationObject> SendspinClient::get_server_information() 
         return std::nullopt;
     }
     return conn->get_server_information();
+}
+
+bool SendspinClient::is_time_synced() const {
+    // current_shared(): called from role threads (sync task, drain threads), so the shared_ptr
+    // must keep the connection alive while it is dereferenced.
+    auto conn = this->connection_manager_->current_shared();
+    return conn != nullptr && conn->is_time_synced();
 }
 
 // ============================================================================
@@ -596,6 +661,68 @@ void SendspinClient::cleanup_connection_state() {
         this->release_high_performance();
         this->high_performance_held_for_time_ = false;
     }
+}
+
+void SendspinClient::stop_role_threads() {
+#ifdef SENDSPIN_ENABLE_PLAYER
+    if (this->player_) {
+        this->player_->impl_->stop();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_) {
+        this->visualizer_->impl_->stop();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    if (this->artwork_) {
+        this->artwork_->impl_->stop();
+    }
+#endif
+}
+
+void SendspinClient::finish_stop(bool notify) {
+    this->run_state_ = SendspinRunState::STOPPED;
+
+    // Goodbye and close every connection, then stop the WebSocket server so no new connections
+    // arrive. Dropping the current slot inside runs cleanup_connection_state(), which quiesces
+    // per-connection state (time burst, role state, high-performance holds) and queues the
+    // roles' clear callbacks for the next loop().
+    this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
+
+    // Join role threads only after the connection teardown above has signaled their streams
+    // closed; a restart via start() re-creates them.
+    this->stop_role_threads();
+
+    // Reset session-scoped published state so a restart begins fresh: group_state_ is a delta
+    // accumulator that would otherwise keep serving the old session's group, and a stale state_
+    // (e.g. ERROR) would be republished verbatim to the next server on handshake. Reset here
+    // rather than in cleanup_connection_state(), which also runs on reconnects and handoffs
+    // where carrying the state forward is intentional.
+    this->group_state_ = GroupUpdateObject{};
+    this->state_ = SendspinClientState::SYNCHRONIZED;
+
+    if (notify && this->listener_ != nullptr) {
+        this->listener_->on_stopped();
+    }
+}
+
+void SendspinClient::request_stop_role_threads() {
+#ifdef SENDSPIN_ENABLE_PLAYER
+    if (this->player_) {
+        this->player_->impl_->request_stop();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_) {
+        this->visualizer_->impl_->request_stop();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    if (this->artwork_) {
+        this->artwork_->impl_->request_stop();
+    }
+#endif
 }
 
 std::string SendspinClient::build_hello_message() {

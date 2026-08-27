@@ -56,6 +56,10 @@ constexpr uint16_t EVICT_TEST_PORT = 18972;
 constexpr uint16_t REJECT_TEST_PORT = 18973;
 constexpr uint16_t STALL_LISTEN_PORT = 18981;
 constexpr uint16_t ADMIT_TEST_PORT = 18982;
+constexpr uint16_t STOP_TEST_PORT = 18991;
+constexpr uint16_t STOP_NOOP_TEST_PORT = 18992;
+constexpr uint16_t REQUEST_STOP_TEST_PORT = 18993;
+constexpr uint16_t REQUEST_STOP_SYNC_TEST_PORT = 18994;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -597,4 +601,156 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
     EXPECT_FALSE(client.is_connected());
     EXPECT_FALSE(mute_a.closed());
     EXPECT_FALSE(mute_b.closed());
+}
+
+// stop() is the full shutdown: the established peer receives a goodbye before its socket closes,
+// the WS server stops listening (new connections are refused at the TCP level), and loop() stays
+// safe to call while stopped. start() afterwards brings the whole stack back on the same port for
+// a fresh establishment.
+TEST(ConnectionLifecycle, StopShutsDownAndRestartAcceptsAgain) {
+    TestNetworkProvider network;
+    SendspinClient client(make_config(STOP_TEST_PORT));
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+    EXPECT_TRUE(client.is_started());
+    pump_for(client, 50);
+
+    {
+        FakeServer server(server_url(STOP_TEST_PORT), "server-before-stop");
+        ASSERT_TRUE(pump_until(
+            client, [&] { return client.is_connected(); }, 4000));
+
+        client.stop();
+        EXPECT_FALSE(client.is_started());
+        EXPECT_FALSE(client.is_connected());
+
+        // Pumping while stopped is allowed and must not revive anything; the peer sees the
+        // goodbye and then the close.
+        EXPECT_TRUE(pump_until(
+            client, [&] { return server.closed(); }, 3000));
+        EXPECT_TRUE(server.got_goodbye());
+    }
+
+    // The listener is gone: a raw TCP connect is refused outright.
+    int probe_fd = connect_loopback(STOP_TEST_PORT);
+    EXPECT_LT(probe_fd, 0);
+    if (probe_fd >= 0) {
+        ::close(probe_fd);
+    }
+
+    // A second stop is a no-op.
+    client.stop();
+
+    // Restart on the same port: a new peer establishes as if this were the first start.
+    ASSERT_TRUE(client.start());
+    EXPECT_TRUE(client.is_started());
+    pump_for(client, 50);
+    FakeServer server_after(server_url(STOP_TEST_PORT), "server-after-restart");
+    EXPECT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+    auto info = client.get_server_information();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->server_id, "server-after-restart");
+
+    client.stop();
+}
+
+// stop() before start(), and loop() while never started, must be safe no-ops.
+TEST(ConnectionLifecycle, StopWithoutStartIsANoOp) {
+    SendspinClient client(make_config(STOP_NOOP_TEST_PORT));
+    client.stop();
+    client.loop();
+    EXPECT_FALSE(client.is_started());
+}
+
+namespace {
+
+// Counts on_stopped() completions from request_stop() teardowns.
+class StopListener : public SendspinClientListener {
+public:
+    void on_stopped() override {
+        ++this->stopped_count;
+    }
+
+    int stopped_count{0};
+};
+
+}  // namespace
+
+// request_stop() must return without tearing anything down itself (state moves to STOPPING),
+// then complete over loop() ticks: the established peer receives a goodbye before its socket
+// closes, on_stopped() fires exactly once, the port stops accepting, and start() works again.
+// start() during the teardown must be refused.
+TEST(ConnectionLifecycle, RequestStopCompletesOverLoopAndNotifies) {
+    TestNetworkProvider network;
+    StopListener stop_listener;
+    SendspinClient client(make_config(REQUEST_STOP_TEST_PORT));
+    client.set_network_provider(&network);
+    client.set_listener(&stop_listener);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    {
+        FakeServer server(server_url(REQUEST_STOP_TEST_PORT), "server-async-stop");
+        ASSERT_TRUE(pump_until(
+            client, [&] { return client.is_connected(); }, 4000));
+
+        client.request_stop();
+        EXPECT_EQ(client.get_run_state(), SendspinRunState::STOPPING);
+        EXPECT_FALSE(client.is_started());
+        EXPECT_EQ(stop_listener.stopped_count, 0);
+
+        // A start during the teardown is refused; a second request_stop is a no-op.
+        EXPECT_FALSE(client.start());
+        client.request_stop();
+
+        ASSERT_TRUE(pump_until(
+            client, [&] { return client.get_run_state() == SendspinRunState::STOPPED; }, 3000));
+        EXPECT_EQ(stop_listener.stopped_count, 1);
+        EXPECT_TRUE(pump_until(
+            client, [&] { return server.closed(); }, 2000));
+        EXPECT_TRUE(server.got_goodbye());
+    }
+
+    // The listener is gone once the teardown completes.
+    int probe_fd = connect_loopback(REQUEST_STOP_TEST_PORT);
+    EXPECT_LT(probe_fd, 0);
+    if (probe_fd >= 0) {
+        ::close(probe_fd);
+    }
+
+    // Restart works, and no further on_stopped() fires for it.
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+    FakeServer server_after(server_url(REQUEST_STOP_TEST_PORT), "server-after-async");
+    EXPECT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+    client.stop();
+    EXPECT_EQ(stop_listener.stopped_count, 1);
+}
+
+// A synchronous stop() while a request_stop() teardown is in progress finishes it immediately
+// and still announces the completion exactly once.
+TEST(ConnectionLifecycle, SyncStopFinishesPendingRequestStop) {
+    TestNetworkProvider network;
+    StopListener stop_listener;
+    SendspinClient client(make_config(REQUEST_STOP_SYNC_TEST_PORT));
+    client.set_network_provider(&network);
+    client.set_listener(&stop_listener);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    client.request_stop();
+    EXPECT_EQ(client.get_run_state(), SendspinRunState::STOPPING);
+    client.stop();
+    EXPECT_EQ(client.get_run_state(), SendspinRunState::STOPPED);
+    EXPECT_EQ(stop_listener.stopped_count, 1);
+
+    // With no connections and no player role, a fresh request_stop() completes on the next
+    // loop() tick, well inside the grace deadline.
+    ASSERT_TRUE(client.start());
+    client.request_stop();
+    EXPECT_TRUE(pump_until(
+        client, [&] { return client.get_run_state() == SendspinRunState::STOPPED; }, 1000));
+    EXPECT_EQ(stop_listener.stopped_count, 2);
 }

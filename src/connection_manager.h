@@ -107,17 +107,18 @@ struct HelloRetryState {
  *  3. Call `loop()` periodically to drive connection state, process deferred events, and retry
  *     hellos.
  *  4. Call `connect_to()` to initiate an outgoing client connection when needed.
- *  5. Call `disconnect()` to gracefully close the active connection.
+ *  5. Call `disconnect()` to gracefully close the active connection, or `stop()` to also shut
+ *     down the WebSocket server (call `init_server()` again before reuse).
  *
  * @code
  * ConnectionManager manager(client);
- * manager.init_server(client, use_psram, priority);
+ * manager.init_server(client);
  *
  * while (running) {
  *     manager.loop();
  * }
  *
- * manager.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+ * manager.stop(SendspinGoodbyeReason::SHUTDOWN);
  * @endcode
  */
 class ConnectionManager {
@@ -146,10 +147,32 @@ public:
     // Server lifecycle
     // ========================================
 
-    /// @brief Creates the WebSocket server and configures callbacks. Call once from start_server().
+    /// @brief Creates the WebSocket server and configures callbacks. Called from
+    /// SendspinClient::start(); call again after stop() before reuse.
     /// Server configuration is read from client->config_.
     /// @param client The SendspinClient that owns this manager.
     void init_server(SendspinClient* client);
+
+    /// @brief Begins an asynchronous stop: stops admitting new peers and sends a goodbye to
+    /// every connected one, but leaves the WebSocket server up so queued goodbye sends can
+    /// still flush (the ESP transport sends via httpd workers).
+    ///
+    /// Must be called from the main loop thread (see disconnect()). Connections leave their
+    /// slots through the normal close-event path on subsequent loop() ticks; poll
+    /// has_connections() for completion and call stop() to finish the teardown. Calling stop()
+    /// after begin_stop() can re-send a goodbye to a peer that ignored the first one.
+    /// @param reason The goodbye reason to send before closing.
+    void begin_stop(SendspinGoodbyeReason reason);
+
+    /// @brief Stops the manager: sends a goodbye to every connected peer, drops every managed
+    /// connection, and stops and destroys the WebSocket server so no new connections arrive.
+    ///
+    /// Must be called from the main loop thread (same transport-stop race rationale as
+    /// disconnect()). The goodbye is best-effort: on ESP the send is queued to an httpd worker
+    /// and the server stop can close the session first. Call init_server() again before reuse;
+    /// loop() stays safe to call while stopped (no server, no connections, nothing to drive).
+    /// @param reason The goodbye reason to send before closing.
+    void stop(SendspinGoodbyeReason reason);
 
     /// @brief Drives connection state: starts server when network ready, processes lifecycle
     /// events, retries hello, calls loop() on active connections.
@@ -170,6 +193,15 @@ public:
     /// @brief Returns true if there is an active connection with completed handshake.
     /// @return True if connected and handshake is complete, false otherwise.
     bool is_connected() const;
+
+    /// @brief Returns true while any managed connection exists (current slot or nursery).
+    /// Lock-free (reads the tick-gating hint atomics); used to poll an asynchronous stop for
+    /// completion.
+    /// @return True if the current slot is occupied or the nursery is non-empty.
+    bool has_connections() const {
+        return this->has_current_.load(std::memory_order_acquire) ||
+               this->nursery_size_.load(std::memory_order_acquire) > 0;
+    }
 
     /// @brief Returns the current active connection. Main-thread only.
     /// @return Pointer to the current connection, or nullptr if none.
@@ -365,6 +397,13 @@ private:
 
     // Atomic fields (lock-free hints for loop() tick gating; ground truth remains the
     // mutex-protected containers/pointer above -- see the "Tick cost" note on loop())
+
+    /// False while the manager is stopped. Cleared at the top of stop(), before the goodbye
+    /// snapshot, and set again by init_server(). Closes the admission window during shutdown: a
+    /// peer the transport delivers between stop()'s goodbye snapshot and the server teardown is
+    /// rejected with a goodbye by on_new_connection() instead of entering the nursery only to be
+    /// force-dropped without one.
+    std::atomic<bool> accepting_{false};
 
     /// True while pending_connected_events_ or pending_disconnect_events_ holds an unswapped
     /// entry. Set under conn_mutex_ at every push into either queue; cleared under conn_mutex_

@@ -211,6 +211,7 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
 
 void ConnectionManager::init_server(SendspinClient* client) {
     this->client_ = client;
+    this->accepting_.store(true, std::memory_order_release);
 
     this->ws_server_ = std::make_unique<SendspinWsServer>();
     this->ws_server_->set_port(this->client_->config_.server_port);
@@ -266,10 +267,63 @@ void ConnectionManager::init_server(SendspinClient* client) {
         });
 }
 
+void ConnectionManager::begin_stop(SendspinGoodbyeReason reason) {
+    // Close the admission door first: a peer delivered after this point is rejected with a
+    // goodbye in on_new_connection() rather than admitted into a nursery that is about to be
+    // torn down.
+    this->accepting_.store(false, std::memory_order_release);
+
+    // Goodbye every connected peer and release unconnected nursery entries. The server stays
+    // up, so queued goodbye sends can flush and each connection leaves its slot through the
+    // normal close-event path; stop() later force-drops whatever remains.
+    this->disconnect(reason);
+}
+
+void ConnectionManager::stop(SendspinGoodbyeReason reason) {
+    // Same admission close + goodbye pass as begin_stop(); when stop() follows a begin_stop()
+    // this re-goodbyes only peers that ignored the first one for the whole grace window.
+    this->begin_stop(reason);
+
+    // Stop accepting and tear down the transport server. Synchronous on both platforms:
+    // httpd_stop tears down every remaining session (ESP) and IXWebSocket's stop joins its
+    // worker threads (host). Close callbacks that fire during the teardown only queue pending
+    // events, which are discarded below. No manager lock is held here, so those callbacks
+    // cannot deadlock against this thread.
+    this->ws_server_.reset();
+    this->ws_server_start_retry_time_us_ = 0;
+
+    // Drop every remaining slot. The transports are gone (or their goodbye was already sent
+    // above), so no further goodbye is attempted. Dropping the current slot also quiesces the
+    // client's per-connection state (cleanup_connection_state), exactly as a connection-lost
+    // event would.
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        this->drop_connection(this->current_connection_.get(), std::nullopt);
+        while (!this->nursery_.empty()) {
+            this->release_nursery_entry(this->nursery_.begin(), std::nullopt);
+        }
+    }
+    this->flush_deferred_releases();
+
+    // Discard pending lifecycle events: every connection they reference was just released, so
+    // draining them later would only no-op through drop_connection. Swapped out under the lock,
+    // destroyed outside it (a connection destructor can join its transport thread).
+    std::vector<std::shared_ptr<SendspinConnection>> stale_connected;
+    std::vector<std::shared_ptr<SendspinConnection>> stale_disconnects;
+    {
+        std::lock_guard<std::mutex> lock(this->conn_mutex_);
+        stale_connected.swap(this->pending_connected_events_);
+        stale_disconnects.swap(this->pending_disconnect_events_);
+        this->has_pending_events_.store(false, std::memory_order_release);
+    }
+}
+
 void ConnectionManager::loop() {
     // Start WS server when network becomes ready. A persistent failure (e.g. the server port is
     // already in use) is retried with backoff instead of on every tick, which would spam the log.
-    if (this->ws_server_ != nullptr && !this->ws_server_->is_started()) {
+    // Gated on accepting_ so a stop in progress cannot belatedly open the server.
+    if (this->accepting_.load(std::memory_order_acquire) && this->ws_server_ != nullptr &&
+        !this->ws_server_->is_started()) {
         const int64_t now_us = platform_time_us();
         if (now_us >= this->ws_server_start_retry_time_us_ && this->client_->network_provider_ &&
             this->client_->network_provider_->is_network_ready()) {
@@ -543,22 +597,32 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
 
-        // The newcomer has not completed the hello handshake, so it never touches the current
-        // slot; it enters the bounded nursery and is promoted only once it establishes. Only
-        // inbound entries count against the capacity (see NURSERY_CAPACITY). If the inbound slots
-        // are full, reject the newcomer: every occupant speaks WebSocket, so there is no safe
-        // eviction candidate. The goodbye reaches the peer because its session is already upgraded,
-        // provided the transport had a socket to accept it on (the NURSERY_CAPACITY + 2 budget).
+        // Reject peers delivered while the manager is stopping (between stop()'s goodbye
+        // snapshot and the server teardown): the nursery is about to be force-drained with no
+        // goodbye, so turning the peer away here, with one, is the only graceful exit left.
+        //
+        // Otherwise: the newcomer has not completed the hello handshake, so it never touches the
+        // current slot; it enters the bounded nursery and is promoted only once it establishes.
+        // Only inbound entries count against the capacity (see NURSERY_CAPACITY). If the inbound
+        // slots are full, reject the newcomer: every occupant speaks WebSocket, so there is no
+        // safe eviction candidate. Either goodbye reaches the peer because its session is already
+        // upgraded, provided the transport had a socket to accept it on (the NURSERY_CAPACITY + 2
+        // budget).
         size_t inbound_count = 0;
         for (const auto& entry : this->nursery_) {
             if (entry.inbound) {
                 ++inbound_count;
             }
         }
-        if (inbound_count >= NURSERY_CAPACITY) {
-            SS_LOGW(TAG, "Nursery full of live connections, rejecting new connection");
+        if (!this->accepting_.load(std::memory_order_acquire)) {
+            SS_LOGD(TAG, "Manager stopping, rejecting new connection");
             // Never managed, but its callbacks are already wired: block dispatch so it cannot
             // inject messages during the goodbye window.
+            conn->disable_message_dispatch();
+            this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::SHUTDOWN);
+        } else if (inbound_count >= NURSERY_CAPACITY) {
+            SS_LOGW(TAG, "Nursery full of live connections, rejecting new connection");
+            // Never managed; same dispatch gating as the stopping rejection above.
             conn->disable_message_dispatch();
             this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::ANOTHER_SERVER);
         } else {

@@ -175,18 +175,35 @@ void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
 bool PlayerRole::Impl::start() {
     this->load_static_delay();
 
-    if (!this->config.audio_formats.empty() && this->listener &&
-        !this->sync_task->is_initialized()) {
-        if (!this->sync_task->init(this, this->client, this->config.audio_buffer_capacity)) {
-            SS_LOGE(TAG, "Failed to initialize sync task");
-            return false;
-        }
-        if (!this->sync_task->start(this->config.psram_stack, this->config.priority)) {
-            SS_LOGE(TAG, "Failed to start sync task thread");
-            return false;
-        }
+    if (this->config.audio_formats.empty() || !this->listener) {
+        return true;
+    }
+
+    // Init once (queues, ring buffer), then start the thread; a restart after stop() skips the
+    // init and only re-creates the joined thread.
+    if (!this->sync_task->is_initialized() &&
+        !this->sync_task->init(this, this->client, this->config.audio_buffer_capacity)) {
+        SS_LOGE(TAG, "Failed to initialize sync task");
+        return false;
+    }
+    if (!this->sync_task->is_thread_running() &&
+        !this->sync_task->start(this->config.psram_stack, this->config.priority)) {
+        SS_LOGE(TAG, "Failed to start sync task thread");
+        return false;
     }
     return true;
+}
+
+void PlayerRole::Impl::stop() const {
+    this->sync_task->stop();
+}
+
+void PlayerRole::Impl::request_stop() const {
+    this->sync_task->request_stop();
+}
+
+bool PlayerRole::Impl::has_stopped() const {
+    return this->sync_task->has_thread_exited();
 }
 
 void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {

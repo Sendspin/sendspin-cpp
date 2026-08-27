@@ -13,14 +13,18 @@
 // limitations under the License.
 
 #include "protocol_messages.h"
+#include "sendspin/client.h"
+#include "sendspin/config.h"
 #include "visualizer_role_impl.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -400,6 +404,60 @@ TEST(VisualizerClearMarker, DiscardDrainsToEmptyWithoutMarker) {
     impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
 
     impl->discard_to_clear_marker();
+
+    std::vector<uint8_t> entry;
+    EXPECT_FALSE(pop_entry(*impl, entry));
+}
+
+// ============================================================================
+// Lifecycle: stop()/start() restart
+// ============================================================================
+
+namespace {
+
+// A visualizer Impl bound to a real, never-started SendspinClient, for tests that run the live
+// drain thread: the thread dereferences client (is_time_synced()/get_client_time()), so the
+// nullptr client the decode-only make_impl() passes would crash it. A never-started client
+// reports no time sync, so the drain thread consumes each entry and drops it unread -- which is
+// exactly the observable these tests use for thread liveness.
+std::unique_ptr<VisualizerRole::Impl> make_impl_with_client() {
+    static std::deque<SendspinClient> clients;
+    static std::deque<Inbox> inboxes;
+
+    VisualizerRoleConfig config;
+    config.support.buffer_capacity = 4096;
+    clients.emplace_back(SendspinClientConfig{});
+    auto impl = std::make_unique<VisualizerRole::Impl>(std::move(config), &clients.back());
+    inboxes.emplace_back();
+    impl->attach_inbox(inboxes.back());
+    impl->stream_active = true;
+    impl->negotiated_types_mask = 0x1F;
+    return impl;
+}
+
+}  // namespace
+
+// A stop()/start() cycle must yield a live drain thread again: stop() leaves COMMAND_STOP set
+// in the surviving flag object, and a start() that does not clear it spawns a thread that exits
+// on its very first flag check, silently killing visualizer delivery for the rest of the
+// process. Liveness is observed through consumption: the restarted thread drains the entry
+// (dropping it for lack of time sync), so the ring is empty once it is stopped again; a dead
+// thread leaves the entry in place.
+TEST(VisualizerLifecycle, RestartDrainsAgain) {
+    auto impl = make_impl_with_client();
+    ASSERT_TRUE(impl->start());
+    impl->stop();
+    ASSERT_TRUE(impl->start());
+
+    std::vector<uint8_t> data;
+    put_be64(data, 123456);
+    put_be16(data, 0xABCD);
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+
+    // Generously past the drain thread's 50 ms receive timeout; the final stop() then makes it
+    // safe for the test thread to probe the SPSC ring as the sole consumer.
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    impl->stop();
 
     std::vector<uint8_t> entry;
     EXPECT_FALSE(pop_entry(*impl, entry));

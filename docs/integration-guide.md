@@ -51,7 +51,7 @@ SendspinClient client(std::move(config));
 
 ## Step 2: Add Roles
 
-Add only the roles your application needs. All roles must be added before calling `start_server()`.
+Add only the roles your application needs. All roles must be added before the first call to `start()`.
 
 ### Player Role (Audio Playback)
 
@@ -522,7 +522,7 @@ client.set_persistence_provider(&persistence_provider); // Optional
 ```cpp
 // Start the WebSocket server and sync task.
 // Task priorities and PSRAM settings are taken from SendspinClientConfig.
-if (!client.start_server()) {
+if (!client.start()) {
     // Handle failure
     return 1;
 }
@@ -537,8 +537,26 @@ while (running) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
-// Clean shutdown
-client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+// Clean shutdown: sends a goodbye, closes every connection, and stops the WebSocket
+// server and background threads. Call start() again later to restart the whole stack;
+// disconnect(SendspinGoodbyeReason) is still available to drop just the active
+// connection while leaving the server listening.
+client.stop();
+```
+
+If blocking the main loop during shutdown is a concern (for example inside a firmware main
+loop), use `request_stop()` instead: it returns immediately, and the teardown completes over
+subsequent `loop()` calls once every connection has closed and the background threads have wound
+down (capped by a fixed grace deadline). Completion is reported through
+`SendspinClientListener::on_stopped()` and can be polled via `get_run_state()`:
+
+```cpp
+client.request_stop();
+
+while (client.get_run_state() != SendspinRunState::STOPPED) {
+    client.loop();  // on_stopped() fires from here when the teardown finishes
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+}
 ```
 
 ## Sending Commands
@@ -700,7 +718,7 @@ int main() {
     player.set_listener(&player_listener);
     client.set_network_provider(&network);
 
-    client.start_server();
+    client.start();
 
     while (true) {
         client.loop();

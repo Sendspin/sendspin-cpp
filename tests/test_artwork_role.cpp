@@ -955,3 +955,30 @@ TEST(ArtworkDisplayLateness, HugeLatenessSaturatesAtUint32Max) {
     // saturate there rather than wrap when narrowed to uint32_t.
     EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, INT64_MAX), UINT32_MAX);
 }
+
+// ============================================================================
+// Lifecycle: stop()/start() restart
+// ============================================================================
+
+// A stop()/start() cycle must yield a live decode thread again: stop() leaves COMMAND_STOP set
+// in the surviving flag object, and a start() that does not clear it spawns a thread that exits
+// on its very first flag check, silently killing artwork delivery for the rest of the process.
+TEST(ArtworkLifecycle, RestartDecodesAgain) {
+    auto impl = make_impl(make_single_slot_config(false));
+    RecordingListener listener;
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    send_frame(*impl, 0, 'A');
+    ASSERT_TRUE(listener.wait_for([&] { return listener.decodes.size() >= 1; }, POSITIVE_TIMEOUT));
+    EXPECT_EQ(listener.decode_marker_at(0), 'A');
+
+    impl->stop();
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    send_frame(*impl, 0, 'B');
+    ASSERT_TRUE(listener.wait_for([&] { return listener.decodes.size() >= 2; }, POSITIVE_TIMEOUT));
+    EXPECT_EQ(listener.decode_marker_at(1), 'B');
+}

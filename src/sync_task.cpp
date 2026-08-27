@@ -96,7 +96,9 @@ bool SyncTask::init(PlayerRole::Impl* player_impl, SendspinClient* client, size_
     this->player_impl_ = player_impl;
     this->client_ = client;
 
-    if (!this->event_flags_.create()) {
+    // Guarded so a retry after a partial failure (flags created, ring-buffer allocation failed)
+    // can call init() again without re-creating the flags.
+    if (!this->event_flags_.is_created() && !this->event_flags_.create()) {
         SS_LOGE(TAG, "Couldn't create event flags.");
         return false;
     }
@@ -784,6 +786,13 @@ void SyncTask::process_playback_progress(SyncContext& sync_context) {
 // Lifecycle
 // ============================================================================
 
+void SyncTask::request_stop() {
+    if (!this->sync_thread_.joinable()) {
+        return;
+    }
+    this->event_flags_.set(EventGroupBits::COMMAND_STOP);
+}
+
 void SyncTask::stop() {
     if (!this->sync_thread_.joinable()) {
         return;
@@ -791,6 +800,14 @@ void SyncTask::stop() {
 
     this->event_flags_.set(EventGroupBits::COMMAND_STOP);
     this->sync_thread_.join();
+
+    // The ring buffer survives a stop()/start() cycle (init() runs once), so discard whatever a
+    // mid-stream stop left in it. Otherwise a restarted thread's wait_for_codec_header() could
+    // pick up a stale pre-stop codec header as the new stream's. Safe here: the consumer thread
+    // is joined, and the producers (network threads) are quiesced before role threads stop.
+    if (this->encoded_ring_buffer_ != nullptr) {
+        this->encoded_ring_buffer_->reset();
+    }
 }
 
 // ============================================================================
@@ -930,6 +947,20 @@ void SyncTask::thread_entry(void* params) {
         // a codec header that arrived during a rapid seek (STREAM_END → STREAM_START).
     }
 
+    // Return any entry still borrowed at exit: the idle-path COMMAND_STOP breaks above can fire
+    // while a codec header is held awaiting COMMAND_START, and an un-returned borrow corrupts
+    // the ring's item accounting for the drain that stop() runs after the join.
+    if (sync_context.encoded_entry != nullptr) {
+        this_task->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+        sync_context.encoded_entry = nullptr;
+    }
+
+    // Clear the state bits before announcing the stop: a COMMAND_STOP that interrupts an active
+    // stream breaks out of the inner loop above without passing the top-of-loop clear, so
+    // TASK_RUNNING would otherwise stay set after the thread is gone -- and is_running() reads
+    // that bit, which would wedge the player's sync-idle gate (a queued STREAM_END would never
+    // deliver its on_stream_end()).
+    this_task->event_flags_.clear(EventGroupBits::TASK_RUNNING | EventGroupBits::TASK_IDLE);
     this_task->event_flags_.set(EventGroupBits::TASK_STOPPED);
 }
 

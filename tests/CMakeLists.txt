@@ -27,9 +27,14 @@ add_executable(sendspin_tests
     test_network_info.cpp
     test_spsc_ring_buffer.cpp
     test_inbox.cpp
+    test_sync_task.cpp
     test_visualizer_role.cpp
     test_artwork_role.cpp
 )
+
+# test_sync_task.cpp stages internal SyncTask states (partial init, mid-stream stop) directly;
+# disable access control for that one TU instead of adding test seams to the production code.
+set_source_files_properties(test_sync_task.cpp PROPERTIES COMPILE_OPTIONS "-fno-access-control")
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...).
 # The public include/ dir and ArduinoJson propagate transitively from `sendspin`.

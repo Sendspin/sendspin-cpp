@@ -130,10 +130,23 @@ public:
     /// @return true if thread started successfully, false otherwise.
     bool start(bool task_stack_in_psram, unsigned priority);
 
+    /// @brief Signals the task to stop and waits for the thread to finish
+    /// Restartable: start() may be called again afterwards.
+    void stop();
+
+    /// @brief Signals the task to stop without waiting for the thread to finish
+    /// Used by the client's asynchronous shutdown so the thread winds down concurrently with the
+    /// network grace period; the eventual stop() then joins an already-exited thread. Poll
+    /// has_thread_exited() for completion. No-op if the thread is not running.
+    void request_stop();
+
     /// @brief Returns true if init() has been called successfully
+    /// Checks every resource init() creates, not just the first: a partially failed init()
+    /// (flags created, ring-buffer allocation failed) reports false so the caller retries
+    /// init() instead of starting a thread that would dereference the missing ring buffer.
     /// @return true if the sync task has been initialized, false otherwise.
     bool is_initialized() const {
-        return this->event_flags_.is_created();
+        return this->event_flags_.is_created() && this->encoded_ring_buffer_ != nullptr;
     }
 
     /// @brief Returns true if the sync task is actively processing a stream
@@ -146,6 +159,25 @@ public:
             return false;
         }
         return (this->event_flags_.get() & EventGroupBits::TASK_RUNNING) != 0U;
+    }
+
+    /// @brief Returns true if the sync thread has finished, or never started
+    /// After request_stop(), true means a subsequent stop() joins without blocking.
+    /// @return true if no thread exists or the thread's entry function has returned.
+    bool has_thread_exited() const {
+        if (!this->sync_thread_.joinable()) {
+            return true;
+        }
+        return (this->event_flags_.get() & EventGroupBits::TASK_STOPPED) != 0U;
+    }
+
+    /// @brief Returns true if the sync thread has been started and not yet stopped
+    /// Distinct from is_running(), which reports whether a stream is actively being processed.
+    /// Only meaningful on the thread that calls start()/stop(): joinable() reflects the
+    /// std::thread object's state, which only those calls mutate.
+    /// @return true if the sync thread exists (started, not yet joined by stop()).
+    bool is_thread_running() const {
+        return this->sync_thread_.joinable();
     }
 
     /// @brief Signals the sync task to end the current stream. Non-blocking
@@ -261,9 +293,6 @@ protected:
     /// @brief Processes playback progress messages from the speaker to update buffered_frames and
     /// playtime.
     void process_playback_progress(SyncContext& sync_context);
-
-    /// @brief Signals the task to stop and waits for the thread to finish
-    void stop();
 
     // Struct fields
     EventFlags event_flags_;

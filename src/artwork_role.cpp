@@ -98,6 +98,11 @@ bool ArtworkRole::Impl::start() {
         return false;
     }
 
+    // The flag object survives a stop()/start() cycle, so clear the stale COMMAND_STOP left by
+    // stop() before spawning; otherwise the new thread's first wait() sees it and exits
+    // immediately.
+    this->drain_task->event_flags.clear(COMMAND_STOP);
+
     platform_configure_thread("SsArt", 4096, static_cast<int>(this->config.priority),
                               this->config.psram_stack);
     this->drain_task->drain_thread = std::thread(drain_thread_func, this);
@@ -110,6 +115,13 @@ void ArtworkRole::Impl::stop() const {
     }
     this->drain_task->event_flags.set(COMMAND_STOP);
     this->drain_task->drain_thread.join();
+}
+
+void ArtworkRole::Impl::request_stop() const {
+    if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
+        return;
+    }
+    this->drain_task->event_flags.set(COMMAND_STOP);
 }
 
 void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {

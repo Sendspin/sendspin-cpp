@@ -185,6 +185,7 @@ struct ArtworkRole::Impl {
     // ========================================
 
     void stop() const;
+    void request_stop() const;
     void enqueue_stream_event(ArtworkEventType event) const;
     // Merges a single-slot display delta into the accumulated cross-thread update. Called under
     // the Inbox mutex via InboxSlot::merge() (see process_notification), so it must stay a pure
