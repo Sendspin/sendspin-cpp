@@ -121,7 +121,7 @@ The slot/channel number for each entry is its position (index) in `preferred_for
 
 ### Visualizer Role (Audio Visualization)
 
-Receives real-time beat, loudness, peak frequency, onset, and spectrum data synchronized to playback.
+Receives real-time beat, loudness, dominant-frequency, onset, and spectrum data synchronized to playback.
 
 ```cpp
 VisualizerSupportObject vis_support;
@@ -143,6 +143,23 @@ vis_support.spectrum = VisualizerSpectrumConfig{
 
 auto& visualizer = client.add_visualizer({.support = vis_support});
 ```
+
+The advertised support object is the starting format. To change it at runtime, call
+`request_format()` with only the fields you want to change; omitted fields keep their
+current value on the server:
+
+```cpp
+visualizer.request_format({.rate_max = 15});  // Halve the frame rate
+
+visualizer.request_format({
+    .types = {{VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS}},
+});
+```
+
+While a stream is active the server replies with a fresh `stream/start`, so
+`on_visualizer_stream_start()` fires again with the updated
+`ServerVisualizerStreamObject`. If no stream is active, the server remembers the request
+and applies it to the next stream.
 
 ### Color Role (Audio-Derived Color Palette)
 
@@ -944,10 +961,11 @@ These represent commands the server can send to the player. The player advertise
 
 | Value | Description |
 |---|---|
-| `BEAT` | Beat detection events |
-| `LOUDNESS` | Loudness level |
-| `F_PEAK` | Peak frequency |
-| `SPECTRUM` | Frequency spectrum bins |
+| `BEAT` | Musical beat events from tempo/beat tracking |
+| `LOUDNESS` | Overall loudness level |
+| `F_PEAK` | Dominant frequency and its amplitude |
+| `SPECTRUM` | Full frequency spectrum bins |
+| `PEAK` | Energy onset (transient) events |
 
 ### VisualizerSpectrumScale
 
