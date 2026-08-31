@@ -65,6 +65,28 @@ logic that ships without a test that could catch its breakage.
   history ("rejects spectrum config missing n_disp_bins", not "regression
   test for the config bug").
 
+## Granularity and independence
+
+- One behavior per test: not one assertion per test, and not one test per
+  bug. Several assertions about the same behavior belong together and
+  splitting them is filler; a long test spanning several behaviors is the
+  opposite failure and gets split along the behaviors it conflates.
+  `MetadataNullClearsAndAbsentPreserves` (`tests/test_protocol.cpp`) asserts
+  three things about the single delta-merge rule it covers.
+- A test name describes the behavior closely enough that a red CI run
+  identifies the break without opening the file (see the naming bullet under
+  "No filler").
+- `ASSERT_*` aborts the test function while `EXPECT_*` continues, so an
+  over-merged test masks later failures behind the first one. Reserve
+  `ASSERT_*` for the point where continuing would be meaningless, such as a
+  parse that must succeed before its result is read.
+- The same behavior over differing inputs belongs in a value-parameterized
+  test (`TEST_P` with `INSTANTIATE_TEST_SUITE_P`) rather than copy-pasted
+  near-duplicate cases. The malformed-input rejection tests in
+  `tests/test_protocol.cpp` are the standing example of that shape.
+- No test depends on execution order, on another test having run first, or on
+  shared mutable global state; each test sets up the world it needs.
+
 ## No test seams in production
 
 - Production code in `src/` and `include/` must not acquire friends,
