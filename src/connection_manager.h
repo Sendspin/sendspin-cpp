@@ -137,9 +137,14 @@ public:
     /// @brief Disconnects from the current server.
     ///
     /// Must be called from the main loop thread: conn->disconnect() runs outside conn_ptr_mutex_
-    /// (it can block on the transport, and on host outbound it joins the transport thread), so
+    /// (it can block on the transport: outbound stops the transport synchronously on both
+    /// platforms, while inbound only starts an asynchronous close), so
     /// only the main loop's serialization keeps it from racing loop()'s reap/handoff release of
     /// the same connection into two concurrent transport stops.
+    ///
+    /// Inbound message dispatch stays enabled on the connections being goodbyed: a client that
+    /// drops one session while running has no teardown window for late frames to corrupt.
+    /// begin_stop() disables it instead (see disconnect_impl()).
     /// @param reason The goodbye reason to send before closing.
     void disconnect(SendspinGoodbyeReason reason);
 
@@ -325,6 +330,14 @@ private:
     // ========================================
     // Connection lifecycle
     // ========================================
+    /// @brief Goodbyes every connected connection and releases the unconnected nursery entries.
+    ///
+    /// Backs both disconnect() and begin_stop(); see disconnect() for the threading contract.
+    /// @param reason The goodbye reason to send before closing.
+    /// @param quiescing True to disable inbound message dispatch on each connection before its
+    /// goodbye, so a peer told SHUTDOWN cannot reach the roles for the rest of the teardown.
+    void disconnect_impl(SendspinGoodbyeReason reason, bool quiescing);
+
     /// @brief Tears down a lost connection (current or nursery). Caller must hold conn_ptr_mutex_.
     /// @param conn The connection that was lost.
     void on_connection_lost(SendspinConnection* conn);

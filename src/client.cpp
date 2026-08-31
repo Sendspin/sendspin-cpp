@@ -212,9 +212,15 @@ void SendspinClient::loop() {
     // Process connection lifecycle events (close, disconnect, hello, handoff, retry)
     this->connection_manager_->loop();
 
-    // Handle time synchronization for the active connection via burst strategy
+    // Handle time synchronization for the active connection via burst strategy. Gated on RUNNING
+    // so a peer already told SHUTDOWN is sent nothing further: begin_stop() leaves the current
+    // connection in its slot until the close event arrives, and on ESP that close is queued to an
+    // httpd worker, so is_connected() stays true across at least one more tick. Only the burst is
+    // gated; the manager loop above and the teardown completion below must keep running while
+    // STOPPING to finish the stop. Nothing leaks if a burst is abandoned mid-flight:
+    // cleanup_connection_state() releases the high-performance hold unconditionally.
     auto* conn = this->connection_manager_->current();
-    if (conn != nullptr) {
+    if (conn != nullptr && this->run_state_ == SendspinRunState::RUNNING) {
         auto result = this->time_burst_->loop(conn);
 
         if (result.sent && !this->high_performance_held_for_time_) {

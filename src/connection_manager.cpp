@@ -177,14 +177,20 @@ void ConnectionManager::connect_to(const std::string& url) {
 }
 
 void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
-    // Collect under the lock, send outside it: disconnect() can block on the transport (and on
-    // host outbound it joins the transport thread), which must not stall other manager entry
-    // points. The connections stay in their slots until their close events arrive (or the
-    // manager is destroyed).
+    this->disconnect_impl(reason, /*quiescing=*/false);
+}
+
+void ConnectionManager::disconnect_impl(SendspinGoodbyeReason reason, bool quiescing) {
+    // Collect under the lock, send outside it: disconnect() can block on the transport, which must
+    // not stall other manager entry points. The connections stay in their slots until their close
+    // events arrive (or the manager is destroyed).
     std::vector<std::shared_ptr<SendspinConnection>> to_disconnect;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         if (this->current_connection_ != nullptr && this->current_connection_->is_connected()) {
+            if (quiescing) {
+                this->current_connection_->disable_message_dispatch();
+            }
             to_disconnect.push_back(this->current_connection_);
         }
         // Drain the nursery too. A connected entry gets a goodbye and leaves on its close event; an
@@ -192,6 +198,9 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
         // release it here rather than leave it for the nursery deadline to reap.
         for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
             if (it->conn->is_connected()) {
+                if (quiescing) {
+                    it->conn->disable_message_dispatch();
+                }
                 to_disconnect.push_back(it->conn);
                 ++it;
             } else {
@@ -276,7 +285,14 @@ void ConnectionManager::begin_stop(SendspinGoodbyeReason reason) {
     // Goodbye every connected peer and release unconnected nursery entries. The server stays
     // up, so queued goodbye sends can flush and each connection leaves its slot through the
     // normal close-event path; stop() later force-drops whatever remains.
-    this->disconnect(reason);
+    //
+    // Quiescing: inbound dispatch is disabled on every connection before its goodbye goes out, so
+    // a peer told SHUTDOWN cannot push stream/role data into the client for the rest of the grace
+    // window. Without it a nursery peer's frames still reached the roles, and because a nursery
+    // entry is released without cleanup_connection_state(), that state outlived the teardown when
+    // no connection had been promoted. The plain disconnect() API keeps dispatch enabled, since a
+    // client that drops one session while running has no such window.
+    this->disconnect_impl(reason, /*quiescing=*/true);
 }
 
 void ConnectionManager::stop(SendspinGoodbyeReason reason) {
@@ -389,12 +405,11 @@ void ConnectionManager::loop() {
             // leaves the nursery only here (handshake complete) or by being reaped, so the current
             // slot never holds a connection that has not proven itself.
             //
-            // Skipped entirely while the manager is stopping (accepting_ cleared): begin_stop()
-            // already sent every connected nursery peer a goodbye without disabling its message
-            // dispatch (disconnect() only does that for the current slot and released nursery
-            // entries, not for the connected-nursery entries it hands to the caller for a
-            // transport-level disconnect()), so an in-flight server/hello can still flip
-            // is_handshake_complete() during the STOPPING window. Promoting that peer here would
+            // Skipped entirely while the manager is stopping (accepting_ cleared). begin_stop()
+            // disables message dispatch on every connected peer before its goodbye, so a
+            // server/hello arriving during the STOPPING window no longer flips
+            // is_handshake_complete(); this guard is the structural backstop, keeping promotion
+            // impossible while stopping rather than resting on that. Promoting a peer here would
             // hand it a client/state message after it was already told SHUTDOWN. (It makes no
             // difference to the teardown deadline either way: has_connections() counts nursery
             // entries as well as the current slot, and both slots are released by the same close
@@ -649,6 +664,15 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             SS_LOGD(TAG, "Manager stopping, rejecting new connection");
             // Never managed, but its callbacks are already wired: block dispatch so it cannot
             // inject messages during the goodbye window.
+            //
+            // The release is immediate, so has_connections() never covers this peer. On ESP the
+            // goodbye is queued to an httpd worker, which means an asynchronous stop can report
+            // completion and tear the server down before that send runs, costing this one peer
+            // its goodbye. Tracking it to closure instead would mean admitting it to the nursery,
+            // which is bounded (loop() copies the nursery into a fixed array sized
+            // NURSERY_CAPACITY + 1) and whose entries are owned by the main loop, not this
+            // thread. Neither is worth breaking for a best-effort frame to a peer that arrived
+            // mid-teardown.
             conn->disable_message_dispatch();
             this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::SHUTDOWN);
         } else if (inbound_count >= NURSERY_CAPACITY) {
