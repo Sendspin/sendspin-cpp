@@ -27,48 +27,9 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 
 Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role receives a `SendspinClient*` at construction time and uses it to access shared services (time sync, state publishing, message sending). The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers.
 
-Roles can be disabled at compile time via `SENDSPIN_ENABLE_*` cmake options (host build) or Kconfig entries (ESP-IDF build). When a role is disabled, its source files are not compiled and its `add_*()` declaration, accessor, and `unique_ptr` member are removed from `client.h`. `#ifdef` guards live in exactly two places: `cmake/sources.cmake` (source lists) and `include/sendspin/client.h` / `src/client.cpp` (dispatch points).
+Roles can be disabled at compile time via `SENDSPIN_ENABLE_*` cmake options (host build) or Kconfig entries (ESP-IDF build). When a role is disabled, its source files are not compiled and its `add_*()` declaration, accessor, and `unique_ptr` member are removed from `client.h`. `#ifdef` guards live in exactly two places: `cmake/sources.cmake` (source lists) and `include/sendspin/client.h` / `src/client.cpp` (dispatch points). Audio codec dependencies (micro-flac, micro-opus) are only linked when the player role is enabled.
 
-```cpp
-// Implement listener interfaces
-struct MyPlayerListener : PlayerRoleListener {
-    size_t on_audio_write(uint8_t* data, size_t len, uint32_t timeout_ms) override {
-        return audio_output.write(data, len, timeout_ms);
-    }
-    void on_stream_start() override { /* ... */ }
-};
-
-struct MyMetadataListener : MetadataRoleListener {
-    void on_metadata(const ServerMetadataStateObject& m) override { /* ... */ }
-};
-
-struct MyNetworkProvider : SendspinNetworkProvider {
-    bool is_network_ready() override { return true; }
-};
-
-MyPlayerListener player_listener;
-MyMetadataListener metadata_listener;
-MyNetworkProvider network_provider;
-
-SendspinClient client(config);
-auto& player = client.add_player(player_config);
-player.set_listener(&player_listener);
-auto& metadata = client.add_metadata();
-metadata.set_listener(&metadata_listener);
-client.set_network_provider(&network_provider);
-client.add_controller();
-client.start_server();
-```
-
-### Platform integration
-
-The platform (e.g., ESPHome) provides:
-
-- A `PlayerRoleListener` implementation with `on_audio_write()` to receive decoded PCM audio
-- An optional `SendspinPersistenceProvider` for saving/loading preferences
-- A `SendspinNetworkProvider` for network readiness
-- An optional `SendspinClientListener` for high-performance WiFi power management callbacks
-- Playback progress feedback via `notify_audio_played()`
+The consuming platform (e.g., ESPHome) supplies the listener implementations plus `SendspinNetworkProvider` and the optional `SendspinPersistenceProvider`/`SendspinClientListener` providers; `docs/integration-guide.md` has the full wiring, including a minimal working example.
 
 ## Project layout
 
@@ -82,6 +43,9 @@ cmake/                      - CMake modules (sources.cmake, host.cmake)
 examples/common/            - Shared PortAudio audio sink used by host examples
 examples/basic_client/      - Standalone host example with PortAudio audio output
 examples/tui_client/        - Terminal UI host example with PortAudio audio output
+tests/                      - Host unit tests (GoogleTest)
+docs/                       - integration-guide.md (consumer guide), internals.md (how the current code works), conventions.md (normative design standards)
+.claude/skills/             - Review checklists applying the standards to a diff (docs-sync, embedded-review, house-patterns, test-standards)
 ```
 
 ### Header visibility
@@ -99,6 +63,9 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `thread.h`: threading utilities
 - `time.h`: time utilities
 - `base64.h`: base64 encoding/decoding
+- `compiler.h`: compiler hints and platform-specific macros
+- `json_arena.h`: bounded internal-RAM bump-arena ArduinoJson allocator with PSRAM fallback
+- `network_info.h`: best-effort lookup of the local network interface MAC address
 - `types.h`: platform type abstractions
 - `spsc_ring_buffer.h`: single-producer/single-consumer ring buffer (ESP: FreeRTOS `xRingbuffer`, host: mutex/condition variable)
 - `thread_safe_queue.h`: thread-safe queue (ESP: FreeRTOS queue, host: mutex/condition variable)
@@ -111,17 +78,18 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 
 - **ESP-IDF**: Used as an IDF component via `idf_component.yml`. Sources defined in `cmake/sources.cmake`.
 - **Host (CMake)**: `cmake -B build && cmake --build build`. Fetches dependencies (ArduinoJson, micro-flac, micro-opus, IXWebSocket) via FetchContent.
+- **Tests**: `cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tests --target sendspin_tests` and `ctest --test-dir build-tests --output-on-failure`.
 - **ESP dependencies**: ArduinoJson, esp_websocket_client, micro-flac, micro-opus, esp_http_server, mbedtls, pthread, esp_ringbuf
 - **Host dependencies**: ArduinoJson, micro-flac, micro-opus, IXWebSocket, pthreads
 
 ## Coding conventions
 
+- Design standards: `docs/conventions.md` is the normative reference (threading/Inbox rules, validation posture, platform abstraction, embedded resource discipline, public API shape, documentation sync); the bullets below are a summary
 - C++20 (`gnu++20` on ESP, `cxx_std_20` on host)
 - Namespace: `sendspin`
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
-- Memory: `platform_malloc`/`platform_realloc`/`platform_malloc_internal`/`platform_realloc_internal`/`platform_free` from `platform/memory.h` (not raw `heap_caps_malloc`). The `_internal` variants prefer internal RAM with SPIRAM fallback; the unsuffixed variants do the reverse. `PlatformBuffer` and `TransferBuffer` accept a `MemoryLocation` argument to select the preference.
+- Memory: the `platform_malloc` family from `platform/memory.h`, never raw `heap_caps_malloc`/`malloc` in core code (variant semantics under Platform abstraction above)
 - Threading: `std::mutex`, `std::thread` (via pthreads on both platforms). ESP build also uses FreeRTOS primitives (`xRingbuffer`, queues, event groups) for performance via the platform abstraction layer.
-- Role composition: Roles are added at runtime via `add_player()`, `add_metadata()`, etc. Roles can be disabled at compile time via `SENDSPIN_ENABLE_*` cmake options / Kconfig entries. Audio codec dependencies (micro-flac, micro-opus) are only linked when the player role is enabled.
 - Apache 2.0 license headers on all files
 
 ## Pre-commit hooks
