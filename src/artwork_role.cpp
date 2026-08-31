@@ -37,6 +37,9 @@ static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 100U;
 
 // Event flag bits for decode thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
+// Set by the decode thread as it exits, so an asynchronous stop can poll has_stopped() and only
+// join once the join is known to be instant (mirrors SyncTask's TASK_STOPPED).
+static constexpr uint32_t THREAD_EXITED = (1 << 1);
 
 // ============================================================================
 // Big-endian helpers
@@ -100,8 +103,8 @@ bool ArtworkRole::Impl::start() {
 
     // The flag object survives a stop()/start() cycle, so clear the stale COMMAND_STOP left by
     // stop() before spawning; otherwise the new thread's first wait() sees it and exits
-    // immediately.
-    this->drain_task->event_flags.clear(COMMAND_STOP);
+    // immediately. THREAD_EXITED is the previous thread's exit marker, stale for the new one.
+    this->drain_task->event_flags.clear(COMMAND_STOP | THREAD_EXITED);
 
     platform_configure_thread("SsArt", 4096, static_cast<int>(this->config.priority),
                               this->config.psram_stack);
@@ -122,6 +125,13 @@ void ArtworkRole::Impl::request_stop() const {
         return;
     }
     this->drain_task->event_flags.set(COMMAND_STOP);
+}
+
+bool ArtworkRole::Impl::has_stopped() const {
+    if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
+        return true;
+    }
+    return (this->drain_task->event_flags.get() & THREAD_EXITED) != 0U;
 }
 
 void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
@@ -715,6 +725,7 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
         self->process_notification(notif);
     }
 
+    flags.set(THREAD_EXITED);
     SS_LOGD(TAG, "Decode thread stopped");
 }
 

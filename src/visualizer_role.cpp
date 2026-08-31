@@ -55,6 +55,9 @@ static constexpr size_t BUFFER_ADVERTISE_DIVISOR = 3;
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
 static constexpr uint32_t COMMAND_FLUSH = (1 << 1);  // Drain to empty (producer already stopped)
 static constexpr uint32_t COMMAND_CLEAR = (1 << 2);  // Discard up to the clear marker entry
+// Set by the drain thread as it exits, so an asynchronous stop can poll has_stopped() and only
+// join once the join is known to be instant (mirrors SyncTask's TASK_STOPPED).
+static constexpr uint32_t THREAD_EXITED = (1 << 3);
 
 // Sentinel entry marking a stream/start or stream/clear boundary in the ring buffer. Entries
 // before the marker predate the boundary and are discarded; entries after it survive. The value
@@ -175,8 +178,10 @@ bool VisualizerRole::Impl::start() {
 
     // The flag object survives a stop()/start() cycle, so clear the stale COMMAND_STOP left by
     // stop() (and any unconsumed flush/clear command) before spawning; otherwise the new
-    // thread's first wait() sees COMMAND_STOP and exits immediately.
-    this->drain_task->event_flags.clear(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR);
+    // thread's first wait() sees COMMAND_STOP and exits immediately. THREAD_EXITED is the
+    // previous thread's exit marker, stale for the new one.
+    this->drain_task->event_flags.clear(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR |
+                                        THREAD_EXITED);
 
     platform_configure_thread("SsVis", 4096, static_cast<int>(this->config.priority),
                               this->config.psram_stack);
@@ -197,6 +202,13 @@ void VisualizerRole::Impl::request_stop() const {
         return;
     }
     this->drain_task->event_flags.set(COMMAND_STOP);
+}
+
+bool VisualizerRole::Impl::has_stopped() const {
+    if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
+        return true;
+    }
+    return (this->drain_task->event_flags.get() & THREAD_EXITED) != 0U;
 }
 
 void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
@@ -631,6 +643,7 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         }
     }
 
+    flags.set(THREAD_EXITED);
     SS_LOGD(TAG, "Drain thread stopped");
 }
 

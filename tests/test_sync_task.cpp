@@ -25,9 +25,11 @@
 #include "sync_task.h"
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <thread>
 
 using namespace sendspin;
 
@@ -101,6 +103,12 @@ TEST(SyncTaskLifecycle, StopDrainsRingBuffer) {
     auto* player = make_player_impl();
     SyncTask task;
     ASSERT_TRUE(task.init(player, player->client, RING_BUFFER_BYTES));
+
+    // Captured before start(), when nothing can be borrowed. chunks_waiting() alone cannot
+    // detect a borrowed-but-never-returned entry (items leave that count at receive time, not
+    // return time), so the free-byte check below is what catches a leaked borrow.
+    const size_t initial_free_bytes = task.encoded_ring_buffer_->ring_buffer_.free_bytes_;
+
     ASSERT_TRUE(task.start(false, 0));
 
     // Queue header + audio + header, as a rapid seek interrupted by stop() would. The idle
@@ -116,4 +124,32 @@ TEST(SyncTaskLifecycle, StopDrainsRingBuffer) {
 
     task.stop();
     EXPECT_EQ(task.encoded_ring_buffer_->chunks_waiting(), 0U);
+    // Every entry, including one the thread had borrowed at stop time, was returned: the ring's
+    // full capacity is available to the next session.
+    EXPECT_EQ(task.encoded_ring_buffer_->ring_buffer_.free_bytes_, initial_free_bytes);
+}
+
+// request_stop() must signal the thread without joining it: the thread exits on its own within
+// its idle poll interval and reports via has_thread_exited(), after which stop() joins without
+// blocking. This is the primitive the client's asynchronous request_stop() is built on.
+TEST(SyncTaskLifecycle, RequestStopSignalsWithoutJoin) {
+    auto* player = make_player_impl();
+    SyncTask task;
+    ASSERT_TRUE(task.init(player, player->client, RING_BUFFER_BYTES));
+    ASSERT_TRUE(task.start(false, 0));
+    EXPECT_FALSE(task.has_thread_exited());
+
+    task.request_stop();
+    // The thread object is intentionally not joined by request_stop().
+    EXPECT_TRUE(task.is_thread_running());
+
+    // The idle poll observes the signal within IDLE_RECEIVE_TIMEOUT_MS (500 ms); allow margin.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!task.has_thread_exited() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(task.has_thread_exited());
+
+    task.stop();
+    EXPECT_FALSE(task.is_thread_running());
 }

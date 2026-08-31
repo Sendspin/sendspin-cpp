@@ -641,6 +641,8 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
 bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
     // Wait for a codec header to arrive in the ring buffer, discarding stale audio chunks.
     // Uses a long timeout (500ms) so the task yields CPU and barely wakes when idle.
+    // Also the worst-case latency for the thread to observe a stop signal while idle:
+    // STOP_GRACE_MS in client.cpp budgets above this value; keep them in sync.
     static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 500;
 
     while (

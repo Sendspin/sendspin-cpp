@@ -22,6 +22,7 @@
 #include "connection_manager.h"  // fnv1_hash for the last-played preference
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/player_role.h"
 #include <gtest/gtest.h>
 #include <ixwebsocket/IXWebSocket.h>
 #include <ixwebsocket/IXWebSocketServer.h>
@@ -60,6 +61,8 @@ constexpr uint16_t STOP_TEST_PORT = 18991;
 constexpr uint16_t STOP_NOOP_TEST_PORT = 18992;
 constexpr uint16_t REQUEST_STOP_TEST_PORT = 18993;
 constexpr uint16_t REQUEST_STOP_SYNC_TEST_PORT = 18994;
+constexpr uint16_t REQUEST_STOP_PLAYER_TEST_PORT = 18995;
+constexpr uint16_t REQUEST_STOP_LATE_PEER_TEST_PORT = 18996;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -638,8 +641,9 @@ TEST(ConnectionLifecycle, StopShutsDownAndRestartAcceptsAgain) {
         ::close(probe_fd);
     }
 
-    // A second stop is a no-op.
+    // A second stop is a no-op: still stopped, nothing revived.
     client.stop();
+    EXPECT_EQ(client.get_run_state(), SendspinRunState::STOPPED);
 
     // Restart on the same port: a new peer establishes as if this were the first start.
     ASSERT_TRUE(client.start());
@@ -703,6 +707,7 @@ TEST(ConnectionLifecycle, RequestStopCompletesOverLoopAndNotifies) {
         // A start during the teardown is refused; a second request_stop is a no-op.
         EXPECT_FALSE(client.start());
         client.request_stop();
+        EXPECT_EQ(client.get_run_state(), SendspinRunState::STOPPING);
 
         ASSERT_TRUE(pump_until(
             client, [&] { return client.get_run_state() == SendspinRunState::STOPPED; }, 3000));
@@ -753,4 +758,84 @@ TEST(ConnectionLifecycle, SyncStopFinishesPendingRequestStop) {
     EXPECT_TRUE(pump_until(
         client, [&] { return client.get_run_state() == SendspinRunState::STOPPED; }, 1000));
     EXPECT_EQ(stop_listener.stopped_count, 2);
+
+    // request_stop() from STOPPED is a no-op: no state change, no notification.
+    client.request_stop();
+    client.loop();
+    EXPECT_EQ(client.get_run_state(), SendspinRunState::STOPPED);
+    EXPECT_EQ(stop_listener.stopped_count, 2);
+}
+
+namespace {
+
+// Minimal player listener so a lifecycle test can attach a real player role (and thus a live
+// sync task thread) without any audio hardware: writes are accepted and discarded.
+class NullPlayerListener : public PlayerRoleListener {
+public:
+    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
+        return length;
+    }
+};
+
+}  // namespace
+
+// With a player role attached, request_stop() must wait for the sync task thread to actually
+// exit (has_stopped() gating in loop()) before completing, and a subsequent start() must bring
+// the thread back. Covers the request-side of the role-thread stop path end to end.
+TEST(ConnectionLifecycle, RequestStopWithPlayerRoleWaitsForSyncTask) {
+    TestNetworkProvider network;
+    StopListener stop_listener;
+    NullPlayerListener player_listener;
+    SendspinClient client(make_config(REQUEST_STOP_PLAYER_TEST_PORT));
+    client.set_network_provider(&network);
+    client.set_listener(&stop_listener);
+    PlayerRoleConfig player_config;
+    player_config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
+    auto& player = client.add_player(std::move(player_config));
+    player.set_listener(&player_listener);
+
+    ASSERT_TRUE(client.start());
+    client.request_stop();
+    EXPECT_EQ(client.get_run_state(), SendspinRunState::STOPPING);
+
+    // Completion waits out the sync task's 500 ms idle poll; well inside the grace deadline.
+    EXPECT_TRUE(pump_until(
+        client, [&] { return client.get_run_state() == SendspinRunState::STOPPED; }, 2000));
+    EXPECT_EQ(stop_listener.stopped_count, 1);
+
+    // The sync task thread restarts with the client.
+    ASSERT_TRUE(client.start());
+    client.stop();
+    EXPECT_EQ(stop_listener.stopped_count, 1);
+}
+
+// A peer that connects during the STOPPING window (goodbyes sent, server still up so they can
+// flush) must be rejected with a goodbye by the admission gate instead of entering the nursery
+// only to be force-dropped without one. The rejection happens entirely on the transport thread,
+// so no loop() pumping is needed for it.
+TEST(ConnectionLifecycle, RequestStopRejectsLateArrivalWithGoodbye) {
+    TestNetworkProvider network;
+    StopListener stop_listener;
+    SendspinClient client(make_config(REQUEST_STOP_LATE_PEER_TEST_PORT));
+    client.set_network_provider(&network);
+    client.set_listener(&stop_listener);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);  // opens the WS server
+
+    client.request_stop();
+
+    // No pumping here: the client stays in STOPPING (completion needs a loop() tick), so the
+    // still-listening server delivers the late peer to the admission gate.
+    FakeServer late(server_url(REQUEST_STOP_LATE_PEER_TEST_PORT), "server-late-arrival");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!late.closed() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_TRUE(late.closed());
+    EXPECT_TRUE(late.got_goodbye());
+    EXPECT_FALSE(late.got_client_hello());
+
+    EXPECT_TRUE(pump_until(
+        client, [&] { return client.get_run_state() == SendspinRunState::STOPPED; }, 2000));
+    EXPECT_EQ(stop_listener.stopped_count, 1);
 }

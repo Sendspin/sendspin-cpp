@@ -982,3 +982,30 @@ TEST(ArtworkLifecycle, RestartDecodesAgain) {
     ASSERT_TRUE(listener.wait_for([&] { return listener.decodes.size() >= 2; }, POSITIVE_TIMEOUT));
     EXPECT_EQ(listener.decode_marker_at(1), 'B');
 }
+
+// request_stop() signals the decode thread without joining it: the thread exits within its
+// receive timeout and reports via has_stopped(), after which stop() joins instantly and a
+// start() revives the role. This is the primitive behind the client's asynchronous
+// request_stop().
+TEST(ArtworkLifecycle, RequestStopReportsExitAndRestarts) {
+    auto impl = make_impl(make_single_slot_config(false));
+    RecordingListener listener;
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    EXPECT_FALSE(impl->has_stopped());
+
+    impl->request_stop();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!impl->has_stopped() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(impl->has_stopped());
+    impl->stop();
+
+    // The role revives: a fresh thread decodes again.
+    ASSERT_TRUE(impl->start());
+    EXPECT_FALSE(impl->has_stopped());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+    send_frame(*impl, 0, 'R');
+    ASSERT_TRUE(listener.wait_for([&] { return listener.decodes.size() >= 1; }, POSITIVE_TIMEOUT));
+}

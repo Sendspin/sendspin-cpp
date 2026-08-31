@@ -113,6 +113,7 @@ struct VisualizerRole::Impl {
 
     void stop() const;
     void request_stop() const;
+    bool has_stopped() const;
     void flush_ring_buffer() const;
     void signal_clear_marker() const;
     void discard_to_clear_marker() const;

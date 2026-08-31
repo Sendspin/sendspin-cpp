@@ -462,3 +462,25 @@ TEST(VisualizerLifecycle, RestartDrainsAgain) {
     std::vector<uint8_t> entry;
     EXPECT_FALSE(pop_entry(*impl, entry));
 }
+
+// request_stop() signals the drain thread without joining it: the thread exits within its
+// receive timeout and reports via has_stopped(), after which stop() joins instantly and a
+// start() revives the role. This is the primitive behind the client's asynchronous
+// request_stop().
+TEST(VisualizerLifecycle, RequestStopReportsExitAndRestarts) {
+    auto impl = make_impl_with_client();
+    ASSERT_TRUE(impl->start());
+    EXPECT_FALSE(impl->has_stopped());
+
+    impl->request_stop();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!impl->has_stopped() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(impl->has_stopped());
+    impl->stop();
+
+    ASSERT_TRUE(impl->start());
+    EXPECT_FALSE(impl->has_stopped());
+    impl->stop();
+}

@@ -49,9 +49,11 @@ static const char* const TAG = "sendspin.client";
 
 namespace sendspin {
 
-/// Grace deadline for a request_stop() teardown: covers the sync task's 500 ms idle poll plus
-/// margin for goodbye sends to flush and close events to arrive. loop() force-finishes the stop
-/// once it expires, so a peer that ignores its goodbye cannot hold the teardown open.
+/// Grace deadline for a request_stop() teardown: covers the sync task's 500 ms idle poll
+/// (IDLE_RECEIVE_TIMEOUT_MS in sync_task.cpp; keep the budget above it) plus margin for goodbye
+/// sends to flush, close events to arrive, and the artwork/visualizer drain receive timeouts
+/// (100 ms / 50 ms). loop() force-finishes the stop once it expires, so a peer that ignores its
+/// goodbye cannot hold the teardown open.
 static constexpr int64_t STOP_GRACE_MS = 750;
 static constexpr int64_t STOP_GRACE_US = STOP_GRACE_MS * 1000;
 
@@ -436,19 +438,28 @@ void SendspinClient::loop() {
     }
 
     // Drive a pending request_stop() to completion. Runs after the manager loop above so this
-    // tick's close events are already reflected in has_connections(). The sync task is the only
-    // role thread polled for exit: its idle poll can take up to 500 ms to observe the stop
-    // signal, while the artwork/visualizer drain threads exit within one 50 ms receive timeout,
-    // so their joins in finish_stop() are effectively instant by then. The deadline caps the
-    // wait when a peer never delivers its close.
+    // tick's close events are already reflected in has_connections(). Completion waits for every
+    // role thread to report exit, so finish_stop()'s joins are instant on this path; the
+    // deadline caps the wait when a peer never delivers its close or a thread is stuck in
+    // in-flight work, at the cost of a bounded blocking join on that final tick.
     if (this->run_state_ == SendspinRunState::STOPPING) {
-        bool player_done = true;
+        bool roles_done = true;
 #ifdef SENDSPIN_ENABLE_PLAYER
         if (this->player_) {
-            player_done = this->player_->impl_->has_stopped();
+            roles_done = this->player_->impl_->has_stopped();
         }
 #endif
-        if ((player_done && !this->connection_manager_->has_connections()) ||
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+        if (roles_done && this->visualizer_) {
+            roles_done = this->visualizer_->impl_->has_stopped();
+        }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+        if (roles_done && this->artwork_) {
+            roles_done = this->artwork_->impl_->has_stopped();
+        }
+#endif
+        if ((roles_done && !this->connection_manager_->has_connections()) ||
             platform_time_us() >= this->stop_deadline_us_) {
             this->finish_stop(/*notify=*/true);
         }

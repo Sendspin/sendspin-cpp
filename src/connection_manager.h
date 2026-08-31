@@ -395,15 +395,18 @@ private:
     // 8-bit fields
     bool has_last_played_server_{false};
 
+    // Atomic control state (authoritative: unlike the hint atomics below, there is no
+    // mutex-protected ground truth behind it)
+
+    /// False while the manager is stopped. Cleared at the top of begin_stop()/stop(), before
+    /// the goodbye snapshot, and set again by init_server(). Closes the admission window during
+    /// shutdown: a peer the transport delivers between the goodbye snapshot and the server
+    /// teardown is rejected with a goodbye by on_new_connection() instead of entering the
+    /// nursery only to be force-dropped without one. Also gates loop()'s server-start block.
+    std::atomic<bool> accepting_{false};
+
     // Atomic fields (lock-free hints for loop() tick gating; ground truth remains the
     // mutex-protected containers/pointer above -- see the "Tick cost" note on loop())
-
-    /// False while the manager is stopped. Cleared at the top of stop(), before the goodbye
-    /// snapshot, and set again by init_server(). Closes the admission window during shutdown: a
-    /// peer the transport delivers between stop()'s goodbye snapshot and the server teardown is
-    /// rejected with a goodbye by on_new_connection() instead of entering the nursery only to be
-    /// force-dropped without one.
-    std::atomic<bool> accepting_{false};
 
     /// True while pending_connected_events_ or pending_disconnect_events_ holds an unswapped
     /// entry. Set under conn_mutex_ at every push into either queue; cleared under conn_mutex_

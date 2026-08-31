@@ -494,6 +494,12 @@ struct MyClientListener : SendspinClientListener {
     void on_release_high_performance() override {
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     }
+
+    // Called when a request_stop() teardown completes (see Clean shutdown below). Everything
+    // is torn down at this point; it is safe to call start() again or destroy the client.
+    void on_stopped() override {
+        mark_client_stopped();
+    }
 };
 ```
 
@@ -934,6 +940,17 @@ These represent commands the server can send to the player. The player advertise
 | `SYNCHRONIZED` | Normal synchronized state |
 | `ERROR` | Error state |
 | `EXTERNAL_SOURCE` | Playing from an external source |
+
+### SendspinRunState
+
+| Value | Description |
+|---|---|
+| `STOPPED` | Before the first `start()` and after a stop completes |
+| `RUNNING` | After a successful `start()` |
+| `STOPPING` | Between `request_stop()` and the completion of its deferred teardown |
+
+Returned by `client.get_run_state()`; `is_started()` is equivalent to `RUNNING`. A synchronous
+`stop()` moves straight to `STOPPED` without passing through `STOPPING`.
 
 ### SendspinGoodbyeReason
 

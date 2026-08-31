@@ -43,25 +43,32 @@ On host builds, `platform_configure_thread()` is a no-op; threads use OS default
 
 ### Thread Lifecycle
 
-**Sync task** (`src/sync_task.cpp:620`):
+All three role threads stop through the same three entry points: the client's synchronous
+`stop()` (signal + join via each role's `Impl::stop()`), the asynchronous `request_stop()`
+(signal via `Impl::request_stop()`, join deferred to `loop()`'s completion tick once the thread
+reports exit), and each `Impl`'s destructor. Threads are restartable: a later
+`SendspinClient::start()` re-runs each role's `Impl::start()`, which clears the stale stop/exit
+flags before spawning a fresh thread.
+
+**Sync task** (`src/sync_task.cpp`):
 
 1. `SyncTask::start()` configures the thread and spawns it.
 2. The caller blocks until the thread reaches IDLE state (`TASK_IDLE` event flag) or exits early due to an allocation failure (`TASK_STOPPED`).
-3. The thread runs a persistent outer loop for the lifetime of the client.
-4. `SyncTask::stop()` sets `COMMAND_STOP` and joins the thread. Called from `SyncTask`'s destructor, which is triggered by `sync_task_.reset()` in `PlayerRole::Impl`'s destructor.
+3. The thread runs a persistent outer loop while the client is started, idling between streams.
+4. `SyncTask::stop()` sets `COMMAND_STOP`, joins the thread, and drains the encoded ring buffer so no stale chunk survives into a restarted session. `SyncTask::request_stop()` only sets the flag; `has_thread_exited()` reports `TASK_STOPPED` so the eventual join is instant. The exit path returns any borrowed ring entry and clears `TASK_RUNNING` before announcing `TASK_STOPPED`.
 
 **Visualizer drain** (`src/visualizer_role.cpp`):
 
 1. `VisualizerRole::Impl::start()` spawns the drain thread.
 2. The thread blocks on ring buffer receives with a 50 ms timeout.
-3. `VisualizerRole::Impl` destructor sets `COMMAND_STOP` and joins.
+3. `stop()` sets `COMMAND_STOP` and joins; `request_stop()` only signals, and the thread sets `THREAD_EXITED` on exit for `has_stopped()`.
 
 **Artwork decode** (`src/artwork_role.cpp`):
 
 1. `ArtworkRole::Impl::start()` spawns the decode thread.
 2. The thread blocks on notification queue receives with a 100 ms timeout.
 3. On notification: calls `on_image_decode()`, then merges an `ArtworkDisplayUpdate` (the slot's server display timestamp plus the `stream_epoch` it was decoded under) into the `ArtworkRole::Impl::EventState::display_slot` `InboxSlot` via `merge_artwork_display_update`. The main loop's `ArtworkRole::Impl::drain_events()` folds the taken update into its main-thread-only `held_display_*` state and fires `on_image_display()` once the timestamp is reached. Latest-wins per slot: if a newer frame's timestamp overwrites the pending one before the main loop takes it, only the newer display fires; the per-slot epoch lets the deadline sweep drop a display whose stream was replaced after the hand-off.
-4. `ArtworkRole::Impl` destructor sets `COMMAND_STOP` and joins.
+4. `stop()` sets `COMMAND_STOP` and joins; `request_stop()` only signals, and the thread sets `THREAD_EXITED` on exit for `has_stopped()`.
 
 **Destruction order** matters because external audio callbacks may still reference the sync task. `PlayerRole::Impl`'s destructor resets the sync task first (`sync_task_.reset()`) before tearing down anything else, so the thread is fully joined before any shared state is destroyed.
 
@@ -452,6 +459,15 @@ When a connection is lost (`on_connection_lost`):
 
 - **ESP server**: the goodbye text is queued as an httpd worker job. The worker resolves the connection by `lock()`ing the `weak_ptr` captured in the queued arg when the goodbye was enqueued; if it resolves it sends the frame, then runs the completion lambda that calls `trigger_close()`. The session slot installed in `open_callback` keeps the connection alive across that whole sequence even after `ConnectionManager`'s observer `shared_ptr` is dropped. The session is finally freed when httpd invokes the slot's `free_fn` (see [Server connection ownership (ESP)](#server-connection-ownership-esp)). The completion lambda also captures a `weak_ptr` to make this lifetime explicit — `trigger_close()` is skipped if the conn has already been freed. Goodbye is one of the two messages that pass `allow_before_hello=true`, so it is not blocked by the pre-hello send gate (a rejected connection is told to leave before it ever sends a hello).
 - **Host client**: the IXWebSocket send is synchronous, so the goodbye and close have both completed by the time `disconnect()` returns and the `shared_ptr` drops the last reference.
+
+### Manager Shutdown
+
+`SendspinClient::stop()`/`request_stop()` tear the manager down through two entry points:
+
+- `ConnectionManager::begin_stop(reason)` (the `request_stop()` path) clears the `accepting_` atomic and sends a goodbye to every connected peer, but leaves the WebSocket server up so queued goodbye sends can still flush (on ESP they are httpd worker jobs). Connections then leave their slots through the normal close-event path over subsequent `loop()` ticks, polled via `has_connections()`.
+- `ConnectionManager::stop(reason)` (the synchronous path, and `request_stop()`'s finisher) runs `begin_stop()`, destroys the WebSocket server, force-drops every remaining slot without a second goodbye, and discards pending lifecycle events whose connections were just released.
+
+While `accepting_` is false, `on_new_connection()` rejects a newly delivered peer with a goodbye instead of admitting it into a nursery that is about to be drained, and `loop()`'s server-start block is gated so a stop in progress cannot belatedly open the server. `accepting_` is authoritative control state (set by `init_server()`, cleared by `begin_stop()`/`stop()`), unlike the manager's other atomics, which are lock-free hints over mutex-protected containers.
 
 ### Server connection ownership (ESP)
 
