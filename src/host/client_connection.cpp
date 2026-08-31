@@ -84,7 +84,14 @@ void SendspinClientConnection::disconnect(SendspinGoodbyeReason reason,
         return;
     }
 
-    // Send goodbye message then stop
+    // Send the goodbye, then stop the transport. This join is synchronous and blocks the caller,
+    // which is why request_stop() cannot promise a non-blocking teardown for an outbound
+    // connection (see SendspinClient::request_stop()). It must stay synchronous: the manager
+    // releases its last reference to the connection immediately after this returns
+    // (disconnect_and_release(), and stop()'s force-drop), so the transport thread has to be
+    // joined while a reference is still held. Deferring the join to the destructor instead lets
+    // the thread deliver its Close event into on_disconnected_cb() during that destructor, where
+    // shared_from_this() throws std::bad_weak_ptr on the already zero refcount and terminates.
     this->send_goodbye_reason(reason, [this, on_complete](bool /*success*/) {
         if (this->ws_) {
             this->ws_->stop();

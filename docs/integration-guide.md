@@ -553,8 +553,10 @@ client.stop();
 If blocking the main loop during shutdown is a concern (for example inside a firmware main
 loop), use `request_stop()` instead: it returns immediately, and the teardown completes over
 subsequent `loop()` calls once every connection has closed and the background threads have wound
-down (capped by a fixed grace deadline). Completion is reported through
-`SendspinClientListener::on_stopped()` and can be polled via `get_run_state()`:
+down. A fixed grace deadline caps how long that wait runs before the teardown is forced, but not
+the forced teardown itself: the `loop()` tick that reaches the deadline joins the role threads,
+and a listener callback still running holds that join until it returns. Completion is reported
+through `SendspinClientListener::on_stopped()` and can be polled via `get_run_state()`:
 
 ```cpp
 client.request_stop();
@@ -947,10 +949,11 @@ These represent commands the server can send to the player. The player advertise
 |---|---|
 | `STOPPED` | Before the first `start()` and after a stop completes |
 | `RUNNING` | After a successful `start()` |
-| `STOPPING` | Between `request_stop()` and the completion of its deferred teardown |
+| `STOPPING` | During either teardown path, until it completes |
 
-Returned by `client.get_run_state()`; `is_started()` is equivalent to `RUNNING`. A synchronous
-`stop()` moves straight to `STOPPED` without passing through `STOPPING`.
+Returned by `client.get_run_state()`; `is_started()` is equivalent to `RUNNING`. `STOPPING` covers
+both the window between `request_stop()` and its completion and the duration of a synchronous
+`stop()` call, so a callback invoked during a teardown observes `STOPPING`, not `STOPPED`.
 
 ### SendspinGoodbyeReason
 

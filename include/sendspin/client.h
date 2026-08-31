@@ -56,7 +56,9 @@ struct GroupUpdateObject;
 
 /// @brief Lifecycle state of a SendspinClient
 /// STOPPED before the first start() and after a stop completes; RUNNING after a successful
-/// start(); STOPPING between request_stop() and the completion of its deferred teardown.
+/// start(); STOPPING for the duration of either teardown path, whether that is request_stop()'s
+/// deferred completion or a direct stop() call, until the teardown finishes and the state
+/// becomes STOPPED.
 enum class SendspinRunState : uint8_t {
     STOPPED = 0,
     RUNNING = 1,
@@ -238,14 +240,18 @@ public:
     /// WebSocket server and role background threads
     ///
     /// Must be called from the main loop thread (see disconnect()). Blocks until the role
-    /// background threads join (bounded by the sync task's 500 ms idle poll plus any in-flight
-    /// decode work). The goodbye is best-effort: on ESP-IDF the send is queued to an httpd
+    /// background threads join. Every role is signaled before any is joined, so their stop
+    /// latencies overlap and the wait is the longest of them (the sync task's 500 ms idle poll)
+    /// rather than their sum. In-flight listener work extends it: a join cannot interrupt a
+    /// callback that is already running, so a slow on_audio_write(), on_image_decode(), or
+    /// visualizer per-frame callback adds its own duration on top. The goodbye is
+    /// best-effort: on ESP-IDF the send is queued to an httpd
     /// worker and the server stop can close the session first; request_stop() avoids that by
-    /// keeping the server up through a grace window. loop() remains safe to call while stopped,
-    /// and the next loop() delivers the roles' clear callbacks queued by the connection
-    /// teardown. Called while a request_stop() is in progress, it finishes that teardown
-    /// synchronously and fires on_stopped() before returning. Call start() to restart. No-op if
-    /// already stopped.
+    /// keeping the server up through a grace window. loop() remains safe to call while stopped.
+    /// The roles' clear callbacks queued by the connection teardown are delivered before this
+    /// call returns, not on a later loop(). Called while a request_stop() is in progress, it
+    /// finishes that teardown synchronously and fires on_stopped() before returning. Call start()
+    /// to restart. No-op if already stopped.
     void stop();
 
     /// @brief Requests an asynchronous stop: goodbyes are sent and role threads are signaled
@@ -254,10 +260,22 @@ public:
     /// Must be called from the main loop thread (see disconnect()) and does not block: keep
     /// calling loop() and the teardown finishes once every connection has closed and the role
     /// threads have wound down, or after a fixed grace deadline (STOP_GRACE_MS in client.cpp),
-    /// whichever comes first. Unlike stop(), the WebSocket server stays up through the grace
+    /// whichever comes first. The deadline bounds when the final teardown
+    /// starts, not how long it takes: the loop() tick that reaches it joins the role threads, and
+    /// a listener callback still running (on_audio_write(), on_image_decode(), a visualizer
+    /// per-frame callback) holds that join for as long as it runs. Those callbacks gate shutdown,
+    /// so they must return promptly. Unlike stop(), the WebSocket server stays up through the grace
     /// window, so on ESP-IDF the queued goodbye sends actually flush before the server is torn
     /// down. Completion is signaled by SendspinClientListener::on_stopped() and observable via
     /// get_run_state() == STOPPED, after which start() may be called again. No-op unless running.
+    ///
+    /// One exception to the non-blocking guarantee: tearing down an outbound connect_to()
+    /// connection stops its transport synchronously on both platforms (esp_websocket_client_stop()
+    /// on ESP-IDF, ix::WebSocket::stop() on host), so this call can stall the main loop for as
+    /// long as that transport takes to wind down. The stop cannot simply be deferred: the manager
+    /// releases its last reference to the connection as soon as the disconnect returns, so the
+    /// transport thread has to be joined before that happens. Inbound (server) connections are
+    /// unaffected on both platforms; they close asynchronously.
     void request_stop();
 
     /// @brief Legacy name for start(), kept for source compatibility
@@ -419,8 +437,9 @@ public:
     }
 
     /// @brief Returns the client lifecycle state. Main-thread only
-    /// STOPPING appears only between request_stop() and its completion; a synchronous stop()
-    /// moves straight to STOPPED.
+    /// STOPPING covers either teardown path: the window between request_stop() and its
+    /// completion, and the duration of a synchronous stop() call. A callback invoked during that
+    /// window (a role's clear callback, or on_release_high_performance()) observes STOPPING.
     /// @return The current SendspinRunState
     SendspinRunState get_run_state() const {
         return this->run_state_;

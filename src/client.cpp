@@ -16,6 +16,7 @@
 
 #include "connection.h"
 #include "connection_manager.h"
+#include "constants.h"
 #include "inbox.h"
 #include "platform/compiler.h"
 #include "platform/json_arena.h"
@@ -52,10 +53,10 @@ namespace sendspin {
 /// Grace deadline for a request_stop() teardown: covers the sync task's 500 ms idle poll
 /// (IDLE_RECEIVE_TIMEOUT_MS in sync_task.cpp; keep the budget above it) plus margin for goodbye
 /// sends to flush, close events to arrive, and the artwork/visualizer drain receive timeouts
-/// (100 ms / 50 ms). loop() force-finishes the stop once it expires, so a peer that ignores its
-/// goodbye cannot hold the teardown open.
+/// (100 ms / 50 ms). Expiring early is bounded, not a fault: loop() force-finishes the stop, so a
+/// peer that ignores its goodbye cannot hold the teardown open.
 static constexpr int64_t STOP_GRACE_MS = 750;
-static constexpr int64_t STOP_GRACE_US = STOP_GRACE_MS * 1000;
+static constexpr int64_t STOP_GRACE_US = STOP_GRACE_MS * US_PER_MS;
 
 /// @brief Deferred event state for time responses and group updates on the main thread
 struct SendspinClient::EventState {
@@ -687,6 +688,14 @@ void SendspinClient::cleanup_connection_state() {
 }
 
 void SendspinClient::stop_role_threads() {
+    // Signal every role before joining any, so their receive timeouts elapse concurrently rather
+    // than in series: each role's stop() below both signals and joins, so without this an idle
+    // client would wait out the sum of the three timeouts instead of the longest one
+    // (ROLE_STOP_LATENCY_MS). Re-signalling inside stop() is harmless, the flags are idempotent.
+    // The request_stop() path has already signalled them by the time it reaches here; this makes
+    // the direct stop() path behave the same way.
+    this->request_stop_role_threads();
+
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         this->player_->impl_->stop();
