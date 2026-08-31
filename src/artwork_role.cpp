@@ -32,7 +32,9 @@ static const char* const TAG = "sendspin.artwork";
 /// @brief Size of the big-endian 64-bit timestamp at the start of artwork binary messages
 static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
 
-/// @brief Timeout for blocking queue receive in decode thread (allows periodic command checks)
+/// @brief Idle-wakeup interval for the decode thread's blocking queue receive. Stop and
+/// parked-slot rechecks wake the receive immediately via wake_receiver(); this only sets how
+/// often an undisturbed thread stirs, so nothing else depends on its value.
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 100U;
 
 // Event flag bits for decode thread signaling
@@ -108,7 +110,11 @@ void ArtworkRole::Impl::stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
         return;
     }
+    // Set the flag before waking: the thread re-checks its command flags at the top of every
+    // loop iteration, so this ordering guarantees it observes the stop as soon as the wake
+    // pulls it out of its blocking queue receive.
     this->drain_task->event_flags.set(COMMAND_STOP);
+    this->drain_task->notify_queue.wake_receiver();
     this->drain_task->drain_thread.join();
 }
 
@@ -181,13 +187,7 @@ bool ArtworkRole::Impl::ack_enabled(uint8_t slot) const {
 }
 
 void ArtworkRole::Impl::wake_drain_thread() const {
-    // Best-effort wakeup: a dropped send just means the decode thread's own
-    // DRAIN_RECEIVE_TIMEOUT_MS receive timeout, plus the parked-slot sweep it runs at the top
-    // of every loop iteration, picks up the parked notification a little later instead of
-    // immediately.
-    ArtworkNotification wake{};
-    wake.slot = ARTWORK_RECHECK_SLOT;
-    this->drain_task->notify_queue.send(wake, 0);
+    this->drain_task->notify_queue.wake_receiver();
 }
 
 // ============================================================================
@@ -683,19 +683,14 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
             self->process_notification(parked_notif);
         }
 
-        // Blocking receive with 100ms timeout (allows periodic command checks and, when nothing
-        // ever wakes the queue, an upper bound on how long a parked notification waits before the
-        // sweep above rechecks it).
+        // Blocking receive; returns early (false) when wake_receiver() signals a stop or a
+        // parked-slot recheck. The timeout is pure idle-wakeup tuning: how often an
+        // undisturbed thread stirs to re-run the sweep above.
         ArtworkNotification notif{};
         if (!queue.receive(notif, DRAIN_RECEIVE_TIMEOUT_MS)) {
             continue;
         }
 
-        if (notif.slot == ARTWORK_RECHECK_SLOT) {
-            // Sentinel used only to unblock receive() so the parked-slot sweep above re-runs
-            // promptly; carries no work of its own.
-            continue;
-        }
         if (notif.slot >= ARTWORK_MAX_SLOTS) {
             continue;
         }

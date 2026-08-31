@@ -68,7 +68,9 @@ static constexpr uint8_t ENTRY_TYPE_CLEAR_MARKER = 0xFF;
 /// falls back to discarding everything it finds (matching the player's marker semantics).
 static constexpr uint32_t MARKER_ENQUEUE_TIMEOUT_MS = 100U;
 
-/// @brief Timeout for blocking ring buffer receive in drain thread (allows periodic command checks)
+/// @brief Idle-wakeup interval for the drain thread's blocking ring buffer receive. Stop and
+/// flush commands wake the receive immediately via wake_receiver(); this only sets how often
+/// an undisturbed thread stirs, so nothing else depends on its value.
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 50U;
 
 static constexpr int64_t TOO_OLD_THRESHOLD_US = 20000;  // 20ms
@@ -183,7 +185,11 @@ void VisualizerRole::Impl::stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
         return;
     }
+    // Set the flag before waking: the thread re-checks its command flags at the top of every
+    // loop iteration, so this ordering guarantees it observes the stop no matter which wait
+    // it was parked in (display-time flags wait or ring buffer receive).
     this->drain_task->event_flags.set(COMMAND_STOP);
+    this->drain_task->ring_buffer.wake_receiver();
     this->drain_task->drain_thread.join();
 }
 
@@ -286,7 +292,10 @@ void VisualizerRole::Impl::handle_stream_end() {
     this->negotiated_types_mask = 0;
 
     if (this->drain_task) {
+        // Flag first, then wake, so a drain thread parked in its ring receive starts the
+        // flush immediately instead of at its next idle-receive timeout.
         this->drain_task->event_flags.set(COMMAND_FLUSH);
+        this->drain_task->ring_buffer.wake_receiver();
     }
 
     this->enqueue_stream_event(VisualizerEventType::STREAM_END);
@@ -348,7 +357,9 @@ void VisualizerRole::Impl::cleanup() {
     this->negotiated_types_mask = 0;
 
     if (this->drain_task) {
+        // Flag first, then wake, matching handle_stream_end().
         this->drain_task->event_flags.set(COMMAND_FLUSH);
+        this->drain_task->ring_buffer.wake_receiver();
     }
 
     // Discard stale slot content from the dead connection. Stale ring-borne events (an in-flight
@@ -439,7 +450,11 @@ void VisualizerRole::Impl::signal_clear_marker() const {
     if (!this->drain_task || !this->drain_task->ring_buffer.is_created()) {
         return;
     }
+    // Flag first, then wake, matching the other command signals. The marker commit below
+    // would usually wake the drain thread anyway, but the explicit wake keeps the discard
+    // prompt even when the marker enqueue times out.
     this->drain_task->event_flags.set(COMMAND_CLEAR);
+    this->drain_task->ring_buffer.wake_receiver();
 
     void* dest = this->drain_task->ring_buffer.acquire(1, MARKER_ENQUEUE_TIMEOUT_MS);
     if (dest == nullptr) {
@@ -518,7 +533,8 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Blocking receive with 50ms timeout (allows periodic command checks)
+        // Blocking receive; returns early (nullptr) when wake_receiver() signals a stop or
+        // flush. The timeout is pure idle-wakeup tuning.
         size_t item_size = 0;
         void* item = rb.receive(&item_size, DRAIN_RECEIVE_TIMEOUT_MS);
         if (item == nullptr) {

@@ -28,9 +28,11 @@ add_executable(sendspin_tests
     test_protocol.cpp
     test_network_info.cpp
     test_spsc_ring_buffer.cpp
+    test_thread_safe_queue.cpp
     test_inbox.cpp
     test_visualizer_role.cpp
     test_artwork_role.cpp
+    test_client_teardown.cpp
 )
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...).

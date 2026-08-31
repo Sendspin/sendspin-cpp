@@ -26,6 +26,7 @@
 // ESP-IDF: thin wrapper around FreeRTOS queue (uses direct task notifications, no std::deque)
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 #include <cstring>
 
@@ -38,6 +39,12 @@ namespace sendspin {
  * Blocking send() and receive() calls wait up to a caller-specified timeout when
  * the queue is full or empty. A non-blocking overwrite() path is available for
  * single-item mailbox use.
+ *
+ * A blocking receive() can be interrupted from any thread with wake_receiver(): the
+ * blocked (or next blocking) receive returns false immediately without consuming an
+ * item. Callers must therefore treat a false return as "re-check state and retry",
+ * not as proof the timeout elapsed. Blocking receive() assumes a single consumer
+ * thread: with multiple concurrent receivers, one send may wake only one of them.
  *
  * Usage:
  * 1. Declare a ThreadSafeQueue<T> member and call create() with the desired depth
@@ -63,6 +70,9 @@ public:
         if (this->handle_ != nullptr) {
             vQueueDelete(this->handle_);
         }
+        if (this->items_or_wake_sem_ != nullptr) {
+            vSemaphoreDelete(this->items_or_wake_sem_);
+        }
     }
 
     // Not copyable or movable
@@ -79,7 +89,16 @@ public:
         } else {
             this->handle_ = xQueueCreate(max_depth, sizeof(T));
         }
-        return this->handle_ != nullptr;
+        if (this->handle_ == nullptr) {
+            return false;
+        }
+        this->items_or_wake_sem_ = xSemaphoreCreateBinary();
+        if (this->items_or_wake_sem_ == nullptr) {
+            vQueueDelete(this->handle_);
+            this->handle_ = nullptr;
+            return false;
+        }
+        return true;
     }
 
     /// @brief Returns true if the queue has been successfully created
@@ -93,15 +112,46 @@ public:
     /// @param timeout_ms Milliseconds to wait if the queue is full (UINT32_MAX = wait forever).
     /// @return true if the item was sent successfully.
     bool send(const T& item, uint32_t timeout_ms) {
-        return xQueueSend(this->handle_, &item, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+        bool ok = xQueueSend(this->handle_, &item, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+        if (ok) {
+            xSemaphoreGive(this->items_or_wake_sem_);
+        }
+        return ok;
     }
 
     /// @brief Receives an item from the front of the queue; blocks up to timeout_ms if empty
     /// @param[out] item Populated with the received item on success.
     /// @param timeout_ms Milliseconds to wait if the queue is empty (UINT32_MAX = wait forever).
-    /// @return true if an item was received successfully.
+    /// @return true if an item was received successfully; false on timeout or wake_receiver()
+    /// interruption.
     bool receive(T& item, uint32_t timeout_ms) {
-        return xQueueReceive(this->handle_, &item, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+        // The blocking wait goes through items_or_wake_sem_, not the queue's own blocking
+        // receive, so wake_receiver() can interrupt it. The semaphore is binary, so a burst
+        // of sends collapses into one token; the non-blocking poll below (before the wait,
+        // and again for every call while items remain) is what guarantees items are never
+        // stranded behind a collapsed token.
+        if (xQueueReceive(this->handle_, &item, 0) == pdTRUE) {
+            return true;
+        }
+        if (timeout_ms == 0) {
+            return false;
+        }
+        TickType_t ticks = timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+        if (xSemaphoreTake(this->items_or_wake_sem_, ticks) != pdTRUE) {
+            return false;  // Timed out
+        }
+        // Woken by a send or by wake_receiver(); either way report what the queue holds now.
+        return xQueueReceive(this->handle_, &item, 0) == pdTRUE;
+    }
+
+    /// @brief Wakes the consumer out of a blocking receive() without providing an item
+    ///
+    /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
+    /// collapse into one, and a wake that races an arriving item may be absorbed by that
+    /// item's delivery -- so callers must re-check their stop/command state after every
+    /// receive() return, not only after false returns. Safe to call from any thread.
+    void wake_receiver() {
+        xSemaphoreGive(this->items_or_wake_sem_);
     }
 
     /// @brief Peeks at the front item without removing it; returns false if empty
@@ -115,7 +165,11 @@ public:
     /// @param item Item to write.
     /// @return true on success.
     bool overwrite(const T& item) {
-        return xQueueOverwrite(this->handle_, &item) == pdTRUE;
+        bool ok = xQueueOverwrite(this->handle_, &item) == pdTRUE;
+        if (ok) {
+            xSemaphoreGive(this->items_or_wake_sem_);
+        }
+        return ok;
     }
 
     /// @brief Discards all items in the queue
@@ -126,6 +180,9 @@ public:
 private:
     // Pointer fields
     QueueHandle_t handle_{nullptr};
+    // Given by every send()/overwrite() and by wake_receiver(); receive() blocks on this
+    // instead of on the queue so it stays interruptible.
+    SemaphoreHandle_t items_or_wake_sem_{nullptr};
 };
 
 }  // namespace sendspin
@@ -146,6 +203,12 @@ namespace sendspin {
  * Backed by a mutex/condition-variable deque on host. Blocking send() and receive()
  * calls wait up to a caller-specified timeout when the queue is full or empty. A
  * non-blocking overwrite() path is available for single-item mailbox use.
+ *
+ * A blocking receive() can be interrupted from any thread with wake_receiver(): the
+ * blocked (or next blocking) receive returns false immediately without consuming an
+ * item. Callers must therefore treat a false return as "re-check state and retry",
+ * not as proof the timeout elapsed. Blocking receive() assumes a single consumer
+ * thread: with multiple concurrent receivers, one send may wake only one of them.
  *
  * Usage:
  * 1. Declare a ThreadSafeQueue<T> member and call create() with the desired depth
@@ -216,21 +279,24 @@ public:
     /// @brief Receives an item from the front of the queue; blocks up to timeout_ms if empty
     /// @param[out] item Populated with the received item on success.
     /// @param timeout_ms Milliseconds to wait if the queue is empty (UINT32_MAX = wait forever).
-    /// @return true if an item was received successfully.
+    /// @return true if an item was received successfully; false on timeout or wake_receiver()
+    /// interruption.
     bool receive(T& item, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);
         if (this->items_.empty()) {
             if (timeout_ms == 0) {
                 return false;
             }
-            auto pred = [&] { return !this->items_.empty(); };
+            auto pred = [&] { return !this->items_.empty() || this->wake_pending_; };
             if (timeout_ms == UINT32_MAX) {
                 this->cv_.wait(lock, pred);
             } else {
-                if (!this->cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), pred)) {
-                    return false;
-                }
+                this->cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), pred);
             }
+            // A pending wake is consumed by whichever blocking receive it terminates, even
+            // when an item arrived in the same window (mirroring the ESP binary-semaphore
+            // collapse); callers re-check their stop/command state after every return.
+            this->wake_pending_ = false;
         }
         if (this->items_.empty()) {
             return false;
@@ -239,6 +305,20 @@ public:
         this->items_.pop_front();
         this->cv_.notify_all();
         return true;
+    }
+
+    /// @brief Wakes the consumer out of a blocking receive() without providing an item
+    ///
+    /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
+    /// collapse into one, and a wake that races an arriving item may be absorbed by that
+    /// item's delivery -- so callers must re-check their stop/command state after every
+    /// receive() return, not only after false returns. Safe to call from any thread.
+    void wake_receiver() {
+        {
+            std::lock_guard<std::mutex> lock(this->mtx_);
+            this->wake_pending_ = true;
+        }
+        this->cv_.notify_all();
     }
 
     /// @brief Peeks at the front item without removing it; returns false if empty
@@ -285,6 +365,7 @@ private:
 
     // 8-bit fields
     bool created_{false};
+    bool wake_pending_{false};
 };
 
 }  // namespace sendspin

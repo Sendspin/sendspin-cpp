@@ -13,15 +13,17 @@
 // limitations under the License.
 
 /// @file test_spsc_ring_buffer.cpp
-/// @brief Tests for the host SpscRingBuffer, focused on wrap-around accounting with
-/// storage sizes that are not a multiple of the internal alignment
+/// @brief Tests for the host SpscRingBuffer: wrap-around accounting with storage sizes
+/// that are not a multiple of the internal alignment, and the wake_receiver() contract
 
 #include "platform/spsc_ring_buffer.h"
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace sendspin {
@@ -120,6 +122,89 @@ TEST(SpscRingBuffer, CreateRejectsTooSmallStorage) {
     EXPECT_FALSE(rb.create(15, storage.data()));
     EXPECT_FALSE(rb.create(8, storage.data()));
     EXPECT_TRUE(rb.create(16, storage.data()));
+}
+
+// Long enough that a receive still parked when the assertion fires is an unambiguous
+// failure, far above any scheduling noise.
+constexpr uint32_t BLOCKED_RECEIVE_TIMEOUT_MS = 10000;
+// Any wake-induced return completes in microseconds; the generous bound only filters
+// out the full BLOCKED_RECEIVE_TIMEOUT_MS park a lost wake would cause.
+constexpr int64_t WAKE_LATENCY_BOUND_MS = 2000;
+
+int64_t elapsed_ms_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                 start)
+        .count();
+}
+
+// wake_receiver() must pull a consumer out of an in-progress blocking receive without
+// handing it data. The sleep only makes the consumer *likely* to be parked when the wake
+// fires; the wake contract covers both orderings (a wake before the park is held pending),
+// so the test cannot race, it just usually exercises the parked path.
+TEST(SpscRingBuffer, WakeReceiverUnblocksBlockedReceive) {
+    std::vector<uint8_t> storage(4096);
+    SpscRingBuffer rb;
+    ASSERT_TRUE(rb.create(storage.size(), storage.data()));
+
+    void* result = &storage;  // Poisoned so a skipped receive is visible
+    int64_t elapsed_ms = 0;
+    std::thread consumer([&] {
+        auto start = std::chrono::steady_clock::now();
+        size_t item_size = 0;
+        result = rb.receive(&item_size, BLOCKED_RECEIVE_TIMEOUT_MS);
+        elapsed_ms = elapsed_ms_since(start);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    rb.wake_receiver();
+    consumer.join();
+
+    EXPECT_EQ(result, nullptr);
+    EXPECT_LT(elapsed_ms, WAKE_LATENCY_BOUND_MS);
+}
+
+// A wake issued while no receive is in progress is held pending: the next blocking
+// receive returns immediately instead of parking. Role stop() paths rely on this to
+// close the set-flag-then-wake race with a thread that has not parked yet.
+TEST(SpscRingBuffer, WakeBeforeReceiveReturnsImmediately) {
+    std::vector<uint8_t> storage(4096);
+    SpscRingBuffer rb;
+    ASSERT_TRUE(rb.create(storage.size(), storage.data()));
+
+    rb.wake_receiver();
+
+    auto start = std::chrono::steady_clock::now();
+    size_t item_size = 0;
+    void* result = rb.receive(&item_size, BLOCKED_RECEIVE_TIMEOUT_MS);
+    EXPECT_EQ(result, nullptr);
+    EXPECT_LT(elapsed_ms_since(start), WAKE_LATENCY_BOUND_MS);
+}
+
+// Control: a wake never consumes or corrupts data, and surviving data does not consume
+// the wake. With both an item and a wake pending, the item is delivered intact and the
+// wake still interrupts the following blocking receive -- so a stop signal cannot be
+// lost behind a racing send.
+TEST(SpscRingBuffer, WakeDoesNotDropDataAndDataDoesNotDropWake) {
+    std::vector<uint8_t> storage(4096);
+    SpscRingBuffer rb;
+    ASSERT_TRUE(rb.create(storage.size(), storage.data()));
+
+    uint8_t item[16];
+    fill_pattern(item, sizeof(item), 7);
+    ASSERT_TRUE(rb.send(item, sizeof(item), 0));
+    rb.wake_receiver();
+
+    size_t item_size = 0;
+    void* received = rb.receive(&item_size, BLOCKED_RECEIVE_TIMEOUT_MS);
+    ASSERT_NE(received, nullptr);
+    EXPECT_EQ(item_size, sizeof(item));
+    EXPECT_TRUE(check_pattern(static_cast<uint8_t*>(received), item_size, 7));
+    rb.return_item(received);
+
+    auto start = std::chrono::steady_clock::now();
+    void* result = rb.receive(&item_size, BLOCKED_RECEIVE_TIMEOUT_MS);
+    EXPECT_EQ(result, nullptr);
+    EXPECT_LT(elapsed_ms_since(start), WAKE_LATENCY_BOUND_MS);
 }
 
 }  // namespace

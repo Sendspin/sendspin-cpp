@@ -133,7 +133,9 @@ public:
     /// @brief Returns true if init() has been called successfully
     /// @return true if the sync task has been initialized, false otherwise.
     bool is_initialized() const {
-        return this->event_flags_.is_created();
+        // Both members are checked so a partially failed init() (flags created, ring buffer
+        // allocation failed) leaves every signal/query path safely inert.
+        return this->event_flags_.is_created() && this->encoded_ring_buffer_ != nullptr;
     }
 
     /// @brief Returns true if the sync task is actively processing a stream
