@@ -1,6 +1,7 @@
 # Design Conventions
 
-This document states the design standards code in this repository is held to.
+This document states the design standards that code in this repository is
+held to.
 It is normative: `docs/internals.md` describes how the current code works,
 while this document describes how new code should be shaped. The review
 checklists in `.claude/skills/` apply these standards to a diff.
@@ -45,10 +46,11 @@ checklists in `.claude/skills/` apply these standards to a diff.
 ## Platform abstraction
 
 - Core sources in `src/` contain no `#ifdef ESP_PLATFORM`. Platform
-  differences live in `src/platform/`, `src/esp/`, and `src/host/`; role
-  compile-gates (`#ifdef SENDSPIN_ENABLE_*`) live only in
+  differences live in `src/platform/`, `src/esp/`, and `src/host/`. Within
+  the library, role compile-gates (`#ifdef SENDSPIN_ENABLE_*`) live only in
   `cmake/sources.cmake` and the dispatch points in
-  `include/sendspin/client.h` / `src/client.cpp`.
+  `include/sendspin/client.h` / `src/client.cpp`; consumers, including the
+  examples, guard their own role usage (see Public API).
 - Logging uses the `SS_LOG*` macros; allocation uses the `platform_malloc`
   family with an explicit `MemoryLocation` choice where it matters.
 - Code that only builds on one platform still keeps the other platform's build
