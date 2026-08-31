@@ -83,7 +83,8 @@ logic that ships without a test that could catch its breakage.
 - The same behavior over differing inputs belongs in a value-parameterized
   test (`TEST_P` with `INSTANTIATE_TEST_SUITE_P`) rather than copy-pasted
   near-duplicate cases. The malformed-input rejection tests in
-  `tests/test_protocol.cpp` are the standing example of that shape.
+  `tests/test_protocol.cpp` are the standing example of the copy-pasted
+  shape, and are what a parameterized suite would replace.
 - No test depends on execution order, on another test having run first, or on
   shared mutable global state; each test sets up the world it needs.
 
