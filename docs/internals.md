@@ -146,8 +146,7 @@ Used for:
 - **`std::atomic<bool>`** on `SendspinConnection::message_dispatch_enabled_`: allows the main loop to instantly suppress message delivery from the network thread.
 - **`std::atomic<bool/uint8_t>`** on `VisualizerRole::Impl`: network thread writes stream config atomically; drain thread reads it.
 - **`std::atomic<bool>`** on `ArtworkRole::Impl::stream_active`: guards `handle_binary()` from writing when no stream is active.
-- **`std::atomic<uint8_t>`** on `ArtworkRole::Impl::SlotBuffer::write_idx`: tracks which of two double-buffers the network thread writes to next.
-- **`std::atomic<bool>`** on `ArtworkRole::Impl::SlotBuffer::drain_active`: set by the decode thread while decoding, checked by the network thread to avoid overwriting an in-use buffer.
+- **`std::mutex`** on `ArtworkRole::Impl::DrainTask::slot_mutex`: guards every field of `SlotBuffer` (shared across all slots; artwork is not a hot path, so contention is negligible). Under that lock `write_idx` tracks which of the two per-slot buffers the network thread writes to next, `drain_active`/`drain_buf_idx` record which buffer the decode thread is decoding, `write_generation[]` lets the decode thread detect a buffer overwritten before it could be claimed, and `ack_state`/`has_parked`/`parked` hold the per-slot frame-done gate.
 - **`std::atomic<uint8_t>`** on `SendspinClient::high_performance_ref_count_`: ref-counted high-performance networking requests from time sync and playback.
 
 ## Message Flow
