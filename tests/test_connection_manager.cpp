@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// White-box test for ConnectionManager's promotion scan, reaching private state directly
-// (compiled with -fno-access-control, see CMakeLists.txt) rather than through a real socket:
-// reproducing the STOPPING-window race described by the accepting_ finding requires a nursery
-// peer whose server/hello is processed by the network thread concurrently with (or immediately
-// after) begin_stop()'s goodbye send, which is not reliably reproducible through a real
-// WebSocket transport on host (IXWebSocket's server-side disconnect is synchronous, so
-// is_connected() flips false in the same call as the goodbye send, closing the timing window
-// that would let a real socket test hit it deterministically). Driving ConnectionManager's
-// private nursery_/accepting_/current_connection_ state directly exercises the exact guarded
-// code path (the promotion scan in ConnectionManager::loop()) under the exact precondition
-// (accepting_ == false, a nursery entry with is_handshake_complete() == true) without depending
-// on that race.
+// White-box tests for what ConnectionManager::loop() must not do while the manager is stopping,
+// plus the client-level stop deadline that depends on a peer the manager never releases. All of
+// it reaches private state directly (compiled with -fno-access-control, see CMakeLists.txt)
+// rather than going through a real socket, because none of these preconditions are reproducible
+// through a real WebSocket transport on host: IXWebSocket's server-side disconnect is
+// synchronous, so is_connected() flips false in the same call as the goodbye send and the close
+// event lands immediately. That closes the window where a nursery peer is still connected with
+// its dispatch enabled after begin_stop(), which is exactly the state the accepting_ gates on
+// the promotion scan and the two hello sites exist for, and it makes a peer that never delivers
+// a close (the only way to reach the grace deadline) impossible to stage. Driving the private
+// nursery_/accepting_/hello_retries_/pending_connected_events_ state directly exercises those
+// guarded paths under their exact preconditions without depending on transport timing.
 
 #include "connection.h"
 #include "connection_manager.h"
@@ -232,4 +232,52 @@ TEST(ConnectionManagerInternal, StopDeadlineFinishesTeardownWhenPeerNeverCloses)
 
     EXPECT_EQ(client.get_run_state(), SendspinRunState::STOPPED);
     EXPECT_FALSE(manager.has_connections());
+}
+
+// Companion to the case above for the other hello site: an outbound connection arms its hello
+// from the transport's connected event rather than at admission, so that arm needs the same
+// accepting_ gate. Without it a connect_to() whose upgrade lands inside the goodbye window is
+// armed during STOPPING and sent a client/hello on the same tick.
+TEST(ConnectionManagerInternal, ConnectedEventDoesNotArmHelloWhileStopping) {
+    SendspinClientConfig config = make_config();
+    SendspinClient client(config);
+    ConnectionManager& manager = *client.connection_manager_;
+
+    auto fake = std::make_shared<FakeConnection>();
+    fake->set_connected(true);
+    fake->mark_ws_upgraded();
+    fake->set_provisional_time_us(platform_time_us());
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.push_nursery_entry(NurseryEntry{fake, /*inbound=*/false});
+    }
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_mutex_);
+        manager.queue_pending_connected(fake);
+    }
+
+    manager.accepting_.store(false, std::memory_order_release);
+
+    manager.loop();
+
+    // Nothing sent, and nothing armed either, so no later tick can send one on its behalf.
+    EXPECT_EQ(fake->send_count(), 0);
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        EXPECT_TRUE(manager.hello_retries_.empty());
+    }
+    manager.loop();
+    EXPECT_EQ(fake->send_count(), 0);
+
+    // Control: the same event arms and sends on one tick once the manager is accepting, so the
+    // guard is what suppressed it rather than the entry being unreachable from this path.
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_mutex_);
+        manager.queue_pending_connected(fake);
+    }
+    manager.accepting_.store(true, std::memory_order_release);
+
+    manager.loop();
+
+    EXPECT_EQ(fake->send_count(), 1);
 }

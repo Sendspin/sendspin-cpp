@@ -21,7 +21,7 @@ FetchContent_MakeAvailable(googletest)
 # registers the individual TEST() cases with CTest so failures are reported per case.
 add_executable(sendspin_tests
     test_audio_stream_info.cpp
-    test_client_lifecycle_internal.cpp
+    test_client_internal.cpp
     test_connection_lifecycle.cpp
     test_connection_manager.cpp
     test_time_filter.cpp
@@ -37,11 +37,11 @@ add_executable(sendspin_tests
 # test_sync_task.cpp stages internal SyncTask states (partial init, mid-stream stop) directly;
 # test_connection_manager.cpp reaches ConnectionManager's private nursery_/accepting_ state to
 # reproduce STOPPING-window behavior not reliably reproducible through a real socket;
-# test_client_lifecycle_internal.cpp stages the client's private session state and a role-start
+# test_client_internal.cpp stages the client's private session state and a role-start
 # failure. Disable access control for these TUs instead of adding test seams to the production
 # code.
 set_source_files_properties(test_sync_task.cpp test_connection_manager.cpp
-                             test_client_lifecycle_internal.cpp
+                             test_client_internal.cpp
                              PROPERTIES COMPILE_OPTIONS "-fno-access-control")
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...).
