@@ -66,6 +66,7 @@ constexpr uint16_t REQUEST_STOP_SYNC_TEST_PORT = 18994;
 constexpr uint16_t REQUEST_STOP_PLAYER_TEST_PORT = 18995;
 constexpr uint16_t REQUEST_STOP_LATE_PEER_TEST_PORT = 18996;
 constexpr uint16_t STOP_ORDERING_TEST_PORT = 18997;
+constexpr uint16_t RESTART_IN_CALLBACK_TEST_PORT = 18998;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -682,6 +683,24 @@ public:
     int stopped_count{0};
 };
 
+// Restarts the client from inside on_stopped(), the pattern the header documents as supported.
+// Only the first completion restarts, so the test's own final teardown is not undone.
+class RestartOnStopListener : public SendspinClientListener {
+public:
+    void on_stopped() override {
+        ++this->stopped_count;
+        if (this->client != nullptr && this->stopped_count == 1) {
+            this->state_seen_in_callback = this->client->get_run_state();
+            this->restart_result = this->client->start();
+        }
+    }
+
+    SendspinClient* client{nullptr};
+    int stopped_count{0};
+    bool restart_result{false};
+    SendspinRunState state_seen_in_callback{SendspinRunState::RUNNING};
+};
+
 }  // namespace
 
 // request_stop() must return without tearing anything down itself (state moves to STOPPING),
@@ -782,6 +801,49 @@ public:
 
 }  // namespace
 
+// Calling start() from inside on_stopped() is documented as supported, and it only works because
+// finish_stop() assigns STOPPED before invoking the callback: start() refuses while STOPPING.
+// That ordering is invisible to the callback-counting tests, which assert the end state after
+// finish_stop() has fully returned and so hold no matter where inside it the write happens. This
+// drives the restart from the callback itself, so moving the assignment below the notify turns
+// the suite red. (Where tearing_down_ is cleared relative to the notify does not matter, since
+// start() does not read it; that it is cleared at all is covered by the second teardown below.)
+TEST(ConnectionLifecycle, StartFromStoppedCallbackRestartsClient) {
+    TestNetworkProvider network;
+    RestartOnStopListener stop_listener;
+    SendspinClient client(make_config(RESTART_IN_CALLBACK_TEST_PORT));
+    stop_listener.client = &client;
+    client.set_network_provider(&network);
+    client.set_listener(&stop_listener);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    client.request_stop();
+    ASSERT_TRUE(pump_until(
+        client, [&] { return stop_listener.stopped_count == 1; }, 3000));
+
+    // The callback saw STOPPED, not the STOPPING that start() refuses.
+    EXPECT_EQ(stop_listener.state_seen_in_callback, SendspinRunState::STOPPED);
+    EXPECT_TRUE(stop_listener.restart_result);
+    EXPECT_EQ(client.get_run_state(), SendspinRunState::RUNNING);
+
+    // Restarted from inside the callback, the client is fully live: the server accepts a peer and
+    // the handshake completes.
+    pump_for(client, 50);
+    {
+        FakeServer server(server_url(RESTART_IN_CALLBACK_TEST_PORT), "server-restart-callback");
+        EXPECT_TRUE(pump_until(
+            client, [&] { return client.is_connected(); }, 4000));
+    }
+
+    // A second teardown still completes and notifies. This is what catches a tearing_down_ that
+    // was never cleared: finish_stop() would return early and the state would never reach STOPPED.
+    client.request_stop();
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.get_run_state() == SendspinRunState::STOPPED; }, 3000));
+    EXPECT_EQ(stop_listener.stopped_count, 2);
+}
+
 // With a player role attached, request_stop() must wait for the sync task thread to actually
 // exit (has_stopped() gating in loop()) before completing, and a subsequent start() must bring
 // the thread back. Covers the request-side of the role-thread stop path end to end.
@@ -798,10 +860,20 @@ TEST(ConnectionLifecycle, RequestStopWithPlayerRoleWaitsForSyncTask) {
     player.set_listener(&player_listener);
 
     ASSERT_TRUE(client.start());
+    // Let the sync thread reach its idle receive before signaling, so the stop lands while it is
+    // parked and the thread is guaranteed not to exit for roughly one idle poll.
+    pump_for(client, 100);
     client.request_stop();
     EXPECT_EQ(client.get_run_state(), SendspinRunState::STOPPING);
 
-    // Completion waits out the sync task's 500 ms idle poll; well inside the grace deadline.
+    // request_stop() is asynchronous, so this tick must hand the teardown to a later one rather
+    // than finishing it here: the sync thread is parked in its idle receive and cannot have
+    // exited yet, so the client is still STOPPING when loop() returns.
+    client.loop();
+    EXPECT_EQ(client.get_run_state(), SendspinRunState::STOPPING);
+    EXPECT_EQ(stop_listener.stopped_count, 0);
+
+    // Completion waits out the sync task's idle poll; well inside the grace deadline.
     EXPECT_TRUE(pump_until(
         client, [&] { return client.get_run_state() == SendspinRunState::STOPPED; }, 2000));
     EXPECT_EQ(stop_listener.stopped_count, 1);

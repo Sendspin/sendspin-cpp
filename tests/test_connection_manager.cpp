@@ -97,11 +97,13 @@ SendspinClientConfig make_config() {
 
 // Finding: the promotion scan in ConnectionManager::loop() must not promote a nursery peer whose
 // handshake completes while the manager is stopping (accepting_ cleared by begin_stop()). A
-// connected nursery peer's message dispatch stays enabled through the goodbye window (unlike a
-// released nursery entry), so an in-flight server/hello can still flip is_handshake_complete()
-// during STOPPING; promoting it would hand it a client/state message after it was already told
-// SHUTDOWN. (Parking it costs nothing: has_connections() counts nursery entries too, so the
-// teardown deadline behaves the same either way.)
+// begin_stop() disables dispatch on connected peers, so an in-flight server/hello no longer flips
+// is_handshake_complete() by itself, but this guard is the structural backstop and is asserted
+// here on its own: the scan is driven with dispatch left enabled (accepting_ cleared directly,
+// as a stopping manager would have it) so the skip is attributable to the guard alone. Promoting
+// a peer here would hand it a client/state message after it was already told SHUTDOWN. (Parking
+// it costs nothing: has_connections() counts nursery entries too, so the teardown deadline
+// behaves the same either way.)
 TEST(ConnectionManagerInternal, PromotionSkippedWhileStopping) {
     SendspinClientConfig config = make_config();
     SendspinClient client(config);
