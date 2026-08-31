@@ -65,6 +65,24 @@ logic that ships without a test that could catch its breakage.
   history ("rejects spectrum config missing n_disp_bins", not "regression
   test for the config bug").
 
+## Granularity and independence
+
+- One behavior per test: not one assertion per test, and not one test per
+  bug. Several assertions about the same behavior belong together and
+  splitting them is filler; a long test spanning several behaviors is the
+  opposite failure and gets split along the behaviors it conflates.
+  `MetadataNullClearsAndAbsentPreserves` (`tests/test_protocol.cpp`) asserts
+  three things about the single delta-merge rule it covers.
+- A test name describes the behavior closely enough that a red CI run
+  identifies the break without opening the file (see the naming bullet under
+  "No filler").
+- `ASSERT_*` aborts the test function while `EXPECT_*` continues, so an
+  over-merged test masks later failures behind the first one. Reserve
+  `ASSERT_*` for the point where continuing would be meaningless, such as a
+  parse that must succeed before its result is read.
+- No test depends on execution order, on another test having run first, or on
+  shared mutable global state; each test sets up the world it needs.
+
 ## No test seams in production
 
 - Production code in `src/` and `include/` must not acquire friends,
@@ -83,6 +101,9 @@ logic that ships without a test that could catch its breakage.
   never assert on a counter that the thread under test would have been the
   one to advance, and never use fixed sleeps as synchronization; use the
   code's own observable outputs or event flags.
+- A sleep that advances wall-clock time toward a real deadline is not
+  synchronization; before calling such a test fragile, compute the margin
+  between its nominal elapsed time and that deadline and state the margin.
 
 ## Sanitizers
 
@@ -91,10 +112,16 @@ logic that ships without a test that could catch its breakage.
 
 ## Honest gaps
 
-- A coverage gap that cannot be closed cheaply (for example, logic needing an
-  injectable clock) is named explicitly in the PR rather than papered over
-  with a test that appears to cover it. Flag apparent coverage that does not
-  actually exercise the gap.
+- A coverage gap that cannot be closed cheaply is named explicitly in the PR
+  rather than papered over with a test that appears to cover it. Flag
+  apparent coverage that does not actually exercise the gap.
+- Naming the gap is the finding. Do not recommend a production seam to close
+  it: an injectable clock, a virtual hook, or a swappable transport added to
+  `src/` or `include/` for a test's benefit is the seam violation above, not
+  the remedy for it. This project has no clock injection seam and a review
+  must not propose introducing one; where a timing decision needs direct
+  coverage, extract it into a pure predicate the test calls with supplied
+  values.
 
 ## Report format
 
