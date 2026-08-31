@@ -83,6 +83,9 @@ logic that ships without a test that could catch its breakage.
   never assert on a counter that the thread under test would have been the
   one to advance, and never use fixed sleeps as synchronization; use the
   code's own observable outputs or event flags.
+- A sleep that advances wall-clock time toward a real deadline is not
+  synchronization; before calling such a test fragile, compute the margin
+  between its nominal elapsed time and that deadline and state the margin.
 
 ## Sanitizers
 
@@ -91,10 +94,16 @@ logic that ships without a test that could catch its breakage.
 
 ## Honest gaps
 
-- A coverage gap that cannot be closed cheaply (for example, logic needing an
-  injectable clock) is named explicitly in the PR rather than papered over
-  with a test that appears to cover it. Flag apparent coverage that does not
-  actually exercise the gap.
+- A coverage gap that cannot be closed cheaply is named explicitly in the PR
+  rather than papered over with a test that appears to cover it. Flag
+  apparent coverage that does not actually exercise the gap.
+- Naming the gap is the finding. Do not recommend a production seam to close
+  it: an injectable clock, a virtual hook, or a swappable transport added to
+  `src/` or `include/` for a test's benefit is the seam violation above, not
+  the remedy for it. This project has no clock injection seam and a review
+  must not propose introducing one; where a timing decision needs direct
+  coverage, extract it into a pure predicate the test calls with supplied
+  values.
 
 ## Report format
 
