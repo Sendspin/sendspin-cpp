@@ -15,3 +15,7 @@ build-*/
 *.a
 *.so
 *.dylib
+
+# Claude Code local state
+.claude/settings.local.json
+.claude/worktrees/
