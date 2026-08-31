@@ -383,44 +383,59 @@ void ConnectionManager::loop() {
             // of our client/hello is picked up on the tick after the send completes. A connection
             // leaves the nursery only here (handshake complete) or by being reaped, so the current
             // slot never holds a connection that has not proven itself.
-            for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
-                if (!it->conn->is_handshake_complete()) {
-                    ++it;
-                    continue;
+            //
+            // Skipped entirely while the manager is stopping (accepting_ cleared): begin_stop()
+            // already sent every connected nursery peer a goodbye without disabling its message
+            // dispatch (disconnect() only does that for the current slot and released nursery
+            // entries, not for the connected-nursery entries it hands to the caller for a
+            // transport-level disconnect()), so an in-flight server/hello can still flip
+            // is_handshake_complete() during the STOPPING window. Promoting that peer here would
+            // hand it a client/state message after it was already told SHUTDOWN, and would keep
+            // has_connections() true and stall stop()'s deadline wait. Leaving it in the nursery is
+            // safe: stop()'s force-drain releases it (no further goodbye needed, one was already
+            // sent), and accepting_ is set again by init_server() before any future promotion.
+            if (this->accepting_.load(std::memory_order_acquire)) {
+                for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
+                    if (!it->conn->is_handshake_complete()) {
+                        ++it;
+                        continue;
+                    }
+                    auto conn = std::move(it->conn);
+                    it = this->nursery_.erase(it);
+                    this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
+                    this->remove_hello_retry(conn.get());
+
+                    if (this->current_connection_ == nullptr) {
+                        this->set_current_connection(std::move(conn));
+                    } else if (this->should_switch_to_new_server(this->current_connection_.get(),
+                                                                 conn.get())) {
+                        // Both sides of the comparison are established, so the PLAYBACK-reason and
+                        // last-played-server preferences always ran on real data. No incumbent is
+                        // ever evicted on timing alone.
+                        SS_LOGI(TAG, "Handoff decision: switch to new server");
+                        this->drop_connection(this->current_connection_.get(),
+                                              SendspinGoodbyeReason::ANOTHER_SERVER);
+                        this->set_current_connection(std::move(conn));
+                    } else {
+                        SS_LOGI(TAG, "Handoff decision: keep current server");
+                        // Leaving management: block stale network-thread dispatch during the
+                        // goodbye window (outgoing sends, including the goodbye itself, are
+                        // unaffected).
+                        conn->disable_message_dispatch();
+                        this->queue_deferred_release(std::move(conn),
+                                                     SendspinGoodbyeReason::ANOTHER_SERVER);
+                        continue;
+                    }
+
+                    // Notify the client and publish state, only for the winner and never for a
+                    // connection that is about to receive a goodbye.
+                    this->client_->on_handshake_complete(this->current_connection_.get());
+
+                    SS_LOGI(TAG,
+                            "Connection handshake complete: server_id=%s, connection_reason=%s",
+                            this->current_connection_->get_server_id().c_str(),
+                            to_cstr(this->current_connection_->get_connection_reason()));
                 }
-                auto conn = std::move(it->conn);
-                it = this->nursery_.erase(it);
-                this->nursery_size_.store(this->nursery_.size(), std::memory_order_release);
-                this->remove_hello_retry(conn.get());
-
-                if (this->current_connection_ == nullptr) {
-                    this->set_current_connection(std::move(conn));
-                } else if (this->should_switch_to_new_server(this->current_connection_.get(),
-                                                             conn.get())) {
-                    // Both sides of the comparison are established, so the PLAYBACK-reason and
-                    // last-played-server preferences always ran on real data. No incumbent is
-                    // ever evicted on timing alone.
-                    SS_LOGI(TAG, "Handoff decision: switch to new server");
-                    this->drop_connection(this->current_connection_.get(),
-                                          SendspinGoodbyeReason::ANOTHER_SERVER);
-                    this->set_current_connection(std::move(conn));
-                } else {
-                    SS_LOGI(TAG, "Handoff decision: keep current server");
-                    // Leaving management: block stale network-thread dispatch during the goodbye
-                    // window (outgoing sends, including the goodbye itself, are unaffected).
-                    conn->disable_message_dispatch();
-                    this->queue_deferred_release(std::move(conn),
-                                                 SendspinGoodbyeReason::ANOTHER_SERVER);
-                    continue;
-                }
-
-                // Notify the client and publish state, only for the winner and never for a
-                // connection that is about to receive a goodbye.
-                this->client_->on_handshake_complete(this->current_connection_.get());
-
-                SS_LOGI(TAG, "Connection handshake complete: server_id=%s, connection_reason=%s",
-                        this->current_connection_->get_server_id().c_str(),
-                        to_cstr(this->current_connection_->get_connection_reason()));
             }
         }
 

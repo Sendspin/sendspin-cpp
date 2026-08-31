@@ -22,6 +22,7 @@
 #include "connection_manager.h"  // fnv1_hash for the last-played preference
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/controller_role.h"
 #include "sendspin/player_role.h"
 #include <gtest/gtest.h>
 #include <ixwebsocket/IXWebSocket.h>
@@ -41,6 +42,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
@@ -63,6 +65,7 @@ constexpr uint16_t REQUEST_STOP_TEST_PORT = 18993;
 constexpr uint16_t REQUEST_STOP_SYNC_TEST_PORT = 18994;
 constexpr uint16_t REQUEST_STOP_PLAYER_TEST_PORT = 18995;
 constexpr uint16_t REQUEST_STOP_LATE_PEER_TEST_PORT = 18996;
+constexpr uint16_t STOP_ORDERING_TEST_PORT = 18997;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -838,4 +841,61 @@ TEST(ConnectionLifecycle, RequestStopRejectsLateArrivalWithGoodbye) {
     EXPECT_TRUE(pump_until(
         client, [&] { return client.get_run_state() == SendspinRunState::STOPPED; }, 2000));
     EXPECT_EQ(stop_listener.stopped_count, 1);
+}
+
+namespace {
+
+// Records the relative order of the controller's clear callback (queued by
+// cleanup_connection_state() during teardown) against on_stopped(), so the test can assert one
+// happens strictly before the other rather than merely that both eventually fire.
+class OrderingListener : public SendspinClientListener, public ControllerRoleListener {
+public:
+    void on_controller_state_clear() override {
+        this->order.push_back("controller_cleared");
+    }
+
+    void on_stopped() override {
+        this->order.push_back("on_stopped");
+    }
+
+    std::vector<std::string> order;
+};
+
+}  // namespace
+
+// on_stopped() is documented as the signal that every role's teardown has already been delivered
+// and it is safe to destroy the client. The clear callbacks that the same teardown queues
+// (cleanup_connection_state(), reached from finish_stop()'s connection_manager_->stop()) must
+// therefore reach the listener before on_stopped() does, not on some later loop() tick.
+TEST(ConnectionLifecycle, StoppedFiresAfterRoleClearCallbacks) {
+    TestNetworkProvider network;
+    OrderingListener listener;
+    SendspinClient client(make_config(STOP_ORDERING_TEST_PORT));
+    client.set_network_provider(&network);
+    client.set_listener(&listener);
+    auto& controller = client.add_controller();
+    controller.set_listener(&listener);
+
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    FakeServer server(server_url(STOP_ORDERING_TEST_PORT), "server-ordering");
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+
+    // No loop() pumping between request_stop() and stop(): the close event that request_stop()'s
+    // goodbye eventually triggers has no chance to be processed first, so stop()'s teardown
+    // (finish_stop()) is guaranteed to run cleanup_connection_state() itself (current_connection_
+    // is still set going in). That exercises the same-tick ordering finish_stop() must get right;
+    // pumping loop() until STOPPED instead would let an earlier tick's close-event handling run
+    // cleanup_connection_state() (and thus drain the clear via that tick's own drain_inbox_events()
+    // call) well before finish_stop() ever runs, which is already safe and would not catch a
+    // regression here.
+    client.request_stop();
+    client.stop();
+
+    ASSERT_EQ(client.get_run_state(), SendspinRunState::STOPPED);
+    ASSERT_EQ(listener.order.size(), 2U);
+    EXPECT_EQ(listener.order[0], "controller_cleared");
+    EXPECT_EQ(listener.order[1], "on_stopped");
 }

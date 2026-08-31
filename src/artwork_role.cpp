@@ -101,9 +101,16 @@ bool ArtworkRole::Impl::start() {
         return false;
     }
 
-    // The flag object survives a stop()/start() cycle, so clear the stale COMMAND_STOP left by
-    // stop() before spawning; otherwise the new thread's first wait() sees it and exits
-    // immediately. THREAD_EXITED is the previous thread's exit marker, stale for the new one.
+    // The flag object survives a stop()/start() cycle. This clear only matters on the async
+    // path: on a plain stop() the drain thread's own exiting wait() call already self-clears
+    // COMMAND_STOP (EventFlags::wait's clear_on_exit clears matched bits unconditionally, even
+    // ones already set before the call), so the bit already reads 0 here. On the async path
+    // request_stop() lets the thread exit (and self-clear) on its own, then a later stop() calls
+    // event_flags.set(COMMAND_STOP) on the now-dead thread with nothing left to clear it, so the
+    // bit is still set by the time start() runs. Clearing it unconditionally here, rather than
+    // relying on which path preceded this start(), keeps a stale bit from making the new thread's
+    // first wait() see COMMAND_STOP and exit immediately. THREAD_EXITED is the previous thread's
+    // exit marker, stale for the new one either way.
     this->drain_task->event_flags.clear(COMMAND_STOP | THREAD_EXITED);
 
     platform_configure_thread("SsArt", 4096, static_cast<int>(this->config.priority),

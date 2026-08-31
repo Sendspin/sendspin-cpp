@@ -176,10 +176,17 @@ bool VisualizerRole::Impl::start() {
         return false;
     }
 
-    // The flag object survives a stop()/start() cycle, so clear the stale COMMAND_STOP left by
-    // stop() (and any unconsumed flush/clear command) before spawning; otherwise the new
-    // thread's first wait() sees COMMAND_STOP and exits immediately. THREAD_EXITED is the
-    // previous thread's exit marker, stale for the new one.
+    // The flag object survives a stop()/start() cycle. This clear only matters on the async
+    // path: on a plain stop() the drain thread's own exiting wait() call already self-clears
+    // COMMAND_STOP (EventFlags::wait's clear_on_exit clears matched bits unconditionally, even
+    // ones already set before the call), so the bit already reads 0 here. On the async path
+    // request_stop() lets the thread exit (and self-clear) on its own, then a later stop() calls
+    // event_flags.set(COMMAND_STOP) on the now-dead thread with nothing left to clear it, so the
+    // bit is still set by the time start() runs. Clearing it (and any unconsumed flush/clear
+    // command) unconditionally here, rather than relying on which path preceded this start(),
+    // keeps a stale bit from making the new thread's first wait() see COMMAND_STOP and exit
+    // immediately. THREAD_EXITED is the previous thread's exit marker, stale for the new one
+    // either way.
     this->drain_task->event_flags.clear(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR |
                                         THREAD_EXITED);
 
@@ -195,6 +202,16 @@ void VisualizerRole::Impl::stop() const {
     }
     this->drain_task->event_flags.set(COMMAND_STOP);
     this->drain_task->drain_thread.join();
+
+    // The ring buffer survives a stop()/start() cycle, so discard whatever is left in it --
+    // including entries queued before this stop and anything the network thread pushes during the
+    // grace window after the drain thread has already exited (on the async request_stop() path the
+    // thread exits on COMMAND_STOP alone; cleanup()'s later COMMAND_FLUSH lands on a dead thread
+    // and never runs). Otherwise a restarted session would decode stale entries against the new
+    // session's spectrum_bin_count/tracks_downbeats. Safe here: the drain thread is already joined,
+    // so this call is the ring's only consumer (the single-consumer contract SpscRingBuffer
+    // requires).
+    this->flush_ring_buffer();
 }
 
 void VisualizerRole::Impl::request_stop() const {

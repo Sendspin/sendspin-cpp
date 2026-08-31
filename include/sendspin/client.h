@@ -494,8 +494,22 @@ private:
     void stop_role_threads();
 
     /// @brief Performs the full teardown shared by stop() and a completing request_stop()
+    ///
+    /// Guarded against re-entrancy by tearing_down_: a listener callback synchronously invoked
+    /// from inside the teardown (e.g. on_release_high_performance() from
+    /// cleanup_connection_state()) may call back into stop()/request_stop()/start()/connect_to().
+    /// run_state_ stays STOPPING (never STOPPED) for the duration, so those re-entrant calls see
+    /// the client as still transitioning and refuse or no-op instead of racing the in-progress
+    /// teardown; see "Re-entrant Teardown During Callback Dispatch" in docs/internals.md for the
+    /// pattern.
     /// @param notify Whether to fire the listener's on_stopped() once torn down
     void finish_stop(bool notify);
+
+    /// @brief Drains the inbox event ring, role event slots, and group-update slot
+    ///
+    /// Shared by loop() (every tick) and finish_stop() (once, after teardown, so the roles' clear
+    /// callbacks reach the listener before on_stopped() does).
+    void drain_inbox_events();
 
     /// @brief Signals every role background thread to stop without joining it
     void request_stop_role_threads();
@@ -597,6 +611,10 @@ private:
     bool high_performance_held_for_time_{false};
     std::atomic<uint8_t> high_performance_ref_count_{0};
     SendspinRunState run_state_{SendspinRunState::STOPPED};
+    /// True for the duration of finish_stop(), guarding it against re-entrant recursion from a
+    /// listener callback invoked synchronously during teardown (see finish_stop()'s doc comment).
+    /// Main-thread only.
+    bool tearing_down_{false};
 };
 
 }  // namespace sendspin

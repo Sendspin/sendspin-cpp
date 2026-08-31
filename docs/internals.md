@@ -61,7 +61,7 @@ flags before spawning a fresh thread.
 
 1. `VisualizerRole::Impl::start()` spawns the drain thread.
 2. The thread blocks on ring buffer receives with a 50 ms timeout.
-3. `stop()` sets `COMMAND_STOP` and joins; `request_stop()` only signals, and the thread sets `THREAD_EXITED` on exit for `has_stopped()`.
+3. `stop()` sets `COMMAND_STOP`, joins, and then flushes the ring buffer so no stale entry (queued before the stop, or pushed by the network thread into the gap between the async `request_stop()` exit and this join) survives into a restarted session and gets decoded against the new session's `spectrum_bin_count`/`tracks_downbeats`. `request_stop()` only signals, and the thread sets `THREAD_EXITED` on exit for `has_stopped()`.
 
 **Artwork decode** (`src/artwork_role.cpp`):
 
@@ -226,25 +226,29 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    ├─ Acquire/release high-performance networking around burst
    └─ Notify listener of sync error when burst completes
 
-3. Drain inbox event ring (when INBOX_TOPIC_EVENTS is set)
-   ├─ Feed TIME_RESPONSE events into time_burst_->on_time_response()
-   ├─ Fire CONTROLLER/METADATA/COLOR_CLEARED via each role's handle_cleared_event()
-   ├─ Dispatch PLAYER_STREAM via player_->impl_->on_stream_ring_event()
-   ├─ Dispatch ARTWORK_STREAM via artwork_->impl_->handle_stream_ring_event()
-   └─ Dispatch VISUALIZER_STREAM via visualizer_->impl_->handle_stream_ring_event()
+3. drain_inbox_events()
+   ├─ Drain inbox event ring (when INBOX_TOPIC_EVENTS is set)
+   │  ├─ Feed TIME_RESPONSE events into time_burst_->on_time_response()
+   │  ├─ Fire CONTROLLER/METADATA/COLOR_CLEARED via each role's handle_cleared_event()
+   │  ├─ Dispatch PLAYER_STREAM via player_->impl_->on_stream_ring_event()
+   │  ├─ Dispatch ARTWORK_STREAM via artwork_->impl_->handle_stream_ring_event()
+   │  └─ Dispatch VISUALIZER_STREAM via visualizer_->impl_->handle_stream_ring_event()
+   ├─ Role event draining (each role's impl_->drain_events(), gated on impl_->needs_drain(slot_bits))
+   │  ├─ player_->impl_->drain_events()
+   │  ├─ controller_->impl_->drain_events()
+   │  ├─ metadata_->impl_->drain_events()
+   │  ├─ color_->impl_->drain_events()
+   │  └─ artwork_->impl_->drain_events()   (display-deadline sweep; visualizer has no drain_events())
+   └─ Drain group_slot (when INBOX_TOPIC_GROUP is set in slot_bits)
+      └─ Apply group deltas, fire on_group_update, persist last played server
 
-4. Role event draining (each role's impl_->drain_events(), gated on impl_->needs_drain(slot_bits))
-   ├─ player_->impl_->drain_events()
-   ├─ controller_->impl_->drain_events()
-   ├─ metadata_->impl_->drain_events()
-   ├─ color_->impl_->drain_events()
-   └─ artwork_->impl_->drain_events()   (display-deadline sweep; visualizer has no drain_events())
-
-5. Drain group_slot (when INBOX_TOPIC_GROUP is set in slot_bits)
-   └─ Apply group deltas, fire on_group_update, persist last played server
+4. Drive a pending request_stop() to completion (only while STOPPING): once every role thread has
+   reported exit and no connection remains, or the grace deadline passes, call finish_stop()
 ```
 
 This ordering matters: connection lifecycle events are processed before role events, and time sync before audio processing, so that roles always see a consistent connection and time state.
+
+`drain_inbox_events()` (step 3) is a standalone private method, not inlined into `loop()`: `finish_stop()` (`SendspinClient::stop()`/a completing `request_stop()`) calls it a second time, after tearing the connection and role threads down but before firing `on_stopped()`. This guarantees the roles' clear callbacks that `cleanup_connection_state()` just queued (STREAM_END / `*_CLEARED` / the artwork and visualizer stream events) are delivered before `on_stopped()` signals completion, rather than waiting for a consumer `loop()` call that may never come once the client reports itself stopped. See "Manager Shutdown" below.
 
 Each `loop()` section that would otherwise take a mutex first consults a lock-free atomic hint, so an idle tick pays only for the atomic loads it needs to decide there is nothing to do. `ConnectionManager` keeps four such hints, each refreshed under the owning mutex right after the container/pointer it mirrors changes (always re-derived from `.size()` or the assigned value, never incremented in place, so the hint cannot drift from ground truth):
 
@@ -255,7 +259,7 @@ Each `loop()` section that would otherwise take a mutex first consults a lock-fr
 
 Steady state is therefore cheap: connected-and-idle costs one `conn_ptr_mutex_` acquisition (the current/nursery copy ahead of the `conn->loop()` calls) plus a handful of atomic loads; disconnected-and-idle costs zero mutex acquisitions. The mutex-protected containers and pointers remain the ground truth in every case; the hints only decide whether it is worth locking to look.
 
-The Inbox drain steps gate the same way, off two lock-free `poll()` snapshots of the topic bitmask. `inbox_bits` is taken first and gates only the event-ring drain (step 3). `slot_bits` is taken *after* that drain completes and gates the role drains (step 4) and the group drain (step 5); the second snapshot catches topic bits a producer set while the ring drain was running (including a ring event's own side effects re-entering the inbox). A bit either snapshot races and misses is not lost - it stays set and the next tick's `poll()` observes it (bounded staleness, per `Inbox::poll()`). Each role's `needs_drain(slot_bits)` decides whether its drain runs: mostly a simple `slot_bits & INBOX_TOPIC_*` test, but the player, metadata, and artwork roles OR in a main-thread-only carry-over term (the player's `awaiting_sync_idle_events`, the metadata role's future-dated `held_delta`, the artwork role's nonzero `held_display_mask`) so that work waiting out a deadline no inbox bit tracks still gets a drain every tick until it fires.
+The Inbox drain steps inside `drain_inbox_events()` gate the same way, off two lock-free `poll()` snapshots of the topic bitmask. `inbox_bits` is taken first and gates only the event-ring drain. `slot_bits` is taken *after* that drain completes and gates the role drains and the group drain; the second snapshot catches topic bits a producer set while the ring drain was running (including a ring event's own side effects re-entering the inbox). A bit either snapshot races and misses is not lost - it stays set and the next tick's `poll()` observes it (bounded staleness, per `Inbox::poll()`). Each role's `needs_drain(slot_bits)` decides whether its drain runs: mostly a simple `slot_bits & INBOX_TOPIC_*` test, but the player, metadata, and artwork roles OR in a main-thread-only carry-over term (the player's `awaiting_sync_idle_events`, the metadata role's future-dated `held_delta`, the artwork role's nonzero `held_display_mask`) so that work waiting out a deadline no inbox bit tracks still gets a drain every tick until it fires.
 
 ## Role Event Draining
 
@@ -469,6 +473,10 @@ When a connection is lost (`on_connection_lost`):
 
 While `accepting_` is false, `on_new_connection()` rejects a newly delivered peer with a goodbye instead of admitting it into a nursery that is about to be drained, and `loop()`'s server-start block is gated so a stop in progress cannot belatedly open the server. `accepting_` is authoritative control state (set by `init_server()`, cleared by `begin_stop()`/`stop()`), unlike the manager's other atomics, which are lock-free hints over mutex-protected containers.
 
+`loop()`'s promotion scan is gated on `accepting_` too, for the same reason: `disconnect()`'s connected-nursery branch (invoked by `begin_stop()`) sends a goodbye but, unlike `release_nursery_entry()`, does not call `disable_message_dispatch()` on it -- disconnect() is also the public per-connection API, and disabling dispatch there would change its non-shutdown behavior. So a connected nursery peer's dispatch stays enabled through the STOPPING window, and an in-flight `server/hello` can still flip its `is_handshake_complete()` after the goodbye went out. Skipping the whole scan while `!accepting_` leaves such a peer parked in the nursery rather than promoted to `current_connection_` (which would hand it a `client/state` message after it was already told SHUTDOWN, and would keep `has_connections()` true for no reason); `stop()`'s force-drain releases it without a second goodbye, and `accepting_` is set again by the next `init_server()` before any future promotion.
+
+`SendspinClient::finish_stop()` (the shared teardown behind both `stop()` and a completing `request_stop()`) guards against re-entrancy with a `tearing_down_` flag and keeps `run_state_` at `STOPPING` (never `STOPPED`) for the duration: `connection_manager_->stop()` synchronously reaches `cleanup_connection_state()`, which can invoke a listener callback (`on_release_high_performance()`, whenever a time-sync burst is in flight) that calls back into `start()`/`stop()`/`request_stop()`/`connect_to()`. With `run_state_` still `STOPPING`, those calls refuse or no-op instead of racing the teardown in progress (`start()` in particular would otherwise see `STOPPED` and spin up a second set of role threads and server on top of the one being torn down). `finish_stop()` sets `run_state_ = STOPPED` and clears `tearing_down_` only at the very end, right before firing `on_stopped()`, so that calling `start()` again from inside `on_stopped()` -- a documented, supported pattern -- still works normally.
+
 ### Server connection ownership (ESP)
 
 On the ESP build, `SendspinServerConnection` lifetime is pinned to the httpd session rather than to `ConnectionManager`:
@@ -527,3 +535,5 @@ A listener callback fired from the main loop can synchronously re-enter connecti
 - `PlayerRole::Impl::cleanup_generation`, bumped by the player's `cleanup()`. `drain_events()` snapshots it around each `on_stream_start()` call; if it changes, the stream was torn down from inside the callback, so the player abandons the rest of the batch rather than re-arm the sync task for a dead stream. `stream_active` is set before the callback runs, so the STREAM_END that `cleanup()` enqueued still passes its gate and delivers a paired `on_stream_end()`.
 
 Neither counter needs atomics: they only let an in-flight drain notice that teardown ran underneath it and stop touching state that cleanup already reset.
+
+A related but distinct guard covers the teardown call itself rather than an in-flight drain: `SendspinClient::tearing_down_`, a plain `bool` set for the duration of `finish_stop()`. The same `cleanup_connection_state()` call above can invoke `on_release_high_performance()` (whenever a time-sync burst is in flight), and a listener that calls `stop()`/`request_stop()`/`start()`/`connect_to()` from inside that callback must not recurse into a second `finish_stop()` or observe `run_state_ == STOPPED` mid-teardown. See "Manager Shutdown" above.

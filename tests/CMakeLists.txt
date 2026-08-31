@@ -22,6 +22,7 @@ FetchContent_MakeAvailable(googletest)
 add_executable(sendspin_tests
     test_audio_stream_info.cpp
     test_connection_lifecycle.cpp
+    test_connection_manager.cpp
     test_time_filter.cpp
     test_protocol.cpp
     test_network_info.cpp
@@ -33,8 +34,11 @@ add_executable(sendspin_tests
 )
 
 # test_sync_task.cpp stages internal SyncTask states (partial init, mid-stream stop) directly;
-# disable access control for that one TU instead of adding test seams to the production code.
-set_source_files_properties(test_sync_task.cpp PROPERTIES COMPILE_OPTIONS "-fno-access-control")
+# test_connection_manager.cpp reaches ConnectionManager's private nursery_/accepting_ state to
+# reproduce a STOPPING-window race not reliably reproducible through a real socket. Disable
+# access control for these TUs instead of adding test seams to the production code.
+set_source_files_properties(test_sync_task.cpp test_connection_manager.cpp
+                             PROPERTIES COMPILE_OPTIONS "-fno-access-control")
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...).
 # The public include/ dir and ArduinoJson propagate transitively from `sendspin`.

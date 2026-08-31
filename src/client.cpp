@@ -232,13 +232,47 @@ void SendspinClient::loop() {
     }
 
     // Process deferred events: all state mutations and user callbacks happen here, on the main
-    // loop thread, to avoid cross-thread data races. Two poll() snapshots gate the work below:
-    // inbox_bits (here) gates only the event-ring drain immediately following it; slot_bits
-    // (taken after that drain completes, below) gates the role drains and the group-update drain,
-    // since a role's InboxSlot can be written by a producer between this snapshot and that one.
-    // Both are lock-free atomic loads, so a tick with nothing pending performs zero inbox mutex
-    // acquisitions in this section. A bit either snapshot races and misses is picked up by the
-    // next tick's poll() -- bounded staleness, already documented on Inbox::poll().
+    // loop thread, to avoid cross-thread data races. See drain_inbox_events() for the two-snapshot
+    // gating rationale.
+    this->drain_inbox_events();
+
+    // Drive a pending request_stop() to completion. Runs after the manager loop above so this
+    // tick's close events are already reflected in has_connections(). Completion waits for every
+    // role thread to report exit, so finish_stop()'s joins are instant on this path; the
+    // deadline caps the wait when a peer never delivers its close or a thread is stuck in
+    // in-flight work, at the cost of a bounded blocking join on that final tick.
+    if (this->run_state_ == SendspinRunState::STOPPING) {
+        bool roles_done = true;
+#ifdef SENDSPIN_ENABLE_PLAYER
+        if (this->player_) {
+            roles_done = this->player_->impl_->has_stopped();
+        }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+        if (roles_done && this->visualizer_) {
+            roles_done = this->visualizer_->impl_->has_stopped();
+        }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+        if (roles_done && this->artwork_) {
+            roles_done = this->artwork_->impl_->has_stopped();
+        }
+#endif
+        if ((roles_done && !this->connection_manager_->has_connections()) ||
+            platform_time_us() >= this->stop_deadline_us_) {
+            this->finish_stop(/*notify=*/true);
+        }
+    }
+}
+
+void SendspinClient::drain_inbox_events() {
+    // Two poll() snapshots gate the work below: inbox_bits (here) gates only the event-ring drain
+    // immediately following it; slot_bits (taken after that drain completes, below) gates the role
+    // drains and the group-update drain, since a role's InboxSlot can be written by a producer
+    // between this snapshot and that one. Both are lock-free atomic loads, so a tick with nothing
+    // pending performs zero inbox mutex acquisitions in this section. A bit either snapshot races
+    // and misses is picked up by the next tick's poll() -- bounded staleness, already documented on
+    // Inbox::poll().
     const uint32_t inbox_bits = this->event_state_->inbox.poll();
 
     // --- Time sync events ---
@@ -434,34 +468,6 @@ void SendspinClient::loop() {
                         : "unchanged",
                     this->group_state_.group_id.value_or("").c_str(),
                     this->group_state_.group_name.value_or("").c_str());
-        }
-    }
-
-    // Drive a pending request_stop() to completion. Runs after the manager loop above so this
-    // tick's close events are already reflected in has_connections(). Completion waits for every
-    // role thread to report exit, so finish_stop()'s joins are instant on this path; the
-    // deadline caps the wait when a peer never delivers its close or a thread is stuck in
-    // in-flight work, at the cost of a bounded blocking join on that final tick.
-    if (this->run_state_ == SendspinRunState::STOPPING) {
-        bool roles_done = true;
-#ifdef SENDSPIN_ENABLE_PLAYER
-        if (this->player_) {
-            roles_done = this->player_->impl_->has_stopped();
-        }
-#endif
-#ifdef SENDSPIN_ENABLE_VISUALIZER
-        if (roles_done && this->visualizer_) {
-            roles_done = this->visualizer_->impl_->has_stopped();
-        }
-#endif
-#ifdef SENDSPIN_ENABLE_ARTWORK
-        if (roles_done && this->artwork_) {
-            roles_done = this->artwork_->impl_->has_stopped();
-        }
-#endif
-        if ((roles_done && !this->connection_manager_->has_connections()) ||
-            platform_time_us() >= this->stop_deadline_us_) {
-            this->finish_stop(/*notify=*/true);
         }
     }
 }
@@ -693,12 +699,27 @@ void SendspinClient::stop_role_threads() {
 }
 
 void SendspinClient::finish_stop(bool notify) {
-    this->run_state_ = SendspinRunState::STOPPED;
+    // Re-entrancy guard: teardown below runs connection_manager_->stop(), which synchronously
+    // invokes listener callbacks (e.g. cleanup_connection_state() -> release_high_performance()
+    // -> on_release_high_performance() whenever a time-sync burst is in flight). A listener that
+    // calls stop()/request_stop()/start()/connect_to() from inside such a callback must not
+    // recurse into a second teardown or observe a state that lets it race the one in progress.
+    if (this->tearing_down_) {
+        return;
+    }
+    this->tearing_down_ = true;
+
+    // Force (rather than assert) STOPPING: stop() can reach here directly from RUNNING, not only
+    // via a completing request_stop(). Staying in STOPPING (never STOPPED) for the duration means
+    // start() explicitly refuses and connect_to()/request_stop() no-op if a listener callback
+    // reached during teardown calls back into the client, instead of start() seeing STOPPED and
+    // spinning up a second set of role threads and server on top of the teardown still in flight.
+    this->run_state_ = SendspinRunState::STOPPING;
 
     // Goodbye and close every connection, then stop the WebSocket server so no new connections
     // arrive. Dropping the current slot inside runs cleanup_connection_state(), which quiesces
     // per-connection state (time burst, role state, high-performance holds) and queues the
-    // roles' clear callbacks for the next loop().
+    // roles' clear callbacks for drain_inbox_events() below.
     this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
 
     // Join role threads only after the connection teardown above has signaled their streams
@@ -709,9 +730,24 @@ void SendspinClient::finish_stop(bool notify) {
     // accumulator that would otherwise keep serving the old session's group, and a stale state_
     // (e.g. ERROR) would be republished verbatim to the next server on handshake. Reset here
     // rather than in cleanup_connection_state(), which also runs on reconnects and handoffs
-    // where carrying the state forward is intentional.
+    // where carrying the state forward is intentional. Runs before drain_inbox_events() below so
+    // that drain cannot resurrect a stale group_state_/state_ even in the (already guarded-against
+    // by cleanup_connection_state()'s group_slot.reset()) case of a leftover group update.
     this->group_state_ = GroupUpdateObject{};
     this->state_ = SendspinClientState::SYNCHRONIZED;
+
+    // Deliver the roles' clear callbacks (STREAM_END / CONTROLLER_CLEARED / METADATA_CLEARED /
+    // COLOR_CLEARED / artwork+visualizer stream events) queued by cleanup_connection_state() above
+    // before on_stopped() fires below: the header documents on_stopped() as the signal that it is
+    // safe to destroy the client, so those callbacks must already have run by then rather than
+    // waiting for a consumer's next loop() call that may never come.
+    this->drain_inbox_events();
+
+    this->run_state_ = SendspinRunState::STOPPED;
+    // Clear before notifying: on_stopped() is documented to allow calling start() again from
+    // inside the callback, which requires run_state_ == STOPPED and tearing_down_ == false to
+    // proceed normally.
+    this->tearing_down_ = false;
 
     if (notify && this->listener_ != nullptr) {
         this->listener_->on_stopped();

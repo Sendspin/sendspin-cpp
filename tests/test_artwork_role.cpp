@@ -960,9 +960,11 @@ TEST(ArtworkDisplayLateness, HugeLatenessSaturatesAtUint32Max) {
 // Lifecycle: stop()/start() restart
 // ============================================================================
 
-// A stop()/start() cycle must yield a live decode thread again: stop() leaves COMMAND_STOP set
-// in the surviving flag object, and a start() that does not clear it spawns a thread that exits
-// on its very first flag check, silently killing artwork delivery for the rest of the process.
+// A stop()/start() cycle must yield a live decode thread again. This exercises the plain
+// stop()/start() path, where the drain thread's own exiting wait() call already self-clears
+// COMMAND_STOP, so start()'s clear of the surviving flag object is a no-op here; see
+// RequestStopReportsExitAndRestarts below for the async path where that clear is load-bearing
+// (stop() re-sets COMMAND_STOP on an already-dead thread, leaving it stale for the next start()).
 TEST(ArtworkLifecycle, RestartDecodesAgain) {
     auto impl = make_impl(make_single_slot_config(false));
     RecordingListener listener;

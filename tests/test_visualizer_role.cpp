@@ -229,7 +229,9 @@ std::unique_ptr<VisualizerRole::Impl> make_impl() {
     return impl;
 }
 
-// Pops one entry from the ring buffer, or returns false if none is waiting.
+// Pops one entry from the ring buffer, or returns false if none is waiting. Not safe to call
+// while the drain thread may still be running: receive()/return_item() assume exactly one
+// consumer (SPSC), and the drain thread is the other one. Callers must stop() first.
 bool pop_entry(VisualizerRole::Impl& impl, std::vector<uint8_t>& out) {
     size_t size = 0;
     void* item = impl.drain_task->ring_buffer.receive(&size, 0);
@@ -240,6 +242,21 @@ bool pop_entry(VisualizerRole::Impl& impl, std::vector<uint8_t>& out) {
     out.assign(bytes, bytes + size);
     impl.drain_task->ring_buffer.return_item(item);
     return true;
+}
+
+// Polls the ring's occupancy count -- not its content -- until it drains or the deadline elapses.
+// is_empty() locks the same mutex as receive()/return_item() for a plain size read, so unlike
+// pop_entry() above it is safe to call while the drain thread is live: it is a size query, not a
+// second consumer.
+bool wait_for_ring_empty(VisualizerRole::Impl& impl, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+        if (impl.drain_task->ring_buffer.is_empty()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return impl.drain_task->ring_buffer.is_empty();
 }
 
 }  // namespace
@@ -437,12 +454,14 @@ std::unique_ptr<VisualizerRole::Impl> make_impl_with_client() {
 
 }  // namespace
 
-// A stop()/start() cycle must yield a live drain thread again: stop() leaves COMMAND_STOP set
-// in the surviving flag object, and a start() that does not clear it spawns a thread that exits
-// on its very first flag check, silently killing visualizer delivery for the rest of the
-// process. Liveness is observed through consumption: the restarted thread drains the entry
-// (dropping it for lack of time sync), so the ring is empty once it is stopped again; a dead
-// thread leaves the entry in place.
+// A stop()/start() cycle must yield a live drain thread again. This exercises the plain
+// stop()/start() path, where the drain thread's own exiting wait() call already self-clears
+// COMMAND_STOP, so start()'s clear of the surviving flag object is a no-op here; see
+// RequestStopReportsExitAndRestarts below for the async path where that clear is load-bearing
+// (stop() re-sets COMMAND_STOP on an already-dead thread, leaving it stale for the next start()).
+// Liveness is observed through consumption: the restarted thread drains the entry (dropping it
+// for lack of time sync), so the ring empties on its own; a dead thread leaves the entry in place
+// forever, which wait_for_ring_empty()'s deadline turns into a bounded failure instead of a hang.
 TEST(VisualizerLifecycle, RestartDrainsAgain) {
     auto impl = make_impl_with_client();
     ASSERT_TRUE(impl->start());
@@ -454,9 +473,41 @@ TEST(VisualizerLifecycle, RestartDrainsAgain) {
     put_be16(data, 0xABCD);
     impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
 
-    // Generously past the drain thread's 50 ms receive timeout; the final stop() then makes it
-    // safe for the test thread to probe the SPSC ring as the sole consumer.
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    // Poll occupancy (safe with the drain thread live) rather than sleeping a fixed guess past
+    // its 50 ms receive timeout; stop() below then makes it safe for the test thread to pop_entry()
+    // as the sole consumer.
+    ASSERT_TRUE(wait_for_ring_empty(*impl, std::chrono::seconds(2)));
+    impl->stop();
+
+    std::vector<uint8_t> entry;
+    EXPECT_FALSE(pop_entry(*impl, entry));
+}
+
+// An entry queued into the ring before stop() must not survive into a restarted session, where
+// it would be decoded against the new session's spectrum_bin_count/tracks_downbeats. Forces the
+// "already dead, not yet flushed" window precisely: request_stop() lets the drain thread exit
+// (self-reported via has_stopped()) without stop() ever running, so the entry pushed right after
+// is guaranteed to still be sitting in the ring, with no consumer thread live to race it, when
+// stop() is finally called -- exactly the network-thread-pushes-during-the-grace-window scenario
+// the fix (flush_ring_buffer() after join() in stop()) covers.
+TEST(VisualizerLifecycle, StopDrainsEntryQueuedBeforeStop) {
+    auto impl = make_impl_with_client();
+    ASSERT_TRUE(impl->start());
+
+    impl->request_stop();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!impl->has_stopped() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(impl->has_stopped());
+
+    // The drain thread has already exited, so this push has no consumer racing it.
+    std::vector<uint8_t> data;
+    put_be64(data, 123456);
+    put_be16(data, 0xABCD);
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+
+    // Joins the already-dead thread, then (with the fix) flushes the ring before returning.
     impl->stop();
 
     std::vector<uint8_t> entry;
