@@ -369,9 +369,14 @@ void ConnectionManager::loop() {
             // so arm its hello. (Inbound connections arrive already upgraded and armed theirs at
             // admission.) Guarded by nursery membership: a connection promoted or released by an
             // earlier event is skipped, and a duplicate event just re-arms the retry in place.
-            for (auto& conn : connected_events) {
-                if (this->find_in_nursery(conn.get()) != this->nursery_.end()) {
-                    this->initiate_hello(conn.get());
+            // Skipped while stopping, for the same reason as the hello retry scan below: a peer
+            // whose upgrade lands inside the goodbye window must not be handed a client/hello
+            // after it was already told SHUTDOWN.
+            if (this->accepting_.load(std::memory_order_acquire)) {
+                for (auto& conn : connected_events) {
+                    if (this->find_in_nursery(conn.get()) != this->nursery_.end()) {
+                        this->initiate_hello(conn.get());
+                    }
                 }
             }
 
@@ -390,10 +395,12 @@ void ConnectionManager::loop() {
             // entries, not for the connected-nursery entries it hands to the caller for a
             // transport-level disconnect()), so an in-flight server/hello can still flip
             // is_handshake_complete() during the STOPPING window. Promoting that peer here would
-            // hand it a client/state message after it was already told SHUTDOWN, and would keep
-            // has_connections() true and stall stop()'s deadline wait. Leaving it in the nursery is
-            // safe: stop()'s force-drain releases it (no further goodbye needed, one was already
-            // sent), and accepting_ is set again by init_server() before any future promotion.
+            // hand it a client/state message after it was already told SHUTDOWN. (It makes no
+            // difference to the teardown deadline either way: has_connections() counts nursery
+            // entries as well as the current slot, and both slots are released by the same close
+            // event or by stop()'s force-drain.) Leaving it in the nursery is safe: stop()'s
+            // force-drain releases it (no further goodbye needed, one was already sent), and
+            // accepting_ is set again by init_server() before any future promotion.
             if (this->accepting_.load(std::memory_order_acquire)) {
                 for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
                     if (!it->conn->is_handshake_complete()) {
@@ -480,7 +487,16 @@ void ConnectionManager::loop() {
 
         // Check hello retry timers (one entry per managed connection, so a second connection
         // arriving mid-handshake cannot clobber the first connection's pending hello).
-        {
+        //
+        // Skipped entirely while the manager is stopping (accepting_ cleared), for the same
+        // reason the promotion scan above is: begin_stop() goodbyes every connected nursery peer
+        // but leaves it in the nursery with its retry entry intact (disconnect() only releases
+        // the unconnected entries). initiate_hello() never sends inline -- it arms an entry whose
+        // send happens on a later tick through this scan -- so without this guard a peer admitted
+        // in the tick before request_stop() would be sent a client/hello after it was already
+        // told SHUTDOWN. Nothing leaks by skipping: every path that erases from nursery_ calls
+        // remove_hello_retry(), and stop()'s force-drain releases whatever is still parked.
+        if (this->accepting_.load(std::memory_order_acquire)) {
             const int64_t now_us = platform_time_us();
             for (auto it = this->hello_retries_.begin(); it != this->hello_retries_.end();) {
                 HelloRetryState& retry = *it;

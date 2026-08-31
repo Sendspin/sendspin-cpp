@@ -257,7 +257,7 @@ public:
     /// whichever comes first. Unlike stop(), the WebSocket server stays up through the grace
     /// window, so on ESP-IDF the queued goodbye sends actually flush before the server is torn
     /// down. Completion is signaled by SendspinClientListener::on_stopped() and observable via
-    /// run_state() == STOPPED, after which start() may be called again. No-op unless running.
+    /// get_run_state() == STOPPED, after which start() may be called again. No-op unless running.
     void request_stop();
 
     /// @brief Legacy name for start(), kept for source compatibility
