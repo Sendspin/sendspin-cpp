@@ -690,8 +690,8 @@ void SendspinClient::cleanup_connection_state() {
 void SendspinClient::stop_role_threads() {
     // Signal every role before joining any, so their receive timeouts elapse concurrently rather
     // than in series: each role's stop() below both signals and joins, so without this an idle
-    // client would wait out the sum of the three timeouts instead of the longest one
-    // (ROLE_STOP_LATENCY_MS). Re-signalling inside stop() is harmless, the flags are idempotent.
+    // client would wait out the sum of the three timeouts instead of the longest one (the sync
+    // task's 500 ms idle poll). Re-signalling inside stop() is harmless, the flags are idempotent.
     // The request_stop() path has already signalled them by the time it reaches here; this makes
     // the direct stop() path behave the same way.
     this->request_stop_role_threads();
