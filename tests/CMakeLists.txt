@@ -31,6 +31,12 @@ add_executable(sendspin_tests
     test_artwork_role.cpp
 )
 
+# The source suite is registered only when the role is compiled in, so a
+# -DSENDSPIN_ENABLE_SOURCE=OFF test build still links.
+if(SENDSPIN_ENABLE_SOURCE)
+    target_sources(sendspin_tests PRIVATE test_source_role.cpp)
+endif()
+
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...).
 # The public include/ dir and ArduinoJson propagate transitively from `sendspin`.
 # Use CMAKE_CURRENT_SOURCE_DIR (not CMAKE_SOURCE_DIR) so the path stays correct even

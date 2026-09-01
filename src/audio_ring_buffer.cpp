@@ -25,10 +25,11 @@ static const char* const TAG = "sendspin.ring_buffer";
 // Constructor / Destructor
 // ============================================================================
 
-std::unique_ptr<SendspinAudioRingBuffer> SendspinAudioRingBuffer::create(size_t buffer_size) {
+std::unique_ptr<SendspinAudioRingBuffer> SendspinAudioRingBuffer::create(size_t buffer_size,
+                                                                         MemoryLocation location) {
     auto rb = std::unique_ptr<SendspinAudioRingBuffer>(new SendspinAudioRingBuffer());
 
-    if (!rb->storage_.allocate(buffer_size)) {
+    if (!rb->storage_.allocate(buffer_size, location)) {
         SS_LOGE(TAG, "Failed to allocate %zu bytes for ring buffer", buffer_size);
         return nullptr;
     }

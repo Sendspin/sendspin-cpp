@@ -26,12 +26,26 @@ function(sendspin_get_sources BASE_DIR)
         PARENT_SCOPE
     )
 
+    # Shared audio sources — appended when any role that moves audio through the SPSC ring
+    # buffer is enabled (player or source), so the filename lives in exactly one list
+    set(SENDSPIN_AUDIO_SOURCES
+        ${BASE_DIR}/src/audio_ring_buffer.cpp
+
+        PARENT_SCOPE
+    )
+
     # Per-role source sets — conditionally compiled based on SENDSPIN_ENABLE_* options
     set(SENDSPIN_PLAYER_SOURCES
         ${BASE_DIR}/src/player_role.cpp
-        ${BASE_DIR}/src/audio_ring_buffer.cpp
         ${BASE_DIR}/src/decoder.cpp
         ${BASE_DIR}/src/sync_task.cpp
+
+        PARENT_SCOPE
+    )
+
+    set(SENDSPIN_SOURCE_SOURCES
+        ${BASE_DIR}/src/source_role.cpp
+        ${BASE_DIR}/src/source_task.cpp
 
         PARENT_SCOPE
     )

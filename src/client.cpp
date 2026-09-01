@@ -37,6 +37,9 @@
 #ifdef SENDSPIN_ENABLE_PLAYER
 #include "player_role_impl.h"
 #endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+#include "source_role_impl.h"
+#endif
 #include "protocol_messages.h"
 #ifdef SENDSPIN_ENABLE_VISUALIZER
 #include "visualizer_role_impl.h"
@@ -82,9 +85,13 @@ SendspinClient::~SendspinClient() {
     // Stop background threads before tearing down connections. Every role is reset explicitly
     // (not just the threaded ones): role InboxSlots release their topic-bit claims against
     // event_state_'s Inbox on destruction, so all roles must be gone before the alphabetized
-    // member order destroys event_state_.
+    // member order destroys event_state_. The source role additionally holds a raw
+    // ConnectionManager* for its task, so it must be gone before connection_manager_ below.
 #ifdef SENDSPIN_ENABLE_PLAYER
     this->player_.reset();
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    this->source_.reset();
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     this->visualizer_.reset();
@@ -141,6 +148,14 @@ bool SendspinClient::start_server() {
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_) {
         if (!this->artwork_->impl_->start()) {
+            return false;
+        }
+    }
+#endif
+
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_) {
+        if (!this->source_->impl_->start()) {
             return false;
         }
     }
@@ -305,6 +320,16 @@ void SendspinClient::loop() {
 #endif
                         break;
                     }
+                    // Appended to the role's pending events; dispatched by this tick's drain
+                    case InboxEventType::SOURCE_STREAM: {
+#ifdef SENDSPIN_ENABLE_SOURCE
+                        if (this->source_) {
+                            this->source_->impl_->on_stream_ring_event(
+                                static_cast<SourceStreamCallbackType>(event.code));
+                        }
+#endif
+                        break;
+                    }
                     default: {
                         // Every InboxEventType is dispatched above; this guards only against a
                         // corrupted enum value.
@@ -355,6 +380,11 @@ void SendspinClient::loop() {
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_ && this->artwork_->impl_->needs_drain(slot_bits)) {
         this->artwork_->impl_->drain_events();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_ && this->source_->impl_->needs_drain(slot_bits)) {
+        this->source_->impl_->drain_events();
     }
 #endif
 
@@ -458,6 +488,19 @@ VisualizerRole& SendspinClient::add_visualizer(VisualizerRoleConfig config) {
     this->visualizer_ = std::make_unique<VisualizerRole>(std::move(config), this);
     this->visualizer_->impl_->attach_inbox(this->event_state_->inbox);
     return *this->visualizer_;
+}
+#endif
+
+#ifdef SENDSPIN_ENABLE_SOURCE
+SourceRole& SendspinClient::add_source(SourceRoleConfig config) {
+    if (this->started_) {
+        SS_LOGW(TAG, "add_source() called after start_server()");
+    }
+    this->source_ = std::make_unique<SourceRole>(config, this);
+    this->source_->impl_->attach_inbox(this->event_state_->inbox);
+    // Only SendspinClient can reach the manager; it outlives the role (destructor order)
+    this->source_->impl_->connection_manager = this->connection_manager_.get();
+    return *this->source_;
 }
 #endif
 
@@ -590,6 +633,11 @@ void SendspinClient::cleanup_connection_state() {
         this->visualizer_->impl_->cleanup();
     }
 #endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_) {
+        this->source_->impl_->cleanup();
+    }
+#endif
 
     // Release high-performance networking for time sync
     if (this->high_performance_held_for_time_) {
@@ -653,6 +701,11 @@ std::string SendspinClient::build_hello_message() {
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     if (this->visualizer_) {
         this->visualizer_->impl_->build_hello_fields(msg);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_) {
+        this->source_->impl_->build_hello_fields(msg);
     }
 #endif
 
@@ -880,6 +933,18 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                 }
             }
 #endif
+
+#ifdef SENDSPIN_ENABLE_SOURCE
+            if (this->source_ != nullptr && conn != nullptr) {
+                SourceCommand source_cmd{};
+                if (process_server_command_source(root, &source_cmd)) {
+                    // The instance id lets the main-loop latch discard stale-connection
+                    // commands (per-connection permission; Sendspin spec, Source messages)
+                    this->source_->impl_->handle_server_command(source_cmd,
+                                                                conn->get_instance_id());
+                }
+            }
+#endif
             break;
         }
         case SendspinServerToClientMessageType::GROUP_UPDATE: {
@@ -967,6 +1032,12 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_) {
         this->player_->impl_->build_state_fields(state_msg);
+    }
+#endif
+
+#ifdef SENDSPIN_ENABLE_SOURCE
+    if (this->source_) {
+        this->source_->impl_->build_state_fields(state_msg);
     }
 #endif
 
