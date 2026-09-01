@@ -29,6 +29,7 @@ add_executable(sendspin_tests
     test_inbox.cpp
     test_visualizer_role.cpp
     test_artwork_role.cpp
+    test_announcement_role.cpp
 )
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...).
