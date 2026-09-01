@@ -11,7 +11,8 @@ dependencies:
   esphome/micro-opus:
     version: ">=0.3.5"
     rules:
-      - if: "$CONFIG{SENDSPIN_ENABLE_PLAYER} == True"
+      # Opus decode for the player role, Opus encode for the source role.
+      - if: "$CONFIG{SENDSPIN_ENABLE_PLAYER} == True || $CONFIG{SENDSPIN_ENABLE_SOURCE} == True"
 description: "Sendspin synchronized audio streaming client for ESP32"
 license: "Apache-2.0"
 maintainers:

@@ -21,6 +21,7 @@
 #include "platform/thread.h"
 #include "platform/time.h"
 #include "protocol_messages.h"
+#include "source_encoder_opus.h"
 #include "source_role_impl.h"
 #include "time_filter.h"
 
@@ -33,7 +34,7 @@ namespace sendspin {
 static const char* const TAG = "sendspin.source_task";
 
 /// @brief Same budget as the sync task: the deepest paths are the stream start/end JSON build
-/// and the transport send
+/// and the transport send; Opus working buffers live on micro-opus's pseudostack, not here
 static constexpr size_t SOURCE_TASK_STACK_SIZE = 6192;
 
 /// @brief Ring receive timeout (ms) bounding how long the task waits before re-checking the
@@ -104,15 +105,25 @@ bool SourceTask::init(SourceRole::Impl* source_impl, SendspinClient* client,
         return false;
     }
 
-    if (!this->staging_.allocate(SOURCE_WIRE_HEADER_SIZE + this->chunk_bytes_,
+    size_t payload_capacity = this->chunk_bytes_;
+    if (config.codec == SendspinCodecFormat::OPUS) {
+        auto opus_encoder = std::make_unique<OpusSourceEncoder>();
+        if (!opus_encoder->init(config)) {
+            return false;  // Cause already logged; no streaming without a working encoder
+        }
+        this->encoder_ = std::move(opus_encoder);
+        // An opus packet can exceed the chunk's PCM size (small chunks vs a high bitrate), so
+        // the payload area covers the encoder's max packet: no accepted config drops on capacity
+        payload_capacity = std::max(payload_capacity, OpusSourceEncoder::MAX_PACKET_BYTES);
+    } else {
+        this->encoder_ = std::make_unique<PcmPassthroughEncoder>();
+    }
+
+    if (!this->staging_.allocate(SOURCE_WIRE_HEADER_SIZE + payload_capacity,
                                  config.buffer_location)) {
         SS_LOGE(TAG, "Couldn't allocate chunk staging buffer.");
         return false;
     }
-
-    // Config validation admits only PCM, so the passthrough is the only encoder to construct;
-    // the seam exists for the Opus encoder to slot in (see source_encoder.h)
-    this->encoder_ = std::make_unique<PcmPassthroughEncoder>();
 
     this->send_complete_cb_ = [this](bool ok) {
         this->last_send_ok_.store(ok, std::memory_order_release);
