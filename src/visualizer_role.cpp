@@ -77,14 +77,6 @@ static constexpr int64_t TOO_OLD_THRESHOLD_US = 20000;  // 20ms
 // Big-endian helpers
 // ============================================================================
 
-static int64_t read_be64(const uint8_t* p) {
-    uint64_t val = 0;
-    for (int i = 0; i < 8; ++i) {
-        val = (val << 8) | p[i];
-    }
-    return static_cast<int64_t>(val);
-}
-
 static uint16_t read_be16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0]) << 8 | static_cast<uint16_t>(p[1]);
 }
@@ -540,7 +532,7 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
         }
         auto* raw = static_cast<const uint8_t*>(item);
         uint8_t wire_type = raw[0];
-        int64_t server_ts = read_be64(raw + ENTRY_TYPE_SIZE);
+        int64_t server_ts = be64_to_host(raw + ENTRY_TYPE_SIZE);
         int64_t client_ts = self->client->get_client_time(server_ts);
 
         if (client_ts == 0) {

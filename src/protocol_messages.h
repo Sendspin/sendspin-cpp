@@ -47,32 +47,59 @@ namespace sendspin {
 enum SendspinBinaryRole : uint8_t {
     SENDSPIN_ROLE_PLAYER = 1,   // 000001xx (IDs 4-7)
     SENDSPIN_ROLE_ARTWORK = 2,  // 000010xx (IDs 8-11)
+    SENDSPIN_ROLE_SOURCE = 3,   // 000011xx (IDs 12-15), outbound-only: never inbound-dispatched
 };
 
 /// @brief Extracts the role field from a standard 4-slot binary message type byte
 /// @param type Binary message type byte.
 /// @return Role portion of the type (bits 7-2).
-/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK, IDs 4-11). The visualizer
-///          range (IDs 16-23) is dispatched by range in SendspinClient::process_binary_message
-///          and must not be routed through this helper: get_binary_role(16) yields 4, which
-///          matches no SendspinBinaryRole enumerator.
+/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK IDs 4-11, SOURCE IDs
+///          12-15). The visualizer range (IDs 16-23) is dispatched by range in
+///          SendspinClient::process_binary_message and must not be routed through this helper:
+///          get_binary_role(16) yields 4, which matches no SendspinBinaryRole enumerator.
 inline uint8_t get_binary_role(uint8_t type) {
     return type >> 2;
 }
 /// @brief Extracts the slot field from a standard 4-slot binary message type byte
 /// @param type Binary message type byte.
 /// @return Slot portion of the type (bits 1-0).
-/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK, IDs 4-11). It masks bits
-///          1-0, so it cannot address the visualizer's 8-slot range (e.g. IDs 16 and 20 both
-///          alias to slot 0); those messages are dispatched by range, not by slot.
+/// @warning Valid only for the standard 4-slot roles (PLAYER/ARTWORK IDs 4-11, SOURCE IDs
+///          12-15). It masks bits 1-0, so it cannot address the visualizer's 8-slot range (e.g.
+///          IDs 16 and 20 both alias to slot 0); those messages are dispatched by range, not by
+///          slot.
 inline uint8_t get_binary_slot(uint8_t type) {
     return type & 0x03;
+}
+
+/// @brief Size of the big-endian 64-bit timestamp that follows the type byte in binary messages
+inline constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
+
+/// @brief Decodes a big-endian 64-bit value to host byte order
+/// @param bytes Pointer to at least BINARY_TIMESTAMP_SIZE bytes.
+/// @return The decoded value as a signed 64-bit integer.
+inline int64_t be64_to_host(const uint8_t* bytes) {
+    uint64_t val = 0;
+    for (size_t i = 0; i < BINARY_TIMESTAMP_SIZE; ++i) {
+        val = (val << 8) | bytes[i];
+    }
+    return static_cast<int64_t>(val);
+}
+
+/// @brief Encodes a host 64-bit value as big-endian bytes
+/// @param value Value to encode.
+/// @param bytes [out] Destination for BINARY_TIMESTAMP_SIZE bytes.
+inline void host_to_be64(int64_t value, uint8_t* bytes) {
+    const auto val = static_cast<uint64_t>(value);
+    for (size_t i = 0; i < BINARY_TIMESTAMP_SIZE; ++i) {
+        bytes[i] = static_cast<uint8_t>(val >> (56 - 8 * i));
+    }
 }
 
 /// @brief Binary message type byte values for known message kinds
 enum SendspinBinaryType : uint8_t {
     SENDSPIN_BINARY_PLAYER_AUDIO = 4,   // Player slot 0: encoded audio chunk
     SENDSPIN_BINARY_ARTWORK_IMAGE = 8,  // Artwork slot 0: image data
+    SENDSPIN_BINARY_SOURCE_AUDIO = 12,  // Source slot 0: encoded audio chunk (client->server)
     // Visualizer expanded allocation (IDs 16-23); each data type is its own message
     // carrying exactly one frame of [timestamp:8][data]
     SENDSPIN_BINARY_VISUALIZER_LOUDNESS = 16,  // uint16 A-weighted loudness
@@ -105,6 +132,7 @@ enum class SendspinRole : uint8_t {
     ARTWORK,     // Album artwork role
     VISUALIZER,  // Audio visualization role
     COLOR,       // Audio-derived color palette role
+    SOURCE,      // Audio capture role (streams to the server)
 };
 
 /// @brief Converts a SendspinRole value to its protocol wire string representation
@@ -124,6 +152,8 @@ inline const char* to_cstr(SendspinRole role) {
             return "visualizer@v1";
         case SendspinRole::COLOR:
             return "color@v1";
+        case SendspinRole::SOURCE:
+            return "source@v1";
         default:
             return "unknown";
     }
@@ -605,6 +635,56 @@ struct ServerColorStateDelta {
     std::optional<std::optional<RgbColor>> on_light;
 };
 
+// --- source role ---
+// Unlike the sibling sections above, these types are not mirrored from a public header: the
+// source role has no role class or include/sendspin/ header yet, so its protocol types are
+// internal-only.
+
+/// @brief Commands addressed to the source role in server/command messages
+enum class SourceCommand : uint8_t {
+    START,  // Begin capturing and streaming audio to the server
+    STOP,   // Stop capturing and streaming audio
+};
+
+inline std::optional<SourceCommand> source_command_from_string(const std::string& str) {
+    if (str == "start") {
+        return SourceCommand::START;
+    }
+    if (str == "stop") {
+        return SourceCommand::STOP;
+    }
+    return std::nullopt;
+}
+
+/// @brief Line-input signal state reported by the source role in client/state messages
+enum class SourceSignal : uint8_t {
+    PRESENT,  // Audio signal detected on the capture input
+    ABSENT,   // No audio signal on the capture input
+};
+
+inline const char* to_cstr(SourceSignal signal) {
+    switch (signal) {
+        case SourceSignal::PRESENT:
+            return "present";
+        case SourceSignal::ABSENT:
+        default:
+            return "absent";
+    }
+}
+
+/// @brief Source capabilities advertised to the server during the hello handshake
+struct SourceSupportObject {
+    bool line_sense{false};
+};
+
+/// @brief Source state reported by the client to the server in client/state messages
+///
+/// The signal field is only meaningful when line_sense was advertised in the hello; the object
+/// itself may be present and empty (Sendspin spec, Source messages — Client state object).
+struct ClientSourceStateObject {
+    std::optional<SourceSignal> signal{};
+};
+
 // ============================================================================
 // Message envelope structs
 // ============================================================================
@@ -619,12 +699,26 @@ struct ClientHelloMessage {
     std::optional<PlayerSupportObject> player_v1_support{};
     std::optional<ArtworkSupportObject> artwork_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
+    std::optional<SourceSupportObject> source_v1_support{};
 };
 
 /// @brief Outgoing client/state message reporting client playback state to the server
 struct ClientStateMessage {
     SendspinClientState state{};
     std::optional<ClientPlayerStateObject> player{};
+    std::optional<ClientSourceStateObject> source{};
+};
+
+/// @brief Outgoing client-stream/start message announcing the source's outbound audio format
+///
+/// Mirrors the AudioSupportedFormatObject field set; codec_header carries the base64-encoded
+/// decoder setup data for codecs that need one (absent for pcm and opus).
+struct ClientStreamStartMessage {
+    SendspinCodecFormat codec{};
+    uint8_t channels{};
+    uint32_t sample_rate{};
+    uint8_t bit_depth{};
+    std::optional<std::string> codec_header{};
 };
 
 /// @brief Parsed server/hello handshake message received at connection startup
@@ -706,6 +800,14 @@ void apply_group_update_deltas(GroupUpdateObject* current, const GroupUpdateObje
 /// @return true if parsing succeeded, false on missing required fields.
 bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_msg);
 
+/// @brief Parses the source section of a server/command JSON message
+/// @param root Parsed JSON object from the message.
+/// @param source_cmd [out] The parsed source command.
+/// @return true if the message carried a source object with a valid command; false when the
+///         section is absent or rejected (a source object with a missing or invalid command is
+///         rejected as a whole).
+bool process_server_command_source(JsonObject root, SourceCommand* source_cmd);
+
 /// @brief Parses the metadata section of a server/state JSON message
 ///
 /// The server/state sections are parsed individually rather than into one aggregate struct: the
@@ -773,6 +875,15 @@ std::string format_client_hello_message(const ClientHelloMessage* msg);
 /// @param msg Message to serialize.
 /// @return State message serialized into JSON format.
 std::string format_client_state_message(const ClientStateMessage* msg);
+
+/// @brief Formats a client-stream/start message as a JSON string for sending to the server
+/// @param msg Message to serialize.
+/// @return Stream start message serialized into JSON format.
+std::string format_client_stream_start_message(const ClientStreamStartMessage* msg);
+
+/// @brief Formats a client-stream/end message as a JSON string for sending to the server
+/// @return Stream end message serialized into JSON format.
+std::string format_client_stream_end_message();
 
 /// @brief Formats a stream/request_format message as a JSON string for sending to the server
 /// @param msg Message to serialize.

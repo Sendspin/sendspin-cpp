@@ -24,6 +24,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <string>
 
@@ -730,6 +731,39 @@ TEST(Protocol, FormatStreamRequestFormatVisualizer) {
     EXPECT_FALSE(doc3["payload"]["visualizer"].is<JsonObject>());
 }
 
+// ============================================================================
+// Binary big-endian helpers
+// ============================================================================
+
+// host_to_be64 -> be64_to_host must be the identity across the full int64_t range. Catches a
+// helper pair that only agrees on non-negative or small values.
+TEST(Protocol, Be64RoundTrip) {
+    const int64_t values[] = {
+        0, 1, -1, 255, 256, INT64_MAX, INT64_MIN, 0x0102030405060708LL, -1234567890123456789LL,
+    };
+    for (const int64_t value : values) {
+        uint8_t bytes[BINARY_TIMESTAMP_SIZE];
+        host_to_be64(value, bytes);
+        EXPECT_EQ(be64_to_host(bytes), value) << "no round-trip for " << value;
+    }
+}
+
+// The encoded layout must be genuinely big-endian (most significant byte first), not host order:
+// the wire format is fixed regardless of platform endianness.
+TEST(Protocol, Be64ByteOrderIsBigEndian) {
+    uint8_t bytes[BINARY_TIMESTAMP_SIZE];
+    host_to_be64(0x0102030405060708LL, bytes);
+    const uint8_t expected[BINARY_TIMESTAMP_SIZE] = {0x01, 0x02, 0x03, 0x04,
+                                                     0x05, 0x06, 0x07, 0x08};
+    EXPECT_EQ(0, std::memcmp(bytes, expected, BINARY_TIMESTAMP_SIZE));
+
+    // Negative values encode as two's complement, most significant byte first.
+    host_to_be64(-2, bytes);
+    const uint8_t expected_negative[BINARY_TIMESTAMP_SIZE] = {0xFF, 0xFF, 0xFF, 0xFF,
+                                                              0xFF, 0xFF, 0xFF, 0xFE};
+    EXPECT_EQ(0, std::memcmp(bytes, expected_negative, BINARY_TIMESTAMP_SIZE));
+}
+
 // Unset optional identity fields must not emit their keys.
 TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
     ClientHelloMessage msg;
@@ -744,4 +778,162 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
     EXPECT_FALSE(doc["payload"]["device_info"]["manufacturer"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["software_version"].is<const char*>());
     EXPECT_FALSE(doc["payload"]["device_info"]["mac_address"].is<const char*>());
+}
+
+// ============================================================================
+// Source role protocol
+// ============================================================================
+
+// The to_cstr(SendspinRole) switch has a default arm, so a forgotten case compiles clean and
+// silently advertises "unknown"; pin the wire string.
+TEST(Protocol, SourceRoleWireString) {
+    EXPECT_STREQ(to_cstr(SendspinRole::SOURCE), "source@v1");
+}
+
+// Pins the source binary ID block to the documented role<<2 scheme (role 3, IDs 12-15).
+TEST(Protocol, SourceBinaryIdScheme) {
+    EXPECT_EQ(SENDSPIN_BINARY_SOURCE_AUDIO, 12);
+    EXPECT_EQ(get_binary_role(SENDSPIN_BINARY_SOURCE_AUDIO), SENDSPIN_ROLE_SOURCE);
+    EXPECT_EQ(get_binary_slot(SENDSPIN_BINARY_SOURCE_AUDIO), 0);
+}
+
+TEST(Protocol, FormatClientHelloSourceSupport) {
+    ClientHelloMessage msg;
+    msg.client_id = "abc";
+    msg.name = "Line In";
+    msg.version = 1;
+    msg.supported_roles = {SendspinRole::SOURCE};
+
+    // line_sense advertised: features.line_sense is true.
+    msg.source_v1_support = SourceSupportObject{.line_sense = true};
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    EXPECT_STREQ(doc["payload"]["supported_roles"][0], "source@v1");
+    EXPECT_TRUE(doc["payload"]["source@v1_support"]["features"]["line_sense"].as<bool>());
+
+    // No line_sense: the support object is present but empty (features omitted, not false).
+    msg.source_v1_support = SourceSupportObject{};
+    JsonDocument doc2;
+    ASSERT_FALSE(deserializeJson(doc2, format_client_hello_message(&msg)));
+    ASSERT_TRUE(doc2["payload"]["source@v1_support"].is<JsonObject>());
+    EXPECT_EQ(doc2["payload"]["source@v1_support"].as<JsonObject>().size(), 0U);
+
+    // Support object not set: the key is absent entirely.
+    msg.supported_roles = {};
+    msg.source_v1_support.reset();
+    JsonDocument doc3;
+    ASSERT_FALSE(deserializeJson(doc3, format_client_hello_message(&msg)));
+    EXPECT_FALSE(doc3["payload"]["source@v1_support"].is<JsonObject>());
+}
+
+// Exact-field assertions, including the hyphenated "client-stream/start" type string (the
+// reference Python implementation still sends an underscore and must not be copied).
+TEST(Protocol, FormatClientStreamStartPcm) {
+    ClientStreamStartMessage msg;
+    msg.codec = SendspinCodecFormat::PCM;
+    msg.channels = 2;
+    msg.sample_rate = 48000;
+    msg.bit_depth = 16;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_stream_start_message(&msg)));
+    EXPECT_STREQ(doc["type"], "client-stream/start");
+    EXPECT_STREQ(doc["payload"]["source"]["codec"], "pcm");
+    EXPECT_EQ(doc["payload"]["source"]["channels"].as<int>(), 2);
+    EXPECT_EQ(doc["payload"]["source"]["sample_rate"].as<uint32_t>(), 48000U);
+    EXPECT_EQ(doc["payload"]["source"]["bit_depth"].as<int>(), 16);
+    // pcm carries no codec header; the key must be absent.
+    EXPECT_FALSE(doc["payload"]["source"]["codec_header"].is<const char*>());
+    EXPECT_EQ(doc["payload"]["source"].as<JsonObject>().size(), 4U);
+}
+
+TEST(Protocol, FormatClientStreamStartFlacCodecHeader) {
+    ClientStreamStartMessage msg;
+    msg.codec = SendspinCodecFormat::FLAC;
+    msg.channels = 2;
+    msg.sample_rate = 44100;
+    msg.bit_depth = 24;
+    msg.codec_header = "c2VuZHNwaW4=";  // base64 payload is passed through verbatim
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_stream_start_message(&msg)));
+    EXPECT_STREQ(doc["type"], "client-stream/start");
+    EXPECT_STREQ(doc["payload"]["source"]["codec"], "flac");
+    EXPECT_STREQ(doc["payload"]["source"]["codec_header"], "c2VuZHNwaW4=");
+}
+
+// client-stream/end is a fixed message with no payload key at all; pin the exact bytes.
+TEST(Protocol, FormatClientStreamEndExactString) {
+    EXPECT_EQ(format_client_stream_end_message(), R"({"type":"client-stream/end"})");
+}
+
+// Control cases for the rejection tests below: a well-formed source command must parse.
+TEST(Protocol, ServerCommandSourceParsesStartAndStop) {
+    JsonDocument doc;
+    JsonObject root;
+    SourceCommand cmd{};
+
+    ASSERT_TRUE(parse(R"({"type":"server/command","payload":{"source":{"command":"start"}}})",
+                      doc, root));
+    ASSERT_TRUE(process_server_command_source(root, &cmd));
+    EXPECT_EQ(cmd, SourceCommand::START);
+
+    ASSERT_TRUE(parse(R"({"type":"server/command","payload":{"source":{"command":"stop"}}})",
+                      doc, root));
+    ASSERT_TRUE(process_server_command_source(root, &cmd));
+    EXPECT_EQ(cmd, SourceCommand::STOP);
+}
+
+// "command" is required with no default: a source object with it missing, unknown, or of the
+// wrong JSON type is rejected as a whole (fail closed).
+TEST(Protocol, ServerCommandSourceRejectsMalformedCommand) {
+    JsonDocument doc;
+    JsonObject root;
+    SourceCommand cmd{};
+
+    // Missing command.
+    ASSERT_TRUE(parse(R"({"type":"server/command","payload":{"source":{}}})", doc, root));
+    EXPECT_FALSE(process_server_command_source(root, &cmd));
+
+    // Unknown command string.
+    ASSERT_TRUE(parse(R"({"type":"server/command","payload":{"source":{"command":"pause"}}})",
+                      doc, root));
+    EXPECT_FALSE(process_server_command_source(root, &cmd));
+
+    // Wrong JSON type.
+    ASSERT_TRUE(parse(R"({"type":"server/command","payload":{"source":{"command":1}}})", doc,
+                      root));
+    EXPECT_FALSE(process_server_command_source(root, &cmd));
+
+    // No source object at all: nothing to dispatch.
+    ASSERT_TRUE(parse(R"({"type":"server/command","payload":{}})", doc, root));
+    EXPECT_FALSE(process_server_command_source(root, &cmd));
+}
+
+TEST(Protocol, FormatClientStateSourceObject) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+
+    // No source state set: the key is absent.
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    EXPECT_FALSE(doc["payload"]["source"].is<JsonObject>());
+
+    // Source state with no signal: present but empty.
+    msg.source = ClientSourceStateObject{};
+    JsonDocument doc2;
+    ASSERT_FALSE(deserializeJson(doc2, format_client_state_message(&msg)));
+    ASSERT_TRUE(doc2["payload"]["source"].is<JsonObject>());
+    EXPECT_EQ(doc2["payload"]["source"].as<JsonObject>().size(), 0U);
+
+    // Signal present and absent both serialize.
+    msg.source = ClientSourceStateObject{.signal = SourceSignal::PRESENT};
+    JsonDocument doc3;
+    ASSERT_FALSE(deserializeJson(doc3, format_client_state_message(&msg)));
+    EXPECT_STREQ(doc3["payload"]["source"]["signal"], "present");
+
+    msg.source = ClientSourceStateObject{.signal = SourceSignal::ABSENT};
+    JsonDocument doc4;
+    ASSERT_FALSE(deserializeJson(doc4, format_client_state_message(&msg)));
+    EXPECT_STREQ(doc4["payload"]["source"]["signal"], "absent");
 }
