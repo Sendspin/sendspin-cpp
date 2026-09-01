@@ -9,9 +9,9 @@ Standalone C++ library implementing the [Sendspin synchronized audio streaming p
 
 ## Features
 
-- Modular Sendspin role composition: artwork, color, controller, metadata, player, and visualizer
+- Modular Sendspin role composition: artwork, color, controller, metadata, player, source, and visualizer
 - WebSocket client and server support
-- Decodes FLAC, Opus, and PCM
+- Decodes FLAC, Opus, and PCM for playback; encodes Opus and PCM for source capture
 - Cross-platform: ESP-IDF (ESP32) and host (macOS/Linux)
 
 ## Documentation
@@ -45,6 +45,7 @@ Requires ESP-IDF v5.1 or later.
 
 - **`examples/basic_client/`** -- Standalone host example with PortAudio audio output
 - **`examples/tui_client/`** -- Terminal UI host example with PortAudio audio output
+- **`examples/source_client/`** -- Standalone host example streaming PortAudio input capture as a source
 
 ## License
 

@@ -7,7 +7,7 @@ This guide describes what you need to implement in order to integrate sendspin-c
 Integration follows this pattern:
 
 1. Create a `SendspinClient` with a configuration struct
-2. Add roles (player, controller, metadata, artwork, visualizer, color) depending on what your application needs
+2. Add roles (player, controller, metadata, artwork, visualizer, color, source) depending on what your application needs
 3. Implement listener interfaces for the roles you added
 4. Implement a network provider (required) and optionally a persistence provider
 5. Wire listeners and providers to the client and roles
@@ -27,6 +27,7 @@ Include `sendspin/client.h` for the client class, config types, and shared types
 #include "sendspin/artwork_role.h"    // ArtworkRole, ArtworkRoleListener
 #include "sendspin/visualizer_role.h" // VisualizerRole, VisualizerRoleListener
 #include "sendspin/color_role.h"      // ColorRole, ColorRoleListener
+#include "sendspin/source_role.h"     // SourceRole, SourceRoleListener
 ```
 
 Only include the role headers you need. `client.h` includes `sendspin/config.h` (all configuration structs, including `SendspinClientConfig`) and `sendspin/types.h` transitively.
@@ -168,6 +169,43 @@ Receives an RGB color palette derived by the server from the currently playing a
 ```cpp
 auto& color = client.add_color();
 ```
+
+### Source Role (Audio Capture)
+
+Streams audio captured by the client (e.g., a line input or microphone) to the server. Requires a configuration struct that declares the capture format; that format is fixed for the lifetime of the role — the server does not negotiate it, and changing formats requires tearing down the client and re-adding the role with a new config.
+
+```cpp
+SourceRoleConfig source_config;
+source_config.codec = SendspinCodecFormat::PCM;  // or OPUS to encode before sending
+source_config.sample_rate = 48000;
+source_config.channels = 2;
+source_config.bit_depth = 16;
+
+auto& source = client.add_source(source_config);
+```
+
+The configuration is validated at `add_source()` time; validation fails closed. An invalid config (see the [SourceRoleConfig](#sourceroleconfig) reference for the per-field rules) logs each rejected field at ERROR and leaves the role inert: it is not advertised to the server and never streams, exactly like a player with no audio formats.
+
+Streaming is gated by the server: the client never streams unsolicited, the default after connect is stopped, and permission does not survive reconnection. When the server commands start, the role opens the outbound stream and fires `on_streaming_started()`; from that point on, feed captured audio to `write_audio()`:
+
+```cpp
+// Capture thread (exactly one producer thread):
+source.write_audio(pcm_bytes, len, capture_time_us);
+```
+
+- `data`/`len`: interleaved little-endian signed PCM in the configured format (24-bit as 3 packed bytes per sample). `len` must be a whole number of frames (one frame = one sample across all channels); a non-whole-frame write is rejected as a whole.
+- `capture_time_us`: local-clock capture time of the FIRST sample in the buffer, in the same domain as the client's time functions (`std::chrono::steady_clock` microseconds on host). Pass `0` to stamp with the current time, a best-effort fallback for callers that cannot timestamp their ADC.
+- Returns `true` if the audio was accepted; `false` when the stream is not open or the capture buffer is full (the write is dropped and counted).
+
+`write_audio()` is a non-blocking, non-allocating hot path, safe to call from an audio capture callback. Exactly one producer thread may call it; the library does not serialize concurrent writers.
+
+If the capture hardware supports line-input signal sensing, set `SourceRoleConfig::line_sense` and report the signal state from the main loop thread; the role publishes it to the server via `client/state`:
+
+```cpp
+source.set_signal(SourceSignal::PRESENT);  // or ABSENT
+```
+
+`is_streaming()` (main loop thread only) returns `true` between the `on_streaming_started()` and `on_streaming_stopped()` callbacks.
 
 ## Step 3: Implement Listener Interfaces
 
@@ -416,6 +454,21 @@ The `ServerColorStateObject` contains a `timestamp` and six optional `RgbColor` 
 
 A field is `nullopt` when the server has not provided it or has explicitly cleared it; listeners do not need to distinguish those cases.
 
+### SourceRoleListener
+
+Both callbacks are optional and fire on the main loop thread. They bracket the outbound stream: enable your capture path in `on_streaming_started()` and disable it in `on_streaming_stopped()` (`write_audio()` rejects audio outside that window either way).
+
+```cpp
+struct MySourceListener : SourceRoleListener {
+    // Called when the outbound stream to the server has opened.
+    void on_streaming_started() override { capture.enable(); }
+
+    // Called when the outbound stream has closed (server stop command,
+    // connection loss, or disconnect).
+    void on_streaming_stopped() override { capture.disable(); }
+};
+```
+
 ## Step 4: Implement Providers
 
 ### SendspinNetworkProvider (Required)
@@ -590,6 +643,7 @@ if (auto* m = client.metadata()) {
 if (auto* a = client.artwork()) { /* ... */ }
 if (auto* v = client.visualizer()) { /* ... */ }
 if (auto* col = client.color()) { /* ... */ }
+if (auto* s = client.source()) { /* ... */ }
 ```
 
 Use these accessors when the role reference from `add_*()` is out of scope.
@@ -664,6 +718,8 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 
 `ArtworkRole::frame_done()` must be called from the main loop thread (typically from inside `on_image_display()`/`on_image_clear()` or when a cross-fade animation completes).
 
+`SourceRole::write_audio()` is designed to be called from your audio capture thread — exactly one producer thread; the library does not serialize concurrent writers. The other `SourceRole` methods (`set_signal()`, `is_streaming()`) must be called from the main loop thread.
+
 ## Minimal Example
 
 A minimal integration that receives and discards audio:
@@ -726,7 +782,8 @@ cmake -B build -DSENDSPIN_ENABLE_CONTROLLER=OFF \
                -DSENDSPIN_ENABLE_METADATA=OFF \
                -DSENDSPIN_ENABLE_ARTWORK=OFF \
                -DSENDSPIN_ENABLE_VISUALIZER=OFF \
-               -DSENDSPIN_ENABLE_COLOR=OFF
+               -DSENDSPIN_ENABLE_COLOR=OFF \
+               -DSENDSPIN_ENABLE_SOURCE=OFF
 ```
 
 Available options (all `ON` by default):
@@ -739,8 +796,9 @@ Available options (all `ON` by default):
 | `SENDSPIN_ENABLE_ARTWORK` | Artwork role |
 | `SENDSPIN_ENABLE_VISUALIZER` | Visualizer role |
 | `SENDSPIN_ENABLE_COLOR` | Color role |
+| `SENDSPIN_ENABLE_SOURCE` | Source role, Opus encoder (micro-opus), source task |
 
-When `SENDSPIN_ENABLE_PLAYER` is `OFF`, the micro-flac and micro-opus dependencies are not fetched.
+The codec dependencies follow the roles that use them: micro-flac is fetched only when `SENDSPIN_ENABLE_PLAYER` is `ON`; micro-opus is fetched when `SENDSPIN_ENABLE_PLAYER` or `SENDSPIN_ENABLE_SOURCE` is `ON`.
 
 ### ESP-IDF (Kconfig)
 
@@ -753,6 +811,7 @@ CONFIG_SENDSPIN_ENABLE_METADATA=y
 CONFIG_SENDSPIN_ENABLE_ARTWORK=y
 CONFIG_SENDSPIN_ENABLE_VISUALIZER=y
 CONFIG_SENDSPIN_ENABLE_COLOR=y
+CONFIG_SENDSPIN_ENABLE_SOURCE=y
 ```
 
 ### Effect on the API
@@ -868,6 +927,27 @@ Configuration passed to `client.add_visualizer()`.
 
 ---
 
+### SourceRoleConfig
+
+Configuration passed to `client.add_source()`. It is the capture format contract for every stream the role opens. Validation fails closed at `add_source()` time: any rule violation below logs at ERROR and leaves the role inert (not advertised, never streaming) — values are never clamped or repaired.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `codec` | `SendspinCodecFormat` | `PCM` | Outbound codec: `PCM` (chunks are the capture bytes, untouched) or `OPUS` (each chunk is encoded into one Opus packet). Any other value is rejected. `OPUS` costs the encoder state plus micro-opus's per-thread scratch arena (~120 KB, SPIRAM-preferred, allocated lazily on the source task's first encode) — the same per-thread arena the player's Opus decode allocates on its own task, so a device doing both holds two such arenas. |
+| `sample_rate` | `uint32_t` | `48000` | Capture sample rate in Hz; must be > 0. `OPUS` accepts only libopus's rates: 8000, 12000, 16000, 24000, or 48000 (a 44100 line-in must use `PCM` or resample upstream). |
+| `channels` | `uint8_t` | `2` | Capture channel count; must be > 0 (1 or 2 for `OPUS`). |
+| `bit_depth` | `uint8_t` | `16` | Bits per sample: 16, 24 (3 packed bytes per sample), or 32. `OPUS` requires 16. |
+| `chunk_duration_ms` | `uint32_t` | `25` | Duration of one outbound audio chunk. `PCM` accepts the spec bounds [5, 150]; `OPUS` accepts only 10, 20, 40, or 60 (one chunk is exactly one legal Opus frame), so the PCM default of 25 is rejected for `OPUS`. |
+| `capture_buffer_ms` | `uint32_t` | `150` | Capture ring capacity in milliseconds of audio in the configured format; must be > 0. The ring is the stall-policy backlog bound: capture beyond it is dropped at `write_audio()` and streaming resumes from live audio. Approximate: per-write ring metadata comes out of a fixed +25% margin, so many very small `write_audio()` calls reduce the effective audio capacity below this figure. |
+| `opus_bitrate` | `uint32_t` | `128000` | Opus bitrate in bit/s, validated against [500, 512000] (the range libopus accepts). Ignored (and unvalidated) when `codec` is `PCM`. |
+| `opus_complexity` | `uint8_t` | `2` | Opus encoder complexity, validated to at most 10. The low default fits an ESP32-class real-time encode budget; hosts may raise it for quality per CPU. Ignored (and unvalidated) when `codec` is `PCM`. |
+| `line_sense` | `bool` | `false` | Advertise line-input signal sensing to the server; see `SourceRole::set_signal()`. |
+| `priority` | `unsigned` | `3` | FreeRTOS priority for the source task (ESP-IDF only). Below the HTTP server task (`5`) and the sync/decode task (`6`) so outbound capture can never starve inbound playback. |
+| `buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the capture ring, chunk staging buffer, and the Opus encoder's scratch buffers. ESP-IDF only; ignored on host. |
+| `psram_stack` | `bool` | `false` | Allocate source task stack in PSRAM (ESP-IDF only) |
+
+---
+
 ## Enums Reference
 
 ### SendspinCodecFormat
@@ -941,6 +1021,15 @@ These represent commands the server can send to the player. The player advertise
 | `ONE` | Repeat current track |
 | `ALL` | Repeat all tracks |
 
+### SourceSignal
+
+| Value | Description |
+|---|---|
+| `PRESENT` | Audio signal detected on the capture input |
+| `ABSENT` | No audio signal on the capture input |
+
+Reported via `SourceRole::set_signal()`; only meaningful when `SourceRoleConfig::line_sense` is set.
+
 ### SendspinImageFormat
 
 | Value | Description |
@@ -995,4 +1084,4 @@ Set with `SendspinClient::set_log_level()`. Only affects host builds; ESP-IDF bu
 | `PREFER_EXTERNAL` | Prefer SPIRAM, fall back to internal RAM (ESP-IDF only) |
 | `PREFER_INTERNAL` | Prefer internal RAM, fall back to SPIRAM (ESP-IDF only) |
 
-Used by `SendspinClientConfig::websocket_payload_location` to control where the per-connection WebSocket payload reassembly buffer is allocated, and by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated. Ignored on host platforms (no internal/external distinction).
+Used by `SendspinClientConfig::websocket_payload_location` to control where the per-connection WebSocket payload reassembly buffer is allocated, by `PlayerRoleConfig::decode_buffer_location` to control where the player's decode transfer buffer is allocated, and by `SourceRoleConfig::buffer_location` to control where the source's capture ring, chunk staging buffer, and Opus encoder scratch buffers are allocated. Ignored on host platforms (no internal/external distinction).

@@ -96,7 +96,10 @@ checklists in `.claude/skills/` apply these standards to a diff.
   at the declaration site.
 - Examples are consumers too: they must build under every
   `SENDSPIN_ENABLE_*` combination, guarding role usage the same way an
-  external consumer would.
+  external consumer would. An example that exists solely to demonstrate one
+  role may instead gate its whole target in CMake on that role's option;
+  an `#ifdef` branch that leaves a do-nothing binary is dead code, not a
+  guard.
 
 ## Consistency
 
