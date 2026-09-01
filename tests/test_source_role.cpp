@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Source role tests. Two layers, mirroring the acceptance criteria:
+// Source role tests. Three layers, mirroring the acceptance criteria:
 //  - Pure chunk/timestamp bookkeeping helpers from source_task.h, tested directly.
 //  - SourceRole::Impl-level tests (make_impl pattern from test_artwork_role.cpp): config
 //    validation, hello/state field building, the command latch's fail-closed path, and
 //    lifecycle callback pairing.
+//  - End-to-end wire tests driving a real SendspinClient against an in-test loopback
+//    IXWebSocket "server" (the harness test_connection_lifecycle.cpp establishes), proving the
+//    wire ordering client-stream/start -> typed+stamped binary chunks -> client-stream/end and
+//    every streaming gate (no start command, stale connection, no time sync, after stop).
 
 #include "connection_manager.h"
 #include "inbox.h"
@@ -29,6 +33,7 @@
 #include "source_task.h"
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
+#include <ixwebsocket/IXWebSocket.h>
 
 #include <algorithm>
 #include <atomic>
@@ -46,6 +51,18 @@
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 namespace {
+
+// Distinct ports per wire test (and distinct from test_connection_lifecycle.cpp's 189xx range)
+// so a lingering socket from one scenario cannot bleed into the next.
+constexpr uint16_t WIRE_TEST_PORT = 19010;
+constexpr uint16_t TIME_GATE_TEST_PORT = 19011;
+constexpr uint16_t RECONNECT_TEST_PORT = 19012;
+
+// Default-config wire framing, derived exactly as source_task.cpp derives it: 25 ms at
+// 48 kHz stereo 16-bit -> 1200 frames x 4 bytes, behind a 1-byte type + 8-byte timestamp header.
+constexpr size_t WIRE_BYTES_PER_FRAME = 4;
+constexpr size_t WIRE_CHUNK_PAYLOAD = 1200 * WIRE_BYTES_PER_FRAME;
+constexpr size_t WIRE_HEADER = 9;
 
 // ============================================================================
 // Pure bookkeeping helpers (source_task.h)
@@ -358,6 +375,382 @@ TEST(SourceWriteAudio, RejectedWhenNotStreaming) {
 
     const uint8_t frame[4] = {1, 2, 3, 4};
     EXPECT_FALSE(impl->write_audio(frame, sizeof(frame), 0));
+}
+
+// ============================================================================
+// Wire tests: a real client against an in-test loopback Sendspin "server"
+// ============================================================================
+
+std::string server_url(uint16_t port) {
+    return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
+}
+
+SendspinClientConfig make_config(uint16_t port) {
+    SendspinClientConfig config;
+    config.client_id = "source-test-client";
+    config.name = "Source Test Client";
+    config.server_port = port;
+    // Fast time-sync cadence so a burst that goes unanswered (the time-gate test's first
+    // phase) retries within the test budget instead of the production 10 s interval.
+    config.time_burst_interval_ms = 200;
+    config.time_burst_response_timeout_ms = 200;
+    return config;
+}
+
+class TestNetworkProvider : public SendspinNetworkProvider {
+public:
+    bool is_network_ready() override {
+        return true;
+    }
+};
+
+/// Pumps client.loop() until the predicate returns true or the timeout elapses.
+bool pump_until(SendspinClient& client, const std::function<bool()>& pred, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        client.loop();
+        if (pred()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return false;
+}
+
+void pump_for(SendspinClient& client, int duration_ms) {
+    pump_until(
+        client, [] { return false; }, duration_ms);
+}
+
+/// A minimal Sendspin "server" for source streaming: an IXWebSocket client that connects to
+/// the SendspinClient's WS server, answers client/hello with server/hello, optionally answers
+/// client/time with a zero-offset server/time, records every received text and binary message
+/// in arrival order, and can send server/command source start/stop.
+class FakeSourceServer {
+public:
+    struct WireEvent {
+        bool binary;
+        std::string data;
+    };
+
+    FakeSourceServer(const std::string& url, std::string server_id, bool answer_time = true)
+        : server_id_(std::move(server_id)), answer_time_(answer_time) {
+        this->ws_.setUrl(url);
+        this->ws_.disableAutomaticReconnection();
+        this->ws_.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
+            if (msg->type != ix::WebSocketMessageType::Message) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(this->mutex_);
+                this->events_.push_back({msg->binary, msg->str});
+            }
+            if (msg->binary) {
+                return;
+            }
+            if (msg->str.find("client/hello") != std::string::npos) {
+                this->ws_.send(
+                    std::string(R"({"type":"server/hello","payload":{"server_id":")") +
+                    this->server_id_ +
+                    R"(","name":"Fake Source Server","version":1,"active_roles":["source"],)" +
+                    R"("connection_reason":"discovery"}})");
+            } else if (msg->str.find("client/time") != std::string::npos &&
+                       this->answer_time_.load()) {
+                // Zero-offset echo: server clock == client clock, which the Kalman filter
+                // accepts as its first measurement.
+                JsonDocument doc;
+                if (deserializeJson(doc, msg->str) == DeserializationError::Ok) {
+                    const int64_t t = doc["payload"]["client_transmitted"] | int64_t{0};
+                    this->ws_.send(std::string(R"({"type":"server/time","payload":)") +
+                                   R"({"client_transmitted":)" + std::to_string(t) +
+                                   R"(,"server_received":)" + std::to_string(t) +
+                                   R"(,"server_transmitted":)" + std::to_string(t) + "}}");
+                }
+            }
+        });
+        this->ws_.start();
+    }
+
+    ~FakeSourceServer() {
+        this->ws_.stop();
+    }
+
+    void enable_time_answers() {
+        this->answer_time_.store(true);
+    }
+
+    void send_source_command(const char* command) {
+        this->ws_.send(std::string(R"({"type":"server/command","payload":{"source":)") +
+                       R"({"command":")" + command + R"("}}})");
+    }
+
+    void disconnect() {
+        this->ws_.stop();
+    }
+
+    std::vector<WireEvent> snapshot() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->events_;
+    }
+
+    size_t count_text_containing(const std::string& needle) const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        size_t count = 0;
+        for (const auto& event : this->events_) {
+            if (!event.binary && event.data.find(needle) != std::string::npos) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    size_t binary_count() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        size_t count = 0;
+        for (const auto& event : this->events_) {
+            if (event.binary) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+private:
+    ix::WebSocket ws_;
+    std::string server_id_;
+    std::atomic<bool> answer_time_;
+    mutable std::mutex mutex_;
+    std::vector<WireEvent> events_;
+};
+
+/// Everything a wire test needs running: a client with the source role added and started, plus
+/// helpers to bring a fake server to the handshake-complete, time-synced state.
+struct WireHarness {
+    explicit WireHarness(uint16_t port, const SourceRoleConfig& role_config = SourceRoleConfig{})
+        : client(make_config(port)) {
+        auto& role = this->client.add_source(role_config);
+        role.set_listener(&this->listener);
+        this->client.set_network_provider(&this->network);
+    }
+
+    bool start() {
+        if (!this->client.start_server()) {
+            return false;
+        }
+        // The WS server starts synchronously on the first loop() once the network is ready.
+        pump_for(this->client, 50);
+        return true;
+    }
+
+    bool establish(FakeSourceServer& fake) {
+        if (!pump_until(
+                this->client, [&] { return this->client.is_connected(); }, 4000)) {
+            return false;
+        }
+        (void)fake;
+        return pump_until(
+            this->client, [&] { return this->client.is_time_synced(); }, 4000);
+    }
+
+    TestNetworkProvider network;
+    RecordingSourceListener listener;
+    SendspinClient client;
+};
+
+// Deliberately independent of protocol_messages.h's be64_to_host(): the wire tests audit the
+// bytes the library produced, so the reader must not share the code under audit.
+int64_t read_be64(const uint8_t* bytes) {
+    uint64_t val = 0;
+    for (int i = 0; i < 8; ++i) {
+        val = (val << 8) | bytes[i];
+    }
+    return static_cast<int64_t>(val);
+}
+
+// The end-to-end pipeline and its exact wire ordering: client-stream/start, then binary chunks
+// carrying [type 12][BE64 first-sample capture timestamp][PCM payload], then a final short
+// chunk and client-stream/end on stop -- with write_audio() gated shut before the start
+// command, validating frames while open, and gated shut again after the stop.
+TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
+    WireHarness harness(WIRE_TEST_PORT);
+    ASSERT_TRUE(harness.start());
+    FakeSourceServer fake(server_url(WIRE_TEST_PORT), "source-server-a");
+    ASSERT_TRUE(harness.establish(fake));
+
+    SourceRole* source = harness.client.source();
+    ASSERT_NE(source, nullptr);
+
+    // Gate: no streaming (and no accepted capture) before the server commands start.
+    uint8_t frame[WIRE_BYTES_PER_FRAME] = {9, 9, 9, 9};
+    EXPECT_FALSE(source->write_audio(frame, sizeof(frame), 0));
+    EXPECT_FALSE(source->is_streaming());
+
+    fake.send_source_command("start");
+    ASSERT_TRUE(pump_until(
+        harness.client,
+        [&] {
+            return harness.listener.started == 1 &&
+                   fake.count_text_containing("client-stream/start") == 1;
+        },
+        4000));
+    EXPECT_TRUE(source->is_streaming());
+
+    // Validation while open: a non-whole-frame write is rejected as a whole.
+    std::vector<uint8_t> odd(WIRE_BYTES_PER_FRAME * 10 + 1, 0xAA);
+    EXPECT_FALSE(source->write_audio(odd.data(), odd.size(), 0));
+
+    // Overflow: a write larger than the whole capture ring cannot be buffered -- rejected and
+    // counted as a drop, never blocked on.
+    std::vector<uint8_t> oversized(WIRE_BYTES_PER_FRAME * 48000, 0);  // 1 s >> 150 ms ring
+    EXPECT_FALSE(source->write_audio(oversized.data(), oversized.size(), 0));
+
+    // 50 ms of ramp PCM in 10 ms writes, capture-stamped 10 ms apart: exactly two full 25 ms
+    // chunks.
+    const int64_t base = platform_time_us();
+    std::vector<uint8_t> chunk(WIRE_BYTES_PER_FRAME * 480);
+    size_t ramp = 0;
+    for (int i = 0; i < 5; ++i) {
+        for (auto& byte : chunk) {
+            byte = static_cast<uint8_t>(ramp++ & 0xFF);
+        }
+        ASSERT_TRUE(source->write_audio(chunk.data(), chunk.size(), base + i * 10000));
+    }
+    ASSERT_TRUE(pump_until(
+        harness.client, [&] { return fake.binary_count() == 2; }, 4000));
+
+    // A duplicate start while streaming MUST NOT restart the stream: no second
+    // client-stream/start, no second listener callback.
+    fake.send_source_command("start");
+    pump_for(harness.client, 300);
+    EXPECT_EQ(fake.count_text_containing("client-stream/start"), 1U);
+    EXPECT_EQ(harness.listener.started, 1);
+
+    // A 10 ms remainder: full chunks only mid-stream, so it must NOT be sent yet...
+    for (auto& byte : chunk) {
+        byte = static_cast<uint8_t>(ramp++ & 0xFF);
+    }
+    ASSERT_TRUE(source->write_audio(chunk.data(), chunk.size(), base + 50000));
+    pump_for(harness.client, 200);
+    EXPECT_EQ(fake.binary_count(), 2U);
+
+    // ...until stream end, where the spec allows a final short chunk before client-stream/end.
+    fake.send_source_command("stop");
+    ASSERT_TRUE(pump_until(
+        harness.client,
+        [&] {
+            return harness.listener.stopped == 1 &&
+                   fake.count_text_containing("client-stream/end") == 1;
+        },
+        4000));
+    EXPECT_FALSE(source->is_streaming());
+    EXPECT_FALSE(source->write_audio(frame, sizeof(frame), 0));
+
+    // Now audit the recorded wire order and framing.
+    const auto events = fake.snapshot();
+    ptrdiff_t start_idx = -1;
+    ptrdiff_t end_idx = -1;
+    std::vector<ptrdiff_t> binary_idx;
+    for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(events.size()); ++i) {
+        if (events[i].binary) {
+            binary_idx.push_back(i);
+        } else if (events[i].data.find("client-stream/start") != std::string::npos) {
+            start_idx = i;
+        } else if (events[i].data.find("client-stream/end") != std::string::npos) {
+            end_idx = i;
+        }
+    }
+    ASSERT_EQ(binary_idx.size(), 3U);  // two full chunks + the final short chunk
+    ASSERT_GE(start_idx, 0);
+    ASSERT_GE(end_idx, 0);
+    EXPECT_LT(start_idx, binary_idx.front());
+    EXPECT_LT(binary_idx.back(), end_idx);
+
+    // Framing: type byte 12, big-endian first-sample capture timestamp (zero-offset time sync,
+    // so the server-domain value stays near the stamps we supplied), untouched PCM payload.
+    const auto& first = events[static_cast<size_t>(binary_idx[0])].data;
+    ASSERT_EQ(first.size(), WIRE_HEADER + WIRE_CHUNK_PAYLOAD);
+    EXPECT_EQ(static_cast<uint8_t>(first[0]), SENDSPIN_BINARY_SOURCE_AUDIO);
+    const int64_t ts1 = read_be64(reinterpret_cast<const uint8_t*>(first.data()) + 1);
+    EXPECT_LT(std::llabs(ts1 - base), 1000000);
+    for (size_t i = 0; i < 16; ++i) {
+        EXPECT_EQ(static_cast<uint8_t>(first[WIRE_HEADER + i]), static_cast<uint8_t>(i & 0xFF));
+    }
+
+    // The second chunk's anchor is exactly one chunk after the first (contiguous capture
+    // stamps); allow slack for the time filter refining its offset between the two sends.
+    const auto& second = events[static_cast<size_t>(binary_idx[1])].data;
+    ASSERT_EQ(second.size(), WIRE_HEADER + WIRE_CHUNK_PAYLOAD);
+    const int64_t ts2 = read_be64(reinterpret_cast<const uint8_t*>(second.data()) + 1);
+    EXPECT_NEAR(static_cast<double>(ts2 - ts1), 25000.0, 2000.0);
+
+    // The final short chunk carries the 10 ms remainder.
+    const auto& last = events[static_cast<size_t>(binary_idx[2])].data;
+    EXPECT_EQ(last.size(), WIRE_HEADER + WIRE_BYTES_PER_FRAME * 480);
+}
+
+// The time-sync convergence gate: a start command on a connection whose time filter has no
+// measurement yet must not open the stream; it opens (without a fresh command) once sync
+// converges.
+TEST(SourceWire, NoStreamBeforeTimeSyncConvergence) {
+    WireHarness harness(TIME_GATE_TEST_PORT);
+    ASSERT_TRUE(harness.start());
+    FakeSourceServer fake(server_url(TIME_GATE_TEST_PORT), "source-server-t",
+                          /*answer_time=*/false);
+    ASSERT_TRUE(pump_until(
+        harness.client, [&] { return harness.client.is_connected(); }, 4000));
+
+    fake.send_source_command("start");
+    pump_for(harness.client, 400);
+    EXPECT_EQ(fake.count_text_containing("client-stream/start"), 0U);
+    EXPECT_EQ(harness.listener.started, 0);
+
+    fake.enable_time_answers();
+    ASSERT_TRUE(pump_until(
+        harness.client,
+        [&] {
+            return harness.client.is_time_synced() &&
+                   fake.count_text_containing("client-stream/start") == 1 &&
+                   harness.listener.started == 1;
+        },
+        4000));
+}
+
+// Streaming permission is per-connection: a disconnect closes the stream, and a new connection
+// (fresh handshake, fresh time sync) must not stream until IT commands start.
+TEST(SourceWire, PermissionDoesNotSurviveReconnect) {
+    WireHarness harness(RECONNECT_TEST_PORT);
+    ASSERT_TRUE(harness.start());
+
+    {
+        FakeSourceServer fake(server_url(RECONNECT_TEST_PORT), "source-server-r1");
+        ASSERT_TRUE(harness.establish(fake));
+        fake.send_source_command("start");
+        ASSERT_TRUE(pump_until(
+            harness.client, [&] { return harness.listener.started == 1; }, 4000));
+
+        fake.disconnect();
+        ASSERT_TRUE(pump_until(
+            harness.client, [&] { return harness.listener.stopped == 1; }, 4000));
+        EXPECT_FALSE(harness.client.source()->is_streaming());
+    }
+
+    FakeSourceServer fake2(server_url(RECONNECT_TEST_PORT), "source-server-r2");
+    ASSERT_TRUE(harness.establish(fake2));
+
+    // The old connection's permission must not leak into this one.
+    pump_for(harness.client, 400);
+    EXPECT_EQ(fake2.count_text_containing("client-stream/start"), 0U);
+    EXPECT_EQ(harness.listener.started, 1);
+
+    // Only this connection's own start command opens a stream.
+    fake2.send_source_command("start");
+    ASSERT_TRUE(pump_until(
+        harness.client,
+        [&] {
+            return harness.listener.started == 2 &&
+                   fake2.count_text_containing("client-stream/start") == 1;
+        },
+        4000));
 }
 
 }  // namespace
