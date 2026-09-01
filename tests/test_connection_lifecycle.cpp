@@ -20,6 +20,9 @@
 // WebSocket upgrade; raw-TCP junk is closed inside the transport layer and never occupies a slot).
 
 #include "connection_manager.h"  // fnv1_hash for the last-played preference
+#include "host/client_connection.h"
+#include "host/server_connection.h"
+#include "protocol_messages.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include <gtest/gtest.h>
@@ -36,7 +39,9 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -56,6 +61,8 @@ constexpr uint16_t EVICT_TEST_PORT = 18972;
 constexpr uint16_t REJECT_TEST_PORT = 18973;
 constexpr uint16_t STALL_LISTEN_PORT = 18981;
 constexpr uint16_t ADMIT_TEST_PORT = 18982;
+constexpr uint16_t BINARY_TEST_PORT = 18992;
+constexpr uint16_t SERVER_BINARY_TEST_PORT = 18993;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -597,4 +604,174 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
     EXPECT_FALSE(client.is_connected());
     EXPECT_FALSE(mute_a.closed());
     EXPECT_FALSE(mute_b.closed());
+}
+
+// send_binary_message on the host client transport must deliver exactly one binary WebSocket
+// frame carrying the exact payload bytes, reporting success through both the return code and the
+// inline completion callback.
+TEST(ConnectionLifecycle, ClientBinarySendDeliversExactBytes) {
+    std::atomic<int> binary_frames{0};
+    std::string received;
+    std::mutex received_mutex;
+
+    ix::WebSocketServer backend(BINARY_TEST_PORT, "127.0.0.1");
+    backend.setOnConnectionCallback([&](const std::weak_ptr<ix::WebSocket>& weak_ws,
+                                        const std::shared_ptr<ix::ConnectionState>& /*state*/) {
+        auto ws = weak_ws.lock();
+        if (!ws) {
+            return;
+        }
+        ws->setOnMessageCallback([&](const ix::WebSocketMessagePtr& msg) {
+            if (msg->type == ix::WebSocketMessageType::Message && msg->binary) {
+                std::lock_guard<std::mutex> lock(received_mutex);
+                received = msg->str;
+                binary_frames.fetch_add(1);
+            }
+        });
+    });
+    ASSERT_TRUE(backend.listen().first);
+    backend.start();
+
+    SendspinClientConnection conn(server_url(BINARY_TEST_PORT));
+    std::atomic<bool> connected{false};
+    conn.on_connected_cb = [&](SendspinConnection*) { connected.store(true); };
+    conn.start();
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!connected.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    ASSERT_TRUE(connected.load());
+
+    // Payload shaped like a source audio chunk (type byte, BE64 capture timestamp, frame data),
+    // with bytes chosen to catch truncation and sign mangling.
+    uint8_t payload[1 + BINARY_TIMESTAMP_SIZE + 4];
+    payload[0] = SENDSPIN_BINARY_SOURCE_AUDIO;
+    host_to_be64(-123456789, payload + 1);
+    payload[1 + BINARY_TIMESTAMP_SIZE + 0] = 0x00;
+    payload[1 + BINARY_TIMESTAMP_SIZE + 1] = 0xFF;
+    payload[1 + BINARY_TIMESTAMP_SIZE + 2] = 0x7F;
+    payload[1 + BINARY_TIMESTAMP_SIZE + 3] = 0x80;
+
+    bool cb_fired = false;
+    bool cb_success = false;
+    EXPECT_EQ(conn.send_binary_message(payload, sizeof(payload),
+                                       [&](bool ok) {
+                                           cb_fired = true;
+                                           cb_success = ok;
+                                       }),
+              SsErr::OK);
+    // Synchronous transport: the completion fires inline in the calling thread.
+    EXPECT_TRUE(cb_fired);
+    EXPECT_TRUE(cb_success);
+
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (binary_frames.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    ASSERT_EQ(binary_frames.load(), 1);
+    {
+        std::lock_guard<std::mutex> lock(received_mutex);
+        ASSERT_EQ(received.size(), sizeof(payload));
+        EXPECT_EQ(0, std::memcmp(received.data(), payload, sizeof(payload)));
+    }
+
+    backend.stop();
+}
+
+// Mirror of ClientBinarySendDeliversExactBytes for the host server transport — the transport a
+// source device uses when the Sendspin server connects inbound, so its parallel but independent
+// send implementation gets its own exact-bytes pin. The library-side connection is constructed
+// directly around the accepted IXWebSocket, the way the host ws_server builds it.
+TEST(ConnectionLifecycle, ServerBinarySendDeliversExactBytes) {
+    std::mutex conn_mutex;
+    std::shared_ptr<SendspinServerConnection> server_conn;
+
+    ix::WebSocketServer listener(SERVER_BINARY_TEST_PORT, "127.0.0.1");
+    listener.setOnConnectionCallback([&](const std::weak_ptr<ix::WebSocket>& weak_ws,
+                                         const std::shared_ptr<ix::ConnectionState>& /*state*/) {
+        auto ws = weak_ws.lock();
+        if (!ws) {
+            return;
+        }
+        // IXWebSocket requires a message callback on every accepted socket; inbound frames are
+        // irrelevant here, only the outbound send path is under test.
+        ws->setOnMessageCallback([](const ix::WebSocketMessagePtr& /*msg*/) {});
+        std::lock_guard<std::mutex> lock(conn_mutex);
+        server_conn = std::make_shared<SendspinServerConnection>(ws, -1);
+    });
+    ASSERT_TRUE(listener.listen().first);
+    listener.start();
+
+    // The peer that receives the frame: an IXWebSocket client capturing binary messages.
+    std::atomic<int> binary_frames{0};
+    std::string received;
+    std::mutex received_mutex;
+    ix::WebSocket peer;
+    peer.setUrl(server_url(SERVER_BINARY_TEST_PORT));
+    peer.disableAutomaticReconnection();
+    peer.setOnMessageCallback([&](const ix::WebSocketMessagePtr& msg) {
+        if (msg->type == ix::WebSocketMessageType::Message && msg->binary) {
+            std::lock_guard<std::mutex> lock(received_mutex);
+            received = msg->str;
+            binary_frames.fetch_add(1);
+        }
+    });
+    peer.start();
+
+    auto conn_ready = [&] {
+        std::lock_guard<std::mutex> lock(conn_mutex);
+        return server_conn != nullptr && server_conn->is_connected();
+    };
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!conn_ready() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    ASSERT_TRUE(conn_ready());
+    std::shared_ptr<SendspinServerConnection> conn;
+    {
+        std::lock_guard<std::mutex> lock(conn_mutex);
+        conn = server_conn;
+    }
+
+    uint8_t payload[1 + BINARY_TIMESTAMP_SIZE + 4];
+    payload[0] = SENDSPIN_BINARY_SOURCE_AUDIO;
+    host_to_be64(-123456789, payload + 1);
+    payload[1 + BINARY_TIMESTAMP_SIZE + 0] = 0x00;
+    payload[1 + BINARY_TIMESTAMP_SIZE + 1] = 0xFF;
+    payload[1 + BINARY_TIMESTAMP_SIZE + 2] = 0x7F;
+    payload[1 + BINARY_TIMESTAMP_SIZE + 3] = 0x80;
+
+    bool cb_fired = false;
+    bool cb_success = false;
+    EXPECT_EQ(conn->send_binary_message(payload, sizeof(payload),
+                                        [&](bool ok) {
+                                            cb_fired = true;
+                                            cb_success = ok;
+                                        }),
+              SsErr::OK);
+    // Synchronous transport: the completion fires inline in the calling thread.
+    EXPECT_TRUE(cb_fired);
+    EXPECT_TRUE(cb_success);
+
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (binary_frames.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    ASSERT_EQ(binary_frames.load(), 1);
+    {
+        std::lock_guard<std::mutex> lock(received_mutex);
+        ASSERT_EQ(received.size(), sizeof(payload));
+        EXPECT_EQ(0, std::memcmp(received.data(), payload, sizeof(payload)));
+    }
+
+    peer.stop();
+    listener.stop();
 }
