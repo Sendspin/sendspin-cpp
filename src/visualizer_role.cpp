@@ -33,7 +33,7 @@ static const char* const TAG = "sendspin.visualizer";
 // each entry costs an aligned per-entry ItemHeader, so effective wire-data capacity is smaller
 // (see the buffer_capacity note in config.h).
 static constexpr size_t ENTRY_TYPE_SIZE = 1;
-static constexpr size_t TIMESTAMP_SIZE = 8;
+static constexpr size_t TIMESTAMP_SIZE = sendspin::BINARY_TIMESTAMP_SIZE;
 
 // Minimum payload bytes after the timestamp, per wire message type
 static constexpr size_t LOUDNESS_PAYLOAD_SIZE = 2;  // uint16 value
