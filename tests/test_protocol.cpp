@@ -826,8 +826,7 @@ TEST(Protocol, FormatClientHelloSourceSupport) {
     EXPECT_FALSE(doc3["payload"]["source@v1_support"].is<JsonObject>());
 }
 
-// Exact-field assertions, including the hyphenated "client-stream/start" type string (the
-// reference Python implementation still sends an underscore and must not be copied).
+// Exact-field assertions include the spec's hyphenated "client-stream/start" type string.
 TEST(Protocol, FormatClientStreamStartPcm) {
     ClientStreamStartMessage msg;
     msg.codec = SendspinCodecFormat::PCM;
