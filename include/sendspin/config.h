@@ -299,8 +299,11 @@ struct SourceRoleConfig {
     /// drain threads (2)
     static constexpr unsigned DEFAULT_SOURCE_TASK_PRIORITY = 3U;
 
+    /// @brief Default capture sample rate (Hz): the native rate of most capture hardware
+    static constexpr uint32_t DEFAULT_SOURCE_SAMPLE_RATE = 48000U;
+
     // 32-bit fields
-    uint32_t sample_rate{48000};  ///< Capture sample rate in Hz; must be > 0
+    uint32_t sample_rate{DEFAULT_SOURCE_SAMPLE_RATE};  ///< Capture sample rate in Hz; must be > 0
 
     /// @brief Outbound chunk duration in milliseconds, validated against the spec bounds
     /// [CHUNK_MIN_MS, CHUNK_MAX_MS]
