@@ -128,6 +128,16 @@ public:
     /// Thread-safe: may be called from any context.
     void signal_stop();
 
+    /// @brief Immediately closes the write_audio() gate without waiting for the task
+    ///
+    /// Cleanup uses this before publishing its synthetic STOPPED event so
+    /// on_streaming_stopped() can never fire while write_audio() still accepts; the task also
+    /// closes the gate itself on every stream exit (an extra store is harmless).
+    /// Thread-safe: may be called from any context.
+    void close_audio_gate() {
+        this->accepting_audio_.store(false, std::memory_order_release);
+    }
+
     /// @brief Writes captured audio into the capture ring
     ///
     /// Hot path: exactly one producer thread, non-blocking, non-allocating. Rejects writes

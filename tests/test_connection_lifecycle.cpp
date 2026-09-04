@@ -611,6 +611,7 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
 // inline completion callback.
 TEST(ConnectionLifecycle, ClientBinarySendDeliversExactBytes) {
     std::atomic<int> binary_frames{0};
+    std::atomic<bool> peer_closed{false};
     std::string received;
     std::mutex received_mutex;
 
@@ -626,6 +627,8 @@ TEST(ConnectionLifecycle, ClientBinarySendDeliversExactBytes) {
                 std::lock_guard<std::mutex> lock(received_mutex);
                 received = msg->str;
                 binary_frames.fetch_add(1);
+            } else if (msg->type == ix::WebSocketMessageType::Close) {
+                peer_closed.store(true);
             }
         });
     });
@@ -673,6 +676,17 @@ TEST(ConnectionLifecycle, ClientBinarySendDeliversExactBytes) {
         }
     }
     ASSERT_EQ(binary_frames.load(), 1);
+    // Exactly-once means no LATER duplicate either: close the sender and drain until the peer
+    // observes the close (everything in flight has been delivered), then re-assert the count.
+    conn.disconnect(SendspinGoodbyeReason::SHUTDOWN, nullptr);
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!peer_closed.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    ASSERT_TRUE(peer_closed.load());
+    ASSERT_EQ(binary_frames.load(), 1);
     {
         std::lock_guard<std::mutex> lock(received_mutex);
         ASSERT_EQ(received.size(), sizeof(payload));
@@ -708,6 +722,7 @@ TEST(ConnectionLifecycle, ServerBinarySendDeliversExactBytes) {
 
     // The peer that receives the frame: an IXWebSocket client capturing binary messages.
     std::atomic<int> binary_frames{0};
+    std::atomic<bool> peer_closed{false};
     std::string received;
     std::mutex received_mutex;
     ix::WebSocket peer;
@@ -718,6 +733,8 @@ TEST(ConnectionLifecycle, ServerBinarySendDeliversExactBytes) {
             std::lock_guard<std::mutex> lock(received_mutex);
             received = msg->str;
             binary_frames.fetch_add(1);
+        } else if (msg->type == ix::WebSocketMessageType::Close) {
+            peer_closed.store(true);
         }
     });
     peer.start();
@@ -765,6 +782,17 @@ TEST(ConnectionLifecycle, ServerBinarySendDeliversExactBytes) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
+    ASSERT_EQ(binary_frames.load(), 1);
+    // Exactly-once means no LATER duplicate either: close the sender and drain until the peer
+    // observes the close (everything in flight has been delivered), then re-assert the count.
+    conn->disconnect(SendspinGoodbyeReason::SHUTDOWN, nullptr);
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!peer_closed.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    ASSERT_TRUE(peer_closed.load());
     ASSERT_EQ(binary_frames.load(), 1);
     {
         std::lock_guard<std::mutex> lock(received_mutex);
