@@ -315,10 +315,13 @@ struct SourceRoleConfig {
     /// budget. Hosts may raise it toward OPUS_COMPLEXITY_MAX for quality per CPU
     static constexpr uint8_t DEFAULT_OPUS_COMPLEXITY = 2U;
 
+    /// @brief Default capture sample rate (Hz): the native rate of most capture hardware
+    static constexpr uint32_t DEFAULT_SOURCE_SAMPLE_RATE = 48000U;
+
     // 32-bit fields
     /// @brief Capture sample rate in Hz; must be > 0. OPUS accepts only libopus's rates:
     /// 8000, 12000, 16000, 24000, or 48000 (a 44100 line-in must use PCM or resample upstream)
-    uint32_t sample_rate{48000};
+    uint32_t sample_rate{DEFAULT_SOURCE_SAMPLE_RATE};
 
     /// @brief Outbound chunk duration in milliseconds, validated against the spec bounds
     /// [CHUNK_MIN_MS, CHUNK_MAX_MS]. OPUS accepts only 10, 20, 40, or 60 (one
