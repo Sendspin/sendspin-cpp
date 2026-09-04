@@ -972,9 +972,9 @@ std::string format_client_stream_start_message(const ClientStreamStartMessage* m
 }
 
 std::string format_client_stream_end_message() {
-    // No payload key at all (Sendspin spec, Source messages); a literal, pinned by the
-    // exact-string unit test
-    return R"({"type":"client-stream/end"})";
+    // Every message carries a payload object, empty when the message defines no fields
+    // (Sendspin spec, Message Format); a literal, pinned by the exact-string unit test
+    return R"({"type":"client-stream/end","payload":{}})";
 }
 
 std::string format_stream_request_format_message(const StreamRequestFormatMessage* msg) {
