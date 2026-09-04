@@ -70,6 +70,7 @@ constexpr uint16_t TIME_GATE_TEST_PORT = 19011;
 constexpr uint16_t RECONNECT_TEST_PORT = 19012;
 constexpr uint16_t OPUS_WIRE_TEST_PORT = 19013;
 constexpr uint16_t OPUS_CAPACITY_WIRE_TEST_PORT = 19014;
+constexpr uint16_t WRITE_GATE_TEST_PORT = 19015;
 
 // Default-config wire framing, derived exactly as source_task.cpp derives it: 25 ms at
 // 48 kHz stereo 16-bit -> 1200 frames x 4 bytes, behind a 1-byte type + 8-byte timestamp header.
@@ -922,7 +923,11 @@ int64_t read_be64(const uint8_t* bytes) {
 // chunk and client-stream/end on stop -- with write_audio() gated shut before the start
 // command, validating frames while open, and gated shut again after the stop.
 TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
-    WireHarness harness(WIRE_TEST_PORT);
+    // The chunk arithmetic below encodes 25 ms chunks; pinned here so the test cannot drift
+    // with the config default.
+    SourceRoleConfig wire_config;
+    wire_config.chunk_duration_ms = 25;
+    WireHarness harness(WIRE_TEST_PORT, wire_config);
     ASSERT_TRUE(harness.start());
     FakeSourceServer fake(server_url(WIRE_TEST_PORT), "source-server-a");
     ASSERT_TRUE(harness.establish(fake));
@@ -944,15 +949,6 @@ TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
         },
         4000));
     EXPECT_TRUE(source->is_streaming());
-
-    // Validation while open: a non-whole-frame write is rejected as a whole.
-    std::vector<uint8_t> odd(WIRE_BYTES_PER_FRAME * 10 + 1, 0xAA);
-    EXPECT_FALSE(source->write_audio(odd.data(), odd.size(), 0));
-
-    // Overflow: a write larger than the whole capture ring cannot be buffered -- rejected and
-    // counted as a drop, never blocked on.
-    std::vector<uint8_t> oversized(WIRE_BYTES_PER_FRAME * 48000, 0);  // 1 s >> 150 ms ring
-    EXPECT_FALSE(source->write_audio(oversized.data(), oversized.size(), 0));
 
     // 50 ms of ramp PCM in 10 ms writes, capture-stamped 10 ms apart: exactly two full 25 ms
     // chunks.
@@ -1022,9 +1018,6 @@ TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
     EXPECT_EQ(static_cast<uint8_t>(first[0]), SENDSPIN_BINARY_SOURCE_AUDIO);
     const int64_t ts1 = read_be64(reinterpret_cast<const uint8_t*>(first.data()) + 1);
     EXPECT_LT(std::llabs(ts1 - base), 1000000);
-    for (size_t i = 0; i < 16; ++i) {
-        EXPECT_EQ(static_cast<uint8_t>(first[WIRE_HEADER + i]), static_cast<uint8_t>(i & 0xFF));
-    }
 
     // The second chunk's anchor is exactly one chunk after the first (contiguous capture
     // stamps); allow slack for the time filter refining its offset between the two sends.
@@ -1036,6 +1029,52 @@ TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
     // The final short chunk carries the 10 ms remainder.
     const auto& last = events[static_cast<size_t>(binary_idx[2])].data;
     EXPECT_EQ(last.size(), WIRE_HEADER + WIRE_BYTES_PER_FRAME * 480);
+
+    // Every payload byte of every chunk continues the write-side ramp: chunk boundaries and
+    // assembly cannot silently reorder, duplicate, or corrupt capture bytes.
+    size_t expected_ramp = 0;
+    bool payload_intact = true;
+    for (const ptrdiff_t idx : binary_idx) {
+        const auto& chunk_data = events[static_cast<size_t>(idx)].data;
+        for (size_t i = WIRE_HEADER; i < chunk_data.size(); ++i) {
+            if (static_cast<uint8_t>(chunk_data[i]) !=
+                static_cast<uint8_t>(expected_ramp++ & 0xFF)) {
+                payload_intact = false;
+                break;
+            }
+        }
+        if (!payload_intact) {
+            break;
+        }
+    }
+    EXPECT_TRUE(payload_intact);
+    EXPECT_EQ(expected_ramp, WIRE_BYTES_PER_FRAME * 480 * 6);
+}
+
+// Mid-stream capture validation, focused so a regression here names itself: a non-whole-frame
+// write is rejected as a whole, and a write larger than the whole capture ring is rejected as
+// a counted drop rather than blocking the producer.
+TEST(SourceWire, RejectsMalformedAndOversizedWritesWhileOpen) {
+    WireHarness harness(WRITE_GATE_TEST_PORT);
+    ASSERT_TRUE(harness.start());
+    FakeSourceServer fake(server_url(WRITE_GATE_TEST_PORT), "source-server-w");
+    ASSERT_TRUE(harness.establish(fake));
+    SourceRole* source = harness.client.source();
+    ASSERT_NE(source, nullptr);
+
+    fake.send_source_command("start");
+    ASSERT_TRUE(pump_until(
+        harness.client, [&] { return harness.listener.started == 1; }, 4000));
+
+    std::vector<uint8_t> odd(WIRE_BYTES_PER_FRAME * 10 + 1, 0xAA);
+    EXPECT_FALSE(source->write_audio(odd.data(), odd.size(), 0));
+
+    std::vector<uint8_t> oversized(WIRE_BYTES_PER_FRAME * 48000, 0);  // 1 s >> 150 ms ring
+    EXPECT_FALSE(source->write_audio(oversized.data(), oversized.size(), 0));
+
+    // Control: a well-formed write on the same open stream is accepted.
+    std::vector<uint8_t> good(WIRE_BYTES_PER_FRAME * 480, 0x42);
+    EXPECT_TRUE(source->write_audio(good.data(), good.size(), 0));
 }
 
 // The time-sync convergence gate: a start command on a connection whose time filter has no
@@ -1088,7 +1127,9 @@ TEST(SourceWire, PermissionDoesNotSurviveReconnect) {
     ASSERT_TRUE(harness.establish(fake2));
 
     // The old connection's permission must not leak into this one.
-    pump_for(harness.client, 400);
+    // Longer than the task's 500 ms failed-open retry (SOURCE_OPEN_RETRY_MS): a permission
+    // leak that merely deferred into the retry window must surface before the fresh command.
+    pump_for(harness.client, 700);
     EXPECT_EQ(fake2.count_text_containing("client-stream/start"), 0U);
     EXPECT_EQ(harness.listener.started, 1);
 

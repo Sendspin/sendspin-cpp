@@ -935,11 +935,15 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
 #endif
 
 #ifdef SENDSPIN_ENABLE_SOURCE
-            if (this->source_ != nullptr && conn != nullptr) {
+            if (this->source_ != nullptr && conn != nullptr &&
+                this->connection_manager_->current_shared().get() == conn) {
+                // Only the current connection may write the command slot: a nursery or
+                // handoff-displaced connection delivering concurrently must not overwrite the
+                // current connection's latest command (per-connection permission; Sendspin
+                // spec, Source messages). The instance id lets the main-loop latch discard the
+                // remaining TOCTOU sliver where the writer is displaced before the drain.
                 SourceCommand source_cmd{};
                 if (process_server_command_source(root, &source_cmd)) {
-                    // The instance id lets the main-loop latch discard stale-connection
-                    // commands (per-connection permission; Sendspin spec, Source messages)
                     this->source_->impl_->handle_server_command(source_cmd,
                                                                 conn->get_instance_id());
                 }

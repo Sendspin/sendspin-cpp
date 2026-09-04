@@ -33,8 +33,10 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.source_task";
 
-/// @brief Same budget as the sync task: the deepest paths are the stream start/end JSON build
-/// and the transport send; Opus working buffers live on micro-opus's pseudostack, not here
+/// @brief Same budget as the sync task. Host -O2 -fstack-usage measures the deepest task-path
+/// chain (stream -> send_chunk -> event wait) near 0.6 KB; the remainder is headroom for the
+/// ESP transport send path pending an on-target high-water measurement. Opus working buffers
+/// live on micro-opus's per-thread pseudostack, not here.
 static constexpr size_t SOURCE_TASK_STACK_SIZE = 6192;
 
 /// @brief Ring receive timeout (ms) bounding how long the task waits before re-checking the
@@ -47,6 +49,11 @@ static constexpr size_t SOURCE_WIRE_HEADER_SIZE = 1U + BINARY_TIMESTAMP_SIZE;
 /// @brief Backoff (ms) before retrying a failed stream open on a still-live connection; coarse
 /// because opens are lifecycle-rare and the failure means transient pressure needing time
 static constexpr uint32_t SOURCE_OPEN_RETRY_MS = 500U;
+
+/// @brief Bound (ms) on waiting for the client-stream/start send confirmation. Generous next to
+/// any healthy queue drain, and safe because the text completion is best-effort: a skipped
+/// callback times out here and the open is retried rather than the task wedging
+static constexpr uint32_t START_CONFIRM_TIMEOUT_MS = 2000U;
 
 /// @brief Ring metadata margin: +1/4 over audio capacity for per-write entry headers, the
 /// inverse of the player's 1/5 advertise fraction (AUDIO_BUFFER_ADVERTISE_DENOMINATOR)
@@ -290,9 +297,24 @@ void SourceTask::stream(const std::shared_ptr<SendspinConnection>& conn) {
     start_msg.channels = config.channels;
     start_msg.sample_rate = config.sample_rate;
     start_msg.bit_depth = config.bit_depth;
-    if (conn->send_text_message(format_client_stream_start_message(&start_msg), nullptr) !=
-        SsErr::OK) {
+    // A clean slate for the confirmation wait: a completion left over from a prior stream's
+    // timed-out send on this connection could otherwise satisfy the wait below spuriously.
+    this->event_flags_.clear(SourceTaskBits::SOURCE_SEND_COMPLETE);
+    if (conn->send_text_message(format_client_stream_start_message(&start_msg),
+                                this->send_complete_cb_) != SsErr::OK) {
         SS_LOGW(TAG, "Failed to send client-stream/start; stream not opened");
+        return;
+    }
+    // Queued is not sent: on the async ESP-server transport OK only means httpd accepted the
+    // work, and the worker can still fail the wire send. Chunks MUST follow a delivered
+    // client-stream/start (Sendspin spec, Source messages), so wait for the completion before
+    // opening the gate. The text callback is best-effort (it can be skipped on teardown), hence
+    // the bounded wait; a timeout or failure is treated as a failed open and retried.
+    const uint32_t bits = this->event_flags_.wait(SourceTaskBits::SOURCE_SEND_COMPLETE, false, true,
+                                                  START_CONFIRM_TIMEOUT_MS);
+    if ((bits & SourceTaskBits::SOURCE_SEND_COMPLETE) == 0U ||
+        !this->last_send_ok_.load(std::memory_order_acquire)) {
+        SS_LOGW(TAG, "client-stream/start not confirmed; stream not opened");
         return;
     }
 

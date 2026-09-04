@@ -290,8 +290,11 @@ void SourceRole::Impl::drain_events() {
 }
 
 void SourceRole::Impl::cleanup() {
-    // Permission does not survive the connection (Sendspin spec, Source messages)
+    // Permission does not survive the connection (Sendspin spec, Source messages). The gate is
+    // closed here, before the synthetic STOPPED below, so the listener can never observe
+    // "stopped" while write_audio() still accepts.
     this->streaming_desired = false;
+    this->task->close_audio_gate();
     this->task->signal_stop();
 
     // Discard a stale command from the dead connection

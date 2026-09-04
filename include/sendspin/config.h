@@ -285,8 +285,10 @@ struct SourceRoleConfig {
 
     /// @brief Default duration (ms) of one outbound audio chunk. Small enough to keep the
     /// capture-to-server latency and per-chunk staging buffer modest, large enough that the
-    /// per-chunk framing/send overhead stays negligible; well inside the spec bounds above
-    static constexpr uint32_t DEFAULT_CHUNK_MS = 25U;
+    /// per-chunk framing/send overhead stays negligible; well inside the spec bounds above,
+    /// and a legal Opus frame duration so switching codec alone never invalidates a default
+    /// config
+    static constexpr uint32_t DEFAULT_CHUNK_MS = 20U;
 
     /// @brief Default capture ring capacity in milliseconds. Derived from the spec's maximum
     /// chunk duration: the ring IS the "small bound" of the spec's stall policy (Source
