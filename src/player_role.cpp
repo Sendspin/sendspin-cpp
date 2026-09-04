@@ -22,21 +22,10 @@
 
 static const char* const TAG = "sendspin.player";
 
-/// @brief Size of the big-endian 64-bit timestamp at the start of player binary messages.
-static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
 static constexpr uint16_t MAX_STATIC_DELAY_MS = 5000U;
 static constexpr uint32_t HEADER_SEND_TIMEOUT_MS = 100U;
 // Denominator for the advertised buffer capacity fraction: advertises (N-1)/N of capacity
 static constexpr size_t AUDIO_BUFFER_ADVERTISE_DENOMINATOR = 5;
-
-/// @brief Swaps bytes of a big-endian 64-bit value to host byte order.
-static int64_t be64_to_host(const uint8_t* bytes) {
-    uint64_t val = 0;
-    for (int i = 0; i < 8; ++i) {
-        val = (val << 8) | bytes[i];
-    }
-    return static_cast<int64_t>(val);
-}
 
 namespace sendspin {
 

@@ -460,6 +460,24 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
     return true;
 }
 
+// A standalone section parser (server/state style) rather than a ServerCommandMessage field:
+// the source command types are internal-only
+bool process_server_command_source(JsonObject root, SourceCommand* source_cmd) {
+    if (source_cmd == nullptr || !root["payload"]["source"].is<JsonObject>()) {
+        return false;
+    }
+    // "command" is required with no default; a bad value rejects the whole source object
+    // (Sendspin spec, Source messages — Server command object)
+    auto command = read_enum_field(root["payload"]["source"]["command"], "command",
+                                   source_command_from_string);
+    if (!command) {
+        SS_LOGW(TAG, "Rejecting server/command source object: missing or invalid 'command'");
+        return false;
+    }
+    *source_cmd = command.value();
+    return true;
+}
+
 // server/state is parsed one section at a time rather than into a single aggregate struct. The
 // caller runs on the network task (the ESP httpd task has a 4 KB stack), and an aggregate would
 // keep every section's fields alive in the caller's frame for the whole parse while the section
@@ -883,6 +901,15 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         }
     }
 
+    // Required whenever source@v1 is advertised; features emitted only when set (Sendspin
+    // spec, Source messages — Hello support object)
+    if (msg->source_v1_support.has_value()) {
+        JsonObject source_json = root["payload"]["source@v1_support"].to<JsonObject>();
+        if (msg->source_v1_support.value().line_sense) {
+            source_json["features"]["line_sense"] = true;
+        }
+    }
+
     std::string output;
     serializeJson(doc, output);
     return output;
@@ -909,9 +936,45 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
         }
     }
 
+    // The source object may legitimately be empty; signal only when set (Sendspin spec,
+    // Source messages — Client state object)
+    if (msg->source.has_value()) {
+        JsonObject source_json = root["payload"]["source"].to<JsonObject>();
+        if (msg->source.value().signal.has_value()) {
+            source_json["signal"] = to_cstr(msg->source.value().signal.value());
+        }
+    }
+
     std::string output;
     serializeJson(doc, output);
     return output;
+}
+
+std::string format_client_stream_start_message(const ClientStreamStartMessage* msg) {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    // Hyphenated type string per the spec; codec_header only when present, bit_depth always
+    // (Sendspin spec, Source messages — client-stream/start)
+    root["type"] = "client-stream/start";
+    JsonObject source_json = root["payload"]["source"].to<JsonObject>();
+    source_json["codec"] = to_cstr(msg->codec);
+    source_json["channels"] = msg->channels;
+    source_json["sample_rate"] = msg->sample_rate;
+    source_json["bit_depth"] = msg->bit_depth;
+    if (msg->codec_header.has_value()) {
+        source_json["codec_header"] = msg->codec_header.value();
+    }
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_stream_end_message() {
+    // Every message carries a payload object, empty when the message defines no fields
+    // (Sendspin spec, Message Format); a literal, pinned by the exact-string unit test
+    return R"({"type":"client-stream/end","payload":{}})";
 }
 
 std::string format_stream_request_format_message(const StreamRequestFormatMessage* msg) {
