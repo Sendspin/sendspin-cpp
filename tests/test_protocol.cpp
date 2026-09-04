@@ -861,9 +861,10 @@ TEST(Protocol, FormatClientStreamStartFlacCodecHeader) {
     EXPECT_STREQ(doc["payload"]["source"]["codec_header"], "c2VuZHNwaW4=");
 }
 
-// client-stream/end is a fixed message with no payload key at all; pin the exact bytes.
+// client-stream/end defines no fields but still carries the required empty payload object
+// (Sendspin spec, Message Format); pin the exact bytes.
 TEST(Protocol, FormatClientStreamEndExactString) {
-    EXPECT_EQ(format_client_stream_end_message(), R"({"type":"client-stream/end"})");
+    EXPECT_EQ(format_client_stream_end_message(), R"({"type":"client-stream/end","payload":{}})");
 }
 
 // Control cases for the rejection tests below: a well-formed source command must parse.
