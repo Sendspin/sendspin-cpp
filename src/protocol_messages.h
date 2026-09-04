@@ -700,7 +700,7 @@ struct ClientHelloMessage {
     std::optional<SourceSupportObject> source_v1_support{};
 };
 
-/// @brief Outgoing client/state message reporting client playback state to the server
+/// @brief Outgoing client/state message reporting client availability and role state to the server
 struct ClientStateMessage {
     SendspinClientState state{};
     std::optional<ClientPlayerStateObject> player{};
