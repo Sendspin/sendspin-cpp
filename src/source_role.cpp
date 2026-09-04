@@ -308,7 +308,7 @@ void SourceRole::Impl::cleanup() {
 // Impl: Consumer-facing method implementations
 // ============================================================================
 
-bool SourceRole::Impl::write_audio(const uint8_t* data, size_t len, int64_t capture_time_us) {
+bool SourceRole::Impl::write_audio(const uint8_t* data, size_t len, int64_t capture_time_us) const {
     return this->task->write_audio(data, len, capture_time_us);
 }
 

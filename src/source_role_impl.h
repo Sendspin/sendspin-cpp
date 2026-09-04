@@ -79,7 +79,7 @@ struct SourceRole::Impl {
     // Consumer-facing method implementations
     // ========================================
 
-    bool write_audio(const uint8_t* data, size_t len, int64_t capture_time_us);
+    bool write_audio(const uint8_t* data, size_t len, int64_t capture_time_us) const;
     void set_signal(SourceSignal new_signal);
 
     // ========================================
