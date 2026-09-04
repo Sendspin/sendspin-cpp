@@ -98,9 +98,10 @@ inline void host_to_be64(int64_t value, uint8_t* bytes) {
 
 /// @brief Binary message type byte values for known message kinds
 enum SendspinBinaryType : uint8_t {
-    SENDSPIN_BINARY_PLAYER_AUDIO = 4,   // Player slot 0: encoded audio chunk
-    SENDSPIN_BINARY_ARTWORK_IMAGE = 8,  // Artwork slot 0: image data
-    SENDSPIN_BINARY_SOURCE_AUDIO = 12,  // Source slot 0: encoded audio chunk (client->server)
+    SENDSPIN_BINARY_PLAYER_AUDIO = SENDSPIN_ROLE_PLAYER << 2,    // Player slot 0: encoded audio
+    SENDSPIN_BINARY_ARTWORK_IMAGE = SENDSPIN_ROLE_ARTWORK << 2,  // Artwork slot 0: image data
+    SENDSPIN_BINARY_SOURCE_AUDIO = SENDSPIN_ROLE_SOURCE << 2,    // Source slot 0: encoded audio
+                                                                 // chunk (client->server)
     // Visualizer expanded allocation (IDs 16-23); each data type is its own message
     // carrying exactly one frame of [timestamp:8][data]
     SENDSPIN_BINARY_VISUALIZER_LOUDNESS = 16,  // uint16 A-weighted loudness
@@ -703,8 +704,9 @@ struct ClientStateMessage {
 
 /// @brief Outgoing client-stream/start message announcing the source's outbound audio format
 ///
-/// Mirrors the AudioSupportedFormatObject field set; codec_header carries the base64-encoded
-/// decoder setup data for codecs that need one (absent for pcm and opus).
+/// Mirrors the AudioSupportedFormatObject field set. codec_header is required for flac and
+/// absent for pcm and opus (Sendspin spec, Source messages -- codec framing); the invariant is
+/// the producer's contract, upheld by the role's config validation rather than checked here.
 struct ClientStreamStartMessage {
     SendspinCodecFormat codec{};
     uint8_t channels{};
