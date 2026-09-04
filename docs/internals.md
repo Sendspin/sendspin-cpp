@@ -14,7 +14,7 @@ Throughout this document, internal field and method references use the `Impl` qu
 
 Roles can be disabled at build time via `SENDSPIN_ENABLE_*` (CMake options on host, Kconfig entries on ESP-IDF). Two mechanisms cooperate, with a strict boundary between them:
 
-1. **CMake source-list exclusion** (`cmake/sources.cmake`). Each role has its own `SENDSPIN_<ROLE>_SOURCES` list. When a role is disabled, its translation units are not added to the build, so the code never compiles and its transitive dependencies are not required; e.g., micro-flac and micro-opus for the player. The ESP-IDF component manifest (`idf_component.yml`) similarly gates the audio codec dependencies on `SENDSPIN_ENABLE_PLAYER` so they are not even fetched.
+1. **CMake source-list exclusion** (`cmake/sources.cmake`). Each role has its own `SENDSPIN_<ROLE>_SOURCES` list. When a role is disabled, its translation units are not added to the build, so the code never compiles and its transitive dependencies are not required; e.g., micro-flac for the player and micro-opus for the player and source. The ESP-IDF component manifest (`idf_component.yml`) similarly gates the codec dependencies so they are not even fetched: micro-flac on `SENDSPIN_ENABLE_PLAYER`, micro-opus on `SENDSPIN_ENABLE_PLAYER` or `SENDSPIN_ENABLE_SOURCE`.
 2. **`#ifdef SENDSPIN_ENABLE_<ROLE>` guards** in `include/sendspin/client.h` and `src/client.cpp`. These are the only core files that must reference role types directly (the `std::unique_ptr<RoleClass>` members, `add_*()` / accessor declarations, and dispatch branches in message handlers). Nowhere else in the core should use these guards.
 
 The split exists because the two problems are different. CMake handles "don't compile this file and don't require its dependencies," while `#ifdef` handles "core code needs to conditionally mention a type." Using `#ifdef` to gate entire files would still force the codec headers onto the include path; using CMake to gate individual member declarations is not possible.
@@ -34,9 +34,10 @@ The library uses a small number of long-lived threads. All state mutations and u
 | Thread | Name | Created by | Stack (ESP) | Priority (ESP) | Purpose |
 |--------|------|-----------|-------------|-----------------|---------|
 | **Main loop** | (caller's) | User code | - | - | Drives `SendspinClient::loop()`. All role event processing and listener callbacks run here. |
-| **Sync task** | `Sendspin` | `PlayerRole::Impl::start()` → `SyncTask::start()` | 6192 B | 2 | Decodes audio, synchronizes to server timestamps, writes PCM to the audio sink via `on_audio_write`. |
+| **Sync task** | `Sendspin` | `PlayerRole::Impl::start()` → `SyncTask::start()` | 6192 B | 6 | Decodes audio, synchronizes to server timestamps, writes PCM to the audio sink via `on_audio_write`. |
 | **Visualizer drain** | `SsVis` | `VisualizerRole::Impl::start()` | 4096 B | 2 | Reads visualization frames from a ring buffer and delivers them to the listener at the correct playback time. |
 | **Artwork decode** | `SsArt` | `ArtworkRole::Impl::start()` | 4096 B | 2 | Receives image notifications and calls the decode callback. Hands the server display timestamp off to the main loop, which fires the display callback at the correct time. |
+| **Source task** | `SsSrc` | `SourceRole::Impl::start()` → `SourceTask::start()` | 6192 B | 3 | Drains the capture ring, assembles timestamped chunks, optionally Opus-encodes them, and sends them (plus the stream's `client-stream/start`/`end` messages) on the bound connection. |
 | **Network** | (library-internal) | IXWebSocket (host) or esp_http_server (ESP) | - | - | WebSocket I/O. Callbacks fire on these threads and must defer work to the main loop. |
 
 On host builds, `platform_configure_thread()` is a no-op; threads use OS defaults. On ESP-IDF it calls `esp_pthread_set_cfg()` to set stack size, priority, name, and optional PSRAM allocation before the `std::thread` is constructed.
@@ -55,6 +56,12 @@ On host builds, `platform_configure_thread()` is a no-op; threads use OS default
 1. `VisualizerRole::Impl::start()` spawns the drain thread.
 2. The thread blocks on ring buffer receives with a 50 ms timeout.
 3. `VisualizerRole::Impl` destructor sets `COMMAND_STOP` and joins.
+
+**Source task** (`src/source_task.cpp`):
+
+1. `SourceRole::Impl::start()` calls `SourceTask::init()` (allocates the capture ring and chunk staging buffer, creates the encoder) and `SourceTask::start()`, which spawns the thread and blocks until it reaches IDLE (`SOURCE_TASK_IDLE`).
+2. The thread runs a persistent outer loop for the lifetime of the client, idling between streams (see [Source Streaming Pipeline](#source-streaming-pipeline)).
+3. `SourceTask::stop()` sets `SOURCE_COMMAND_STOP` and joins. Called from `SourceTask`'s destructor, triggered by `SourceRole::Impl`'s destructor.
 
 **Artwork decode** (`src/artwork_role.cpp`):
 
@@ -84,7 +91,7 @@ TASK_ERROR           (1 << 11)  Allocation or decode failure
 TASK_IDLE            (1 << 12)  Waiting for work
 ```
 
-The sync task, visualizer drain thread, and artwork decode thread all use event flags for command signaling from the main loop and status reporting back. The artwork decode thread uses a simpler subset: just `COMMAND_STOP`. The visualizer drain thread adds `COMMAND_FLUSH` and `COMMAND_CLEAR`. `COMMAND_CLEAR` discards buffered entries up to a 1-byte marker the network thread enqueues on `stream/start` and `stream/clear` (mirroring the sync task's clear-marker chunk) so frames received after the boundary survive; `COMMAND_FLUSH` (drain to empty) is only used when the producer is already stopped (`stream/end`, cleanup).
+The sync task, visualizer drain thread, artwork decode thread, and source task all use event flags for command signaling from the main loop and status reporting back. The artwork decode thread uses a simpler subset: just `COMMAND_STOP`. The visualizer drain thread adds `COMMAND_FLUSH` and `COMMAND_CLEAR`. `COMMAND_CLEAR` discards buffered entries up to a 1-byte marker the network thread enqueues on `stream/start` and `stream/clear` (mirroring the sync task's clear-marker chunk) so frames received after the boundary survive; `COMMAND_FLUSH` (drain to empty) is only used when the producer is already stopped (`stream/end`, cleanup). The source task has its own enum (`SourceTaskBits` in `src/source_task.h`): `SOURCE_COMMAND_STOP`/`SOURCE_TASK_RUNNING`/`SOURCE_TASK_STOPPED`/`SOURCE_TASK_IDLE` mirror the sync task's lifecycle bits, `SOURCE_COMMAND_UPDATE` signals that the desired streaming state (a latest-wins atomic) changed, and `SOURCE_SEND_COMPLETE` paces chunk sends against their completion callbacks.
 
 ### ThreadSafeQueue (`src/platform/thread_safe_queue.h`)
 
@@ -117,7 +124,7 @@ State currently on the Inbox:
 
 | Endpoint | Topic bit | Data | Producer |
 |----------|-----------|------|----------|
-| Event ring | `INBOX_TOPIC_EVENTS` | Lifecycle events (`TimeResponsePayload`, `PLAYER_STREAM` STREAM_START/STREAM_END, `ARTWORK_STREAM` STREAM_END/STREAM_CLEAR, `VISUALIZER_STREAM` STREAM_START/STREAM_END/STREAM_CLEAR, plus `CONTROLLER_CLEARED` / `METADATA_CLEARED` / `COLOR_CLEARED`) via `InboxEvent` | Network thread (`TimeResponsePayload`, `PLAYER_STREAM`, `ARTWORK_STREAM`, `VISUALIZER_STREAM`) / main-loop thread (`*_CLEARED` and the synthetic `cleanup()` stream events) |
+| Event ring | `INBOX_TOPIC_EVENTS` | Lifecycle events (`TimeResponsePayload`, `PLAYER_STREAM` STREAM_START/STREAM_END, `ARTWORK_STREAM` STREAM_END/STREAM_CLEAR, `VISUALIZER_STREAM` STREAM_START/STREAM_END/STREAM_CLEAR, `SOURCE_STREAM` STREAMING_STARTED/STREAMING_STOPPED, plus `CONTROLLER_CLEARED` / `METADATA_CLEARED` / `COLOR_CLEARED`) via `InboxEvent` | Network thread (`TimeResponsePayload`, `PLAYER_STREAM`, `ARTWORK_STREAM`, `VISUALIZER_STREAM`) / source task thread (`SOURCE_STREAM`) / main-loop thread (`*_CLEARED` and the synthetic `cleanup()` stream events) |
 | `Client::group_slot` | `INBOX_TOPIC_GROUP` | `GroupUpdateObject` (field-by-field delta merge) | Network thread |
 | `ControllerRole::Impl::slot` | `INBOX_TOPIC_CONTROLLER` | `ServerStateControllerObject` (latest wins) | Network thread |
 | `MetadataRole::Impl::slot` | `INBOX_TOPIC_METADATA` | `ServerMetadataStateDelta` (field-by-field delta merge) | Network thread |
@@ -127,8 +134,9 @@ State currently on the Inbox:
 | `PlayerRole::Impl::EventState::state_slot` | `INBOX_TOPIC_PLAYER_STATE` | `SendspinClientState` (latest wins) | Sync task thread |
 | `VisualizerRole::Impl::EventState::config_slot` | `INBOX_TOPIC_VISUALIZER_CONFIG` | `ServerVisualizerStreamObject` (latest wins) | Network thread |
 | `ArtworkRole::Impl::EventState::display_slot` | `INBOX_TOPIC_ARTWORK_DISPLAY` | `ArtworkDisplayUpdate` (per-slot display timestamp + epoch, merged) | Artwork decode thread |
+| `SourceRole::Impl::EventState::command_slot` | `INBOX_TOPIC_SOURCE_COMMAND` | `SourceCommandEnvelope` (server start/stop command + originating connection instance id, latest wins) | Network thread |
 
-All roles have been migrated onto the Inbox. The controller/metadata/color roles write or merge server state into their `InboxSlot` from `handle_server_state()`, and their disconnect clear arrives as a `*_CLEARED` lifecycle event on the shared ring rather than a per-role flag. The player role owns three `InboxSlot`s (stream params, command, and client state, on its `EventState`) plus `PLAYER_STREAM` lifecycle events on the shared ring; its disconnect clear is the synthetic STREAM_END that `cleanup()` pushes onto the ring. The visualizer role writes its stream config to `config_slot` and delivers STREAM_START/END/CLEAR as `VISUALIZER_STREAM` ring events (no per-tick `drain_events()`; the config is taken when the START event is dispatched). The artwork role merges per-slot display timestamps (tagged with the decode `stream_epoch`) into `display_slot`, delivers STREAM_END/CLEAR as `ARTWORK_STREAM` ring events, and keeps a per-tick `drain_events()` for its server-clock display-deadline sweep. Both roles' disconnect clears are synthetic stream events that `cleanup()` pushes onto the ring.
+All roles have been migrated onto the Inbox. The controller/metadata/color roles write or merge server state into their `InboxSlot` from `handle_server_state()`, and their disconnect clear arrives as a `*_CLEARED` lifecycle event on the shared ring rather than a per-role flag. The player role owns three `InboxSlot`s (stream params, command, and client state, on its `EventState`) plus `PLAYER_STREAM` lifecycle events on the shared ring; its disconnect clear is the synthetic STREAM_END that `cleanup()` pushes onto the ring. The visualizer role writes its stream config to `config_slot` and delivers STREAM_START/END/CLEAR as `VISUALIZER_STREAM` ring events (no per-tick `drain_events()`; the config is taken when the START event is dispatched). The artwork role merges per-slot display timestamps (tagged with the decode `stream_epoch`) into `display_slot`, delivers STREAM_END/CLEAR as `ARTWORK_STREAM` ring events, and keeps a per-tick `drain_events()` for its server-clock display-deadline sweep. Both roles' disconnect clears are synthetic stream events that `cleanup()` pushes onto the ring. The source role's `command_slot` is latest-wins on purpose: start and stop are idempotent and only the final desired state matters, so commands coalescing between drains loses nothing; its STREAMING_STARTED/STOPPED lifecycle callbacks ride the shared ring as `SOURCE_STREAM` events pushed by the source task thread.
 
 ### SpscRingBuffer (`src/platform/spsc_ring_buffer.h`)
 
@@ -138,6 +146,7 @@ Used for:
 
 - **Encoded audio**: Via the `SendspinAudioRingBuffer` wrapper (which adds chunk headers and exposes `write_chunk` / `receive_chunk` / `return_chunk`). Network thread writes chunks; sync task reads and decodes them.
 - **Visualizer frames**: Used directly. Network thread writes one entry per visualizer binary message; drain thread reads them at the correct playback time.
+- **Captured audio**: Via the same `SendspinAudioRingBuffer` wrapper, in the outbound direction. The consumer's capture thread writes one timestamped entry per `SourceRole::write_audio()` call; the source task reads entries and assembles them into wire chunks.
 
 ### Other Primitives
 
@@ -176,7 +185,7 @@ Network thread (IXWebSocket / esp_http_server)
 | `SERVER_HELLO` | Stores server info and connection reason on the connection, then sets `server_hello_received_` (an atomic store that publishes the fields to the main loop; the manager's promotion scan observes `is_handshake_complete()` on its next tick) |
 | `SERVER_TIME` | Pushes a `TIME_RESPONSE` `InboxEvent` onto the shared inbox ring |
 | `SERVER_STATE` | Writes/merges into the controller, metadata, and color `InboxSlot`s via each role's `handle_server_state()` |
-| `SERVER_COMMAND` | Merges into the player's `command_slot` (`InboxSlot<ServerCommandMessage>`) |
+| `SERVER_COMMAND` | Merges into the player's `command_slot` (`InboxSlot<ServerCommandMessage>`); a source start/stop command is written to the source's `command_slot` (`InboxSlot<SourceCommandEnvelope>`, latest wins) together with the originating connection's instance id |
 | `GROUP_UPDATE` | Merges into `Client::group_slot` (`InboxSlot<GroupUpdateObject>`) |
 | `STREAM_START` | Writes to the player's `stream_params_slot`, pushes a `PLAYER_STREAM` (STREAM_START) event onto the inbox ring. Marks the artwork stream active, flushes the decode thread's notification queue, bumps the artwork `stream_epoch`, and resets the artwork `display_slot`. Writes the config to the visualizer's `config_slot` and pushes a `VISUALIZER_STREAM` (STREAM_START) event onto the inbox ring. |
 | `STREAM_END` | Pushes a `PLAYER_STREAM` (STREAM_END) event onto the inbox ring and signals sync task `COMMAND_STREAM_END`; pushes `ARTWORK_STREAM` (STREAM_END) and `VISUALIZER_STREAM` (STREAM_END) events onto the inbox ring |
@@ -197,6 +206,8 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
 | Player audio | `PlayerRole::Impl::handle_binary()`: writes to encoded audio ring buffer |
 | Artwork image | `ArtworkRole::Impl::handle_binary()`: copies image data to a per-slot double buffer and enqueues a notification for the artwork decode thread |
 | Visualizer data (binary types 16-20) | `VisualizerRole::Impl::handle_binary()`: writes to visualizer ring buffer |
+
+The source role's binary ID block (types 12-15, `SENDSPIN_ROLE_SOURCE`) is outbound only: the client sends `SENDSPIN_BINARY_SOURCE_AUDIO` (12) chunks to the server and never receives messages in that block, so it has no inbound dispatch row (see [Outbound send path](#outbound-send-path)).
 
 ### Main Loop Processing
 
@@ -224,14 +235,17 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    ├─ Fire CONTROLLER/METADATA/COLOR_CLEARED via each role's handle_cleared_event()
    ├─ Dispatch PLAYER_STREAM via player_->impl_->on_stream_ring_event()
    ├─ Dispatch ARTWORK_STREAM via artwork_->impl_->handle_stream_ring_event()
-   └─ Dispatch VISUALIZER_STREAM via visualizer_->impl_->handle_stream_ring_event()
+   ├─ Dispatch VISUALIZER_STREAM via visualizer_->impl_->handle_stream_ring_event()
+   └─ Dispatch SOURCE_STREAM via source_->impl_->on_stream_ring_event()
+      (appends to pending_events; the callbacks fire from drain_events() below)
 
 4. Role event draining (each role's impl_->drain_events(), gated on impl_->needs_drain(slot_bits))
    ├─ player_->impl_->drain_events()
    ├─ controller_->impl_->drain_events()
    ├─ metadata_->impl_->drain_events()
    ├─ color_->impl_->drain_events()
-   └─ artwork_->impl_->drain_events()   (display-deadline sweep; visualizer has no drain_events())
+   ├─ artwork_->impl_->drain_events()   (display-deadline sweep; visualizer has no drain_events())
+   └─ source_->impl_->drain_events()   (server command latch + streaming started/stopped callbacks)
 
 5. Drain group_slot (when INBOX_TOPIC_GROUP is set in slot_bits)
    └─ Apply group deltas, fire on_group_update, persist last played server
@@ -289,6 +303,7 @@ The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering
 - **ArtworkRole**: Stream end/clear lifecycle is handled earlier in the tick by `handle_stream_ring_event()` (dispatched from the ring drain, before this call), which clears `held_display_mask`/`display_slot` and fires `on_image_clear()` for each configured slot - preserving the "lifecycle before display" ordering the old single-function drain guaranteed. `drain_events()` itself folds any taken `display_slot` update into the main-thread-only `held_display_*` state (latest-wins per slot), then sweeps the held slots and fires `on_image_display(slot, lateness_ms)` for any whose timestamp is due on the synced client clock (or immediately if there is no active connection). The deadline is computed by the pure `display_overdue_us()` helper, which applies the slot's `display_offset_ms` shift (positive fires early) and returns the overdue microseconds; `display_lateness_ms()` maps that to the `lateness_ms` argument, reserving `0` for the no-connection case (a connected on-time display is floored to 1 ms so it never collides with that sentinel). Per-slot epochs drop a held display whose stream was replaced after the decode hand-off. `needs_drain()` ORs a nonzero `held_display_mask` into the `INBOX_TOPIC_ARTWORK_DISPLAY` bit test (the same carry-over pattern the metadata role uses for `held_delta`) so held displays keep getting a drain every tick until their deadline fires, even though the deadline sets no inbox bit; `on_image_decode` still happens on the dedicated artwork decode thread.
   - **Ack gate (`require_frame_done`)**: A slot can opt into per-slot back-pressure. Each `SlotBuffer` carries a `SlotAckState` (`IDLE` -> `DECODE_DELIVERED` once `on_image_decode()` fires -> `PRESENTED` once `on_image_display()`/`on_image_clear()` fires), all guarded by `slot_mutex`. While a gated slot is not `IDLE`, the decode thread (`process_notification()`) does not decode a newer notification; it *parks* it latest-wins in `SlotBuffer::parked` (`has_parked`) instead of decoding concurrently with the un-acked delivery. `ArtworkRole::frame_done(slot)` (main loop) returns the gate to `IDLE` and, if a notification is parked, calls `wake_drain_thread()` -- a sentinel `ARTWORK_RECHECK_SLOT` notification that unblocks the decode thread's `notify_queue.receive()` so it re-runs the top-of-loop parked-slot sweep (a dropped wake is covered by the `DRAIN_RECEIVE_TIMEOUT_MS` fallback). The parked notification is re-validated on replay, so a since-stale generation/epoch is simply skipped. A clear counts as a delivery: `handle_stream_ring_event()` drops any parked notification and forces gated slots to `PRESENTED`, so exactly one `frame_done()` is owed after it. A stream restart releases only `DECODE_DELIVERED` slots (their display can no longer fire); `PRESENTED` stays armed because the consumer may still be mid-fade on the prior stream's last delivery. There is no timeout.
 - **VisualizerRole**: Has no `drain_events()`. STREAM_START/END/CLEAR are dispatched entirely from `handle_stream_ring_event()` (from the ring drain): STREAM_START `take()`s the config from `config_slot` and fires `on_visualizer_stream_start()`; STREAM_END/CLEAR fire `on_visualizer_stream_end()`/`on_visualizer_stream_clear()`.
+- **SourceRole**: Two stages. The **server command latch**: `take()` from `command_slot`, discard the command if its connection instance id no longer matches the current connection (streaming permission is per-connection), and forward only desired-state *transitions* to the task (`signal_start()`/`signal_stop()`; a start while streaming or a stop while stopped is ignored — commands are idempotent). The **stream lifecycle callbacks**: `SOURCE_STREAM` ring events land in `pending_events` during the ring drain (step 3) and are delivered here as `on_streaming_started()`/`on_streaming_stopped()`, with a `streaming_active` gate keeping the pair 1:1. The vector is indexed with a fresh `size()` check per iteration because a callback may re-enter teardown, whose `cleanup()` clears it mid-loop; `needs_drain()` ORs `!pending_events.empty()` into the `INBOX_TOPIC_SOURCE_COMMAND` bit test so same-tick events appended during the ring drain get delivered without waiting for a topic bit.
 
 ## Sync Task State Machine
 
@@ -383,6 +398,45 @@ new_audio_client_playtime = last_finish_timestamp + remaining_buffered_frames_as
 
 This feedback loop is what makes the sync error calculation accurate.
 
+## Source Streaming Pipeline
+
+The source role is the player's inverse: audio flows from the consumer's capture thread through a ring buffer to a dedicated task (`SourceTask`, `src/source_task.cpp`), which assembles it into timestamped wire chunks and sends them to the server. Like the sync task, the thread is created once and idles between streams to avoid create/destroy churn.
+
+### Capture ring
+
+`SourceRole::write_audio()` writes each call's bytes as one timestamped entry into a `SendspinAudioRingBuffer` (the same SPSC wrapper the player uses, outbound direction: producer = the consumer's capture thread, consumer = the source task). The path is non-blocking and non-allocating. An `accepting_audio_` atomic gates it: set only between `client-stream/start` being sent and the stream closing, so writes outside an open stream are rejected without touching the ring. A full ring drops the write and warns once per overflow episode (the recovery log carries the drop total); the ring's capacity (`SourceRoleConfig::capture_buffer_ms`, sized with a +1/4 metadata margin — the inverse of the player's advertise fraction) is deliberately the stall-policy backlog bound.
+
+### Task loop and stream binding
+
+The task's outer loop idles on `SOURCE_COMMAND_STOP | SOURCE_COMMAND_UPDATE`. The desired streaming state is a latest-wins atomic (`stream_requested_`) written by the role's main-loop command latch via `signal_start()`/`signal_stop()`; the task converges on it, so a start-stop-start flurry cannot be misordered by event bits. When a stream is requested, the task binds it to ONE connection for its whole life (`ConnectionManager::current_shared()`): streaming permission is per-connection (Sendspin spec, Source messages), so a drop or handoff ends the stream rather than migrating it — `stream_still_open()` re-checks `current_shared() == conn` every iteration.
+
+A stream then runs entirely on the task thread:
+
+1. **Wait for time sync** on the bound connection (chunk timestamps are meaningless before the local clock maps to the server's); same poll cadence as the sync task.
+2. **Send `client-stream/start`** announcing the configured format (no negotiation; the `add_source()` config is the contract). If this send fails on a still-live connection, the task returns to idle and retries the open after a 500 ms backoff (`SOURCE_OPEN_RETRY_MS`) — the server already said start and will not repeat it, so without the retry the task would park with no wake-up coming. A stop or connection swap during the backoff is observed by the fresh desired-state and connection reads on re-entry.
+3. **Flush the ring and open the gate**: the flush makes the first chunk live audio by construction, and only then is `accepting_audio_` set. A `SOURCE_STREAM` STREAMING_STARTED event is pushed onto the inbox ring.
+4. **Assemble and send chunks** (below) until the desired state drops, the bound connection stops being current, or the task is told to exit.
+5. **Close**: clear `accepting_audio_` first (so the tail is finite), send a final short chunk only if the encoder can take it (allowed at stream end by the spec but not required; an Opus remainder that is not a legal frame duration is dropped rather than padded), send `client-stream/end` from this same thread — ordered after the last chunk by construction — and push STREAMING_STOPPED.
+
+### Chunk assembly and timestamps
+
+Ring entries and wire chunks have independent sizes: the task copies entry bytes into a staging buffer until `chunk_duration_ms` worth of frames is assembled, consuming entries across chunk boundaries. Each ring entry's timestamp stamps its FIRST sample; when a chunk starts mid-entry, the anchor advances past the consumed frames (`source_entry_anchor_us()`). The wire timestamp is the server-domain capture time of the chunk's first sample: the local anchor minus the encoder's lookahead (so the timestamp names the audio the payload actually carries), converted with the bound connection's Kalman filter offset AND drift (`compute_server_time()`); no playback or static delay term is ever added. The staging buffer is laid out as the wire chunk itself — `[type byte 12][BE64 server-clock capture µs][payload]` — so a send is one contiguous buffer with no copy.
+
+### Encoder seam
+
+`SourceEncoder` (`src/source_encoder.h`) is the codec seam: `PcmPassthroughEncoder` returns the staged bytes untouched, and `OpusSourceEncoder` (`src/source_encoder_opus.cpp`) encodes each chunk into exactly one Opus packet (config validation guarantees one chunk is one legal Opus frame). The staging payload area is sized to `max(chunk PCM bytes, OpusSourceEncoder::MAX_PACKET_BYTES)` so no accepted config can ever drop a chunk on payload capacity. The encoder is created in `init()` and `reset()` at each stream open.
+
+### Stall policy
+
+A failed chunk send is a task-side stall: the failed chunk is dropped and the ring flushed to live (`flush_ring_to_live()`), so streaming resumes from live capture instead of bursting stale audio (Sendspin spec, Source messages — stall policy). The capture timestamps make the resulting gap self-describing to the server; the sample stream within each chunk stays continuous. Stall logging is episode-edged (one warning on entry, one recovery log with the flushed-entry count) so a stall cannot flood the log. The producer-side analogue is the full-ring drop in `write_audio()` — together the ring capacity is the "small bound" of the spec's backlog rule.
+
+### Outbound send path
+
+`SendspinConnection::send_binary_message()` is the transport contract the source task depends on (`src/connection.h`): callable from role task threads, and the completion callback fires **exactly once for every call** — inline before an error return, later from the transport, or from connection teardown for work that can never run. The task waits out every send's completion (`SOURCE_SEND_COMPLETE`) before reusing the staging buffer, which is also what makes destroying the task safe; the exactly-once contract is what keeps that unbounded wait from wedging.
+
+- **Host (IXWebSocket)** and **ESP client (esp_websocket_client)**: sends are synchronous in the calling thread; the callback is invoked inline.
+- **ESP server (httpd)**: sends go through a per-connection **single-in-flight send slot**, allocation-free in steady state (it runs per audio chunk). The payload is copied into a connection-owned buffer sized by the first send and grown only for a larger payload; the queued worker is identified through a once-per-connection `BinarySendLookup` block holding a `weak_ptr` to the connection. If the previous send has not completed, the call returns `SsErr::NOT_FINISHED` immediately and the caller drops the chunk (the source task treats this like any failed send: a stall). The slot is released only by the worker's completion path or by the connection's destructor — never by a caller-side timeout. The worker `lock()`s the `weak_ptr` before touching anything: a connection torn down with work queued makes the worker a clean no-op (the destructor already failed the pending completion), and a locked `shared_ptr` blocks destruction until the worker returns. Binary frames are gated behind `client_hello_sent_` exactly like text frames; no binary message may legitimately precede the hello.
+
 ## Time Synchronization
 
 ### Burst Strategy (`src/time_burst.h`)
@@ -462,7 +516,7 @@ On the ESP build, `SendspinServerConnection` lifetime is pinned to the httpd ses
 3. The httpd WebSocket handler (`websocket_handler`) looks the connection up by `httpd_sess_get_ctx(handle, sockfd)` at run time, copying the slot's `shared_ptr` for the duration of its work; it never assumes the manager's observer slot is alive. The queued send workers (`async_send_text`, `async_send_time_text`) instead capture a `weak_ptr<SendspinServerConnection>` to the originating connection and `lock()` it when they run.
 4. When the socket closes, httpd calls the `close_fn` first (which fires `connection_closed_callback_` so `ConnectionManager` can drop its observer in the next `loop()`), then later calls the slot's `free_fn` to release the authoritative reference once no workers are queued for that session.
 
-Queued send workers capture a `weak_ptr<SendspinServerConnection>` to the originating connection — `AsyncRespArg` for text sends, `SessionLookup` for time sends — and `lock()` it when the worker runs. This is deliberately **not** a `{httpd_handle_t, int sockfd}` pair: identifying the target by sockfd risked binding to a *different* connection that had recycled the same fd after the original closed, sending a frame to the wrong peer. The `weak_ptr` resolves to the exact connection that queued the work, or to null if it has since been destroyed, in which case the worker no-ops cleanly. Because these structs now hold non-trivial members (the `weak_ptr`, and `AsyncRespArg`'s completion `std::function`), they are constructed with placement-new and explicitly destroyed before `platform_free` rather than treated as POD. Both are allocated through `platform_malloc` / `platform_malloc_internal`.
+Queued send workers capture a `weak_ptr<SendspinServerConnection>` to the originating connection — `AsyncRespArg` for text sends, `SessionLookup` for time sends, `BinarySendLookup` for binary sends — and `lock()` it when the worker runs. Unlike the per-message text contexts, `BinarySendLookup` is a reusable once-per-connection block backing the single-in-flight binary send slot: `async_send_binary` sends from the connection-owned payload buffer, releases the slot, and fires the completion exactly once on every exit path; the slot is otherwise released only by the connection destructor, and blocks whose queued worker was discarded by `httpd_stop` are reclaimed by `reclaim_orphaned_binary_send_work()` from the ws server's stop path. This is deliberately **not** a `{httpd_handle_t, int sockfd}` pair: identifying the target by sockfd risked binding to a *different* connection that had recycled the same fd after the original closed, sending a frame to the wrong peer. The `weak_ptr` resolves to the exact connection that queued the work, or to null if it has since been destroyed, in which case the worker no-ops cleanly. Because these structs now hold non-trivial members (the `weak_ptr`, and `AsyncRespArg`'s completion `std::function`), they are constructed with placement-new and explicitly destroyed before `platform_free` rather than treated as POD. Both are allocated through `platform_malloc` / `platform_malloc_internal`.
 
 The send workers also enforce the protocol's "hello is always first" rule: a frame is dropped unless `client_hello_sent_` is set on the resolved connection, *unless* the caller passed `allow_before_hello=true`. Exactly two callers do — the `client/hello` itself (which would otherwise gate its own send and deadlock) and `goodbye` — so a stale or out-of-order frame can never precede the handshake. The `weak_ptr` guards identity; the gate guards ordering; the two are independent.
 
