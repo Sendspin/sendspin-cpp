@@ -35,4 +35,8 @@ menu "sendspin-cpp"
         bool "Enable visualizer role"
         default y
 
+    config SENDSPIN_ENABLE_SOURCE
+        bool "Enable source role (audio capture)"
+        default y
+
 endmenu

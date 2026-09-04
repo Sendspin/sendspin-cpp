@@ -78,6 +78,16 @@ if(ESP_IDF_BUILD)
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_VISUALIZER)
     endif()
 
+    if(CONFIG_SENDSPIN_ENABLE_SOURCE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_SOURCES})
+        list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_SOURCE)
+    endif()
+
+    # Shared audio infrastructure for the roles that stream audio through the SPSC ring
+    if(CONFIG_SENDSPIN_ENABLE_PLAYER OR CONFIG_SENDSPIN_ENABLE_SOURCE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_AUDIO_SOURCES})
+    endif()
+
     # Register the component — uses assembled source list
     idf_component_register(
         SRCS ${SENDSPIN_ALL_SOURCES}
@@ -109,6 +119,7 @@ else()
     option(SENDSPIN_ENABLE_COLOR "Enable color role" ON)
     option(SENDSPIN_ENABLE_ARTWORK "Enable artwork role" ON)
     option(SENDSPIN_ENABLE_VISUALIZER "Enable visualizer role" ON)
+    option(SENDSPIN_ENABLE_SOURCE "Enable source role (audio capture)" ON)
 
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/host.cmake)
 
@@ -136,6 +147,13 @@ else()
     if(SENDSPIN_ENABLE_VISUALIZER)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_VISUALIZER_SOURCES})
     endif()
+    if(SENDSPIN_ENABLE_SOURCE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_SOURCES})
+    endif()
+    # Shared audio infrastructure for the roles that stream audio through the SPSC ring
+    if(SENDSPIN_ENABLE_PLAYER OR SENDSPIN_ENABLE_SOURCE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_AUDIO_SOURCES})
+    endif()
 
     # Create the library — core sources + enabled role sources + host networking (added via host.cmake)
     add_library(sendspin STATIC ${SENDSPIN_ALL_SOURCES})
@@ -158,6 +176,9 @@ else()
     endif()
     if(SENDSPIN_ENABLE_VISUALIZER)
         target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_VISUALIZER)
+    endif()
+    if(SENDSPIN_ENABLE_SOURCE)
+        target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_SOURCE)
     endif()
 
     # Host build options

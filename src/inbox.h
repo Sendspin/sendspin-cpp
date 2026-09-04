@@ -48,6 +48,7 @@ static constexpr uint32_t INBOX_TOPIC_PLAYER_STREAM_PARAMS = 1U << 6;  // Player
 static constexpr uint32_t INBOX_TOPIC_VISUALIZER_CONFIG = 1U << 7;     // Visualizer config slot
 static constexpr uint32_t INBOX_TOPIC_ARTWORK_DISPLAY = 1U << 8;       // Artwork display slot
 static constexpr uint32_t INBOX_TOPIC_PLAYER_STATE = 1U << 9;          // Player client-state slot
+static constexpr uint32_t INBOX_TOPIC_SOURCE_COMMAND = 1U << 10;       // Source command slot
 
 // ============================================================================
 // Event ring types
@@ -65,6 +66,7 @@ enum class InboxEventType : uint8_t {
     COLOR_CLEARED,       // Color state cleared on disconnect; no payload
     ARTWORK_STREAM,      // Artwork stream lifecycle; code = ArtworkEventType
     VISUALIZER_STREAM,   // Visualizer stream lifecycle; code = VisualizerEventType
+    SOURCE_STREAM,       // Source stream lifecycle; code = SourceStreamCallbackType
 };
 
 /// @brief Payload for TIME_RESPONSE events
