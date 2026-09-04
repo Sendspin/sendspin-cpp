@@ -119,6 +119,9 @@ void SendspinWsServer::stop() {
         SS_LOGD(TAG, "Stopping server");
         httpd_stop(this->server_);
         this->server_ = nullptr;
+        // No queued worker can run once httpd_stop returns; break the keep-alive cycles of any
+        // binary send work httpd discarded so restarts cannot accumulate stranded blocks.
+        reclaim_orphaned_binary_send_work();
     }
 
     // httpd_stop tore down every session (each close_callback dropped its pending entry), so
