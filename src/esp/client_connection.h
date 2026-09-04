@@ -90,6 +90,13 @@ public:
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                             bool allow_before_hello) override;
 
+    /// @brief Sends a binary message to the server, synchronously like the text path
+    /// @param data Pointer to the message bytes.
+    /// @param len Length of the message in bytes.
+    /// @param cb Callback invoked inline in the calling thread with the send result.
+    /// @return SsErr::OK if sent successfully, error code otherwise.
+    SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) override;
+
     /// @brief Sends a client/time message, capturing the timestamp just before send
     /// @return true if the message was sent successfully, false otherwise.
     bool send_time_message() override;

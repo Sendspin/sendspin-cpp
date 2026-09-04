@@ -157,6 +157,34 @@ SsErr SendspinClientConnection::send_text_message(const std::string& message,
     return SsErr::OK;
 }
 
+SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t len,
+                                                    SendCompleteCallback cb) {
+    if (!this->is_connected()) {
+        if (cb) {
+            cb(false);
+        }
+        return SsErr::INVALID_STATE;
+    }
+
+    // esp_websocket_client_send_bin is synchronous in the current task, like the text path
+    int sent = esp_websocket_client_send_bin(this->client_, reinterpret_cast<const char*>(data),
+                                             static_cast<int>(len),
+                                             pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));
+
+    bool success = (sent >= 0);
+
+    if (cb) {
+        cb(success);
+    }
+
+    if (!success) {
+        SS_LOGE(TAG, "Failed to send binary message (timeout or error): %d", sent);
+        return SsErr::FAIL;
+    }
+
+    return SsErr::OK;
+}
+
 bool SendspinClientConnection::send_time_message() {
     if (!this->is_connected()) {
         return false;

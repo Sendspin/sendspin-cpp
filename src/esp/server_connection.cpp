@@ -22,6 +22,8 @@
 #include <esp_timer.h>
 
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 namespace sendspin {
 
@@ -55,16 +57,60 @@ struct SessionLookup {
     std::weak_ptr<SendspinServerConnection> conn;
 };
 
+/// @brief Once-per-connection identity block for queued binary send work (a reusable
+/// SessionLookup: the binary path runs per chunk and must not allocate in steady state)
+///
+/// While a work item is queued, `self` keeps the block alive independently of the connection;
+/// the worker moves `self` into a local before resolving `conn`, so teardown with work in
+/// flight makes the worker a clean no-op. httpd_queue_work has no cancellation hook, so work
+/// discarded by httpd_stop would strand the engaged `self` cycle; every engaged block is
+/// therefore tracked in the registry below and reclaimed by
+/// reclaim_orphaned_binary_send_work() once the server is stopped. The destructor still fails
+/// the pending completion.
+struct BinarySendLookup {
+    std::weak_ptr<SendspinServerConnection> conn;
+    std::shared_ptr<BinarySendLookup> self;
+};
+
+// Engaged lookup blocks with a queued worker that has not yet run. The worker removes its block
+// on entry; reclaim_orphaned_binary_send_work() clears whatever remains after httpd_stop, when
+// no queued worker can ever run again. Guarded by its own mutex: inserts come from role task
+// threads, removals from the httpd worker, the sweep from whichever thread stops the server.
+namespace {
+std::mutex g_engaged_binary_sends_mutex;
+std::vector<std::shared_ptr<BinarySendLookup>> g_engaged_binary_sends;
+}  // namespace
+
+void reclaim_orphaned_binary_send_work() {
+    std::lock_guard<std::mutex> lock(g_engaged_binary_sends_mutex);
+    for (auto& lookup : g_engaged_binary_sends) {
+        lookup->self.reset();
+    }
+    g_engaged_binary_sends.clear();
+}
+
 // ============================================================================
 // SendspinConnection interface implementation
 // ============================================================================
 
 SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int sockfd)
     : server_(server), sockfd_(sockfd) {
+    // Allocated here, off the send path; the weak self-reference is bound on the first send
+    // (shared_from_this is unusable inside a constructor)
+    this->binary_send_lookup_ = std::make_shared<BinarySendLookup>();
     // Disabling Nagle's algorithm significantly improves the time syncing accuracy
     int nodelay = 1;
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
         SS_LOGW(TAG, "Failed to turn on TCP_NODELAY, syncing may be inaccurate");
+    }
+}
+
+SendspinServerConnection::~SendspinServerConnection() {
+    // A still-queued worker can never touch this connection again (weak_ptr lock fails), so the
+    // pending completion is failed here; a worker that DID lock blocks destruction until done
+    if (this->binary_send_in_flight_.load(std::memory_order_acquire) && this->binary_send_cb_) {
+        SendCompleteCallback pending = std::move(this->binary_send_cb_);
+        pending(false);
     }
 }
 
@@ -170,6 +216,115 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
         return SsErr::FAIL;
     }
     return SsErr::OK;
+}
+
+SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
+                                                    SendCompleteCallback on_complete) {
+    if (!this->is_connected()) {
+        if (on_complete) {
+            on_complete(false);
+        }
+        return SsErr::INVALID_STATE;
+    }
+
+    // Single-in-flight slot: a chunk arriving while the previous is still queued is rejected
+    // and the caller drops it (the spec's stall policy)
+    if (this->binary_send_in_flight_.exchange(true, std::memory_order_acq_rel)) {
+        if (on_complete) {
+            on_complete(false);
+        }
+        return SsErr::NOT_FINISHED;
+    }
+
+    // Grow-only buffer sized by the first payload: chunks are near-constant size, so steady
+    // state allocates nothing and any growth is loud. SPIRAM-preferred like the receive buffer.
+    if (this->binary_send_payload_.size() < len) {
+        bool grown;
+        if (this->binary_send_payload_.data() == nullptr) {
+            grown = this->binary_send_payload_.allocate(len, MemoryLocation::PREFER_EXTERNAL);
+        } else {
+            SS_LOGW(TAG, "Growing binary send slot %zu -> %zu bytes",
+                    this->binary_send_payload_.size(), len);
+            grown = this->binary_send_payload_.realloc(len);
+        }
+        if (!grown) {
+            SS_LOGE(TAG, "Failed to allocate %zu bytes for binary send slot", len);
+            this->binary_send_in_flight_.store(false, std::memory_order_release);
+            if (on_complete) {
+                on_complete(false);
+            }
+            return SsErr::NO_MEM;
+        }
+    }
+
+    std::memcpy(this->binary_send_payload_.data(), data, len);
+    this->binary_send_len_ = len;
+    this->binary_send_cb_ = std::move(on_complete);
+
+    if (this->binary_send_lookup_->conn.expired()) {
+        this->binary_send_lookup_->conn =
+            std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
+    }
+    // Engage the keep-alive reference for the queued worker and track it for reclamation at
+    // server stop (see BinarySendLookup).
+    this->binary_send_lookup_->self = this->binary_send_lookup_;
+    {
+        std::lock_guard<std::mutex> lock(g_engaged_binary_sends_mutex);
+        g_engaged_binary_sends.push_back(this->binary_send_lookup_);
+    }
+
+    if (httpd_queue_work(this->server_, async_send_binary, this->binary_send_lookup_.get()) !=
+        ESP_OK) {
+        SS_LOGE(TAG, "httpd_queue_work failed for binary message");
+        {
+            std::lock_guard<std::mutex> lock(g_engaged_binary_sends_mutex);
+            std::erase(g_engaged_binary_sends, this->binary_send_lookup_);
+        }
+        this->binary_send_lookup_->self.reset();
+        SendCompleteCallback pending = std::move(this->binary_send_cb_);
+        this->binary_send_in_flight_.store(false, std::memory_order_release);
+        if (pending) {
+            pending(false);
+        }
+        return SsErr::FAIL;
+    }
+    return SsErr::OK;
+}
+
+void SendspinServerConnection::async_send_binary(void* arg) {
+    auto* lookup = static_cast<BinarySendLookup*>(arg);
+    // Take the keep-alive back first; a successful lock() then blocks destruction until return.
+    // Also leave the reclamation registry: this worker is running, so it owns the cleanup.
+    std::shared_ptr<BinarySendLookup> keep = std::move(lookup->self);
+    {
+        std::lock_guard<std::mutex> lock(g_engaged_binary_sends_mutex);
+        std::erase(g_engaged_binary_sends, keep);
+    }
+    auto conn = lookup->conn.lock();
+    if (conn == nullptr) {
+        return;  // Torn down with work queued: the destructor already failed the completion
+    }
+
+    bool success = false;
+    // Same identity and hello gating as async_send_text
+    if (conn->is_connected() && conn->client_hello_sent_) {
+        httpd_ws_frame_t ws_pkt;
+        memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+        ws_pkt.payload = conn->binary_send_payload_.data();
+        ws_pkt.len = conn->binary_send_len_;
+        ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+        success = httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt) == ESP_OK;
+    }
+
+    // The completion fires on every exit path with a live connection (sent, send failed, gated,
+    // or already disconnected) — the slot would wedge otherwise. The callback is moved out and
+    // the slot released before invoking it, so a completion that immediately sends the next
+    // chunk finds the slot free.
+    SendCompleteCallback pending = std::move(conn->binary_send_cb_);
+    conn->binary_send_in_flight_.store(false, std::memory_order_release);
+    if (pending) {
+        pending(success);
+    }
 }
 
 void SendspinServerConnection::trigger_close() {

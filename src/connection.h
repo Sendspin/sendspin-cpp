@@ -152,6 +152,28 @@ public:
     virtual SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                                     bool allow_before_hello = false) = 0;
 
+    /// @brief Sends a binary message to the server with a completion callback
+    ///
+    /// Callable from role task threads via ConnectionManager::current_shared(). The payload
+    /// must stay valid until @p cb fires or the call returns an error (queuing transports copy
+    /// it first). Binary frames are gated behind the client/hello like the default text path.
+    ///
+    /// Unlike the text path's best-effort callback, @p cb fires exactly once for EVERY call --
+    /// on success, every failure path, and connection teardown -- because single-in-flight
+    /// transports release their send slot from the completion path. Its execution context is
+    /// transport-dependent: inline on the calling thread for synchronous transports and for
+    /// immediate failures, from the httpd worker for a queued ESP-server send, and from the
+    /// destructor's thread for work that can never run -- so the callback must not perform
+    /// thread-affine work or call back into the connection.
+    ///
+    /// @param data Pointer to the message bytes (type byte first).
+    /// @param len Length of the message in bytes.
+    /// @param cb Callback invoked with the send result.
+    /// @return SsErr::OK if sent/queued successfully; SsErr::NOT_FINISHED if a previous binary
+    ///         send is still in flight on a single-in-flight transport (the caller treats this
+    ///         as "drop this chunk" and owns logging that drop); other codes on failure.
+    virtual SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb) = 0;
+
     /// @brief Sends a client/time synchronization message
     ///
     /// The transport implementation captures `client_transmitted` as close to the actual wire
