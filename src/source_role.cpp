@@ -19,6 +19,9 @@
 #include "sendspin/client.h"
 #include "source_role_impl.h"
 
+#include <algorithm>
+#include <iterator>
+
 static const char* const TAG = "sendspin.source";
 
 namespace sendspin {
@@ -32,34 +35,85 @@ namespace sendspin {
 /// advertised or streaming), like a player with no audio formats.
 static bool validate_config(const SourceRoleConfig& config) {
     bool valid = true;
-    if (config.codec != SendspinCodecFormat::PCM) {
-        // OPUS is a recognized config value but not implemented yet; anything else is invalid
-        // outright. Both reject the same way (fail closed).
-        SS_LOGE(TAG, "Rejecting source config: only the pcm codec is supported (got %d)",
+    if (config.codec != SendspinCodecFormat::PCM && config.codec != SendspinCodecFormat::OPUS) {
+        SS_LOGE(TAG, "Rejecting source config: codec must be pcm or opus (got %d)",
                 static_cast<int>(config.codec));
         valid = false;
     }
-    if (config.sample_rate == 0) {
-        SS_LOGE(TAG, "Rejecting source config: sample_rate must be > 0");
-        valid = false;
-    }
-    if (config.channels == 0) {
-        SS_LOGE(TAG, "Rejecting source config: channels must be > 0");
-        valid = false;
-    }
-    if (config.bit_depth != 16 && config.bit_depth != 24 && config.bit_depth != 32) {
-        SS_LOGE(TAG, "Rejecting source config: bit_depth must be 16, 24, or 32 (got %u)",
-                config.bit_depth);
-        valid = false;
-    }
-    if (config.chunk_duration_ms < SourceRoleConfig::CHUNK_MIN_MS ||
-        config.chunk_duration_ms > SourceRoleConfig::CHUNK_MAX_MS) {
-        // Sendspin spec, Source messages: MUST <= 150 ms, SHOULD >= 5 ms; the SHOULD is
-        // deliberately enforced as hard as the MUST
-        SS_LOGE(TAG, "Rejecting source config: chunk_duration_ms %u outside [%u, %u]",
-                config.chunk_duration_ms, SourceRoleConfig::CHUNK_MIN_MS,
-                SourceRoleConfig::CHUNK_MAX_MS);
-        valid = false;
+    if (config.codec == SendspinCodecFormat::OPUS) {
+        // libopus accepts exactly these rates; a 44100 line-in must use PCM or resample
+        static constexpr uint32_t OPUS_SAMPLE_RATES[] = {8000, 12000, 16000, 24000, 48000};
+        // Single legal Opus frames within the spec's chunk bounds
+        static constexpr uint32_t OPUS_CHUNK_DURATIONS_MS[] = {5, 10, 20, 40, 60};
+        const auto contains = [](const auto& values, uint32_t value) {
+            return std::find(std::begin(values), std::end(values), value) != std::end(values);
+        };
+        if (!contains(OPUS_SAMPLE_RATES, config.sample_rate)) {
+            SS_LOGE(TAG,
+                    "Rejecting source config: opus sample_rate must be 8000, 12000, 16000, "
+                    "24000, or 48000 (got %u)",
+                    config.sample_rate);
+            valid = false;
+        }
+        if (config.channels != 1 && config.channels != 2) {
+            SS_LOGE(TAG, "Rejecting source config: opus channels must be 1 or 2 (got %u)",
+                    config.channels);
+            valid = false;
+        }
+        if (config.bit_depth != 16) {
+            // The capture contract: the encoder consumes 16-bit PCM (the wire field is ignored
+            // by servers for opus per the Sendspin spec)
+            SS_LOGE(TAG, "Rejecting source config: opus bit_depth must be 16 (got %u)",
+                    config.bit_depth);
+            valid = false;
+        }
+        if (!contains(OPUS_CHUNK_DURATIONS_MS, config.chunk_duration_ms)) {
+            // One chunk is one opus_encode() call, so it must be one legal frame; the PCM
+            // default of 25 is deliberately not remapped -- fail closed beats silent repair
+            SS_LOGE(TAG,
+                    "Rejecting source config: opus chunk_duration_ms must be 5, 10, 20, 40, or "
+                    "60 "
+                    "(got %u)",
+                    config.chunk_duration_ms);
+            valid = false;
+        }
+        if (config.opus_bitrate < SourceRoleConfig::OPUS_BITRATE_MIN ||
+            config.opus_bitrate > SourceRoleConfig::OPUS_BITRATE_MAX) {
+            // libopus's accepted OPUS_SET_BITRATE range
+            SS_LOGE(TAG, "Rejecting source config: opus_bitrate %u outside [%u, %u]",
+                    config.opus_bitrate, SourceRoleConfig::OPUS_BITRATE_MIN,
+                    SourceRoleConfig::OPUS_BITRATE_MAX);
+            valid = false;
+        }
+        if (config.opus_complexity > SourceRoleConfig::OPUS_COMPLEXITY_MAX) {
+            SS_LOGE(TAG, "Rejecting source config: opus_complexity %u exceeds %u",
+                    config.opus_complexity, SourceRoleConfig::OPUS_COMPLEXITY_MAX);
+            valid = false;
+        }
+    } else {
+        // PCM format rules (also applied to a rejected codec value)
+        if (config.sample_rate == 0) {
+            SS_LOGE(TAG, "Rejecting source config: sample_rate must be > 0");
+            valid = false;
+        }
+        if (config.channels == 0) {
+            SS_LOGE(TAG, "Rejecting source config: channels must be > 0");
+            valid = false;
+        }
+        if (config.bit_depth != 16 && config.bit_depth != 24 && config.bit_depth != 32) {
+            SS_LOGE(TAG, "Rejecting source config: bit_depth must be 16, 24, or 32 (got %u)",
+                    config.bit_depth);
+            valid = false;
+        }
+        if (config.chunk_duration_ms < SourceRoleConfig::CHUNK_MIN_MS ||
+            config.chunk_duration_ms > SourceRoleConfig::CHUNK_MAX_MS) {
+            // Sendspin spec, Source messages: MUST <= 150 ms, SHOULD >= 5 ms; the SHOULD is
+            // deliberately enforced as hard as the MUST
+            SS_LOGE(TAG, "Rejecting source config: chunk_duration_ms %u outside [%u, %u]",
+                    config.chunk_duration_ms, SourceRoleConfig::CHUNK_MIN_MS,
+                    SourceRoleConfig::CHUNK_MAX_MS);
+            valid = false;
+        }
     }
     if (config.capture_buffer_ms == 0) {
         SS_LOGE(TAG, "Rejecting source config: capture_buffer_ms must be > 0");

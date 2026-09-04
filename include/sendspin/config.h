@@ -273,9 +273,10 @@ struct VisualizerRoleConfig {
 /// @brief Configuration for the source role (audio capture streamed to the server)
 ///
 /// The configured format is the contract for every stream the role opens: there is no
-/// negotiation, and write_audio() bytes are forwarded untouched. An invalid config leaves the
-/// role added but inert (logged at ERROR; the role is not advertised and never streams) --
-/// spec-invalid values are rejected, never clamped or repaired.
+/// negotiation, and write_audio() consumes PCM in exactly that format (sent untouched for the
+/// PCM codec, encoded chunk-by-chunk for OPUS). An invalid config leaves the role added but
+/// inert (logged at ERROR; the role is not advertised and never streams) -- spec-invalid values
+/// are rejected, never clamped or repaired.
 struct SourceRoleConfig {
     /// @brief Chunk duration bounds from the Sendspin spec (Source messages): chunks MUST be
     /// at most 150 ms and SHOULD be at least 5 ms
@@ -301,14 +302,32 @@ struct SourceRoleConfig {
     /// drain threads (2)
     static constexpr unsigned DEFAULT_SOURCE_TASK_PRIORITY = 3U;
 
+    /// @brief Opus bitrate bounds in bit/s: the range libopus's OPUS_SET_BITRATE accepts
+    static constexpr uint32_t OPUS_BITRATE_MIN = 500U;
+    static constexpr uint32_t OPUS_BITRATE_MAX = 512000U;
+
+    /// @brief Default Opus bitrate (bit/s): transparent-leaning for 48 kHz stereo music per
+    /// Opus encoding guidance. Mono/voice configs typically run 24000-64000
+    static constexpr uint32_t DEFAULT_OPUS_BITRATE = 128000U;
+
+    /// @brief Maximum value libopus's OPUS_SET_COMPLEXITY accepts
+    static constexpr uint8_t OPUS_COMPLEXITY_MAX = 10U;
+
+    /// @brief Default Opus encoder complexity: low, to fit an ESP32-class real-time encode
+    /// budget. Hosts may raise it toward OPUS_COMPLEXITY_MAX for quality per CPU
+    static constexpr uint8_t DEFAULT_OPUS_COMPLEXITY = 2U;
+
     /// @brief Default capture sample rate (Hz): the native rate of most capture hardware
     static constexpr uint32_t DEFAULT_SOURCE_SAMPLE_RATE = 48000U;
 
     // 32-bit fields
-    uint32_t sample_rate{DEFAULT_SOURCE_SAMPLE_RATE};  ///< Capture sample rate in Hz; must be > 0
+    /// @brief Capture sample rate in Hz; must be > 0. OPUS accepts only libopus's rates:
+    /// 8000, 12000, 16000, 24000, or 48000 (a 44100 line-in must use PCM or resample upstream)
+    uint32_t sample_rate{DEFAULT_SOURCE_SAMPLE_RATE};
 
     /// @brief Outbound chunk duration in milliseconds, validated against the spec bounds
-    /// [CHUNK_MIN_MS, CHUNK_MAX_MS]
+    /// [CHUNK_MIN_MS, CHUNK_MAX_MS]. OPUS accepts only 5, 10, 20, 40, or 60 (one
+    /// chunk is exactly one legal Opus frame), so the PCM default of 25 is rejected for OPUS
     uint32_t chunk_duration_ms{DEFAULT_CHUNK_MS};
 
     /// @brief Capture ring capacity in milliseconds of audio in the configured format (the
@@ -318,20 +337,33 @@ struct SourceRoleConfig {
     /// small write_audio() calls reduce the effective audio capacity below this figure
     uint32_t capture_buffer_ms{DEFAULT_CAPTURE_BUFFER_MS};
 
+    /// @brief Opus bitrate in bit/s, validated against [OPUS_BITRATE_MIN,
+    /// OPUS_BITRATE_MAX]. Ignored (and unvalidated) when codec is PCM
+    uint32_t opus_bitrate{DEFAULT_OPUS_BITRATE};
+
     unsigned priority{DEFAULT_SOURCE_TASK_PRIORITY};  ///< FreeRTOS priority for the source
                                                       ///< task (ESP-IDF only)
 
-    /// @brief Memory placement for the capture ring and chunk staging buffer (ESP-IDF only;
-    /// ignored on host). Bulk audio with sequential access, so PREFER_EXTERNAL (SPIRAM) --
-    /// mirrors the player decode buffer's choice
+    /// @brief Memory placement for the capture ring, chunk staging buffer, and the Opus
+    /// encoder's scratch buffers (ESP-IDF only; ignored on host). Bulk audio with sequential
+    /// access, so PREFER_EXTERNAL (SPIRAM) -- mirrors the player decode buffer's choice
     MemoryLocation buffer_location{MemoryLocation::PREFER_EXTERNAL};
 
     // 8-bit fields
-    /// @brief Outbound codec. Only PCM is accepted; an OPUS config is rejected as inert until
-    /// Opus encoding lands
+    /// @brief Outbound codec: PCM (chunks are the capture bytes, untouched) or OPUS (each
+    /// chunk is encoded into one RFC 6716 packet). OPUS narrows the accepted format -- see the
+    /// per-field validation notes on the fields above. OPUS also costs
+    /// the encoder state plus micro-opus's per-thread scratch arena (~120 KB,
+    /// SPIRAM-preferred, allocated lazily on the source task's first encode) -- the same
+    /// per-thread arena the player's Opus decode allocates on its own task, so a device doing
+    /// both holds two such arenas
     SendspinCodecFormat codec{SendspinCodecFormat::PCM};
-    uint8_t channels{2};      ///< Capture channel count; must be > 0
-    uint8_t bit_depth{16};    ///< Bits per sample; 16, 24 (3 packed bytes), or 32
+
+    /// @brief Opus encoder complexity, validated to at most OPUS_COMPLEXITY_MAX.
+    /// Ignored (and unvalidated) when codec is PCM
+    uint8_t opus_complexity{DEFAULT_OPUS_COMPLEXITY};
+    uint8_t channels{2};      ///< Capture channel count; must be > 0 (1 or 2 for OPUS)
+    uint8_t bit_depth{16};    ///< Bits per sample; 16, 24 (3 packed bytes), or 32 (16 for OPUS)
     bool line_sense{false};   ///< Advertise line-input signal sensing (see SourceRole::set_signal)
     bool psram_stack{false};  ///< Allocate source task stack in PSRAM (ESP-IDF only)
 };

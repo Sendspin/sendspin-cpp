@@ -58,8 +58,9 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         ARDUINOJSON_USE_LONG_LONG=1
     )
 
-    # micro-flac and micro-opus (audio codec libraries, required by player/decoder)
-    # Only fetched and linked when the player role is enabled.
+    # Audio codec libraries: micro-flac decodes FLAC for the player only; micro-opus carries
+    # both the Opus decoder (player) and encoder (source), so it is fetched and linked when
+    # either of those roles is enabled.
     if(SENDSPIN_ENABLE_PLAYER)
         FetchContent_Declare(
             micro_flac
@@ -69,7 +70,9 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         )
         FetchContent_MakeAvailable(micro_flac)
         target_link_libraries(${TARGET_LIB} PUBLIC micro_flac)
+    endif()
 
+    if(SENDSPIN_ENABLE_PLAYER OR SENDSPIN_ENABLE_SOURCE)
         FetchContent_Declare(
             micro_opus
             GIT_REPOSITORY https://github.com/esphome-libs/micro-opus.git

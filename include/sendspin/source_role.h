@@ -108,7 +108,8 @@ public:
     /// writers.
     ///
     /// @param data Interleaved little-endian signed PCM in the configured format (24-bit as 3
-    ///        packed bytes per sample). Bytes are forwarded untouched; the config passed to
+    ///        packed bytes per sample). PCM bytes are forwarded untouched; an Opus config
+    ///        encodes each assembled chunk before sending. The config passed to
     ///        add_source() is the format contract.
     /// @param len Length in bytes; must be a whole number of frames (one frame = one sample
     ///        across all channels). A non-whole-frame write is rejected as a whole.

@@ -80,8 +80,13 @@ if(ESP_IDF_BUILD)
 
     if(CONFIG_SENDSPIN_ENABLE_SOURCE)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_SOURCES})
+        # The source role's Opus encoder comes from micro-opus, which the player block above
+        # may already require; the dedup below keeps the REQUIRES list clean either way.
+        list(APPEND SENDSPIN_REQUIRES esphome__micro-opus)
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_SOURCE)
     endif()
+
+    list(REMOVE_DUPLICATES SENDSPIN_REQUIRES)
 
     # Shared audio infrastructure for the roles that stream audio through the SPSC ring
     if(CONFIG_SENDSPIN_ENABLE_PLAYER OR CONFIG_SENDSPIN_ENABLE_SOURCE)
