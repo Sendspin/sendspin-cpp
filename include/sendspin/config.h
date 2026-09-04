@@ -326,7 +326,7 @@ struct SourceRoleConfig {
     uint32_t sample_rate{DEFAULT_SOURCE_SAMPLE_RATE};
 
     /// @brief Outbound chunk duration in milliseconds, validated against the spec bounds
-    /// [CHUNK_MIN_MS, CHUNK_MAX_MS]. OPUS accepts only 10, 20, 40, or 60 (one
+    /// [CHUNK_MIN_MS, CHUNK_MAX_MS]. OPUS accepts only 5, 10, 20, 40, or 60 (one
     /// chunk is exactly one legal Opus frame), so the PCM default of 25 is rejected for OPUS
     uint32_t chunk_duration_ms{DEFAULT_CHUNK_MS};
 

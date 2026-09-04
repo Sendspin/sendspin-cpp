@@ -293,15 +293,18 @@ TEST(SourceOpusEncoder, SmallChunkHighBitratePacketsFitGuaranteedCapacity) {
     // packets far beyond the 320-byte PCM chunk.
     EXPECT_GT(max_written, CHUNK_BYTES);
 
-    // The capacity guard the guarantee rests on: the same encoder offered a payload area of
-    // only the chunk's PCM size must drop the oversized packet (return 0), never truncate it
-    // or write past the buffer.
+    // A smaller payload area is a hard packet cap, not an overflow: libopus degrades the
+    // packet to fit the offered capacity, so a caller gets a valid (lower-quality) packet and
+    // never a truncated or out-of-bounds write. The task always offers MAX_PACKET_BYTES, so
+    // in-tree streams never degrade.
     for (auto& sample : noise) {
         lcg = lcg * 1664525U + 1013904223U;
         sample = static_cast<int16_t>(lcg >> 16);
     }
-    EXPECT_EQ(0U, encoder.encode(reinterpret_cast<const uint8_t*>(noise.data()), CHUNK_BYTES,
-                                 out.data(), CHUNK_BYTES));
+    const size_t capped = encoder.encode(reinterpret_cast<const uint8_t*>(noise.data()),
+                                         CHUNK_BYTES, out.data(), CHUNK_BYTES);
+    EXPECT_GT(capped, 0U);
+    EXPECT_LE(capped, CHUNK_BYTES);
 }
 
 // Defends the seam's in == out contract (the task assembles PCM into the send buffer's payload
@@ -363,17 +366,16 @@ TEST(SourceOpusEncoder, RoundTripThroughLibraryDecoder) {
 
     const auto input = make_sine(CHUNK_FRAMES * NUM_CHUNKS, CHANNELS, RATE);
     std::vector<int16_t> decoded(input.size());
-    std::vector<uint8_t> packet(CHUNK_BYTES);
+    std::vector<uint8_t> packet(OpusSourceEncoder::MAX_PACKET_BYTES);
     std::vector<uint8_t> decode_buf(decoder.get_decode_buffer_size());
 
     for (size_t chunk = 0; chunk < NUM_CHUNKS; ++chunk) {
         const auto* in_bytes =
             reinterpret_cast<const uint8_t*>(input.data() + chunk * CHUNK_FRAMES * CHANNELS);
         const size_t written = encoder.encode(in_bytes, CHUNK_BYTES, packet.data(), packet.size());
-        // Packet bound: nonempty and inside the 4000-byte scratch (libopus's recommended
-        // maximum) at the default bitrate.
+        // Packet bound: nonempty and inside the encoder's guaranteed maximum.
         ASSERT_GT(written, 0U);
-        ASSERT_LE(written, 4000U);
+        ASSERT_LE(written, OpusSourceEncoder::MAX_PACKET_BYTES);
 
         size_t decoded_size = 0;
         ASSERT_TRUE(decoder.decode_audio_chunk(packet.data(), written, decode_buf.data(),
@@ -545,10 +547,10 @@ TEST(SourceConfigValidation, OpusFormatRules) {
             << rate;
     }
 
-    // chunk_duration_ms: one legal Opus frame; the PCM default (25) is rejected, not remapped.
+    // chunk_duration_ms: one legal Opus frame at or above the spec's 5 ms minimum; a non-frame
+    // duration like 25 is rejected, not remapped.
     EXPECT_FALSE(advertises_source(*opus_with([](auto& c) { c.chunk_duration_ms = 25; })));
-    EXPECT_FALSE(advertises_source(*opus_with([](auto& c) { c.chunk_duration_ms = 5; })));
-    for (uint32_t ms : {10, 20, 40, 60}) {
+    for (uint32_t ms : {5, 10, 20, 40, 60}) {
         EXPECT_TRUE(advertises_source(*opus_with([&](auto& c) { c.chunk_duration_ms = ms; })))
             << ms;
     }
