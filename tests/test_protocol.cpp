@@ -809,6 +809,7 @@ TEST(Protocol, FormatClientHelloSourceSupport) {
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
     EXPECT_STREQ(doc["payload"]["supported_roles"][0], "source@v1");
+    ASSERT_TRUE(doc["payload"]["source@v1_support"]["features"]["line_sense"].is<bool>());
     EXPECT_TRUE(doc["payload"]["source@v1_support"]["features"]["line_sense"].as<bool>());
 
     // No line_sense: the support object is present but empty (features omitted, not false).
