@@ -44,7 +44,7 @@ static bool validate_config(const SourceRoleConfig& config) {
         // libopus accepts exactly these rates; a 44100 line-in must use PCM or resample
         static constexpr uint32_t OPUS_SAMPLE_RATES[] = {8000, 12000, 16000, 24000, 48000};
         // Single legal Opus frames within the spec's chunk bounds
-        static constexpr uint32_t OPUS_CHUNK_DURATIONS_MS[] = {10, 20, 40, 60};
+        static constexpr uint32_t OPUS_CHUNK_DURATIONS_MS[] = {5, 10, 20, 40, 60};
         const auto contains = [](const auto& values, uint32_t value) {
             return std::find(std::begin(values), std::end(values), value) != std::end(values);
         };
@@ -71,7 +71,8 @@ static bool validate_config(const SourceRoleConfig& config) {
             // One chunk is one opus_encode() call, so it must be one legal frame; the PCM
             // default of 25 is deliberately not remapped -- fail closed beats silent repair
             SS_LOGE(TAG,
-                    "Rejecting source config: opus chunk_duration_ms must be 10, 20, 40, or 60 "
+                    "Rejecting source config: opus chunk_duration_ms must be 5, 10, 20, 40, or "
+                    "60 "
                     "(got %u)",
                     config.chunk_duration_ms);
             valid = false;
@@ -290,8 +291,11 @@ void SourceRole::Impl::drain_events() {
 }
 
 void SourceRole::Impl::cleanup() {
-    // Permission does not survive the connection (Sendspin spec, Source messages)
+    // Permission does not survive the connection (Sendspin spec, Source messages). The gate is
+    // closed here, before the synthetic STOPPED below, so the listener can never observe
+    // "stopped" while write_audio() still accepts.
     this->streaming_desired = false;
+    this->task->close_audio_gate();
     this->task->signal_stop();
 
     // Discard a stale command from the dead connection

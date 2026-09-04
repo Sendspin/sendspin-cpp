@@ -60,9 +60,6 @@ private:
     PlatformBuffer encoder_state_;
     /// Aligned PCM copy of the chunk under encode; see encode() for why the input is copied
     PlatformBuffer pcm_scratch_;
-    /// Encoded packet landing area, sized to libopus's recommended maximum; encode() copies
-    /// the packet out to satisfy the seam's in == out contract
-    PlatformBuffer packet_scratch_;
 
     // 64-bit fields
     /// Encoder delay in µs, converted from OPUS_GET_LOOKAHEAD samples once at init

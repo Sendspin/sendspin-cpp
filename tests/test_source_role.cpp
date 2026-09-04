@@ -70,6 +70,7 @@ constexpr uint16_t TIME_GATE_TEST_PORT = 19011;
 constexpr uint16_t RECONNECT_TEST_PORT = 19012;
 constexpr uint16_t OPUS_WIRE_TEST_PORT = 19013;
 constexpr uint16_t OPUS_CAPACITY_WIRE_TEST_PORT = 19014;
+constexpr uint16_t WRITE_GATE_TEST_PORT = 19015;
 
 // Default-config wire framing, derived exactly as source_task.cpp derives it: 25 ms at
 // 48 kHz stereo 16-bit -> 1200 frames x 4 bytes, behind a 1-byte type + 8-byte timestamp header.
@@ -292,15 +293,18 @@ TEST(SourceOpusEncoder, SmallChunkHighBitratePacketsFitGuaranteedCapacity) {
     // packets far beyond the 320-byte PCM chunk.
     EXPECT_GT(max_written, CHUNK_BYTES);
 
-    // The capacity guard the guarantee rests on: the same encoder offered a payload area of
-    // only the chunk's PCM size must drop the oversized packet (return 0), never truncate it
-    // or write past the buffer.
+    // A smaller payload area is a hard packet cap, not an overflow: libopus degrades the
+    // packet to fit the offered capacity, so a caller gets a valid (lower-quality) packet and
+    // never a truncated or out-of-bounds write. The task always offers MAX_PACKET_BYTES, so
+    // in-tree streams never degrade.
     for (auto& sample : noise) {
         lcg = lcg * 1664525U + 1013904223U;
         sample = static_cast<int16_t>(lcg >> 16);
     }
-    EXPECT_EQ(0U, encoder.encode(reinterpret_cast<const uint8_t*>(noise.data()), CHUNK_BYTES,
-                                 out.data(), CHUNK_BYTES));
+    const size_t capped = encoder.encode(reinterpret_cast<const uint8_t*>(noise.data()),
+                                         CHUNK_BYTES, out.data(), CHUNK_BYTES);
+    EXPECT_GT(capped, 0U);
+    EXPECT_LE(capped, CHUNK_BYTES);
 }
 
 // Defends the seam's in == out contract (the task assembles PCM into the send buffer's payload
@@ -362,17 +366,16 @@ TEST(SourceOpusEncoder, RoundTripThroughLibraryDecoder) {
 
     const auto input = make_sine(CHUNK_FRAMES * NUM_CHUNKS, CHANNELS, RATE);
     std::vector<int16_t> decoded(input.size());
-    std::vector<uint8_t> packet(CHUNK_BYTES);
+    std::vector<uint8_t> packet(OpusSourceEncoder::MAX_PACKET_BYTES);
     std::vector<uint8_t> decode_buf(decoder.get_decode_buffer_size());
 
     for (size_t chunk = 0; chunk < NUM_CHUNKS; ++chunk) {
         const auto* in_bytes =
             reinterpret_cast<const uint8_t*>(input.data() + chunk * CHUNK_FRAMES * CHANNELS);
         const size_t written = encoder.encode(in_bytes, CHUNK_BYTES, packet.data(), packet.size());
-        // Packet bound: nonempty and inside the 4000-byte scratch (libopus's recommended
-        // maximum) at the default bitrate.
+        // Packet bound: nonempty and inside the encoder's guaranteed maximum.
         ASSERT_GT(written, 0U);
-        ASSERT_LE(written, 4000U);
+        ASSERT_LE(written, OpusSourceEncoder::MAX_PACKET_BYTES);
 
         size_t decoded_size = 0;
         ASSERT_TRUE(decoder.decode_audio_chunk(packet.data(), written, decode_buf.data(),
@@ -544,10 +547,10 @@ TEST(SourceConfigValidation, OpusFormatRules) {
             << rate;
     }
 
-    // chunk_duration_ms: one legal Opus frame; the PCM default (25) is rejected, not remapped.
+    // chunk_duration_ms: one legal Opus frame at or above the spec's 5 ms minimum; a non-frame
+    // duration like 25 is rejected, not remapped.
     EXPECT_FALSE(advertises_source(*opus_with([](auto& c) { c.chunk_duration_ms = 25; })));
-    EXPECT_FALSE(advertises_source(*opus_with([](auto& c) { c.chunk_duration_ms = 5; })));
-    for (uint32_t ms : {10, 20, 40, 60}) {
+    for (uint32_t ms : {5, 10, 20, 40, 60}) {
         EXPECT_TRUE(advertises_source(*opus_with([&](auto& c) { c.chunk_duration_ms = ms; })))
             << ms;
     }
@@ -922,7 +925,11 @@ int64_t read_be64(const uint8_t* bytes) {
 // chunk and client-stream/end on stop -- with write_audio() gated shut before the start
 // command, validating frames while open, and gated shut again after the stop.
 TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
-    WireHarness harness(WIRE_TEST_PORT);
+    // The chunk arithmetic below encodes 25 ms chunks; pinned here so the test cannot drift
+    // with the config default.
+    SourceRoleConfig wire_config;
+    wire_config.chunk_duration_ms = 25;
+    WireHarness harness(WIRE_TEST_PORT, wire_config);
     ASSERT_TRUE(harness.start());
     FakeSourceServer fake(server_url(WIRE_TEST_PORT), "source-server-a");
     ASSERT_TRUE(harness.establish(fake));
@@ -944,15 +951,6 @@ TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
         },
         4000));
     EXPECT_TRUE(source->is_streaming());
-
-    // Validation while open: a non-whole-frame write is rejected as a whole.
-    std::vector<uint8_t> odd(WIRE_BYTES_PER_FRAME * 10 + 1, 0xAA);
-    EXPECT_FALSE(source->write_audio(odd.data(), odd.size(), 0));
-
-    // Overflow: a write larger than the whole capture ring cannot be buffered -- rejected and
-    // counted as a drop, never blocked on.
-    std::vector<uint8_t> oversized(WIRE_BYTES_PER_FRAME * 48000, 0);  // 1 s >> 150 ms ring
-    EXPECT_FALSE(source->write_audio(oversized.data(), oversized.size(), 0));
 
     // 50 ms of ramp PCM in 10 ms writes, capture-stamped 10 ms apart: exactly two full 25 ms
     // chunks.
@@ -1022,9 +1020,6 @@ TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
     EXPECT_EQ(static_cast<uint8_t>(first[0]), SENDSPIN_BINARY_SOURCE_AUDIO);
     const int64_t ts1 = read_be64(reinterpret_cast<const uint8_t*>(first.data()) + 1);
     EXPECT_LT(std::llabs(ts1 - base), 1000000);
-    for (size_t i = 0; i < 16; ++i) {
-        EXPECT_EQ(static_cast<uint8_t>(first[WIRE_HEADER + i]), static_cast<uint8_t>(i & 0xFF));
-    }
 
     // The second chunk's anchor is exactly one chunk after the first (contiguous capture
     // stamps); allow slack for the time filter refining its offset between the two sends.
@@ -1036,6 +1031,52 @@ TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
     // The final short chunk carries the 10 ms remainder.
     const auto& last = events[static_cast<size_t>(binary_idx[2])].data;
     EXPECT_EQ(last.size(), WIRE_HEADER + WIRE_BYTES_PER_FRAME * 480);
+
+    // Every payload byte of every chunk continues the write-side ramp: chunk boundaries and
+    // assembly cannot silently reorder, duplicate, or corrupt capture bytes.
+    size_t expected_ramp = 0;
+    bool payload_intact = true;
+    for (const ptrdiff_t idx : binary_idx) {
+        const auto& chunk_data = events[static_cast<size_t>(idx)].data;
+        for (size_t i = WIRE_HEADER; i < chunk_data.size(); ++i) {
+            if (static_cast<uint8_t>(chunk_data[i]) !=
+                static_cast<uint8_t>(expected_ramp++ & 0xFF)) {
+                payload_intact = false;
+                break;
+            }
+        }
+        if (!payload_intact) {
+            break;
+        }
+    }
+    EXPECT_TRUE(payload_intact);
+    EXPECT_EQ(expected_ramp, WIRE_BYTES_PER_FRAME * 480 * 6);
+}
+
+// Mid-stream capture validation, focused so a regression here names itself: a non-whole-frame
+// write is rejected as a whole, and a write larger than the whole capture ring is rejected as
+// a counted drop rather than blocking the producer.
+TEST(SourceWire, RejectsMalformedAndOversizedWritesWhileOpen) {
+    WireHarness harness(WRITE_GATE_TEST_PORT);
+    ASSERT_TRUE(harness.start());
+    FakeSourceServer fake(server_url(WRITE_GATE_TEST_PORT), "source-server-w");
+    ASSERT_TRUE(harness.establish(fake));
+    SourceRole* source = harness.client.source();
+    ASSERT_NE(source, nullptr);
+
+    fake.send_source_command("start");
+    ASSERT_TRUE(pump_until(
+        harness.client, [&] { return harness.listener.started == 1; }, 4000));
+
+    std::vector<uint8_t> odd(WIRE_BYTES_PER_FRAME * 10 + 1, 0xAA);
+    EXPECT_FALSE(source->write_audio(odd.data(), odd.size(), 0));
+
+    std::vector<uint8_t> oversized(WIRE_BYTES_PER_FRAME * 48000, 0);  // 1 s >> 150 ms ring
+    EXPECT_FALSE(source->write_audio(oversized.data(), oversized.size(), 0));
+
+    // Control: a well-formed write on the same open stream is accepted.
+    std::vector<uint8_t> good(WIRE_BYTES_PER_FRAME * 480, 0x42);
+    EXPECT_TRUE(source->write_audio(good.data(), good.size(), 0));
 }
 
 // The time-sync convergence gate: a start command on a connection whose time filter has no
@@ -1088,7 +1129,9 @@ TEST(SourceWire, PermissionDoesNotSurviveReconnect) {
     ASSERT_TRUE(harness.establish(fake2));
 
     // The old connection's permission must not leak into this one.
-    pump_for(harness.client, 400);
+    // Longer than the task's 500 ms failed-open retry (SOURCE_OPEN_RETRY_MS): a permission
+    // leak that merely deferred into the retry window must surface before the fresh command.
+    pump_for(harness.client, 700);
     EXPECT_EQ(fake2.count_text_containing("client-stream/start"), 0U);
     EXPECT_EQ(harness.listener.started, 1);
 

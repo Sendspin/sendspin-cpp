@@ -160,7 +160,11 @@ public:
     ///
     /// Unlike the text path's best-effort callback, @p cb fires exactly once for EVERY call --
     /// on success, every failure path, and connection teardown -- because single-in-flight
-    /// transports release their send slot from the completion path.
+    /// transports release their send slot from the completion path. Its execution context is
+    /// transport-dependent: inline on the calling thread for synchronous transports and for
+    /// immediate failures, from the httpd worker for a queued ESP-server send, and from the
+    /// destructor's thread for work that can never run -- so the callback must not perform
+    /// thread-affine work or call back into the connection.
     ///
     /// @param data Pointer to the message bytes (type byte first).
     /// @param len Length of the message in bytes.

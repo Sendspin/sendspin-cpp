@@ -69,9 +69,8 @@ bool OpusSourceEncoder::init(const SourceRoleConfig& config) {
     // Both scratches follow the audio buffers' placement choice (same bytes, same access)
     const uint64_t chunk_bytes =
         source_ms_to_frames(config.chunk_duration_ms, config.sample_rate) * this->bytes_per_frame_;
-    if (!this->pcm_scratch_.allocate(static_cast<size_t>(chunk_bytes), config.buffer_location) ||
-        !this->packet_scratch_.allocate(MAX_PACKET_BYTES, config.buffer_location)) {
-        SS_LOGE(TAG, "Couldn't allocate the Opus chunk scratch buffers");
+    if (!this->pcm_scratch_.allocate(static_cast<size_t>(chunk_bytes), config.buffer_location)) {
+        SS_LOGE(TAG, "Couldn't allocate the Opus chunk scratch buffer");
         this->encoder_state_.reset();
         return false;
     }
@@ -103,23 +102,23 @@ size_t OpusSourceEncoder::encode(const uint8_t* in, size_t in_len, uint8_t* out,
         return 0;
     }
 
-    // `in` sits behind the 9-byte wire header and is not int16-aligned, so copy to the aligned
-    // scratch; encoding into the packet scratch (never `out`) is what honors in == out
+    // `in` sits behind the 9-byte wire header and is not int16-aligned, so the PCM is copied to
+    // the aligned scratch; that copy is also what honors the seam's in == out contract, so the
+    // packet can be encoded straight into `out` with no second buffer or copy.
     memcpy(this->pcm_scratch_.data(), in, in_len);
+    // libopus treats max_data_bytes as a hard packet cap and degrades quality to fit it, so a
+    // small payload area yields a valid smaller packet rather than an error. The task offers
+    // MAX_PACKET_BYTES, above every accepted config's worst case, so in-tree streams never
+    // degrade.
+    const auto capacity =
+        static_cast<opus_int32>(std::min(out_capacity, static_cast<size_t>(MAX_PACKET_BYTES)));
     const opus_int32 written =
         opus_encode(this->encoder_state_.as<OpusEncoder>(), this->pcm_scratch_.as<opus_int16>(),
-                    static_cast<int>(in_len / this->bytes_per_frame_), this->packet_scratch_.data(),
-                    static_cast<opus_int32>(MAX_PACKET_BYTES));
+                    static_cast<int>(in_len / this->bytes_per_frame_), out, capacity);
     if (written <= 0) {
         SS_LOGE(TAG, "Opus encode failed, error %d", static_cast<int>(written));
         return 0;
     }
-    if (static_cast<size_t>(written) > out_capacity) {
-        SS_LOGE(TAG, "Opus packet of %d bytes exceeds the %u-byte payload capacity; dropping chunk",
-                static_cast<int>(written), static_cast<unsigned>(out_capacity));
-        return 0;
-    }
-    memcpy(out, this->packet_scratch_.data(), static_cast<size_t>(written));
     return static_cast<size_t>(written);
 }
 

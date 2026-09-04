@@ -101,11 +101,15 @@ public:
 
     /// @brief Writes captured audio into the outbound stream
     ///
-    /// Hot path: non-blocking and non-allocating. Exactly one producer thread may call this;
-    /// the library does not serialize concurrent writers.
+    /// Hot path: non-allocating and never waiting on the consumer (ring timeout 0). The ring is
+    /// lock-free on ESP; the host implementation takes a short mutex-guarded critical section,
+    /// so hard-real-time host callers should hand off through their own lock-free stage.
+    /// Exactly one producer thread may call this; the library does not serialize concurrent
+    /// writers.
     ///
     /// @param data Interleaved little-endian signed PCM in the configured format (24-bit as 3
-    ///        packed bytes per sample). Bytes are forwarded untouched; the config passed to
+    ///        packed bytes per sample). PCM bytes are forwarded untouched; an Opus config
+    ///        encodes each assembled chunk before sending. The config passed to
     ///        add_source() is the format contract.
     /// @param len Length in bytes; must be a whole number of frames (one frame = one sample
     ///        across all channels). A non-whole-frame write is rejected as a whole.
