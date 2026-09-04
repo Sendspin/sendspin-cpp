@@ -92,7 +92,7 @@ inline int64_t be64_to_host(const uint8_t* bytes) {
 inline void host_to_be64(int64_t value, uint8_t* bytes) {
     const auto val = static_cast<uint64_t>(value);
     for (size_t i = 0; i < BINARY_TIMESTAMP_SIZE; ++i) {
-        bytes[i] = static_cast<uint8_t>(val >> (56 - 8 * i));
+        bytes[i] = static_cast<uint8_t>(val >> ((BINARY_TIMESTAMP_SIZE - 1 - i) * 8U));
     }
 }
 
