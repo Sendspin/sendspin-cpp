@@ -91,7 +91,7 @@ inline int64_t be64_to_host(const uint8_t* bytes) {
 inline void host_to_be64(int64_t value, uint8_t* bytes) {
     const auto val = static_cast<uint64_t>(value);
     for (size_t i = 0; i < BINARY_TIMESTAMP_SIZE; ++i) {
-        bytes[i] = static_cast<uint8_t>(val >> (56 - 8 * i));
+        bytes[i] = static_cast<uint8_t>(val >> ((BINARY_TIMESTAMP_SIZE - 1 - i) * 8U));
     }
 }
 
@@ -636,9 +636,6 @@ struct ServerColorStateDelta {
 };
 
 // --- source role ---
-// Unlike the sibling sections above, these types are not mirrored from a public header: the
-// source role has no role class or include/sendspin/ header yet, so its protocol types are
-// internal-only.
 
 /// @brief Commands addressed to the source role in server/command messages
 enum class SourceCommand : uint8_t {
