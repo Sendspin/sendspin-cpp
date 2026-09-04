@@ -188,6 +188,8 @@ The configuration is validated at `add_source()` time; validation fails closed. 
 
 Streaming is gated by the server: the client never streams unsolicited, the default after connect is stopped, and permission does not survive reconnection. When the server commands start, the role opens the outbound stream and fires `on_streaming_started()`; from that point on, feed captured audio to `write_audio()`:
 
+> **Authorization on this protocol revision:** the spec additionally gates source activation on a paired (`user`-trust) connection, with the decision on the server side. This library predates the pairing/encryption transport, so the start command of any server that completed the handshake is honored; treat every network the client can be reached from as trusted until the encryption work lands, and prefer wired/isolated networks for privacy-sensitive inputs such as microphones.
+
 ```cpp
 // Capture thread (exactly one producer thread):
 source.write_audio(pcm_bytes, len, capture_time_us);
@@ -937,7 +939,7 @@ Configuration passed to `client.add_source()`. It is the capture format contract
 | `sample_rate` | `uint32_t` | `48000` | Capture sample rate in Hz; must be > 0. `OPUS` accepts only libopus's rates: 8000, 12000, 16000, 24000, or 48000 (a 44100 line-in must use `PCM` or resample upstream). |
 | `channels` | `uint8_t` | `2` | Capture channel count; must be > 0 (1 or 2 for `OPUS`). |
 | `bit_depth` | `uint8_t` | `16` | Bits per sample: 16, 24 (3 packed bytes per sample), or 32. `OPUS` requires 16. |
-| `chunk_duration_ms` | `uint32_t` | `25` | Duration of one outbound audio chunk. `PCM` accepts the spec bounds [5, 150]; `OPUS` accepts only 10, 20, 40, or 60 (one chunk is exactly one legal Opus frame), so the PCM default of 25 is rejected for `OPUS`. |
+| `chunk_duration_ms` | `uint32_t` | `20` | Duration of one outbound audio chunk. `PCM` accepts the spec bounds [5, 150]; `OPUS` accepts only 5, 10, 20, 40, or 60 (one chunk is exactly one legal Opus frame). The default is a legal Opus frame, so switching `codec` alone keeps a valid config. |
 | `capture_buffer_ms` | `uint32_t` | `150` | Capture ring capacity in milliseconds of audio in the configured format; must be > 0. The ring is the stall-policy backlog bound: capture beyond it is dropped at `write_audio()` and streaming resumes from live audio. Approximate: per-write ring metadata comes out of a fixed +25% margin, so many very small `write_audio()` calls reduce the effective audio capacity below this figure. |
 | `opus_bitrate` | `uint32_t` | `128000` | Opus bitrate in bit/s, validated against [500, 512000] (the range libopus accepts). Ignored (and unvalidated) when `codec` is `PCM`. |
 | `opus_complexity` | `uint8_t` | `2` | Opus encoder complexity, validated to at most 10. The low default fits an ESP32-class real-time encode budget; hosts may raise it for quality per CPU. Ignored (and unvalidated) when `codec` is `PCM`. |

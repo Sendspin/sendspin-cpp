@@ -254,9 +254,10 @@ private:
 
         if (!self->source_->write_audio(static_cast<const uint8_t*>(input),
                                         frame_count * self->bytes_per_frame_, capture_us)) {
-            // Counted here and reported from the main loop: no logging on the audio
-            // callback. A rejected write means the capture ring is full, or the stream
-            // closed while this callback was in flight.
+            // Counted here and reported from the main loop; this example adds no logging of
+            // its own on the audio callback (the library itself warns once per overflow
+            // episode from this thread). A rejected write means the capture ring is full, or
+            // the stream closed while this callback was in flight.
             self->dropped_writes_.fetch_add(1, std::memory_order_relaxed);
         }
         return paContinue;
@@ -370,6 +371,37 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // --- Listener implementations ---
+    // Declared before the client: the client and role retain raw pointers to these for their
+    // whole lifetime, so they must be destroyed after the client (reverse declaration order).
+
+    struct CaptureSourceListener : SourceRoleListener {
+        PortAudioCapture& capture;
+        explicit CaptureSourceListener(PortAudioCapture& c) : capture(c) {}
+
+        void on_streaming_started() override {
+            fprintf(stderr, ">>> Streaming started\n");
+            if (!capture.start()) {
+                // The stream is open on the wire but capture cannot run; exit the main loop so
+                // shutdown closes the stream instead of leaving the server waiting on silence.
+                fprintf(stderr, ">>> Failed to start capture; shutting down\n");
+                running.store(false);
+            }
+        }
+
+        void on_streaming_stopped() override {
+            fprintf(stderr, ">>> Streaming stopped\n");
+            capture.stop();
+        }
+    };
+
+    struct HostNetworkProvider : SendspinNetworkProvider {
+        bool is_network_ready() override { return true; }
+    };
+
+    CaptureSourceListener source_listener(capture);
+    HostNetworkProvider network_provider;
+
     // Configure the client
     SendspinClientConfig config;
     config.client_id = "source-client-example";
@@ -396,32 +428,6 @@ int main(int argc, char* argv[]) {
     if (!capture.open(source, CAPTURE_SAMPLE_RATE, channels)) {
         return 1;
     }
-
-    // --- Listener implementations ---
-
-    struct CaptureSourceListener : SourceRoleListener {
-        PortAudioCapture& capture;
-        explicit CaptureSourceListener(PortAudioCapture& c) : capture(c) {}
-
-        void on_streaming_started() override {
-            fprintf(stderr, ">>> Streaming started\n");
-            if (!capture.start()) {
-                fprintf(stderr, ">>> Failed to start capture\n");
-            }
-        }
-
-        void on_streaming_stopped() override {
-            fprintf(stderr, ">>> Streaming stopped\n");
-            capture.stop();
-        }
-    };
-
-    struct HostNetworkProvider : SendspinNetworkProvider {
-        bool is_network_ready() override { return true; }
-    };
-
-    CaptureSourceListener source_listener(capture);
-    HostNetworkProvider network_provider;
 
     source.set_listener(&source_listener);
     client.set_network_provider(&network_provider);
@@ -456,17 +462,24 @@ int main(int argc, char* argv[]) {
         client.connect_to(connect_url);
     }
 
-    fprintf(stderr, "Press Ctrl+C to stop. The server controls when streaming starts.\n\n");
+    fprintf(stderr, "Press Ctrl+C to stop. The server controls when streaming starts.\n");
+    fprintf(stderr,
+            "NOTE: on this protocol revision any Sendspin server that completes the handshake\n"
+            "can start capture from the default input; keep this example on trusted networks\n"
+            "(pairing-based authorization arrives with the encryption work).\n\n");
 
     // Main loop
-    int tick = 0;
+    constexpr auto DROP_REPORT_INTERVAL = std::chrono::seconds(5);
+    auto next_drop_report = std::chrono::steady_clock::now() + DROP_REPORT_INTERVAL;
     while (running.load()) {
         client.loop();
         // Surface capture drops off the audio callback (which only counts them)
-        if (++tick % 500 == 0) {
+        if (std::chrono::steady_clock::now() >= next_drop_report) {
+            next_drop_report += DROP_REPORT_INTERVAL;
             uint32_t dropped = capture.take_dropped_writes();
             if (dropped > 0) {
-                fprintf(stderr, ">>> Dropped %u capture writes in the last 5 s\n", dropped);
+                fprintf(stderr, ">>> Dropped %u capture writes in the last %lld s\n", dropped,
+                        static_cast<long long>(DROP_REPORT_INTERVAL.count()));
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
