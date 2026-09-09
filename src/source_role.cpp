@@ -68,8 +68,8 @@ static bool validate_config(const SourceRoleConfig& config) {
             valid = false;
         }
         if (!contains(OPUS_CHUNK_DURATIONS_MS, config.chunk_duration_ms)) {
-            // One chunk is one opus_encode() call, so it must be one legal frame; the PCM
-            // default of 25 is deliberately not remapped -- fail closed beats silent repair
+            // One chunk is one opus_encode() call, so it must be one legal frame; a
+            // non-frame duration is rejected, not remapped -- fail closed beats silent repair
             SS_LOGE(TAG,
                     "Rejecting source config: opus chunk_duration_ms must be 5, 10, 20, 40, or "
                     "60 "

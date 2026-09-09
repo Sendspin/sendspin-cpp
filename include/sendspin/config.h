@@ -327,7 +327,7 @@ struct SourceRoleConfig {
 
     /// @brief Outbound chunk duration in milliseconds, validated against the spec bounds
     /// [CHUNK_MIN_MS, CHUNK_MAX_MS]. OPUS accepts only 5, 10, 20, 40, or 60 (one
-    /// chunk is exactly one legal Opus frame), so the PCM default of 25 is rejected for OPUS
+    /// chunk is exactly one legal Opus frame; the default already is one)
     uint32_t chunk_duration_ms{DEFAULT_CHUNK_MS};
 
     /// @brief Capture ring capacity in milliseconds of audio in the configured format (the

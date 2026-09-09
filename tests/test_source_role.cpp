@@ -169,8 +169,7 @@ TEST(SourceBookkeeping, PcmPassthroughEncoderContract) {
 // Opus encoder (source_encoder_opus.h / .cpp)
 // ============================================================================
 
-/// Baseline opus source config: 48 kHz stereo 16-bit, 20 ms chunks (one legal Opus frame; the
-/// PCM chunk default of 25 ms is invalid for opus).
+/// Baseline opus source config: 48 kHz stereo 16-bit, 20 ms chunks (one legal Opus frame).
 SourceRoleConfig make_opus_config() {
     SourceRoleConfig config;
     config.codec = SendspinCodecFormat::OPUS;
