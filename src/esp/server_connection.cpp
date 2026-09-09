@@ -14,6 +14,7 @@
 
 #include "server_connection.h"
 
+#include "binary_send_registry.h"
 #include "lwip/sockets.h"  // for setsockopt, IPPROTO_TCP, NODELAY
 #include "platform/compiler.h"
 #include "platform/logging.h"
@@ -22,8 +23,6 @@
 #include <esp_timer.h>
 
 #include <cstring>
-#include <mutex>
-#include <vector>
 
 namespace sendspin {
 
@@ -61,32 +60,25 @@ struct SessionLookup {
 /// SessionLookup: the binary path runs per chunk and must not allocate in steady state)
 ///
 /// While a work item is queued, `self` keeps the block alive independently of the connection;
-/// the worker moves `self` into a local before resolving `conn`, so teardown with work in
-/// flight makes the worker a clean no-op. httpd_queue_work has no cancellation hook, so work
-/// discarded by httpd_stop would strand the engaged `self` cycle; every engaged block is
-/// therefore tracked in the registry below and reclaimed by
-/// reclaim_orphaned_binary_send_work() once the server is stopped. The destructor still fails
-/// the pending completion.
+/// the worker claims it back before resolving `conn`, so teardown with work in flight makes the
+/// worker a clean no-op. httpd_queue_work has no cancellation hook, so work discarded by
+/// httpd_stop would strand the engaged `self` cycle; engaged blocks are therefore tracked in a
+/// registry scoped by their owning httpd handle and reclaimed by
+/// reclaim_orphaned_binary_send_work(handle) once THAT server is stopped -- another live
+/// server's queued work is never touched. The destructor still fails the pending completion.
 struct BinarySendLookup {
     std::weak_ptr<SendspinServerConnection> conn;
     std::shared_ptr<BinarySendLookup> self;
 };
 
-// Engaged lookup blocks with a queued worker that has not yet run. The worker removes its block
-// on entry; reclaim_orphaned_binary_send_work() clears whatever remains after httpd_stop, when
-// no queued worker can ever run again. Guarded by its own mutex: inserts come from role task
-// threads, removals from the httpd worker, the sweep from whichever thread stops the server.
+// Engage/claim/reclaim transitions live in the host-tested registry; this file only decides
+// when to call them. One process-wide instance, keyed by httpd handle.
 namespace {
-std::mutex g_engaged_binary_sends_mutex;
-std::vector<std::shared_ptr<BinarySendLookup>> g_engaged_binary_sends;
+BinarySendRegistry<BinarySendLookup> g_binary_send_registry;
 }  // namespace
 
-void reclaim_orphaned_binary_send_work() {
-    std::lock_guard<std::mutex> lock(g_engaged_binary_sends_mutex);
-    for (auto& lookup : g_engaged_binary_sends) {
-        lookup->self.reset();
-    }
-    g_engaged_binary_sends.clear();
+void reclaim_orphaned_binary_send_work(httpd_handle_t server) {
+    g_binary_send_registry.reclaim(server);
 }
 
 // ============================================================================
@@ -265,22 +257,14 @@ SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t 
         this->binary_send_lookup_->conn =
             std::static_pointer_cast<SendspinServerConnection>(this->shared_from_this());
     }
-    // Engage the keep-alive reference for the queued worker and track it for reclamation at
-    // server stop (see BinarySendLookup).
-    this->binary_send_lookup_->self = this->binary_send_lookup_;
-    {
-        std::lock_guard<std::mutex> lock(g_engaged_binary_sends_mutex);
-        g_engaged_binary_sends.push_back(this->binary_send_lookup_);
-    }
+    // Engage the keep-alive reference for the queued worker, scoped to this connection's httpd
+    // handle for reclamation at that server's stop (see BinarySendLookup).
+    g_binary_send_registry.engage(this->binary_send_lookup_, this->server_);
 
     if (httpd_queue_work(this->server_, async_send_binary, this->binary_send_lookup_.get()) !=
         ESP_OK) {
         SS_LOGE(TAG, "httpd_queue_work failed for binary message");
-        {
-            std::lock_guard<std::mutex> lock(g_engaged_binary_sends_mutex);
-            std::erase(g_engaged_binary_sends, this->binary_send_lookup_);
-        }
-        this->binary_send_lookup_->self.reset();
+        g_binary_send_registry.claim(this->binary_send_lookup_.get());
         SendCompleteCallback pending = std::move(this->binary_send_cb_);
         this->binary_send_in_flight_.store(false, std::memory_order_release);
         if (pending) {
@@ -293,12 +277,11 @@ SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t 
 
 void SendspinServerConnection::async_send_binary(void* arg) {
     auto* lookup = static_cast<BinarySendLookup*>(arg);
-    // Take the keep-alive back first; a successful lock() then blocks destruction until return.
-    // Also leave the reclamation registry: this worker is running, so it owns the cleanup.
-    std::shared_ptr<BinarySendLookup> keep = std::move(lookup->self);
-    {
-        std::lock_guard<std::mutex> lock(g_engaged_binary_sends_mutex);
-        std::erase(g_engaged_binary_sends, keep);
+    // Claim the keep-alive back under the registry lock (serialized against reclaim); a
+    // successful conn.lock() then blocks destruction until return.
+    std::shared_ptr<BinarySendLookup> keep = g_binary_send_registry.claim(lookup);
+    if (keep == nullptr) {
+        return;  // Reclaimed or already claimed; nothing here is safe to touch
     }
     auto conn = lookup->conn.lock();
     if (conn == nullptr) {
