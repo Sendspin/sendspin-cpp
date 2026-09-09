@@ -46,11 +46,13 @@ and are in scope regardless of who wrote them.
   surviving mutation is a defect of the test only when it breaks a contract
   the test claims to cover; otherwise it belongs under "Honest gaps".
 - An assertion that claims to cover several failure modes must fail for each
-  one on its own. A single bound against a sum of timeouts detects only the
-  largest term; regress each path alone to check the small ones.
-- A mutation claim in a finding is verified by running it, with evidence the
-  binary actually rebuilt; a stale build directory has passed mutations here
-  before.
+  one on its own; a single aggregate check detects only the mode that
+  dominates it. Regress each path alone to confirm the others.
+- A mutation claim is verified by building and running the mutant after the
+  unmutated build passes, and the finding states the command and result; a
+  stale build directory has passed mutations here before, so check that the
+  objects rebuilt. This is the same overclaim that "Granularity and
+  independence" catches by reading; report it once.
 - Watch for self-referential tests: asserting on state the test itself set,
   exercising only the mock, or re-deriving the expected value with the same
   code path the production code uses.
@@ -115,14 +117,18 @@ and are in scope regardless of who wrote them.
   guards.
 - Concurrency tests observe real effects rather than self-referential timing:
   never assert on a counter that the thread under test would have been the
-  one to advance; use the code's own observable outputs or event flags. Time
-  itself is covered under "No wall-clock assertions".
+  one to advance; use the code's own observable outputs or event flags. A
+  fixed sleep is not a synchronization tool; the narrow ordering use it is
+  allowed is in "No wall-clock assertions".
 
 ## No wall-clock assertions
 
-- A unit test does not assert on elapsed time. A stopwatch measures the
-  runner and the scheduler, not the code, and the bound it needs is a guess
-  about how slow a machine might be; every such guess is eventually wrong.
+- A unit test never makes elapsed time the pass/fail condition
+  (`EXPECT_LT(elapsed, x)`, `EXPECT_GE(elapsed, y)`). A stopwatch measures
+  the runner and the scheduler, not the code, and the bound it needs is a
+  guess about machine speed that is eventually wrong. A bounded wait that
+  only decides when to sample an observation is scheduling, not an
+  assertion; the last bullet says when that is allowed.
 - An elapsed-time assertion is a symptom: the call under test has a second
   way to return (a timeout) and the clock exists only to tell the two apart.
   Remove the second exit instead. Wait with no timeout so the event under
@@ -136,19 +142,17 @@ and are in scope regardless of who wrote them.
   Name it under "Honest gaps" rather than approximating it with a bound.
 - The CTest `TIMEOUT` in `tests/CMakeLists.txt` is a hang guard, not an
   assertion. It sits far above any real run time so a regression reports
-  instead of hanging forever.
+  instead of hanging forever. It only fires under `ctest`; a hung wait in a
+  direct or debugger run hangs, and a timeout gives no diagnostic beyond
+  the test name. That is the accepted price of removing the bound.
 - A fixed sleep may order events between threads only when a delayed thread
-  yields a false pass, never a false failure. It is never itself an
-  assertion, and the test must still be correct if the sleep is too short. A
-  bounded window is likewise acceptable only for a "must not happen" check
-  on a monotonic observation, where a short window can only miss a
-  regression.
-
-## Platform branches
-
-- State which `#ifdef ESP_PLATFORM` arm a test exercises. The host suite
-  compiles only the host arm; a change to the ESP arm is an honest gap, not
-  covered, and a host mutation result says nothing about device behavior.
+  yields a false pass, never a false failure: sleep so a consumer is likely
+  parked before the wake, and if it was not yet parked the wake is held and
+  the test still passes. It is never itself an assertion. A bounded window
+  is likewise acceptable only for a "must not happen" check on a monotonic
+  observation (a flag or counter that cannot un-set within the test), where
+  a short window can only miss a regression. A watchdog is tested the same
+  way: wait with no timeout for "it fires", a bounded window for "not yet".
 
 ## Sanitizers
 
@@ -166,10 +170,19 @@ and are in scope regardless of who wrote them.
   the remedy for it. This project has no clock injection seam and a review
   must not propose introducing one; where a timing decision needs direct
   coverage, extract it into a pure predicate the test calls with supplied
-  values.
+  values. Unlike a seam, the predicate takes `now` as an ordinary argument
+  and the production call site still reads the real clock; nothing becomes
+  swappable. `display_overdue_us` in `src/artwork_role.cpp` is the shape.
+- The host suite compiles only the host arm of `#ifdef ESP_PLATFORM`. A
+  finding that touches platform-guarded code states which arm the test
+  exercises; a change to the ESP arm is a gap to name, and a host mutation
+  result says nothing about it.
+- A test that fails without a code change is a defect in the test. Fix it or
+  delete it; never retry it into passing.
 
 ## Report format
 
 For each finding: location (file:line), the standard it misses, and the
-concrete improvement (including "delete this test" where warranted). Separate
+concrete improvement (including "delete this test" where warranted); a
+mutation finding also states the command run and the observed result. Separate
 sections for weak tests, missing tests, and production-testability issues.
