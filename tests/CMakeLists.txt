@@ -50,4 +50,4 @@ if(ENABLE_SANITIZERS)
 endif()
 
 include(GoogleTest)
-gtest_discover_tests(sendspin_tests)
+gtest_discover_tests(sendspin_tests PROPERTIES TIMEOUT 60)
