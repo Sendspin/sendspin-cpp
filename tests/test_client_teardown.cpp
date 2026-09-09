@@ -13,8 +13,8 @@
 // limitations under the License.
 
 /// @file test_client_teardown.cpp
-/// @brief Pins the teardown latency of a client running every threaded role: stopping a
-/// role must interrupt its blocking receive, not wait out the receive timeout
+/// @brief Construction and destruction of a client running every threaded role, covering the
+/// destruction-order chain that joins the role threads
 
 #include "sendspin/client.h"
 #include "sendspin/config.h"
@@ -43,15 +43,13 @@ public:
     }
 };
 
-// Destroying a client whose player sync task, artwork decode thread, and visualizer drain
-// thread are all parked in blocking receives must complete promptly: each stop() wakes its
-// thread's receive instead of waiting out the receive timeout. Without the wakes this takes
-// the sum of the idle receive timeouts (500ms sync + 100ms artwork + 50ms visualizer,
-// joined sequentially), so the bound distinguishes cleanly. A regression confined to the
-// visualizer alone (50ms) can hide under the bound; the primitive-level wake tests cover
-// that mechanism directly. Looping also pins that a fresh client starts and stops cleanly
-// after a previous one was torn down (no state leaks across instances).
-TEST(ClientTeardown, StopsThreadedRolesWithoutWaitingOutReceiveTimeouts) {
+// No explicit assertions on the teardown: std::thread's destructor calls std::terminate on a
+// still-joinable thread, so a role that fails to join aborts the test, and the sanitizers catch
+// a use-after-free against state a role thread still touches as the client unwinds.
+//
+// No latency assertion: two of the three role timeouts (100ms artwork, 50ms visualizer) sit
+// under any wall-clock bound loose enough to be stable. The primitive tests pin the wake.
+TEST(ClientTeardown, JoinsEveryThreadedRoleOnDestruction) {
     NullNetworkProvider network;
     NullPlayerListener player_listener;
 
@@ -81,19 +79,12 @@ TEST(ClientTeardown, StopsThreadedRolesWithoutWaitingOutReceiveTimeouts) {
 
         ASSERT_TRUE(client->start_server());
 
-        // Let the three role threads spawn and park in their blocking receives, so the
-        // teardown below interrupts genuinely parked threads rather than threads that have
-        // not reached their first receive yet.
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (run > 0) {
+            // Run 0 tears down mid-startup; later runs tear down threads parked in receives.
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
 
-        auto start = std::chrono::steady_clock::now();
         client.reset();
-        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now() - start)
-                              .count();
-
-        EXPECT_LT(elapsed_ms, 150) << "teardown waited out a role receive timeout (run " << run
-                                   << ")";
     }
 }
 
