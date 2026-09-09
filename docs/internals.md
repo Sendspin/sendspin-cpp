@@ -88,7 +88,7 @@ The sync task, visualizer drain thread, and artwork decode thread all use event 
 
 ### ThreadSafeQueue (`src/platform/thread_safe_queue.h`)
 
-Fixed-depth FIFO queue with timed send/receive. A blocking `receive()` is interruptible from any thread via `wake_receiver()` (see SpscRingBuffer below for the shared mechanism). Used to defer events from network threads to the main loop:
+Fixed-depth FIFO queue with timed send/receive. A blocking `receive()` is interruptible from any thread via `wake_receiver()` (see SpscRingBuffer below for the shared mechanism). Used to hand work from a network thread to a dedicated worker thread:
 
 | Queue | Depth | Data | Producer | Consumer |
 |-------|-------|------|----------|----------|
