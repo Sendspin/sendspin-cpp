@@ -41,7 +41,8 @@ class SendspinConnection;
 enum SourceTaskBits : uint16_t {
     SOURCE_COMMAND_STOP = (1 << 0),    // Signal task thread to exit
     SOURCE_COMMAND_UPDATE = (1 << 1),  // Desired streaming state changed; re-read the atomic
-    SOURCE_SEND_COMPLETE = (1 << 2),   // A binary send's completion callback fired
+    SOURCE_SEND_COMPLETE = (1 << 2),   // A binary chunk send's completion callback fired
+    SOURCE_START_COMPLETE = (1 << 3),  // The client-stream/start text send's completion fired
     SOURCE_TASK_RUNNING = (1 << 8),    // Task is actively streaming to the server
     SOURCE_TASK_STOPPED = (1 << 10),   // Task thread has exited
     SOURCE_TASK_IDLE = (1 << 12),      // Task is idle, waiting for a start command
@@ -128,14 +129,16 @@ public:
     /// Thread-safe: may be called from any context.
     void signal_stop();
 
-    /// @brief Immediately closes the write_audio() gate without waiting for the task
+    /// @brief Immediately withdraws streaming: clears the desired state and closes the
+    /// write_audio() gate in one atomic transition
     ///
     /// Cleanup uses this before publishing its synthetic STOPPED event so
-    /// on_streaming_stopped() can never fire while write_audio() still accepts; the task also
-    /// closes the gate itself on every stream exit (an extra store is harmless).
-    /// Thread-safe: may be called from any context.
-    void close_audio_gate() {
-        this->accepting_audio_.store(false, std::memory_order_release);
+    /// on_streaming_stopped() can never fire while write_audio() still accepts, and so a
+    /// stream mid-open cannot re-open the gate afterwards (the open is a CAS that requires the
+    /// desired bit). Thread-safe: may be called from any context.
+    void withdraw_streaming() {
+        this->stream_state_.fetch_and(static_cast<uint8_t>(~(STREAM_DESIRED | STREAM_ACCEPTING)),
+                                      std::memory_order_acq_rel);
     }
 
     /// @brief Writes captured audio into the capture ring
@@ -188,12 +191,33 @@ protected:
     /// @brief Signals the task to stop and waits for the thread to finish
     void stop();
 
+    /// @brief Bits of stream_state_: the desired streaming state (latest server command on the
+    /// current connection) and the write_audio() acceptance gate. One atomic so opening the
+    /// gate can be a CAS conditioned on the desired bit: a stop or cleanup racing a stream
+    /// open cannot be overwritten by the open, and STREAMING_STARTED is emitted only when the
+    /// transition wins.
+    static constexpr uint8_t STREAM_DESIRED = 1U << 0;
+    static constexpr uint8_t STREAM_ACCEPTING = 1U << 1;
+
+    /// @brief Opens the write_audio() gate iff streaming is still desired
+    /// @return true if the gate opened; false if a stop or cleanup won the race.
+    bool try_open_audio_gate() {
+        uint8_t expected = STREAM_DESIRED;
+        return this->stream_state_.compare_exchange_strong(
+            expected, STREAM_DESIRED | STREAM_ACCEPTING, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+
     // Struct fields
     EventFlags event_flags_;
     /// Built once in init(); per-send copies stay in std::function's small-buffer storage (no
     /// allocation). Must not call back into the connection (may run mid-teardown on the
     /// transport's thread): it only records last_send_ok_ and sets SOURCE_SEND_COMPLETE.
     std::function<void(bool)> send_complete_cb_;
+    /// The client-stream/start send's own completion channel (start_send_ok_ +
+    /// SOURCE_START_COMPLETE): kept separate from the per-chunk channel so a start completion
+    /// arriving after its bounded wait timed out can never satisfy a later chunk-send wait.
+    std::function<void(bool)> start_complete_cb_;
     /// Wire chunk under assembly: [type byte][BE64 server-clock capture µs][payload]
     /// (Sendspin spec, Source messages)
     PlatformBuffer staging_;
@@ -227,13 +251,13 @@ protected:
     uint32_t producer_dropped_writes_{0};
 
     // 8-bit fields
-    /// write_audio() gate, open only between client-stream/start and stream close. A lone
-    /// atomic, not a ShadowSlot: single flag on a lock-free hot path (the Inbox bitmask trade)
-    std::atomic<bool> accepting_audio_{false};
-    /// Latest-wins desired streaming state from the role's main-loop command latch
-    std::atomic<bool> stream_requested_{false};
-    /// Result of the last binary send, written before SOURCE_SEND_COMPLETE is set
+    /// STREAM_DESIRED | STREAM_ACCEPTING (see the bit docs above). A lone atomic, not a
+    /// ShadowSlot: two flags on a lock-free hot path (the Inbox bitmask trade)
+    std::atomic<uint8_t> stream_state_{0};
+    /// Result of the last binary chunk send, written before SOURCE_SEND_COMPLETE is set
     std::atomic<bool> last_send_ok_{false};
+    /// Result of the last client-stream/start send, written before SOURCE_START_COMPLETE is set
+    std::atomic<bool> start_send_ok_{false};
     /// Task-side stall episode (send failed); episode edges are the only log sites
     bool stall_episode_{false};
     // Producer-thread-only episode flags for write_audio()'s throttled warnings
