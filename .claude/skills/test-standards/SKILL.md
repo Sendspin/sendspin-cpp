@@ -19,7 +19,9 @@ Determine the diff: if `$ARGUMENTS` contains a PR number, use
 `git diff HEAD`. If the review environment already supplies the diff (for
 example an automated PR review), review that diff directly instead of
 computing one. Consider both directions: new tests that are weak, and new
-logic that ships without a test that could catch its breakage.
+logic that ships without a test that could catch its breakage. "Pre-existing"
+means present on `main`; new files and new hunks in the diff are the PR's code
+and are in scope regardless of who wrote them.
 
 ## Extract for testability
 
@@ -35,9 +37,20 @@ logic that ships without a test that could catch its breakage.
 
 ## Mutation survival
 
-- For every new test, identify the production line or branch it defends, and
-  check: if that line were deleted or its condition inverted, would this test
-  fail? A test that would still pass is filler.
+- For every new test, identify the production line or branch its name or
+  comment claims to defend, and check: if that line were deleted or its
+  condition inverted, would this test fail? A test that would still pass is
+  filler. Mutations are scoped to that line, not to every line reachable from
+  the test; prefer edits a person would plausibly make (dropping a reset,
+  inverting a comparison, removing a guard) over line-by-line deletion. A
+  surviving mutation is a defect of the test only when it breaks a contract
+  the test claims to cover; otherwise it belongs under "Honest gaps".
+- An assertion that claims to cover several failure modes must fail for each
+  one on its own. A single bound against a sum of timeouts detects only the
+  largest term; regress each path alone to check the small ones.
+- A mutation claim in a finding is verified by running it, with evidence the
+  binary actually rebuilt; a stale build directory has passed mutations here
+  before.
 - Watch for self-referential tests: asserting on state the test itself set,
   exercising only the mock, or re-deriving the expected value with the same
   code path the production code uses.
@@ -76,6 +89,9 @@ logic that ships without a test that could catch its breakage.
 - A test name describes the behavior closely enough that a red CI run
   identifies the break without opening the file (see the naming bullet under
   "No filler").
+- A test's assertions establish what its name and comment claim, no more and
+  no less. A comment that promises a property the assertions do not check is
+  an overclaim; add the assertion or narrow the comment.
 - `ASSERT_*` aborts the test function while `EXPECT_*` continues, so an
   over-merged test masks later failures behind the first one. Reserve
   `ASSERT_*` for the point where continuing would be meaningless, such as a
@@ -99,11 +115,40 @@ logic that ships without a test that could catch its breakage.
   guards.
 - Concurrency tests observe real effects rather than self-referential timing:
   never assert on a counter that the thread under test would have been the
-  one to advance, and never use fixed sleeps as synchronization; use the
-  code's own observable outputs or event flags.
-- A sleep that advances wall-clock time toward a real deadline is not
-  synchronization; before calling such a test fragile, compute the margin
-  between its nominal elapsed time and that deadline and state the margin.
+  one to advance; use the code's own observable outputs or event flags. Time
+  itself is covered under "No wall-clock assertions".
+
+## No wall-clock assertions
+
+- A unit test does not assert on elapsed time. A stopwatch measures the
+  runner and the scheduler, not the code, and the bound it needs is a guess
+  about how slow a machine might be; every such guess is eventually wrong.
+- An elapsed-time assertion is a symptom: the call under test has a second
+  way to return (a timeout) and the clock exists only to tell the two apart.
+  Remove the second exit instead. Wait with no timeout so the event under
+  test is the only way out and completion is the proof; assert on a value
+  that only a correctly blocked call could produce ("the consumer received
+  the item sent after it parked"); or rely on a structural failure
+  (`std::thread` terminates on a joinable thread, the sanitizers catch a
+  use-after-free). Timing decisions inside production code are covered by
+  extracting a pure predicate (see "Honest gaps"), not by timing the test.
+- If the property is latency itself, it is a benchmark, not a unit test.
+  Name it under "Honest gaps" rather than approximating it with a bound.
+- The CTest `TIMEOUT` in `tests/CMakeLists.txt` is a hang guard, not an
+  assertion. It sits far above any real run time so a regression reports
+  instead of hanging forever.
+- A fixed sleep may order events between threads only when a delayed thread
+  yields a false pass, never a false failure. It is never itself an
+  assertion, and the test must still be correct if the sleep is too short. A
+  bounded window is likewise acceptable only for a "must not happen" check
+  on a monotonic observation, where a short window can only miss a
+  regression.
+
+## Platform branches
+
+- State which `#ifdef ESP_PLATFORM` arm a test exercises. The host suite
+  compiles only the host arm; a change to the ESP arm is an honest gap, not
+  covered, and a host mutation result says nothing about device behavior.
 
 ## Sanitizers
 
