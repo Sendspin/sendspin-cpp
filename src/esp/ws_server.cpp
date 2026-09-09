@@ -117,11 +117,13 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
 void SendspinWsServer::stop() {
     if (this->server_ != nullptr) {
         SS_LOGD(TAG, "Stopping server");
-        httpd_stop(this->server_);
+        httpd_handle_t stopped = this->server_;
+        httpd_stop(stopped);
         this->server_ = nullptr;
-        // No queued worker can run once httpd_stop returns; break the keep-alive cycles of any
-        // binary send work httpd discarded so restarts cannot accumulate stranded blocks.
-        reclaim_orphaned_binary_send_work();
+        // None of THIS server's queued workers can run once httpd_stop returns; break the
+        // keep-alive cycles of the binary send work it discarded so restarts cannot accumulate
+        // stranded blocks. Scoped by handle: another live server's queued work is untouched.
+        reclaim_orphaned_binary_send_work(stopped);
     }
 
     // httpd_stop tore down every session (each close_callback dropped its pending entry), so
