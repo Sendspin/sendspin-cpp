@@ -291,7 +291,7 @@ void VisualizerRole::Impl::handle_stream_end() {
     this->stream_active = false;
     this->negotiated_types_mask = 0;
 
-    if (this->drain_task) {
+    if (this->drain_task && this->drain_task->ring_buffer.is_created()) {
         // Flag first, then wake, so a drain thread parked in its ring receive starts the
         // flush immediately instead of at its next idle-receive timeout.
         this->drain_task->event_flags.set(COMMAND_FLUSH);
@@ -356,7 +356,7 @@ void VisualizerRole::Impl::cleanup() {
     this->stream_active = false;
     this->negotiated_types_mask = 0;
 
-    if (this->drain_task) {
+    if (this->drain_task && this->drain_task->ring_buffer.is_created()) {
         // Flag first, then wake, matching handle_stream_end().
         this->drain_task->event_flags.set(COMMAND_FLUSH);
         this->drain_task->ring_buffer.wake_receiver();
