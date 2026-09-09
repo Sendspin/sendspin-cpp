@@ -75,28 +75,31 @@ bool SourceTask::init(SourceRole::Impl* source_impl, SendspinClient* client,
     const SourceRoleConfig& config = source_impl->config;
     this->bytes_per_frame_ = source_bytes_per_frame(config.channels, config.bit_depth);
 
-    // 64-bit intermediates with a fail-closed cap: ms x rate x bytes-per-frame can wrap a
-    // 32-bit size_t, and a wrapped size would be a repaired config rather than a rejected one
+    // 64-bit intermediates with a fail-closed cap: ms x rate x bytes-per-frame can wrap even a
+    // 64-bit product for hostile uint32 inputs, and a wrapped size would be a repaired config
+    // rather than a rejected one -- so the frame count is bounds-checked BEFORE multiplying.
+    // (ms x rate itself cannot wrap: (2^32-1)^2 < 2^64.)
     constexpr uint64_t MAX_BUFFER_BYTES = UINT32_MAX / 2;
-    const uint64_t chunk_bytes =
-        source_ms_to_frames(config.chunk_duration_ms, config.sample_rate) * this->bytes_per_frame_;
-    if (chunk_bytes == 0 || chunk_bytes > MAX_BUFFER_BYTES) {
-        // Zero: a sample rate so low the chunk duration holds no whole frame
-        SS_LOGE(TAG, "Source chunk of %u ms at %u Hz is unusable (%llu bytes)",
-                config.chunk_duration_ms, config.sample_rate,
-                static_cast<unsigned long long>(chunk_bytes));
-        return false;
-    }
-    this->chunk_bytes_ = static_cast<size_t>(chunk_bytes);
+    const uint64_t max_frames = MAX_BUFFER_BYTES / this->bytes_per_frame_;
 
-    const uint64_t audio_bytes =
-        source_ms_to_frames(config.capture_buffer_ms, config.sample_rate) * this->bytes_per_frame_;
-    if (audio_bytes > MAX_BUFFER_BYTES) {
-        SS_LOGE(TAG, "Source capture buffer of %u ms at %u Hz is too large (%llu bytes)",
-                config.capture_buffer_ms, config.sample_rate,
-                static_cast<unsigned long long>(audio_bytes));
+    const uint64_t chunk_frames = source_ms_to_frames(config.chunk_duration_ms, config.sample_rate);
+    if (chunk_frames == 0 || chunk_frames > max_frames) {
+        // Zero: a sample rate so low the chunk duration holds no whole frame
+        SS_LOGE(TAG, "Source chunk of %u ms at %u Hz is unusable (%llu frames)",
+                config.chunk_duration_ms, config.sample_rate,
+                static_cast<unsigned long long>(chunk_frames));
         return false;
     }
+    this->chunk_bytes_ = static_cast<size_t>(chunk_frames * this->bytes_per_frame_);
+
+    const uint64_t audio_frames = source_ms_to_frames(config.capture_buffer_ms, config.sample_rate);
+    if (audio_frames > max_frames) {
+        SS_LOGE(TAG, "Source capture buffer of %u ms at %u Hz is too large (%llu frames)",
+                config.capture_buffer_ms, config.sample_rate,
+                static_cast<unsigned long long>(audio_frames));
+        return false;
+    }
+    const uint64_t audio_bytes = audio_frames * this->bytes_per_frame_;
 
     this->capture_ring_ = SendspinAudioRingBuffer::create(
         static_cast<size_t>(audio_bytes + audio_bytes / CAPTURE_RING_OVERHEAD_DENOMINATOR),
@@ -119,6 +122,10 @@ bool SourceTask::init(SourceRole::Impl* source_impl, SendspinClient* client,
     this->send_complete_cb_ = [this](bool ok) {
         this->last_send_ok_.store(ok, std::memory_order_release);
         this->event_flags_.set(SourceTaskBits::SOURCE_SEND_COMPLETE);
+    };
+    this->start_complete_cb_ = [this](bool ok) {
+        this->start_send_ok_.store(ok, std::memory_order_release);
+        this->event_flags_.set(SourceTaskBits::SOURCE_START_COMPLETE);
     };
 
     // Created last: is_initialized() reports the flags' existence, so ordering the one
@@ -146,7 +153,8 @@ bool SourceTask::start(bool task_stack_in_psram, unsigned priority) {
     this->event_flags_.clear(
         SourceTaskBits::SOURCE_TASK_RUNNING | SourceTaskBits::SOURCE_TASK_STOPPED |
         SourceTaskBits::SOURCE_TASK_IDLE | SourceTaskBits::SOURCE_COMMAND_STOP |
-        SourceTaskBits::SOURCE_COMMAND_UPDATE | SourceTaskBits::SOURCE_SEND_COMPLETE);
+        SourceTaskBits::SOURCE_COMMAND_UPDATE | SourceTaskBits::SOURCE_SEND_COMPLETE |
+        SourceTaskBits::SOURCE_START_COMPLETE);
 
     platform_configure_thread("SsSrc", SOURCE_TASK_STACK_SIZE, static_cast<int>(priority),
                               task_stack_in_psram);
@@ -170,7 +178,7 @@ void SourceTask::signal_start() {
     if (!this->is_initialized()) {
         return;
     }
-    this->stream_requested_.store(true, std::memory_order_release);
+    this->stream_state_.fetch_or(STREAM_DESIRED, std::memory_order_acq_rel);
     this->event_flags_.set(SourceTaskBits::SOURCE_COMMAND_UPDATE);
 }
 
@@ -178,13 +186,15 @@ void SourceTask::signal_stop() {
     if (!this->is_initialized()) {
         return;
     }
-    this->stream_requested_.store(false, std::memory_order_release);
+    // Clears the gate together with the desired bit: a stop always closes write_audio()
+    // immediately, and a stream mid-open loses its CAS and never re-opens it.
+    this->withdraw_streaming();
     this->event_flags_.set(SourceTaskBits::SOURCE_COMMAND_UPDATE);
 }
 
 bool SourceTask::write_audio(const uint8_t* data, size_t len, int64_t capture_time_us) {
-    // Defaults false and is only set by a running task, so a never-initialized role rejects too
-    if (!this->accepting_audio_.load(std::memory_order_acquire)) {
+    // Defaults closed and only a running task opens it, so a never-initialized role rejects too
+    if ((this->stream_state_.load(std::memory_order_acquire) & STREAM_ACCEPTING) == 0U) {
         return false;
     }
     if (data == nullptr || len == 0 || (len % this->bytes_per_frame_) != 0U) {
@@ -241,7 +251,7 @@ void SourceTask::run() {
             break;
         }
         this->event_flags_.clear(SourceTaskBits::SOURCE_COMMAND_UPDATE);
-        if (!this->stream_requested_.load(std::memory_order_acquire)) {
+        if ((this->stream_state_.load(std::memory_order_acquire) & STREAM_DESIRED) == 0U) {
             continue;  // A stop that raced an earlier start; nothing to do while idle
         }
 
@@ -262,7 +272,7 @@ void SourceTask::run() {
         // means the open itself failed (every other exit clears one of these conditions);
         // the server will not repeat its start, so back off and re-attempt instead of parking
         if ((this->event_flags_.get() & SourceTaskBits::SOURCE_COMMAND_STOP) == 0U &&
-            this->stream_requested_.load(std::memory_order_acquire) &&
+            (this->stream_state_.load(std::memory_order_acquire) & STREAM_DESIRED) != 0U &&
             this->connections_->current_shared() == conn) {
             this->event_flags_.wait(
                 SourceTaskBits::SOURCE_COMMAND_STOP | SourceTaskBits::SOURCE_COMMAND_UPDATE, false,
@@ -290,10 +300,13 @@ void SourceTask::stream(const std::shared_ptr<SendspinConnection>& conn) {
     start_msg.sample_rate = config.sample_rate;
     start_msg.bit_depth = config.bit_depth;
     // A clean slate for the confirmation wait: a completion left over from a prior stream's
-    // timed-out send on this connection could otherwise satisfy the wait below spuriously.
-    this->event_flags_.clear(SourceTaskBits::SOURCE_SEND_COMPLETE);
+    // timed-out start on this connection could otherwise satisfy the wait below spuriously.
+    // The start has its own completion channel so that stale completion can only ever cross
+    // another START wait -- where a late success means the start really is on the wire (a
+    // duplicate replaces the stream format in place per the spec) -- never a chunk-send wait.
+    this->event_flags_.clear(SourceTaskBits::SOURCE_START_COMPLETE);
     if (conn->send_text_message(format_client_stream_start_message(&start_msg),
-                                this->send_complete_cb_) != SsErr::OK) {
+                                this->start_complete_cb_) != SsErr::OK) {
         SS_LOGW(TAG, "Failed to send client-stream/start; stream not opened");
         return;
     }
@@ -302,10 +315,10 @@ void SourceTask::stream(const std::shared_ptr<SendspinConnection>& conn) {
     // client-stream/start (Sendspin spec, Source messages), so wait for the completion before
     // opening the gate. The text callback is best-effort (it can be skipped on teardown), hence
     // the bounded wait; a timeout or failure is treated as a failed open and retried.
-    const uint32_t bits = this->event_flags_.wait(SourceTaskBits::SOURCE_SEND_COMPLETE, false, true,
-                                                  START_CONFIRM_TIMEOUT_MS);
-    if ((bits & SourceTaskBits::SOURCE_SEND_COMPLETE) == 0U ||
-        !this->last_send_ok_.load(std::memory_order_acquire)) {
+    const uint32_t bits = this->event_flags_.wait(SourceTaskBits::SOURCE_START_COMPLETE, false,
+                                                  true, START_CONFIRM_TIMEOUT_MS);
+    if ((bits & SourceTaskBits::SOURCE_START_COMPLETE) == 0U ||
+        !this->start_send_ok_.load(std::memory_order_acquire)) {
         SS_LOGW(TAG, "client-stream/start not confirmed; stream not opened");
         return;
     }
@@ -317,8 +330,13 @@ void SourceTask::stream(const std::shared_ptr<SendspinConnection>& conn) {
 
     // Flush while the gate is still closed (no writer can race it), so the first chunk is live
     // audio by construction; then open for capture -- chunks must follow client-stream/start
+    // The open is a CAS that requires the desired bit: a stop or cleanup that landed since the
+    // confirmation wins the race, the gate stays shut, and no STREAMING_STARTED follows a stop.
     this->flush_ring_to_live();
-    this->accepting_audio_.store(true, std::memory_order_release);
+    if (!this->try_open_audio_gate()) {
+        conn->send_text_message(format_client_stream_end_message(), nullptr);
+        return;
+    }
     this->source_impl_->enqueue_stream_event(SourceStreamCallbackType::STREAMING_STARTED);
 
     while (this->stream_still_open(conn)) {
@@ -370,7 +388,8 @@ void SourceTask::stream(const std::shared_ptr<SendspinConnection>& conn) {
     }
 
     // Close: stop accepting capture first so the tail below is finite
-    this->accepting_audio_.store(false, std::memory_order_release);
+    this->stream_state_.fetch_and(static_cast<uint8_t>(~STREAM_ACCEPTING),
+                                  std::memory_order_acq_rel);
 
     // A final short chunk is allowed at stream end but not required (Sendspin spec, Source
     // messages): a remainder the encoder cannot take is dropped rather than padded
@@ -449,7 +468,7 @@ bool SourceTask::stream_still_open(const std::shared_ptr<SendspinConnection>& co
     if ((this->event_flags_.get() & SourceTaskBits::SOURCE_COMMAND_STOP) != 0U) {
         return false;
     }
-    if (!this->stream_requested_.load(std::memory_order_acquire)) {
+    if ((this->stream_state_.load(std::memory_order_acquire) & STREAM_DESIRED) == 0U) {
         return false;
     }
     // Permission is per-connection: the stream ends as soon as its connection stops being
