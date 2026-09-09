@@ -38,5 +38,13 @@ menu "sendspin-cpp"
     config SENDSPIN_ENABLE_SOURCE
         bool "Enable source role (audio capture)"
         default y
+        depends on !OPUS_USE_ALLOCA
+        depends on !(SENDSPIN_ENABLE_PLAYER && OPUS_NONTHREADSAFE_PSEUDOSTACK)
+        help
+            Requires micro-opus's thread-safe pseudostack allocation mode when combined
+            with the player role: the source task's stack budget assumes Opus working
+            memory lives on the per-thread pseudostack (OPUS_USE_ALLOCA would need ~120 KB
+            of task stack), and the non-thread-safe pseudostack is a single shared arena
+            that the player's decode and this role's encode would race.
 
 endmenu

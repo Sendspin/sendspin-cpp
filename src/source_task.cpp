@@ -36,7 +36,8 @@ static const char* const TAG = "sendspin.source_task";
 /// @brief Same budget as the sync task. Host -O2 -fstack-usage measures the deepest task-path
 /// chain (stream -> send_chunk -> event wait) near 0.6 KB; the remainder is headroom for the
 /// ESP transport send path pending an on-target high-water measurement. Opus working buffers
-/// live on micro-opus's per-thread pseudostack, not here.
+/// live on micro-opus's per-thread pseudostack, not here -- an assumption Kconfig enforces by
+/// refusing the source role under OPUS_USE_ALLOCA.
 static constexpr size_t SOURCE_TASK_STACK_SIZE = 6192;
 
 /// @brief Ring receive timeout (ms) bounding how long the task waits before re-checking the
@@ -99,11 +100,6 @@ bool SourceTask::init(SourceRole::Impl* source_impl, SendspinClient* client,
         return false;
     }
 
-    if (!this->event_flags_.create()) {
-        SS_LOGE(TAG, "Couldn't create event flags.");
-        return false;
-    }
-
     this->capture_ring_ = SendspinAudioRingBuffer::create(
         static_cast<size_t>(audio_bytes + audio_bytes / CAPTURE_RING_OVERHEAD_DENOMINATOR),
         config.buffer_location);
@@ -136,6 +132,14 @@ bool SourceTask::init(SourceRole::Impl* source_impl, SendspinClient* client,
         this->last_send_ok_.store(ok, std::memory_order_release);
         this->event_flags_.set(SourceTaskBits::SOURCE_SEND_COMPLETE);
     };
+
+    // Created last: is_initialized() reports the flags' existence, so ordering the one
+    // non-fallible-after step at the end makes it mean fully initialized -- a failed
+    // allocation above cannot leave a half-built task that a retried start() would accept.
+    if (!this->event_flags_.create()) {
+        SS_LOGE(TAG, "Couldn't create event flags.");
+        return false;
+    }
 
     return true;
 }
