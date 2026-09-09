@@ -29,9 +29,10 @@ namespace sendspin {
 
 struct BinarySendLookup;
 
-/// @brief Breaks the keep-alive cycles of binary send workers that were queued but will never
-/// run. Call only after httpd_stop() has returned (no worker can run afterwards).
-void reclaim_orphaned_binary_send_work();
+/// @brief Breaks the keep-alive cycles of binary send workers queued on the given server that
+/// will never run. Call only after httpd_stop() for that handle has returned (none of its
+/// workers can run afterwards); other servers' queued work is untouched.
+void reclaim_orphaned_binary_send_work(httpd_handle_t server);
 
 /**
  * @brief ESP-IDF HTTP server WebSocket connection representing a single Sendspin server session
@@ -116,7 +117,8 @@ public:
 
     /// @brief Sends a binary message through the connection's single-in-flight send slot:
     /// allocation-free in steady state (per-chunk path), NOT_FINISHED while the previous send
-    /// is in flight, slot released only by the worker's completion or the destructor
+    /// is in flight; the slot is released on every completion or immediate-failure path, or by
+    /// the destructor for work that can never run
     /// @param data Pointer to the message bytes.
     /// @param len Length of the message in bytes.
     /// @param on_complete Callback invoked with the send result.

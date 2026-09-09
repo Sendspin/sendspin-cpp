@@ -29,6 +29,7 @@ add_executable(sendspin_tests
     test_inbox.cpp
     test_visualizer_role.cpp
     test_artwork_role.cpp
+    test_binary_send_registry.cpp
 )
 
 # The source suite is registered only when the role is compiled in, so a

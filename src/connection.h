@@ -156,7 +156,9 @@ public:
     ///
     /// Callable from role task threads via ConnectionManager::current_shared(). The payload
     /// must stay valid until @p cb fires or the call returns an error (queuing transports copy
-    /// it first). Binary frames are gated behind the client/hello like the default text path.
+    /// it first). Binary frames are gated behind the client/hello like the default text path:
+    /// asynchronous transports enforce the gate themselves; synchronous transports send inline
+    /// and rely on caller ordering, exactly as their text sends do.
     ///
     /// Unlike the text path's best-effort callback, @p cb fires exactly once for EVERY call --
     /// on success, every failure path, and connection teardown -- because single-in-flight
