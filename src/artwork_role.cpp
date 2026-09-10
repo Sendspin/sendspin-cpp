@@ -685,8 +685,8 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
         }
 
         // Blocking receive; returns early (false) when wake_receiver() signals a stop or a
-        // parked-slot recheck. The timeout is pure idle-wakeup tuning: how often an
-        // undisturbed thread stirs to re-run the sweep above.
+        // parked-slot recheck. The timeout is only a safety net against a missed wake (see
+        // DRAIN_RECEIVE_TIMEOUT_MS); a timeout return simply re-runs the sweep above.
         ArtworkNotification notif{};
         if (!queue.receive(notif, DRAIN_RECEIVE_TIMEOUT_MS)) {
             continue;

@@ -534,8 +534,9 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
             continue;
         }
 
-        // Blocking receive; returns early (nullptr) when wake_receiver() signals a stop or
-        // flush. The timeout is pure idle-wakeup tuning.
+        // Blocking receive; returns early (nullptr) when wake_receiver() signals a stop,
+        // flush, or clear. The timeout is only a safety net against a missed wake (see
+        // DRAIN_RECEIVE_TIMEOUT_MS).
         size_t item_size = 0;
         void* item = rb.receive(&item_size, DRAIN_RECEIVE_TIMEOUT_MS);
         if (item == nullptr) {
