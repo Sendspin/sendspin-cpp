@@ -41,9 +41,11 @@ void put_be64(std::vector<uint8_t>& out, int64_t val) {
     }
 }
 
-// Window for "must NOT fire" checks: past the decode thread's 100ms parked-slot sweep fallback
-// (see DRAIN_RECEIVE_TIMEOUT_MS in artwork_role.cpp). Every counter it watches is monotonic, so
-// a window that is too short can only miss a regression, never fail a correct run.
+// Window for "must NOT fire" checks. The decode thread replays parked slots only when woken
+// (frame_done or an epoch release), so a spurious replay would arrive promptly or not at all;
+// this is settle time for that wake, not a bound tied to the thread's receive timeout. Every
+// counter it watches is monotonic, so a window that is too short can only miss a regression,
+// never fail a correct run.
 constexpr auto NEGATIVE_WINDOW = std::chrono::milliseconds(300);
 
 // Records every callback fired by an ArtworkRole::Impl under test, guarded by its own mutex so

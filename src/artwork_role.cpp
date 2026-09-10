@@ -32,10 +32,11 @@ static const char* const TAG = "sendspin.artwork";
 /// @brief Size of the big-endian 64-bit timestamp at the start of artwork binary messages
 static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
 
-/// @brief Idle-wakeup interval for the decode thread's blocking queue receive. Stop and
-/// parked-slot rechecks wake the receive immediately via wake_receiver(); this only sets how
-/// often an undisturbed thread stirs, so nothing else depends on its value.
-static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 100U;
+/// @brief Fallback wakeup interval for the decode thread's blocking queue receive. Stop and
+/// parked-slot rechecks wake the receive immediately via wake_receiver(), so this is only a
+/// safety net against a missed wake: long enough to keep an idle thread asleep, short enough
+/// that a wake bug degrades to a slow reaction rather than a hang.
+static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 5000U;
 
 // Event flag bits for decode thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);

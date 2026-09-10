@@ -643,10 +643,10 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
 
 bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
     // Wait for a codec header to arrive in the ring buffer, discarding stale audio chunks.
-    // The timeout is pure idle-wakeup tuning (how often an undisturbed task stirs); stop and
-    // stream commands wake the receive immediately via wake_receiver(), so nothing else
-    // depends on its value.
-    static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 500;
+    // Stop and stream commands wake the receive immediately via wake_receiver(), so the timeout
+    // is only a safety net against a missed wake: long enough to keep an idle task asleep, short
+    // enough that a wake bug degrades to a slow reaction rather than a hang.
+    static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 5000;
 
     while (
         !(this->event_flags_.get() & (COMMAND_STOP | COMMAND_STREAM_END | COMMAND_STREAM_CLEAR))) {

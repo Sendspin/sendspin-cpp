@@ -53,13 +53,13 @@ On host builds, `platform_configure_thread()` is a no-op; threads use OS default
 **Visualizer drain** (`src/visualizer_role.cpp`):
 
 1. `VisualizerRole::Impl::start()` spawns the drain thread.
-2. The thread blocks on ring buffer receives with a 50 ms idle-wakeup timeout; commands interrupt the receive immediately via `wake_receiver()`, so nothing depends on the timeout's value.
+2. The thread blocks on ring buffer receives; commands interrupt the receive immediately via `wake_receiver()`. The 5 s receive timeout is only a fallback against a missed wake.
 3. `VisualizerRole::Impl` destructor sets `COMMAND_STOP`, wakes the ring buffer receive, and joins.
 
 **Artwork decode** (`src/artwork_role.cpp`):
 
 1. `ArtworkRole::Impl::start()` spawns the decode thread.
-2. The thread blocks on notification queue receives with a 100 ms idle-wakeup timeout; commands interrupt the receive immediately via `wake_receiver()`, so nothing depends on the timeout's value.
+2. The thread blocks on notification queue receives; commands interrupt the receive immediately via `wake_receiver()`. The 5 s receive timeout is only a fallback against a missed wake.
 3. On notification: calls `on_image_decode()`, then merges an `ArtworkDisplayUpdate` (the slot's server display timestamp plus the `stream_epoch` it was decoded under) into the `ArtworkRole::Impl::EventState::display_slot` `InboxSlot` via `merge_artwork_display_update`. The main loop's `ArtworkRole::Impl::drain_events()` folds the taken update into its main-thread-only `held_display_*` state and fires `on_image_display()` once the timestamp is reached. Latest-wins per slot: if a newer frame's timestamp overwrites the pending one before the main loop takes it, only the newer display fires; the per-slot epoch lets the deadline sweep drop a display whose stream was replaced after the hand-off.
 4. `ArtworkRole::Impl` destructor sets `COMMAND_STOP`, wakes the queue receive, and joins.
 
@@ -309,7 +309,7 @@ The sync task (`SyncTask::thread_entry`, `src/sync_task.cpp`) runs a two-level s
 │  │    COMMAND flags                   │                  │
 │  │  • Set TASK_IDLE                   │                  │
 │  │  • Reset context + progress queue  │                  │
-│  │  • Wait for codec header (500ms)   │◄──┐              │
+│  │  • Wait for codec header (wake)    │◄──┐              │
 │  └────────────┬───────────────────────┘   │              │
 │               │ got header                │              │
 │               ▼                           │              │

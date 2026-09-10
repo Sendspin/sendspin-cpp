@@ -68,10 +68,11 @@ static constexpr uint8_t ENTRY_TYPE_CLEAR_MARKER = 0xFF;
 /// falls back to discarding everything it finds (matching the player's marker semantics).
 static constexpr uint32_t MARKER_ENQUEUE_TIMEOUT_MS = 100U;
 
-/// @brief Idle-wakeup interval for the drain thread's blocking ring buffer receive. Stop and
-/// flush commands wake the receive immediately via wake_receiver(); this only sets how often
-/// an undisturbed thread stirs, so nothing else depends on its value.
-static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 50U;
+/// @brief Fallback wakeup interval for the drain thread's blocking ring buffer receive. Stop,
+/// flush, and clear commands wake the receive immediately via wake_receiver(), so this is only
+/// a safety net against a missed wake: long enough to keep an idle thread asleep, short enough
+/// that a wake bug degrades to a slow reaction rather than a hang.
+static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 5000U;
 
 static constexpr int64_t TOO_OLD_THRESHOLD_US = 20000;  // 20ms
 
