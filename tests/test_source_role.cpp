@@ -72,8 +72,10 @@ constexpr uint16_t OPUS_WIRE_TEST_PORT = 19013;
 constexpr uint16_t OPUS_CAPACITY_WIRE_TEST_PORT = 19014;
 constexpr uint16_t WRITE_GATE_TEST_PORT = 19015;
 
-// Default-config wire framing, derived exactly as source_task.cpp derives it: 25 ms at
-// 48 kHz stereo 16-bit -> 1200 frames x 4 bytes, behind a 1-byte type + 8-byte timestamp header.
+// Wire framing for the ordering test's pinned 25 ms chunk config (the role default is 20 ms;
+// the test overrides to 25 ms so this arithmetic is stable), derived exactly as
+// source_task.cpp does: 25 ms at 48 kHz stereo 16-bit -> 1200 frames x 4 bytes, behind a
+// 1-byte type + 8-byte timestamp header.
 constexpr size_t WIRE_BYTES_PER_FRAME = 4;
 constexpr size_t WIRE_CHUNK_PAYLOAD = 1200 * WIRE_BYTES_PER_FRAME;
 constexpr size_t WIRE_HEADER = 9;
@@ -785,8 +787,11 @@ public:
         std::string data;
     };
 
-    FakeSourceServer(const std::string& url, std::string server_id, bool answer_time = true)
-        : server_id_(std::move(server_id)), answer_time_(answer_time) {
+    FakeSourceServer(const std::string& url, std::string server_id, bool answer_time = true,
+                     int64_t clock_offset_us = 0)
+        : server_id_(std::move(server_id)),
+          answer_time_(answer_time),
+          clock_offset_us_(clock_offset_us) {
         this->ws_.setUrl(url);
         this->ws_.disableAutomaticReconnection();
         this->ws_.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
@@ -808,15 +813,16 @@ public:
                     R"("connection_reason":"discovery"}})");
             } else if (msg->str.find("client/time") != std::string::npos &&
                        this->answer_time_.load()) {
-                // Zero-offset echo: server clock == client clock, which the Kalman filter
-                // accepts as its first measurement.
+                // The server clock runs clock_offset_us_ ahead of the client's: the filter
+                // converges to that offset, so compute_server_time(local) == local + offset.
                 JsonDocument doc;
                 if (deserializeJson(doc, msg->str) == DeserializationError::Ok) {
                     const int64_t t = doc["payload"]["client_transmitted"] | int64_t{0};
+                    const int64_t srv = t + this->clock_offset_us_;
                     this->ws_.send(std::string(R"({"type":"server/time","payload":)") +
                                    R"({"client_transmitted":)" + std::to_string(t) +
-                                   R"(,"server_received":)" + std::to_string(t) +
-                                   R"(,"server_transmitted":)" + std::to_string(t) + "}}");
+                                   R"(,"server_received":)" + std::to_string(srv) +
+                                   R"(,"server_transmitted":)" + std::to_string(srv) + "}}");
                 }
             }
         });
@@ -871,6 +877,7 @@ private:
     ix::WebSocket ws_;
     std::string server_id_;
     std::atomic<bool> answer_time_;
+    int64_t clock_offset_us_{0};
     mutable std::mutex mutex_;
     std::vector<WireEvent> events_;
 };
@@ -930,7 +937,11 @@ TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
     wire_config.chunk_duration_ms = 25;
     WireHarness harness(WIRE_TEST_PORT, wire_config);
     ASSERT_TRUE(harness.start());
-    FakeSourceServer fake(server_url(WIRE_TEST_PORT), "source-server-a");
+    // Server clock 500 ms ahead of the client: chunk timestamps must be converted into that
+    // domain, so a regression that shipped the raw client stamp instead would be caught below.
+    constexpr int64_t SERVER_OFFSET_US = 500000;
+    FakeSourceServer fake(server_url(WIRE_TEST_PORT), "source-server-a", /*answer_time=*/true,
+                          SERVER_OFFSET_US);
     ASSERT_TRUE(harness.establish(fake));
 
     SourceRole* source = harness.client.source();
@@ -940,6 +951,14 @@ TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
     uint8_t frame[WIRE_BYTES_PER_FRAME] = {9, 9, 9, 9};
     EXPECT_FALSE(source->write_audio(frame, sizeof(frame), 0));
     EXPECT_FALSE(source->is_streaming());
+
+    // No unsolicited open: observe a quiet window past the 500 ms failed-open retry interval and
+    // confirm nothing streams before the command (an erroneous auto-open would surface here).
+    pump_for(harness.client, 700);
+    EXPECT_FALSE(source->is_streaming());
+    EXPECT_EQ(harness.listener.started, 0);
+    EXPECT_EQ(fake.count_text_containing("client-stream/start"), 0U);
+    EXPECT_FALSE(source->write_audio(frame, sizeof(frame), 0));
 
     fake.send_source_command("start");
     ASSERT_TRUE(pump_until(
@@ -1012,13 +1031,16 @@ TEST(SourceWire, StreamsPcmEndToEndWithExactOrdering) {
     EXPECT_LT(start_idx, binary_idx.front());
     EXPECT_LT(binary_idx.back(), end_idx);
 
-    // Framing: type byte 12, big-endian first-sample capture timestamp (zero-offset time sync,
-    // so the server-domain value stays near the stamps we supplied), untouched PCM payload.
+    // Framing: type byte 12, big-endian first-sample capture timestamp converted into the
+    // server clock domain (client capture stamp + the 500 ms server offset the filter learned),
+    // untouched PCM payload.
     const auto& first = events[static_cast<size_t>(binary_idx[0])].data;
     ASSERT_EQ(first.size(), WIRE_HEADER + WIRE_CHUNK_PAYLOAD);
     EXPECT_EQ(static_cast<uint8_t>(first[0]), SENDSPIN_BINARY_SOURCE_AUDIO);
     const int64_t ts1 = read_be64(reinterpret_cast<const uint8_t*>(first.data()) + 1);
-    EXPECT_LT(std::llabs(ts1 - base), 1000000);
+    // Near base + offset, not base: shipping the raw client stamp would land ~500 ms low and
+    // fail this bound.
+    EXPECT_LT(std::llabs(ts1 - (base + SERVER_OFFSET_US)), 100000);
 
     // The second chunk's anchor is exactly one chunk after the first (contiguous capture
     // stamps); allow slack for the time filter refining its offset between the two sends.

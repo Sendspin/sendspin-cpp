@@ -301,8 +301,9 @@ void SendspinServerConnection::async_send_binary(void* arg) {
 
     // The completion fires on every exit path with a live connection (sent, send failed, gated,
     // or already disconnected) — the slot would wedge otherwise. The callback is moved out and
-    // the slot released before invoking it, so a completion that immediately sends the next
-    // chunk finds the slot free.
+    // the slot released before invoking it, so the source task, once woken by the completion,
+    // finds the slot free for its next send. The callback itself does not re-enter the
+    // connection (the interface forbids it); it only records the result and wakes the task.
     SendCompleteCallback pending = std::move(conn->binary_send_cb_);
     conn->binary_send_in_flight_.store(false, std::memory_order_release);
     if (pending) {
