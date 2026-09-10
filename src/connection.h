@@ -137,6 +137,11 @@ public:
         return this->provisional_time_us_.load(std::memory_order_relaxed);
     }
 
+    /// @brief Returns the arrival timestamp of the last complete inbound message, or 0 if none.
+    int64_t get_last_receive_time_us() const {
+        return this->last_receive_time_us_.load(std::memory_order_relaxed);
+    }
+
     /// @brief Sends a text message to the server with a completion callback
     /// @param message The message string to send.
     /// @param cb Callback invoked with the send result. On asynchronous transports it is not
@@ -409,6 +414,10 @@ protected:
     /// slot. Atomic because it is written at admission (possibly on a network thread) and read on
     /// the main loop (provisional-connection timeout check). 0 = not yet set.
     std::atomic<int64_t> provisional_time_us_{0};
+
+    /// Monotonic timestamp (platform_time_us()) of the last complete inbound message. Atomic
+    /// because it is written on the network thread and read by the main-loop liveness check.
+    std::atomic<int64_t> last_receive_time_us_{0};
 
     /// EMA (microseconds) of format_client_time_message() duration. Atomic because the ESP
     /// server worker thread updates it while the hub thread reads it for logging.

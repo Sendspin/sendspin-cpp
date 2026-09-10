@@ -86,6 +86,11 @@ struct SendspinClientConfig {
     int64_t time_burst_response_timeout_ms{
         DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
 
+    /// @brief Milliseconds of inbound silence before the established connection is dropped as
+    /// dead. Unset derives it from the time burst settings, tolerating two consecutive unanswered
+    /// time messages (60000 with the defaults); 0 disables.
+    std::optional<int64_t> liveness_timeout_ms{};
+
     /// @brief Memory placement for the per-connection WebSocket payload reassembly buffer
     /// (ESP-IDF only; ignored on host). Defaults to PREFER_EXTERNAL (SPIRAM).
     MemoryLocation websocket_payload_location{MemoryLocation::PREFER_EXTERNAL};

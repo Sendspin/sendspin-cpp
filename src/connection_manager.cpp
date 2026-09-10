@@ -69,11 +69,24 @@ static const char* to_cstr(SetupStage stage) {
     return "UNKNOWN";
 }
 
+int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config) {
+    if (config.liveness_timeout_ms.has_value()) {
+        return config.liveness_timeout_ms.value();
+    }
+    // The next message goes out after at most one inter-burst interval, and an unanswered one
+    // times out after one response timeout.
+    return (LIVENESS_TOLERATED_MISSES + 1) *
+           (config.time_burst_interval_ms + config.time_burst_response_timeout_ms);
+}
+
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
 
-ConnectionManager::ConnectionManager(SendspinClient* client) : client_(client) {}
+// Reading config_ here is safe: SendspinClient declares it before connection_manager_.
+ConnectionManager::ConnectionManager(SendspinClient* client)
+    : client_(client),
+      liveness_timeout_us_(resolve_liveness_timeout_ms(client->config_) * US_PER_MS) {}
 
 ConnectionManager::~ConnectionManager() {
     // Move everything out under the locks, destroy outside them: a connection destructor can join
@@ -466,6 +479,23 @@ void ConnectionManager::loop() {
                 }
                 ++it;
             }
+        }
+    }
+
+    // Liveness tick: a blackholed socket (no FIN, RST, or close frame) never produces a transport
+    // close event, so drop the established connection once its inbound silence reaches the timeout.
+    if (this->liveness_timeout_us_ > 0 && this->has_current_.load(std::memory_order_acquire)) {
+        const int64_t now_us = platform_time_us();
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        if (this->current_connection_ != nullptr &&
+            now_us - this->current_connection_->get_last_receive_time_us() >=
+                this->liveness_timeout_us_) {
+            SS_LOGW(TAG, "Current connection silent for >%" PRId64 " ms, dropping as lost",
+                    this->liveness_timeout_us_ / US_PER_MS);
+            // The goodbye actively closes the transport, which the silent peer never will; an
+            // inbound session would otherwise hold its server slot. Per the spec's
+            // `client/goodbye` section, restart asks a server that was only slow to reconnect.
+            this->drop_connection(this->current_connection_.get(), SendspinGoodbyeReason::RESTART);
         }
     }
 

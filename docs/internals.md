@@ -213,8 +213,11 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    │  (handoff decisions against the incumbent)
    ├─ Call loop() on the current and nursery connections   (only when has_current_ or nursery_size_)
    ├─ Check per-connection hello retry timers   (only when nursery_size_)
-   ├─ Reap nursery connections past the establish deadline; tick the platform ws_server
-   └─ flush_deferred_releases()   (early-returns without locking when deferred_size_ is 0)
+   ├─ Reap nursery connections past the establish deadline
+   ├─ Liveness: drop the current connection once inbound silence reaches liveness_timeout_us_
+   │  (only when has_current_; stamped per complete inbound message at dispatch)
+   ├─ flush_deferred_releases()   (early-returns without locking when deferred_size_ is 0)
+   └─ Tick the platform ws_server (ESP: reap stalled upgrades; host: no-op)
 
 2. time_burst_->loop(conn)  (skipped when no current connection)
    ├─ Send next time message if ready
