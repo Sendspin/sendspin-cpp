@@ -469,6 +469,31 @@ void ConnectionManager::loop() {
         }
     }
 
+    // Liveness tick: drop the established connection once the peer has been silent for longer
+    // than the configured timeout. A blackholed socket (no FIN, no RST, no close frame) never
+    // produces a transport close event on either platform, so without this the connection would
+    // stay current forever, its time bursts timing out indefinitely (issue #119). Any complete
+    // inbound frame counts as life; a live server answers every time burst, so the default
+    // timeout spans two bursts. Nursery connections have their own establish deadline above.
+    if (this->has_current_.load(std::memory_order_acquire) &&
+        this->client_->config_.liveness_timeout_ms > 0) {
+        const int64_t now_us = platform_time_us();
+        const int64_t timeout_us = this->client_->config_.liveness_timeout_ms * US_PER_MS;
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        if (this->current_connection_ != nullptr &&
+            now_us - this->current_connection_->get_last_receive_time_us() >= timeout_us) {
+            SS_LOGW(TAG, "Current connection silent for >%lld ms, dropping as lost",
+                    static_cast<long long>(this->client_->config_.liveness_timeout_ms));
+            // Dropped with a goodbye, like a reaped nursery peer, so the transport is actively
+            // closed: an inbound httpd session or IXWebSocket server socket would otherwise stay
+            // open (the peer never closes it), leaking a server slot. The goodbye is a few dozen
+            // bytes into a kernel buffer that a few bursts of time messages cannot have filled,
+            // and each transport's close is bounded, so the main loop cannot wedge here.
+            this->drop_connection(this->current_connection_.get(),
+                                  SendspinGoodbyeReason::ANOTHER_SERVER);
+        }
+    }
+
     // Send the goodbyes and release the connections reaped by the nursery tick, outside the lock.
     this->flush_deferred_releases();
 

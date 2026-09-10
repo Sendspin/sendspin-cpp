@@ -89,6 +89,9 @@ void SendspinConnection::commit_receive_buffer(size_t data_len) {
 }
 
 SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t receive_time) {
+    // Liveness stamp: any complete inbound frame (text or binary) proves the peer is alive.
+    this->last_receive_time_us_.store(receive_time, std::memory_order_relaxed);
+
     if (!this->websocket_payload_) {
         return;
     }

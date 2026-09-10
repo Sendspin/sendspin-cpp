@@ -22,11 +22,10 @@
 #include "connection_manager.h"  // fnv1_hash for the last-played preference
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <ixwebsocket/IXWebSocket.h>
 #include <ixwebsocket/IXWebSocketServer.h>
-
-#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -56,6 +55,8 @@ constexpr uint16_t EVICT_TEST_PORT = 18972;
 constexpr uint16_t REJECT_TEST_PORT = 18973;
 constexpr uint16_t STALL_LISTEN_PORT = 18981;
 constexpr uint16_t ADMIT_TEST_PORT = 18982;
+constexpr uint16_t LIVENESS_TEST_PORT = 18983;
+constexpr uint16_t LIVENESS_CONTROL_PORT = 18984;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -65,6 +66,22 @@ std::string server_hello_json(const std::string& server_id, const std::string& r
     return std::string(R"({"type":"server/hello","payload":{"server_id":")") + server_id +
            R"(","name":"Fake Server","version":1,"active_roles":["player"],)" +
            R"("connection_reason":")" + reason + R"("}})";
+}
+
+/// Builds a server/time reply echoing the client_transmitted value out of a client/time message,
+/// with server timestamps that yield a positive round trip (any value works: only the arrival of
+/// the reply matters to the liveness tests, and the burst tolerates any measurement).
+std::string server_time_json(const std::string& client_time_msg) {
+    const std::string key = "\"client_transmitted\":";
+    const size_t pos = client_time_msg.find(key);
+    std::string transmitted = "0";
+    if (pos != std::string::npos) {
+        const size_t start = pos + key.size();
+        const size_t end = client_time_msg.find_first_of(",}", start);
+        transmitted = client_time_msg.substr(start, end - start);
+    }
+    return std::string(R"({"type":"server/time","payload":{"client_transmitted":)") + transmitted +
+           R"(,"server_received":1000,"server_transmitted":1001}})";
 }
 
 SendspinClientConfig make_config(uint16_t port) {
@@ -93,7 +110,6 @@ public:
 private:
     uint32_t hash_;
 };
-
 
 // Pumps client.loop() until pred() is true. No timeout: a regression hangs here and the CTest
 // TIMEOUT reports it.
@@ -155,6 +171,8 @@ struct FakeServerOptions {
                                 ///< client/hello arrives (a nonconforming peer)
     bool answer_hello{true};    ///< Reply to client/hello with server/hello (false: mute peer
                                 ///< that upgrades and then never establishes)
+    bool answer_time{false};    ///< Reply to client/time with server/time (a live server); false
+                                ///< models a peer whose socket went silent after establishing
 };
 
 /// A minimal Sendspin "server": an IXWebSocket client that connects to the SendspinClient's WS
@@ -180,6 +198,12 @@ public:
             } else if (msg->type == ix::WebSocketMessageType::Message &&
                        msg->str.find("client/goodbye") != std::string::npos) {
                 this->got_goodbye_.store(true);
+            } else if (msg->type == ix::WebSocketMessageType::Message &&
+                       msg->str.find("client/time") != std::string::npos) {
+                this->got_client_time_.store(true);
+                if (options.answer_time) {
+                    this->ws_.send(server_time_json(msg->str));
+                }
             } else if (msg->type == ix::WebSocketMessageType::Close ||
                        msg->type == ix::WebSocketMessageType::Error) {
                 this->closed_.store(true);
@@ -204,12 +228,17 @@ public:
         return this->got_goodbye_.load();
     }
 
+    bool got_client_time() const {
+        return this->got_client_time_.load();
+    }
+
 private:
     ix::WebSocket ws_;
     std::string server_id_;
     std::atomic<bool> closed_{false};
     std::atomic<bool> got_client_hello_{false};
     std::atomic<bool> got_goodbye_{false};
+    std::atomic<bool> got_client_time_{false};
 };
 
 /// TCP relay that accepts one connection, sits on it without reading for delay_ms (the peer's
@@ -580,4 +609,56 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
     EXPECT_FALSE(client.is_connected());
     EXPECT_FALSE(mute_a.closed());
     EXPECT_FALSE(mute_b.closed());
+}
+
+// An established peer whose socket goes silent (no close frame, no time responses) must be
+// detected and dropped: the liveness timeout treats inbound silence as loss (issue #119). The
+// burst settings are tightened so client/time goes out within the window, proving the drop is
+// not a nursery reap: the connection is admitted (is_connected) and answered nothing afterwards.
+TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
+    TestNetworkProvider network;
+    SendspinClientConfig config = make_config(LIVENESS_TEST_PORT);
+    config.time_burst_interval_ms = 20;
+    config.time_burst_response_timeout_ms = 20;
+    config.liveness_timeout_ms = 300;
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start_server());
+    client.loop();  // First tick binds the WS server
+
+    FakeServer silent(server_url(LIVENESS_TEST_PORT), "server-silent", {.answer_time = false});
+    pump_until(client, [&] { return client.is_connected(); });
+    pump_until(client, [&] { return silent.got_client_time(); });
+
+    pump_until(client, [&] { return !client.is_connected(); });
+    pump_until(client, [&] { return silent.closed(); });
+    EXPECT_TRUE(silent.got_goodbye());
+    EXPECT_FALSE(client.get_server_information().has_value());
+}
+
+// Control for the test above: a peer that answers time messages produces inbound traffic inside
+// every liveness window and must stay current well past the timeout.
+TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
+    TestNetworkProvider network;
+    SendspinClientConfig config = make_config(LIVENESS_CONTROL_PORT);
+    config.time_burst_interval_ms = 20;
+    config.time_burst_response_timeout_ms = 20;
+    config.liveness_timeout_ms = 300;
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start_server());
+    client.loop();  // First tick binds the WS server
+
+    FakeServer live(server_url(LIVENESS_CONTROL_PORT), "server-live", {.answer_time = true});
+    pump_until(client, [&] { return client.is_connected(); });
+    pump_until(client, [&] { return live.got_client_time(); });
+
+    // Several liveness windows: a false drop here is the regression.
+    pump_for(client, 1200);
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_FALSE(live.closed());
+    EXPECT_FALSE(live.got_goodbye());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
 }
