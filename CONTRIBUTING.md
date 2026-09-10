@@ -19,6 +19,15 @@ cmake --build build-tests --target sendspin_tests
 ctest --test-dir build-tests --output-on-failure
 ```
 
+CI also runs the suite under ThreadSanitizer in a separate job. TSan cannot be
+combined with ASan/UBSan, so it is a second build directory:
+
+```bash
+cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .
+cmake --build build-tsan --target sendspin_tests
+TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure
+```
+
 On ESP-IDF the library is consumed as a component via `idf_component.yml`; the
 source lists live in `cmake/sources.cmake`.
 

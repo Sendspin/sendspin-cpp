@@ -79,6 +79,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 - **ESP-IDF**: Used as an IDF component via `idf_component.yml`. Sources defined in `cmake/sources.cmake`.
 - **Host (CMake)**: `cmake -B build && cmake --build build`. Fetches dependencies (ArduinoJson, micro-flac, micro-opus, IXWebSocket) via FetchContent.
 - **Tests**: `cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tests --target sendspin_tests` and `ctest --test-dir build-tests --output-on-failure`.
+- **ThreadSanitizer tests**: `cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tsan --target sendspin_tests` and `TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure`. `ENABLE_TSAN` applies the thread sanitizer to every target, including the fetched dependencies, and cannot be combined with `ENABLE_SANITIZERS`.
 - **ESP dependencies**: ArduinoJson, esp_websocket_client, micro-flac, micro-opus, esp_http_server, mbedtls, pthread, esp_ringbuf
 - **Host dependencies**: ArduinoJson, micro-flac, micro-opus, IXWebSocket, pthreads
 
