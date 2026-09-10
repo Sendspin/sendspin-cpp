@@ -149,7 +149,11 @@ void SyncTask::signal_stream_end() {
     if (!this->is_initialized()) {
         return;
     }
+    // Flag first, then wake, so the task observes the command after leaving a ring
+    // buffer receive; without the wake an idle task would only notice at its next
+    // idle-receive timeout.
     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_END);
+    this->encoded_ring_buffer_->wake_receiver();
 }
 
 void SyncTask::signal_stream_clear() {
@@ -157,6 +161,7 @@ void SyncTask::signal_stream_clear() {
         return;
     }
     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_CLEAR);
+    this->encoded_ring_buffer_->wake_receiver();
 }
 
 void SyncTask::signal_stream_start() {
@@ -638,8 +643,10 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
 
 bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
     // Wait for a codec header to arrive in the ring buffer, discarding stale audio chunks.
-    // Uses a long timeout (500ms) so the task yields CPU and barely wakes when idle.
-    static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 500;
+    // Stop and stream commands wake the receive immediately via wake_receiver(), so the timeout
+    // is only a safety net against a missed wake: long enough to keep an idle task asleep, short
+    // enough that a wake bug degrades to a slow reaction rather than a hang.
+    static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 5000;
 
     while (
         !(this->event_flags_.get() & (COMMAND_STOP | COMMAND_STREAM_END | COMMAND_STREAM_CLEAR))) {
@@ -789,7 +796,11 @@ void SyncTask::stop() {
         return;
     }
 
+    // Set the flag before waking: the thread re-checks its command flags after every
+    // receive return, so this ordering guarantees it observes the stop no matter which
+    // wait it was parked in (event flags or ring buffer receive).
     this->event_flags_.set(EventGroupBits::COMMAND_STOP);
+    this->encoded_ring_buffer_->wake_receiver();
     this->sync_thread_.join();
 }
 
