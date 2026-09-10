@@ -23,6 +23,7 @@
 #include "sendspin/client.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -64,6 +65,53 @@ static constexpr int64_t LIVENESS_TOLERATED_MISSES = 2;
 /// @param config The client configuration.
 /// @return Timeout in milliseconds; 0 or negative disables the check.
 int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config);
+
+/// @brief Bound (milliseconds) on waiting for stop()'s goodbyes to be sent before the transports
+/// are torn down
+///
+/// The host transports send synchronously, so on host the wait resolves before it starts. On the
+/// ESP server path the goodbye is queued to the httpd worker, and this is a few scheduler quanta
+/// for the worker to dequeue the frame and hand it to lwIP. Send completion is best-effort (see
+/// SendspinConnection::send_text_message): a session that closes first never reports, so this is
+/// a cap on how long stop() blocks for its peers' sake, never a guarantee the goodbye arrived.
+static constexpr uint32_t GOODBYE_FLUSH_TIMEOUT_MS = 50;
+
+/// @brief Counts the goodbye sends stop() is waiting on
+///
+/// Shared by stop() and each connection's completion callback through a shared_ptr captured by
+/// value, so a completion that runs on a transport thread after stop() has given up (an ESP httpd
+/// worker draining late) touches only this record, never stop()'s stack or the manager.
+struct GoodbyeWait {
+    /// @brief Registers one goodbye whose completion is awaited
+    void add_pending() {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        ++this->pending;
+    }
+
+    /// @brief Records one completion; wakes wait() when none remain
+    void complete_one() {
+        {
+            std::lock_guard<std::mutex> lock(this->mutex);
+            if (this->pending > 0) {
+                --this->pending;
+            }
+        }
+        this->cv.notify_all();
+    }
+
+    /// @brief Blocks until every registered goodbye has completed or the bound elapses
+    /// @param timeout_ms Maximum time to wait.
+    /// @return true if every goodbye completed, false if the bound elapsed first.
+    bool wait(uint32_t timeout_ms) {
+        std::unique_lock<std::mutex> lock(this->mutex);
+        return this->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                 [this] { return this->pending == 0; });
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t pending{0};
+};
 
 /// @brief A connection that has not completed the hello handshake
 ///
@@ -113,21 +161,22 @@ struct HelloRetryState {
  *
  * Typical usage:
  *  1. Construct with a `SendspinClient*`.
- *  2. Call `init_server()` once to create and configure the WebSocket server.
+ *  2. Call `start()` to open admission and create the WebSocket server.
  *  3. Call `loop()` periodically to drive connection state, process deferred events, and retry
  *     hellos.
  *  4. Call `connect_to()` to initiate an outgoing client connection when needed.
- *  5. Call `disconnect()` to gracefully close the active connection.
+ *  5. Call `disconnect()` to gracefully close the active connection, or `stop()` to tear
+ *     every connection and the server down synchronously.
  *
  * @code
  * ConnectionManager manager(client);
- * manager.init_server(client, use_psram, priority);
+ * manager.start();
  *
  * while (running) {
  *     manager.loop();
  * }
  *
- * manager.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+ * manager.stop(SendspinGoodbyeReason::SHUTDOWN);
  * @endcode
  */
 class ConnectionManager {
@@ -156,10 +205,24 @@ public:
     // Server lifecycle
     // ========================================
 
-    /// @brief Creates the WebSocket server and configures callbacks. Call once from start_server().
-    /// Server configuration is read from client->config_.
-    /// @param client The SendspinClient that owns this manager.
-    void init_server(SendspinClient* client);
+    /// @brief Opens admission and creates the WebSocket server on first use
+    ///
+    /// Server configuration is read from the client's config. loop() starts the server once the
+    /// network provider reports ready. Main-loop thread only.
+    void start();
+
+    /// @brief Synchronous teardown: goodbyes every managed connection, waits up to
+    /// GOODBYE_FLUSH_TIMEOUT_MS for the sends to complete, then stops the WebSocket server and
+    /// releases every connection regardless
+    ///
+    /// Closes admission first, so a peer delivered during the wait is rejected with a goodbye.
+    /// Blocks on the transports' own teardown as well as the flush bound: the host server joins
+    /// its connection threads (each waits up to IXWebSocket's 300 ms close handshake), the ESP
+    /// server waits for the httpd task to exit, and an outbound connection's transport stop is
+    /// synchronous (esp_websocket_client_stop() / ix::WebSocket::stop()). Client-state cleanup is
+    /// the caller's job: this only detaches connections. Main-loop thread only.
+    /// @param reason The goodbye reason sent to every connected peer.
+    void stop(SendspinGoodbyeReason reason);
 
     /// @brief Drives connection state: starts server when network ready, processes lifecycle
     /// events, retries hello, calls loop() on active connections.
@@ -345,7 +408,7 @@ private:
     /// Socket-budget invariant: gracefully rejecting a surplus inbound peer requires the transport
     /// to accept NURSERY_CAPACITY + 2 sockets (1 established + the nursery + the surplus peer,
     /// which must be connected to receive its goodbye). The default server_max_connections
-    /// satisfies this; init_server warns when a configured value does not.
+    /// satisfies this; start() warns when a configured value does not.
     static constexpr size_t NURSERY_CAPACITY = 2;
 
     // Struct fields
@@ -401,6 +464,11 @@ private:
     /// queue_deferred_release()) and after the drain swap in flush_deferred_releases(). Lets
     /// flush_deferred_releases() early-return without locking when nothing is queued.
     std::atomic<size_t> deferred_size_{0};
+
+    /// True between start() and stop(). Written under conn_ptr_mutex_ and read under it by
+    /// on_new_connection() (network thread), so a peer delivered after stop() closed admission is
+    /// rejected rather than admitted into a nursery stop() has already emptied.
+    std::atomic<bool> accepting_{false};
 };
 
 }  // namespace sendspin

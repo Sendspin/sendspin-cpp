@@ -79,6 +79,15 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
 }
 
 SendspinClient::~SendspinClient() {
+    // Transport-only teardown: goodbye and close every peer and join every thread, exactly as
+    // stop() does, but deliver no listener callback. A consumer that destroys its listeners
+    // before the client (the natural declaration order when a listener needs a role reference)
+    // is never called into from here.
+    if (this->started_) {
+        this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
+        this->stop_role_threads();
+    }
+
     // Stop background threads before tearing down connections. Every role is reset explicitly
     // (not just the threaded ones): role InboxSlots release their topic-bit claims against
     // event_state_'s Inbox on destruction, so all roles must be gone before the alphabetized
@@ -116,43 +125,102 @@ LogLevel SendspinClient::get_log_level() {
 // Lifecycle
 // ============================================================================
 
-bool SendspinClient::start_server() {
-    this->started_ = true;
+bool SendspinClient::start() {
+    if (this->started_) {
+        return true;
+    }
+    if (this->stopping_) {
+        SS_LOGW(TAG, "start() ignored: called from a callback while stop() is in progress");
+        return false;
+    }
 
     // Load persisted state
     this->load_last_played_server();
 
+    // Start the role threads. A failure part-way stops the roles that did start, so the client
+    // is back in the stopped state and a corrected retry begins clean.
+    bool roles_started = true;
 #ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_) {
-        if (!this->player_->impl_->start()) {
-            return false;
-        }
+    if (roles_started && this->player_) {
+        roles_started = this->player_->impl_->start();
     }
 #endif
-
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_) {
-        if (!this->visualizer_->impl_->start()) {
-            return false;
-        }
+    if (roles_started && this->visualizer_) {
+        roles_started = this->visualizer_->impl_->start();
     }
 #endif
-
 #ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_) {
-        if (!this->artwork_->impl_->start()) {
-            return false;
-        }
+    if (roles_started && this->artwork_) {
+        roles_started = this->artwork_->impl_->start();
     }
 #endif
+    if (!roles_started) {
+        this->stop_role_threads();
+        return false;
+    }
 
-    // Create and configure the WebSocket server (started later when network is ready)
-    this->connection_manager_->init_server(this);
-
+    // Open admission and create the WebSocket server (started by loop() once the network is
+    // ready).
+    this->connection_manager_->start();
+    this->started_ = true;
     return true;
 }
 
+void SendspinClient::stop() {
+    if (!this->started_ || this->stopping_) {
+        return;
+    }
+    this->stopping_ = true;
+
+    // 1. Transports first: goodbye every peer, wait up to the flush bound, then close the server
+    //    and every connection. This joins every network thread, so nothing reaches a role or the
+    //    inbox from the network after it returns, and a network thread blocked on ring space
+    //    (write_audio_chunk) resolves while its consumer is still alive.
+    this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
+
+    // 2. Role threads. Each role discards its ring/queue content after its own join.
+    this->stop_role_threads();
+
+    // From here the client reads as stopped: loop() is a no-op and connect_to() is refused, so a
+    // listener callback below cannot restart the server or admit a connection.
+    this->started_ = false;
+
+    // 3. Reset per-connection and role state exactly as a lost connection does, then deliver
+    //    the clear callbacks it queued now rather than on a loop() tick that is not coming. With
+    //    every producer thread joined, the state the drain leaves behind is the state a restart
+    //    begins from.
+    this->cleanup_connection_state();
+    this->drain_inbox();
+    this->group_state_ = GroupUpdateObject{};
+    this->state_ = SendspinClientState::SYNCHRONIZED;
+
+    this->stopping_ = false;
+}
+
+void SendspinClient::stop_role_threads() {
+#ifdef SENDSPIN_ENABLE_PLAYER
+    if (this->player_) {
+        this->player_->impl_->stop();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_) {
+        this->visualizer_->impl_->stop();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    if (this->artwork_) {
+        this->artwork_->impl_->stop();
+    }
+#endif
+}
+
 void SendspinClient::connect_to(const std::string& url) {
+    if (!this->started_) {
+        SS_LOGW(TAG, "connect_to() ignored: client is not started");
+        return;
+    }
     this->connection_manager_->connect_to(url);
 }
 
@@ -161,6 +229,12 @@ void SendspinClient::disconnect(SendspinGoodbyeReason reason) {
 }
 
 void SendspinClient::loop() {
+    // A stopped client is quiescent: no connections, no threads, and the manager loop must not
+    // restart the WebSocket server the moment the network reads ready.
+    if (!this->started_) {
+        return;
+    }
+
     // Process connection lifecycle events (close, disconnect, hello, handoff, retry)
     this->connection_manager_->loop();
 
@@ -183,6 +257,10 @@ void SendspinClient::loop() {
         }
     }
 
+    this->drain_inbox();
+}
+
+void SendspinClient::drain_inbox() {
     // Process deferred events: all state mutations and user callbacks happen here, on the main
     // loop thread, to avoid cross-thread data races. Two poll() snapshots gate the work below:
     // inbox_bits (here) gates only the event-ring drain immediately following it; slot_bits
@@ -253,8 +331,9 @@ void SendspinClient::loop() {
                     // CLEARED per role is ever pending when this drain runs: cleanup() is called
                     // only from cleanup_connection_state(), which first calls inbox.reset_events()
                     // (wiping the whole ring) before any role re-pushes its CLEARED, and that path
-                    // runs only under conn_ptr_mutex_ (ConnectionManager::drop_connection), so it
-                    // cannot interleave with itself. So even a back-to-back disconnect/reconnect
+                    // runs only on the main loop (under conn_ptr_mutex_ from
+                    // ConnectionManager::drop_connection, or directly from stop()), so it cannot
+                    // interleave with itself. So even a back-to-back disconnect/reconnect
                     // coalesces to a single CLEARED -- the reset_events() ordering is what
                     // guarantees it, not clear-callback idempotency. (Callbacks are idempotent by
                     // contract anyway; see on_controller_state_clear() / on_metadata_clear() /
@@ -391,13 +470,13 @@ void SendspinClient::loop() {
 }
 
 // ============================================================================
-// Role registration (call before start_server)
+// Role registration (call before start())
 // ============================================================================
 
 #ifdef SENDSPIN_ENABLE_PLAYER
 PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
     if (this->started_) {
-        SS_LOGW(TAG, "add_player() called after start_server(); role may not initialize correctly");
+        SS_LOGW(TAG, "add_player() called while started; role may not initialize correctly");
     }
     this->player_ =
         std::make_unique<PlayerRole>(std::move(config), this, this->persistence_provider_);
@@ -409,7 +488,7 @@ PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
 #ifdef SENDSPIN_ENABLE_CONTROLLER
 ControllerRole& SendspinClient::add_controller() {
     if (this->started_) {
-        SS_LOGW(TAG, "add_controller() called after start_server()");
+        SS_LOGW(TAG, "add_controller() called while started");
     }
     this->controller_ = std::make_unique<ControllerRole>(this);
     this->controller_->impl_->attach_inbox(this->event_state_->inbox);
@@ -420,7 +499,7 @@ ControllerRole& SendspinClient::add_controller() {
 #ifdef SENDSPIN_ENABLE_METADATA
 MetadataRole& SendspinClient::add_metadata() {
     if (this->started_) {
-        SS_LOGW(TAG, "add_metadata() called after start_server()");
+        SS_LOGW(TAG, "add_metadata() called while started");
     }
     this->metadata_ = std::make_unique<MetadataRole>(this);
     this->metadata_->impl_->attach_inbox(this->event_state_->inbox);
@@ -431,7 +510,7 @@ MetadataRole& SendspinClient::add_metadata() {
 #ifdef SENDSPIN_ENABLE_COLOR
 ColorRole& SendspinClient::add_color() {
     if (this->started_) {
-        SS_LOGW(TAG, "add_color() called after start_server()");
+        SS_LOGW(TAG, "add_color() called while started");
     }
     this->color_ = std::make_unique<ColorRole>(this);
     this->color_->impl_->attach_inbox(this->event_state_->inbox);
@@ -442,7 +521,7 @@ ColorRole& SendspinClient::add_color() {
 #ifdef SENDSPIN_ENABLE_ARTWORK
 ArtworkRole& SendspinClient::add_artwork(ArtworkRoleConfig config) {
     if (this->started_) {
-        SS_LOGW(TAG, "add_artwork() called after start_server()");
+        SS_LOGW(TAG, "add_artwork() called while started");
     }
     this->artwork_ = std::make_unique<ArtworkRole>(std::move(config), this);
     this->artwork_->impl_->attach_inbox(this->event_state_->inbox);
@@ -453,7 +532,7 @@ ArtworkRole& SendspinClient::add_artwork(ArtworkRoleConfig config) {
 #ifdef SENDSPIN_ENABLE_VISUALIZER
 VisualizerRole& SendspinClient::add_visualizer(VisualizerRoleConfig config) {
     if (this->started_) {
-        SS_LOGW(TAG, "add_visualizer() called after start_server()");
+        SS_LOGW(TAG, "add_visualizer() called while started");
     }
     this->visualizer_ = std::make_unique<VisualizerRole>(std::move(config), this);
     this->visualizer_->impl_->attach_inbox(this->event_state_->inbox);

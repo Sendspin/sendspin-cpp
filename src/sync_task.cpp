@@ -802,6 +802,15 @@ void SyncTask::stop() {
     this->event_flags_.set(EventGroupBits::COMMAND_STOP);
     this->encoded_ring_buffer_->wake_receiver();
     this->sync_thread_.join();
+
+    // A stop mid-stream leaves TASK_RUNNING set (only the idle transition clears it). The player's
+    // sync-idle gate reads is_running() to decide when a STREAM_END may fire, so a stopped task
+    // must read as idle or the stop-time on_stream_end() would wait for a thread that is gone.
+    this->event_flags_.clear(EventGroupBits::TASK_RUNNING);
+
+    // The thread is joined, so this is the ring's only consumer (the single-consumer contract
+    // reset() requires). Discard buffered audio so a restart does not replay the old stream.
+    this->encoded_ring_buffer_->reset();
 }
 
 // ============================================================================
@@ -939,6 +948,13 @@ void SyncTask::thread_entry(void* params) {
         // Don't drain the ring buffer here; the idle wait loop already discards
         // stale audio and stops at codec headers. Draining here would throw away
         // a codec header that arrived during a rapid seek (STREAM_END → STREAM_START).
+    }
+
+    // The idle-state exits above break out while still holding the codec header they received;
+    // hand it back so stop()'s ring reset sees no borrowed entry.
+    if (sync_context.encoded_entry != nullptr) {
+        this_task->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+        sync_context.encoded_entry = nullptr;
     }
 
     this_task->event_flags_.set(EventGroupBits::TASK_STOPPED);

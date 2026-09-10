@@ -380,7 +380,7 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     TestNetworkProvider network;
     SendspinClient client(make_config(PROBE_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     client.loop();  // First tick binds the WS server
 
     // Hold a raw TCP connection open without ever speaking WebSocket.
@@ -440,7 +440,7 @@ TEST(ConnectionLifecycle, SlowOutboundSurvivesUpgradeTier) {
     TestNetworkProvider network;
     SendspinClient client(make_config(OUTBOUND_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     client.loop();  // First tick binds the WS server
 
     client.connect_to(server_url(PROXY_LISTEN_PORT));
@@ -479,7 +479,7 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
     TestNetworkProvider network;
     SendspinClient client(make_config(ADMIT_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     client.loop();  // First tick binds the WS server
 
     client.connect_to(server_url(STALL_LISTEN_PORT));
@@ -509,7 +509,7 @@ TEST(ConnectionLifecycle, EarlyServerHelloDoesNotWedge) {
     TestNetworkProvider network;
     SendspinClient client(make_config(EARLY_HELLO_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     client.loop();  // First tick binds the WS server
 
     FakeServer eager(server_url(EARLY_HELLO_TEST_PORT), "server-eager", {.hello_on_open = true});
@@ -530,7 +530,7 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     SendspinClient client(make_config(RACE_TEST_PORT));
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     client.loop();  // First tick binds the WS server
 
     // server-a establishes and is promoted into the empty slot first...
@@ -561,7 +561,7 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
     TestNetworkProvider network;
     SendspinClient client(make_config(EVICT_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     client.loop();  // First tick binds the WS server
 
     // Two held raw probes, enough to fill every nursery slot if they were admitted at accept.
@@ -595,7 +595,7 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
     TestNetworkProvider network;
     SendspinClient client(make_config(REJECT_TEST_PORT));
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     client.loop();  // First tick binds the WS server
 
     // Two mute peers: they upgrade and receive client/hello but never answer it, occupying both

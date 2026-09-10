@@ -763,7 +763,7 @@ int main(int argc, char* argv[]) {
 #endif
 
     // Start the server
-    if (!client.start_server()) {
+    if (!client.start()) {
         fprintf(stderr, "Failed to start server\n");
         return 1;
     }
@@ -951,7 +951,7 @@ int main(int argc, char* argv[]) {
     mdns_browser.stop();
     mdns.stop();
 #endif
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    client.stop();
 
     return 0;
 }

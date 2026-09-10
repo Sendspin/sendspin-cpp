@@ -33,6 +33,7 @@ add_executable(sendspin_tests
     test_visualizer_role.cpp
     test_artwork_role.cpp
     test_client_teardown.cpp
+    test_client_lifecycle.cpp
 )
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...).

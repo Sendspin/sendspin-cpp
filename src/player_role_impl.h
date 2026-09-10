@@ -86,6 +86,8 @@ struct PlayerRole::Impl {
     }
     void drain_events();
     void cleanup();
+    /// @brief Joins the sync task thread and discards its buffered audio; no-op if not started.
+    void stop() const;
 
     // ========================================
     // Consumer-facing method implementations

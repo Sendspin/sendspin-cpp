@@ -222,8 +222,18 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
 // Server lifecycle
 // ============================================================================
 
-void ConnectionManager::init_server(SendspinClient* client) {
-    this->client_ = client;
+void ConnectionManager::start() {
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        this->accepting_.store(true, std::memory_order_release);
+    }
+    // A restart reuses the server object: stop() only stopped it, and loop() starts it again
+    // once the network is ready. Retry immediately rather than honoring a backoff from before
+    // the stop.
+    this->ws_server_start_retry_time_us_ = 0;
+    if (this->ws_server_ != nullptr) {
+        return;
+    }
 
     this->ws_server_ = std::make_unique<SendspinWsServer>();
     this->ws_server_->set_port(this->client_->config_.server_port);
@@ -277,6 +287,71 @@ void ConnectionManager::init_server(SendspinClient* client) {
             }
             return nullptr;
         });
+}
+
+void ConnectionManager::stop(SendspinGoodbyeReason reason) {
+    // Close admission and detach every managed connection under the lock. Nothing is sent or
+    // released here (see DeferredRelease): the goodbyes below run outside the lock, and a
+    // rejection for a peer delivered during the wait can take the lock meanwhile.
+    std::vector<std::shared_ptr<SendspinConnection>> to_goodbye;
+    std::vector<std::shared_ptr<SendspinConnection>> to_drop;
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        this->accepting_.store(false, std::memory_order_release);
+        if (this->current_connection_ != nullptr) {
+            this->current_connection_->disable_message_dispatch();
+            to_goodbye.push_back(std::move(this->current_connection_));
+            this->set_current_connection(nullptr);
+        }
+        for (auto& entry : this->nursery_) {
+            entry.conn->disable_message_dispatch();
+            to_goodbye.push_back(std::move(entry.conn));
+        }
+        this->nursery_.clear();
+        this->nursery_size_.store(0, std::memory_order_release);
+        this->hello_retries_.clear();
+        // Releases already queued (a handoff loser, a reaped entry) had their dispatch disabled
+        // when they were queued; the shutdown goodbye replaces whatever reason they carried.
+        for (auto& release : this->deferred_releases_) {
+            (release.goodbye.has_value() ? to_goodbye : to_drop).push_back(std::move(release.conn));
+        }
+        this->deferred_releases_.clear();
+        this->deferred_size_.store(0, std::memory_order_release);
+    }
+
+    // Goodbye every connection and wait, bounded, for the sends to complete. Every count is
+    // registered before the wait starts, so a completion that runs inline (host, and any
+    // not-connected transport) cannot satisfy the wait early. A disconnected connection completes
+    // immediately (see SendspinConnection::disconnect), so none needs a pre-check.
+    auto wait = std::make_shared<GoodbyeWait>();
+    for (auto& conn : to_goodbye) {
+        wait->add_pending();
+        conn->disconnect(reason, [wait] { wait->complete_one(); });
+    }
+    if (!wait->wait(GOODBYE_FLUSH_TIMEOUT_MS)) {
+        SS_LOGD(TAG, "Goodbye flush bound (%u ms) elapsed; closing regardless",
+                static_cast<unsigned>(GOODBYE_FLUSH_TIMEOUT_MS));
+    }
+
+    // Tear the server down regardless. This joins every network thread on host and waits for
+    // the httpd task on ESP, so no callback of any kind arrives after it returns. Close
+    // callbacks fired during it queue disconnect events under conn_mutex_, which is not held.
+    if (this->ws_server_ != nullptr) {
+        this->ws_server_->stop();
+    }
+
+    // Drop the lifecycle events those closes queued: the connections they name are gone. Moved
+    // out under the lock and destroyed after it, since a destructor can join a transport thread.
+    std::vector<std::shared_ptr<SendspinConnection>> pending_connected;
+    std::vector<std::shared_ptr<SendspinConnection>> pending_disconnects;
+    {
+        std::lock_guard<std::mutex> lock(this->conn_mutex_);
+        pending_connected = std::move(this->pending_connected_events_);
+        pending_disconnects = std::move(this->pending_disconnect_events_);
+        this->has_pending_events_.store(false, std::memory_order_release);
+    }
+    // Locals release here, outside every lock. An outbound connection's destructor stops its
+    // transport synchronously; deferring that is not an option (see DeferredRelease).
 }
 
 void ConnectionManager::loop() {
@@ -585,7 +660,14 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
                 ++inbound_count;
             }
         }
-        if (inbound_count >= NURSERY_CAPACITY) {
+        if (!this->accepting_.load(std::memory_order_acquire)) {
+            // Delivered while stop() is tearing down (or before start()): the nursery is being
+            // emptied, so the newcomer gets a goodbye and a close instead of a slot. Same shape
+            // as the nursery-full rejection below.
+            SS_LOGD(TAG, "Not accepting connections, rejecting new connection");
+            conn->disable_message_dispatch();
+            this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::SHUTDOWN);
+        } else if (inbound_count >= NURSERY_CAPACITY) {
             SS_LOGW(TAG, "Nursery full of live connections, rejecting new connection");
             // Never managed, but its callbacks are already wired: block dispatch so it cannot
             // inject messages during the goodbye window.

@@ -176,6 +176,12 @@ bool VisualizerRole::Impl::start() {
         return false;
     }
 
+    // The flags survive a stop()/start() cycle. The exiting thread's own wait() normally clears
+    // COMMAND_STOP, but a flush or clear signalled after the join (cleanup() on a stopped role)
+    // is still set; clear all three so the new thread starts from a clean command state (stop()
+    // already emptied the ring).
+    this->drain_task->event_flags.clear(COMMAND_STOP | COMMAND_FLUSH | COMMAND_CLEAR);
+
     platform_configure_thread("SsVis", 4096, static_cast<int>(this->config.priority),
                               this->config.psram_stack);
     this->drain_task->drain_thread = std::thread(drain_thread_func, this);
@@ -192,6 +198,11 @@ void VisualizerRole::Impl::stop() const {
     this->drain_task->event_flags.set(COMMAND_STOP);
     this->drain_task->ring_buffer.wake_receiver();
     this->drain_task->drain_thread.join();
+
+    // Joined, so this is the ring's only consumer (the single-consumer contract the ring
+    // requires): discard entries the old thread never took, so a restart does not deliver the
+    // previous session's frames against the new session's format.
+    this->flush_ring_buffer();
 }
 
 void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {

@@ -75,7 +75,7 @@ public:
 };
 
 /// @brief Platform hook for network readiness
-/// Must be set before start_server()
+/// Must be set before start()
 class SendspinNetworkProvider {
 public:
     virtual ~SendspinNetworkProvider() = default;
@@ -147,8 +147,9 @@ class SendspinTimeBurst;
  * 2. Construct a SendspinClient with that config
  * 3. Add roles via add_player(), add_controller(), add_metadata(), etc.
  * 4. Set listeners on each role and set the network provider on the client
- * 5. Call start_server() to start the WebSocket server and background tasks
+ * 5. Call start() to start the role threads and the WebSocket server
  * 6. Call loop() periodically from the platform main loop
+ * 7. Call stop() to goodbye every peer and tear everything down; start() again to restart
  *
  * @code
  * struct MyPlayerListener : PlayerRoleListener {
@@ -175,11 +176,12 @@ class SendspinTimeBurst;
  * player.set_listener(&player_listener);
  * client.add_controller();
  * client.set_network_provider(&network_provider);
- * client.start_server();
+ * client.start();
  *
- * while (true) {
+ * while (running) {
  *     client.loop();
  * }
+ * client.stop();
  * @endcode
  */
 class SendspinClient {
@@ -201,15 +203,58 @@ public:
     // Lifecycle
     // ========================================
 
-    /// @brief Starts the WebSocket server and initializes the sync task (if audio is configured)
-    /// @return true on success, false on failure
-    bool start_server();
+    /// @brief Starts the role threads and arms the WebSocket server
+    ///
+    /// The server itself comes up on the first loop() tick after the network provider reports
+    /// ready. If a role fails to start, the roles that did start are stopped again so a corrected
+    /// retry begins from the stopped state. Main-loop thread only.
+    /// @return true if the client is running (including when it already was), false on failure
+    bool start();
+
+    /// @brief Stops the client and returns only once it is fully stopped
+    ///
+    /// Sends a client/goodbye (reason shutdown) to every peer, waits up to a short bound for
+    /// those sends to complete, then closes the server and every connection regardless, joins
+    /// the role threads, resets every role, and delivers the roles' clear callbacks
+    /// (on_stream_end(), on_image_clear(), on_metadata_clear(), ...) before returning. No-op
+    /// when stopped. Calling start() afterwards restarts the client; start, stop, and start
+    /// again can be repeated indefinitely.
+    ///
+    /// Blocking is bounded, but not by the goodbye bound alone. It also includes: the
+    /// transports' own close (the host server waits up to 300 ms per connection for the close
+    /// handshake; the ESP server waits for the httpd task to exit, which polls at 100 ms and
+    /// first finishes any queued send, up to its send timeout for a peer that stops reading); an
+    /// outbound connect_to() transport's synchronous stop; and any listener callback already
+    /// running on a role thread, which the join cannot interrupt (on_audio_write() is bounded by
+    /// its timeout_ms, on_image_decode() is not).
+    ///
+    /// Listener callbacks fire from inside this call. One that calls start() has no effect and
+    /// returns false; one that calls stop() or connect_to() is ignored. Main-loop thread only:
+    /// calling it from a role-thread callback would join the calling thread.
+    void stop();
+
+    /// @brief Returns true between a successful start() and stop()
+    ///
+    /// Running means the role threads are up and the server is armed, not that the server is
+    /// listening yet (that waits for the network provider).
+    bool is_started() const {
+        return this->started_;
+    }
+
+    /// @brief Starts the client
+    /// @deprecated Use start(). Kept as an alias for existing consumers; removal is planned for
+    /// v0.8.0.
+    /// @return See start().
+    [[deprecated("Use start()")]] bool start_server() {
+        return this->start();
+    }
 
     /// @brief Initiates a client connection to a Sendspin server at the given URL
     ///
-    /// Must be called from the main loop thread: it tears down and replaces connection state
-    /// (time filter, dispatch, client state) directly rather than deferring to loop(), so calling
-    /// it concurrently with loop() would race those mutations.
+    /// Ignored (with a warning) while the client is not started. Must be called from the main
+    /// loop thread: it tears down and replaces connection state (time filter, dispatch, client
+    /// state) directly rather than deferring to loop(), so calling it concurrently with loop()
+    /// would race those mutations.
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
@@ -222,10 +267,11 @@ public:
     void disconnect(SendspinGoodbyeReason reason);
 
     /// @brief Processes events, drives time sync, checks network. Call from main loop
+    /// A no-op while the client is stopped.
     void loop();
 
     // ========================================
-    // Role registration (call before start_server)
+    // Role registration (call before start())
     // ========================================
 
 #ifdef SENDSPIN_ENABLE_PLAYER
@@ -379,7 +425,7 @@ public:
         this->listener_ = listener;
     }
 
-    /// @brief Sets the network provider (required before start_server())
+    /// @brief Sets the network provider (required before start())
     /// The provider must outlive this client
     void set_network_provider(SendspinNetworkProvider* provider) {
         this->network_provider_ = provider;
@@ -410,6 +456,13 @@ public:
 private:
     /// @brief Cleans up playback state when the active streaming connection is removed
     void cleanup_connection_state();
+
+    /// @brief Drains the inbox: lifecycle events, role slots, and group updates, dispatching
+    /// listener callbacks on the calling (main-loop) thread. Shared by loop() and stop().
+    void drain_inbox();
+
+    /// @brief Stops and joins every threaded role; each is a no-op if not running
+    void stop_role_threads();
 
     /// @brief Builds the formatted client hello message from config
     std::string build_hello_message();
@@ -502,7 +555,11 @@ private:
     // 8-bit fields
     bool high_performance_held_for_time_{false};
     std::atomic<uint8_t> high_performance_ref_count_{0};
+    /// True between a successful start() and stop(); see is_started().
     bool started_{false};
+    /// True for the duration of stop(). Refuses a start() and ignores a stop() issued by a
+    /// listener callback fired from inside the teardown, which would otherwise recurse into it.
+    bool stopping_{false};
 };
 
 }  // namespace sendspin

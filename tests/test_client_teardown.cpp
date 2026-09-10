@@ -81,7 +81,7 @@ TEST(ClientTeardown, JoinsEveryThreadedRoleOnDestruction) {
         vis_cfg.support.rate_max = 30;
         client->add_visualizer(std::move(vis_cfg));
 
-        ASSERT_TRUE(client->start_server());
+        ASSERT_TRUE(client->start());
 
         if (run > 0) {
             // Run 0 tears down mid-startup; later runs tear down threads parked in receives.
