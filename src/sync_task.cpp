@@ -121,10 +121,9 @@ bool SyncTask::start(bool task_stack_in_psram, unsigned priority) {
         return false;
     }
 
-    this->event_flags_.clear(EventGroupBits::TASK_RUNNING | EventGroupBits::TASK_STOPPED |
-                             EventGroupBits::TASK_IDLE | EventGroupBits::COMMAND_STOP |
-                             EventGroupBits::COMMAND_STREAM_END |
-                             EventGroupBits::COMMAND_STREAM_CLEAR | EventGroupBits::COMMAND_START);
+    // A fresh thread starts from a clean group: no stale task state and no command signalled
+    // between the previous join and this start (cleanup() on a stopped task).
+    this->event_flags_.clear_all();
 
     platform_configure_thread("Sendspin", SYNC_TASK_STACK_SIZE, static_cast<int>(priority),
                               task_stack_in_psram);

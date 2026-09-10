@@ -101,10 +101,10 @@ bool ArtworkRole::Impl::start() {
         return false;
     }
 
-    // The flags survive a stop()/start() cycle. The exiting thread's own wait() normally clears
-    // COMMAND_STOP, but clear it here too so the new thread's first wait() can never see a stale
-    // stop and exit immediately.
-    this->drain_task->event_flags.clear(COMMAND_STOP);
+    // The flags survive a stop()/start() cycle, and a command signalled between the join and this
+    // start (cleanup() on a stopped role) is still set. Clear the whole group so the new thread's
+    // first wait() starts from a clean command state whatever bits the role defines.
+    this->drain_task->event_flags.clear_all();
 
     platform_configure_thread("SsArt", 4096, static_cast<int>(this->config.priority),
                               this->config.psram_stack);
@@ -112,7 +112,7 @@ bool ArtworkRole::Impl::start() {
     return true;
 }
 
-void ArtworkRole::Impl::stop() const {
+void ArtworkRole::Impl::signal_stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
         return;
     }
@@ -121,6 +121,13 @@ void ArtworkRole::Impl::stop() const {
     // pulls it out of its blocking queue receive.
     this->drain_task->event_flags.set(COMMAND_STOP);
     this->drain_task->notify_queue.wake_receiver();
+}
+
+void ArtworkRole::Impl::stop() const {
+    if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
+        return;
+    }
+    this->signal_stop();
     this->drain_task->drain_thread.join();
 
     // Joined, so this is the queue's only consumer: discard notifications the old thread never
