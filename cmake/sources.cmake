@@ -46,6 +46,7 @@ function(sendspin_get_sources BASE_DIR)
     set(SENDSPIN_SOURCE_SOURCES
         ${BASE_DIR}/src/source_role.cpp
         ${BASE_DIR}/src/source_task.cpp
+        ${BASE_DIR}/src/source_encoder_opus.cpp
 
         PARENT_SCOPE
     )
