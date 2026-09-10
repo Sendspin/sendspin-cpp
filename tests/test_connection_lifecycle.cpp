@@ -58,6 +58,7 @@ constexpr uint16_t STALL_LISTEN_PORT = 18981;
 constexpr uint16_t ADMIT_TEST_PORT = 18982;
 constexpr uint16_t LIVENESS_TEST_PORT = 18983;
 constexpr uint16_t LIVENESS_CONTROL_PORT = 18984;
+constexpr uint16_t LIVENESS_DISABLED_PORT = 18985;
 
 std::string server_url(uint16_t port) {
     return "ws://127.0.0.1:" + std::to_string(port) + "/sendspin";
@@ -678,6 +679,32 @@ TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
     EXPECT_TRUE(client.is_connected());
     EXPECT_FALSE(live.closed());
     EXPECT_FALSE(live.got_goodbye());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// liveness_timeout_ms = 0 disables the check: a peer that never answers stays current. Guards the
+// `liveness_timeout_us_ > 0` gate, without which a zero timeout drops every connection at once.
+TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
+    TestNetworkProvider network;
+    SendspinClientConfig config = make_config(LIVENESS_DISABLED_PORT);
+    config.time_burst_interval_ms = 20;
+    config.time_burst_response_timeout_ms = 20;
+    config.liveness_timeout_ms = 0;
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start_server());
+    client.loop();  // First tick binds the WS server
+
+    FakeServer silent(server_url(LIVENESS_DISABLED_PORT), "server-silent", {.answer_time = false});
+    pump_until(client, [&] { return client.is_connected(); });
+    pump_until(client, [&] { return silent.got_client_time(); });
+
+    pump_for(client, 300);  // Several time messages go unanswered
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_FALSE(silent.closed());
+    EXPECT_FALSE(silent.got_goodbye());
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
