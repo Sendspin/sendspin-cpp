@@ -32,6 +32,18 @@ cmake --build build-tests-asan --target sendspin_tests
 ctest --test-dir build-tests-asan --output-on-failure
 ```
 
+`-DENABLE_TSAN=ON` builds with ThreadSanitizer instead. CI runs this as a separate job because
+TSan cannot be combined with ASan/UBSan. It is the configuration to reach for on the threaded code
+(the sync task, the connection threads, the inbox handoffs) the way ASan is for the parsers. The
+flag applies to every target, including the fetched dependencies, because TSan cannot see atomics
+in uninstrumented code and reports IXWebSocket's stop flags as false races otherwise:
+
+```bash
+cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON .
+cmake --build build-tsan --target sendspin_tests
+TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure
+```
+
 ## Layout
 
 `main.cpp` is the entry point. It registers a hang watchdog that aborts the binary with the

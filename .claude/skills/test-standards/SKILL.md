@@ -72,9 +72,11 @@ during this review.
   build passes, and the report states the command and the result.
 - Running a mutant: apply the edit, rebuild, run, then revert with
   `git checkout -- <file>` and confirm `git status` shows the tree as it was
-  before the review. Build under ASan/UBSan (`-DENABLE_SANITIZERS=ON`, the
-  CI configuration). A stale build directory has passed mutations here
-  before, so check that the build output shows the mutated object
+  before the review. Build under ASan/UBSan (`-DENABLE_SANITIZERS=ON`); a
+  mutant that changes thread interaction (a dropped lock, a reordered store,
+  a removed join) is built under ThreadSanitizer (`-DENABLE_TSAN=ON`) instead,
+  since ASan does not see it. A stale build directory has passed mutations
+  here before, so check that the build output shows the mutated object
   recompiling.
 - A surviving mutation is a defect of the test only when it breaks a contract
   the test claims to cover; otherwise it is a gap. A surviving mutation and
@@ -138,9 +140,11 @@ during this review.
 - Concurrency tests observe real effects: never assert on a counter the
   thread under test would have been the one to advance; use the code's own
   observable outputs or event flags.
-- CI runs the suite under ASan/UBSan only. A concurrency finding backed by a
-  local ThreadSanitizer run says so and states the command; the absence of a
-  TSan run is not itself a finding.
+- CI runs the suite under ASan/UBSan and, in a separate job, ThreadSanitizer
+  (`-DENABLE_TSAN=ON`; the two cannot be combined). A concurrency finding, or
+  a certification that a threaded test is adequate, is backed by a TSan run
+  and states the command. A race TSan reports is real until shown otherwise;
+  the review never proposes a suppressions file.
 
 ## No wall-clock assertions
 
