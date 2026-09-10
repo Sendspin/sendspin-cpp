@@ -140,11 +140,11 @@ and are in scope regardless of who wrote them.
   extracting a pure predicate (see "Honest gaps"), not by timing the test.
 - If the property is latency itself, it is a benchmark, not a unit test.
   Name it under "Honest gaps" rather than approximating it with a bound.
-- The CTest `TIMEOUT` in `tests/CMakeLists.txt` is a hang guard, not an
-  assertion. It sits far above any real run time so a regression reports
-  instead of hanging forever. It only fires under `ctest`; a hung wait in a
-  direct or debugger run hangs, and a timeout gives no diagnostic beyond
-  the test name. That is the accepted price of removing the bound.
+- Hangs are guarded, not asserted, at a magnitude that is never a judgment
+  about test speed: the watchdog listener in `tests/main.cpp` aborts a test
+  still running after its budget and prints the main thread's stack, so a
+  direct or debugger run fails loudly and names the wait; the CTest
+  `TIMEOUT` in `tests/CMakeLists.txt` sits just above it as the backstop.
 - A fixed sleep may order events between threads only when a delayed thread
   yields a false pass, never a false failure: sleep so a consumer is likely
   parked before the wake, and if it was not yet parked the wake is held and
