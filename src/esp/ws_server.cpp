@@ -118,12 +118,20 @@ void SendspinWsServer::stop() {
     if (this->server_ != nullptr) {
         SS_LOGD(TAG, "Stopping server");
         httpd_handle_t stopped = this->server_;
-        httpd_stop(stopped);
+        const esp_err_t stop_err = httpd_stop(stopped);
         this->server_ = nullptr;
-        // None of THIS server's queued workers can run once httpd_stop returns; break the
-        // keep-alive cycles of the binary send work it discarded so restarts cannot accumulate
-        // stranded blocks. Scoped by handle: another live server's queued work is untouched.
-        reclaim_orphaned_binary_send_work(stopped);
+        if (stop_err == ESP_OK) {
+            // Only on a clean stop can no worker of THIS server run again: break the keep-alive
+            // cycles of the binary send work it discarded so restarts cannot accumulate
+            // stranded blocks (scoped by handle; another live server's work is untouched). On a
+            // failed stop the httpd task may still run queued workers, so reclaim()'s "no worker
+            // can run" precondition would be violated -- leave the blocks (a bounded leak) so a
+            // late worker never collides with a reclaimed lookup.
+            reclaim_orphaned_binary_send_work(stopped);
+        } else {
+            SS_LOGW(TAG, "httpd_stop failed (%s); leaving queued binary send work intact",
+                    esp_err_to_name(stop_err));
+        }
     }
 
     // httpd_stop tore down every session (each close_callback dropped its pending entry), so
