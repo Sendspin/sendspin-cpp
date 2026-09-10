@@ -1,6 +1,6 @@
 ---
 name: test-standards
-description: Review the tests in a branch or PR against sendspin-cpp's test-quality standards - extract-for-testability, mutation-survivable assertions, control cases, no filler tests, no test seams in production code, and scaffolding that satisfies production invariants. Use when reviewing new or changed tests, or when asked whether a change is adequately tested.
+description: Review the tests in a branch or PR against sendspin-cpp's test-quality standards - extract-for-testability, mutation-survivable assertions, control cases, no filler tests, no wall-clock assertions, no test seams in production code, and scaffolding that satisfies production invariants. Use when reviewing new or changed tests, or when asked whether a change is adequately tested.
 user-invocable: true
 allowed-tools: Read, Grep, Glob, Bash
 ---
@@ -19,54 +19,73 @@ Determine the diff: if `$ARGUMENTS` contains a PR number, use
 `git diff HEAD`. If the review environment already supplies the diff (for
 example an automated PR review), review that diff directly instead of
 computing one. Consider both directions: new tests that are weak, and new
-logic that ships without a test that could catch its breakage. "Pre-existing"
-means present on `main`; new files and new hunks in the diff are the PR's code
-and are in scope regardless of who wrote them.
+logic that ships without a test that could catch its breakage. New files and
+new hunks are in scope regardless of who wrote them; a test already weak on
+`main` is out of scope unless the diff touches it or relies on it for
+coverage.
+
+Back every claim with a command: a "checked and clean" statement, a mutation
+result, or "the suite passes" rests on a build, run, grep, or read performed
+during this review. The suite must pass under ASan/UBSan
+(`-DENABLE_SANITIZERS=ON`, the CI configuration); a stale build directory
+has passed mutations here before, so check that the objects rebuilt.
 
 ## Extract for testability
 
-- Nontrivial pure logic buried inside a threaded or I/O-coupled path should
-  be extracted into a static member or free function with no thread, socket,
-  or callback dependencies, then unit-tested directly. This is the
-  established pattern: `decode_visualizer_message()`
-  (`src/visualizer_role.cpp`) and the static display-timing helpers in
-  `src/artwork_role.cpp` exist for exactly this reason.
-- Extraction purely for testability is encouraged; it needs no other
-  justification. Flag new decision-heavy logic that is only reachable through
-  a thread or a full client as a testability finding.
+- Nontrivial pure logic buried inside a threaded or I/O-coupled path is
+  extracted into a static member or free function with no thread, socket, or
+  callback dependencies, then unit-tested directly. `decode_visualizer_message()`
+  (`src/visualizer_role.cpp`) is the established pattern. Extraction purely
+  for testability needs no other justification; flag new decision-heavy
+  logic that is only reachable through a thread or a full client.
+- A timing decision is extracted into a pure predicate that takes `now` as an
+  ordinary argument; the production call site still reads the real clock and
+  nothing becomes swappable. `display_overdue_us` in `src/artwork_role.cpp`
+  is the shape. This project has no clock injection seam by decision, and a
+  review must not propose one. A predicate covers a decision, not a sequence
+  over time; sequencing that needs direct coverage is a gap to name.
+
+## No test seams in production
+
+- Production code in `src/` and `include/` must not acquire friends,
+  test-only hooks, widened visibility, extra template parameters, injectable
+  clocks or transports, or fixture-aware naming in order to be testable. The
+  fix is extraction (above), a test-side technique, or a named gap.
+- Allowed test-side techniques: tests are white-box and include private
+  headers from `src/`; a fixture may construct and drive a role's `Impl`
+  directly (`tests/test_artwork_role.cpp`); connection tests use real
+  loopback sockets (`tests/test_connection_lifecycle.cpp`); a single
+  white-box translation unit may be compiled with `-fno-access-control`
+  (set per file in `tests/CMakeLists.txt`, never suite-wide), with every
+  private touch routed through a documented fixture helper so the
+  depended-on surface stays auditable in one place.
 
 ## Mutation survival
 
 - For every new test, identify the production line or branch its name or
-  comment claims to defend, and check: if that line were deleted or its
+  comment claims to defend and ask: if that line were deleted or its
   condition inverted, would this test fail? A test that would still pass is
-  filler. Mutations are scoped to that line, not to every line reachable from
-  the test; prefer edits a person would plausibly make (dropping a reset,
-  inverting a comparison, removing a guard) over line-by-line deletion. A
-  surviving mutation is a defect of the test only when it breaks a contract
-  the test claims to cover; otherwise it belongs under "Honest gaps".
+  filler. Scope mutations to that line, preferring edits a person would
+  plausibly make (dropping a reset, inverting a comparison, removing a guard)
+  over line-by-line deletion.
+- Reasoning is enough to pass a test. Before reporting a survival finding or
+  certifying a subtle test as adequate, build and run the mutant after the
+  unmutated build passes, and state the command and result.
+- A surviving mutation is a defect of the test only when it breaks a contract
+  the test claims to cover; otherwise it is a gap. A surviving mutation and
+  an overclaiming comment on the same test are one finding.
 - An assertion that claims to cover several failure modes must fail for each
-  one on its own; a single aggregate check detects only the mode that
-  dominates it. Regress each path alone to confirm the others.
-- A mutation claim is verified by building and running the mutant after the
-  unmutated build passes, and the finding states the command and result; a
-  stale build directory has passed mutations here before, so check that the
-  objects rebuilt. This is the same overclaim that "Granularity and
-  independence" catches by reading; report it once.
+  one on its own; break each path alone to confirm.
 - Watch for self-referential tests: asserting on state the test itself set,
-  exercising only the mock, or re-deriving the expected value with the same
+  exercising only the fake, or re-deriving the expected value with the same
   code path the production code uses.
-- When a test's protective value is non-obvious, a comment or the PR
-  description saying which mutation it catches ("deleting X makes tests Y and
-  Z fail") helps; its absence on a subtle test is worth a note, not a
-  blocker.
 
 ## Validation-test template
 
 - Tests for parsing/validation pair every malformed-input case with an
   explicit control case (comment prefix `Control:`) proving the same parser
-  accepts valid input. A rejection suite with no control case cannot
-  distinguish "rejects bad input" from "rejects everything".
+  accepts valid input; without one, "rejects bad input" is indistinguishable
+  from "rejects everything".
 - Cover the reject-the-whole-object rule: one bad sibling field must reject
   the enclosing object, and the test must show neighboring valid fields did
   not survive into the output.
@@ -78,107 +97,70 @@ and are in scope regardless of who wrote them.
   Recommending deletion of a weak test is a valid review outcome.
 - Test names and comments describe the behavior under test, not the defect
   history ("rejects spectrum config missing n_disp_bins", not "regression
-  test for the config bug").
+  test for the config bug"), closely enough that a red CI run identifies the
+  break without opening the file.
 
 ## Granularity and independence
 
 - One behavior per test: not one assertion per test, and not one test per
-  bug. Several assertions about the same behavior belong together and
-  splitting them is filler; a long test spanning several behaviors is the
-  opposite failure and gets split along the behaviors it conflates.
+  bug. Several assertions about the same behavior belong together; a test
+  spanning several behaviors is split along the behaviors it conflates.
   `MetadataNullClearsAndAbsentPreserves` (`tests/test_protocol.cpp`) asserts
   three things about the single delta-merge rule it covers.
-- A test name describes the behavior closely enough that a red CI run
-  identifies the break without opening the file (see the naming bullet under
-  "No filler").
 - A test's assertions establish what its name and comment claim, no more and
-  no less. A comment that promises a property the assertions do not check is
-  an overclaim; add the assertion or narrow the comment.
-- `ASSERT_*` aborts the test function while `EXPECT_*` continues, so an
-  over-merged test masks later failures behind the first one. Reserve
+  no less; a comment that promises an unchecked property is an overclaim.
+- `ASSERT_*` aborts the test function while `EXPECT_*` continues; reserve
   `ASSERT_*` for the point where continuing would be meaningless, such as a
   parse that must succeed before its result is read.
 - No test depends on execution order, on another test having run first, or on
-  shared mutable global state; each test sets up the world it needs.
+  shared mutable global state. A test that fails without a code change is a
+  defect in the test: fix it or delete it, never retry it into passing.
 
-## No test seams in production
-
-- Production code in `src/` and `include/` must not acquire friends,
-  test-only hooks, widened visibility, extra template parameters, or
-  fixture-aware naming in order to be testable. The fix for hard-to-reach
-  code is extraction (above) or test-side techniques, never a seam in the
-  shipped code.
-
-## Scaffolding parity
+## Scaffolding and test doubles
 
 - Test harnesses satisfy production invariants instead of stubbing around
-  them: if production code asserts a bound `Inbox`, the test fixture binds
-  one. A harness that suppresses an invariant hides every bug that invariant
-  guards.
-- Concurrency tests observe real effects rather than self-referential timing:
-  never assert on a counter that the thread under test would have been the
-  one to advance; use the code's own observable outputs or event flags. A
-  fixed sleep is not a synchronization tool; the narrow ordering use it is
-  allowed is in "No wall-clock assertions".
+  them: if production code asserts a bound `Inbox`, the fixture binds one. A
+  harness that suppresses an invariant hides every bug it guards.
+- Doubles are hand-written fakes that record outcomes; the tree uses no
+  gmock. A test that asserts on which calls were made rather than on what
+  resulted is exercising the double, not the code.
+- Concurrency tests observe real effects: never assert on a counter the
+  thread under test would have been the one to advance; use the code's own
+  observable outputs or event flags.
 
 ## No wall-clock assertions
 
 - A unit test never makes elapsed time the pass/fail condition
-  (`EXPECT_LT(elapsed, x)`, `EXPECT_GE(elapsed, y)`). A stopwatch measures
-  the runner and the scheduler, not the code, and the bound it needs is a
-  guess about machine speed that is eventually wrong. A bounded wait that
-  only decides when to sample an observation is scheduling, not an
-  assertion; the last bullet says when that is allowed.
-- An elapsed-time assertion is a symptom: the call under test has a second
-  way to return (a timeout) and the clock exists only to tell the two apart.
-  Remove the second exit instead. Wait with no timeout so the event under
-  test is the only way out and completion is the proof; assert on a value
-  that only a correctly blocked call could produce ("the consumer received
-  the item sent after it parked"); or rely on a structural failure
-  (`std::thread` terminates on a joinable thread, the sanitizers catch a
-  use-after-free). Timing decisions inside production code are covered by
-  extracting a pure predicate (see "Honest gaps"), not by timing the test.
-- If the property is latency itself, it is a benchmark, not a unit test.
-  Name it under "Honest gaps" rather than approximating it with a bound.
-- Hangs are guarded, not asserted, at a magnitude that is never a judgment
-  about test speed: the watchdog listener in `tests/main.cpp` aborts a test
-  still running after its budget and prints the main thread's stack, so a
-  direct or debugger run fails loudly and names the wait; the CTest
-  `TIMEOUT` in `tests/CMakeLists.txt` sits just above it as the backstop.
-- A fixed sleep may order events between threads only when a delayed thread
-  yields a false pass, never a false failure: sleep so a consumer is likely
-  parked before the wake, and if it was not yet parked the wake is held and
-  the test still passes. It is never itself an assertion. A bounded window
-  is likewise acceptable only for a "must not happen" check on a monotonic
-  observation (a flag or counter that cannot un-set within the test), where
-  a short window can only miss a regression. A watchdog is tested the same
-  way: wait with no timeout for "it fires", a bounded window for "not yet".
-
-## Sanitizers
-
-- The suite must pass under ASan/UBSan (`-DENABLE_SANITIZERS=ON`, the CI
-  configuration).
+  (`EXPECT_LT(elapsed, x)`, `EXPECT_GE(elapsed, y)`); the bound is a guess
+  about machine speed that is eventually wrong. If the property is latency
+  itself, it is a benchmark: name it as a gap.
+- An elapsed-time assertion means the call under test has a second exit (a
+  timeout) and the clock exists to tell the two apart. Remove the second
+  exit: wait with no timeout so completion is the proof; assert on a value
+  only a correctly blocked call could produce ("the consumer received the
+  item sent after it parked"); or rely on a structural failure (`std::thread`
+  terminates on a joinable thread, the sanitizers catch a use-after-free).
+  Hangs are guarded by the watchdog in `tests/main.cpp` and the CTest
+  `TIMEOUT` in `tests/CMakeLists.txt`, both far above any test's real
+  duration.
+- Allowed: a bounded wait that only decides when to sample; a fixed sleep
+  that orders threads only when a late thread yields a false pass, never a
+  false failure (sleep so the consumer is likely parked, and if it was not,
+  the wake is held and the test still passes); a bounded window for a "must
+  not happen" check on a monotonic observation, where a short window can
+  only miss a regression. A watchdog is tested with these: no timeout for
+  "it fires", a bounded window for "not yet".
 
 ## Honest gaps
 
 - A coverage gap that cannot be closed cheaply is named explicitly in the PR
   rather than papered over with a test that appears to cover it. Flag
-  apparent coverage that does not actually exercise the gap.
-- Naming the gap is the finding. Do not recommend a production seam to close
-  it: an injectable clock, a virtual hook, or a swappable transport added to
-  `src/` or `include/` for a test's benefit is the seam violation above, not
-  the remedy for it. This project has no clock injection seam and a review
-  must not propose introducing one; where a timing decision needs direct
-  coverage, extract it into a pure predicate the test calls with supplied
-  values. Unlike a seam, the predicate takes `now` as an ordinary argument
-  and the production call site still reads the real clock; nothing becomes
-  swappable. `display_overdue_us` in `src/artwork_role.cpp` is the shape.
+  apparent coverage that does not exercise the gap. Naming the gap is the
+  finding; never recommend a production seam to close it.
 - The host suite compiles only the host arm of `#ifdef ESP_PLATFORM`. A
   finding that touches platform-guarded code states which arm the test
   exercises; a change to the ESP arm is a gap to name, and a host mutation
   result says nothing about it.
-- A test that fails without a code change is a defect in the test. Fix it or
-  delete it; never retry it into passing.
 
 ## Report format
 
