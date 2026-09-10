@@ -47,8 +47,12 @@ public:
 // still-joinable thread, so a role that fails to join aborts the test, and the sanitizers catch
 // a use-after-free against state a role thread still touches as the client unwinds.
 //
-// No latency assertion: two of the three role timeouts (100ms artwork, 50ms visualizer) sit
-// under any wall-clock bound loose enough to be stable. The primitive tests pin the wake.
+// Coverage gap: this test does not assert that each role's stop() returns promptly. A role
+// whose stop() no longer wakes its thread's blocking receive still passes here, after waiting
+// out that receive's fallback timeout. Promptness is a latency property and the suite does not
+// make elapsed time a pass/fail condition; the primitive tests pin that wake_receiver() itself
+// interrupts a blocked receive, and each role's stop() is one visible call next to its stop
+// flag.
 TEST(ClientTeardown, JoinsEveryThreadedRoleOnDestruction) {
     NullNetworkProvider network;
     NullPlayerListener player_listener;
