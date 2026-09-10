@@ -2,7 +2,7 @@
 name: test-standards
 description: Review the tests in a branch or PR against sendspin-cpp's test-quality standards - extract-for-testability, mutation-survivable assertions, control cases, no filler tests, no wall-clock assertions, no test seams in production code, and scaffolding that satisfies production invariants. Use when reviewing new or changed tests, or when asked whether a change is adequately tested.
 user-invocable: true
-allowed-tools: Read, Grep, Glob, Bash
+allowed-tools: Read, Grep, Glob, Bash, Edit
 ---
 
 # Test Standards Review
@@ -10,7 +10,11 @@ allowed-tools: Read, Grep, Glob, Bash
 Review the tests a change adds or modifies, and whether the change's logic is
 testable at all. A test's job is to fail when the production code is broken;
 a test that cannot fail that way is filler, and filler has negative value.
-Report findings only; do not edit files.
+Report findings only. The normative rules live in `docs/conventions.md`
+("Testing"); this checklist applies them to a diff. The only edits this
+review makes are temporary mutations of production code for the checks
+under "Mutation survival", and every one of them is reverted before the
+report is written.
 
 ## Scope
 
@@ -20,15 +24,13 @@ Determine the diff: if `$ARGUMENTS` contains a PR number, use
 example an automated PR review), review that diff directly instead of
 computing one. Consider both directions: new tests that are weak, and new
 logic that ships without a test that could catch its breakage. New files and
-new hunks are in scope regardless of who wrote them; a test already weak on
-`main` is out of scope unless the diff touches it or relies on it for
-coverage.
+new hunks are in scope whether a person or a coding agent wrote them; a test
+already weak on `main` is out of scope unless the diff touches it or relies
+on it for coverage.
 
 Back every claim with a command: a "checked and clean" statement, a mutation
 result, or "the suite passes" rests on a build, run, grep, or read performed
-during this review. The suite must pass under ASan/UBSan
-(`-DENABLE_SANITIZERS=ON`, the CI configuration); a stale build directory
-has passed mutations here before, so check that the objects rebuilt.
+during this review.
 
 ## Extract for testability
 
@@ -54,11 +56,7 @@ has passed mutations here before, so check that the objects rebuilt.
 - Allowed test-side techniques: tests are white-box and include private
   headers from `src/`; a fixture may construct and drive a role's `Impl`
   directly (`tests/test_artwork_role.cpp`); connection tests use real
-  loopback sockets (`tests/test_connection_lifecycle.cpp`); a single
-  white-box translation unit may be compiled with `-fno-access-control`
-  (set per file in `tests/CMakeLists.txt`, never suite-wide), with every
-  private touch routed through a documented fixture helper so the
-  depended-on surface stays auditable in one place.
+  loopback sockets (`tests/test_connection_lifecycle.cpp`).
 
 ## Mutation survival
 
@@ -68,9 +66,16 @@ has passed mutations here before, so check that the objects rebuilt.
   filler. Scope mutations to that line, preferring edits a person would
   plausibly make (dropping a reset, inverting a comparison, removing a guard)
   over line-by-line deletion.
-- Reasoning is enough to pass a test. Before reporting a survival finding or
-  certifying a subtle test as adequate, build and run the mutant after the
-  unmutated build passes, and state the command and result.
+- Reasoning alone may clear a test whose assertion obviously pins the line
+  it claims. A survival finding, or a certification that a subtle test is
+  adequate, requires building and running the mutant after the unmutated
+  build passes, and the report states the command and the result.
+- Running a mutant: apply the edit, rebuild, run, then revert with
+  `git checkout -- <file>` and confirm `git status` shows the tree as it was
+  before the review. Build under ASan/UBSan (`-DENABLE_SANITIZERS=ON`, the
+  CI configuration). A stale build directory has passed mutations here
+  before, so check that the build output shows the mutated object
+  recompiling.
 - A surviving mutation is a defect of the test only when it breaks a contract
   the test claims to cover; otherwise it is a gap. A surviving mutation and
   an overclaiming comment on the same test are one finding.
@@ -80,7 +85,7 @@ has passed mutations here before, so check that the objects rebuilt.
   exercising only the fake, or re-deriving the expected value with the same
   code path the production code uses.
 
-## Validation-test template
+## Validation tests
 
 - Tests for parsing/validation pair every malformed-input case with an
   explicit control case (comment prefix `Control:`) proving the same parser
@@ -112,6 +117,10 @@ has passed mutations here before, so check that the objects rebuilt.
 - `ASSERT_*` aborts the test function while `EXPECT_*` continues; reserve
   `ASSERT_*` for the point where continuing would be meaningless, such as a
   parse that must succeed before its result is read.
+- An assertion whose failure would not explain itself carries a `<<` message
+  with the observed value: a "must not happen" window reports the count it
+  saw, a multi-step sequence reports which step it reached. A red run should
+  be diagnosable from the log alone.
 - No test depends on execution order, on another test having run first, or on
   shared mutable global state. A test that fails without a code change is a
   defect in the test: fix it or delete it, never retry it into passing.
@@ -121,12 +130,17 @@ has passed mutations here before, so check that the objects rebuilt.
 - Test harnesses satisfy production invariants instead of stubbing around
   them: if production code asserts a bound `Inbox`, the fixture binds one. A
   harness that suppresses an invariant hides every bug it guards.
+- Production `assert()` calls are contracts for callers, not behavior under
+  test; the suite has no death tests and a review does not ask for one.
 - Doubles are hand-written fakes that record outcomes; the tree uses no
   gmock. A test that asserts on which calls were made rather than on what
   resulted is exercising the double, not the code.
 - Concurrency tests observe real effects: never assert on a counter the
   thread under test would have been the one to advance; use the code's own
   observable outputs or event flags.
+- CI runs the suite under ASan/UBSan only. A concurrency finding backed by a
+  local ThreadSanitizer run says so and states the command; the absence of a
+  TSan run is not itself a finding.
 
 ## No wall-clock assertions
 
@@ -150,6 +164,10 @@ has passed mutations here before, so check that the objects rebuilt.
   not happen" check on a monotonic observation, where a short window can
   only miss a regression. A watchdog is tested with these: no timeout for
   "it fires", a bounded window for "not yet".
+- Sleeps and windows are the minimum that reliably orders the threads, on
+  the order of milliseconds. A test that takes longer than a few hundred
+  milliseconds carries a comment saying why; the watchdog budget is shared
+  by the whole suite and slow tests hide hangs behind it.
 
 ## Honest gaps
 
@@ -166,5 +184,8 @@ has passed mutations here before, so check that the objects rebuilt.
 
 For each finding: location (file:line), the standard it misses, and the
 concrete improvement (including "delete this test" where warranted); a
-mutation finding also states the command run and the observed result. Separate
-sections for weak tests, missing tests, and production-testability issues.
+mutation finding also states the command run and the observed result.
+Separate sections for weak tests, missing tests, production-testability
+issues, and named gaps (coverage that is missing by acknowledged decision,
+listed so the PR can state them; no action requested). Close with the
+`git status` output showing every mutation was reverted.
