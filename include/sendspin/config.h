@@ -86,16 +86,10 @@ struct SendspinClientConfig {
     int64_t time_burst_response_timeout_ms{
         DEFAULT_BURST_TIMEOUT_MS};  ///< Milliseconds before a burst message times out
 
-    /// @brief Default established-connection liveness timeout: two burst intervals plus one
-    /// response timeout, so a live server that answers even one message per burst never trips it.
-    static constexpr int64_t DEFAULT_LIVENESS_TIMEOUT_MS =
-        2 * DEFAULT_BURST_INTERVAL_MS + DEFAULT_BURST_TIMEOUT_MS;
-
-    /// @brief Milliseconds of inbound silence after which an established connection is treated
-    /// as dead and dropped (the listener sees the usual disconnect). Any complete inbound message
-    /// counts; a live server answers every time burst, so the default is derived from the burst
-    /// settings. Lower it together with the burst settings if you shorten those. 0 disables.
-    int64_t liveness_timeout_ms{DEFAULT_LIVENESS_TIMEOUT_MS};
+    /// @brief Milliseconds of inbound silence before the established connection is dropped as
+    /// dead. Unset derives it from the time burst settings, tolerating two consecutive unanswered
+    /// time messages (60000 with the defaults); 0 disables.
+    std::optional<int64_t> liveness_timeout_ms{};
 
     /// @brief Memory placement for the per-connection WebSocket payload reassembly buffer
     /// (ESP-IDF only; ignored on host). Defaults to PREFER_EXTERNAL (SPIRAM).

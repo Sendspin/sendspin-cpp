@@ -137,10 +137,7 @@ public:
         return this->provisional_time_us_.load(std::memory_order_relaxed);
     }
 
-    /// @brief Returns the timestamp (platform_time_us()) of the last complete inbound message,
-    /// or 0 if none has arrived. Stamped on the network thread in dispatch_completed_message();
-    /// the established-connection liveness check in ConnectionManager::loop() reads it on the
-    /// main loop, hence atomic.
+    /// @brief Returns the arrival timestamp of the last complete inbound message, or 0 if none.
     int64_t get_last_receive_time_us() const {
         return this->last_receive_time_us_.load(std::memory_order_relaxed);
     }
@@ -418,8 +415,8 @@ protected:
     /// the main loop (provisional-connection timeout check). 0 = not yet set.
     std::atomic<int64_t> provisional_time_us_{0};
 
-    /// Monotonic timestamp (platform_time_us()) of the last complete inbound message. Written on
-    /// the network thread at dispatch, read on the main loop by the liveness check. 0 = none yet.
+    /// Monotonic timestamp (platform_time_us()) of the last complete inbound message. Atomic
+    /// because it is written on the network thread and read by the main-loop liveness check.
     std::atomic<int64_t> last_receive_time_us_{0};
 
     /// EMA (microseconds) of format_client_time_message() duration. Atomic because the ESP

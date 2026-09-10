@@ -55,6 +55,16 @@ static constexpr double NURSERY_ESTABLISH_TIMEOUT_S = 30.0;
 /// @brief Timeout in microseconds (derived from NURSERY_ESTABLISH_TIMEOUT_S).
 static constexpr int64_t NURSERY_ESTABLISH_TIMEOUT_US = seconds_to_us(NURSERY_ESTABLISH_TIMEOUT_S);
 
+/// @brief Consecutive unanswered client/time messages the derived liveness timeout tolerates.
+static constexpr int64_t LIVENESS_TOLERATED_MISSES = 2;
+
+/// @brief Returns config.liveness_timeout_ms if set, otherwise a timeout derived from the time
+/// burst settings that outlasts LIVENESS_TOLERATED_MISSES consecutive unanswered time messages by
+/// at least one response timeout.
+/// @param config The client configuration.
+/// @return Timeout in milliseconds; 0 or negative disables the check.
+int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config);
+
 /// @brief A connection that has not completed the hello handshake
 ///
 /// Unproven connections never occupy the current-connection slot; they wait in the bounded nursery
@@ -357,6 +367,8 @@ private:
     uint32_t last_played_server_hash_{0};
 
     // 64-bit fields
+    /// From resolve_liveness_timeout_ms(), in microseconds; 0 or negative disables the check.
+    int64_t liveness_timeout_us_{0};
     /// Earliest time (us) to attempt another WS server start after a failure. Main-loop only.
     int64_t ws_server_start_retry_time_us_{0};
 

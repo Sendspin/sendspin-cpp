@@ -19,7 +19,7 @@
 // property or the delivery-at-upgrade contract (connections reach the manager only after their
 // WebSocket upgrade; raw-TCP junk is closed inside the transport layer and never occupies a slot).
 
-#include "connection_manager.h"  // fnv1_hash for the last-played preference
+#include "connection_manager.h"  // fnv1_hash, resolve_liveness_timeout_ms
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include <arpa/inet.h>
@@ -36,6 +36,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -68,21 +69,9 @@ std::string server_hello_json(const std::string& server_id, const std::string& r
            R"("connection_reason":")" + reason + R"("}})";
 }
 
-/// Builds a server/time reply echoing the client_transmitted value out of a client/time message,
-/// with server timestamps that yield a positive round trip (any value works: only the arrival of
-/// the reply matters to the liveness tests, and the burst tolerates any measurement).
-std::string server_time_json(const std::string& client_time_msg) {
-    const std::string key = "\"client_transmitted\":";
-    const size_t pos = client_time_msg.find(key);
-    std::string transmitted = "0";
-    if (pos != std::string::npos) {
-        const size_t start = pos + key.size();
-        const size_t end = client_time_msg.find_first_of(",}", start);
-        transmitted = client_time_msg.substr(start, end - start);
-    }
-    return std::string(R"({"type":"server/time","payload":{"client_transmitted":)") + transmitted +
-           R"(,"server_received":1000,"server_transmitted":1001}})";
-}
+// Any complete inbound frame counts for liveness, so the reply's timestamps need not be real.
+constexpr const char* SERVER_TIME_JSON =
+    R"({"type":"server/time","payload":{"client_transmitted":0,"server_received":1000,"server_transmitted":1001}})";
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
@@ -197,12 +186,16 @@ public:
                 }
             } else if (msg->type == ix::WebSocketMessageType::Message &&
                        msg->str.find("client/goodbye") != std::string::npos) {
+                {
+                    std::lock_guard<std::mutex> lock(this->goodbye_mutex_);
+                    this->goodbye_message_ = msg->str;
+                }
                 this->got_goodbye_.store(true);
             } else if (msg->type == ix::WebSocketMessageType::Message &&
                        msg->str.find("client/time") != std::string::npos) {
                 this->got_client_time_.store(true);
                 if (options.answer_time) {
-                    this->ws_.send(server_time_json(msg->str));
+                    this->ws_.send(SERVER_TIME_JSON);
                 }
             } else if (msg->type == ix::WebSocketMessageType::Close ||
                        msg->type == ix::WebSocketMessageType::Error) {
@@ -228,6 +221,11 @@ public:
         return this->got_goodbye_.load();
     }
 
+    std::string goodbye_message() const {
+        std::lock_guard<std::mutex> lock(this->goodbye_mutex_);
+        return this->goodbye_message_;
+    }
+
     bool got_client_time() const {
         return this->got_client_time_.load();
     }
@@ -235,6 +233,8 @@ public:
 private:
     ix::WebSocket ws_;
     std::string server_id_;
+    mutable std::mutex goodbye_mutex_;
+    std::string goodbye_message_;
     std::atomic<bool> closed_{false};
     std::atomic<bool> got_client_hello_{false};
     std::atomic<bool> got_goodbye_{false};
@@ -611,10 +611,30 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
     EXPECT_FALSE(mute_b.closed());
 }
 
-// An established peer whose socket goes silent (no close frame, no time responses) must be
-// detected and dropped: the liveness timeout treats inbound silence as loss (issue #119). The
-// burst settings are tightened so client/time goes out within the window, proving the drop is
-// not a nursery reap: the connection is admitted (is_connected) and answered nothing afterwards.
+// The derived liveness timeout tracks the configured burst settings, not their defaults.
+TEST(LivenessTimeout, DerivedFromConfiguredBurstSettings) {
+    SendspinClientConfig config;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 60000);
+
+    config.time_burst_interval_ms = 60000;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 210000);
+
+    config.time_burst_interval_ms = 10000;
+    config.time_burst_response_timeout_ms = 20000;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 90000);
+}
+
+TEST(LivenessTimeout, ExplicitValueUsedAsGiven) {
+    SendspinClientConfig config;
+    config.time_burst_interval_ms = 60000;
+    config.liveness_timeout_ms = 5000;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 5000);
+    config.liveness_timeout_ms = 0;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 0);
+}
+
+// An established peer that stops answering without closing is dropped with a restart goodbye.
+// Waiting for client/time proves the peer was admitted, so the drop is not a nursery reap.
 TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
     TestNetworkProvider network;
     SendspinClientConfig config = make_config(LIVENESS_TEST_PORT);
@@ -633,11 +653,12 @@ TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
     pump_until(client, [&] { return !client.is_connected(); });
     pump_until(client, [&] { return silent.closed(); });
     EXPECT_TRUE(silent.got_goodbye());
+    EXPECT_NE(silent.goodbye_message().find(R"("reason":"restart")"), std::string::npos)
+        << "goodbye: " << silent.goodbye_message();
     EXPECT_FALSE(client.get_server_information().has_value());
 }
 
-// Control for the test above: a peer that answers time messages produces inbound traffic inside
-// every liveness window and must stay current well past the timeout.
+// Control for the test above: a peer that answers time messages stays current past the timeout.
 TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
     TestNetworkProvider network;
     SendspinClientConfig config = make_config(LIVENESS_CONTROL_PORT);
@@ -653,8 +674,7 @@ TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
     pump_until(client, [&] { return client.is_connected(); });
     pump_until(client, [&] { return live.got_client_time(); });
 
-    // Several liveness windows: a false drop here is the regression.
-    pump_for(client, 1200);
+    pump_for(client, 1200);  // Four liveness windows
     EXPECT_TRUE(client.is_connected());
     EXPECT_FALSE(live.closed());
     EXPECT_FALSE(live.got_goodbye());
