@@ -66,12 +66,14 @@ static constexpr int64_t LIVENESS_TOLERATED_MISSES = 2;
 /// @return Timeout in milliseconds; 0 or negative disables the check.
 int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config);
 
-/// @brief Bound (milliseconds) on waiting for stop()'s goodbyes to be sent before the transports
-/// are torn down
+/// @brief Bound (milliseconds, per goodbye) on waiting for stop()'s goodbyes to be sent before
+/// the transports are torn down
 ///
-/// The host transports send synchronously, so on host the wait resolves before it starts. On the
-/// ESP server path the goodbye is queued to the httpd worker, and this is a few scheduler quanta
-/// for the worker to dequeue the frame and hand it to lwIP. Send completion is best-effort (see
+/// stop() waits this long times the number of goodbyes it issued: on the ESP server path every
+/// goodbye is queued to the single httpd worker and handed to lwIP in turn, so a fixed bound
+/// would let the last of several peers lose its goodbye to the close. Per goodbye this is a few
+/// scheduler quanta for the worker to dequeue the frame. The host transports send synchronously,
+/// so on host the wait resolves before it starts. Send completion is best-effort (see
 /// SendspinConnection::send_text_message): a session that closes first never reports, so this is
 /// a cap on how long stop() blocks for its peers' sake, never a guarantee the goodbye arrived.
 static constexpr uint32_t GOODBYE_FLUSH_TIMEOUT_MS = 50;
@@ -207,13 +209,14 @@ public:
 
     /// @brief Opens admission and creates the WebSocket server on first use
     ///
-    /// Server configuration is read from the client's config. loop() starts the server once the
-    /// network provider reports ready. Main-loop thread only.
+    /// Server configuration is read from the client's config and applied on every call, so a
+    /// restart picks up the current values. loop() starts the server once the network provider
+    /// reports ready. Main-loop thread only.
     void start();
 
     /// @brief Synchronous teardown: goodbyes every managed connection, waits up to
-    /// GOODBYE_FLUSH_TIMEOUT_MS for the sends to complete, then stops the WebSocket server and
-    /// releases every connection regardless
+    /// GOODBYE_FLUSH_TIMEOUT_MS per goodbye for the sends to complete, then stops the WebSocket
+    /// server and releases every connection regardless
     ///
     /// Closes admission first, so a peer delivered during the wait is rejected with a goodbye.
     /// Blocks on the transports' own teardown as well as the flush bound: the host server joins
@@ -312,6 +315,15 @@ private:
     /// Caller must hold conn_mutex_.
     /// @param conn The freshly connected connection to defer to loop().
     void queue_pending_connected(std::shared_ptr<SendspinConnection> conn);
+
+    /// @brief Moves both pending lifecycle event queues out under conn_mutex_ and clears
+    /// has_pending_events_ in the same critical section. Caller must NOT hold conn_mutex_ and
+    /// must let the returned connections release outside every lock (a connection destructor
+    /// can join its transport thread).
+    /// @param connected Receives pending_connected_events_.
+    /// @param disconnects Receives pending_disconnect_events_.
+    void take_pending_events(std::vector<std::shared_ptr<SendspinConnection>>& connected,
+                             std::vector<std::shared_ptr<SendspinConnection>>& disconnects);
 
     /// @brief Appends a connection to pending_disconnect_events_ and sets has_pending_events_ in
     /// the same critical section, so loop()'s lock-free gate can never miss a pushed event.
