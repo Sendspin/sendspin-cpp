@@ -15,7 +15,9 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `ArtworkRole` (`artwork_role.h`): receives album artwork images
 - `VisualizerRole` (`visualizer_role.h`): receives spectrum/beat visualization data
 - `ColorRole` (`color_role.h`): receives audio-derived RGB color palette from the server
+- `SourceRole` (`source_role.h`): audio capture role, owns `SourceTask`, accepts captured audio via `write_audio()` and streams it to the server
 - `SyncTask` (`sync_task.h`): decodes encoded audio, synchronizes to server timestamps, writes PCM via audio write callback
+- `SourceTask` (`source_task.h`): assembles captured audio into timestamped chunks, encodes them via `SourceEncoder` (PCM passthrough or Opus), and sends them on the stream's bound connection
 - `SendspinConnection` (`connection.h`): abstract WebSocket connection base
 - `SendspinServerConnection` / `SendspinClientConnection`: platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
 - `Inbox` / `InboxSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle/time events
@@ -25,9 +27,9 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 
 ### Role composition
 
-Roles are added to the client at runtime via `add_player()`, `add_metadata()`, etc. Each role receives a `SendspinClient*` at construction time and uses it to access shared services (time sync, state publishing, message sending). The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers.
+Roles are added to the client at runtime via `add_player()`, `add_source()`, `add_metadata()`, etc. Each role receives a `SendspinClient*` at construction time and uses it to access shared services (time sync, state publishing, message sending). The consumer provides behavior by implementing listener interfaces (`PlayerRoleListener`, `MetadataRoleListener`, etc.) and setting them via `set_listener()`. Required callbacks are pure virtual; optional callbacks have default no-op implementations. The client dispatches messages to roles via null-pointer checks on role pointers.
 
-Roles can be disabled at compile time via `SENDSPIN_ENABLE_*` cmake options (host build) or Kconfig entries (ESP-IDF build). When a role is disabled, its source files are not compiled and its `add_*()` declaration, accessor, and `unique_ptr` member are removed from `client.h`. `#ifdef` guards live in exactly two places in the library: `cmake/sources.cmake` (source lists) and `include/sendspin/client.h` / `src/client.cpp` (dispatch points); examples guard their own role usage like any consumer. Audio codec dependencies (micro-flac, micro-opus) are only linked when the player role is enabled.
+Roles can be disabled at compile time via `SENDSPIN_ENABLE_*` cmake options (host build) or Kconfig entries (ESP-IDF build). When a role is disabled, its source files are not compiled and its `add_*()` declaration, accessor, and `unique_ptr` member are removed from `client.h`. `#ifdef` guards live in exactly two places in the library: `cmake/sources.cmake` (source lists) and `include/sendspin/client.h` / `src/client.cpp` (dispatch points); examples guard their own role usage like any consumer (a single-role example may instead gate its whole target in CMake). Audio codec dependencies follow the roles that use them: micro-flac is linked only when the player role is enabled; micro-opus is linked when the player or source role is enabled.
 
 The consuming platform (e.g., ESPHome) supplies the listener implementations plus `SendspinNetworkProvider` and the optional `SendspinPersistenceProvider`/`SendspinClientListener` providers; `docs/integration-guide.md` has the full wiring, including a minimal working example.
 
@@ -43,6 +45,7 @@ cmake/                      - CMake modules (sources.cmake, host.cmake)
 examples/common/            - Shared PortAudio audio sink used by host examples
 examples/basic_client/      - Standalone host example with PortAudio audio output
 examples/tui_client/        - Terminal UI host example with PortAudio audio output
+examples/source_client/     - Host example streaming PortAudio input capture as a source
 tests/                      - Host unit tests (GoogleTest)
 docs/                       - integration-guide.md (consumer guide), internals.md (how the current code works), conventions.md (normative design standards)
 .claude/skills/             - Review checklists applying the standards to a diff (docs-sync, embedded-review, house-patterns, test-standards)
@@ -50,7 +53,7 @@ docs/                       - integration-guide.md (consumer guide), internals.m
 
 ### Header visibility
 
-- **Public** (`include/sendspin/`): `client.h`, `config.h`, `types.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`, `color_role.h`). These are the consumer-facing API. `config.h` contains all configuration structs (`SendspinClientConfig` and role configs). Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles.
+- **Public** (`include/sendspin/`): `client.h`, `config.h`, `types.h`, and role headers (`player_role.h`, `controller_role.h`, `metadata_role.h`, `artwork_role.h`, `visualizer_role.h`, `color_role.h`, `source_role.h`). These are the consumer-facing API. `config.h` contains all configuration structs (`SendspinClientConfig` and role configs). Each role header defines its own protocol types (enums, structs, conversion functions). `types.h` contains shared types used across the client and roles.
 - **Private** (`src/`): All internal headers (decoder, sync_task, time_filter, ring buffers, protocol_messages, etc.). Not exposed to consumers. `protocol_messages.h` contains message envelope structs, internal protocol enums, and protocol function declarations.
 - **Platform-specific** (`src/esp/`, `src/host/`): Networking headers with the same names (`client_connection.h`, `server_connection.h`, `ws_server.h`) but different implementations per platform.
 
