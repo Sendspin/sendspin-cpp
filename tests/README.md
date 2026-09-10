@@ -59,6 +59,6 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 
 These are white-box tests: they include private headers from `src/`, so the test target adds
 `src/` to its include path. To add a new test file, create `test_<unit>.cpp` here and add it to
-the `add_executable(sendspin_tests ...)` list in `tests/CMakeLists.txt`. The standards new tests
-are held to are in `docs/conventions.md` ("Testing"); the `test-standards` skill in
+the `add_executable(sendspin_tests ...)` list in `tests/CMakeLists.txt`. New tests are held to
+the standards in `docs/conventions.md` ("Testing"); the `test-standards` skill in
 `.claude/skills/` applies them to a diff.
