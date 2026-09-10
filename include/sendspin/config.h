@@ -107,7 +107,7 @@ struct SendspinClientConfig {
 // Player config types
 // ============================================================================
 
-/// @brief Audio codec format for a player stream
+/// @brief Audio codec format for an audio stream (player playback or source capture)
 enum class SendspinCodecFormat : uint8_t {
     FLAC,         // FLAC lossless audio
     OPUS,         // Opus compressed audio
@@ -264,6 +264,76 @@ struct VisualizerRoleConfig {
     VisualizerSupportObject support;
     bool psram_stack{false};  ///< Allocate drain thread stack in PSRAM (ESP-IDF only)
     unsigned priority{2};     ///< FreeRTOS priority for the drain thread (ESP-IDF only)
+};
+
+// ============================================================================
+// Source config types
+// ============================================================================
+
+/// @brief Configuration for the source role (audio capture streamed to the server)
+///
+/// The configured format is the contract for every stream the role opens: there is no
+/// negotiation, and write_audio() bytes are forwarded untouched. An invalid config leaves the
+/// role added but inert (logged at ERROR; the role is not advertised and never streams) --
+/// spec-invalid values are rejected, never clamped or repaired.
+struct SourceRoleConfig {
+    /// @brief Chunk duration bounds from the Sendspin spec (Source messages): chunks MUST be
+    /// at most 150 ms and SHOULD be at least 5 ms
+    static constexpr uint32_t CHUNK_MIN_MS = 5U;
+    static constexpr uint32_t CHUNK_MAX_MS = 150U;
+
+    /// @brief Default duration (ms) of one outbound audio chunk. Small enough to keep the
+    /// capture-to-server latency and per-chunk staging buffer modest, large enough that the
+    /// per-chunk framing/send overhead stays negligible; well inside the spec bounds above,
+    /// and a legal Opus frame duration so switching codec alone never invalidates a default
+    /// config
+    static constexpr uint32_t DEFAULT_CHUNK_MS = 20U;
+
+    /// @brief Default capture ring capacity in milliseconds. Derived from the spec's maximum
+    /// chunk duration: the ring IS the "small bound" of the spec's stall policy (Source
+    /// messages) -- backlog beyond it is dropped at write_audio() and streaming resumes from
+    /// live capture rather than bursting stale audio
+    static constexpr uint32_t DEFAULT_CAPTURE_BUFFER_MS = CHUNK_MAX_MS;
+
+    /// @brief Default FreeRTOS priority for the source task (ESP-IDF only). Below the HTTP
+    /// server task (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY = 5) and the sync/decode task
+    /// (6) so outbound capture can never starve inbound playback, above the artwork/visualizer
+    /// drain threads (2)
+    static constexpr unsigned DEFAULT_SOURCE_TASK_PRIORITY = 3U;
+
+    /// @brief Default capture sample rate (Hz): the native rate of most capture hardware
+    static constexpr uint32_t DEFAULT_SOURCE_SAMPLE_RATE = 48000U;
+
+    // 32-bit fields
+    uint32_t sample_rate{DEFAULT_SOURCE_SAMPLE_RATE};  ///< Capture sample rate in Hz; must be > 0
+
+    /// @brief Outbound chunk duration in milliseconds, validated against the spec bounds
+    /// [CHUNK_MIN_MS, CHUNK_MAX_MS]
+    uint32_t chunk_duration_ms{DEFAULT_CHUNK_MS};
+
+    /// @brief Capture ring capacity in milliseconds of audio in the configured format (the
+    /// byte size is computed from sample_rate, channels, and bit_depth). See
+    /// DEFAULT_CAPTURE_BUFFER_MS for why this doubles as the stall-policy backlog bound.
+    /// Approximate: per-write ring metadata comes out of a fixed +25% margin, so many very
+    /// small write_audio() calls reduce the effective audio capacity below this figure
+    uint32_t capture_buffer_ms{DEFAULT_CAPTURE_BUFFER_MS};
+
+    unsigned priority{DEFAULT_SOURCE_TASK_PRIORITY};  ///< FreeRTOS priority for the source
+                                                      ///< task (ESP-IDF only)
+
+    /// @brief Memory placement for the capture ring and chunk staging buffer (ESP-IDF only;
+    /// ignored on host). Bulk audio with sequential access, so PREFER_EXTERNAL (SPIRAM) --
+    /// mirrors the player decode buffer's choice
+    MemoryLocation buffer_location{MemoryLocation::PREFER_EXTERNAL};
+
+    // 8-bit fields
+    /// @brief Outbound codec. Only PCM is accepted; an OPUS config is rejected as inert until
+    /// Opus encoding lands
+    SendspinCodecFormat codec{SendspinCodecFormat::PCM};
+    uint8_t channels{2};      ///< Capture channel count; must be > 0
+    uint8_t bit_depth{16};    ///< Bits per sample; 16, 24 (3 packed bytes), or 32
+    bool line_sense{false};   ///< Advertise line-input signal sensing (see SourceRole::set_signal)
+    bool psram_stack{false};  ///< Allocate source task stack in PSRAM (ESP-IDF only)
 };
 
 }  // namespace sendspin

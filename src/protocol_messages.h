@@ -23,6 +23,7 @@
 #include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
+#include "sendspin/source_role.h"
 #include "sendspin/types.h"
 #include "sendspin/visualizer_role.h"
 #include <ArduinoJson.h>
@@ -653,12 +654,6 @@ inline std::optional<SourceCommand> source_command_from_string(const std::string
     }
     return std::nullopt;
 }
-
-/// @brief Line-input signal state reported by the source role in client/state messages
-enum class SourceSignal : uint8_t {
-    PRESENT,  // Audio signal detected on the capture input
-    ABSENT,   // No audio signal on the capture input
-};
 
 inline const char* to_cstr(SourceSignal signal) {
     switch (signal) {

@@ -47,6 +47,9 @@ class MetadataRole;
 #ifdef SENDSPIN_ENABLE_PLAYER
 class PlayerRole;
 #endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+class SourceRole;
+#endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
 class VisualizerRole;
 #endif
@@ -258,6 +261,11 @@ public:
     VisualizerRole& add_visualizer(VisualizerRoleConfig config);
 #endif
 
+#ifdef SENDSPIN_ENABLE_SOURCE
+    /// @brief Adds the source role. Returns a reference for setting callbacks
+    SourceRole& add_source(SourceRoleConfig config);
+#endif
+
     // ========================================
     // Role access (nullptr if not added)
     // ========================================
@@ -320,6 +328,18 @@ public:
     /// @return Const pointer to the player role, or nullptr
     const PlayerRole* player() const {
         return this->player_.get();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    /// @brief Returns the source role, or nullptr if not added
+    /// @return Pointer to the source role, or nullptr
+    SourceRole* source() {
+        return this->source_.get();
+    }
+    /// @brief Returns the source role (const), or nullptr if not added
+    /// @return Const pointer to the source role, or nullptr
+    const SourceRole* source() const {
+        return this->source_.get();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
@@ -490,6 +510,9 @@ private:
     SendspinPersistenceProvider* persistence_provider_{nullptr};
 #ifdef SENDSPIN_ENABLE_PLAYER
     std::unique_ptr<PlayerRole> player_;
+#endif
+#ifdef SENDSPIN_ENABLE_SOURCE
+    std::unique_ptr<SourceRole> source_;
 #endif
     std::unique_ptr<SendspinTimeBurst> time_burst_;
 #ifdef SENDSPIN_ENABLE_VISUALIZER
