@@ -9,7 +9,7 @@ static library and run on macOS/Linux with [GoogleTest](https://github.com/googl
 From the repository root:
 
 ```bash
-cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON .
+cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DBUILD_EXAMPLES=OFF .
 cmake --build build-tests --target sendspin_tests
 ctest --test-dir build-tests --output-on-failure
 ```
@@ -27,7 +27,7 @@ is what CI runs, and it is the recommended way to exercise the pointer-heavy cod
 formatter, JSON parsing):
 
 ```bash
-cmake -B build-tests-asan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON .
+cmake -B build-tests-asan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .
 cmake --build build-tests-asan --target sendspin_tests
 ctest --test-dir build-tests-asan --output-on-failure
 ```
@@ -39,7 +39,7 @@ flag applies to every target, including the fetched dependencies, because TSan c
 in uninstrumented code and reports IXWebSocket's stop flags as false races otherwise:
 
 ```bash
-cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON .
+cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .
 cmake --build build-tsan --target sendspin_tests
 TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure
 ```
