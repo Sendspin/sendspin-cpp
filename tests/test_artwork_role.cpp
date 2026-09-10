@@ -47,7 +47,8 @@ void put_be64(std::vector<uint8_t>& out, int64_t val) {
 constexpr auto NEGATIVE_WINDOW = std::chrono::milliseconds(300);
 
 // Records every callback fired by an ArtworkRole::Impl under test, guarded by its own mutex so
-// the test thread can safely poll state produced on the decode thread and the main thread. If
+// the test thread can safely poll state produced on the decode thread and the main thread.
+// Every test declares it before the Impl so it outlives the drain thread, which ~Impl joins. If
 // frame_done_on_display is set, on_image_display() immediately (and reentrantly) calls
 // frame_done() on the Impl this listener was bound to, exercising the reentrant-ack path.
 class RecordingListener : public ArtworkRoleListener {
@@ -283,8 +284,8 @@ void wait_slot_state(ArtworkRole::Impl& impl, Pred pred) {
 // ============================================================================
 
 TEST(ArtworkFrameDoneGate, DefaultUngatedUnchanged) {
-    auto impl = make_impl(make_single_slot_config(false));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -303,8 +304,8 @@ TEST(ArtworkFrameDoneGate, DefaultUngatedUnchanged) {
 // ============================================================================
 
 TEST(ArtworkFrameDoneGate, GateHoldsSecondFrame) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -323,8 +324,8 @@ TEST(ArtworkFrameDoneGate, GateHoldsSecondFrame) {
 }
 
 TEST(ArtworkFrameDoneGate, GateHoldsThroughDisplay) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -345,8 +346,8 @@ TEST(ArtworkFrameDoneGate, GateHoldsThroughDisplay) {
 }
 
 TEST(ArtworkFrameDoneGate, SupersedeKeepsNewestParked) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -377,8 +378,8 @@ TEST(ArtworkFrameDoneGate, SupersedeKeepsNewestParked) {
 // ============================================================================
 
 TEST(ArtworkFrameDoneGate, ClearIsADeliveryAndDropsParked) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -411,8 +412,8 @@ TEST(ArtworkFrameDoneGate, ClearIsADeliveryAndDropsParked) {
 }
 
 TEST(ArtworkFrameDoneGate, ClearGateHoldsNextStreamFirstFrame) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -441,8 +442,8 @@ TEST(ArtworkFrameDoneGate, ClearGateHoldsNextStreamFirstFrame) {
 // ============================================================================
 
 TEST(ArtworkChannelClear, EmptyPayloadFiresClearWithoutDecoding) {
-    auto impl = make_impl(make_single_slot_config(false));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -460,8 +461,8 @@ TEST(ArtworkChannelClear, EmptyPayloadFiresClearWithoutDecoding) {
 }
 
 TEST(ArtworkChannelClear, ClearAfterDisplayedFrameFiresAgain) {
-    auto impl = make_impl(make_single_slot_config(false));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -483,8 +484,8 @@ TEST(ArtworkChannelClear, ClearAfterDisplayedFrameFiresAgain) {
 }
 
 TEST(ArtworkChannelClear, ClearOnlyAffectsItsOwnSlot) {
-    auto impl = make_impl(make_two_slot_config());
     RecordingListener listener;
+    auto impl = make_impl(make_two_slot_config());
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -504,8 +505,8 @@ TEST(ArtworkChannelClear, ClearOnlyAffectsItsOwnSlot) {
 }
 
 TEST(ArtworkChannelClear, GatedClearParksBehindUnackedFrame) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -531,8 +532,8 @@ TEST(ArtworkChannelClear, GatedClearParksBehindUnackedFrame) {
 }
 
 TEST(ArtworkChannelClear, GatedClearOwesExactlyOneAck) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -553,8 +554,8 @@ TEST(ArtworkChannelClear, GatedClearOwesExactlyOneAck) {
 }
 
 TEST(ArtworkChannelClear, GatedClearSupersedesParkedClear) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -582,8 +583,8 @@ TEST(ArtworkChannelClear, GatedClearSupersedesParkedClear) {
 }
 
 TEST(ArtworkChannelClear, StreamEndOnTopOfUnackedChannelClearFiresAgain) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -610,8 +611,8 @@ TEST(ArtworkChannelClear, StreamEndOnTopOfUnackedChannelClearFiresAgain) {
 }
 
 TEST(ArtworkChannelClear, ClearIgnoredWithoutActiveStream) {
-    auto impl = make_impl(make_single_slot_config(false));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
 
@@ -630,8 +631,8 @@ TEST(ArtworkChannelClear, ClearIgnoredWithoutActiveStream) {
 // ============================================================================
 
 TEST(ArtworkFrameDoneGate, FrameDoneNoOpWhenIdle) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -650,8 +651,8 @@ TEST(ArtworkFrameDoneGate, FrameDoneNoOpWhenIdle) {
 // ============================================================================
 
 TEST(ArtworkFrameDoneGate, RestartReleasesUndisplayedDecode) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -676,8 +677,8 @@ TEST(ArtworkFrameDoneGate, RestartReleasesUndisplayedDecode) {
 }
 
 TEST(ArtworkFrameDoneGate, RestartKeepsPresentedGate) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -702,8 +703,8 @@ TEST(ArtworkFrameDoneGate, RestartKeepsPresentedGate) {
 // ============================================================================
 
 TEST(ArtworkFrameDoneGate, FrameDoneReentrantFromDisplay) {
-    auto impl = make_impl(make_single_slot_config(true));
     RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
     listener.frame_done_on_display = true;
     listener.impl = impl.get();
     impl->listener = &listener;
@@ -729,8 +730,8 @@ TEST(ArtworkFrameDoneGate, FrameDoneReentrantFromDisplay) {
 // ============================================================================
 
 TEST(ArtworkFrameDoneGate, UngatedSlotUnaffectedBesideGatedSlot) {
-    auto impl = make_impl(make_two_slot_config());
     RecordingListener listener;
+    auto impl = make_impl(make_two_slot_config());
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
