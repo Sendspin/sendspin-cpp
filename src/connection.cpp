@@ -89,7 +89,8 @@ void SendspinConnection::commit_receive_buffer(size_t data_len) {
 }
 
 SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t receive_time) {
-    // Any complete frame proves the peer is alive, even one that is not dispatched below.
+    // Any complete data message proves the peer is alive, including an empty one or one that
+    // arrives while dispatch is disabled.
     this->last_receive_time_us_.store(receive_time, std::memory_order_relaxed);
 
     if (!this->websocket_payload_) {
