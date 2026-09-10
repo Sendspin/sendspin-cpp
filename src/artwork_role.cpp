@@ -29,27 +29,11 @@ static const char* const TAG = "sendspin.artwork";
 // Constants
 // ============================================================================
 
-/// @brief Size of the big-endian 64-bit timestamp at the start of artwork binary messages
-static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
-
 /// @brief Timeout for blocking queue receive in decode thread (allows periodic command checks)
 static constexpr uint32_t DRAIN_RECEIVE_TIMEOUT_MS = 100U;
 
 // Event flag bits for decode thread signaling
 static constexpr uint32_t COMMAND_STOP = (1 << 0);
-
-// ============================================================================
-// Big-endian helpers
-// ============================================================================
-
-/// @brief Swaps bytes of a big-endian 64-bit value to host byte order
-static int64_t be64_to_host(const uint8_t* bytes) {
-    uint64_t val = 0;
-    for (int i = 0; i < 8; ++i) {
-        val = (val << 8) | bytes[i];
-    }
-    return static_cast<int64_t>(val);
-}
 
 namespace sendspin {
 
