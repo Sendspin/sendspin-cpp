@@ -54,6 +54,11 @@ static constexpr uint32_t SOURCE_OPEN_RETRY_MS = 500U;
 /// callback times out here and the open is retried rather than the task wedging
 static constexpr uint32_t START_CONFIRM_TIMEOUT_MS = 2000U;
 
+/// @brief Bound (ms) on waiting for a binary chunk send's completion. Generous next to any
+/// healthy send; a timeout means the transport accepted the work but never confirmed it (an
+/// ESP httpd_queue_work silent drop), so the chunk is dropped rather than hanging the task
+static constexpr uint32_t SEND_CONFIRM_TIMEOUT_MS = 2000U;
+
 /// @brief Ring metadata margin: +1/4 over audio capacity for per-write entry headers, the
 /// inverse of the player's 1/5 advertise fraction (AUDIO_BUFFER_ADVERTISE_DENOMINATOR)
 static constexpr size_t CAPTURE_RING_OVERHEAD_DENOMINATOR = 4U;
@@ -436,14 +441,29 @@ bool SourceTask::send_chunk(const std::shared_ptr<SendspinConnection>& conn) {
     staging[0] = SENDSPIN_BINARY_SOURCE_AUDIO;
     host_to_be64(server_ts, staging + 1);
 
+    // Clear before sending so a stale completion left over from a prior send's timeout cannot
+    // satisfy this wait.
+    this->event_flags_.clear(SourceTaskBits::SOURCE_SEND_COMPLETE);
     const SsErr err = conn->send_binary_message(staging, SOURCE_WIRE_HEADER_SIZE + payload_len,
                                                 this->send_complete_cb_);
+    if (err != SsErr::OK) {
+        return false;  // Slot busy or send refused; the completion callback already fired inline
+    }
 
-    // Consume the completion unconditionally: the callback fires exactly once for EVERY call
-    // (connection.h contract), so skipping the wait on an error would leave a stale bit pacing
-    // the next send, and waiting every send out is what makes staging reuse and teardown safe
-    this->event_flags_.wait(SourceTaskBits::SOURCE_SEND_COMPLETE, false, true, UINT32_MAX);
-    return err == SsErr::OK && this->last_send_ok_.load(std::memory_order_acquire);
+    // Wait for the completion, bounded: the callback is exactly-once by contract, but a queued
+    // ESP-server work item that httpd_queue_work accepted yet silently dropped (a full control
+    // mailbox reports ESP_OK) would never fire it, hanging the task on an unbounded wait. On
+    // timeout, treat the chunk as failed WITHOUT releasing the slot: the reuse-after-timeout
+    // hazard the slot guards against still applies, so the connection simply degrades to
+    // NOT_FINISHED until its teardown releases the slot and a reconnect re-arms it.
+    const uint32_t bits = this->event_flags_.wait(SourceTaskBits::SOURCE_SEND_COMPLETE, false, true,
+                                                  SEND_CONFIRM_TIMEOUT_MS);
+    if ((bits & SourceTaskBits::SOURCE_SEND_COMPLETE) == 0U) {
+        SS_LOGW(TAG, "Source chunk send not confirmed within %u ms; dropping to live capture",
+                SEND_CONFIRM_TIMEOUT_MS);
+        return false;
+    }
+    return this->last_send_ok_.load(std::memory_order_acquire);
 }
 
 size_t SourceTask::flush_ring_to_live() {
