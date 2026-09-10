@@ -213,32 +213,32 @@ public:
 
     /// @brief Stops the client and returns only once it is fully stopped
     ///
-    /// Sends a client/goodbye (reason shutdown) to every peer, waits up to a short bound for
-    /// those sends to complete, then closes the server and every connection regardless, joins
-    /// the role threads, resets every role, and delivers the roles' clear callbacks
-    /// (on_stream_end(), on_image_clear(), on_metadata_clear(), ...) before returning. No-op
-    /// when stopped. Calling start() afterwards restarts the client; start, stop, and start
-    /// again can be repeated indefinitely.
+    /// Sends a client/goodbye (reason shutdown) to every peer, waits a short bound for those
+    /// sends to complete, then closes the server and every connection regardless, joins the role
+    /// threads, resets every role, and delivers the roles' clear callbacks (on_stream_end(),
+    /// on_image_clear(), on_metadata_clear(), ...) before returning. No-op when stopped. Calling
+    /// start() afterwards restarts the client; start, stop, and start again can be repeated
+    /// indefinitely.
     ///
-    /// Blocking is bounded, but not by the goodbye bound alone. It also includes: the
-    /// transports' own close (the host server waits up to 300 ms per connection for the close
-    /// handshake; the ESP server waits for the httpd task to exit, which polls at 100 ms and
-    /// first finishes any queued send, up to its send timeout for a peer that stops reading); an
-    /// outbound connect_to() transport's synchronous stop; and any listener callback already
-    /// running on a role thread, which the join cannot interrupt (on_audio_write() is bounded by
-    /// its timeout_ms, on_image_decode() is not).
+    /// Blocking is bounded by the goodbye wait, the transports' own close, and any listener
+    /// callback already running on a role thread, which the join cannot interrupt. The
+    /// per-transport bounds are described in docs/integration-guide.md (Stopping and
+    /// Restarting).
     ///
-    /// Listener callbacks fire from inside this call. One that calls start() has no effect and
-    /// returns false; one that calls stop() or connect_to() is ignored. Main-loop thread only:
-    /// calling it from a role-thread callback would join the calling thread.
+    /// Listener callbacks fire from inside this call, after every role has been reset, so the
+    /// state they observe through the getters is the stopped state. One that calls start() has
+    /// no effect and returns false; one that calls stop(), connect_to(), or disconnect() is
+    /// ignored. Main-loop thread only: calling it from a role-thread callback would join the
+    /// calling thread.
     void stop();
 
     /// @brief Returns true between a successful start() and stop()
     ///
     /// Running means the role threads are up and the server is armed, not that the server is
-    /// listening yet (that waits for the network provider).
+    /// listening yet (that waits for the network provider). Reads false for the whole duration
+    /// of stop(), including from the clear callbacks it fires. Safe to call from any thread.
     bool is_started() const {
-        return this->started_;
+        return this->lifecycle_.load(std::memory_order_acquire) == LifecycleState::RUNNING;
     }
 
     /// @brief Starts the client
@@ -251,15 +251,16 @@ public:
 
     /// @brief Initiates a client connection to a Sendspin server at the given URL
     ///
-    /// Ignored (with a warning) while the client is not started. Must be called from the main
-    /// loop thread: it tears down and replaces connection state (time filter, dispatch, client
-    /// state) directly rather than deferring to loop(), so calling it concurrently with loop()
-    /// would race those mutations.
+    /// Ignored (with a warning) unless the client is running, including from a callback fired
+    /// inside stop(). Must be called from the main loop thread: it tears down and replaces
+    /// connection state (time filter, dispatch, client state) directly rather than deferring to
+    /// loop(), so calling it concurrently with loop() would race those mutations.
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
     /// @brief Disconnects from the current server with the given reason
     ///
+    /// Ignored unless the client is running, including from a callback fired inside stop().
     /// Must be called from the main loop thread: the blocking transport close runs outside the
     /// manager lock, so a call from another thread could race loop()'s own release of the same
     /// connection (two concurrent transport stops).
@@ -451,6 +452,11 @@ public:
     void acquire_high_performance();
 
     /// @brief Releases a ref-counted high-performance networking request
+    ///
+    /// The listener's on_release_high_performance() is not called inline: the last release can
+    /// run inside ConnectionManager::drop_connection(), which holds conn_ptr_mutex_, and a
+    /// listener that reacts by calling disconnect() or connect_to() would re-lock it on the same
+    /// thread. The release is recorded and delivered on the next drain with no lock held.
     void release_high_performance();
 
 private:
@@ -460,6 +466,15 @@ private:
     /// @brief Drains the inbox: lifecycle events, role slots, and group updates, dispatching
     /// listener callbacks on the calling (main-loop) thread. Shared by loop() and stop().
     void drain_inbox();
+
+    /// @brief Delivers a high-performance release the counter recorded while a manager lock was
+    /// held (see release_high_performance()). Main-loop thread, no lock held.
+    void deliver_pending_high_performance_release();
+
+    /// @brief Asks the artwork and visualizer threads to exit without joining them, so their
+    /// exit overlaps the transport teardown. The player is excluded: its ring must keep a
+    /// consumer until the network threads are gone (see stop()).
+    void signal_drain_role_stops();
 
     /// @brief Stops and joins every threaded role; each is a no-op if not running
     void stop_role_threads();
@@ -555,11 +570,15 @@ private:
     // 8-bit fields
     bool high_performance_held_for_time_{false};
     std::atomic<uint8_t> high_performance_ref_count_{0};
-    /// True between a successful start() and stop(); see is_started().
-    bool started_{false};
-    /// True for the duration of stop(). Refuses a start() and ignores a stop() issued by a
-    /// listener callback fired from inside the teardown, which would otherwise recurse into it.
-    bool stopping_{false};
+    /// Set when the high-performance count reaches zero; the listener's release callback is
+    /// delivered from the main loop with no manager lock held (see release_high_performance()).
+    std::atomic<bool> high_performance_release_pending_{false};
+    /// Where the client is in its lifecycle. Written only by start()/stop() on the main loop;
+    /// atomic so is_started() can be read from any thread. STOPPING covers the whole of stop():
+    /// start() is refused and stop()/connect_to()/disconnect() are ignored while it is set, so a
+    /// listener callback fired from inside the teardown cannot recurse into it.
+    enum class LifecycleState : uint8_t { STOPPED, RUNNING, STOPPING };
+    std::atomic<LifecycleState> lifecycle_{LifecycleState::STOPPED};
 };
 
 }  // namespace sendspin

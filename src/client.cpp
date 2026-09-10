@@ -79,17 +79,19 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
 }
 
 SendspinClient::~SendspinClient() {
-    // Transport-only teardown: goodbye and close every peer and join every thread, exactly as
-    // stop() does, but deliver no listener callback. A consumer that destroys its listeners
-    // before the client (the natural declaration order when a listener needs a role reference)
-    // is never called into from here.
-    if (this->started_) {
+    // Transport-only teardown: goodbye and close every peer in the same order as stop(), but
+    // deliver no listener callback. A consumer that destroys its listeners before the client
+    // (the natural declaration order when a listener needs a role reference) is never called
+    // into from here. The role threads are joined by the role resets below, whose destructors
+    // run the same stop() the explicit path would.
+    if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
+        this->signal_drain_role_stops();
         this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
-        this->stop_role_threads();
     }
 
-    // Stop background threads before tearing down connections. Every role is reset explicitly
-    // (not just the threaded ones): role InboxSlots release their topic-bit claims against
+    // The network threads are gone (above, or never started), so the role threads are the only
+    // producers left; each role's destructor joins its own. Every role is reset explicitly (not
+    // just the threaded ones): role InboxSlots release their topic-bit claims against
     // event_state_'s Inbox on destruction, so all roles must be gone before the alphabetized
     // member order destroys event_state_.
 #ifdef SENDSPIN_ENABLE_PLAYER
@@ -126,12 +128,14 @@ LogLevel SendspinClient::get_log_level() {
 // ============================================================================
 
 bool SendspinClient::start() {
-    if (this->started_) {
-        return true;
-    }
-    if (this->stopping_) {
-        SS_LOGW(TAG, "start() ignored: called from a callback while stop() is in progress");
-        return false;
+    switch (this->lifecycle_.load(std::memory_order_relaxed)) {
+        case LifecycleState::RUNNING:
+            return true;
+        case LifecycleState::STOPPING:
+            SS_LOGW(TAG, "start() ignored: called from a callback while stop() is in progress");
+            return false;
+        case LifecycleState::STOPPED:
+            break;
     }
 
     // Load persisted state
@@ -163,39 +167,62 @@ bool SendspinClient::start() {
     // Open admission and create the WebSocket server (started by loop() once the network is
     // ready).
     this->connection_manager_->start();
-    this->started_ = true;
+    this->lifecycle_.store(LifecycleState::RUNNING, std::memory_order_release);
     return true;
 }
 
 void SendspinClient::stop() {
-    if (!this->started_ || this->stopping_) {
+    if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::RUNNING) {
         return;
     }
-    this->stopping_ = true;
+    // From here the client reads as stopped: is_started() is false, loop() is a no-op, and
+    // start()/stop()/connect_to()/disconnect() are refused, so a listener callback fired below
+    // cannot recurse into the teardown, restart the server, or admit a connection.
+    this->lifecycle_.store(LifecycleState::STOPPING, std::memory_order_release);
 
-    // 1. Transports first: goodbye every peer, wait up to the flush bound, then close the server
-    //    and every connection. This joins every network thread, so nothing reaches a role or the
-    //    inbox from the network after it returns, and a network thread blocked on ring space
-    //    (write_audio_chunk) resolves while its consumer is still alive.
+    // 1. Ask the artwork and visualizer threads to exit now, so a slow on_image_decode() or a
+    //    parked drain overlaps the transport teardown instead of following it. Their inbound
+    //    channels never block a network thread (a zero-timeout queue send, a bounded ring
+    //    acquire), so they need no consumer while the transports close. The player's ring does:
+    //    a network thread blocked on ring space (write_audio_chunk) resolves only while the sync
+    //    task is alive, so the player is signalled in step 3, after the network threads are gone.
+    this->signal_drain_role_stops();
+
+    // 2. Transports: goodbye every peer, wait up to the flush bound, then close the server and
+    //    every connection. This joins every network thread, so nothing reaches a role or the
+    //    inbox from the network after it returns.
     this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
 
-    // 2. Role threads. Each role discards its ring/queue content after its own join.
+    // 3. Role threads. Each role discards its ring/queue content after its own join.
     this->stop_role_threads();
 
-    // From here the client reads as stopped: loop() is a no-op and connect_to() is refused, so a
-    // listener callback below cannot restart the server or admit a connection.
-    this->started_ = false;
-
-    // 3. Reset per-connection and role state exactly as a lost connection does, then deliver
-    //    the clear callbacks it queued now rather than on a loop() tick that is not coming. With
-    //    every producer thread joined, the state the drain leaves behind is the state a restart
-    //    begins from.
+    // 4. Reset per-connection and role state exactly as a lost connection does. With every
+    //    producer thread joined, the state this leaves behind is the state a restart begins
+    //    from. The group slot is reset here too, so the drain below cannot repopulate
+    //    group_state_ from a delta that arrived before the stop.
     this->cleanup_connection_state();
-    this->drain_inbox();
     this->group_state_ = GroupUpdateObject{};
     this->state_ = SendspinClientState::SYNCHRONIZED;
 
-    this->stopping_ = false;
+    // 5. Deliver the clear callbacks the cleanup queued, now rather than on a loop() tick that is
+    //    not coming. Every getter already reports the stopped state, so a callback that reads
+    //    the client sees exactly what a caller sees once stop() returns.
+    this->drain_inbox();
+
+    this->lifecycle_.store(LifecycleState::STOPPED, std::memory_order_release);
+}
+
+void SendspinClient::signal_drain_role_stops() {
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_) {
+        this->visualizer_->impl_->signal_stop();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    if (this->artwork_) {
+        this->artwork_->impl_->signal_stop();
+    }
+#endif
 }
 
 void SendspinClient::stop_role_threads() {
@@ -217,21 +244,27 @@ void SendspinClient::stop_role_threads() {
 }
 
 void SendspinClient::connect_to(const std::string& url) {
-    if (!this->started_) {
-        SS_LOGW(TAG, "connect_to() ignored: client is not started");
+    if (!this->is_started()) {
+        SS_LOGW(TAG, "connect_to() ignored: client is not running");
         return;
     }
     this->connection_manager_->connect_to(url);
 }
 
 void SendspinClient::disconnect(SendspinGoodbyeReason reason) {
+    // A stopped client has nothing to disconnect, and inside stop() the manager is already
+    // goodbying every peer; a second pass would race the first.
+    if (!this->is_started()) {
+        SS_LOGD(TAG, "disconnect() ignored: client is not running");
+        return;
+    }
     this->connection_manager_->disconnect(reason);
 }
 
 void SendspinClient::loop() {
     // A stopped client is quiescent: no connections, no threads, and the manager loop must not
     // restart the WebSocket server the moment the network reads ready.
-    if (!this->started_) {
+    if (!this->is_started()) {
         return;
     }
 
@@ -261,6 +294,8 @@ void SendspinClient::loop() {
 }
 
 void SendspinClient::drain_inbox() {
+    this->deliver_pending_high_performance_release();
+
     // Process deferred events: all state mutations and user callbacks happen here, on the main
     // loop thread, to avoid cross-thread data races. Two poll() snapshots gate the work below:
     // inbox_bits (here) gates only the event-ring drain immediately following it; slot_bits
@@ -475,7 +510,7 @@ void SendspinClient::drain_inbox() {
 
 #ifdef SENDSPIN_ENABLE_PLAYER
 PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
-    if (this->started_) {
+    if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         SS_LOGW(TAG, "add_player() called while started; role may not initialize correctly");
     }
     this->player_ =
@@ -487,7 +522,7 @@ PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
 
 #ifdef SENDSPIN_ENABLE_CONTROLLER
 ControllerRole& SendspinClient::add_controller() {
-    if (this->started_) {
+    if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         SS_LOGW(TAG, "add_controller() called while started");
     }
     this->controller_ = std::make_unique<ControllerRole>(this);
@@ -498,7 +533,7 @@ ControllerRole& SendspinClient::add_controller() {
 
 #ifdef SENDSPIN_ENABLE_METADATA
 MetadataRole& SendspinClient::add_metadata() {
-    if (this->started_) {
+    if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         SS_LOGW(TAG, "add_metadata() called while started");
     }
     this->metadata_ = std::make_unique<MetadataRole>(this);
@@ -509,7 +544,7 @@ MetadataRole& SendspinClient::add_metadata() {
 
 #ifdef SENDSPIN_ENABLE_COLOR
 ColorRole& SendspinClient::add_color() {
-    if (this->started_) {
+    if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         SS_LOGW(TAG, "add_color() called while started");
     }
     this->color_ = std::make_unique<ColorRole>(this);
@@ -520,7 +555,7 @@ ColorRole& SendspinClient::add_color() {
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
 ArtworkRole& SendspinClient::add_artwork(ArtworkRoleConfig config) {
-    if (this->started_) {
+    if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         SS_LOGW(TAG, "add_artwork() called while started");
     }
     this->artwork_ = std::make_unique<ArtworkRole>(std::move(config), this);
@@ -531,7 +566,7 @@ ArtworkRole& SendspinClient::add_artwork(ArtworkRoleConfig config) {
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
 VisualizerRole& SendspinClient::add_visualizer(VisualizerRoleConfig config) {
-    if (this->started_) {
+    if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         SS_LOGW(TAG, "add_visualizer() called while started");
     }
     this->visualizer_ = std::make_unique<VisualizerRole>(std::move(config), this);
@@ -595,7 +630,15 @@ void SendspinClient::send_text(const std::string& text) {
 }
 
 void SendspinClient::acquire_high_performance() {
-    if (this->high_performance_ref_count_.fetch_add(1) == 0 && this->listener_) {
+    if (this->high_performance_ref_count_.fetch_add(1) != 0) {
+        return;
+    }
+    // A release recorded but not yet delivered is cancelled by this re-acquire: the listener
+    // still holds high performance from its earlier request, so it gets neither callback.
+    if (this->high_performance_release_pending_.exchange(false)) {
+        return;
+    }
+    if (this->listener_) {
         this->listener_->on_request_high_performance();
     }
 }
@@ -606,11 +649,23 @@ void SendspinClient::release_high_performance() {
     uint8_t count = this->high_performance_ref_count_.load();
     while (count != 0) {
         if (this->high_performance_ref_count_.compare_exchange_weak(count, count - 1)) {
-            if (count == 1 && this->listener_) {
-                this->listener_->on_release_high_performance();
+            if (count == 1) {
+                // Recorded, not delivered: this can run under conn_ptr_mutex_ (drop_connection ->
+                // cleanup_connection_state -> here) and the listener may call back into the
+                // manager. drain_inbox() delivers it lock-free on the main loop.
+                this->high_performance_release_pending_.store(true);
             }
             return;
         }
+    }
+}
+
+void SendspinClient::deliver_pending_high_performance_release() {
+    if (!this->high_performance_release_pending_.exchange(false)) {
+        return;
+    }
+    if (this->listener_) {
+        this->listener_->on_release_high_performance();
     }
 }
 

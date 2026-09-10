@@ -546,7 +546,7 @@ client.stop();
 
 ## Stopping and Restarting
 
-`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer, waits up to a short bound (50 ms) for those sends to complete, then closes the server and every connection regardless, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
+`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer, waits up to a short bound (50 ms per peer) for those sends to complete, then closes the server and every connection regardless, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
 
 Restarting is `start()` again; start, stop, and start again can be repeated indefinitely, and a restarted client begins with no connection, no group state, and no role state from before the stop.
 
@@ -556,7 +556,9 @@ Restarting is `start()` again; start, stop, and start again can be repeated inde
 - An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`).
 - A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
 
-Listener callbacks fire from inside `stop()`. One that calls `start()` gets `false` and starts nothing; one that calls `stop()` or `connect_to()` is ignored. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
+Listener callbacks fire from inside `stop()`, after every role and the group state have been reset, so a callback that reads the client through its getters sees the stopped state. One that calls `start()` gets `false` and starts nothing; one that calls `stop()`, `connect_to()`, or `disconnect()` is ignored. `is_started()` reads `false` throughout and is safe to call from any thread. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
+
+`on_release_high_performance()` is delivered from `loop()` (or from inside `stop()`) rather than from wherever the last hold was released, so it is always safe to call `disconnect()` or `connect_to()` from that callback.
 
 Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) but delivers no listener callback, so a consumer that destroys its listeners before the client is never called into. Call `stop()` first when the clear callbacks matter.
 

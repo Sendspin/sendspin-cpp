@@ -456,33 +456,50 @@ When a connection is lost (`on_connection_lost`):
 
 `SendspinClient::start()` loads persisted state, starts the threaded roles (player sync task, visualizer drain, artwork decode; a failure part-way stops the ones that did start), and calls `ConnectionManager::start()`, which opens admission (`accepting_`) and creates the `SendspinWsServer` on first use. The server itself is started by the manager's `loop()` once the network provider reports ready, so `is_started()` means "running", not "listening".
 
-`SendspinClient::stop()` is synchronous and ordered so that every producer is gone before any state is reset:
+`SendspinClient::stop()` is synchronous and ordered so that every producer is gone before any state is reset. The client's lifecycle is one atomic `lifecycle_` field (`STOPPED`, `RUNNING`, `STOPPING`); `is_started()` reads it from any thread.
 
 ```api
-1. ConnectionManager::stop(SHUTDOWN)
+0. lifecycle_ = STOPPING (is_started() reads false; loop() is a no-op; start() is refused and
+   stop()/connect_to()/disconnect() are ignored from here on, so a callback fired below cannot
+   recurse into the teardown)
+1. VisualizerRole/ArtworkRole::Impl::signal_stop(): set COMMAND_STOP and wake, no join, so a
+   slow on_image_decode() or a parked drain exits while the transports close. The player is
+   not signalled yet: a network thread blocked on its ring (write_audio_chunk) needs the sync
+   task alive until the network threads are gone
+2. ConnectionManager::stop(SHUTDOWN)
    ├─ Under conn_ptr_mutex_: accepting_ = false; disable_message_dispatch() on every managed
    │  connection; move the current slot, the nursery, and the deferred releases out; clear the
    │  hello retries
    ├─ Outside the lock: conn->disconnect(SHUTDOWN, completion) on each, completion counted by a
-   │  shared GoodbyeWait; wait up to GOODBYE_FLUSH_TIMEOUT_MS (50 ms) for the count to reach zero
+   │  shared GoodbyeWait; wait up to GOODBYE_FLUSH_TIMEOUT_MS (50 ms) per goodbye for the count
+   │  to reach zero (the ESP httpd worker hands the frames to lwIP one at a time)
    ├─ ws_server_->stop() regardless (host: joins every connection thread, each bounded by
    │  IXWebSocket's 300 ms close handshake; ESP: httpd_stop(), which runs queued sends first,
    │  then every session's close_fn and ctx free_fn, polling at 100 ms)
-   └─ Move the pending connected/disconnect event queues out under conn_mutex_; every moved-out
-      shared_ptr is released outside the locks (an outbound connection's destructor stops its
-      transport synchronously)
-2. Role threads: PlayerRole/VisualizerRole/ArtworkRole::Impl::stop() join, then each discards
+   └─ take_pending_events(): move the pending connected/disconnect event queues out under
+      conn_mutex_; every moved-out shared_ptr is released outside the locks (an outbound
+      connection's destructor stops its transport synchronously)
+3. Role threads: PlayerRole/VisualizerRole/ArtworkRole::Impl::stop() join, then each discards
    its ring/queue content (sole consumer after the join)
-3. started_ = false (loop() is a no-op and connect_to() is refused from here on)
-4. cleanup_connection_state() (the same reset a lost connection triggers), then drain_inbox()
-   delivers the CLEARED / STREAM_END callbacks it queued; group_state_ and state_ are reset
+4. cleanup_connection_state() (the same reset a lost connection triggers, including the group
+   slot), then group_state_ and state_ are reset
+5. drain_inbox() delivers the CLEARED / STREAM_END callbacks step 4 queued. Every getter already
+   reports the stopped state, so a callback that reads the client sees what a caller sees once
+   stop() returns
+6. lifecycle_ = STOPPED
 ```
 
 The goodbye completion is best-effort: on ESP a session that closes before its queued worker runs, or whose `weak_ptr` no longer resolves, never reports, which is why the wait is bounded rather than exact. The `GoodbyeWait` record is held by `shared_ptr` and captured by value in each completion, so a completion that runs late on a transport thread touches nothing `stop()` owns. A peer delivered by the ws_server while admission is closed is rejected in `on_new_connection()` with a shutdown goodbye, the same shape as the nursery-full rejection.
 
-`stopping_` guards re-entrancy: a listener callback fired from inside `stop()` that calls `start()` gets `false`, and one that calls `stop()` returns immediately. The reset in step 4 runs with no manager lock held, so it does not reach the pre-existing lock re-entry in which `drop_connection()` holds `conn_ptr_mutex_` through `cleanup_connection_state()` and a listener's `on_release_high_performance()` calls `disconnect()`.
+`ConnectionManager::start()` re-applies the server port, connection budget, and control port from the client config on every call, so a restart listens with the values the client holds now rather than the ones captured at the first start.
 
-The client destructor performs steps 1 and 2 only, so a consumer that destroyed its listeners first is never called into; the roles' own destructors then run as before.
+Each threaded role's `start()` calls `EventFlags::clear_all()` before creating its thread rather than clearing a hand-listed set of bits: a command signalled between the previous join and the restart (`cleanup()` on a stopped role) would otherwise survive into the new thread's first wait, and a bit added to the role's enum later cannot be forgotten.
+
+The client destructor performs steps 1 and 2 only, so a consumer that destroyed its listeners first is never called into; the roles' own destructors then join their threads as before.
+
+### High-performance release delivery
+
+`release_high_performance()` never calls the listener inline. The last release can run inside `drop_connection()`, which holds `conn_ptr_mutex_` through `cleanup_connection_state()` (both the time-burst hold and the player's playback hold are released there), and a listener whose `on_release_high_performance()` reacts by calling `disconnect()` or `connect_to()` would re-lock the same non-recursive mutex on the same thread. The release is recorded in `high_performance_release_pending_` and delivered at the top of `drain_inbox()`, which every path (`loop()` and `stop()`) runs with no manager lock held. An `acquire_high_performance()` that lands before the delivery cancels it instead of issuing a second request, so the listener always sees request and release strictly alternate.
 
 ### Graceful Disconnect
 
@@ -504,7 +521,7 @@ Queued send workers capture a `weak_ptr<SendspinServerConnection>` to the origin
 
 The send workers also enforce the protocol's "hello is always first" rule: a frame is dropped unless `client_hello_sent_` is set on the resolved connection, *unless* the caller passed `allow_before_hello=true`. Exactly two callers do — the `client/hello` itself (which would otherwise gate its own send and deadlock) and `goodbye` — so a stale or out-of-order frame can never precede the handshake. The `weak_ptr` guards identity; the gate guards ordering; the two are independent.
 
-The host build does not need this scheme: `SendspinWsServer` (host) routes IXWebSocket messages by calling `find_connection_callback_` to resolve a synthetic sockfd back to the connection that `ConnectionManager` is holding. The ESP build keeps the `set_find_connection_callback()` setter as a no-op stub for symmetry; see the comment at the call site in `ConnectionManager::init_server`.
+The host build does not need this scheme: `SendspinWsServer` (host) routes IXWebSocket messages by calling `find_connection_callback_` to resolve a synthetic sockfd back to the connection that `ConnectionManager` is holding. The ESP build keeps the `set_find_connection_callback()` setter as a no-op stub for symmetry; see the comment at the call site in `ConnectionManager::start`.
 
 ## Ordering Guarantees Summary
 
