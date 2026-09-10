@@ -38,6 +38,7 @@ enum class SsErr : int16_t {
     NOT_FOUND = 0x105,      // Resource not found
     NOT_SUPPORTED = 0x106,  // Operation not supported
     TIMEOUT = 0x107,        // Operation timed out
+    NOT_FINISHED = 0x10C,   // Previous operation has not fully completed
 
     // Errors (< 0)
     FAIL = -1,  // Generic failure

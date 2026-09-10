@@ -83,6 +83,26 @@ SsErr SendspinServerConnection::send_text_message(const std::string& message,
     return success ? SsErr::OK : SsErr::FAIL;
 }
 
+SsErr SendspinServerConnection::send_binary_message(const uint8_t* data, size_t len,
+                                                    SendCompleteCallback on_complete) {
+    if (!this->is_connected()) {
+        if (on_complete) {
+            on_complete(false);
+        }
+        return SsErr::INVALID_STATE;
+    }
+
+    // IXWebSocket's API forces a std::string copy of the payload; acceptable on host.
+    auto info = this->ws_->sendBinary(std::string(reinterpret_cast<const char*>(data), len));
+    bool success = info.success;
+
+    if (on_complete) {
+        on_complete(success);
+    }
+
+    return success ? SsErr::OK : SsErr::FAIL;
+}
+
 bool SendspinServerConnection::send_time_message() {
     if (!this->is_connected()) {
         return false;
