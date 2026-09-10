@@ -199,7 +199,7 @@ source.write_audio(pcm_bytes, len, capture_time_us);
 - `capture_time_us`: local-clock capture time of the FIRST sample in the buffer, in the same domain as the client's time functions (`std::chrono::steady_clock` microseconds on host). Pass `0` to stamp with the current time, a best-effort fallback for callers that cannot timestamp their ADC.
 - Returns `true` if the audio was accepted; `false` when the stream is not open or the capture buffer is full (the write is dropped and counted).
 
-`write_audio()` is a non-blocking, non-allocating hot path, safe to call from an audio capture callback. Exactly one producer thread may call it; the library does not serialize concurrent writers.
+`write_audio()` is a non-allocating hot path that never waits on the consumer (the ring uses a zero timeout). On ESP the ring is lock-free, so it is safe directly from an audio capture callback; on host the ring takes a short mutex, so a hard-real-time host callback should hand off through its own lock-free stage rather than call `write_audio()` inline. Exactly one producer thread may call it; the library does not serialize concurrent writers.
 
 If the capture hardware supports line-input signal sensing, set `SourceRoleConfig::line_sense` and report the signal state from the main loop thread; the role publishes it to the server via `client/state`:
 

@@ -32,6 +32,8 @@
 #include "sendspin/player_role.h"
 #include "sendspin/visualizer_role.h"
 #ifdef SENDSPIN_HAS_PORTAUDIO
+#include "cli_util.h"
+#include "mdns_advertiser.h"
 #include "portaudio_sink.h"
 #endif
 
@@ -75,41 +77,8 @@ static size_t null_audio_write(uint8_t*, size_t length, uint32_t) {
     return length;
 }
 
+
 #ifdef SENDSPIN_HAS_MDNS
-// Manages mDNS service advertisement via dns_sd.h
-class MdnsAdvertiser {
-public:
-    ~MdnsAdvertiser() {
-        stop();
-    }
-
-    bool start(const std::string& name, uint16_t port, const std::string& path) {
-        TXTRecordRef txt;
-        TXTRecordCreate(&txt, 0, nullptr);
-        TXTRecordSetValue(&txt, "path", static_cast<uint8_t>(path.size()), path.c_str());
-        TXTRecordSetValue(&txt, "name", static_cast<uint8_t>(name.size()), name.c_str());
-
-        DNSServiceErrorType err =
-            DNSServiceRegister(&service_ref_, 0, 0, name.c_str(), "_sendspin._tcp", nullptr,
-                               nullptr, htons(port), TXTRecordGetLength(&txt),
-                               TXTRecordGetBytesPtr(&txt), nullptr, nullptr);
-
-        TXTRecordDeallocate(&txt);
-
-        return err == kDNSServiceErr_NoError;
-    }
-
-    void stop() {
-        if (service_ref_ != nullptr) {
-            DNSServiceRefDeallocate(service_ref_);
-            service_ref_ = nullptr;
-        }
-    }
-
-private:
-    DNSServiceRef service_ref_{nullptr};
-};
-
 // Manages mDNS service browsing to discover Sendspin servers via dns_sd.h.
 // Runs a background thread that processes DNS-SD events non-blockingly.
 class MdnsBrowser {

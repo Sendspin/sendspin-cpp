@@ -44,6 +44,9 @@
 #include <dns_sd.h>
 #endif
 
+#include "cli_util.h"
+#include "mdns_advertiser.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -72,60 +75,6 @@ static constexpr uint8_t CAPTURE_BIT_DEPTH = 16;
 // overhead (40/60 ms). The PCM path keeps the library's default chunk duration.
 static constexpr uint32_t OPUS_CHUNK_MS = 20;
 
-#ifdef SENDSPIN_HAS_MDNS
-// Manages mDNS service advertisement via dns_sd.h
-class MdnsAdvertiser {
-public:
-    ~MdnsAdvertiser() {
-        stop();
-    }
-
-    bool start(const std::string& name, uint16_t port, const std::string& path) {
-        // Build TXT record with path and name keys
-        TXTRecordRef txt;
-        TXTRecordCreate(&txt, 0, nullptr);
-        TXTRecordSetValue(&txt, "path", static_cast<uint8_t>(path.size()), path.c_str());
-        TXTRecordSetValue(&txt, "name", static_cast<uint8_t>(name.size()), name.c_str());
-
-        DNSServiceErrorType err = DNSServiceRegister(
-            &service_ref_,
-            0,                    // flags
-            0,                    // interface index (0 = all)
-            name.c_str(),         // service name
-            "_sendspin._tcp",     // service type
-            nullptr,              // domain (default)
-            nullptr,              // host (default)
-            htons(port),          // port (network byte order)
-            TXTRecordGetLength(&txt),
-            TXTRecordGetBytesPtr(&txt),
-            nullptr,              // callback (not needed for simple registration)
-            nullptr               // context
-        );
-
-        TXTRecordDeallocate(&txt);
-
-        if (err != kDNSServiceErr_NoError) {
-            fprintf(stderr, "Failed to register mDNS service: error %d\n", err);
-            return false;
-        }
-
-        fprintf(stderr, "mDNS: Advertising _sendspin._tcp on port %u (name: %s)\n", port,
-                name.c_str());
-        return true;
-    }
-
-    void stop() {
-        if (service_ref_ != nullptr) {
-            DNSServiceRefDeallocate(service_ref_);
-            service_ref_ = nullptr;
-            fprintf(stderr, "mDNS: Service advertisement stopped\n");
-        }
-    }
-
-private:
-    DNSServiceRef service_ref_{nullptr};
-};
-#endif  // SENDSPIN_HAS_MDNS
 
 /// @brief Captures the default PortAudio input device and feeds the source role: the input
 /// callback forwards each buffer to write_audio() (callback-safe) with its capture time mapped
@@ -289,15 +238,6 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  -h            Show this help\n");
 }
 
-static bool parse_log_level(const char* str, LogLevel& level) {
-    if (strcmp(str, "none") == 0) { level = LogLevel::NONE; return true; }
-    if (strcmp(str, "error") == 0) { level = LogLevel::ERROR; return true; }
-    if (strcmp(str, "warn") == 0) { level = LogLevel::WARN; return true; }
-    if (strcmp(str, "info") == 0) { level = LogLevel::INFO; return true; }
-    if (strcmp(str, "debug") == 0) { level = LogLevel::DEBUG; return true; }
-    if (strcmp(str, "verbose") == 0) { level = LogLevel::VERBOSE; return true; }
-    return false;
-}
 
 static bool parse_port(const char* str, uint16_t& port) {
     char* end = nullptr;
@@ -336,7 +276,7 @@ int main(int argc, char* argv[]) {
                 use_opus = true;
                 break;
             case 'l':
-                if (!parse_log_level(optarg, log_level)) {
+                if (!sendspin_examples::parse_log_level(optarg, log_level)) {
                     fprintf(stderr, "Unknown log level: %s\n", optarg);
                     print_usage(argv[0]);
                     return 1;

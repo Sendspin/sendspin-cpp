@@ -15,7 +15,7 @@ add_executable(source_client main.cpp)
 target_link_libraries(source_client PRIVATE sendspin)
 target_compile_features(source_client PRIVATE cxx_std_20)
 
-target_include_directories(source_client PRIVATE ${PORTAUDIO_INCLUDE_DIRS})
+target_include_directories(source_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common ${PORTAUDIO_INCLUDE_DIRS})
 target_link_directories(source_client PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
 target_link_libraries(source_client PRIVATE ${PORTAUDIO_LINK_LIBRARIES})
 
