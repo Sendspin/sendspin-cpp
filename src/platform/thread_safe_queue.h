@@ -122,8 +122,10 @@ public:
     /// @brief Receives an item from the front of the queue; blocks up to timeout_ms if empty
     /// @param[out] item Populated with the received item on success.
     /// @param timeout_ms Milliseconds to wait if the queue is empty (UINT32_MAX = wait forever).
-    /// @return true if an item was received successfully; false on timeout or wake_receiver()
-    /// interruption.
+    /// @return true if an item was received successfully; false on timeout, on wake_receiver()
+    /// interruption, or (at most once after a burst is drained) on a token a send left behind
+    /// after its item was taken by the non-blocking poll. Callers must treat every false return
+    /// as "re-check state and retry", never as proof the timeout elapsed.
     bool receive(T& item, uint32_t timeout_ms) {
         // The blocking wait goes through items_or_wake_sem_, not the queue's own blocking
         // receive, so wake_receiver() can interrupt it. The semaphore is binary, so a burst

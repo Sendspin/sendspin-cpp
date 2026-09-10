@@ -160,7 +160,10 @@ public:
     /// @brief Receive the next item; caller must call return_item() when done
     /// @param[out] item_size Set to the size of the received item.
     /// @param timeout_ms Milliseconds to wait if no item is available (UINT32_MAX = wait forever).
-    /// @return Pointer to item data, or nullptr on timeout or wake_receiver() interruption.
+    /// @return Pointer to item data, or nullptr on timeout, on wake_receiver() interruption, or
+    /// (at most once after a burst is drained) on a token a send left behind after its item was
+    /// taken by the non-blocking poll. Callers must treat every nullptr return as "re-check state
+    /// and retry", never as proof the timeout elapsed.
     void* receive(size_t* item_size, uint32_t timeout_ms) {
         // The blocking wait goes through items_or_wake_sem_, not the ring buffer's own
         // blocking receive, so wake_receiver() can interrupt it. The semaphore is binary,
