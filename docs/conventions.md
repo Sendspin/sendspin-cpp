@@ -118,6 +118,32 @@ checklists in `.claude/skills/` apply these standards to a diff.
   of a paired flag and value, a derived constant) so the invariant holds by
   construction.
 
+## Testing
+
+- Tests are host-only, white-box, and live in `tests/`; they include private
+  headers from `src/` and run under ASan/UBSan in CI.
+- Production code in `src/` and `include/` acquires nothing for the sake of
+  tests: no friends, test-only hooks, widened visibility, extra template
+  parameters, injectable clocks or transports, or fixture-aware naming.
+  Logic that is hard to reach is extracted into a pure static member or
+  free function and tested directly; a timing decision becomes a predicate
+  that takes `now` as an argument while the call site keeps reading the real
+  clock.
+- A test defends a specific production line or branch and fails when that
+  line is deleted or its condition inverted. A test that cannot fail that
+  way is filler and is deleted. Every malformed-input case in a validation
+  test is paired with a `Control:` case showing the same parser accepts
+  valid input.
+- Elapsed time is never a pass/fail condition. A blocked call is proven by
+  waiting with no timeout, by a value only the correct path can produce, or
+  by a structural failure; hangs are caught by the suite watchdog and the
+  CTest timeout, not by per-test bounds.
+- Fixtures satisfy production invariants rather than stubbing around them.
+  Test doubles are hand-written fakes that record outcomes; the tree uses no
+  gmock.
+- Coverage that cannot be obtained without a production seam is named as a
+  gap in the PR rather than approximated by a test that appears to cover it.
+
 ## Documentation
 
 - Comments and docs describe the current state of the code. No history

@@ -17,9 +17,11 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)  # only gtest_main is used; skip building gmock
 FetchContent_MakeAvailable(googletest)
 
-# One executable aggregating every test_*.cpp file. gtest_discover_tests still
-# registers the individual TEST() cases with CTest so failures are reported per case.
+# One executable aggregating every test_*.cpp file behind the main.cpp watchdog entry point.
+# gtest_discover_tests still registers the individual TEST() cases with CTest so failures are
+# reported per case.
 add_executable(sendspin_tests
+    main.cpp
     test_audio_stream_info.cpp
     test_connection_lifecycle.cpp
     test_time_filter.cpp
@@ -37,7 +39,12 @@ add_executable(sendspin_tests
 # if sendspin is ever added as a subdirectory of a larger superproject.
 target_include_directories(sendspin_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
-target_link_libraries(sendspin_tests PRIVATE sendspin GTest::gtest_main)
+target_link_libraries(sendspin_tests PRIVATE sendspin GTest::gtest)
+# The watchdog in main.cpp prints a backtrace on a hang; glibc needs exported symbols to name
+# the frames.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(sendspin_tests PRIVATE -rdynamic)
+endif()
 
 target_compile_features(sendspin_tests PRIVATE cxx_std_20)
 target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
@@ -50,4 +57,6 @@ if(ENABLE_SANITIZERS)
 endif()
 
 include(GoogleTest)
-gtest_discover_tests(sendspin_tests)
+# Backstop above the 55 s watchdog in main.cpp, which fires first and prints the hung test's
+# stack.
+gtest_discover_tests(sendspin_tests PROPERTIES TIMEOUT 60)

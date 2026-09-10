@@ -94,23 +94,27 @@ private:
     uint32_t hash_;
 };
 
-/// Pumps client.loop() (like a platform main loop would) until the predicate returns true or the
-/// timeout elapses. Returns true if the predicate was satisfied.
-bool pump_until(SendspinClient& client, const std::function<bool()>& pred, int timeout_ms) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
+
+// Pumps client.loop() until pred() is true. No timeout: a regression hangs here and the CTest
+// TIMEOUT reports it.
+void pump_until(SendspinClient& client, const std::function<bool()>& pred) {
+    for (;;) {
         client.loop();
         if (pred()) {
-            return true;
+            return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    return false;
 }
 
+// Pumps client.loop() for a fixed window. Only for spacing events or "must not happen" checks:
+// a window that is too short can miss a regression, never fail a correct run.
 void pump_for(SendspinClient& client, int duration_ms) {
-    pump_until(
-        client, [] { return false; }, duration_ms);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(duration_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        client.loop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 int connect_loopback(uint16_t port) {
@@ -347,8 +351,7 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     SendspinClient client(make_config(PROBE_TEST_PORT));
     client.set_network_provider(&network);
     ASSERT_TRUE(client.start_server());
-    // The WS server starts synchronously on the first loop() once the network reports ready.
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     // Hold a raw TCP connection open without ever speaking WebSocket.
     int probe_fd = connect_loopback(PROBE_TEST_PORT);
@@ -360,8 +363,7 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     // A real server connects while the probe is held: it must establish promptly, not after the
     // probe's deadline.
     FakeServer real_server(server_url(PROBE_TEST_PORT), "server-a");
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, "server-a");
@@ -369,8 +371,7 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     // The probe never completes a WebSocket handshake, so the transport layer closes it without
     // it ever reaching the manager (host: IXWebSocket's 3 s server-side handshake timeout; on
     // ESP the ws_server tick would reap it at 5 s). Budget covers either bound plus margin.
-    EXPECT_TRUE(pump_until(
-        client, [&] { return socket_closed(probe_fd); }, 6500));
+    pump_until(client, [&] { return socket_closed(probe_fd); });
     ::close(probe_fd);
 
     // The established connection must have been untouched by the probe reap.
@@ -410,17 +411,13 @@ TEST(ConnectionLifecycle, SlowOutboundSurvivesUpgradeTier) {
     SendspinClient client(make_config(OUTBOUND_TEST_PORT));
     client.set_network_provider(&network);
     ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     client.connect_to(server_url(PROXY_LISTEN_PORT));
 
-    // Nothing can establish before the proxy forwards the upgrade at ~8 s; the connection must
-    // still be alive past the 5 s mark, well beyond any inbound-side upgrade deadline.
-    EXPECT_FALSE(pump_until(
-        client, [&] { return client.is_connected(); }, 6500));
-
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 7500));
+    // The proxy holds the upgrade for 8 s, past any inbound-side upgrade deadline; the outbound
+    // tier must ride that out and still establish.
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, "server-slow");
@@ -453,19 +450,17 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
     SendspinClient client(make_config(ADMIT_TEST_PORT));
     client.set_network_provider(&network);
     ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     client.connect_to(server_url(STALL_LISTEN_PORT));
 
     // A mute inbound peer occupies one inbound slot past TCP_OPEN.
     FakeServer mute(server_url(ADMIT_TEST_PORT), "mute", {.answer_hello = false});
-    ASSERT_TRUE(pump_until(
-        client, [&] { return mute.got_client_hello(); }, 3000));
+    pump_until(client, [&] { return mute.got_client_hello(); });
 
     // The real server takes the second inbound slot; the stalled outbound must not consume it.
     FakeServer real_server(server_url(ADMIT_TEST_PORT), "server-real");
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, "server-real");
@@ -485,11 +480,10 @@ TEST(ConnectionLifecycle, EarlyServerHelloDoesNotWedge) {
     SendspinClient client(make_config(EARLY_HELLO_TEST_PORT));
     client.set_network_provider(&network);
     ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     FakeServer eager(server_url(EARLY_HELLO_TEST_PORT), "server-eager", {.hello_on_open = true});
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, "server-eager");
@@ -507,33 +501,26 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     // server-a establishes and is promoted into the empty slot first...
     FakeServer server_a(server_url(RACE_TEST_PORT), "server-a");
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] {
-            auto info = client.get_server_information();
-            return info.has_value() && info->server_id == "server-a";
-        },
-        3000));
+    pump_until(client, [&] {
+        auto info = client.get_server_information();
+        return info.has_value() && info->server_id == "server-a";
+    });
 
     // ...then server-b establishes against the incumbent. Both sides of the comparison are
     // established; the last-played preference (server-b) must win the handoff, and the later
     // arrival must not be evicted for finishing second.
     FakeServer server_b(server_url(RACE_TEST_PORT), "server-b");
-    EXPECT_TRUE(pump_until(
-        client,
-        [&] {
-            auto info = client.get_server_information();
-            return info.has_value() && info->server_id == "server-b";
-        },
-        3000));
+    pump_until(client, [&] {
+        auto info = client.get_server_information();
+        return info.has_value() && info->server_id == "server-b";
+    });
 
     // The displaced incumbent is released with a goodbye, not left dangling.
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server_a.closed(); }, 3000));
+    pump_until(client, [&] { return server_a.closed(); });
     EXPECT_FALSE(server_b.closed());
     EXPECT_TRUE(client.is_connected());
 }
@@ -545,7 +532,7 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
     SendspinClient client(make_config(EVICT_TEST_PORT));
     client.set_network_provider(&network);
     ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     // Two held raw probes, enough to fill every nursery slot if they were admitted at accept.
     int probe1 = connect_loopback(EVICT_TEST_PORT);
@@ -558,15 +545,13 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
     // The real server must establish promptly: the probes hold no nursery slots, so nothing
     // needs evicting and nothing is rejected.
     FakeServer real_server(server_url(EVICT_TEST_PORT), "server-real");
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, "server-real");
 
     // The transport layer closes the probes on its own (host: IX 3 s handshake timeout).
-    EXPECT_TRUE(pump_until(
-        client, [&] { return socket_closed(probe1) && socket_closed(probe2); }, 6500));
+    pump_until(client, [&] { return socket_closed(probe1) && socket_closed(probe2); });
     EXPECT_TRUE(client.is_connected());
 
     ::close(probe1);
@@ -581,18 +566,16 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
     SendspinClient client(make_config(REJECT_TEST_PORT));
     client.set_network_provider(&network);
     ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    client.loop();  // First tick binds the WS server
 
     // Two mute peers: they upgrade and receive client/hello but never answer it, occupying both
     // nursery slots past TCP_OPEN until the establish deadline.
     FakeServer mute_a(server_url(REJECT_TEST_PORT), "mute-a", {.answer_hello = false});
     FakeServer mute_b(server_url(REJECT_TEST_PORT), "mute-b", {.answer_hello = false});
-    ASSERT_TRUE(pump_until(
-        client, [&] { return mute_a.got_client_hello() && mute_b.got_client_hello(); }, 3000));
+    pump_until(client, [&] { return mute_a.got_client_hello() && mute_b.got_client_hello(); });
 
     FakeServer late(server_url(REJECT_TEST_PORT), "server-late");
-    EXPECT_TRUE(pump_until(
-        client, [&] { return late.closed(); }, 3000));
+    pump_until(client, [&] { return late.closed(); });
     EXPECT_TRUE(late.got_goodbye());
     EXPECT_FALSE(client.is_connected());
     EXPECT_FALSE(mute_a.closed());

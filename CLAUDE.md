@@ -84,7 +84,7 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 
 ## Coding conventions
 
-- Design standards: `docs/conventions.md` is the normative reference (threading/Inbox rules, validation posture, platform abstraction, embedded resource discipline, public API shape, documentation sync); the bullets below are a summary
+- Design standards: `docs/conventions.md` is the normative reference (threading/Inbox rules, validation posture, platform abstraction, embedded resource discipline, public API shape, testing, documentation sync); the bullets below are a summary
 - C++20 (`gnu++20` on ESP, `cxx_std_20` on host)
 - Namespace: `sendspin`
 - Logging: Platform macros `SS_LOGE`, `SS_LOGW`, `SS_LOGI`, `SS_LOGD`, `SS_LOGV` (not raw `ESP_LOG*`)
