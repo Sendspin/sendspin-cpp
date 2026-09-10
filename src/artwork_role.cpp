@@ -89,7 +89,7 @@ void ArtworkRole::Impl::attach_inbox(Inbox& inbox) {
 }
 
 bool ArtworkRole::Impl::start() {
-    if (!this->drain_task) {
+    if (!this->drain_task || !this->drain_task->notify_queue.is_created()) {
         SS_LOGE(TAG, "Failed to start artwork: decode task not initialized");
         return false;
     }
