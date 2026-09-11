@@ -32,6 +32,7 @@
 #include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/persistence_codec.h"
+#include "sendspin/source_role.h"
 #include "sendspin/types.h"
 
 #include <gtest/gtest.h>
@@ -69,6 +70,7 @@ constexpr uint16_t PREHANDSHAKE_BINARY_TEST_PORT = 19000;
 constexpr uint16_t PREADMISSION_ROLE_TEST_PORT = 19001;
 constexpr uint16_t REVOCATION_SWEEP_TEST_PORT = 19002;
 constexpr uint16_t REACTIVATE_PAIRING_TEST_PORT = 19003;
+constexpr uint16_t SOURCE_ROLE_TEST_PORT = 19004;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -820,6 +822,39 @@ TEST(EncryptedLifecycle, ManagementListRecordsRoundTripOverEncryptedTransport) {
         }
     }
     EXPECT_TRUE(found_seeded_record) << "management/result did not list the seeded record";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// A paired LONG_TERM connection must carry source@v1 through the encrypted hello/activate cycle.
+// This is the integration seam Music Assistant relies on before it exposes a Sendspin Live Input.
+TEST(EncryptedLifecycle, PairedSourceRoleActivatesOverEncryptedTransport) {
+    SendspinClientConfig config;
+    config.name = "Encrypted Source Test Client";
+    config.server_port = SOURCE_ROLE_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    SourceRole& source = client.add_source(SourceRoleConfig{});
+    ASSERT_TRUE(bundle.start());
+
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServerOptions options;
+    options.first_activities_json = R"(["playback"])";
+    options.first_roles_json = R"(["source@v1"])";
+    FakeEncryptedServer server(server_url(SOURCE_ROLE_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               bundle.peer.record.psk_id, bundle.peer.psk, options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "Paired encrypted source handshake/hello/activate did not complete";
+    EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER);
+    const auto supported_roles = server.hello_supported_roles();
+    EXPECT_NE(std::find(supported_roles.begin(), supported_roles.end(), "source@v1"),
+              supported_roles.end());
+    EXPECT_EQ(client.source(), &source);
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

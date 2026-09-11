@@ -43,6 +43,7 @@ add_executable(sendspin_tests
     test_dynamic_pin.cpp
     test_pin_state_machine.cpp
     test_persistence_codec.cpp
+    test_binary_send_registry.cpp
 
     # FilePersistenceProvider is a host example helper (examples/common/), not part of the
     # library; compile it into the test target so the record-store tests can exercise it.
@@ -51,6 +52,11 @@ add_executable(sendspin_tests
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...) and
 # the src/crypto/ headers.
+# The source suite is registered only when the role is compiled in, so a
+# -DSENDSPIN_ENABLE_SOURCE=OFF test build still links.
+if(SENDSPIN_ENABLE_SOURCE)
+    target_sources(sendspin_tests PRIVATE test_source_role.cpp)
+endif()
 # The public include/ dir and ArduinoJson propagate transitively from `sendspin`.
 # Use CMAKE_CURRENT_SOURCE_DIR (not CMAKE_SOURCE_DIR) so the path stays correct even
 # if sendspin is ever added as a subdirectory of a larger superproject.

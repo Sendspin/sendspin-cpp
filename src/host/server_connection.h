@@ -86,6 +86,7 @@ public:
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete,
                             bool allow_before_hello) override;
 
+
     /// @brief Sends a client/time message, capturing the timestamp synchronously before send
     /// @return true if the message was sent successfully, false otherwise.
     bool send_time_message() override;
@@ -96,7 +97,7 @@ public:
     /// @param on_complete Optional completion callback.
     /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback on_complete,
-                              bool allow_before_hello) override;
+                              bool allow_before_hello = false) override;
 
     /// @brief Requests the WebSocket connection to close
     void trigger_close();

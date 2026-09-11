@@ -18,6 +18,7 @@
 #pragma once
 
 #include "connection.h"
+#include "platform/memory.h"
 #include "platform/types.h"
 #include "sendspin/types.h"
 #include <esp_err.h>
@@ -27,9 +28,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace sendspin {
+
+struct BinarySendLookup;
+
+/// @brief Breaks the keep-alive cycles of binary send workers queued on the given server that
+/// will never run. Call only after httpd_stop() for that handle has returned (none of its
+/// workers can run afterwards); other servers' queued work is untouched.
+void reclaim_orphaned_binary_send_work(httpd_handle_t server);
 
 /**
  * @brief ESP-IDF HTTP server WebSocket connection representing a single Sendspin server session
@@ -63,7 +72,10 @@ public:
     /// @param sockfd The socket file descriptor for this connection.
     SendspinServerConnection(httpd_handle_t server, int sockfd);
 
-    ~SendspinServerConnection() override = default;
+    /// @brief Fails a still-in-flight binary send whose queued worker can never run anymore
+    /// (teardown half of the send-slot contract: only the worker or this destructor releases
+    /// the slot, never a caller-side timeout)
+    ~SendspinServerConnection() override;
 
     // ========================================
     // SendspinConnection interface implementation
@@ -113,6 +125,7 @@ public:
     SsErr send_text_message(const std::string& message, SendCompleteCallback on_complete,
                             bool allow_before_hello) override;
 
+
     /// @brief Sends a client/time message, stamping the timestamp inside the httpd worker
     ///
     /// Schedules a worker job that captures `client_transmitted` and serializes the JSON
@@ -128,7 +141,7 @@ public:
     /// @param allow_before_hello If true, bypasses the pre-hello send gate.
     /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback on_complete,
-                              bool allow_before_hello) override;
+                              bool allow_before_hello = false) override;
 
     /// @brief Triggers the underlying socket to close
     ///
@@ -186,10 +199,31 @@ protected:
     ///            destroyed and freed before the worker returns.
     static void async_send_time_text(void* arg);
 
+    /// @brief httpd_queue_work callback that sends the binary frame held in the send slot
+    /// @param arg This connection's BinarySendLookup (lifetime protocol at its definition).
+    static void async_send_binary(void* arg);
+
+    // Struct fields
+
+    /// @brief Binary send slot payload: sized by the first send, grow-only, reused (zero
+    /// steady-state allocation)
+    PlatformBuffer binary_send_payload_;
+
+    /// @brief In-flight completion callback, fired by the worker or the destructor
+    SendCompleteCallback binary_send_cb_;
+
     // Pointer fields
 
     /// @brief The httpd server handle (owned by SendspinWsServer)
     httpd_handle_t server_;
+
+    /// @brief Identity block handed to queued binary send work (see BinarySendLookup)
+    std::shared_ptr<BinarySendLookup> binary_send_lookup_;
+
+    // size_t fields
+
+    /// @brief Length of the payload currently held in the binary send slot
+    size_t binary_send_len_{0};
 
     // 32-bit fields
 
@@ -200,6 +234,11 @@ protected:
 
     /// @brief Set once the httpd session has closed (see mark_closed())
     std::atomic<bool> closed_{false};
+
+    /// @brief True while a binary send occupies the slot (queued or being sent). Written by the
+    /// sending role thread (acquire the slot) and the httpd worker (release it); the destructor
+    /// reads it to detect work that never ran.
+    std::atomic<bool> binary_send_in_flight_{false};
 };
 
 }  // namespace sendspin

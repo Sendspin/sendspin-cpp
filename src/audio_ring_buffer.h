@@ -50,13 +50,15 @@ struct AudioRingBufferEntry {
 };
 
 /**
- * @brief Pre-allocated SPSC ring buffer for zero-copy encoded audio chunk transfer between
- * the network thread and sync task
+ * @brief Pre-allocated SPSC ring buffer for zero-copy timestamped audio chunk transfer
+ * between one producer thread and one consumer thread
  *
  * Each entry stores an AudioRingBufferEntry header followed immediately by the variable-
  * length audio payload. All storage is pre-allocated at construction; there are no per-
- * chunk heap allocations. The SPSC contract is: one producer (WebSocket callback thread)
- * calls write_chunk(), and one consumer (sync task) calls receive_chunk() / return_chunk().
+ * chunk heap allocations. The SPSC contract is: exactly one producer calls write_chunk(),
+ * and exactly one consumer calls receive_chunk() / return_chunk(). The player uses it
+ * inbound (network thread -> sync task, encoded audio); the source uses it outbound (the
+ * consumer's capture thread -> source task, captured PCM).
  *
  * Usage:
  * 1. Call create() to allocate and initialize the ring buffer
@@ -83,15 +85,18 @@ class SendspinAudioRingBuffer {
 public:
     /// @brief Creates a ring buffer with the specified total storage size.
     /// @param buffer_size Total ring buffer storage in bytes.
+    /// @param location Memory placement for the storage (ESP-IDF only; ignored on host).
     /// @return unique_ptr to the ring buffer, or nullptr on allocation failure.
-    static std::unique_ptr<SendspinAudioRingBuffer> create(size_t buffer_size);
+    static std::unique_ptr<SendspinAudioRingBuffer> create(
+        size_t buffer_size, MemoryLocation location = MemoryLocation::PREFER_EXTERNAL);
 
     ~SendspinAudioRingBuffer();
 
     /// @brief Writes an audio chunk into the ring buffer.
     /// @param data Pointer to the audio data.
     /// @param data_size Size of the audio data in bytes.
-    /// @param timestamp Server timestamp for this chunk.
+    /// @param timestamp Producer-defined timestamp for this chunk; the time domain is the
+    ///        producer's contract (server play time inbound, local capture time outbound).
     /// @param chunk_type Type of audio chunk.
     /// @param timeout_ms Milliseconds to wait if buffer is full (UINT32_MAX = wait forever).
     /// @return true if successfully written, false if buffer full or error.

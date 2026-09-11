@@ -473,6 +473,12 @@ public:
         return this->hello_pair_methods_;
     }
 
+    /// supported_roles from the most recent encrypted client/hello, in wire order.
+    std::vector<std::string> hello_supported_roles() const {
+        std::lock_guard<std::mutex> lock(this->pair_methods_mutex_);
+        return this->hello_supported_roles_;
+    }
+
     bool closed() const {
         return this->closed_.load();
     }
@@ -605,6 +611,11 @@ private:
                      doc["payload"]["supported_pair_methods"].as<JsonArrayConst>()) {
                     this->hello_pair_methods_.emplace_back(m["method"] | "");
                 }
+                this->hello_supported_roles_.clear();
+                for (JsonVariantConst role :
+                     doc["payload"]["supported_roles"].as<JsonArrayConst>()) {
+                    this->hello_supported_roles_.emplace_back(role | "");
+                }
             }
             const std::string& activities =
                 count <= 1 ? this->options_.first_activities_json
@@ -730,6 +741,7 @@ private:
     std::atomic<int> client_hello_count_{0};
     mutable std::mutex pair_methods_mutex_;
     std::vector<std::string> hello_pair_methods_;
+    std::vector<std::string> hello_supported_roles_;
     std::atomic<bool> closed_{false};
 
     mutable std::mutex pair_mutex_;

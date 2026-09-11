@@ -78,7 +78,22 @@ if(ESP_IDF_BUILD)
         list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_VISUALIZER)
     endif()
 
-    # Register the component using the assembled source list
+    if(CONFIG_SENDSPIN_ENABLE_SOURCE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_SOURCES})
+        # The source role's Opus encoder comes from micro-opus, which the player block above
+        # may already require; the dedup below keeps the REQUIRES list clean either way.
+        list(APPEND SENDSPIN_REQUIRES esphome__micro-opus)
+        list(APPEND SENDSPIN_COMPILE_DEFS SENDSPIN_ENABLE_SOURCE)
+    endif()
+
+    list(REMOVE_DUPLICATES SENDSPIN_REQUIRES)
+
+    # Shared audio infrastructure for the roles that stream audio through the SPSC ring
+    if(CONFIG_SENDSPIN_ENABLE_PLAYER OR CONFIG_SENDSPIN_ENABLE_SOURCE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_AUDIO_SOURCES})
+    endif()
+
+    # Register the component using the assembled source list.
     # WHOLE_ARCHIVE: this component defines noise_rand_bytes() (src/esp/noise_rand.cpp), which the
     # esphome__noise-c component references but does not define (it is built with
     # NOISE_USE_CUSTOM_RAND=1). Because noise-c depends on sendspin-cpp and sendspin-cpp depends on
@@ -86,6 +101,7 @@ if(ESP_IDF_BUILD)
     # from libsendspin-cpp.a (it is not referenced at the point that archive is scanned) and the
     # link fails with "undefined reference to noise_rand_bytes". --gc-sections still strips genuinely
     # unused sections, so this does not bloat the image.
+
     idf_component_register(
         SRCS ${SENDSPIN_ALL_SOURCES}
         INCLUDE_DIRS "include"
@@ -117,6 +133,7 @@ else()
     option(SENDSPIN_ENABLE_COLOR "Enable color role" ON)
     option(SENDSPIN_ENABLE_ARTWORK "Enable artwork role" ON)
     option(SENDSPIN_ENABLE_VISUALIZER "Enable visualizer role" ON)
+    option(SENDSPIN_ENABLE_SOURCE "Enable source role (audio capture)" ON)
 
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/host.cmake)
 
@@ -144,6 +161,13 @@ else()
     if(SENDSPIN_ENABLE_VISUALIZER)
         list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_VISUALIZER_SOURCES})
     endif()
+    if(SENDSPIN_ENABLE_SOURCE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_SOURCE_SOURCES})
+    endif()
+    # Shared audio infrastructure for the roles that stream audio through the SPSC ring
+    if(SENDSPIN_ENABLE_PLAYER OR SENDSPIN_ENABLE_SOURCE)
+        list(APPEND SENDSPIN_ALL_SOURCES ${SENDSPIN_AUDIO_SOURCES})
+    endif()
 
     # Create the library: core sources, enabled role sources, host networking (via host.cmake)
     add_library(sendspin STATIC ${SENDSPIN_ALL_SOURCES})
@@ -166,6 +190,9 @@ else()
     endif()
     if(SENDSPIN_ENABLE_VISUALIZER)
         target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_VISUALIZER)
+    endif()
+    if(SENDSPIN_ENABLE_SOURCE)
+        target_compile_definitions(sendspin PUBLIC SENDSPIN_ENABLE_SOURCE)
     endif()
 
     # Host build options
@@ -194,6 +221,13 @@ else()
     if(BUILD_EXAMPLES)
         add_subdirectory(examples/basic_client)
         add_subdirectory(examples/tui_client)
+        # source_client exists solely to demonstrate the source role, so its whole target is
+        # gated on the role's option (docs/conventions.md, Public API)
+        if(SENDSPIN_ENABLE_SOURCE)
+            add_subdirectory(examples/source_client)
+        else()
+            message(STATUS "Skipping source_client example (SENDSPIN_ENABLE_SOURCE=OFF)")
+        endif()
     else()
         message(STATUS "Skipping sendspin-cpp examples (BUILD_EXAMPLES=OFF)")
     endif()

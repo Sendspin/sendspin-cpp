@@ -14,6 +14,7 @@
 
 #include "server_connection.h"
 
+#include "binary_send_registry.h"
 #include "lwip/sockets.h"  // for setsockopt, IPPROTO_TCP, NODELAY
 #include "platform/compiler.h"
 #include "platform/logging.h"
@@ -70,16 +71,53 @@ struct SessionLookup {
     std::weak_ptr<SendspinServerConnection> conn;
 };
 
+/// @brief Once-per-connection identity block for queued binary send work (a reusable
+/// SessionLookup: the binary path runs per chunk and must not allocate in steady state)
+///
+/// While a work item is queued, `self` keeps the block alive independently of the connection;
+/// the worker claims it back before resolving `conn`, so teardown with work in flight makes the
+/// worker a clean no-op. httpd_queue_work has no cancellation hook, so work discarded by
+/// httpd_stop would strand the engaged `self` cycle; engaged blocks are therefore tracked in a
+/// registry scoped by their owning httpd handle and reclaimed by
+/// reclaim_orphaned_binary_send_work(handle) once THAT server is stopped -- another live
+/// server's queued work is never touched. The destructor still fails the pending completion.
+struct BinarySendLookup {
+    std::weak_ptr<SendspinServerConnection> conn;
+    std::shared_ptr<BinarySendLookup> self;
+};
+
+// Engage/claim/reclaim transitions live in the host-tested registry; this file only decides
+// when to call them. One process-wide instance, keyed by httpd handle.
+namespace {
+BinarySendRegistry<BinarySendLookup> g_binary_send_registry;
+}  // namespace
+
+void reclaim_orphaned_binary_send_work(httpd_handle_t server) {
+    g_binary_send_registry.reclaim(server);
+}
+
 // ============================================================================
 // SendspinConnection interface implementation
 // ============================================================================
 
 SendspinServerConnection::SendspinServerConnection(httpd_handle_t server, int sockfd)
     : server_(server), sockfd_(sockfd) {
+    // Allocated here, off the send path; the weak self-reference is bound on the first send
+    // (shared_from_this is unusable inside a constructor)
+    this->binary_send_lookup_ = std::make_shared<BinarySendLookup>();
     // Disabling Nagle's algorithm significantly improves the time syncing accuracy
     int nodelay = 1;
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
         SS_LOGW(TAG, "Failed to turn on TCP_NODELAY, syncing may be inaccurate");
+    }
+}
+
+SendspinServerConnection::~SendspinServerConnection() {
+    // A still-queued worker can never touch this connection again (weak_ptr lock fails), so the
+    // pending completion is failed here; a worker that DID lock blocks destruction until done
+    if (this->binary_send_in_flight_.load(std::memory_order_acquire) && this->binary_send_cb_) {
+        SendCompleteCallback pending = std::move(this->binary_send_cb_);
+        pending(false);
     }
 }
 
@@ -214,6 +252,42 @@ SsErr SendspinServerConnection::queue_async_send(const uint8_t* data, size_t len
         return SsErr::FAIL;
     }
     return SsErr::OK;
+}
+
+void SendspinServerConnection::async_send_binary(void* arg) {
+    auto* lookup = static_cast<BinarySendLookup*>(arg);
+    // Claim the keep-alive back under the registry lock (serialized against reclaim); a
+    // successful conn.lock() then blocks destruction until return.
+    std::shared_ptr<BinarySendLookup> keep = g_binary_send_registry.claim(lookup);
+    if (keep == nullptr) {
+        return;  // Reclaimed or already claimed; nothing here is safe to touch
+    }
+    auto conn = lookup->conn.lock();
+    if (conn == nullptr) {
+        return;  // Torn down with work queued: the destructor already failed the completion
+    }
+
+    bool success = false;
+    // Same identity and hello gating as async_send_text
+    if (conn->is_connected() && conn->client_hello_sent_) {
+        httpd_ws_frame_t ws_pkt;
+        memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+        ws_pkt.payload = conn->binary_send_payload_.data();
+        ws_pkt.len = conn->binary_send_len_;
+        ws_pkt.type = HTTPD_WS_TYPE_BINARY;
+        success = httpd_ws_send_frame_async(conn->server_, conn->sockfd_, &ws_pkt) == ESP_OK;
+    }
+
+    // The completion fires on every exit path with a live connection (sent, send failed, gated,
+    // or already disconnected) — the slot would wedge otherwise. The callback is moved out and
+    // the slot released before invoking it, so the source task, once woken by the completion,
+    // finds the slot free for its next send. The callback itself does not re-enter the
+    // connection (the interface forbids it); it only records the result and wakes the task.
+    SendCompleteCallback pending = std::move(conn->binary_send_cb_);
+    conn->binary_send_in_flight_.store(false, std::memory_order_release);
+    if (pending) {
+        pending(success);
+    }
 }
 
 void SendspinServerConnection::trigger_close() {

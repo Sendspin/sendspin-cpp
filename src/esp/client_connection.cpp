@@ -202,6 +202,7 @@ SsErr SendspinClientConnection::send_binary_message(const uint8_t* data, size_t 
         return SsErr::INVALID_STATE;
     }
 
+    // esp_websocket_client_send_bin is synchronous in the current task, like the text path
     int sent = esp_websocket_client_send_bin(this->client_, reinterpret_cast<const char*>(data),
                                              static_cast<int>(len),
                                              pdMS_TO_TICKS(WEBSOCKET_SEND_TIMEOUT_MS));

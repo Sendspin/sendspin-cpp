@@ -42,9 +42,6 @@ static constexpr uint32_t INITIAL_SYNC_ZEROS_DURATION_MS = 25;
 
 static constexpr size_t SYNC_TASK_STACK_SIZE = 6192;  // Opus uses more stack than FLAC
 
-/// @brief Wait time (ms) between retries when time sync is not yet available
-static constexpr uint32_t WAIT_FOR_TIME_SYNC_MS = 15U;
-
 /// @brief Timeout (ms) for receiving the next encoded audio chunk from the ring buffer
 static constexpr uint32_t ENCODED_CHUNK_RECEIVE_TIMEOUT_MS = 15U;
 

@@ -92,6 +92,18 @@ SsErr SendspinConnection::send_app_json(const char* json, size_t len, SendComple
     return this->send_text_message(std::string(json, len), std::move(cb), allow_before_hello);
 }
 
+SsErr SendspinConnection::send_app_binary(const uint8_t* data, size_t len,
+                                          SendCompleteCallback cb) {
+    if (this->noise_transport_.is_active()) {
+        SsErr err = this->noise_transport_.send_binary(data, len);
+        if (cb) {
+            cb(err == SsErr::OK);
+        }
+        return err;
+    }
+    return this->send_binary_message(data, len, std::move(cb));
+}
+
 // ============================================================================
 // Noise transport
 // ============================================================================

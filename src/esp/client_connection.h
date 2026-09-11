@@ -102,6 +102,7 @@ public:
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                             bool allow_before_hello) override;
 
+
     /// @brief Sends a client/time message, capturing the timestamp just before send
     /// @return true if the message was sent successfully, false otherwise.
     bool send_time_message() override;
@@ -113,7 +114,7 @@ public:
     /// @param allow_before_hello If true, bypasses the pre-hello send gate.
     /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
-                              bool allow_before_hello) override;
+                              bool allow_before_hello = false) override;
 
     // ========================================
     // Client connection-specific configuration
