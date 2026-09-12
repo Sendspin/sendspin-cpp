@@ -71,6 +71,7 @@ constexpr uint16_t PREADMISSION_ROLE_TEST_PORT = 19001;
 constexpr uint16_t REVOCATION_SWEEP_TEST_PORT = 19002;
 constexpr uint16_t REACTIVATE_PAIRING_TEST_PORT = 19003;
 constexpr uint16_t SOURCE_ROLE_TEST_PORT = 19004;
+constexpr uint16_t SOURCE_ACTIVATION_RACE_TEST_PORT = 19005;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -855,6 +856,47 @@ TEST(EncryptedLifecycle, PairedSourceRoleActivatesOverEncryptedTransport) {
     EXPECT_NE(std::find(supported_roles.begin(), supported_roles.end(), "source@v1"),
               supported_roles.end());
     EXPECT_EQ(client.source(), &source);
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// Music Assistant pipelines role traffic immediately after source server/activate. The activate
+// is deferred to the client's main loop for admission, but ordered traffic behind it must survive
+// that thread handoff and run after the connection is promoted.
+TEST(EncryptedLifecycle, RoleMessageImmediatelyAfterSourceActivateIsAppliedAfterAdmission) {
+    SendspinClientConfig config;
+    config.name = "Source Activation Race Test Client";
+    config.server_port = SOURCE_ACTIVATION_RACE_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    client.add_source(SourceRoleConfig{});
+    struct Listener : MetadataRoleListener {
+        void on_metadata(const ServerMetadataStateObject& metadata) override {
+            this->title = metadata.title.value_or("");
+            this->updates.fetch_add(1);
+        }
+        std::atomic<int> updates{0};
+        std::string title;
+    } listener;
+    client.add_metadata().set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServerOptions options;
+    options.first_activities_json = R"(["playback"])";
+    options.first_roles_json = R"(["source@v1"])";
+    options.post_activate_message = R"({"type":"server/state","payload":{"metadata":{
+        "timestamp":1,"title":"Source Active"}}})";
+    FakeEncryptedServer server(server_url(SOURCE_ACTIVATION_RACE_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               bundle.peer.record.psk_id, bundle.peer.psk, options);
+
+    ASSERT_TRUE(pump_until(client, [&] { return listener.updates.load() > 0; }, 4000))
+        << "Role state pipelined behind source server/activate was lost before admission";
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_EQ(listener.title, "Source Active");
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

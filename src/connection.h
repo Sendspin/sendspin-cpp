@@ -186,6 +186,23 @@ public:
         this->admitted_.store(admitted, std::memory_order_release);
     }
 
+    /// @brief Track a parsed server/activate awaiting main-loop admission processing.
+    ///
+    /// The network thread uses this marker to defer role messages that follow the activate on the
+    /// same ordered transport instead of mistaking the main-loop handoff window for unauthorized
+    /// pre-admission traffic. A counter keeps overlapping queued activates balanced.
+    void note_activate_pending() {
+        this->pending_activate_count_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void note_activate_processed() {
+        this->pending_activate_count_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    bool has_pending_activate() const {
+        return this->pending_activate_count_.load(std::memory_order_acquire) != 0;
+    }
+
     // ========================================
     // Noise transport
     // ========================================
@@ -1133,6 +1150,10 @@ protected:
     /// by ConnectionManager::set_current_connection() on the main loop; read on the network
     /// thread by the role-dispatch gate. See is_admitted().
     std::atomic<bool> admitted_{false};
+
+    /// Number of server/activate messages parsed on the network thread but not yet applied on the
+    /// main loop. Role traffic ordered behind one is deferred until admission resolves.
+    std::atomic<uint32_t> pending_activate_count_{0};
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).
     /// Written from the transport connected callback (network thread), read by the manager's

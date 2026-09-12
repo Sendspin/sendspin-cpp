@@ -208,6 +208,13 @@ struct ServerActivateEvent {
     std::optional<int> pairing_pin_length;                 ///< From the pairing object's pin_length
 };
 
+/// @brief Role-bound JSON ordered after a queued server/activate on the same connection.
+struct DeferredRoleMessage {
+    std::shared_ptr<SendspinConnection> conn;
+    std::string json;
+    int64_t timestamp{0};
+};
+
 /**
  * @brief Manages WebSocket connection lifecycle.
  *
@@ -381,6 +388,11 @@ public:
     /// @param event The server/activate event to schedule (moved).
     void schedule_activate(ServerActivateEvent event);
 
+    /// @brief Queue role traffic behind an activate still awaiting main-loop admission.
+    /// @return false when no activate is pending; the caller must apply the normal admission gate.
+    bool defer_role_message_until_admission(SendspinConnection* conn, const char* data, size_t len,
+                                            int64_t timestamp);
+
     /// @brief Schedules a hello-cycle re-arm after a successful in-band re-handshake.
     ///
     /// Called from SendspinClient::process_json_message() on the NETWORK thread right after
@@ -408,6 +420,7 @@ private:
     struct DrainedEvents {
         std::vector<std::shared_ptr<SendspinConnection>> connected, disconnected, rehandshake;
         std::vector<ServerActivateEvent> activates;
+        std::vector<DeferredRoleMessage> role_messages;
         std::vector<PairAbortEvent> pair_aborts;
         std::vector<ManagementRequestEvent> management_requests;
         std::vector<ServerUnpairEvent> server_unpairs;
@@ -874,6 +887,7 @@ private:
     std::vector<std::shared_ptr<SendspinConnection>> pending_connected_events_;
     std::vector<std::shared_ptr<SendspinConnection>> pending_disconnect_events_;
     std::vector<ServerActivateEvent> pending_activate_events_;  // Deferred server/activate events
+    std::vector<DeferredRoleMessage> pending_role_messages_;    // Ordered behind queued activates
     // Connections whose in-band re-handshake just swapped sessions; loop() re-arms their hello.
     std::vector<std::shared_ptr<SendspinConnection>> pending_rehandshake_events_;
     std::vector<PairAbortEvent> pending_pair_abort_events_;  // Deferred pair/abort events

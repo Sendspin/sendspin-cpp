@@ -1110,9 +1110,20 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
     // arbitration, is not misbehaving, and the establish/re-prove watchdogs already reap a
     // connection that never gets admitted.
     if (requires_admitted_connection(message_type) && (conn == nullptr || !conn->is_admitted())) {
-        SS_LOGW(TAG, "Ignoring role message from a connection that is not admitted (server_id=%s)",
-                conn != nullptr ? conn->get_server_id().c_str() : "?");
-        return;
+        // server/activate is parsed on this network thread but deliberately applied on the main
+        // loop. Preserve ordered role traffic that follows it on the same WebSocket until that
+        // admission decision resolves; traffic before any activate remains unauthorized.
+        if (conn != nullptr && this->connection_manager_->defer_role_message_until_admission(
+                                   conn, data, len, timestamp)) {
+            return;
+        }
+        // Admission may have completed between the first atomic read and the queue-lock recheck.
+        if (conn == nullptr || !conn->is_admitted()) {
+            SS_LOGW(TAG,
+                    "Ignoring role message from a connection that is not admitted (server_id=%s)",
+                    conn != nullptr ? conn->get_server_id().c_str() : "?");
+            return;
+        }
     }
 
     switch (message_type) {

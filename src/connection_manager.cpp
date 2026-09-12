@@ -209,6 +209,8 @@ ConnectionManager::~ConnectionManager() {
     // cppcheck-suppress variableScope
     std::vector<ServerActivateEvent> pending_activates;
     // cppcheck-suppress variableScope
+    std::vector<DeferredRoleMessage> pending_role_messages;
+    // cppcheck-suppress variableScope
     std::vector<std::shared_ptr<SendspinConnection>> pending_rehandshakes;
     {
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
@@ -218,6 +220,8 @@ ConnectionManager::~ConnectionManager() {
         pending_disconnects = std::move(this->pending_disconnect_events_);
         // cppcheck-suppress unreadVariable
         pending_activates = std::move(this->pending_activate_events_);
+        // cppcheck-suppress unreadVariable
+        pending_role_messages = std::move(this->pending_role_messages_);
         // cppcheck-suppress unreadVariable
         pending_rehandshakes = std::move(this->pending_rehandshake_events_);
         this->has_pending_events_.store(false, std::memory_order_release);
@@ -413,7 +417,7 @@ void ConnectionManager::init_server(SendspinClient* client) {
 
 bool ConnectionManager::DrainedEvents::any() const {
     return !this->connected.empty() || !this->disconnected.empty() || !this->activates.empty() ||
-           !this->rehandshake.empty() || !this->pair_aborts.empty() ||
+           !this->role_messages.empty() || !this->rehandshake.empty() || !this->pair_aborts.empty() ||
            !this->management_requests.empty() || !this->server_unpairs.empty() ||
            !this->pin_messages.empty() || !this->pairing_succeeded.empty() ||
            this->pairing_window_confirm;
@@ -445,6 +449,7 @@ ConnectionManager::DrainedEvents ConnectionManager::swap_out_pending_events() {
         ev.connected.swap(this->pending_connected_events_);
         ev.disconnected.swap(this->pending_disconnect_events_);
         ev.activates.swap(this->pending_activate_events_);
+        ev.role_messages.swap(this->pending_role_messages_);
         ev.rehandshake.swap(this->pending_rehandshake_events_);
         ev.pair_aborts.swap(this->pending_pair_abort_events_);
         ev.management_requests.swap(this->pending_management_request_events_);
@@ -521,6 +526,15 @@ void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
             continue;
         }
         it = this->promote_or_arbitrate_nursery_entry(it);
+    }
+
+    // Admission has now resolved for every activate drained in this pass. Clear each connection's
+    // marker only after the promotion scan so role traffic arriving in the apply-to-promote window
+    // is still deferred rather than dropped.
+    for (auto& event : ev.activates) {
+        if (event.conn) {
+            event.conn->note_activate_processed();
+        }
     }
 }
 
@@ -1052,6 +1066,16 @@ void ConnectionManager::loop() {
         this->drain_management_events(ev);
     }
 
+    // Replay role traffic outside conn_ptr_mutex_: source command dispatch takes a thread-safe
+    // current_shared() snapshot and would deadlock inside the lifecycle section. Only the winner
+    // of admission is eligible; rejected or stale connection messages stay inert.
+    for (auto& event : ev.role_messages) {
+        if (event.conn && event.conn->is_admitted()) {
+            this->client_->process_json_message(event.conn.get(), event.json.data(), event.json.size(),
+                                                event.timestamp);
+        }
+    }
+
     // Send the goodbyes and release the connections dropped above, outside the lock.
     this->flush_deferred_releases();
 
@@ -1109,7 +1133,26 @@ void ConnectionManager::set_last_played_server_id(const std::string& server_id) 
 void ConnectionManager::schedule_activate(ServerActivateEvent event) {
     // Called from SendspinClient::process_json_message() on the network thread.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
+    if (event.conn) {
+        event.conn->note_activate_pending();
+    }
     this->queue_pending(this->pending_activate_events_, std::move(event));
+}
+
+bool ConnectionManager::defer_role_message_until_admission(SendspinConnection* conn, const char* data,
+                                                           size_t len, int64_t timestamp) {
+    if (conn == nullptr || data == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(this->conn_mutex_);
+    // The main loop may have admitted the connection between process_json_message()'s first gate
+    // read and this lock. In that case the caller dispatches normally instead of delaying a tick.
+    if (conn->is_admitted() || !conn->has_pending_activate()) {
+        return false;
+    }
+    this->queue_pending(this->pending_role_messages_,
+                        DeferredRoleMessage{conn->shared_from_this(), std::string(data, len), timestamp});
+    return true;
 }
 
 void ConnectionManager::schedule_rehandshake_rearm(std::shared_ptr<SendspinConnection> conn) {
