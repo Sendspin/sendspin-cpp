@@ -322,8 +322,8 @@ void SourceTask::stream(const std::shared_ptr<SendspinConnection>& conn) {
     // another START wait -- where a late success means the start really is on the wire (a
     // duplicate replaces the stream format in place per the spec) -- never a chunk-send wait.
     this->event_flags_.clear(SourceTaskBits::SOURCE_START_COMPLETE);
-    if (conn->send_text_message(format_client_stream_start_message(&start_msg),
-                                this->start_complete_cb_) != SsErr::OK) {
+    if (conn->send_app_json(format_client_stream_start_message(&start_msg),
+                            this->start_complete_cb_) != SsErr::OK) {
         SS_LOGW(TAG, "Failed to send client-stream/start; stream not opened");
         return;
     }
@@ -351,7 +351,7 @@ void SourceTask::stream(const std::shared_ptr<SendspinConnection>& conn) {
     // confirmation wins the race, the gate stays shut, and no STREAMING_STARTED follows a stop.
     this->flush_ring_to_live();
     if (!this->try_open_audio_gate()) {
-        conn->send_text_message(format_client_stream_end_message(), nullptr);
+        conn->send_app_json(format_client_stream_end_message(), nullptr);
         return;
     }
     this->source_impl_->enqueue_stream_event(SourceStreamCallbackType::STREAMING_STARTED);
@@ -417,7 +417,7 @@ void SourceTask::stream(const std::shared_ptr<SendspinConnection>& conn) {
 
     // Sent from this thread so it is ordered after the last chunk by construction; best-effort,
     // the connection may already be gone
-    conn->send_text_message(format_client_stream_end_message(), nullptr);
+    conn->send_app_json(format_client_stream_end_message(), nullptr);
     this->source_impl_->enqueue_stream_event(SourceStreamCallbackType::STREAMING_STOPPED);
 
     this->flush_ring_to_live();

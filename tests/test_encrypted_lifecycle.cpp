@@ -28,6 +28,7 @@
 #include "crypto/keys.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/crypto.h"
+#include "platform/time.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
@@ -72,6 +73,7 @@ constexpr uint16_t REVOCATION_SWEEP_TEST_PORT = 19002;
 constexpr uint16_t REACTIVATE_PAIRING_TEST_PORT = 19003;
 constexpr uint16_t SOURCE_ROLE_TEST_PORT = 19004;
 constexpr uint16_t SOURCE_ACTIVATION_RACE_TEST_PORT = 19005;
+constexpr uint16_t SOURCE_STREAM_TEST_PORT = 19006;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -856,6 +858,69 @@ TEST(EncryptedLifecycle, PairedSourceRoleActivatesOverEncryptedTransport) {
     EXPECT_NE(std::find(supported_roles.begin(), supported_roles.end(), "source@v1"),
               supported_roles.end());
     EXPECT_EQ(client.source(), &source);
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// The source stream lifecycle is application traffic and must stay inside Noise transport after
+// pairing. A raw WebSocket TEXT client-stream/start appears sent to the ESP transport but is not a
+// valid post-handshake frame, which leaves Music Assistant waiting until its source-start timeout.
+TEST(EncryptedLifecycle, PairedSourceCommandStartsCaptureAndSendsEncryptedAudio) {
+    SendspinClientConfig config;
+    config.name = "Encrypted Source Stream Test Client";
+    config.server_port = SOURCE_STREAM_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    struct Listener : SourceRoleListener {
+        void on_streaming_started() override {
+            this->started.fetch_add(1);
+        }
+        void on_streaming_stopped() override {
+            this->stopped.fetch_add(1);
+        }
+        std::atomic<int> started{0};
+        std::atomic<int> stopped{0};
+    } listener;
+    SourceRole& source = client.add_source(SourceRoleConfig{});
+    source.set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServerOptions options;
+    options.first_activities_json = R"(["playback"])";
+    options.first_roles_json = R"(["source@v1"])";
+    options.answer_time = true;
+    FakeEncryptedServer server(server_url(SOURCE_STREAM_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               bundle.peer.record.psk_id, bundle.peer.psk, options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected() && client.is_time_synced(); }, 4000));
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/command","payload":{"source":{"command":"start"}}})"));
+    ASSERT_TRUE(pump_until(
+        client,
+        [&] { return listener.started.load() == 1 && server.client_stream_start_count() == 1; },
+        4000))
+        << "Encrypted source start did not invoke its listener and reach the server";
+
+    // One complete default 20 ms PCM chunk: 48 kHz, stereo, signed 16-bit.
+    std::vector<uint8_t> pcm(960U * 2U * 2U, 0x2A);
+    ASSERT_TRUE(source.write_audio(pcm.data(), pcm.size(), platform_time_us()));
+    ASSERT_TRUE(pump_until(client, [&] { return server.source_audio_count() == 1; }, 4000))
+        << "Capture accepted after source start but produced no encrypted source frame";
+
+    // Keep pumping after data transfer: malformed cleartext lifecycle traffic used to make the
+    // peer drop this connection, surfacing later as its WebSocket PONG timeout.
+    pump_for(client, 500);
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_FALSE(server.closed());
+
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/command","payload":{"source":{"command":"stop"}}})"));
+    EXPECT_TRUE(pump_until(client, [&] { return listener.stopped.load() == 1; }, 4000));
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

@@ -29,6 +29,7 @@
 #include "noise_test_helpers.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
+#include "protocol_messages.h"
 #include "sendspin/client.h"
 #include "sendspin/persistence_codec.h"
 #include "sendspin/types.h"
@@ -350,20 +351,29 @@ protected:
         this->send_encrypted_locked(hello_text);
     }
 
-    // Decrypts an inbound binary frame and returns its JSON text, or nullopt if no session is
-    // active yet, decrypt fails, or the leading type byte is not MSG_TYPE_JSON_BODY. Does not
-    // itself parse the JSON: callers deserialize it into their own JsonDocument. Caller must hold
-    // crypto_mutex_.
-    std::optional<std::string> decrypt_json_locked(const std::string& bytes) {
+    // Decrypts an inbound binary frame and returns its complete application plaintext. Caller
+    // must hold crypto_mutex_. Keeping the type byte lets source lifecycle tests distinguish JSON
+    // control messages from source-audio frames without attempting a second Noise decrypt.
+    std::optional<std::vector<uint8_t>> decrypt_plaintext_locked(const std::string& bytes) {
         if (this->active_.send_cs == nullptr) {
             return std::nullopt;
         }
         std::vector<uint8_t> ct(bytes.begin(), bytes.end());
         auto pt = raw_decrypt(this->active_.recv_cs, std::move(ct));
-        if (pt.empty() || pt[0] != MSG_TYPE_JSON_BODY) {
+        if (pt.empty()) {
             return std::nullopt;
         }
-        return std::string(reinterpret_cast<char*>(pt.data() + 1), pt.size() - 1);
+        return pt;
+    }
+
+    // Decrypts an inbound binary frame and returns its JSON text, or nullopt if the leading type
+    // byte is not MSG_TYPE_JSON_BODY. Does not itself parse the JSON.
+    std::optional<std::string> decrypt_json_locked(const std::string& bytes) {
+        auto pt = this->decrypt_plaintext_locked(bytes);
+        if (!pt.has_value() || (*pt)[0] != MSG_TYPE_JSON_BODY) {
+            return std::nullopt;
+        }
+        return std::string(reinterpret_cast<char*>(pt->data() + 1), pt->size() - 1);
     }
 
     std::string suite_name_;
@@ -415,6 +425,10 @@ struct FakeEncryptedServerOptions {
     // (so its psk_id/category are resolved) and the hello exchange, but never proves itself, so
     // it stays in the nursery instead of being promoted.
     bool suppress_activate{false};
+    // Reply to client/time messages with a zero-offset sample. Most lifecycle tests do not need
+    // time sync; source streaming does, and opt-in avoids introducing unrelated traffic into
+    // re-handshake tests whose cipher transition is the behavior under test.
+    bool answer_time{false};
 };
 
 class FakeEncryptedServer : public NoiseInitiatorFixtureBase {
@@ -535,6 +549,14 @@ public:
         return this->client_state_count_.load();
     }
 
+    int client_stream_start_count() const {
+        return this->client_stream_start_count_.load();
+    }
+
+    int source_audio_count() const {
+        return this->source_audio_count_.load();
+    }
+
 private:
     void on_message(const ix::WebSocketMessagePtr& msg) {
         if (msg->type == ix::WebSocketMessageType::Close ||
@@ -595,11 +617,19 @@ private:
 
     void handle_binary(const std::string& bytes) {
         std::lock_guard<std::mutex> lock(this->crypto_mutex_);
-        auto json_opt = this->decrypt_json_locked(bytes);
-        if (!json_opt.has_value()) {
+        auto plaintext = this->decrypt_plaintext_locked(bytes);
+        if (!plaintext.has_value()) {
             return;
         }
-        const std::string& json = *json_opt;
+        if ((*plaintext)[0] == SENDSPIN_BINARY_SOURCE_AUDIO) {
+            this->source_audio_count_.fetch_add(1);
+            return;
+        }
+        if ((*plaintext)[0] != MSG_TYPE_JSON_BODY) {
+            return;
+        }
+        const std::string json(reinterpret_cast<char*>(plaintext->data() + 1),
+                               plaintext->size() - 1);
         JsonDocument doc;
         if (deserializeJson(doc, json)) {
             return;
@@ -690,6 +720,21 @@ private:
             return;
         }
 
+        if (std::strcmp(type, "client/time") == 0 && this->options_.answer_time) {
+            const int64_t transmitted = doc["payload"]["client_transmitted"] | int64_t{0};
+            this->send_encrypted_locked(
+                std::string(R"({"type":"server/time","payload":{"client_transmitted":)") +
+                std::to_string(transmitted) + R"(,"server_received":)" +
+                std::to_string(transmitted) + R"(,"server_transmitted":)" +
+                std::to_string(transmitted) + "}}");
+            return;
+        }
+
+        if (std::strcmp(type, "client-stream/start") == 0) {
+            this->client_stream_start_count_.fetch_add(1);
+            return;
+        }
+
         if (std::strcmp(type, "noise/handshake") == 0 && this->rehandshake_hs_ != nullptr) {
             // The client's msg2 for the in-band re-handshake, still encrypted under the OLD
             // (currently active) session, decrypted above like any other frame.
@@ -759,6 +804,8 @@ private:
     std::optional<std::string> last_management_result_;
 
     std::atomic<int> client_state_count_{0};
+    std::atomic<int> client_stream_start_count_{0};
+    std::atomic<int> source_audio_count_{0};
 };
 
 // A fake Sendspin "server" that LISTENS for a real Sendspin client's OUTBOUND connection (backed
