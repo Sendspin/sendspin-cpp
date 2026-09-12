@@ -417,10 +417,10 @@ void ConnectionManager::init_server(SendspinClient* client) {
 
 bool ConnectionManager::DrainedEvents::any() const {
     return !this->connected.empty() || !this->disconnected.empty() || !this->activates.empty() ||
-           !this->role_messages.empty() || !this->rehandshake.empty() || !this->pair_aborts.empty() ||
-           !this->management_requests.empty() || !this->server_unpairs.empty() ||
-           !this->pin_messages.empty() || !this->pairing_succeeded.empty() ||
-           this->pairing_window_confirm;
+           !this->role_messages.empty() || !this->rehandshake.empty() ||
+           !this->pair_aborts.empty() || !this->management_requests.empty() ||
+           !this->server_unpairs.empty() || !this->pin_messages.empty() ||
+           !this->pairing_succeeded.empty() || this->pairing_window_confirm;
 }
 
 void ConnectionManager::maybe_start_ws_server() {
@@ -1071,8 +1071,8 @@ void ConnectionManager::loop() {
     // of admission is eligible; rejected or stale connection messages stay inert.
     for (auto& event : ev.role_messages) {
         if (event.conn && event.conn->is_admitted()) {
-            this->client_->process_json_message(event.conn.get(), event.json.data(), event.json.size(),
-                                                event.timestamp);
+            this->client_->process_json_message(event.conn.get(), event.json.data(),
+                                                event.json.size(), event.timestamp);
         }
     }
 
@@ -1139,8 +1139,9 @@ void ConnectionManager::schedule_activate(ServerActivateEvent event) {
     this->queue_pending(this->pending_activate_events_, std::move(event));
 }
 
-bool ConnectionManager::defer_role_message_until_admission(SendspinConnection* conn, const char* data,
-                                                           size_t len, int64_t timestamp) {
+bool ConnectionManager::defer_role_message_until_admission(SendspinConnection* conn,
+                                                           const char* data, size_t len,
+                                                           int64_t timestamp) {
     if (conn == nullptr || data == nullptr) {
         return false;
     }
@@ -1150,8 +1151,9 @@ bool ConnectionManager::defer_role_message_until_admission(SendspinConnection* c
     if (conn->is_admitted() || !conn->has_pending_activate()) {
         return false;
     }
-    this->queue_pending(this->pending_role_messages_,
-                        DeferredRoleMessage{conn->shared_from_this(), std::string(data, len), timestamp});
+    this->queue_pending(
+        this->pending_role_messages_,
+        DeferredRoleMessage{conn->shared_from_this(), std::string(data, len), timestamp});
     return true;
 }
 
