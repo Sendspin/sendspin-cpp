@@ -65,6 +65,7 @@ constexpr uint16_t HIGH_PERF_TEST_PORT = 18997;
 constexpr uint16_t VISUALIZER_TEST_PORT = 18998;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 18999;
 constexpr uint16_t FORMATS_TEST_PORT = 19000;
+constexpr uint16_t OPUS_TEST_PORT = 19001;
 
 /// Reports whether anything is listening on the loopback port.
 bool port_accepts(uint16_t port) {
@@ -427,6 +428,28 @@ TEST(ClientLifecycle, PlayerWithoutFlacOrPcmRefusesToStart) {
         ASSERT_TRUE(client.start());
         client.stop();
     }
+}
+
+// An opus entry next to a baseline codec is accepted only in a build with the Opus decoder
+// (SENDSPIN_ENABLE_OPUS); otherwise start() refuses it, so the hello never advertises a codec this
+// build cannot decode.
+TEST(ClientLifecycle, OpusEntryRequiresTheOpusDecoder) {
+    TestNetworkProvider network;
+    CountingPlayerListener listener;
+    SendspinClient client(make_config(OPUS_TEST_PORT));
+    client.set_network_provider(&network);
+
+    PlayerRoleConfig config;
+    config.audio_formats.push_back({SendspinCodecFormat::OPUS, 2, 48000, 16});
+    config.audio_formats.push_back({SendspinCodecFormat::PCM, 2, 48000, 16});
+    client.add_player(std::move(config)).set_listener(&listener);
+#ifdef SENDSPIN_ENABLE_OPUS
+    ASSERT_TRUE(client.start());
+    client.stop();
+#else
+    EXPECT_FALSE(client.start());
+    EXPECT_FALSE(client.is_started());
+#endif
 }
 
 /// Counts loudness deliveries; they fire on the visualizer drain thread.

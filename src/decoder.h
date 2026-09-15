@@ -13,7 +13,7 @@
 // limitations under the License.
 
 /// @file decoder.h
-/// @brief Audio decoder wrapper supporting FLAC, Opus, and raw PCM codec formats
+/// @brief Audio decoder wrapper supporting FLAC, raw PCM, and (with SENDSPIN_ENABLE_OPUS) Opus
 
 #pragma once
 
@@ -22,19 +22,22 @@
 #include "platform/memory.h"
 #include "sendspin/player_role.h"  // For SendspinCodecFormat
 #include <micro_flac/flac_decoder.h>
+#ifdef SENDSPIN_ENABLE_OPUS
 #include <opus.h>
+#endif
 
 #include <memory>
 
 namespace sendspin {
 
 /**
- * @brief Audio decoder wrapper supporting FLAC, Opus, and raw PCM codec formats
+ * @brief Audio decoder wrapper supporting FLAC, raw PCM, and (with SENDSPIN_ENABLE_OPUS) Opus
  *
  * Manages codec state for a single active stream. The caller first passes a header chunk
  * via process_header() to initialize the decoder and populate an AudioStreamInfo, then
- * calls decode_audio_chunk() for each subsequent encoded chunk. FLAC uses micro_flac,
- * Opus uses libopus. PCM and dummy headers bypass decoding and copy data directly.
+ * calls decode_audio_chunk() for each subsequent encoded chunk. FLAC uses micro_flac. Opus
+ * uses libopus and is only compiled in with SENDSPIN_ENABLE_OPUS; an Opus header is rejected
+ * otherwise. PCM and dummy headers bypass decoding and copy data directly.
  *
  * Usage:
  * 1. Call process_header() with the first chunk to initialize the codec and stream info
@@ -116,7 +119,9 @@ protected:
 
     // Struct fields
     AudioStreamInfo current_stream_info_;
+#ifdef SENDSPIN_ENABLE_OPUS
     PlatformBuffer opus_decoder_buf_;
+#endif
 
     // Pointer fields
     std::unique_ptr<micro_flac::FLACDecoder> flac_decoder_;

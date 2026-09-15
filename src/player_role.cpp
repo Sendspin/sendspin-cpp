@@ -28,6 +28,13 @@ static constexpr uint16_t MAX_STATIC_DELAY_MS = 5000U;
 static constexpr uint32_t HEADER_SEND_TIMEOUT_MS = 100U;
 // Denominator for the advertised buffer capacity fraction: advertises (N-1)/N of capacity
 static constexpr size_t AUDIO_BUFFER_ADVERTISE_DENOMINATOR = 5;
+// Whether this build decodes Opus (SENDSPIN_ENABLE_OPUS); opus entries in audio_formats and opus
+// streams are refused otherwise
+#ifdef SENDSPIN_ENABLE_OPUS
+static constexpr bool OPUS_DECODER_ENABLED = true;
+#else
+static constexpr bool OPUS_DECODER_ENABLED = false;
+#endif
 
 /// @brief Swaps bytes of a big-endian 64-bit value to host byte order.
 static int64_t be64_to_host(const uint8_t* bytes) {
@@ -64,17 +71,25 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
 
 /// @brief Checks the configured formats against the codec rules of the player spec
 /// (roles/player/v1.md, "Servers MUST support the flac and pcm codecs"): the list must contain
-/// a flac or pcm entry, since a player is not told which other codecs a server has.
+/// a flac or pcm entry, since a player is not told which other codecs a server has, and may
+/// list opus only when this build decodes it.
 static bool audio_formats_valid(const std::vector<AudioSupportedFormatObject>& formats) {
     bool has_baseline = false;
+    bool has_opus = false;
     for (const auto& format : formats) {
         if (format.codec == SendspinCodecFormat::FLAC || format.codec == SendspinCodecFormat::PCM) {
             has_baseline = true;
+        } else if (format.codec == SendspinCodecFormat::OPUS) {
+            has_opus = true;
         }
     }
     if (!has_baseline) {
         SS_LOGE(TAG,
                 "audio_formats has no flac or pcm entry; servers need not support any other codec");
+        return false;
+    }
+    if (has_opus && !OPUS_DECODER_ENABLED) {
+        SS_LOGE(TAG, "audio_formats lists opus but this build has no Opus decoder");
         return false;
     }
     return true;
@@ -288,7 +303,8 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     } else {
         auto codec = player_obj.codec.value();
 
-        if ((codec == SendspinCodecFormat::PCM) || (codec == SendspinCodecFormat::OPUS)) {
+        if (codec == SendspinCodecFormat::PCM ||
+            (OPUS_DECODER_ENABLED && codec == SendspinCodecFormat::OPUS)) {
             DummyHeader header{};
             header.sample_rate = player_obj.sample_rate.value();
             header.bits_per_sample = player_obj.bit_depth.value();

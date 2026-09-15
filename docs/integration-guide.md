@@ -74,7 +74,7 @@ player_config.extra_startup_silence_ms = 50;     // Extra startup silence for de
 auto& player = client.add_player(std::move(player_config));
 ```
 
-List at least one `FLAC` or `PCM` format. Those are the only codecs a server must support, and the server picks only among the formats it can produce, so a list with neither can leave the player with nothing to play; `start()` refuses it. `OPUS` is optional.
+List at least one `FLAC` or `PCM` format. Those are the only codecs a server must support, and the server picks only among the formats it can produce, so a list with neither can leave the player with nothing to play; `start()` refuses it. `OPUS` is optional and needs a build with the Opus decoder (`SENDSPIN_ENABLE_OPUS`, on by default); `start()` refuses an `OPUS` entry otherwise.
 
 Each `AudioSupportedFormatObject` declares a codec/channels/sample_rate/bit_depth combination. The server selects from these when establishing an audio stream.
 
@@ -755,13 +755,14 @@ Available options (all `ON` by default):
 | Option | Controls |
 |---|---|
 | `SENDSPIN_ENABLE_PLAYER` | Player role, audio decoders (micro-flac, micro-opus), sync task |
+| `SENDSPIN_ENABLE_OPUS` | Opus decoder (micro-opus) within the player role; no effect when the player is `OFF` |
 | `SENDSPIN_ENABLE_CONTROLLER` | Controller role |
 | `SENDSPIN_ENABLE_METADATA` | Metadata role |
 | `SENDSPIN_ENABLE_ARTWORK` | Artwork role |
 | `SENDSPIN_ENABLE_VISUALIZER` | Visualizer role |
 | `SENDSPIN_ENABLE_COLOR` | Color role |
 
-When `SENDSPIN_ENABLE_PLAYER` is `OFF`, the micro-flac and micro-opus dependencies are not fetched.
+When `SENDSPIN_ENABLE_PLAYER` is `OFF`, the micro-flac and micro-opus dependencies are not fetched. `SENDSPIN_ENABLE_OPUS=OFF` drops micro-opus alone, for products that must avoid the Opus patent licence (see the player role spec); the player then refuses `OPUS` entries in `audio_formats`.
 
 ### ESP-IDF (Kconfig)
 
@@ -769,6 +770,7 @@ Role flags are exposed via Kconfig under `Component config → sendspin-cpp`:
 
 ```kconfig
 CONFIG_SENDSPIN_ENABLE_PLAYER=y
+CONFIG_SENDSPIN_ENABLE_OPUS=y
 CONFIG_SENDSPIN_ENABLE_CONTROLLER=y
 CONFIG_SENDSPIN_ENABLE_METADATA=y
 CONFIG_SENDSPIN_ENABLE_ARTWORK=y
@@ -817,7 +819,7 @@ Configuration passed to `client.add_player()`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports, in preference order; advertised to the server during the hello handshake. The server selects one when establishing a stream. Must include a `FLAC` or `PCM` entry, the only codecs every server supports; `start()` refuses a non-empty list without one. `OPUS` may be listed in addition. |
+| `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports, in preference order; advertised to the server during the hello handshake. The server selects one when establishing a stream. Must include a `FLAC` or `PCM` entry, the only codecs every server supports; `start()` refuses a non-empty list without one. `OPUS` may be listed in addition when the build has the Opus decoder (`SENDSPIN_ENABLE_OPUS`). |
 | `audio_buffer_capacity` | `size_t` | `1000000` | Internal ring buffer size in bytes. Larger buffers absorb more jitter at the cost of memory. |
 | `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable static delay. |
 | `initial_static_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable static delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
@@ -897,7 +899,7 @@ Configuration passed to `client.add_visualizer()`.
 | Value | Description |
 |---|---|
 | `FLAC` | FLAC lossless audio |
-| `OPUS` | Opus lossy audio |
+| `OPUS` | Opus lossy audio; decodable only in a build with `SENDSPIN_ENABLE_OPUS` |
 | `PCM` | Raw PCM audio |
 | `UNSUPPORTED` | Unsupported codec |
 

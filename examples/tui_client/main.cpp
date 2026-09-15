@@ -348,7 +348,12 @@ static bool parse_audio_format(const std::string& str, sendspin::AudioSupportedF
     if (codec_str == "flac") {
         fmt.codec = sendspin::SendspinCodecFormat::FLAC;
     } else if (codec_str == "opus") {
+#ifdef SENDSPIN_ENABLE_OPUS
         fmt.codec = sendspin::SendspinCodecFormat::OPUS;
+#else
+        fprintf(stderr, "opus is not available: built without SENDSPIN_ENABLE_OPUS\n");
+        return false;
+#endif
     } else if (codec_str == "pcm") {
         fmt.codec = sendspin::SendspinCodecFormat::PCM;
     } else {
@@ -483,7 +488,11 @@ int main(int argc, char* argv[]) {
         static constexpr uint32_t SAMPLE_RATES[] = {44100, 48000, 88200, 96000};
         static constexpr uint8_t BIT_DEPTHS[] = {16, 24, 32};
         static constexpr SendspinCodecFormat CODECS[] = {
-            SendspinCodecFormat::FLAC, SendspinCodecFormat::OPUS, SendspinCodecFormat::PCM,
+            SendspinCodecFormat::FLAC,
+#ifdef SENDSPIN_ENABLE_OPUS
+            SendspinCodecFormat::OPUS,
+#endif
+            SendspinCodecFormat::PCM,
         };
 
         for (uint32_t rate : SAMPLE_RATES) {
@@ -509,8 +518,12 @@ int main(int argc, char* argv[]) {
 #else
     if (audio_formats.empty()) {
         audio_formats = {
-            {SendspinCodecFormat::FLAC, 2, 44100, 16}, {SendspinCodecFormat::FLAC, 2, 48000, 16},
-            {SendspinCodecFormat::OPUS, 2, 48000, 16}, {SendspinCodecFormat::PCM, 2, 44100, 16},
+            {SendspinCodecFormat::FLAC, 2, 44100, 16},
+            {SendspinCodecFormat::FLAC, 2, 48000, 16},
+#ifdef SENDSPIN_ENABLE_OPUS
+            {SendspinCodecFormat::OPUS, 2, 48000, 16},
+#endif
+            {SendspinCodecFormat::PCM, 2, 44100, 16},
             {SendspinCodecFormat::PCM, 2, 48000, 16},
         };
     }

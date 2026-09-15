@@ -79,11 +79,13 @@ the descriptions in `docs/internals.md`:
   `src/platform/`, `src/esp/`, `src/host/`.
 - Role compile-gates (`SENDSPIN_ENABLE_*`) appear only in
   `cmake/sources.cmake` and the dispatch points in
-  `include/sendspin/client.h` / `src/client.cpp`. Examples must build with
-  roles disabled: role usage in `examples/` is guarded like an external
-  consumer would guard it. Verify this by grepping the example for the
-  role's types and calls and confirming each use sits inside the matching
-  `#ifdef`; do not report gate coverage without that check.
+  `include/sendspin/client.h` / `src/client.cpp`; the codec gate
+  `SENDSPIN_ENABLE_OPUS` only in `src/decoder.h`, `src/decoder.cpp`, and
+  `src/player_role.cpp`. Examples must build with roles (and Opus) disabled:
+  role and opus usage in `examples/` is guarded like an external consumer
+  would guard it. Verify this by grepping the example for the role's types
+  and calls and confirming each use sits inside the matching `#ifdef`; do
+  not report gate coverage without that check.
 - `SS_LOG*` for logging, `platform_malloc` family for allocation. Raw
   `ESP_LOG*` or `heap_caps_*` in cross-platform code is a finding.
 - Changes keep both platforms' builds coherent (source lists, Kconfig, CMake
