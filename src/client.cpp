@@ -85,8 +85,7 @@ SendspinClient::~SendspinClient() {
     // into from here. The role threads are joined by the role resets below, whose destructors
     // run the same stop() the explicit path would.
     if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
-        this->signal_drain_role_stops();
-        this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
+        this->close_transports();
     }
 
     // The network threads are gone (above, or never started), so the role threads are the only
@@ -180,18 +179,9 @@ void SendspinClient::stop() {
     // cannot recurse into the teardown, restart the server, or admit a connection.
     this->lifecycle_.store(LifecycleState::STOPPING, std::memory_order_release);
 
-    // 1. Ask the artwork and visualizer threads to exit now, so a slow on_image_decode() or a
-    //    parked drain overlaps the transport teardown instead of following it. Their inbound
-    //    channels never block a network thread (a zero-timeout queue send, a bounded ring
-    //    acquire), so they need no consumer while the transports close. The player's ring does:
-    //    a network thread blocked on ring space (write_audio_chunk) resolves only while the sync
-    //    task is alive, so the player is signalled in step 3, after the network threads are gone.
-    this->signal_drain_role_stops();
-
-    // 2. Transports: goodbye every peer, wait up to the flush bound, then close the server and
-    //    every connection. This joins every network thread, so nothing reaches a role or the
-    //    inbox from the network after it returns.
-    this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
+    // 1-2. Signal the drain roles, then goodbye and close every transport (see
+    //      close_transports()). Nothing reaches a role or the inbox from the network after this.
+    this->close_transports();
 
     // 3. Role threads. Each role discards its ring/queue content after its own join.
     this->stop_role_threads();
@@ -210,6 +200,20 @@ void SendspinClient::stop() {
     this->drain_inbox();
 
     this->lifecycle_.store(LifecycleState::STOPPED, std::memory_order_release);
+}
+
+void SendspinClient::close_transports() {
+    // 1. Ask the artwork and visualizer threads to exit now, so a slow on_image_decode() or a
+    //    parked drain overlaps the transport teardown instead of following it. Their inbound
+    //    channels never block a network thread (a zero-timeout queue send, a bounded ring
+    //    acquire), so they need no consumer while the transports close. The player's ring does:
+    //    a network thread blocked on ring space (write_audio_chunk) resolves only while the sync
+    //    task is alive, so the player is joined by the caller after the network threads are gone.
+    this->signal_drain_role_stops();
+
+    // 2. Transports: goodbye every peer, wait up to the flush bound, then close the server and
+    //    every connection. This joins every network thread.
+    this->connection_manager_->stop(SendspinGoodbyeReason::SHUTDOWN);
 }
 
 void SendspinClient::signal_drain_role_stops() {

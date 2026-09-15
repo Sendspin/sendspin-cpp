@@ -209,9 +209,9 @@ public:
 
     /// @brief Opens admission and creates the WebSocket server on first use
     ///
-    /// Server configuration is read from the client's config and applied on every call, so a
-    /// restart picks up the current values. loop() starts the server once the network provider
-    /// reports ready. Main-loop thread only.
+    /// Server configuration is read from the client's config when the server object is created;
+    /// a restart reuses the object. loop() starts the server once the network provider reports
+    /// ready. Main-loop thread only.
     void start();
 
     /// @brief Synchronous teardown: goodbyes every managed connection, waits up to
@@ -220,10 +220,11 @@ public:
     ///
     /// Closes admission first, so a peer delivered during the wait is rejected with a goodbye.
     /// Blocks on the transports' own teardown as well as the flush bound: the host server joins
-    /// its connection threads (each waits up to IXWebSocket's 300 ms close handshake), the ESP
-    /// server waits for the httpd task to exit, and an outbound connection's transport stop is
-    /// synchronous (esp_websocket_client_stop() / ix::WebSocket::stop()). Client-state cleanup is
-    /// the caller's job: this only detaches connections. Main-loop thread only.
+    /// every accepted connection thread, including a raw socket that never completed its
+    /// WebSocket upgrade, which can hold the join for the full WS_HANDSHAKE_TIMEOUT_SECS (3 s);
+    /// the ESP server waits for the httpd task to exit, and an outbound connection's transport
+    /// stop is synchronous (esp_websocket_client_stop() / ix::WebSocket::stop()). Client-state
+    /// cleanup is the caller's job: this only detaches connections. Main-loop thread only.
     /// @param reason The goodbye reason sent to every connected peer.
     void stop(SendspinGoodbyeReason reason);
 
@@ -449,6 +450,10 @@ private:
 
     // 8-bit fields
     bool has_last_played_server_{false};
+    /// True between start() and stop(). Written and read only under conn_ptr_mutex_ (the read is
+    /// on_new_connection(), on the network thread), so a peer delivered after stop() closed
+    /// admission is rejected rather than admitted into a nursery stop() has already emptied.
+    bool accepting_{false};
 
     // Atomic fields (lock-free hints for loop() tick gating; ground truth remains the
     // mutex-protected containers/pointer above -- see the "Tick cost" note on loop())
@@ -476,11 +481,6 @@ private:
     /// queue_deferred_release()) and after the drain swap in flush_deferred_releases(). Lets
     /// flush_deferred_releases() early-return without locking when nothing is queued.
     std::atomic<size_t> deferred_size_{0};
-
-    /// True between start() and stop(). Written under conn_ptr_mutex_ and read under it by
-    /// on_new_connection() (network thread), so a peer delivered after stop() closed admission is
-    /// rejected rather than admitted into a nursery stop() has already emptied.
-    std::atomic<bool> accepting_{false};
 };
 
 }  // namespace sendspin

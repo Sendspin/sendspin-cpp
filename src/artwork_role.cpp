@@ -112,22 +112,22 @@ bool ArtworkRole::Impl::start() {
     return true;
 }
 
-void ArtworkRole::Impl::signal_stop() const {
+bool ArtworkRole::Impl::signal_stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
-        return;
+        return false;
     }
     // Set the flag before waking: the thread re-checks its command flags at the top of every
     // loop iteration, so this ordering guarantees it observes the stop as soon as the wake
     // pulls it out of its blocking queue receive.
     this->drain_task->event_flags.set(COMMAND_STOP);
     this->drain_task->notify_queue.wake_receiver();
+    return true;
 }
 
 void ArtworkRole::Impl::stop() const {
-    if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
+    if (!this->signal_stop()) {
         return;
     }
-    this->signal_stop();
     this->drain_task->drain_thread.join();
 
     // Joined, so this is the queue's only consumer: discard notifications the old thread never

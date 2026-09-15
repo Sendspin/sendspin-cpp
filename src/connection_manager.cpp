@@ -220,24 +220,22 @@ void ConnectionManager::disconnect(SendspinGoodbyeReason reason) {
 void ConnectionManager::start() {
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        this->accepting_.store(true, std::memory_order_release);
+        this->accepting_ = true;
     }
     // A restart reuses the server object: stop() only stopped it, and loop() starts it again
     // once the network is ready. Retry immediately rather than honoring a backoff from before
     // the stop.
     this->ws_server_start_retry_time_us_ = 0;
-    const bool first_start = this->ws_server_ == nullptr;
-    if (first_start) {
-        this->ws_server_ = std::make_unique<SendspinWsServer>();
+    if (this->ws_server_ != nullptr) {
+        return;
     }
-    // Applied on every start, not just the first: the transport is (re)created from these values
-    // when loop() starts it, so a restart listens with the config the client holds now.
+
+    // First start: create the server object and configure it once. The config is immutable for
+    // the client's lifetime, so a restart reuses these values along with the object.
+    this->ws_server_ = std::make_unique<SendspinWsServer>();
     this->ws_server_->set_port(this->client_->config_.server_port);
     this->ws_server_->set_max_connections(this->client_->config_.server_max_connections);
     this->ws_server_->set_ctrl_port(this->client_->config_.httpd_ctrl_port);
-    if (!first_start) {
-        return;
-    }
 
     // Graceful rejection needs transport headroom: the manager can hold one established inbound
     // connection plus NURSERY_CAPACITY unproven ones, and rejecting a surplus peer with a
@@ -295,7 +293,7 @@ void ConnectionManager::stop(SendspinGoodbyeReason reason) {
     std::vector<std::shared_ptr<SendspinConnection>> to_goodbye;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        this->accepting_.store(false, std::memory_order_release);
+        this->accepting_ = false;
         if (this->current_connection_ != nullptr) {
             this->current_connection_->disable_message_dispatch();
             to_goodbye.push_back(std::move(this->current_connection_));
@@ -667,7 +665,7 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
                 ++inbound_count;
             }
         }
-        if (!this->accepting_.load(std::memory_order_acquire)) {
+        if (!this->accepting_) {
             // Delivered while stop() is tearing down (or before start()): the nursery is being
             // emptied, so the newcomer gets a goodbye and a close instead of a slot. Same shape
             // as the nursery-full rejection below.

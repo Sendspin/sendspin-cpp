@@ -188,22 +188,22 @@ bool VisualizerRole::Impl::start() {
     return true;
 }
 
-void VisualizerRole::Impl::signal_stop() const {
+bool VisualizerRole::Impl::signal_stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
-        return;
+        return false;
     }
     // Set the flag before waking: the thread re-checks its command flags at the top of every
     // loop iteration, so this ordering guarantees it observes the stop no matter which wait
     // it was parked in (display-time flags wait or ring buffer receive).
     this->drain_task->event_flags.set(COMMAND_STOP);
     this->drain_task->ring_buffer.wake_receiver();
+    return true;
 }
 
 void VisualizerRole::Impl::stop() const {
-    if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
+    if (!this->signal_stop()) {
         return;
     }
-    this->signal_stop();
     this->drain_task->drain_thread.join();
 
     // Joined, so this is the ring's only consumer (the single-consumer contract the ring

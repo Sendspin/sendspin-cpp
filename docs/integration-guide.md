@@ -552,7 +552,7 @@ Restarting is `start()` again; start, stop, and start again can be repeated inde
 
 `stop()` may block, but the wait is bounded. Besides the goodbye bound it includes:
 
-- The transports' own close. The host server waits up to 300 ms per connection for the WebSocket close handshake. The ESP server waits for the httpd task to exit, which polls at 100 ms and first finishes any queued send, which can take up to httpd's send timeout for a peer that has stopped reading.
+- The transports' own close. The host server joins every accepted connection thread; a WebSocket peer completes its close handshake within about 300 ms, but a raw socket that connected and never completed the upgrade holds the join for the full 3 s handshake timeout. The ESP server waits for the httpd task to exit, which polls at 100 ms and first finishes any queued send, which can take up to httpd's send timeout for a peer that has stopped reading.
 - An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`).
 - A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
 

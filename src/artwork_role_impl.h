@@ -181,9 +181,10 @@ struct ArtworkRole::Impl {
     // Helpers
     // ========================================
 
-    /// @brief Asks the decode thread to exit without waiting for it; stop() joins. No-op when
-    /// the thread is not running. Lets a caller overlap the thread's exit with other teardown.
-    void signal_stop() const;
+    /// @brief Asks the decode thread to exit without waiting for it; stop() joins. Lets a caller
+    /// overlap the thread's exit with other teardown.
+    /// @return true if a running thread was signalled, false if none was running.
+    bool signal_stop() const;
     void stop() const;
     void enqueue_stream_event(ArtworkEventType event) const;
     // Merges a single-slot display delta into the accumulated cross-thread update. Called under

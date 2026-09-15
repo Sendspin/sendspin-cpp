@@ -472,6 +472,10 @@ private:
     /// listener callbacks on the calling (main-loop) thread. Shared by loop() and stop().
     void drain_inbox();
 
+    /// @brief Signals the drain roles, then goodbyes and closes every transport, joining the
+    /// network threads. The shared first half of stop() and the destructor's teardown.
+    void close_transports();
+
     /// @brief Asks the artwork and visualizer threads to exit without joining them, so their
     /// exit overlaps the transport teardown. The player is excluded: its ring must keep a
     /// consumer until the network threads are gone (see stop()).
