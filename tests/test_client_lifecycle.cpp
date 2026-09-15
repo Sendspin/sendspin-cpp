@@ -66,6 +66,7 @@ constexpr uint16_t VISUALIZER_TEST_PORT = 18998;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 18999;
 constexpr uint16_t FORMATS_TEST_PORT = 19000;
 constexpr uint16_t OPUS_TEST_PORT = 19001;
+constexpr uint16_t OPUS_STREAM_TEST_PORT = 19002;
 
 /// Reports whether anything is listening on the loopback port.
 bool port_accepts(uint16_t port) {
@@ -137,9 +138,13 @@ public:
     }
 };
 
+std::string stream_start_json(const char* codec) {
+    return std::string(R"({"type":"stream/start","payload":{"player":{"codec":")") + codec +
+           R"(","sample_rate":48000,"channels":2,"bit_depth":16}}})";
+}
+
 std::string stream_start_pcm_json() {
-    return R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":48000,)"
-           R"("channels":2,"bit_depth":16}}})";
+    return stream_start_json("pcm");
 }
 
 PlayerRoleConfig make_player_config() {
@@ -451,6 +456,33 @@ TEST(ClientLifecycle, OpusEntryRequiresTheOpusDecoder) {
     EXPECT_FALSE(client.is_started());
 #endif
 }
+
+#ifndef SENDSPIN_ENABLE_OPUS
+// Without the Opus decoder, a stream/start naming opus (a server ignoring the advertised list)
+// takes the unsupported-codec path: no codec header reaches the sync task and no
+// on_stream_start() fires. The pcm stream/start sent right behind it starts normally, which also
+// proves the opus one was processed and dropped rather than left pending.
+TEST(ClientLifecycle, OpusStreamStartIsRefusedWithoutTheOpusDecoder) {
+    TestNetworkProvider network;
+    CountingPlayerListener listener;
+    SendspinClient client(make_config(OPUS_STREAM_TEST_PORT));
+    client.set_network_provider(&network);
+    client.add_player(make_player_config()).set_listener(&listener);
+    ASSERT_TRUE(client.start());
+
+    FakeServer server(server_url(OPUS_STREAM_TEST_PORT), "server-a");
+    pump_until(client, [&] { return client.is_connected(); });
+
+    server.send_text(stream_start_json("opus"));
+    server.send_text(stream_start_pcm_json());
+    pump_until(client, [&] { return listener.stream_starts >= 1; });
+    EXPECT_EQ(listener.stream_starts, 1);
+    EXPECT_EQ(client.player()->get_current_stream_params().codec, SendspinCodecFormat::PCM);
+
+    client.stop();
+    EXPECT_EQ(listener.stream_ends, 1);
+}
+#endif
 
 /// Counts loudness deliveries; they fire on the visualizer drain thread.
 class CountingVisualizerListener : public VisualizerRoleListener {

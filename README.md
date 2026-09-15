@@ -28,7 +28,7 @@ cmake -B build
 cmake --build build
 ```
 
-Dependencies (fetched automatically via CMake FetchContent): ArduinoJson, micro-flac, IXWebSocket, and micro-opus unless `SENDSPIN_ENABLE_OPUS` is `OFF`.
+Dependencies (fetched automatically via CMake FetchContent): ArduinoJson, IXWebSocket, and, for the player role, micro-flac plus micro-opus when `SENDSPIN_ENABLE_OPUS` is on.
 
 ### ESP-IDF
 

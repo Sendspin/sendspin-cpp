@@ -62,7 +62,9 @@ PlayerRoleConfig player_config;
 player_config.audio_formats = {
     {SendspinCodecFormat::FLAC, 2, 44100, 16},
     {SendspinCodecFormat::FLAC, 2, 48000, 16},
+#ifdef SENDSPIN_ENABLE_OPUS
     {SendspinCodecFormat::OPUS, 2, 48000, 16},
+#endif
     {SendspinCodecFormat::PCM, 2, 44100, 16},
     {SendspinCodecFormat::PCM, 2, 48000, 16},
 };
