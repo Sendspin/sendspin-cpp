@@ -334,6 +334,13 @@ private:
 
 /// Parse an audio format string like "flac:48000:24:2" into an AudioSupportedFormatObject.
 /// Returns true on success.
+// Codecs the -f option accepts in this build
+#ifdef SENDSPIN_ENABLE_OPUS
+static constexpr const char* SUPPORTED_CODECS = "flac, opus, pcm";
+#else
+static constexpr const char* SUPPORTED_CODECS = "flac, pcm";
+#endif
+
 static bool parse_audio_format(const std::string& str, sendspin::AudioSupportedFormatObject& fmt) {
     std::istringstream ss(str);
     std::string codec_str, rate_str, bits_str, channels_str;
@@ -348,11 +355,17 @@ static bool parse_audio_format(const std::string& str, sendspin::AudioSupportedF
     if (codec_str == "flac") {
         fmt.codec = sendspin::SendspinCodecFormat::FLAC;
     } else if (codec_str == "opus") {
+#ifdef SENDSPIN_ENABLE_OPUS
         fmt.codec = sendspin::SendspinCodecFormat::OPUS;
+#else
+        fprintf(stderr, "opus is not available: built without SENDSPIN_ENABLE_OPUS\n");
+        return false;
+#endif
     } else if (codec_str == "pcm") {
         fmt.codec = sendspin::SendspinCodecFormat::PCM;
     } else {
-        fprintf(stderr, "Unknown codec: %s (expected flac, opus, or pcm)\n", codec_str.c_str());
+        fprintf(stderr, "Unknown codec: %s (expected one of: %s)\n", codec_str.c_str(),
+                SUPPORTED_CODECS);
         return false;
     }
 
@@ -399,7 +412,8 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  -u URL        Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)\n");
     fprintf(stderr, "  -p PORT       Listen on PORT (default: %u)\n", DEFAULT_SENDSPIN_PORT);
     fprintf(stderr, "  -f FORMAT     Audio format as codec:rate:bits:channels (e.g. flac:48000:24:2)\n");
-    fprintf(stderr, "                Can be specified multiple times. Codecs: flac, opus, pcm\n");
+    fprintf(stderr, "                Can be specified multiple times. Codecs: %s\n",
+            SUPPORTED_CODECS);
     fprintf(stderr, "  -V            Disable visualizer\n");
     fprintf(stderr, "  -h            Show this help\n");
 }
@@ -483,7 +497,11 @@ int main(int argc, char* argv[]) {
         static constexpr uint32_t SAMPLE_RATES[] = {44100, 48000, 88200, 96000};
         static constexpr uint8_t BIT_DEPTHS[] = {16, 24, 32};
         static constexpr SendspinCodecFormat CODECS[] = {
-            SendspinCodecFormat::FLAC, SendspinCodecFormat::OPUS, SendspinCodecFormat::PCM,
+            SendspinCodecFormat::FLAC,
+#ifdef SENDSPIN_ENABLE_OPUS
+            SendspinCodecFormat::OPUS,
+#endif
+            SendspinCodecFormat::PCM,
         };
 
         for (uint32_t rate : SAMPLE_RATES) {
@@ -509,8 +527,12 @@ int main(int argc, char* argv[]) {
 #else
     if (audio_formats.empty()) {
         audio_formats = {
-            {SendspinCodecFormat::FLAC, 2, 44100, 16}, {SendspinCodecFormat::FLAC, 2, 48000, 16},
-            {SendspinCodecFormat::OPUS, 2, 48000, 16}, {SendspinCodecFormat::PCM, 2, 44100, 16},
+            {SendspinCodecFormat::FLAC, 2, 44100, 16},
+            {SendspinCodecFormat::FLAC, 2, 48000, 16},
+#ifdef SENDSPIN_ENABLE_OPUS
+            {SendspinCodecFormat::OPUS, 2, 48000, 16},
+#endif
+            {SendspinCodecFormat::PCM, 2, 44100, 16},
             {SendspinCodecFormat::PCM, 2, 48000, 16},
         };
     }
