@@ -151,15 +151,20 @@ public:
         this->ws_.send(text);
     }
 
-    /// Sends one player audio chunk: binary type 4, big-endian server timestamp, PCM payload.
-    void send_audio(int64_t timestamp_us, size_t payload_bytes) {
+    /// Sends one binary message: type byte, big-endian server timestamp, then the payload.
+    void send_binary(uint8_t binary_type, int64_t timestamp_us, const std::string& payload) {
         std::string frame;
-        frame.push_back(static_cast<char>(4));
+        frame.push_back(static_cast<char>(binary_type));
         for (int shift = 56; shift >= 0; shift -= 8) {
             frame.push_back(static_cast<char>((timestamp_us >> shift) & 0xFF));
         }
-        frame.append(payload_bytes, '\0');
+        frame.append(payload);
         this->ws_.sendBinary(frame);
+    }
+
+    /// Sends one player audio chunk: binary type 4 with a zeroed PCM payload.
+    void send_audio(int64_t timestamp_us, size_t payload_bytes) {
+        this->send_binary(4, timestamp_us, std::string(payload_bytes, '\0'));
     }
 
     bool closed() const {

@@ -560,7 +560,7 @@ Listener callbacks fire from inside `stop()`, after every role and the group sta
 
 `on_request_high_performance()` and `on_release_high_performance()` can fire while the client holds an internal lock, so their bodies must only toggle the platform networking mode and must not call any client or role method.
 
-Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) but delivers no listener callback, so a consumer that destroys its listeners before the client is never called into. Call `stop()` first when the clear callbacks matter.
+Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no teardown or clear callback. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
 
 ## Sending Commands
 

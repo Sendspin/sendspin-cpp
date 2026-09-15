@@ -80,10 +80,10 @@ SendspinClient::SendspinClient(SendspinClientConfig config)
 
 SendspinClient::~SendspinClient() {
     // Transport-only teardown: goodbye and close every peer in the same order as stop(), but
-    // deliver no listener callback. A consumer that destroys its listeners before the client
-    // (the natural declaration order when a listener needs a role reference) is never called
-    // into from here. The role threads are joined by the role resets below, whose destructors
-    // run the same stop() the explicit path would.
+    // dispatch no teardown or clear callback (nothing reaches the inbox and no drain runs). A
+    // role-thread callback can still run until its role is joined by the resets below, whose
+    // destructors run the same stop() the explicit path would, so listeners must outlive the
+    // client.
     if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         this->close_transports();
     }

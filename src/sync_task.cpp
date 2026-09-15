@@ -825,7 +825,7 @@ void SyncTask::thread_entry(void* params) {
     sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
     sync_context.decoder = std::make_unique<SendspinDecoder>();
 
-    // === OUTER LOOP: persists for the lifetime of the client ===
+    // === OUTER LOOP: persists for one started session, until stop() ===
     while (!(this_task->event_flags_.get() & COMMAND_STOP)) {
         // --- IDLE STATE ---
         this_task->event_flags_.clear(

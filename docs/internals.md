@@ -47,7 +47,7 @@ On host builds, `platform_configure_thread()` is a no-op; threads use OS default
 
 1. `SyncTask::start()` configures the thread and spawns it.
 2. The caller blocks until the thread reaches IDLE state (`TASK_IDLE` event flag) or exits early due to an allocation failure (`TASK_STOPPED`).
-3. The thread runs a persistent outer loop for the lifetime of the client.
+3. The thread runs a persistent outer loop for one started session, until `stop()`.
 4. `SyncTask::stop()` sets `COMMAND_STOP`, wakes the ring buffer receive via `wake_receiver()`, and joins the thread; after the join it clears `TASK_RUNNING` (a stop mid-stream leaves it set, and the player's sync-idle gate must read a stopped task as idle) and resets the encoded ring buffer, so a later `start()` begins with an empty ring. Called from `PlayerRole::Impl::stop()` (`SendspinClient::stop()` and the client destructor) and from `SyncTask`'s destructor, which is triggered by `sync_task_.reset()` in `PlayerRole::Impl`'s destructor.
 5. `SyncTask::start()` clears every command and state flag before spawning, so a restart after `stop()` inherits nothing from the previous thread.
 

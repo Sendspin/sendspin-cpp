@@ -22,12 +22,14 @@
 
 #include "connection_manager.h"  // GoodbyeWait, GOODBYE_FLUSH_TIMEOUT_MS
 #include "platform/time.h"
+#include "protocol_messages.h"  // SENDSPIN_BINARY_VISUALIZER_LOUDNESS
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
 #include "sendspin/visualizer_role.h"
 #include "test_support.h"
+#include "visualizer_role_impl.h"  // Ring state after stop(); private access, see tests/CMakeLists.txt
 
 #include <gtest/gtest.h>
 
@@ -60,6 +62,7 @@ constexpr uint16_t CALLBACK_TEST_PORT = 18994;
 constexpr uint16_t DESTRUCTOR_TEST_PORT = 18995;
 constexpr uint16_t ROLLBACK_TEST_PORT = 18996;
 constexpr uint16_t HIGH_PERF_TEST_PORT = 18997;
+constexpr uint16_t VISUALIZER_TEST_PORT = 18998;
 
 /// Reports whether anything is listening on the loopback port.
 bool port_accepts(uint16_t port) {
@@ -338,24 +341,22 @@ TEST(ClientLifecycle, CallbackDuringStopCannotRecurse) {
     EXPECT_EQ(listener.clears, 2);
 }
 
-// Destroying a running client goodbyes its peer like stop() does, but delivers no listener
-// callback: the listener here is released before the client, the natural order for a consumer
-// that never called stop(), and the sanitizer turns any callback into a use-after-free.
+// Destroying a running client goodbyes its peer like stop() does, but dispatches no clear
+// callback: the listener outlives the client, as the role contract requires, and fails the test
+// if the destructor calls into it.
 TEST(ClientLifecycle, DestructorGoodbyesPeersWithoutCallbacks) {
     TestNetworkProvider network;
     FakeServer* server = nullptr;
-    auto listener = std::make_unique<ForbiddenMetadataListener>();
+    ForbiddenMetadataListener listener;
     {
         SendspinClient client(make_config(DESTRUCTOR_TEST_PORT));
         client.set_network_provider(&network);
-        client.add_metadata().set_listener(listener.get());
+        client.add_metadata().set_listener(&listener);
         ASSERT_TRUE(client.start());
 
         server = new FakeServer(server_url(DESTRUCTOR_TEST_PORT), "server-a");
         pump_until(client, [&] { return client.is_connected(); });
-
-        listener.reset();
-        // Client destroyed here while established, with its listener already gone.
+        // Client destroyed here while established.
     }
 
     wait_until([&] { return server->closed(); });
@@ -400,6 +401,95 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     stream_audio_until(client, server, listener, 1);  // The rolled-back player plays again
     client.stop();
     EXPECT_EQ(listener.stream_ends, 1);
+}
+
+/// Counts loudness deliveries; they fire on the visualizer drain thread.
+class CountingVisualizerListener : public VisualizerRoleListener {
+public:
+    void on_loudness(int64_t /*client_timestamp*/, uint16_t /*loudness*/) override {
+        this->loudness.fetch_add(1);
+    }
+
+    std::atomic<size_t> loudness{0};
+};
+
+std::string stream_start_visualizer_json() {
+    return R"({"type":"stream/start","payload":{"visualizer":{"types":["loudness"],"rate_max":30}}})";
+}
+
+VisualizerRoleConfig make_visualizer_config() {
+    VisualizerRoleConfig config;
+    config.support.types = {VisualizerDataType::LOUDNESS};
+    config.support.buffer_capacity = 4096;
+    config.support.rate_max = 30;
+    return config;
+}
+
+// Waits for a fresh peer that answers time messages to be established and synced: the drain
+// thread delivers nothing until the client is time synced.
+void pump_until_synced(SendspinClient& client) {
+    pump_until(client, [&] { return client.is_connected() && client.is_time_synced(); });
+}
+
+// Pumps until pred() holds, sending one loudness frame per iteration stamped `lead_us` ahead of
+// the current time (the drain thread drops a frame whose display time is well past). A frame
+// can be lost to the ring's documented wake race right after a stream/start (the drain thread
+// may take the clear marker as a stray entry and then discard up to a marker that is gone),
+// which production shrugs off because the next frame follows; so does this.
+void send_loudness_until(SendspinClient& client, FakeServer& server, int64_t lead_us,
+                         const std::function<bool()>& pred) {
+    pump_until(client, [&] {
+        if (pred()) {
+            return true;
+        }
+        server.send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, platform_time_us() + lead_us,
+                           std::string("\x00\x10", 2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return false;
+    });
+}
+
+// stop() joins the visualizer drain thread and flushes the frames it had buffered, and start()
+// clears the stop command, so a restart begins with an empty ring and a thread that delivers.
+// The old frames are stamped far into the future, so the first session's thread parks on the
+// first one with the rest buffered behind it when stop() runs; the ring is read directly after
+// the stop because the restarted thread would silently drop leftovers before the new peer is
+// time synced, and the new session's stream/start would discard them at its clear marker.
+TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
+    constexpr int64_t OLD_FRAME_LEAD_US = 5 * 1000 * 1000;
+
+    TestNetworkProvider network;
+    CountingVisualizerListener listener;
+    auto config = make_config(VISUALIZER_TEST_PORT);
+    config.time_burst_interval_ms = 100;  // Sync promptly after each (re)connect
+    SendspinClient client(std::move(config));
+    client.set_network_provider(&network);
+    client.add_visualizer(make_visualizer_config()).set_listener(&listener);
+
+    ASSERT_TRUE(client.start());
+    {
+        FakeServer server(server_url(VISUALIZER_TEST_PORT), "server-a",
+                          FakeServerOptions{.answer_time = true});
+        pump_until_synced(client);
+        server.send_text(stream_start_visualizer_json());
+        // The thread holds the first frame while it waits for its display time; the ones behind
+        // it are the ring content stop() must discard.
+        auto& ring = client.visualizer()->impl_->drain_task->ring_buffer;
+        send_loudness_until(client, server, OLD_FRAME_LEAD_US,
+                            [&] { return ring.items_waiting() >= 2; });
+        client.stop();
+        EXPECT_TRUE(ring.is_empty());
+        wait_until([&] { return server.closed(); });
+    }
+    EXPECT_EQ(listener.loudness.load(), 0U);
+
+    ASSERT_TRUE(client.start());
+    FakeServer server(server_url(VISUALIZER_TEST_PORT), "server-b",
+                      FakeServerOptions{.answer_time = true});
+    pump_until_synced(client);
+    server.send_text(stream_start_visualizer_json());
+    send_loudness_until(client, server, 0, [&] { return listener.loudness.load() >= 1; });
+    client.stop();
 }
 
 /// Counts high-performance requests and releases without touching the client, as the listener

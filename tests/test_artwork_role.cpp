@@ -703,6 +703,81 @@ TEST(ArtworkFrameDoneGate, RestartKeepsPresentedGate) {
 }
 
 // ============================================================================
+// Impl stop()/start(): the decode thread is joined and restarted between sessions
+// ============================================================================
+
+namespace {
+
+// A RecordingListener whose on_image_decode() parks until release(), so a test can hold the
+// decode thread inside a callback while it queues more work behind it.
+class BlockingListener : public RecordingListener {
+public:
+    void on_image_decode(uint8_t slot, const uint8_t* data, size_t length,
+                         SendspinImageFormat format) override {
+        RecordingListener::on_image_decode(slot, data, length, format);
+        std::unique_lock<std::mutex> lock(this->gate_mutex_);
+        this->gate_cv_.wait(lock, [this] { return this->released_; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(this->gate_mutex_);
+            this->released_ = true;
+        }
+        this->gate_cv_.notify_all();
+    }
+
+private:
+    std::mutex gate_mutex_;
+    std::condition_variable gate_cv_;
+    bool released_{false};
+};
+
+// Two ungated slots, so a frame on each is decoded without an ack.
+ArtworkRoleConfig make_two_ungated_slot_config() {
+    ArtworkRoleConfig config;
+    config.preferred_formats.push_back(
+        {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 100, 100, false});
+    config.preferred_formats.push_back(
+        {SendspinImageSource::ARTIST, SendspinImageFormat::JPEG, 100, 100, false});
+    return config;
+}
+
+}  // namespace
+
+// stop() joins the decode thread and discards the notifications it never took, and start()
+// clears the stop command, so a restarted role decodes fresh frames without replaying the
+// previous session's. The thread is held inside frame A's decode while frame B is queued behind
+// it and the stop is signalled; on release it exits at its command check without taking B. The
+// stream is deliberately not restarted after start(): a stream restart bumps the epoch that
+// would make a replayed B stale on its own, and this test is about the queue reset.
+TEST(ArtworkRestart, StopDiscardsQueuedFramesAndStartDecodesNewOnes) {
+    BlockingListener listener;
+    auto impl = make_impl(make_two_ungated_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    send_frame(*impl, 0, 'A');
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });  // Thread parked in A
+    send_frame(*impl, 1, 'B');                                          // Queued behind A
+
+    ASSERT_TRUE(impl->signal_stop());
+    listener.release();
+    impl->stop();
+    EXPECT_EQ(listener.decode_count(), 1U);
+
+    ASSERT_TRUE(impl->start());
+    // B was discarded with the old session, not replayed by the new thread.
+    EXPECT_TRUE(listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+
+    // The new thread decodes: the stop command did not survive the restart.
+    send_frame(*impl, 1, 'C');
+    listener.wait_until([&] { return listener.decodes.size() >= 2; });
+    EXPECT_EQ(listener.decode_marker_at(1), 'C');
+}
+
+// ============================================================================
 // Reentrant frame_done() from inside on_image_display()
 // ============================================================================
 
