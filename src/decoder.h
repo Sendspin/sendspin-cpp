@@ -37,7 +37,7 @@ namespace sendspin {
  * via process_header() to initialize the decoder and populate an AudioStreamInfo, then
  * calls decode_audio_chunk() for each subsequent encoded chunk. FLAC uses micro_flac. Opus
  * uses libopus and is only compiled in with SENDSPIN_ENABLE_OPUS; an Opus header is rejected
- * otherwise. PCM and dummy headers bypass decoding and copy data directly.
+ * otherwise. PCM chunks bypass decoding and are copied directly.
  *
  * Usage:
  * 1. Call process_header() with the first chunk to initialize the codec and stream info

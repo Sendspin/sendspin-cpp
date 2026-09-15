@@ -473,6 +473,7 @@ TEST(ClientLifecycle, OpusStreamStartIsRefusedWithoutTheOpusDecoder) {
     client.set_network_provider(&network);
     client.add_player(make_player_config()).set_listener(&listener);
     ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     FakeServer server(server_url(OPUS_STREAM_TEST_PORT), "server-a");
     pump_until(client, [&] { return client.is_connected(); });

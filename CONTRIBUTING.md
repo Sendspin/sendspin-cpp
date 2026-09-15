@@ -28,8 +28,8 @@ cmake --build build-tsan --target sendspin_tests
 TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure
 ```
 
-A third CI job builds the library, the examples, and the tests with the Opus decoder off
-(`-DSENDSPIN_ENABLE_OPUS=OFF`, also under ASan/UBSan). One player test only exists in that
+CI also builds the library, the examples, and the tests with the Opus decoder off
+(`-DSENDSPIN_ENABLE_OPUS=OFF`, again under ASan/UBSan). One player test only exists in that
 configuration, so run it too when touching the player's codec handling.
 
 On ESP-IDF the library is consumed as a component via `idf_component.yml`; the
