@@ -68,8 +68,12 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
     config.max_open_sockets = this->max_connections_;
     config.open_fn = SendspinWsServer::open_callback;
     config.close_fn = SendspinWsServer::close_callback;
+    // httpd_stop() releases the global user context: with a null free function it calls plain
+    // free() on the pointer (esp_http_server httpd_main.c), which would free this object while
+    // the ConnectionManager still owns it and stop() still runs on it. A no-op free function
+    // keeps ownership here.
     config.global_user_ctx = (void*)this;
-    config.global_user_ctx_free_fn = nullptr;
+    config.global_user_ctx_free_fn = [](void* /*ctx*/) {};
     // Use the configured ctrl_port, or fall back to ESP_HTTPD_DEF_CTRL_PORT + 1 to avoid
     // conflict with the web_server component
     config.ctrl_port = (this->ctrl_port_ != 0) ? this->ctrl_port_

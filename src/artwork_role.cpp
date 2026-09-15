@@ -101,22 +101,38 @@ bool ArtworkRole::Impl::start() {
         return false;
     }
 
+    // The flags survive a stop()/start() cycle, and a command signalled between the join and this
+    // start (cleanup() on a stopped role) is still set. Clear the whole group so the new thread's
+    // first wait() starts from a clean command state whatever bits the role defines.
+    this->drain_task->event_flags.clear_all();
+
     platform_configure_thread("SsArt", 4096, static_cast<int>(this->config.priority),
                               this->config.psram_stack);
     this->drain_task->drain_thread = std::thread(drain_thread_func, this);
     return true;
 }
 
-void ArtworkRole::Impl::stop() const {
+bool ArtworkRole::Impl::signal_stop() const {
     if (!this->drain_task || !this->drain_task->drain_thread.joinable()) {
-        return;
+        return false;
     }
     // Set the flag before waking: the thread re-checks its command flags at the top of every
     // loop iteration, so this ordering guarantees it observes the stop as soon as the wake
     // pulls it out of its blocking queue receive.
     this->drain_task->event_flags.set(COMMAND_STOP);
     this->drain_task->notify_queue.wake_receiver();
+    return true;
+}
+
+void ArtworkRole::Impl::stop() const {
+    if (!this->signal_stop()) {
+        return;
+    }
     this->drain_task->drain_thread.join();
+
+    // Joined, so this is the queue's only consumer: discard notifications the old thread never
+    // took, so a restart does not decode the previous session's images.
+    this->drain_task->notify_queue.reset();
 }
 
 void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {

@@ -51,7 +51,7 @@ SendspinClient client(std::move(config));
 
 ## Step 2: Add Roles
 
-Add only the roles your application needs. All roles must be added before calling `start_server()`.
+Add only the roles your application needs. All roles must be added before calling `start()`.
 
 ### Player Role (Audio Playback)
 
@@ -499,7 +499,7 @@ struct MyClientListener : SendspinClientListener {
 
 ## Step 5: Wire Everything Together
 
-Listeners and providers are set as raw pointers. They must outlive the client.
+Listeners and providers are set as raw pointers. They must stay alive for as long as the client can call them: until `stop()` returns, or until the client is destroyed if `stop()` is never called. The destructor itself never invokes a listener (see [Stopping and Restarting](#stopping-and-restarting)).
 
 ```cpp
 MyPlayerListener player_listener;
@@ -520,9 +520,10 @@ client.set_persistence_provider(&persistence_provider); // Optional
 ## Step 6: Start and Run
 
 ```cpp
-// Start the WebSocket server and sync task.
+// Start the role threads and arm the WebSocket server (it comes up on the first loop() tick
+// after the network provider reports ready).
 // Task priorities and PSRAM settings are taken from SendspinClientConfig.
-if (!client.start_server()) {
+if (!client.start()) {
     // Handle failure
     return 1;
 }
@@ -537,9 +538,29 @@ while (running) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
-// Clean shutdown
-client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+// Clean shutdown: goodbye every peer, tear everything down, deliver the clear callbacks.
+client.stop();
 ```
+
+`start_server()` is a deprecated alias of `start()`.
+
+## Stopping and Restarting
+
+`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer, waits up to a short bound (50 ms per peer) for those sends to complete, then closes the server and every connection regardless, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
+
+Restarting is `start()` again; start, stop, and start again can be repeated indefinitely, and a restarted client begins with no connection, no group state, and no role state from before the stop.
+
+`stop()` may block, but the wait is bounded. Besides the goodbye bound it includes:
+
+- The transports' own close. The host server joins every accepted connection thread; a WebSocket peer completes its close handshake within about 300 ms, but a raw socket that connected and never completed the upgrade holds the join for the full 3 s handshake timeout. The ESP server waits for the httpd task to exit, which polls at 100 ms and first finishes any queued send, which can take up to httpd's send timeout for a peer that has stopped reading.
+- An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`).
+- A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
+
+Listener callbacks fire from inside `stop()`, after every role and the group state have been reset, so a callback that reads the client through its getters sees the stopped state. One that calls `start()` gets `false` and starts nothing; one that calls `stop()`, `connect_to()`, or `disconnect()` is ignored. `is_started()` reads `false` throughout and is safe to call from any thread. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
+
+`on_request_high_performance()` and `on_release_high_performance()` can fire while the client holds an internal lock, so their bodies must only toggle the platform networking mode and must not call any client or role method.
+
+Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no teardown or clear callback. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
 
 ## Sending Commands
 
@@ -700,7 +721,7 @@ int main() {
     player.set_listener(&player_listener);
     client.set_network_provider(&network);
 
-    client.start_server();
+    client.start();
 
     while (true) {
         client.loop();

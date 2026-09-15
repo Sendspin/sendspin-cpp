@@ -33,7 +33,12 @@ add_executable(sendspin_tests
     test_visualizer_role.cpp
     test_artwork_role.cpp
     test_client_teardown.cpp
+    test_client_lifecycle.cpp
 )
+
+# test_client_lifecycle.cpp checks what a role's stop() left in its ring, which nothing on the
+# public surface reports; it reads the private members directly instead of adding a seam.
+set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...).
 # The public include/ dir and ArduinoJson propagate transitively from `sendspin`.

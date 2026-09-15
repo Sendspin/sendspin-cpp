@@ -47,21 +47,22 @@ On host builds, `platform_configure_thread()` is a no-op; threads use OS default
 
 1. `SyncTask::start()` configures the thread and spawns it.
 2. The caller blocks until the thread reaches IDLE state (`TASK_IDLE` event flag) or exits early due to an allocation failure (`TASK_STOPPED`).
-3. The thread runs a persistent outer loop for the lifetime of the client.
-4. `SyncTask::stop()` sets `COMMAND_STOP`, wakes the ring buffer receive via `wake_receiver()`, and joins the thread. Called from `SyncTask`'s destructor, which is triggered by `sync_task_.reset()` in `PlayerRole::Impl`'s destructor.
+3. The thread runs a persistent outer loop for one started session, until `stop()`.
+4. `SyncTask::stop()` sets `COMMAND_STOP`, wakes the ring buffer receive via `wake_receiver()`, and joins the thread; after the join it clears `TASK_RUNNING` (a stop mid-stream leaves it set, and the player's sync-idle gate must read a stopped task as idle) and resets the encoded ring buffer, so a later `start()` begins with an empty ring. Called from `PlayerRole::Impl::stop()` (`SendspinClient::stop()` and the client destructor) and from `SyncTask`'s destructor, which is triggered by `sync_task_.reset()` in `PlayerRole::Impl`'s destructor.
+5. `SyncTask::start()` clears every command and state flag before spawning, so a restart after `stop()` inherits nothing from the previous thread.
 
 **Visualizer drain** (`src/visualizer_role.cpp`):
 
 1. `VisualizerRole::Impl::start()` spawns the drain thread.
 2. The thread blocks on ring buffer receives; commands interrupt the receive immediately via `wake_receiver()`. The 5 s receive timeout is only a fallback against a missed wake.
-3. `VisualizerRole::Impl` destructor sets `COMMAND_STOP`, wakes the ring buffer receive, and joins.
+3. `VisualizerRole::Impl::stop()` (from `SendspinClient::stop()`, the client destructor, and the `Impl` destructor) sets `COMMAND_STOP`, wakes the ring buffer receive, joins, and then flushes the ring buffer: with the thread joined it is the ring's only consumer, and a restart must not deliver the previous session's frames. `start()` clears `COMMAND_STOP`, `COMMAND_FLUSH`, and `COMMAND_CLEAR` before spawning, since `cleanup()` on a stopped role leaves a flush flagged.
 
 **Artwork decode** (`src/artwork_role.cpp`):
 
 1. `ArtworkRole::Impl::start()` spawns the decode thread.
 2. The thread blocks on notification queue receives; commands interrupt the receive immediately via `wake_receiver()`. The 5 s receive timeout is only a fallback against a missed wake.
 3. On notification: calls `on_image_decode()`, then merges an `ArtworkDisplayUpdate` (the slot's server display timestamp plus the `stream_epoch` it was decoded under) into the `ArtworkRole::Impl::EventState::display_slot` `InboxSlot` via `merge_artwork_display_update`. The main loop's `ArtworkRole::Impl::drain_events()` folds the taken update into its main-thread-only `held_display_*` state and fires `on_image_display()` once the timestamp is reached. Latest-wins per slot: if a newer frame's timestamp overwrites the pending one before the main loop takes it, only the newer display fires; the per-slot epoch lets the deadline sweep drop a display whose stream was replaced after the hand-off.
-4. `ArtworkRole::Impl` destructor sets `COMMAND_STOP`, wakes the queue receive, and joins.
+4. `ArtworkRole::Impl::stop()` (from `SendspinClient::stop()`, the client destructor, and the `Impl` destructor) sets `COMMAND_STOP`, wakes the queue receive, joins, and then resets the notification queue so a restart does not decode the previous session's images. `start()` clears `COMMAND_STOP` before spawning.
 
 **Destruction order** matters because external audio callbacks may still reference the sync task. `PlayerRole::Impl`'s destructor resets the sync task first (`sync_task_.reset()`) before tearing down anything else, so the thread is fully joined before any shared state is destroyed.
 
@@ -202,7 +203,7 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
 
 ### Main Loop Processing
 
-`SendspinClient::loop()` (`src/client.cpp`) runs the following steps **in order** on each tick:
+`SendspinClient::loop()` (`src/client.cpp`) is a no-op while the client is stopped (a stopped client has no connections or threads, and the manager loop must not restart the WebSocket server). While started it runs the following steps **in order** on each tick; steps 3 onward are `SendspinClient::drain_inbox()`, which `stop()` also calls once so the clear callbacks are delivered synchronously:
 
 ```api
 1. connection_manager_->loop()   (sections gated on lock-free atomic hints - see below)
@@ -451,6 +452,56 @@ When a connection is lost (`on_connection_lost`):
 
 `disable_message_dispatch()` is the first step because it's an atomic flag that the network thread checks before invoking any callback. This prevents stale messages from a dead connection from racing into freshly-reset role queues.
 
+### Client Start and Stop
+
+`SendspinClient::start()` loads persisted state, starts the threaded roles (player sync task, visualizer drain, artwork decode; a failure part-way stops the ones that did start), and calls `ConnectionManager::start()`, which opens admission (`accepting_`) and creates the `SendspinWsServer` on first use. The server itself is started by the manager's `loop()` once the network provider reports ready, so `is_started()` means "running", not "listening".
+
+`SendspinClient::stop()` is synchronous and ordered so that every producer is gone before any state is reset. The client's lifecycle is one atomic `lifecycle_` field (`STOPPED`, `RUNNING`, `STOPPING`); `is_started()` reads it from any thread.
+
+```api
+0. lifecycle_ = STOPPING (is_started() reads false; loop() is a no-op; start() is refused and
+   stop()/connect_to()/disconnect() are ignored from here on, so a callback fired below cannot
+   recurse into the teardown)
+1. VisualizerRole/ArtworkRole::Impl::signal_stop(): set COMMAND_STOP and wake, no join, so a
+   slow on_image_decode() or a parked drain exits while the transports close. The player is
+   not signalled yet: a network thread blocked on its ring (write_audio_chunk) needs the sync
+   task alive until the network threads are gone
+2. ConnectionManager::stop(SHUTDOWN)
+   ├─ Under conn_ptr_mutex_: accepting_ = false; disable_message_dispatch() on every managed
+   │  connection; move the current slot, the nursery, and the deferred releases out; clear the
+   │  hello retries
+   ├─ Outside the lock: conn->disconnect(SHUTDOWN, completion) on each, completion counted by a
+   │  shared GoodbyeWait; wait up to GOODBYE_FLUSH_TIMEOUT_MS (50 ms) per goodbye for the count
+   │  to reach zero (the ESP httpd worker hands the frames to lwIP one at a time)
+   ├─ ws_server_->stop() regardless (host: joins every accepted connection thread, a WebSocket
+   │  peer within its ~300 ms close handshake and a raw never-upgraded socket within the 3 s
+   │  WS_HANDSHAKE_TIMEOUT_SECS; ESP: httpd_stop(), which runs queued sends first,
+   │  then every session's close_fn and ctx free_fn, polling at 100 ms)
+   └─ take_pending_events(): move the pending connected/disconnect event queues out under
+      conn_mutex_; every moved-out shared_ptr is released outside the locks (an outbound
+      connection's destructor stops its transport synchronously)
+3. Role threads: PlayerRole/VisualizerRole/ArtworkRole::Impl::stop() join, then each discards
+   its ring/queue content (sole consumer after the join)
+4. cleanup_connection_state() (the same reset a lost connection triggers, including the group
+   slot), then group_state_ and state_ are reset
+5. drain_inbox() delivers the CLEARED / STREAM_END callbacks step 4 queued. Every getter already
+   reports the stopped state, so a callback that reads the client sees what a caller sees once
+   stop() returns
+6. lifecycle_ = STOPPED
+```
+
+The goodbye completion is best-effort: on ESP a session that closes before its queued worker runs, or whose `weak_ptr` no longer resolves, never reports, which is why the wait is bounded rather than exact. The `GoodbyeWait` record is held by `shared_ptr` and captured by value in each completion, so a completion that runs late on a transport thread touches nothing `stop()` owns. A peer delivered by the ws_server while admission is closed is rejected in `on_new_connection()` with a shutdown goodbye, the same shape as the nursery-full rejection.
+
+`ConnectionManager::start()` creates and configures the server object on the first call only; the client config is immutable for the client's lifetime, so a restart reuses the object and its settings.
+
+Each threaded role's `start()` calls `EventFlags::clear_all()` before creating its thread rather than clearing a hand-listed set of bits: a command signalled between the previous join and the restart (`cleanup()` on a stopped role) would otherwise survive into the new thread's first wait, and a bit added to the role's enum later cannot be forgotten.
+
+The client destructor performs steps 1 and 2 only, so a consumer that destroyed its listeners first is never called into; the roles' own destructors then join their threads as before.
+
+### High-performance release delivery
+
+`release_high_performance()` calls the listener inline. The last release can run inside `drop_connection()`, which holds `conn_ptr_mutex_` through `cleanup_connection_state()` (both the time-burst hold and the player's playback hold are released there), so the listener contract for `on_request_high_performance()` / `on_release_high_performance()` is that the body toggles the platform's networking mode and nothing else: it must not call back into the client or a role.
+
 ### Graceful Disconnect
 
 `disconnect_and_release()` calls `conn->disconnect(reason, nullptr)` and lets the local `shared_ptr` go out of scope.
@@ -471,7 +522,7 @@ Queued send workers capture a `weak_ptr<SendspinServerConnection>` to the origin
 
 The send workers also enforce the protocol's "hello is always first" rule: a frame is dropped unless `client_hello_sent_` is set on the resolved connection, *unless* the caller passed `allow_before_hello=true`. Exactly two callers do — the `client/hello` itself (which would otherwise gate its own send and deadlock) and `goodbye` — so a stale or out-of-order frame can never precede the handshake. The `weak_ptr` guards identity; the gate guards ordering; the two are independent.
 
-The host build does not need this scheme: `SendspinWsServer` (host) routes IXWebSocket messages by calling `find_connection_callback_` to resolve a synthetic sockfd back to the connection that `ConnectionManager` is holding. The ESP build keeps the `set_find_connection_callback()` setter as a no-op stub for symmetry; see the comment at the call site in `ConnectionManager::init_server`.
+The host build does not need this scheme: `SendspinWsServer` (host) routes IXWebSocket messages by calling `find_connection_callback_` to resolve a synthetic sockfd back to the connection that `ConnectionManager` is holding. The ESP build keeps the `set_find_connection_callback()` setter as a no-op stub for symmetry; see the comment at the call site in `ConnectionManager::start`.
 
 ## Ordering Guarantees Summary
 
