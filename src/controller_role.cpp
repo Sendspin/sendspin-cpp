@@ -47,11 +47,6 @@ void ControllerRole::send_command(const ClientCommandControllerObject& cmd) {
     this->impl_->send_command(cmd);
 }
 
-void ControllerRole::send_command(SendspinControllerCommand cmd, std::optional<uint8_t> volume,
-                                  std::optional<bool> mute) {
-    this->impl_->send_command({.command = cmd, .volume = volume, .muted = mute});
-}
-
 // ============================================================================
 // Impl method implementations
 // ============================================================================

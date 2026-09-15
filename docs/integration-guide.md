@@ -592,8 +592,6 @@ controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .o
 
 Fields that do not match the command are ignored when the message is serialized. The server clamps seeks to the seekable range and ignores any command not present in the controller state's `supported_commands`.
 
-> **Deprecated:** the earlier positional overload `send_command(cmd, volume, mute)` still works but cannot carry seek parameters and will be removed in v0.8.0. Migrate to the struct form above.
-
 ## Accessing Roles
 
 In addition to the references returned by `add_*()`, you can access roles at any time through the client's accessor methods. These return `nullptr` if the role was not added.
