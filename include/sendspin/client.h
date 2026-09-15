@@ -250,7 +250,7 @@ public:
 
     /// @brief Starts the client
     /// @deprecated Use start(). Kept as an alias for existing consumers; removal is planned for
-    /// v0.8.0.
+    /// v0.9.0.
     /// @return See start().
     [[deprecated("Use start()")]] bool start_server() {
         return this->start();
