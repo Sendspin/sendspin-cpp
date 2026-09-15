@@ -86,6 +86,12 @@ SendspinClient::~SendspinClient() {
     // client.
     if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         this->close_transports();
+        // Every high-performance hold ends with the client. The release sites for the time hold
+        // (cleanup_connection_state()) and the playback hold (the player's cleanup()) do not run
+        // here, and nothing can acquire once the network threads are gone.
+        while (this->high_performance_ref_count_.load() > 0) {
+            this->release_high_performance();
+        }
     }
 
     // The network threads are gone (above, or never started), so the role threads are the only

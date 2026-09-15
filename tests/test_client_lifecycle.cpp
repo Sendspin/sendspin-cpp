@@ -54,7 +54,7 @@ using namespace sendspin::test;  // NOLINT(google-build-using-namespace): shared
 namespace {
 
 // Distinct ports per test so a lingering socket from one scenario cannot bleed into the next
-// (and into test_connection_lifecycle.cpp, which uses 18941-18982).
+// (and into test_connection_lifecycle.cpp, which uses 18941-18985).
 constexpr uint16_t RESTART_TEST_PORT = 18991;
 constexpr uint16_t NURSERY_GOODBYE_TEST_PORT = 18992;
 constexpr uint16_t STREAM_TEST_PORT = 18993;
@@ -63,6 +63,7 @@ constexpr uint16_t DESTRUCTOR_TEST_PORT = 18995;
 constexpr uint16_t ROLLBACK_TEST_PORT = 18996;
 constexpr uint16_t HIGH_PERF_TEST_PORT = 18997;
 constexpr uint16_t VISUALIZER_TEST_PORT = 18998;
+constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 18999;
 
 /// Reports whether anything is listening on the loopback port.
 bool port_accepts(uint16_t port) {
@@ -535,6 +536,28 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
     pump_until(client, [&] { return client.is_connected() && listener.requests == 2; });
     client.stop();
     EXPECT_EQ(listener.releases, 2);
+}
+
+// Destroying a running client ends the hold too: the release sites stop() reaches through the
+// connection cleanup do not run in the destructor, so it has to release on its own or the
+// platform is left in high-performance mode after the client is gone.
+TEST(ClientLifecycle, DestructorReleasesHighPerformanceHold) {
+    TestNetworkProvider network;
+    CountingClientListener listener;
+    {
+        auto config = make_config(DESTRUCTOR_HIGH_PERF_TEST_PORT);
+        config.time_burst_interval_ms = 50;
+        SendspinClient client(std::move(config));
+        client.set_network_provider(&network);
+        client.set_listener(&listener);
+        ASSERT_TRUE(client.start());
+
+        FakeServer server(server_url(DESTRUCTOR_HIGH_PERF_TEST_PORT), "server-a");
+        pump_until(client, [&] { return client.is_connected() && listener.requests == 1; });
+        EXPECT_EQ(listener.releases, 0);
+        // Client destroyed here mid-burst, with the hold open.
+    }
+    EXPECT_EQ(listener.releases, 1);
 }
 
 }  // namespace
