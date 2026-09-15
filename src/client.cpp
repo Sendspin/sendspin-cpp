@@ -294,8 +294,6 @@ void SendspinClient::loop() {
 }
 
 void SendspinClient::drain_inbox() {
-    this->deliver_pending_high_performance_release();
-
     // Process deferred events: all state mutations and user callbacks happen here, on the main
     // loop thread, to avoid cross-thread data races. Two poll() snapshots gate the work below:
     // inbox_bits (here) gates only the event-ring drain immediately following it; slot_bits
@@ -630,15 +628,7 @@ void SendspinClient::send_text(const std::string& text) {
 }
 
 void SendspinClient::acquire_high_performance() {
-    if (this->high_performance_ref_count_.fetch_add(1) != 0) {
-        return;
-    }
-    // A release recorded but not yet delivered is cancelled by this re-acquire: the listener
-    // still holds high performance from its earlier request, so it gets neither callback.
-    if (this->high_performance_release_pending_.exchange(false)) {
-        return;
-    }
-    if (this->listener_) {
+    if (this->high_performance_ref_count_.fetch_add(1) == 0 && this->listener_) {
         this->listener_->on_request_high_performance();
     }
 }
@@ -649,23 +639,11 @@ void SendspinClient::release_high_performance() {
     uint8_t count = this->high_performance_ref_count_.load();
     while (count != 0) {
         if (this->high_performance_ref_count_.compare_exchange_weak(count, count - 1)) {
-            if (count == 1) {
-                // Recorded, not delivered: this can run under conn_ptr_mutex_ (drop_connection ->
-                // cleanup_connection_state -> here) and the listener may call back into the
-                // manager. drain_inbox() delivers it lock-free on the main loop.
-                this->high_performance_release_pending_.store(true);
+            if (count == 1 && this->listener_) {
+                this->listener_->on_release_high_performance();
             }
             return;
         }
-    }
-}
-
-void SendspinClient::deliver_pending_high_performance_release() {
-    if (!this->high_performance_release_pending_.exchange(false)) {
-        return;
-    }
-    if (this->listener_) {
-        this->listener_->on_release_high_performance();
     }
 }
 

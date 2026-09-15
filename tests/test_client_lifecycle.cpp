@@ -402,39 +402,31 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     EXPECT_EQ(listener.stream_ends, 1);
 }
 
-/// Reacts to the high-performance release the way a consumer that reconfigures its radio might:
-/// by calling back into the client.
-class DisconnectingClientListener : public SendspinClientListener {
+/// Counts high-performance requests and releases without touching the client, as the listener
+/// contract requires.
+class CountingClientListener : public SendspinClientListener {
 public:
-    explicit DisconnectingClientListener(SendspinClient& client) : client_(client) {}
-
     void on_request_high_performance() override {
         ++this->requests;
     }
     void on_release_high_performance() override {
         ++this->releases;
-        this->client_.disconnect(SendspinGoodbyeReason::SHUTDOWN);
-        this->client_.connect_to("ws://127.0.0.1:1/sendspin");
     }
 
     int requests{0};
     int releases{0};
-
-private:
-    SendspinClient& client_;
 };
 
-// The high-performance hold taken for a time burst is released inside the connection-loss path,
-// which runs under the manager lock. A listener that calls disconnect()/connect_to() from
-// on_release_high_performance() must not deadlock: the release is delivered from the drain with
-// no lock held. Before the fix this test hangs on the mutex and the suite watchdog reports it.
-TEST(ClientLifecycle, ReleaseCallbackMayReenterTheManager) {
+// The high-performance hold taken for a time burst is released inside the connection-loss path
+// and again by stop(); request and release stay paired across a peer loss, a reconnect, and the
+// stop.
+TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
     TestNetworkProvider network;
     auto config = make_config(HIGH_PERF_TEST_PORT);
     config.time_burst_interval_ms = 50;
     SendspinClient client(std::move(config));
     client.set_network_provider(&network);
-    DisconnectingClientListener listener(client);
+    CountingClientListener listener;
     client.set_listener(&listener);
     ASSERT_TRUE(client.start());
 
@@ -445,11 +437,10 @@ TEST(ClientLifecycle, ReleaseCallbackMayReenterTheManager) {
     pump_until(client, [&] { return listener.requests == 1; });
     EXPECT_EQ(listener.releases, 0);
 
-    server.reset();  // Peer goes away mid-burst: drop_connection releases the hold under the lock
+    server.reset();  // Peer goes away mid-burst: drop_connection releases the hold
     pump_until(client, [&] { return listener.releases == 1; });
     EXPECT_FALSE(client.is_connected());
 
-    // Request and release stay paired across a reconnect.
     FakeServer again(server_url(HIGH_PERF_TEST_PORT), "server-b");
     pump_until(client, [&] { return client.is_connected() && listener.requests == 2; });
     client.stop();

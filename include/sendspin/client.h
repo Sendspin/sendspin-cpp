@@ -68,9 +68,16 @@ public:
 
     /// @brief Called when the library needs high-performance networking (e.g., disable WiFi
     /// power saving)
+    ///
+    /// Toggle the platform's networking mode and return. This callback and its release can fire
+    /// while the client holds an internal lock (the last release runs inside the connection-loss
+    /// path), so the body must not call any SendspinClient or role method.
     virtual void on_request_high_performance() {}
 
     /// @brief Called when the library no longer needs high-performance networking
+    ///
+    /// Same contract as on_request_high_performance(): toggle the platform mode only, never call
+    /// back into the client.
     virtual void on_release_high_performance() {}
 };
 
@@ -453,10 +460,8 @@ public:
 
     /// @brief Releases a ref-counted high-performance networking request
     ///
-    /// The listener's on_release_high_performance() is not called inline: the last release can
-    /// run inside ConnectionManager::drop_connection(), which holds conn_ptr_mutex_, and a
-    /// listener that reacts by calling disconnect() or connect_to() would re-lock it on the same
-    /// thread. The release is recorded and delivered on the next drain with no lock held.
+    /// The last release calls the listener inline, possibly under conn_ptr_mutex_ (the
+    /// connection-loss path); the listener contract forbids calling back into the client there.
     void release_high_performance();
 
 private:
@@ -466,10 +471,6 @@ private:
     /// @brief Drains the inbox: lifecycle events, role slots, and group updates, dispatching
     /// listener callbacks on the calling (main-loop) thread. Shared by loop() and stop().
     void drain_inbox();
-
-    /// @brief Delivers a high-performance release the counter recorded while a manager lock was
-    /// held (see release_high_performance()). Main-loop thread, no lock held.
-    void deliver_pending_high_performance_release();
 
     /// @brief Asks the artwork and visualizer threads to exit without joining them, so their
     /// exit overlaps the transport teardown. The player is excluded: its ring must keep a
@@ -570,9 +571,6 @@ private:
     // 8-bit fields
     bool high_performance_held_for_time_{false};
     std::atomic<uint8_t> high_performance_ref_count_{0};
-    /// Set when the high-performance count reaches zero; the listener's release callback is
-    /// delivered from the main loop with no manager lock held (see release_high_performance()).
-    std::atomic<bool> high_performance_release_pending_{false};
     /// Where the client is in its lifecycle. Written only by start()/stop() on the main loop;
     /// atomic so is_started() can be read from any thread. STOPPING covers the whole of stop():
     /// start() is refused and stop()/connect_to()/disconnect() are ignored while it is set, so a

@@ -558,7 +558,7 @@ Restarting is `start()` again; start, stop, and start again can be repeated inde
 
 Listener callbacks fire from inside `stop()`, after every role and the group state have been reset, so a callback that reads the client through its getters sees the stopped state. One that calls `start()` gets `false` and starts nothing; one that calls `stop()`, `connect_to()`, or `disconnect()` is ignored. `is_started()` reads `false` throughout and is safe to call from any thread. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
 
-`on_release_high_performance()` is delivered from `loop()` (or from inside `stop()`) rather than from wherever the last hold was released, so it is always safe to call `disconnect()` or `connect_to()` from that callback.
+`on_request_high_performance()` and `on_release_high_performance()` can fire while the client holds an internal lock, so their bodies must only toggle the platform networking mode and must not call any client or role method.
 
 Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) but delivers no listener callback, so a consumer that destroys its listeners before the client is never called into. Call `stop()` first when the clear callbacks matter.
 

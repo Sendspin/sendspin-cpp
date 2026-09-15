@@ -499,7 +499,7 @@ The client destructor performs steps 1 and 2 only, so a consumer that destroyed 
 
 ### High-performance release delivery
 
-`release_high_performance()` never calls the listener inline. The last release can run inside `drop_connection()`, which holds `conn_ptr_mutex_` through `cleanup_connection_state()` (both the time-burst hold and the player's playback hold are released there), and a listener whose `on_release_high_performance()` reacts by calling `disconnect()` or `connect_to()` would re-lock the same non-recursive mutex on the same thread. The release is recorded in `high_performance_release_pending_` and delivered at the top of `drain_inbox()`, which every path (`loop()` and `stop()`) runs with no manager lock held. An `acquire_high_performance()` that lands before the delivery cancels it instead of issuing a second request, so the listener always sees request and release strictly alternate.
+`release_high_performance()` calls the listener inline. The last release can run inside `drop_connection()`, which holds `conn_ptr_mutex_` through `cleanup_connection_state()` (both the time-burst hold and the player's playback hold are released there), so the listener contract for `on_request_high_performance()` / `on_release_high_performance()` is that the body toggles the platform's networking mode and nothing else: it must not call back into the client or a role.
 
 ### Graceful Disconnect
 
