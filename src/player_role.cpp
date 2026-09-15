@@ -62,6 +62,24 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
     return output;
 }
 
+/// @brief Checks the configured formats against the codec rules of the player spec
+/// (roles/player/v1.md, "Servers MUST support the flac and pcm codecs"): the list must contain
+/// a flac or pcm entry, since a player is not told which other codecs a server has.
+static bool audio_formats_valid(const std::vector<AudioSupportedFormatObject>& formats) {
+    bool has_baseline = false;
+    for (const auto& format : formats) {
+        if (format.codec == SendspinCodecFormat::FLAC || format.codec == SendspinCodecFormat::PCM) {
+            has_baseline = true;
+        }
+    }
+    if (!has_baseline) {
+        SS_LOGE(TAG,
+                "audio_formats has no flac or pcm entry; servers need not support any other codec");
+        return false;
+    }
+    return true;
+}
+
 // ============================================================================
 // Impl constructor / destructor
 // ============================================================================
@@ -175,7 +193,15 @@ void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
 bool PlayerRole::Impl::start() {
     this->load_static_delay();
 
-    if (this->config.audio_formats.empty() || !this->listener) {
+    // An empty list leaves the player role out of the hello (see build_hello_fields()), so the
+    // codec rules do not apply to it.
+    if (this->config.audio_formats.empty()) {
+        return true;
+    }
+    if (!audio_formats_valid(this->config.audio_formats)) {
+        return false;
+    }
+    if (!this->listener) {
         return true;
     }
     // Init once (event flags, ring buffer); the thread is created on every start(), including a

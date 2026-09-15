@@ -64,6 +64,7 @@ constexpr uint16_t ROLLBACK_TEST_PORT = 18996;
 constexpr uint16_t HIGH_PERF_TEST_PORT = 18997;
 constexpr uint16_t VISUALIZER_TEST_PORT = 18998;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 18999;
+constexpr uint16_t FORMATS_TEST_PORT = 19000;
 
 /// Reports whether anything is listening on the loopback port.
 bool port_accepts(uint16_t port) {
@@ -402,6 +403,30 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     stream_audio_until(client, server, listener, 1);  // The rolled-back player plays again
     client.stop();
     EXPECT_EQ(listener.stream_ends, 1);
+}
+
+// A player must list flac or pcm, the only codecs every server supports (roles/player/v1.md); with
+// neither, a server that lacks the listed codecs has no format it can stream. start() refuses such
+// a list and the client stays stopped. Control: either baseline codec on its own starts.
+TEST(ClientLifecycle, PlayerWithoutFlacOrPcmRefusesToStart) {
+    TestNetworkProvider network;
+    CountingPlayerListener listener;
+    SendspinClient client(make_config(FORMATS_TEST_PORT));
+    client.set_network_provider(&network);
+
+    PlayerRoleConfig opus_only;
+    opus_only.audio_formats.push_back({SendspinCodecFormat::OPUS, 2, 48000, 16});
+    client.add_player(std::move(opus_only)).set_listener(&listener);
+    EXPECT_FALSE(client.start());
+    EXPECT_FALSE(client.is_started());
+
+    for (SendspinCodecFormat codec : {SendspinCodecFormat::FLAC, SendspinCodecFormat::PCM}) {
+        PlayerRoleConfig baseline;
+        baseline.audio_formats.push_back({codec, 2, 48000, 16});
+        client.add_player(std::move(baseline)).set_listener(&listener);
+        ASSERT_TRUE(client.start());
+        client.stop();
+    }
 }
 
 /// Counts loudness deliveries; they fire on the visualizer drain thread.

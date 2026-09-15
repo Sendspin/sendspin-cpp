@@ -74,6 +74,8 @@ player_config.extra_startup_silence_ms = 50;     // Extra startup silence for de
 auto& player = client.add_player(std::move(player_config));
 ```
 
+List at least one `FLAC` or `PCM` format. Those are the only codecs a server must support, and the server picks only among the formats it can produce, so a list with neither can leave the player with nothing to play; `start()` refuses it. `OPUS` is optional.
+
 Each `AudioSupportedFormatObject` declares a codec/channels/sample_rate/bit_depth combination. The server selects from these when establishing an audio stream.
 
 The stream parameters negotiated by the server are available via `get_current_stream_params()`, which returns a `ServerPlayerStreamObject` with these fields:
@@ -815,7 +817,7 @@ Configuration passed to `client.add_player()`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports; advertised to the server during the hello handshake. The server selects one when establishing a stream. |
+| `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports, in preference order; advertised to the server during the hello handshake. The server selects one when establishing a stream. Must include a `FLAC` or `PCM` entry, the only codecs every server supports; `start()` refuses a non-empty list without one. `OPUS` may be listed in addition. |
 | `audio_buffer_capacity` | `size_t` | `1000000` | Internal ring buffer size in bytes. Larger buffers absorb more jitter at the cost of memory. |
 | `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable static delay. |
 | `initial_static_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable static delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
