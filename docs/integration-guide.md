@@ -764,7 +764,7 @@ Available options (all `ON` by default):
 | `SENDSPIN_ENABLE_VISUALIZER` | Visualizer role |
 | `SENDSPIN_ENABLE_COLOR` | Color role |
 
-When `SENDSPIN_ENABLE_PLAYER` is `OFF`, the micro-flac and micro-opus dependencies are not fetched. `SENDSPIN_ENABLE_OPUS=OFF` drops micro-opus alone, for products that must avoid the Opus patent licence (see the player role spec); the player then refuses `OPUS` entries in `audio_formats`.
+When `SENDSPIN_ENABLE_PLAYER` is `OFF`, the micro-flac and micro-opus dependencies are not fetched. `SENDSPIN_ENABLE_OPUS=OFF` drops micro-opus alone, for products that cannot ship Opus (see the patent note in the player role spec); the player then refuses `OPUS` entries in `audio_formats`.
 
 ### ESP-IDF (Kconfig)
 

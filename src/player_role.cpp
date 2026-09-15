@@ -70,9 +70,9 @@ static std::vector<uint8_t> base64_decode(const std::string& input) {
 }
 
 /// @brief Checks the configured formats against the codec rules of the player spec
-/// (roles/player/v1.md, "Servers MUST support the flac and pcm codecs"): the list must contain
-/// a flac or pcm entry, since a player is not told which other codecs a server has, and may
-/// list opus only when this build decodes it.
+/// (roles/player/v1.md, client/hello player@v1 support object: "Servers MUST support the flac
+/// and pcm codecs"): the list must contain a flac or pcm entry, since a player is not told which
+/// other codecs a server has, and may list opus only when this build decodes it.
 static bool audio_formats_valid(const std::vector<AudioSupportedFormatObject>& formats) {
     bool has_baseline = false;
     bool has_opus = false;

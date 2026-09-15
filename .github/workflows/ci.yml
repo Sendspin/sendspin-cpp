@@ -93,8 +93,9 @@ jobs:
 
       - name: Configure CMake
         # SENDSPIN_ENABLE_OPUS=OFF must build the library, the examples, and the tests without
-        # micro-opus; the suite also covers the player refusing an opus entry in this build.
-        run: cmake -B build-no-opus -DSENDSPIN_ENABLE_OPUS=OFF -DSENDSPIN_BUILD_TESTS=ON .
+        # micro-opus. The player tests that only exist in this configuration run under ASan/UBSan
+        # here, like the default suite does in the test job.
+        run: cmake -B build-no-opus -DSENDSPIN_ENABLE_OPUS=OFF -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON .
 
       - name: Build
         run: cmake --build build-no-opus

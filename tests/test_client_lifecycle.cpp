@@ -66,7 +66,9 @@ constexpr uint16_t VISUALIZER_TEST_PORT = 18998;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 18999;
 constexpr uint16_t FORMATS_TEST_PORT = 19000;
 constexpr uint16_t OPUS_TEST_PORT = 19001;
+#ifndef SENDSPIN_ENABLE_OPUS
 constexpr uint16_t OPUS_STREAM_TEST_PORT = 19002;
+#endif
 
 /// Reports whether anything is listening on the loopback port.
 bool port_accepts(uint16_t port) {
@@ -413,7 +415,8 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
 
 // A player must list flac or pcm, the only codecs every server supports (roles/player/v1.md); with
 // neither, a server that lacks the listed codecs has no format it can stream. start() refuses such
-// a list and the client stays stopped. Control: either baseline codec on its own starts.
+// a list and the client stays stopped. The refused player has no listener: the rule covers what the
+// hello advertises, not whether audio could play. Control: either baseline codec on its own starts.
 TEST(ClientLifecycle, PlayerWithoutFlacOrPcmRefusesToStart) {
     TestNetworkProvider network;
     CountingPlayerListener listener;
@@ -422,7 +425,7 @@ TEST(ClientLifecycle, PlayerWithoutFlacOrPcmRefusesToStart) {
 
     PlayerRoleConfig opus_only;
     opus_only.audio_formats.push_back({SendspinCodecFormat::OPUS, 2, 48000, 16});
-    client.add_player(std::move(opus_only)).set_listener(&listener);
+    client.add_player(std::move(opus_only));
     EXPECT_FALSE(client.start());
     EXPECT_FALSE(client.is_started());
 
@@ -460,8 +463,9 @@ TEST(ClientLifecycle, OpusEntryRequiresTheOpusDecoder) {
 #ifndef SENDSPIN_ENABLE_OPUS
 // Without the Opus decoder, a stream/start naming opus (a server ignoring the advertised list)
 // takes the unsupported-codec path: no codec header reaches the sync task and no
-// on_stream_start() fires. The pcm stream/start sent right behind it starts normally, which also
-// proves the opus one was processed and dropped rather than left pending.
+// on_stream_start() fires. The pcm stream/start sent right behind it starts normally; stream
+// events drain in arrival order, so once the pcm params are current an accepted opus start would
+// already have been counted.
 TEST(ClientLifecycle, OpusStreamStartIsRefusedWithoutTheOpusDecoder) {
     TestNetworkProvider network;
     CountingPlayerListener listener;
@@ -475,9 +479,10 @@ TEST(ClientLifecycle, OpusStreamStartIsRefusedWithoutTheOpusDecoder) {
 
     server.send_text(stream_start_json("opus"));
     server.send_text(stream_start_pcm_json());
-    pump_until(client, [&] { return listener.stream_starts >= 1; });
+    pump_until(client, [&] {
+        return client.player()->get_current_stream_params().codec == SendspinCodecFormat::PCM;
+    });
     EXPECT_EQ(listener.stream_starts, 1);
-    EXPECT_EQ(client.player()->get_current_stream_params().codec, SendspinCodecFormat::PCM);
 
     client.stop();
     EXPECT_EQ(listener.stream_ends, 1);

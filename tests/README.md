@@ -44,6 +44,10 @@ cmake --build build-tsan --target sendspin_tests
 TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure
 ```
 
+CI also builds and runs the suite with `-DSENDSPIN_ENABLE_OPUS=OFF` (under ASan/UBSan).
+`test_client_lifecycle.cpp` has one test that only compiles in that configuration, so add the flag
+to a build directory of your own when touching the player's codec handling.
+
 ## Layout
 
 `main.cpp` is the entry point. It registers a hang watchdog that aborts the binary with the
