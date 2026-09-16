@@ -293,8 +293,7 @@ TEST(AnnouncementRole, StreamStartParsesAnnouncementObject) {
         "server_transmitted":123,
         "announcement":{"codec":"opus","sample_rate":48000,"channels":1,"bit_depth":16,
                         "codec_header":"aGVhZGVy","start_timestamp":1700000000000000,
-                        "media_duck_db":20,"duck_ramp_ms":250,"volume":60,
-                        "override_mute":true}}})",
+                        "media_duck_db":200,"duck_ramp_ms":250,"volume":60}}})",
                       doc, root));
 
     StreamStartMessage stream_msg;
@@ -310,15 +309,15 @@ TEST(AnnouncementRole, StreamStartParsesAnnouncementObject) {
     EXPECT_EQ(announcement.format.bit_depth.value(), 16);
     EXPECT_EQ(announcement.format.codec_header.value(), "aGVhZGVy");
     EXPECT_EQ(announcement.start_timestamp, 1700000000000000LL);
-    EXPECT_EQ(announcement.media_duck_db, 20);
+    // media_duck_db is uncapped: a large value that silences the media round-trips unchanged
+    EXPECT_EQ(announcement.media_duck_db, 200);
     EXPECT_EQ(announcement.duck_ramp_ms, 250);
     ASSERT_TRUE(announcement.volume.has_value());
     EXPECT_EQ(announcement.volume.value(), 60);
-    EXPECT_TRUE(announcement.override_mute);
 }
 
-// Optional fields carry defined defaults, and both stream objects can coexist. override_mute
-// defaults to false and volume to unset when absent.
+// Optional fields carry defined defaults, and both stream objects can coexist. volume defaults to
+// unset when absent.
 TEST(AnnouncementRole, StreamStartDefaultsAndCoexistence) {
     JsonDocument doc;
     JsonObject root;
@@ -339,17 +338,17 @@ TEST(AnnouncementRole, StreamStartDefaultsAndCoexistence) {
     EXPECT_EQ(announcement.media_duck_db, 0);       // default: no ducking
     EXPECT_EQ(announcement.duck_ramp_ms, 100);      // default ramp
     EXPECT_FALSE(announcement.volume.has_value());  // default: follow master volume
-    EXPECT_FALSE(announcement.override_mute);       // default: silenced while muted
 }
 
-// Out-of-range duck/volume values and a non-boolean override_mute are dropped, leaving defaults
+// Out-of-range ramp and volume values are dropped, leaving defaults. media_duck_db has no upper
+// bound, so a large value is kept.
 TEST(AnnouncementRole, StreamStartRejectsOutOfRangeFields) {
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{
         "announcement":{"codec":"pcm","sample_rate":16000,"channels":1,"bit_depth":16,
-                        "start_timestamp":42,"media_duck_db":51,"duck_ramp_ms":2001,
-                        "volume":101,"override_mute":1}}})",
+                        "start_timestamp":42,"media_duck_db":200,"duck_ramp_ms":2001,
+                        "volume":101}}})",
                       doc, root));
 
     StreamStartMessage stream_msg;
@@ -357,10 +356,9 @@ TEST(AnnouncementRole, StreamStartRejectsOutOfRangeFields) {
     ASSERT_TRUE(stream_msg.announcement.has_value());
 
     const ServerAnnouncementStreamObject& announcement = stream_msg.announcement.value();
-    EXPECT_EQ(announcement.media_duck_db, 0);
+    EXPECT_EQ(announcement.media_duck_db, 200);
     EXPECT_EQ(announcement.duck_ramp_ms, 100);
     EXPECT_FALSE(announcement.volume.has_value());
-    EXPECT_FALSE(announcement.override_mute);  // integer 1 is not a JSON boolean, so dropped
 }
 
 // start_timestamp is required: an otherwise-complete announcement object without it fails the
@@ -394,8 +392,8 @@ TEST(AnnouncementRole, StreamStartRejectsIncompleteAnnouncement) {
 // ============================================================================
 
 // A stream/start arriving while an announcement is active is a config update: the role adopts
-// the new duck/volume/override_mute params and re-invokes on_announcement_start, without ending
-// the stream or flipping the playing state.
+// the new duck/volume params and re-invokes on_announcement_start, without ending the stream or
+// flipping the playing state.
 TEST(AnnouncementRole, ResentStreamStartUpdatesConfigInPlace) {
     auto impl = make_announcement_impl();
     RecordingListener listener;
@@ -413,7 +411,6 @@ TEST(AnnouncementRole, ResentStreamStartUpdatesConfigInPlace) {
     updated.start_timestamp = 99;
     updated.media_duck_db = 30;
     updated.volume = 80;
-    updated.override_mute = true;
     impl->event_state->stream_params_slot.write(updated);
     impl->on_stream_ring_event(AnnouncementStreamCallbackType::CONFIG_UPDATE);
 
@@ -425,7 +422,6 @@ TEST(AnnouncementRole, ResentStreamStartUpdatesConfigInPlace) {
     EXPECT_EQ(listener.last_params.media_duck_db, 30);
     ASSERT_TRUE(listener.last_params.volume.has_value());
     EXPECT_EQ(listener.last_params.volume.value(), 80);
-    EXPECT_TRUE(listener.last_params.override_mute);
     EXPECT_TRUE(impl->announcement_playing);
     EXPECT_EQ(impl->current_stream_params.media_duck_db, 30);
 }

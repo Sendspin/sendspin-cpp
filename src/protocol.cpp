@@ -34,9 +34,6 @@ static const char* const TAG = "sendspin.protocol";
 /// @brief Protocol maximum for volume fields (volume is 0-100 on the wire).
 static constexpr uint8_t VOLUME_MAX = 100;
 
-/// @brief Protocol maximum for the announcement media_duck_db field (0-50 dB on the wire).
-static constexpr uint8_t MEDIA_DUCK_DB_MAX = 50;
-
 /// @brief Protocol maximum for the announcement duck_ramp_ms field (0-2000 ms on the wire).
 static constexpr uint16_t DUCK_RAMP_MS_MAX = 2000;
 
@@ -712,8 +709,9 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
                 return false;
             }
             announcement_obj.start_timestamp = announcement_json["start_timestamp"].as<int64_t>();
-            if (auto v = read_uint_field<uint8_t>(announcement_json["media_duck_db"],
-                                                  "media_duck_db", 0, MEDIA_DUCK_DB_MAX)) {
+            // media_duck_db is uncapped by the protocol: a large value simply silences the media.
+            if (auto v = read_uint_field<uint16_t>(announcement_json["media_duck_db"],
+                                                   "media_duck_db")) {
                 announcement_obj.media_duck_db = *v;
             }
             if (auto v = read_uint_field<uint16_t>(announcement_json["duck_ramp_ms"],
@@ -723,9 +721,6 @@ bool process_stream_start_message(JsonObject root, StreamStartMessage* stream_ms
             if (auto v = read_uint_field<uint8_t>(announcement_json["volume"], "volume", 0,
                                                   VOLUME_MAX)) {
                 announcement_obj.volume = v;
-            }
-            if (auto v = read_bool_field(announcement_json["override_mute"], "override_mute")) {
-                announcement_obj.override_mute = *v;
             }
             stream_msg->announcement = std::move(announcement_obj);
         } else {

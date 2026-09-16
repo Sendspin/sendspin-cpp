@@ -51,9 +51,10 @@ struct ServerAnnouncementStreamObject {
     /// multi-speaker start. Required.
     int64_t start_timestamp{0};
 
-    /// Reduction in decibel (0-50) to apply to this client's own media output while the
-    /// announcement stream is active. 0 means no ducking.
-    uint8_t media_duck_db{0};
+    /// Non-negative reduction in decibel to apply to this client's own media output while the
+    /// announcement stream is active. 0 (the default) means no ducking; a large value (e.g. 200)
+    /// silences the media.
+    uint16_t media_duck_db{0};
 
     /// Ramp duration in milliseconds (0-2000) for both applying and releasing the ducking.
     uint16_t duck_ramp_ms{DEFAULT_DUCK_RAMP_MS};
@@ -62,9 +63,6 @@ struct ServerAnnouncementStreamObject {
     /// `volume` (0-100) would produce, regardless of the current master volume. When absent,
     /// the announcement follows the current master volume.
     std::optional<uint8_t> volume{};
-
-    /// When true, a muted client still renders the announcement while its media stays muted.
-    bool override_mute{false};
 
     bool is_complete() const {
         return this->format.is_complete();
@@ -94,11 +92,10 @@ public:
     /// @brief Called when an announcement stream starts. Fires on the main loop thread
     ///
     /// The embedder applies the ducking policy here (e.g. duck the media pipeline by
-    /// `params.media_duck_db` over `params.duck_ramp_ms`) and honors `params.override_mute` and
-    /// `params.volume`. Also fires when the server re-sends `stream/start` to update the active
-    /// announcement's config (duck level, volume, or override_mute): the embedder re-applies the
-    /// updated policy, ramping a new `media_duck_db` from the current gain, without any
-    /// intervening on_announcement_end().
+    /// `params.media_duck_db` over `params.duck_ramp_ms`) and honors `params.volume`. Also fires
+    /// when the server re-sends `stream/start` to update the active announcement's config (duck
+    /// level or volume): the embedder re-applies the updated policy, ramping a new
+    /// `media_duck_db` from the current gain, without any intervening on_announcement_end().
     virtual void on_announcement_start(const ServerAnnouncementStreamObject& /*params*/) {}
 
     /// @brief Called when the announcement stream ends (normally, aborted, or on transport

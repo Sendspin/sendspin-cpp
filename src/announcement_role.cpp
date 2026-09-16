@@ -161,10 +161,10 @@ void AnnouncementRole::Impl::handle_stream_start(
     }
 
     // A stream/start arriving while the announcement is already playing is a configuration update
-    // (duck level, volume, or override_mute), not a new clip: update the params in place and let
-    // the main thread re-apply the policy via on_announcement_start, without a codec header, a
-    // buffer clear, or a task restart. Replacing a clip is done by the server with stream/end
-    // then a fresh stream/start.
+    // (duck level or volume), not a new clip: update the params in place and let the main thread
+    // re-apply the policy via on_announcement_start, without a codec header, a buffer clear, or a
+    // task restart. Replacing a clip is done by the server with stream/end then a fresh
+    // stream/start.
     if (this->task->is_running()) {
         this->event_state->stream_params_slot.write(announcement_obj);
         this->enqueue_stream_event(AnnouncementStreamCallbackType::CONFIG_UPDATE);
@@ -295,9 +295,9 @@ void AnnouncementRole::Impl::drain_events() {
                 break;
             }
             case AnnouncementStreamCallbackType::CONFIG_UPDATE: {
-                // Re-sent stream/start on an active stream: adopt the new duck/volume/override_mute
-                // params and re-apply the policy through on_announcement_start. The task keeps
-                // playing; no state change and no task signal.
+                // Re-sent stream/start on an active stream: adopt the new duck/volume params and
+                // re-apply the policy through on_announcement_start. The task keeps playing; no
+                // state change and no task signal.
                 ServerAnnouncementStreamObject stream_params;
                 if (this->event_state->stream_params_slot.take(stream_params)) {
                     this->current_stream_params = std::move(stream_params);
