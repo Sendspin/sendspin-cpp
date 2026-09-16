@@ -95,9 +95,10 @@ static NoiseHandshakeState* build_responder_hs(const std::string& suite_name,
                                                const uint8_t* prologue, size_t prologue_len,
                                                const uint8_t* psk) {
     NoiseHandshakeState* hs = nullptr;
-    if (noise_handshakestate_new_by_name(&hs, suite_name.c_str(), NOISE_ROLE_RESPONDER) !=
-        NOISE_ERROR_NONE) {
-        SS_LOGE(TAG, "noise_handshakestate_new_by_name failed for suite %s", suite_name.c_str());
+    int err = noise_handshakestate_new_by_name(&hs, suite_name.c_str(), NOISE_ROLE_RESPONDER);
+    if (err != NOISE_ERROR_NONE) {
+        SS_LOGE(TAG, "noise_handshakestate_new_by_name failed for suite %s (error 0x%04x: %d)",
+                suite_name.c_str(), err, err);
         return nullptr;
     }
 

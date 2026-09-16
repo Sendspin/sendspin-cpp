@@ -103,6 +103,23 @@ if(ESP_IDF_BUILD)
     # Apply ESP-IDF configuration
     sendspin_configure_esp_idf(${COMPONENT_LIB} ${COMPONENT_DIR})
 
+    # esphome__noise-c disables protocol name tables by default (NOISE_USE_PROTOCOL_NAME_TABLE=0),
+    # which pins noise-c to only Noise_NNpsk0 for the ESPHome native API.
+    # Sendspin uses Noise_KKpsk2, so re-enable the protocol name tables and full pattern expansion.
+    foreach(_noise_target esphome__noise-c __idf_esphome__noise-c)
+        if(TARGET ${_noise_target})
+            get_target_property(_noise_defs ${_noise_target} COMPILE_DEFINITIONS)
+            if(_noise_defs)
+                list(REMOVE_ITEM _noise_defs "NOISE_USE_PROTOCOL_NAME_TABLE=0")
+                list(APPEND _noise_defs "NOISE_USE_PROTOCOL_NAME_TABLE=1")
+                set_target_properties(${_noise_target} PROPERTIES COMPILE_DEFINITIONS "${_noise_defs}")
+            else()
+                target_compile_definitions(${_noise_target} PRIVATE NOISE_USE_PROTOCOL_NAME_TABLE=1)
+            endif()
+            target_compile_options(${_noise_target} PRIVATE "-DNOISE_USE_PROTOCOL_NAME_TABLE=1")
+        endif()
+    endforeach()
+
 # ==============================================================================
 # Host Build
 # ==============================================================================
