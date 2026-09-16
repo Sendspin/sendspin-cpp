@@ -47,21 +47,22 @@ On host builds, `platform_configure_thread()` is a no-op; threads use OS default
 
 1. `SyncTask::start()` configures the thread and spawns it.
 2. The caller blocks until the thread reaches IDLE state (`TASK_IDLE` event flag) or exits early due to an allocation failure (`TASK_STOPPED`).
-3. The thread runs a persistent outer loop for the lifetime of the client.
-4. `SyncTask::stop()` sets `COMMAND_STOP` and joins the thread. Called from `SyncTask`'s destructor, which is triggered by `sync_task_.reset()` in `PlayerRole::Impl`'s destructor.
+3. The thread runs a persistent outer loop for one started session, until `stop()`.
+4. `SyncTask::stop()` sets `COMMAND_STOP`, wakes the ring buffer receive via `wake_receiver()`, and joins the thread; after the join it clears `TASK_RUNNING` (a stop mid-stream leaves it set, and the player's sync-idle gate must read a stopped task as idle) and resets the encoded ring buffer, so a later `start()` begins with an empty ring. Called from `PlayerRole::Impl::stop()` (`SendspinClient::stop()` and the client destructor) and from `SyncTask`'s destructor, which is triggered by `sync_task_.reset()` in `PlayerRole::Impl`'s destructor.
+5. `SyncTask::start()` clears every command and state flag before spawning, so a restart after `stop()` inherits nothing from the previous thread.
 
 **Visualizer drain** (`src/visualizer_role.cpp`):
 
 1. `VisualizerRole::Impl::start()` spawns the drain thread.
-2. The thread blocks on ring buffer receives with a 50 ms timeout.
-3. `VisualizerRole::Impl` destructor sets `COMMAND_STOP` and joins.
+2. The thread blocks on ring buffer receives; commands interrupt the receive immediately via `wake_receiver()`. The 5 s receive timeout is only a fallback against a missed wake.
+3. `VisualizerRole::Impl::stop()` (from `SendspinClient::stop()`, the client destructor, and the `Impl` destructor) sets `COMMAND_STOP`, wakes the ring buffer receive, joins, and then flushes the ring buffer: with the thread joined it is the ring's only consumer, and a restart must not deliver the previous session's frames. `start()` clears `COMMAND_STOP`, `COMMAND_FLUSH`, and `COMMAND_CLEAR` before spawning, since `cleanup()` on a stopped role leaves a flush flagged.
 
 **Artwork decode** (`src/artwork_role.cpp`):
 
 1. `ArtworkRole::Impl::start()` spawns the decode thread.
-2. The thread blocks on notification queue receives with a 100 ms timeout.
+2. The thread blocks on notification queue receives; commands interrupt the receive immediately via `wake_receiver()`. The 5 s receive timeout is only a fallback against a missed wake.
 3. On notification: calls `on_image_decode()`, then merges an `ArtworkDisplayUpdate` (the slot's server display timestamp plus the `stream_epoch` it was decoded under) into the `ArtworkRole::Impl::EventState::display_slot` `InboxSlot` via `merge_artwork_display_update`. The main loop's `ArtworkRole::Impl::drain_events()` folds the taken update into its main-thread-only `held_display_*` state and fires `on_image_display()` once the timestamp is reached. Latest-wins per slot: if a newer frame's timestamp overwrites the pending one before the main loop takes it, only the newer display fires; the per-slot epoch lets the deadline sweep drop a display whose stream was replaced after the hand-off.
-4. `ArtworkRole::Impl` destructor sets `COMMAND_STOP` and joins.
+4. `ArtworkRole::Impl::stop()` (from `SendspinClient::stop()`, the client destructor, and the `Impl` destructor) sets `COMMAND_STOP`, wakes the queue receive, joins, and then resets the notification queue so a restart does not decode the previous session's images. `start()` clears `COMMAND_STOP` before spawning.
 
 **Destruction order** matters because external audio callbacks may still reference the sync task. `PlayerRole::Impl`'s destructor resets the sync task first (`sync_task_.reset()`) before tearing down anything else, so the thread is fully joined before any shared state is destroyed.
 
@@ -88,7 +89,7 @@ The sync task, visualizer drain thread, and artwork decode thread all use event 
 
 ### ThreadSafeQueue (`src/platform/thread_safe_queue.h`)
 
-Fixed-depth FIFO queue with timed send/receive. Used to defer events from network threads to the main loop:
+Fixed-depth FIFO queue with timed send/receive. A blocking `receive()` is interruptible from any thread via `wake_receiver()` (see SpscRingBuffer below for the shared mechanism). Used to hand work from a network thread to a dedicated worker thread:
 
 | Queue | Depth | Data | Producer | Consumer |
 |-------|-------|------|----------|----------|
@@ -136,6 +137,8 @@ All roles have been migrated onto the Inbox. The controller/metadata/color roles
 
 Single-producer/single-consumer ring buffer for variable-size binary data. Two-phase API: `acquire` → `commit` (producer), `receive` → `return_item` (consumer). Also supports a single-phase `send` for the producer.
 
+A blocking `receive()` is interruptible from any thread via `wake_receiver()`: the blocked (or next blocking) receive returns null early without consuming data, and the consumer re-checks its command flags. This is what makes role stop and stream commands take effect immediately instead of at the next receive timeout, so the receive timeouts are pure idle-wakeup tuning. On ESP the mechanism is an internal binary "items-or-wake" semaphore: every producer send/commit and every `wake_receiver()` gives it, and `receive()` polls the buffer non-blocking, then blocks on the semaphore, then polls again. Because the semaphore is binary, a burst of sends collapses into one token; the poll-before-block (repeated on every call while data remains) is what keeps items from being stranded behind a collapsed token, and a wake absorbed by a racing item's delivery is covered by the consumers' loop-top command checks. The flip side of that poll is a stale token: an item taken by the poll leaves its send's token behind, so the next blocking `receive()` after a burst is drained returns null once without waiting. The semaphore is binary, so this happens at most once per drained burst, and every consumer already treats a null return as "re-check state and retry" (the same spurious-wakeup discipline a condition variable demands), so the cost is one extra loop iteration rather than a busy loop. On host it is a `wake_pending_` flag on the receive condition variable with the same semantics.
+
 Used for:
 
 - **Encoded audio**: Via the `SendspinAudioRingBuffer` wrapper (which adds chunk headers and exposes `write_chunk` / `receive_chunk` / `return_chunk`). Network thread writes chunks; sync task reads and decodes them.
@@ -148,8 +151,7 @@ Used for:
 - **`std::atomic<bool>`** on `SendspinConnection::message_dispatch_enabled_`: allows the main loop to instantly suppress message delivery from the network thread.
 - **`std::atomic<bool/uint8_t>`** on `VisualizerRole::Impl`: network thread writes stream config atomically; drain thread reads it.
 - **`std::atomic<bool>`** on `ArtworkRole::Impl::stream_active`: guards `handle_binary()` from writing when no stream is active.
-- **`std::atomic<uint8_t>`** on `ArtworkRole::Impl::SlotBuffer::write_idx`: tracks which of two double-buffers the network thread writes to next.
-- **`std::atomic<bool>`** on `ArtworkRole::Impl::SlotBuffer::drain_active`: set by the decode thread while decoding, checked by the network thread to avoid overwriting an in-use buffer.
+- **`std::mutex`** on `ArtworkRole::Impl::DrainTask::slot_mutex`: guards every field of `SlotBuffer` (shared across all slots; artwork is not a hot path, so contention is negligible). Under that lock `write_idx` tracks which of the two per-slot buffers the network thread writes to next, `drain_active`/`drain_buf_idx` record which buffer the decode thread is decoding, `write_generation[]` lets the decode thread detect a buffer overwritten before it could be claimed, and `ack_state`/`has_parked`/`parked` hold the per-slot frame-done gate.
 - **`std::atomic<uint8_t>`** on `SendspinClient::high_performance_ref_count_`: ref-counted high-performance networking requests from time sync and playback.
 
 ## Message Flow
@@ -218,7 +220,7 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
 
 ### Main Loop Processing
 
-`SendspinClient::loop()` (`src/client.cpp`) runs the following steps **in order** on each tick:
+`SendspinClient::loop()` (`src/client.cpp`) is a no-op while the client is stopped (a stopped client has no connections or threads, and the manager loop must not restart the WebSocket server). While started it runs the following steps **in order** on each tick; steps 3 onward are `SendspinClient::drain_inbox()`, which `stop()` also calls once so the clear callbacks are delivered synchronously:
 
 ```api
 1. connection_manager_->loop()   (sections gated on lock-free atomic hints - see below)
@@ -229,8 +231,11 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
    │  (handoff decisions against the incumbent)
    ├─ Call loop() on the current and nursery connections   (only when has_current_ or nursery_size_)
    ├─ Check per-connection hello retry timers   (only when nursery_size_)
-   ├─ Reap nursery connections past the establish deadline; tick the platform ws_server
-   └─ flush_deferred_releases()   (early-returns without locking when deferred_size_ is 0)
+   ├─ Reap nursery connections past the establish deadline
+   ├─ Liveness: drop the current connection once inbound silence reaches liveness_timeout_us_
+   │  (only when has_current_; stamped per complete inbound message at dispatch)
+   ├─ flush_deferred_releases()   (early-returns without locking when deferred_size_ is 0)
+   └─ Tick the platform ws_server (ESP: reap stalled upgrades; host: no-op)
 
 2. time_burst_->loop(conn)  (requires conn != nullptr && conn->is_operational()
                              && !conn->is_pairing_in_progress(), so it is also skipped
@@ -311,7 +316,7 @@ The `awaiting_sync_idle_events` list (on `PlayerRole::Impl`) is the key ordering
 - **MetadataRole**: `InboxSlot` has no `take_if`, so the deadline gate that used to run under the shadow slot's mutex is split in two: `take()` unconditionally moves any pending delta into a main-thread-only `held_delta` (folding it into an already-held delta), then the server-clock deadline is evaluated with no lock held, applying deltas and firing `on_metadata()` once the `timestamp` is reached (or immediately if there is no active connection). A future-dated `held_delta` persists across ticks with no topic bit set, which is why `needs_drain()` ORs in `held_delta.has_value()` alongside the `INBOX_TOPIC_METADATA` bit test: the deadline sets no inbox bit, so without that term a bit-gated tick would strand the delta until an unrelated new delta happened to re-set the bit, silently starving deadline-based delivery. The clear arrives separately as a `METADATA_CLEARED` ring event (`handle_cleared_event()` fires `on_metadata_clear()`), deferred from `cleanup()` for the same `conn_ptr_mutex_` reason.
 - **ColorRole**: Same structure as MetadataRole: `take()` into `held_delta`, a lock-free server-clock deadline gate firing `on_color()`, and a `COLOR_CLEARED` ring event driving `on_color_clear()`.
 - **ArtworkRole**: Stream end/clear lifecycle is handled earlier in the tick by `handle_stream_ring_event()` (dispatched from the ring drain, before this call), which clears `held_display_mask`/`display_slot` and fires `on_image_clear()` for each configured slot - preserving the "lifecycle before display" ordering the old single-function drain guaranteed. `drain_events()` itself folds any taken `display_slot` update into the main-thread-only `held_display_*` state (latest-wins per slot), then sweeps the held slots and fires `on_image_display(slot, lateness_ms)` for any whose timestamp is due on the synced client clock (or immediately if there is no active connection). The deadline is computed by the pure `display_overdue_us()` helper, which applies the slot's `display_offset_ms` shift (positive fires early) and returns the overdue microseconds; `display_lateness_ms()` maps that to the `lateness_ms` argument, reserving `0` for the no-connection case (a connected on-time display is floored to 1 ms so it never collides with that sentinel). Per-slot epochs drop a held display whose stream was replaced after the decode hand-off. `needs_drain()` ORs a nonzero `held_display_mask` into the `INBOX_TOPIC_ARTWORK_DISPLAY` bit test (the same carry-over pattern the metadata role uses for `held_delta`) so held displays keep getting a drain every tick until their deadline fires, even though the deadline sets no inbox bit; `on_image_decode` still happens on the dedicated artwork decode thread.
-  - **Ack gate (`require_frame_done`)**: A slot can opt into per-slot back-pressure. Each `SlotBuffer` carries a `SlotAckState` (`IDLE` -> `DECODE_DELIVERED` once `on_image_decode()` fires -> `PRESENTED` once `on_image_display()`/`on_image_clear()` fires), all guarded by `slot_mutex`. While a gated slot is not `IDLE`, the decode thread (`process_notification()`) does not decode a newer notification; it *parks* it latest-wins in `SlotBuffer::parked` (`has_parked`) instead of decoding concurrently with the un-acked delivery. `ArtworkRole::frame_done(slot)` (main loop) returns the gate to `IDLE` and, if a notification is parked, calls `wake_drain_thread()` -- a sentinel `ARTWORK_RECHECK_SLOT` notification that unblocks the decode thread's `notify_queue.receive()` so it re-runs the top-of-loop parked-slot sweep (a dropped wake is covered by the `DRAIN_RECEIVE_TIMEOUT_MS` fallback). The parked notification is re-validated on replay, so a since-stale generation/epoch is simply skipped. A clear counts as a delivery: `handle_stream_ring_event()` drops any parked notification and forces gated slots to `PRESENTED`, so exactly one `frame_done()` is owed after it. A stream restart releases only `DECODE_DELIVERED` slots (their display can no longer fire); `PRESENTED` stays armed because the consumer may still be mid-fade on the prior stream's last delivery. There is no timeout.
+  - **Ack gate (`require_frame_done`)**: A slot can opt into per-slot back-pressure. Each `SlotBuffer` carries a `SlotAckState` (`IDLE` -> `DECODE_DELIVERED` once `on_image_decode()` fires -> `PRESENTED` once `on_image_display()`/`on_image_clear()` fires), all guarded by `slot_mutex`. While a gated slot is not `IDLE`, the decode thread (`process_notification()`) does not decode a newer notification; it *parks* it latest-wins in `SlotBuffer::parked` (`has_parked`) instead of decoding concurrently with the un-acked delivery. `ArtworkRole::frame_done(slot)` (main loop) returns the gate to `IDLE` and, if a notification is parked, calls `wake_drain_thread()` -- `notify_queue.wake_receiver()`, which unblocks the decode thread's `notify_queue.receive()` so it re-runs the top-of-loop parked-slot sweep. The parked notification is re-validated on replay, so a since-stale generation/epoch is simply skipped. A clear counts as a delivery: `handle_stream_ring_event()` drops any parked notification and forces gated slots to `PRESENTED`, so exactly one `frame_done()` is owed after it. A stream restart releases only `DECODE_DELIVERED` slots (their display can no longer fire); `PRESENTED` stays armed because the consumer may still be mid-fade on the prior stream's last delivery. There is no timeout.
 - **VisualizerRole**: Has no `drain_events()`. STREAM_START/END/CLEAR are dispatched entirely from `handle_stream_ring_event()` (from the ring drain): STREAM_START `take()`s the config from `config_slot` and fires `on_visualizer_stream_start()`; STREAM_END/CLEAR fire `on_visualizer_stream_end()`/`on_visualizer_stream_clear()`.
 
 ## Sync Task State Machine
@@ -331,7 +336,7 @@ The sync task (`SyncTask::thread_entry`, `src/sync_task.cpp`) runs a two-level s
 │  │    COMMAND flags                   │                  │
 │  │  • Set TASK_IDLE                   │                  │
 │  │  • Reset context + progress queue  │                  │
-│  │  • Wait for codec header (500ms)   │◄──┐              │
+│  │  • Wait for codec header (wake)    │◄──┐              │
 │  └────────────┬───────────────────────┘   │              │
 │               │ got header                │              │
 │               ▼                           │              │
@@ -582,6 +587,61 @@ When a connection is lost (`on_connection_lost`):
 
 `disable_message_dispatch()` is the first step because it's an atomic flag that the network thread checks before invoking any callback. This prevents stale messages from a dead connection from racing into freshly-reset role queues.
 
+### Client Start and Stop
+
+`SendspinClient::start()` loads persisted state, starts the threaded roles (player sync task, visualizer drain, artwork decode; a failure part-way stops the ones that did start), and calls `ConnectionManager::start()`, which opens admission (`accepting_`) and creates the `SendspinWsServer` on first use. The server itself is started by the manager's `loop()` once the network provider reports ready, so `is_started()` means "running", not "listening".
+
+`SendspinClient::stop()` is synchronous and ordered so that every producer is gone before any state is reset. The client's lifecycle is one atomic `lifecycle_` field (`STOPPED`, `RUNNING`, `STOPPING`); `is_started()` reads it from any thread.
+
+```api
+0. lifecycle_ = STOPPING (is_started() reads false; loop() is a no-op; start() is refused and
+   stop()/connect_to()/disconnect() are ignored from here on, so a callback fired below cannot
+   recurse into the teardown)
+1. VisualizerRole/ArtworkRole::Impl::signal_stop(): set COMMAND_STOP and wake, no join, so a
+   slow on_image_decode() or a parked drain exits while the transports close. The player is
+   not signalled yet: a network thread blocked on its ring (write_audio_chunk) needs the sync
+   task alive until the network threads are gone
+2. ConnectionManager::stop(SHUTDOWN)
+   ├─ Under conn_ptr_mutex_: accepting_ = false; snapshot each connection's PIN / pairing-window
+   │  display flags (PairingUiSnapshot); disable_message_dispatch() on every managed
+   │  connection; move the current slot, the nursery, and the deferred releases out; clear the
+   │  hello retries and close any standing pairing window
+   ├─ Outside the lock: conn->disconnect(SHUTDOWN, completion) on each, completion counted by a
+   │  shared GoodbyeWait; wait up to GOODBYE_FLUSH_TIMEOUT_MS (50 ms) per goodbye for the count
+   │  to reach zero (the ESP httpd worker hands the frames to lwIP one at a time)
+   ├─ ws_server_->stop() regardless (host: joins every accepted connection thread, a WebSocket
+   │  peer within its ~300 ms close handshake and a raw never-upgraded socket within the 3 s
+   │  WS_HANDSHAKE_TIMEOUT_SECS; ESP: httpd_stop(), which runs queued sends first,
+   │  then every session's close_fn and ctx free_fn, polling at 100 ms)
+   └─ swap_out_pending_events(): move every pending event queue (lifecycle, activate,
+      re-handshake, pairing, management) out under conn_mutex_; every moved-out shared_ptr is
+      released outside the locks (an outbound connection's destructor stops its transport
+      synchronously). Returns the pairing-UI snapshot
+3. Role threads: PlayerRole/VisualizerRole/ArtworkRole::Impl::stop() join, then each discards
+   its ring/queue content (sole consumer after the join)
+4. cleanup_connection_state() (the same reset a lost connection triggers, including the group
+   slot), then group_state_ and state_ are reset. The PIN / pairing-window dismissals the
+   snapshot from step 2 calls for are queued now (note_clear_pin() /
+   note_close_pairing_window()), after the cleanup that would have wiped them
+5. drain_inbox() delivers the CLEARED / STREAM_END callbacks and pairing notes step 4 queued,
+   and persists a pairing record a pair-finalize left staged. Every getter already
+   reports the stopped state, so a callback that reads the client sees what a caller sees once
+   stop() returns
+6. lifecycle_ = STOPPED
+```
+
+The goodbye completion is best-effort: on ESP a session that closes before its queued worker runs, or whose `weak_ptr` no longer resolves, never reports, which is why the wait is bounded rather than exact. The `GoodbyeWait` record is held by `shared_ptr` and captured by value in each completion, so a completion that runs late on a transport thread touches nothing `stop()` owns. A peer delivered by the ws_server while admission is closed is rejected in `on_new_connection()` with a shutdown goodbye, the same shape as the nursery-full rejection.
+
+`ConnectionManager::start()` creates and configures the server object on the first call only; the client config is immutable for the client's lifetime, so a restart reuses the object and its settings.
+
+Each threaded role's `start()` calls `EventFlags::clear_all()` before creating its thread rather than clearing a hand-listed set of bits: a command signalled between the previous join and the restart (`cleanup()` on a stopped role) would otherwise survive into the new thread's first wait, and a bit added to the role's enum later cannot be forgotten.
+
+The client destructor performs steps 1 and 2 only, so a consumer that destroyed its listeners first is never called into; the roles' own destructors then join their threads as before.
+
+### High-performance release delivery
+
+`release_high_performance()` calls the listener inline. The last release can run inside `drop_connection()`, which holds `conn_ptr_mutex_` through `cleanup_connection_state()` (both the time-burst hold and the player's playback hold are released there), so the listener contract for `on_request_high_performance()` / `on_release_high_performance()` is that the body toggles the platform's networking mode and nothing else: it must not call back into the client or a role.
+
 ### Graceful Disconnect
 
 `disconnect_and_release()` calls `conn->disconnect(reason, nullptr)` and lets the local `shared_ptr` go out of scope.
@@ -602,7 +662,7 @@ Queued send workers capture a `weak_ptr<SendspinServerConnection>` to the origin
 
 The send workers also enforce the protocol's "hello is always first" rule: a frame is dropped unless `client_hello_sent_` is set on the resolved connection, *unless* the caller passed `allow_before_hello=true`. Exactly two callers do — the `client/hello` itself (which would otherwise gate its own send and deadlock) and `goodbye` — so a stale or out-of-order frame can never precede the handshake. The `weak_ptr` guards identity; the gate guards ordering; the two are independent.
 
-The host build does not need this scheme: `SendspinWsServer` (host) routes IXWebSocket messages by calling `find_connection_callback_` to resolve a synthetic sockfd back to the connection that `ConnectionManager` is holding. The ESP build keeps the `set_find_connection_callback()` setter as a no-op stub for symmetry; see the comment at the call site in `ConnectionManager::init_server`.
+The host build does not need this scheme: `SendspinWsServer` (host) routes IXWebSocket messages by calling `find_connection_callback_` to resolve a synthetic sockfd back to the connection that `ConnectionManager` is holding. The ESP build keeps the `set_find_connection_callback()` setter as a no-op stub for symmetry; see the comment at the call site in `ConnectionManager::start`.
 
 ## Ordering Guarantees Summary
 

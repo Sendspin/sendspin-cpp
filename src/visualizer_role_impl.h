@@ -111,6 +111,10 @@ struct VisualizerRole::Impl {
     // Internal helpers
     // ========================================
 
+    /// @brief Asks the drain thread to exit without waiting for it; stop() joins. Lets a caller
+    /// overlap the thread's exit with other teardown.
+    /// @return true if a running thread was signalled, false if none was running.
+    bool signal_stop() const;
     void stop() const;
     void flush_ring_buffer() const;
     void signal_clear_marker() const;

@@ -26,6 +26,7 @@
 // ESP-IDF: thin wrapper around FreeRTOS NOSPLIT ring buffer (uses direct task notifications)
 #include <freertos/FreeRTOS.h>
 #include <freertos/ringbuf.h>
+#include <freertos/semphr.h>
 
 namespace sendspin {
 
@@ -36,6 +37,11 @@ namespace sendspin {
  * implementation on host. Items are written as contiguous blobs and read back in
  * the same order. Supports both a one-phase send() and a two-phase acquire()/commit()
  * path for zero-copy writes.
+ *
+ * A blocking receive() can be interrupted from any thread with wake_receiver(): the
+ * blocked (or next blocking) receive returns nullptr immediately without consuming
+ * data. Callers must therefore treat a nullptr return as "re-check state and retry",
+ * not as proof the timeout elapsed.
  *
  * Usage:
  * 1. Allocate a storage buffer, then call create() with a pointer to it
@@ -63,6 +69,9 @@ public:
         if (this->handle_ != nullptr) {
             vRingbufferDelete(this->handle_);
         }
+        if (this->items_or_wake_sem_ != nullptr) {
+            vSemaphoreDelete(this->items_or_wake_sem_);
+        }
     }
 
     // Not copyable or movable
@@ -76,7 +85,16 @@ public:
     bool create(size_t size, uint8_t* storage) {
         this->handle_ =
             xRingbufferCreateStatic(size, RINGBUF_TYPE_NOSPLIT, storage, &this->structure_);
-        return this->handle_ != nullptr;
+        if (this->handle_ == nullptr) {
+            return false;
+        }
+        this->items_or_wake_sem_ = xSemaphoreCreateBinary();
+        if (this->items_or_wake_sem_ == nullptr) {
+            vRingbufferDelete(this->handle_);
+            this->handle_ = nullptr;
+            return false;
+        }
+        return true;
     }
 
     /// @brief Returns true if the ring buffer has been successfully created
@@ -119,7 +137,11 @@ public:
     /// @param ptr Pointer returned by a prior call to acquire().
     /// @return true on success.
     bool commit(void* ptr) {
-        return xRingbufferSendComplete(this->handle_, ptr) == pdTRUE;
+        bool ok = xRingbufferSendComplete(this->handle_, ptr) == pdTRUE;
+        if (ok) {
+            xSemaphoreGive(this->items_or_wake_sem_);
+        }
+        return ok;
     }
 
     /// @brief One-phase write: copy data into the ring buffer
@@ -128,15 +150,46 @@ public:
     /// @param timeout_ms Milliseconds to wait if space is unavailable (UINT32_MAX = wait forever).
     /// @return true if the data was written successfully.
     bool send(const void* data, size_t size, uint32_t timeout_ms) {
-        return xRingbufferSend(this->handle_, data, size, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+        bool ok = xRingbufferSend(this->handle_, data, size, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+        if (ok) {
+            xSemaphoreGive(this->items_or_wake_sem_);
+        }
+        return ok;
     }
 
     /// @brief Receive the next item; caller must call return_item() when done
     /// @param[out] item_size Set to the size of the received item.
     /// @param timeout_ms Milliseconds to wait if no item is available (UINT32_MAX = wait forever).
-    /// @return Pointer to item data, or nullptr on timeout.
+    /// @return Pointer to item data, or nullptr on timeout, on wake_receiver() interruption, or
+    /// (at most once after a burst is drained) on a token a send left behind after its item was
+    /// taken by the non-blocking poll. Callers must treat every nullptr return as "re-check state
+    /// and retry", never as proof the timeout elapsed.
     void* receive(size_t* item_size, uint32_t timeout_ms) {
-        return xRingbufferReceive(this->handle_, item_size, pdMS_TO_TICKS(timeout_ms));
+        // The blocking wait goes through items_or_wake_sem_, not the ring buffer's own
+        // blocking receive, so wake_receiver() can interrupt it. The semaphore is binary,
+        // so a burst of sends collapses into one token; the non-blocking poll below (before
+        // the wait, and again for every call while data remains) is what guarantees items
+        // are never stranded behind a collapsed token.
+        void* item = xRingbufferReceive(this->handle_, item_size, 0);
+        if (item != nullptr || timeout_ms == 0) {
+            return item;
+        }
+        TickType_t ticks = timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+        if (xSemaphoreTake(this->items_or_wake_sem_, ticks) != pdTRUE) {
+            return nullptr;  // Timed out
+        }
+        // Woken by a send or by wake_receiver(); either way report what the buffer holds now.
+        return xRingbufferReceive(this->handle_, item_size, 0);
+    }
+
+    /// @brief Wakes the consumer out of a blocking receive() without providing data
+    ///
+    /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
+    /// collapse into one, and a wake that races an arriving item may be absorbed by that
+    /// item's delivery -- so callers must re-check their stop/command state after every
+    /// receive() return, not only after nullptr returns. Safe to call from any thread.
+    void wake_receiver() {
+        xSemaphoreGive(this->items_or_wake_sem_);
     }
 
     /// @brief Return a previously received item to the ring buffer
@@ -151,6 +204,9 @@ private:
 
     // Pointer fields
     RingbufHandle_t handle_{nullptr};
+    // Given by every send()/commit() and by wake_receiver(); receive() blocks on this
+    // instead of on the ring buffer so it stays interruptible.
+    SemaphoreHandle_t items_or_wake_sem_{nullptr};
 };
 
 }  // namespace sendspin
@@ -170,6 +226,11 @@ namespace sendspin {
  * Backed by a mutex/condition-variable implementation on host. Items are written as
  * contiguous blobs and read back in the same order. Supports both a one-phase send()
  * and a two-phase acquire()/commit() path for zero-copy writes.
+ *
+ * A blocking receive() can be interrupted from any thread with wake_receiver(): the
+ * blocked (or next blocking) receive returns nullptr immediately without consuming
+ * data. Callers must therefore treat a nullptr return as "re-check state and retry",
+ * not as proof the timeout elapsed.
  *
  * Usage:
  * 1. Allocate a storage buffer, then call create() with a pointer to it
@@ -315,7 +376,7 @@ public:
     /// @brief Receive the next item; caller must call return_item() when done
     /// @param[out] item_size Set to the size of the received item.
     /// @param timeout_ms Milliseconds to wait if no item is available (UINT32_MAX = wait forever).
-    /// @return Pointer to item data, or nullptr on timeout.
+    /// @return Pointer to item data, or nullptr on timeout or wake_receiver() interruption.
     void* receive(size_t* item_size, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);
 
@@ -328,19 +389,35 @@ public:
             return nullptr;
         }
 
+        auto pred = [&] {
+            result = try_read(item_size);
+            return result != nullptr || this->wake_pending_;
+        };
         if (timeout_ms == UINT32_MAX) {
-            this->cv_read_.wait(lock, [&] {
-                result = try_read(item_size);
-                return result != nullptr;
-            });
+            this->cv_read_.wait(lock, pred);
         } else {
-            this->cv_read_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-                result = try_read(item_size);
-                return result != nullptr;
-            });
+            this->cv_read_.wait_for(lock, std::chrono::milliseconds(timeout_ms), pred);
         }
 
+        // A pending wake is consumed by whichever blocking receive it terminates, even when
+        // an item arrived in the same window (mirroring the ESP binary-semaphore collapse);
+        // callers re-check their stop/command state after every return.
+        this->wake_pending_ = false;
         return result;
+    }
+
+    /// @brief Wakes the consumer out of a blocking receive() without providing data
+    ///
+    /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
+    /// collapse into one, and a wake that races an arriving item may be absorbed by that
+    /// item's delivery -- so callers must re-check their stop/command state after every
+    /// receive() return, not only after nullptr returns. Safe to call from any thread.
+    void wake_receiver() {
+        {
+            std::lock_guard<std::mutex> lock(this->mtx_);
+            this->wake_pending_ = true;
+        }
+        this->cv_read_.notify_all();
     }
 
     /// @brief Return a previously received item to the ring buffer
@@ -456,6 +533,7 @@ private:
 
     // 8-bit fields
     bool created_{false};
+    bool wake_pending_{false};
 };
 
 }  // namespace sendspin

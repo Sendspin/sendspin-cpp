@@ -92,6 +92,15 @@ public:
         return xEventGroupClearBits(this->handle_, bits);
     }
 
+    /// @brief Clears every bit, returning the group to its freshly created state
+    ///
+    /// For resetting a group whose consumer thread has been joined before a new one starts, so
+    /// no caller has to enumerate the bits its group defines.
+    /// @return Bit pattern captured before clearing.
+    uint32_t clear_all() {
+        return xEventGroupClearBits(this->handle_, USABLE_BITS);
+    }
+
     /// @brief Returns the current bit pattern
     /// @return Current bit pattern.
     uint32_t get() const {
@@ -110,6 +119,14 @@ public:
     }
 
 private:
+    /// The bits a FreeRTOS event group exposes: 24 with 32-bit ticks, 8 with 16-bit ticks. The
+    /// upper bits are reserved by the kernel and must never be passed to the clear/set calls.
+#if configUSE_16_BIT_TICKS == 1
+    static constexpr uint32_t USABLE_BITS = 0x00FFU;
+#else
+    static constexpr uint32_t USABLE_BITS = 0x00FFFFFFU;
+#endif
+
     // Pointer fields
     EventGroupHandle_t handle_{nullptr};
 };
@@ -188,6 +205,15 @@ public:
         uint32_t old = this->bits_;
         this->bits_ &= ~bits;
         return old;
+    }
+
+    /// @brief Clears every bit, returning the group to its freshly created state
+    ///
+    /// For resetting a group whose consumer thread has been joined before a new one starts, so
+    /// no caller has to enumerate the bits its group defines.
+    /// @return Bit pattern captured before clearing.
+    uint32_t clear_all() {
+        return this->clear(~0U);
     }
 
     /// @brief Returns the current bit pattern

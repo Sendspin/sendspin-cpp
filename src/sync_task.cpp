@@ -121,10 +121,9 @@ bool SyncTask::start(bool task_stack_in_psram, unsigned priority) {
         return false;
     }
 
-    this->event_flags_.clear(EventGroupBits::TASK_RUNNING | EventGroupBits::TASK_STOPPED |
-                             EventGroupBits::TASK_IDLE | EventGroupBits::COMMAND_STOP |
-                             EventGroupBits::COMMAND_STREAM_END |
-                             EventGroupBits::COMMAND_STREAM_CLEAR | EventGroupBits::COMMAND_START);
+    // A fresh thread starts from a clean group: no stale task state and no command signalled
+    // between the previous join and this start (cleanup() on a stopped task).
+    this->event_flags_.clear_all();
 
     platform_configure_thread("Sendspin", SYNC_TASK_STACK_SIZE, static_cast<int>(priority),
                               task_stack_in_psram);
@@ -149,7 +148,11 @@ void SyncTask::signal_stream_end() {
     if (!this->is_initialized()) {
         return;
     }
+    // Flag first, then wake, so the task observes the command after leaving a ring
+    // buffer receive; without the wake an idle task would only notice at its next
+    // idle-receive timeout.
     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_END);
+    this->encoded_ring_buffer_->wake_receiver();
 }
 
 void SyncTask::signal_stream_clear() {
@@ -157,6 +160,7 @@ void SyncTask::signal_stream_clear() {
         return;
     }
     this->event_flags_.set(EventGroupBits::COMMAND_STREAM_CLEAR);
+    this->encoded_ring_buffer_->wake_receiver();
 }
 
 void SyncTask::signal_stream_start() {
@@ -638,8 +642,10 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
 
 bool SyncTask::wait_for_codec_header(SyncContext& sync_context) {
     // Wait for a codec header to arrive in the ring buffer, discarding stale audio chunks.
-    // Uses a long timeout (500ms) so the task yields CPU and barely wakes when idle.
-    static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 500;
+    // Stop and stream commands wake the receive immediately via wake_receiver(), so the timeout
+    // is only a safety net against a missed wake: long enough to keep an idle task asleep, short
+    // enough that a wake bug degrades to a slow reaction rather than a hang.
+    static const uint32_t IDLE_RECEIVE_TIMEOUT_MS = 5000;
 
     while (
         !(this->event_flags_.get() & (COMMAND_STOP | COMMAND_STREAM_END | COMMAND_STREAM_CLEAR))) {
@@ -789,8 +795,21 @@ void SyncTask::stop() {
         return;
     }
 
+    // Set the flag before waking: the thread re-checks its command flags after every
+    // receive return, so this ordering guarantees it observes the stop no matter which
+    // wait it was parked in (event flags or ring buffer receive).
     this->event_flags_.set(EventGroupBits::COMMAND_STOP);
+    this->encoded_ring_buffer_->wake_receiver();
     this->sync_thread_.join();
+
+    // A stop mid-stream leaves TASK_RUNNING set (only the idle transition clears it). The player's
+    // sync-idle gate reads is_running() to decide when a STREAM_END may fire, so a stopped task
+    // must read as idle or the stop-time on_stream_end() would wait for a thread that is gone.
+    this->event_flags_.clear(EventGroupBits::TASK_RUNNING);
+
+    // The thread is joined, so this is the ring's only consumer (the single-consumer contract
+    // reset() requires). Discard buffered audio so a restart does not replay the old stream.
+    this->encoded_ring_buffer_->reset();
 }
 
 // ============================================================================
@@ -806,7 +825,7 @@ void SyncTask::thread_entry(void* params) {
     sync_context.bytes_per_frame = sync_context.current_stream_info.frames_to_bytes(1);
     sync_context.decoder = std::make_unique<SendspinDecoder>();
 
-    // === OUTER LOOP: persists for the lifetime of the client ===
+    // === OUTER LOOP: persists for one started session, until stop() ===
     while (!(this_task->event_flags_.get() & COMMAND_STOP)) {
         // --- IDLE STATE ---
         this_task->event_flags_.clear(
@@ -928,6 +947,13 @@ void SyncTask::thread_entry(void* params) {
         // Don't drain the ring buffer here; the idle wait loop already discards
         // stale audio and stops at codec headers. Draining here would throw away
         // a codec header that arrived during a rapid seek (STREAM_END → STREAM_START).
+    }
+
+    // The idle-state exits above break out while still holding the codec header they received;
+    // hand it back so stop()'s ring reset sees no borrowed entry.
+    if (sync_context.encoded_entry != nullptr) {
+        this_task->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+        sync_context.encoded_entry = nullptr;
     }
 
     this_task->event_flags_.set(EventGroupBits::TASK_STOPPED);

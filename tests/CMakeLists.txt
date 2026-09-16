@@ -17,9 +17,11 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)  # only gtest_main is used; skip building gmock
 FetchContent_MakeAvailable(googletest)
 
-# One executable aggregating every test_*.cpp file. gtest_discover_tests still
-# registers the individual TEST() cases with CTest so failures are reported per case.
+# One executable aggregating every test_*.cpp file behind the main.cpp watchdog entry point.
+# gtest_discover_tests still registers the individual TEST() cases with CTest so failures are
+# reported per case.
 add_executable(sendspin_tests
+    main.cpp
     test_audio_stream_info.cpp
     test_connection_lifecycle.cpp
     test_encrypted_lifecycle.cpp
@@ -27,6 +29,7 @@ add_executable(sendspin_tests
     test_protocol.cpp
     test_network_info.cpp
     test_spsc_ring_buffer.cpp
+    test_thread_safe_queue.cpp
     test_inbox.cpp
     test_visualizer_role.cpp
     test_artwork_role.cpp
@@ -43,11 +46,17 @@ add_executable(sendspin_tests
     test_dynamic_pin.cpp
     test_pin_state_machine.cpp
     test_persistence_codec.cpp
+    test_client_teardown.cpp
+    test_client_lifecycle.cpp
 
     # FilePersistenceProvider is a host example helper (examples/common/), not part of the
     # library; compile it into the test target so the record-store tests can exercise it.
     ../examples/common/file_persistence_provider.cpp
 )
+
+# test_client_lifecycle.cpp checks what a role's stop() left in its ring, which nothing on the
+# public surface reports; it reads the private members directly instead of adding a seam.
+set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...) and
 # the src/crypto/ headers.
@@ -60,7 +69,12 @@ target_include_directories(sendspin_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../examples/common
 )
 
-target_link_libraries(sendspin_tests PRIVATE sendspin GTest::gtest_main)
+target_link_libraries(sendspin_tests PRIVATE sendspin GTest::gtest)
+# The watchdog in main.cpp prints a backtrace on a hang; glibc needs exported symbols to name
+# the frames.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(sendspin_tests PRIVATE -rdynamic)
+endif()
 
 target_compile_features(sendspin_tests PRIVATE cxx_std_20)
 target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
@@ -97,4 +111,6 @@ if(ENABLE_TSAN)
 endif()
 
 include(GoogleTest)
-gtest_discover_tests(sendspin_tests)
+# Backstop above the 55 s watchdog in main.cpp, which fires first and prints the hung test's
+# stack.
+gtest_discover_tests(sendspin_tests PROPERTIES TIMEOUT 60)

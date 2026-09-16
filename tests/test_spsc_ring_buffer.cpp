@@ -13,15 +13,17 @@
 // limitations under the License.
 
 /// @file test_spsc_ring_buffer.cpp
-/// @brief Tests for the host SpscRingBuffer, focused on wrap-around accounting with
-/// storage sizes that are not a multiple of the internal alignment
+/// @brief Tests for the host SpscRingBuffer: wrap-around accounting with storage sizes
+/// that are not a multiple of the internal alignment, and the wake_receiver() contract
 
 #include "platform/spsc_ring_buffer.h"
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace sendspin {
@@ -120,6 +122,89 @@ TEST(SpscRingBuffer, CreateRejectsTooSmallStorage) {
     EXPECT_FALSE(rb.create(15, storage.data()));
     EXPECT_FALSE(rb.create(8, storage.data()));
     EXPECT_TRUE(rb.create(16, storage.data()));
+}
+
+// wake_receiver() is the only way out of an infinite park, so a returning receive is itself
+// the proof the wake landed. The sleep only makes the consumer likely to be parked; a wake
+// before the park is held pending, so either ordering passes.
+TEST(SpscRingBuffer, WakeReceiverUnblocksBlockedReceive) {
+    std::vector<uint8_t> storage(4096);
+    SpscRingBuffer rb;
+    ASSERT_TRUE(rb.create(storage.size(), storage.data()));
+
+    void* result = &storage;  // Poisoned so a skipped receive is visible
+    std::thread consumer([&] {
+        size_t item_size = 0;
+        result = rb.receive(&item_size, UINT32_MAX);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    rb.wake_receiver();
+    consumer.join();
+
+    EXPECT_EQ(result, nullptr);
+}
+
+// A wake with no receive in progress is held pending, closing the set-flag-then-wake race
+// with a role stop() whose thread has not parked yet.
+TEST(SpscRingBuffer, WakeBeforeReceiveIsHeldPending) {
+    std::vector<uint8_t> storage(4096);
+    SpscRingBuffer rb;
+    ASSERT_TRUE(rb.create(storage.size(), storage.data()));
+
+    rb.wake_receiver();
+
+    size_t item_size = 0;
+    EXPECT_EQ(rb.receive(&item_size, UINT32_MAX), nullptr);
+}
+
+// Control: with both an item and a wake pending, the item is delivered intact and the wake
+// still interrupts the next receive, so a stop cannot be lost behind a racing send.
+TEST(SpscRingBuffer, WakeDoesNotDropDataAndDataDoesNotDropWake) {
+    std::vector<uint8_t> storage(4096);
+    SpscRingBuffer rb;
+    ASSERT_TRUE(rb.create(storage.size(), storage.data()));
+
+    uint8_t item[16];
+    fill_pattern(item, sizeof(item), 7);
+    ASSERT_TRUE(rb.send(item, sizeof(item), 0));
+    rb.wake_receiver();
+
+    size_t item_size = 0;
+    void* received = rb.receive(&item_size, UINT32_MAX);
+    ASSERT_NE(received, nullptr);
+    EXPECT_EQ(item_size, sizeof(item));
+    EXPECT_TRUE(check_pattern(static_cast<uint8_t*>(received), item_size, 7));
+    rb.return_item(received);
+
+    EXPECT_EQ(rb.receive(&item_size, UINT32_MAX), nullptr);
+}
+
+// The wake is one-shot: the receive it interrupts consumes it, and the next one parks again.
+// An unconsumed wake would return nullptr before the send below ever runs.
+TEST(SpscRingBuffer, WakeIsConsumedByTheReceiveItInterrupts) {
+    std::vector<uint8_t> storage(4096);
+    SpscRingBuffer rb;
+    ASSERT_TRUE(rb.create(storage.size(), storage.data()));
+
+    rb.wake_receiver();
+    size_t item_size = 0;
+    ASSERT_EQ(rb.receive(&item_size, UINT32_MAX), nullptr);
+
+    void* received = nullptr;
+    std::thread consumer([&] {
+        size_t got_size = 0;
+        received = rb.receive(&got_size, UINT32_MAX);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    uint8_t item[16];
+    fill_pattern(item, sizeof(item), 9);
+    ASSERT_TRUE(rb.send(item, sizeof(item), 0));
+    consumer.join();
+
+    ASSERT_NE(received, nullptr);
+    rb.return_item(received);
 }
 
 }  // namespace

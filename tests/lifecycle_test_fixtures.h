@@ -29,6 +29,7 @@
 #include "noise_test_helpers.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
+#include "platform/time.h"
 #include "sendspin/client.h"
 #include "sendspin/persistence_codec.h"
 #include "sendspin/types.h"
@@ -94,7 +95,7 @@ public:
     explicit TestPersistenceProvider(std::vector<SendspinPairingRecord> records)
         : records_(std::move(records)) {}
 
-    /// Seeds persistence_keys::LAST_PLAYED. Must be called before start_server(), which is where
+    /// Seeds persistence_keys::LAST_PLAYED. Must be called before start(), which is where
     /// the client loads it into ConnectionManager::last_played_server_id_.
     void set_last_played_server_id(std::string server_id) {
         this->last_played_server_id_ = std::move(server_id);
@@ -134,6 +135,19 @@ inline void pump_for(SendspinClient& client, int duration_ms) {
         client, [] { return false; }, duration_ms);
 }
 
+/// Waits for pred() without pumping the client: for observations on a fake peer after the client
+/// has been stopped or destroyed, when loop() is not the thing that would satisfy the predicate.
+inline bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return false;
+}
+
 /// A fresh long-term pairing record plus the PSK behind it, so a test can seed the client's
 /// RecordStore and hand the same PSK to a fake server. The resulting connection resolves to
 /// PskCategory::LONG_TERM, which admits any subset of {playback, management} plus the empty set.
@@ -154,7 +168,7 @@ inline PairedPeer make_paired_peer() {
 /// ready for the test to finish any per-scenario setup (extra roles, extra config fields) before
 /// calling start(). SendspinClient is not movable (it owns a std::mutex), so it is heap-allocated
 /// and this bundle is meant to be constructed once, in place, at the call site, mirroring the
-/// peer + network + persistence + client + start_server + pump bundle every lifecycle test needs.
+/// peer + network + persistence + client + start + pump bundle every lifecycle test needs.
 class PairedClientBundle {
 public:
     explicit PairedClientBundle(SendspinClientConfig config)
@@ -172,7 +186,7 @@ public:
     /// Starts the server and pumps for the 50 ms bring-up window every call site uses before its
     /// first fake-server connection.
     bool start() {
-        if (!this->client_->start_server()) {
+        if (!this->client_->start()) {
             return false;
         }
         pump_for(*this->client_, 50);
@@ -411,6 +425,11 @@ struct FakeEncryptedServerOptions {
     // (so its psk_id/category are resolved) and the hello exchange, but never proves itself, so
     // it stays in the nursery instead of being promoted.
     bool suppress_activate{false};
+    // When true, every client/time is answered with a server/time whose clock is the client's
+    // own (both sides read platform_time_us(), so the offset is ~0 and audio timestamps mean
+    // what they say). Off by default: a peer that never answers keeps the time burst open, which
+    // the liveness and high-performance-hold tests rely on.
+    bool answer_time{false};
 };
 
 class FakeEncryptedServer : public NoiseInitiatorFixtureBase {
@@ -515,6 +534,37 @@ public:
     std::optional<std::string> last_management_result() const {
         std::lock_guard<std::mutex> lock(this->management_mutex_);
         return this->last_management_result_;
+    }
+
+    bool got_client_time() const {
+        return this->got_client_time_.load();
+    }
+
+    // Sends one role binary message over the active encrypted session: type byte, big-endian
+    // server timestamp, then the payload (the same body the cleartext wire carries).
+    bool send_binary(uint8_t binary_type, int64_t timestamp_us, const std::string& payload) {
+        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+        if (this->active_.send_cs == nullptr) {
+            return false;
+        }
+        std::vector<uint8_t> plaintext;
+        plaintext.reserve(1 + 8 + payload.size());
+        plaintext.push_back(binary_type);
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            plaintext.push_back(static_cast<uint8_t>((timestamp_us >> shift) & 0xFF));
+        }
+        plaintext.insert(plaintext.end(), payload.begin(), payload.end());
+        auto ct = raw_encrypt(this->active_.send_cs, plaintext);
+        if (ct.empty()) {
+            return false;
+        }
+        this->send_binary_frame_locked(std::string(ct.begin(), ct.end()));
+        return true;
+    }
+
+    // Sends one player audio chunk: SENDSPIN_BINARY_PLAYER_AUDIO (4) with a zeroed PCM payload.
+    bool send_audio(int64_t timestamp_us, size_t payload_bytes) {
+        return this->send_binary(4, timestamp_us, std::string(payload_bytes, '\0'));
     }
 
     // Number of client/state messages received so far. Used to prove a client/state was, or was
@@ -632,6 +682,20 @@ private:
             return;
         }
 
+        if (std::strcmp(type, "client/time") == 0) {
+            this->got_client_time_.store(true);
+            if (this->options_.answer_time) {
+                const long long client_transmitted = doc["payload"]["client_transmitted"] | 0LL;
+                const int64_t now = platform_time_us();
+                this->send_encrypted_locked(
+                    std::string(R"({"type":"server/time","payload":{)") +
+                    "\"client_transmitted\":" + std::to_string(client_transmitted) +
+                    ",\"server_received\":" + std::to_string(now) +
+                    ",\"server_transmitted\":" + std::to_string(now) + "}}");
+            }
+            return;
+        }
+
         if (std::strcmp(type, "client/goodbye") == 0) {
             const char* reason = doc["payload"]["reason"] | "";
             {
@@ -740,13 +804,14 @@ private:
     std::optional<std::string> last_management_result_;
 
     std::atomic<int> client_state_count_{0};
+    std::atomic<bool> got_client_time_{false};
 };
 
 // A fake Sendspin "server" that LISTENS for a real Sendspin client's OUTBOUND connection (backed
 // by ix::WebSocketServer), speaking the same Noise KKpsk2-initiator protocol as
 // FakeEncryptedServer above.
 //
-// A test that instead drives client.start_server() and connects FakeEncryptedServer to it as a WS
+// A test that instead drives client.start() and connects FakeEncryptedServer to it as a WS
 // client exercises SendspinServerConnection (host/server_connection.cpp); that class's
 // disconnect() only ever calls the already-async trigger_close(), so it never needs the
 // network-thread deadlock/crash guard close_transport_now() (connection.h) provides.

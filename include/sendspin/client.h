@@ -69,9 +69,16 @@ public:
 
     /// @brief Called when the library needs high-performance networking (e.g., disable WiFi
     /// power saving)
+    ///
+    /// Toggle the platform's networking mode and return. This callback and its release can fire
+    /// while the client holds an internal lock (the last release runs inside the connection-loss
+    /// path), so the body must not call any SendspinClient or role method.
     virtual void on_request_high_performance() {}
 
     /// @brief Called when the library no longer needs high-performance networking
+    ///
+    /// Same contract as on_request_high_performance(): toggle the platform mode only, never call
+    /// back into the client.
     virtual void on_release_high_performance() {}
 
     // ========================================
@@ -143,7 +150,7 @@ public:
 };
 
 /// @brief Platform hook for network readiness
-/// Must be set before start_server()
+/// Must be set before start()
 class SendspinNetworkProvider {
 public:
     virtual ~SendspinNetworkProvider() = default;
@@ -168,7 +175,7 @@ public:
 /// thread, the pairing record committed at server/pair-finalize, is staged internally and
 /// flushed to `save_blob(persistence_keys::RECORDS, ...)` from the next `loop()` tick.)
 /// `save_blob(persistence_keys::KEYPAIR, ...)` is the one write that happens exactly once, at
-/// startup during `start_server()`, rather than in response to a runtime event.
+/// startup during `start()`, rather than in response to a runtime event.
 ///
 /// Re-entrancy: implementations must NOT call back into the library (SendspinClient or any of
 /// its objects) from inside load_blob/save_blob/erase_blob. The library invokes these methods
@@ -282,6 +289,7 @@ enum class LogLevel : uint8_t {
 
 // Forward declarations
 class ConnectionManager;
+struct PairingUiSnapshot;
 class RecordStore;
 class SendspinArenaAllocator;
 class SendspinConnection;
@@ -301,8 +309,9 @@ struct Identity;
  * 2. Construct a SendspinClient with that config
  * 3. Add roles via add_player(), add_controller(), add_metadata(), etc.
  * 4. Set listeners on each role and set the network provider on the client
- * 5. Call start_server() to start the WebSocket server and background tasks
+ * 5. Call start() to start the role threads and the WebSocket server
  * 6. Call loop() periodically from the platform main loop
+ * 7. Call stop() to goodbye every peer and tear everything down; start() again to restart
  *
  * @code
  * struct MyPlayerListener : PlayerRoleListener {
@@ -328,11 +337,12 @@ struct Identity;
  * player.set_listener(&player_listener);
  * client.add_controller();
  * client.set_network_provider(&network_provider);
- * client.start_server();
+ * client.start();
  *
- * while (true) {
+ * while (running) {
  *     client.loop();
  * }
+ * client.stop();
  * @endcode
  */
 class SendspinClient {
@@ -354,25 +364,69 @@ public:
     // Lifecycle
     // ========================================
 
-    /// @brief Starts the WebSocket server and initializes the sync task (if audio is configured)
-    /// @return true on success, false on failure
-    bool start_server();
+    /// @brief Starts the role threads and arms the WebSocket server
+    ///
+    /// The server itself comes up on the first loop() tick after the network provider reports
+    /// ready. If a role fails to start, the roles that did start are stopped again so a corrected
+    /// retry begins from the stopped state. Main-loop thread only.
+    /// @return true if the client is running (including when it already was), false on failure
+    bool start();
+
+    /// @brief Stops the client and returns only once it is fully stopped
+    ///
+    /// Sends a client/goodbye (reason shutdown) to every peer, waits a short bound for those
+    /// sends to complete, then closes the server and every connection regardless, joins the role
+    /// threads, resets every role, and delivers the roles' clear callbacks (on_stream_end(),
+    /// on_image_clear(), on_metadata_clear(), ...) before returning. A pairing prompt still
+    /// showing is dismissed the same way (on_clear_pairing_pin() / on_close_pairing_window()),
+    /// and a pairing record staged by a pair-finalize is persisted first. No-op when stopped.
+    /// Calling start() afterwards restarts the client on the same identity and record store;
+    /// start, stop, and start again can be repeated indefinitely.
+    ///
+    /// Blocking is bounded by the goodbye wait, the transports' own close, and any listener
+    /// callback already running on a role thread, which the join cannot interrupt. The
+    /// per-transport bounds are described in docs/integration-guide.md (Stopping and
+    /// Restarting).
+    ///
+    /// Listener callbacks fire from inside this call, after every role has been reset, so the
+    /// state they observe through the getters is the stopped state. One that calls start() has
+    /// no effect and returns false; one that calls stop(), connect_to(), or disconnect() is
+    /// ignored. Main-loop thread only: calling it from a role-thread callback would join the
+    /// calling thread.
+    void stop();
+
+    /// @brief Returns true between a successful start() and stop()
+    ///
+    /// Running means the role threads are up and the server is armed, not that the server is
+    /// listening yet (that waits for the network provider). Reads false for the whole duration
+    /// of stop(), including from the clear callbacks it fires. Safe to call from any thread.
+    bool is_started() const {
+        return this->lifecycle_.load(std::memory_order_acquire) == LifecycleState::RUNNING;
+    }
+
+    /// @brief Starts the client
+    /// @deprecated Use start(). Kept as an alias for existing consumers; removal is planned for
+    /// v0.9.0.
+    /// @return See start().
+    [[deprecated("Use start()")]] bool start_server() {
+        return this->start();
+    }
 
     /// @brief Initiates a client connection to a Sendspin server at the given URL
     ///
-    /// Must be called from the main loop thread: it tears down and replaces connection state
-    /// (time filter, dispatch, client state) directly rather than deferring to loop(), so calling
-    /// it concurrently with loop() would race those mutations.
-    ///
-    /// Requires a successful start_server() first: the static identity and record store the Noise
-    /// handshake needs are created there. Calling this earlier (or after start_server() returned
-    /// false) logs an error and does nothing rather than building a connection that would fault
-    /// once its WebSocket upgrade completed.
+    /// Ignored (with a warning) unless the client is running, including from a callback fired
+    /// inside stop(). Running implies a successful start(), which is where the static identity
+    /// and record store the Noise handshake needs are created; a connection built before that
+    /// would fault once its WebSocket upgrade completed. Must be called from the main loop
+    /// thread: it tears down and replaces connection state (time filter, dispatch, client state)
+    /// directly rather than deferring to loop(), so calling it concurrently with loop() would
+    /// race those mutations.
     /// @param url WebSocket server URL (e.g., "ws://server.local:8927/sendspin")
     void connect_to(const std::string& url);
 
     /// @brief Disconnects from the current server with the given reason
     ///
+    /// Ignored unless the client is running, including from a callback fired inside stop().
     /// Must be called from the main loop thread: the blocking transport close runs outside the
     /// manager lock, so a call from another thread could race loop()'s own release of the same
     /// connection (two concurrent transport stops).
@@ -380,10 +434,11 @@ public:
     void disconnect(SendspinGoodbyeReason reason);
 
     /// @brief Processes events, drives time sync, checks network. Call from main loop
+    /// A no-op while the client is stopped.
     void loop();
 
     // ========================================
-    // Role registration (call before start_server)
+    // Role registration (call before start())
     // ========================================
 
 #ifdef SENDSPIN_ENABLE_PLAYER
@@ -504,7 +559,7 @@ public:
     /// @brief Returns the client's cryptographic identity string.
     /// This is base64url(X25519 public key), 43 chars: the Sendspin client_id.
     /// Generated on first boot and persisted via the persistence provider.
-    /// Empty until start_server() is called.
+    /// Empty until start() is called.
     [[nodiscard]] const std::string& client_id() const {
         return this->client_id_;
     }
@@ -517,7 +572,7 @@ public:
     /// @param pairing_psk The 32-byte Sendspin Pairing PSK to encode alongside this client's
     ///                    identity.
     /// @return The 107-character token string, or nullopt if no identity has been initialized
-    ///         yet (before start_server() is called).
+    ///         yet (before start() is called).
     [[nodiscard]] std::optional<std::string> format_pairing_token(
         const std::array<uint8_t, 32>& pairing_psk) const;
 
@@ -525,7 +580,7 @@ public:
     /// The Pairing PSK is provisioned automatically on first boot and persisted, so this token
     /// is stable for the lifetime of the stored key: display it (or its QR code) for the
     /// operator to transfer into a server that is setting this client up.
-    /// @return The 107-character token string, or nullopt before start_server() or when no
+    /// @return The 107-character token string, or nullopt before start() or when no
     ///         Pairing PSK is configured.
     [[nodiscard]] std::optional<std::string> pairing_token() const;
 
@@ -589,7 +644,7 @@ public:
         this->listener_ = listener;
     }
 
-    /// @brief Sets the network provider (required before start_server())
+    /// @brief Sets the network provider (required before start())
     /// The provider must outlive this client
     void set_network_provider(SendspinNetworkProvider* provider) {
         this->network_provider_ = provider;
@@ -615,11 +670,32 @@ public:
     void acquire_high_performance();
 
     /// @brief Releases a ref-counted high-performance networking request
+    ///
+    /// The last release calls the listener inline, possibly under conn_ptr_mutex_ (the
+    /// connection-loss path); the listener contract forbids calling back into the client there.
     void release_high_performance();
 
 private:
     /// @brief Cleans up playback state when the active streaming connection is removed
     void cleanup_connection_state();
+
+    /// @brief Drains the inbox: lifecycle events, role slots, and group updates, dispatching
+    /// listener callbacks on the calling (main-loop) thread. Shared by loop() and stop().
+    void drain_inbox();
+
+    /// @brief Signals the drain roles, then goodbyes and closes every transport, joining the
+    /// network threads. The shared first half of stop() and the destructor's teardown.
+    /// @return The pairing prompts the dropped connections left showing; stop() dismisses them
+    ///         after cleanup_connection_state(), the destructor dispatches nothing.
+    PairingUiSnapshot close_transports();
+
+    /// @brief Asks the artwork and visualizer threads to exit without joining them, so their
+    /// exit overlaps the transport teardown. The player is excluded: its ring must keep a
+    /// consumer until the network threads are gone (see stop()).
+    void signal_drain_role_stops();
+
+    /// @brief Stops and joins every threaded role; each is a no-op if not running
+    void stop_role_threads();
 
     /// @brief Builds the formatted client hello message from config
     /// @param conn The connection the hello will be sent on; used to derive trust_level from
@@ -661,11 +737,11 @@ private:
     // ========================================
 
     /// @brief Loads or generates the static X25519 identity keypair via the persistence
-    /// provider. Sets identity_ on success. Called once from start_server(), before the
+    /// provider. Sets identity_ on success. Called once from start(), before the
     /// connection manager can hand the identity out to any connection.
     /// @return false if the stored key was corrupt/wrong-length or key generation failed (e.g.
     /// noise-c allocation failure); identity_ is left null in that case and the caller
-    /// (start_server()) must not proceed. Never leaves identity_ set to an all-zero keypair.
+    /// (start()) must not proceed. Never leaves identity_ set to an all-zero keypair.
     bool load_or_generate_identity();
 
     /// @brief Loads the last played server_id from persistence
@@ -735,7 +811,7 @@ private:
 #endif
     std::unique_ptr<EventState> event_state_;
     /// Static X25519 identity (generated on first boot, persisted via the persistence
-    /// provider). Set by load_or_generate_identity() in start_server(); outlives every
+    /// provider). Set by load_or_generate_identity() in start(); outlives every
     /// connection the manager hands it out to.
     std::unique_ptr<Identity> identity_;
     /// Internal-RAM scratch arena for parsing incoming JSON; null unless config_.json_arena_size >
@@ -753,7 +829,7 @@ private:
 #ifdef SENDSPIN_ENABLE_PLAYER
     std::unique_ptr<PlayerRole> player_;
 #endif
-    /// In-memory pairing record store (PSK resolution, trust config). Set in start_server();
+    /// In-memory pairing record store (PSK resolution, trust config). Set in start();
     /// outlives every connection the manager hands it out to.
     std::unique_ptr<RecordStore> record_store_;
     std::unique_ptr<SendspinTimeBurst> time_burst_;
@@ -770,7 +846,12 @@ private:
     ConnectionTrust current_trust_{ConnectionTrust::NONE};
     bool high_performance_held_for_time_{false};
     std::atomic<uint8_t> high_performance_ref_count_{0};
-    bool started_{false};
+    /// Where the client is in its lifecycle. Written only by start()/stop() on the main loop;
+    /// atomic so is_started() can be read from any thread. STOPPING covers the whole of stop():
+    /// start() is refused and stop()/connect_to()/disconnect() are ignored while it is set, so a
+    /// listener callback fired from inside the teardown cannot recurse into it.
+    enum class LifecycleState : uint8_t { STOPPED, RUNNING, STOPPING };
+    std::atomic<LifecycleState> lifecycle_{LifecycleState::STOPPED};
 };
 
 }  // namespace sendspin

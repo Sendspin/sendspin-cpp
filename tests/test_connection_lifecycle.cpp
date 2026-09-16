@@ -24,6 +24,7 @@
 // pairing, management, in-band re-handshake) against the same fixtures.
 
 #include "crypto/constants.h"
+#include "connection_manager.h"  // resolve_liveness_timeout_ms
 #include "crypto/keys.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/crypto.h"
@@ -57,7 +58,7 @@
 #include <utility>
 #include <vector>
 
-using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
+using namespace sendspin;        // NOLINT(google-build-using-namespace): test-local convenience
 
 namespace {
 
@@ -406,14 +407,14 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     TestNetworkProvider network;
     TestPersistenceProvider persistence(
         std::vector<SendspinPairingRecord>{peer_a.record, peer_b.record});
-    // Seeded before start_server(), which is where the client loads it into the manager.
+    // Seeded before start(), which is where the client loads it into the manager.
     persistence.set_last_played_server_id(identity_b.peer_id());
 
     SendspinClient client(make_config(RACE_TEST_PORT));
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
-    pump_for(client, 50);
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
 
     // Server A establishes and is promoted into the empty slot first...
     FakeEncryptedServer server_a(server_url(RACE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
@@ -517,4 +518,131 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
     EXPECT_FALSE(client.is_connected());
     EXPECT_FALSE(mute_a.closed());
     EXPECT_FALSE(mute_b.closed());
+}
+
+// ============================================================================
+// Liveness timeout
+// ============================================================================
+
+// A peer that sends server/hello before the client's own client/hello (main's
+// EarlyServerHelloDoesNotWedge scenario) needs no test of its own here: FakeEncryptedServer
+// sends its server/hello the moment the Noise handshake completes, before any client/hello
+// arrives, so every establishment above already runs that ordering.
+
+namespace {
+
+constexpr uint16_t LIVENESS_TEST_PORT = 18983;
+constexpr uint16_t LIVENESS_CONTROL_PORT = 18984;
+constexpr uint16_t LIVENESS_DISABLED_PORT = 18985;
+
+SendspinClientConfig make_liveness_config(uint16_t port, int64_t liveness_timeout_ms) {
+    SendspinClientConfig config = make_config(port);
+    config.time_burst_interval_ms = 20;
+    config.time_burst_response_timeout_ms = 20;
+    config.liveness_timeout_ms = liveness_timeout_ms;
+    return config;
+}
+
+FakeEncryptedServerOptions time_answering_options(bool answer_time) {
+    FakeEncryptedServerOptions options;
+    options.answer_time = answer_time;
+    return options;
+}
+
+}  // namespace
+
+// The derived liveness timeout tracks the configured burst settings, not their defaults.
+TEST(LivenessTimeout, DerivedFromConfiguredBurstSettings) {
+    SendspinClientConfig config;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 60000);
+
+    config.time_burst_interval_ms = 60000;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 210000);
+
+    config.time_burst_interval_ms = 10000;
+    config.time_burst_response_timeout_ms = 20000;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 90000);
+}
+
+TEST(LivenessTimeout, ExplicitValueUsedAsGiven) {
+    SendspinClientConfig config;
+    config.time_burst_interval_ms = 60000;
+    config.liveness_timeout_ms = 5000;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 5000);
+    config.liveness_timeout_ms = 0;
+    EXPECT_EQ(resolve_liveness_timeout_ms(config), 0);
+}
+
+// An established peer that stops answering without closing is dropped with a restart goodbye.
+// Waiting for client/time proves the peer was admitted, so the drop is not a nursery reap.
+TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
+    PairedClientBundle bundle(make_liveness_config(LIVENESS_TEST_PORT, 300));
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    Identity identity = Identity::generate().value();
+    FakeEncryptedServer silent(server_url(LIVENESS_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                               identity, bundle.peer.record.psk_id, bundle.peer.psk,
+                               time_answering_options(false));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return silent.got_client_time(); }, 4000));
+
+    EXPECT_TRUE(pump_until(
+        client, [&] { return !client.is_connected(); }, 4000));
+    EXPECT_TRUE(pump_until(
+        client, [&] { return silent.closed(); }, 4000));
+    EXPECT_EQ(silent.goodbye_reason().value_or(""), "restart");
+    EXPECT_FALSE(client.get_server_information().has_value());
+}
+
+// Control for the test above: a peer that answers time messages stays current past the timeout.
+TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
+    PairedClientBundle bundle(make_liveness_config(LIVENESS_CONTROL_PORT, 300));
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    Identity identity = Identity::generate().value();
+    FakeEncryptedServer live(server_url(LIVENESS_CONTROL_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+                             identity, bundle.peer.record.psk_id, bundle.peer.psk,
+                             time_answering_options(true));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return live.got_client_time(); }, 4000));
+
+    pump_for(client, 1200);  // Four liveness windows
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_FALSE(live.closed());
+    EXPECT_FALSE(live.goodbye_reason().has_value());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// liveness_timeout_ms = 0 disables the check: a peer that never answers stays current. Guards the
+// `liveness_timeout_us_ > 0` gate, without which a zero timeout drops every connection at once.
+TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
+    PairedClientBundle bundle(make_liveness_config(LIVENESS_DISABLED_PORT, 0));
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    Identity identity = Identity::generate().value();
+    FakeEncryptedServer silent(server_url(LIVENESS_DISABLED_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), identity,
+                               bundle.peer.record.psk_id, bundle.peer.psk,
+                               time_answering_options(false));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return silent.got_client_time(); }, 4000));
+
+    pump_for(client, 300);  // Several time messages go unanswered
+    EXPECT_TRUE(client.is_connected());
+    EXPECT_FALSE(silent.closed());
+    EXPECT_FALSE(silent.goodbye_reason().has_value());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
 }

@@ -88,14 +88,14 @@ public:
     // enforces this via ConnectionManager::loop()'s pairing-method admissibility check).
     // The Pairing PSK Flow test below needs the fake server to connect using this PSK directly
     // (matching PskCategory::PAIRING immediately), not the Sentinel PSK, so this must be set
-    // before start_server() reads it into the RecordStore.
+    // before start() reads it into the RecordStore.
     void set_configured_pairing_psk(SendspinPairingPsk psk) {
         this->configured_pairing_psk_ = std::move(psk);
     }
 
     // Optionally pre-seed a LONG_TERM record so the fake server can connect to it directly
     // (bypassing pairing) before a test drives an in-band re-handshake onto the pairing PSK
-    // above, on an already-admitted connection. Must be set before start_server() reads it into
+    // above, on an already-admitted connection. Must be set before start() reads it into
     // the RecordStore, like set_configured_pairing_psk() above.
     void set_seeded_long_term_record(SendspinPairingRecord record) {
         this->seeded_long_term_record_ = std::move(record);
@@ -317,7 +317,7 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
 // WebSocket::run() uncaught and calls std::terminate(), crashing the whole test process.
 //
 // This must be driven through a real client.connect_to() (SendspinClientConnection): plugging a
-// fake peer into client.start_server() instead (as every other test in this file does) exercises
+// fake peer into client.start() instead (as every other test in this file does) exercises
 // SendspinServerConnection, whose disconnect() only ever calls the already-async trigger_close()
 // and was never vulnerable to this bug. FakeOutboundEncryptedServer above plays the opposite role
 // (a real ix::WebSocketServer the DUT connects out to) specifically so this test reaches
@@ -490,7 +490,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     client.set_listener(&listener);
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     pump_for(client, 50);
 
     // Initial handshake uses the accepted Pairing PSK directly (matching PskCategory::PAIRING),
@@ -617,7 +617,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     client.set_listener(&listener);
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     pump_for(client, 50);
 
     // The FIRST server/activate (default options) is a normal playback activate that brings the
@@ -720,7 +720,7 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     client.set_listener(&listener);
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     pump_for(client, 50);
 
     Identity server_identity = Identity::generate().value();
@@ -840,7 +840,7 @@ TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
 
     SendspinClient client(config);
     client.set_network_provider(&network);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     pump_for(client, 50);
 
     // A bare WebSocket peer: it completes the upgrade and then says nothing the protocol expects.
@@ -972,7 +972,7 @@ TEST(EncryptedLifecycle, RemoveRecordDropsTheRevokedDevicesLiveSession) {
     SendspinClient client(config);
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     pump_for(client, 50);
 
     // A: admitted, with MANAGEMENT activity so its management/remove-record is honoured.
