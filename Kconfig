@@ -35,4 +35,11 @@ menu "sendspin-cpp"
         bool "Enable visualizer role"
         default y
 
+    config SENDSPIN_ENABLE_ANNOUNCEMENT
+        bool "Enable announcement role (draft)"
+        # Reuses the player role's ring buffer and decoder sources
+        depends on SENDSPIN_ENABLE_PLAYER
+        # Draft role (announcement@v1 spec proposal); opt-in until the spec lands
+        default n
+
 endmenu

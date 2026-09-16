@@ -36,6 +36,14 @@ function(sendspin_get_sources BASE_DIR)
         PARENT_SCOPE
     )
 
+    # Requires SENDSPIN_PLAYER_SOURCES: reuses the player's ring buffer and decoder
+    set(SENDSPIN_ANNOUNCEMENT_SOURCES
+        ${BASE_DIR}/src/announcement_role.cpp
+        ${BASE_DIR}/src/announcement_task.cpp
+
+        PARENT_SCOPE
+    )
+
     set(SENDSPIN_CONTROLLER_SOURCES
         ${BASE_DIR}/src/controller_role.cpp
 
