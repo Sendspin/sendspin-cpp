@@ -23,6 +23,7 @@
 #include "time_burst.h"
 #include "ws_server.h"
 
+#include <algorithm>
 #include <array>
 #include <utility>
 
@@ -106,6 +107,8 @@ ConnectionManager::~ConnectionManager() {
         nursery = std::move(this->nursery_);
         retries = std::move(this->hello_retries_);
         releases = std::move(this->deferred_releases_);
+        this->reconnect_retries_.clear();
+        this->reconnect_pending_.store(false, std::memory_order_release);
         // Keep the hint atomics in sync with the now-empty containers (has_pending_events_ was
         // handled above under its own mutex). Nothing reads them again after destruction, but
         // this keeps the "atomic mirrors container" invariant unconditional rather than carving
@@ -129,6 +132,8 @@ void ConnectionManager::connect_to(const std::string& url) {
     client_conn->set_auto_reconnect(false);
     client_conn->set_task_config(this->client_->config_.websocket_priority);
     client_conn->set_websocket_payload_location(this->client_->config_.websocket_payload_location);
+    client_conn->set_outbound(true);
+    client_conn->set_target_url(url);
 
     this->setup_connection_callbacks(client_conn.get());
     client_conn->on_connected_cb = [this](SendspinConnection* c) {
@@ -306,6 +311,11 @@ void ConnectionManager::stop(SendspinGoodbyeReason reason) {
         this->nursery_.clear();
         this->nursery_size_.store(0, std::memory_order_release);
         this->hello_retries_.clear();
+        // Deliberate teardown: a stale reconnect target must not outlive it, or the next
+        // start() would auto-connect to a URL the integrator no longer asked for. The
+        // destructor clears the same state.
+        this->reconnect_retries_.clear();
+        this->reconnect_pending_.store(false, std::memory_order_release);
         // Releases already queued (a handoff loser, a reaped entry) had their dispatch disabled
         // when they were queued; the shutdown goodbye replaces whatever reason they carried. One
         // queued without a reason has a transport that is already gone, and every transport's
@@ -453,6 +463,13 @@ void ConnectionManager::loop() {
                     continue;
                 }
 
+                // A promoted outbound connection proves its target is reachable again: clear any
+                // reconnect state armed for that URL so the backoff retries stop. Read the flags
+                // from current_connection_: conn was moved out by set_current_connection() above.
+                if (this->current_connection_->is_outbound()) {
+                    this->on_target_admitted(this->current_connection_->get_target_url());
+                }
+
                 // Notify the client and publish state, only for the winner and never for a
                 // connection that is about to receive a goodbye.
                 this->client_->on_handshake_complete(this->current_connection_.get());
@@ -572,14 +589,43 @@ void ConnectionManager::loop() {
                 this->liveness_timeout_us_) {
             SS_LOGW(TAG, "Current connection silent for >%" PRId64 " ms, dropping as lost",
                     this->liveness_timeout_us_ / US_PER_MS);
+            // Capture the target before the drop moves the connection out of the slot.
+            const bool was_outbound = this->current_connection_->is_outbound();
+            const std::string target_url = this->current_connection_->get_target_url();
             // The goodbye actively closes the transport, which the silent peer never will; an
             // inbound session would otherwise hold its server slot. Per the spec's
             // `client/goodbye` section, restart asks a server that was only slow to reconnect.
             this->drop_connection(this->current_connection_.get(), SendspinGoodbyeReason::RESTART);
+            // The dropped connection was outbound (connect_to): there is no server watching this
+            // client, so recovery must come from here. Queue a reconnect to the same URL with
+            // backoff; the reconnect scan below re-issues connect_to() when the timer elapses.
+            // Inbound connections rely on their server reconnecting instead.
+            if (was_outbound && this->client_->config_.reconnect_on_liveness_loss) {
+                this->arm_reconnect(target_url);
+            }
         }
     }
 
     // Send the goodbyes and release the connections reaped by the nursery tick, outside the lock.
+    this->flush_deferred_releases();
+
+    // Outbound reconnect scan: re-issue connect_to() for targets the liveness watchdog dropped.
+    // Gated on reconnect_pending_ (not has_current_/nursery_size_, which are all false after a
+    // drop) so an idle tick with no pending reconnect never locks. connect_to() must run outside
+    // conn_ptr_mutex_ (it re-enters the manager), so due URLs are collected under the lock and
+    // issued after it; the entry stays armed and its delay doubles per attempt until a connection
+    // to that URL establishes (on_target_admitted), which is what stops the retries.
+    if (this->reconnect_pending_.load(std::memory_order_acquire)) {
+        const int64_t now_us = platform_time_us();
+        std::vector<std::string> due_urls;
+        {
+            std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+            due_urls = this->collect_due_reconnects(now_us);
+        }
+        for (const auto& url : due_urls) {
+            this->connect_to(url);
+        }
+    }
     this->flush_deferred_releases();
 
     // Drive the platform ws_server's pending-upgrade reap (ESP: close sessions that never
@@ -924,6 +970,62 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
         this->release_nursery_entry(it, goodbye);
     }
     // Not a managed connection: nothing to do (already released by an earlier event this tick).
+}
+
+// ============================================================================
+// Outbound reconnect after liveness loss
+// ============================================================================
+
+void ConnectionManager::arm_reconnect(const std::string& url) {
+    // Note: caller must hold conn_ptr_mutex_
+    if (url.empty()) {
+        return;
+    }
+    for (auto& retry : this->reconnect_retries_) {
+        if (retry.url == url) {
+            // Already armed (a second drop before the first retry fired): keep the accumulated
+            // backoff, just note that the target is still unreachable.
+            return;
+        }
+    }
+    ReconnectState retry;
+    retry.url = url;
+    retry.next_attempt_us = platform_time_us();
+    this->reconnect_retries_.push_back(std::move(retry));
+    this->reconnect_pending_.store(true, std::memory_order_release);
+}
+
+void ConnectionManager::on_target_admitted(const std::string& url) {
+    // Note: caller must hold conn_ptr_mutex_
+    if (url.empty()) {
+        return;
+    }
+    for (auto it = this->reconnect_retries_.begin(); it != this->reconnect_retries_.end(); ++it) {
+        if (it->url == url) {
+            this->reconnect_retries_.erase(it);
+            this->reconnect_pending_.store(!this->reconnect_retries_.empty(),
+                                           std::memory_order_release);
+            return;
+        }
+    }
+}
+
+std::vector<std::string> ConnectionManager::collect_due_reconnects(int64_t now_us) {
+    // Note: caller must hold conn_ptr_mutex_
+    std::vector<std::string> due_urls;
+    for (auto& retry : this->reconnect_retries_) {
+        if (now_us < retry.next_attempt_us) {
+            continue;
+        }
+        due_urls.push_back(retry.url);
+        SS_LOGI(TAG, "Attempting to reconnect to %s", retry.url.c_str());
+        // Double the backoff for the next attempt, capped. Scheduling the next attempt now (not
+        // after the connect resolves) bounds the attempt rate: a retry that fails silently,
+        // without ever establishing, waits out the doubled delay like any other.
+        retry.delay_ms = std::min<uint32_t>(retry.delay_ms * 2, ReconnectState::MAX_RETRY_DELAY_MS);
+        retry.next_attempt_us = now_us + static_cast<int64_t>(retry.delay_ms) * US_PER_MS;
+    }
+    return due_urls;
 }
 
 bool ConnectionManager::should_switch_to_new_server(SendspinConnection* current,

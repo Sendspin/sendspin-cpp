@@ -61,6 +61,8 @@ constexpr uint16_t ADMIT_TEST_PORT = 18982;
 constexpr uint16_t LIVENESS_TEST_PORT = 18983;
 constexpr uint16_t LIVENESS_CONTROL_PORT = 18984;
 constexpr uint16_t LIVENESS_DISABLED_PORT = 18985;
+constexpr uint16_t LIVENESS_RECONNECT_PORT = 18986;
+constexpr uint16_t LIVENESS_NO_RECONNECT_PORT = 18987;
 
 class TestPersistenceProvider : public SendspinPersistenceProvider {
 public:
@@ -573,4 +575,108 @@ TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+// An outbound connect_to() peer that goes silently dead is dropped by the liveness watchdog and
+// then re-established automatically: the manager re-issues connect_to() to the same URL with
+// backoff until the server answers again. This is the recovery half of the watchdog for
+// server-initiated clients, where nothing else re-issues the connect after a drop.
+TEST(ConnectionLifecycle, OutboundSilentPeerIsDroppedAndReconnected) {
+    // Backend that answers client/hello with server/hello and client/time with server/time, so
+    // each connection proves itself and stays live while the backend is up.
+    ix::WebSocketServer backend(LIVENESS_RECONNECT_PORT, "127.0.0.1");
+    std::atomic<int> hello_count{0};
+    backend.setOnConnectionCallback([&hello_count](const std::weak_ptr<ix::WebSocket>& weak_ws,
+                                                   const std::shared_ptr<ix::ConnectionState>&) {
+        auto ws = weak_ws.lock();
+        if (!ws) {
+            return;
+        }
+        ws->setOnMessageCallback([weak_ws, &hello_count](const ix::WebSocketMessagePtr& msg) {
+            if (msg->type == ix::WebSocketMessageType::Message &&
+                msg->str.find("client/hello") != std::string::npos) {
+                hello_count.fetch_add(1);
+                if (auto locked = weak_ws.lock()) {
+                    locked->send(server_hello_json("server-reconnect", "discovery"));
+                }
+            }
+        });
+    });
+    ASSERT_TRUE(backend.listen().first);
+    backend.start();
+
+    TestNetworkProvider network;
+    SendspinClientConfig config = make_config(LIVENESS_NO_RECONNECT_PORT + 1);
+    config.time_burst_interval_ms = 20;
+    config.time_burst_response_timeout_ms = 20;
+    config.liveness_timeout_ms = 300;
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    client.connect_to(server_url(LIVENESS_RECONNECT_PORT));
+    pump_until(client, [&] { return client.is_connected(); });
+    EXPECT_EQ(hello_count.load(), 1);
+
+    // The backend answers hello but not time, so the connection goes silent after establishing;
+    // the watchdog drops it and the reconnect scan re-issues connect_to(). The second hello
+    // exchange proves the reconnection actually established, not just retried.
+    pump_until(client, [&] { return hello_count.load() >= 2 && client.is_connected(); });
+    auto info = client.get_server_information();
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->server_id, "server-reconnect");
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+    backend.stop();
+}
+
+// reconnect_on_liveness_loss = false keeps the integration in charge: the silent outbound peer is
+// still dropped, but no reconnect is attempted, so the client stays disconnected.
+TEST(ConnectionLifecycle, OutboundSilentPeerWithoutReconnectStaysDown) {
+    ix::WebSocketServer backend(LIVENESS_NO_RECONNECT_PORT, "127.0.0.1");
+    std::atomic<int> hello_count{0};
+    backend.setOnConnectionCallback([&hello_count](const std::weak_ptr<ix::WebSocket>& weak_ws,
+                                                   const std::shared_ptr<ix::ConnectionState>&) {
+        auto ws = weak_ws.lock();
+        if (!ws) {
+            return;
+        }
+        ws->setOnMessageCallback([weak_ws, &hello_count](const ix::WebSocketMessagePtr& msg) {
+            if (msg->type == ix::WebSocketMessageType::Message &&
+                msg->str.find("client/hello") != std::string::npos) {
+                hello_count.fetch_add(1);
+                if (auto locked = weak_ws.lock()) {
+                    locked->send(server_hello_json("server-norecon", "discovery"));
+                }
+            }
+        });
+    });
+    ASSERT_TRUE(backend.listen().first);
+    backend.start();
+
+    TestNetworkProvider network;
+    SendspinClientConfig config = make_config(LIVENESS_NO_RECONNECT_PORT + 1);
+    config.time_burst_interval_ms = 20;
+    config.time_burst_response_timeout_ms = 20;
+    config.liveness_timeout_ms = 300;
+    config.reconnect_on_liveness_loss = false;
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    client.connect_to(server_url(LIVENESS_NO_RECONNECT_PORT));
+    pump_until(client, [&] { return client.is_connected(); });
+    EXPECT_EQ(hello_count.load(), 1);
+
+    // Dropped on silence, and with reconnection disabled the client stays down: exactly one hello
+    // exchange ever happens.
+    pump_until(client, [&] { return !client.is_connected(); });
+    pump_for(client, 2000);
+    EXPECT_EQ(hello_count.load(), 1);
+    EXPECT_FALSE(client.is_connected());
+
+    backend.stop();
 }
