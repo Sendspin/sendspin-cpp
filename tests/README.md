@@ -67,7 +67,24 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: decode thread, slot
   gating, `frame_done()` acks, and stream restart/clear.
 - `test_connection_lifecycle.cpp`: the connection nursery (prove-then-admit) over real loopback
-  sockets: junk probes, slow peers, early server hello, and capacity.
+  sockets: junk probes, slow peers, capacity, and the liveness timeout.
+- `test_encrypted_lifecycle.cpp`: the Noise transport end to end over loopback: re-handshake,
+  pairing over the pairing PSK, management round trips, and pre-admission traffic.
+- `test_client_lifecycle.cpp`: `start()`/`stop()`/restart: goodbyes, clear callbacks delivered
+  inside `stop()`, re-entrancy from callbacks, role start rollback, and the high-performance
+  hold.
+- `test_client_teardown.cpp`: destroying a running client joins every threaded role.
+- `test_crypto.cpp`, `test_cpace.cpp`, `test_pin.cpp`, `test_psk_wrap.cpp`,
+  `test_pairing_token.cpp`, `test_noise_transport.cpp`, `test_noise_rehandshake.cpp`,
+  `test_admission.cpp`, `test_record_store.cpp`, `test_management.cpp`, `test_dynamic_pin.cpp`,
+  `test_pin_state_machine.cpp`, `test_persistence_codec.cpp`: the encryption and pairing units,
+  from the primitives up to the record store and the PIN state machine.
+
+The loopback tests share `lifecycle_test_fixtures.h`: `FakeEncryptedServer` and
+`FakeOutboundEncryptedServer` play a Sendspin server as the Noise initiator over a real socket,
+and `PairedClientBundle` wires a client to a seeded record store. Every connection is encrypted,
+so there is no cleartext fake; the fake sends its `server/hello` as soon as the handshake
+completes, before any `client/hello`, so that ordering is exercised by every test.
 
 These are white-box tests: they include private headers from `src/`, so the test target adds
 `src/` to its include path. To add a new test file, create `test_<unit>.cpp` here and add it to
