@@ -427,6 +427,10 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
             ui.pin_was_displayed |= current_ui.pin_was_displayed;
             ui.window_was_shown |= current_ui.window_was_shown;
             this->current_connection_->disable_message_dispatch();
+            // Vacate the admitted slot explicitly, as drop_connection() does: the connection is
+            // moved out below, so set_current_connection(nullptr) finds an empty slot and clears
+            // nothing, and the goodbye keeps the connection alive past this call.
+            this->current_connection_->set_admitted(false);
             to_goodbye.push_back(std::move(this->current_connection_));
             this->set_current_connection(nullptr);
         }
