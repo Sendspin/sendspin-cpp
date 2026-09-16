@@ -23,6 +23,7 @@
 #include "connection_manager.h"  // GoodbyeWait, GOODBYE_FLUSH_TIMEOUT_MS
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "fake_persistence.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/time.h"
 #include "protocol_messages.h"  // SENDSPIN_BINARY_VISUALIZER_LOUDNESS
@@ -65,6 +66,7 @@ constexpr uint16_t ROLLBACK_TEST_PORT = 19016;
 constexpr uint16_t HIGH_PERF_TEST_PORT = 19017;
 constexpr uint16_t VISUALIZER_TEST_PORT = 19018;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 19019;
+constexpr uint16_t PROVIDER_TEST_PORT = 19020;
 
 /// Bound on every pump/wait: generous next to the loopback round trips involved, so the verdict
 /// comes from the predicate rather than the clock.
@@ -273,6 +275,33 @@ TEST(ClientLifecycle, RestartYieldsALiveClient) {
         pump_for(client, 100);
         EXPECT_FALSE(port_accepts(RESTART_TEST_PORT));
     }
+}
+
+// The identity and record store read the persistence provider once, when start() builds them, so
+// a provider installed between a stop and the next start must make start() rebuild both: the
+// ephemeral keypair the provider-less run generated was never persisted, so the restarted client
+// generates and saves a new one. Control: a restart with the same provider keeps the identity.
+TEST(ClientLifecycle, ProviderSetBetweenStopAndStartIsHonored) {
+    TestNetworkProvider network;
+    SendspinClient client(make_config(PROVIDER_TEST_PORT));
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+    const std::string ephemeral_id = client.client_id();
+    EXPECT_FALSE(ephemeral_id.empty());
+    client.stop();
+
+    InMemoryPersistenceProvider store;
+    client.set_persistence_provider(&store);
+    ASSERT_TRUE(client.start());
+    const std::string persisted_id = client.client_id();
+    EXPECT_NE(persisted_id, ephemeral_id);
+    EXPECT_TRUE(store.load_blob(persistence_keys::KEYPAIR).has_value());
+    client.stop();
+
+    ASSERT_TRUE(client.start());
+    EXPECT_EQ(client.client_id(), persisted_id);
+    EXPECT_EQ(store.save_attempts(persistence_keys::KEYPAIR), 1);
+    client.stop();
 }
 
 // A peer still in the nursery (it handshook and answered the hello but never activated) gets the
