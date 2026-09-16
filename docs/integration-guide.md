@@ -51,7 +51,7 @@ SendspinClient client(std::move(config));
 `client_id` is not a configuration field. The library derives it automatically from the
 static X25519 keypair (`base64url(public_key)`, 43 characters). The keypair is generated
 on first boot and, when a `SendspinPersistenceProvider` is set, persisted so that the same
-identity survives reboots. After `start_server()` the derived `client_id` is available
+identity survives reboots. After `start()` the derived `client_id` is available
 via `client.client_id()`.
 
 The `client_id` uniquely identifies this device to Sendspin servers and must be stable
@@ -60,7 +60,7 @@ provider the keypair is regenerated on every boot (development use only).
 
 ## Step 2: Add Roles
 
-Add only the roles your application needs. All roles must be added before calling `start_server()`.
+Add only the roles your application needs. All roles must be added before calling `start()`.
 
 ### Player Role (Audio Playback)
 
@@ -132,7 +132,7 @@ The slot/channel number for each entry is its position (index) in `preferred_for
 
 ### Visualizer Role (Audio Visualization)
 
-Receives real-time beat, loudness, peak frequency, onset, and spectrum data synchronized to playback.
+Receives real-time beat, loudness, dominant-frequency, onset, and spectrum data synchronized to playback.
 
 ```cpp
 VisualizerSupportObject vis_support;
@@ -154,6 +154,23 @@ vis_support.spectrum = VisualizerSpectrumConfig{
 
 auto& visualizer = client.add_visualizer({.support = vis_support});
 ```
+
+The advertised support object is the starting format. To change it at runtime, call
+`request_format()` with only the fields you want to change; omitted fields keep their
+current value on the server:
+
+```cpp
+visualizer.request_format({.rate_max = 15});  // Halve the frame rate
+
+visualizer.request_format({
+    .types = {{VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS}},
+});
+```
+
+While a stream is active the server replies with a fresh `stream/start`, so
+`on_visualizer_stream_start()` fires again with the updated
+`ServerVisualizerStreamObject`. If no stream is active, the server remembers the request
+and applies it to the next stream.
 
 ### Color Role (Audio-Derived Color Palette)
 
@@ -461,7 +478,7 @@ of its own. (The one library write that originates on the network thread -- the 
 committed when a pairing finalizes -- is staged internally and flushed to
 `save_blob(persistence_keys::RECORDS, ...)` from the next `loop()` tick.)
 `save_blob(persistence_keys::KEYPAIR, ...)` is the one startup-time write: it fires once,
-during `start_server()`, rather than in response to a runtime event.
+during `start()`, rather than in response to a runtime event.
 
 #### Keyspace
 
@@ -515,7 +532,7 @@ entry's ~4 KB limit.
 Once the cap is reached, a new pairing falls back to the shared-PSK record instead of minting
 a per-server one, and `management/add-record` returns `storage_exhausted`; replacing a record
 already held for a given `psk_id` or `server_id` is unaffected, since that never grows the
-store. Raise or lower the cap by setting `max_pairing_records` before calling `start_server()`:
+store. Raise or lower the cap by setting `max_pairing_records` before calling `start()`:
 
 ```cpp
 SendspinClientConfig config;
@@ -633,7 +650,7 @@ struct MyClientListener : SendspinClientListener {
 
 ## Step 5: Wire Everything Together
 
-Listeners and providers are set as raw pointers. They must outlive the client.
+Listeners and providers are set as raw pointers. They must stay alive for as long as the client can call them: until `stop()` returns, or until the client is destroyed if `stop()` is never called. The destructor itself never invokes a listener (see [Stopping and Restarting](#stopping-and-restarting)).
 
 ```cpp
 MyPlayerListener player_listener;
@@ -654,9 +671,10 @@ client.set_persistence_provider(&persistence_provider); // Optional
 ## Step 6: Start and Run
 
 ```cpp
-// Start the WebSocket server and sync task.
+// Start the role threads and arm the WebSocket server (it comes up on the first loop() tick
+// after the network provider reports ready).
 // Task priorities and PSRAM settings are taken from SendspinClientConfig.
-if (!client.start_server()) {
+if (!client.start()) {
     // Handle failure
     return 1;
 }
@@ -671,9 +689,31 @@ while (running) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 }
 
-// Clean shutdown
-client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+// Clean shutdown: goodbye every peer, tear everything down, deliver the clear callbacks.
+client.stop();
 ```
+
+`start_server()` is a deprecated alias of `start()`.
+
+## Stopping and Restarting
+
+`stop()` is synchronous: when it returns the client is fully stopped. It sends a `client/goodbye` (reason `shutdown`) to every peer, waits up to a short bound (50 ms per peer) for those sends to complete, then closes the server and every connection regardless, joins the role threads, resets every role, and delivers the roles' clear callbacks (`on_stream_end()`, `on_image_clear()`, `on_visualizer_stream_end()`, `on_metadata_clear()`, `on_controller_state_clear()`, `on_color_clear()`) before returning. It is a no-op on a stopped client. `is_started()` reports the state, and `loop()` is a no-op while stopped.
+
+Restarting is `start()` again; start, stop, and start again can be repeated indefinitely, and a restarted client begins with no connection, no group state, and no role state from before the stop.
+
+`stop()` may block, but the wait is bounded. Besides the goodbye bound it includes:
+
+- The transports' own close. The host server joins every accepted connection thread; a WebSocket peer completes its close handshake within about 300 ms, but a raw socket that connected and never completed the upgrade holds the join for the full 3 s handshake timeout. The ESP server waits for the httpd task to exit, which polls at 100 ms and first finishes any queued send, which can take up to httpd's send timeout for a peer that has stopped reading.
+- An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`).
+- A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
+
+A pairing attempt in flight is cut short the same way: `on_clear_pairing_pin()` and `on_close_pairing_window()` fire from inside `stop()` for a prompt that was still showing, and a long-term record a `server/pair-finalize` had staged is persisted before `stop()` returns. The identity and record store survive the stop, so a restarted client keeps its `client_id`, its pairing token, and every record.
+
+Listener callbacks fire from inside `stop()`, after every role and the group state have been reset, so a callback that reads the client through its getters sees the stopped state. One that calls `start()` gets `false` and starts nothing; one that calls `stop()`, `connect_to()`, or `disconnect()` is ignored. `is_started()` reads `false` throughout and is safe to call from any thread. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
+
+`on_request_high_performance()` and `on_release_high_performance()` can fire while the client holds an internal lock, so their bodies must only toggle the platform networking mode and must not call any client or role method.
+
+Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no teardown or clear callback. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
 
 ## Encryption and Pairing
 
@@ -692,7 +732,7 @@ Without a persistence provider the keypair is regenerated on every boot. Pairing
 and server preferences will not survive reboots in that case.
 
 ```cpp
-client.start_server();
+client.start();
 printf("client_id: %s\n", client.client_id().c_str());
 ```
 
@@ -736,14 +776,14 @@ To pair, the server must learn that PSK out of band. Surface it as a **pairing t
 paste (or scan) into the server:
 
 ```cpp
-auto token = client.pairing_token();  // e.g. "SP:0AAAQ..." (107 chars), nullopt before start_server()
+auto token = client.pairing_token();  // e.g. "SP:0AAAQ..." (107 chars), nullopt before start()
 ```
 
 The token is stable for the lifetime of the stored PSK, so it can be printed at startup, shown
 in a UI, or rendered as a QR code.
 
 To pin a specific PSK instead (for factory provisioning, where the same key is baked into a
-setup tool), write one through the persistence provider before `start_server()`, encoded with
+setup tool), write one through the persistence provider before `start()`, encoded with
 the codec so it round-trips through the library's own loader:
 
 ```cpp
@@ -816,7 +856,7 @@ library had no idea where the secret was published, and afterwards it does.
 Nothing clears the flag short of a factory reset (which drops the pairing config together with
 the secret it describes). Installing the shipped secrets is not a rotation: first-boot
 provisioning of the Pairing PSK, and the `persistence_keys::PAIRING_PSK` / `STATIC_PIN` blobs a
-factory tool writes before `start_server()`, both leave the configured hint in place.
+factory tool writes before `start()`, both leave the configured hint in place.
 
 ### Trust Levels
 
@@ -907,7 +947,7 @@ the struct's compiled-in defaults rather than merely failing to change `unpaired
 `RecordStore` does notice the empty `record_mode_psk_id` and re-provisions a fresh shared-PSK
 fallback record for it, but that repair does not restore the OTHER policy fields the bare write
 clobbered, and it does not count as a first boot (the config blob still decoded successfully),
-so `initial_unpaired_access_enabled` is not reapplied either. Before the first `start_server()`
+so `initial_unpaired_access_enabled` is not reapplied either. Before the first `start()`
 there is no stored config to modify, so use the seed instead.
 
 Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
@@ -942,8 +982,6 @@ controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .o
 ```
 
 Fields that do not match the command are ignored when the message is serialized. The server clamps seeks to the seekable range and ignores any command not present in the controller state's `supported_commands`.
-
-> **Deprecated:** the earlier positional overload `send_command(cmd, volume, mute)` still works but cannot carry seek parameters and will be removed in v0.8.0. Migrate to the struct form above.
 
 ## Accessing Roles
 
@@ -1078,7 +1116,7 @@ int main() {
     player.set_listener(&player_listener);
     client.set_network_provider(&network);
 
-    client.start_server();
+    client.start();
 
     while (true) {
         client.loop();
@@ -1146,7 +1184,7 @@ When a role is disabled, its `add_*()` method, accessor method, and backing memb
 Main client configuration passed to the `SendspinClient` constructor.
 
 `client_id` is not a field in `SendspinClientConfig`. It is derived from the static
-X25519 keypair and read back via `client.client_id()` after `start_server()`.
+X25519 keypair and read back via `client.client_id()` after `start()`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -1169,6 +1207,7 @@ X25519 keypair and read back via `client.client_id()` after `start_server()`.
 | `time_burst_size` | `uint8_t` | `8` | Number of messages per time sync burst |
 | `time_burst_interval_ms` | `int64_t` | `10000` | Milliseconds between time sync bursts |
 | `time_burst_response_timeout_ms` | `int64_t` | `10000` | Milliseconds before a burst message times out |
+| `liveness_timeout_ms` | `std::optional<int64_t>` | unset (`60000` with default burst settings) | Milliseconds of inbound silence before the established connection is dropped as dead, with a `restart` goodbye so a server that was only slow reconnects. Unset derives it from the time burst settings, tolerating two consecutive unanswered time messages. An explicit value below `time_burst_interval_ms + time_burst_response_timeout_ms` drops healthy connections. `0` disables the check. |
 | `websocket_payload_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the per-connection WebSocket payload reassembly buffer (sized to the largest incoming frame, holds raw audio chunks delivered by httpd). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
 | `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `websocket_payload_location` (which covers the raw WebSocket frame buffer). ESP-IDF only; ignored on host. |
 | `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint. Superseded by `["operator"]` once the secret is rotated, see [Rotated secrets and the locations hint](#rotated-secrets-and-the-locations-hint). |
@@ -1379,10 +1418,10 @@ These represent commands the server can send to the player. The player advertise
 
 | Value | Description |
 |---|---|
-| `BEAT` | Beat detection events |
-| `LOUDNESS` | Loudness level |
-| `F_PEAK` | Peak frequency |
-| `SPECTRUM` | Frequency spectrum bins |
+| `BEAT` | Musical beat events from tempo/beat tracking |
+| `LOUDNESS` | Overall loudness level |
+| `F_PEAK` | Dominant frequency and its amplitude |
+| `SPECTRUM` | Full frequency spectrum bins |
 | `PEAK` | Energy onset (transient) events |
 
 ### VisualizerSpectrumScale

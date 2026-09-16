@@ -18,7 +18,7 @@
 // and adds C++-specific tests for keypair persistence and first-boot
 // provisioning. Most tests exercise RecordStore and FilePersistenceProvider
 // standalone; the KeypairPersistsViaClientStartServer test below exercises
-// the full SendspinClient::start_server() -> client_id() path.
+// the full SendspinClient::start() -> client_id() path.
 //
 // The persistence provider is a blob store (SendspinPersistenceProvider::load_blob /
 // save_blob / erase_blob); RecordStore and FilePersistenceProvider are pure byte stores for the
@@ -1136,7 +1136,7 @@ TEST(FilePersistenceProvider, KeypairPersistsAcrossReboots) {
     }
 }
 
-// Exercises the full public path: SendspinClient::start_server() loads or generates the
+// Exercises the full public path: SendspinClient::start() loads or generates the
 // identity via load_or_generate_identity() and exposes it through client_id(). Two separate
 // SendspinClient instances sharing the same FilePersistenceProvider file must derive the same
 // client_id: the second instance is the "reboot" case.
@@ -1150,7 +1150,7 @@ TEST(FilePersistenceProvider, KeypairPersistsViaClientStartServer) {
         config.name = "test-client";
         SendspinClient client(std::move(config));
         client.set_persistence_provider(&provider);
-        ASSERT_TRUE(client.start_server());
+        ASSERT_TRUE(client.start());
         client_id_first = client.client_id();
         EXPECT_FALSE(client_id_first.empty());
     }
@@ -1163,7 +1163,7 @@ TEST(FilePersistenceProvider, KeypairPersistsViaClientStartServer) {
         config.name = "test-client";
         SendspinClient client(std::move(config));
         client.set_persistence_provider(&provider);
-        ASSERT_TRUE(client.start_server());
+        ASSERT_TRUE(client.start());
         EXPECT_EQ(client.client_id(), client_id_first);
     }
 }
@@ -1179,7 +1179,7 @@ TEST(FilePersistenceProvider, StartServerNeverProducesAllZeroClientId) {
     config.name = "test-client";
     SendspinClient client(std::move(config));
     client.set_persistence_provider(&provider);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
 
     Identity zero_identity{};  // default-constructed = all-zero private/public bytes
     EXPECT_NE(client.client_id(), zero_identity.peer_id());
@@ -1196,7 +1196,7 @@ TEST(SendspinClientIdentity, WrongSizeKeypairBlobIsRejectedAndRegenerated) {
     config.name = "wrong-size-keypair-test";
     SendspinClient client(std::move(config));
     client.set_persistence_provider(&provider);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
 
     EXPECT_FALSE(client.client_id().empty());
 
@@ -1774,7 +1774,7 @@ TEST(PlayerRoleStaticDelay, PersistsAsAsciiDecimal) {
 
     PlayerRoleConfig player_config;
     auto& player = client.add_player(player_config);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     player.set_static_delay_adjustable(true);
     player.update_static_delay(1234);
 
@@ -1790,7 +1790,7 @@ TEST(PlayerRoleStaticDelay, PersistsAsAsciiDecimal) {
     client2.set_persistence_provider(&provider);
     PlayerRoleConfig player_config2;
     auto& player2 = client2.add_player(player_config2);
-    ASSERT_TRUE(client2.start_server());
+    ASSERT_TRUE(client2.start());
     player2.set_static_delay_adjustable(true);
     EXPECT_EQ(player2.get_static_delay_ms(), 1234u);
 }
@@ -1810,7 +1810,7 @@ TEST(PlayerRoleStaticDelay, InvalidPersistedValueIsTreatedAsAbsent) {
     PlayerRoleConfig player_config;
     player_config.initial_static_delay_ms = 77;
     auto& player = client.add_player(player_config);
-    ASSERT_TRUE(client.start_server());
+    ASSERT_TRUE(client.start());
     player.set_static_delay_adjustable(true);
 
     EXPECT_EQ(player.get_static_delay_ms(), 77u)
@@ -2066,19 +2066,19 @@ TEST(RecordStore, ClampsNegativeStoredDynamicPinFailureCounter) {
     EXPECT_TRUE(store.dynamic_pin_escalated());
 }
 
-// connect_to() before a successful start_server() must be refused, not allowed to build a
+// connect_to() before a successful start() must be refused, not allowed to build a
 // connection that dereferences the null identity_ once its WebSocket upgrade completes.
 TEST(SendspinClientIdentity, ConnectToBeforeStartServerIsRefused) {
     SendspinClientConfig config;
     config.name = "connect-before-start";
     SendspinClient client(std::move(config));
 
-    EXPECT_TRUE(client.client_id().empty()) << "no identity exists before start_server()";
+    EXPECT_TRUE(client.client_id().empty()) << "no identity exists before start()";
     client.connect_to("ws://192.0.2.1:8927/sendspin");
     client.loop();  // must not fault on a null identity_
 
     EXPECT_FALSE(client.is_connected())
-        << "connect_to() before start_server() must not produce a live connection";
+        << "connect_to() before start() must not produce a live connection";
 }
 
 // Ordering makes a crash between the two provisioning writes self-healing, but a provider that

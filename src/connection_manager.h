@@ -26,6 +26,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -77,6 +78,64 @@ static constexpr double REPROVE_TIMEOUT_S = NURSERY_ESTABLISH_TIMEOUT_S;
 
 /// @brief Timeout in microseconds (derived from REPROVE_TIMEOUT_S).
 static constexpr int64_t REPROVE_TIMEOUT_US = seconds_to_us(REPROVE_TIMEOUT_S);
+/// @brief Consecutive unanswered client/time messages the derived liveness timeout tolerates.
+static constexpr int64_t LIVENESS_TOLERATED_MISSES = 2;
+
+/// @brief Returns config.liveness_timeout_ms if set, otherwise a timeout derived from the time
+/// burst settings that outlasts LIVENESS_TOLERATED_MISSES consecutive unanswered time messages by
+/// at least one response timeout.
+/// @param config The client configuration.
+/// @return Timeout in milliseconds; 0 or negative disables the check.
+int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config);
+
+/// @brief Bound (milliseconds, per goodbye) on waiting for stop()'s goodbyes to be sent before
+/// the transports are torn down
+///
+/// stop() waits this long times the number of goodbyes it issued: on the ESP server path every
+/// goodbye is queued to the single httpd worker and handed to lwIP in turn, so a fixed bound
+/// would let the last of several peers lose its goodbye to the close. Per goodbye this is a few
+/// scheduler quanta for the worker to dequeue the frame. The host transports send synchronously,
+/// so on host the wait resolves before it starts. Send completion is best-effort (see
+/// SendspinConnection::send_text_message): a session that closes first never reports, so this is
+/// a cap on how long stop() blocks for its peers' sake, never a guarantee the goodbye arrived.
+static constexpr uint32_t GOODBYE_FLUSH_TIMEOUT_MS = 50;
+
+/// @brief Counts the goodbye sends stop() is waiting on
+///
+/// Shared by stop() and each connection's completion callback through a shared_ptr captured by
+/// value, so a completion that runs on a transport thread after stop() has given up (an ESP httpd
+/// worker draining late) touches only this record, never stop()'s stack or the manager.
+struct GoodbyeWait {
+    /// @brief Registers one goodbye whose completion is awaited
+    void add_pending() {
+        std::lock_guard<std::mutex> lock(this->mutex);
+        ++this->pending;
+    }
+
+    /// @brief Records one completion; wakes wait() when none remain
+    void complete_one() {
+        {
+            std::lock_guard<std::mutex> lock(this->mutex);
+            if (this->pending > 0) {
+                --this->pending;
+            }
+        }
+        this->cv.notify_all();
+    }
+
+    /// @brief Blocks until every registered goodbye has completed or the bound elapses
+    /// @param timeout_ms Maximum time to wait.
+    /// @return true if every goodbye completed, false if the bound elapsed first.
+    bool wait(uint32_t timeout_ms) {
+        std::unique_lock<std::mutex> lock(this->mutex);
+        return this->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                 [this] { return this->pending == 0; });
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t pending{0};
+};
 
 /// @brief A connection that has not completed the hello handshake
 ///
@@ -208,6 +267,20 @@ struct ServerActivateEvent {
     std::optional<int> pairing_pin_length;                 ///< From the pairing object's pin_length
 };
 
+/// @brief Pairing-UI display flags snapshotted from a connection's PinSession.
+///
+/// conn->pin_session().pin_displayed / .window_shown are the sole record of whether a PIN or
+/// pairing-window prompt is still showing, and every path that ends a pairing attempt clears
+/// that state (cleanup_connection_state() on the current-slot drop path,
+/// clear_pairing_state()) before it gets a chance to dismiss the prompt. Capture the flags
+/// BEFORE that cleanup runs, then dismiss afterward (dismiss_pairing_ui(), or the client's
+/// note_*() calls on the stop() path) so the dismissal still happens even though the flags it
+/// would have read are already gone.
+struct PairingUiSnapshot {
+    bool pin_was_displayed;
+    bool window_was_shown;
+};
+
 /**
  * @brief Manages WebSocket connection lifecycle.
  *
@@ -236,21 +309,22 @@ struct ServerActivateEvent {
  *
  * Typical usage:
  *  1. Construct with a `SendspinClient*`.
- *  2. Call `init_server()` once to create and configure the WebSocket server.
+ *  2. Call `start()` to open admission and create the WebSocket server.
  *  3. Call `loop()` periodically to drive connection state, process deferred events, and retry
  *     hellos.
  *  4. Call `connect_to()` to initiate an outgoing client connection when needed.
- *  5. Call `disconnect()` to gracefully close the active connection.
+ *  5. Call `disconnect()` to gracefully close the active connection, or `stop()` to tear
+ *     every connection and the server down synchronously.
  *
  * @code
  * ConnectionManager manager(client);
- * manager.init_server(client, use_psram, priority);
+ * manager.start();
  *
  * while (running) {
  *     manager.loop();
  * }
  *
- * manager.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+ * manager.stop(SendspinGoodbyeReason::SHUTDOWN);
  * @endcode
  */
 class ConnectionManager {
@@ -279,10 +353,29 @@ public:
     // Server lifecycle
     // ========================================
 
-    /// @brief Creates the WebSocket server and configures callbacks. Call once from start_server().
-    /// Server configuration is read from client->config_.
-    /// @param client The SendspinClient that owns this manager.
-    void init_server(SendspinClient* client);
+    /// @brief Opens admission and creates the WebSocket server on first use
+    ///
+    /// Server configuration is read from the client's config when the server object is created;
+    /// a restart reuses the object. loop() starts the server once the network provider reports
+    /// ready. Main-loop thread only.
+    void start();
+
+    /// @brief Synchronous teardown: goodbyes every managed connection, waits up to
+    /// GOODBYE_FLUSH_TIMEOUT_MS per goodbye for the sends to complete, then stops the WebSocket
+    /// server and releases every connection regardless
+    ///
+    /// Closes admission first, so a peer delivered during the wait is rejected with a goodbye.
+    /// Blocks on the transports' own teardown as well as the flush bound: the host server joins
+    /// every accepted connection thread, including a raw socket that never completed its
+    /// WebSocket upgrade, which can hold the join for the full WS_HANDSHAKE_TIMEOUT_SECS (3 s);
+    /// the ESP server waits for the httpd task to exit, and an outbound connection's transport
+    /// stop is synchronous (esp_websocket_client_stop() / ix::WebSocket::stop()). Client-state
+    /// cleanup is the caller's job: this only detaches connections. Main-loop thread only.
+    /// @param reason The goodbye reason sent to every connected peer.
+    /// @return The pairing prompts the dropped connections left showing. The caller dismisses
+    ///         them (SendspinClient::note_clear_pin() / note_close_pairing_window()) AFTER its
+    ///         own cleanup_connection_state(), which would otherwise wipe the queued notes.
+    PairingUiSnapshot stop(SendspinGoodbyeReason reason);
 
     /// @brief Drives connection state: starts server when network ready, processes lifecycle
     /// events, retries hello, calls loop() on active connections.
@@ -702,7 +795,7 @@ private:
     /// Socket-budget invariant: gracefully rejecting a surplus inbound peer requires the transport
     /// to accept NURSERY_CAPACITY + 2 sockets (1 established + the nursery + the surplus peer,
     /// which must be connected to receive its goodbye). The default server_max_connections
-    /// satisfies this; init_server warns when a configured value does not.
+    /// satisfies this; start() warns when a configured value does not.
     static constexpr size_t NURSERY_CAPACITY = 2;
 
     // ========================================
@@ -896,11 +989,17 @@ private:
     std::string last_played_server_id_;  ///< server_id of the last-played server (empty if unset).
 
     // 64-bit fields
+    /// From resolve_liveness_timeout_ms(), in microseconds; 0 or negative disables the check.
+    int64_t liveness_timeout_us_{0};
     /// Earliest time (us) to attempt another WS server start after a failure. Main-loop only.
     int64_t ws_server_start_retry_time_us_{0};
 
     // 8-bit fields
     bool has_last_played_server_{false};
+    /// True between start() and stop(). Written and read only under conn_ptr_mutex_ (the read is
+    /// on_new_connection(), on the network thread), so a peer delivered after stop() closed
+    /// admission is rejected rather than admitted into a nursery stop() has already emptied.
+    bool accepting_{false};
 
     // Atomic fields (lock-free hints for loop() tick gating; ground truth remains the
     // mutex-protected containers/pointer above; see the "Tick cost" note on loop())

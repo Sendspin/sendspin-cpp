@@ -178,6 +178,18 @@ else()
         message(FATAL_ERROR "ENABLE_TSAN and ENABLE_SANITIZERS are mutually exclusive")
     endif()
 
+    # ThreadSanitizer is applied globally rather than per target, and before the FetchContent
+    # dependencies are declared, so IXWebSocket, GoogleTest and the codecs are instrumented too.
+    # TSan intercepts pthread calls in uninstrumented code but cannot see its std::atomic
+    # accesses, which reports the lock-free stop flags in IXWebSocket as false races.
+    if(ENABLE_TSAN)
+        string(APPEND CMAKE_C_FLAGS " -fsanitize=thread -fno-omit-frame-pointer -g")
+        string(APPEND CMAKE_CXX_FLAGS " -fsanitize=thread -fno-omit-frame-pointer -g")
+        string(APPEND CMAKE_EXE_LINKER_FLAGS " -fsanitize=thread")
+        string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fsanitize=thread")
+        string(APPEND CMAKE_MODULE_LINKER_FLAGS " -fsanitize=thread")
+    endif()
+
     # Examples build by default for standalone development, but not when sendspin is pulled into
     # a larger project via add_subdirectory (where the consumer doesn't want the example deps,
     # e.g. FTXUI). Override either way with -DBUILD_EXAMPLES=ON/OFF.

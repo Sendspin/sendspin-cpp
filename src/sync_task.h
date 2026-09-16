@@ -130,10 +130,17 @@ public:
     /// @return true if thread started successfully, false otherwise.
     bool start(bool task_stack_in_psram, unsigned priority);
 
+    /// @brief Signals the task to stop, joins the thread, and discards buffered audio
+    /// A later start() creates a fresh thread on the same (still initialized) queues. No-op when
+    /// the thread is not running. Main-loop thread only: joins the sync thread.
+    void stop();
+
     /// @brief Returns true if init() has been called successfully
     /// @return true if the sync task has been initialized, false otherwise.
     bool is_initialized() const {
-        return this->event_flags_.is_created();
+        // Both members are checked so a partially failed init() (flags created, ring buffer
+        // allocation failed) leaves every signal/query path safely inert.
+        return this->event_flags_.is_created() && this->encoded_ring_buffer_ != nullptr;
     }
 
     /// @brief Returns true if the sync task is actively processing a stream
@@ -261,9 +268,6 @@ protected:
     /// @brief Processes playback progress messages from the speaker to update buffered_frames and
     /// playtime.
     void process_playback_progress(SyncContext& sync_context);
-
-    /// @brief Signals the task to stop and waits for the thread to finish
-    void stop();
 
     // Struct fields
     EventFlags event_flags_;

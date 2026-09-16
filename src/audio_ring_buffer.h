@@ -100,9 +100,16 @@ public:
 
     /// @brief Receives the next audio chunk from the ring buffer.
     /// @param timeout_ms Milliseconds to wait if buffer is empty (UINT32_MAX = wait forever).
-    /// @return Pointer to the entry, or nullptr if nothing available.
+    /// @return Pointer to the entry, or nullptr on timeout or wake_receiver() interruption.
     /// @note Caller MUST call return_chunk() when done with the entry.
     AudioRingBufferEntry* receive_chunk(uint32_t timeout_ms);
+
+    /// @brief Wakes the consumer out of a blocking receive_chunk() without providing data
+    /// One-shot and safe from any thread; see SpscRingBuffer::wake_receiver() for the
+    /// exact semantics (the consumer must re-check its command flags after every return).
+    void wake_receiver() {
+        this->ring_buffer_.wake_receiver();
+    }
 
     /// @brief Returns a previously received chunk to the ring buffer.
     /// @param entry Pointer previously returned by receive_chunk(). May be nullptr (no-op).

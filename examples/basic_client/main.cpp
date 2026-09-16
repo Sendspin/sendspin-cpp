@@ -385,7 +385,7 @@ int main(int argc, char* argv[]) {
     // Start the server
     fprintf(stderr, "Starting Sendspin basic client on port %u...\n", server_port);
 
-    if (!client.start_server()) {
+    if (!client.start()) {
         fprintf(stderr, "Failed to start server\n");
         return 1;
     }
@@ -447,7 +447,7 @@ int main(int argc, char* argv[]) {
 #ifdef SENDSPIN_HAS_MDNS
     mdns.stop();
 #endif
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    client.stop();
 
 #ifndef SENDSPIN_HAS_PORTAUDIO
     fprintf(stderr, "Total audio bytes received: %zu\n", null_audio_total_bytes);

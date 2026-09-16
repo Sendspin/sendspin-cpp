@@ -435,7 +435,7 @@ protected:
         this->client_->set_listener(&this->listener_);
         this->client_->set_network_provider(&this->network_provider_);
         this->client_->set_persistence_provider(&this->persistence_provider_);
-        ASSERT_TRUE(this->client_->start_server());
+        ASSERT_TRUE(this->client_->start());
         // A device that implements static_pin enables it in its live pairing config (the flag a
         // real client would flip once, independent of whether a PIN is currently configured).
         // Needed since spec "server/activate"'s pairing-method admissibility check (see

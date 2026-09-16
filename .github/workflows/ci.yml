@@ -99,6 +99,11 @@ jobs:
       - name: Build tests
         run: cmake --build build-tsan --target sendspin_tests
 
+      - name: Reduce mmap randomization
+        # TSan aborts at startup with "unexpected memory mapping" under the 32-bit mmap
+        # randomization the runner kernel defaults to.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
       - name: Run tests
         # halt_on_error makes a detected race fail the job deterministically rather than relying
         # on the process happening to abort afterwards.
