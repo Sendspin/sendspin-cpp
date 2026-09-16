@@ -20,6 +20,7 @@
 // WebSocket upgrade; raw-TCP junk is closed inside the transport layer and never occupies a slot).
 
 #include "connection_manager.h"  // fnv1_hash, resolve_liveness_timeout_ms
+#include "sendspin/announcement_role.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "test_support.h"
@@ -61,6 +62,7 @@ constexpr uint16_t ADMIT_TEST_PORT = 18982;
 constexpr uint16_t LIVENESS_TEST_PORT = 18983;
 constexpr uint16_t LIVENESS_CONTROL_PORT = 18984;
 constexpr uint16_t LIVENESS_DISABLED_PORT = 18985;
+constexpr uint16_t ANNOUNCEMENT_TEST_PORT = 18991;
 
 class TestPersistenceProvider : public SendspinPersistenceProvider {
 public:
@@ -235,6 +237,38 @@ private:
     int delay_ms_;
     bool ok_{false};
 };
+
+// Counts the announcement lifecycle callbacks delivered to the embedder. on_announcement_start /
+// on_announcement_end fire on the main loop (the pump thread), on_announcement_write on the task
+// thread; atomics keep the test thread's reads safe against the latter.
+class AnnouncementRoutingListener : public AnnouncementRoleListener {
+public:
+    size_t on_announcement_write(uint8_t* /*data*/, size_t length,
+                                 uint32_t /*timeout_ms*/) override {
+        return length;  // accept everything so the task is never sink-blocked
+    }
+    void on_announcement_start(const ServerAnnouncementStreamObject& /*params*/) override {
+        ++this->starts_;
+    }
+    void on_announcement_end() override {
+        ++this->ends_;
+    }
+    int starts() const {
+        return this->starts_.load();
+    }
+    int ends() const {
+        return this->ends_.load();
+    }
+
+private:
+    std::atomic<int> starts_{0};
+    std::atomic<int> ends_{0};
+};
+
+std::string announcement_stream_start_json() {
+    return R"({"type":"stream/start","payload":{"announcement":{"codec":"pcm",)"
+           R"("sample_rate":48000,"channels":1,"bit_depth":16,"start_timestamp":0}}})";
+}
 
 }  // namespace
 
@@ -570,6 +604,44 @@ TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
     EXPECT_TRUE(client.is_connected());
     EXPECT_FALSE(silent.closed());
     EXPECT_FALSE(silent.got_goodbye());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// The announcement stream is independent of the media streams' stream/end. A bare stream/end
+// (omitted roles) must leave an active announcement playing and ducked; only a stream/end that
+// explicitly names the "announcement" role ends it. Exercises the routing in
+// SendspinClient::process_json_message().
+TEST(ConnectionLifecycle, BareStreamEndKeepsAnnouncementExplicitEndsIt) {
+    TestNetworkProvider network;
+    SendspinClient client(make_config(ANNOUNCEMENT_TEST_PORT));
+    client.set_network_provider(&network);
+
+    AnnouncementRoutingListener listener;
+    AnnouncementRoleConfig announcement_config;
+    announcement_config.audio_formats.push_back({SendspinCodecFormat::PCM, 1, 48000, 16});
+    client.add_announcement(announcement_config).set_listener(&listener);
+
+    ASSERT_TRUE(client.start());
+    client.loop();  // First tick binds the WS server
+
+    FakeServer server(server_url(ANNOUNCEMENT_TEST_PORT), "announce-server");
+    pump_until(client, [&] { return client.is_connected(); });
+
+    // Start an announcement: the embedder is told to duck (on_announcement_start).
+    server.send_text(announcement_stream_start_json());
+    pump_until(client, [&] { return listener.starts() >= 1; });
+
+    // A bare stream/end must not touch the announcement: no on_announcement_end, duck stays. The
+    // 500 ms window is well under the task's 5 s stall guard, so nothing else can end the stream.
+    server.send_text(R"({"type":"stream/end","payload":{}})");
+    pump_for(client, 500);
+    EXPECT_EQ(listener.ends(), 0);
+
+    // A stream/end naming the announcement role ends it (draining the empty buffer immediately).
+    server.send_text(R"({"type":"stream/end","payload":{"roles":["announcement"]}})");
+    pump_until(client, [&] { return listener.ends() >= 1; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
