@@ -380,8 +380,9 @@ public:
     /// on_image_clear(), on_metadata_clear(), ...) before returning. A pairing prompt still
     /// showing is dismissed the same way (on_clear_pairing_pin() / on_close_pairing_window()),
     /// and a pairing record staged by a pair-finalize is persisted first. No-op when stopped.
-    /// Calling start() afterwards restarts the client on the same identity and record store;
-    /// start, stop, and start again can be repeated indefinitely.
+    /// Calling start() afterwards restarts the client on the same identity and record store
+    /// (both are rebuilt only if the persistence provider changed in between); start, stop, and
+    /// start again can be repeated indefinitely.
     ///
     /// Blocking is bounded by the goodbye wait, the transports' own close, and any listener
     /// callback already running on a role thread, which the join cannot interrupt. The
@@ -824,6 +825,9 @@ private:
 #ifdef SENDSPIN_ENABLE_METADATA
     std::unique_ptr<MetadataRole> metadata_;
 #endif
+    /// The provider identity_ and record_store_ were built from; start() rebuilds both when
+    /// persistence_provider_ no longer matches it.
+    SendspinPersistenceProvider* identity_provider_{nullptr};
     SendspinNetworkProvider* network_provider_{nullptr};
     SendspinPersistenceProvider* persistence_provider_{nullptr};
 #ifdef SENDSPIN_ENABLE_PLAYER

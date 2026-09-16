@@ -269,16 +269,22 @@ bool SendspinClient::start() {
     // connection manager can hand them out to any connection (connection_manager_->start() below
     // arms the ws_server, and connect_to() may be called any time after start() RETURNS TRUE).
     // A restart keeps both: the store already holds the records the last run persisted, and the
-    // identity is fixed for the lifetime of the stored keypair.
-    if (this->record_store_ == nullptr) {
+    // identity is fixed for the lifetime of the stored keypair. They are rebuilt only when the
+    // persistence provider changed since they were built (each reads the provider once, at
+    // construction, so a provider set between a stop and the next start would otherwise never
+    // be consulted) or when the previous start failed part-way (a store without an identity).
+    if (this->record_store_ == nullptr || this->identity_ == nullptr ||
+        this->identity_provider_ != this->persistence_provider_) {
+        this->identity_.reset();
         this->record_store_ = std::make_unique<RecordStore>(
             this->persistence_provider_, this->config_.initial_unpaired_access_enabled,
             this->config_.max_pairing_records);
-    }
-    if (this->identity_ == nullptr && !this->load_or_generate_identity()) {
-        // identity_ is left null: there is no safe key to fall back to (see
-        // load_or_generate_identity()'s doc comment), so the client must not start.
-        return false;
+        if (!this->load_or_generate_identity()) {
+            // identity_ is left null: there is no safe key to fall back to (see
+            // load_or_generate_identity()'s doc comment), so the client must not start.
+            return false;
+        }
+        this->identity_provider_ = this->persistence_provider_;
     }
 
     // Load persisted state
