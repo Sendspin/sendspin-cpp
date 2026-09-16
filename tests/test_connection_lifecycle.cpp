@@ -58,7 +58,7 @@
 #include <utility>
 #include <vector>
 
-using namespace sendspin;        // NOLINT(google-build-using-namespace): test-local convenience
+using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
 namespace {
 
