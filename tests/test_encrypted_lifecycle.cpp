@@ -28,6 +28,7 @@
 #include "crypto/keys.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/crypto.h"
+#include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
@@ -68,6 +69,8 @@ constexpr uint16_t PREHANDSHAKE_BINARY_TEST_PORT = 19000;
 constexpr uint16_t PREADMISSION_ROLE_TEST_PORT = 19001;
 constexpr uint16_t REVOCATION_SWEEP_TEST_PORT = 19002;
 constexpr uint16_t REACTIVATE_PAIRING_TEST_PORT = 19003;
+constexpr uint16_t UNPAIR_RECORD_TEST_PORT = 19004;
+constexpr uint16_t UNPAIR_SENTINEL_TEST_PORT = 19005;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -868,6 +871,179 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
         client, [&] { return metadata_listener.updates.load() > 0; }, 4000))
         << "Role traffic from the admitted connection was incorrectly dropped";
     EXPECT_EQ(metadata_listener.last_title, "Post-Admission OK");
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// Seeds a set of LONG_TERM records and keeps the persisted "records" array up to date, so an
+// unpair test can assert on what the store would come back with after a reboot as well as on
+// what it resolves right now. TestPersistenceProvider rejects writes on purpose (see its
+// comment), which is exactly what these tests need to observe.
+class RecordsMirrorPersistenceProvider : public SendspinPersistenceProvider {
+public:
+    explicit RecordsMirrorPersistenceProvider(std::vector<SendspinPairingRecord> records)
+        : records_(std::move(records)) {}
+
+    /// Seeds the stored pairing config. Must be called before start(): a client that already
+    /// holds records is not on its first boot, so SendspinClientConfig's unpaired-access seed no
+    /// longer applies and the stored config is the only way in.
+    void set_unpaired_access_enabled(bool enabled) {
+        this->unpaired_access_enabled_ = enabled;
+    }
+
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        if (key == persistence_keys::PAIR_CONFIG) {
+            SendspinPairingConfig config;
+            config.unpaired_access_enabled = this->unpaired_access_enabled_;
+            std::string encoded = encode_pairing_config(config);
+            return std::vector<uint8_t>(encoded.begin(), encoded.end());
+        }
+        if (key != persistence_keys::RECORDS) {
+            return std::nullopt;
+        }
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        std::string encoded = encode_pairing_records(this->records_);
+        return std::vector<uint8_t>(encoded.begin(), encoded.end());
+    }
+
+    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        if (key != persistence_keys::RECORDS) {
+            return true;  // The keypair and pair config are not under test here.
+        }
+        std::string_view text(reinterpret_cast<const char*>(data), len);
+        auto decoded = decode_pairing_records(text);
+        if (!decoded.has_value()) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->records_ = std::move(decoded.value());
+        return true;
+    }
+
+    /// @brief The psk_ids the store would load on the next boot.
+    [[nodiscard]] std::vector<std::string> persisted_psk_ids() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        std::vector<std::string> ids;
+        ids.reserve(this->records_.size());
+        for (const auto& record : this->records_) {
+            ids.push_back(record.psk_id);
+        }
+        return ids;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<SendspinPairingRecord> records_;
+    bool unpaired_access_enabled_{false};
+};
+
+/// Build a LONG_TERM record for `identity` with a random PSK.
+SendspinPairingRecord make_record_for(const Identity& identity) {
+    SendspinPairingRecord record;
+    platform_random_bytes(record.psk.data(), record.psk.size());
+    record.psk_id = psk_id_for(record.psk);
+    record.server_id = identity.peer_id();
+    return record;
+}
+
+// server/unpair revokes the credential itself, not just the session: the matched record must be
+// gone from the store AND from the persisted blob, or the server pairs its way back in at the
+// next boot (spec "server/unpair").
+//
+// Only the matched record goes: a client paired with several servers keeps the others, which is
+// the difference between honouring an unpair and wiping the device.
+TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
+    Identity unpairing_identity = Identity::generate().value();
+    Identity bystander_identity = Identity::generate().value();
+    SendspinPairingRecord unpairing_record = make_record_for(unpairing_identity);
+    SendspinPairingRecord bystander_record = make_record_for(bystander_identity);
+
+    TestNetworkProvider network;
+    RecordsMirrorPersistenceProvider persistence(
+        std::vector<SendspinPairingRecord>{unpairing_record, bystander_record});
+    SendspinClientConfig config;
+    config.name = "Unpair Record Test Client";
+    config.server_port = UNPAIR_RECORD_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    FakeEncryptedServer server(server_url(UNPAIR_RECORD_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), unpairing_identity,
+                               unpairing_record.psk_id, unpairing_record.psk);
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "The paired session never reached operational";
+
+    ASSERT_TRUE(server.send_app_json(R"({"type":"server/unpair","payload":{}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.closed(); }, 4000))
+        << "The unpaired session was never dropped";
+    EXPECT_EQ(server.goodbye_reason().value_or(""), "unpaired");
+
+    // The record is gone for this boot: it no longer resolves a handshake at all.
+    EXPECT_FALSE(client.record_store_->resolve_by_psk_id(unpairing_record.psk_id).has_value())
+        << "server/unpair must revoke the matched record, not just end the session";
+    auto bystander_resolved =
+        client.record_store_->resolve_by_psk_id(bystander_record.psk_id);
+    ASSERT_TRUE(bystander_resolved.has_value())
+        << "another server's record must survive an unpair it had no part in";
+    EXPECT_EQ(bystander_resolved->category, PskCategory::LONG_TERM);
+
+    // ...and gone for the next one: the removal reached the provider through the main loop.
+    EXPECT_EQ(persistence.persisted_psk_ids(),
+              std::vector<std::string>{bystander_record.psk_id})
+        << "the persisted records blob must hold exactly the surviving record";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// An unpaired session has no record to revoke, so server/unpair on one is ignored outright: it
+// must not drop the session and must not touch stored records (spec "server/unpair": if the
+// session is unpaired, ignore the message).
+TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
+    Identity sentinel_identity = Identity::generate().value();
+    Identity paired_identity = Identity::generate().value();
+    SendspinPairingRecord paired_record = make_record_for(paired_identity);
+
+    TestNetworkProvider network;
+    RecordsMirrorPersistenceProvider persistence(
+        std::vector<SendspinPairingRecord>{paired_record});
+    SendspinClientConfig config;
+    config.name = "Unpair Sentinel Test Client";
+    config.server_port = UNPAIR_SENTINEL_TEST_PORT;
+    persistence.set_unpaired_access_enabled(true);
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    // The Sentinel PSK admits an unpaired server (ConnectionTrust::NONE).
+    FakeEncryptedServer server(server_url(UNPAIR_SENTINEL_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), sentinel_identity,
+                               std::string(SENTINEL_PSK_ID), SENTINEL_PSK);
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "The unpaired session never reached operational";
+
+    ASSERT_TRUE(server.send_app_json(R"({"type":"server/unpair","payload":{}})"));
+    pump_for(client, 500);
+
+    EXPECT_FALSE(server.closed())
+        << "server/unpair on an unpaired session must be ignored, not acted on";
+    EXPECT_FALSE(server.goodbye_reason().has_value());
+    EXPECT_TRUE(client.is_connected());
+
+    // The paired server's record is untouched: it was never what this session ran on.
+    EXPECT_TRUE(client.record_store_->resolve_by_psk_id(paired_record.psk_id).has_value());
+    EXPECT_EQ(persistence.persisted_psk_ids(), std::vector<std::string>{paired_record.psk_id});
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

@@ -87,6 +87,13 @@ target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
 set_source_files_properties(test_pin_state_machine.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
+# test_encrypted_lifecycle.cpp needs it too: the unpair tests assert that the matched record left
+# the RecordStore itself, and the client exposes no accessor for its store. The alternative (a
+# second handshake on the revoked psk_id) would answer the same question through a timing-bound
+# reconnect instead of a direct read.
+set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
+    COMPILE_OPTIONS "-fno-access-control")
+
 # test_cpace.cpp needs the same treatment for one reason: pinning CPace::derive()/tag()/isk()
 # against the reference vectors requires a known scalar, and start() always samples a fresh one
 # from the CSPRNG. The fixed-scalar KAT overwrites the private scalar_/public_share_ instead of
