@@ -821,25 +821,18 @@ fire, so a gated attempt sends `client/pair-pending`, logs a warning, and waits 
 server's own timeout to cancel it. A device that offers `dynamic_pin` should therefore set
 `pairing_window_supported` and implement the gesture callbacks.
 
-#### Rotated secrets and the locations hint
+#### The locations hint
 
 `SendspinClientConfig::pairing_psk_locations` and `static_pin_locations` tell a server where
 the operator can find each secret (`"device"`, `"leaflet"`, `"operator"`), and ride out as the
-`locations` hint on the matching `client/hello` pair-method descriptor. They describe the
-secret the device shipped with, so set them to match what your product actually publishes: a
-PIN on the device label is `{"device"}`, a pairing token in the box is `{"leaflet"}`.
+`locations` hint on the matching `client/hello` pair-method descriptor. Only the application
+knows where its secrets were published, so an empty value omits the hint rather than guessing:
+a PIN on the device label is `{"device"}`, a pairing token in the box is `{"leaflet"}`, and a
+secret an operator provisioned out of band is `{"operator"}`.
 
-Replacing either secret at runtime invalidates every distributed copy of the shipped one, so
-the configured answer stops being true, and the library switches that method's hint to
-`["operator"]` from the next `client/hello` onward. Rotation is recorded in the persisted
-pairing config, so the corrected hint survives reboots along with the rotated secret, and it is
-advertised even when the application configured no locations at all: before the rotation the
-library had no idea where the secret was published, and afterwards it does.
-
-Nothing clears the flag short of a factory reset (which drops the pairing config together with
-the secret it describes). Installing the shipped secrets is not a rotation: first-boot
-provisioning of the Pairing PSK, and the `persistence_keys::PAIRING_PSK` / `STATIC_PIN` blobs a
-factory tool writes before `start()`, both leave the configured hint in place.
+The secrets themselves come from the persistence provider (`persistence_keys::PAIRING_PSK` and
+`STATIC_PIN`), read once at `start()`, so a provisioning tool that replaces one also updates
+these config values in the same pass.
 
 ### Trust Levels
 
@@ -906,9 +899,8 @@ if (blob.has_value()) {
 This is why the read-modify-write step matters: the provider is a byte store and does not
 validate what it is handed, so saving a bare, default-constructed `SendspinPairingConfig`
 *will* be written and *will* take effect on the next boot -- silently resetting every policy
-field (`pairing_psk_enabled`, `dynamic_pin_enabled`, and the rotation flags behind the
-[locations hint](#rotated-secrets-and-the-locations-hint)) to the struct's compiled-in defaults
-rather than merely failing to change `unpaired_access_enabled`. A bare write also does not count
+field (`pairing_psk_enabled`, `dynamic_pin_enabled`, `static_pin_enabled`,
+`dynamic_pin_min_length`) to the struct's compiled-in defaults rather than merely failing to change `unpaired_access_enabled`. A bare write also does not count
 as a first boot (the config blob still decodes), so `initial_unpaired_access_enabled` is not
 reapplied either. Before the first `start()` there is no stored config to modify, so use the
 seed instead.
@@ -1173,8 +1165,8 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `liveness_timeout_ms` | `std::optional<int64_t>` | unset (`60000` with default burst settings) | Milliseconds of inbound silence before the established connection is dropped as dead, with a `restart` goodbye so a server that was only slow reconnects. Unset derives it from the time burst settings, tolerating two consecutive unanswered time messages. An explicit value below `time_burst_interval_ms + time_burst_response_timeout_ms` drops healthy connections. `0` disables the check. |
 | `websocket_payload_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the per-connection WebSocket payload reassembly buffer (sized to the largest incoming frame, holds raw audio chunks delivered by httpd). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
 | `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `websocket_payload_location` (which covers the raw WebSocket frame buffer). ESP-IDF only; ignored on host. |
-| `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint. Superseded by `["operator"]` once the secret is rotated, see [Rotated secrets and the locations hint](#rotated-secrets-and-the-locations-hint). |
-| `static_pin_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static PIN the device shipped with, same values as above. Advertised on the `static_pin` descriptor in `client/hello`; empty omits the hint. Superseded by `["operator"]` on rotation, exactly as `pairing_psk_locations` is. |
+| `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint, see [The locations hint](#the-locations-hint). |
+| `static_pin_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static PIN the device shipped with, same values as above. Advertised on the `static_pin` descriptor in `client/hello`; empty omits the hint. |
 | `initial_unpaired_access_enabled` | `bool` | `false` | First-boot default for unpaired (Sentinel) access. Applies only on a genuine first boot; see [Unpaired Access](#unpaired-access). |
 | `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer used to parse incoming JSON protocol messages, instead of the default PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the network task on every message. Messages too large for the budget fall back to PSRAM; the default covers steady-state traffic (including the FLAC stream-start header), while large track-metadata messages may spill over (but those arrive only once per song). Set to `0` to disable and keep PSRAM-only behaviour. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer for the parse (still used, harmless). |
 

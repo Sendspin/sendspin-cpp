@@ -73,8 +73,8 @@ struct SendspinPairingRecord {
     /// the persisted blob for as long as the record is paired, by design (see persist_records_
     /// locked() in record_store.cpp). The copy/move members are defaulted explicitly (rather than
     /// left to go through this destructor's precedent of suppressing them, as `Identity` does):
-    /// records move through `std::vector`/`std::optional` on real paths (store_record's and
-    /// store_record_superseding's insert/replace, decode_pairing_records' push_back,
+    /// records move through `std::vector`/`std::optional` on real paths
+    /// (store_record_superseding's insert/replace, decode_pairing_records' push_back,
     /// resolve_pairing_outcome's PairingOutcome), so keeping those moves real (not copies)
     /// matters here.
     ~SendspinPairingRecord() {
@@ -111,14 +111,6 @@ struct SendspinPairingConfig {
     /// @brief When true, the client advertises static_pin as a supported pair method (also
     /// requires a configured static PIN and platform pairing-window support).
     bool static_pin_enabled{false};
-    /// @brief True once the Pairing PSK has been rotated away from the value the device shipped
-    /// with, which retires the configured `pairing_psk_locations` hint (spec: "client/hello
-    /// pair-method descriptor"). Persisted so the retirement survives reboots, like the rotated
-    /// secret itself. Never cleared: a factory reset drops this blob along with the secret.
-    bool pairing_psk_rotated{false};
-    /// @brief True once the static PIN has been rotated away from the value the device shipped
-    /// with, retiring the configured `static_pin_locations` hint. See `pairing_psk_rotated`.
-    bool static_pin_rotated{false};
     /// @brief Minimum PIN length the client will accept; server chooses within [min, MAX].
     int dynamic_pin_min_length{6};
 };
@@ -164,17 +156,11 @@ struct SendspinClientConfig {
     /// @brief Where the operator can find the Pairing PSK the device shipped with (as a pairing
     /// token): any of "device", "leaflet", "operator". Advertised as the informational
     /// `locations` hint on the pairing_psk descriptor in client/hello; empty = omit the hint.
-    ///
-    /// This describes the FACTORY secret only. Once the Pairing PSK is rotated, whatever was
-    /// printed on the device or its leaflet no longer opens it, so the client advertises
-    /// `["operator"]` from then on and ignores this value (spec: "client/hello pair-method
-    /// descriptor").
     std::vector<std::string> pairing_psk_locations{};
 
     /// @brief Where the operator can find the static PIN the device shipped with: any of
     /// "device", "leaflet", "operator". Advertised as the informational `locations` hint on the
-    /// static_pin descriptor in client/hello; empty = omit the hint. Superseded by
-    /// `["operator"]` once the PIN is rotated, exactly as `pairing_psk_locations` is.
+    /// static_pin descriptor in client/hello; empty = omit the hint.
     std::vector<std::string> static_pin_locations{};
 
     /// @brief First-boot default for unpaired (Sentinel) access.

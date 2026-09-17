@@ -97,17 +97,11 @@ struct ResolvedPsk {
 ///     `records`) are for internal-locked or single-threaded (main-loop-only) use ONLY;
 ///     callers must not retain a returned pointer or reference across any mutation, and must
 ///     never call them from the network thread.
-///   - Most config fields (`unpaired_access_enabled_`, `dynamic_pin_enabled_`,
-///     `static_pin_enabled_`, `dynamic_pin_min_length_`) are main-loop-only: written only on
-///     the main loop and read only on the main loop, so no lock is needed.
-///   - `pairing_psk_enabled_` is the ONE exception and IS guarded by `mutex_`. It is written on
-///     the main loop like its neighbours, but it is also READ on the network thread, inside
-///     `resolve_by_psk_id`'s locked section, because a disabled Pairing PSK must drop out of the
-///     handshake candidate set. Its setter therefore takes `mutex_`, exactly as
-///     `set_pairing_psk()` does for the value half of that same condition. Do not "simplify" the
-///     lock away to match the other config setters: without it the network-thread read is an
-///     unsynchronized race and an operator-disabled Pairing PSK can keep authenticating
-///     handshakes for a window after the toggle.
+///   - The pairing config (`pairing_psk_enabled_`, `unpaired_access_enabled_`,
+///     `dynamic_pin_enabled_`, `static_pin_enabled_`, `dynamic_pin_min_length_`, `static_pin_`)
+///     is construction-time state: seeded from the persisted blob and the client config by the
+///     constructor, then read-only for the object's life, so no lock is needed even for the
+///     network-thread read of `pairing_psk_enabled_` inside `resolve_by_psk_id`.
 ///   - `resolve_by_psk_id` runs on the network thread (Noise handshake and re-handshake)
 ///     under `mutex_` so a network-thread resolve cannot race a main-loop mutation of
 ///     `records_` / `pairing_psk_`.
@@ -167,28 +161,15 @@ public:
         return r ? std::optional<SendspinPairingRecord>(*r) : std::nullopt;
     }
 
-    /// @brief Persist and store a long-term record. Replaces any existing record
-    /// with the same psk_id, and leaves records for other psk_ids alone.
-    ///
-    /// The provider write happens first: when it fails, the in-memory store is left
-    /// untouched so the caller can fail the exchange closed instead of completing it on
-    /// a key that would be lost at the next reboot.
-    ///
-    /// This plain form does NOT supersede other records bound to the same server_id, so a
-    /// caller may deliberately hold more than one record for one server. Use
-    /// store_record_superseding() for the pairing path.
-    /// @return true when the record is stored (and persisted, when a provider is set);
-    /// false when the persistence provider rejected the write.
-    bool store_record(SendspinPairingRecord record);
-
-    /// @brief Like store_record(), but RAM-only and additionally retires any OTHER record
-    /// bound to the same server_id.
+    /// @brief Store a long-term record in RAM, retiring any OTHER record bound to the same
+    /// server_id. Replaces any existing record with the same psk_id, and leaves records for
+    /// other psk_ids alone.
     ///
     /// This is the pairing-completion form: pairing mints a fresh per-server PSK that
     /// REPLACES whatever that server held before, so leaving the prior record in place
     /// would keep the old PSK valid forever and let repeated re-pairs exhaust storage.
     ///
-    /// Unlike store_record(), this NEVER calls the provider: it runs on the NETWORK thread
+    /// This NEVER calls the provider: it runs on the NETWORK thread
     /// (the server/pair-finalize ack handler), where the record must become resolvable before
     /// the handler returns but the provider contract only permits main-loop calls. The caller
     /// must arrange for persist_records() to run on the main loop afterwards (the client does
@@ -213,16 +194,6 @@ public:
     // ========================================
     // Pairing PSK (the one the client accepts to admit a new server)
     // ========================================
-
-    /// @brief Set the accepted Pairing PSK, replacing any existing one.
-    /// psk_id is re-derived from the supplied secret; any id in `psk` is ignored.
-    /// Marks the Pairing PSK rotated (see pairing_psk_rotated()): this is the rotation entry
-    /// point, distinct from the constructor's first-boot provisioning and provider load, which
-    /// install the shipped secret and leave the flag alone.
-    void set_pairing_psk(SendspinPairingPsk psk);
-
-    /// @brief Clear the accepted Pairing PSK. No-op if absent.
-    void clear_pairing_psk();
 
     /// @brief Return the accepted Pairing PSK, if any.
     [[nodiscard]] const std::optional<SendspinPairingPsk>& pairing_psk() const {
@@ -253,22 +224,6 @@ public:
         return this->dynamic_pin_min_length_;
     }
 
-    /// @brief Return whether the Pairing PSK has been rotated away from the shipped secret.
-    /// True retires SendspinClientConfig::pairing_psk_locations, which described where the
-    /// shipped secret was published: the current one exists only wherever the operator who
-    /// rotated it keeps it, so client/hello advertises `["operator"]` instead. Persisted through
-    /// SendspinPairingConfig so it survives reboots alongside the rotated secret.
-    [[nodiscard]] bool pairing_psk_rotated() const {
-        return this->pairing_psk_rotated_;
-    }
-
-    /// @brief Return whether the static PIN has been rotated away from the shipped secret.
-    /// Retires SendspinClientConfig::static_pin_locations the same way pairing_psk_rotated()
-    /// retires its own hint.
-    [[nodiscard]] bool static_pin_rotated() const {
-        return this->static_pin_rotated_;
-    }
-
     // ========================================
     // Static PIN
     // ========================================
@@ -282,29 +237,6 @@ public:
     [[nodiscard]] bool static_pin_enabled() const {
         return this->static_pin_enabled_;
     }
-
-    /// @brief Set the configured static PIN (8 decimal digits), replacing any existing one.
-    /// Marks the static PIN rotated (see static_pin_rotated()); the provider load that restores
-    /// a shipped PIN at construction does not.
-    void set_static_pin(const std::string& pin);
-
-    /// @brief Clear the configured static PIN. No-op if absent.
-    void clear_static_pin();
-
-    /// @brief Set the static-PIN-enabled flag and persist the config.
-    void set_static_pin_enabled(bool enabled);
-
-    /// @brief Set the pairing-PSK-enabled flag and persist the config.
-    void set_pairing_psk_enabled(bool enabled);
-
-    /// @brief Set the unpaired-access-enabled flag and persist the config.
-    void set_unpaired_access_enabled(bool enabled);
-
-    /// @brief Set the dynamic-PIN-enabled flag and persist the config.
-    void set_dynamic_pin_enabled(bool enabled);
-
-    /// @brief Set the minimum PIN length and persist the config.
-    void set_dynamic_pin_min_length(int length);
 
     // ========================================
     // Pairing outcome
@@ -396,8 +328,7 @@ private:
     /// MUST be called with mutex_ already held (the "_locked" suffix), so the encoded snapshot
     /// is always exactly what is in memory at the moment of the write. Every mutation path that
     /// touches records_ and needs to persist it goes through this one helper; see the locking
-    /// discipline comment above its definition in the .cpp for why this is safe and how
-    /// store_record()'s fail-closed contract is preserved despite it.
+    /// discipline comment above its definition in the .cpp for why this is safe.
     /// @return true on success (or when there is no provider); false on a rejected write.
     bool persist_records_locked();
 
@@ -432,13 +363,7 @@ private:
     // 8-bit fields
     bool dynamic_pin_enabled_{true};
     bool pairing_psk_enabled_{true};
-    /// Set by set_pairing_psk() and persisted through SendspinPairingConfig; see
-    /// pairing_psk_rotated(). Main-loop-only like the other config flags: written by
-    /// set_pairing_psk() and read by build_hello_message().
-    bool pairing_psk_rotated_{false};
     bool static_pin_enabled_{false};
-    /// Set by set_static_pin(); see static_pin_rotated().
-    bool static_pin_rotated_{false};
     bool unpaired_access_enabled_{false};
 };
 

@@ -270,7 +270,7 @@ static std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     rec.psk_id = psk_id;
     rec.psk = psk;
     rec.server_id = server_id.peer_id();
-    rs.store_record(std::move(rec));
+    rs.store_record_superseding(std::move(rec));
 
     // -----------------------------------------------------------------
     // Create the NoiseHandshake (our responder driver)
@@ -674,7 +674,7 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     rec.psk_id = psk_id_val;
     rec.psk = psk;
     rec.server_id = other_server.peer_id();  // bound to other_server
-    rs.store_record(std::move(rec));
+    rs.store_record_superseding(std::move(rec));
 
     NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
 

@@ -20,6 +20,11 @@ item against the current code before acting on it; line numbers drift as phases 
   replacement.
 - The optional dual-connection hold (a pairing connection alongside a playback connection) is
   not implemented; the single-slot fallback the spec allows stays.
+- Pairing configuration (which methods are enabled, the static code, unpaired access, and the
+  secrets themselves) is construction-time only: `RecordStore` reads it from the persistence
+  provider at `start()` and never writes it back. With the management namespace gone the library
+  has no runtime mutators for any of it, so a device changes its pairing policy by writing the
+  blobs and restarting. A public runtime API for it is possible later work.
 
 ## Conformance oracle
 

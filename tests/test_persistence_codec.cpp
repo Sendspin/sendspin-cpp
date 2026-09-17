@@ -307,8 +307,6 @@ TEST(PersistenceCodec, ConfigRoundTrip) {
     c.dynamic_pin_enabled = false;
     c.static_pin_enabled = true;
     c.dynamic_pin_min_length = 8;
-    c.pairing_psk_rotated = true;
-    c.static_pin_rotated = true;
 
     std::string blob = encode_pairing_config(c);
     auto decoded = decode_pairing_config(blob);
@@ -318,8 +316,17 @@ TEST(PersistenceCodec, ConfigRoundTrip) {
     EXPECT_EQ(decoded->dynamic_pin_enabled, c.dynamic_pin_enabled);
     EXPECT_EQ(decoded->static_pin_enabled, c.static_pin_enabled);
     EXPECT_EQ(decoded->dynamic_pin_min_length, c.dynamic_pin_min_length);
-    EXPECT_EQ(decoded->pairing_psk_rotated, c.pairing_psk_rotated);
-    EXPECT_EQ(decoded->static_pin_rotated, c.static_pin_rotated);
+}
+
+// A config blob written by an older build carries keys this codec no longer knows. They are
+// ignored like any other unknown field, and the fields it does know still come through.
+TEST(PersistenceCodec, ConfigDecodeIgnoresUnknownFields) {
+    auto decoded = decode_pairing_config(
+        R"({"v":1,"static_pin_enabled":true,"dynamic_pin_min_length":8,)"
+        R"("pairing_psk_rotated":true,"static_pin_rotated":true,"whatever":[1,2]})");
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_TRUE(decoded->static_pin_enabled);
+    EXPECT_EQ(decoded->dynamic_pin_min_length, 8);
 }
 
 TEST(PersistenceCodec, ConfigDecodeMissingFieldsTakeDefaults) {
@@ -331,10 +338,6 @@ TEST(PersistenceCodec, ConfigDecodeMissingFieldsTakeDefaults) {
     EXPECT_EQ(decoded->dynamic_pin_enabled, defaults.dynamic_pin_enabled);
     EXPECT_EQ(decoded->static_pin_enabled, defaults.static_pin_enabled);
     EXPECT_EQ(decoded->dynamic_pin_min_length, defaults.dynamic_pin_min_length);
-    // A blob written before the rotation flags existed must read back as "never rotated", so an
-    // upgrade keeps advertising the factory locations hint rather than inventing a rotation.
-    EXPECT_FALSE(decoded->pairing_psk_rotated);
-    EXPECT_FALSE(decoded->static_pin_rotated);
 }
 
 TEST(PersistenceCodec, ConfigDecodeRejectsParseFailure) {

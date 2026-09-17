@@ -92,7 +92,7 @@ void RecordStore::load_records_from_provider() {
     // blob itself could not be parsed. Continue with an empty store rather than refusing to
     // start. load_decode_wipe() logs the warning and wipes the raw blob on both paths; the raw
     // blob is base64 PSK text (even when it failed to decode), mirroring the save-path wipes in
-    // persist_records_locked() and set_pairing_psk().
+    // persist_records_locked().
     auto decoded = load_decode_wipe<std::vector<SendspinPairingRecord>>(
         *this->provider_, persistence_keys::RECORDS, decode_pairing_records,
         "starting with an empty store");
@@ -124,8 +124,8 @@ void RecordStore::load_static_pin_from_provider() {
     if (auto pin_blob = this->provider_->load_blob(persistence_keys::STATIC_PIN)) {
         std::string loaded_pin(reinterpret_cast<const char*>(pin_blob->data()), pin_blob->size());
         // Validate on load, the same way RECORDS and PAIRING_PSK are validated by their
-        // decoders. The write path already checks this, so a value that fails here came from
-        // provider corruption or out-of-band provisioning.
+        // decoders: the PIN is provisioned into the store out of band, so this is the only
+        // place the library gets to check it.
         // Accepting it would leave the device advertising static_pin while feeding malformed
         // PRS bytes to the PAKE, which can only ever produce pin_mismatch, a pairing that
         // deterministically fails with nothing in the logs pointing at storage.
@@ -151,8 +151,6 @@ bool RecordStore::load_pairing_config_from_provider() {
             this->dynamic_pin_enabled_ = config->dynamic_pin_enabled;
             this->static_pin_enabled_ = config->static_pin_enabled;
             this->dynamic_pin_min_length_ = config->dynamic_pin_min_length;
-            this->pairing_psk_rotated_ = config->pairing_psk_rotated;
-            this->static_pin_rotated_ = config->static_pin_rotated;
             return true;
         }
         SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; ignoring",
@@ -322,57 +320,8 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
     return nullptr;
 }
 
-bool RecordStore::store_record(SendspinPairingRecord record) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-
-    size_t idx = this->find_index(record.psk_id);
-    const std::string incoming_psk_id = record.psk_id;
-    const bool is_insert = (idx == static_cast<size_t>(-1));
-
-    // Capacity: a genuine insert grows records_ by one and is subject to max_records_. A
-    // replace by psk_id (idx already found, handled below) never grows it, so it is exempt.
-    if (is_insert && !this->has_capacity_locked()) {
-        SS_LOGW(TAG, "Storage full (%zu/%zu); rejecting new pairing record %s",
-                this->records_.size(), this->max_records_, incoming_psk_id.c_str());
-        return false;
-    }
-
-    // Insert/replace the new record. Fails closed: the record must not survive in records_
-    // when the provider rejects the write (see the class doc: the return value must be honest
-    // about durability).
-    // This is safe under mutex_ (held for the whole sequence, so no reader - in particular
-    // resolve_by_psk_id() on the network thread - can observe the tentative mutation before it
-    // commits or rolls back; see the locking-discipline comment on persist_records_locked() for
-    // the general rule this is the one exception to), and each branch below only ever needs to
-    // undo the single element it just touched, not the whole vector: a replace snapshots just
-    // the record it is about to overwrite, and an insert only needs to pop the one it just
-    // pushed.
-    if (!is_insert) {
-        SendspinPairingRecord replaced = std::move(this->records_[idx]);
-        this->records_[idx] = std::move(record);
-
-        if (!this->persist_records_locked()) {
-            SS_LOGW(TAG, "Provider rejected pairing record %s; not storing",
-                    incoming_psk_id.c_str());
-            this->records_[idx] = std::move(replaced);
-            return false;
-        }
-    } else {
-        this->records_.push_back(std::move(record));
-
-        if (!this->persist_records_locked()) {
-            SS_LOGW(TAG, "Provider rejected pairing record %s; not storing",
-                    incoming_psk_id.c_str());
-            this->records_.pop_back();
-            return false;
-        }
-    }
-
-    return true;
-}
-
 bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
-    // RAM-only, unlike store_record(): this runs on the NETWORK thread (the server/pair-finalize
+    // RAM-only: this runs on the NETWORK thread (the server/pair-finalize
     // ack handler), where the record must become resolvable before the handler returns (the
     // server's follow-up re-handshake is the next message on that thread) but the provider may
     // not be called (its contract is main-loop-only). The caller schedules persist_records() on
@@ -409,8 +358,7 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
     // Retire any OTHER record still bound to this server_id: pairing mints a fresh per-server
     // PSK that REPLACES whatever that server held before, and leaving the prior record in place
     // would let re-pairing accumulate a second working PSK for the same server, so "rotation"
-    // never revokes anything. Only the pairing path asks for this; store_record() stores
-    // plainly.
+    // never revokes anything.
     const std::string superseded_server_id = this->records_[idx].server_id;
     for (size_t i = 0; i < this->records_.size();) {
         if (i != idx && this->records_[i].server_id == superseded_server_id) {
@@ -478,115 +426,6 @@ void RecordStore::mark_record_used(const std::string& psk_id) {
 }
 
 // ============================================================================
-// Pairing PSK
-// ============================================================================
-
-void RecordStore::set_pairing_psk(SendspinPairingPsk psk) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    // Derive psk_id from the secret rather than trusting the caller's: it is the id the server
-    // will reference in its handshake, so a supplied mismatch would make the key unresolvable.
-    psk.psk_id = psk_id_for(psk.psk);
-    this->pairing_psk_ = std::move(psk);
-    // The secret the device shipped with is now dead, so whatever the application published it
-    // in (device label, leaflet) no longer opens this client and the locations hint has to stop
-    // pointing there. Persisting under mutex_ is the pattern set_pairing_psk_enabled() documents;
-    // skip the write once the flag is already set so a re-rotation costs no extra flash.
-    //
-    // Ordered before the secret's own write, since the two blobs are separate keys and a provider
-    // can take one and reject the other. Losing the secret's write after this one leaves a device
-    // whose shipped secret still works pointing an operator at the server that set the
-    // replacement, which merely wastes a lookup; the reverse order would leave a rotated device
-    // pointing at a label that no longer opens it.
-    if (!this->pairing_psk_rotated_) {
-        this->pairing_psk_rotated_ = true;
-        this->persist_config();
-    }
-    if (this->provider_ != nullptr) {
-        std::string encoded = encode_pairing_psk(this->pairing_psk_.value());
-        this->provider_->save_blob(persistence_keys::PAIRING_PSK,
-                                   reinterpret_cast<const uint8_t*>(encoded.data()),
-                                   encoded.size());
-        // See the constructor's provisioning branch for why this is wiped rather than left for
-        // the string's destructor to free unwiped: it is base64 PSK text.
-        secure_zero(encoded.data(), encoded.size());
-    }
-}
-
-void RecordStore::clear_pairing_psk() {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    this->pairing_psk_.reset();
-    if (this->provider_ != nullptr && !this->provider_->erase_blob(persistence_keys::PAIRING_PSK)) {
-        SS_LOGW(TAG,
-                "Cleared the Pairing PSK but the provider did not delete it; it is gone for this "
-                "boot only and will authenticate pairing again after a reboot");
-    }
-}
-
-// ============================================================================
-// Pairing config
-// ============================================================================
-
-void RecordStore::set_pairing_psk_enabled(bool enabled) {
-    // Locked, unlike the other config setters: resolve_by_psk_id() reads this field on the
-    // NETWORK thread inside its own mutex_ section (see the thread-safety note on the class).
-    // Holding mutex_ across persist_config() is safe on both counts that matter: it does not
-    // take mutex_ itself, so there is no recursive acquisition inside this class; and it reaches
-    // the consumer's provider, which SendspinPersistenceProvider's documented re-entrancy
-    // contract forbids from calling back into the library (that contract cites this exact
-    // pattern: set_pairing_psk() has always held mutex_ across its own save_blob()).
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    this->pairing_psk_enabled_ = enabled;
-    this->persist_config();
-}
-
-void RecordStore::set_unpaired_access_enabled(bool enabled) {
-    this->unpaired_access_enabled_ = enabled;
-    this->persist_config();
-}
-
-void RecordStore::set_dynamic_pin_enabled(bool enabled) {
-    this->dynamic_pin_enabled_ = enabled;
-    this->persist_config();
-}
-
-void RecordStore::set_dynamic_pin_min_length(int length) {
-    this->dynamic_pin_min_length_ = length;
-    this->persist_config();
-}
-
-// ============================================================================
-// Static PIN
-// ============================================================================
-
-void RecordStore::set_static_pin(const std::string& pin) {
-    this->static_pin_ = pin;
-    // Retires the configured locations hint, and ordered ahead of the PIN's own write for the
-    // reason set_pairing_psk() spells out.
-    if (!this->static_pin_rotated_) {
-        this->static_pin_rotated_ = true;
-        this->persist_config();
-    }
-    if (this->provider_ != nullptr) {
-        this->provider_->save_blob(persistence_keys::STATIC_PIN,
-                                   reinterpret_cast<const uint8_t*>(pin.data()), pin.size());
-    }
-}
-
-void RecordStore::clear_static_pin() {
-    this->static_pin_.reset();
-    if (this->provider_ != nullptr && !this->provider_->erase_blob(persistence_keys::STATIC_PIN)) {
-        SS_LOGW(TAG,
-                "Cleared the static PIN but the provider did not delete it; it is gone for this "
-                "boot only and will pair devices again after a reboot");
-    }
-}
-
-void RecordStore::set_static_pin_enabled(bool enabled) {
-    this->static_pin_enabled_ = enabled;
-    this->persist_config();
-}
-
-// ============================================================================
 // Pairing outcome
 // ============================================================================
 
@@ -641,8 +480,6 @@ bool RecordStore::persist_config() {
     config.dynamic_pin_enabled = this->dynamic_pin_enabled_;
     config.static_pin_enabled = this->static_pin_enabled_;
     config.dynamic_pin_min_length = this->dynamic_pin_min_length_;
-    config.pairing_psk_rotated = this->pairing_psk_rotated_;
-    config.static_pin_rotated = this->static_pin_rotated_;
     std::string encoded = encode_pairing_config(config);
     if (!this->provider_->save_blob(persistence_keys::PAIR_CONFIG,
                                     reinterpret_cast<const uint8_t*>(encoded.data()),
@@ -663,17 +500,10 @@ bool RecordStore::persist_config() {
 // place, then encode the WHOLE array and save it while STILL HOLDING mutex_
 // (persist_records_locked(), below), so the encoded snapshot is always exactly what is in memory
 // at the moment of the write. This adds no new deadlock class: providers are already called
-// under mutex_ at several call sites in this file (mark_record_used, set_pairing_psk), and no
-// provider implementation calls back into RecordStore.
+// under mutex_ at other call sites in this file (mark_record_used), and no provider
+// implementation calls back into RecordStore.
 //
-// store_record() is the one exception, because it must fail closed: the new record must not
-// survive in records_ when the provider rejects the write. It snapshots the element it is about
-// to touch, applies the insert/replace in place, persists via this same helper, and rolls
-// records_ back on failure. That is safe under the same reasoning: the whole sequence runs under
-// mutex_, so no reader (in particular resolve_by_psk_id() on the network thread) can observe the
-// tentative state before it commits or rolls back.
-//
-// store_record_superseding() is the other exception, in the other direction: it mutates records_
+// store_record_superseding() is the exception: it mutates records_
 // WITHOUT persisting at all, because it runs on the network thread where the provider may not be
 // called. Its deferred flush is persist_records() (the public wrapper below), scheduled onto the
 // main loop by the client via INBOX_TOPIC_RECORDS; one flush write covers the insert and the

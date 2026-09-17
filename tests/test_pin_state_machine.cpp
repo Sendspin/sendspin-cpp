@@ -44,6 +44,7 @@
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/persistence_codec.h"
 #include "sendspin/types.h"
 
 #include <ArduinoJson.h>
@@ -261,16 +262,29 @@ public:
     bool is_network_ready() override { return false; }
 };
 
-/// Persistence provider that does nothing (in-memory RecordStore defaults are sufficient for
-/// these tests: nothing is restored, no config restrictions). Counts
-/// save_blob() calls per key, still returning false like the base class default, so tests can
-/// assert on write counts (e.g. the persist_last_played_server() dedup guard) without disturbing
-/// the always-fails behavior the RECORDS-storage-failure tests rely on.
+/// Persistence provider that serves only what a test seeded into it, which is how the pairing
+/// configuration reaches RecordStore at all (its constructor reads these blobs; there are no
+/// runtime setters). Counts save_blob() calls per key, still returning false like the base class
+/// default, so tests can assert on write counts (e.g. the persist_last_played_server() dedup
+/// guard) without disturbing the always-fails behavior the RECORDS-storage-failure tests rely on.
 class FakePersistenceProvider : public SendspinPersistenceProvider {
 public:
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        auto it = this->seeded_.find(key);
+        if (it == this->seeded_.end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
     bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
         this->save_attempts_[key]++;
         return false;
+    }
+
+    /// @brief Place a blob in the store directly, as out-of-band provisioning would.
+    void seed_blob(const std::string& key, const std::string& bytes) {
+        this->seeded_[key] = std::vector<uint8_t>(bytes.begin(), bytes.end());
     }
 
     [[nodiscard]] int save_attempts(const std::string& key) const {
@@ -280,6 +294,7 @@ public:
 
 private:
     std::map<std::string, int> save_attempts_;
+    std::map<std::string, std::vector<uint8_t>> seeded_;
 };
 
 // =============================================================================
@@ -425,22 +440,57 @@ protected:
     void init_client(bool pin_display_supported, bool pairing_window_supported,
                      std::vector<std::string> pairing_psk_locations = {},
                      std::vector<std::string> static_pin_locations = {}) {
+        this->pin_display_supported_ = pin_display_supported;
+        this->pairing_window_supported_ = pairing_window_supported;
+        this->pairing_psk_locations_ = std::move(pairing_psk_locations);
+        this->static_pin_locations_ = std::move(static_pin_locations);
+        this->build_client();
+    }
+
+    /// Configure the static PIN a device was provisioned with, then rebuild the client. The
+    /// pairing configuration is construction-time state (RecordStore reads it from the
+    /// persistence provider and never writes it again), so it is seeded and the client rebuilt
+    /// rather than set on a live store.
+    void configure_static_pin(const std::string& pin) {
+        this->static_pin_ = pin;
+        this->build_client();
+    }
+
+    /// Configure the minimum dynamic PIN length, then rebuild the client (see
+    /// configure_static_pin() for why this is a rebuild).
+    void configure_dynamic_pin_min_length(int length) {
+        this->dynamic_pin_min_length_ = length;
+        this->build_client();
+    }
+
+    /// Build the SendspinClient under test from the fixture's current configuration, seeding
+    /// the pairing blobs its RecordStore reads at construction.
+    void build_client() {
+        SendspinPairingConfig pairing_config;
+        // A device that implements static_pin enables it in its pairing config, independent of
+        // whether a PIN is currently configured. Needed since spec "server/activate"'s
+        // pairing-method admissibility check (see ConnectionManager::loop()) gates entry on
+        // RecordStore::static_pin_enabled().
+        pairing_config.static_pin_enabled = true;
+        pairing_config.dynamic_pin_min_length = this->dynamic_pin_min_length_;
+        this->persistence_provider_.seed_blob(persistence_keys::PAIR_CONFIG,
+                                              encode_pairing_config(pairing_config));
+        if (this->static_pin_.has_value()) {
+            this->persistence_provider_.seed_blob(persistence_keys::STATIC_PIN,
+                                                  this->static_pin_.value());
+        }
+
         SendspinClientConfig config;
         config.name = "PinStateMachineTestDevice";
-        config.pin_display_supported = pin_display_supported;
-        config.pairing_window_supported = pairing_window_supported;
-        config.pairing_psk_locations = std::move(pairing_psk_locations);
-        config.static_pin_locations = std::move(static_pin_locations);
+        config.pin_display_supported = this->pin_display_supported_;
+        config.pairing_window_supported = this->pairing_window_supported_;
+        config.pairing_psk_locations = this->pairing_psk_locations_;
+        config.static_pin_locations = this->static_pin_locations_;
         this->client_ = std::make_unique<SendspinClient>(config);
         this->client_->set_listener(&this->listener_);
         this->client_->set_network_provider(&this->network_provider_);
         this->client_->set_persistence_provider(&this->persistence_provider_);
         ASSERT_TRUE(this->client_->start());
-        // A device that implements static_pin enables it in its live pairing config (the flag a
-        // real client would flip once, independent of whether a PIN is currently configured).
-        // Needed since spec "server/activate"'s pairing-method admissibility check (see
-        // ConnectionManager::loop()) gates entry on RecordStore::static_pin_enabled().
-        this->record_store().set_static_pin_enabled(true);
     }
 
     /// Inject a fresh FakeConnection as current_connection_, with the given server_id and
@@ -596,15 +646,6 @@ protected:
     }
 
     RecordStore& record_store() { return *this->client_->record_store_; }
-
-    /// Install a static PIN the way a factory-provisioned one arrives: straight into the store's
-    /// value, as RecordStore's constructor does from the persistence provider's STATIC_PIN blob.
-    /// The public setter cannot stand in here, because it is the rotation entry point and marks
-    /// the PIN rotated (see RecordStore::static_pin_rotated()), which is exactly the distinction
-    /// the locations-hint tests below are about.
-    void seed_shipped_static_pin(const std::string& pin) {
-        this->record_store().static_pin_ = pin;
-    }
 
     /// Return the `locations` array on the client/hello descriptor for `method`, or nullopt when
     /// the descriptor omits the hint. Fails the calling test if the method is not advertised at
@@ -782,6 +823,14 @@ protected:
     RecordingListener listener_;
     FakeNetworkProvider network_provider_;
     FakePersistenceProvider persistence_provider_;
+
+    // Construction-time inputs replayed by build_client() on every rebuild.
+    bool pin_display_supported_{true};
+    bool pairing_window_supported_{true};
+    std::vector<std::string> pairing_psk_locations_;
+    std::vector<std::string> static_pin_locations_;
+    std::optional<std::string> static_pin_;
+    int dynamic_pin_min_length_{6};
     /// Keeps the last-injected FakeConnection alive independently of ConnectionManager's slot
     /// (see inject_current_connection). Only one connection is injected per test.
     std::shared_ptr<SendspinConnection> injected_conn_;
@@ -1133,7 +1182,7 @@ TEST_F(PinStateMachineTest, DynamicPinDeriveFailureOnPairAuthClosesSilently) {
 // (spec: Pairing Window).
 TEST_F(PinStateMachineTest, ShortDynamicPinIsGestureGated) {
     // Allow short PINs so the activation passes pin_length validation.
-    this->record_store().set_dynamic_pin_min_length(4);
+    this->configure_dynamic_pin_min_length(4);
 
     FakeConnection* conn = this->inject_current_connection(
         "server-dyn-short", SendspinPairMethod::DYNAMIC_PIN, /*pin_length=*/4);
@@ -1162,7 +1211,7 @@ TEST_F(PinStateMachineTest, ShortDynamicPinIsGestureGated) {
 // state: a gated attempt arriving within its lifetime proceeds without a further gesture
 // (and without a client/pair-pending).
 TEST_F(PinStateMachineTest, StandingWindowAdmitsLaterGatedAttempt) {
-    this->record_store().set_static_pin("13572468");
+    this->configure_static_pin("13572468");
 
     // Gesture first: no attempt is waiting, so the window stands open.
     this->client_->confirm_pairing_window();
@@ -1186,7 +1235,7 @@ TEST_F(PinStateMachineTest, StandingWindowAdmitsLaterGatedAttempt) {
 // An expired standing window admits nothing: the gated attempt falls back to
 // client/pair-pending and a fresh gesture.
 TEST_F(PinStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
-    this->record_store().set_static_pin("13572468");
+    this->configure_static_pin("13572468");
 
     this->client_->confirm_pairing_window();
     this->client_->loop();
@@ -1212,7 +1261,7 @@ TEST_F(PinStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
 // path.
 TEST_F(PinStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
     this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/false);
-    this->record_store().set_dynamic_pin_min_length(4);
+    this->configure_dynamic_pin_min_length(4);
 
     FakeConnection* conn = this->inject_current_connection(
         "server-dyn-nowindow", SendspinPairMethod::DYNAMIC_PIN, /*pin_length=*/4);
@@ -1239,7 +1288,7 @@ TEST_F(PinStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
 // =============================================================================
 
 TEST_F(PinStateMachineTest, StaticPinHappyPath) {
-    this->record_store().set_static_pin("13572468");
+    this->configure_static_pin("13572468");
 
     FakeConnection* conn =
         this->inject_current_connection("server-static-1", SendspinPairMethod::STATIC_PIN);
@@ -1307,7 +1356,7 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
 // activate" and the pairing window never opens. Mirrors the reference's _handle_server_activate,
 // which runs pairing on any pairing activate, not only the first.
 TEST_F(PinStateMachineTest, SubsequentActivateEntersStaticPinPairing) {
-    this->record_store().set_static_pin("13572468");
+    this->configure_static_pin("13572468");
 
     FakeConnection* conn = this->inject_provisional_current_connection("server-static-sub");
 
@@ -1426,7 +1475,7 @@ TEST_F(PinStateMachineTest, PairingActivateWithoutMethodIsAborted) {
 // =============================================================================
 
 TEST_F(PinStateMachineTest, StaticPinMismatchRecordsFailureAndAborts) {
-    this->record_store().set_static_pin("13572468");
+    this->configure_static_pin("13572468");
     FakeConnection* conn =
         this->inject_current_connection("server-static-2", SendspinPairMethod::STATIC_PIN);
     this->enter_pairing(conn);
@@ -1475,7 +1524,7 @@ TEST_F(PinStateMachineTest, StaticPinMismatchRecordsFailureAndAborts) {
 // own timeout and cancels via server/activate), so the wait for the gesture must not be
 // aborted by the client's attempt-timeout check.
 TEST_F(PinStateMachineTest, GestureWaitHasNoClientTimeout) {
-    this->record_store().set_static_pin("13572468");
+    this->configure_static_pin("13572468");
     FakeConnection* conn =
         this->inject_current_connection("server-static-3", SendspinPairMethod::STATIC_PIN);
     this->enter_pairing(conn);
@@ -1512,7 +1561,7 @@ TEST_F(PinStateMachineTest, GestureWaitHasNoClientTimeout) {
 // =============================================================================
 
 TEST_F(PinStateMachineTest, ConnectionLossDuringStaticPairingWindowClosesWindow) {
-    this->record_store().set_static_pin("13572468");
+    this->configure_static_pin("13572468");
     FakeConnection* conn =
         this->inject_current_connection("server-static-5", SendspinPairMethod::STATIC_PIN);
     this->enter_pairing(conn);
@@ -1588,7 +1637,7 @@ TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
 TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupStaticWindow) {
     // Static-PIN flavor: abort while AWAIT_PAIRING_WINDOW (before any PIN exchange even starts)
     // must still fire on_pairing_failed + on_close_pairing_window.
-    this->record_store().set_static_pin("13572468");
+    this->configure_static_pin("13572468");
     FakeConnection* conn =
         this->inject_current_connection("server-static-6", SendspinPairMethod::STATIC_PIN);
     this->enter_pairing(conn);
@@ -1619,7 +1668,7 @@ TEST_F(PinStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupStaticW
 // "connection is now operational" path converges, so no operational-entry path can leave a
 // stale PIN session or pending record behind.
 TEST_F(PinStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPinSession) {
-    this->record_store().set_static_pin("13572468");
+    this->configure_static_pin("13572468");
     FakeConnection* conn =
         this->inject_current_connection("server-leftover", SendspinPairMethod::STATIC_PIN);
     this->enter_pairing(conn);
@@ -1850,7 +1899,7 @@ TEST_F(PinStateMachineTest, ReproveWatchdogDropsConnectionAfterFinalizeAckGoesSi
 // own, must survive even though its provisional_time_us_ is stale by far more than
 // REPROVE_TIMEOUT_US.
 TEST_F(PinStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingHumanPinGesture) {
-    this->record_store().set_static_pin("13572468");
+    this->configure_static_pin("13572468");
     FakeConnection* conn =
         this->inject_current_connection("server-reprove-pin-wait", SendspinPairMethod::STATIC_PIN);
 
@@ -2020,60 +2069,27 @@ TEST_F(PinStateMachineTest, PersistLastPlayedServerSkipsDuplicateWrite) {
 }
 
 // ============================================================================
-// client/hello locations hint across a secret rotation
+// client/hello locations hint
 // ============================================================================
 
 // The configured hints describe where the shipped secrets were published, and ride every
-// client/hello until something rotates them (spec "client/hello pair-method descriptor").
+// client/hello (spec "client/hello pair-method descriptor").
 TEST_F(PinStateMachineTest, HelloAdvertisesConfiguredLocationsForShippedSecrets) {
     this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/true,
                       /*pairing_psk_locations=*/{"device"},
                       /*static_pin_locations=*/{"leaflet", "operator"});
-    this->seed_shipped_static_pin("13572468");
+    this->configure_static_pin("13572468");
 
     EXPECT_EQ(this->hello_locations("pairing_psk"), (std::vector<std::string>{"device"}));
     EXPECT_EQ(this->hello_locations("static_pin"),
               (std::vector<std::string>{"leaflet", "operator"}));
 }
 
-// Rotating the Pairing PSK kills every distributed copy of the shipped one, so the descriptor
-// must stop pointing at the device label. The static PIN was not
-// touched, so its own hint stands.
-TEST_F(PinStateMachineTest, HelloLocationsFollowThePairingPskRotation) {
-    this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/true,
-                      /*pairing_psk_locations=*/{"device"},
-                      /*static_pin_locations=*/{"leaflet"});
-    this->seed_shipped_static_pin("13572468");
+// With nothing configured the hint is omitted rather than guessed at: only the application knows
+// where its secrets were published.
+TEST_F(PinStateMachineTest, HelloOmitsLocationsWhenNoneAreConfigured) {
+    this->configure_static_pin("13572468");
 
-    SendspinPairingPsk rotated;
-    rotated.psk.fill(0x5a);
-    this->record_store().set_pairing_psk(rotated);
-
-    EXPECT_EQ(this->hello_locations("pairing_psk"), (std::vector<std::string>{"operator"}));
-    EXPECT_EQ(this->hello_locations("static_pin"), (std::vector<std::string>{"leaflet"}));
-}
-
-TEST_F(PinStateMachineTest, HelloLocationsFollowTheStaticPinRotation) {
-    this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/true,
-                      /*pairing_psk_locations=*/{"device"},
-                      /*static_pin_locations=*/{"device", "leaflet"});
-
-    this->record_store().set_static_pin("13572468");
-
-    EXPECT_EQ(this->hello_locations("static_pin"), (std::vector<std::string>{"operator"}));
-    EXPECT_EQ(this->hello_locations("pairing_psk"), (std::vector<std::string>{"device"}));
-}
-
-// With nothing configured the hint is omitted, since the library has no idea where the shipped
-// secret was published. A rotation is the point where it does know: the operator who sent it is
-// the only place the new secret exists, so the hint appears even though none was configured.
-TEST_F(PinStateMachineTest, HelloLocationsAppearOnRotationWithoutConfiguredHints) {
-    this->seed_shipped_static_pin("13572468");
     EXPECT_FALSE(this->hello_locations("pairing_psk").has_value());
     EXPECT_FALSE(this->hello_locations("static_pin").has_value());
-
-    this->record_store().set_static_pin("87654321");
-
-    EXPECT_EQ(this->hello_locations("static_pin"), (std::vector<std::string>{"operator"}));
-    EXPECT_FALSE(this->hello_locations("pairing_psk").has_value());
 }

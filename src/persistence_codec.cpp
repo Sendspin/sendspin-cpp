@@ -244,8 +244,6 @@ std::string encode_pairing_config(const SendspinPairingConfig& c) {
     doc["dynamic_pin_enabled"] = c.dynamic_pin_enabled;
     doc["static_pin_enabled"] = c.static_pin_enabled;
     doc["dynamic_pin_min_length"] = c.dynamic_pin_min_length;
-    doc["pairing_psk_rotated"] = c.pairing_psk_rotated;
-    doc["static_pin_rotated"] = c.static_pin_rotated;
     std::string out;
     serializeJson(doc, out);
     return out;
@@ -272,12 +270,6 @@ std::optional<SendspinPairingConfig> decode_pairing_config(std::string_view byte
     }
     if (obj["dynamic_pin_min_length"].is<int>()) {
         cfg.dynamic_pin_min_length = obj["dynamic_pin_min_length"].as<int>();
-    }
-    if (obj["pairing_psk_rotated"].is<bool>()) {
-        cfg.pairing_psk_rotated = obj["pairing_psk_rotated"].as<bool>();
-    }
-    if (obj["static_pin_rotated"].is<bool>()) {
-        cfg.static_pin_rotated = obj["static_pin_rotated"].as<bool>();
     }
     return cfg;
 }

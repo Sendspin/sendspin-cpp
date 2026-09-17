@@ -219,13 +219,11 @@ public:
     /// @brief Remove key. Absent counts as success. A false return means the value may
     /// survive a reboot.
     ///
-    /// Only `persistence_keys::PAIRING_PSK` and `persistence_keys::STATIC_PIN` are ever erased
-    /// this way; `persistence_keys::RECORDS` is never erased (a removal re-saves the shrunken
-    /// array instead, so the key stays present with an empty array). The in-memory effect of a
-    /// clear always takes place regardless of the return value (the PSK/PIN stops working for
-    /// the current boot either way); a `false` return means the value the library just cleared
-    /// may still be sitting in the store and will resume authenticating pairing attempts /
-    /// admitting the static PIN again after a reboot.
+    /// The library never erases a key today: every blob it owns is either rewritten in place or
+    /// left alone (a record removal re-saves the shrunken array, so
+    /// `persistence_keys::RECORDS` stays present with a shorter array). Implement it anyway so
+    /// the store has a working delete for an application that wipes the library keyspace itself,
+    /// for example on a factory reset.
     /// @return true if the key is gone from the store, false if it may still be there.
     virtual bool erase_blob(const std::string& /*key*/) {
         return false;

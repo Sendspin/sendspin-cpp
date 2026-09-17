@@ -252,89 +252,13 @@ TEST(RecordStore, RecordsRejectWrongPskSize) {
 }
 
 // =============================================================================
-// store_record: provider failure fails closed
-// =============================================================================
-
-TEST(RecordStore, StoreRecordFailsClosedWhenProviderRejectsWrite) {
-    RejectingPersistenceProvider provider;
-    RecordStore store(&provider);
-
-    SendspinPairingRecord rec = make_client_record("server-X");
-    EXPECT_FALSE(store.store_record(rec)) << "provider rejection must be reported";
-    EXPECT_GE(provider.save_attempts, 1);
-
-    // The in-memory store must be untouched: the record is neither resolvable for a
-    // handshake nor listed.
-    auto resolved = store.resolve_by_psk_id(rec.psk_id);
-    EXPECT_TRUE(!resolved.has_value() || resolved->category != PskCategory::LONG_TERM)
-        << "a rejected record must not resolve as long-term";
-    EXPECT_EQ(store.record_by_psk_id(rec.psk_id), nullptr);
-}
-
-// The same contract, phrased directly against the blob-store interface's
-// "records" key, with the InMemoryPersistenceProvider fake's fail-injection.
-TEST(RecordStore, StoreRecordFailsClosedWhenRecordsBlobSaveIsRejected) {
-    InMemoryPersistenceProvider provider;
-    RecordStore store(&provider);  // First-boot provisioning succeeds normally.
-
-    // One accepted record, so the rejected write below has a prior blob to preserve.
-    SendspinPairingRecord kept = make_client_record("server-kept");
-    ASSERT_TRUE(store.store_record(kept));
-
-    const int baseline_save_attempts = provider.save_attempts(persistence_keys::RECORDS);
-    provider.reject_save_keys.insert(persistence_keys::RECORDS);
-
-    SendspinPairingRecord rec = make_client_record("server-X");
-    EXPECT_FALSE(store.store_record(rec));
-    EXPECT_EQ(store.record_by_psk_id(rec.psk_id), nullptr);
-    EXPECT_GT(provider.save_attempts(persistence_keys::RECORDS), baseline_save_attempts)
-        << "the rejected write must have been attempted";
-
-    // The persisted blob must still decode to exactly what it held before the rejected write:
-    // the new record must not have leaked into the store despite the rejection.
-    auto decoded = decode_records_blob(provider.blob(persistence_keys::RECORDS));
-    ASSERT_TRUE(decoded.has_value());
-    ASSERT_EQ(decoded->size(), 1u);
-    EXPECT_EQ((*decoded)[0].psk_id, kept.psk_id);
-}
-
-TEST(RecordStore, StoreRecordReportsSuccessWithoutProvider) {
-    RecordStore store(nullptr);
-
-    SendspinPairingRecord rec = make_client_record("server-X");
-    EXPECT_TRUE(store.store_record(rec)) << "in-memory-only store must report success";
-    EXPECT_NE(store.record_by_psk_id(rec.psk_id), nullptr);
-}
-
-TEST(RecordStore, StoreRecordRejectionDoesNotReplaceExistingRecord) {
-    // Store an original record while the provider accepts, then flip the provider to
-    // rejecting and try to overwrite it under the same psk_id: the original must survive.
-    RejectingPersistenceProvider provider;
-    provider.reject = false;
-    RecordStore store(&provider);
-
-    SendspinPairingRecord original = make_client_record("server-X", "original");
-    ASSERT_TRUE(store.store_record(original));
-
-    provider.reject = true;
-    SendspinPairingRecord replacement = original;
-    replacement.label = "replacement";
-    EXPECT_FALSE(store.store_record(replacement));
-
-    const auto* kept = store.record_by_psk_id(original.psk_id);
-    ASSERT_NE(kept, nullptr);
-    EXPECT_EQ(kept->label, std::optional<std::string>("original"))
-        << "a rejected overwrite must leave the existing record untouched";
-}
-
-// =============================================================================
 // store_record_superseding: at most one record per server_id
 // =============================================================================
 
 // Re-pairing the same server_id twice (e.g. after the server was factory-reset and re-paired)
 // must revoke the prior per-server PSK rather than leaving it valid forever alongside the new
 // one. Mirrors the server/pair-finalize ack commit path: resolve_pairing_outcome() mints a
-// fresh record, then store_record() commits it.
+// fresh record, then store_record_superseding() commits it.
 TEST(RecordStore, StoreRecordSupersedesPriorRecordForSameServerId) {
     RecordStore store(nullptr);
     const std::string server_id = "server-repair";
@@ -423,22 +347,22 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
 // Capacity enforcement (max_records_)
 // =============================================================================
 
-// Filling the store to DEFAULT_MAX_RECORDS must succeed; the next genuine insert must be
-// rejected and must not change what is stored.
+// Pairing DEFAULT_MAX_RECORDS distinct servers must succeed; the next net-new pairing must be
+// refused before a record is minted, and must not change what is stored.
 TEST(RecordStore, CapacityRejectsInsertPastDefaultCap) {
     RecordStore store(nullptr);
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        SendspinPairingRecord rec = make_client_record("server-" + std::to_string(i));
-        ASSERT_TRUE(store.store_record(rec)) << "insert " << i << " should still fit";
+        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        ASSERT_TRUE(outcome.has_value()) << "pairing " << i << " should still fit";
+        ASSERT_TRUE(store.store_record_superseding(outcome->record));
     }
     ASSERT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
 
-    SendspinPairingRecord overflow = make_client_record("server-overflow");
-    EXPECT_FALSE(store.store_record(overflow))
-        << "store_record must reject a genuine insert once the store is at capacity";
-    EXPECT_EQ(store.record_by_psk_id(overflow.psk_id), nullptr);
+    EXPECT_FALSE(store.resolve_pairing_outcome("server-overflow").has_value())
+        << "a net-new pairing must be refused once the store is at capacity";
+    EXPECT_EQ(store.record_by_server_id("server-overflow"), nullptr);
     EXPECT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS)
-        << "a rejected insert must not change the record count";
+        << "a refused pairing must not change the record count";
 }
 
 // A supersede that replaces the record already held for a given server_id does not grow the
@@ -454,8 +378,9 @@ TEST(RecordStore, CapacitySupersedeAtCapacityStillSucceeds) {
 
     // Fill every remaining slot with other servers' records.
     for (size_t i = 1; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        SendspinPairingRecord rec = make_client_record("server-" + std::to_string(i));
-        ASSERT_TRUE(store.store_record(rec));
+        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        ASSERT_TRUE(outcome.has_value());
+        ASSERT_TRUE(store.store_record_superseding(outcome->record));
     }
     ASSERT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
 
@@ -480,11 +405,13 @@ TEST(RecordStore, CapacitySupersedeAtCapacityStillSucceeds) {
 TEST(RecordStore, CapacityCustomCapIsRespected) {
     RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/2);
 
-    ASSERT_TRUE(store.store_record(make_client_record("server-A")));
-    ASSERT_TRUE(store.store_record(make_client_record("server-B")));
+    for (const std::string& server_id : {std::string("server-A"), std::string("server-B")}) {
+        auto outcome = store.resolve_pairing_outcome(server_id);
+        ASSERT_TRUE(outcome.has_value());
+        ASSERT_TRUE(store.store_record_superseding(outcome->record));
+    }
 
-    SendspinPairingRecord overflow = make_client_record("server-C");
-    EXPECT_FALSE(store.store_record(overflow));
+    EXPECT_FALSE(store.resolve_pairing_outcome("server-C").has_value());
     EXPECT_EQ(store.records_snapshot().size(), 2u);
 }
 
@@ -496,7 +423,7 @@ TEST(RecordStore, ResolveByPskIdLongTermFirst) {
     RecordStore store(nullptr);
 
     SendspinPairingRecord rec = make_client_record("server-X");
-    store.store_record(rec);
+    store.store_record_superseding(rec);
 
     auto resolved = store.resolve_by_psk_id(rec.psk_id);
     ASSERT_TRUE(resolved.has_value());
@@ -507,10 +434,10 @@ TEST(RecordStore, ResolveByPskIdLongTermFirst) {
 }
 
 TEST(RecordStore, ResolveByPskIdPairingPskSecond) {
-    RecordStore store(nullptr);
-
+    InMemoryPersistenceProvider provider;
     SendspinPairingPsk p = make_pairing_psk();
-    store.set_pairing_psk(p);
+    provider.seed_blob(persistence_keys::PAIRING_PSK, to_bytes(encode_pairing_psk(p)));
+    RecordStore store(&provider);
 
     auto resolved = store.resolve_by_psk_id(p.psk_id);
     ASSERT_TRUE(resolved.has_value());
@@ -519,7 +446,7 @@ TEST(RecordStore, ResolveByPskIdPairingPskSecond) {
 }
 
 TEST(RecordStore, LongTermRecordWinsOverPairingPskWithSamePskId) {
-    RecordStore store(nullptr);
+    InMemoryPersistenceProvider provider;
 
     // Build a record and a pairing PSK that share the same psk_id (and PSK bytes).
     SendspinPairingRecord rec = make_client_record("server-X");
@@ -527,9 +454,10 @@ TEST(RecordStore, LongTermRecordWinsOverPairingPskWithSamePskId) {
     p.psk_id = rec.psk_id;
     p.psk = rec.psk;
     p.label = "dup";
+    provider.seed_blob(persistence_keys::PAIRING_PSK, to_bytes(encode_pairing_psk(p)));
 
-    store.set_pairing_psk(p);
-    store.store_record(rec);
+    RecordStore store(&provider);
+    store.store_record_superseding(rec);
 
     // Long-term record must win.
     auto resolved = store.resolve_by_psk_id(rec.psk_id);
@@ -563,7 +491,7 @@ TEST(RecordStore, RecordByServerIdFindsStoredPubkeyRecord) {
     RecordStore store(nullptr);
 
     SendspinPairingRecord rec = make_client_record("server-X");
-    store.store_record(rec);
+    store.store_record_superseding(rec);
 
     const auto* found = store.record_by_server_id("server-X");
     ASSERT_NE(found, nullptr);
@@ -583,7 +511,7 @@ TEST(RecordStore, MarkRecordUsed) {
 
     SendspinPairingRecord rec = make_client_record("server-X");
     EXPECT_FALSE(rec.used);
-    store.store_record(rec);
+    store.store_record_superseding(rec);
 
     store.mark_record_used(rec.psk_id);
 
@@ -611,8 +539,8 @@ TEST(RecordStore, RemoveRecordAndList) {
 
     SendspinPairingRecord a = make_client_record("server-A");
     SendspinPairingRecord b = make_client_record("server-B");
-    store.store_record(a);
-    store.store_record(b);
+    store.store_record_superseding(a);
+    store.store_record_superseding(b);
 
     // Both records are now findable.
     EXPECT_NE(store.record_by_psk_id(a.psk_id), nullptr);
@@ -664,22 +592,8 @@ public:
         return true;
     }
 
-    bool erase_blob(const std::string& key) override {
-        if (key == persistence_keys::PAIRING_PSK) {
-            this->clear_psk_attempts++;
-            return !this->refuse_delete;
-        }
-        if (key == persistence_keys::STATIC_PIN) {
-            this->clear_pin_attempts++;
-            return !this->refuse_delete;
-        }
-        return true;
-    }
-
     bool refuse_delete{true};
     std::vector<std::string> remove_attempts{};
-    int clear_psk_attempts{0};
-    int clear_pin_attempts{0};
 
 private:
     std::vector<SendspinPairingRecord> saved_{};
@@ -728,7 +642,8 @@ TEST(RecordStore, RemoveRecordErasesFromMemoryAndWarnsWhenTheProviderRefusesTheD
     RecordStore store(&provider);
 
     SendspinPairingRecord a = make_client_record("server-A");
-    store.store_record(a);
+    ASSERT_TRUE(store.store_record_superseding(a));
+    ASSERT_TRUE(store.persist_records());
     ASSERT_NE(store.record_by_psk_id(a.psk_id), nullptr);
 
     std::string logs;
@@ -757,7 +672,8 @@ TEST(RecordStore, RemoveRecordIsSilentWhenTheProviderAcceptsTheDelete) {
     RecordStore store(&provider);
 
     SendspinPairingRecord a = make_client_record("server-A");
-    store.store_record(a);
+    ASSERT_TRUE(store.store_record_superseding(a));
+    ASSERT_TRUE(store.persist_records());
 
     std::string logs;
     {
@@ -834,36 +750,6 @@ TEST(RecordStore, SupersedeIsSilentWhenTheProviderAcceptsTheFlush) {
     EXPECT_TRUE(rebooted.resolve_by_psk_id(replacement.psk_id).has_value());
 }
 
-// The Pairing PSK and the static PIN are revocations too, and carry the same contract: a store
-// that keeps them keeps authenticating pairing / pairing devices after a reboot.
-TEST(RecordStore, ClearPairingPskAndStaticPinWarnOnlyWhenTheProviderRefuses) {
-    RejectingDeleteProvider provider;
-    RecordStore store(&provider);
-
-    std::string refused_logs;
-    {
-        StderrCapture capture;
-        store.clear_pairing_psk();
-        store.clear_static_pin();
-        refused_logs = capture.release();
-    }
-    EXPECT_EQ(provider.clear_psk_attempts, 1);
-    EXPECT_EQ(provider.clear_pin_attempts, 1);
-    EXPECT_NE(refused_logs.find(REBOOT_WARNING), std::string::npos)
-        << "refused clears must be reported; got: " << refused_logs;
-
-    provider.refuse_delete = false;
-    std::string accepted_logs;
-    {
-        StderrCapture capture;
-        store.clear_pairing_psk();
-        store.clear_static_pin();
-        accepted_logs = capture.release();
-    }
-    EXPECT_EQ(accepted_logs.find(REBOOT_WARNING), std::string::npos)
-        << "accepted clears must not warn; got: " << accepted_logs;
-}
-
 // The refused delete is exactly the durability hole the bool return exists to surface: the
 // record the store kept comes back on the next start, and resolves as LONG_TERM trust again.
 TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
@@ -872,7 +758,8 @@ TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
     SendspinPairingRecord a = make_client_record("server-A");
     {
         RecordStore store(&provider);
-        store.store_record(a);
+        ASSERT_TRUE(store.store_record_superseding(a));
+        ASSERT_TRUE(store.persist_records());
         store.remove_record(a.psk_id);
         ASSERT_EQ(store.record_by_psk_id(a.psk_id), nullptr);
     }
@@ -889,32 +776,6 @@ TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
 // =============================================================================
 // Pairing PSK lifecycle
 // =============================================================================
-
-TEST(RecordStore, PairingPskLifecycle) {
-    RecordStore store(nullptr);
-
-    // First-boot provisioning already installed one; setting replaces it.
-    ASSERT_TRUE(store.pairing_psk().has_value());
-    const std::string provisioned_psk_id = store.pairing_psk()->psk_id;
-
-    SendspinPairingPsk p = make_pairing_psk();
-    store.set_pairing_psk(p);
-    EXPECT_TRUE(store.pairing_psk().has_value());
-    EXPECT_EQ(store.pairing_psk()->psk_id, p.psk_id);
-    EXPECT_FALSE(store.resolve_by_psk_id(provisioned_psk_id).has_value());
-
-    // Setting a new one replaces the old.
-    SendspinPairingPsk other = make_pairing_psk();
-    store.set_pairing_psk(other);
-    EXPECT_EQ(store.pairing_psk()->psk_id, other.psk_id);
-
-    store.clear_pairing_psk();
-    EXPECT_FALSE(store.pairing_psk().has_value());
-    EXPECT_FALSE(store.resolve_by_psk_id(other.psk_id).has_value());
-
-    // Clearing when absent is a no-op.
-    store.clear_pairing_psk();
-}
 
 /// A persistence provider that hands back a Pairing PSK whose psk_id does not match its secret.
 class MismatchedPairingPskProvider : public SendspinPersistenceProvider {
@@ -943,21 +804,6 @@ public:
 private:
     SendspinPairingPsk psk_;
 };
-
-TEST(RecordStore, PairingPskIdIsDerivedFromTheSecret) {
-    // A caller-supplied psk_id is ignored: the server references the derived id, so anything
-    // else would never resolve.
-    RecordStore store(nullptr);
-    SendspinPairingPsk p = make_pairing_psk();
-    const std::string correct_psk_id = p.psk_id;
-    p.psk_id = "not-a-derived-psk-id";
-    store.set_pairing_psk(p);
-
-    ASSERT_TRUE(store.pairing_psk().has_value());
-    EXPECT_EQ(store.pairing_psk()->psk_id, correct_psk_id);
-    EXPECT_TRUE(store.resolve_by_psk_id(correct_psk_id).has_value());
-    EXPECT_FALSE(store.resolve_by_psk_id("not-a-derived-psk-id").has_value());
-}
 
 TEST(RecordStore, LoadedPairingPskIdIsCorrected) {
     SendspinPairingPsk stored = make_pairing_psk();
@@ -1280,8 +1126,9 @@ TEST(RecordStoreWithFile, RemoveRecordShrinksThePersistedBlob) {
         RecordStore store(&provider);
         SendspinPairingRecord a = make_client_record("server-A");
         SendspinPairingRecord b = make_client_record("server-B");
-        ASSERT_TRUE(store.store_record(a));
-        ASSERT_TRUE(store.store_record(b));
+        ASSERT_TRUE(store.store_record_superseding(a));
+        ASSERT_TRUE(store.store_record_superseding(b));
+        ASSERT_TRUE(store.persist_records());
         a_psk_id = a.psk_id;
         b_psk_id = b.psk_id;
         store.remove_record(a_psk_id);
@@ -1439,11 +1286,15 @@ TEST(RecordStoreWithFile, UnpairedAccessSeedPersistsOnFirstBoot) {
 TEST(RecordStoreWithFile, UnpairedAccessSeedDoesNotOverrideStoredConfig) {
     TempFile tmp;
 
-    // First boot with the seed on, then the server turns unpaired access off.
+    // A device provisioned with unpaired access off already has a stored config saying so.
     {
         FilePersistenceProvider provider(tmp.path());
-        RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true);
-        store.set_unpaired_access_enabled(false);
+        SendspinPairingConfig stored;
+        stored.unpaired_access_enabled = false;
+        std::string blob = encode_pairing_config(stored);
+        ASSERT_TRUE(provider.save_blob(persistence_keys::PAIR_CONFIG,
+                                       reinterpret_cast<const uint8_t*>(blob.data()),
+                                       blob.size()));
     }
 
     // Reboot with the same seed still configured: the stored decision wins.
@@ -1490,7 +1341,7 @@ TEST(RecordStore, ResolvePairingOutcomeNormal) {
 // Storage-exhausted case: a net-new record has nowhere to go, so the pairing cannot be minted.
 TEST(RecordStore, ResolvePairingOutcomeExhausted) {
     RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/1);
-    ASSERT_TRUE(store.store_record(make_client_record("server-holding-the-slot")));
+    ASSERT_TRUE(store.store_record_superseding(make_client_record("server-holding-the-slot")));
 
     auto outcome = store.resolve_pairing_outcome("server-exhausted");
 
@@ -1508,7 +1359,7 @@ TEST(RecordStore, ResolvePairingOutcomeThenStore) {
     ASSERT_TRUE(outcome.has_value());
 
     // Simulate the ack path: store the pending record.
-    store.store_record(outcome->record);
+    store.store_record_superseding(outcome->record);
 
     const auto* stored = store.record_by_server_id(server_id);
     ASSERT_NE(stored, nullptr) << "record must be retrievable by server_id after store";
@@ -1527,8 +1378,8 @@ TEST(RecordStore, RecordsSnapshotReturnsAllRecords) {
 
     SendspinPairingRecord a = make_client_record("server-A");
     SendspinPairingRecord b = make_client_record("server-B");
-    store.store_record(a);
-    store.store_record(b);
+    store.store_record_superseding(a);
+    store.store_record_superseding(b);
 
     auto snap = store.records_snapshot();
     EXPECT_EQ(snap.size(), 2u);
@@ -1547,7 +1398,7 @@ TEST(RecordStore, RecordsSnapshotReturnsAllRecords) {
 TEST(RecordStore, RecordByPskIdCopyReturnsValueForPresent) {
     RecordStore store(nullptr);
     SendspinPairingRecord rec = make_client_record("server-copy-test");
-    store.store_record(rec);
+    store.store_record_superseding(rec);
 
     auto copy = store.record_by_psk_id_copy(rec.psk_id);
     ASSERT_TRUE(copy.has_value());
@@ -1622,52 +1473,8 @@ TEST(PlayerRoleStaticDelay, InvalidPersistedValueIsTreatedAsAbsent) {
 }
 
 // ============================================================================
-// Provisioning write ordering, load-time validation, and counter clamping
+// Static PIN load-time validation
 // ============================================================================
-
-namespace {
-
-/// @brief Blob store that records the ORDER in which keys were written, which
-/// InMemoryPersistenceProvider (a count-only fake) cannot express. Only the provisioning-order
-/// test needs this, so it stays local per the file's bespoke-fake convention above.
-class OrderRecordingProvider : public SendspinPersistenceProvider {
-public:
-    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
-        auto it = this->blobs_.find(key);
-        if (it == this->blobs_.end()) {
-            return std::nullopt;
-        }
-        return it->second;
-    }
-
-    bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
-        this->save_order.push_back(key);
-        this->blobs_[key] = std::vector<uint8_t>(data, data + len);
-        return true;
-    }
-
-    bool erase_blob(const std::string& key) override {
-        this->blobs_.erase(key);
-        return true;
-    }
-
-    /// @return Index of the first save of `key` in save_order, or -1 if never saved.
-    [[nodiscard]] int first_save_index(const std::string& key) const {
-        for (size_t i = 0; i < this->save_order.size(); ++i) {
-            if (this->save_order[i] == key) {
-                return static_cast<int>(i);
-            }
-        }
-        return -1;
-    }
-
-    std::vector<std::string> save_order;
-
-private:
-    std::map<std::string, std::vector<uint8_t>> blobs_;
-};
-
-}  // namespace
 
 // A STATIC_PIN blob that is not 8 decimal digits is rejected at load, exactly as RECORDS and
 // PAIRING_PSK are rejected by their decoders. Accepting it would leave the device advertising
@@ -1689,95 +1496,6 @@ TEST(RecordStore, AcceptsValidStoredStaticPin) {
     RecordStore store(&provider);
     ASSERT_TRUE(store.static_pin().has_value());
     EXPECT_EQ(store.static_pin().value(), "12345678");
-}
-
-// ============================================================================
-// Secret-rotation flags (retire the client/hello locations hint)
-// ============================================================================
-
-// Installing the shipped secrets is not a rotation: first-boot provisioning generates the
-// Pairing PSK, and a provider load restores whatever the factory wrote. Both must leave the
-// flags clear so a device keeps advertising the locations its label or leaflet really carries.
-TEST(RecordStore, ShippedSecretsAreNotRotations) {
-    InMemoryPersistenceProvider provider;
-    provider.seed_blob(persistence_keys::STATIC_PIN, to_bytes("12345678"));
-
-    RecordStore store(&provider);
-
-    ASSERT_TRUE(store.pairing_psk().has_value()) << "first boot provisions a Pairing PSK";
-    ASSERT_TRUE(store.static_pin().has_value());
-    EXPECT_FALSE(store.pairing_psk_rotated());
-    EXPECT_FALSE(store.static_pin_rotated());
-}
-
-TEST(RecordStore, RotationFlagsAreSetIndependently) {
-    RecordStore store(nullptr);
-    ASSERT_FALSE(store.pairing_psk_rotated());
-    ASSERT_FALSE(store.static_pin_rotated());
-
-    store.set_pairing_psk(make_pairing_psk());
-    EXPECT_TRUE(store.pairing_psk_rotated());
-    EXPECT_FALSE(store.static_pin_rotated()) << "the PIN's own hint is untouched";
-
-    store.set_static_pin("87654321");
-    EXPECT_TRUE(store.static_pin_rotated());
-}
-
-// The rotated secret survives a reboot, so the retired hint has to as well: reloading a factory
-// hint next to a server-set secret would send every server back to a label that no longer opens
-// the device.
-TEST(RecordStore, RotationFlagsSurviveAReboot) {
-    InMemoryPersistenceProvider provider;
-    provider.seed_blob(persistence_keys::STATIC_PIN, to_bytes("12345678"));
-    {
-        RecordStore store(&provider);
-        store.set_pairing_psk(make_pairing_psk());
-        store.set_static_pin("87654321");
-    }
-
-    RecordStore reloaded(&provider);
-    EXPECT_TRUE(reloaded.pairing_psk_rotated());
-    EXPECT_TRUE(reloaded.static_pin_rotated());
-}
-
-// The rotated secret and the flag retiring its locations hint live under separate provider keys,
-// so a provider that takes one write and rejects the other leaves them disagreeing. The order
-// decides which way: config first means the survivable state is "hint retired while the shipped
-// secret still works", costing an operator one wasted lookup, where the reverse would leave a
-// rotated device pointing at a label that no longer opens it.
-TEST(RecordStore, RotationWritesTheRetiredHintBeforeTheSecret) {
-    OrderRecordingProvider provider;
-    RecordStore store(&provider);
-
-    provider.save_order.clear();  // Drop first-boot provisioning's own writes.
-    store.set_pairing_psk(make_pairing_psk());
-    const int psk_config_idx = provider.first_save_index(persistence_keys::PAIR_CONFIG);
-    const int psk_idx = provider.first_save_index(persistence_keys::PAIRING_PSK);
-    ASSERT_GE(psk_config_idx, 0) << "the first rotation must persist the retired hint";
-    ASSERT_GE(psk_idx, 0);
-    EXPECT_LT(psk_config_idx, psk_idx);
-
-    provider.save_order.clear();
-    store.set_static_pin("87654321");
-    const int pin_config_idx = provider.first_save_index(persistence_keys::PAIR_CONFIG);
-    const int pin_idx = provider.first_save_index(persistence_keys::STATIC_PIN);
-    ASSERT_GE(pin_config_idx, 0);
-    ASSERT_GE(pin_idx, 0);
-    EXPECT_LT(pin_config_idx, pin_idx);
-}
-
-// Only the first rotation of each secret pays for a config write; the flag is already true
-// afterwards.
-TEST(RecordStore, RepeatedRotationSkipsTheRedundantConfigWrite) {
-    InMemoryPersistenceProvider provider;
-    RecordStore store(&provider);
-    const int writes_before = provider.save_attempts(persistence_keys::PAIR_CONFIG);
-
-    store.set_pairing_psk(make_pairing_psk());
-    EXPECT_EQ(provider.save_attempts(persistence_keys::PAIR_CONFIG), writes_before + 1);
-
-    store.set_pairing_psk(make_pairing_psk());
-    EXPECT_EQ(provider.save_attempts(persistence_keys::PAIR_CONFIG), writes_before + 1);
 }
 
 TEST(SendspinClientIdentity, ConnectToBeforeStartServerIsRefused) {
