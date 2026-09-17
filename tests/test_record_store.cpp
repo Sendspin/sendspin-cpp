@@ -988,10 +988,25 @@ TEST(FilePersistenceProvider, RecordWithoutServerIdIsSkipped) {
                                    reinterpret_cast<const uint8_t*>(encoded.data()),
                                    encoded.size()));
 
-    auto decoded = decode_records_blob(provider.load_blob(persistence_keys::RECORDS));
+    std::optional<std::vector<SendspinPairingRecord>> decoded;
+    std::string logs;
+    {
+        StderrCapture capture;
+        decoded = decode_records_blob(provider.load_blob(persistence_keys::RECORDS));
+        logs = capture.release();
+    }
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 1u) << "the unbound entry must be skipped, the bound one kept";
     EXPECT_EQ((*decoded)[0].psk_id, bound.psk_id);
+
+    // A silently dropped pairing makes a server look forgotten for no stated reason, so the skip
+    // names the record and why it went.
+    EXPECT_NE(logs.find("unbound"), std::string::npos)
+        << "the skip must name the record it dropped; got: " << logs;
+    EXPECT_NE(logs.find("server_id"), std::string::npos)
+        << "the skip must say why the record was dropped; got: " << logs;
+    EXPECT_EQ(logs.find(bound.psk_id), std::string::npos)
+        << "the accepted record must not be warned about; got: " << logs;
 }
 
 // The clear_* revocations (Pairing PSK / static PIN) carry the same contract via erase_blob():

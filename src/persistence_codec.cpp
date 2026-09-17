@@ -16,6 +16,7 @@
 
 #include "platform/base64.h"
 #include "platform/crypto.h"
+#include "platform/logging.h"
 #include "platform/memory.h"
 #include <ArduinoJson.h>
 
@@ -27,6 +28,8 @@
 #include <vector>
 
 namespace sendspin {
+
+static const char* const TAG = "sendspin.persistence_codec";
 
 namespace {
 
@@ -196,9 +199,23 @@ std::optional<std::vector<SendspinPairingRecord>> decode_pairing_records(std::st
     }
     std::vector<SendspinPairingRecord> out;
     for (JsonVariantConst entry : root["records"].as<JsonArrayConst>()) {
-        auto rec = record_from_object(entry.as<JsonObjectConst>());
+        JsonObjectConst obj = entry.as<JsonObjectConst>();
+        auto rec = record_from_object(obj);
         if (rec.has_value()) {
             out.push_back(std::move(rec.value()));
+            continue;
+        }
+        // A record the codec cannot accept is skipped so the rest of the blob still loads. Name
+        // the case a stored blob can actually hit: a record written before every PSK carried the
+        // server it was minted for (spec "Pre-Shared Key"), which nothing can match a handshake
+        // against now.
+        const bool has_server_id =
+            obj["server_id"].is<const char*>() && obj["server_id"].as<const char*>()[0] != '\0';
+        if (obj["psk_id"].is<const char*>() && !has_server_id) {
+            SS_LOGW(TAG,
+                    "Skipping stored pairing record %s: no server_id, so it cannot be bound to "
+                    "the server that holds it; that server has to pair again",
+                    obj["psk_id"].as<const char*>());
         }
     }
     return out;
