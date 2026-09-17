@@ -138,7 +138,11 @@ Lands as one reviewed series; interop is verified only at its end, in strict mod
   and cross-message merging; an included object replaces the current or pending state. An omitted
   `progress` clears the position.
 - A1/B11: drop `MANAGEMENT` from admission; accept `['playback', 'pairing']` and route the
-  pairing entry path for it; pairing no longer quiesces playback.
+  pairing entry path for it; pairing no longer quiesces playback. Two rows of the
+  category-to-activities table are still wrong and are corrected in the same pass: a long-term
+  PSK must not admit `['pairing']` (today `activities_allowed()` accepts it for every category),
+  and a Pairing PSK must admit the empty set, plus `['playback']` when unpaired access is
+  enabled (today it admits only `['pairing']`).
 
 Exit: strict-mode run pairs (Pairing PSK), plays and shows metadata with no rejection.
 
@@ -182,6 +186,6 @@ Exit: strict-mode dynamic and static code pairing against the harness.
 
 The controller role, visualizer binary layouts (IDs 16-20), metadata progress math and
 scheduled-update gating, the `client/goodbye` reason set, the 30 second provisional timeout, the
-admission rank mechanism and last-playback tiebreak, the stored-`server_id` post-match check,
+activity-rank arbitration and last-playback tiebreak, the stored-`server_id` post-match check,
 arrival time taken after decrypt and reassembly, `available: true` gated on time-filter
 convergence, `stream/clear` buffer discard, mid-stream format switches.

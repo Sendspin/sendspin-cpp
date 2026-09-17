@@ -59,12 +59,15 @@ inline bool contains_activity(const std::vector<SendspinActivity>& activities,
 /// Ports `_activities_allowed` from
 /// aiosendspin/aiosendspin/client/connection.py.
 ///
-/// Rules (mirroring the reference exactly):
-///   - If PAIRING in activities -> only {PAIRING} is valid.
+/// What the code does today, in the order it decides:
+///   - PAIRING present in activities -> allowed for ANY category, and only as {PAIRING}.
 ///   - LONG_TERM category -> the empty set or {PLAYBACK}.
-///   - SENTINEL category -> empty set is ok; {PLAYBACK} is ok IFF unpaired_access.
-///   - PAIRING category -> only {PAIRING} (handled by the first check above;
-///     anything else falls through to false).
+///   - SENTINEL category -> the empty set is ok; {PLAYBACK} is ok IFF unpaired_access.
+///   - PAIRING category -> nothing beyond the {PAIRING} the first branch already took.
+///
+/// The first branch does not consult the category, so a long-term PSK can declare {PAIRING} and
+/// a Pairing PSK cannot declare the empty set or {PLAYBACK}. Both differ from the spec's
+/// category table in "server/activate"; see docs/rc1-migration.md, phase 3.
 ///
 /// @param category    PSK category matched during the Noise handshake.
 /// @param activities  Activities declared in the server/activate message.
@@ -74,7 +77,7 @@ inline bool activities_allowed(PskCategory category,
                                const std::vector<SendspinActivity>& activities,
                                bool unpaired_access) {
     if (contains_activity(activities, SendspinActivity::PAIRING)) {
-        // Only {PAIRING} is valid when PAIRING is present.
+        // Pairing is exclusive: nothing else may ride along with it.
         return activities.size() == 1;
     }
 
