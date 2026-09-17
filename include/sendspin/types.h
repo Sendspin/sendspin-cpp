@@ -43,7 +43,7 @@ enum class SendspinGoodbyeReason : uint8_t {
     UNAUTHORIZED,        // Server requested an activity the client's trust level does not permit
     PAIRING_REQUIRED,    // Server requested playback but client requires pairing first
     CONCURRENT_ATTEMPT,  // Incoming connection rejected because another is already admitted
-    UNPAIRED,            // Server unpaired this device via management/server-unpair
+    UNPAIRED,            // Server unpaired this device via server/unpair
 };
 
 /// @brief Server identity fields received in server/hello messages

@@ -55,8 +55,7 @@ static constexpr int PIN_MAX_DIGITS = 12;
 /// @brief Default minimum PIN length (server-chosen default).
 static constexpr int PIN_DEFAULT_MIN_DIGITS = 6;
 
-/// @brief Fixed length of a static PIN, in decimal digits.
-/// Mirrors `_STATIC_PIN_DIGITS` in aiosendspin/client/management.py.
+/// @brief Fixed length of a static PIN, in decimal digits (spec "Static Pairing Code").
 static constexpr int STATIC_PIN_DIGITS = 8;
 
 // ============================================================================
@@ -64,7 +63,6 @@ static constexpr int STATIC_PIN_DIGITS = 8;
 // ============================================================================
 
 /// @brief Return whether `pin` is exactly STATIC_PIN_DIGITS decimal digits.
-/// Mirrors `_valid_static_pin` in aiosendspin/client/management.py.
 inline bool is_valid_static_pin(const std::string& pin) {
     if (pin.size() != static_cast<size_t>(STATIC_PIN_DIGITS)) {
         return false;

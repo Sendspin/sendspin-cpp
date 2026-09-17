@@ -57,7 +57,7 @@ std::string psk_id_for(const std::array<uint8_t, NOISE_PSK_SIZE>& psk) {
     // psk.size() == NOISE_PSK_SIZE always for a fixed-size array, so the only way the
     // pointer/length overload can fail here is if the underlying SHA-256 computation itself
     // failed. This overload's non-optional return type is depended on throughout the tree
-    // (record store, management, tests) as a plain std::string, so there is no safe value to
+    // (record store, tests) as a plain std::string, so there is no safe value to
     // return on failure; fail loudly rather than silently deriving a psk_id from a
     // zero digest (matching the CSPRNG-failure precedent in platform_random_bytes()).
     auto result = psk_id_for(psk.data(), psk.size());

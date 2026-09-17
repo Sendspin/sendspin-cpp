@@ -1376,7 +1376,7 @@ TEST(NoiseHandshakeDriver, MalformedMsg1GarbageAborts) {
 //
 // Sends come from more than one thread in production: on ESP the periodic client/time message
 // is built and encrypted on the httpd worker task (async_send_time_text in
-// esp/server_connection.cpp), while management and pairing sends encrypt on the main loop.
+// esp/server_connection.cpp), while pairing sends encrypt on the main loop.
 // fragment_and_send_locked() therefore has to hold session_mutex_ across every frame, not
 // re-acquire it per frame; otherwise a small concurrent send lands a complete frame in the gap.
 //

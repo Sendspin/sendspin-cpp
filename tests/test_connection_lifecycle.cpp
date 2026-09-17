@@ -21,7 +21,7 @@
 // transport layer and never occupies a slot).
 //
 // test_encrypted_lifecycle.cpp covers the protocol layer riding on that lifecycle (hello/activate,
-// pairing, management, in-band re-handshake) against the same fixtures.
+// pairing, in-band re-handshake) against the same fixtures.
 
 #include "crypto/constants.h"
 #include "connection_manager.h"  // resolve_liveness_timeout_ms

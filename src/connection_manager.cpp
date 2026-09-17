@@ -1476,7 +1476,7 @@ std::vector<NurseryEntry>::iterator ConnectionManager::release_nursery_entry(
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
     this->refresh_nursery_size_hint();
-    // Leaving management: block stale network-thread dispatch into role/state queues during the
+    // Leaving the manager: block stale network-thread dispatch into role/state queues during the
     // goodbye window. Outgoing sends, including the goodbye itself, are unaffected.
     conn->disable_message_dispatch();
     this->remove_hello_retry(conn.get());
@@ -1702,7 +1702,7 @@ std::vector<NurseryEntry>::iterator ConnectionManager::promote_or_arbitrate_nurs
             conn->send_app_json(format_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT),
                                 nullptr);
         }
-        // Leaving management: block stale network-thread dispatch during the goodbye window
+        // Leaving the manager: block stale network-thread dispatch during the goodbye window
         // (outgoing sends, including the goodbye itself, are unaffected).
         conn->disable_message_dispatch();
         this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);

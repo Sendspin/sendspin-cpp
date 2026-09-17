@@ -185,7 +185,7 @@ public:
 /// and return, not add blocking of its own (a synchronous retry loop, a multi-second fsync
 /// chain). Held locks are on the call stack for the duration. A failed write should be reported
 /// by returning false rather than retried inline; the library already handles that (durability
-/// warnings, fail-closed management add-record) as described below on save_blob/erase_blob.
+/// warnings) as described below on save_blob/erase_blob.
 class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;
@@ -196,9 +196,8 @@ public:
         return std::nullopt;
     }
 
-    /// @brief Persist bytes under key. Returning true means DURABLY stored (the library
-    /// gates management/add-record results on this for the "records" key, and revocation
-    /// durability on it for removals).
+    /// @brief Persist bytes under key. Returning true means DURABLY stored (the library gates
+    /// revocation durability on it for removals from the "records" key).
     ///
     /// A rejected write is reported, not retried: the in-memory state it was meant to capture
     /// stays authoritative for the current boot, and the library logs a warning naming what will
@@ -208,9 +207,7 @@ public:
     /// removal means the store still holds the old array and will hand the revoked record back
     /// at the next boot, silently making the revoked PSK valid again (the revoked record is
     /// always dropped from RAM regardless of this return value, so a `false` does not undo
-    /// that). The one fail-closed consumer is `management/add-record`, which reports a rejected
-    /// write to the requesting server as storage_exhausted rather than promising a credential
-    /// the device does not durably hold.
+    /// that).
     /// A provider that cannot report durability synchronously (one that queues the write) should
     /// return true and surface its own write failures; the library's warnings are only as
     /// accurate as this return value, so report failure honestly rather than swallowing it.

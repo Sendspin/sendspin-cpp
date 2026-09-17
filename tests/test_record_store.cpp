@@ -1309,7 +1309,7 @@ TEST(RecordStoreWithFile, RemoveRecordShrinksThePersistedBlob) {
 // =============================================================================
 
 /// A persistence provider that hands back a canned pairing config. Lets a test present a
-/// loaded config whose record_mode_psk_id is empty or dangling: states FilePersistenceProvider
+/// loaded config: states FilePersistenceProvider
 /// collapses into "nothing stored", so they are unreachable through it.
 class CannedConfigProvider : public SendspinPersistenceProvider {
 public:
@@ -1767,7 +1767,7 @@ TEST(RecordStore, RotationWritesTheRetiredHintBeforeTheSecret) {
 }
 
 // Only the first rotation of each secret pays for a config write; the flag is already true
-// afterwards, and this path is reachable from the network (management/set-pairing-config).
+// afterwards.
 TEST(RecordStore, RepeatedRotationSkipsTheRedundantConfigWrite) {
     InMemoryPersistenceProvider provider;
     RecordStore store(&provider);
@@ -1888,7 +1888,7 @@ TEST(RecordStoreConcurrency, ResolvePairingOutcomeDoesNotRaceRecordStores) {
         auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i %
                                                                                 SERVER_ID_SPACE));
         // Every resolve must yield a usable PSK: either a freshly minted long-term one or the
-        // shared-PSK fallback. A torn read of records_ would surface here as a miss.
+        // record. A torn read of records_ would surface here as a miss.
         ASSERT_TRUE(outcome.has_value());
     }
 

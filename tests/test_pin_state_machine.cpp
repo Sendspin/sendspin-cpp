@@ -262,7 +262,7 @@ public:
 };
 
 /// Persistence provider that does nothing (in-memory RecordStore defaults are sufficient for
-/// these tests: shared-PSK fallback record is generated fresh, no config restrictions). Counts
+/// these tests: nothing is restored, no config restrictions). Counts
 /// save_blob() calls per key, still returning false like the base class default, so tests can
 /// assert on write counts (e.g. the persist_last_played_server() dedup guard) without disturbing
 /// the always-fails behavior the RECORDS-storage-failure tests rely on.
