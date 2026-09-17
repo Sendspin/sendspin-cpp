@@ -98,9 +98,8 @@ struct ResolvedPsk {
 ///     callers must not retain a returned pointer or reference across any mutation, and must
 ///     never call them from the network thread.
 ///   - Most config fields (`unpaired_access_enabled_`, `dynamic_pin_enabled_`,
-///     `static_pin_enabled_`, `dynamic_pin_min_length_`, `dynamic_pin_failures_`) are
-///     main-loop-only: written only on the main loop and read only on the main loop, so no
-///     lock is needed.
+///     `static_pin_enabled_`, `dynamic_pin_min_length_`) are main-loop-only: written only on
+///     the main loop and read only on the main loop, so no lock is needed.
 ///   - `pairing_psk_enabled_` is the ONE exception and IS guarded by `mutex_`. It is written on
 ///     the main loop like its neighbours, but it is also READ on the network thread, inside
 ///     `resolve_by_psk_id`'s locked section, because a disabled Pairing PSK must drop out of the
@@ -271,36 +270,6 @@ public:
     }
 
     // ========================================
-    // Dynamic-PIN failure counter (escalation, persisted)
-    // ========================================
-
-    /// @brief Failure count at which dynamic_pin becomes escalated (gesture-gated).
-    static constexpr int DYNAMIC_PIN_ESCALATION_THRESHOLD = 10;
-
-    /// @brief Return true if dynamic_pin is escalated: every attempt is gesture-gated until a
-    /// successful server_kc verification de-escalates it. Escalation is not an error state:
-    /// the method stays offered.
-    [[nodiscard]] bool dynamic_pin_escalated() const {
-        return this->dynamic_pin_failures_ >= DYNAMIC_PIN_ESCALATION_THRESHOLD;
-    }
-
-    /// @brief Return the current dynamic-PIN failure count.
-    [[nodiscard]] int dynamic_pin_failure_count() const {
-        return this->dynamic_pin_failures_;
-    }
-
-    /// @brief Increment the dynamic-PIN failure counter. Called only when the client's own
-    /// verification of server_kc fails; no other event increments it. Persists only at the
-    /// first failure since a reset and at the failure that crosses
-    /// DYNAMIC_PIN_ESCALATION_THRESHOLD (see the .cpp for the durability invariant this
-    /// preserves), not on every call, to bound flash writes on this network-reachable path.
-    void record_dynamic_pin_failure();
-
-    /// @brief Reset the dynamic-PIN failure counter to zero and persist it. Called when the
-    /// client's own verification of server_kc succeeds, whether or not the attempt finalizes.
-    void reset_dynamic_pin_failures();
-
-    // ========================================
     // Static PIN
     // ========================================
 
@@ -452,9 +421,6 @@ private:
     size_t max_records_{DEFAULT_MAX_RECORDS};
 
     // 32-bit fields
-    /// Dynamic-PIN failure counter (persisted through SendspinPairingConfig so escalation
-    /// survives reboots). static_pin has no counter: it is gesture-gated on every attempt.
-    int dynamic_pin_failures_{0};
     int dynamic_pin_min_length_{PIN_DEFAULT_MIN_DIGITS};
     // include/sendspin/config.h's SendspinPairingConfig::dynamic_pin_min_length hardcodes this
     // same default as a literal (a public header cannot include this private one); keep the two

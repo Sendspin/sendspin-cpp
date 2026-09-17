@@ -122,8 +122,7 @@ static constexpr int64_t PIN_ATTEMPT_TIMEOUT_US = 120LL * 1000LL * US_PER_MS;
 static constexpr int64_t WINDOW_LIFETIME_US = 300LL * 1000LL * US_PER_MS;
 
 /// @brief Dynamic-PIN gesture-gating floor (spec: Pairing Window): a session PIN shorter than
-/// this many digits is gesture-gated even when the method is not escalated: short PINs are
-/// bought with a gesture. static_pin is gesture-gated on every attempt.
+/// this many digits is bought with a gesture. static_pin is gesture-gated on every attempt.
 static constexpr int PIN_GESTURE_GATE_MIN_LENGTH = 6;
 
 /// @brief CPace sid label (spec "PAKE"): sid = LABEL || h || counter (big-endian uint32).
@@ -1831,9 +1830,8 @@ void ConnectionManager::handle_enter_pairing_pin(SendspinConnection* conn, uint3
     }
 
     // Gesture gating (spec: Pairing Window). static_pin: every attempt. dynamic_pin: only
-    // when the method is escalated by its failure counter, or the session PIN is short.
-    const bool gesture_gated =
-        !is_dynamic || store.dynamic_pin_escalated() || ps.pin_length < PIN_GESTURE_GATE_MIN_LENGTH;
+    // when the session PIN is short.
+    const bool gesture_gated = !is_dynamic || ps.pin_length < PIN_GESTURE_GATE_MIN_LENGTH;
 
     if (gesture_gated && !this->pairing_window_open()) {
         // No window open: report the pending gesture with client/pair-pending and wait.
@@ -2328,26 +2326,14 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
         return;
     }
 
-    // Verify server_kc (server confirmation tag). Only dynamic_pin carries a failure
-    // counter (spec: Failure counter): the client's own verification of server_kc
-    // failing is the ONE event that increments it, and it escalates the method to
-    // gesture-gating at the threshold rather than locking it out.
+    // Verify server_kc (server confirmation tag).
     if (!ps.cpace.verify(event.server_kc.data(), event.server_kc.size())) {
         SS_LOGW(TAG,
                 "handle_pin_pairing_message: server_kc verification failed "
                 "(PIN mismatch) for server_id=%s",
                 server_id.c_str());
-        if (ps.method == SendspinPairMethod::DYNAMIC_PIN) {
-            store.record_dynamic_pin_failure();
-        }
         this->local_abort_pin_pairing(conn, PairAbortReason::PIN_MISMATCH);
         return;
-    }
-
-    // server_kc verified: the dynamic-PIN failure counter resets (whether or not the
-    // attempt goes on to finalize), de-escalating the method.
-    if (ps.method == SendspinPairMethod::DYNAMIC_PIN) {
-        store.reset_dynamic_pin_failures();
     }
 
     // Compute client_kc (our confirmation tag).

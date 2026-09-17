@@ -490,7 +490,7 @@ public:
     enum class PinStep : uint8_t {
         IDLE,                        ///< No PIN session active.
         AWAIT_PAIRING_WINDOW,        ///< Gesture-gated attempt (static PIN always; dynamic PIN when
-                                     ///< escalated or pin_length < 6): client/pair-pending was sent
+                                     ///< pin_length < 6): client/pair-pending was sent
                                      ///< and client/pair-init waits for a pairing window to open.
         AWAIT_SERVER_PAIR_INIT,      ///< dynamic PIN only: sent client/pair-init (commit_B);
                                      ///< waiting for server/pair-init.

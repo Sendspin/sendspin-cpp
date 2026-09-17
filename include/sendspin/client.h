@@ -134,14 +134,13 @@ public:
 
     /// @brief Called when the operator must perform the device pairing-window gesture to allow
     /// a gesture-gated PIN pairing attempt (static PIN: every attempt; dynamic PIN: when the
-    /// method is escalated by its failure counter or the session PIN is shorter than 6 digits).
+    /// session PIN is shorter than 6 digits).
     ///
     /// Fires on the main loop. Only called when SendspinClientConfig::pairing_window_supported
     /// is true; a device offering dynamic_pin should therefore also implement this gesture UI,
-    /// or an escalated/short-PIN attempt can only proceed via management/open-pairing-window
-    /// (or stall until the server cancels it). Always followed by on_close_pairing_window when
-    /// the attempt concludes. The application confirms the gesture by calling
-    /// SendspinClient::confirm_pairing_window().
+    /// or a short-PIN attempt stalls until the server cancels it. Always followed by
+    /// on_close_pairing_window when the attempt concludes. The application confirms the gesture
+    /// by calling SendspinClient::confirm_pairing_window().
     virtual void on_open_pairing_window() {}
 
     /// @brief Called to dismiss the pairing-window prompt after every attempt that triggered
@@ -631,7 +630,7 @@ public:
 
     /// @brief Signals that the operator performed the device pairing-window gesture.
     /// Thread-safe. Opens a pairing window: a gesture-gated PIN attempt already waiting
-    /// (static PIN always; dynamic PIN when escalated or the session PIN is short) proceeds
+    /// (static PIN always; dynamic PIN when the session PIN is short) proceeds
     /// immediately; otherwise the window stands open for 5 minutes and admits the next pairing
     /// attempt without a further gesture.
     void confirm_pairing_window();

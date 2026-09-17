@@ -824,15 +824,11 @@ TEST_F(PinStateMachineTest, DynamicPinHappyPath) {
     // comment for the rationale.
     ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_psk_finalize(conn->sent_text_, server));
 
-    // Success callbacks: on_clear_pairing_pin fires (display -> clear ordering), and the
-    // dynamic-PIN failure counter is reset (was already 0, but exercise the call path by
-    // checking it stays at 0 and the method is not escalated).
+    // Success callbacks: on_clear_pairing_pin fires (display -> clear ordering).
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_PIN));
     EXPECT_LT(this->listener_.first_index_of(PairingEventKind::DISPLAY_PIN),
              this->listener_.first_index_of(PairingEventKind::CLEAR_PIN));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
-    EXPECT_FALSE(this->record_store().dynamic_pin_escalated());
-    EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 0);
 }
 
 // A PIN attempt that reaches PAIR_CONFIRM success already dismisses the displayed PIN there (see
@@ -879,7 +875,7 @@ TEST_F(PinStateMachineTest, AbortAfterConfirmDoesNotReclearAlreadyDismissedPin) 
 // Dynamic PIN: PIN mismatch (bad server_kc)
 // =============================================================================
 
-TEST_F(PinStateMachineTest, DynamicPinMismatchRecordsFailureAndAborts) {
+TEST_F(PinStateMachineTest, DynamicPinMismatchAborts) {
     FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-2");
 
     PinDisplayResult display;
@@ -905,11 +901,9 @@ TEST_F(PinStateMachineTest, DynamicPinMismatchRecordsFailureAndAborts) {
     bogus_server_kc.fill(0xAB);
     this->schedule_pair_confirm(bogus_server_kc);
 
-    // Device must abort with pin_mismatch, record a DYNAMIC_PIN failure, and fire the failure
-    // callbacks: on_pairing_failed AND on_clear_pairing_pin both survive
-    // cleanup_connection_state().
+    // Device must abort with pin_mismatch and fire the failure callbacks: on_pairing_failed
+    // AND on_clear_pairing_pin both survive cleanup_connection_state().
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pin_mismatch");
-    EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 1);
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::PIN_MISMATCH);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_PIN));
@@ -1083,10 +1077,8 @@ TEST_F(PinStateMachineTest, DynamicPinMalformedFrameWithNoActiveSessionIsIgnored
 // any application-level error message, and persists nothing. A derive() failure happens on the
 // peer's raw share BEFORE the PIN-derived generator can even be compared, so it can never be
 // produced by an operator simply mistyping the PIN (that produces a well-formed shared secret
-// that only fails the confirm-tag check exercised by DynamicPinMismatchRecordsFailureAndAborts
-// above); it must not count toward the dynamic-PIN failure counter or escalate the method, which
-// is the security-relevant half of this test.
-TEST_F(PinStateMachineTest, DynamicPinDeriveFailureOnPairAuthClosesSilentlyWithoutFailureCount) {
+// that only fails the confirm-tag check exercised by DynamicPinMismatchAborts above).
+TEST_F(PinStateMachineTest, DynamicPinDeriveFailureOnPairAuthClosesSilently) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-7", SendspinPairMethod::DYNAMIC_PIN);
     this->enter_pairing(conn);
@@ -1135,60 +1127,13 @@ TEST_F(PinStateMachineTest, DynamicPinDeriveFailureOnPairAuthClosesSilentlyWitho
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_PIN))
         << "PIN was displayed for this session, so the close must clear it";
-
-    // Security-relevant assertion: a peer that never knew the PIN, and only sent a malformed
-    // share, must NOT be able to drive the dynamic-PIN failure counter or escalate the method.
-    EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 0);
-    EXPECT_FALSE(this->record_store().dynamic_pin_escalated());
 }
 
-// =============================================================================
-// Dynamic PIN: escalation (gesture gating, not a lockout)
-// =============================================================================
-
-// At the failure threshold the method is escalated, NOT locked out: the attempt is not
-// refused, it is gesture-gated. The client reports the pending gesture with
-// client/pair-pending and proceeds normally once the operator opens the window.
-TEST_F(PinStateMachineTest, EscalatedDynamicPinIsGestureGatedNotRefused) {
-    FakeConnection* conn =
-        this->inject_current_connection("server-dyn-6", SendspinPairMethod::DYNAMIC_PIN);
-
-    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
-        this->record_store().record_dynamic_pin_failure();
-    }
-    ASSERT_TRUE(this->record_store().dynamic_pin_escalated());
-
-    this->enter_pairing(conn);
-    this->client_->loop();
-
-    // No abort, no refusal: client/pair-pending goes out and the operator is prompted.
-    ASSERT_EQ(conn->sent_text_.size(), 1u);
-    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
-    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_PAIRING_WINDOW);
-    EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED));
-    EXPECT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
-    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
-    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-init"));
-
-    // pair-pending does not start the attempt or its timeout.
-    EXPECT_EQ(conn->pin_session().attempt_deadline_us, 0);
-
-    // The operator gesture opens the window: the attempt starts (client/pair-init with
-    // commit_B) and the attempt timeout is armed.
-    this->client_->confirm_pairing_window();
-    this->client_->loop();
-    ASSERT_EQ(conn->sent_text_.size(), 2u);
-    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
-    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_SERVER_PAIR_INIT);
-    EXPECT_GT(conn->pin_session().attempt_deadline_us, 0);
-}
-
-// A session pin_length below 6 gesture-gates the attempt even when the method is not
-// escalated: short PINs are bought with a gesture (spec: Pairing Window).
+// A session pin_length below 6 gesture-gates the attempt: short PINs are bought with a gesture
+// (spec: Pairing Window).
 TEST_F(PinStateMachineTest, ShortDynamicPinIsGestureGated) {
     // Allow short PINs so the activation passes pin_length validation.
     this->record_store().set_dynamic_pin_min_length(4);
-    ASSERT_FALSE(this->record_store().dynamic_pin_escalated());
 
     FakeConnection* conn = this->inject_current_connection(
         "server-dyn-short", SendspinPairMethod::DYNAMIC_PIN, /*pin_length=*/4);
@@ -1260,21 +1205,17 @@ TEST_F(PinStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
 }
 
 // A device that offers dynamic_pin but has no pairing-window gesture UI
-// (pairing_window_supported=false) can still hit the gesture gate through escalation. The
-// on_open_pairing_window prompt must NOT fire (its contract requires the flag), but the
+// (pairing_window_supported=false) can still hit the gesture gate through a short session PIN.
+// The on_open_pairing_window prompt must NOT fire (its contract requires the flag), but the
 // spec-mandated client/pair-pending still goes out, and the attempt remains recoverable by a
 // window opened through confirm_pairing_window(), which drives the same open_pairing_window()
 // path.
 TEST_F(PinStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
     this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/false);
+    this->record_store().set_dynamic_pin_min_length(4);
 
-    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
-        this->record_store().record_dynamic_pin_failure();
-    }
-    ASSERT_TRUE(this->record_store().dynamic_pin_escalated());
-
-    FakeConnection* conn =
-        this->inject_current_connection("server-dyn-nowindow", SendspinPairMethod::DYNAMIC_PIN);
+    FakeConnection* conn = this->inject_current_connection(
+        "server-dyn-nowindow", SendspinPairMethod::DYNAMIC_PIN, /*pin_length=*/4);
     this->enter_pairing(conn);
     this->client_->loop();
 
@@ -1353,8 +1294,6 @@ TEST_F(PinStateMachineTest, StaticPinHappyPath) {
     EXPECT_LT(this->listener_.first_index_of(PairingEventKind::OPEN_WINDOW),
              this->listener_.first_index_of(PairingEventKind::CLOSE_WINDOW));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
-    EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 0)
-        << "a static-PIN attempt must never touch the dynamic-PIN failure counter";
 }
 
 // =============================================================================
@@ -1526,9 +1465,6 @@ TEST_F(PinStateMachineTest, StaticPinMismatchRecordsFailureAndAborts) {
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::PIN_MISMATCH);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::SUCCEEDED));
-    // The failure counter is dynamic-PIN only (spec: Failure counter); a static-PIN mismatch
-    // must not touch it.
-    EXPECT_EQ(this->record_store().dynamic_pin_failure_count(), 0);
 }
 
 // =============================================================================

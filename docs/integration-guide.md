@@ -627,8 +627,8 @@ struct MyClientListener : SendspinClientListener {
     }
 
     // PIN pairing: prompt/dismiss the operator pairing-window gesture for a gesture-gated
-    // attempt (static PIN: every attempt; dynamic PIN: when the method is escalated by its
-    // failure counter or the session PIN is shorter than 6 digits). Confirm the gesture by
+    // attempt (static PIN: every attempt; dynamic PIN: when the session PIN is shorter than
+    // 6 digits). Confirm the gesture by
     // calling client.confirm_pairing_window() (thread-safe) once the operator performs it;
     // calling it with no attempt waiting opens a standing 5-minute pairing window that admits
     // the next attempt without a further gesture.
@@ -809,8 +809,8 @@ says, and the server is then limited to the pairing-token flow.
 
 Some PIN attempts are **gesture-gated**: the client answers the pairing activation with
 `client/pair-pending` and withholds `client/pair-init` until a pairing window is open. Static
-PIN gates every attempt; dynamic PIN gates an attempt only when the method is *escalated* or
-the session's PIN length is below 6 digits. The window opens on the operator gesture
+PIN gates every attempt; dynamic PIN gates an attempt only when the session's PIN length is
+below 6 digits. The window opens on the operator gesture
 (`confirm_pairing_window()`), it lives for 5 minutes, and it admits exactly one attempt. A gesture performed before the
 activation arrives leaves the window standing open, so the next attempt within its lifetime
 proceeds without a prompt.
@@ -820,12 +820,6 @@ The gating rules apply to dynamic PIN even on a device that leaves
 fire, so a gated attempt sends `client/pair-pending`, logs a warning, and waits for the
 server's own timeout to cancel it. A device that offers `dynamic_pin` should therefore set
 `pairing_window_supported` and implement the gesture callbacks.
-
-Repeated dynamic-PIN failures escalate the method rather than locking it out: the client
-keeps a single failure counter (persisted across reboots) that increments only when its own
-verification of the server's key-confirmation tag fails, and resets when that verification
-succeeds. At 10 failures the method becomes escalated -- every attempt is gesture-gated --
-but it stays offered; there is no lockout state.
 
 #### Rotated secrets and the locations hint
 
@@ -1163,7 +1157,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `software_version` | `std::optional<std::string>` | unset | Software version string; sent in `client/hello` only when set |
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
 | `pin_display_supported` | `bool` | `false` | Set to `true` when the application implements `on_display_pairing_pin` / `on_clear_pairing_pin` on its `SendspinClientListener`. When `false`, dynamic-PIN pairing is not advertised even if enabled in `SendspinPairingConfig`. |
-| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, static-PIN pairing is not advertised even if a static PIN is configured. Dynamic-PIN devices should also set it: escalated or short-PIN dynamic attempts are gesture-gated through the same callbacks, and without them such an attempt stalls until the server cancels it. |
+| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, static-PIN pairing is not advertised even if a static PIN is configured. Dynamic-PIN devices should also set it: short-PIN dynamic attempts are gesture-gated through the same callbacks, and without them such an attempt stalls until the server cancels it. |
 | `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains. See [Record capacity](#record-capacity). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |

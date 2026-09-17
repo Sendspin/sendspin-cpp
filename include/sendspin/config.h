@@ -121,10 +121,6 @@ struct SendspinPairingConfig {
     bool static_pin_rotated{false};
     /// @brief Minimum PIN length the client will accept; server chooses within [min, MAX].
     int dynamic_pin_min_length{6};
-    /// @brief Dynamic-PIN failure counter, persisted across reboots (spec: a single counter for
-    /// the method, not partitioned by server). At 10 the method is escalated to gesture-gating
-    /// (still offered); the client's own successful server_kc verification resets it.
-    int dynamic_pin_failures{0};
 };
 
 // ============================================================================

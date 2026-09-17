@@ -151,15 +151,6 @@ bool RecordStore::load_pairing_config_from_provider() {
             this->dynamic_pin_enabled_ = config->dynamic_pin_enabled;
             this->static_pin_enabled_ = config->static_pin_enabled;
             this->dynamic_pin_min_length_ = config->dynamic_pin_min_length;
-            // Clamp the failure counter into its meaningful range instead of trusting the
-            // blob. Only the >= threshold predicate consumes this value, so saturating at
-            // the threshold is lossless, and it makes record_dynamic_pin_failure()'s
-            // increment unable to overflow (signed overflow is UB) no matter what a corrupt
-            // or hand-edited blob supplies, including a negative value, which would
-            // otherwise read as "not escalated" and undo the durability guarantee that
-            // function documents.
-            this->dynamic_pin_failures_ =
-                std::clamp(config->dynamic_pin_failures, 0, DYNAMIC_PIN_ESCALATION_THRESHOLD);
             this->pairing_psk_rotated_ = config->pairing_psk_rotated;
             this->static_pin_rotated_ = config->static_pin_rotated;
             return true;
@@ -564,57 +555,6 @@ void RecordStore::set_dynamic_pin_min_length(int length) {
 }
 
 // ============================================================================
-// Dynamic-PIN failure counter (escalation)
-// ============================================================================
-
-void RecordStore::record_dynamic_pin_failure() {
-    // Failures arrive network-reachable and unthrottled (every rejected PIN guess calls this),
-    // so persisting on every increment would put an attacker-driven write rate directly on
-    // flash. Persist only at the two points where losing the in-memory update to an untimely
-    // reboot would change observable behavior:
-    //  - the first failure after a reset (0 -> 1), so a power-cycle cannot silently erase the
-    //    fact that a failed attempt happened at all;
-    //  - the failure that crosses DYNAMIC_PIN_ESCALATION_THRESHOLD, so a power-cycle cannot
-    //    un-escalate dynamic_pin.
-    // Invariant this guarantees: dynamic_pin_escalated() is durable; if it is true before a
-    // reboot, it is true after (escalation only clears via reset_dynamic_pin_failures(), which
-    // always persists), and it cannot be un-escalated by power-cycling. Non-escalating counts
-    // strictly between 1 and DYNAMIC_PIN_ESCALATION_THRESHOLD may be lost to an untimely
-    // reboot; that only costs the attacker's own progress toward escalation, not the escalation
-    // guarantee itself, in exchange for not touching flash on every guess.
-    //
-    // This is a considered tradeoff, not just an optimistic one: an attacker who can force a
-    // reboot or crash by unrelated means (a bug, a power blip, physical access) gets at most
-    // DYNAMIC_PIN_ESCALATION_THRESHOLD - 1 fresh online guesses per forced cycle. Each of those
-    // guesses still costs a full CPace PAKE handshake (see crypto/cpace.h); there is no faster
-    // offline path, so the reboot-assisted budget only multiplies an already-expensive
-    // per-guess cost by a small bounded factor; it does not turn the PIN into a cheap oracle.
-    const bool was_escalated = this->dynamic_pin_escalated();
-    const bool first_failure_since_reset = (this->dynamic_pin_failures_ == 0);
-    // Saturate at the threshold rather than incrementing without bound: nothing reads the count
-    // above it (dynamic_pin_escalated() is the only consumer, plus the log line below), and an
-    // unbounded ++ on a signed int is UB once it reaches INT_MAX.
-    if (this->dynamic_pin_failures_ < DYNAMIC_PIN_ESCALATION_THRESHOLD) {
-        this->dynamic_pin_failures_++;
-    }
-    SS_LOGW(TAG, "Dynamic-PIN failure recorded (count=%d, escalation threshold=%d)",
-            this->dynamic_pin_failures_, DYNAMIC_PIN_ESCALATION_THRESHOLD);
-
-    const bool now_escalated = this->dynamic_pin_escalated();
-    if (first_failure_since_reset || (now_escalated && !was_escalated)) {
-        this->persist_config();
-    }
-}
-
-void RecordStore::reset_dynamic_pin_failures() {
-    if (this->dynamic_pin_failures_ == 0) {
-        return;  // Nothing to reset; skip the persistence write.
-    }
-    this->dynamic_pin_failures_ = 0;
-    this->persist_config();
-}
-
-// ============================================================================
 // Static PIN
 // ============================================================================
 
@@ -701,7 +641,6 @@ bool RecordStore::persist_config() {
     config.dynamic_pin_enabled = this->dynamic_pin_enabled_;
     config.static_pin_enabled = this->static_pin_enabled_;
     config.dynamic_pin_min_length = this->dynamic_pin_min_length_;
-    config.dynamic_pin_failures = this->dynamic_pin_failures_;
     config.pairing_psk_rotated = this->pairing_psk_rotated_;
     config.static_pin_rotated = this->static_pin_rotated_;
     std::string encoded = encode_pairing_config(config);

@@ -1780,50 +1780,6 @@ TEST(RecordStore, RepeatedRotationSkipsTheRedundantConfigWrite) {
     EXPECT_EQ(provider.save_attempts(persistence_keys::PAIR_CONFIG), writes_before + 1);
 }
 
-// A corrupt PAIR_CONFIG could otherwise seed the failure counter at INT_MAX, where the next
-// increment is signed overflow (UB). Clamped on load and saturating on increment, neither the
-// stored value nor any number of failures can push it out of range.
-TEST(RecordStore, ClampsCorruptDynamicPinFailureCounter) {
-    InMemoryPersistenceProvider provider;
-    SendspinPairingConfig cfg;
-    cfg.dynamic_pin_failures = std::numeric_limits<int>::max();
-    provider.seed_blob(persistence_keys::PAIR_CONFIG, to_bytes(encode_pairing_config(cfg)));
-
-    RecordStore store(&provider);
-    EXPECT_TRUE(store.dynamic_pin_escalated())
-        << "a stored count above the threshold still means escalated";
-
-    // The increment must not overflow: it saturates instead.
-    for (int i = 0; i < 5; ++i) {
-        store.record_dynamic_pin_failure();
-    }
-    EXPECT_TRUE(store.dynamic_pin_escalated());
-
-    store.reset_dynamic_pin_failures();
-    EXPECT_FALSE(store.dynamic_pin_escalated()) << "reset must still clear escalation";
-}
-
-// A negative stored count would read as "not escalated" and silently undo the durability
-// guarantee record_dynamic_pin_failure() documents. Clamp it up to zero.
-TEST(RecordStore, ClampsNegativeStoredDynamicPinFailureCounter) {
-    InMemoryPersistenceProvider provider;
-    SendspinPairingConfig cfg;
-    cfg.dynamic_pin_failures = -5;
-    provider.seed_blob(persistence_keys::PAIR_CONFIG, to_bytes(encode_pairing_config(cfg)));
-
-    RecordStore store(&provider);
-    EXPECT_FALSE(store.dynamic_pin_escalated());
-
-    // From a clamped 0, exactly threshold failures must escalate; a negative start would have
-    // required far more.
-    for (int i = 0; i < RecordStore::DYNAMIC_PIN_ESCALATION_THRESHOLD; ++i) {
-        store.record_dynamic_pin_failure();
-    }
-    EXPECT_TRUE(store.dynamic_pin_escalated());
-}
-
-// connect_to() before a successful start() must be refused, not allowed to build a
-// connection that dereferences the null identity_ once its WebSocket upgrade completes.
 TEST(SendspinClientIdentity, ConnectToBeforeStartServerIsRefused) {
     SendspinClientConfig config;
     config.name = "connect-before-start";

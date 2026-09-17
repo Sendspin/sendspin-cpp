@@ -1055,9 +1055,7 @@ std::string SendspinClient::build_hello_message() {
                                             this->record_store_->pairing_psk_rotated());
         msg.supported_pair_methods.push_back(std::move(psk_desc));
     }
-    // Advertise dynamic_pin when enabled and the platform can display a PIN. An escalated
-    // failure counter does NOT drop the method from the hello: escalation only gesture-gates
-    // attempts (spec: Failure counter), it is not an error state.
+    // Advertise dynamic_pin when enabled and the platform can display a PIN.
     if (this->config_.pin_display_supported && this->record_store_ &&
         this->record_store_->dynamic_pin_enabled()) {
         PairMethodDescriptor dyn_pin;
