@@ -891,9 +891,10 @@ void ConnectionManager::drain_pairing_events(DrainedEvents& ev) {
 }
 
 void ConnectionManager::drain_unpair_events(DrainedEvents& ev) {
-    // Only ever targets the current connection: server/unpair is only admissible post-
-    // promotion (LONG_TERM trust with an active session), never a still-unproven nursery
-    // entry.
+    // Only the current connection is acted on. A nursery peer that has proven itself can send
+    // server/unpair too (the spec calls it valid regardless of the current activities), so this
+    // drops one from a peer the client is not actually running a session with. Rare, and it
+    // costs that peer nothing but a repeat once it holds the session.
     for (auto& event : ev.server_unpairs) {
         if (!event.conn || event.conn.get() != this->current_connection_.get()) {
             continue;
@@ -1476,8 +1477,8 @@ std::vector<NurseryEntry>::iterator ConnectionManager::release_nursery_entry(
     auto conn = std::move(it->conn);
     auto next = this->nursery_.erase(it);
     this->refresh_nursery_size_hint();
-    // Leaving the manager: block stale network-thread dispatch into role/state queues during the
-    // goodbye window. Outgoing sends, including the goodbye itself, are unaffected.
+    // Leaving the connection manager: block stale network-thread dispatch into role/state queues
+    // during the goodbye window. Outgoing sends, including the goodbye itself, are unaffected.
     conn->disable_message_dispatch();
     this->remove_hello_retry(conn.get());
     this->queue_deferred_release(std::move(conn), reason);
@@ -1702,8 +1703,8 @@ std::vector<NurseryEntry>::iterator ConnectionManager::promote_or_arbitrate_nurs
             conn->send_app_json(format_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT),
                                 nullptr);
         }
-        // Leaving the manager: block stale network-thread dispatch during the goodbye window
-        // (outgoing sends, including the goodbye itself, are unaffected).
+        // Leaving the connection manager: block stale network-thread dispatch during the goodbye
+        // window (outgoing sends, including the goodbye itself, are unaffected).
         conn->disable_message_dispatch();
         this->queue_deferred_release(std::move(conn), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
         return next;

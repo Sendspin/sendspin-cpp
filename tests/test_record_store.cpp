@@ -1170,9 +1170,9 @@ TEST(RecordStoreWithFile, RemoveRecordShrinksThePersistedBlob) {
 // Unpaired-access first-boot seed
 // =============================================================================
 
-/// A persistence provider that hands back a canned pairing config. Lets a test present a
-/// loaded config: states FilePersistenceProvider
-/// collapses into "nothing stored", so they are unreachable through it.
+/// A persistence provider that hands back a canned pairing config, so a test can present a
+/// stored config without a first boot ever having written one. FilePersistenceProvider cannot:
+/// it collapses an absent file into "nothing stored", which is the first-boot case itself.
 class CannedConfigProvider : public SendspinPersistenceProvider {
 public:
     explicit CannedConfigProvider(SendspinPairingConfig config) : config_(std::move(config)) {}
@@ -1620,8 +1620,8 @@ TEST(RecordStoreConcurrency, ResolvePairingOutcomeDoesNotRaceRecordStores) {
     for (int i = 0; i < ITERATIONS; ++i) {
         auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i %
                                                                                 SERVER_ID_SPACE));
-        // Every resolve must yield a usable PSK: either a freshly minted long-term one or the
-        // record. A torn read of records_ would surface here as a miss.
+        // Every resolve must mint a usable outcome, whether this server is new or is re-pairing
+        // over its own record. A torn read of records_ would surface here as a miss.
         ASSERT_TRUE(outcome.has_value());
     }
 

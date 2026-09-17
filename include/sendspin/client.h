@@ -624,10 +624,10 @@ public:
     // ========================================
 
     /// @brief Signals that the operator performed the device pairing-window gesture.
-    /// Thread-safe. Opens a pairing window: a gesture-gated PIN attempt already waiting
-    /// (static PIN always; dynamic PIN when the session PIN is short) proceeds
-    /// immediately; otherwise the window stands open for 5 minutes and admits the next pairing
-    /// attempt without a further gesture.
+    /// Thread-safe. Opens a pairing window: a gesture-gated PIN attempt already waiting (static
+    /// PIN always; dynamic PIN when the session PIN is short) proceeds immediately; otherwise the
+    /// window stands open for 5 minutes and admits the next pairing attempt without a further
+    /// gesture.
     void confirm_pairing_window();
 
     // ========================================

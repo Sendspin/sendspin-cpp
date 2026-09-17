@@ -524,9 +524,9 @@ The library's built-in `RecordStore` caps the number of long-term records it wil
 `SendspinClientConfig::max_pairing_records`, which defaults to
 `SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS` (12). An encoded record is roughly 250
 bytes, so the default keeps the serialized `RECORDS` blob comfortably under a typical NVS
-entry's ~4 KB limit.
-Once the cap is reached a new pairing fails; replacing a record already held for a given
-`psk_id` or `server_id` is unaffected, since that never grows the store. Raise or lower the cap by setting `max_pairing_records` before calling `start()`:
+entry's ~4 KB limit. Once the cap is reached a new pairing fails; replacing a record already
+held for a given `psk_id` or `server_id` is unaffected, since that never grows the store. Raise
+or lower the cap by setting `max_pairing_records` before calling `start()`:
 
 ```cpp
 SendspinClientConfig config;
@@ -810,10 +810,10 @@ says, and the server is then limited to the pairing-token flow.
 Some PIN attempts are **gesture-gated**: the client answers the pairing activation with
 `client/pair-pending` and withholds `client/pair-init` until a pairing window is open. Static
 PIN gates every attempt; dynamic PIN gates an attempt only when the session's PIN length is
-below 6 digits. The window opens on the operator gesture
-(`confirm_pairing_window()`), it lives for 5 minutes, and it admits exactly one attempt. A gesture performed before the
-activation arrives leaves the window standing open, so the next attempt within its lifetime
-proceeds without a prompt.
+below 6 digits. The window opens on the operator gesture (`confirm_pairing_window()`), it lives
+for 5 minutes, and it admits exactly one attempt. A gesture performed before the activation
+arrives leaves the window standing open, so the next attempt within its lifetime proceeds
+without a prompt.
 
 The gating rules apply to dynamic PIN even on a device that leaves
 `pairing_window_supported` false. On such a device the `on_open_pairing_window` prompt cannot
@@ -866,9 +866,9 @@ config.initial_unpaired_access_enabled = true;
 ```
 
 The seed applies only on a genuine first boot, and the seeded value is written through the
-persistence provider then. On every later start the stored config
-wins, so unpaired access stays off across reboots once it has been turned off. With no persistence provider there is no stored config, so the seed
-applies on every start.
+persistence provider then. On every later start the stored config wins, so unpaired access stays
+off across reboots once it has been turned off. With no persistence provider there is no stored
+config, so the seed applies on every start.
 
 A config that fails to load is not treated as a first boot. The library's internal load of the
 `persistence_keys::PAIR_CONFIG` blob is treated as "nothing stored" both when the key is truly

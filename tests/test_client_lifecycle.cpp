@@ -310,8 +310,7 @@ TEST(ClientLifecycle, StopGoodbyesNurseryPeersToo) {
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
 
-    auto established =
-        connect_paired_server(bundle.peer, NURSERY_GOODBYE_TEST_PORT);
+    auto established = connect_paired_server(bundle.peer, NURSERY_GOODBYE_TEST_PORT);
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
 
