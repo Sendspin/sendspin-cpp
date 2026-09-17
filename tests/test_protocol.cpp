@@ -1325,7 +1325,7 @@ TEST(Protocol, FormatClientHelloSourceSupport) {
     EXPECT_FALSE(doc3["payload"]["source@v1_support"].is<JsonObject>());
 }
 
-// Exact-field assertions include the spec's hyphenated "client-stream/start" type string.
+// Assertions match aiosendspin's expected "client_stream/start" type string.
 TEST(Protocol, FormatClientStreamStartPcm) {
     ClientStreamStartMessage msg;
     msg.codec = SendspinCodecFormat::PCM;
@@ -1335,7 +1335,7 @@ TEST(Protocol, FormatClientStreamStartPcm) {
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_stream_start_message(&msg)));
-    EXPECT_STREQ(doc["type"], "client-stream/start");
+    EXPECT_STREQ(doc["type"], "client_stream/start");
     EXPECT_STREQ(doc["payload"]["source"]["codec"], "pcm");
     EXPECT_EQ(doc["payload"]["source"]["channels"].as<int>(), 2);
     EXPECT_EQ(doc["payload"]["source"]["sample_rate"].as<uint32_t>(), 48000U);
@@ -1355,15 +1355,15 @@ TEST(Protocol, FormatClientStreamStartFlacCodecHeader) {
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_stream_start_message(&msg)));
-    EXPECT_STREQ(doc["type"], "client-stream/start");
+    EXPECT_STREQ(doc["type"], "client_stream/start");
     EXPECT_STREQ(doc["payload"]["source"]["codec"], "flac");
     EXPECT_STREQ(doc["payload"]["source"]["codec_header"], "c2VuZHNwaW4=");
 }
 
-// client-stream/end defines no fields but still carries the required empty payload object
+// client_stream/end defines no fields but still carries the required empty payload object
 // (Sendspin spec, Message Format); pin the exact bytes.
 TEST(Protocol, FormatClientStreamEndExactString) {
-    EXPECT_EQ(format_client_stream_end_message(), R"({"type":"client-stream/end","payload":{}})");
+    EXPECT_EQ(format_client_stream_end_message(), R"({"type":"client_stream/end","payload":{}})");
 }
 
 // Control cases for the rejection tests below: a well-formed source command must parse.

@@ -730,7 +730,7 @@ private:
             return;
         }
 
-        if (std::strcmp(type, "client-stream/start") == 0) {
+        if (std::strcmp(type, "client_stream/start") == 0 || std::strcmp(type, "client-stream/start") == 0) {
             this->client_stream_start_count_.fetch_add(1);
             return;
         }

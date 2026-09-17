@@ -958,7 +958,7 @@ TEST(SourceWire, DISABLED_StreamsPcmEndToEndWithExactOrdering) {
     pump_for(harness.client, 700);
     EXPECT_FALSE(source->is_streaming());
     EXPECT_EQ(harness.listener.started, 0);
-    EXPECT_EQ(fake.count_text_containing("client-stream/start"), 0U);
+    EXPECT_EQ(fake.count_text_containing("client_stream/start"), 0U);
     EXPECT_FALSE(source->write_audio(frame, sizeof(frame), 0));
 
     fake.send_source_command("start");
@@ -966,7 +966,7 @@ TEST(SourceWire, DISABLED_StreamsPcmEndToEndWithExactOrdering) {
         harness.client,
         [&] {
             return harness.listener.started == 1 &&
-                   fake.count_text_containing("client-stream/start") == 1;
+                   fake.count_text_containing("client_stream/start") == 1;
         },
         4000));
     EXPECT_TRUE(source->is_streaming());
@@ -989,7 +989,7 @@ TEST(SourceWire, DISABLED_StreamsPcmEndToEndWithExactOrdering) {
     // client-stream/start, no second listener callback.
     fake.send_source_command("start");
     pump_for(harness.client, 300);
-    EXPECT_EQ(fake.count_text_containing("client-stream/start"), 1U);
+    EXPECT_EQ(fake.count_text_containing("client_stream/start"), 1U);
     EXPECT_EQ(harness.listener.started, 1);
 
     // A 10 ms remainder: full chunks only mid-stream, so it must NOT be sent yet...
@@ -1006,7 +1006,7 @@ TEST(SourceWire, DISABLED_StreamsPcmEndToEndWithExactOrdering) {
         harness.client,
         [&] {
             return harness.listener.stopped == 1 &&
-                   fake.count_text_containing("client-stream/end") == 1;
+                   fake.count_text_containing("client_stream/end") == 1;
         },
         4000));
     EXPECT_FALSE(source->is_streaming());
@@ -1020,9 +1020,9 @@ TEST(SourceWire, DISABLED_StreamsPcmEndToEndWithExactOrdering) {
     for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(events.size()); ++i) {
         if (events[i].binary) {
             binary_idx.push_back(i);
-        } else if (events[i].data.find("client-stream/start") != std::string::npos) {
+        } else if (events[i].data.find("client_stream/start") != std::string::npos) {
             start_idx = i;
-        } else if (events[i].data.find("client-stream/end") != std::string::npos) {
+        } else if (events[i].data.find("client_stream/end") != std::string::npos) {
             end_idx = i;
         }
     }
@@ -1114,7 +1114,7 @@ TEST(SourceWire, DISABLED_NoStreamBeforeTimeSyncConvergence) {
 
     fake.send_source_command("start");
     pump_for(harness.client, 400);
-    EXPECT_EQ(fake.count_text_containing("client-stream/start"), 0U);
+    EXPECT_EQ(fake.count_text_containing("client_stream/start"), 0U);
     EXPECT_EQ(harness.listener.started, 0);
 
     fake.enable_time_answers();
@@ -1122,7 +1122,7 @@ TEST(SourceWire, DISABLED_NoStreamBeforeTimeSyncConvergence) {
         harness.client,
         [&] {
             return harness.client.is_time_synced() &&
-                   fake.count_text_containing("client-stream/start") == 1 &&
+                   fake.count_text_containing("client_stream/start") == 1 &&
                    harness.listener.started == 1;
         },
         4000));
@@ -1154,7 +1154,7 @@ TEST(SourceWire, DISABLED_PermissionDoesNotSurviveReconnect) {
     // Longer than the task's 500 ms failed-open retry (SOURCE_OPEN_RETRY_MS): a permission
     // leak that merely deferred into the retry window must surface before the fresh command.
     pump_for(harness.client, 700);
-    EXPECT_EQ(fake2.count_text_containing("client-stream/start"), 0U);
+    EXPECT_EQ(fake2.count_text_containing("client_stream/start"), 0U);
     EXPECT_EQ(harness.listener.started, 1);
 
     // Only this connection's own start command opens a stream.
@@ -1163,7 +1163,7 @@ TEST(SourceWire, DISABLED_PermissionDoesNotSurviveReconnect) {
         harness.client,
         [&] {
             return harness.listener.started == 2 &&
-                   fake2.count_text_containing("client-stream/start") == 1;
+                   fake2.count_text_containing("client_stream/start") == 1;
         },
         4000));
 }
@@ -1185,7 +1185,7 @@ TEST(SourceWire, DISABLED_StreamsOpusPacketsEndToEnd) {
         harness.client,
         [&] {
             return harness.listener.started == 1 &&
-                   fake.count_text_containing("client-stream/start") == 1;
+                   fake.count_text_containing("client_stream/start") == 1;
         },
         4000));
     // The announced format carries the opus contract.
@@ -1207,7 +1207,7 @@ TEST(SourceWire, DISABLED_StreamsOpusPacketsEndToEnd) {
         harness.client,
         [&] {
             return harness.listener.stopped == 1 &&
-                   fake.count_text_containing("client-stream/end") == 1;
+                   fake.count_text_containing("client_stream/end") == 1;
         },
         4000));
 

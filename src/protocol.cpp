@@ -1076,9 +1076,8 @@ std::string format_client_stream_start_message(const ClientStreamStartMessage* m
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();
 
-    // Hyphenated type string per the spec; codec_header only when present, bit_depth always
-    // (Sendspin spec, Source messages — client-stream/start)
-    root["type"] = "client-stream/start";
+    // Sendspin wire format: aiosendspin expects client_stream/start
+    root["type"] = "client_stream/start";
     JsonObject source_json = root["payload"]["source"].to<JsonObject>();
     source_json["codec"] = to_cstr(msg->codec);
     source_json["channels"] = msg->channels;
@@ -1094,9 +1093,8 @@ std::string format_client_stream_start_message(const ClientStreamStartMessage* m
 }
 
 std::string format_client_stream_end_message() {
-    // Every message carries a payload object, empty when the message defines no fields
-    // (Sendspin spec, Message Format); a literal, pinned by the exact-string unit test
-    return R"({"type":"client-stream/end","payload":{}})";
+    // Sendspin wire format: aiosendspin expects client_stream/end
+    return R"({"type":"client_stream/end","payload":{}})";
 }
 
 std::string format_stream_request_format_message(const StreamRequestFormatMessage* msg) {
