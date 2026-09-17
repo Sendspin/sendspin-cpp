@@ -52,12 +52,12 @@ inline void secure_zero_psk(std::array<uint8_t, 32>& psk) {
 // ============================================================================
 
 /// @brief A long-term pairing record stored on behalf of the client.
-/// Mirrors `ClientPairingRecord` in `aiosendspin/noise/trust_store.py`.
-/// `server_id` is absent for shared-PSK (fallback) records.
+/// Every long-term PSK is persisted alongside the `server_id` of the server it was minted for,
+/// and a handshake that matches the record must come from that server (spec "Pre-Shared Key").
 struct SendspinPairingRecord {
     std::string psk_id;
     std::array<uint8_t, 32> psk{};
-    std::optional<std::string> server_id;  ///< Absent = shared-PSK record.
+    std::string server_id;  ///< peer_id of the server this PSK is bound to.
     std::optional<std::string> label;
     bool used{false};
 
@@ -125,7 +125,6 @@ struct SendspinPairingConfig {
     /// the method, not partitioned by server). At 10 the method is escalated to gesture-gating
     /// (still offered); the client's own successful server_kc verification resets it.
     int dynamic_pin_failures{0};
-    std::string record_mode_psk_id;  ///< psk_id of the shared-PSK fallback record.
 };
 
 // ============================================================================
@@ -170,10 +169,10 @@ struct SendspinClientConfig {
     /// token): any of "device", "leaflet", "operator". Advertised as the informational
     /// `locations` hint on the pairing_psk descriptor in client/hello; empty = omit the hint.
     ///
-    /// This describes the FACTORY secret only. Once the Pairing PSK is rotated (a paired server
-    /// sending management/set-pairing-config), whatever was printed on the device or its leaflet
-    /// no longer opens it, so the client advertises `["operator"]` from then on and ignores this
-    /// value (spec: "client/hello pair-method descriptor").
+    /// This describes the FACTORY secret only. Once the Pairing PSK is rotated, whatever was
+    /// printed on the device or its leaflet no longer opens it, so the client advertises
+    /// `["operator"]` from then on and ignores this value (spec: "client/hello pair-method
+    /// descriptor").
     std::vector<std::string> pairing_psk_locations{};
 
     /// @brief Where the operator can find the static PIN the device shipped with: any of
@@ -185,21 +184,19 @@ struct SendspinClientConfig {
     /// @brief First-boot default for unpaired (Sentinel) access.
     /// Seeds `SendspinPairingConfig::unpaired_access_enabled` only on a genuine first boot; the
     /// seeded value is then written through the persistence provider. Once a config exists the
-    /// stored value always wins, so a server that turns unpaired access off via
-    /// management/set-pairing-config keeps it off across reboots. With no persistence provider
-    /// there is no stored config, so this value applies on every start.
+    /// stored value always wins, so unpaired access stays off across reboots once it is turned
+    /// off. With no persistence provider there is no stored config, so this value applies on
+    /// every start.
     /// A config that fails to load does not count as a first boot when any provisioned material
     /// (a pairing record or the Pairing PSK) survived: the seed is skipped and unpaired access
     /// stays disabled, so a damaged config fails closed. See the integration guide.
     bool initial_unpaired_access_enabled{false};
 
-    /// @brief Default maximum number of long-term pairing records the store retains (the
-    /// shared-PSK fallback record counts against this too). An encoded record is roughly 250
-    /// bytes (see persistence_codec.h's blob-size doc), so this default keeps the serialized
-    /// "records" blob comfortably under a typical NVS entry's ~4 KB limit even while a pairing
-    /// supersede transiently persists one extra record. Past the cap, a new pairing falls back
-    /// to the shared-PSK record instead of minting one, and management/add-record returns
-    /// storage_exhausted; replacing a record already held for a given psk_id or server_id is
+    /// @brief Default maximum number of long-term pairing records the store retains. An encoded
+    /// record is roughly 250 bytes (see persistence_codec.h's blob-size doc), so this default
+    /// keeps the serialized "records" blob comfortably under a typical NVS entry's ~4 KB limit
+    /// even while a pairing supersede transiently persists one extra record. Past the cap a new
+    /// pairing fails; replacing a record already held for a given psk_id or server_id is
     /// unaffected, since that never grows the store.
     static constexpr size_t DEFAULT_MAX_PAIRING_RECORDS = 12;
 

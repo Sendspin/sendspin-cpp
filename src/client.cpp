@@ -1487,8 +1487,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                         stored_record = true;
                     }
                 } else {
-                    SS_LOGI(TAG, "server/pair-finalize: no record to store "
-                                 "(shared-PSK fallback or no pending pairing)");
+                    SS_LOGI(TAG, "server/pair-finalize: no pending pairing record to store");
                 }
                 if (stored_record) {
                     // Stage the durable write for the main loop. Written BEFORE
@@ -1499,9 +1498,8 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                     this->event_state_->records_dirty_slot.write(true);
                     // Defer on_pairing_succeeded to the main loop via the same
                     // pending_*_events_ / has_pending_events_ idiom every other cross-thread
-                    // connection-state mutation in ConnectionManager uses. Only fire when an
-                    // actual long-term record was stored (not the shared-PSK fallback case, and
-                    // not the capacity-rejection case).
+                    // connection-state mutation in ConnectionManager uses. Only fire when the
+                    // long-term record was actually stored (not the capacity-rejection case).
                     this->connection_manager_->schedule_pairing_succeeded(conn->get_server_id());
                 }
                 // Re-arm the provisional timeout so the 30 s watchdog fires if the server

@@ -119,18 +119,7 @@ public:
         }
         std::string_view text(reinterpret_cast<const char*>(data), len);
         auto decoded = decode_pairing_records(text).value_or(std::vector<SendspinPairingRecord>{});
-        // Only capture/reject a write that includes a record WITH a server_id: the RecordStore
-        // also persists a shared-PSK fallback record (no server_id) on first boot as part of the
-        // very same whole-array write, and that provisioning write must always succeed
-        // unconditionally so it is unaffected by reject_pairing_records_.
-        const SendspinPairingRecord* with_server_id = nullptr;
-        for (const auto& r : decoded) {
-            if (r.server_id.has_value()) {
-                with_server_id = &r;
-                break;
-            }
-        }
-        if (with_server_id == nullptr) {
+        if (decoded.empty()) {
             return true;
         }
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -138,7 +127,7 @@ public:
             this->rejected_record_saves_++;
             return false;
         }
-        this->captured_ = *with_server_id;
+        this->captured_ = decoded.front();
         return true;
     }
 
@@ -147,17 +136,16 @@ public:
         return this->captured_;
     }
 
-    // When set, save_blob(RECORDS, ...) rejects any write that includes a record with a
-    // server_id (simulating a persistence-provider failure, e.g. storage full), while still
-    // succeeding for the first-boot shared-PSK fallback record. Used to verify the deferred
-    // fail-open contract: the pairing still completes on the RAM commit, and the rejected flush
-    // (counted below) is only a durability warning.
+    // When set, save_blob(RECORDS, ...) rejects any write that carries a record (simulating a
+    // persistence-provider failure, e.g. storage full). Used to verify the deferred fail-open
+    // contract: the pairing still completes on the RAM commit, and the rejected flush (counted
+    // below) is only a durability warning.
     void set_reject_pairing_records(bool reject) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->reject_pairing_records_ = reject;
     }
 
-    // Number of RECORDS writes (with a server_id record) rejected because of the flag above:
+    // Number of RECORDS writes rejected because of the flag above:
     // proves the deferred flush was actually attempted, since a rejected write captures nothing.
     int rejected_record_saves() const {
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -268,7 +256,7 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
 
-    Identity server_identity = Identity::generate().value();
+    const Identity& server_identity = bundle.peer.server_identity;
     FakeEncryptedServer server(server_url(RESUME_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                                server_identity, bundle.peer.record.psk_id, bundle.peer.psk);
 
@@ -336,7 +324,7 @@ TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
 
-    Identity server_identity = Identity::generate().value();
+    const Identity& server_identity = bundle.peer.server_identity;
     FakeOutboundEncryptedServer server(AEAD_FAILURE_OUTBOUND_PORT,
                                        std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                        bundle.peer.record.psk_id, bundle.peer.psk);
@@ -384,7 +372,7 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
 
-    Identity server_identity = Identity::generate().value();
+    const Identity& server_identity = bundle.peer.server_identity;
     // After the re-handshake, the fake server keeps declaring ["playback"], which the
     // SENTINEL-category PSK it re-handshakes to cannot satisfy while unpaired access is disabled
     // (see admission.h::activities_allowed).
@@ -434,7 +422,7 @@ TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
 
-    Identity server_identity = Identity::generate().value();
+    const Identity& server_identity = bundle.peer.server_identity;
     FakeEncryptedServer server(server_url(PAIR_METHODS_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                bundle.peer.record.psk_id, bundle.peer.psk);
@@ -528,7 +516,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     auto captured = persistence.captured_record();
     ASSERT_TRUE(captured.has_value());
     EXPECT_EQ(captured->psk_id, server.learned_psk_id().value());
-    EXPECT_EQ(captured->server_id.value_or(""), server_identity.peer_id());
+    EXPECT_EQ(captured->server_id, server_identity.peer_id());
 
     ASSERT_TRUE(pump_until(
         client, [&] { return listener.pairing_succeeded_server_id().has_value(); }, 4000))
@@ -853,7 +841,7 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
 
     ASSERT_TRUE(bundle.start());
 
-    Identity server_identity = Identity::generate().value();
+    const Identity& server_identity = bundle.peer.server_identity;
     FakeEncryptedServerOptions options;
     // Sent on the encrypted stream immediately before the first server/activate, so the DUT sees
     // it while the connection is handshake-complete but still unadmitted.

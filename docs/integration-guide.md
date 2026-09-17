@@ -520,16 +520,13 @@ produces -- it is not something a provider hand-rolls its own version of.
 
 #### Record capacity
 
-The library's built-in `RecordStore` caps the number of long-term records it will hold (the
-shared-PSK fallback record counts against the cap too) at
+The library's built-in `RecordStore` caps the number of long-term records it will hold at
 `SendspinClientConfig::max_pairing_records`, which defaults to
 `SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS` (12). An encoded record is roughly 250
 bytes, so the default keeps the serialized `RECORDS` blob comfortably under a typical NVS
 entry's ~4 KB limit.
-Once the cap is reached, a new pairing falls back to the shared-PSK record instead of minting
-a per-server one, and `management/add-record` returns `storage_exhausted`; replacing a record
-already held for a given `psk_id` or `server_id` is unaffected, since that never grows the
-store. Raise or lower the cap by setting `max_pairing_records` before calling `start()`:
+Once the cap is reached a new pairing fails; replacing a record already held for a given
+`psk_id` or `server_id` is unaffected, since that never grows the store. Raise or lower the cap by setting `max_pairing_records` before calling `start()`:
 
 ```cpp
 SendspinClientConfig config;
@@ -613,8 +610,7 @@ struct MyClientListener : SendspinClientListener {
     // Called after the Noise handshake completes, and again after each successful
     // re-handshake (notably the post-pairing rekey).
     // trust reflects the PSK category used:
-    //   ConnectionTrust::USER  -- long-term record: a paired server, or one holding
-    //                             the shared-PSK fallback record (see Record Mode)
+    //   ConnectionTrust::USER  -- long-term record: a paired server
     //   ConnectionTrust::NONE  -- Sentinel or Pairing PSK (unpaired access)
     void on_trust_changed(ConnectionTrust trust) override {
         bool paired = (trust == ConnectionTrust::USER);
@@ -857,7 +853,7 @@ factory tool writes before `start()`, both leave the configured hint in place.
 
 | Value | PSK used | Meaning |
 |-------|---------|---------|
-| `ConnectionTrust::USER` | Long-term record | Server holds a stored record (see Record Mode below) |
+| `ConnectionTrust::USER` | Long-term record | Server holds a record minted for it during pairing |
 | `ConnectionTrust::NONE` | Sentinel or Pairing PSK | Unpaired access |
 
 `on_trust_changed` fires after `server/activate` is processed and the connection is promoted
@@ -866,22 +862,6 @@ Pairing an already-connected server therefore delivers the callback twice: once 
 `ConnectionTrust::NONE` at admission, then again with `ConnectionTrust::USER` once the
 post-pairing rekey completes. Connections that are rejected (e.g., missing record when
 unpaired access is disabled) do not fire this callback.
-
-#### Record Mode
-
-`ConnectionTrust::USER` means the server presented a PSK matching a stored record. That is
-usually a record minted for it during pairing, but it is not always a per-server record.
-
-The client provisions one **shared-PSK fallback record** on first boot, before any pairing has
-happened. When the record store is full (`max_pairing_records`, default 12) and a new server
-pairs, the client hands that server the shared record's PSK instead of minting a new record.
-The protocol models this deliberately: `management/get-pairing-config` reports it as
-`record_mode`, and storage accounting distinguishes `cost_individual` from `cost_shared`.
-
-Servers holding the shared record are therefore indistinguishable from each other, and each
-gets `ConnectionTrust::USER` with the same `{playback}` rights as a
-per-server-paired server. Raise `max_pairing_records` if a deployment needs every server to
-have its own record.
 
 ### Unpaired Access
 
@@ -899,9 +879,8 @@ config.initial_unpaired_access_enabled = true;
 ```
 
 The seed applies only on a genuine first boot, and the seeded value is written through the
-persistence provider during first-boot provisioning. On every later start the stored config
-wins, so a server that turns unpaired access off through `management/set-pairing-config` keeps
-it off across reboots. With no persistence provider there is no stored config, so the seed
+persistence provider then. On every later start the stored config
+wins, so unpaired access stays off across reboots once it has been turned off. With no persistence provider there is no stored config, so the seed
 applies on every start.
 
 A config that fails to load is not treated as a first boot. The library's internal load of the
@@ -933,15 +912,12 @@ if (blob.has_value()) {
 This is why the read-modify-write step matters: the provider is a byte store and does not
 validate what it is handed, so saving a bare, default-constructed `SendspinPairingConfig`
 *will* be written and *will* take effect on the next boot -- silently resetting every policy
-field (`pairing_psk_enabled`, `dynamic_pin_enabled`, the rotation flags behind the
-[locations hint](#rotated-secrets-and-the-locations-hint), and in particular the empty
-`record_mode_psk_id`, which drops the client's reference to its shared-PSK fallback record) to
-the struct's compiled-in defaults rather than merely failing to change `unpaired_access_enabled`.
-`RecordStore` does notice the empty `record_mode_psk_id` and re-provisions a fresh shared-PSK
-fallback record for it, but that repair does not restore the OTHER policy fields the bare write
-clobbered, and it does not count as a first boot (the config blob still decoded successfully),
-so `initial_unpaired_access_enabled` is not reapplied either. Before the first `start()`
-there is no stored config to modify, so use the seed instead.
+field (`pairing_psk_enabled`, `dynamic_pin_enabled`, and the rotation flags behind the
+[locations hint](#rotated-secrets-and-the-locations-hint)) to the struct's compiled-in defaults
+rather than merely failing to change `unpaired_access_enabled`. A bare write also does not count
+as a first boot (the config blob still decodes), so `initial_unpaired_access_enabled` is not
+reapplied either. Before the first `start()` there is no stored config to modify, so use the
+seed instead.
 
 Connections admitted with the Sentinel PSK report `ConnectionTrust::NONE`. Disabling
 unpaired access after the device is paired is the typical production configuration.
@@ -1188,7 +1164,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
 | `pin_display_supported` | `bool` | `false` | Set to `true` when the application implements `on_display_pairing_pin` / `on_clear_pairing_pin` on its `SendspinClientListener`. When `false`, dynamic-PIN pairing is not advertised even if enabled in `SendspinPairingConfig`. |
 | `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, static-PIN pairing is not advertised even if a static PIN is configured. Dynamic-PIN devices should also set it: escalated or short-PIN dynamic attempts are gesture-gated through the same callbacks, and without them such an attempt stalls until the server cancels it. |
-| `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains (the shared-PSK fallback record counts against it too). See [Record capacity](#record-capacity). |
+| `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains. See [Record capacity](#record-capacity). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
 | `httpd_stack_size` | `size_t` | `8192` | HTTP server task stack size in bytes (ESP-IDF only). The Noise handshake (and especially the in-band re-handshake after pairing) runs its X25519 crypto on this task; values below the default are clamped up to it with a warning, since a smaller stack overflows during the post-pairing re-handshake. Raising it is allowed. |
@@ -1296,11 +1272,10 @@ Configuration passed to `client.add_visualizer()`.
 | Value | Description |
 |---|---|
 | `NONE` | Sentinel or Pairing PSK was used; this server has not been paired |
-| `USER` | Long-term record matched; the server is paired, or holds the shared-PSK record |
+| `USER` | Long-term record matched; the server is paired |
 
 Reported via `SendspinClientListener::on_trust_changed` on admission and again after each
-successful in-band re-handshake. See [Trust Levels](#trust-levels) and
-[Record Mode](#record-mode).
+successful in-band re-handshake. See [Trust Levels](#trust-levels).
 
 ### SendspinPairAbortReason
 

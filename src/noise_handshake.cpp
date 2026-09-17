@@ -204,11 +204,12 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
         return std::nullopt;
     }
 
-    // Stored-pubkey post-match check: if the record is bound to a specific server,
-    // verify it matches the server we actually reached.
-    if (resolved->counterparty_id.has_value() && resolved->counterparty_id.value() != server_id) {
+    // Post-match check (spec "Pre-Shared Key"): every long-term PSK is persisted with the
+    // server_id it was minted for, and the match only counts when that is the server actually
+    // reached. The Pairing and Sentinel PSKs are bound to no server and skip it.
+    if (resolved->category == PskCategory::LONG_TERM && resolved->counterparty_id != server_id) {
         SS_LOGW(TAG, "%s: PSK bound to server_id='%s', but connected to '%s'", log_prefix,
-                resolved->counterparty_id->c_str(), server_id.c_str());
+                resolved->counterparty_id.value_or("").c_str(), server_id.c_str());
         return std::nullopt;
     }
 

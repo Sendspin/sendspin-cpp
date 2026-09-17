@@ -279,7 +279,7 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
 
     // A real server connects while the probe is held: it must establish promptly, not after the
     // probe's deadline.
-    Identity server_identity = Identity::generate().value();
+    const Identity& server_identity = bundle.peer.server_identity;
     FakeEncryptedServer real_server(server_url(PROBE_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                     bundle.peer.record.psk_id, bundle.peer.psk);
@@ -310,7 +310,7 @@ TEST(ConnectionLifecycle, SlowOutboundSurvivesUpgradeTier) {
     SendspinClient& client = bundle.client();
 
     // Real Sendspin-speaking endpoint the proxy forwards to.
-    Identity server_identity = Identity::generate().value();
+    const Identity& server_identity = bundle.peer.server_identity;
     FakeOutboundEncryptedServer backend(PROXY_BACKEND_PORT, std::string(NOISE_SUITE_CHACHAPOLY),
                                         server_identity, bundle.peer.record.psk_id,
                                         bundle.peer.psk);
@@ -373,7 +373,7 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
         client, [&] { return mute.client_hello_count() > 0; }, 4000));
 
     // The real server takes the second inbound slot; the stalled outbound must not consume it.
-    Identity server_identity = Identity::generate().value();
+    const Identity& server_identity = bundle.peer.server_identity;
     FakeEncryptedServer real_server(server_url(ADMIT_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                     bundle.peer.record.psk_id, bundle.peer.psk);
@@ -397,8 +397,8 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
 TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     PairedPeer peer_a = make_paired_peer();
     PairedPeer peer_b = make_paired_peer();
-    Identity identity_a = Identity::generate().value();
-    Identity identity_b = Identity::generate().value();
+    const Identity& identity_a = peer_a.server_identity;
+    const Identity& identity_b = peer_b.server_identity;
 
     TestNetworkProvider network;
     TestPersistenceProvider persistence(
@@ -463,7 +463,7 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
 
     // The real server must establish promptly: the probes hold no nursery slots, so nothing
     // needs evicting and nothing is rejected.
-    Identity server_identity = Identity::generate().value();
+    const Identity& server_identity = bundle.peer.server_identity;
     FakeEncryptedServer real_server(server_url(EVICT_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                     bundle.peer.record.psk_id, bundle.peer.psk);
@@ -505,7 +505,7 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
         client,
         [&] { return mute_a.client_hello_count() > 0 && mute_b.client_hello_count() > 0; }, 4000));
 
-    Identity late_identity = Identity::generate().value();
+    const Identity& late_identity = bundle.peer.server_identity;
     FakeEncryptedServer late(server_url(REJECT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                              late_identity, bundle.peer.record.psk_id, bundle.peer.psk);
     EXPECT_TRUE(pump_until(
@@ -576,7 +576,7 @@ TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
 
-    Identity identity = Identity::generate().value();
+    const Identity& identity = bundle.peer.server_identity;
     FakeEncryptedServer silent(server_url(LIVENESS_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                                identity, bundle.peer.record.psk_id, bundle.peer.psk,
                                time_answering_options(false));
@@ -599,7 +599,7 @@ TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
 
-    Identity identity = Identity::generate().value();
+    const Identity& identity = bundle.peer.server_identity;
     FakeEncryptedServer live(server_url(LIVENESS_CONTROL_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                              identity, bundle.peer.record.psk_id, bundle.peer.psk,
                              time_answering_options(true));
@@ -624,7 +624,7 @@ TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
 
-    Identity identity = Identity::generate().value();
+    const Identity& identity = bundle.peer.server_identity;
     FakeEncryptedServer silent(server_url(LIVENESS_DISABLED_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), identity,
                                bundle.peer.record.psk_id, bundle.peer.psk,

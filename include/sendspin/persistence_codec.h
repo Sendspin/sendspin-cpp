@@ -25,16 +25,14 @@
 /// exposed publicly so a custom provider (or a test) can inspect or seed that content in the
 /// same format the library itself produces, not so providers hand-roll their own encoding.
 ///
-/// This is a STORAGE codec, intentionally independent of the Sendspin protocol wire format
-/// (see `src/management.h`, which never carries the PSK secret in list-records responses: the
-/// two formats have different jobs and must not be confused).
+/// This is a STORAGE codec, intentionally independent of the Sendspin protocol wire format.
 ///
 /// ## Wire format
 ///
 /// Every encoded blob is a JSON object stamped with a "v" (version) field:
 ///
 /// - Record: `{"v":1,"psk_id":"...","psk":"<base64url>","server_id":"...","label":"...",
-///   "used":bool}`, with "server_id"/"label" omitted when absent.
+///   "used":bool}`, with "label" omitted when absent.
 /// - Records array: `{"v":1,"records":[<record objects, without their own "v">]}`. The array
 ///   wrapper carries "v" once; each entry has the same fields as a record minus "v".
 ///   `decode_pairing_record()` still accepts an entry that has its own "v" (it is ignored like
@@ -42,7 +40,7 @@
 ///   `encode_pairing_record()` or was lifted out of a records array.
 /// - Pairing PSK: `{"v":1,"psk_id":"...","psk":"<base64url>","label":"..."}`, with "label"
 ///   omitted when absent.
-/// - Pairing config: `{"v":1,"record_mode_psk_id":"...","pairing_psk_enabled":bool,
+/// - Pairing config: `{"v":1,"pairing_psk_enabled":bool,
 ///   "unpaired_access_enabled":bool,"dynamic_pin_enabled":bool,"static_pin_enabled":bool,
 ///   "dynamic_pin_min_length":int,"dynamic_pin_failures":int,"pairing_psk_rotated":bool,
 ///   "static_pin_rotated":bool}`.
@@ -60,7 +58,8 @@
 ///   default value.
 /// - `decode_pairing_record()` / `decode_pairing_psk()` return `std::nullopt` when: the JSON
 ///   fails to parse, "psk_id" is missing or empty, "psk" is missing, or "psk" does not
-///   base64url-decode to exactly 32 bytes.
+///   base64url-decode to exactly 32 bytes. A record additionally needs a non-empty "server_id",
+///   without which the PSK could never pass the post-match server check.
 /// - `decode_pairing_records()` returns `std::nullopt` only when the JSON fails to parse or the
 ///   root has no array "records" field. An individual entry that fails record validation is
 ///   SKIPPED rather than failing the whole decode: a provider should not lose its entire store

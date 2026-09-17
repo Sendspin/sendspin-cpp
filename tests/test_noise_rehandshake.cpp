@@ -93,6 +93,7 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
     SendspinPairingRecord rec;
     rec.psk_id = r.psk_id;
     rec.psk = r.psk;
+    rec.server_id = r.server_id.peer_id();
     rs.store_record(std::move(rec));
 
     // Run initial handshake via NoiseHandshake state machine
@@ -311,6 +312,7 @@ static void run_rehandshake_test(const std::string& suite_name) {
     SendspinPairingRecord rec;
     rec.psk_id = init.psk_id;
     rec.psk = init.psk;
+    rec.server_id = init.server_id.peer_id();
     rs.store_record(std::move(rec));
 
     // Step 3: Run the re-handshake (same PSK, new session).
@@ -356,12 +358,14 @@ TEST(NoiseRehandshake, RehandshakeWithDifferentPsk_ChaChaPoly) {
         SendspinPairingRecord rec;
         rec.psk_id = init.psk_id;
         rec.psk = init.psk;
+        rec.server_id = init.server_id.peer_id();
         rs.store_record(std::move(rec));
     }
     {
         SendspinPairingRecord rec2;
         rec2.psk_id = new_psk_id;
         rec2.psk = new_psk;
+        rec2.server_id = init.server_id.peer_id();
         rs.store_record(std::move(rec2));
     }
 

@@ -80,11 +80,10 @@ SendspinClientConfig make_config(uint16_t port) {
 }
 
 /// A paired fake server connected to the bundle's client on `port`.
-std::unique_ptr<FakeEncryptedServer> connect_paired_server(const PairedPeer& peer,
-                                                           const Identity& identity, uint16_t port,
+std::unique_ptr<FakeEncryptedServer> connect_paired_server(const PairedPeer& peer, uint16_t port,
                                                            FakeEncryptedServerOptions options = {}) {
     return std::make_unique<FakeEncryptedServer>(server_url(port), std::string(NOISE_SUITE_CHACHAPOLY),
-                                                 identity, peer.record.psk_id, peer.psk,
+                                                 peer.server_identity, peer.record.psk_id, peer.psk,
                                                  std::move(options));
 }
 
@@ -247,13 +246,12 @@ TEST(ClientLifecycle, RestartYieldsALiveClient) {
         EXPECT_TRUE(client.start());  // Already running: reports true, starts nothing twice
         EXPECT_TRUE(client.is_started());
 
-        Identity identity = Identity::generate().value();
-        auto server = connect_paired_server(bundle.peer, identity, RESTART_TEST_PORT);
+        auto server = connect_paired_server(bundle.peer, RESTART_TEST_PORT);
         ASSERT_TRUE(pump_until(
             client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
         auto info = client.get_server_information();
         ASSERT_TRUE(info.has_value());
-        EXPECT_EQ(info->server_id, identity.peer_id());
+        EXPECT_EQ(info->server_id, bundle.peer.server_identity.peer_id());
 
         // Some group state for stop() to reset.
         ASSERT_TRUE(server->send_app_json(group_update_playing_json()));
@@ -312,9 +310,8 @@ TEST(ClientLifecycle, StopGoodbyesNurseryPeersToo) {
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
 
-    Identity established_identity = Identity::generate().value();
     auto established =
-        connect_paired_server(bundle.peer, established_identity, NURSERY_GOODBYE_TEST_PORT);
+        connect_paired_server(bundle.peer, NURSERY_GOODBYE_TEST_PORT);
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
 
@@ -352,8 +349,7 @@ TEST(ClientLifecycle, StopEndsTheStreamAndRestartPlaysAgain) {
     options.answer_time = true;
     for (int cycle = 0; cycle < 2; ++cycle) {
         ASSERT_TRUE(bundle.start());
-        Identity identity = Identity::generate().value();
-        auto server = connect_paired_server(bundle.peer, identity, STREAM_TEST_PORT, options);
+        auto server = connect_paired_server(bundle.peer, STREAM_TEST_PORT, options);
         ASSERT_TRUE(pump_until(
             client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
 
@@ -388,8 +384,7 @@ TEST(ClientLifecycle, CallbackDuringStopCannotRecurse) {
     ASSERT_TRUE(bundle.start());
 
     {
-        Identity identity = Identity::generate().value();
-        auto server = connect_paired_server(bundle.peer, identity, CALLBACK_TEST_PORT);
+        auto server = connect_paired_server(bundle.peer, CALLBACK_TEST_PORT);
         ASSERT_TRUE(pump_until(
             client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
         // Group state the callback must already see reset.
@@ -410,8 +405,7 @@ TEST(ClientLifecycle, CallbackDuringStopCannotRecurse) {
 
     // The refused start() inside the callback left the client stopped; a real start() works.
     ASSERT_TRUE(bundle.start());
-    Identity identity = Identity::generate().value();
-    auto server = connect_paired_server(bundle.peer, identity, CALLBACK_TEST_PORT);
+    auto server = connect_paired_server(bundle.peer, CALLBACK_TEST_PORT);
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
     client.stop();
@@ -430,8 +424,7 @@ TEST(ClientLifecycle, DestructorGoodbyesPeersWithoutCallbacks) {
         client.add_metadata().set_listener(&listener);
         ASSERT_TRUE(bundle.start());
 
-        Identity identity = Identity::generate().value();
-        server = connect_paired_server(bundle.peer, identity, DESTRUCTOR_TEST_PORT);
+        server = connect_paired_server(bundle.peer, DESTRUCTOR_TEST_PORT);
         ASSERT_TRUE(pump_until(
             client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
         // Client destroyed here while established.
@@ -471,8 +464,7 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     ASSERT_TRUE(bundle.start());
     FakeEncryptedServerOptions options;
     options.answer_time = true;
-    Identity identity = Identity::generate().value();
-    auto server = connect_paired_server(bundle.peer, identity, ROLLBACK_TEST_PORT, options);
+    auto server = connect_paired_server(bundle.peer, ROLLBACK_TEST_PORT, options);
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
@@ -555,8 +547,7 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
 
     ASSERT_TRUE(bundle.start());
     {
-        Identity identity = Identity::generate().value();
-        auto server = connect_paired_server(bundle.peer, identity, VISUALIZER_TEST_PORT, options);
+        auto server = connect_paired_server(bundle.peer, VISUALIZER_TEST_PORT, options);
         ASSERT_TRUE(pump_until_synced(client));
         ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
         // The thread holds the first frame while it waits for its display time; the ones behind
@@ -571,8 +562,7 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     EXPECT_EQ(listener.loudness.load(), 0U);
 
     ASSERT_TRUE(bundle.start());
-    Identity identity = Identity::generate().value();
-    auto server = connect_paired_server(bundle.peer, identity, VISUALIZER_TEST_PORT, options);
+    auto server = connect_paired_server(bundle.peer, VISUALIZER_TEST_PORT, options);
     ASSERT_TRUE(pump_until_synced(client));
     ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
     EXPECT_TRUE(send_loudness_until(client, *server, 0, [&] { return listener.loudness.load() >= 1; }));
@@ -606,8 +596,7 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
     client.set_listener(&listener);
     ASSERT_TRUE(bundle.start());
 
-    Identity identity_a = Identity::generate().value();
-    auto server = connect_paired_server(bundle.peer, identity_a, HIGH_PERF_TEST_PORT);
+    auto server = connect_paired_server(bundle.peer, HIGH_PERF_TEST_PORT);
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
     // The default fake server never answers client/time, so the burst stays open and the hold
@@ -621,8 +610,7 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
         client, [&] { return listener.releases == 1; }, PUMP_TIMEOUT_MS));
     EXPECT_FALSE(client.is_connected());
 
-    Identity identity_b = Identity::generate().value();
-    auto again = connect_paired_server(bundle.peer, identity_b, HIGH_PERF_TEST_PORT);
+    auto again = connect_paired_server(bundle.peer, HIGH_PERF_TEST_PORT);
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected() && listener.requests == 2; },
         PUMP_TIMEOUT_MS));
@@ -644,8 +632,7 @@ TEST(ClientLifecycle, DestructorReleasesHighPerformanceHold) {
         client.set_listener(&listener);
         ASSERT_TRUE(bundle.start());
 
-        Identity identity = Identity::generate().value();
-        server = connect_paired_server(bundle.peer, identity, DESTRUCTOR_HIGH_PERF_TEST_PORT);
+        server = connect_paired_server(bundle.peer, DESTRUCTOR_HIGH_PERF_TEST_PORT);
         ASSERT_TRUE(pump_until(
             client, [&] { return client.is_connected() && listener.requests == 1; },
             PUMP_TIMEOUT_MS));

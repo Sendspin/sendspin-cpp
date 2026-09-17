@@ -264,12 +264,12 @@ static std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     platform_random_bytes(psk.data(), psk.size());
     std::string psk_id = psk_id_for(psk);
 
-    // Build a RecordStore with the PSK (no counterparty_id constraint).
-    // RecordStore(nullptr) provisions the sentinel shared-PSK fallback on construction.
+    // Build a RecordStore holding the PSK, bound to the server identity the handshake reaches.
     RecordStore rs(nullptr);
     SendspinPairingRecord rec;
     rec.psk_id = psk_id;
     rec.psk = psk;
+    rec.server_id = server_id.peer_id();
     rs.store_record(std::move(rec));
 
     // -----------------------------------------------------------------

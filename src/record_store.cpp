@@ -78,7 +78,7 @@ RecordStore::RecordStore(SendspinPersistenceProvider* provider,
         loaded_config = this->load_pairing_config_from_provider();
     }
 
-    this->provision_shared_record_if_needed(loaded_config, initial_unpaired_access_enabled);
+    this->seed_first_boot_config(loaded_config, initial_unpaired_access_enabled);
     this->provision_pairing_psk_if_needed();
 }
 
@@ -162,9 +162,6 @@ bool RecordStore::load_pairing_config_from_provider() {
                 std::clamp(config->dynamic_pin_failures, 0, DYNAMIC_PIN_ESCALATION_THRESHOLD);
             this->pairing_psk_rotated_ = config->pairing_psk_rotated;
             this->static_pin_rotated_ = config->static_pin_rotated;
-            this->record_mode_psk_id_ = config->record_mode_psk_id;
-            SS_LOGD(TAG, "Loaded pairing config: record_mode_psk_id=%s",
-                    this->record_mode_psk_id_.c_str());
             return true;
         }
         SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; ignoring",
@@ -173,13 +170,14 @@ bool RecordStore::load_pairing_config_from_provider() {
     return false;
 }
 
-void RecordStore::provision_shared_record_if_needed(bool loaded_config,
-                                                    bool initial_unpaired_access_enabled) {
+void RecordStore::seed_first_boot_config(bool loaded_config, bool initial_unpaired_access_enabled) {
+    if (loaded_config) {
+        return;
+    }
+
     // First-boot seed: the application's configured default for unpaired access applies only on
-    // a genuine first boot. A loaded config always wins, so a server that turned unpaired access
-    // off keeps it off across reboots. The value is
-    // persisted below by the first-boot provisioning branch, which the !loaded_config condition
-    // always enters.
+    // a genuine first boot. A loaded config always wins, so unpaired access stays off across
+    // reboots once it has been turned off. The value is persisted below.
     //
     // !loaded_config alone is NOT sufficient evidence of a first boot, and getting that wrong
     // fails open. loaded_config stays false both when the persistence_keys::PAIR_CONFIG blob was
@@ -195,81 +193,28 @@ void RecordStore::provision_shared_record_if_needed(bool loaded_config,
     // A store that lost EVERYTHING is indistinguishable from a factory-fresh device by
     // construction, so the seed does apply there, as it does when there is no provider at all.
     const bool previously_provisioned = !this->records_.empty() || this->pairing_psk_.has_value();
-    if (!loaded_config && !previously_provisioned) {
-        this->unpaired_access_enabled_ = initial_unpaired_access_enabled;
-    } else if (!loaded_config) {
+    if (previously_provisioned) {
         SS_LOGW(TAG,
                 "No pairing config loaded but %zu record(s) survived; ignoring the unpaired-"
                 "access seed and leaving unpaired access disabled",
                 this->records_.size());
+    } else {
+        this->unpaired_access_enabled_ = initial_unpaired_access_enabled;
     }
     // Scope note: only unpaired_access_enabled_ is protected this way, and deliberately so. It
     // defaults to false, so declining to seed it can only ever withhold a permission; it
     // cannot break a working device. The sibling flags (pairing_psk_enabled_,
     // dynamic_pin_enabled_) default to TRUE, so a config that fails to load does resurrect a
-    // pairing method an operator had turned off, and the provisioning branch below persists
-    // that. Forcing those to false here is not a correct fix: a provider that seeds records or a
-    // Pairing PSK without implementing config persistence at all returns nullopt for exactly the
-    // same reason a damaged one does, and disabling pairing for it would break a legitimate
-    // integration. Closing that hole properly needs the provider interface to distinguish
-    // "never stored" from "could not be read" (a tri-state load result) rather than more
-    // guessing here.
-
-    // First-boot provisioning: if no config was loaded (or the referenced shared
-    // record is missing), generate a fresh shared-PSK fallback record.
-    if (!loaded_config || this->record_mode_psk_id_.empty() ||
-        this->record_by_psk_id(this->record_mode_psk_id_) == nullptr) {
-        SS_LOGD(TAG, "First-boot provisioning: generating shared-PSK fallback record");
-
-        std::array<uint8_t, NOISE_PSK_SIZE> shared_psk{};
-        platform_random_bytes(shared_psk.data(), shared_psk.size());
-        std::string shared_psk_id = psk_id_for(shared_psk);
-
-        SendspinPairingRecord shared_record;
-        shared_record.psk_id = shared_psk_id;
-        shared_record.psk = shared_psk;
-        // server_id absent = shared record
-
-        this->records_.push_back(shared_record);
-        this->record_mode_psk_id_ = shared_psk_id;
-
-        // Persist the config BEFORE the record, not after. These are two independent provider
-        // writes (PAIR_CONFIG and RECORDS) with no atomicity between them (the in-tree
-        // reference provider does a full fsync+rename per save_blob()), so a power loss can
-        // land between them, and the ORDER decides whether that is self-healing:
-        //
-        //   config first (this order): the interrupted state is a config naming a record that
-        //     RECORDS never received. Next boot takes the third clause of the guard above
-        //     (record_by_psk_id(record_mode_psk_id_) == nullptr), regenerates, and overwrites
-        //     both keys. Nothing is left behind.
-        //   record first (the reverse): the interrupted state is a stored record that no config
-        //     references. Next boot sees !loaded_config, re-enters, and APPENDS a second record
-        //     while the first stays in records_, still resolvable by resolve_by_psk_id() but
-        //     unreferenced. Every repeat of that crash window adds another orphan.
-        //
-        // Ordering alone only covers a crash. A provider that REJECTS the config write while
-        // accepting the record write would reach the same orphaned state by a different route,
-        // so skip the record write when the config write was refused: leaving neither key
-        // written keeps the next boot a clean first boot instead of a re-provisioning one.
-        //
-        // A rejected write leaves the record RAM-only for this boot: the device stays usable
-        // (pairing_token() etc. still work against the in-memory record), but the record will be
-        // regenerated on the next reboot, so any token printed before persistence is fixed would
-        // silently stop working. Surface that instead of logging success unconditionally. No lock
-        // needed here: the constructor runs before this object is reachable by any other thread.
-        const bool config_persisted = this->persist_config();
-        const bool record_persisted = config_persisted && this->persist_records_locked();
-
-        if (record_persisted) {
-            SS_LOGI(TAG, "Provisioned shared-PSK fallback record: %s", shared_psk_id.c_str());
-        } else {
-            SS_LOGW(TAG,
-                    "Provisioned shared-PSK fallback record %s but failed to persist it; it is "
-                    "RAM-only for this boot and will be replaced (invalidating this token) on "
-                    "the next reboot",
-                    shared_psk_id.c_str());
-        }
-    }
+    // pairing method an operator had turned off, and the write below persists that. Forcing
+    // those to false here is not a correct fix: a provider that seeds records or a Pairing PSK
+    // without implementing config persistence at all returns nullopt for exactly the same reason
+    // a damaged one does, and disabling pairing for it would break a legitimate integration.
+    // Closing that hole properly needs the provider interface to distinguish "never stored" from
+    // "could not be read" (a tri-state load result) rather than more guessing here.
+    //
+    // No lock needed here: the constructor runs before this object is reachable by any other
+    // thread.
+    this->persist_config();
 }
 
 void RecordStore::provision_pairing_psk_if_needed() {
@@ -379,7 +324,7 @@ const SendspinPairingRecord* RecordStore::record_by_psk_id(const std::string& ps
 
 const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string& server_id) const {
     for (const auto& rec : this->records_) {
-        if (rec.server_id.has_value() && rec.server_id.value() == server_id) {
+        if (rec.server_id == server_id) {
             return &rec;
         }
     }
@@ -455,9 +400,7 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
     // the one way this function fails, and it fails closed: an unresolvable record drops the
     // connection when the server rekeys onto it.
     if (is_insert) {
-        const bool will_supersede_existing =
-            record.server_id.has_value() &&
-            this->record_by_server_id(record.server_id.value()) != nullptr;
+        const bool will_supersede_existing = this->record_by_server_id(record.server_id) != nullptr;
         if (!will_supersede_existing && !this->has_capacity_locked()) {
             SS_LOGW(TAG, "Storage full (%zu/%zu); rejecting new pairing record %s",
                     this->records_.size(), this->max_records_, incoming_psk_id.c_str());
@@ -476,22 +419,19 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
     // PSK that REPLACES whatever that server held before, and leaving the prior record in place
     // would let re-pairing accumulate a second working PSK for the same server, so "rotation"
     // never revokes anything. Only the pairing path asks for this; store_record() stores
-    // plainly. Shared-PSK records (server_id absent) never match here.
-    if (this->records_[idx].server_id.has_value()) {
-        const std::string superseded_server_id = this->records_[idx].server_id.value();
-        for (size_t i = 0; i < this->records_.size();) {
-            if (i != idx && this->records_[i].server_id.has_value() &&
-                this->records_[i].server_id.value() == superseded_server_id) {
-                SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
-                        this->records_[i].psk_id.c_str(), superseded_server_id.c_str());
-                this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(i));
-                if (i < idx) {
-                    --idx;
-                }
-                continue;  // The element that shifted into position i still needs checking.
+    // plainly.
+    const std::string superseded_server_id = this->records_[idx].server_id;
+    for (size_t i = 0; i < this->records_.size();) {
+        if (i != idx && this->records_[i].server_id == superseded_server_id) {
+            SS_LOGI(TAG, "Superseding prior record %s for server_id=%s",
+                    this->records_[i].psk_id.c_str(), superseded_server_id.c_str());
+            this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(i));
+            if (i < idx) {
+                --idx;
             }
-            ++i;
+            continue;  // The element that shifted into position i still needs checking.
         }
+        ++i;
     }
 
     return true;
@@ -594,25 +534,6 @@ void RecordStore::clear_pairing_psk() {
 // ============================================================================
 // Pairing config
 // ============================================================================
-
-bool RecordStore::is_shared_record(const ResolvedPsk& r) {
-    return r.category == PskCategory::LONG_TERM && !r.counterparty_id.has_value();
-}
-
-bool RecordStore::set_record_mode_psk_id(const std::string& psk_id) {
-    auto resolved = this->resolve_by_psk_id(psk_id);
-    if (!resolved.has_value()) {
-        SS_LOGE(TAG, "record_mode psk_id '%s' references no record", psk_id.c_str());
-        return false;
-    }
-    if (!this->is_shared_record(resolved.value())) {
-        SS_LOGE(TAG, "record_mode psk_id '%s' must reference a shared-PSK record", psk_id.c_str());
-        return false;
-    }
-    this->record_mode_psk_id_ = psk_id;
-    this->persist_config();
-    return true;
-}
 
 void RecordStore::set_pairing_psk_enabled(bool enabled) {
     // Locked, unlike the other config setters: resolve_by_psk_id() reads this field on the
@@ -732,12 +653,10 @@ void RecordStore::set_static_pin_enabled(bool enabled) {
 std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
     const std::string& server_id, const std::optional<std::string>& label) {
     // Hold mutex_ for the whole body rather than letting each step lock on its own. The
-    // capacity probe, the server_id probe, and the shared-PSK fallback lookup must all see one
-    // consistent view of records_, and record_by_server_id() iterates records_ directly: without
-    // this lock a network-thread store_record_superseding() (client.cpp's server/pair-finalize
-    // handler commits synchronously on that thread) can reallocate the vector mid-iteration.
-    // Every helper called below is therefore the _locked variant; calling the public
-    // can_store_record()/resolve_by_psk_id() here would self-deadlock on this non-recursive mutex.
+    // capacity probe and the server_id probe must see one consistent view of records_, and
+    // record_by_server_id() iterates records_ directly: without this lock a network-thread
+    // store_record_superseding() (client.cpp's server/pair-finalize handler commits
+    // synchronously on that thread) can reallocate the vector mid-iteration.
     std::lock_guard<std::mutex> lock(this->mutex_);
 
     // A re-pair for a server_id that already holds a long-term record supersedes it in place
@@ -747,34 +666,24 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
     // already occupies the store's last slot could never re-pair once other servers filled
     // the rest of it.
     const bool replaces_existing = this->record_by_server_id(server_id) != nullptr;
-    if (replaces_existing || this->has_capacity_locked()) {
-        std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-        platform_random_bytes(psk.data(), psk.size());
-        std::string pid = psk_id_for(psk);
-
-        SendspinPairingRecord record;
-        record.psk_id = pid;
-        record.psk = psk;
-        record.server_id = server_id;
-        record.label = label;
-
-        PairingOutcome outcome;
-        outcome.psk = psk;
-        outcome.record = std::move(record);
-        return outcome;
-    }
-
-    // Storage exhausted: fall back to the shared-PSK record.
-    auto resolved = this->resolve_by_psk_id_locked(this->record_mode_psk_id_);
-    if (!resolved.has_value() || !this->is_shared_record(resolved.value())) {
-        SS_LOGE(TAG, "shared-PSK fallback record '%s' is missing or not shared",
-                this->record_mode_psk_id_.c_str());
+    if (!replaces_existing && !this->has_capacity_locked()) {
+        SS_LOGE(TAG, "Storage full (%zu/%zu); cannot pair with server_id=%s", this->records_.size(),
+                this->max_records_, server_id.c_str());
         return std::nullopt;
     }
 
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+    platform_random_bytes(psk.data(), psk.size());
+
+    SendspinPairingRecord record;
+    record.psk_id = psk_id_for(psk);
+    record.psk = psk;
+    record.server_id = server_id;
+    record.label = label;
+
     PairingOutcome outcome;
-    outcome.psk = resolved->psk;
-    // outcome.record is nullopt: caller should not store a new record.
+    outcome.psk = psk;
+    outcome.record = std::move(record);
     return outcome;
 }
 
@@ -795,15 +704,12 @@ bool RecordStore::persist_config() {
     config.dynamic_pin_failures = this->dynamic_pin_failures_;
     config.pairing_psk_rotated = this->pairing_psk_rotated_;
     config.static_pin_rotated = this->static_pin_rotated_;
-    config.record_mode_psk_id = this->record_mode_psk_id_;
     std::string encoded = encode_pairing_config(config);
     if (!this->provider_->save_blob(persistence_keys::PAIR_CONFIG,
                                     reinterpret_cast<const uint8_t*>(encoded.data()),
                                     encoded.size())) {
-        SS_LOGW(TAG,
-                "Provider rejected pairing config write (record_mode_psk_id=%s); the change is "
-                "RAM-only for this boot and will not survive a reboot",
-                config.record_mode_psk_id.c_str());
+        SS_LOGW(TAG, "Provider rejected pairing config write; the change is RAM-only for this "
+                     "boot and will not survive a reboot");
         return false;
     }
     return true;
@@ -834,9 +740,7 @@ bool RecordStore::persist_config() {
 // main loop by the client via INBOX_TOPIC_RECORDS; one flush write covers the insert and the
 // retire together.
 //
-// Precondition: the caller holds mutex_, with one exception: the constructor's first-boot
-// provisioning path, which calls this before the object is reachable by any other thread and
-// therefore needs (and takes) no lock. Every post-construction caller must hold mutex_.
+// Precondition: the caller holds mutex_.
 bool RecordStore::persist_records_locked() {
     if (this->provider_ == nullptr) {
         return true;

@@ -568,21 +568,19 @@ public:
     }
 
     /// @brief Stores the pending pairing record, committed if/when the server acks with
-    /// server/pair-finalize. A nullopt record = storage-exhausted / shared-PSK case: send the
-    /// shared PSK but store nothing on ack. Written on the main loop when entering pairing; taken
-    /// on the network thread in the server/pair-finalize handler (the commit must happen there,
-    /// before the server's re-handshake msg1 (the next message on the same thread) resolves the new
-    /// PSK against the RecordStore). Thin wrapper around pending_pairing_slot_ (ShadowSlot);
+    /// server/pair-finalize. Written on the main loop when entering pairing; taken on the
+    /// network thread in the server/pair-finalize handler (the commit must happen there, before
+    /// the server's re-handshake msg1 (the next message on the same thread) resolves the new PSK
+    /// against the RecordStore). Thin wrapper around pending_pairing_slot_ (ShadowSlot);
     /// latest-wins overwrite, matching write()'s semantics.
-    void set_pending_pairing_record(std::optional<SendspinPairingRecord> record) {
+    void set_pending_pairing_record(SendspinPairingRecord record) {
         this->pending_pairing_slot_.write(std::move(record));
     }
 
     /// @brief Atomically returns and clears the pending pairing record. A returned value is a
-    /// record to store; nullopt means store nothing (shared-PSK case or no pending pairing:
-    /// take() leaves the out-param at its default-constructed nullopt when the slot is clean, so
-    /// both cases collapse to the same observable result). Called on the network thread when the
-    /// server/pair-finalize ack arrives.
+    /// record to store; nullopt means there was no pending pairing (take() leaves the out-param
+    /// at its default-constructed nullopt when the slot is clean). Called on the network thread
+    /// when the server/pair-finalize ack arrives.
     std::optional<SendspinPairingRecord> take_pending_pairing_record() {
         std::optional<SendspinPairingRecord> out;
         this->pending_pairing_slot_.take(out);
@@ -1027,7 +1025,7 @@ protected:
     std::atomic<bool> pairing_finalized_{false};
 
     /// Pending pairing record to be committed when the server/pair-finalize ack arrives (nullopt
-    /// = shared-PSK / nothing to store). Written on the main loop (enter pairing), taken on the
+    /// = nothing to store). Written on the main loop (enter pairing), taken on the
     /// network thread (server/pair-finalize handler), cleared on the main loop (abort/leftover).
     /// A ShadowSlot: latest-wins write, take-and-clear read, single mutex internal to the slot.
     ShadowSlot<std::optional<SendspinPairingRecord>> pending_pairing_slot_{};

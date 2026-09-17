@@ -48,15 +48,4 @@ inline SendspinPairingRecord make_client_record(const std::string& server_id,
     return rec;
 }
 
-/// Build a shared-PSK (fallback) record: no server_id.
-inline SendspinPairingRecord make_shared_record(const std::optional<std::string>& label = {}) {
-    auto psk = make_random_psk();
-    SendspinPairingRecord rec;
-    rec.psk_id = psk_id_for(psk);
-    rec.psk = psk;
-    // server_id absent = shared record
-    rec.label = label;
-    return rec;
-}
-
 }  // namespace sendspin

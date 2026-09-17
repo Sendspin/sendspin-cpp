@@ -22,9 +22,6 @@
 ///
 /// Resolution order: long-term record -> accepted Pairing PSK -> Sentinel PSK.
 ///
-/// Construction pre-provisions a shared-PSK fallback record and points
-/// `record_mode_psk_id` at it, mirroring the Python store's `__init__`.
-///
 /// The record types used here (`SendspinPairingRecord`, `SendspinPairingPsk`,
 /// `SendspinPairingConfig`) are the public types from `sendspin/config.h` so
 /// that the persistence provider can pass them through without conversion.
@@ -68,7 +65,7 @@ struct ResolvedPsk {
     std::string psk_id;
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     PskCategory category{PskCategory::SENTINEL};
-    /// Peer server_id for stored-pubkey records; empty optional = shared / sentinel / pairing.
+    /// Peer server_id; set for every long-term record, empty for the Sentinel and Pairing PSKs.
     std::optional<std::string> counterparty_id;
 
     ResolvedPsk() = default;
@@ -101,9 +98,9 @@ struct ResolvedPsk {
 ///     callers must not retain a returned pointer or reference across any mutation, and must
 ///     never call them from the network thread.
 ///   - Most config fields (`unpaired_access_enabled_`, `dynamic_pin_enabled_`,
-///     `static_pin_enabled_`, `dynamic_pin_min_length_`, `dynamic_pin_failures_`,
-///     `record_mode_psk_id_`) are main-loop-only: written only on the main loop and read only
-///     on the main loop, so no lock is needed.
+///     `static_pin_enabled_`, `dynamic_pin_min_length_`, `dynamic_pin_failures_`) are
+///     main-loop-only: written only on the main loop and read only on the main loop, so no
+///     lock is needed.
 ///   - `pairing_psk_enabled_` is the ONE exception and IS guarded by `mutex_`. It is written on
 ///     the main loop like its neighbours, but it is also READ on the network thread, inside
 ///     `resolve_by_psk_id`'s locked section, because a disabled Pairing PSK must drop out of the
@@ -122,7 +119,7 @@ public:
     /// so there is one source of truth for the number.
     static constexpr size_t DEFAULT_MAX_RECORDS = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS;
 
-    /// @brief Construct and pre-provision the shared-PSK fallback record and the Pairing PSK.
+    /// @brief Construct and pre-provision the Pairing PSK.
     /// If a persistence provider is supplied, attempts to load saved records
     /// and pairing config first; generates fresh material only when absent.
     /// @param provider Persistence provider, or nullptr for an in-memory-only store.
@@ -150,8 +147,7 @@ public:
     /// @brief Return the long-term record identified by psk_id, if any.
     [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(const std::string& psk_id) const;
 
-    /// @brief Return the stored-pubkey record bound to server_id, if any.
-    /// Shared-PSK records (server_id absent) are never returned here.
+    /// @brief Return the record bound to server_id, if any.
     [[nodiscard]] const SendspinPairingRecord* record_by_server_id(
         const std::string& server_id) const;
 
@@ -192,8 +188,6 @@ public:
     /// This is the pairing-completion form: pairing mints a fresh per-server PSK that
     /// REPLACES whatever that server held before, so leaving the prior record in place
     /// would keep the old PSK valid forever and let repeated re-pairs exhaust storage.
-    /// Shared-PSK records (server_id absent) are never subject to this supersede, which is
-    /// what keeps the record-mode fallback record safe.
     ///
     /// Unlike store_record(), this NEVER calls the provider: it runs on the NETWORK thread
     /// (the server/pair-finalize ack handler), where the record must become resolvable before
@@ -343,25 +337,15 @@ public:
     /// @brief Set the minimum PIN length and persist the config.
     void set_dynamic_pin_min_length(int length);
 
-    /// @brief Return the psk_id of the shared-PSK fallback record.
-    [[nodiscard]] const std::string& record_mode_psk_id() const {
-        return this->record_mode_psk_id_;
-    }
-
-    /// @brief Set the shared-PSK fallback record.
-    /// @return false if psk_id does not reference an existing shared-PSK record.
-    bool set_record_mode_psk_id(const std::string& psk_id);
-
     // ========================================
     // Pairing outcome
     // ========================================
 
-    /// @brief Result of resolve_pairing_outcome(): either a fresh per-server PSK/record pair,
-    /// or the shared-PSK fallback when storage is exhausted.
+    /// @brief Result of resolve_pairing_outcome(): a fresh per-server PSK and the record that
+    /// holds it.
     struct PairingOutcome {
         std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-        /// nullopt = storage exhausted, use the shared-PSK fallback record.
-        std::optional<SendspinPairingRecord> record;
+        SendspinPairingRecord record;
 
         PairingOutcome() = default;
         PairingOutcome(const PairingOutcome&) = default;
@@ -376,12 +360,11 @@ public:
         }
     };
 
-    /// @brief Decide a pairing outcome.
+    /// @brief Mint a pairing outcome: a fresh PSK bound to server_id and the record holding it.
     ///
-    /// When the store has room for the record, generates a fresh PSK bound to server_id and
-    /// returns {psk, record}.
-    /// When storage is exhausted, returns the shared fallback PSK and record=nullopt.
-    /// Returns nullopt on error (missing shared fallback).
+    /// A re-pair for a server that already holds a record supersedes it in place, so it is not
+    /// subject to the capacity cap.
+    /// @return nullopt when the store is full and the record would be a net-new one.
     [[nodiscard]] std::optional<PairingOutcome> resolve_pairing_outcome(
         const std::string& server_id, const std::optional<std::string>& label = std::nullopt);
 
@@ -404,23 +387,18 @@ private:
     void load_static_pin_from_provider();
 
     /// @brief Load the pairing config fields from the provider's PAIR_CONFIG blob, if present.
-    /// @return True if a valid config was loaded; the provisioning helpers below use this (the
+    /// @return True if a valid config was loaded; the seeding helper below uses this (the
     ///         "loaded_config" signal) to decide first-boot vs. damaged-config behavior.
     bool load_pairing_config_from_provider();
 
-    /// @brief First-boot handling for the unpaired-access default and the shared-PSK fallback
-    /// record: seeds unpaired_access_enabled_ only on a genuine first boot, then generates and
-    /// persists the fallback record when the loaded config did not already reference one.
+    /// @brief First-boot handling for the unpaired-access default: seeds
+    /// unpaired_access_enabled_ only on a genuine first boot, then persists the config.
     /// @param loaded_config Whether load_pairing_config_from_provider() found a usable config.
     /// @param initial_unpaired_access_enabled First-boot default for unpaired access.
-    void provision_shared_record_if_needed(bool loaded_config,
-                                           bool initial_unpaired_access_enabled);
+    void seed_first_boot_config(bool loaded_config, bool initial_unpaired_access_enabled);
 
     /// @brief Generate and persist the Pairing PSK if the store has none.
     void provision_pairing_psk_if_needed();
-
-    /// @brief Return true if a resolved PSK is a shared-PSK record (long-term, no counterparty).
-    static bool is_shared_record(const ResolvedPsk& r);
 
     /// @brief Return true if there is room for one genuine net-new record under max_records_.
     /// MUST be called with mutex_ already held.
@@ -460,8 +438,6 @@ private:
     mutable std::mutex mutex_;
 
     std::optional<SendspinPairingPsk> pairing_psk_;
-
-    std::string record_mode_psk_id_;
 
     std::vector<SendspinPairingRecord> records_;
 

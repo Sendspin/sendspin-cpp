@@ -59,8 +59,7 @@ TEST(PersistenceCodec, RecordRoundTripWithOptionalFields) {
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->psk_id, r.psk_id);
     EXPECT_EQ(decoded->psk, r.psk);
-    ASSERT_TRUE(decoded->server_id.has_value());
-    EXPECT_EQ(decoded->server_id.value(), r.server_id.value());
+    EXPECT_EQ(decoded->server_id, r.server_id);
     ASSERT_TRUE(decoded->label.has_value());
     EXPECT_EQ(decoded->label.value(), r.label.value());
     EXPECT_TRUE(decoded->used);
@@ -70,24 +69,35 @@ TEST(PersistenceCodec, RecordRoundTripWithoutOptionalFields) {
     SendspinPairingRecord r;
     r.psk_id = "rec-2";
     r.psk = make_psk(0x20);
+    r.server_id = "srv-2";
     r.used = false;
 
     std::string blob = encode_pairing_record(r);
-    EXPECT_EQ(blob.find("server_id"), std::string::npos);
     EXPECT_EQ(blob.find("label"), std::string::npos);
 
     auto decoded = decode_pairing_record(blob);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->psk_id, r.psk_id);
     EXPECT_EQ(decoded->psk, r.psk);
-    EXPECT_FALSE(decoded->server_id.has_value());
+    EXPECT_EQ(decoded->server_id, r.server_id);
     EXPECT_FALSE(decoded->label.has_value());
     EXPECT_FALSE(decoded->used);
 }
 
+// A record with no server_id could never satisfy the post-match server check, so it is not a
+// usable credential and the decoder rejects it (spec "Pre-Shared Key").
+TEST(PersistenceCodec, RecordDecodeRejectsMissingServerId) {
+    const std::string head = R"({"v":1,"psk_id":"rec-9","psk":")" +
+                             base64url_encode(make_psk(0x21).data(), 32);
+    EXPECT_FALSE(decode_pairing_record(head + R"("})").has_value());
+    EXPECT_FALSE(decode_pairing_record(head + R"(","server_id":""})").has_value());
+    // Control: the same record with a server_id decodes.
+    EXPECT_TRUE(decode_pairing_record(head + R"(","server_id":"srv-9"})").has_value());
+}
+
 TEST(PersistenceCodec, RecordDecodeAcceptsMissingVersion) {
     std::string blob =
-        R"({"psk_id":"rec-3","psk":")" +
+        R"({"server_id":"srv-rec-3","psk_id":"rec-3","psk":")" +
         base64url_encode(make_psk(0x30).data(), 32) + R"(","used":false})";
     auto decoded = decode_pairing_record(blob);
     ASSERT_TRUE(decoded.has_value());
@@ -95,7 +105,7 @@ TEST(PersistenceCodec, RecordDecodeAcceptsMissingVersion) {
 }
 
 TEST(PersistenceCodec, RecordDecodeIgnoresUnknownFields) {
-    std::string blob = R"({"v":1,"psk_id":"rec-4","psk":")" +
+    std::string blob = R"({"v":1,"server_id":"srv-rec-4","psk_id":"rec-4","psk":")" +
                        base64url_encode(make_psk(0x40).data(), 32) +
                        R"(","used":false,"totally_unknown":{"nested":[1,2,3]},"another":"x"})";
     auto decoded = decode_pairing_record(blob);
@@ -104,7 +114,7 @@ TEST(PersistenceCodec, RecordDecodeIgnoresUnknownFields) {
 }
 
 TEST(PersistenceCodec, RecordDecodeBestEffortOnFutureVersion) {
-    std::string blob = R"({"v":99,"psk_id":"rec-5","psk":")" +
+    std::string blob = R"({"v":99,"server_id":"srv-rec-5","psk_id":"rec-5","psk":")" +
                        base64url_encode(make_psk(0x50).data(), 32) + R"(","used":true})";
     auto decoded = decode_pairing_record(blob);
     ASSERT_TRUE(decoded.has_value());
@@ -143,7 +153,7 @@ TEST(PersistenceCodec, RecordDecodeWrongTypedUsedFallsBackToFalse) {
     // would turn a corrupt "used":"false" STRING into used == true and flip the single-use
     // admission gate. A wrong-typed field must keep the struct default.
     for (const char* corrupt_used : {R"("false")", R"("yes")", R"("")", "[1,2]", "{}"}) {
-        std::string blob = R"({"v":1,"psk_id":"rec-u","psk":")" +
+        std::string blob = R"({"v":1,"server_id":"srv-u","psk_id":"rec-u","psk":")" +
                            base64url_encode(make_psk(0x62).data(), 32) + R"(","used":)" +
                            corrupt_used + "}";
         auto decoded = decode_pairing_record(blob);
@@ -154,7 +164,7 @@ TEST(PersistenceCodec, RecordDecodeWrongTypedUsedFallsBackToFalse) {
 
 TEST(PersistenceCodec, RecordDecodeRejectsWrongLengthPsk) {
     std::array<uint8_t, 16> short_psk{};
-    std::string blob = R"({"v":1,"psk_id":"rec-8","psk":")" +
+    std::string blob = R"({"v":1,"server_id":"srv-rec-8","psk_id":"rec-8","psk":")" +
                        base64url_encode(short_psk.data(), short_psk.size()) + R"("})";
     EXPECT_FALSE(decode_pairing_record(blob).has_value());
 }
@@ -174,6 +184,7 @@ TEST(PersistenceCodec, RecordsArrayRoundTrip) {
     SendspinPairingRecord r2;
     r2.psk_id = "b";
     r2.psk = make_psk(2);
+    r2.server_id = "srv-b";
     r2.used = true;
     recs.push_back(r2);
 
@@ -191,8 +202,7 @@ TEST(PersistenceCodec, RecordsArrayRoundTrip) {
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 2u);
     EXPECT_EQ((*decoded)[0].psk_id, "a");
-    ASSERT_TRUE((*decoded)[0].server_id.has_value());
-    EXPECT_EQ((*decoded)[0].server_id.value(), "srv-a");
+    EXPECT_EQ((*decoded)[0].server_id, "srv-a");
     EXPECT_EQ((*decoded)[1].psk_id, "b");
     EXPECT_TRUE((*decoded)[1].used);
 }
@@ -219,14 +229,14 @@ TEST(PersistenceCodec, RecordsArrayDecodeRejectsNonArrayRecordsField) {
 TEST(PersistenceCodec, RecordsArraySkipsCorruptEntryKeepsGoodOnes) {
     std::string good_psk = base64url_encode(make_psk(9).data(), 32);
     std::string blob = R"({"v":1,"records":[)"
-                       R"({"psk_id":"good-1","psk":")" +
+                       R"({"server_id":"srv-1","psk_id":"good-1","psk":")" +
                        good_psk +
                        R"("},)"
-                       R"({"psk_id":"bad","psk":"not-valid-base64!!"},)"
-                       R"({"psk":")" +
+                       R"({"server_id":"srv-bad","psk_id":"bad","psk":"not-valid-base64!!"},)"
+                       R"({"server_id":"srv-2","psk":")" +
                        good_psk +
                        R"("},)"  // missing psk_id
-                       R"({"psk_id":"good-2","psk":")" +
+                       R"({"server_id":"srv-3","psk_id":"good-2","psk":")" +
                        good_psk + R"("}]})";
 
     auto decoded = decode_pairing_records(blob);
@@ -300,7 +310,6 @@ TEST(PersistenceCodec, ConfigRoundTrip) {
     c.dynamic_pin_failures = 3;
     c.pairing_psk_rotated = true;
     c.static_pin_rotated = true;
-    c.record_mode_psk_id = "fallback-id";
 
     std::string blob = encode_pairing_config(c);
     auto decoded = decode_pairing_config(blob);
@@ -313,7 +322,6 @@ TEST(PersistenceCodec, ConfigRoundTrip) {
     EXPECT_EQ(decoded->dynamic_pin_failures, c.dynamic_pin_failures);
     EXPECT_EQ(decoded->pairing_psk_rotated, c.pairing_psk_rotated);
     EXPECT_EQ(decoded->static_pin_rotated, c.static_pin_rotated);
-    EXPECT_EQ(decoded->record_mode_psk_id, c.record_mode_psk_id);
 }
 
 TEST(PersistenceCodec, ConfigDecodeMissingFieldsTakeDefaults) {
@@ -330,7 +338,6 @@ TEST(PersistenceCodec, ConfigDecodeMissingFieldsTakeDefaults) {
     // upgrade keeps advertising the factory locations hint rather than inventing a rotation.
     EXPECT_FALSE(decoded->pairing_psk_rotated);
     EXPECT_FALSE(decoded->static_pin_rotated);
-    EXPECT_EQ(decoded->record_mode_psk_id, defaults.record_mode_psk_id);
 }
 
 TEST(PersistenceCodec, ConfigDecodeRejectsParseFailure) {
@@ -398,8 +405,7 @@ TEST(PersistenceCodec, DecodesHostExampleLegacyRecordShape) {
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->psk_id, "legacy-psk-id");
     EXPECT_EQ(decoded->psk, psk);
-    ASSERT_TRUE(decoded->server_id.has_value());
-    EXPECT_EQ(decoded->server_id.value(), "legacy-server");
+    EXPECT_EQ(decoded->server_id, "legacy-server");
     ASSERT_TRUE(decoded->label.has_value());
     EXPECT_EQ(decoded->label.value(), "living room");
     EXPECT_TRUE(decoded->used);

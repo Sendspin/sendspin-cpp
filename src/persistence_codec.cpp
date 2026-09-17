@@ -82,8 +82,15 @@ std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj) {
     SendspinPairingRecord rec;
     rec.psk_id = std::move(core->psk_id);
     rec.psk = core->psk;
-    if (obj["server_id"].is<const char*>()) {
-        rec.server_id = obj["server_id"].as<const char*>();
+    // A record whose PSK is not bound to a server can never satisfy the post-match server_id
+    // check (spec "Pre-Shared Key"), so it is not a usable record: reject it here rather than
+    // load a credential no handshake could ever accept.
+    if (!obj["server_id"].is<const char*>()) {
+        return std::nullopt;
+    }
+    rec.server_id = obj["server_id"].as<const char*>();
+    if (rec.server_id.empty()) {
+        return std::nullopt;
     }
     if (obj["label"].is<const char*>()) {
         rec.label = obj["label"].as<const char*>();
@@ -108,9 +115,7 @@ void write_record_fields(TTarget& target, const SendspinPairingRecord& r) {
     std::string psk_b64 = base64url_encode(r.psk.data(), r.psk.size());
     target["psk"] = psk_b64;
     secure_zero(psk_b64.data(), psk_b64.size());
-    if (r.server_id.has_value()) {
-        target["server_id"] = r.server_id.value();
-    }
+    target["server_id"] = r.server_id;
     if (r.label.has_value()) {
         target["label"] = r.label.value();
     }
@@ -234,7 +239,6 @@ std::optional<SendspinPairingPsk> decode_pairing_psk(std::string_view bytes) {
 std::string encode_pairing_config(const SendspinPairingConfig& c) {
     JsonDocument doc = make_json_document();
     doc["v"] = RECORD_CODEC_VERSION;
-    doc["record_mode_psk_id"] = c.record_mode_psk_id;
     doc["pairing_psk_enabled"] = c.pairing_psk_enabled;
     doc["unpaired_access_enabled"] = c.unpaired_access_enabled;
     doc["dynamic_pin_enabled"] = c.dynamic_pin_enabled;
@@ -255,9 +259,6 @@ std::optional<SendspinPairingConfig> decode_pairing_config(std::string_view byte
         return std::nullopt;
     }
     SendspinPairingConfig cfg;
-    if (obj["record_mode_psk_id"].is<const char*>()) {
-        cfg.record_mode_psk_id = obj["record_mode_psk_id"].as<const char*>();
-    }
     if (obj["pairing_psk_enabled"].is<bool>()) {
         cfg.pairing_psk_enabled = obj["pairing_psk_enabled"].as<bool>();
     }
