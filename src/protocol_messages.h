@@ -143,9 +143,8 @@ inline const char* to_cstr(SendspinRole role) {
 /// A connection declares a SET of activities rather than a single reason (spec "server/activate").
 /// Mirrors Activity in aiosendspin/models/types.py.
 enum class SendspinActivity : uint8_t {
-    PLAYBACK,    // Active or upcoming playback
-    PAIRING,     // A pairing exchange
-    MANAGEMENT,  // A dedicated management session
+    PLAYBACK,  // Active or upcoming playback
+    PAIRING,   // A pairing exchange
 };
 
 /// @brief Converts a SendspinActivity value to its protocol wire string
@@ -157,8 +156,6 @@ inline const char* to_cstr(SendspinActivity activity) {
             return "playback";
         case SendspinActivity::PAIRING:
             return "pairing";
-        case SendspinActivity::MANAGEMENT:
-            return "management";
         default:
             return "unknown";
     }
@@ -173,9 +170,6 @@ inline std::optional<SendspinActivity> activity_from_string(const std::string& s
     }
     if (str == "pairing") {
         return SendspinActivity::PAIRING;
-    }
-    if (str == "management") {
-        return SendspinActivity::MANAGEMENT;
     }
     return std::nullopt;
 }

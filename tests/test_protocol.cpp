@@ -929,15 +929,14 @@ TEST(Protocol, ServerActivateAllActivities) {
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(
-        R"({"type":"server/activate","payload":{"activities":["playback","pairing","management"]}})",
+        R"({"type":"server/activate","payload":{"activities":["playback","pairing"]}})",
         doc, root));
 
     ServerActivateMessage msg;
     ASSERT_TRUE(process_server_activate_message(root, &msg));
-    ASSERT_EQ(msg.activities.size(), 3u);
+    ASSERT_EQ(msg.activities.size(), 2u);
     EXPECT_EQ(msg.activities[0], SendspinActivity::PLAYBACK);
     EXPECT_EQ(msg.activities[1], SendspinActivity::PAIRING);
-    EXPECT_EQ(msg.activities[2], SendspinActivity::MANAGEMENT);
 }
 
 TEST(Protocol, ServerActivateEmptyActivities) {
@@ -1058,13 +1057,11 @@ TEST(Protocol, ServerActivateMissingActivitiesFails) {
 TEST(Protocol, ActivityToString) {
     EXPECT_STREQ(to_cstr(SendspinActivity::PLAYBACK), "playback");
     EXPECT_STREQ(to_cstr(SendspinActivity::PAIRING), "pairing");
-    EXPECT_STREQ(to_cstr(SendspinActivity::MANAGEMENT), "management");
 }
 
 TEST(Protocol, ActivityFromString) {
     EXPECT_EQ(activity_from_string("playback"), SendspinActivity::PLAYBACK);
     EXPECT_EQ(activity_from_string("pairing"), SendspinActivity::PAIRING);
-    EXPECT_EQ(activity_from_string("management"), SendspinActivity::MANAGEMENT);
     EXPECT_FALSE(activity_from_string("unknown_activity").has_value());
 }
 

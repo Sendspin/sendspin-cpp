@@ -879,7 +879,7 @@ The protocol models this deliberately: `management/get-pairing-config` reports i
 `record_mode`, and storage accounting distinguishes `cost_individual` from `cost_shared`.
 
 Servers holding the shared record are therefore indistinguishable from each other, and each
-gets `ConnectionTrust::USER` with the same `{playback, management}` rights as a
+gets `ConnectionTrust::USER` with the same `{playback}` rights as a
 per-server-paired server. Raise `max_pairing_records` if a deployment needs every server to
 have its own record.
 

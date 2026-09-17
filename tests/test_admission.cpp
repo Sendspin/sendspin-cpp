@@ -44,7 +44,6 @@ static std::vector<SendspinActivity> acts(SendspinActivity a, SendspinActivity b
 }
 
 static const auto PB = SendspinActivity::PLAYBACK;
-static const auto MG = SendspinActivity::MANAGEMENT;
 static const auto PR = SendspinActivity::PAIRING;
 
 // ============================================================================
@@ -60,16 +59,6 @@ TEST(ActivitiesAllowed, SentinelEmpty_IsAllowed) {
 TEST(ActivitiesAllowed, SentinelPlayback_OnlyWithUnpairedAccess) {
     EXPECT_FALSE(activities_allowed(PskCategory::SENTINEL, acts(PB), false));
     EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(PB), true));
-}
-
-TEST(ActivitiesAllowed, SentinelManagement_NeverAllowed) {
-    EXPECT_FALSE(activities_allowed(PskCategory::SENTINEL, acts(MG), false));
-    EXPECT_FALSE(activities_allowed(PskCategory::SENTINEL, acts(MG), true));
-}
-
-TEST(ActivitiesAllowed, SentinelPlaybackManagement_NeverAllowed) {
-    EXPECT_FALSE(activities_allowed(PskCategory::SENTINEL, acts(PB, MG), false));
-    EXPECT_FALSE(activities_allowed(PskCategory::SENTINEL, acts(PB, MG), true));
 }
 
 TEST(ActivitiesAllowed, SentinelPairing_OnlyExactlyPairing) {
@@ -95,16 +84,6 @@ TEST(ActivitiesAllowed, LongTermPlayback_IsAllowed) {
     EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(PB), true));
 }
 
-TEST(ActivitiesAllowed, LongTermManagement_IsAllowed) {
-    EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(MG), false));
-    EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(MG), true));
-}
-
-TEST(ActivitiesAllowed, LongTermPlaybackManagement_IsAllowed) {
-    EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(PB, MG), false));
-    EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(PB, MG), true));
-}
-
 TEST(ActivitiesAllowed, LongTermPairing_OnlyExactlyPairing) {
     // {PAIRING} alone is allowed (by the general "only {PAIRING}" check)
     EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(PR), false));
@@ -112,10 +91,6 @@ TEST(ActivitiesAllowed, LongTermPairing_OnlyExactlyPairing) {
 
 TEST(ActivitiesAllowed, LongTermPairingPlayback_NotAllowed) {
     EXPECT_FALSE(activities_allowed(PskCategory::LONG_TERM, acts(PR, PB), false));
-}
-
-TEST(ActivitiesAllowed, LongTermPairingManagement_NotAllowed) {
-    EXPECT_FALSE(activities_allowed(PskCategory::LONG_TERM, acts(PR, MG), false));
 }
 
 // PAIRING category (the Pairing PSK)
@@ -133,10 +108,6 @@ TEST(ActivitiesAllowed, PairingCatEmpty_NotAllowed) {
 TEST(ActivitiesAllowed, PairingCatPlayback_NotAllowed) {
     EXPECT_FALSE(activities_allowed(PskCategory::PAIRING, acts(PB), false));
     EXPECT_FALSE(activities_allowed(PskCategory::PAIRING, acts(PB), true));
-}
-
-TEST(ActivitiesAllowed, PairingCatManagement_NotAllowed) {
-    EXPECT_FALSE(activities_allowed(PskCategory::PAIRING, acts(MG), false));
 }
 
 TEST(ActivitiesAllowed, PairingCatPairingPlayback_NotAllowed) {
@@ -169,13 +140,6 @@ TEST(Admissible, SentinelPlaybackHasRoles_RequiresUnpairedAccess) {
     EXPECT_TRUE(admissible(PskCategory::SENTINEL, acts(PB), true, true));
 }
 
-TEST(Admissible, SentinelManagement_NotAdmissible) {
-    EXPECT_FALSE(admissible(PskCategory::SENTINEL, acts(MG), false, false));
-    EXPECT_FALSE(admissible(PskCategory::SENTINEL, acts(MG), false, true));
-    EXPECT_FALSE(admissible(PskCategory::SENTINEL, acts(MG), true, false));
-    EXPECT_FALSE(admissible(PskCategory::SENTINEL, acts(MG), true, true));
-}
-
 TEST(Admissible, LongTermPlaybackNoRoles_Admissible) {
     EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(PB), false, false));
     EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(PB), false, true));
@@ -183,17 +147,6 @@ TEST(Admissible, LongTermPlaybackNoRoles_Admissible) {
 
 TEST(Admissible, LongTermPlaybackHasRoles_Admissible) {
     EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(PB), true, false));
-}
-
-TEST(Admissible, LongTermManagement_AdmissibleWithoutRoles) {
-    // {MG} alone: allowed; then MG | {PB} = {PB, MG} which is also allowed for LONG_TERM
-    EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(MG), false, false));
-    EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(MG), true, false));
-}
-
-TEST(Admissible, LongTermPlaybackManagement_Admissible) {
-    EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(PB, MG), false, false));
-    EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(PB, MG), true, false));
 }
 
 TEST(Admissible, LongTermPairing_AdmissibleOnlyWithoutRoles) {
@@ -242,12 +195,6 @@ TEST(RejectReason, SentinelPlaybackRolesNoUnpaired_PairingRequired) {
               SendspinGoodbyeReason::PAIRING_REQUIRED);
 }
 
-TEST(RejectReason, SentinelManagement_Unauthorized) {
-    // Still unauthorized even with unpaired_access=true, unlike the PLAYBACK cases above.
-    EXPECT_EQ(reject_reason_for(PskCategory::SENTINEL, acts(MG), false, false),
-              SendspinGoodbyeReason::UNAUTHORIZED);
-}
-
 TEST(RejectReason, SentinelEmptyHasRolesNoUnpaired_PairingRequired) {
     // SENTINEL + {} + has_roles + !unpaired_access:
     // admissible(SENTINEL, {}, true, true) = true -> pairing_required
@@ -287,20 +234,7 @@ TEST(ActivityRank, PlaybackPairing_Two) {
     EXPECT_EQ(activity_rank(acts(PB, PR)), 2);
 }
 
-TEST(ActivityRank, Management_Three) {
-    EXPECT_EQ(activity_rank(acts(MG)), 3);
-}
-
-TEST(ActivityRank, ManagementPlayback_Three) {
-    EXPECT_EQ(activity_rank(acts(MG, PB)), 3);
-}
-
-TEST(ActivityRank, ManagementAll_Three) {
-    EXPECT_EQ(activity_rank(acts(MG, PB, PR)), 3);
-}
-
 TEST(ActivityRank, Ordering) {
-    EXPECT_GT(activity_rank(acts(MG)), activity_rank(acts(PB)));
     EXPECT_GT(activity_rank(acts(PB)), activity_rank(acts(PR)));
     EXPECT_GT(activity_rank(acts(PR)), activity_rank(acts()));
 }
@@ -313,15 +247,17 @@ static bool admit(const std::vector<SendspinActivity>& incoming_acts,
                   const std::string& incoming_id,
                   const std::vector<SendspinActivity>& admitted_acts,
                   const std::string& admitted_id, bool has_admitted,
-                  const std::string& last_playback = "", bool has_last = false) {
+                  const std::string& last_playback = "", bool has_last = false,
+                  bool admitted_pairing_in_flight = true) {
     return should_admit_connection(incoming_acts, incoming_id, admitted_acts, admitted_id,
-                                   has_admitted, last_playback, has_last);
+                                   has_admitted, last_playback, has_last,
+                                   admitted_pairing_in_flight);
 }
 
 TEST(ShouldAdmit, NoCurrent_AlwaysAdmit) {
     EXPECT_TRUE(admit(acts(), "new", acts(), "", false));
     EXPECT_TRUE(admit(acts(PB), "new", acts(), "", false));
-    EXPECT_TRUE(admit(acts(MG), "new", acts(), "", false));
+    EXPECT_TRUE(admit(acts(PR), "new", acts(), "", false));
 }
 
 TEST(ShouldAdmit, HigherRankDisplaces) {
@@ -329,12 +265,12 @@ TEST(ShouldAdmit, HigherRankDisplaces) {
     // (the in-flight-pairing rule blocks it)
     EXPECT_FALSE(admit(acts(PB), "new", acts(PR), "old", true));
 
-    // incoming=management(3), admitted=pairing(1)
-    // admitted_rank=1; incoming_rank=3 -> 3 > 1, and rank-3 is not in {1,2}, so -> admit
-    EXPECT_TRUE(admit(acts(MG), "new", acts(PR), "old", true));
+    // Once the pairing is no longer in flight, the rank comparison decides and rank 2 wins.
+    EXPECT_TRUE(admit(acts(PB), "new", acts(PR), "old", true, "", false,
+                      /*admitted_pairing_in_flight=*/false));
 
-    // incoming=management(3), admitted=playback(2)
-    EXPECT_TRUE(admit(acts(MG), "new", acts(PB), "old", true));
+    // incoming=playback(2), admitted=empty(0)
+    EXPECT_TRUE(admit(acts(PB), "new", acts(), "old", true));
 }
 
 TEST(ShouldAdmit, InFlightPairing_NotDisplacedByPairing) {
@@ -359,8 +295,9 @@ TEST(ShouldAdmit, EqualNonZeroRank_Admits) {
     // Both playback(2) -> admit incoming
     EXPECT_TRUE(admit(acts(PB), "new", acts(PB), "old", true));
 
-    // Both management(3) -> admit incoming
-    EXPECT_TRUE(admit(acts(MG), "new", acts(MG), "old", true));
+    // Both pairing(1), with the admitted pairing already finished -> admit incoming
+    EXPECT_TRUE(admit(acts(PR), "new", acts(PR), "old", true, "", false,
+                      /*admitted_pairing_in_flight=*/false));
 }
 
 TEST(ShouldAdmit, BothEmpty_ResolvesByLastPlayback_IncomingMatches) {

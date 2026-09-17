@@ -61,7 +61,7 @@ inline bool contains_activity(const std::vector<SendspinActivity>& activities,
 ///
 /// Rules (mirroring the reference exactly):
 ///   - If PAIRING in activities -> only {PAIRING} is valid.
-///   - LONG_TERM category -> any subset of {PLAYBACK, MANAGEMENT}.
+///   - LONG_TERM category -> the empty set or {PLAYBACK}.
 ///   - SENTINEL category -> empty set is ok; {PLAYBACK} is ok IFF unpaired_access.
 ///   - PAIRING category -> only {PAIRING} (handled by the first check above;
 ///     anything else falls through to false).
@@ -79,9 +79,10 @@ inline bool activities_allowed(PskCategory category,
     }
 
     if (category == PskCategory::LONG_TERM) {
-        // Any subset of {PLAYBACK, MANAGEMENT} is allowed.
+        // The empty set or {PLAYBACK} (spec "server/activate": a long-term PSK admits no other
+        // activity).
         for (const auto& a : activities) {
-            if (a != SendspinActivity::PLAYBACK && a != SendspinActivity::MANAGEMENT) {
+            if (a != SendspinActivity::PLAYBACK) {
                 return false;
             }
         }
@@ -195,25 +196,19 @@ inline SendspinGoodbyeReason inadmissible_reject_reason(
 /// Ports `_activity_rank` from
 /// aiosendspin/aiosendspin/client/client.py.
 ///
-/// management=3 > playback=2 > pairing=1 > none=0.
+/// playback=2 > pairing=1 > none=0.
 ///
 /// @param activities Activities declared by the connection.
-/// @return Integer rank (0-3).
+/// @return Integer rank (0-2).
 inline int activity_rank(const std::vector<SendspinActivity>& activities) {
-    bool has_management = false;
     bool has_playback = false;
     bool has_pairing = false;
     for (const auto& a : activities) {
-        if (a == SendspinActivity::MANAGEMENT) {
-            has_management = true;
-        } else if (a == SendspinActivity::PLAYBACK) {
+        if (a == SendspinActivity::PLAYBACK) {
             has_playback = true;
         } else if (a == SendspinActivity::PAIRING) {
             has_pairing = true;
         }
-    }
-    if (has_management) {
-        return 3;
     }
     if (has_playback) {
         return 2;
