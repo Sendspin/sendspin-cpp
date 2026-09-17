@@ -33,12 +33,10 @@ namespace sendspin {
 
 static const char* const TAG = "sendspin.source_task";
 
-/// @brief Same budget as the sync task. Host -O2 -fstack-usage measures the deepest task-path
-/// chain (stream -> send_chunk -> event wait) near 0.6 KB; the remainder is headroom for the
-/// ESP transport send path pending an on-target high-water measurement. Opus working buffers
-/// live on micro-opus's per-thread pseudostack, not here -- an assumption Kconfig enforces by
-/// refusing the source role under OPUS_USE_ALLOCA.
-static constexpr size_t SOURCE_TASK_STACK_SIZE = 6192;
+/// @brief Fallback source task stack budget if not configured. Deep call frames from Opus encoding,
+/// Noise encryption (ChaCha20-Poly1305), WebSocket framing, and FreeRTOS context switching require
+/// substantial stack space on Xtensa.
+static constexpr size_t SOURCE_TASK_STACK_SIZE = SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE;
 
 /// @brief Ring receive timeout (ms) bounding how long the task waits before re-checking the
 /// stop/connection conditions; same cadence as the sync task's encoded-chunk receive
@@ -173,7 +171,16 @@ bool SourceTask::start(bool task_stack_in_psram, unsigned priority) {
         SourceTaskBits::SOURCE_COMMAND_UPDATE | SourceTaskBits::SOURCE_SEND_COMPLETE |
         SourceTaskBits::SOURCE_START_COMPLETE);
 
-    platform_configure_thread("SsSrc", SOURCE_TASK_STACK_SIZE, static_cast<int>(priority),
+    size_t stack_size = this->source_impl_->config.task_stack_size;
+    if (stack_size < SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE) {
+        stack_size = SourceRoleConfig::DEFAULT_SOURCE_TASK_STACK_SIZE;
+    }
+    if (task_stack_in_psram &&
+        stack_size < SourceRoleConfig::DEFAULT_SOURCE_TASK_PSRAM_STACK_SIZE) {
+        stack_size = SourceRoleConfig::DEFAULT_SOURCE_TASK_PSRAM_STACK_SIZE;
+    }
+
+    platform_configure_thread("SsSrc", stack_size, static_cast<int>(priority),
                               task_stack_in_psram);
 
     this->task_thread_ = std::thread(thread_entry, this);

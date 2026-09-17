@@ -486,6 +486,14 @@ struct SourceRoleConfig {
     /// drain threads (2)
     static constexpr unsigned DEFAULT_SOURCE_TASK_PRIORITY = 3U;
 
+    /// @brief Default source task stack size in bytes (ESP-IDF only). Substantially larger than the
+    /// sync task because the source task performs Opus encoding, Noise transport encryption
+    /// (ChaCha20-Poly1305), WebSocket framing, and async queue dispatch directly on this thread.
+    static constexpr size_t DEFAULT_SOURCE_TASK_STACK_SIZE = 24576U;
+
+    /// @brief Default source task stack size when placed in PSRAM (ESP-IDF only).
+    static constexpr size_t DEFAULT_SOURCE_TASK_PSRAM_STACK_SIZE = 32768U;
+
     /// @brief Opus bitrate bounds in bit/s: the range libopus's OPUS_SET_BITRATE accepts
     static constexpr uint32_t OPUS_BITRATE_MIN = 500U;
     static constexpr uint32_t OPUS_BITRATE_MAX = 512000U;
@@ -527,6 +535,11 @@ struct SourceRoleConfig {
 
     unsigned priority{DEFAULT_SOURCE_TASK_PRIORITY};  ///< FreeRTOS priority for the source
                                                       ///< task (ESP-IDF only)
+
+    size_t task_stack_size{DEFAULT_SOURCE_TASK_STACK_SIZE};  ///< Source task stack size in bytes
+                                                             ///< (ESP-IDF only). Values below
+                                                             ///< DEFAULT_SOURCE_TASK_STACK_SIZE are clamped
+                                                             ///< up to it; raising it is allowed.
 
     /// @brief Memory placement for the capture ring, chunk staging buffer, and the Opus
     /// encoder's scratch buffers (ESP-IDF only; ignored on host). Bulk audio with sequential
