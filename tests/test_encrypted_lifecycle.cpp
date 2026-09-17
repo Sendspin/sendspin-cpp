@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Integration tests for the protocol-level connection lifecycle: a real SendspinClient driving
-// admission, the hello/activate cycle, pairing, management, and an in-band re-handshake against
+// admission, the hello/activate cycle, pairing, and an in-band re-handshake against
 // fake Sendspin "server" peers that speak real Noise KKpsk2 over a real loopback WebSocket.
 // test_connection_lifecycle.cpp covers the connection nursery's structural mechanics (accept,
 // prove, admit, reap, arbitration) over the same encrypted transport; the crypto primitives
@@ -60,7 +60,6 @@ namespace {
 constexpr uint16_t RESUME_TEST_PORT = 18991;
 constexpr uint16_t DOWNGRADE_TEST_PORT = 18992;
 constexpr uint16_t PAIRING_TEST_PORT = 18993;
-constexpr uint16_t MANAGEMENT_TEST_PORT = 18994;
 constexpr uint16_t PAIRING_PERSIST_FAILURE_TEST_PORT = 18995;
 constexpr uint16_t PAIR_METHODS_TEST_PORT = 18997;
 constexpr uint16_t AEAD_FAILURE_TEST_PORT = 18998;
@@ -386,11 +385,11 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
     ASSERT_TRUE(bundle.start());
 
     Identity server_identity = Identity::generate().value();
-    // After the re-handshake, the fake server switches to declaring ["management"], which the
-    // SENTINEL-category PSK it re-handshakes to cannot satisfy (management requires a long-term
-    // PSK match; see admission.h::activities_allowed).
+    // After the re-handshake, the fake server keeps declaring ["playback"], which the
+    // SENTINEL-category PSK it re-handshakes to cannot satisfy while unpaired access is disabled
+    // (see admission.h::activities_allowed).
     FakeEncryptedServerOptions options;
-    options.second_activities_json = R"(["management"])";
+    options.second_activities_json = R"(["playback"])";
     options.second_roles_json = R"([])";
     FakeEncryptedServer server(server_url(DOWNGRADE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                                server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
@@ -400,8 +399,8 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
         client, [&] { return client.is_connected(); }, 4000))
         << "Initial encrypted handshake/hello/activate did not complete";
 
-    // Re-handshake down to the Sentinel PSK (unpaired access is disabled by default, so even
-    // ["playback"] would be inadmissible for it, and ["management"] is doubly so).
+    // Re-handshake down to the Sentinel PSK (unpaired access is disabled by default, so
+    // ["playback"] is inadmissible for it).
     ASSERT_TRUE(server.trigger_rehandshake(std::string(SENTINEL_PSK_ID), SENTINEL_PSK));
 
     // The connection must be dropped (never come back operational) once the inadmissible
@@ -413,7 +412,9 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
 
     auto reason = server.goodbye_reason();
     ASSERT_TRUE(reason.has_value()) << "No client/goodbye observed before close";
-    EXPECT_EQ(reason.value(), "unauthorized");
+    EXPECT_EQ(reason.value(), "pairing_required")
+        << "Enabling unpaired access would have admitted this activate, so the server must be "
+           "told pairing is what is missing";
 
     pump_for(client, 100);
 }
@@ -770,61 +771,6 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     pump_for(client, 100);
 }
 
-// Management-suite round trip over an already-encrypted, already-admitted (LONG_TERM/MANAGEMENT)
-// transport: the fake server sends management/list-records and the client must reply
-// management/result with result=ok and the one seeded record, proving the management dispatch
-// path (trust gating -> handle_management_request -> format_management_result_message) works
-// end to end over the real Noise transport, not just at the unit level (test_management.cpp).
-TEST(EncryptedLifecycle, ManagementListRecordsRoundTripOverEncryptedTransport) {
-    SendspinClientConfig config;
-    config.name = "Management Round-Trip Test Client";
-    config.server_port = MANAGEMENT_TEST_PORT;
-
-    PairedClientBundle bundle(config);
-    SendspinClient& client = bundle.client();
-    ASSERT_TRUE(bundle.start());
-
-    // A LONG_TERM PSK activated with the MANAGEMENT activity (no roles): admissible per
-    // admission.h::activities_allowed (LONG_TERM allows any subset of {PLAYBACK, MANAGEMENT}),
-    // and satisfies handle_management_request()'s has_activity(MANAGEMENT) trust gate.
-    Identity server_identity = Identity::generate().value();
-    FakeEncryptedServerOptions options;
-    options.first_activities_json = R"(["management"])";
-    options.first_roles_json = R"([])";
-    FakeEncryptedServer server(server_url(MANAGEMENT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-                               server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
-                               options);
-
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Initial encrypted handshake/hello/activate(management) did not complete";
-
-    ASSERT_TRUE(server.send_management_list_records());
-
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.last_management_result().has_value(); }, 4000))
-        << "management/result was never observed";
-
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, server.last_management_result().value()));
-    JsonObject root = doc.as<JsonObject>();
-    EXPECT_STREQ(root["type"] | "", "management/result");
-    EXPECT_STREQ(root["payload"]["result"] | "", "ok");
-    JsonArray records = root["payload"]["data"]["records"].as<JsonArray>();
-    ASSERT_FALSE(records.isNull());
-    bool found_seeded_record = false;
-    for (JsonObject rec : records) {
-        if (std::string(rec["psk_id"] | "") == bundle.peer.record.psk_id) {
-            found_seeded_record = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(found_seeded_record) << "management/result did not list the seeded record";
-
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
-    pump_for(client, 100);
-}
-
 // A binary WebSocket frame that arrives while the Noise handshake is still pending must close the
 // connection, not be dispatched.
 //
@@ -939,34 +885,33 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     pump_for(client, 100);
 }
 
-// Revoking a record via management/remove-record must also end the revoked device's live session.
+// server/unpair must drop the record AND end every live session running on it, not just the
+// session that asked (spec "server/unpair").
 //
 // A connection resolves its psk_id and PSK category once, at Noise-handshake completion, and never
-// re-checks them against the RecordStore, so deleting the record alone does not stop the revoked
-// peer: handle_remove_record must disconnect both the REQUESTER (the is_self path) and any other
-// live connection running on the removed record. Otherwise that connection would keep its
-// LONG_TERM trust, and with it management authority and playback, until it happened to disconnect
-// on its own, leaving revocation ineffective until the peer's next connection.
-TEST(EncryptedLifecycle, RemoveRecordDropsTheRevokedDevicesLiveSession) {
-    // Two distinct paired records: the admitted management session (A) and the peer it revokes (B).
-    std::array<uint8_t, NOISE_PSK_SIZE> psk_a{};
-    std::array<uint8_t, NOISE_PSK_SIZE> psk_b{};
-    platform_random_bytes(psk_a.data(), psk_a.size());
-    platform_random_bytes(psk_b.data(), psk_b.size());
-    const std::string psk_id_a = psk_id_for(psk_a);
-    const std::string psk_id_b = psk_id_for(psk_b);
+// re-checks them against the RecordStore, so deleting the record alone does not stop a second
+// session holding the same credential: it would keep its LONG_TERM trust, and with it playback,
+// until it happened to disconnect on its own.
+TEST(EncryptedLifecycle, UnpairDropsEverySessionOnTheRecord) {
+    // One paired record, two sessions on it: the admitted one (A) and a nursery entry (B).
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+    platform_random_bytes(psk.data(), psk.size());
+    const std::string psk_id = psk_id_for(psk);
 
-    SendspinPairingRecord record_a;
-    record_a.psk_id = psk_id_a;
-    record_a.psk = psk_a;
-    SendspinPairingRecord record_b;
-    record_b.psk_id = psk_id_b;
-    record_b.psk = psk_b;
+    // One server identity, two transports: the record's stored server_id must match the peer on
+    // both, since every long-term PSK is bound to its server (spec "Pre-Shared Key").
+    Identity identity = Identity::generate().value();
+
+    SendspinPairingRecord record;
+    record.psk_id = psk_id;
+    record.psk = psk;
+    record.server_id =
+        base64url_encode(identity.public_bytes.data(), identity.public_bytes.size());
 
     TestNetworkProvider network;
-    TestPersistenceProvider persistence(std::vector<SendspinPairingRecord>{record_a, record_b});
+    TestPersistenceProvider persistence(std::vector<SendspinPairingRecord>{record});
     SendspinClientConfig config;
-    config.name = "Revocation Sweep Test Client";
+    config.name = "Unpair Sweep Test Client";
     config.server_port = REVOCATION_SWEEP_TEST_PORT;
 
     SendspinClient client(config);
@@ -975,40 +920,38 @@ TEST(EncryptedLifecycle, RemoveRecordDropsTheRevokedDevicesLiveSession) {
     ASSERT_TRUE(client.start());
     pump_for(client, 50);
 
-    // A: admitted, with MANAGEMENT activity so its management/remove-record is honoured.
-    Identity identity_a = Identity::generate().value();
+    // A: admitted, so its server/unpair is honoured.
     FakeEncryptedServerOptions options_a;
-    options_a.first_activities_json = R"(["management"])";
+    options_a.first_activities_json = R"([])";
     options_a.first_roles_json = R"([])";
     FakeEncryptedServer server_a(server_url(REVOCATION_SWEEP_TEST_PORT),
-                                 std::string(NOISE_SUITE_CHACHAPOLY), identity_a, psk_id_a, psk_a,
+                                 std::string(NOISE_SUITE_CHACHAPOLY), identity, psk_id, psk,
                                  options_a);
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000))
-        << "Management session did not reach operational";
+        << "Session A did not reach operational";
 
     // B: completes the Noise handshake (so its psk_id is resolved and cached on the connection)
     // but never sends server/activate, so it sits in the nursery as a second live session.
-    Identity identity_b = Identity::generate().value();
     FakeEncryptedServerOptions options_b;
     options_b.suppress_activate = true;
     FakeEncryptedServer server_b(server_url(REVOCATION_SWEEP_TEST_PORT),
-                                 std::string(NOISE_SUITE_CHACHAPOLY), identity_b, psk_id_b, psk_b,
+                                 std::string(NOISE_SUITE_CHACHAPOLY), identity, psk_id, psk,
                                  options_b);
     ASSERT_TRUE(pump_until(
         client, [&] { return server_b.client_hello_count() > 0; }, 4000))
         << "Second session never completed its Noise handshake / hello";
-    ASSERT_FALSE(server_b.closed()) << "Second session closed before the revocation";
+    ASSERT_FALSE(server_b.closed()) << "Second session closed before the unpair";
 
-    // A revokes B's record.
-    ASSERT_TRUE(server_a.send_app_json(
-        R"({"type":"management/remove-record","payload":{"psk_id":")" + psk_id_b + R"("}})"));
+    ASSERT_TRUE(server_a.send_app_json(R"({"type":"server/unpair","payload":{}})"));
 
     EXPECT_TRUE(pump_until(
         client, [&] { return server_b.closed(); }, 4000))
-        << "Revoking a record left the revoked device's live session running";
-    // The requester keeps its own session: it removed someone else's record, not its own.
-    EXPECT_FALSE(server_a.closed()) << "The requesting management session must not be dropped";
+        << "server/unpair left another live session on the same record running";
+    EXPECT_TRUE(pump_until(
+        client, [&] { return server_a.closed(); }, 4000))
+        << "The unpaired session itself must be dropped";
+    EXPECT_EQ(server_a.goodbye_reason().value_or(""), "unpaired");
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

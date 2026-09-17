@@ -88,29 +88,23 @@ enum SendspinBinaryType : uint8_t {
 
 /// @brief JSON message types sent from the server to the client
 enum class SendspinServerToClientMessageType : uint8_t {
-    SERVER_HELLO,                    // server/hello handshake
-    SERVER_ACTIVATE,                 // server/activate declares activities and active_roles
-    SERVER_TIME,                     // server/time clock sync reply
-    SERVER_STATE,                    // server/state playback state update
-    SERVER_COMMAND,                  // server/command player command
-    STREAM_START,                    // stream/start new stream parameters
-    STREAM_END,                      // stream/end normal stream completion
-    STREAM_CLEAR,                    // stream/clear immediate buffer flush
-    GROUP_UPDATE,                    // group/update group membership change
-    NOISE_HANDSHAKE,                 // noise/handshake in-band re-handshake
-    SERVER_PAIR_FINALIZE,            // server/pair-finalize empty ack from server
-    PAIR_ABORT,                      // pair/abort pairing failure from either side
-    SERVER_UNPAIR,                   // server/unpair request to drop pairing record
-    MANAGEMENT_LIST_RECORDS,         // management/list-records stored record summaries
-    MANAGEMENT_ADD_RECORD,           // management/add-record store a new pairing PSK
-    MANAGEMENT_REMOVE_RECORD,        // management/remove-record delete a stored record
-    MANAGEMENT_GET_PAIRING_CONFIG,   // management/get-pairing-config read pairing method config
-    MANAGEMENT_SET_PAIRING_CONFIG,   // management/set-pairing-config update pairing method config
-    MANAGEMENT_OPEN_PAIRING_WINDOW,  // management/open-pairing-window remote operator gesture
-    SERVER_PAIR_INIT,                // server/pair-init: nonce_A
-    SERVER_PAIR_AUTH,                // server/pair-auth: pake_msg_1
-    SERVER_PAIR_CONFIRM,             // server/pair-confirm: server_kc
-    UNKNOWN,                         // Unrecognized message type
+    SERVER_HELLO,          // server/hello handshake
+    SERVER_ACTIVATE,       // server/activate declares activities and active_roles
+    SERVER_TIME,           // server/time clock sync reply
+    SERVER_STATE,          // server/state playback state update
+    SERVER_COMMAND,        // server/command player command
+    STREAM_START,          // stream/start new stream parameters
+    STREAM_END,            // stream/end normal stream completion
+    STREAM_CLEAR,          // stream/clear immediate buffer flush
+    GROUP_UPDATE,          // group/update group membership change
+    NOISE_HANDSHAKE,       // noise/handshake in-band re-handshake
+    SERVER_PAIR_FINALIZE,  // server/pair-finalize empty ack from server
+    PAIR_ABORT,            // pair/abort pairing failure from either side
+    SERVER_UNPAIR,         // server/unpair request to drop pairing record
+    SERVER_PAIR_INIT,      // server/pair-init: nonce_A
+    SERVER_PAIR_AUTH,      // server/pair-auth: pake_msg_1
+    SERVER_PAIR_CONFIRM,   // server/pair-confirm: server_kc
+    UNKNOWN,               // Unrecognized message type
 };
 
 /// @brief Protocol role identifiers used in hello messages and role negotiation
@@ -772,157 +766,6 @@ struct ServerColorStateDelta {
 // Message envelope structs
 // ============================================================================
 
-// ============================================================================
-// Management result types
-// ============================================================================
-
-/// @brief Result code for management/result messages.
-/// Mirrors ManagementResult in aiosendspin/models/types.py.
-enum class ManagementResult : uint8_t {
-    OK,                 // ok
-    PERMISSION_DENIED,  // permission_denied
-    ALREADY_EXISTS,     // already_exists
-    INVALID,            // invalid
-    NOT_FOUND,          // not_found
-    STORAGE_EXHAUSTED,  // storage_exhausted
-};
-
-/// @brief Converts a ManagementResult to its wire string.
-/// @param result The result to convert.
-/// @return Null-terminated wire string (e.g., "ok").
-inline const char* to_cstr(ManagementResult result) {
-    switch (result) {
-        case ManagementResult::OK:
-            return "ok";
-        case ManagementResult::PERMISSION_DENIED:
-            return "permission_denied";
-        case ManagementResult::ALREADY_EXISTS:
-            return "already_exists";
-        case ManagementResult::INVALID:
-            return "invalid";
-        case ManagementResult::NOT_FOUND:
-            return "not_found";
-        case ManagementResult::STORAGE_EXHAUSTED:
-            return "storage_exhausted";
-        default:
-            return "invalid";
-    }
-}
-
-/// @brief One entry in a list-records result.
-/// Mirrors RecordSummary in aiosendspin/models/management.py.
-struct RecordSummary {
-    std::string psk_id{};
-    std::optional<std::string>
-        server_id;     ///< Present for stored-pubkey records; absent for shared.
-    bool used{false};  ///< True once a server authenticated a session with this record's PSK.
-};
-
-/// @brief Pairing method config in a get-pairing-config result.
-/// Mirrors PairingMethodConfig in aiosendspin/models/management.py.
-struct PairingMethodConfig {
-    bool enabled{false};
-    /// @brief For dynamic_pin only: shortest PIN length in digits the client will accept (4-12).
-    std::optional<int> min_pin_length;
-    /// @brief For dynamic_pin only: true when the method is escalated to gesture-gating by its
-    /// failure counter.
-    std::optional<bool> escalated;
-};
-
-/// @brief Record mode config in get/set-pairing-config messages.
-/// Mirrors RecordModeConfig in aiosendspin/models/management.py.
-struct RecordModeConfig {
-    std::string psk_id{};
-};
-
-/// @brief Unpaired access config in get/set-pairing-config messages.
-struct UnpairedAccessConfig {
-    std::optional<bool> enabled;
-};
-
-/// @brief Patch for the Pairing PSK method in set-pairing-config.
-/// Mirrors SetPairingPskConfig in aiosendspin/models/management.py.
-struct SetPairingPskConfig {
-    std::optional<bool> enabled;
-    std::optional<std::string> psk;  ///< 43-char base64url 32-byte PSK; replaces current.
-};
-
-/// @brief Patch for the static-PIN method in set-pairing-config.
-/// Mirrors SetStaticPinConfig in aiosendspin/models/management.py.
-struct SetStaticPinConfig {
-    std::optional<bool> enabled;
-    std::optional<std::string> pin;  ///< 8 decimal digits; replaces the configured static PIN.
-};
-
-/// @brief Patch for the dynamic-PIN method in set-pairing-config.
-/// Mirrors SetDynamicPinConfig in aiosendspin/models/management.py.
-/// The failure counter is not settable: escalation de-escalates only through the client's own
-/// successful server_kc verification (there is no locked_out-clearing field in the spec).
-struct SetDynamicPinConfig {
-    std::optional<bool> enabled;
-    std::optional<int> min_pin_length;  ///< Shortest PIN length in digits accepted; must be 4-12.
-};
-
-/// @brief Operation-specific data for management/result (present only on ok).
-/// Mirrors ManagementResultData in aiosendspin/models/management.py.
-struct ManagementResultData {
-    /// Present for list-records.
-    std::optional<std::vector<RecordSummary>> records;
-    /// Present for get-pairing-config: pairing_psk config.
-    std::optional<PairingMethodConfig> pairing_psk;
-    /// Present for get-pairing-config: record mode.
-    std::optional<RecordModeConfig> record_mode;
-    /// Present for get-pairing-config: unpaired access.
-    std::optional<UnpairedAccessConfig> unpaired_access;
-    /// Present for get-pairing-config: static_pin config.
-    std::optional<PairingMethodConfig> static_pin;
-    /// Present for get-pairing-config: dynamic_pin config.
-    std::optional<PairingMethodConfig> dynamic_pin;
-};
-
-/// @brief Storage accounting attached to management/result responses.
-/// Mirrors StorageAccounting in aiosendspin/models/management.py.
-struct StorageAccountingPayload {
-    int free{0};                         ///< Number of free slots; always present.
-    std::optional<int> capacity;         ///< Present on list-records and get-pairing-config only.
-    std::optional<int> cost_individual;  ///< Present on list-records and get-pairing-config only.
-    std::optional<int> cost_shared;      ///< Present on list-records and get-pairing-config only.
-};
-
-/// @brief Result payload for management/result messages.
-/// Mirrors ManagementResultPayload in aiosendspin/models/management.py.
-struct ManagementResultPayload {
-    ManagementResult result{ManagementResult::INVALID};
-    std::optional<ManagementResultData> data;  ///< Present only on ok, and only when relevant.
-    std::optional<StorageAccountingPayload>
-        storage;  ///< Present when the store reports accounting.
-};
-
-// ============================================================================
-// Management request message structs (server -> client)
-// ============================================================================
-
-/// @brief Parsed management/add-record payload.
-struct ManagementAddRecordPayload {
-    std::string psk{};  ///< 43-char base64url 32-byte PSK.
-    std::optional<std::string>
-        server_id;  ///< Present for stored-pubkey records; absent for shared.
-};
-
-/// @brief Parsed management/remove-record payload.
-struct ManagementRemoveRecordPayload {
-    std::string psk_id{};
-};
-
-/// @brief Parsed management/set-pairing-config payload.
-struct ManagementSetPairingConfigPayload {
-    std::optional<SetPairingPskConfig> pairing_psk;
-    std::optional<SetStaticPinConfig> static_pin;
-    std::optional<SetDynamicPinConfig> dynamic_pin;
-    std::optional<RecordModeConfig> record_mode;
-    std::optional<UnpairedAccessConfig> unpaired_access;
-};
-
 /// @brief A pairing method descriptor for client/hello supported_pair_methods.
 /// Optional fields are omitted from the wire when not set (omit_none semantics).
 struct PairMethodDescriptor {
@@ -1286,35 +1129,5 @@ std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& cl
 /// @param client_kc 64-byte client CPace confirmation tag (base64url-encoded on the wire).
 /// @return JSON string for the client/pair-confirm message with client_kc only.
 std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc);
-
-// ============================================================================
-// Management protocol functions
-// ============================================================================
-
-/// @brief Parses a management/add-record JSON message payload into the provided struct.
-/// @param root Parsed JSON object from the message.
-/// @param payload [out] Struct to populate with the parsed psk and optional server_id.
-/// @return true if parsing succeeded (psk field present), false otherwise.
-bool process_management_add_record_message(JsonObject root, ManagementAddRecordPayload* payload);
-
-/// @brief Parses a management/remove-record JSON message payload into the provided struct.
-/// @param root Parsed JSON object from the message.
-/// @param payload [out] Struct to populate with the parsed psk_id.
-/// @return true if parsing succeeded (psk_id field present), false otherwise.
-bool process_management_remove_record_message(JsonObject root,
-                                              ManagementRemoveRecordPayload* payload);
-
-/// @brief Parses a management/set-pairing-config JSON message payload into the provided struct.
-/// @param root Parsed JSON object from the message.
-/// @param payload [out] Struct to populate.
-/// @return Always returns true (all fields are optional; only fields present with the right JSON
-///         type are populated, leaving the corresponding optional unset otherwise).
-bool process_management_set_pairing_config_message(JsonObject root,
-                                                   ManagementSetPairingConfigPayload* payload);
-
-/// @brief Formats a management/result message as a JSON string for sending to the server.
-/// @param payload The result payload to serialize.
-/// @return JSON string for the management/result message.
-std::string format_management_result_message(const ManagementResultPayload& payload);
 
 }  // namespace sendspin

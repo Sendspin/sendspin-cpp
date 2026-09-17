@@ -150,7 +150,7 @@ inline bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
 
 /// A fresh long-term pairing record plus the PSK behind it, so a test can seed the client's
 /// RecordStore and hand the same PSK to a fake server. The resulting connection resolves to
-/// PskCategory::LONG_TERM, which admits any subset of {playback, management} plus the empty set.
+/// PskCategory::LONG_TERM, which admits the empty activity set and {playback}.
 struct PairedPeer {
     SendspinPairingRecord record;
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
@@ -235,7 +235,7 @@ inline std::string noise_handshake_envelope(const std::vector<uint8_t>& noise_by
 /// disconnect()/close_transport_now() code paths: see FakeOutboundEncryptedServer's class comment
 /// for why. Each subclass implements send_text_frame_locked()/send_binary_frame_locked() over its
 /// own transport handle and keeps its own type-specific dispatch (client/hello, client/goodbye,
-/// management, in-band re-handshake, etc.).
+/// in-band re-handshake, etc.).
 class NoiseInitiatorFixtureBase {
 public:
     virtual ~NoiseInitiatorFixtureBase() {
@@ -408,7 +408,7 @@ struct FakeEncryptedServerOptions {
     std::string first_roles_json{R"(["player@v1"])"};
     // Present only when the first server/activate should select a pairing method (e.g.
     // "pairing_psk"), emitted as the nested payload.pairing object per the current spec;
-    // omitted (nullopt) for the normal playback/management admission path.
+    // omitted (nullopt) for the normal playback admission path.
     std::optional<std::string> first_pairing_method;
     // Sent in server/activate after the SECOND client/hello (i.e. the one that follows a
     // trigger_rehandshake() call and its resulting fresh hello cycle).
@@ -509,18 +509,6 @@ public:
         return this->learned_psk_id_;
     }
 
-    // Sends a management/list-records request to the client over the active encrypted session
-    // (mirrors the server-initiated management request pattern; the client responds with
-    // management/result, captured by the "management/result" branch in handle_binary()).
-    bool send_management_list_records() {
-        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
-        if (this->active_.send_cs == nullptr) {
-            return false;
-        }
-        this->send_encrypted_locked(R"({"type":"management/list-records","payload":{}})");
-        return true;
-    }
-
     // Sends an arbitrary application JSON message over the active encrypted session.
     bool send_app_json(const std::string& json) {
         std::lock_guard<std::mutex> lock(this->crypto_mutex_);
@@ -529,11 +517,6 @@ public:
         }
         this->send_encrypted_locked(json);
         return true;
-    }
-
-    std::optional<std::string> last_management_result() const {
-        std::lock_guard<std::mutex> lock(this->management_mutex_);
-        return this->last_management_result_;
     }
 
     bool got_client_time() const {
@@ -725,12 +708,6 @@ private:
             return;
         }
 
-        if (std::strcmp(type, "management/result") == 0) {
-            std::lock_guard<std::mutex> mlock(this->management_mutex_);
-            this->last_management_result_ = json;
-            return;
-        }
-
         if (std::strcmp(type, "client/state") == 0) {
             this->client_state_count_.fetch_add(1);
             return;
@@ -799,9 +776,6 @@ private:
     mutable std::mutex pair_mutex_;
     std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> learned_psk_;
     std::optional<std::string> learned_psk_id_;
-
-    mutable std::mutex management_mutex_;
-    std::optional<std::string> last_management_result_;
 
     std::atomic<int> client_state_count_{0};
     std::atomic<bool> got_client_time_{false};

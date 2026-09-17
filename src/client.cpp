@@ -870,7 +870,7 @@ std::optional<std::string> SendspinClient::format_pairing_token(
 
 std::optional<std::string> SendspinClient::pairing_token() const {
     // Main-loop-only, like the other record-store config reads: the Pairing PSK is mutated only
-    // from the main loop (first-boot provisioning and set-pairing-config management).
+    // from the main loop (first-boot provisioning).
     if (this->record_store_ == nullptr || !this->record_store_->pairing_psk().has_value()) {
         return std::nullopt;
     }
@@ -1142,9 +1142,8 @@ namespace {
 /// messages may touch a role.
 ///
 /// False for the establishment and trust-negotiation traffic a connection must be able to send
-/// before it is admitted (hello, activate, in-band re-handshake), and for the pairing and
-/// management messages, which carry their own gating on the main loop (management additionally
-/// requires the MANAGEMENT activity, which is itself only reachable through admission).
+/// before it is admitted (hello, activate, in-band re-handshake), and for the pairing messages,
+/// which carry their own gating on the main loop.
 bool requires_admitted_connection(SendspinServerToClientMessageType type) {
     switch (type) {
         case SendspinServerToClientMessageType::SERVER_STATE:
@@ -1482,7 +1481,6 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                     // The superseding form is correct here and only here: this PSK replaces
                     // whatever this server held before, so the prior record for the same
                     // server_id must be retired or the old PSK stays valid forever.
-                    // management/add-record deliberately uses the plain store_record().
                     if (this->record_store_->store_record_superseding(std::move(record.value()))) {
                         SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
                                 psk_id.c_str());
@@ -1523,8 +1521,7 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                         {conn->shared_from_this(), abort_msg.reason});
                 } else {
                     // pair/abort must always trigger cleanup even if the reason is unrecognized,
-                    // hence the fallback schedule with METHOD_NOT_SUPPORTED (intentionally
-                    // different from the drop-and-ignore used for malformed management messages).
+                    // hence the fallback schedule with METHOD_NOT_SUPPORTED.
                     SS_LOGW(TAG, "Malformed pair/abort message; treating as abort with "
                                  "method_not_supported");
                     this->connection_manager_->schedule_pair_abort(
@@ -1543,74 +1540,6 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                 event.psk_category = conn->get_psk_category();
                 SS_LOGI(TAG, "server/unpair received (psk_id=%s)", event.matched_psk_id.c_str());
                 this->connection_manager_->schedule_server_unpair(std::move(event));
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::MANAGEMENT_LIST_RECORDS: {
-            if (conn != nullptr) {
-                ManagementRequestEvent event;
-                event.conn = conn->shared_from_this();
-                event.kind = ManagementRequestKind::LIST_RECORDS;
-                this->connection_manager_->schedule_management_request(std::move(event));
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::MANAGEMENT_ADD_RECORD: {
-            if (conn != nullptr) {
-                ManagementRequestEvent event;
-                if (process_management_add_record_message(root, &event.add_payload)) {
-                    event.conn = conn->shared_from_this();
-                    event.kind = ManagementRequestKind::ADD_RECORD;
-                    this->connection_manager_->schedule_management_request(std::move(event));
-                } else {
-                    SS_LOGW(TAG, "Malformed management/add-record; ignoring");
-                }
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::MANAGEMENT_REMOVE_RECORD: {
-            if (conn != nullptr) {
-                ManagementRequestEvent event;
-                if (process_management_remove_record_message(root, &event.remove_payload)) {
-                    event.conn = conn->shared_from_this();
-                    event.kind = ManagementRequestKind::REMOVE_RECORD;
-                    this->connection_manager_->schedule_management_request(std::move(event));
-                } else {
-                    SS_LOGW(TAG, "Malformed management/remove-record; ignoring");
-                }
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::MANAGEMENT_GET_PAIRING_CONFIG: {
-            if (conn != nullptr) {
-                ManagementRequestEvent event;
-                event.conn = conn->shared_from_this();
-                event.kind = ManagementRequestKind::GET_PAIRING_CONFIG;
-                this->connection_manager_->schedule_management_request(std::move(event));
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::MANAGEMENT_SET_PAIRING_CONFIG: {
-            if (conn != nullptr) {
-                ManagementRequestEvent event;
-                if (process_management_set_pairing_config_message(root,
-                                                                  &event.set_config_payload)) {
-                    event.conn = conn->shared_from_this();
-                    event.kind = ManagementRequestKind::SET_PAIRING_CONFIG;
-                    this->connection_manager_->schedule_management_request(std::move(event));
-                } else {
-                    SS_LOGW(TAG, "Malformed management/set-pairing-config; ignoring");
-                }
-            }
-            break;
-        }
-        case SendspinServerToClientMessageType::MANAGEMENT_OPEN_PAIRING_WINDOW: {
-            // No payload fields; opens a pairing window in place of the operator gesture.
-            if (conn != nullptr) {
-                ManagementRequestEvent event;
-                event.conn = conn->shared_from_this();
-                event.kind = ManagementRequestKind::OPEN_PAIRING_WINDOW;
-                this->connection_manager_->schedule_management_request(std::move(event));
             }
             break;
         }

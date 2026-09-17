@@ -567,11 +567,6 @@ protected:
         this->client_->connection_manager_->schedule_pair_abort(std::move(event));
     }
 
-    /// Schedule a management/* request event for deferred processing, without pumping loop().
-    void schedule_management(ManagementRequestEvent event) {
-        this->client_->connection_manager_->schedule_management_request(std::move(event));
-    }
-
     /// Schedule a server/activate event on the injected current connection for deferred
     /// processing, without pumping loop(). Drives the real activate-arbitration path in
     /// ConnectionManager::loop() (trust check, apply_server_activate, then either the
@@ -1268,8 +1263,8 @@ TEST_F(PinStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
 // (pairing_window_supported=false) can still hit the gesture gate through escalation. The
 // on_open_pairing_window prompt must NOT fire (its contract requires the flag), but the
 // spec-mandated client/pair-pending still goes out, and the attempt remains recoverable by a
-// window opened without the local gesture (management/open-pairing-window remotely; modeled
-// here via confirm_pairing_window(), which drives the same open_pairing_window() path).
+// window opened through confirm_pairing_window(), which drives the same open_pairing_window()
+// path.
 TEST_F(PinStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
     this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/false);
 
@@ -1291,82 +1286,11 @@ TEST_F(PinStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
         << "on_open_pairing_window must not fire when pairing_window_supported is false";
     EXPECT_FALSE(conn->pin_session().window_shown);
 
-    // A window opened without the local gesture still starts the waiting attempt.
+    // A window opened later still starts the waiting attempt.
     this->client_->confirm_pairing_window();
     this->client_->loop();
     ASSERT_EQ(conn->sent_text_.size(), 2u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
-}
-
-// =============================================================================
-// management/open-pairing-window
-// =============================================================================
-
-// Fixture-level helpers for driving a management/open-pairing-window request through the real
-// deferred-event path (schedule_management_request + loop), on a connection whose activate
-// declared the MANAGEMENT activity.
-
-TEST_F(PinStateMachineTest, ManagementOpenPairingWindowOpensWindow) {
-    FakeConnection* conn = this->inject_provisional_current_connection("server-mgmt-1");
-    conn->apply_server_activate({SendspinActivity::MANAGEMENT}, std::vector<std::string>{},
-                                std::nullopt, std::nullopt);
-    ASSERT_EQ(this->window_deadline(), 0);
-
-    ManagementRequestEvent event;
-    event.conn = this->current_connection_sp();
-    event.kind = ManagementRequestKind::OPEN_PAIRING_WINDOW;
-    this->schedule_management(std::move(event));
-    this->client_->loop();
-
-    // The result is ok and a standing window is now open.
-    ASSERT_EQ(conn->sent_text_.size(), 1u);
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse_json(conn->sent_text_.back(), doc, root));
-    EXPECT_STREQ(root["type"], "management/result");
-    EXPECT_STREQ(root["payload"]["result"], "ok");
-    EXPECT_GT(this->window_deadline(), 0);
-
-    // A second request while the window is open is a no-op ok: the deadline is not extended.
-    const int64_t deadline_before = this->window_deadline();
-    ManagementRequestEvent again;
-    again.conn = this->current_connection_sp();
-    again.kind = ManagementRequestKind::OPEN_PAIRING_WINDOW;
-    this->schedule_management(std::move(again));
-    this->client_->loop();
-
-    ASSERT_EQ(conn->sent_text_.size(), 2u);
-    JsonDocument doc2;
-    JsonObject root2;
-    ASSERT_TRUE(parse_json(conn->sent_text_.back(), doc2, root2));
-    EXPECT_STREQ(root2["payload"]["result"], "ok");
-    EXPECT_EQ(this->window_deadline(), deadline_before)
-        << "a no-op ok must not extend the open window's lifetime";
-}
-
-TEST_F(PinStateMachineTest, ManagementOpenPairingWindowInvalidWhenNoPinMethodEnabled) {
-    // Disable dynamic_pin; static_pin is enabled in the fixture but has no PIN configured, so
-    // neither PIN method is offered.
-    this->record_store().set_dynamic_pin_enabled(false);
-    ASSERT_FALSE(this->record_store().static_pin().has_value());
-
-    FakeConnection* conn = this->inject_provisional_current_connection("server-mgmt-2");
-    conn->apply_server_activate({SendspinActivity::MANAGEMENT}, std::vector<std::string>{},
-                                std::nullopt, std::nullopt);
-
-    ManagementRequestEvent event;
-    event.conn = this->current_connection_sp();
-    event.kind = ManagementRequestKind::OPEN_PAIRING_WINDOW;
-    this->schedule_management(std::move(event));
-    this->client_->loop();
-
-    ASSERT_EQ(conn->sent_text_.size(), 1u);
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse_json(conn->sent_text_.back(), doc, root));
-    EXPECT_STREQ(root["type"], "management/result");
-    EXPECT_STREQ(root["payload"]["result"], "invalid");
-    EXPECT_EQ(this->window_deadline(), 0) << "a rejected request must not open a window";
 }
 
 // =============================================================================
@@ -2176,8 +2100,8 @@ TEST_F(PinStateMachineTest, HelloAdvertisesConfiguredLocationsForShippedSecrets)
               (std::vector<std::string>{"leaflet", "operator"}));
 }
 
-// Rotating the Pairing PSK (management/set-pairing-config) kills every distributed copy of the
-// shipped one, so the descriptor must stop pointing at the device label. The static PIN was not
+// Rotating the Pairing PSK kills every distributed copy of the shipped one, so the descriptor
+// must stop pointing at the device label. The static PIN was not
 // touched, so its own hint stands.
 TEST_F(PinStateMachineTest, HelloLocationsFollowThePairingPskRotation) {
     this->init_client(/*pin_display_supported=*/true, /*pairing_window_supported=*/true,

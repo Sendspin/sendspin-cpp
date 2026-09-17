@@ -470,7 +470,6 @@ TEST(RecordStore, CapacityRejectsInsertPastDefaultCap) {
         ASSERT_TRUE(store.store_record(rec)) << "insert " << i << " should still fit";
     }
     ASSERT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
-    EXPECT_FALSE(store.can_store_record());
 
     SendspinPairingRecord overflow = make_client_record("server-overflow");
     EXPECT_FALSE(store.store_record(overflow))
@@ -498,7 +497,6 @@ TEST(RecordStore, CapacitySupersedeAtCapacityStillSucceeds) {
         ASSERT_TRUE(store.store_record(rec));
     }
     ASSERT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
-    ASSERT_FALSE(store.can_store_record());
 
     // Re-pairing the already-known server must still mint and store a fresh record: it
     // supersedes its own prior record rather than growing the store past capacity.
@@ -518,23 +516,17 @@ TEST(RecordStore, CapacitySupersedeAtCapacityStillSucceeds) {
 }
 
 // A caller-supplied cap (the max_records constructor parameter, wired from
-// SendspinClientConfig::max_pairing_records) must be respected in place of the default, both
-// for store_record() and for storage_accounting()'s reported capacity.
+// SendspinClientConfig::max_pairing_records) must be respected in place of the default.
 TEST(RecordStore, CapacityCustomCapIsRespected) {
     RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/2);
 
     // 1 slot already used by the shared fallback; one more genuine insert should still fit.
     SendspinPairingRecord rec = make_client_record("server-A");
     ASSERT_TRUE(store.store_record(rec));
-    EXPECT_FALSE(store.can_store_record());
 
     SendspinPairingRecord overflow = make_client_record("server-B");
     EXPECT_FALSE(store.store_record(overflow));
     EXPECT_EQ(store.records_snapshot().size(), 2u);
-
-    const auto report = store.storage_accounting();
-    EXPECT_EQ(report.capacity, 2);
-    EXPECT_EQ(report.free, 0);
 }
 
 // =============================================================================
@@ -966,24 +958,6 @@ TEST(RecordStore, SetRecordModePskIdValidation) {
     // Valid shared record -> succeeds.
     EXPECT_TRUE(store.set_record_mode_psk_id(shared.psk_id));
     EXPECT_EQ(store.record_mode_psk_id(), shared.psk_id);
-}
-
-// =============================================================================
-// can_remove_record: record_mode-referenced record is protected
-// =============================================================================
-
-TEST(RecordStore, CanRemoveRecordProtectsRecordModeFallback) {
-    RecordStore store(nullptr);
-
-    // The auto-provisioned fallback record is the record_mode record.
-    const std::string& protected_id = store.record_mode_psk_id();
-    EXPECT_FALSE(store.can_remove_record(protected_id))
-        << "record_mode-referenced record must not be removable";
-
-    // A different record is removable.
-    SendspinPairingRecord other = make_client_record("server-X");
-    store.store_record(other);
-    EXPECT_TRUE(store.can_remove_record(other.psk_id));
 }
 
 // resolve_pairing_outcome coverage (normal mint and storage-exhausted fallback) lives further
@@ -1686,40 +1660,6 @@ TEST(RecordStore, RecordsSnapshotReturnsAllRecords) {
     for (const auto& r : snap) {
         if (r.psk_id == a.psk_id) found_a = true;
         if (r.psk_id == b.psk_id) found_b = true;
-    }
-    EXPECT_TRUE(found_a);
-    EXPECT_TRUE(found_b);
-}
-
-// records_summary_snapshot() carries psk_id/server_id/used for every record (including the
-// shared fallback, which has no server_id) without exposing the PSK bytes at all.
-TEST(RecordStore, RecordsSummarySnapshotMatchesRecordsWithoutPsk) {
-    RecordStore store(nullptr);
-    // Auto-provisioned shared fallback is already present (1 record, no server_id).
-    ASSERT_EQ(store.records_snapshot().size(), 1u);
-
-    SendspinPairingRecord a = make_client_record("server-A");
-    SendspinPairingRecord b = make_shared_record();
-    store.store_record(a);
-    store.store_record(b);
-    store.mark_record_used(a.psk_id);
-
-    auto summaries = store.records_summary_snapshot();
-    EXPECT_EQ(summaries.size(), 3u);
-
-    bool found_a = false;
-    bool found_b = false;
-    for (const auto& summary : summaries) {
-        if (summary.psk_id == a.psk_id) {
-            found_a = true;
-            ASSERT_TRUE(summary.server_id.has_value());
-            EXPECT_EQ(summary.server_id.value(), "server-A");
-            EXPECT_TRUE(summary.used);
-        } else if (summary.psk_id == b.psk_id) {
-            found_b = true;
-            EXPECT_FALSE(summary.server_id.has_value());
-            EXPECT_FALSE(summary.used);
-        }
     }
     EXPECT_TRUE(found_a);
     EXPECT_TRUE(found_b);

@@ -177,32 +177,8 @@ struct PairAbortEvent {
 };
 
 // ============================================================================
-// Management deferred events
+// Unpair deferred events
 // ============================================================================
-
-/// @brief Type tag for which management/* request arrived.
-enum class ManagementRequestKind : uint8_t {
-    LIST_RECORDS,
-    ADD_RECORD,
-    REMOVE_RECORD,
-    GET_PAIRING_CONFIG,
-    SET_PAIRING_CONFIG,
-    OPEN_PAIRING_WINDOW,
-};
-
-/// @brief Deferred management request event.
-///
-/// Parsed on the network thread; handler runs on the main loop so it can safely
-/// mutate the RecordStore and send the result from the main-loop thread.
-/// management is request/response at-most-one-in-flight; FIFO deferred processing
-/// preserves the reference's single-concurrent-request property naturally.
-struct ManagementRequestEvent {
-    std::shared_ptr<SendspinConnection> conn;              ///< Connection that received the request
-    ManagementRequestKind kind{};                          ///< Which management/* request type
-    ManagementAddRecordPayload add_payload;                ///< Populated for ADD_RECORD
-    ManagementRemoveRecordPayload remove_payload;          ///< Populated for REMOVE_RECORD
-    ManagementSetPairingConfigPayload set_config_payload;  ///< Populated for SET_PAIRING_CONFIG
-};
 
 /// @brief Deferred server/unpair event.
 ///
@@ -421,10 +397,6 @@ public:
     /// @param event The pair-abort event to schedule (moved).
     void schedule_pair_abort(PairAbortEvent event);
 
-    /// @brief Schedules a management request event for deferred processing in loop().
-    /// @param event The management request event to schedule (moved).
-    void schedule_management_request(ManagementRequestEvent&& event);
-
     /// @brief Schedules a server/unpair event for deferred processing in loop().
     /// @param event The server/unpair event to schedule (moved).
     void schedule_server_unpair(ServerUnpairEvent&& event);
@@ -502,7 +474,6 @@ private:
         std::vector<std::shared_ptr<SendspinConnection>> connected, disconnected, rehandshake;
         std::vector<ServerActivateEvent> activates;
         std::vector<PairAbortEvent> pair_aborts;
-        std::vector<ManagementRequestEvent> management_requests;
         std::vector<ServerUnpairEvent> server_unpairs;
         std::vector<ServerPairingMessageEvent> pin_messages;
         std::vector<std::string> pairing_succeeded;
@@ -548,10 +519,9 @@ private:
     /// @param ev Drained events from swap_out_pending_events(); consumed in place.
     void drain_pairing_events(DrainedEvents& ev);
 
-    /// @brief Applies server/unpair events, then management request events (unpair first,
-    /// management last). Caller must hold conn_ptr_mutex_.
+    /// @brief Applies server/unpair events. Caller must hold conn_ptr_mutex_.
     /// @param ev Drained events from swap_out_pending_events(); consumed in place.
-    void drain_management_events(DrainedEvents& ev);
+    void drain_unpair_events(DrainedEvents& ev);
 
     /// @brief Copies current_connection_ and every nursery entry under a brief conn_ptr_mutex_
     /// lock, then calls loop() on each copy outside the lock. Acquires conn_ptr_mutex_
@@ -709,8 +679,8 @@ private:
     void on_connection_lost(SendspinConnection* conn);
     /// @brief Decides whether an incoming connection should be admitted over the current one.
     ///
-    /// Ports admission.h::should_admit_connection (activity-priority arbitration: management >
-    /// playback > pairing > empty, with last-played-server_id as the empty/empty tiebreak and an
+    /// Ports admission.h::should_admit_connection (activity-priority arbitration: playback >
+    /// pairing > empty, with last-played-server_id as the empty/empty tiebreak and an
     /// in-flight pairing immune to displacement by incoming pairing/playback). Trust enforcement
     /// (admission.h::admissible) is applied separately, before this is ever consulted, in
     /// loop()'s server/activate handling.
@@ -773,8 +743,8 @@ private:
     /// running on it: a connection caches its resolved psk_id and PSK category at Noise-handshake
     /// completion (see SendspinConnection::get_psk_category()) and never re-resolves them against
     /// the store. Without this sweep a revoked device would keep its LONG_TERM trust (and with
-    /// it management authority and playback) until it happened to disconnect, so revocation
-    /// would not take effect until the peer's next connection.
+    /// it playback) until it happened to disconnect, so revocation would not take effect until
+    /// the peer's next connection.
     ///
     /// Covers the current slot and the nursery. Caller must hold conn_ptr_mutex_ and call
     /// flush_deferred_releases() after dropping it.
@@ -920,13 +890,12 @@ private:
     /// @param conn The connection whose session starts.
     void start_pin_attempt(SendspinConnection* conn);
 
-    /// @brief Return true if a standing pairing window is open (opened by an operator gesture or
-    /// management/open-pairing-window and neither consumed by a client/pair-init nor past its
-    /// 5-minute lifetime). Main-loop-only.
+    /// @brief Return true if a standing pairing window is open (opened by an operator gesture and
+    /// neither consumed by a client/pair-init nor past its 5-minute lifetime). Main-loop-only.
     [[nodiscard]] bool pairing_window_open() const;
 
-    /// @brief Open the pairing window on the main loop (operator gesture or
-    /// management/open-pairing-window). If an attempt is already waiting in
+    /// @brief Open the pairing window on the main loop (operator gesture). If an attempt is
+    /// already waiting in
     /// AWAIT_PAIRING_WINDOW, the window is consumed immediately by starting it; otherwise the
     /// window stands open for WINDOW_LIFETIME (5 minutes) awaiting a pairing activate.
     void open_pairing_window();
@@ -936,19 +905,12 @@ private:
     void handle_pairing_window_confirmed();
 
     // ========================================
-    // Management main-loop handlers
+    // Unpair main-loop handler
     // ========================================
 
-    /// @brief Handles a management/* request on the main loop.
-    /// Enforces trust gating, dispatches to the appropriate handler, formats and sends the result,
-    /// and applies the effect (GOODBYE_UNAUTHORIZED -> disconnect).
-    /// @param conn The connection that received the request.
-    /// @param event The management request event carrying the parsed payload.
-    void handle_management_request(SendspinConnection* conn, const ManagementRequestEvent& event);
-
     /// @brief Handles a server/unpair event on the main loop.
-    /// Checks PSK category (LONG_TERM only), removes the matched record (unless shared),
-    /// and disconnects with UNPAIRED reason.
+    /// Checks PSK category (LONG_TERM only), removes the matched record, and disconnects with
+    /// the UNPAIRED reason.
     /// @param conn The connection that received server/unpair.
     /// @param event The server/unpair event.
     void handle_server_unpair(SendspinConnection* conn, const ServerUnpairEvent& event);
@@ -970,14 +932,13 @@ private:
     // Connections whose in-band re-handshake just swapped sessions; loop() re-arms their hello.
     std::vector<std::shared_ptr<SendspinConnection>> pending_rehandshake_events_;
     std::vector<PairAbortEvent> pending_pair_abort_events_;  // Deferred pair/abort events
-    std::vector<ManagementRequestEvent> pending_management_request_events_;
     std::vector<ServerUnpairEvent> pending_server_unpair_events_;
     std::vector<ServerPairingMessageEvent> pending_pin_pairing_events_;
     std::vector<std::string> pending_pairing_succeeded_events_;  // server_ids to notify
     bool pending_pairing_window_confirm_{false};                 // Pairing-window gesture confirm
     // Standing pairing window: platform_time_us() deadline until which the window admits one
-    // pairing attempt; 0 = closed. Opened by the operator gesture or
-    // management/open-pairing-window, consumed when client/pair-init is sent. Main-loop-only.
+    // pairing attempt; 0 = closed. Opened by the operator gesture, consumed when client/pair-init
+    // is sent. Main-loop-only.
     int64_t pairing_window_open_until_us_{0};
 
     // Pointer fields

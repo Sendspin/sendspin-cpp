@@ -22,7 +22,6 @@
 #include "crypto/cpace.h"
 #include "crypto/pin.h"
 #include "crypto/psk_wrap.h"
-#include "management.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
 #include "platform/time.h"
@@ -404,9 +403,8 @@ void ConnectionManager::start() {
 bool ConnectionManager::DrainedEvents::any() const {
     return !this->connected.empty() || !this->disconnected.empty() || !this->activates.empty() ||
            !this->rehandshake.empty() || !this->pair_aborts.empty() ||
-           !this->management_requests.empty() || !this->server_unpairs.empty() ||
-           !this->pin_messages.empty() || !this->pairing_succeeded.empty() ||
-           this->pairing_window_confirm;
+           !this->server_unpairs.empty() || !this->pin_messages.empty() ||
+           !this->pairing_succeeded.empty() || this->pairing_window_confirm;
 }
 
 PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
@@ -486,7 +484,7 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
     }
 
     // Drop every deferred event those closes (or the last ticks) queued: the connections they
-    // name are gone, and a pairing or management event has no session to act on.
+    // name are gone, and a pairing event has no session to act on.
     DrainedEvents dropped = this->swap_out_pending_events();
     // Locals release here, outside every lock. An outbound connection's destructor stops its
     // transport synchronously; deferring that is not an option (see DeferredRelease).
@@ -521,7 +519,6 @@ ConnectionManager::DrainedEvents ConnectionManager::swap_out_pending_events() {
         ev.activates.swap(this->pending_activate_events_);
         ev.rehandshake.swap(this->pending_rehandshake_events_);
         ev.pair_aborts.swap(this->pending_pair_abort_events_);
-        ev.management_requests.swap(this->pending_management_request_events_);
         ev.server_unpairs.swap(this->pending_server_unpair_events_);
         ev.pin_messages.swap(this->pending_pin_pairing_events_);
         ev.pairing_succeeded.swap(this->pending_pairing_succeeded_events_);
@@ -894,8 +891,7 @@ void ConnectionManager::drain_pairing_events(DrainedEvents& ev) {
     }
 }
 
-void ConnectionManager::drain_management_events(DrainedEvents& ev) {
-    // ==== server/unpair deferred events ====
+void ConnectionManager::drain_unpair_events(DrainedEvents& ev) {
     // Only ever targets the current connection: server/unpair is only admissible post-
     // promotion (LONG_TERM trust with an active session), never a still-unproven nursery
     // entry.
@@ -904,15 +900,6 @@ void ConnectionManager::drain_management_events(DrainedEvents& ev) {
             continue;
         }
         this->handle_server_unpair(event.conn.get(), event);
-    }
-
-    // ==== Management request deferred events ====
-    // At-most-one-in-flight (server waits for result); FIFO processing is correct.
-    for (auto& event : ev.management_requests) {
-        if (!event.conn || event.conn.get() != this->current_connection_.get()) {
-            continue;
-        }
-        this->handle_management_request(event.conn.get(), event);
     }
 }
 
@@ -1111,7 +1098,7 @@ void ConnectionManager::loop() {
     this->maybe_start_ws_server();
 
     // Process deferred connection lifecycle events: one conn_mutex_ swap, then (when there is
-    // something to do) one conn_ptr_mutex_ section applying lifecycle, pairing, and management
+    // something to do) one conn_ptr_mutex_ section applying lifecycle, pairing, and unpair
     // events in order.
     DrainedEvents ev = this->swap_out_pending_events();
 
@@ -1123,7 +1110,7 @@ void ConnectionManager::loop() {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         this->drain_lifecycle_events(ev);
         this->drain_pairing_events(ev);
-        this->drain_management_events(ev);
+        this->drain_unpair_events(ev);
     }
 
     // Send the goodbyes and release the connections dropped above, outside the lock.
@@ -1215,13 +1202,6 @@ void ConnectionManager::schedule_pair_abort(PairAbortEvent event) {
     // message arrives (or a malformed pairing frame forces one).
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->queue_pending(this->pending_pair_abort_events_, std::move(event));
-}
-
-void ConnectionManager::schedule_management_request(ManagementRequestEvent&& event) {
-    // Called from SendspinClient::process_json_message() on the network thread when a
-    // management/* request arrives.
-    std::lock_guard<std::mutex> lock(this->conn_mutex_);
-    this->queue_pending(this->pending_management_request_events_, std::move(event));
 }
 
 void ConnectionManager::schedule_server_unpair(ServerUnpairEvent&& event) {
@@ -1845,10 +1825,8 @@ void ConnectionManager::handle_enter_pairing_pin(SendspinConnection* conn, uint3
         // Validated against [min_pin_length, 12] when the activation was admitted.
         ps.pin_length = conn->get_pairing_pin_length().value_or(0);
     } else {
-        // Capture the static PIN now, before any operator window wait, so a concurrent
-        // management PIN change during the open window cannot swap the CPace secret
-        // mid-attempt. Mirrors the reference capturing static_pin before awaiting
-        // pairing_window().
+        // Capture the static PIN now, before any operator window wait, so a PIN change during
+        // the open window cannot swap the CPace secret mid-attempt.
         ps.static_pin_value = store.static_pin().value();
     }
 
@@ -1873,10 +1851,9 @@ void ConnectionManager::handle_enter_pairing_pin(SendspinConnection* conn, uint3
         // Surface the pairing-window prompt to the operator, but only when the platform
         // actually implements the gesture UI (on_open_pairing_window's contract is that it
         // fires only when pairing_window_supported is true). A gated dynamic_pin attempt can
-        // still reach this branch on a device without that UI (escalation and the short-PIN
-        // gate apply to dynamic_pin regardless of the flag); the attempt then waits for a
-        // window opened remotely via management/open-pairing-window, or for the server's own
-        // timeout to cancel it. Log loudly so the stall is diagnosable.
+        // still reach this branch on a device without that UI (the short-PIN gate applies to
+        // dynamic_pin regardless of the flag); the attempt then has no way to proceed and waits
+        // for the server's own timeout to cancel it. Log loudly so the stall is diagnosable.
         if (this->client_->config_.pairing_window_supported) {
             this->client_->note_open_pairing_window();
             ps.window_shown = true;
@@ -1884,7 +1861,7 @@ void ConnectionManager::handle_enter_pairing_pin(SendspinConnection* conn, uint3
             SS_LOGW(TAG,
                     "Gesture-gated %s attempt for server_id=%s but "
                     "pairing_window_supported=false: no operator prompt can be shown; "
-                    "waiting for management/open-pairing-window or server cancel",
+                    "waiting for the server to cancel the attempt",
                     to_cstr(ps.method), server_id.c_str());
         }
 
@@ -2458,115 +2435,8 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
 }
 
 // ============================================================================
-// Management main-loop handlers
+// Unpair main-loop handler
 // ============================================================================
-
-void ConnectionManager::handle_management_request(SendspinConnection* conn,
-                                                  const ManagementRequestEvent& event) {
-    // Runs on the main loop (caller holds conn_ptr_mutex_). conn is always current_connection_:
-    // management/* is only ever admissible for a MANAGEMENT-activity session, which by
-    // definition has already been promoted (see the admissibility check in loop()).
-    if (conn == nullptr || this->client_->record_store_ == nullptr) {
-        return;
-    }
-
-    RecordStore& store = *this->client_->record_store_;
-
-    // Trust gating: MANAGEMENT activity is required.
-    if (!conn->has_activity(SendspinActivity::MANAGEMENT)) {
-        SS_LOGW(TAG,
-                "management request without MANAGEMENT activity; replying permission_denied "
-                "(server_id=%s)",
-                conn->get_server_id().c_str());
-        ManagementResultPayload result;
-        result.result = ManagementResult::PERMISSION_DENIED;
-        conn->send_app_json(format_management_result_message(result), nullptr);
-        return;
-    }
-
-    ManagementResultPayload result;
-    ManagementEffect effect = ManagementEffect::NONE;
-    bool include_static_storage = false;
-
-    switch (event.kind) {
-        case ManagementRequestKind::LIST_RECORDS:
-            include_static_storage = true;
-            handle_list_records(store, result, effect);
-            break;
-        case ManagementRequestKind::ADD_RECORD:
-            handle_add_record(store, event.add_payload, result, effect);
-            break;
-        case ManagementRequestKind::REMOVE_RECORD: {
-            // requester_psk_id: the psk_id that authenticated this connection, used to detect
-            // own-record removal (see handle_remove_record's doc comment for why psk_id, not
-            // server_id, is the right key here).
-            //
-            // Read once into a local: this runs on the main loop, and the server can start an
-            // in-band re-handshake (which rewrites psk_id_ on the network thread) at any point
-            // between queueing this request and this drain.
-            std::optional<std::string> requester_psk_id;
-            if (std::string psk_id = conn->get_psk_id(); !psk_id.empty()) {
-                requester_psk_id = std::move(psk_id);
-            }
-            handle_remove_record(store, event.remove_payload, requester_psk_id, result, effect);
-            // Revocation must end the revoked device's live sessions, not just delete the
-            // record: a connection resolves its psk_id/category once at handshake time and never
-            // re-checks the store. The requester's own connection is excluded here because the
-            // GOODBYE_UNAUTHORIZED effect below already drops it (and only after its
-            // management/result has been sent).
-            if (result.result == ManagementResult::OK) {
-                this->drop_connections_using_psk_id(event.remove_payload.psk_id, conn);
-            }
-            break;
-        }
-        case ManagementRequestKind::GET_PAIRING_CONFIG:
-            include_static_storage = true;
-            handle_get_pairing_config(store, this->client_->config_.pin_display_supported,
-                                      this->client_->config_.pairing_window_supported, result,
-                                      effect);
-            break;
-        case ManagementRequestKind::SET_PAIRING_CONFIG:
-            handle_set_pairing_config(
-                store, event.set_config_payload, this->client_->config_.pin_display_supported,
-                this->client_->config_.pairing_window_supported, result, effect);
-            break;
-        case ManagementRequestKind::OPEN_PAIRING_WINDOW: {
-            // Opens a pairing window in place of the operator gesture. Handled here rather than
-            // in management.h because the window state lives on the ConnectionManager, not the
-            // RecordStore. Rejected as invalid when no PIN method is enabled (the same offered
-            // logic as build_hello_message); a no-op ok when a window is already open.
-            const auto& cfg = this->client_->config_;
-            const bool dynamic_offered = cfg.pin_display_supported && store.dynamic_pin_enabled();
-            const bool static_offered = cfg.pairing_window_supported &&
-                                        store.static_pin_enabled() &&
-                                        store.static_pin().has_value();
-            if (!dynamic_offered && !static_offered) {
-                SS_LOGW(TAG, "management/open-pairing-window: no PIN method enabled; invalid");
-                result.result = ManagementResult::INVALID;
-            } else {
-                if (!this->pairing_window_open()) {
-                    this->open_pairing_window();
-                }
-                result.result = ManagementResult::OK;
-            }
-            effect = ManagementEffect::NONE;
-            break;
-        }
-    }
-
-    // Attach storage accounting when the store provides it.
-    attach_storage_accounting(store, result, include_static_storage);
-
-    conn->send_app_json(format_management_result_message(result), nullptr);
-
-    if (effect == ManagementEffect::GOODBYE_UNAUTHORIZED) {
-        SS_LOGI(TAG,
-                "management/remove-record: requester removed its own record; disconnecting "
-                "(server_id=%s)",
-                conn->get_server_id().c_str());
-        this->drop_connection(conn, SendspinGoodbyeReason::UNAUTHORIZED);
-    }
-}
 
 void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
                                              const ServerUnpairEvent& event) {
@@ -2575,8 +2445,9 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
         return;
     }
 
-    // If the PSK category is not LONG_TERM, ignore (trust_level 'none': pairing /
-    // unpaired handshake). Mirrors _handle_unpair in aiosendspin/client/connection.py.
+    // Only a session running on a long-term record is paired at all (spec "server/unpair": if
+    // the session is unpaired, ignore the message), so a pairing or Sentinel handshake has
+    // nothing to drop.
     if (event.psk_category != PskCategory::LONG_TERM) {
         SS_LOGD(TAG, "server/unpair ignored (non-LONG_TERM category, server_id=%s)",
                 conn->get_server_id().c_str());
@@ -2586,9 +2457,9 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
     SS_LOGI(TAG, "server/unpair: dropping record and disconnecting (server_id=%s, psk_id=%s)",
             conn->get_server_id().c_str(), event.matched_psk_id.c_str());
 
-    // Remove the matched record (unless it is a shared-PSK record).
+    // Drop the matched pairing record (spec "server/unpair").
     if (this->client_->record_store_ != nullptr) {
-        handle_unpair(*this->client_->record_store_, event.matched_psk_id);
+        this->client_->record_store_->remove_record(event.matched_psk_id);
     }
 
     // Any OTHER session running on the same record is no longer trusted either; see

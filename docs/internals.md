@@ -534,7 +534,7 @@ The long-term record is committed to RAM on the network thread (synchronously, i
 
 If the server sends `pair/abort` at any point, `ConnectionManager::handle_pair_abort()` runs on the main loop and fires `on_pairing_failed` (only reason `concurrent_attempt` also closes the connection). The dynamic-PIN (CPace PAKE) and static-PIN pairing methods follow a similar main-loop-only state-machine shape but are driven by their own deferred event types (`ServerPairingMessageEvent`, the pairing-window confirm flag); see `handle_pin_pairing_message()` / `local_abort_pin_pairing()` / `start_pin_attempt()` in `connection_manager.cpp`.
 
-PIN specifics, per the current spec: the session `pin_length` arrives in the activation's `pairing` object and is validated there (`pair/abort` reason `pin_length_unacceptable` outside `[min_pin_length, 12]`); `server/pair-init` carries only `nonce_A`. A gesture-gated attempt (static PIN always; dynamic PIN when escalated or `pin_length < 6`) answers the activation with `client/pair-pending` and waits -- without an attempt timeout -- for a pairing window, which the operator gesture or `management/open-pairing-window` opens (standing state on `ConnectionManager`, 5-minute lifetime, consumed when `client/pair-init` is sent). The dynamic-PIN failure counter is escalation, not lockout: persisted through `SendspinPairingConfig`, incremented only when the client's own `server_kc` verification fails, reset when it succeeds, gesture-gating the method at 10 while it stays offered.
+PIN specifics, per the current spec: the session `pin_length` arrives in the activation's `pairing` object and is validated there (`pair/abort` reason `pin_length_unacceptable` outside `[min_pin_length, 12]`); `server/pair-init` carries only `nonce_A`. A gesture-gated attempt (static PIN always; dynamic PIN when escalated or `pin_length < 6`) answers the activation with `client/pair-pending` and waits -- without an attempt timeout -- for a pairing window, which the operator gesture opens (standing state on `ConnectionManager`, 5-minute lifetime, consumed when `client/pair-init` is sent). The dynamic-PIN failure counter is escalation, not lockout: persisted through `SendspinPairingConfig`, incremented only when the client's own `server_kc` verification fails, reset when it succeeds, gesture-gating the method at 10 while it stays offered.
 
 ### PSK Admission (trust gating)
 
@@ -614,7 +614,7 @@ When a connection is lost (`on_connection_lost`):
    │  WS_HANDSHAKE_TIMEOUT_SECS; ESP: httpd_stop(), which runs queued sends first,
    │  then every session's close_fn and ctx free_fn, polling at 100 ms)
    └─ swap_out_pending_events(): move every pending event queue (lifecycle, activate,
-      re-handshake, pairing, management) out under conn_mutex_; every moved-out shared_ptr is
+      re-handshake, pairing, unpair) out under conn_mutex_; every moved-out shared_ptr is
       released outside the locks (an outbound connection's destructor stops its transport
       synchronously). Returns the pairing-UI snapshot
 3. Role threads: PlayerRole/VisualizerRole/ArtworkRole::Impl::stop() join, then each discards

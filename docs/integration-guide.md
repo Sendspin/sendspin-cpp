@@ -510,10 +510,7 @@ produces -- it is not something a provider hand-rolls its own version of.
   pairing working for this boot only (`on_pairing_succeeded` still fires; the record is gone
   after a reboot), and a rejected write of a removal means the store still holds the old array
   and will hand the revoked record back at the next boot, silently making the revoked PSK valid
-  again (the revoked record is always dropped from RAM regardless of the return value). The one
-  fail-closed consumer is `management/add-record`, which reports a rejected write to the
-  requesting server as `storage_exhausted` rather than promising a credential the device does
-  not durably hold.
+  again (the revoked record is always dropped from RAM regardless of the return value).
 - `erase_blob()` is only ever called for `persistence_keys::PAIRING_PSK` and
   `persistence_keys::STATIC_PIN` (a removal from `RECORDS` re-saves the shrunken array instead,
   so that key stays present). Absent counts as success. Same durability contract as a rejected
@@ -818,24 +815,21 @@ Some PIN attempts are **gesture-gated**: the client answers the pairing activati
 `client/pair-pending` and withholds `client/pair-init` until a pairing window is open. Static
 PIN gates every attempt; dynamic PIN gates an attempt only when the method is *escalated* or
 the session's PIN length is below 6 digits. The window opens on the operator gesture
-(`confirm_pairing_window()`) or via `management/open-pairing-window` from a paired server, it
-lives for 5 minutes, and it admits exactly one attempt. A gesture performed before the
+(`confirm_pairing_window()`), it lives for 5 minutes, and it admits exactly one attempt. A gesture performed before the
 activation arrives leaves the window standing open, so the next attempt within its lifetime
 proceeds without a prompt.
 
 The gating rules apply to dynamic PIN even on a device that leaves
 `pairing_window_supported` false. On such a device the `on_open_pairing_window` prompt cannot
-fire, so a gated attempt sends `client/pair-pending`, logs a warning, and waits for either a
-window opened remotely via `management/open-pairing-window` or the server's own timeout. To
-keep escalated recovery in the operator's hands, a device that offers `dynamic_pin` should
-set `pairing_window_supported` and implement the gesture callbacks.
+fire, so a gated attempt sends `client/pair-pending`, logs a warning, and waits for the
+server's own timeout to cancel it. A device that offers `dynamic_pin` should therefore set
+`pairing_window_supported` and implement the gesture callbacks.
 
 Repeated dynamic-PIN failures escalate the method rather than locking it out: the client
 keeps a single failure counter (persisted across reboots) that increments only when its own
 verification of the server's key-confirmation tag fails, and resets when that verification
 succeeds. At 10 failures the method becomes escalated -- every attempt is gesture-gated --
-but it stays offered; there is no lockout state and no management command to clear the
-counter.
+but it stays offered; there is no lockout state.
 
 #### Rotated secrets and the locations hint
 
@@ -845,9 +839,8 @@ the operator can find each secret (`"device"`, `"leaflet"`, `"operator"`), and r
 secret the device shipped with, so set them to match what your product actually publishes: a
 PIN on the device label is `{"device"}`, a pairing token in the box is `{"leaflet"}`.
 
-A paired server can replace either secret at runtime with `management/set-pairing-config`
-(`pairing_psk.psk` / `static_pin.pin`). That invalidates every distributed copy of the shipped
-one, so the configured answer stops being true, and the library switches that method's hint to
+Replacing either secret at runtime invalidates every distributed copy of the shipped one, so
+the configured answer stops being true, and the library switches that method's hint to
 `["operator"]` from the next `client/hello` onward. Rotation is recorded in the persisted
 pairing config, so the corrected hint survives reboots along with the rotated secret, and it is
 advertised even when the application configured no locations at all: before the rotation the
@@ -1194,7 +1187,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `software_version` | `std::optional<std::string>` | unset | Software version string; sent in `client/hello` only when set |
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
 | `pin_display_supported` | `bool` | `false` | Set to `true` when the application implements `on_display_pairing_pin` / `on_clear_pairing_pin` on its `SendspinClientListener`. When `false`, dynamic-PIN pairing is not advertised even if enabled in `SendspinPairingConfig`. |
-| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, static-PIN pairing is not advertised even if a static PIN is configured. Dynamic-PIN devices should also set it: escalated or short-PIN dynamic attempts are gesture-gated through the same callbacks, and without them such an attempt can only proceed via `management/open-pairing-window` (or stalls until the server cancels it). |
+| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, static-PIN pairing is not advertised even if a static PIN is configured. Dynamic-PIN devices should also set it: escalated or short-PIN dynamic attempts are gesture-gated through the same callbacks, and without them such an attempt stalls until the server cancels it. |
 | `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains (the shared-PSK fallback record counts against it too). See [Record capacity](#record-capacity). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
@@ -1381,7 +1374,7 @@ These represent commands the server can send to the player. The player advertise
 | `UNAUTHORIZED` | Server requested an activity its trust level does not permit |
 | `PAIRING_REQUIRED` | Server requested playback but the client requires pairing first |
 | `CONCURRENT_ATTEMPT` | Incoming connection rejected because another is already admitted. Distinct from the same-named `SendspinPairAbortReason`, which is specific to pairing |
-| `UNPAIRED` | Server unpaired this device via `management/server-unpair` |
+| `UNPAIRED` | Server unpaired this device via `server/unpair` |
 
 ### SendspinPlaybackState
 

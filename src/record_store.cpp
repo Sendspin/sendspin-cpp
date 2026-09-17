@@ -19,7 +19,6 @@
 #include "crypto/pin.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
-#include "protocol_messages.h"
 #include "sendspin/persistence_codec.h"
 
 #include <algorithm>
@@ -125,8 +124,8 @@ void RecordStore::load_static_pin_from_provider() {
     if (auto pin_blob = this->provider_->load_blob(persistence_keys::STATIC_PIN)) {
         std::string loaded_pin(reinterpret_cast<const char*>(pin_blob->data()), pin_blob->size());
         // Validate on load, the same way RECORDS and PAIRING_PSK are validated by their
-        // decoders. The write path (management/set-pairing-config) already checks this, so a
-        // value that fails here came from provider corruption or out-of-band provisioning.
+        // decoders. The write path already checks this, so a value that fails here came from
+        // provider corruption or out-of-band provisioning.
         // Accepting it would leave the device advertising static_pin while feeding malformed
         // PRS bytes to the PAKE, which can only ever produce pin_mismatch, a pairing that
         // deterministically fails with nothing in the logs pointing at storage.
@@ -178,7 +177,7 @@ void RecordStore::provision_shared_record_if_needed(bool loaded_config,
                                                     bool initial_unpaired_access_enabled) {
     // First-boot seed: the application's configured default for unpaired access applies only on
     // a genuine first boot. A loaded config always wins, so a server that turned unpaired access
-    // off through management/set-pairing-config keeps it off across reboots. The value is
+    // off keeps it off across reboots. The value is
     // persisted below by the first-boot provisioning branch, which the !loaded_config condition
     // always enters.
     //
@@ -387,20 +386,6 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
     return nullptr;
 }
 
-std::vector<RecordSummary> RecordStore::records_summary_snapshot() const {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    std::vector<RecordSummary> summaries;
-    summaries.reserve(this->records_.size());
-    for (const auto& rec : this->records_) {
-        RecordSummary summary;
-        summary.psk_id = rec.psk_id;
-        summary.server_id = rec.server_id;
-        summary.used = rec.used;
-        summaries.push_back(std::move(summary));
-    }
-    return summaries;
-}
-
 bool RecordStore::store_record(SendspinPairingRecord record) {
     std::lock_guard<std::mutex> lock(this->mutex_);
 
@@ -417,8 +402,8 @@ bool RecordStore::store_record(SendspinPairingRecord record) {
     }
 
     // Insert/replace the new record. Fails closed: the record must not survive in records_
-    // when the provider rejects the write (see the class doc; the caller, management/add-record,
-    // reports the result over the wire, so the return value must be honest about durability).
+    // when the provider rejects the write (see the class doc: the return value must be honest
+    // about durability).
     // This is safe under mutex_ (held for the whole sequence, so no reader - in particular
     // resolve_by_psk_id() on the network thread - can observe the tentative mutation before it
     // commits or rolls back; see the locking-discipline comment on persist_records_locked() for
@@ -490,11 +475,8 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
     // Retire any OTHER record still bound to this server_id: pairing mints a fresh per-server
     // PSK that REPLACES whatever that server held before, and leaving the prior record in place
     // would let re-pairing accumulate a second working PSK for the same server, so "rotation"
-    // never revokes anything. Only the pairing path asks for this: management/add-record stores
-    // plainly, because the spec's only stated add-record collision rule is keyed on psk_id (a
-    // psk whose psk_id is already known is already_exists) and it defines no outcome for a
-    // server_id collision: silently deleting a record the caller never named would be unattested
-    // by any result code. Shared-PSK records (server_id absent) never match here.
+    // never revokes anything. Only the pairing path asks for this; store_record() stores
+    // plainly. Shared-PSK records (server_id absent) never match here.
     if (this->records_[idx].server_id.has_value()) {
         const std::string superseded_server_id = this->records_[idx].server_id.value();
         for (size_t i = 0; i < this->records_.size();) {
@@ -562,10 +544,6 @@ void RecordStore::mark_record_used(const std::string& psk_id) {
     // Best-effort: a rejected write here is not reported, since "used" is advisory bookkeeping
     // rather than a revocation whose durability the caller depends on.
     this->persist_records_locked();
-}
-
-bool RecordStore::can_remove_record(const std::string& psk_id) const {
-    return psk_id != this->record_mode_psk_id_;
 }
 
 // ============================================================================
@@ -798,28 +776,6 @@ std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
     outcome.psk = resolved->psk;
     // outcome.record is nullopt: caller should not store a new record.
     return outcome;
-}
-
-bool RecordStore::can_store_record() const {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    return this->has_capacity_locked();
-}
-
-// ============================================================================
-// Storage accounting
-// ============================================================================
-
-RecordStore::StorageReport RecordStore::storage_accounting() const {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    StorageReport report;
-    report.capacity = static_cast<int>(this->max_records_);
-    report.free = static_cast<int>(this->max_records_) - static_cast<int>(this->records_.size());
-    if (report.free < 0) {
-        report.free = 0;  // Defensive: a shrunk max_records_ must not advertise negative room.
-    }
-    report.cost_individual = 1;
-    report.cost_shared = 1;
-    return report;
 }
 
 // ============================================================================

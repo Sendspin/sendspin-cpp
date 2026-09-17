@@ -46,13 +46,6 @@
 
 namespace sendspin {
 
-/// Forward-declared rather than pulled in via protocol_messages.h: that header drags in every
-/// role header (color_role.h, controller_role.h, ...) plus ArduinoJson, and record_store.h is
-/// itself included by low-level files (connection.h, admission.h) that have no business seeing
-/// any of that. records_summary_snapshot() is declared here and defined in record_store.cpp,
-/// which already sits at the leaf of the include graph and can afford the real include.
-struct RecordSummary;
-
 // ============================================================================
 // PSK category
 // ============================================================================
@@ -135,8 +128,8 @@ public:
     /// @param provider Persistence provider, or nullptr for an in-memory-only store.
     /// @param initial_unpaired_access_enabled First-boot default for unpaired (Sentinel) access.
     ///        Applied only when no pairing config was loaded; a loaded config always wins.
-    /// @param max_records Cap on the number of long-term records retained (see
-    ///        can_store_record()). Defaults to DEFAULT_MAX_RECORDS.
+    /// @param max_records Cap on the number of long-term records retained. Defaults to
+    ///        DEFAULT_MAX_RECORDS.
     explicit RecordStore(SendspinPersistenceProvider* provider,
                          bool initial_unpaired_access_enabled = false,
                          size_t max_records = DEFAULT_MAX_RECORDS);
@@ -169,13 +162,6 @@ public:
         return this->records_;
     }
 
-    /// @brief Return a locked snapshot of psk_id/server_id/used for every long-term record
-    /// (thread-safe), without materializing any PSK bytes. The only production caller is
-    /// management/list-records (see handle_list_records() in management.h), which never needs
-    /// the PSK; use records_snapshot() instead when the full record (including the PSK) is
-    /// actually required.
-    [[nodiscard]] std::vector<RecordSummary> records_summary_snapshot() const;
-
     /// @brief Return a locked copy of the record identified by psk_id, if any (thread-safe).
     /// Calls the unlocked record_by_psk_id helper while holding mutex_; no recursion since
     /// record_by_psk_id does not lock. Returns nullopt when the psk_id is not found.
@@ -194,9 +180,8 @@ public:
     /// a key that would be lost at the next reboot.
     ///
     /// This plain form does NOT supersede other records bound to the same server_id, so a
-    /// caller may deliberately hold more than one record for one server (for example an
-    /// operator staging a replacement credential via `management/add-record` before
-    /// retiring the old one). Use store_record_superseding() for the pairing path.
+    /// caller may deliberately hold more than one record for one server. Use
+    /// store_record_superseding() for the pairing path.
     /// @return true when the record is stored (and persisted, when a provider is set);
     /// false when the persistence provider rejected the write.
     bool store_record(SendspinPairingRecord record);
@@ -231,10 +216,6 @@ public:
 
     /// @brief Flag the record at psk_id as used. No-op if absent or already used.
     void mark_record_used(const std::string& psk_id);
-
-    /// @brief Return whether the record may be removed.
-    /// The record referenced by record_mode_psk_id is protected.
-    [[nodiscard]] bool can_remove_record(const std::string& psk_id) const;
 
     // ========================================
     // Pairing PSK (the one the client accepts to admit a new server)
@@ -397,49 +378,12 @@ public:
 
     /// @brief Decide a pairing outcome.
     ///
-    /// When storage is not exhausted (`can_store_record()` is true), generates a
-    /// fresh PSK bound to server_id and returns {psk, record}.
+    /// When the store has room for the record, generates a fresh PSK bound to server_id and
+    /// returns {psk, record}.
     /// When storage is exhausted, returns the shared fallback PSK and record=nullopt.
     /// Returns nullopt on error (missing shared fallback).
     [[nodiscard]] std::optional<PairingOutcome> resolve_pairing_outcome(
         const std::string& server_id, const std::optional<std::string>& label = std::nullopt);
-
-    /// @brief Return true if a new record can be stored.
-    ///
-    /// Reports free capacity against max_records_ (see DEFAULT_MAX_RECORDS).
-    ///
-    /// This is an advisory pre-check consulted by callers (resolve_pairing_outcome(),
-    /// management/add-record) before attempting to store a record; it takes mutex_ and releases
-    /// it before returning, so the actual insert (store_record() or store_record_superseding())
-    /// still re-checks max_records_ under its own hold of mutex_. An insert that lands in that gap
-    /// therefore cannot grow the in-memory array past the cap. A record replacement (matching
-    /// psk_id, or a pairing supersede of the record already held for the target server_id) is
-    /// exempt from the cap in both places: it does not grow the store.
-    [[nodiscard]] bool can_store_record() const;
-
-    // ========================================
-    // Storage accounting
-    // ========================================
-
-    /// @brief Storage accounting report returned by storage_accounting().
-    struct StorageReport {
-        int free{0};             ///< Number of free record slots.
-        int capacity{0};         ///< Total record slot capacity.
-        int cost_individual{1};  ///< Slots consumed by a stored-pubkey record.
-        int cost_shared{1};      ///< Slots consumed by a shared-PSK record.
-    };
-
-    /// @brief Return storage accounting info for a management result.
-    ///
-    /// The store is always capacity-bounded, so this always reports real numbers: free =
-    /// max_records_ minus the current record count, capacity = max_records_, both costs 1 slot.
-    /// A managing server needs to see the actual cap to avoid flooding the store via
-    /// management/add-record.
-    ///
-    /// include_static semantics (attachment point in management.h attach_storage_accounting):
-    ///   - list-records and get-pairing-config: include capacity/costs.
-    ///   - all other results: free only.
-    [[nodiscard]] StorageReport storage_accounting() const;
 
 private:
     // ========================================
@@ -483,7 +427,6 @@ private:
     [[nodiscard]] bool has_capacity_locked() const {
         return this->records_.size() < this->max_records_;
     }
-
     /// @brief Body of resolve_by_psk_id(). MUST be called with mutex_ already held.
     /// Exists so resolve_pairing_outcome(), which holds mutex_ across its whole body, can run
     /// the same resolution without re-entering this non-recursive mutex.
@@ -528,9 +471,8 @@ private:
     SendspinPersistenceProvider* provider_{nullptr};
 
     // size_t fields
-    /// Cap on records_.size() enforced by has_capacity_locked() / can_store_record(), and
-    /// reported by storage_accounting(); see DEFAULT_MAX_RECORDS. Set once at construction,
-    /// then read-only.
+    /// Cap on records_.size() enforced by has_capacity_locked(); see DEFAULT_MAX_RECORDS. Set
+    /// once at construction, then read-only.
     size_t max_records_{DEFAULT_MAX_RECORDS};
 
     // 32-bit fields
@@ -549,8 +491,8 @@ private:
     bool dynamic_pin_enabled_{true};
     bool pairing_psk_enabled_{true};
     /// Set by set_pairing_psk() and persisted through SendspinPairingConfig; see
-    /// pairing_psk_rotated(). Main-loop-only like the other config flags: written from the
-    /// management handler and read by build_hello_message().
+    /// pairing_psk_rotated(). Main-loop-only like the other config flags: written by
+    /// set_pairing_psk() and read by build_hello_message().
     bool pairing_psk_rotated_{false};
     bool static_pin_enabled_{false};
     /// Set by set_static_pin(); see static_pin_rotated().
