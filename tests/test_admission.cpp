@@ -38,10 +38,6 @@ static std::vector<SendspinActivity> acts(SendspinActivity a) {
 static std::vector<SendspinActivity> acts(SendspinActivity a, SendspinActivity b) {
     return {a, b};
 }
-static std::vector<SendspinActivity> acts(SendspinActivity a, SendspinActivity b,
-                                          SendspinActivity c) {
-    return {a, b, c};
-}
 
 static const auto PB = SendspinActivity::PLAYBACK;
 static const auto PR = SendspinActivity::PAIRING;

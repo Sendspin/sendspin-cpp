@@ -1379,7 +1379,7 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
         return true;
     }
 
-    std::string hello_message = this->client_->build_hello_message(conn);
+    std::string hello_message = this->client_->build_hello_message();
 
     // send_app_json (not send_text_message): client/hello is encrypted like every other
     // post-handshake message. The hello is only ever armed once the Noise handshake completes,

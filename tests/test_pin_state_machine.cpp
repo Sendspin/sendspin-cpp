@@ -612,7 +612,7 @@ protected:
     std::optional<std::vector<std::string>> hello_locations(const char* method) {
         JsonDocument doc;
         JsonObject root;
-        EXPECT_TRUE(parse_json(this->client_->build_hello_message(nullptr), doc, root));
+        EXPECT_TRUE(parse_json(this->client_->build_hello_message(), doc, root));
         for (JsonObjectConst desc :
              root["payload"]["supported_pair_methods"].as<JsonArrayConst>()) {
             if (std::string(desc["method"].as<const char*>()) != method) {

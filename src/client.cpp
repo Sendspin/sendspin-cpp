@@ -1028,7 +1028,7 @@ void SendspinClient::cleanup_connection_state() {
     }
 }
 
-std::string SendspinClient::build_hello_message(const SendspinConnection* conn) {
+std::string SendspinClient::build_hello_message() {
     ClientHelloMessage msg;
     msg.name = this->config_.name;
 
@@ -1043,13 +1043,6 @@ std::string SendspinClient::build_hello_message(const SendspinConnection* conn) 
     device_info.software_version = this->config_.software_version;
     device_info.mac_address = interface_mac;
     msg.device_info = device_info;
-
-    // trust_level: USER iff the PSK the Noise handshake matched is a long-term (paired)
-    // record; NONE for Sentinel/Pairing PSKs or when no Noise handshake ran on this
-    // connection at all (encryption not required).
-    msg.trust_level = (conn != nullptr && conn->get_psk_category() == PskCategory::LONG_TERM)
-                          ? ConnectionTrust::USER
-                          : ConnectionTrust::NONE;
 
     // Advertise supported pair methods from the record store. pairing_psk needs an actual
     // Pairing PSK behind it (normally auto-provisioned on first boot): advertising the method

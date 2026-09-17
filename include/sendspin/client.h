@@ -699,9 +699,7 @@ private:
     void stop_role_threads();
 
     /// @brief Builds the formatted client hello message from config
-    /// @param conn The connection the hello will be sent on; used to derive trust_level from
-    ///        the resolved PSK category. May be null (trust_level defaults to "none").
-    std::string build_hello_message(const SendspinConnection* conn);
+    std::string build_hello_message();
 
     // ========================================
     // Message processing

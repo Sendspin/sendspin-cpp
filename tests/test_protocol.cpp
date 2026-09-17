@@ -801,25 +801,17 @@ TEST(Protocol, ClientHelloNoClientIdOrVersion) {
         << "version must NOT appear in client/hello under encryption";
 }
 
-// trust_level is always emitted (either "none" or "user").
-TEST(Protocol, ClientHelloTrustLevelNone) {
+// The hello carries no trust field: the server learns the client's trust from the PSK the Noise
+// handshake matched (spec "client/hello").
+TEST(Protocol, ClientHelloOmitsTrustLevel) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
-    msg.trust_level = ConnectionTrust::NONE;
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
-    EXPECT_STREQ(doc["payload"]["trust_level"], "none");
-}
-
-TEST(Protocol, ClientHelloTrustLevelUser) {
-    ClientHelloMessage msg;
-    msg.name = "TestDevice";
-    msg.trust_level = ConnectionTrust::USER;
-
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
-    EXPECT_STREQ(doc["payload"]["trust_level"], "user");
+    EXPECT_TRUE(doc["payload"]["trust_level"].isUnbound());
+    // Control: the sibling always-emitted field is still there.
+    EXPECT_TRUE(doc["payload"]["unpaired_access"]["enabled"].is<bool>());
 }
 
 // unpaired_access.enabled is always emitted.
