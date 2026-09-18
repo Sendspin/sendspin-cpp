@@ -117,8 +117,8 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - A change that substantially rewrites a region conforms any drifted
   patterns inside the touched region in the same PR, rather than carrying
   them forward because the old code already had them.
-- Parallel code paths (stream start versus stream clear, hello versus
-  request-format) stay structurally identical so a reader can diff them
+- Parallel code paths (stream start versus stream clear, one role's
+  `client/state` object versus another's) stay structurally identical so a reader can diff them
   mentally. Deliberate asymmetry gets a comment at the asymmetric site
   explaining why, so nobody "fixes" it back.
 - When two things must stay in sync at every call site, do not rely on care:

@@ -139,41 +139,31 @@ Receives real-time beat, loudness, dominant-frequency, onset, and spectrum data 
 
 ```cpp
 VisualizerSupportObject vis_support;
-vis_support.types = {
+vis_support.buffer_capacity = 32768;  // Total ring buffer bytes; ~1/3 holds wire data
+
+VisualizerStreamConfig vis_stream;
+vis_stream.types = {
     VisualizerDataType::BEAT,
     VisualizerDataType::LOUDNESS,
     VisualizerDataType::F_PEAK,
     VisualizerDataType::SPECTRUM,
     VisualizerDataType::PEAK,
 };
-vis_support.buffer_capacity = 32768;  // Total ring buffer bytes; ~1/3 holds wire data
-vis_support.rate_max = 30;  // Set to the display refresh rate
-vis_support.spectrum = VisualizerSpectrumConfig{
+vis_stream.rate_max = 30;  // Set to the display refresh rate
+vis_stream.spectrum = VisualizerSpectrumConfig{
     .n_disp_bins = 32,
     .scale = VisualizerSpectrumScale::MEL,
     .f_min = 40,
     .f_max = 16000,
 };
 
-auto& visualizer = client.add_visualizer({.support = vis_support});
+auto& visualizer = client.add_visualizer({.support = vis_support, .stream = vis_stream});
 ```
 
-The advertised support object is the starting format. To change it at runtime, call
-`request_format()` with only the fields you want to change; omitted fields keep their
-current value on the server:
-
-```cpp
-visualizer.request_format({.rate_max = 15});  // Halve the frame rate
-
-visualizer.request_format({
-    .types = {{VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS}},
-});
-```
-
-While a stream is active the server replies with a fresh `stream/start`, so
-`on_visualizer_stream_start()` fires again with the updated
-`ServerVisualizerStreamObject`. If no stream is active, the server remembers the request
-and applies it to the next stream.
+`support` is the capacity the client advertises once in `client/hello`; `stream` is the
+configuration it reports in `client/state`, from which the server derives the stream it
+sends. Both are set at construction time, so the stream configuration is reported as
+configured and does not change while the client runs.
 
 ### Color Role (Audio-Derived Color Palette)
 
@@ -1251,6 +1241,7 @@ Configuration passed to `client.add_visualizer()`.
 | Field | Type | Default | Description |
 |---|---|--|---|
 | `support` | `VisualizerSupportObject` | - | Visualizer capabilities advertised to the server during the hello handshake |
+| `stream` | `VisualizerStreamConfig` | - | Stream configuration reported to the server in `client/state` |
 | `psram_stack` | `bool` | `false` | Allocate drain thread stack in PSRAM (ESP-IDF only) |
 | `priority` | `unsigned` | `2` | FreeRTOS priority for the drain thread (ESP-IDF only) |
 
@@ -1258,8 +1249,13 @@ Configuration passed to `client.add_visualizer()`.
 
 | Field | Type | Description |
 |---|---|---|
-| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`) |
 | `buffer_capacity` | `size_t` | Total RAM budget in bytes for the internal ring buffer. Per-entry overhead means only ~1/3 holds wire data; the client advertises that effective capacity to the server |
+
+`VisualizerStreamConfig` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`); may be empty to request none |
 | `rate_max` | `uint16_t` | Maximum periodic frames per second; set to the display refresh rate |
 | `spectrum` | `std::optional<VisualizerSpectrumConfig>` | Spectrum analysis parameters; required when `SPECTRUM` is in `types` |
 

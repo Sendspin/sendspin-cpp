@@ -630,6 +630,13 @@ struct ServerArtworkStreamObject {
     std::optional<std::vector<ServerArtworkChannelObject>> channels;
 };
 
+/// @brief Visualizer stream configuration reported by the client in client/state messages
+struct ClientVisualizerStateObject {
+    std::vector<VisualizerDataType> types{};
+    uint16_t rate_max{};
+    std::optional<VisualizerSpectrumConfig> spectrum;
+};
+
 /// @brief Artwork channel configuration reported by the client in client/state messages
 struct ClientArtworkStateObject {
     std::vector<ArtworkChannelFormatObject> channels;
@@ -775,6 +782,7 @@ struct ClientStateMessage {
     SendspinClientState state{};
     std::optional<ClientPlayerStateObject> player{};
     std::optional<ClientArtworkStateObject> artwork{};
+    std::optional<ClientVisualizerStateObject> visualizer{};
 };
 
 /// @brief Parsed server/hello handshake message received at connection startup.
@@ -810,13 +818,6 @@ struct StreamStartMessage {
     std::optional<ServerPlayerStreamObject> player;
     std::optional<ServerArtworkStreamObject> artwork;
     std::optional<ServerVisualizerStreamObject> visualizer;
-};
-
-/// @brief Outgoing stream/request_format message used for codec, artwork, and visualizer
-/// format negotiation
-struct StreamRequestFormatMessage {
-    std::optional<ServerPlayerStreamObject> player;
-    std::optional<VisualizerFormatRequest> visualizer;
 };
 
 /// @brief Parsed stream/end message listing which roles the stream end applies to
@@ -974,11 +975,6 @@ std::string format_client_hello_message(const ClientHelloMessage* msg);
 /// @param msg Message to serialize.
 /// @return State message serialized into JSON format.
 std::string format_client_state_message(const ClientStateMessage* msg);
-
-/// @brief Formats a stream/request_format message as a JSON string for sending to the server
-/// @param msg Message to serialize.
-/// @return Stream request format message serialized into JSON format.
-std::string format_stream_request_format_message(const StreamRequestFormatMessage* msg);
 
 /// @brief Formats a client/leave message as a JSON string for sending to the server
 /// messaging.md "client/leave": leaves the client's current group; no payload fields.

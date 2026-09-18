@@ -561,19 +561,21 @@ int main(int argc, char* argv[]) {
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     VisualizerRole* vis_role = nullptr;
     if (enable_visualizer) {
-        VisualizerSupportObject vis;
-        vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
-                     VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
-                     VisualizerDataType::PEAK};
-        vis.buffer_capacity = 32768;
-        vis.rate_max = 30;
-        vis.spectrum = VisualizerSpectrumConfig{
+        VisualizerSupportObject vis_support;
+        vis_support.buffer_capacity = 32768;
+        VisualizerStreamConfig vis_stream;
+        vis_stream.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
+                            VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
+                            VisualizerDataType::PEAK};
+        vis_stream.rate_max = 30;
+        vis_stream.spectrum = VisualizerSpectrumConfig{
             .n_disp_bins = 32,
             .scale = VisualizerSpectrumScale::MEL,
             .f_min = 40,
             .f_max = 16000,
         };
-        vis_role = &client.add_visualizer(VisualizerRoleConfig{.support = vis});
+        vis_role = &client.add_visualizer(
+            VisualizerRoleConfig{.support = vis_support, .stream = vis_stream});
     }
 #else
     (void)enable_visualizer;

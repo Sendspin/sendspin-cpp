@@ -469,8 +469,6 @@ struct VisualizerSpectrumConfig {
 
 /// @brief Visualizer capabilities advertised to the server during the hello handshake
 struct VisualizerSupportObject {
-    /// @brief Data types the client wants to receive
-    std::vector<VisualizerDataType> types{};
     /// @brief Total RAM budget in bytes for the internal ring buffer (the exact allocation size).
     /// This is not the amount of wire data that fits: each entry stores its full wire message
     /// (message-type byte + timestamp + data) plus an aligned per-entry ItemHeader, so for the
@@ -478,6 +476,12 @@ struct VisualizerSupportObject {
     /// client advertises that effective (~1/3) capacity to the server, not this raw budget, so the
     /// server's flow control does not overrun the ring
     size_t buffer_capacity{};
+};
+
+/// @brief Visualization data the client asks the server to stream, reported in client/state
+struct VisualizerStreamConfig {
+    /// @brief Data types the client wants to receive. May be empty to request no data
+    std::vector<VisualizerDataType> types{};
     /// @brief Maximum periodic visualization frames per second (applies to LOUDNESS, F_PEAK,
     /// SPECTRUM). Event types (BEAT, PEAK) are not throttled. Set to the display refresh rate
     uint16_t rate_max{};
@@ -487,7 +491,10 @@ struct VisualizerSupportObject {
 
 /// @brief Configuration for the visualizer role
 struct VisualizerRoleConfig {
+    /// @brief Capabilities the client/hello support object carries
     VisualizerSupportObject support;
+    /// @brief Stream configuration the client/state visualizer object carries
+    VisualizerStreamConfig stream;
     bool psram_stack{false};  ///< Allocate drain thread stack in PSRAM (ESP-IDF only)
     unsigned priority{2};     ///< FreeRTOS priority for the drain thread (ESP-IDF only)
 };

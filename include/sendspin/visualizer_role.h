@@ -45,14 +45,6 @@ struct ServerVisualizerStreamObject {
     std::optional<VisualizerSpectrumConfig> spectrum;
 };
 
-/// @brief Format change request sent to the server via stream/request-format.
-/// All fields are optional; omitted fields keep their current value on the server
-struct VisualizerFormatRequest {
-    std::optional<std::vector<VisualizerDataType>> types;
-    std::optional<uint16_t> rate_max;
-    std::optional<VisualizerSpectrumConfig> spectrum;
-};
-
 /// @brief Listener for visualizer role events
 ///
 /// Data values (loudness, spectrum bins, f_peak amplitude) use the full uint16 range
@@ -113,8 +105,8 @@ public:
  *
  * Usage:
  * 1. Implement VisualizerRoleListener with the data callbacks you need
- * 2. Build a VisualizerSupportObject describing supported data types, buffer capacity,
- *    and frame rate cap
+ * 2. Fill a VisualizerRoleConfig: the buffer capacity it can hold, and the data types,
+ *    frame-rate cap and spectrum layout it wants streamed
  * 3. Add the role to the client via SendspinClient::add_visualizer()
  * 4. Call set_listener() with your listener implementation
  *
@@ -130,10 +122,10 @@ public:
  *
  * MyVisualizerListener listener;
  * VisualizerRoleConfig config;
- * config.support.types = {VisualizerDataType::SPECTRUM, VisualizerDataType::BEAT};
  * config.support.buffer_capacity = 4096;
- * config.support.rate_max = 30;
- * config.support.spectrum = VisualizerSpectrumConfig{
+ * config.stream.types = {VisualizerDataType::SPECTRUM, VisualizerDataType::BEAT};
+ * config.stream.rate_max = 30;
+ * config.stream.spectrum = VisualizerSpectrumConfig{
  *     .n_disp_bins = 32,
  *     .scale = VisualizerSpectrumScale::MEL,
  *     .f_min = 40,
@@ -155,14 +147,6 @@ public:
     /// @brief Sets the listener for visualizer events
     /// @note The listener must outlive this role
     void set_listener(VisualizerRoleListener* listener);
-
-    /// @brief Requests a different stream format from the server via stream/request-format
-    ///
-    /// If a visualizer stream is active, the server responds with a stream/start carrying
-    /// the new configuration; otherwise it remembers the request for the next stream. Sent only
-    /// while the server has visualizer@v1 among the connection's active roles.
-    /// @param request Fields to change; omitted fields keep their current value
-    void request_format(const VisualizerFormatRequest& request);
 
 private:
     std::unique_ptr<Impl> impl_;

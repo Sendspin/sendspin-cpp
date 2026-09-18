@@ -919,7 +919,7 @@ void SendspinClient::leave() {
 
 void SendspinClient::send_text(const std::string& text, const std::string& role_family) {
     // Single choke point for every role-originated send that is not a protocol-internal pairing
-    // message (controller commands, visualizer stream/request-format): pairing messages are sent
+    // message (controller commands): pairing messages are sent
     // directly via SendspinConnection::send_app_json() from connection_manager.cpp and never
     // route through here. A declared PAIRING activity is not a gate: pairing.md "Entering and
     // leaving pairing" says an activate that adds it does not by itself affect active_roles, so
@@ -935,7 +935,7 @@ void SendspinClient::send_text(const std::string& text, const std::string& role_
     if (!conn->first_activate_received()) {
         return;
     }
-    // The role's own gate, matching the one publish_client_state() applies to the player object:
+    // The role's own gate, matching the one publish_client_state() applies to each role object:
     // a role that the server has not activated, or has removed, drives no traffic of its own.
     if (!conn->is_role_active(role_family)) {
         SS_LOGD(TAG, "Dropping a %s message: the role is not active on this connection",
@@ -1737,6 +1737,11 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
 #ifdef SENDSPIN_ENABLE_ARTWORK
     if (this->artwork_ && conn->is_role_active("artwork")) {
         this->artwork_->impl_->build_state_fields(state_msg);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_ && conn->is_role_active("visualizer")) {
+        this->visualizer_->impl_->build_state_fields(state_msg);
     }
 #endif
 

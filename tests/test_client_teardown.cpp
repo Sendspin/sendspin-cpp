@@ -76,9 +76,9 @@ TEST(ClientTeardown, JoinsEveryThreadedRoleOnDestruction) {
         client->add_artwork(std::move(art_cfg));
 
         VisualizerRoleConfig vis_cfg;
-        vis_cfg.support.types.push_back(VisualizerDataType::LOUDNESS);
+        vis_cfg.stream.types.push_back(VisualizerDataType::LOUDNESS);
         vis_cfg.support.buffer_capacity = 4096;
-        vis_cfg.support.rate_max = 30;
+        vis_cfg.stream.rate_max = 30;
         client->add_visualizer(std::move(vis_cfg));
 
         ASSERT_TRUE(client->start());

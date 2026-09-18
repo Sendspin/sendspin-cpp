@@ -150,10 +150,6 @@ void VisualizerRole::set_listener(VisualizerRoleListener* listener) {
     this->impl_->listener = listener;
 }
 
-void VisualizerRole::request_format(const VisualizerFormatRequest& request) {
-    this->impl_->request_format(request);
-}
-
 // ============================================================================
 // Impl method implementations
 // ============================================================================
@@ -225,10 +221,16 @@ void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     }
 }
 
-void VisualizerRole::Impl::request_format(const VisualizerFormatRequest& request) const {
-    StreamRequestFormatMessage msg{};
-    msg.visualizer = request;
-    this->client->send_text(format_stream_request_format_message(&msg), "visualizer");
+void VisualizerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
+    if (!this->visualizer_support.has_value()) {
+        return;
+    }
+
+    ClientVisualizerStateObject visualizer_state{};
+    visualizer_state.types = this->config.stream.types;
+    visualizer_state.rate_max = this->config.stream.rate_max;
+    visualizer_state.spectrum = this->config.stream.spectrum;
+    msg.visualizer = std::move(visualizer_state);
 }
 
 // ============================================================================

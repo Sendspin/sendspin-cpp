@@ -445,9 +445,9 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     client.add_player(make_player_config()).set_listener(&listener);
 
     VisualizerRoleConfig broken;
-    broken.support.types = {VisualizerDataType::LOUDNESS};
+    broken.stream.types = {VisualizerDataType::LOUDNESS};
     broken.support.buffer_capacity = 0;  // Below the ring's minimum: start() fails
-    broken.support.rate_max = 30;
+    broken.stream.rate_max = 30;
     client.add_visualizer(std::move(broken));
 
     EXPECT_FALSE(client.start());
@@ -455,9 +455,9 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     EXPECT_FALSE(client.start());  // Still broken, still refused, still not stuck half-started
 
     VisualizerRoleConfig working;
-    working.support.types = {VisualizerDataType::LOUDNESS};
+    working.stream.types = {VisualizerDataType::LOUDNESS};
     working.support.buffer_capacity = 4096;
-    working.support.rate_max = 30;
+    working.stream.rate_max = 30;
     client.add_visualizer(std::move(working));
 
     ASSERT_TRUE(bundle.start());
@@ -490,9 +490,9 @@ std::string stream_start_visualizer_json() {
 
 VisualizerRoleConfig make_visualizer_config() {
     VisualizerRoleConfig config;
-    config.support.types = {VisualizerDataType::LOUDNESS};
+    config.stream.types = {VisualizerDataType::LOUDNESS};
     config.support.buffer_capacity = 4096;
-    config.support.rate_max = 30;
+    config.stream.rate_max = 30;
     return config;
 }
 

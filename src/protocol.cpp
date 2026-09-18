@@ -875,8 +875,7 @@ void apply_color_state_deltas(ServerColorStateObject* current, const ServerColor
 
 // Message formatting
 
-// Writes a spectrum config as the "spectrum" key of a visualizer JSON object. Shared between
-// client/hello and stream/request-format so the two serializations cannot silently diverge.
+// Writes a spectrum config as the "spectrum" key of the client/state visualizer object.
 static void write_visualizer_spectrum(JsonObject vis_json, const VisualizerSpectrumConfig& spec) {
     vis_json["spectrum"]["n_disp_bins"] = spec.n_disp_bins;
     vis_json["spectrum"]["scale"] = to_cstr(spec.scale);
@@ -952,17 +951,11 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
     }
 
     if (msg->visualizer_support.has_value()) {
-        const auto& vis = msg->visualizer_support.value();
-        JsonObject vis_json = root["payload"]["visualizer@v1_support"].to<JsonObject>();
-        JsonArray types_list = vis_json["types"].to<JsonArray>();
-        for (const auto& type : vis.types) {
-            types_list.add(to_cstr(type));
-        }
-        vis_json["buffer_capacity"] = vis.buffer_capacity;
-        vis_json["rate_max"] = vis.rate_max;
-        if (vis.spectrum.has_value()) {
-            write_visualizer_spectrum(vis_json, vis.spectrum.value());
-        }
+        // roles/visualizer/v1.md "client/hello visualizer@v1 support object": buffer_capacity is
+        // the object's only field; the data types, frame-rate cap and spectrum configuration are
+        // dynamic and reported in the client/state visualizer object.
+        root["payload"]["visualizer@v1_support"]["buffer_capacity"] =
+            msg->visualizer_support.value().buffer_capacity;
     }
 
     std::string output;
@@ -1013,54 +1006,18 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
         }
     }
 
-    std::string output;
-    serializeJson(doc, output);
-    return output;
-}
-
-std::string format_stream_request_format_message(const StreamRequestFormatMessage* msg) {
-    (void)msg;
-
-    JsonDocument doc = make_json_document();
-    JsonObject root = doc.to<JsonObject>();
-
-    root["type"] = "stream/request-format";
-
-    if (msg->player.has_value()) {
-        const auto& player = msg->player.value();
-        if (player.codec.has_value()) {
-            root["payload"]["player"]["codec"] = to_cstr(player.codec.value());
-        }
-        if (player.sample_rate.has_value()) {
-            root["payload"]["player"]["sample_rate"] = player.sample_rate.value();
-        }
-        if (player.channels.has_value()) {
-            root["payload"]["player"]["channels"] = player.channels.value();
-        }
-        if (player.bit_depth.has_value()) {
-            root["payload"]["player"]["bit_depth"] = player.bit_depth.value();
-        }
-    }
-
     if (msg->visualizer.has_value()) {
         const auto& vis = msg->visualizer.value();
-        // Only create the "visualizer" key when at least one field is set: an all-empty request
-        // must emit no key at all, since a present-but-empty object could read as "reset to
-        // defaults" rather than "no change" on the server.
-        if (vis.types.has_value() || vis.rate_max.has_value() || vis.spectrum.has_value()) {
-            JsonObject vis_json = root["payload"]["visualizer"].to<JsonObject>();
-            if (vis.types.has_value()) {
-                JsonArray types_list = vis_json["types"].to<JsonArray>();
-                for (const auto& type : vis.types.value()) {
-                    types_list.add(to_cstr(type));
-                }
-            }
-            if (vis.rate_max.has_value()) {
-                vis_json["rate_max"] = vis.rate_max.value();
-            }
-            if (vis.spectrum.has_value()) {
-                write_visualizer_spectrum(vis_json, vis.spectrum.value());
-            }
+        JsonObject vis_json = root["payload"]["visualizer"].to<JsonObject>();
+        // roles/visualizer/v1.md "client/state visualizer object": types and rate_max are always
+        // present (types may be empty to request no data), spectrum only with that type.
+        JsonArray types_list = vis_json["types"].to<JsonArray>();
+        for (const auto& type : vis.types) {
+            types_list.add(to_cstr(type));
+        }
+        vis_json["rate_max"] = vis.rate_max;
+        if (vis.spectrum.has_value()) {
+            write_visualizer_spectrum(vis_json, vis.spectrum.value());
         }
     }
 

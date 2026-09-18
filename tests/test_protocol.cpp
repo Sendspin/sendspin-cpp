@@ -649,18 +649,37 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsPresent) {
     EXPECT_STREQ(doc["payload"]["device_info"]["mac_address"], "aa:bb:cc:dd:ee:ff");
 }
 
-// The visualizer@v1 support object serializes with the spec's field layout: types (including
-// the event types), buffer_capacity, top-level rate_max, and a spectrum object without a
-// nested rate cap.
+// roles/visualizer/v1.md "client/hello visualizer@v1 support object": buffer_capacity is the
+// object's only field. The stream configuration is dynamic and belongs to client/state, so a
+// hello that repeated it there would put the server on a superseded reading of the session.
 TEST(Protocol, FormatClientHelloVisualizerSupport) {
     ClientHelloMessage msg;
     msg.name = "Speaker";
     msg.supported_roles.push_back(SendspinRole::VISUALIZER);
     VisualizerSupportObject vis{};
+    vis.buffer_capacity = 8192;
+    msg.visualizer_support = vis;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    EXPECT_STREQ(doc["payload"]["supported_roles"][0], "visualizer@v1");
+    JsonObject support = doc["payload"]["visualizer@v1_support"];
+    EXPECT_EQ(support["buffer_capacity"].as<int>(), 8192);
+    EXPECT_EQ(support.size(), 1U);
+    EXPECT_TRUE(support["types"].isUnbound());
+    EXPECT_TRUE(support["rate_max"].isUnbound());
+    EXPECT_TRUE(support["spectrum"].isUnbound());
+}
+
+// roles/visualizer/v1.md "client/state visualizer object": the requested types, the periodic
+// frame-rate cap, and the spectrum layout, which is sent only with that type.
+TEST(Protocol, FormatClientStateVisualizerCarriesStreamConfig) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+    ClientVisualizerStateObject vis{};
     vis.types = {VisualizerDataType::BEAT, VisualizerDataType::LOUDNESS,
                  VisualizerDataType::F_PEAK, VisualizerDataType::SPECTRUM,
                  VisualizerDataType::PEAK};
-    vis.buffer_capacity = 8192;
     vis.rate_max = 60;
     vis.spectrum = VisualizerSpectrumConfig{
         .n_disp_bins = 32,
@@ -668,63 +687,48 @@ TEST(Protocol, FormatClientHelloVisualizerSupport) {
         .f_min = 40,
         .f_max = 16000,
     };
-    msg.visualizer_support = vis;
+    msg.visualizer = vis;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
-    EXPECT_STREQ(doc["payload"]["supported_roles"][0], "visualizer@v1");
-    JsonObject support = doc["payload"]["visualizer@v1_support"];
-    ASSERT_TRUE(support["types"].is<JsonArray>());
-    EXPECT_EQ(support["types"].size(), 5U);
-    EXPECT_STREQ(support["types"][4], "peak");
-    EXPECT_EQ(support["buffer_capacity"].as<int>(), 8192);
-    EXPECT_EQ(support["rate_max"].as<int>(), 60);
-    EXPECT_EQ(support["spectrum"]["n_disp_bins"].as<int>(), 32);
-    EXPECT_STREQ(support["spectrum"]["scale"], "mel");
-    EXPECT_EQ(support["spectrum"]["f_min"].as<int>(), 40);
-    EXPECT_EQ(support["spectrum"]["f_max"].as<int>(), 16000);
-    EXPECT_FALSE(support["spectrum"]["rate_max"].is<int>());
-    EXPECT_FALSE(support["batch_max"].is<int>());
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    JsonObject state = doc["payload"]["visualizer"];
+    ASSERT_TRUE(state["types"].is<JsonArray>());
+    EXPECT_EQ(state["types"].size(), 5U);
+    EXPECT_STREQ(state["types"][4], "peak");
+    EXPECT_EQ(state["rate_max"].as<int>(), 60);
+    EXPECT_EQ(state["spectrum"]["n_disp_bins"].as<int>(), 32);
+    EXPECT_STREQ(state["spectrum"]["scale"], "mel");
+    EXPECT_EQ(state["spectrum"]["f_min"].as<int>(), 40);
+    EXPECT_EQ(state["spectrum"]["f_max"].as<int>(), 16000);
+    // buffer_capacity is a hello field; repeating it here is not part of this object.
+    EXPECT_TRUE(state["buffer_capacity"].isUnbound());
 }
 
-// stream/request-format serializes the visualizer object with only the fields the caller set;
-// omitted optionals keep their current server-side value and must not emit keys.
-TEST(Protocol, FormatStreamRequestFormatVisualizer) {
-    StreamRequestFormatMessage msg;
-    VisualizerFormatRequest req{};
-    req.rate_max = 24;
-    msg.visualizer = req;
+// A client that asks for no visualization data still reports both required keys: types as an
+// empty array, and the frame-rate cap that applies once it asks for a periodic type.
+TEST(Protocol, FormatClientStateVisualizerWithoutTypesStillReportsRateMax) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+    ClientVisualizerStateObject vis{};
+    vis.rate_max = 24;
+    msg.visualizer = vis;
 
     JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_stream_request_format_message(&msg)));
-    EXPECT_STREQ(doc["type"], "stream/request-format");
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    ASSERT_TRUE(doc["payload"]["visualizer"]["types"].is<JsonArrayConst>());
+    EXPECT_EQ(doc["payload"]["visualizer"]["types"].as<JsonArrayConst>().size(), 0u);
     EXPECT_EQ(doc["payload"]["visualizer"]["rate_max"].as<int>(), 24);
-    EXPECT_FALSE(doc["payload"]["visualizer"]["types"].is<JsonArray>());
-    EXPECT_FALSE(doc["payload"]["visualizer"]["spectrum"].is<JsonObject>());
+    EXPECT_TRUE(doc["payload"]["visualizer"]["spectrum"].isUnbound());
+}
 
-    // Full request: all fields emitted.
-    VisualizerFormatRequest full{};
-    full.types = std::vector<VisualizerDataType>{VisualizerDataType::SPECTRUM};
-    full.rate_max = 30;
-    full.spectrum = VisualizerSpectrumConfig{
-        .n_disp_bins = 16,
-        .scale = VisualizerSpectrumScale::LOG,
-        .f_min = 20,
-        .f_max = 20000,
-    };
-    msg.visualizer = full;
-    JsonDocument doc2;
-    ASSERT_FALSE(deserializeJson(doc2, format_stream_request_format_message(&msg)));
-    EXPECT_STREQ(doc2["payload"]["visualizer"]["types"][0], "spectrum");
-    EXPECT_EQ(doc2["payload"]["visualizer"]["spectrum"]["n_disp_bins"].as<int>(), 16);
-    EXPECT_STREQ(doc2["payload"]["visualizer"]["spectrum"]["scale"], "log");
+// Control: a client with no visualizer role sends no visualizer object at all.
+TEST(Protocol, FormatClientStateOmitsVisualizerWhenUnset) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
 
-    // All-empty request: no "visualizer" key at all. A present-but-empty object could read as
-    // "reset to defaults" rather than "no change" on the server.
-    msg.visualizer = VisualizerFormatRequest{};
-    JsonDocument doc3;
-    ASSERT_FALSE(deserializeJson(doc3, format_stream_request_format_message(&msg)));
-    EXPECT_FALSE(doc3["payload"]["visualizer"].is<JsonObject>());
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    EXPECT_TRUE(doc["payload"]["visualizer"].isUnbound());
 }
 
 // Unset optional identity fields must not emit their keys.

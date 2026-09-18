@@ -34,6 +34,7 @@ namespace sendspin {
 
 class SendspinClient;
 struct ClientHelloMessage;
+struct ClientStateMessage;
 
 /// @brief Deferred visualizer event types (used internally in the visualizer role)
 enum class VisualizerEventType : uint8_t {
@@ -99,13 +100,13 @@ struct VisualizerRole::Impl {
     void attach_inbox(Inbox& inbox);
     bool start();
     void build_hello_fields(ClientHelloMessage& msg);
+    void build_state_fields(ClientStateMessage& msg) const;
     void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len);
     void handle_stream_start(const ServerVisualizerStreamObject& stream);
     void handle_stream_end();
     void handle_stream_clear() const;
     void handle_stream_ring_event(VisualizerEventType event) const;
     void cleanup();
-    void request_format(const VisualizerFormatRequest& request) const;
 
     // ========================================
     // Internal helpers

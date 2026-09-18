@@ -404,3 +404,61 @@ TEST(VisualizerClearMarker, DiscardDrainsToEmptyWithoutMarker) {
     std::vector<uint8_t> entry;
     EXPECT_FALSE(pop_entry(*impl, entry));
 }
+
+// ============================================================================
+// client/hello and client/state configuration reporting
+// ============================================================================
+
+// roles/visualizer/v1.md splits what the client reports: buffer_capacity is a constant capability
+// in the hello support object, while the requested types, frame-rate cap and spectrum layout are
+// dynamic and go in the client/state visualizer object.
+TEST(VisualizerConfigReporting, HelloAdvertisesCapacityAndStateCarriesTheStreamConfig) {
+    static std::deque<Inbox> inboxes;
+
+    VisualizerRoleConfig config;
+    config.support.buffer_capacity = 6144;
+    config.stream.types = {VisualizerDataType::SPECTRUM, VisualizerDataType::BEAT};
+    config.stream.rate_max = 25;
+    config.stream.spectrum = VisualizerSpectrumConfig{
+        .n_disp_bins = 16,
+        .scale = VisualizerSpectrumScale::LOG,
+        .f_min = 20,
+        .f_max = 20000,
+    };
+    auto impl = std::make_unique<VisualizerRole::Impl>(std::move(config), nullptr);
+    inboxes.emplace_back();
+    impl->attach_inbox(inboxes.back());
+
+    ClientHelloMessage hello;
+    impl->build_hello_fields(hello);
+    ASSERT_EQ(hello.supported_roles.size(), 1u);
+    EXPECT_EQ(hello.supported_roles[0], SendspinRole::VISUALIZER);
+    ASSERT_TRUE(hello.visualizer_support.has_value());
+    // The advertised capacity is the effective wire-data fraction of the ring's RAM budget.
+    EXPECT_LT(hello.visualizer_support->buffer_capacity, 6144u);
+    EXPECT_GT(hello.visualizer_support->buffer_capacity, 0u);
+
+    ClientStateMessage state;
+    impl->build_state_fields(state);
+    ASSERT_TRUE(state.visualizer.has_value());
+    EXPECT_EQ(state.visualizer->types, (std::vector<VisualizerDataType>{
+                                           VisualizerDataType::SPECTRUM,
+                                           VisualizerDataType::BEAT,
+                                       }));
+    EXPECT_EQ(state.visualizer->rate_max, 25);
+    ASSERT_TRUE(state.visualizer->spectrum.has_value());
+    EXPECT_EQ(state.visualizer->spectrum->n_disp_bins, 16);
+    EXPECT_EQ(state.visualizer->spectrum->scale, VisualizerSpectrumScale::LOG);
+}
+
+// Control: a role that asks for no data still reports the object, so the server knows the role
+// is configured and streams nothing rather than waiting for a state that never comes.
+TEST(VisualizerConfigReporting, StateIsReportedWithNoRequestedTypes) {
+    auto impl = make_impl();
+
+    ClientStateMessage state;
+    impl->build_state_fields(state);
+    ASSERT_TRUE(state.visualizer.has_value());
+    EXPECT_TRUE(state.visualizer->types.empty());
+    EXPECT_FALSE(state.visualizer->spectrum.has_value());
+}
