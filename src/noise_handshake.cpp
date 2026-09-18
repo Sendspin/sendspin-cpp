@@ -147,21 +147,15 @@ static const char* to_cstr(HandshakeKind kind) {
 /// @param server_id     Known/claimed server peer_id (43-char base64url).
 /// @param prologue      Exact prologue bytes for this handshake (caller-specific).
 /// @param prologue_len  Length of `prologue`.
-/// @param msg1_json     Raw noise/handshake JSON envelope text containing msg1.
+/// @param msg1_root     Parsed noise/handshake envelope containing msg1.
 /// @return Populated Msg1CoreResult on success, or nullopt on any failure (caller aborts).
 std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& identity,
                                             const RecordStore& record_store,
                                             const std::string& suite_name,
                                             const std::string& server_id, const uint8_t* prologue,
-                                            size_t prologue_len, const std::string& msg1_json) {
+                                            size_t prologue_len, JsonObjectConst msg1_root) {
     const char* log_prefix = to_cstr(kind);
-    auto doc_opt = parse_json_envelope(msg1_json, "noise/handshake", log_prefix);
-    if (!doc_opt.has_value()) {
-        return std::nullopt;
-    }
-    JsonDocument doc = std::move(doc_opt.value());
-
-    const char* data_b64 = doc["payload"]["data"] | "";
+    const char* data_b64 = msg1_root["payload"]["data"] | "";
     if (data_b64[0] == '\0') {
         SS_LOGE(TAG, "%s: missing data field", log_prefix);
         return std::nullopt;
@@ -317,81 +311,82 @@ std::string NoiseHandshake::build_client_init() {
     return text;
 }
 
-bool NoiseHandshake::take_server_error(const std::string& text, const char* log_context) {
-    JsonDocument doc = make_json_document();
-    if (deserializeJson(doc, text) || doc.isNull()) {
-        return false;
-    }
-    if (std::strcmp(doc["type"] | "", "server/error") != 0) {
-        return false;
-    }
+void NoiseHandshake::take_server_error(JsonObjectConst root, const char* log_context) {
     // The handshake aborts either way; recognizing the message is what turns that abort from "the
     // peer sent something unparseable" into the server's own account of why it refused.
-    this->server_error_reason_ = doc["payload"]["reason"] | "";
+    this->server_error_reason_ = root["payload"]["reason"] | "";
     SS_LOGE(TAG, "%s: server/error, reason='%s'; the server refused the connection", log_context,
             this->server_error_reason_.c_str());
-    return true;
 }
 
 HandshakeFrameResult NoiseHandshake::on_text_frame(
     const std::string& text, const std::function<bool(const std::string&)>& send_fn) {
-    switch (this->state_) {
-        case State::WAIT_SERVER_INIT:
-            if (this->take_server_error(text, "awaiting server/init")) {
-                this->state_ = State::ABORTED;
-                return HandshakeFrameResult::ABORT;
-            }
-            if (!this->handle_server_init(text)) {
-                this->state_ = State::ABORTED;
-                return HandshakeFrameResult::ABORT;
-            }
-            this->state_ = State::WAIT_MSG1;
-            return HandshakeFrameResult::NEED_MORE;
+    if (this->state_ != State::WAIT_SERVER_INIT && this->state_ != State::WAIT_MSG1) {
+        SS_LOGE(TAG, "on_text_frame: no frame expected in this state");
+        this->state_ = State::ABORTED;
+        return HandshakeFrameResult::ABORT;
+    }
 
-        case State::WAIT_MSG1:
-            if (this->take_server_error(text, "awaiting noise/handshake msg1")) {
-                this->state_ = State::ABORTED;
-                return HandshakeFrameResult::ABORT;
-            }
-            if (!this->handle_msg1(text, send_fn)) {
-                this->state_ = State::ABORTED;
-                return HandshakeFrameResult::ABORT;
-            }
-            this->state_ = State::COMPLETE;
-            return HandshakeFrameResult::COMPLETE;
+    // One parse per frame: the type decides what this is, and the handlers work from the parsed
+    // envelope rather than deserializing the same bytes again.
+    JsonDocument doc = make_json_document();
+    if (deserializeJson(doc, text) || doc.isNull()) {
+        SS_LOGE(TAG, "on_text_frame: JSON parse failed");
+        this->state_ = State::ABORTED;
+        return HandshakeFrameResult::ABORT;
+    }
+    JsonObjectConst root = doc.as<JsonObjectConst>();
+    const char* type = root["type"] | "";
 
-        case State::INIT:
-            SS_LOGE(TAG, "on_text_frame: client/init not sent yet");
+    const bool awaiting_server_init = this->state_ == State::WAIT_SERVER_INIT;
+    const char* log_context =
+        awaiting_server_init ? "awaiting server/init" : "awaiting noise/handshake msg1";
+
+    // messaging.md "server/error": sent in place of server/init when the server cannot accept our
+    // client/init. Recognized in either wait so an abort names the server's reason.
+    if (std::strcmp(type, "server/error") == 0) {
+        this->take_server_error(root, log_context);
+        this->state_ = State::ABORTED;
+        return HandshakeFrameResult::ABORT;
+    }
+
+    const char* expected_type = awaiting_server_init ? "server/init" : "noise/handshake";
+    if (std::strcmp(type, expected_type) != 0) {
+        SS_LOGE(TAG, "%s: unexpected type '%s'", log_context, type);
+        this->state_ = State::ABORTED;
+        return HandshakeFrameResult::ABORT;
+    }
+
+    if (awaiting_server_init) {
+        if (!this->handle_server_init(root, text)) {
             this->state_ = State::ABORTED;
             return HandshakeFrameResult::ABORT;
-
-        case State::COMPLETE:
-        case State::ABORTED:
-        default:
-            SS_LOGE(TAG, "on_text_frame called in terminal state");
-            return HandshakeFrameResult::ABORT;
+        }
+        this->state_ = State::WAIT_MSG1;
+        return HandshakeFrameResult::NEED_MORE;
     }
+
+    if (!this->handle_msg1(root, send_fn)) {
+        this->state_ = State::ABORTED;
+        return HandshakeFrameResult::ABORT;
+    }
+    this->state_ = State::COMPLETE;
+    return HandshakeFrameResult::COMPLETE;
 }
 
 // ============================================================================
 // Private: handle server/init
 // ============================================================================
 
-bool NoiseHandshake::handle_server_init(const std::string& text) {
-    auto doc_opt = parse_json_envelope(text, "server/init", "handle_server_init");
-    if (!doc_opt.has_value()) {
-        return false;
-    }
-    JsonDocument doc = std::move(doc_opt.value());
-
-    int version = doc["payload"]["version"] | 0;
+bool NoiseHandshake::handle_server_init(JsonObjectConst root, const std::string& text) {
+    int version = root["payload"]["version"] | 0;
     if (version != PROTOCOL_VERSION) {
         SS_LOGE(TAG, "handle_server_init: unsupported version %d (expected %d)", version,
                 PROTOCOL_VERSION);
         return false;
     }
 
-    const char* server_id = doc["payload"]["server_id"] | "";
+    const char* server_id = root["payload"]["server_id"] | "";
     if (std::strlen(server_id) != PEER_ID_SIZE) {
         SS_LOGE(TAG, "handle_server_init: invalid server_id length %zu", std::strlen(server_id));
         return false;
@@ -408,7 +403,7 @@ bool NoiseHandshake::handle_server_init(const std::string& text) {
 // Private: handle noise/handshake msg1
 // ============================================================================
 
-bool NoiseHandshake::handle_msg1(const std::string& text,
+bool NoiseHandshake::handle_msg1(JsonObjectConst root,
                                  const std::function<bool(const std::string&)>& send_fn) {
     // Prologue = exact bytes of client/init || server/init
     std::string prologue_str = this->client_init_text_ + this->server_init_text_;
@@ -416,7 +411,7 @@ bool NoiseHandshake::handle_msg1(const std::string& text,
     size_t prologue_len = prologue_str.size();
 
     auto core = run_msg1_core(HandshakeKind::INITIAL, this->identity_, this->record_store_,
-                              this->suite_name_, this->server_id_, prologue, prologue_len, text);
+                              this->suite_name_, this->server_id_, prologue, prologue_len, root);
     if (!core.has_value()) {
         return false;
     }
@@ -450,8 +445,15 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(const std::string& msg1
     const uint8_t* prologue = prior_h.data();
     const size_t prologue_len = prior_h.size();
 
+    auto doc_opt =
+        parse_json_envelope(msg1_json, "noise/handshake", to_cstr(HandshakeKind::REHANDSHAKE));
+    if (!doc_opt.has_value()) {
+        return std::nullopt;
+    }
+    JsonDocument doc = std::move(doc_opt.value());
+
     auto core = run_msg1_core(HandshakeKind::REHANDSHAKE, identity, record_store, suite_name,
-                              server_id, prologue, prologue_len, msg1_json);
+                              server_id, prologue, prologue_len, doc.as<JsonObjectConst>());
     if (!core.has_value()) {
         return std::nullopt;
     }

@@ -656,7 +656,9 @@ public:
     bool is_role_active(const std::string& family) const {
         for (const auto& role : this->active_roles_) {
             auto at = role.find('@');
-            if (at != std::string::npos && role.substr(0, at) == family) {
+            // compare() against the prefix rather than substr(): this runs on every role-
+            // originated send, and a temporary string per active role is not worth a name check.
+            if (at != std::string::npos && role.compare(0, at, family) == 0) {
                 return true;
             }
         }

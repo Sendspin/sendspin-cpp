@@ -415,6 +415,7 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "  -p PORT       Listen on PORT (default: %u)\n", DEFAULT_SENDSPIN_PORT);
     fprintf(stderr, "  -f FORMAT     Audio format as codec:rate:bits:channels (e.g. flac:48000:24:2)\n");
     fprintf(stderr, "                Can be specified multiple times. Codecs: flac, opus, pcm\n");
+    fprintf(stderr, "                At least one flac or pcm format is required\n");
     fprintf(stderr, "  -V            Disable visualizer\n");
     fprintf(stderr, "  -h            Show this help\n");
 }

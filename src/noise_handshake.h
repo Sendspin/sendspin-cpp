@@ -42,6 +42,7 @@
 #include "crypto/keys.h"
 #include "noise_session.h"
 #include "record_store.h"
+#include <ArduinoJson.h>
 
 #include <array>
 #include <cstdint>
@@ -178,18 +179,18 @@ private:
         ABORTED,           ///< terminal error
     };
 
-    /// @brief Recognizes a cleartext server/error, recording and logging the reason it carries.
-    /// @param text        The received cleartext frame.
+    /// @brief Records and logs the reason a received server/error carries.
+    /// @param root        Parsed envelope of the received frame.
     /// @param log_context Handshake state to name in the log line.
-    /// @return true if the frame was a server/error, which aborts the handshake.
-    bool take_server_error(const std::string& text, const char* log_context);
+    void take_server_error(JsonObjectConst root, const char* log_context);
 
-    /// @brief Parse and validate the server/init text frame.
-    bool handle_server_init(const std::string& text);
+    /// @brief Validate the parsed server/init frame.
+    /// @param root Parsed envelope.
+    /// @param text Exact received bytes, retained for the handshake prologue.
+    bool handle_server_init(JsonObjectConst root, const std::string& text);
 
-    /// @brief Parse, authenticate, and respond to the noise/handshake msg1 frame.
-    bool handle_msg1(const std::string& text,
-                     const std::function<bool(const std::string&)>& send_fn);
+    /// @brief Authenticate and respond to the parsed noise/handshake msg1 frame.
+    bool handle_msg1(JsonObjectConst root, const std::function<bool(const std::string&)>& send_fn);
 
     // Struct fields
     /// Exact bytes of the client/init frame we sent (retained for prologue).
