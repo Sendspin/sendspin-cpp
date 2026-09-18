@@ -603,9 +603,18 @@ private:
 
     /// @brief Assigns current_connection_ and refreshes has_current_ in the same critical section,
     /// so the hint atomic can never drift from "current_connection_ != nullptr". Pass nullptr to
-    /// clear the slot. Caller must hold conn_ptr_mutex_.
+    /// clear the slot. Caller must hold conn_ptr_mutex_ and call flush_pending_admission() after
+    /// dropping it: installing a connection only stages its admission.
     /// @param conn The connection to install as current, or nullptr to clear; moved from.
     void set_current_connection(std::shared_ptr<SendspinConnection> conn);
+
+    /// @brief Admits the connection staged by the last set_current_connection(), if any.
+    /// Caller must NOT hold conn_ptr_mutex_: admission replays the held role messages under
+    /// SendspinClient's json_processing_mutex_, which the lock order in docs/conventions.md
+    /// ("Threading and cross-thread state") places outside conn_ptr_mutex_. Staging and flushing
+    /// are both main-loop-only and the flush follows its staging in the same call, so a slot
+    /// cleared meanwhile leaves nothing to admit.
+    void flush_pending_admission();
 
     /// @brief Appends `item` to a pending_*_events_ queue and sets has_pending_events_ in the
     /// same critical section, so loop()'s lock-free gate can never miss a pushed event. Every
@@ -1007,6 +1016,11 @@ private:
     // Pointer fields
     SendspinClient* client_;
     std::shared_ptr<SendspinConnection> current_connection_;
+    /// The connection the last set_current_connection() installed, waiting for
+    /// flush_pending_admission() to admit it once conn_ptr_mutex_ is dropped. Null between a
+    /// flush and the next assignment, and reset by a clearing assignment. Written and read only
+    /// under conn_ptr_mutex_, on the main loop.
+    std::shared_ptr<SendspinConnection> pending_admission_;
     std::unique_ptr<SendspinWsServer> ws_server_;
 
     // String fields

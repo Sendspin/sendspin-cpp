@@ -36,11 +36,20 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - A message handler on the receive path writes to Inbox slots and role buffers
   and nothing else. It does not reach back into the client for the current
   connection, the clock, or a state publish, and it does not call a listener:
-  those belong in `drain_events()`. Besides keeping the network thread cheap,
-  this is what lets the admission replay run the same handlers while the
-  connection manager's `conn_ptr_mutex_` is held (see
-  `SendspinClient::admit_connection()`), which would deadlock on the first such
-  call.
+  those belong in `drain_events()`. That keeps the network thread cheap and
+  keeps the admission replay, which runs the same handlers, as short as the
+  live path.
+- The client holds exactly one lock order, and every site that takes two locks
+  cites it: `SendspinClient::json_processing_mutex_`, then
+  `ConnectionManager::conn_ptr_mutex_`, then the leaves
+  (`ConnectionManager::conn_mutex_`, `RecordStore::mutex_`, the Inbox mutex),
+  which nest under anything and under nothing. Taking a lock further left while
+  holding one further right is a defect, not a local trade-off. The receive path fixes this
+  order: a `server/pair-finalize` handler runs under the JSON lock and asks the
+  connection manager for the open connections' psk_ids, so work that needs the
+  JSON lock is pushed out from under `conn_ptr_mutex_` instead (see
+  `ConnectionManager::flush_pending_admission()`), the same way a blocking
+  release is (`flush_deferred_releases()`).
 
 ## Protocol validation
 

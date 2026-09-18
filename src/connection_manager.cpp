@@ -1015,10 +1015,12 @@ void ConnectionManager::drain_unpair_events(DrainedEvents& ev) {
 
 std::vector<std::string> ConnectionManager::open_connection_psk_ids() const {
     // Called from the network thread (the server/pair-finalize ack handler) as well as the main
-    // loop, so it takes conn_ptr_mutex_ and copies. The lock order is conn_ptr_mutex_ before
-    // RecordStore::mutex_, matching every main-loop path that reaches the store while holding
-    // this lock; the caller passes the result into the store afterwards rather than holding
-    // both at once.
+    // loop, so it takes conn_ptr_mutex_ and copies. The ack handler holds SendspinClient's
+    // json_processing_mutex_ while it calls this, which is the order the whole client obeys
+    // (docs/conventions.md, "Threading and cross-thread state"): json_processing_mutex_ outside
+    // conn_ptr_mutex_, never the reverse. Then conn_ptr_mutex_ before RecordStore::mutex_,
+    // matching every main-loop path that reaches the store while holding this lock; the caller
+    // passes the result into the store afterwards rather than holding both at once.
     std::vector<std::string> psk_ids;
     psk_ids.reserve(MAX_OPEN_CONNECTIONS);
     std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
@@ -1249,6 +1251,12 @@ void ConnectionManager::loop() {
         this->drain_pairing_events(ev);
         this->drain_unpair_events(ev);
     }
+
+    // Admit the connection the promotion scan installed, outside the lock: the replay takes
+    // SendspinClient's json_processing_mutex_, which is the outer lock of the pair. Ahead of the
+    // goodbyes below so the incoming connection is driving the roles before the outgoing one is
+    // told to leave.
+    this->flush_pending_admission();
 
     // Send the goodbyes and release the connections dropped above, outside the lock.
     this->flush_deferred_releases();
@@ -1591,13 +1599,29 @@ void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnectio
     if (this->current_connection_ != nullptr && this->current_connection_ != conn) {
         this->current_connection_->set_admitted(false);
     }
-    if (conn != nullptr) {
-        // Admitting also replays the role messages this connection held while it was proving
-        // itself, which is why it goes through the client rather than setting the flag here.
-        this->client_->admit_connection(conn.get());
-    }
+    // Admitting replays the role messages this connection held while it was proving itself, so
+    // it goes through the client rather than setting the flag here -- and it runs outside this
+    // lock, in flush_pending_admission(). Staging it on every assignment, including the null
+    // one, is what keeps the staged pointer and the slot the same connection: a slot cleared
+    // before the flush has nothing to admit.
+    this->pending_admission_ = conn;
     this->has_current_.store(conn != nullptr, std::memory_order_release);
     this->current_connection_ = std::move(conn);
+}
+
+void ConnectionManager::flush_pending_admission() {
+    // Note: caller must NOT hold conn_ptr_mutex_ (see the lock order in docs/conventions.md,
+    // "Threading and cross-thread state": json_processing_mutex_ is taken before conn_ptr_mutex_,
+    // never after, and SendspinClient::admit_connection() takes the JSON lock).
+    std::shared_ptr<SendspinConnection> conn;
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        conn = std::move(this->pending_admission_);
+        this->pending_admission_.reset();
+    }
+    if (conn != nullptr) {
+        this->client_->admit_connection(conn.get());
+    }
 }
 
 std::vector<NurseryEntry>::iterator ConnectionManager::release_nursery_entry(

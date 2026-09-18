@@ -1237,11 +1237,13 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
 }
 
 void SendspinClient::admit_connection(SendspinConnection* conn) {
-    // Runs on the main loop, from ConnectionManager::set_current_connection(). Holding
-    // json_processing_mutex_ across both steps is what makes the replay exact: a network thread
-    // that reaches the dispatch gate meanwhile either blocks here and then sees an admitted
-    // connection (dispatching live, after everything held), or already held its message and is
-    // drained below. Nothing can land between the last replay and the flag.
+    // Runs on the main loop, from ConnectionManager::flush_pending_admission(), which calls it
+    // with conn_ptr_mutex_ dropped: json_processing_mutex_ is the outer lock of the pair (see
+    // docs/conventions.md, "Threading and cross-thread state"). Holding it across both steps is
+    // what makes the replay exact: a network thread that reaches the dispatch gate meanwhile
+    // either blocks here and then sees an admitted connection (dispatching live, after everything
+    // held), or already held its message and is drained below. Nothing can land between the last
+    // replay and the flag.
     std::lock_guard<std::mutex> lock(this->json_processing_mutex_);
     conn->replay_pre_admission_messages(
         [this, conn](const char* data, size_t len, int64_t arrival_us) {

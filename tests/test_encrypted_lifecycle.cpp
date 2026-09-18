@@ -1961,6 +1961,11 @@ public:
     }
 
     void deliver(SendspinConnection& conn, const std::string& json) {
+        // A complete message off a transport proves the peer alive (dispatch_completed_message()),
+        // and loop()'s liveness tick reaps a current connection whose last arrival is older than
+        // the timeout. Handing the JSON straight to the dispatch entry point skips the stamp, so
+        // do it here rather than stubbing the tick out.
+        conn.last_receive_time_us_.store(platform_time_us(), std::memory_order_relaxed);
         this->client_storage->process_json_message(&conn, json.data(), json.size(),
                                                    platform_time_us());
     }
@@ -2268,21 +2273,16 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBounded) {
               "Title " + std::to_string(SendspinConnection::MAX_HELD_MESSAGES - 1));
 }
 
-// The replay runs inside ConnectionManager's conn_ptr_mutex_, because set_current_connection() is
-// what calls admit_connection(). Nothing a replayed message dispatches may reach back into the
-// manager: SendspinClient::get_client_time(), publish_state(), send_text() and the
-// current-connection accessors all take that mutex again, and it does not nest. Replaying one
-// message of every held type with the lock held exactly as production holds it is what keeps that
-// true as handlers change: a handler that reaches back hangs here, and the suite watchdog names
-// it.
-TEST(EncryptedLifecycle, ReplayedHandlersDoNotReEnterTheConnectionManager) {
-    HoldTestClient bundle("Replay Re-entry Test Client");
+// Control: the replay runs every held type's real handler to completion. One message of each
+// type, replayed in one admission, so a handler that throws the replay off (or blocks in it)
+// takes the metadata message behind it down with it.
+TEST(EncryptedLifecycle, EveryHeldMessageTypeReplaysThroughItsHandler) {
+    HoldTestClient bundle("Replay Handler Test Client");
 
     HoldTestConnection conn;
     conn.note_activate_delivered();
     for (const std::string& json :
-         {metadata_state_json(1, "Replayed"),
-          std::string(R"({"type":"server/state","payload":{"controller":{"playback_state":)"
+         {std::string(R"({"type":"server/state","payload":{"controller":{"playback_state":)"
                       R"("playing"}}})"),
           std::string(R"({"type":"server/command","payload":{"player":{"command":"volume",)"
                       R"("volume":42}}})"),
@@ -2290,18 +2290,80 @@ TEST(EncryptedLifecycle, ReplayedHandlersDoNotReEnterTheConnectionManager) {
                       R"("sample_rate":44100,"channels":2,"bit_depth":16}}})"),
           std::string(R"({"type":"stream/clear","payload":{}})"),
           std::string(R"({"type":"stream/end","payload":{}})"),
-          std::string(R"({"type":"group/update","payload":{"group_name":"Kitchen"}})")}) {
+          std::string(R"({"type":"group/update","payload":{"group_name":"Kitchen"}})"),
+          metadata_state_json(1, "Replayed")}) {
         bundle.deliver(conn, json);
     }
 
-    {
-        std::lock_guard<std::mutex> lock(bundle.client_ref().connection_manager_->conn_ptr_mutex_);
-        bundle.client_ref().admit_connection(&conn);
-    }
+    bundle.client_ref().admit_connection(&conn);
 
     bundle.pump();
     EXPECT_EQ(bundle.listener.updates.load(), 1) << "the replay did not run to completion";
     EXPECT_EQ(bundle.listener.last_title, "Replayed");
+}
+
+// The two locks the client holds are ordered json_processing_mutex_ then conn_ptr_mutex_
+// (docs/conventions.md, "Threading and cross-thread state"). The live receive path fixes that
+// order: a server/pair-finalize handler runs under the JSON lock and asks the manager for the
+// open connections' psk_ids. Admission is the other half of the pair, and it takes the JSON lock
+// to replay, so it must not run under conn_ptr_mutex_ -- which is why set_current_connection()
+// only stages it and flush_pending_admission() performs it after the lock is dropped.
+//
+// Driving both halves at once pins that. The pairing connection's network thread is parked
+// holding the JSON lock and waiting for conn_ptr_mutex_ (this thread holds it), which is the
+// state a real pairing ack reaches whenever the main loop is inside its lifecycle block. An
+// admission that took the JSON lock from here would close the cycle and hang: the suite watchdog
+// in tests/main.cpp names the test, since no timeout of this test's own can distinguish a
+// deadlock from a slow machine.
+TEST(EncryptedLifecycle, PairFinalizeDoesNotDeadlockAgainstAnAdmission) {
+    HoldTestClient bundle("Pair Finalize Admission Test Client");
+    SendspinClient& client = bundle.client_ref();
+    ConnectionManager& manager = *client.connection_manager_;
+
+    auto admitted = std::make_shared<HoldTestConnection>();
+    admitted->note_activate_delivered();
+    bundle.deliver(*admitted, metadata_state_json(1, "Held Across A Pair Finalize"));
+
+    // The peer whose pairing the server has just acked, with the record its handler commits.
+    auto pairing = std::make_shared<HoldTestConnection>();
+    SendspinPairingRecord record;
+    record.psk_id = "pair-finalize-deadlock-psk-id";
+    record.psk.fill(0x5A);
+    record.server_id = "pair-finalize-deadlock-server";
+    pairing->set_pending_pairing_record(std::move(record));
+
+    std::unique_lock<std::mutex> conn_lock(manager.conn_ptr_mutex_);
+
+    std::thread network([&] {
+        bundle.deliver(*pairing, R"({"type":"server/pair-finalize","payload":{}})");
+    });
+
+    // Park until that thread holds the JSON lock. It cannot release it before it takes
+    // conn_ptr_mutex_, which this thread holds, so the observation is stable rather than a
+    // window: from here on the pairing handler is blocked inside open_connection_psk_ids().
+    while (client.json_processing_mutex_.try_lock()) {
+        client.json_processing_mutex_.unlock();
+        std::this_thread::yield();
+    }
+
+    // What the main loop does inside its lifecycle block. Staging only; taking the JSON lock
+    // here is the deadlock.
+    manager.set_current_connection(admitted);
+    conn_lock.unlock();
+
+    network.join();
+    manager.flush_pending_admission();
+
+    bundle.pump();
+    EXPECT_EQ(bundle.listener.updates.load(), 1)
+        << "the connection staged under the manager lock was never admitted";
+    EXPECT_EQ(bundle.listener.last_title, "Held Across A Pair Finalize");
+    EXPECT_TRUE(admitted->is_admitted());
+    // The pairing half ran to completion rather than being skipped: its record is resolvable.
+    EXPECT_TRUE(client.record_store_
+                    ->resolve_by_psk_id("pair-finalize-deadlock-psk-id", PskCategory::LONG_TERM)
+                    .has_value())
+        << "the server/pair-finalize handler never committed its record";
 }
 
 // Seeds a set of LONG_TERM records and keeps the persisted "records" array up to date, so an

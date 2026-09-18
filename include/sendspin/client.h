@@ -777,17 +777,19 @@ private:
 
     /// @brief Replays the connection's held role messages and marks it admitted.
     ///
-    /// Main loop only; ConnectionManager::set_current_connection() is the only caller. The
+    /// Main loop only; ConnectionManager::flush_pending_admission() is the only caller. The
     /// replay and the flag happen under one hold of json_processing_mutex_ so the role traffic a
     /// server sent between its server/activate and this admission is applied exactly once, in
     /// arrival order, ahead of anything that arrives afterwards.
     ///
-    /// THREADING: the caller holds ConnectionManager's conn_ptr_mutex_, so the lock order here is
-    /// conn_ptr_mutex_ then json_processing_mutex_, and nothing a replayed message dispatches may
-    /// reach back into the manager: get_client_time(), publish_state(), send_text(), leave() and
-    /// the current-connection accessors all take conn_ptr_mutex_ again, which does not nest. The
-    /// role handlers on this path only write to Inbox slots and role buffers, and a handler that
-    /// needs the connection or a listener defers it to drain_events() like every other.
+    /// THREADING: takes json_processing_mutex_, so the caller must hold no ConnectionManager
+    /// lock. That is the lock order the whole client obeys (docs/conventions.md, "Threading and
+    /// cross-thread state"): json_processing_mutex_ outside conn_ptr_mutex_, which is the order
+    /// the live receive path already needs, since a server/pair-finalize handler asks the manager
+    /// for the open connections' psk_ids while the JSON lock is held. A replayed message may
+    /// therefore reach back into the manager without deadlocking, though the receive-path rule
+    /// keeps it from doing so: the role handlers write to Inbox slots and role buffers, and a
+    /// handler that needs the connection or a listener defers it to drain_events().
     /// @param conn The connection entering the admitted slot
     void admit_connection(SendspinConnection* conn);
 
