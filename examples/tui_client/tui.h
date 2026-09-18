@@ -23,6 +23,7 @@
 
 #include <ftxui/component/screen_interactive.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -107,6 +108,20 @@ struct TuiState {
     int64_t vis_beat_expire_us{0};
     bool vis_peak{false};         // energy-onset (peak) blinker
     int64_t vis_peak_expire_us{0};
+
+    // Artwork: what the server last delivered per channel, in configuration order
+    struct ArtworkChannelStatus {
+        std::string wanted;       ///< The source, format and size this channel asks for
+        size_t image_bytes{0};    ///< Encoded size of the image on display, 0 when none is
+        uint32_t images{0};       ///< Images delivered to this channel so far
+    };
+    std::vector<ArtworkChannelStatus> artwork_channels;
+
+    // Colors derived from the current audio, as [R, G, B]
+    bool color_received{false};
+    std::optional<std::array<uint8_t, 3>> color_primary;
+    std::optional<std::array<uint8_t, 3>> color_accent;
+    std::optional<std::array<uint8_t, 3>> color_background_dark;
 
     // Tab state
     bool show_visualizer{false};

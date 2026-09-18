@@ -2,6 +2,8 @@
 
 Runs the sendspin-cpp client with a terminal user interface showing playback info, volume, progress, and keyboard controls. Requires PortAudio for audio playback.
 
+The client takes the player, controller, metadata, artwork, color and visualizer roles. Artwork images are reported by channel and size rather than drawn, and the audio-derived palette is shown as its RGB values, so a terminal can still show that both roles are being served.
+
 ## Build
 
 From the repository root:

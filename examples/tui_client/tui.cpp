@@ -83,6 +83,13 @@ struct TuiSnapshot {
     std::string highlighted_label;
     bool highlight_active{false};
 
+    // Artwork and colors
+    std::vector<TuiState::ArtworkChannelStatus> artwork_channels;
+    bool color_received{false};
+    std::optional<std::array<uint8_t, 3>> color_primary;
+    std::optional<std::array<uint8_t, 3>> color_accent;
+    std::optional<std::array<uint8_t, 3>> color_background_dark;
+
     // Visualizer
     bool show_visualizer{false};
     bool visualizer_active{false};
@@ -132,6 +139,11 @@ static TuiSnapshot take_snapshot(TuiState& state) {
         snap.highlighted_label = state.highlighted_label;
         snap.highlight_active = true;
     }
+    snap.artwork_channels = state.artwork_channels;
+    snap.color_received = state.color_received;
+    snap.color_primary = state.color_primary;
+    snap.color_accent = state.color_accent;
+    snap.color_background_dark = state.color_background_dark;
     snap.show_visualizer = state.show_visualizer;
     snap.visualizer_active = state.visualizer_active;
     snap.vis_peak_freq = state.vis_peak_freq;
@@ -450,6 +462,61 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
     return hbox({playback_panel | flex, stream_panel | flex, server_panel | flex});
 }
 
+// Artwork channels and the audio-derived palette, side by side. Artwork images are reported by
+// size rather than drawn: a terminal has no pixels to put them in, and the size plus the channel
+// they arrived on is what tells an integrator the transfer worked.
+static Element render_artwork_and_color(const TuiSnapshot& snap) {
+    Elements artwork_rows;
+    for (size_t channel = 0; channel < snap.artwork_channels.size(); ++channel) {
+        const auto& status = snap.artwork_channels[channel];
+        std::string value = status.wanted;
+        if (status.image_bytes > 0) {
+            value += "  " + std::to_string((status.image_bytes + 512) / 1024) + " kB";
+        }
+        artwork_rows.push_back(hbox({
+            text("  Ch " + std::to_string(channel) + ": ") | color(Color::White) | dim,
+            status.image_bytes > 0 ? text(value) | color(Color::Cyan)
+                                   : text(value) | color(Color::White) | dim,
+            text(status.images > 0 ? "  x" + std::to_string(status.images) : "") |
+                color(Color::White) | dim,
+        }));
+    }
+    if (artwork_rows.empty()) {
+        artwork_rows.push_back(text("  No channels configured") | color(Color::White) | dim);
+    }
+    auto artwork_panel =
+        window(text(" Artwork ") | bold, vbox(std::move(artwork_rows))) | color(Color::Yellow);
+
+    auto swatch = [](const std::string& label, const std::optional<std::array<uint8_t, 3>>& rgb) {
+        if (!rgb.has_value()) {
+            return hbox({text("  " + label) | color(Color::White) | dim,
+                         text("\u2014") | color(Color::White) | dim});
+        }
+        const auto& c = rgb.value();
+        std::string value = std::to_string(c[0]) + "," + std::to_string(c[1]) + "," +
+                            std::to_string(c[2]);
+        return hbox({
+            text("  " + label) | color(Color::White) | dim,
+            text("\u2588\u2588 ") | color(Color::RGB(c[0], c[1], c[2])),
+            text(value) | color(Color::Cyan),
+        });
+    };
+
+    Elements color_rows{
+        swatch("Primary:  ", snap.color_primary),
+        swatch("Accent:   ", snap.color_accent),
+        swatch("Backdrop: ", snap.color_background_dark),
+    };
+    if (!snap.color_received) {
+        color_rows.push_back(text("  Waiting for the server's palette") | color(Color::White) |
+                             dim);
+    }
+    auto color_panel =
+        window(text(" Colors ") | bold, vbox(std::move(color_rows))) | color(Color::Yellow);
+
+    return hbox({artwork_panel | flex, color_panel | flex});
+}
+
 static Color spectrum_color_for_bin(int bin, int total_bins) {
     // Gradient: blue (low freq) -> green (mid) -> red (high)
     float t = total_bins > 1 ? static_cast<float>(bin) / (total_bins - 1) : 0.0f;
@@ -700,6 +767,11 @@ static Element render_tui(TuiState& state) {
         render_progress(snap),
         render_info_panels(snap, width),
     };
+    // Only once one of the two roles is active: an idle pair of panels would push the rest of
+    // the screen down for nothing.
+    if (!snap.artwork_channels.empty() || snap.color_received) {
+        sections.push_back(render_artwork_and_color(snap));
+    }
     // Show the Pairing PSK token only until this connection is paired: once trust is USER,
     // the token has already served its purpose and the vertical space goes back to filler().
     if (!snap.pairing_token.empty() && snap.trust != ConnectionTrust::USER) {

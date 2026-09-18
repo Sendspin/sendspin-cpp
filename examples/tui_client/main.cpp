@@ -27,7 +27,9 @@
 
 #include "tui.h"
 
+#include "sendspin/artwork_role.h"
 #include "sendspin/client.h"
+#include "sendspin/color_role.h"
 #include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
@@ -557,6 +559,27 @@ int main(int argc, char* argv[]) {
     // Suppress unused variable warning
     (void)controller;
 
+    // Artwork channels: album art on channel 0, artist image on channel 1. The TUI reports what
+    // arrives rather than drawing it, so the sizes are the small ones a display of this kind asks
+    // for.
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    ArtworkRoleConfig artwork_config;
+    artwork_config.preferred_formats = {
+        {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 320},
+        {SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 64},
+    };
+    // What each channel asked for, in channel order, for the Artwork panel to label its rows.
+    const std::vector<std::string> artwork_channel_labels = {
+        "album jpeg 320x320",
+        "artist png 64x64",
+    };
+    auto& artwork = client.add_artwork(std::move(artwork_config));
+#endif
+
+#ifdef SENDSPIN_ENABLE_COLOR
+    auto& color_role = client.add_color();
+#endif
+
     // Visualizer support (disabled with -V flag)
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     VisualizerRole* vis_role = nullptr;
@@ -729,6 +752,54 @@ int main(int argc, char* argv[]) {
         }
     };
 
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    struct TuiArtworkListener : ArtworkRoleListener {
+        TuiState& state;
+        explicit TuiArtworkListener(TuiState& s) : state(s) {}
+
+        // Fires on the decode thread. A TUI has nothing to decode the image into, so it records
+        // what arrived and leaves the bytes alone.
+        void on_image_decode(uint8_t slot, const uint8_t* /*data*/, size_t length,
+                             SendspinImageFormat /*format*/) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (slot < state.artwork_channels.size()) {
+                state.artwork_channels[slot].image_bytes = length;
+                ++state.artwork_channels[slot].images;
+            }
+        }
+
+        void on_image_clear(uint8_t slot) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (slot < state.artwork_channels.size()) {
+                state.artwork_channels[slot].image_bytes = 0;
+            }
+        }
+    };
+#endif
+
+#ifdef SENDSPIN_ENABLE_COLOR
+    struct TuiColorListener : ColorRoleListener {
+        TuiState& state;
+        explicit TuiColorListener(TuiState& s) : state(s) {}
+
+        void on_color(const ServerColorStateObject& palette) override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.color_received = true;
+            state.color_primary = palette.primary;
+            state.color_accent = palette.accent;
+            state.color_background_dark = palette.background_dark;
+        }
+
+        void on_color_clear() override {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.color_received = false;
+            state.color_primary.reset();
+            state.color_accent.reset();
+            state.color_background_dark.reset();
+        }
+    };
+#endif
+
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     struct TuiVisualizerListener : VisualizerRoleListener {
         TuiState& state;
@@ -806,6 +877,11 @@ int main(int argc, char* argv[]) {
 
     // Shared TUI state
     TuiState state;
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    for (const auto& label : artwork_channel_labels) {
+        state.artwork_channels.push_back({label, 0, 0});
+    }
+#endif
 
     // Create and wire listeners
 #ifdef SENDSPIN_HAS_PORTAUDIO
@@ -818,6 +894,12 @@ int main(int argc, char* argv[]) {
 #endif
     TuiMetadataListener metadata_listener(state);
     TuiClientListener client_listener(state);
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    TuiArtworkListener artwork_listener(state);
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    TuiColorListener color_listener(state);
+#endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     TuiVisualizerListener visualizer_listener(state);
 #endif
@@ -827,6 +909,12 @@ int main(int argc, char* argv[]) {
     metadata.set_listener(&metadata_listener);
     client.set_listener(&client_listener);
     client.set_network_provider(&network_provider);
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    artwork.set_listener(&artwork_listener);
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    color_role.set_listener(&color_listener);
+#endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     if (vis_role) {
         vis_role->set_listener(&visualizer_listener);
