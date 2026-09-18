@@ -604,12 +604,12 @@ inline std::optional<SendspinImageSource> image_source_from_string(const std::st
     return std::nullopt;
 }
 
-/// @brief Format and resolution for a single supported artwork channel
+/// @brief Format and resolution the client wants for a single artwork channel
 struct ArtworkChannelFormatObject {
     SendspinImageSource source{};
     SendspinImageFormat format{};
-    uint16_t media_width{};
-    uint16_t media_height{};
+    uint16_t width{};
+    uint16_t height{};
 };
 
 /// @brief Server-side description of one artwork channel's format and dimensions
@@ -630,18 +630,9 @@ struct ServerArtworkStreamObject {
     std::optional<std::vector<ServerArtworkChannelObject>> channels;
 };
 
-/// @brief Artwork capabilities advertised to the server during the hello handshake
-struct ArtworkSupportObject {
+/// @brief Artwork channel configuration reported by the client in client/state messages
+struct ClientArtworkStateObject {
     std::vector<ArtworkChannelFormatObject> channels;
-};
-
-/// @brief Client request for a specific artwork channel format, sent in stream/request_format
-struct ClientArtworkRequestObject {
-    uint8_t channel{};
-    std::optional<SendspinImageSource> source;
-    std::optional<SendspinImageFormat> format;
-    std::optional<uint16_t> media_width;
-    std::optional<uint16_t> media_height;
 };
 
 // --- visualizer_role.h ---
@@ -774,7 +765,6 @@ struct ClientHelloMessage {
     std::optional<DeviceInfoObject> device_info{};
     std::vector<SendspinRole> supported_roles{};
     std::optional<PlayerSupportObject> player_v1_support{};
-    std::optional<ArtworkSupportObject> artwork_v1_support{};
     std::optional<VisualizerSupportObject> visualizer_support{};
     bool unpaired_access_enabled{false};
     std::vector<PairMethodDescriptor> supported_pair_methods{};
@@ -784,6 +774,7 @@ struct ClientHelloMessage {
 struct ClientStateMessage {
     SendspinClientState state{};
     std::optional<ClientPlayerStateObject> player{};
+    std::optional<ClientArtworkStateObject> artwork{};
 };
 
 /// @brief Parsed server/hello handshake message received at connection startup.
@@ -825,7 +816,6 @@ struct StreamStartMessage {
 /// format negotiation
 struct StreamRequestFormatMessage {
     std::optional<ServerPlayerStreamObject> player;
-    std::optional<ClientArtworkRequestObject> artwork;
     std::optional<VisualizerFormatRequest> visualizer;
 };
 

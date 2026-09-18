@@ -1726,9 +1726,17 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     ClientStateMessage state_msg;
     state_msg.state = this->state_;
 
+    // spec "client/state": a role object is included only while that role is active, and every
+    // active role's object is included, so the first state after a server/activate carries them
+    // all.
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_ && conn->is_role_active("player")) {
         this->player_->impl_->build_state_fields(state_msg);
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    if (this->artwork_ && conn->is_role_active("artwork")) {
+        this->artwork_->impl_->build_state_fields(state_msg);
     }
 #endif
 

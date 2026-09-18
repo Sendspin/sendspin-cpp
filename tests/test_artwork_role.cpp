@@ -16,6 +16,7 @@
 #include "constants.h"
 #include "protocol_messages.h"
 #include "sendspin/client.h"
+#include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
 #include <chrono>
@@ -1017,6 +1018,57 @@ TEST(ArtworkDisplayLateness, ZeroIsReservedForNoConnection) {
     EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(0, 0), 0u);                  // no connection
     EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, US_PER_MS - 1), 1u);      // connected, <1ms
     EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, 600 * US_PER_MS), 600u);  // connected slip
+}
+
+// ============================================================================
+// client/hello and client/state channel reporting
+// ============================================================================
+
+// messaging.md "client/hello" defines no artwork support object, and roles/artwork/v1.md
+// "client/state artwork object" carries the channels instead. The hello therefore lists the role
+// and says nothing else about artwork.
+TEST(ArtworkChannelReporting, HelloListsTheRoleWithoutChannels) {
+    auto impl = make_impl(make_two_slot_config());
+
+    ClientHelloMessage hello;
+    impl->build_hello_fields(hello);
+
+    ASSERT_EQ(hello.supported_roles.size(), 1u);
+    EXPECT_EQ(hello.supported_roles[0], SendspinRole::ARTWORK);
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&hello)));
+    EXPECT_TRUE(doc["payload"]["artwork@v1_support"].isUnbound());
+}
+
+// The configured slots reach the client/state artwork object in configuration order, which is
+// what makes the array index the channel number.
+TEST(ArtworkChannelReporting, StateCarriesTheConfiguredChannelsInOrder) {
+    auto impl = make_impl(make_two_slot_config());
+
+    ClientStateMessage state;
+    impl->build_state_fields(state);
+
+    ASSERT_TRUE(state.artwork.has_value());
+    ASSERT_EQ(state.artwork->channels.size(), 2u);
+    EXPECT_EQ(state.artwork->channels[0].source, SendspinImageSource::ALBUM);
+    EXPECT_EQ(state.artwork->channels[1].source, SendspinImageSource::ARTIST);
+    EXPECT_EQ(state.artwork->channels[0].width, 100);
+    EXPECT_EQ(state.artwork->channels[0].height, 100);
+}
+
+// Control: a role configured with no channels has nothing to report, so it neither lists itself
+// nor contributes an artwork object a server would have to interpret as an empty channel list.
+TEST(ArtworkChannelReporting, NoConfiguredChannelsReportsNothing) {
+    auto impl = make_impl(ArtworkRoleConfig{});
+
+    ClientHelloMessage hello;
+    impl->build_hello_fields(hello);
+    EXPECT_TRUE(hello.supported_roles.empty());
+
+    ClientStateMessage state;
+    impl->build_state_fields(state);
+    EXPECT_FALSE(state.artwork.has_value());
 }
 
 TEST(ArtworkDisplayLateness, HugeLatenessSaturatesAtUint32Max) {

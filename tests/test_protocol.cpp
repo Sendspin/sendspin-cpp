@@ -840,6 +840,64 @@ TEST(Protocol, FormatClientStatePlayerReportsZeroTimingFields) {
     EXPECT_EQ(doc["payload"]["player"]["min_buffer_ms"].as<uint16_t>(), 0);
 }
 
+// roles/artwork/v1.md "client/state artwork object": each channels entry carries source, format,
+// width and height, positional from channel 0. The two channels differ in every field so a
+// serializer that wrote one channel's value under another's key would be caught.
+TEST(Protocol, FormatClientStateArtworkChannels) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+    ClientArtworkStateObject artwork{};
+    artwork.channels.push_back({SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 240});
+    artwork.channels.push_back({SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 48});
+    msg.artwork = artwork;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    JsonArrayConst channels = doc["payload"]["artwork"]["channels"].as<JsonArrayConst>();
+    ASSERT_EQ(channels.size(), 2u);
+    EXPECT_STREQ(channels[0]["source"], "album");
+    EXPECT_STREQ(channels[0]["format"], "jpeg");
+    EXPECT_EQ(channels[0]["width"].as<int>(), 320);
+    EXPECT_EQ(channels[0]["height"].as<int>(), 240);
+    EXPECT_STREQ(channels[1]["source"], "artist");
+    EXPECT_STREQ(channels[1]["format"], "png");
+    EXPECT_EQ(channels[1]["width"].as<int>(), 64);
+    EXPECT_EQ(channels[1]["height"].as<int>(), 48);
+    // The pre-rename dimension keys are gone; a server reading them would find nothing.
+    EXPECT_TRUE(channels[0]["media_width"].isUnbound());
+    EXPECT_TRUE(channels[0]["media_height"].isUnbound());
+}
+
+// A channel whose source is 'none' streams nothing, so it carries no format or size: those keys
+// are required only for a channel that is actually served.
+TEST(Protocol, FormatClientStateArtworkNoneChannelOmitsFormatAndSize) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+    ClientArtworkStateObject artwork{};
+    artwork.channels.push_back({SendspinImageSource::NONE, SendspinImageFormat::JPEG, 320, 240});
+    msg.artwork = artwork;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    JsonArrayConst channels = doc["payload"]["artwork"]["channels"].as<JsonArrayConst>();
+    ASSERT_EQ(channels.size(), 1u);
+    EXPECT_STREQ(channels[0]["source"], "none");
+    EXPECT_TRUE(channels[0]["format"].isUnbound());
+    EXPECT_TRUE(channels[0]["width"].isUnbound());
+    EXPECT_TRUE(channels[0]["height"].isUnbound());
+}
+
+// Control: a client with no artwork role sends no artwork object at all, which leaves that role's
+// state unchanged on the server rather than declaring an empty channel list.
+TEST(Protocol, FormatClientStateOmitsArtworkWhenUnset) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    EXPECT_TRUE(doc["payload"]["artwork"].isUnbound());
+}
+
 // spec "client/state": the client-level field is the boolean `available`, not a multi-valued
 // state string. SYNCHRONIZED must serialize to available:true, and no legacy top-level "state"
 // key may appear (a strict-mode server hard-rejects client/state carrying an unknown field).

@@ -951,17 +951,6 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             msg->player_v1_support.value().buffer_capacity;
     }
 
-    if (msg->artwork_v1_support.has_value()) {
-        JsonArray channels_list = root["payload"]["artwork@v1_support"]["channels"].to<JsonArray>();
-        for (const auto& channel : msg->artwork_v1_support.value().channels) {
-            JsonObject channel_obj = channels_list.add<JsonObject>();
-            channel_obj["source"] = to_cstr(channel.source);
-            channel_obj["format"] = to_cstr(channel.format);
-            channel_obj["media_width"] = channel.media_width;
-            channel_obj["media_height"] = channel.media_height;
-        }
-    }
-
     if (msg->visualizer_support.has_value()) {
         const auto& vis = msg->visualizer_support.value();
         JsonObject vis_json = root["payload"]["visualizer@v1_support"].to<JsonObject>();
@@ -1008,6 +997,22 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
         }
     }
 
+    if (msg->artwork.has_value()) {
+        JsonArray channels_list = root["payload"]["artwork"]["channels"].to<JsonArray>();
+        for (const auto& channel : msg->artwork.value().channels) {
+            JsonObject channel_obj = channels_list.add<JsonObject>();
+            channel_obj["source"] = to_cstr(channel.source);
+            // roles/artwork/v1.md "client/state artwork object": format, width and height are
+            // required unless the channel's source is 'none', which streams nothing and so has
+            // no format or size to deliver.
+            if (channel.source != SendspinImageSource::NONE) {
+                channel_obj["format"] = to_cstr(channel.format);
+                channel_obj["width"] = channel.width;
+                channel_obj["height"] = channel.height;
+            }
+        }
+    }
+
     std::string output;
     serializeJson(doc, output);
     return output;
@@ -1034,23 +1039,6 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
         }
         if (player.bit_depth.has_value()) {
             root["payload"]["player"]["bit_depth"] = player.bit_depth.value();
-        }
-    }
-
-    if (msg->artwork.has_value()) {
-        const auto& artwork = msg->artwork.value();
-        root["payload"]["artwork"]["channel"] = artwork.channel;
-        if (artwork.source.has_value()) {
-            root["payload"]["artwork"]["source"] = to_cstr(artwork.source.value());
-        }
-        if (artwork.format.has_value()) {
-            root["payload"]["artwork"]["format"] = to_cstr(artwork.format.value());
-        }
-        if (artwork.media_width.has_value()) {
-            root["payload"]["artwork"]["media_width"] = artwork.media_width.value();
-        }
-        if (artwork.media_height.has_value()) {
-            root["payload"]["artwork"]["media_height"] = artwork.media_height.value();
         }
     }
 

@@ -65,7 +65,7 @@ ArtworkRole::Impl::Impl(ArtworkRoleConfig config, SendspinClient* client)
       client(client),
       drain_task(std::make_unique<DrainTask>()),
       event_state(std::make_unique<EventState>()) {
-    // The array index is authoritative for channel/slot mapping: the hello advertises channels
+    // The array index is authoritative for channel/slot mapping: client/state reports channels
     // in this->artwork_channels order, and handle_binary looks up this->config.preferred_formats
     // by index to match.
     if (this->config.preferred_formats.size() > ARTWORK_MAX_SLOTS) {
@@ -139,11 +139,19 @@ void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
     if (this->artwork_channels.empty()) {
         return;
     }
+    // messaging.md "client/hello" defines no artwork support object: the role is listed here and
+    // the channels it wants are reported in client/state (see build_state_fields).
     msg.supported_roles.push_back(SendspinRole::ARTWORK);
+}
 
-    ArtworkSupportObject artwork_support{};
-    artwork_support.channels = this->artwork_channels;
-    msg.artwork_v1_support = artwork_support;
+void ArtworkRole::Impl::build_state_fields(ClientStateMessage& msg) const {
+    if (this->artwork_channels.empty()) {
+        return;
+    }
+
+    ClientArtworkStateObject artwork_state{};
+    artwork_state.channels = this->artwork_channels;
+    msg.artwork = std::move(artwork_state);
 }
 
 // ============================================================================
@@ -309,16 +317,16 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
             if (srv.format.has_value() && srv.format.value() != req.format) {
                 SS_LOGW(TAG, "Artwork channel %zu format mismatch", i);
             }
-            if (srv.width.has_value() && srv.width.value() != req.media_width) {
+            if (srv.width.has_value() && srv.width.value() != req.width) {
                 SS_LOGW(TAG,
                         "Artwork channel %zu width mismatch: server %" PRIu16 ", expected %" PRIu16,
-                        i, srv.width.value(), req.media_width);
+                        i, srv.width.value(), req.width);
             }
-            if (srv.height.has_value() && srv.height.value() != req.media_height) {
+            if (srv.height.has_value() && srv.height.value() != req.height) {
                 SS_LOGW(TAG,
                         "Artwork channel %zu height mismatch: server %" PRIu16
                         ", expected %" PRIu16,
-                        i, srv.height.value(), req.media_height);
+                        i, srv.height.value(), req.height);
             }
         }
     }

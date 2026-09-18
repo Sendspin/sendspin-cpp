@@ -36,6 +36,7 @@ namespace sendspin {
 
 class SendspinClient;
 struct ClientHelloMessage;
+struct ClientStateMessage;
 
 /// @brief Deferred artwork event types
 enum class ArtworkEventType : uint8_t {
@@ -155,6 +156,7 @@ struct ArtworkRole::Impl {
     void attach_inbox(Inbox& inbox);
     bool start();
     void build_hello_fields(ClientHelloMessage& msg) const;
+    void build_state_fields(ClientStateMessage& msg) const;
     void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
     void handle_stream_start(const ServerArtworkStreamObject& stream);
     void handle_stream_end();
