@@ -226,14 +226,14 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   with its bytes dropped. `roles/artwork/v1.md` "Artwork (Binary)" allows this (it is the
   "unavailable client" path) but sets no cap of its own, so a server that encodes an image larger
   than the channel's budget sees the channel keep its previous image rather than an error.
-- The two places that read `active_roles` judge a role differently. Role removal compares the
+- The send gate still judges a role by family. Role removal and the receive gate compare the
   exact versioned name the library implements, as messaging.md "server/activate" requires
-  ("replacement of an active role version" is a removal), while the send gate
-  (`SendspinConnection::is_role_active()`, used by `send_text()` and the `client/state` builders)
-  matches the family. A server that activates `player@v2` on a client that advertised only
-  `player@v1` therefore tears the player down and then still reports a player object. No
-  conformant server can produce that set (the version has to be one the client advertised), so
-  this only shows up against a server that activates a version it was never offered.
+  ("replacement of an active role version" is a removal), but `send_text()` and the `client/state`
+  builders go through `SendspinConnection::is_role_active(family)`. A server that activates
+  `player@v2` on a client that advertised only `player@v1` therefore tears the player down and
+  ignores its traffic, yet still reports a player object in `client/state`. No conformant server
+  can produce that set (the version has to be one the client advertised), so this only shows up
+  against a server that activates a version it was never offered.
 - A device that offers `dynamic_pairing_code` without implementing the pairing-window gesture
   (`pairing_window_supported` false) has no way to clear a standing round limit, which
   `pairing.md` "Rounds" says only a deliberate operator action clears. Its attempts then sit at

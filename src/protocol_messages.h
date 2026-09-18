@@ -116,6 +116,7 @@ enum class SendspinRole : uint8_t {
     ARTWORK,     // Album artwork role
     VISUALIZER,  // Audio visualization role
     COLOR,       // Audio-derived color palette role
+    COUNT,       // Not a role; bounds the walk in active_role_mask(). Keep last.
 };
 
 /// @brief Converts a SendspinRole value to its protocol wire string representation
@@ -138,6 +139,46 @@ inline const char* to_cstr(SendspinRole role) {
         default:
             return "unknown";
     }
+}
+
+/// @brief Whether a versioned role name is in an active_roles set.
+/// @param active_roles The set to search, as the server wrote it.
+/// @param role The role to look for, compared against its full versioned name ("player@v1").
+///
+/// The comparison is on the exact versioned name this library implements, not the family, because
+/// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
+/// version that was active: a client offered `player@v1` that is handed `player@v2` implements
+/// neither the new version's behavior nor, any longer, the old one's.
+inline bool role_in(const std::vector<std::string>& active_roles, SendspinRole role) {
+    const char* name = to_cstr(role);
+    for (const auto& active : active_roles) {
+        if (active == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// @brief Bit that represents `role` in an active-role mask.
+inline uint16_t role_mask_bit(SendspinRole role) {
+    return static_cast<uint16_t>(1U << static_cast<uint8_t>(role));
+}
+
+/// @brief Builds the mask of roles this library implements that `active_roles` names.
+///
+/// The mask is what the receive path reads (a connection publishes it atomically), so it is built
+/// with the same exact-version test role removal uses and the two can never disagree.
+/// @param active_roles The set from a server/activate.
+/// @return OR of role_mask_bit() for every implemented role named in the set.
+inline uint16_t active_role_mask(const std::vector<std::string>& active_roles) {
+    uint16_t mask = 0;
+    for (uint8_t i = 0; i < static_cast<uint8_t>(SendspinRole::COUNT); ++i) {
+        const auto role = static_cast<SendspinRole>(i);
+        if (role_in(active_roles, role)) {
+            mask |= role_mask_bit(role);
+        }
+    }
+    return mask;
 }
 
 /// @brief Activity declared in a server/activate message.

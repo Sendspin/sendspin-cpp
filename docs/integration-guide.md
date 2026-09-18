@@ -184,7 +184,9 @@ that role down on the spot: a stream role stops its output, drops its buffers, a
 role drops its state and reports the clear (`on_metadata_clear()`, `on_color_clear()`,
 `on_controller_state_clear()`). The connection stays up and the other roles keep running. A clear
 callback is therefore not proof that the server is gone; treat it as "this role has nothing to
-show" and make it idempotent. If the server adds the role back later, the role resumes normally.
+show" and make it idempotent. Until the server adds the role back, anything it still sends for
+that role is ignored rather than acted on, so a removed role stays quiet; when it is added back,
+the role resumes normally.
 
 ### PlayerRoleListener (Required if Using Player Role)
 

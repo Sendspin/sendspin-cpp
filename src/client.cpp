@@ -114,20 +114,27 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
     return configured;
 }
 
-/// @brief Whether a versioned role name is in an active_roles set.
-/// @param active_roles The set to search, as the server wrote it.
-/// @param role The role to look for, compared against its full versioned name ("player@v1").
+/// @brief Whether inbound traffic for `role` may be acted on, i.e. the role is active on the
+/// connection it arrived on.
 ///
-/// The comparison is on the exact versioned name this library implements, not the family, because
-/// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
-/// version that was active.
-bool role_in(const std::vector<std::string>& active_roles, SendspinRole role) {
-    const char* name = to_cstr(role);
-    for (const auto& active : active_roles) {
-        if (active == name) {
-            return true;
-        }
+/// messaging.md "Communication" keeps a message the client implements *recognized* while its role
+/// is inactive ("An ID the receiver implements is still recognized when its role is inactive"), so
+/// this is not the unknown-message rule: the message is parsed and validated as usual, the
+/// connection is never closed for it, and only the role's own handling is skipped. messaging.md
+/// "server/activate" expects exactly this of both sides, since it has servers ignore inactive-role
+/// objects "without closing solely for their presence, since the client may not yet have received
+/// the role removal" -- the client's mirror of that is not to act on what the server sent before
+/// it learned of one.
+///
+/// Runs on the network thread, so it reads the connection's atomic role mask. `conn` is never null
+/// at the dispatch points: the admission gate ahead of them returns first.
+/// @param conn The connection the message arrived on.
+/// @param role The role that owns the message.
+bool role_accepts_traffic(const SendspinConnection* conn, SendspinRole role) {
+    if (conn->is_role_active(role)) {
+        return true;
     }
+    SS_LOGD(TAG, "Ignoring %s traffic: the role is not active on this connection", to_cstr(role));
     return false;
 }
 
@@ -1291,19 +1298,22 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             }
 
 #ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_ && stream_msg.player.has_value()) {
+            if (this->player_ && stream_msg.player.has_value() &&
+                role_accepts_traffic(conn, SendspinRole::PLAYER)) {
                 this->player_->impl_->handle_stream_start(stream_msg.player.value());
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
-            if (this->artwork_ && stream_msg.artwork.has_value()) {
+            if (this->artwork_ && stream_msg.artwork.has_value() &&
+                role_accepts_traffic(conn, SendspinRole::ARTWORK)) {
                 this->artwork_->impl_->handle_stream_start(stream_msg.artwork.value());
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-            if (this->visualizer_ && stream_msg.visualizer.has_value()) {
+            if (this->visualizer_ && stream_msg.visualizer.has_value() &&
+                role_accepts_traffic(conn, SendspinRole::VISUALIZER)) {
                 this->visualizer_->impl_->handle_stream_start(stream_msg.visualizer.value());
             }
 #endif
@@ -1332,19 +1342,22 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                         end_artwork, end_visualizer);
 
 #ifdef SENDSPIN_ENABLE_PLAYER
-                if (this->player_ && end_player) {
+                if (this->player_ && end_player &&
+                    role_accepts_traffic(conn, SendspinRole::PLAYER)) {
                     this->player_->impl_->handle_stream_end();
                 }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
-                if (this->artwork_ && end_artwork) {
+                if (this->artwork_ && end_artwork &&
+                    role_accepts_traffic(conn, SendspinRole::ARTWORK)) {
                     this->artwork_->impl_->handle_stream_end();
                 }
 #endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-                if (this->visualizer_ && end_visualizer) {
+                if (this->visualizer_ && end_visualizer &&
+                    role_accepts_traffic(conn, SendspinRole::VISUALIZER)) {
                     this->visualizer_->impl_->handle_stream_end();
                 }
 #endif
@@ -1374,19 +1387,22 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                         clear_artwork, clear_visualizer);
 
 #ifdef SENDSPIN_ENABLE_PLAYER
-                if (this->player_ && clear_player) {
+                if (this->player_ && clear_player &&
+                    role_accepts_traffic(conn, SendspinRole::PLAYER)) {
                     this->player_->impl_->handle_stream_clear();
                 }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
-                if (this->artwork_ && clear_artwork) {
+                if (this->artwork_ && clear_artwork &&
+                    role_accepts_traffic(conn, SendspinRole::ARTWORK)) {
                     this->artwork_->impl_->handle_stream_clear();
                 }
 #endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-                if (this->visualizer_ && clear_visualizer) {
+                if (this->visualizer_ && clear_visualizer &&
+                    role_accepts_traffic(conn, SendspinRole::VISUALIZER)) {
                     this->visualizer_->impl_->handle_stream_clear();
                 }
 #endif
@@ -1428,6 +1444,12 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     // must be held rather than dropped, and it can arrive on this thread the
                     // moment the activate leaves it (see the admission gate above).
                     conn->note_activate_delivered();
+                    // Likewise before the handoff: a role this activation adds must accept the
+                    // traffic the server sends behind it, which can also arrive the moment the
+                    // activate leaves this thread (see note_activated_roles()).
+                    if (activate_msg.active_roles.has_value()) {
+                        conn->note_activated_roles(activate_msg.active_roles.value());
+                    }
                     this->connection_manager_->schedule_activate(
                         {conn->shared_from_this(), std::move(activate_msg.activities),
                          std::move(activate_msg.active_roles), activate_msg.pairing_method,
@@ -1485,7 +1507,8 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             // stack is small on ESP-IDF. Scoping the sections lets the compiler reuse the same
             // slots, and a section is only parsed at all when its role is present.
 #ifdef SENDSPIN_ENABLE_CONTROLLER
-            if (this->controller_ != nullptr) {
+            if (this->controller_ != nullptr &&
+                role_accepts_traffic(conn, SendspinRole::CONTROLLER)) {
                 ServerStateControllerObject controller_state;
                 if (process_server_state_controller(root, &controller_state)) {
                     this->controller_->impl_->handle_server_state(std::move(controller_state));
@@ -1494,7 +1517,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
 #endif
 
 #ifdef SENDSPIN_ENABLE_METADATA
-            if (this->metadata_ != nullptr) {
+            if (this->metadata_ != nullptr && role_accepts_traffic(conn, SendspinRole::METADATA)) {
                 ServerMetadataStateObject metadata_state;
                 if (process_server_state_metadata(root, &metadata_state)) {
                     this->metadata_->impl_->handle_server_state(std::move(metadata_state));
@@ -1503,7 +1526,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
 #endif
 
 #ifdef SENDSPIN_ENABLE_COLOR
-            if (this->color_ != nullptr) {
+            if (this->color_ != nullptr && role_accepts_traffic(conn, SendspinRole::COLOR)) {
                 ServerColorStateObject color_state;
                 if (process_server_state_color(root, &color_state)) {
                     this->color_->impl_->handle_server_state(color_state);
@@ -1514,7 +1537,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
         }
         case SendspinServerToClientMessageType::SERVER_COMMAND: {
 #ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_) {
+            if (this->player_ && role_accepts_traffic(conn, SendspinRole::PLAYER)) {
                 ServerCommandMessage cmd_msg;
                 if (process_server_command_message(root, &cmd_msg)) {
                     this->player_->impl_->handle_server_command(cmd_msg);
@@ -1731,7 +1754,7 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, con
     if (binary_type >= SENDSPIN_BINARY_VISUALIZER_FIRST &&
         binary_type <= SENDSPIN_BINARY_VISUALIZER_LAST) {
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-        if (this->visualizer_) {
+        if (this->visualizer_ && role_accepts_traffic(conn, SendspinRole::VISUALIZER)) {
             this->visualizer_->impl_->handle_binary(binary_type, data, data_len);
         }
 #endif
@@ -1741,7 +1764,7 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, con
     switch (role) {
         case SENDSPIN_ROLE_PLAYER: {
 #ifdef SENDSPIN_ENABLE_PLAYER
-            if (this->player_) {
+            if (this->player_ && role_accepts_traffic(conn, SendspinRole::PLAYER)) {
                 uint8_t slot = get_binary_slot(binary_type);
                 if (slot == 0) {
                     this->player_->impl_->handle_binary(data, data_len);
@@ -1754,6 +1777,16 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, con
         }
         case SENDSPIN_ROLE_ARTWORK: {
 #ifdef SENDSPIN_ENABLE_ARTWORK
+            // Deliberately not gated on the role being active, unlike every other role dispatch
+            // here. messaging.md "Communication" keeps a message the client implements recognized
+            // while its role is inactive, and "the validation, direction, and sequencing rules for
+            // recognized messages still apply", so an artwork message that is malformed as a
+            // message is still the protocol error the role closes on. The role already drops the
+            // payload of a message that arrives outside an active stream, below those shape
+            // checks, and a removed role has no active stream (cleanup() clears it and a
+            // stream/start for an inactive role is refused above), so handing the message to the
+            // role is what "recognized but not acted upon" means here. The player and visualizer
+            // have no closing check of their own, so gating their dispatch costs nothing.
             if (this->artwork_) {
                 uint8_t slot = get_binary_slot(binary_type);
                 if (!this->artwork_->impl_->handle_binary(slot, data, data_len)) {

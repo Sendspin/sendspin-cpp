@@ -689,6 +689,32 @@ public:
     /// Implemented in connection.cpp to avoid pulling platform/time.h into this header.
     void note_pairing_finalize_ack();
 
+    /// @brief ORs the roles a just-received server/activate names into the active-role mask.
+    ///
+    /// Runs on the network thread, where the activate is parsed, so a role the activation ADDS is
+    /// already active for the receive gate when the traffic that legitimately follows it arrives:
+    /// messaging.md "server/state" has the server send a re-added role's state promptly, and it
+    /// does not wait for the client's next main-loop tick. Removals are deliberately not applied
+    /// here -- they take effect in apply_server_activate() on the main loop, in the same step that
+    /// tears the removed roles down, so the gate and the teardown always agree on when a role
+    /// stopped.
+    /// @param active_roles The active_roles of the activate just received (empty when it omitted
+    ///                     the field, which adds nothing).
+    void note_activated_roles(const std::vector<std::string>& active_roles) {
+        this->active_role_mask_.fetch_or(active_role_mask(active_roles), std::memory_order_acq_rel);
+    }
+
+    /// @brief Returns true if `role` is active on this connection, judged on the exact versioned
+    /// name this library implements.
+    ///
+    /// Reads an atomic mask rebuilt by apply_server_activate(), so the receive path may call it
+    /// from the network thread while the main loop applies an activation; active_roles_ itself is
+    /// main-loop-only and must not be walked from there.
+    /// @param role The role to test.
+    bool is_role_active(SendspinRole role) const {
+        return (this->active_role_mask_.load(std::memory_order_acquire) & role_mask_bit(role)) != 0;
+    }
+
     /// @brief Returns true if any active role is in the given family (e.g., "player" matches
     /// the active role "player@v1").
     /// @param family Role family name without the "@vN" version suffix.
@@ -737,6 +763,10 @@ public:
         if (active_roles.has_value()) {
             this->active_roles_ = active_roles.value();
         }
+        // Republished on every activation, sticky set included, so the mask the receive path reads
+        // cannot drift from active_roles_.
+        this->active_role_mask_.store(active_role_mask(this->active_roles_),
+                                      std::memory_order_release);
         bool has_pairing = false;
         for (const auto& a : activities) {
             if (a == SendspinActivity::PAIRING) {
@@ -1075,6 +1105,11 @@ protected:
     /// Active roles declared by server/activate (sticky: preserved across activates that omit
     /// the field). Empty until the first activate that includes active_roles.
     std::vector<std::string> active_roles_{};
+
+    /// active_roles_ as a bitmask of the roles this library implements, so the network thread can
+    /// test a role without reading the vector the main loop rewrites. Written only by
+    /// apply_server_activate().
+    std::atomic<uint16_t> active_role_mask_{0};
 
     /// Pairing method from the pairing object of the last pairing server/activate; nullopt
     /// outside a pairing activation. Read by the pairing flow. Written and read on
