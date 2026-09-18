@@ -526,7 +526,7 @@ public:
         return this->activate_count_.load();
     }
 
-    /// supported_pair_methods from the most recent client/hello, in wire order.
+    /// The keys of supported_pair_methods from the most recent client/hello, in wire order.
     std::vector<std::string> hello_pair_methods() const {
         std::lock_guard<std::mutex> lock(this->pair_methods_mutex_);
         return this->hello_pair_methods_;
@@ -720,9 +720,9 @@ private:
             {
                 std::lock_guard<std::mutex> plock(this->pair_methods_mutex_);
                 this->hello_pair_methods_.clear();
-                for (JsonVariantConst m :
-                     doc["payload"]["supported_pair_methods"].as<JsonArrayConst>()) {
-                    this->hello_pair_methods_.emplace_back(m["method"] | "");
+                for (JsonPairConst m :
+                     doc["payload"]["supported_pair_methods"].as<JsonObjectConst>()) {
+                    this->hello_pair_methods_.emplace_back(m.key().c_str());
                 }
             }
             if (this->options_.suppress_activate) {

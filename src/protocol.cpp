@@ -905,14 +905,15 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             root["payload"]["device_info"]["mac_address"] = info.mac_address.value();
         }
     }
-    // supported_pair_methods is REQUIRED on the wire (spec "client/hello": every client implements
-    // at least pairing_psk, so the field can never be legitimately absent). Always emit the array,
-    // even if empty in a degenerate configuration with every method disabled.
+    // pairing.md "client/hello pair-method descriptor": supported_pair_methods is an object keyed
+    // by pairing method identifier, each value the method's descriptor. It is REQUIRED on the wire
+    // (spec "client/hello": every client implements at least pairing_psk, so the field can never
+    // be legitimately absent), so the object is emitted even in a degenerate configuration with
+    // every method disabled.
     {
-        JsonArray methods_list = root["payload"]["supported_pair_methods"].to<JsonArray>();
+        JsonObject methods_obj = root["payload"]["supported_pair_methods"].to<JsonObject>();
         for (const auto& desc : msg->supported_pair_methods) {
-            JsonObject method_obj = methods_list.add<JsonObject>();
-            method_obj["method"] = to_cstr(desc.method);
+            JsonObject method_obj = methods_obj[to_cstr(desc.method)].to<JsonObject>();
             if (desc.out_channels.has_value() && !desc.out_channels->empty()) {
                 JsonArray ch_arr = method_obj["out_channels"].to<JsonArray>();
                 for (const auto& ch : desc.out_channels.value()) {

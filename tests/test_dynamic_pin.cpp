@@ -484,20 +484,21 @@ TEST(DynamicPin, ClientHelloDynamicPinDescriptorOutChannels) {
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
 
-    JsonArrayConst methods = doc["payload"]["supported_pair_methods"].as<JsonArrayConst>();
+    JsonObjectConst methods = doc["payload"]["supported_pair_methods"].as<JsonObjectConst>();
     ASSERT_EQ(methods.size(), 1u);
-    EXPECT_STREQ(methods[0]["method"], "dynamic_pin");
+    JsonVariantConst descriptor = methods["dynamic_pin"];
+    ASSERT_FALSE(descriptor.isUnbound());
 
-    JsonArrayConst ch = methods[0]["out_channels"].as<JsonArrayConst>();
+    JsonArrayConst ch = descriptor["out_channels"].as<JsonArrayConst>();
     ASSERT_EQ(ch.size(), 1u);
     EXPECT_STREQ(ch[0], "display");
 
-    EXPECT_EQ(methods[0]["min_pin_length"].as<int>(), 6);
+    EXPECT_EQ(descriptor["min_pin_length"].as<int>(), 6);
 
     // locked_out is not part of the wire format; it must never be emitted. locations is a
     // static_pin/pairing_psk hint, absent for dynamic_pin.
-    EXPECT_TRUE(methods[0]["locked_out"].isUnbound());
-    EXPECT_TRUE(methods[0]["locations"].isUnbound());
+    EXPECT_TRUE(descriptor["locked_out"].isUnbound());
+    EXPECT_TRUE(descriptor["locations"].isUnbound());
 }
 
 // ============================================================================
@@ -576,16 +577,17 @@ TEST(StaticPin, ClientHelloStaticPinDescriptorShape) {
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
 
-    JsonArrayConst methods = doc["payload"]["supported_pair_methods"].as<JsonArrayConst>();
+    JsonObjectConst methods = doc["payload"]["supported_pair_methods"].as<JsonObjectConst>();
     ASSERT_EQ(methods.size(), 1u);
-    EXPECT_STREQ(methods[0]["method"], "static_pin");
+    JsonVariantConst descriptor = methods["static_pin"];
+    ASSERT_FALSE(descriptor.isUnbound());
 
     // locked_out is never emitted; out_channels and min_pin_length are absent for static_pin,
     // and so is locations when the descriptor sets none.
-    EXPECT_TRUE(methods[0]["locked_out"].isUnbound());
-    EXPECT_TRUE(methods[0]["out_channels"].isUnbound());
-    EXPECT_TRUE(methods[0]["min_pin_length"].isUnbound());
-    EXPECT_TRUE(methods[0]["locations"].isUnbound());
+    EXPECT_TRUE(descriptor["locked_out"].isUnbound());
+    EXPECT_TRUE(descriptor["out_channels"].isUnbound());
+    EXPECT_TRUE(descriptor["min_pin_length"].isUnbound());
+    EXPECT_TRUE(descriptor["locations"].isUnbound());
 }
 
 // The locations hint ('device' | 'leaflet' | 'operator') serializes for static_pin (and
@@ -602,9 +604,9 @@ TEST(StaticPin, ClientHelloStaticPinLocationsHint) {
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out));
 
-    JsonArrayConst methods = doc["payload"]["supported_pair_methods"].as<JsonArrayConst>();
+    JsonObjectConst methods = doc["payload"]["supported_pair_methods"].as<JsonObjectConst>();
     ASSERT_EQ(methods.size(), 1u);
-    JsonArrayConst locations = methods[0]["locations"].as<JsonArrayConst>();
+    JsonArrayConst locations = methods["static_pin"]["locations"].as<JsonArrayConst>();
     ASSERT_EQ(locations.size(), 2u);
     EXPECT_STREQ(locations[0], "device");
     EXPECT_STREQ(locations[1], "leaflet");

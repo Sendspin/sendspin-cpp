@@ -750,7 +750,10 @@ struct ServerColorStateDelta {
 // ============================================================================
 
 /// @brief A pairing method descriptor for client/hello supported_pair_methods.
-/// Optional fields are omitted from the wire when not set (omit_none semantics).
+/// Optional fields are omitted from the wire when not set (omit_none semantics). The methods are
+/// held as a list rather than a map because the wire object has at most three keys and the
+/// descriptor names its own: `method` is serialized as the key this descriptor sits under, not as
+/// a field of it (pairing.md "client/hello pair-method descriptor").
 struct PairMethodDescriptor {
     SendspinPairMethod method{SendspinPairMethod::PAIRING_PSK};
     /// @brief For methods with output channels (e.g., dynamic_pin: ["display"]).

@@ -992,23 +992,35 @@ TEST(Protocol, ClientHelloUnpairedAccessDisabled) {
     EXPECT_FALSE(doc["payload"]["unpaired_access"]["enabled"].as<bool>());
 }
 
-// supported_pair_methods: pairing_psk emitted with correct wire shape.
-TEST(Protocol, ClientHelloPairingPskMethodDescriptor) {
+// pairing.md "client/hello pair-method descriptor": supported_pair_methods is an object keyed by
+// method identifier, so the method names its descriptor rather than sitting inside it.
+TEST(Protocol, ClientHelloPairMethodsAreKeyedByMethod) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
     PairMethodDescriptor psk_desc;
     psk_desc.method = SendspinPairMethod::PAIRING_PSK;
+    psk_desc.locations = std::vector<std::string>{"device"};
     msg.supported_pair_methods.push_back(std::move(psk_desc));
+    PairMethodDescriptor static_desc;
+    static_desc.method = SendspinPairMethod::STATIC_PIN;
+    msg.supported_pair_methods.push_back(std::move(static_desc));
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
-    JsonArrayConst methods = doc["payload"]["supported_pair_methods"].as<JsonArrayConst>();
-    ASSERT_EQ(methods.size(), 1u);
-    EXPECT_STREQ(methods[0]["method"], "pairing_psk");
+    JsonObjectConst methods = doc["payload"]["supported_pair_methods"].as<JsonObjectConst>();
+    ASSERT_EQ(methods.size(), 2u);
+    ASSERT_TRUE(methods["pairing_psk"].is<JsonObjectConst>());
+    ASSERT_TRUE(methods["static_pin"].is<JsonObjectConst>());
+    // The key replaces the field: a descriptor that also named itself would look like an
+    // unrecognized field to a server reading the descriptor.
+    EXPECT_TRUE(methods["pairing_psk"]["method"].isUnbound());
+    // Each descriptor keeps its own values under its own key.
+    EXPECT_STREQ(methods["pairing_psk"]["locations"][0], "device");
+    EXPECT_TRUE(methods["static_pin"]["locations"].isUnbound());
 }
 
 // supported_pair_methods: the field itself is REQUIRED on the wire even when there are no
-// methods to advertise (spec's "client/hello" section): it must be emitted as an empty array,
+// methods to advertise (spec's "client/hello" section): it must be emitted as an empty object,
 // not omitted, since every client is expected to implement at least pairing_psk.
 TEST(Protocol, ClientHelloNoSupportedPairMethods) {
     ClientHelloMessage msg;
@@ -1017,8 +1029,8 @@ TEST(Protocol, ClientHelloNoSupportedPairMethods) {
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
-    ASSERT_TRUE(doc["payload"]["supported_pair_methods"].is<JsonArrayConst>());
-    EXPECT_EQ(doc["payload"]["supported_pair_methods"].as<JsonArrayConst>().size(), 0u);
+    ASSERT_TRUE(doc["payload"]["supported_pair_methods"].is<JsonObjectConst>());
+    EXPECT_EQ(doc["payload"]["supported_pair_methods"].as<JsonObjectConst>().size(), 0u);
 }
 
 // ============================================================================
