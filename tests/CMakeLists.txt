@@ -48,6 +48,7 @@ add_executable(sendspin_tests
     test_persistence_codec.cpp
     test_client_teardown.cpp
     test_client_lifecycle.cpp
+    test_role_deactivation.cpp
 
     # FilePersistenceProvider is a host example helper (examples/common/), not part of the
     # library; compile it into the test target so the record-store tests can exercise it.
@@ -57,6 +58,11 @@ add_executable(sendspin_tests
 # test_client_lifecycle.cpp checks what a role's stop() left in its ring, which nothing on the
 # public surface reports; it reads the private members directly instead of adding a seam.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
+
+# test_role_deactivation.cpp reads what a removed role left behind (the sync task's run state, the
+# artwork transfer in flight, a state role's held scheduled update), none of which the public
+# surface reports; it reads the private members directly instead of adding a seam.
+set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_player_role.cpp builds the client/state player object by calling the role's Impl directly,
 # which is the only way to see that object without a connected server.

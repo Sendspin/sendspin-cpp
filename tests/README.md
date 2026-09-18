@@ -77,6 +77,8 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   inside `stop()`, re-entrancy from callbacks, role start rollback, and the high-performance
   hold.
 - `test_client_teardown.cpp`: destroying a running client joins every threaded role.
+- `test_role_deactivation.cpp`: a later `server/activate` that removes a role: output stopped,
+  buffers and state dropped, the roles it keeps left alone, and a removed role added back.
 - `test_crypto.cpp`, `test_cpace.cpp`, `test_pairing_code.cpp`, `test_psk_wrap.cpp`,
   `test_pairing_token.cpp`, `test_noise_transport.cpp`, `test_noise_rehandshake.cpp`,
   `test_admission.cpp`, `test_record_store.cpp`, `test_dynamic_pairing_code.cpp`,

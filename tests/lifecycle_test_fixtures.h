@@ -585,6 +585,23 @@ public:
         return true;
     }
 
+    // Sends one role binary message whose body is already laid out: `body` is the decrypted
+    // payload verbatim, starting with its type byte. For the roles whose wire layout is not
+    // [type][timestamp][payload] -- artwork puts a flags byte before the timestamp, and its parts
+    // and cancels carry no timestamp at all (roles/artwork/v1.md "Artwork (Binary)").
+    bool send_binary_body(const std::vector<uint8_t>& body) {
+        std::lock_guard<std::mutex> lock(this->crypto_mutex_);
+        if (this->active_.send_cs == nullptr) {
+            return false;
+        }
+        auto ct = raw_encrypt(this->active_.send_cs, body);
+        if (ct.empty()) {
+            return false;
+        }
+        this->send_binary_frame_locked(std::string(ct.begin(), ct.end()));
+        return true;
+    }
+
     // Sends one player audio chunk: SENDSPIN_BINARY_PLAYER_AUDIO (4) with a zeroed PCM payload.
     // roles/player/v1.md "Audio Chunks (Binary)" puts a big-endian uint32 send_ahead between the
     // timestamp and the encoded audio.
