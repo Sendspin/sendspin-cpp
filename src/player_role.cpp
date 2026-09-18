@@ -275,7 +275,12 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     bool adjustable = this->output_delay_adjustable.load(std::memory_order_relaxed);
     player_state.output_delay_ms =
         adjustable ? this->output_delay_ms.load(std::memory_order_relaxed) : 0;
-    player_state.required_lead_time_ms = this->config.required_lead_time_ms;
+    // Never below what the pipeline itself spends: the server extends lead only toward the
+    // reported number, so a configured value under that floor would truncate the stream start
+    // (roles/player/v1.md "Timing parameters").
+    player_state.required_lead_time_ms =
+        std::max(this->config.required_lead_time_ms.value_or(0),
+                 PlayerRoleConfig::pipeline_lead_time_ms(this->config.extra_startup_silence_ms));
     player_state.min_buffer_ms = this->config.min_buffer_ms;
     if (adjustable) {
         player_state.supported_commands = {SendspinPlayerCommand::SET_OUTPUT_DELAY};

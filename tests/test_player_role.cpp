@@ -100,8 +100,8 @@ TEST(PlayerRoleFormats, StartAcceptsFlacOrPcmAmongOthers) {
 // ============================================================================
 
 // roles/player/v1.md "client/state player object": required_lead_time_ms and min_buffer_ms are
-// reported in every player state object. They come from PlayerRoleConfig, so a configured value
-// must reach the state object unchanged rather than being replaced by the default.
+// reported in every player state object. A configured lead time above what the pipeline spends
+// reaches the state object unchanged.
 TEST(PlayerRoleTimingParameters, ConfiguredValuesAreReported) {
     PlayerRoleConfig player_config = make_player_config();
     player_config.required_lead_time_ms = 321;
@@ -123,10 +123,39 @@ TEST(PlayerRoleTimingParameters, DefaultsAreReported) {
     auto& player = client.add_player(make_player_config());
 
     ClientPlayerStateObject state = build_player_state(player);
-    EXPECT_EQ(state.required_lead_time_ms, PlayerRoleConfig::DEFAULT_REQUIRED_LEAD_TIME_MS);
+    EXPECT_EQ(state.required_lead_time_ms,
+              PlayerRoleConfig::pipeline_lead_time_ms(
+                  PlayerRoleConfig::DEFAULT_EXTRA_STARTUP_SILENCE_MS));
     EXPECT_EQ(state.min_buffer_ms, PlayerRoleConfig::DEFAULT_MIN_BUFFER_MS);
-    EXPECT_GT(PlayerRoleConfig::DEFAULT_REQUIRED_LEAD_TIME_MS,
-              PlayerRoleConfig::DEFAULT_EXTRA_STARTUP_SILENCE_MS);
+    EXPECT_GT(state.required_lead_time_ms, PlayerRoleConfig::DEFAULT_EXTRA_STARTUP_SILENCE_MS);
+}
+
+// The reported lead time follows the pipeline it describes: raising the startup silence the sync
+// task inserts raises what the server is asked to give, with no second setting to remember.
+TEST(PlayerRoleTimingParameters, StartupSilenceRaisesTheReportedLeadTime) {
+    PlayerRoleConfig player_config = make_player_config();
+    player_config.extra_startup_silence_ms = 400;
+
+    SendspinClient client(make_client_config("player-timing-startup-silence"));
+    auto& player = client.add_player(std::move(player_config));
+
+    ClientPlayerStateObject state = build_player_state(player);
+    EXPECT_EQ(state.required_lead_time_ms, PlayerRoleConfig::pipeline_lead_time_ms(400));
+    EXPECT_GT(state.required_lead_time_ms, 400);
+}
+
+// A configured value below what the pipeline spends is raised to it: the server extends lead only
+// toward the reported number, so reporting less than the truth truncates the stream start.
+TEST(PlayerRoleTimingParameters, ConfiguredLeadTimeCannotUndercutThePipeline) {
+    PlayerRoleConfig player_config = make_player_config();
+    player_config.extra_startup_silence_ms = 400;
+    player_config.required_lead_time_ms = 10;
+
+    SendspinClient client(make_client_config("player-timing-undercut"));
+    auto& player = client.add_player(std::move(player_config));
+
+    ClientPlayerStateObject state = build_player_state(player);
+    EXPECT_EQ(state.required_lead_time_ms, PlayerRoleConfig::pipeline_lead_time_ms(400));
 }
 
 // The timing parameters describe the pipeline, not the delay knob: they are reported whether or
@@ -138,6 +167,8 @@ TEST(PlayerRoleTimingParameters, ReportedWhileOutputDelayIsNotAdjustable) {
 
     ClientPlayerStateObject state = build_player_state(player);
     EXPECT_EQ(state.output_delay_ms, 0);
-    EXPECT_EQ(state.required_lead_time_ms, PlayerRoleConfig::DEFAULT_REQUIRED_LEAD_TIME_MS);
+    EXPECT_EQ(state.required_lead_time_ms,
+              PlayerRoleConfig::pipeline_lead_time_ms(
+                  PlayerRoleConfig::DEFAULT_EXTRA_STARTUP_SILENCE_MS));
     EXPECT_EQ(state.min_buffer_ms, PlayerRoleConfig::DEFAULT_MIN_BUFFER_MS);
 }

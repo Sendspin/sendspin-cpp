@@ -318,21 +318,31 @@ struct PlayerRoleConfig {
     /// Larger values trade longer startup latency for more underflow protection; 0 disables.
     uint16_t extra_startup_silence_ms{DEFAULT_EXTRA_STARTUP_SILENCE_MS};
 
-    /// @brief Default startup lead requested from the server: the sync task's 25 ms of
-    /// initial-sync priming silence, plus the extra startup silence it queues behind it, plus a
-    /// 75 ms allowance for codec init, the first decode, and the audio backend's own buffering
-    /// on an ESP32-class target.
-    static constexpr uint16_t DEFAULT_REQUIRED_LEAD_TIME_MS =
-        25U + DEFAULT_EXTRA_STARTUP_SILENCE_MS + 75U;
+    /// @brief Startup lead the decode pipeline itself spends before the first chunk can play in
+    /// full, for a given `extra_startup_silence_ms`: the sync task's 25 ms of initial-sync priming
+    /// silence, the extra startup silence, and a 75 ms allowance for codec init, the first decode
+    /// and the audio backend's own buffering on an ESP32-class target. A deliberate overestimate:
+    /// the extra silence replaces whatever priming silence is still unsent, so those two terms
+    /// overlap in part.
+    /// @param extra_startup_silence_ms The configured extra startup silence.
+    /// @return Lead time in milliseconds.
+    static constexpr uint16_t pipeline_lead_time_ms(uint16_t extra_startup_silence_ms) {
+        return static_cast<uint16_t>(25U + extra_startup_silence_ms + 75U);
+    }
 
     /// @brief Startup lead in milliseconds reported as `required_lead_time_ms` in every
     /// client/state player object, measured from the server's transmission of a stream/start or
     /// stream/clear to the playback timestamp of the first chunk that can be played in full
     /// (roles/player/v1.md "client/state player object"). The server treats it as a hint and may
-    /// give less. This library reports the configured value rather than a measured one; raise it
-    /// alongside `extra_startup_silence_ms`, and to cover an output whose own startup latency the
-    /// default allowance does not reach.
-    uint16_t required_lead_time_ms{DEFAULT_REQUIRED_LEAD_TIME_MS};
+    /// give less.
+    ///
+    /// Unset reports `pipeline_lead_time_ms(extra_startup_silence_ms)`, so raising the startup
+    /// silence raises the lead the server gives without a second setting to remember. Set it to
+    /// cover an output whose own startup latency the allowance above does not reach; the reported
+    /// value is never below what the pipeline spends, since the server extends lead only toward
+    /// the number it is given. This library reports a configured or derived value, not a measured
+    /// one.
+    std::optional<uint16_t> required_lead_time_ms{};
 
     /// @brief Default ongoing buffer requested from the server. Sized to ride out the
     /// interference bursts a Wi-Fi client sees on a shared channel, and small enough that the
