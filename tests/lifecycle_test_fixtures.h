@@ -638,6 +638,13 @@ public:
         return this->client_state_count_.load();
     }
 
+    /// The client/state messages received, whole, in arrival order. Lets a test read the role
+    /// objects a state carried, which is what the server derives each role's stream from.
+    std::vector<std::string> client_states() const {
+        std::lock_guard<std::mutex> lock(this->pair_mutex_);
+        return this->client_states_;
+    }
+
     /// pair/abort reasons the client sent, in arrival order.
     std::vector<std::string> pair_abort_reasons() const {
         std::lock_guard<std::mutex> lock(this->pair_mutex_);
@@ -813,6 +820,10 @@ private:
         }
 
         if (std::strcmp(type, "client/state") == 0) {
+            {
+                std::lock_guard<std::mutex> plock(this->pair_mutex_);
+                this->client_states_.push_back(json);
+            }
             this->client_state_count_.fetch_add(1);
             return;
         }
@@ -897,6 +908,7 @@ private:
     std::atomic<bool> closed_{false};
 
     mutable std::mutex pair_mutex_;
+    std::vector<std::string> client_states_;
     std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> learned_psk_;
     std::optional<std::string> learned_psk_id_;
     std::vector<std::string> controller_commands_;

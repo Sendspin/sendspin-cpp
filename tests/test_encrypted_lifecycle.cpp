@@ -26,6 +26,7 @@
 
 #include "connection.h"
 #include "connection_manager.h"
+#include "constants.h"
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "lifecycle_test_fixtures.h"
@@ -90,6 +91,10 @@ constexpr uint16_t COMBINED_FIRST_TEST_PORT = 19012;
 constexpr uint16_t COMBINED_REKEY_TEST_PORT = 19013;
 constexpr uint16_t COMBINED_METHOD_TEST_PORT = 19014;
 constexpr uint16_t RESELECT_PAIRING_TEST_PORT = 19015;
+constexpr uint16_t ROLE_STATE_OBJECTS_TEST_PORT = 19016;
+constexpr uint16_t ROLE_ADDED_STATE_TEST_PORT = 19017;
+constexpr uint16_t METADATA_SCHEDULE_TEST_PORT = 19018;
+constexpr uint16_t METADATA_PENDING_TEST_PORT = 19019;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -1236,6 +1241,168 @@ TEST(EncryptedLifecycle, ControllerCommandsWaitForTheRoleToBeActive) {
     pump_for(client, 100);
 }
 
+namespace {
+
+// The roles whose client/state objects these tests read, configured the way a display device
+// would: two artwork channels and a spectrum visualizer.
+void add_state_object_roles(SendspinClient& client) {
+    PlayerRoleConfig player_config;
+    player_config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
+    client.add_player(std::move(player_config));
+
+    ArtworkRoleConfig artwork_config;
+    artwork_config.preferred_formats = {
+        {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 320},
+        {SendspinImageSource::ARTIST, SendspinImageFormat::PNG, 64, 64},
+    };
+    client.add_artwork(std::move(artwork_config));
+
+    VisualizerRoleConfig visualizer_config;
+    visualizer_config.support.buffer_capacity = 4096;
+    visualizer_config.stream.types = {VisualizerDataType::SPECTRUM};
+    visualizer_config.stream.rate_max = 30;
+    visualizer_config.stream.spectrum = VisualizerSpectrumConfig{
+        .n_disp_bins = 16,
+        .scale = VisualizerSpectrumScale::MEL,
+        .f_min = 40,
+        .f_max = 16000,
+    };
+    client.add_visualizer(std::move(visualizer_config));
+}
+
+// Parses the last client/state the fake server received. Fails the calling test if none arrived.
+bool parse_last_client_state(const FakeEncryptedServer& server, JsonDocument& doc) {
+    const std::vector<std::string> states = server.client_states();
+    if (states.empty()) {
+        ADD_FAILURE() << "no client/state was sent";
+        return false;
+    }
+    return deserializeJson(doc, states.back()) == DeserializationError::Ok;
+}
+
+}  // namespace
+
+// messaging.md "client/state": a client/state carries an object for each role that is active, and
+// nothing for a role that is not, since a server must ignore an inactive role's object rather
+// than stream from it. The client configures all three state-object roles here and the server
+// activates two of them, so one message shows both halves of that rule.
+TEST(EncryptedLifecycle, ClientStateCarriesAnObjectForEachActiveRole) {
+    SendspinClientConfig config;
+    config.name = "Role State Objects Test Client";
+    config.server_port = ROLE_STATE_OBJECTS_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    add_state_object_roles(client);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["player@v1","visualizer@v1"])";
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(ROLE_STATE_OBJECTS_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server->client_state_count() > 0; }, 4000))
+        << "the client sent no client/state after the activation";
+
+    JsonDocument doc;
+    ASSERT_TRUE(parse_last_client_state(*server, doc));
+    JsonObjectConst payload = doc["payload"].as<JsonObjectConst>();
+
+    ASSERT_TRUE(payload["player"].is<JsonObjectConst>()) << "the active player role reported none";
+    EXPECT_TRUE(payload["player"]["supported_commands"].is<JsonArrayConst>());
+
+    ASSERT_TRUE(payload["visualizer"].is<JsonObjectConst>())
+        << "the active visualizer role reported no state";
+    EXPECT_EQ(payload["visualizer"]["rate_max"].as<int>(), 30);
+    EXPECT_STREQ(payload["visualizer"]["types"][0], "spectrum");
+
+    // The artwork role is configured on this client but not activated, so its object stays off
+    // the wire: a server that received it would have to ignore it.
+    EXPECT_TRUE(payload["artwork"].isUnbound())
+        << "an inactive role's object was reported in client/state";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// messaging.md "client/state": when a role that defines a state object becomes active in
+// active_roles, the client sends an update that includes that role's object, and "stream/start"
+// has the server wait for that update before starting the role's stream. A role added by a later
+// activation therefore needs its own publication; without one the server never starts its stream.
+TEST(EncryptedLifecycle, ActivateThatAddsARoleSendsItsClientState) {
+    SendspinClientConfig config;
+    config.name = "Role Added State Test Client";
+    config.server_port = ROLE_ADDED_STATE_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    add_state_object_roles(client);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["player@v1"])";
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(ROLE_ADDED_STATE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server->client_state_count() > 0; }, 4000))
+        << "the client sent no client/state after the first activation";
+    const int states_after_admission = server->client_state_count();
+    {
+        JsonDocument doc;
+        ASSERT_TRUE(parse_last_client_state(*server, doc));
+        ASSERT_TRUE(doc["payload"]["artwork"].isUnbound())
+            << "artwork@v1 is not active yet, so its object cannot be reported";
+    }
+
+    // An activation that leaves the set alone asks for nothing new: the state the server holds is
+    // still the state of every active role.
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["player@v1"]}})"));
+    pump_for(client, 200);
+    EXPECT_EQ(server->client_state_count(), states_after_admission)
+        << "an activation that changed no role republished state the server already had";
+
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["player@v1","artwork@v1"]}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server->client_state_count() > states_after_admission; }, 4000))
+        << "the activation that added artwork@v1 published no client/state";
+
+    JsonDocument doc;
+    ASSERT_TRUE(parse_last_client_state(*server, doc));
+    JsonArrayConst channels = doc["payload"]["artwork"]["channels"].as<JsonArrayConst>();
+    ASSERT_EQ(channels.size(), 2u) << "the added role's object did not carry its channels";
+    EXPECT_STREQ(channels[0]["source"], "album");
+    EXPECT_EQ(channels[0]["width"].as<int>(), 320);
+    // The roles that were already active are reported in the same message, which is the full
+    // state the server keeps for this client.
+    EXPECT_TRUE(doc["payload"]["player"].is<JsonObjectConst>());
+
+    // A removal is the mirror image: the next state simply stops carrying the role's object.
+    const int states_before_removal = server->client_state_count();
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["player@v1"]}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server->client_state_count() > states_before_removal; }, 4000))
+        << "the activation that removed artwork@v1 published no client/state";
+    JsonDocument after_removal;
+    ASSERT_TRUE(parse_last_client_state(*server, after_removal));
+    EXPECT_TRUE(after_removal["payload"]["artwork"].isUnbound())
+        << "a removed role's object was still reported";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
 // connection.md "Re-handshake": once the client has received Noise message 1 it sends nothing but
 // the handshake until the new server/activate arrives. Role-originated traffic waits with
 // everything else, even though the connection keeps its admitted slot and its active roles
@@ -1713,6 +1880,103 @@ TEST(EncryptedLifecycle, MetadataStateReplacesRatherThanMerges) {
     EXPECT_EQ(bundle.listener.last_title, "Second");
     EXPECT_EQ(bundle.listener.last_artist, "") << "an omitted artist must not carry forward";
     EXPECT_FALSE(bundle.listener.last_had_progress) << "an omitted progress clears the position";
+}
+
+// messaging.md "server/state": the first state a server sends for a role carries a past or
+// present timestamp, so the client is brought up to date, and a scheduled update may follow it
+// immediately. Both land before the main loop runs, and the state describing what is playing now
+// must still be applied rather than skipped in favor of the one timed to the next track.
+TEST(EncryptedLifecycle, ImmediateMetadataSurvivesAScheduledStateInTheSameTick) {
+    RecordingMetadataListener listener;
+
+    SendspinClientConfig config;
+    config.name = "Metadata Immediate Plus Scheduled Test Client";
+    config.server_port = METADATA_SCHEDULE_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    client.add_metadata().set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["metadata@v1"])";
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(METADATA_SCHEDULE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+
+    // Far enough ahead that the scheduled state cannot come due while this test runs.
+    const int64_t scheduled_at = platform_time_us() + 30 * static_cast<int64_t>(US_PER_SECOND);
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Now Playing"}}})"));
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
+        std::to_string(scheduled_at) + R"(,"title":"Next Track"}}})"));
+
+    // Both cross the network thread while the main loop is parked, so a single drain takes them.
+    EXPECT_FALSE(wait_until([&] { return listener.updates.load() > 0; }, 300))
+        << "a state was applied without a main-loop tick";
+    pump_for(client, 50);
+
+    EXPECT_EQ(listener.updates.load(), 1)
+        << "the state describing the current track was dropped for the scheduled one";
+    EXPECT_EQ(listener.last_title, "Now Playing");
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// roles/metadata/v1.md "Scheduled metadata updates": a state whose timestamp is still in the
+// future becomes the pending update, replacing any held one, and only the survivor is applied
+// when its moment arrives.
+TEST(EncryptedLifecycle, ANewerScheduledMetadataStateReplacesThePendingOne) {
+    RecordingMetadataListener listener;
+
+    SendspinClientConfig config;
+    config.name = "Metadata Pending Replace Test Client";
+    config.server_port = METADATA_PENDING_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    client.add_metadata().set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["metadata@v1"])";
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(METADATA_PENDING_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
+        std::to_string(platform_time_us() + 30 * static_cast<int64_t>(US_PER_SECOND)) +
+        R"(,"title":"First Pending"}}})"));
+    pump_for(client, 100);
+    ASSERT_EQ(listener.updates.load(), 0) << "a future-dated state was applied early";
+
+    // Comes due shortly, so a client that kept the first pending state instead of replacing it
+    // never fires at all.
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
+        std::to_string(platform_time_us() + static_cast<int64_t>(US_PER_SECOND) / 4) +
+        R"(,"title":"Second Pending"}}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return listener.updates.load() > 0; }, 4000))
+        << "the scheduled state that replaced the pending one never fired";
+
+    EXPECT_EQ(listener.last_title, "Second Pending");
+    EXPECT_EQ(listener.updates.load(), 1)
+        << "the replaced pending state fired as well as the one that replaced it";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
 }
 
 // Control: the harness itself delivers. An admitted connection's role message reaches the

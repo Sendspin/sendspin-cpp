@@ -733,8 +733,13 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         event.active_roles.has_value()
             ? event.active_roles
             : (!playback_capable ? std::make_optional(EMPTY_ROLES) : std::nullopt);
+    // Copied before the activate is applied: messaging.md "client/state" ties the next state
+    // update to the active-role set changing, so the comparison needs the set this activation
+    // replaces.
+    const std::vector<std::string> roles_before = event.conn->get_active_roles();
     event.conn->apply_server_activate(event.activities, active_roles_to_apply, event.pairing_method,
                                       event.pairing_pin_length);
+    const bool roles_changed = roles_before != event.conn->get_active_roles();
 
     // First activate on a long-term PSK: mark the record used (reference parity).
     // Safe here because RecordStore mutations stay on the main loop.
@@ -831,6 +836,17 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
             }
         } else if (is_first && event.conn->is_handshake_complete()) {
             this->client_->on_handshake_complete(event.conn.get());
+        }
+
+        // messaging.md "client/state": a role that defines a state object and becomes active in
+        // active_roles must be told about in an update that includes that role's object, and
+        // "stream/start" has the server wait for that update before starting the role's stream.
+        // publish_client_state() builds an object for every role active on the connection, so one
+        // publish serves an added role and, equally, drops the object of a removed one. A first
+        // activate publishes through on_handshake_complete(); this covers every later one that
+        // moves the set.
+        if (roles_changed && !is_first && event.conn->is_operational()) {
+            this->client_->publish_client_state(event.conn.get());
         }
         return;
     }
