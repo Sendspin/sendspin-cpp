@@ -77,6 +77,7 @@ constexpr uint16_t REACTIVATE_PAIRING_TEST_PORT = 19003;
 constexpr uint16_t UNPAIR_RECORD_TEST_PORT = 19004;
 constexpr uint16_t UNPAIR_SENTINEL_TEST_PORT = 19005;
 constexpr uint16_t INACTIVE_ROLE_SEND_TEST_PORT = 19006;
+constexpr uint16_t LEAVE_TEST_PORT = 19007;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -843,6 +844,53 @@ TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
         << "An unauthenticated binary frame must close the connection, not be dispatched";
 
     ws.stop();
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// messaging.md "client/leave": a client that no longer wants to take part in its group's playback
+// says so, and the server moves it to a solo stopped group. It needs an admitted connection that
+// has been activated; before that there is no group to leave and nothing may be sent.
+TEST(EncryptedLifecycle, LeaveIsSentOnlyOnAnActivatedConnection) {
+    SendspinClientConfig config;
+    config.name = "Leave Test Client";
+    config.server_port = LEAVE_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    // No connection at all: the call is refused rather than queued for the next server.
+    client.leave();
+    pump_for(client, 20);
+
+    FakeEncryptedServerOptions options;
+    options.suppress_activate = true;
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(LEAVE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    // Handshake and hello complete, but the connection is never activated, so it stays in the
+    // nursery and has no group.
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server->client_hello_count() > 0; }, 4000));
+    client.leave();
+    pump_for(client, 50);
+    EXPECT_EQ(server->client_leave_count(), 0)
+        << "client/leave was sent on a connection that was never activated";
+
+    // Control: once the activate lands and the connection is admitted, the same call goes out.
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["player@v1"]}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+    client.leave();
+    EXPECT_TRUE(pump_until(
+        client, [&] { return server->client_leave_count() == 1; }, 4000))
+        << "client/leave was not sent on an admitted, activated connection";
+
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
 }

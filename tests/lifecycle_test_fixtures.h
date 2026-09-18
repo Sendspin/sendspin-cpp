@@ -603,6 +603,11 @@ public:
         return this->pair_init_preceded_finalize_;
     }
 
+    // Number of client/leave messages received so far.
+    int client_leave_count() const {
+        return this->client_leave_count_.load();
+    }
+
     // Number of client/command messages received so far, with the command each carried. Lets a
     // test show that a role message was, or was not, sent while its role was inactive.
     std::vector<std::string> controller_commands() const {
@@ -781,6 +786,11 @@ private:
             return;
         }
 
+        if (std::strcmp(type, "client/leave") == 0) {
+            this->client_leave_count_.fetch_add(1);
+            return;
+        }
+
         if (std::strcmp(type, "client/command") == 0) {
             std::lock_guard<std::mutex> plock(this->pair_mutex_);
             this->controller_commands_.push_back(doc["payload"]["controller"]["command"] | "");
@@ -859,6 +869,7 @@ private:
     std::optional<PairInitRecord> pair_init_;
     bool pair_init_preceded_finalize_{false};
 
+    std::atomic<int> client_leave_count_{0};
     std::atomic<int> client_state_count_{0};
     std::atomic<bool> got_client_time_{false};
 };

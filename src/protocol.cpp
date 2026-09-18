@@ -1087,6 +1087,20 @@ std::string format_stream_request_format_message(const StreamRequestFormatMessag
     return output;
 }
 
+std::string format_client_leave_message() {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/leave";
+    // messaging.md "client/leave": no payload fields, but the envelope carries a payload object
+    // like every other message.
+    root["payload"].to<JsonObject>();
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
 std::string format_client_goodbye_message(SendspinGoodbyeReason reason) {
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();

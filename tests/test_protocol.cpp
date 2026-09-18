@@ -741,6 +741,16 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
     EXPECT_FALSE(doc["payload"]["device_info"]["mac_address"].is<const char*>());
 }
 
+// messaging.md "client/leave": the message carries no payload fields, but the envelope shape is
+// the same as every other message's, so a server parsing it finds the payload object it expects.
+TEST(Protocol, FormatClientLeaveHasEmptyPayload) {
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_leave_message()));
+    EXPECT_STREQ(doc["type"].as<const char*>(), "client/leave");
+    ASSERT_TRUE(doc["payload"].is<JsonObject>());
+    EXPECT_EQ(doc["payload"].as<JsonObject>().size(), 0U);
+}
+
 // ============================================================================
 // client/state field set
 // ============================================================================

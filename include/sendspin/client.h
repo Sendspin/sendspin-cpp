@@ -621,6 +621,21 @@ public:
     /// @param state The new client state to publish
     void update_state(SendspinClientState state);
 
+    /// @brief Leaves the current group with client/leave. Main loop only.
+    ///
+    /// Sends messaging.md "client/leave": the client no longer wants to take part in its group's
+    /// playback, for example while it plays a local source it can be interrupted out of. The
+    /// server treats it as it treats a client becoming unavailable: this client ends up alone in
+    /// a stopped group, and rejoins only when an operator switches it back. Leaving does not
+    /// change availability, so the server may still take the client over for new playback; a
+    /// client that will not yield reports SendspinClientState::EXTERNAL_SOURCE through
+    /// update_state() instead.
+    ///
+    /// Only meaningful while the group is playing: a client in a stopped group keeps its
+    /// grouping by staying. Ignored, with a log, unless a connection is admitted and has sent
+    /// its first server/activate, and while that activation declares a pairing activity.
+    void leave();
+
     // ========================================
     // Pairing
     // ========================================

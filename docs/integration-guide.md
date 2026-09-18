@@ -987,6 +987,24 @@ client.update_state(SendspinClientState::ERROR);             // Error condition
 client.update_state(SendspinClientState::SYNCHRONIZED);      // Back to normal
 ```
 
+## Leaving the Group
+
+A device that plays a local source it can be interrupted out of stays available and leaves its
+group instead of reporting itself unavailable:
+
+```cpp
+client.leave();  // Sends client/leave
+```
+
+The server treats this as it treats a client becoming unavailable: the client ends up alone in a
+stopped group and rejoins only when an operator switches it back. Availability is unchanged, so
+the server may still take the client over for new playback. A device that will not yield reports
+`SendspinClientState::EXTERNAL_SOURCE` instead.
+
+Leaving is only meaningful while the group is playing; a client in a stopped group keeps its
+grouping by staying. The call needs an admitted connection that has received its first
+`server/activate`, and is ignored (with a log) otherwise. Call it from the main loop thread.
+
 ## Querying State
 
 The client and roles expose query methods for polling state in your main loop or UI update cycle:

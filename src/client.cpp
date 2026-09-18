@@ -912,6 +912,21 @@ void SendspinClient::publish_state() {
     this->publish_client_state(this->connection_manager_->current());
 }
 
+void SendspinClient::leave() {
+    // messaging.md "Client to Server: client/leave". Not a role message, so it does not route
+    // through send_text(): leaving the group is a client-level act that no role activation gates.
+    // The activation gate is the one every outbound message shares, since nothing may be sent
+    // before the connection is admitted and its first server/activate has arrived.
+    auto* conn = this->connection_manager_->current();
+    if (conn == nullptr || !conn->is_connected() || !conn->is_admitted() ||
+        !conn->first_activate_received() || conn->has_activity(SendspinActivity::PAIRING)) {
+        SS_LOGW(TAG, "client/leave ignored: no admitted connection to leave a group on");
+        return;
+    }
+    SS_LOGI(TAG, "Leaving the group (client/leave)");
+    conn->send_app_json(format_client_leave_message(), nullptr);
+}
+
 void SendspinClient::send_text(const std::string& text, const std::string& role_family) {
     // Single choke point for every role-originated send that is not a protocol-internal pairing
     // message (controller commands, visualizer stream/request-format): pairing messages are sent

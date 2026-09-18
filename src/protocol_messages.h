@@ -991,6 +991,11 @@ std::string format_client_state_message(const ClientStateMessage* msg);
 /// @return Stream request format message serialized into JSON format.
 std::string format_stream_request_format_message(const StreamRequestFormatMessage* msg);
 
+/// @brief Formats a client/leave message as a JSON string for sending to the server
+/// messaging.md "client/leave": leaves the client's current group; no payload fields.
+/// @return Leave message serialized into JSON format.
+std::string format_client_leave_message();
+
 /// @brief Formats a client/goodbye message as a JSON string for sending to the server
 /// @param reason The reason for disconnecting.
 /// @return Goodbye message serialized into JSON format.
