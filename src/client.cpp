@@ -1640,9 +1640,12 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
     }
 }
 
-SS_HOT void SendspinClient::process_binary_message(const SendspinConnection* conn,
-                                                   const uint8_t* payload, size_t len) {
-    if (len < 2) {
+SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, const uint8_t* payload,
+                                                   size_t len) {
+    // One byte is enough to name the role that owns the message; how short a body that role
+    // tolerates is the role's own rule (roles/artwork/v1.md, for one, closes the connection on a
+    // message shorter than 2 bytes).
+    if (len < 1) {
         return;
     }
 
@@ -1696,7 +1699,14 @@ SS_HOT void SendspinClient::process_binary_message(const SendspinConnection* con
 #ifdef SENDSPIN_ENABLE_ARTWORK
             if (this->artwork_) {
                 uint8_t slot = get_binary_slot(binary_type);
-                this->artwork_->impl_->handle_binary(slot, data, data_len);
+                if (!this->artwork_->impl_->handle_binary(slot, data, data_len)) {
+                    // roles/artwork/v1.md "Artwork (Binary)": a malformed artwork message, and a
+                    // malformed sequence within an active artwork stream, are protocol errors the
+                    // client MUST close the connection on. Closed silently, like every other
+                    // protocol error reached from the network thread (see close_silently()).
+                    SS_LOGW(TAG, "Malformed artwork message; closing connection");
+                    conn->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
+                }
             }
 #endif
             break;

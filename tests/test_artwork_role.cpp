@@ -19,10 +19,12 @@
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -33,13 +35,77 @@ using namespace sendspin;
 
 namespace {
 
-// Appends val as 8 big-endian bytes (the server timestamp prefix of every artwork binary
-// message), mirroring put_be64 in test_visualizer_role.cpp.
+// Appends val as 8 big-endian bytes (an announce's timestamp), mirroring put_be64 in
+// test_visualizer_role.cpp.
 void put_be64(std::vector<uint8_t>& out, int64_t val) {
     auto u = static_cast<uint64_t>(val);
     for (int i = 7; i >= 0; --i) {
         out.push_back(static_cast<uint8_t>((u >> (8 * i)) & 0xFF));
     }
+}
+
+// Appends val as 4 big-endian bytes (an announce's total_size).
+void put_be32(std::vector<uint8_t>& out, uint32_t val) {
+    for (int i = 3; i >= 0; --i) {
+        out.push_back(static_cast<uint8_t>((val >> (8 * i)) & 0xFF));
+    }
+}
+
+// Flag bits of roles/artwork/v1.md "Artwork (Binary)": bit 0 cancels, bit 1 announces, a part
+// sets neither.
+constexpr uint8_t FLAG_CANCEL = 0x01;
+constexpr uint8_t FLAG_ANNOUNCE = 0x02;
+
+// Builds an announce body: everything the role sees of `[type][flags][timestamp][total_size]`
+// once the caller has stripped the type byte.
+std::vector<uint8_t> announce_body(int64_t timestamp, uint32_t total_size) {
+    std::vector<uint8_t> data{FLAG_ANNOUNCE};
+    put_be64(data, timestamp);
+    put_be32(data, total_size);
+    return data;
+}
+
+// Builds a part body: the flags byte (no bits set) followed by the part's image data.
+std::vector<uint8_t> part_body(const std::vector<uint8_t>& payload) {
+    std::vector<uint8_t> data{0};
+    data.insert(data.end(), payload.begin(), payload.end());
+    return data;
+}
+
+// An image of `length` bytes whose first byte is `marker`, so a test can tell which image
+// decoded, and whose remaining bytes are a position-dependent pattern, so a reassembly that
+// drops, duplicates or reorders a part is visible in the decoded bytes.
+std::vector<uint8_t> make_image(uint8_t marker, size_t length) {
+    std::vector<uint8_t> image(length);
+    for (size_t i = 0; i < length; ++i) {
+        image[i] = static_cast<uint8_t>(marker + i);
+    }
+    return image;
+}
+
+// Feeds one message to the role. Returns what handle_binary() reported: false means the message
+// is a protocol error and the connection must be closed.
+bool feed(ArtworkRole::Impl& impl, uint8_t slot, const std::vector<uint8_t>& body) {
+    return impl.handle_binary(slot, body.data(), body.size());
+}
+
+// Announces `image` on `slot` and sends it as `parts` equal-sized parts (the last one taking the
+// remainder). Returns false if any message was rejected.
+bool send_image(ArtworkRole::Impl& impl, uint8_t slot, const std::vector<uint8_t>& image,
+                size_t parts = 1, int64_t timestamp = 1) {
+    if (!feed(impl, slot, announce_body(timestamp, static_cast<uint32_t>(image.size())))) {
+        return false;
+    }
+    const size_t chunk = (image.size() + parts - 1) / parts;
+    for (size_t offset = 0; offset < image.size(); offset += chunk) {
+        const size_t take = std::min(chunk, image.size() - offset);
+        std::vector<uint8_t> slice(image.begin() + static_cast<long>(offset),
+                                   image.begin() + static_cast<long>(offset + take));
+        if (!feed(impl, slot, part_body(slice))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Window for "must NOT fire" checks. Every path that reopens a slot's gate (frame_done or an
@@ -179,6 +245,26 @@ ArtworkRoleConfig make_single_slot_config(bool gated) {
     return config;
 }
 
+// Builds a one-slot ArtworkRoleConfig whose channel is large enough that its derived image cap
+// (see ArtworkRole::Impl::slot_image_cap) admits an image spanning several maximum-sized
+// messages, which the 100x100 channels above are far too small for.
+ArtworkRoleConfig make_large_slot_config() {
+    ArtworkRoleConfig config;
+    config.preferred_formats.push_back(
+        {SendspinImageSource::ALBUM, SendspinImageFormat::PNG, 512, 512, false});
+    return config;
+}
+
+// Two ungated slots, so a frame on each is decoded without an ack.
+ArtworkRoleConfig make_two_ungated_slot_config() {
+    ArtworkRoleConfig config;
+    config.preferred_formats.push_back(
+        {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 100, 100, false});
+    config.preferred_formats.push_back(
+        {SendspinImageSource::ARTIST, SendspinImageFormat::JPEG, 100, 100, false});
+    return config;
+}
+
 // Builds a two-slot ArtworkRoleConfig: slot 0 gated, slot 1 not.
 ArtworkRoleConfig make_two_slot_config() {
     ArtworkRoleConfig config;
@@ -208,23 +294,17 @@ std::unique_ptr<ArtworkRole::Impl> make_impl(ArtworkRoleConfig config) {
     return impl;
 }
 
-// Sends one fake frame to `slot` whose image payload is [marker, 0xAA] (a distinct first byte
-// per frame so tests can tell which frame decoded).
+// Sends one fake frame to `slot` as a complete single-part transfer; `marker` is the image's
+// first byte, so tests can tell which frame decoded.
 void send_frame(ArtworkRole::Impl& impl, uint8_t slot, uint8_t marker, int64_t timestamp = 1) {
-    std::vector<uint8_t> data;
-    put_be64(data, timestamp);
-    data.push_back(marker);
-    data.push_back(0xAA);
-    impl.handle_binary(slot, data.data(), data.size());
+    send_image(impl, slot, make_image(marker, 2), /*parts=*/1, timestamp);
 }
 
-// Sends a per-channel clear to `slot`: an artwork binary message carrying only the timestamp and
-// no image bytes, which is how the server says the artwork on that channel is no longer valid
-// (as opposed to simply not resending an image that still is).
+// Sends a per-channel clear to `slot`: an announce with total_size 0, the protocol's empty
+// image, which is how the server says the artwork on that channel is no longer valid (as opposed
+// to simply not resending an image that still is).
 void send_clear(ArtworkRole::Impl& impl, uint8_t slot, int64_t timestamp = 1) {
-    std::vector<uint8_t> data;
-    put_be64(data, timestamp);
-    impl.handle_binary(slot, data.data(), data.size());
+    feed(impl, slot, announce_body(timestamp, 0));
 }
 
 // Polls drain_events() until `pred` is true. drain_events() must run on the "main loop" thread
@@ -283,6 +363,472 @@ void wait_slot_state(ArtworkRole::Impl& impl, Pred pred) {
 }
 
 }  // namespace
+
+// ============================================================================
+// Transfer format: an announce, its parts, and the cancel that abandons them
+// (roles/artwork/v1.md "Server -> Client: Artwork (Binary)")
+// ============================================================================
+
+TEST(ArtworkTransfer, AnnounceThenPartsCompletesOneImage) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // "The concatenated data of all parts is the encoded image": the decoded bytes must be the
+    // image in order, which a part written at the wrong offset or a dropped part would break.
+    const std::vector<uint8_t> image = make_image('A', 300);
+    EXPECT_TRUE(send_image(*impl, 0, image, /*parts=*/4));
+
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    EXPECT_EQ(listener.decodes[0].payload, image);
+    // One image is one delivery, however many messages carried it.
+    EXPECT_TRUE(
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+    poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
+    EXPECT_EQ(listener.clear_count(), 0U);
+}
+
+TEST(ArtworkTransfer, TransferDeliversNothingUntilItCompletes) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    const std::vector<uint8_t> image = make_image('A', 100);
+    ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
+    ASSERT_TRUE(feed(*impl, 0, part_body({image.begin(), image.begin() + 60})));
+    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+
+    // Control: the part that takes the accumulated data to total_size completes the transfer.
+    ASSERT_TRUE(feed(*impl, 0, part_body({image.begin() + 60, image.end()})));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    EXPECT_EQ(listener.decodes[0].payload, image);
+}
+
+TEST(ArtworkTransfer, EmptyImageCompletesAtItsAnnounce) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // "An announce with total_size 0 completes immediately, with no parts": nothing is left in
+    // flight, so the next announce is a legal one rather than the malformed sequence it would be
+    // if the empty image were still waiting for parts.
+    ASSERT_TRUE(feed(*impl, 0, announce_body(1, 0)));
+    poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
+
+    EXPECT_TRUE(send_image(*impl, 0, make_image('A', 20)));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+}
+
+TEST(ArtworkTransfer, CancelAbandonsTheTransferInFlight) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
+    ASSERT_TRUE(feed(*impl, 0, part_body(make_image('A', 60))));
+    ASSERT_TRUE(feed(*impl, 0, {FLAG_CANCEL}));
+
+    // The abandoned image never reaches the listener, and the announce that follows is accepted:
+    // the cancel ended the transfer rather than leaving it in flight.
+    EXPECT_TRUE(send_image(*impl, 0, make_image('B', 40)));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    EXPECT_EQ(listener.decode_marker_at(0), 'B');
+    EXPECT_TRUE(
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+}
+
+TEST(ArtworkTransfer, CancelDiscardsThePendingImage) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // A complete image whose display has not been drained yet is the channel's pending image, and
+    // "it discards the channel's pending image" -- so the display must never fire.
+    ASSERT_TRUE(send_image(*impl, 0, make_image('A', 20)));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    ASSERT_TRUE(feed(*impl, 0, {FLAG_CANCEL}));
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW));
+    // "the current image is unaffected": a cancel is not itself a delivery, so it clears nothing.
+    EXPECT_EQ(listener.clear_count(), 0U);
+
+    // Control: the same image with no cancel is displayed.
+    ASSERT_TRUE(send_image(*impl, 0, make_image('B', 20)));
+    listener.wait_until([&] { return listener.decodes.size() >= 2; });
+    poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
+}
+
+TEST(ArtworkTransfer, AnnounceDiscardsThePendingImage) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // "An announce discards that channel's pending image": A is complete but not yet displayed,
+    // so B's announce must leave only B to be displayed. The gated slot is what makes the
+    // discard observable: no frame_done() is ever called here, so B can only reach the decode
+    // callback if discarding A released the delivery A's on_image_decode() armed.
+    ASSERT_TRUE(send_image(*impl, 0, make_image('A', 20)));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    ASSERT_TRUE(send_image(*impl, 0, make_image('B', 20)));
+
+    poll_drain_until(*impl, [&] { return listener.decode_count() >= 2; });
+    EXPECT_EQ(listener.decode_marker_at(1), 'B');
+    // One display, B's: A's was discarded before it could fire.
+    poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 2; }, NEGATIVE_WINDOW));
+}
+
+TEST(ArtworkTransfer, AnnounceTimestampAndSizeAreReadFromTheAnnounce) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(true));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // The gated slot holds the first delivery un-acked, so the second image's notification parks
+    // where the test can read the timestamp and length that were parsed off its announce. A
+    // timestamp read at the wrong offset, or byte-swapped, shows up here.
+    constexpr int64_t TIMESTAMP = 0x0102030405060708;
+    ASSERT_TRUE(send_image(*impl, 0, make_image('A', 8)));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    ASSERT_TRUE(send_image(*impl, 0, make_image('B', 37), /*parts=*/3, TIMESTAMP));
+
+    wait_slot_state(*impl, [&] { return impl->drain_task->slot_buffers[0].has_parked; });
+    std::lock_guard<std::mutex> lock(impl->drain_task->slot_mutex);
+    EXPECT_EQ(impl->drain_task->slot_buffers[0].parked.timestamp, TIMESTAMP);
+    EXPECT_EQ(impl->drain_task->slot_buffers[0].parked.data_length, 37U);
+}
+
+// ============================================================================
+// Malformed sequences: the connection closes (roles/artwork/v1.md "Malformed sequences within an
+// active artwork stream")
+// ============================================================================
+
+TEST(ArtworkMalformedSequence, AnnounceWhileATransferIsInFlightCloses) {
+    RecordingListener listener;
+    auto impl = make_impl(make_two_ungated_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
+    // "At most one image transfer is in flight at a time across all of the role's channels", so
+    // the other channel's announce is a protocol error too.
+    EXPECT_FALSE(feed(*impl, 1, announce_body(1, 20)));
+    EXPECT_FALSE(feed(*impl, 0, announce_body(1, 20)));
+}
+
+TEST(ArtworkMalformedSequence, AnnounceAfterTheTransferCompletesIsAccepted) {
+    RecordingListener listener;
+    auto impl = make_impl(make_two_ungated_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // Control for AnnounceWhileATransferIsInFlightCloses: the same two announces, with the first
+    // transfer finished in between, are both legal.
+    EXPECT_TRUE(send_image(*impl, 0, make_image('A', 100), /*parts=*/2));
+    EXPECT_TRUE(send_image(*impl, 1, make_image('B', 20)));
+    listener.wait_until([&] { return listener.decodes.size() >= 2; });
+}
+
+TEST(ArtworkMalformedSequence, PartWithNoTransferInFlightCloses) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    EXPECT_FALSE(feed(*impl, 0, part_body(make_image('A', 20))));
+}
+
+TEST(ArtworkMalformedSequence, PartOnAnotherChannelCloses) {
+    RecordingListener listener;
+    auto impl = make_impl(make_two_ungated_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
+    EXPECT_FALSE(feed(*impl, 1, part_body(make_image('A', 20))));
+}
+
+TEST(ArtworkMalformedSequence, PartPastTotalSizeCloses) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
+    ASSERT_TRUE(feed(*impl, 0, part_body(make_image('A', 60))));
+    // 41 more bytes would take the image one byte past its announced size.
+    EXPECT_FALSE(feed(*impl, 0, part_body(make_image('A', 41))));
+}
+
+TEST(ArtworkMalformedSequence, PartThatExactlyFillsTheImageIsAccepted) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // Control for PartPastTotalSizeCloses: one byte fewer is the last part of a complete image.
+    ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
+    ASSERT_TRUE(feed(*impl, 0, part_body(make_image('A', 60))));
+    EXPECT_TRUE(feed(*impl, 0, part_body(make_image('B', 40))));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+}
+
+TEST(ArtworkMalformedSequence, SequenceRulesOnlyApplyWithinAnActiveStream) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+
+    // "Servers MUST NOT send artwork messages outside an active artwork stream." A well-formed
+    // message that arrives anyway is ignored, not closed on: the sequence rules are scoped to an
+    // active stream and there is no sequence for it to break.
+    EXPECT_TRUE(feed(*impl, 0, part_body(make_image('A', 20))));
+    EXPECT_TRUE(feed(*impl, 0, {FLAG_CANCEL}));
+    EXPECT_TRUE(
+        listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+}
+
+// ============================================================================
+// Malformed messages: the connection closes (roles/artwork/v1.md "Malformed messages")
+// ============================================================================
+
+TEST(ArtworkMalformedMessage, MessageShorterThanTwoBytesCloses) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // A message of just its type byte: nothing is left once the caller strips it.
+    const uint8_t* no_body = nullptr;
+    EXPECT_FALSE(impl->handle_binary(0, no_body, 0));
+    // Control: two bytes is the shortest legal message, a cancel.
+    EXPECT_TRUE(feed(*impl, 0, {FLAG_CANCEL}));
+}
+
+TEST(ArtworkMalformedMessage, AnnounceThatIsNotFourteenBytesCloses) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    std::vector<uint8_t> short_announce = announce_body(1, 20);
+    short_announce.pop_back();
+    EXPECT_FALSE(feed(*impl, 0, short_announce));
+
+    std::vector<uint8_t> long_announce = announce_body(1, 20);
+    long_announce.push_back(0);
+    EXPECT_FALSE(feed(*impl, 0, long_announce));
+
+    // Control: exactly 14 bytes on the wire (13 here, the type byte stripped).
+    EXPECT_TRUE(feed(*impl, 0, announce_body(1, 0)));
+}
+
+TEST(ArtworkMalformedMessage, CancelWithABodyCloses) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    EXPECT_FALSE(feed(*impl, 0, {FLAG_CANCEL, 0x00}));
+    // Control: the same cancel without the trailing byte.
+    EXPECT_TRUE(feed(*impl, 0, {FLAG_CANCEL}));
+}
+
+TEST(ArtworkMalformedMessage, ReservedFlagBitsClose) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // "Bits 2-7 are reserved and MUST be zero", on every message shape.
+    for (int bit = 2; bit < 8; ++bit) {
+        const auto flags = static_cast<uint8_t>(1U << bit);
+        EXPECT_FALSE(feed(*impl, 0, {flags})) << "part with reserved bit " << bit;
+        EXPECT_FALSE(feed(*impl, 0, {static_cast<uint8_t>(FLAG_CANCEL | flags)}))
+            << "cancel with reserved bit " << bit;
+        std::vector<uint8_t> announce = announce_body(1, 0);
+        announce[0] = static_cast<uint8_t>(FLAG_ANNOUNCE | flags);
+        EXPECT_FALSE(feed(*impl, 0, announce)) << "announce with reserved bit " << bit;
+    }
+    // Control: the three defined flag values are all accepted.
+    EXPECT_TRUE(feed(*impl, 0, announce_body(1, 20)));
+    EXPECT_TRUE(feed(*impl, 0, part_body(make_image('A', 20))));
+    EXPECT_TRUE(feed(*impl, 0, {FLAG_CANCEL}));
+}
+
+TEST(ArtworkMalformedMessage, CancelAndAnnounceFlagsTogetherClose) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    std::vector<uint8_t> both = announce_body(1, 0);
+    both[0] = FLAG_ANNOUNCE | FLAG_CANCEL;
+    EXPECT_FALSE(feed(*impl, 0, both));
+    // A two-byte message with both bits set is refused for the flags, not for its length.
+    EXPECT_FALSE(feed(*impl, 0, {FLAG_ANNOUNCE | FLAG_CANCEL}));
+}
+
+TEST(ArtworkMalformedMessage, MessagePastTheSizeCapCloses) {
+    RecordingListener listener;
+    auto impl = make_impl(make_large_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // "An artwork message MUST NOT exceed 65519 bytes": a part carries at most 65517 data bytes.
+    constexpr size_t MAX_PART_DATA = 65519 - 2;
+    ASSERT_TRUE(feed(*impl, 0, announce_body(1, MAX_PART_DATA * 2)));
+    // Control: a part exactly at the cap is accepted, and is the first half of the image.
+    EXPECT_TRUE(feed(*impl, 0, part_body(make_image('A', MAX_PART_DATA))));
+    // One byte more is a message of 65520 bytes.
+    EXPECT_FALSE(feed(*impl, 0, part_body(make_image('B', MAX_PART_DATA + 1))));
+}
+
+TEST(ArtworkMalformedMessage, ShapeRulesApplyWithNoStreamActive) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+
+    // Unlike the sequence rules, "Malformed messages are protocol errors" is not scoped to an
+    // active stream: the bytes are indefensible whenever they arrive.
+    EXPECT_FALSE(feed(*impl, 0, {0x04}));
+    EXPECT_FALSE(feed(*impl, 0, {FLAG_CANCEL, 0x00}));
+    // Control: a well-formed message outside a stream is ignored, not closed on.
+    EXPECT_TRUE(feed(*impl, 0, announce_body(1, 20)));
+}
+
+// ============================================================================
+// Image cap: an image the role will not hold is discarded, while its sequence is tracked to the
+// end (roles/artwork/v1.md "Artwork (Binary)" on unavailable clients)
+// ============================================================================
+
+TEST(ArtworkImageCap, DerivedFromTheChannelDimensions) {
+    // Four bytes per pixel plus the header allowance: large enough for any encoding of the
+    // geometry the client asked for, and derived from it rather than from a fixed budget.
+    EXPECT_EQ(ArtworkRole::Impl::slot_image_cap(100, 100), 100U * 100U * 4U + 4096U);
+    EXPECT_EQ(ArtworkRole::Impl::slot_image_cap(0, 0), 4096U);
+    // The multiply must be done in size_t: 4096x4096x4 overflows a uint16 or a uint32 product of
+    // the dimensions alone.
+    EXPECT_EQ(ArtworkRole::Impl::slot_image_cap(4096, 4096), 4096U * 4096U * 4U + 4096U);
+}
+
+TEST(ArtworkImageCap, ImageOverTheCapIsDiscardedAndItsSequenceTracked) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // "clients discarding image data MUST still process announces and cancels and count each
+    // part's data bytes toward total_size": the transfer runs to its end holding nothing, so the
+    // announce that follows it is legal rather than a second announce in flight.
+    const uint32_t over_cap =
+        static_cast<uint32_t>(ArtworkRole::Impl::slot_image_cap(100, 100) + 1);
+    ASSERT_TRUE(feed(*impl, 0, announce_body(1, over_cap)));
+    for (uint32_t sent = 0; sent < over_cap;) {
+        const uint32_t take = std::min<uint32_t>(60000, over_cap - sent);
+        ASSERT_TRUE(feed(*impl, 0, part_body(make_image('A', take))));
+        sent += take;
+    }
+    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+
+    // Control: an image within the cap on the same channel is delivered.
+    EXPECT_TRUE(send_image(*impl, 0, make_image('B', 20)));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    EXPECT_EQ(listener.decode_marker_at(0), 'B');
+}
+
+TEST(ArtworkImageCap, ChannelTheRoleDidNotConfigureHoldsNothing) {
+    RecordingListener listener;
+    auto impl = make_impl(make_two_ungated_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // Channel 2 was never declared in client/state, so the role holds no image for it and does
+    // not close on its arrival either.
+    EXPECT_TRUE(send_image(*impl, 2, make_image('A', 20)));
+    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+
+    // Control: the same image on a declared channel decodes.
+    EXPECT_TRUE(send_image(*impl, 1, make_image('B', 20)));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+}
+
+// ============================================================================
+// Stream lifecycle and disconnect drop the transfer in flight
+// ============================================================================
+
+namespace {
+
+// Feeds a partial transfer, applies `end_the_stream`, and asserts that the transfer is gone: a
+// fresh stream takes a new announce (rather than closing on a second announce in flight) and the
+// abandoned image never reaches the listener.
+void expect_transfer_dropped_by(const std::function<void(ArtworkRole::Impl&)>& end_the_stream) {
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
+    ASSERT_TRUE(feed(*impl, 0, part_body(make_image('A', 60))));
+
+    end_the_stream(*impl);
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    EXPECT_TRUE(send_image(*impl, 0, make_image('B', 40)));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    EXPECT_EQ(listener.decode_marker_at(0), 'B');
+    EXPECT_TRUE(
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+}
+
+}  // namespace
+
+TEST(ArtworkTransfer, StreamEndDropsTheTransferInFlight) {
+    expect_transfer_dropped_by([](ArtworkRole::Impl& impl) { impl.handle_stream_end(); });
+}
+
+TEST(ArtworkTransfer, StreamClearDropsTheTransferInFlight) {
+    expect_transfer_dropped_by([](ArtworkRole::Impl& impl) { impl.handle_stream_clear(); });
+}
+
+TEST(ArtworkTransfer, StreamStartDropsTheTransferInFlight) {
+    expect_transfer_dropped_by(
+        [](ArtworkRole::Impl& impl) { impl.handle_stream_start(ServerArtworkStreamObject{}); });
+}
+
+TEST(ArtworkTransfer, DisconnectDropsTheTransferInFlight) {
+    expect_transfer_dropped_by([](ArtworkRole::Impl& impl) { impl.cleanup(); });
+}
 
 // ============================================================================
 // Ungated behavior: require_frame_done = false must reproduce today's behavior exactly
@@ -518,6 +1064,9 @@ TEST(ArtworkChannelClear, GatedClearParksBehindUnackedFrame) {
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    // A is displayed and un-acked, so it is the channel's current image rather than its pending
+    // one, and the clear that follows cannot discard it.
+    poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
 
     // A's delivery is un-acked, so the clear parks rather than overtaking it: the consumer is
     // mid-presentation of A and its buffers must not be disturbed.
@@ -527,8 +1076,7 @@ TEST(ArtworkChannelClear, GatedClearParksBehindUnackedFrame) {
     EXPECT_TRUE(
         poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW));
 
-    // A's own display still fires; only then does acking it release the parked clear.
-    poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
+    // Only acking A releases the parked clear.
     impl->frame_done(0);
     poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
     EXPECT_EQ(listener.clear_at(0), 0);
@@ -567,6 +1115,8 @@ TEST(ArtworkChannelClear, GatedClearSupersedesParkedClear) {
 
     send_frame(*impl, 0, 'A');
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    // A is displayed, so it is the current image and neither clear's announce can discard it.
+    poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
 
     // Two clears arrive back to back while A is un-acked. Both park, and the second must overwrite
     // the first (latest-wins) rather than queue behind it, so the consumer is asked to clear once
@@ -580,7 +1130,6 @@ TEST(ArtworkChannelClear, GatedClearSupersedesParkedClear) {
     wait_slot_state(
         *impl, [&] { return impl->drain_task->slot_buffers[0].parked.timestamp == 2; });
 
-    poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
     impl->frame_done(0);
     poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
     EXPECT_TRUE(
@@ -734,16 +1283,6 @@ private:
     bool released_{false};
 };
 
-// Two ungated slots, so a frame on each is decoded without an ack.
-ArtworkRoleConfig make_two_ungated_slot_config() {
-    ArtworkRoleConfig config;
-    config.preferred_formats.push_back(
-        {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 100, 100, false});
-    config.preferred_formats.push_back(
-        {SendspinImageSource::ARTIST, SendspinImageFormat::JPEG, 100, 100, false});
-    return config;
-}
-
 }  // namespace
 
 // stop() joins the decode thread and discards the notifications it never took, and start()
@@ -791,12 +1330,13 @@ TEST(ArtworkFrameDoneGate, FrameDoneReentrantFromDisplay) {
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
 
+    // Each image is displayed before the next is announced, so neither is discarded as the
+    // other's pending image: both must decode and display on the reentrant ack alone, with no
+    // external frame_done() call and no deadlock.
     send_frame(*impl, 0, 'A');
-    // B may arrive while A is still un-acked (it will park, then replay once the reentrant ack
-    // from A's on_image_display() fires) or after; either way both must eventually decode and
-    // display without any external frame_done() call and without deadlock.
+    poll_drain_until(
+        *impl, [&] { return listener.decode_count() >= 1 && listener.display_count() >= 1; });
     send_frame(*impl, 0, 'B');
-
     poll_drain_until(
         *impl, [&] { return listener.decode_count() >= 2 && listener.display_count() >= 2; });
 

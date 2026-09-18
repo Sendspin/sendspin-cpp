@@ -779,7 +779,7 @@ private:
     /// @param conn The connection the message arrived on
     /// @param payload Pointer to the raw binary data
     /// @param len Length of the binary data in bytes
-    void process_binary_message(const SendspinConnection* conn, const uint8_t* payload, size_t len);
+    void process_binary_message(SendspinConnection* conn, const uint8_t* payload, size_t len);
 
     // ========================================
     // State publishing

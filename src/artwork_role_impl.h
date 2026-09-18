@@ -55,22 +55,22 @@ enum class SlotAckState : uint8_t {
     PRESENTED,         // on_image_display or on_image_clear fired, awaiting frame_done()
 };
 
-/// @brief Notification sent from the network thread to the decode thread when new image data
-/// arrives
+/// @brief Notification sent from the network thread to the decode thread when an image transfer
+/// completes
 ///
 /// All metadata is carried in the notification itself (not in SlotBuffer) so that the
 /// ThreadSafeQueue's internal mutex provides the happens-before guarantee between the
 /// network thread's writes and the decode thread's reads.
 ///
-/// `generation` and `stream_epoch` let the decode thread detect a stale notification: if the
-/// buffer it names has since been overwritten (generation mismatch) or the stream has moved on
-/// (stream_epoch mismatch), the notification is skipped rather than decoding torn or
-/// superseded data. See ArtworkRole::Impl::drain_thread_func.
+/// `generation` and `epoch` let the decode thread detect a stale notification: if the buffer it
+/// names has since been claimed for another transfer (generation mismatch) or the slot has moved
+/// on (epoch mismatch, see ArtworkRole::Impl::slot_epochs), the notification is skipped rather
+/// than decoding torn or superseded data. See ArtworkRole::Impl::drain_thread_func.
 ///
-/// `data_length == 0` marks the protocol's per-channel clear (an artwork binary message carrying
-/// only the type byte and timestamp). It names no buffer, so `buffer_idx`/`generation` are unused
-/// and left at 0; everything else about it -- queue ordering, the ack gate, and the
-/// timestamp-scheduled hand-off to the main loop -- matches a frame. See handle_binary().
+/// `data_length == 0` marks the protocol's empty image (an announce with `total_size` 0), which
+/// clears the channel. It names no buffer, so `buffer_idx`/`generation` are unused and left at 0;
+/// everything else about it -- queue ordering, the ack gate, and the timestamp-scheduled hand-off
+/// to the main loop -- matches a frame. See handle_binary().
 struct ArtworkNotification {
     uint8_t slot;
     uint8_t buffer_idx;
@@ -78,7 +78,34 @@ struct ArtworkNotification {
     int64_t timestamp;
     SendspinImageFormat format;
     uint32_t generation;
-    uint32_t stream_epoch;
+    uint32_t epoch;
+};
+
+/// @brief The one image transfer the role has in flight, across all of its channels
+///
+/// roles/artwork/v1.md "Artwork (Binary)" allows at most one transfer in flight per role: it
+/// begins at an announce and ends when the accumulated part data reaches `total_size`, when a
+/// cancel abandons it, or when the stream it belongs to goes away. One role-wide record is
+/// therefore enough, and a second announce arriving while `in_flight` is set is the
+/// malformed-sequence rule rather than a second record.
+///
+/// Guarded by DrainTask::slot_mutex: written from the network thread (handle_binary() and the
+/// stream lifecycle handlers) and cleared from the main loop by cleanup().
+///
+/// `buffer_idx`/`generation` name the SlotBuffer the parts accumulate into, claimed once at the
+/// announce so every part of the transfer lands in the same buffer. `discarding` marks a transfer
+/// whose image the role will not hold (see ArtworkRole::Impl::image_cap): per "Artwork (Binary)",
+/// a client discarding image data must still count each part's bytes toward `total_size`, so the
+/// sequence is tracked to the end and only the bytes are dropped.
+struct ArtworkTransfer {
+    int64_t timestamp{0};
+    uint32_t total_size{0};
+    uint32_t received{0};
+    uint32_t generation{0};
+    bool in_flight{false};
+    uint8_t slot{0};
+    uint8_t buffer_idx{0};
+    bool discarding{false};
 };
 
 /// @brief Double-buffered image storage for a single artwork slot
@@ -110,12 +137,12 @@ struct SlotBuffer {
 ///
 /// Merged cross-thread by the decode thread (one slot per merge) and taken whole by the
 /// main-loop drain; a bit set in valid_mask means timestamps[i] holds a pending display.
-/// epochs[i] carries the stream_epoch the decode ran under, so the main-loop deadline check can
-/// drop a display whose stream has since been replaced (a stream restart bumps the epoch but
-/// cannot reach a display already folded into the main-thread holds). A bit set in clear_mask
-/// means slot i's pending delivery is a per-channel clear rather than a decoded frame, so the
-/// deadline fires on_image_clear() instead of on_image_display(); it is meaningful only where
-/// valid_mask is set.
+/// epochs[i] carries the slot epoch the decode ran under, so the main-loop deadline check can
+/// drop a display the slot has since moved past (a stream restart, a cancel, or a fresh announce
+/// bumps the epoch but cannot reach a display already folded into the main-thread holds). A bit
+/// set in clear_mask means slot i's pending delivery is a per-channel clear rather than a decoded
+/// frame, so the deadline fires on_image_clear() instead of on_image_display(); it is meaningful
+/// only where valid_mask is set.
 struct ArtworkDisplayUpdate {
     int64_t timestamps[ARTWORK_MAX_SLOTS]{};
     uint32_t epochs[ARTWORK_MAX_SLOTS]{};
@@ -138,8 +165,9 @@ struct ArtworkRole::Impl {
         EventFlags event_flags;
         std::thread drain_thread;
         SlotBuffer slot_buffers[ARTWORK_MAX_SLOTS];
-        /// @brief Guards every field of every entry in slot_buffers. One mutex for all slots
-        /// is intentional: artwork is not a hot path, so cross-slot contention is negligible.
+        /// @brief Guards every field of every entry in slot_buffers, plus the role-wide
+        /// ArtworkTransfer. One mutex for all slots is intentional: artwork is not a hot path,
+        /// so cross-slot contention is negligible.
         std::mutex slot_mutex;
     };
 
@@ -157,7 +185,13 @@ struct ArtworkRole::Impl {
     bool start();
     void build_hello_fields(ClientHelloMessage& msg) const;
     void build_state_fields(ClientStateMessage& msg) const;
-    void handle_binary(uint8_t slot, const uint8_t* data, size_t len);
+    /// @brief Handles one artwork binary message, the type byte already stripped by the caller.
+    /// @param slot Artwork channel the message's type byte named (0-3).
+    /// @param data The message from its flags byte on.
+    /// @param len Length of `data`, one less than the message's own length.
+    /// @return false when the message is a protocol error per roles/artwork/v1.md "Artwork
+    /// (Binary)" and the caller MUST close the connection; true when it was processed or ignored.
+    bool handle_binary(uint8_t slot, const uint8_t* data, size_t len);
     void handle_stream_start(const ServerArtworkStreamObject& stream);
     void handle_stream_end();
     void handle_stream_clear();
@@ -216,6 +250,42 @@ struct ArtworkRole::Impl {
     static uint32_t display_lateness_ms(int64_t client_ts, int64_t overdue_us);
     // True if `slot` is within range and configured with require_frame_done.
     bool ack_enabled(uint8_t slot) const;
+    // Largest encoded image the role will hold for a channel of `width` by `height` pixels: the
+    // uncompressed 4-bytes-per-pixel size of the dimensions the client itself asked for, plus an
+    // allowance for container headers and per-row filter bytes. No encoding of that geometry is
+    // larger in practice, so the bound never rejects an image the server was asked for, while an
+    // implausible `total_size` is refused before a byte of it is allocated. Pure and static for
+    // direct unit testing.
+    static size_t slot_image_cap(uint16_t width, uint16_t height);
+    // slot_image_cap() for a configured slot; 0 for a slot the role declared no channel for, so
+    // an image the role never asked for is never held.
+    size_t image_cap(uint8_t slot) const;
+    // Format the decode callback reports for `slot`: the one the channel was configured with, so
+    // the array index stays authoritative for slot mapping (see the Impl constructor).
+    SendspinImageFormat image_format(uint8_t slot) const;
+    // Discards the slot's pending image by bumping its epoch, and abandons the in-flight transfer
+    // if it is that slot's. Both a cancel message and a fresh announce need exactly this.
+    void discard_pending(uint8_t slot);
+    // Discards every channel's pending image: bumps all the epochs and drops any transfer in
+    // flight. A stream start, end or clear and a disconnect each end whatever was in flight.
+    void bump_all_epochs();
+    // Outcome of one transfer message. MALFORMED is the protocol error handle_binary() reports to
+    // its caller; COMPLETED means the notification it filled in is ready to enqueue.
+    enum class TransferOutcome : uint8_t {
+        ACCEPTED,
+        COMPLETED,
+        MALFORMED,
+    };
+    // Starts the transfer an announce declares, filling `complete` and returning COMPLETED for the
+    // empty image (`total_size` 0), which has no parts to wait for.
+    TransferOutcome begin_transfer(uint8_t slot, const uint8_t* body,
+                                   ArtworkNotification& complete);
+    // Appends one part's data to the transfer in flight, filling `complete` and returning
+    // COMPLETED once the accumulated data reaches `total_size`.
+    TransferOutcome append_part(uint8_t slot, const uint8_t* part, size_t part_len,
+                                ArtworkNotification& complete);
+    // Hands a completed image (or empty image) to the decode thread.
+    void enqueue_notification(const ArtworkNotification& notif) const;
     // Wakes the decode thread out of its blocking queue receive so it re-runs the parked-slot
     // sweep at the top of its loop.
     void wake_drain_thread() const;
@@ -231,6 +301,8 @@ struct ArtworkRole::Impl {
     // Struct fields
     ArtworkRoleConfig config;
     std::vector<ArtworkChannelFormatObject> artwork_channels;
+    // The role's single image transfer in flight; guarded by DrainTask::slot_mutex.
+    ArtworkTransfer transfer;
 
     // Pointer fields
     SendspinClient* client;
@@ -247,11 +319,20 @@ struct ArtworkRole::Impl {
     int64_t held_display_ts[ARTWORK_MAX_SLOTS]{};
 
     // 32-bit fields
-    // Stream epoch each held display was decoded under; a mismatch against stream_epoch at
-    // deadline-check time means the stream was since replaced (e.g. a restart with no
-    // intervening end/clear) and the display must be dropped, since the network thread cannot
-    // reach the main-thread holds to cancel it. Main-thread only; see held_display_ts.
+    // Slot epoch each held display was decoded under; a mismatch against slot_epochs at
+    // deadline-check time means the slot has since moved past it (a stream restart, a cancel, or
+    // a fresh announce) and the display must be dropped, since the network thread cannot reach
+    // the main-thread holds to cancel it. Main-thread only; see held_display_ts.
     uint32_t held_display_epoch[ARTWORK_MAX_SLOTS]{};
+
+    /// @brief Per-channel delivery epoch, bumped whenever the channel's pending image is
+    /// discarded: by a stream start/end/clear or cleanup (every channel at once), and by a cancel
+    /// message or a fresh announce (that channel alone, per roles/artwork/v1.md "Artwork
+    /// (Binary)"). A notification, a decode hand-off, and a held display all carry the epoch they
+    /// were made under, so each drops itself at its next check instead of having to be hunted
+    /// down across three threads. An image already displayed has left the pipeline, which is what
+    /// makes the current image survive a cancel.
+    std::atomic<uint32_t> slot_epochs[ARTWORK_MAX_SLOTS]{};
 
     // 8-bit fields
     std::atomic<bool> stream_active{false};
@@ -261,12 +342,6 @@ struct ArtworkRole::Impl {
     // on_image_clear() over on_image_display() when slot i's deadline fires. Only meaningful where
     // held_display_mask is set. Main-thread only; see held_display_ts.
     uint8_t held_display_clear{0};
-
-    /// @brief Bumped on stream start/end/clear/cleanup so in-flight notifications from a
-    /// previous stream are recognized as stale and skipped by the decode thread, instead of
-    /// relying on draining the notify queue (which could discard a new stream's first image
-    /// if it was queued before the flush was serviced).
-    std::atomic<uint32_t> stream_epoch{0};
 };
 
 }  // namespace sendspin

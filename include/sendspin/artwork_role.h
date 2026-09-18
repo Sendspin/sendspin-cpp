@@ -44,16 +44,20 @@ class SendspinClient;
 ///  - A payload -- a frame, or the server's per-channel clear for that slot -- arriving while a
 ///    delivery is un-acked is buffered latest-wins and delivered only after frame_done(slot), and
 ///    then owes its own frame_done(). It waits behind the outstanding delivery rather than
-///    replacing it, so a consumer is never interrupted mid-presentation.
+///    replacing it, so a consumer is never interrupted mid-presentation. A delivery that has not
+///    yet reached on_image_display() is the exception: the server announcing a newer image
+///    replaces it outright (see the last paragraph), and the buffered payload follows once that
+///    release reopens the gate.
 ///  - A stream end or stream clear is a lifecycle event, not a payload, so it is never buffered:
 ///    it fires on_image_clear() immediately for every configured slot, discards anything buffered,
 ///    and replaces whatever delivery was outstanding. Exactly one frame_done() is owed afterward
 ///    whatever was in flight -- including when it lands on an un-acked per-channel clear, which
 ///    fires on_image_clear() again and still owes exactly one ack.
 ///
-/// A stream restart automatically releases a frame that was decoded but never displayed (its
-/// display can no longer fire), but a delivery that already reached on_image_display()/
-/// on_image_clear() stays gated until frame_done() is called.
+/// A frame that was decoded but never displayed is released automatically whenever its display
+/// can no longer fire: a stream restart, and the server replacing or cancelling that image before
+/// its display was due. A delivery that already reached on_image_display()/on_image_clear() stays
+/// gated until frame_done() is called.
 class ArtworkRoleListener {
 public:
     virtual ~ArtworkRoleListener() = default;
@@ -105,11 +109,17 @@ public:
 /**
  * @brief Artwork role that receives album art and artist images from the server
  *
- * Receives binary image payloads from the server and delivers them to the platform
- * through ArtworkRoleListener callbacks. A dedicated decode thread fires on_image_decode()
- * immediately when data arrives; on_image_display() and on_image_clear() fire on the main
- * loop thread, with on_image_display() scheduled to the server timestamp. Supports multiple
- * image slots with configurable format and resolution preferences.
+ * Receives images from the server and delivers them to the platform through
+ * ArtworkRoleListener callbacks. Each image arrives as a transfer of several binary messages,
+ * which the role reassembles; a dedicated decode thread fires on_image_decode() once the image
+ * is complete. on_image_display() and on_image_clear() fire on the main loop thread, with
+ * on_image_display() scheduled to the server timestamp. Supports multiple image slots with
+ * configurable format and resolution preferences.
+ *
+ * The server may replace or cancel an image it has sent but whose display time has not arrived,
+ * in which case that image is dropped and its on_image_display() never fires. An image the
+ * server declares larger than the uncompressed size of the slot's configured dimensions is
+ * refused rather than buffered, so a slot's memory is bounded by what the consumer asked for.
  *
  * A slot may opt into a back-pressure gate via ImageSlotPreference::require_frame_done: see
  * the ArtworkRoleListener class comment for the ack contract. Call frame_done() once the

@@ -405,6 +405,9 @@ enum class SendspinImageSource : uint8_t {
 struct ImageSlotPreference {
     SendspinImageSource source{};
     SendspinImageFormat format{};
+    /// @brief Pixel dimensions the server delivers this channel's images at. They also bound the
+    /// memory the channel can cost: the role refuses an image the server declares larger than the
+    /// uncompressed size of these dimensions instead of buffering it.
     uint16_t width{};
     uint16_t height{};
 
