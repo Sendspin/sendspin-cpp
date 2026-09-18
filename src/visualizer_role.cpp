@@ -20,6 +20,7 @@
 #include "sendspin/client.h"
 #include "visualizer_role_impl.h"
 
+#include <algorithm>
 #include <cstring>
 
 static const char* const TAG = "sendspin.visualizer";
@@ -130,6 +131,20 @@ VisualizerRole::Impl::Impl(VisualizerRoleConfig config, SendspinClient* client)
         if (this->drain_task->ring_storage.allocate(capacity)) {
             this->drain_task->ring_buffer.create(capacity, this->drain_task->ring_storage.data());
         }
+    }
+
+    // roles/visualizer/v1.md "client/state visualizer object": rate_max is a positive integer, and
+    // a types list containing 'spectrum' without a spectrum object is a protocol error the server
+    // closes the connection for. The configuration is reported as given, so a mismatch is named
+    // here rather than discovered as an unexplained disconnect.
+    const VisualizerStreamConfig& stream = this->config.stream;
+    if (stream.rate_max == 0 && !stream.types.empty()) {
+        SS_LOGW(TAG, "Visualizer configured with rate_max 0 while requesting data types");
+    }
+    if (!stream.spectrum.has_value() &&
+        std::find(stream.types.begin(), stream.types.end(), VisualizerDataType::SPECTRUM) !=
+            stream.types.end()) {
+        SS_LOGW(TAG, "Visualizer requests the spectrum type without a spectrum configuration");
     }
 }
 

@@ -264,7 +264,7 @@ The `ServerMetadataStateObject` contains these fields (all optional except `time
 
 `MetadataProgressObject` contains `track_progress` (ms), `track_duration` (ms), and `playback_speed`.
 
-A field is `nullopt` when the server has not provided it or has explicitly cleared it. Listeners that mirror metadata into display state should overwrite the displayed value on every `on_metadata()` call (using e.g. `value_or("")`) so that server clears propagate.
+Every `on_metadata()` call carries the full state of the track being described, not a set of changes: a field the server left out of that update is `nullopt`, whatever an earlier update reported for it, and a state without `progress` means there is no position to show. Listeners that mirror metadata into display state should therefore overwrite every displayed value on each call (using e.g. `value_or("")`) rather than merging into what they already show.
 
 You can also poll track progress at any time:
 
@@ -419,7 +419,7 @@ The `ServerColorStateObject` contains a `timestamp` and six optional `RgbColor` 
 | `on_dark` | Light foreground for use on dark backgrounds |
 | `on_light` | Dark foreground for use on light backgrounds |
 
-A field is `nullopt` when the server has not provided it or has explicitly cleared it; listeners do not need to distinguish those cases.
+Every `on_color()` call carries the full palette: a color the server left out of that update is `nullopt`, whatever an earlier update reported for it, so listeners render from the palette they are handed rather than merging it into the one they already hold.
 
 ## Step 4: Implement Providers
 

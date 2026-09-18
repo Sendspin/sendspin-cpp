@@ -1428,10 +1428,10 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
         }
         case SendspinServerToClientMessageType::SERVER_STATE: {
             // Parse and hand off one section at a time, each in its own scope. Parsing the whole
-            // message into an aggregate would hold every section's storage (a metadata delta alone
-            // is 200 bytes) in this frame at once, and this runs on the network task, whose stack
-            // is small on ESP-IDF. Scoping the sections lets the compiler reuse the same slots, and
-            // a section is only parsed at all when its role is present.
+            // message into an aggregate would hold every section's storage (a metadata state
+            // alone is 200 bytes) in this frame at once, and this runs on the network task, whose
+            // stack is small on ESP-IDF. Scoping the sections lets the compiler reuse the same
+            // slots, and a section is only parsed at all when its role is present.
 #ifdef SENDSPIN_ENABLE_CONTROLLER
             if (this->controller_ != nullptr) {
                 ServerStateControllerObject controller_state;
