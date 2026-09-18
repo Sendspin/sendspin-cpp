@@ -280,13 +280,13 @@ public:
     /// session via NoiseTransport::send_msg2_and_swap() (msg2 sent under the OLD session,
     /// swap happens under the same lock so a concurrent main-loop encrypt cannot interleave).
     ///
-    /// Resets first_activate_received_/server_hello_received_/client_hello_sent_ so the
-    /// post-swap server/hello -> client/hello -> server/activate flow re-runs under the new
-    /// session keys; the manager's nursery is not involved (the connection stays current/
-    /// established throughout, with no drop/reconnect).
+    /// Resets first_activate_received_ so the connection waits for the post-swap
+    /// server/activate that connection.md "Re-handshake" makes the server's first message under
+    /// the new keys; neither hello is re-sent, and the manager's nursery is not involved (the
+    /// connection stays current/established throughout, with no drop/reconnect).
     ///
     /// @param msg1_json  The decrypted noise/handshake JSON string (msg1 envelope).
-    /// @return true on success (session swapped; a post-swap server/hello is expected next).
+    /// @return true on success (session swapped; a post-swap server/activate is expected next).
     ///         false on any failure (caller should close the WebSocket).
     bool handle_noise_rehandshake(const std::string& msg1_json);
 
@@ -1097,9 +1097,10 @@ protected:
     ///    connection_manager.cpp).
     ///  - Proving axis: noise_handshake_complete_ is set ONCE on the network thread at handshake
     ///    COMPLETE and never cleared: not even by an in-band re-handshake, because the transport
-    ///    stays active across it. Alongside it, the RESETTABLE trio client_hello_sent_ /
-    ///    server_hello_received_ / first_activate_received_ tracks the hello + first-activate
-    ///    cycle, which does re-run on re-handshake.
+    ///    stays active across it. client_hello_sent_ / server_hello_received_ track the hello
+    ///    exchange, which happens once per connection (connection.md "Re-handshake": neither
+    ///    hello is re-sent), and the RESETTABLE first_activate_received_ tracks the activation,
+    ///    which the server owes again after every re-handshake.
     ///  - Admission axis: admitted_ (whether this connection occupies the manager's current
     ///    slot). Written only by ConnectionManager::set_current_connection() / drop_connection() on
     ///    the main loop; read by the network thread's role-dispatch gate. Orthogonal to proving:
@@ -1109,12 +1110,11 @@ protected:
     /// Writer/thread map:
     ///  - client_hello_sent_: set by the hello send-completion callback in
     ///    ConnectionManager::send_hello_message (httpd worker thread on ESP, inline on host);
-    ///    cleared by handle_noise_rehandshake (network thread) at the start of a key rotation
-    ///    and by the outbound transports' disconnect handlers (esp/host client_connection.cpp,
-    ///    transport thread). Inbound connections are never reset on disconnect: a dropped
-    ///    server connection is torn down, not reused.
+    ///    cleared by the outbound transports' disconnect handlers (esp/host
+    ///    client_connection.cpp, transport thread). Inbound connections are never reset on
+    ///    disconnect: a dropped server connection is torn down, not reused.
     ///  - server_hello_received_: set by SendspinClient::process_json_message on server/hello
-    ///    (network thread); cleared by the same two paths as client_hello_sent_.
+    ///    (network thread); cleared by the same path as client_hello_sent_.
     ///  - first_activate_received_: set by apply_server_activate (main loop only); cleared by
     ///    handle_noise_rehandshake and note_pairing_finalize_ack (both network thread).
     ///  - noise_handshake_complete_: set once in handle_noise_handshake_text at COMPLETE (network
@@ -1128,10 +1128,10 @@ protected:
     ///    peer's server/hello can race ahead of our client/hello send completion). That is exactly
     ///    why the manager's promotion scan is level-triggered rather than edge-triggered. A single
     ///    enum would force an ordering that does not exist.
-    ///  - Transitions are non-monotonic by design: handle_noise_rehandshake rewinds the hello +
-    ///    activate flags from the network thread while the main loop reads them;
-    ///    note_pairing_finalize_ack rewinds first_activate_received_ alone. Monotonic-transition
-    ///    assertions would fire on legitimate operation.
+    ///  - Transitions are non-monotonic by design: handle_noise_rehandshake and
+    ///    note_pairing_finalize_ack both rewind first_activate_received_ from the network thread
+    ///    while the main loop reads it. Monotonic-transition assertions would fire on
+    ///    legitimate operation.
     ///  - The axes are orthogonal (see above), so one scalar cannot represent, e.g., "admitted but
     ///    not operational" during re-proving.
     ///  - The sanctioned way to get a readable single "phase" is to DERIVE it on demand from these

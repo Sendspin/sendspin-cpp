@@ -82,6 +82,7 @@ constexpr uint16_t INACTIVE_ROLE_SEND_TEST_PORT = 19006;
 constexpr uint16_t LEAVE_TEST_PORT = 19007;
 constexpr uint16_t LEAVE_REPROVE_TEST_PORT = 19008;
 constexpr uint16_t LEAVE_PAIRING_TEST_PORT = 19009;
+constexpr uint16_t REKEY_ROLE_SEND_TEST_PORT = 19010;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -259,8 +260,9 @@ private:
 // Full encrypted lifecycle: accept -> Noise handshake -> hello -> server/activate -> operational,
 // then a server-initiated in-band re-handshake on the ADMITTED connection -> the connection must
 // come back operational via a fresh hello/activate cycle under the new session keys, without ever
-// being dropped or re-entering nursery arbitration. client/hello must be re-armed for a connection
-// outside the nursery so it does not stay permanently non-operational after the swap.
+// being dropped or re-entering nursery arbitration, on the strength of that activation alone:
+// connection.md "Re-handshake" makes server/activate the server's first message under the new
+// keys and re-sends neither hello.
 TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     SendspinClientConfig config;
     config.name = "Encrypted Lifecycle Test Client";
@@ -287,19 +289,19 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     // resumption from trust change, which is covered separately below).
     ASSERT_TRUE(server.trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
 
-    // Immediately after the swap the connection must go non-operational: first_activate_received_,
-    // server_hello_received_, and client_hello_sent_ are reset. This is the expected transient dip
-    // described in connection_manager.h's invariant comment, not a failure.
+    // Immediately after the swap the connection must go non-operational: first_activate_received_
+    // is reset. This is the expected transient dip described in connection_manager.h's invariant
+    // comment, not a failure.
     EXPECT_TRUE(pump_until(
         client, [&] { return !client.is_connected(); }, 2000))
         << "Connection should go non-operational immediately after the re-handshake swap";
 
-    // schedule_rehandshake_rearm() must re-arm the hello retry so the connection comes back within
-    // a few ticks; without it, the connection would stay non-operational forever.
+    // The post-swap server/activate alone brings it back.
     EXPECT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000))
         << "Connection did not resume operational status after the in-band re-handshake";
-    EXPECT_EQ(server.client_hello_count(), 2) << "A fresh client/hello must follow the re-handshake";
+    EXPECT_EQ(server.client_hello_count(), 1) << "client/hello must not be re-sent";
+    EXPECT_EQ(server.activate_count(), 2) << "the server's first message under the new keys";
     // server_id is unchanged (same server, new session keys).
     auto info2 = client.get_server_information();
     ASSERT_TRUE(info2.has_value());
@@ -930,8 +932,10 @@ TEST(EncryptedLifecycle, LeaveWaitsForTheActivateThatFollowsAReHandshake) {
 
     ASSERT_TRUE(server->trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
     ASSERT_TRUE(pump_until(
-        client, [&] { return server->client_hello_count() > 1; }, 4000))
-        << "the connection never re-proved itself after the re-handshake";
+        client, [&] { return !client.is_connected(); }, 4000))
+        << "the connection never rewound to awaiting its post-rekey activate";
+    EXPECT_EQ(server->client_hello_count(), 1)
+        << "connection.md \"Re-handshake\": client/hello is not re-sent";
 
     client.leave();
     pump_for(client, 50);
@@ -1043,6 +1047,67 @@ TEST(EncryptedLifecycle, ControllerCommandsWaitForTheRoleToBeActive) {
         4000))
         << "a controller command was dropped while controller@v1 was active";
     EXPECT_EQ(server->controller_commands().front(), "play");
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// connection.md "Re-handshake": once the client has received Noise message 1 it sends nothing but
+// the handshake until the new server/activate arrives. Role-originated traffic waits with
+// everything else, even though the connection keeps its admitted slot and its active roles
+// throughout.
+TEST(EncryptedLifecycle, RoleTrafficWaitsForTheActivateThatFollowsAReHandshake) {
+    SendspinClientConfig config;
+    config.name = "Rekey Role Send Test Client";
+    config.server_port = REKEY_ROLE_SEND_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    auto& controller = client.add_controller();
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.suppress_activate = true;  // Every activate in this test is sent by hand.
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(REKEY_ROLE_SEND_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    const std::string controller_activate =
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["controller@v1"]}})";
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server->client_hello_count() > 0; }, 4000));
+    ASSERT_TRUE(server->send_app_json(controller_activate));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+    controller.send_command({.command = SendspinControllerCommand::PLAY});
+    ASSERT_TRUE(pump_until(
+        client, [&] { return !server->controller_commands().empty(); }, 4000))
+        << "the controller role never became usable in the first place";
+    const size_t before_rekey = server->controller_commands().size();
+
+    ASSERT_TRUE(server->trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return !client.is_connected(); }, 4000))
+        << "the connection never rewound to awaiting its post-rekey activate";
+
+    controller.send_command({.command = SendspinControllerCommand::PAUSE});
+    pump_for(client, 100);
+    EXPECT_EQ(server->controller_commands().size(), before_rekey)
+        << "a controller command was sent while the connection awaited its post-rekey activate";
+
+    // Control: the same command goes out once that activation arrives, so the gate is the
+    // re-handshake window and not the role, which stayed active across it.
+    ASSERT_TRUE(server->send_app_json(controller_activate));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+    controller.send_command({.command = SendspinControllerCommand::PAUSE});
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server->controller_commands().size() > before_rekey; }, 4000))
+        << "a controller command was dropped after the post-rekey activate arrived";
+    EXPECT_EQ(server->controller_commands().back(), "pause");
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

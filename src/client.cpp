@@ -942,6 +942,13 @@ void SendspinClient::send_text(const std::string& text, const std::string& role_
     if (conn == nullptr || !conn->is_connected() || conn->has_activity(SendspinActivity::PAIRING)) {
         return;
     }
+    // connection.md "Re-handshake": once the client has received Noise message 1 it sends nothing
+    // but the handshake until the new server/activate arrives. An in-band re-handshake rewinds
+    // the connection to awaiting its next activation while it keeps the admitted slot, so this is
+    // the same gate client/leave and client/state apply.
+    if (!conn->first_activate_received()) {
+        return;
+    }
     // The role's own gate, matching the one publish_client_state() applies to the player object:
     // a role that the server has not activated, or has removed, drives no traffic of its own.
     if (!conn->is_role_active(role_family)) {
@@ -1399,14 +1406,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             if (conn != nullptr) {
                 SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
                 std::string msg1_json(data, len);
-                if (conn->handle_noise_rehandshake(msg1_json)) {
-                    // handle_noise_rehandshake() reset server_hello_received_/
-                    // client_hello_sent_/first_activate_received_ so the hello cycle re-runs
-                    // under the new session keys, but nothing else ever re-sends client/hello
-                    // for a connection outside the nursery. Defer the re-arm to the main loop,
-                    // matching every other cross-thread connection-state mutation.
-                    this->connection_manager_->schedule_rehandshake_rearm(conn->shared_from_this());
-                } else {
+                if (!conn->handle_noise_rehandshake(msg1_json)) {
                     SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
                     // Close the WebSocket silently (do not leave a half-swapped session).
                     // UNAUTHORIZED is the closest available reason for a crypto failure, though

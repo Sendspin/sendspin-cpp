@@ -198,7 +198,7 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     // server/activate" (under the new keys). ConnectionManager::loop()'s re-proving-deadline
     // check reads this timestamp for current_connection_ (gated on !is_operational()) and
     // drops the connection after REPROVE_TIMEOUT_US (see connection_manager.h) if the post-swap
-    // server/hello -> client/hello -> server/activate cycle does not complete in time.
+    // server/activate does not arrive in time.
     //
     // This must precede the first_activate_received_ store below. The watchdog reads
     // is_operational() and then get_provisional_time_us() while holding nothing that excludes
@@ -261,14 +261,12 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     // fresh count for the pairing_index / CPace-sid counter, same as an initial handshake.
     this->reset_pairing_index();
 
-    // Reset hello handshake state so the post-swap server/hello -> client/hello ->
-    // server/activate flow re-runs under the new session keys. The caller (network thread)
-    // arms the actual hello retry via ConnectionManager::schedule_rehandshake_rearm() once
-    // this call returns true.
-    this->server_hello_received_.store(false, std::memory_order_release);
-    this->client_hello_sent_.store(false, std::memory_order_release);
-
-    SS_LOGI(TAG, "Noise re-handshake complete: server_id=%s psk_category=%d; awaiting server/hello",
+    // connection.md "Re-handshake": neither server/hello nor client/hello is re-sent, so the
+    // hello handshake state carries over untouched. The server's first message under the new
+    // keys is server/activate, and first_activate_received_ (cleared above) is what this
+    // connection now waits on.
+    SS_LOGI(TAG,
+            "Noise re-handshake complete: server_id=%s psk_category=%d; awaiting server/activate",
             current_server_id.c_str(), static_cast<int>(this->get_psk_category()));
     return true;
 }

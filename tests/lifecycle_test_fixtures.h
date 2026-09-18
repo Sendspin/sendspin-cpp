@@ -424,7 +424,7 @@ protected:
 };
 
 struct FakeEncryptedServerOptions {
-    // Sent in server/activate after the FIRST client/hello.
+    // Sent in the FIRST server/activate, the one that follows client/hello.
     std::string first_activities_json{R"(["playback"])"};
     std::string first_roles_json{R"(["player@v1"])"};
     // The psk_category the server declares in its Noise message 1 payload. Unset means the
@@ -435,8 +435,8 @@ struct FakeEncryptedServerOptions {
     // "pairing_psk"), emitted as the nested payload.pairing object per the current spec;
     // omitted (nullopt) for the normal playback admission path.
     std::optional<std::string> first_pairing_method;
-    // Sent in server/activate after the SECOND client/hello (i.e. the one that follows a
-    // trigger_rehandshake() call and its resulting fresh hello cycle).
+    // Sent in the SECOND server/activate, the one connection.md "Re-handshake" makes the
+    // server's first message under the new keys after a trigger_rehandshake() call.
     std::string second_activities_json{R"(["playback"])"};
     std::string second_roles_json{R"(["player@v1"])"};
     // Mirrors first_pairing_method for the SECOND server/activate: present only when it should
@@ -517,7 +517,10 @@ public:
         return this->client_hello_count_.load();
     }
 
-
+    /// How many server/activate messages this fixture has sent.
+    int activate_count() const {
+        return this->activate_count_.load();
+    }
 
     /// supported_pair_methods from the most recent client/hello, in wire order.
     std::vector<std::string> hello_pair_methods() const {
@@ -703,7 +706,7 @@ private:
         const char* type = doc["type"] | "";
 
         if (std::strcmp(type, "client/hello") == 0) {
-            int count = this->client_hello_count_.fetch_add(1) + 1;
+            this->client_hello_count_.fetch_add(1);
             {
                 std::lock_guard<std::mutex> plock(this->pair_methods_mutex_);
                 this->hello_pair_methods_.clear();
@@ -712,29 +715,15 @@ private:
                     this->hello_pair_methods_.emplace_back(m["method"] | "");
                 }
             }
-            const std::string& activities =
-                count <= 1 ? this->options_.first_activities_json
-                          : this->options_.second_activities_json;
-            const std::string& roles =
-                count <= 1 ? this->options_.first_roles_json : this->options_.second_roles_json;
-            std::string activate = std::string(R"({"type":"server/activate","payload":{)") +
-                                   R"("activities":)" + activities + R"(,"active_roles":)" + roles;
-            const std::optional<std::string>& pairing_method =
-                count <= 1 ? this->options_.first_pairing_method
-                          : this->options_.second_pairing_method;
-            if (pairing_method.has_value()) {
-                activate += R"(,"pairing":{"method":")" + pairing_method.value() + "\"}";
-            }
-            activate += "}}";
             if (this->options_.suppress_activate) {
                 return;
             }
-            if (count <= 1 && this->options_.pre_activate_message.has_value()) {
+            if (this->options_.pre_activate_message.has_value()) {
                 // Ordered strictly before the activate on the same encrypted stream, so the DUT
                 // sees it while the connection is handshake-complete but not yet admitted.
                 this->send_encrypted_locked(this->options_.pre_activate_message.value());
             }
-            this->send_encrypted_locked(activate);
+            this->send_activate_locked();
             return;
         }
 
@@ -849,14 +838,32 @@ private:
             this->active_.recv_cs = recv_cs;
             this->prior_h_ = h;
 
-            // Resume the post-swap protocol flow: a fresh server/hello.
-            JsonDocument hdoc;
-            hdoc["type"] = "server/hello";
-            hdoc["payload"]["name"] = "Fake Encrypted Server";
-            std::string hello_text;
-            serializeJson(hdoc, hello_text);
-            this->send_encrypted_locked(hello_text);
+            // connection.md "Re-handshake": neither hello is re-sent, and server/activate is
+            // the server's first message under the new keys.
+            if (!this->options_.suppress_activate) {
+                this->send_activate_locked();
+            }
         }
+    }
+
+    // Sends the next server/activate: the first_* options for the one that follows
+    // client/hello, the second_* options for every one after a re-handshake. Caller must hold
+    // crypto_mutex_.
+    void send_activate_locked() {
+        const bool first = this->activate_count_.fetch_add(1) == 0;
+        const std::string& activities = first ? this->options_.first_activities_json
+                                              : this->options_.second_activities_json;
+        const std::string& roles =
+            first ? this->options_.first_roles_json : this->options_.second_roles_json;
+        std::string activate = std::string(R"({"type":"server/activate","payload":{)") +
+                               R"("activities":)" + activities + R"(,"active_roles":)" + roles;
+        const std::optional<std::string>& pairing_method =
+            first ? this->options_.first_pairing_method : this->options_.second_pairing_method;
+        if (pairing_method.has_value()) {
+            activate += R"(,"pairing":{"method":")" + pairing_method.value() + "\"}";
+        }
+        activate += "}}";
+        this->send_encrypted_locked(activate);
     }
 
     ix::WebSocket ws_;
@@ -866,6 +873,7 @@ private:
     NoiseHandshakeState* rehandshake_hs_{nullptr};
 
     std::atomic<int> client_hello_count_{0};
+    std::atomic<int> activate_count_{0};
     mutable std::mutex pair_methods_mutex_;
     std::vector<std::string> hello_pair_methods_;
     std::atomic<bool> closed_{false};

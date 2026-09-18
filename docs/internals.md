@@ -513,7 +513,9 @@ After transport is active, the server may initiate a new KKpsk2 handshake to rot
 1. Runs the deferred-PSK-binding msg1 read with the re-handshake PSK.
 2. Builds msg2 and encrypts it under the old session.
 3. Atomically swaps the active `NoiseSession` under a per-connection mutex (`session_mutex_` in `NoiseTransport`).
-4. Resets `first_activate_received_` / `server_hello_received_` / `client_hello_sent_`, so the connection goes momentarily non-operational and `ConnectionManager::schedule_rehandshake_rearm()` re-arms `client/hello` for it on the main loop -- without that re-arm the connection would stay non-operational forever after the swap (see the hello re-arm scan in `loop()`).
+4. Resets `first_activate_received_`, so the connection goes momentarily non-operational while it waits for the `server/activate` that connection.md "Re-handshake" makes the server's first message under the new keys. Neither `server/hello` nor `client/hello` is re-sent, so the hello flags carry over untouched and that activation alone restores the connection. The re-proving watchdog (`REPROVE_TIMEOUT_US`, `scan_reprove_watchdog()`) drops a connection whose server rekeys and then never activates it.
+
+The client sends nothing but the handshake between Noise message 1 and that activation: `client/time`, `client/state`, `client/leave` and role-originated sends all gate on `first_activate_received()`.
 
 This is the mechanism that upgrades a Pairing-PSK connection to a long-term PSK immediately after pairing finalizes.
 
@@ -531,7 +533,7 @@ durable provider write is deferred to the next loop() tick)
 Server -> Client: noise/handshake msg1 (re-keying onto the new long-term PSK)
 Client -> Server: noise/handshake msg2
 -- transport upgraded to long-term PSK --
-Server -> Client: server/hello, server/activate (normal operational flow)
+Server -> Client: server/activate (normal operational flow)
 ```
 
 The long-term record is committed to RAM on the network thread (synchronously, inside `SendspinClient::process_json_message()`'s `SERVER_PAIR_FINALIZE` handler) so the immediately following `noise/handshake` msg1 can resolve the new `psk_id` from the record store. That handler calls `RecordStore::store_record_superseding()`, which retires any prior record for the same `server_id` in the same locked section that inserts the new one and never touches the persistence provider (the provider contract is main-loop-only). The durable write is staged through the client's records-dirty `InboxSlot` (`INBOX_TOPIC_RECORDS`) and flushed by `SendspinClient::loop()` via `RecordStore::persist_records()`; the destructor flushes a still-pending write so an orderly shutdown does not lose the pairing.
