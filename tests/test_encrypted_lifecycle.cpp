@@ -80,6 +80,8 @@ constexpr uint16_t UNPAIR_RECORD_TEST_PORT = 19004;
 constexpr uint16_t UNPAIR_SENTINEL_TEST_PORT = 19005;
 constexpr uint16_t INACTIVE_ROLE_SEND_TEST_PORT = 19006;
 constexpr uint16_t LEAVE_TEST_PORT = 19007;
+constexpr uint16_t LEAVE_REPROVE_TEST_PORT = 19008;
+constexpr uint16_t LEAVE_PAIRING_TEST_PORT = 19009;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -892,6 +894,106 @@ TEST(EncryptedLifecycle, LeaveIsSentOnlyOnAnActivatedConnection) {
     EXPECT_TRUE(pump_until(
         client, [&] { return server->client_leave_count() == 1; }, 4000))
         << "client/leave was not sent on an admitted, activated connection";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// An in-band re-handshake rewinds the connection to awaiting its next server/activate while it
+// keeps the admitted slot, and messaging.md "Overview" allows nothing but that activation until it
+// arrives. client/leave waits for it, and goes out once it lands.
+TEST(EncryptedLifecycle, LeaveWaitsForTheActivateThatFollowsAReHandshake) {
+    SendspinClientConfig config;
+    config.name = "Leave Reprove Test Client";
+    config.server_port = LEAVE_REPROVE_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.suppress_activate = true;  // Every activate in this test is sent by hand.
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(LEAVE_REPROVE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    const std::string playback_activate =
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["player@v1"]}})";
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server->client_hello_count() > 0; }, 4000));
+    ASSERT_TRUE(server->send_app_json(playback_activate));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+
+    ASSERT_TRUE(server->trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server->client_hello_count() > 1; }, 4000))
+        << "the connection never re-proved itself after the re-handshake";
+
+    client.leave();
+    pump_for(client, 50);
+    EXPECT_EQ(server->client_leave_count(), 0)
+        << "client/leave was sent while the connection awaited its post-rekey activate";
+
+    // Control: the same call goes out once that activation arrives.
+    ASSERT_TRUE(server->send_app_json(playback_activate));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+    client.leave();
+    EXPECT_TRUE(pump_until(
+        client, [&] { return server->client_leave_count() == 1; }, 4000))
+        << "client/leave was not sent once the connection was activated again";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// A connection whose activation declares a pairing activity carries no group playback to leave,
+// and pairing.md "Entering and leaving pairing" leaves the exchange to run undisturbed until the
+// server sends the activate that ends it. client/leave is refused there, like client/state.
+TEST(EncryptedLifecycle, LeaveIsRefusedWhilePairing) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+    std::array<uint8_t, 32> pairing_psk_bytes{};
+    for (size_t i = 0; i < pairing_psk_bytes.size(); ++i) {
+        pairing_psk_bytes[i] = static_cast<uint8_t>(0xB0 + i);
+    }
+    SendspinPairingPsk configured_pairing_psk;
+    configured_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
+    configured_pairing_psk.psk = pairing_psk_bytes;
+    persistence.set_configured_pairing_psk(configured_pairing_psk);
+
+    SendspinClientConfig config;
+    config.name = "Leave Pairing Test Client";
+    config.server_port = LEAVE_PAIRING_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServerOptions options;
+    options.first_activities_json = R"(["pairing"])";
+    options.first_roles_json = R"([])";
+    options.first_pairing_method = "pairing_psk";
+    options.psk_category = "pr";
+    FakeEncryptedServer server(server_url(LEAVE_PAIRING_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               configured_pairing_psk.psk_id, pairing_psk_bytes, options);
+
+    // The pairing activate has been applied by the time the attempt reaches pair-finalize.
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.learned_psk_id().has_value(); }, 4000));
+
+    client.leave();
+    pump_for(client, 50);
+    EXPECT_EQ(server.client_leave_count(), 0)
+        << "client/leave was sent on a connection whose activation declares pairing";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

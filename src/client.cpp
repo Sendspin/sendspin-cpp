@@ -916,11 +916,13 @@ void SendspinClient::leave() {
     // messaging.md "Client to Server: client/leave". Not a role message, so it does not route
     // through send_text(): leaving the group is a client-level act that no role activation gates.
     // The activation gate is the one every outbound message shares, since nothing may be sent
-    // before the connection is admitted and its first server/activate has arrived.
+    // before the connection is admitted and its server/activate has arrived. Admission does not
+    // imply the latter: an in-band re-handshake rewinds the connection to awaiting its next
+    // activation while it keeps the admitted slot.
     auto* conn = this->connection_manager_->current();
     if (conn == nullptr || !conn->is_connected() || !conn->is_admitted() ||
         !conn->first_activate_received() || conn->has_activity(SendspinActivity::PAIRING)) {
-        SS_LOGW(TAG, "client/leave ignored: no admitted connection to leave a group on");
+        SS_LOGW(TAG, "client/leave ignored: no activated connection with a group to leave");
         return;
     }
     SS_LOGI(TAG, "Leaving the group (client/leave)");
