@@ -117,16 +117,30 @@ struct Msg1CoreResult {
     std::vector<uint8_t> msg2_bytes;
 };
 
+/// @brief Which handshake a msg1 belongs to.
+///
+/// The two differ in their prologue, in how msg2 reaches the peer, and in what a psk_id lookup
+/// miss means: connection.md "Sentinel Fallback" has the initial handshake answer a miss with the
+/// Sentinel PSK, while a miss in a re-handshake fails the handshake.
+enum class HandshakeKind : uint8_t {
+    INITIAL,
+    REHANDSHAKE,
+};
+
+/// @brief Name used for this handshake in log lines.
+static const char* to_cstr(HandshakeKind kind) {
+    return kind == HandshakeKind::INITIAL ? "handshake" : "re-handshake";
+}
+
 /// @brief Run the shared core of Noise msg1 processing: decode msg1 + server_id, read msg1
 /// to expose psk_id, resolve the PSK via the record store, verify any stored-pubkey
 /// binding, bind the resolved PSK onto the same session, and write msg2.
 ///
-/// Used identically by the initial handshake (`NoiseHandshake::handle_msg1`) and the
-/// in-band re-handshake (`run_rehandshake_msg1`); the only differences between the two
-/// callers are the prologue bytes and how msg2 is delivered to the peer, both handled
-/// by the caller after this returns.
+/// Used by the initial handshake (`NoiseHandshake::handle_msg1`) and the in-band re-handshake
+/// (`run_rehandshake_msg1`); what differs between them is carried by `kind` and the prologue,
+/// plus how msg2 is delivered to the peer, which the caller does after this returns.
 ///
-/// @param log_prefix    Prefix used for all log lines (mirrors the caller's function name).
+/// @param kind          Which handshake this msg1 belongs to.
 /// @param identity      Our static X25519 identity.
 /// @param record_store  Record store for psk_id resolution (read-only on network thread).
 /// @param suite_name    Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
@@ -135,11 +149,12 @@ struct Msg1CoreResult {
 /// @param prologue_len  Length of `prologue`.
 /// @param msg1_json     Raw noise/handshake JSON envelope text containing msg1.
 /// @return Populated Msg1CoreResult on success, or nullopt on any failure (caller aborts).
-std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identity& identity,
+std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& identity,
                                             const RecordStore& record_store,
                                             const std::string& suite_name,
                                             const std::string& server_id, const uint8_t* prologue,
                                             size_t prologue_len, const std::string& msg1_json) {
+    const char* log_prefix = to_cstr(kind);
     auto doc_opt = parse_json_envelope(msg1_json, "noise/handshake", log_prefix);
     if (!doc_opt.has_value()) {
         return std::nullopt;
@@ -210,18 +225,37 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
     SS_LOGD(TAG, "%s: psk_id='%s' psk_category='%s'", log_prefix, psk_id, psk_category_code);
 
     auto resolved = record_store.resolve_by_psk_id(std::string(psk_id), psk_category.value());
-    if (!resolved.has_value()) {
+    if (resolved.has_value()) {
+        // Post-match check (connection.md "Pre-Shared Key"): every long-term PSK is persisted with
+        // the server_id it was minted for, and the match only counts when that is the server
+        // actually reached. The Pairing and Sentinel PSKs are bound to no server and skip it. A
+        // failure here is a misbinding rather than a lookup miss, so it fails the handshake in
+        // both kinds (connection.md "Sentinel Fallback").
+        if (resolved->category == PskCategory::LONG_TERM &&
+            resolved->counterparty_id != server_id) {
+            SS_LOGW(TAG, "%s: PSK bound to server_id='%s', but connected to '%s'", log_prefix,
+                    resolved->counterparty_id.value_or("").c_str(), server_id.c_str());
+            return std::nullopt;
+        }
+    } else if (kind == HandshakeKind::INITIAL) {
+        // connection.md "Sentinel Fallback": on a lookup miss in the initial handshake the client
+        // completes msg2 with the Sentinel PSK instead of failing. The server, which holds the PSK
+        // it referenced, cannot read a msg2 keyed with the Sentinel one, and so receives an
+        // authenticated credential-mismatch signal it can offer its operator (pairing.md
+        // "Pairing Records": an evicted record needs no wire signal of its own). Failing here
+        // instead would leave a client that lost its record reconnect-looping with no way back.
+        SS_LOGW(TAG, "%s: no '%s' PSK for psk_id='%s'; answering with the Sentinel PSK", log_prefix,
+                psk_category_code, psk_id);
+        resolved = record_store.resolve_by_psk_id(SENTINEL_PSK_ID, PskCategory::SENTINEL);
+        if (!resolved.has_value()) {
+            SS_LOGE(TAG, "%s: the Sentinel PSK did not resolve", log_prefix);
+            return std::nullopt;
+        }
+    } else {
+        // A miss during a re-handshake is a silent failure: the fallback applies to the initial
+        // handshake alone (connection.md "Sentinel Fallback").
         SS_LOGW(TAG, "%s: no '%s' PSK for psk_id='%s', aborting", log_prefix, psk_category_code,
                 psk_id);
-        return std::nullopt;
-    }
-
-    // Post-match check (spec "Pre-Shared Key"): every long-term PSK is persisted with the
-    // server_id it was minted for, and the match only counts when that is the server actually
-    // reached. The Pairing and Sentinel PSKs are bound to no server and skip it.
-    if (resolved->category == PskCategory::LONG_TERM && resolved->counterparty_id != server_id) {
-        SS_LOGW(TAG, "%s: PSK bound to server_id='%s', but connected to '%s'", log_prefix,
-                resolved->counterparty_id.value_or("").c_str(), server_id.c_str());
         return std::nullopt;
     }
 
@@ -381,7 +415,7 @@ bool NoiseHandshake::handle_msg1(const std::string& text,
     const uint8_t* prologue = reinterpret_cast<const uint8_t*>(prologue_str.data());
     size_t prologue_len = prologue_str.size();
 
-    auto core = run_msg1_core("handle_msg1", this->identity_, this->record_store_,
+    auto core = run_msg1_core(HandshakeKind::INITIAL, this->identity_, this->record_store_,
                               this->suite_name_, this->server_id_, prologue, prologue_len, text);
     if (!core.has_value()) {
         return false;
@@ -416,8 +450,8 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(const std::string& msg1
     const uint8_t* prologue = prior_h.data();
     const size_t prologue_len = prior_h.size();
 
-    auto core = run_msg1_core("run_rehandshake_msg1", identity, record_store, suite_name, server_id,
-                              prologue, prologue_len, msg1_json);
+    auto core = run_msg1_core(HandshakeKind::REHANDSHAKE, identity, record_store, suite_name,
+                              server_id, prologue, prologue_len, msg1_json);
     if (!core.has_value()) {
         return std::nullopt;
     }

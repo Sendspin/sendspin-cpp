@@ -617,48 +617,6 @@ TEST(NoiseTransport, FragmentOverMaxTransportPlaintext) {
 // Error cases: driver abort on bad inputs
 // =============================================================================
 
-TEST(NoiseHandshakeDriver, UnknownPskIdAborts) {
-    Identity client_id = Identity::generate().value();
-    Identity server_id = Identity::generate().value();
-
-    // RecordStore has no matching PSK for the one the server will advertise
-    RecordStore rs(nullptr);
-
-    // Generate a PSK with a random psk_id that is NOT in the store
-    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
-    platform_random_bytes(psk.data(), psk.size());
-    std::string psk_id = psk_id_for(psk);
-
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
-
-    std::string client_init = nh.build_client_init();
-    ASSERT_FALSE(client_init.empty());
-
-    std::string server_init_text = make_server_init(server_id.peer_id());
-    std::string prologue_str = client_init + server_init_text;
-    const uint8_t* prologue = reinterpret_cast<const uint8_t*>(prologue_str.data());
-    size_t prologue_len = prologue_str.size();
-
-    // server/init: NEED_MORE
-    auto r1 = nh.on_text_frame(server_init_text, [](const std::string&) { return true; });
-    EXPECT_EQ(r1, HandshakeFrameResult::NEED_MORE);
-
-    // Build initiator (uses same psk, so msg1 auth passes, but psk_id not in store)
-    NoiseHandshakeState* init_hs_raw =
-        build_initiator(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
-                           server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
-                           prologue, prologue_len);
-    ASSERT_NE(init_hs_raw, nullptr);
-    HsGuard guard(init_hs_raw);
-
-    std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id);
-    ASSERT_FALSE(msg1_text.empty());
-
-    // Should abort because psk_id not found
-    auto r2 = nh.on_text_frame(msg1_text, [](const std::string&) { return true; });
-    EXPECT_EQ(r2, HandshakeFrameResult::ABORT);
-}
-
 TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     Identity client_id = Identity::generate().value();
     Identity server_id = Identity::generate().value();
@@ -712,8 +670,19 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
 // with the message 1 payload the caller supplies, and reports what the driver made of it. The
 // initiator always uses the record's PSK, so message 1 authenticates and the payload is the only
 // variable.
-HandshakeFrameResult run_msg1_with_payload(
-    const std::function<std::string(const std::string& psk_id)>& make_payload) {
+/// What the driver made of one Noise message 1.
+struct Msg1Outcome {
+    HandshakeFrameResult result{HandshakeFrameResult::ABORT};
+    /// Category of the PSK the driver bound, when the handshake completed.
+    std::optional<PskCategory> category;
+    /// Whether the peer that sent message 1 could read the message 2 that came back, i.e. whether
+    /// both sides mixed in the same PSK.
+    bool peer_read_msg2{false};
+};
+
+Msg1Outcome run_msg1_with_payload(
+    const std::function<std::string(const std::string& psk_id)>& make_payload,
+    bool store_record = true) {
     Identity client_id = Identity::generate().value();
     Identity server_id = Identity::generate().value();
 
@@ -722,11 +691,13 @@ HandshakeFrameResult run_msg1_with_payload(
     const std::string psk_id = psk_id_for(psk);
 
     RecordStore rs(nullptr);
-    SendspinPairingRecord rec;
-    rec.psk_id = psk_id;
-    rec.psk = psk;
-    rec.server_id = server_id.peer_id();
-    rs.store_record_superseding(std::move(rec));
+    if (store_record) {
+        SendspinPairingRecord rec;
+        rec.psk_id = psk_id;
+        rec.psk = psk;
+        rec.server_id = server_id.peer_id();
+        rs.store_record_superseding(std::move(rec));
+    }
 
     NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
     const std::string client_init = nh.build_client_init();
@@ -742,33 +713,90 @@ HandshakeFrameResult run_msg1_with_payload(
         reinterpret_cast<const uint8_t*>(prologue_str.data()), prologue_str.size());
     EXPECT_NE(init_hs_raw, nullptr);
     if (init_hs_raw == nullptr) {
-        return HandshakeFrameResult::ABORT;
+        return {};
     }
     HsGuard guard(init_hs_raw);
 
     const std::string msg1_text =
         build_msg1_envelope_with_payload(init_hs_raw, make_payload(psk_id));
     EXPECT_FALSE(msg1_text.empty());
-    return nh.on_text_frame(msg1_text, [](const std::string&) { return true; });
+
+    Msg1Outcome outcome;
+    std::string captured_msg2;
+    outcome.result = nh.on_text_frame(msg1_text, [&captured_msg2](const std::string& text) {
+        captured_msg2 = text;
+        return true;
+    });
+    if (outcome.result != HandshakeFrameResult::COMPLETE) {
+        return outcome;
+    }
+
+    auto result = nh.take_result();
+    EXPECT_TRUE(result.has_value());
+    if (result.has_value()) {
+        outcome.category = result->resolved_psk.category;
+        EXPECT_NE(result->session, nullptr) << "a completed handshake must carry its session";
+    }
+
+    // The peer holds the PSK it referenced, so it can only read message 2 if the client bound the
+    // same one. A read failure here is the credential-mismatch signal the Sentinel fallback exists
+    // to produce.
+    auto msg2_bytes = extract_noise_bytes(captured_msg2);
+    EXPECT_TRUE(msg2_bytes.has_value());
+    if (msg2_bytes.has_value()) {
+        std::vector<uint8_t> payload_buf(4096);
+        NoiseBuffer msg2_in;
+        noise_buffer_set_input(msg2_in, msg2_bytes->data(), msg2_bytes->size());
+        NoiseBuffer payload_out;
+        noise_buffer_set_output(payload_out, payload_buf.data(), payload_buf.size());
+        outcome.peer_read_msg2 =
+            noise_handshakestate_read_message(init_hs_raw, &msg2_in, &payload_out) ==
+            NOISE_ERROR_NONE;
+    }
+    return outcome;
 }
 
 // connection.md "Pre-Shared Key": the psk_id is compared only against the candidates of the
 // declared category, so a psk_id the client holds as a long-term record is a lookup miss when the
-// server declares it as its pairing PSK. Without the scoping the same payload would resolve and
-// the connection would proceed with the activities the pairing category grants.
-TEST(NoiseHandshakeDriver, PskCategoryMismatchIsALookupMiss) {
-    EXPECT_EQ(run_msg1_with_payload([](const std::string& psk_id) {
-                  return R"({"psk_id":")" + psk_id + R"(","psk_category":"pr"})";
-              }),
-              HandshakeFrameResult::ABORT);
+// server declares it as its pairing PSK. Being a miss, it takes the Sentinel Fallback rather than
+// resolving to the record: without the scoping the connection would come up on the long-term PSK
+// and inherit the trust that category carries.
+TEST(NoiseHandshakeDriver, PskCategoryMismatchFallsBackToTheSentinelPsk) {
+    Msg1Outcome outcome = run_msg1_with_payload([](const std::string& psk_id) {
+        return R"({"psk_id":")" + psk_id + R"(","psk_category":"pr"})";
+    });
+    EXPECT_EQ(outcome.result, HandshakeFrameResult::COMPLETE);
+    EXPECT_EQ(outcome.category, PskCategory::SENTINEL);
+    EXPECT_FALSE(outcome.peer_read_msg2)
+        << "the peer must see the credential mismatch, not a session on its own PSK";
 }
 
-// Control: the same psk_id under the category the client actually holds it in completes.
+// Control: the same psk_id under the category the client actually holds it in resolves to the
+// record, and the peer that sent message 1 can read the message 2 that comes back.
 TEST(NoiseHandshakeDriver, MatchingPskCategoryCompletes) {
-    EXPECT_EQ(run_msg1_with_payload([](const std::string& psk_id) {
-                  return R"({"psk_id":")" + psk_id + R"(","psk_category":"lt"})";
-              }),
-              HandshakeFrameResult::COMPLETE);
+    Msg1Outcome outcome = run_msg1_with_payload([](const std::string& psk_id) {
+        return R"({"psk_id":")" + psk_id + R"(","psk_category":"lt"})";
+    });
+    EXPECT_EQ(outcome.result, HandshakeFrameResult::COMPLETE);
+    EXPECT_EQ(outcome.category, PskCategory::LONG_TERM);
+    EXPECT_TRUE(outcome.peer_read_msg2);
+}
+
+// connection.md "Sentinel Fallback": on a lookup miss in the initial handshake the client
+// completes message 2 with the Sentinel PSK instead of failing, whichever category the server
+// declared. The connection then proceeds as an ordinary unpaired one, and the server learns its
+// credential no longer matches (pairing.md "Pairing Records").
+TEST(NoiseHandshakeDriver, UnknownPskIdFallsBackToTheSentinelPsk) {
+    for (const char* category : {"lt", "pr", "sn"}) {
+        Msg1Outcome outcome = run_msg1_with_payload(
+            [category](const std::string& psk_id) {
+                return R"({"psk_id":")" + psk_id + R"(","psk_category":")" + category + R"("})";
+            },
+            /*store_record=*/false);
+        EXPECT_EQ(outcome.result, HandshakeFrameResult::COMPLETE) << "category " << category;
+        EXPECT_EQ(outcome.category, PskCategory::SENTINEL) << "category " << category;
+        EXPECT_FALSE(outcome.peer_read_msg2) << "category " << category;
+    }
 }
 
 // messaging.md "noise/handshake": a psk_category outside the three defined codes makes the payload
@@ -777,7 +805,7 @@ TEST(NoiseHandshakeDriver, MatchingPskCategoryCompletes) {
 TEST(NoiseHandshakeDriver, UnknownPskCategoryAborts) {
     EXPECT_EQ(run_msg1_with_payload([](const std::string& psk_id) {
                   return R"({"psk_id":")" + psk_id + R"(","psk_category":"xx"})";
-              }),
+              }).result,
               HandshakeFrameResult::ABORT);
 }
 
@@ -786,7 +814,7 @@ TEST(NoiseHandshakeDriver, UnknownPskCategoryAborts) {
 TEST(NoiseHandshakeDriver, MissingPskCategoryAborts) {
     EXPECT_EQ(run_msg1_with_payload([](const std::string& psk_id) {
                   return R"({"psk_id":")" + psk_id + R"("})";
-              }),
+              }).result,
               HandshakeFrameResult::ABORT);
 }
 
@@ -1103,15 +1131,16 @@ TEST(ReceiveBufferCap, ExactlyAtCapAccepted) {
 }
 
 TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
-    // A fatal initial-handshake error (here: an unresolvable psk_id in msg1) must
-    // close the connection. This drives the full chain through dispatch_completed_message() ->
+    // A fatal initial-handshake error (here: a psk_category outside the three the protocol
+    // defines, which messaging.md "noise/handshake" makes a malformed payload) must close the
+    // connection. An unresolvable psk_id is not such an error: it takes the Sentinel Fallback. This drives the full chain through dispatch_completed_message() ->
     // handle_noise_handshake_text(), using the same fake-connection pattern (TestConnection,
     // disconnect_calls_) as the other dispatch tests above. This differs from the
     // NoiseHandshakeDriver.*Aborts tests, which call NoiseHandshake::on_text_frame() directly
     // and only prove the state machine returns ABORT, not that the connection actually closes.
     Identity client_id = Identity::generate().value();
     Identity server_id = Identity::generate().value();
-    RecordStore rs(nullptr);  // Empty store: any psk_id lookup misses.
+    RecordStore rs(nullptr);
 
     TestConnection conn;
     conn.init_noise_handshake(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
@@ -1124,7 +1153,7 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
     EXPECT_TRUE(conn.disconnect_calls_.empty()) << "server/init alone must not close";
     EXPECT_EQ(conn.close_transport_now_calls_, 0) << "server/init alone must not close";
 
-    // Build a syntactically valid msg1 whose psk_id is not in the (empty) record store.
+    // Build a msg1 whose payload declares a category the protocol does not define.
     std::string prologue_str = client_init_text + server_init_text;
     const uint8_t* prologue = reinterpret_cast<const uint8_t*>(prologue_str.data());
     size_t prologue_len = prologue_str.size();
@@ -1140,7 +1169,7 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
     ASSERT_NE(init_hs_raw, nullptr);
     HsGuard guard(init_hs_raw);
 
-    std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id);
+    std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id, "xx");
     ASSERT_FALSE(msg1_text.empty());
 
     conn.inject_text_payload(msg1_text);

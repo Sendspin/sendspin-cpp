@@ -110,6 +110,11 @@ Exit: tolerant-mode run unchanged from the baseline.
 - C9: do not drop role messages between `server/activate` and admission.
 - A3: parse `psk_category` from Noise message 1, scope the PSK lookup by it, treat a category
   miss as a lookup miss (Sentinel fallback) and an unknown category as a silent failure.
+- A10: the Sentinel fallback itself (`connection.md` "Sentinel Fallback"): a `psk_id` lookup miss
+  in the initial handshake completes message 2 with the Sentinel PSK instead of failing, so the
+  server learns its credential no longer matches. A miss in a re-handshake and a failed
+  stored-`server_id` post-match check stay silent failures. Lands with A3, whose category rule
+  creates a new way to miss.
 - A7: recognize `server/error` during the init phase and surface its reason.
 - C1: `client/leave` message and a public entry point.
 - C4: controller commands are not sent while the controller role is inactive.
