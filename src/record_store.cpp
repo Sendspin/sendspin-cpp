@@ -247,44 +247,56 @@ void RecordStore::provision_pairing_psk_if_needed() {
 // PSK resolution
 // ============================================================================
 
-std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk_id) const {
+std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id(const std::string& psk_id,
+                                                          PskCategory category) const {
     // Runs on the network thread; lock against main-loop mutations of records_/pairing_psk_.
     // Calls the unlocked record_by_psk_id() helper, so no recursive acquisition occurs.
     std::lock_guard<std::mutex> lock(this->mutex_);
-    return this->resolve_by_psk_id_locked(psk_id);
+    return this->resolve_by_psk_id_locked(psk_id, category);
 }
 
-std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id_locked(const std::string& psk_id) const {
-    // 1. Long-term records (highest priority).
-    const SendspinPairingRecord* rec = this->record_by_psk_id(psk_id);
-    if (rec != nullptr) {
-        ResolvedPsk r;
-        r.psk_id = rec->psk_id;
-        r.psk = rec->psk;
-        r.category = PskCategory::LONG_TERM;
-        r.counterparty_id = rec->server_id;
-        return r;
-    }
-
-    // 2. Accepted Pairing PSK. Excluded from the candidate set when pairing_psk is disabled in
-    // the live pairing config (spec "Pre-Shared Key"): a handshake referencing it then fails as a
-    // lookup miss, exactly as if no Pairing PSK were configured at all.
-    if (this->pairing_psk_.has_value() && this->pairing_psk_->psk_id == psk_id &&
-        this->pairing_psk_enabled_) {
-        ResolvedPsk r;
-        r.psk_id = this->pairing_psk_->psk_id;
-        r.psk = this->pairing_psk_->psk;
-        r.category = PskCategory::PAIRING;
-        return r;
-    }
-
-    // 3. Sentinel PSK.
-    if (psk_id == SENTINEL_PSK_ID) {
-        ResolvedPsk r;
-        r.psk_id = SENTINEL_PSK_ID;
-        r.psk = SENTINEL_PSK;
-        r.category = PskCategory::SENTINEL;
-        return r;
+std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id_locked(const std::string& psk_id,
+                                                                 PskCategory category) const {
+    // Only the declared category's candidates are searched (connection.md "Pre-Shared Key"): the
+    // same psk_id under another category is a lookup miss, which keeps a server from using, say, a
+    // long-term PSK as though it were the Pairing PSK and inheriting that category's activities.
+    switch (category) {
+        case PskCategory::LONG_TERM: {
+            const SendspinPairingRecord* rec = this->record_by_psk_id(psk_id);
+            if (rec != nullptr) {
+                ResolvedPsk r;
+                r.psk_id = rec->psk_id;
+                r.psk = rec->psk;
+                r.category = PskCategory::LONG_TERM;
+                r.counterparty_id = rec->server_id;
+                return r;
+            }
+            break;
+        }
+        case PskCategory::PAIRING: {
+            // Excluded from the candidate set when pairing_psk is disabled in the live pairing
+            // config (spec "Pre-Shared Key"): a handshake referencing it then fails as a lookup
+            // miss, exactly as if no Pairing PSK were configured at all.
+            if (this->pairing_psk_.has_value() && this->pairing_psk_->psk_id == psk_id &&
+                this->pairing_psk_enabled_) {
+                ResolvedPsk r;
+                r.psk_id = this->pairing_psk_->psk_id;
+                r.psk = this->pairing_psk_->psk;
+                r.category = PskCategory::PAIRING;
+                return r;
+            }
+            break;
+        }
+        case PskCategory::SENTINEL: {
+            if (psk_id == SENTINEL_PSK_ID) {
+                ResolvedPsk r;
+                r.psk_id = SENTINEL_PSK_ID;
+                r.psk = SENTINEL_PSK;
+                r.category = PskCategory::SENTINEL;
+                return r;
+            }
+            break;
+        }
     }
 
     return std::nullopt;

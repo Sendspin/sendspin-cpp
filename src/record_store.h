@@ -55,6 +55,25 @@ enum class PskCategory : uint8_t {
     SENTINEL,   ///< Published Sentinel PSK: authenticates nothing on its own.
 };
 
+/// @brief Parses the psk_category code carried in the Noise message 1 payload.
+///
+/// messaging.md "noise/handshake": 'lt' (long-term), 'pr' (pairing), 'sn' (Sentinel). Anything
+/// else is not a category the protocol defines.
+/// @param code The wire code.
+/// @return The category, or nullopt if the code is not one of the three.
+inline std::optional<PskCategory> psk_category_from_string(const std::string& code) {
+    if (code == "lt") {
+        return PskCategory::LONG_TERM;
+    }
+    if (code == "pr") {
+        return PskCategory::PAIRING;
+    }
+    if (code == "sn") {
+        return PskCategory::SENTINEL;
+    }
+    return std::nullopt;
+}
+
 // ============================================================================
 // Resolved PSK (handshake currency)
 // ============================================================================
@@ -128,10 +147,16 @@ public:
     // PSK resolution (used by the Noise handshake)
     // ========================================
 
-    /// @brief Resolve a psk_id to its PSK for the handshake.
-    /// Order: long-term record -> accepted Pairing PSK -> Sentinel PSK.
-    /// Returns nullopt only if psk_id is entirely unknown (not even Sentinel).
-    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id(const std::string& psk_id) const;
+    /// @brief Resolve a psk_id to its PSK for the handshake, within one category.
+    ///
+    /// connection.md "Pre-Shared Key": the client compares the psk_id to the hash of each
+    /// candidate PSK OF THE DECLARED CATEGORY, so a psk_id the client holds only under a
+    /// different category is a lookup miss rather than a match.
+    /// @param psk_id   The psk_id from the Noise message 1 payload.
+    /// @param category The category the server declared it is using that PSK as.
+    /// @return The matching PSK, or nullopt if this client holds no such PSK in that category.
+    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id(const std::string& psk_id,
+                                                               PskCategory category) const;
 
     // ========================================
     // Long-term record management
@@ -306,11 +331,11 @@ private:
     [[nodiscard]] bool has_capacity_locked() const {
         return this->records_.size() < this->max_records_;
     }
-    /// @brief Body of resolve_by_psk_id(). MUST be called with mutex_ already held.
-    /// Exists so resolve_pairing_outcome(), which holds mutex_ across its whole body, can run
-    /// the same resolution without re-entering this non-recursive mutex.
-    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id_locked(
-        const std::string& psk_id) const;
+    /// @brief Body of resolve_by_psk_id(). MUST be called with mutex_ already held, so a caller
+    /// that holds mutex_ across a wider body can run the same resolution without re-entering
+    /// this non-recursive mutex.
+    [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id_locked(const std::string& psk_id,
+                                                                      PskCategory category) const;
 
     /// @brief Find the index of a record by psk_id, or npos if absent.
     [[nodiscard]] size_t find_index(const std::string& psk_id) const;

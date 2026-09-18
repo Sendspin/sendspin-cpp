@@ -206,8 +206,18 @@ private:
     std::unique_ptr<SendspinClient> client_;
 };
 
-inline std::vector<uint8_t> write_msg1(NoiseHandshakeState* hs, const std::string& psk_id) {
-    std::string psk_id_json = "{\"psk_id\":\"" + psk_id + "\"}";
+/// The psk_category code (messaging.md "noise/handshake") a server declares for a psk_id when the
+/// test has not said otherwise: the Sentinel PSK is the one every peer holds, and anything else a
+/// fake server was handed is a long-term record. Pairing PSKs are declared explicitly, since no
+/// property of the id distinguishes one.
+inline const char* default_psk_category_code(const std::string& psk_id) {
+    return psk_id == SENTINEL_PSK_ID ? "sn" : "lt";
+}
+
+inline std::vector<uint8_t> write_msg1(NoiseHandshakeState* hs, const std::string& psk_id,
+                                       const std::string& psk_category) {
+    std::string psk_id_json =
+        "{\"psk_id\":\"" + psk_id + "\",\"psk_category\":\"" + psk_category + "\"}";
     std::vector<uint8_t> msg1_raw(4096);
     NoiseBuffer msg1_out;
     noise_buffer_set_output(msg1_out, msg1_raw.data(), msg1_raw.size());
@@ -256,13 +266,18 @@ public:
     }
 
 protected:
+    /// @param psk_category The psk_category to declare in the initial handshake's message 1;
+    ///                     empty means the default for psk_id (see default_psk_category_code).
     NoiseInitiatorFixtureBase(std::string suite_name, Identity server_identity, std::string psk_id,
-                              std::array<uint8_t, NOISE_PSK_SIZE> psk, std::string server_hello_name)
+                              std::array<uint8_t, NOISE_PSK_SIZE> psk, std::string server_hello_name,
+                              std::string psk_category = "")
         : suite_name_(std::move(suite_name)),
           server_identity_(server_identity),
           psk_id_(std::move(psk_id)),
           psk_(psk),
-          server_hello_name_(std::move(server_hello_name)) {}
+          server_hello_name_(std::move(server_hello_name)),
+          psk_category_(psk_category.empty() ? default_psk_category_code(this->psk_id_)
+                                             : std::move(psk_category)) {}
 
     // Sends `frame` as a WebSocket TEXT/BINARY frame over the concrete transport. Caller must
     // hold crypto_mutex_. A dead/absent socket is silently swallowed, matching every call site's
@@ -314,7 +329,7 @@ protected:
         if (this->init_hs_ == nullptr) {
             return;
         }
-        auto msg1_bytes = write_msg1(this->init_hs_, this->psk_id_);
+        auto msg1_bytes = write_msg1(this->init_hs_, this->psk_id_, this->psk_category_);
         if (msg1_bytes.empty()) {
             noise_handshakestate_free(this->init_hs_);
             this->init_hs_ = nullptr;
@@ -390,6 +405,7 @@ protected:
     std::string psk_id_;
     std::array<uint8_t, NOISE_PSK_SIZE> psk_;
     std::string server_hello_name_;
+    std::string psk_category_;
 
     // Guards every field below: the concrete subclass's message handlers run on IXWebSocket's own
     // thread(s), while the test thread may call into subclass methods (trigger_rehandshake,
@@ -411,6 +427,10 @@ struct FakeEncryptedServerOptions {
     // Sent in server/activate after the FIRST client/hello.
     std::string first_activities_json{R"(["playback"])"};
     std::string first_roles_json{R"(["player@v1"])"};
+    // The psk_category the server declares in its Noise message 1 payload. Unset means the
+    // default for the psk_id (see default_psk_category_code); tests that hand the fixture a
+    // pairing PSK set "pr".
+    std::optional<std::string> psk_category;
     // Present only when the first server/activate should select a pairing method (e.g.
     // "pairing_psk"), emitted as the nested payload.pairing object per the current spec;
     // omitted (nullopt) for the normal playback admission path.
@@ -443,7 +463,8 @@ public:
                         std::string psk_id, std::array<uint8_t, NOISE_PSK_SIZE> psk,
                         FakeEncryptedServerOptions options = {})
         : NoiseInitiatorFixtureBase(std::move(suite_name), server_identity, std::move(psk_id), psk,
-                                    "Fake Encrypted Server"),
+                                    "Fake Encrypted Server",
+                                    options.psk_category.value_or("")),
           options_(std::move(options)) {
         this->ws_.setUrl(url);
         this->ws_.disableAutomaticReconnection();
@@ -463,8 +484,11 @@ public:
     // Starts an in-band re-handshake to (new_psk_id, new_psk), sent encrypted under the
     // currently active session (mirrors handle_noise_rehandshake's "travels under the current
     // transport keys" contract). No-op (returns false) if the initial handshake never completed.
+    /// @param psk_category The category to declare for new_psk_id; defaults to the one the id
+    ///                     implies (see default_psk_category_code).
     bool trigger_rehandshake(const std::string& new_psk_id,
-                             const std::array<uint8_t, NOISE_PSK_SIZE>& new_psk) {
+                             const std::array<uint8_t, NOISE_PSK_SIZE>& new_psk,
+                             const std::string& psk_category = "") {
         std::lock_guard<std::mutex> lock(this->crypto_mutex_);
         if (this->active_.send_cs == nullptr) {
             return false;
@@ -477,7 +501,9 @@ public:
         if (hs == nullptr) {
             return false;
         }
-        auto msg1_bytes = write_msg1(hs, new_psk_id);
+        auto msg1_bytes = write_msg1(
+            hs, new_psk_id,
+            psk_category.empty() ? default_psk_category_code(new_psk_id) : psk_category);
         if (msg1_bytes.empty()) {
             noise_handshakestate_free(hs);
             return false;
@@ -490,6 +516,8 @@ public:
     int client_hello_count() const {
         return this->client_hello_count_.load();
     }
+
+
 
     /// supported_pair_methods from the most recent client/hello, in wire order.
     std::vector<std::string> hello_pair_methods() const {

@@ -122,7 +122,7 @@ TEST(RecordStore, FirstBootProvisioningCreatesPairingPsk) {
     ASSERT_TRUE(store.pairing_psk().has_value());
     EXPECT_EQ(store.pairing_psk()->psk_id, psk_id_for(store.pairing_psk()->psk));
 
-    auto resolved = store.resolve_by_psk_id(store.pairing_psk()->psk_id);
+    auto resolved = store.resolve_by_psk_id(store.pairing_psk()->psk_id, PskCategory::PAIRING);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::PAIRING);
     EXPECT_EQ(resolved->psk, store.pairing_psk()->psk);
@@ -163,7 +163,7 @@ TEST(RecordStore, FirstBootProvisioningSurvivesPersistenceFailureForThisBoot) {
     // Despite every write being rejected, the device remains usable for this boot: the Pairing
     // PSK is present and resolvable in memory.
     ASSERT_TRUE(store.pairing_psk().has_value());
-    auto resolved = store.resolve_by_psk_id(store.pairing_psk()->psk_id);
+    auto resolved = store.resolve_by_psk_id(store.pairing_psk()->psk_id, PskCategory::PAIRING);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::PAIRING);
 }
@@ -172,7 +172,7 @@ TEST(RecordStore, FirstBootPskIdIsSentinelPskIdResolvable) {
     RecordStore store(nullptr);
 
     // Even on first boot the Sentinel PSK must be resolvable.
-    auto resolved = store.resolve_by_psk_id(SENTINEL_PSK_ID);
+    auto resolved = store.resolve_by_psk_id(SENTINEL_PSK_ID, PskCategory::SENTINEL);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::SENTINEL);
     EXPECT_EQ(resolved->psk_id, SENTINEL_PSK_ID);
@@ -208,7 +208,7 @@ TEST(RecordStore, BootsFromBlobStoreSeededViaCodec) {
     EXPECT_EQ(provider.save_attempts(persistence_keys::RECORDS), 0)
         << "a fully-seeded store must not trigger first-boot re-provisioning";
 
-    auto resolved_paired = store.resolve_by_psk_id(paired.psk_id);
+    auto resolved_paired = store.resolve_by_psk_id(paired.psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(resolved_paired.has_value());
     EXPECT_EQ(resolved_paired->category, PskCategory::LONG_TERM);
     EXPECT_EQ(resolved_paired->counterparty_id, paired.server_id);
@@ -277,11 +277,11 @@ TEST(RecordStore, StoreRecordSupersedesPriorRecordForSameServerId) {
 
     // The prior PSK must no longer resolve at all: re-pairing revokes it instead of leaving a
     // second working credential for the same server.
-    EXPECT_FALSE(store.resolve_by_psk_id(first_psk_id).has_value());
+    EXPECT_FALSE(store.resolve_by_psk_id(first_psk_id, PskCategory::LONG_TERM).has_value());
     EXPECT_EQ(store.record_by_psk_id(first_psk_id), nullptr);
 
     // The new PSK resolves as the server's long-term record.
-    auto resolved = store.resolve_by_psk_id(second_psk_id);
+    auto resolved = store.resolve_by_psk_id(second_psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
     EXPECT_EQ(resolved->counterparty_id, server_id);
@@ -323,7 +323,7 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
         << "store_record_superseding must not call the provider";
 
     // RAM state is authoritative for this boot: the replacement resolves, the original is gone.
-    auto resolved = store.resolve_by_psk_id(replacement.psk_id);
+    auto resolved = store.resolve_by_psk_id(replacement.psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
     EXPECT_EQ(store.record_by_psk_id(original.psk_id), nullptr);
@@ -339,8 +339,8 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
     // "Reboot": the provider still holds the last accepted blob, so the original record
     // resurfaces and the replacement is lost.
     RecordStore rebooted(&provider);
-    EXPECT_TRUE(rebooted.resolve_by_psk_id(original.psk_id).has_value());
-    EXPECT_FALSE(rebooted.resolve_by_psk_id(replacement.psk_id).has_value());
+    EXPECT_TRUE(rebooted.resolve_by_psk_id(original.psk_id, PskCategory::LONG_TERM).has_value());
+    EXPECT_FALSE(rebooted.resolve_by_psk_id(replacement.psk_id, PskCategory::LONG_TERM).has_value());
 }
 
 // =============================================================================
@@ -425,7 +425,7 @@ TEST(RecordStore, ResolveByPskIdLongTermFirst) {
     SendspinPairingRecord rec = make_client_record("server-X");
     store.store_record_superseding(rec);
 
-    auto resolved = store.resolve_by_psk_id(rec.psk_id);
+    auto resolved = store.resolve_by_psk_id(rec.psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
     EXPECT_EQ(resolved->psk_id, rec.psk_id);
@@ -439,13 +439,16 @@ TEST(RecordStore, ResolveByPskIdPairingPskSecond) {
     provider.seed_blob(persistence_keys::PAIRING_PSK, to_bytes(encode_pairing_psk(p)));
     RecordStore store(&provider);
 
-    auto resolved = store.resolve_by_psk_id(p.psk_id);
+    auto resolved = store.resolve_by_psk_id(p.psk_id, PskCategory::PAIRING);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::PAIRING);
     EXPECT_FALSE(resolved->counterparty_id.has_value());
 }
 
-TEST(RecordStore, LongTermRecordWinsOverPairingPskWithSamePskId) {
+// One psk_id held under two categories resolves to whichever the server declared: there is no
+// precedence between the candidate sets, only the declared category's set
+// (connection.md "Pre-Shared Key").
+TEST(RecordStore, DeclaredCategoryPicksBetweenTwoPsksWithTheSamePskId) {
     InMemoryPersistenceProvider provider;
 
     // Build a record and a pairing PSK that share the same psk_id (and PSK bytes).
@@ -459,17 +462,57 @@ TEST(RecordStore, LongTermRecordWinsOverPairingPskWithSamePskId) {
     RecordStore store(&provider);
     store.store_record_superseding(rec);
 
-    // Long-term record must win.
-    auto resolved = store.resolve_by_psk_id(rec.psk_id);
-    ASSERT_TRUE(resolved.has_value());
-    EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
-    EXPECT_EQ(resolved->counterparty_id, rec.server_id);
+    auto as_long_term = store.resolve_by_psk_id(rec.psk_id, PskCategory::LONG_TERM);
+    ASSERT_TRUE(as_long_term.has_value());
+    EXPECT_EQ(as_long_term->category, PskCategory::LONG_TERM);
+    EXPECT_EQ(as_long_term->counterparty_id, rec.server_id);
+
+    auto as_pairing = store.resolve_by_psk_id(rec.psk_id, PskCategory::PAIRING);
+    ASSERT_TRUE(as_pairing.has_value());
+    EXPECT_EQ(as_pairing->category, PskCategory::PAIRING);
+    EXPECT_FALSE(as_pairing->counterparty_id.has_value());
+}
+
+// A psk_id the client holds only under another category is a lookup miss, not a match
+// (connection.md "Pre-Shared Key"). Each case pairs with the resolution that does succeed, so a
+// resolver that simply stopped finding anything would not pass.
+TEST(RecordStore, ResolveMissesAPskIdHeldUnderAnotherCategory) {
+    InMemoryPersistenceProvider provider;
+    RecordStore store(&provider);
+
+    SendspinPairingRecord rec = make_client_record("server-X");
+    store.store_record_superseding(rec);
+    ASSERT_TRUE(store.pairing_psk().has_value());
+    const std::string pairing_psk_id = store.pairing_psk()->psk_id;
+
+    EXPECT_FALSE(store.resolve_by_psk_id(rec.psk_id, PskCategory::PAIRING).has_value())
+        << "a long-term record must not answer a pairing-category lookup";
+    EXPECT_FALSE(store.resolve_by_psk_id(rec.psk_id, PskCategory::SENTINEL).has_value());
+    EXPECT_TRUE(store.resolve_by_psk_id(rec.psk_id, PskCategory::LONG_TERM).has_value());
+
+    EXPECT_FALSE(store.resolve_by_psk_id(pairing_psk_id, PskCategory::LONG_TERM).has_value())
+        << "the Pairing PSK must not answer a long-term lookup";
+    EXPECT_TRUE(store.resolve_by_psk_id(pairing_psk_id, PskCategory::PAIRING).has_value());
+
+    EXPECT_FALSE(store.resolve_by_psk_id(SENTINEL_PSK_ID, PskCategory::LONG_TERM).has_value())
+        << "the Sentinel PSK must not answer a long-term lookup";
+    EXPECT_TRUE(store.resolve_by_psk_id(SENTINEL_PSK_ID, PskCategory::SENTINEL).has_value());
+}
+
+// The three wire codes, and nothing else (messaging.md "noise/handshake").
+TEST(RecordStore, PskCategoryFromStringAcceptsOnlyTheThreeCodes) {
+    EXPECT_EQ(psk_category_from_string("lt"), PskCategory::LONG_TERM);
+    EXPECT_EQ(psk_category_from_string("pr"), PskCategory::PAIRING);
+    EXPECT_EQ(psk_category_from_string("sn"), PskCategory::SENTINEL);
+    EXPECT_FALSE(psk_category_from_string("").has_value());
+    EXPECT_FALSE(psk_category_from_string("LT").has_value());
+    EXPECT_FALSE(psk_category_from_string("long_term").has_value());
 }
 
 TEST(RecordStore, ResolveByPskIdSentinelAlwaysResolvable) {
     RecordStore store(nullptr);
 
-    auto resolved = store.resolve_by_psk_id(SENTINEL_PSK_ID);
+    auto resolved = store.resolve_by_psk_id(SENTINEL_PSK_ID, PskCategory::SENTINEL);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::SENTINEL);
     EXPECT_EQ(resolved->psk, SENTINEL_PSK);
@@ -479,7 +522,7 @@ TEST(RecordStore, ResolveByPskIdSentinelAlwaysResolvable) {
 TEST(RecordStore, ResolveByPskIdUnknownReturnsNullopt) {
     RecordStore store(nullptr);
 
-    auto resolved = store.resolve_by_psk_id("nope-not-a-real-psk-id");
+    auto resolved = store.resolve_by_psk_id("nope-not-a-real-psk-id", PskCategory::LONG_TERM);
     EXPECT_FALSE(resolved.has_value());
 }
 
@@ -655,7 +698,7 @@ TEST(RecordStore, RemoveRecordErasesFromMemoryAndWarnsWhenTheProviderRefusesTheD
 
     EXPECT_EQ(store.record_by_psk_id(a.psk_id), nullptr)
         << "a refused delete must not leave the revoked credential resolvable this boot";
-    EXPECT_FALSE(store.resolve_by_psk_id(a.psk_id).has_value());
+    EXPECT_FALSE(store.resolve_by_psk_id(a.psk_id, PskCategory::LONG_TERM).has_value());
     ASSERT_EQ(provider.remove_attempts.size(), 1u);
     EXPECT_EQ(provider.remove_attempts[0], a.psk_id);
     EXPECT_NE(logs.find(REBOOT_WARNING), std::string::npos)
@@ -705,7 +748,7 @@ TEST(RecordStore, SupersedeErasesFromMemoryAndFlushWarnsWhenTheProviderRefusesTh
 
     // The RAM effect precedes any provider traffic: the supersede itself asked for nothing.
     EXPECT_EQ(store.record_by_psk_id(original.psk_id), nullptr);
-    EXPECT_FALSE(store.resolve_by_psk_id(original.psk_id).has_value());
+    EXPECT_FALSE(store.resolve_by_psk_id(original.psk_id, PskCategory::LONG_TERM).has_value());
     EXPECT_NE(store.record_by_psk_id(replacement.psk_id), nullptr);
     EXPECT_TRUE(provider.remove_attempts.empty())
         << "store_record_superseding must not call the provider";
@@ -746,8 +789,8 @@ TEST(RecordStore, SupersedeIsSilentWhenTheProviderAcceptsTheFlush) {
         << "an accepted supersede flush must not warn; got: " << logs;
 
     RecordStore rebooted(&provider);
-    EXPECT_FALSE(rebooted.resolve_by_psk_id(original.psk_id).has_value());
-    EXPECT_TRUE(rebooted.resolve_by_psk_id(replacement.psk_id).has_value());
+    EXPECT_FALSE(rebooted.resolve_by_psk_id(original.psk_id, PskCategory::LONG_TERM).has_value());
+    EXPECT_TRUE(rebooted.resolve_by_psk_id(replacement.psk_id, PskCategory::LONG_TERM).has_value());
 }
 
 // The refused delete is exactly the durability hole the bool return exists to surface: the
@@ -766,7 +809,7 @@ TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
 
     // Reboot: a new store over the same provider reloads what the provider still holds.
     RecordStore rebooted(&provider);
-    auto resolved = rebooted.resolve_by_psk_id(a.psk_id);
+    auto resolved = rebooted.resolve_by_psk_id(a.psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(resolved.has_value())
         << "the provider kept the record, so it must come back: this is what the false return "
            "from a rejected \"records\" save warns about";
@@ -816,7 +859,7 @@ TEST(RecordStore, LoadedPairingPskIdIsCorrected) {
     ASSERT_TRUE(store.pairing_psk().has_value());
     EXPECT_EQ(store.pairing_psk()->psk_id, correct_psk_id);
     EXPECT_EQ(store.pairing_psk()->psk, stored.psk) << "the secret itself must be preserved";
-    EXPECT_TRUE(store.resolve_by_psk_id(correct_psk_id).has_value());
+    EXPECT_TRUE(store.resolve_by_psk_id(correct_psk_id, PskCategory::PAIRING).has_value());
     EXPECT_FALSE(provider.saved.has_value())
         << "a loaded Pairing PSK must not trigger re-provisioning";
 }
@@ -1380,7 +1423,7 @@ TEST(RecordStore, ResolvePairingOutcomeThenStore) {
     EXPECT_EQ(stored->psk_id, outcome->record.psk_id);
     EXPECT_EQ(stored->psk, outcome->psk);
 
-    auto resolved = store.resolve_by_psk_id(stored->psk_id);
+    auto resolved = store.resolve_by_psk_id(stored->psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
 }

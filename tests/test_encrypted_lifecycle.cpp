@@ -498,6 +498,9 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     options.first_activities_json = R"(["pairing"])";
     options.first_roles_json = R"([])";
     options.first_pairing_method = "pairing_psk";
+    // The initial handshake runs on the Pairing PSK, so message 1 declares that category
+    // (messaging.md "noise/handshake").
+    options.psk_category = "pr";
     FakeEncryptedServer server(server_url(PAIRING_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                                server_identity, configured_pairing_psk.psk_id, pairing_psk_bytes,
                                options);
@@ -658,7 +661,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     // Re-handshake the LIVE, admitted connection onto the pairing PSK, exactly like the server
     // re-pairing an already-connected client (e.g. Music Assistant token-pairing a device that
     // is already streaming).
-    ASSERT_TRUE(server.trigger_rehandshake(configured_pairing_psk.psk_id, pairing_psk_bytes))
+    ASSERT_TRUE(server.trigger_rehandshake(configured_pairing_psk.psk_id, pairing_psk_bytes, "pr"))
         << "Failed to start the in-band re-handshake onto the pairing PSK";
 
     // The fixed client must reply with client/pair-finalize instead of hard-stalling; the
@@ -745,6 +748,9 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     options.first_activities_json = R"(["pairing"])";
     options.first_roles_json = R"([])";
     options.first_pairing_method = "pairing_psk";
+    // The initial handshake runs on the Pairing PSK, so message 1 declares that category
+    // (messaging.md "noise/handshake").
+    options.psk_category = "pr";
     FakeEncryptedServer server(server_url(PAIRING_PERSIST_FAILURE_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                configured_pairing_psk.psk_id, pairing_psk_bytes, options);
@@ -935,8 +941,8 @@ std::string metadata_state_json(int timestamp, const std::string& title) {
 // admitted must be ignored.
 //
 // Completing the handshake is not authorization: the Sentinel PSK is a spec constant that
-// RecordStore::resolve_by_psk_id() accepts unconditionally, so any peer on the network can reach
-// handshake-complete and sit in the nursery. Whether its PSK category may drive playback at all is
+// resolves for every peer, so any peer on the network can reach handshake-complete and sit in
+// the nursery. Whether its PSK category may drive playback at all is
 // decided by admission when server/activate arrives. Before the gate, a peer could simply send
 // stream/state traffic ahead of server/activate (or never send one) and drive the roles anyway for
 // the whole nursery establish window.
@@ -1203,10 +1209,10 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
     EXPECT_EQ(server.goodbye_reason().value_or(""), "unpaired");
 
     // The record is gone for this boot: it no longer resolves a handshake at all.
-    EXPECT_FALSE(client.record_store_->resolve_by_psk_id(unpairing_record.psk_id).has_value())
+    EXPECT_FALSE(client.record_store_->resolve_by_psk_id(unpairing_record.psk_id, PskCategory::LONG_TERM).has_value())
         << "server/unpair must revoke the matched record, not just end the session";
     auto bystander_resolved =
-        client.record_store_->resolve_by_psk_id(bystander_record.psk_id);
+        client.record_store_->resolve_by_psk_id(bystander_record.psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(bystander_resolved.has_value())
         << "another server's record must survive an unpair it had no part in";
     EXPECT_EQ(bystander_resolved->category, PskCategory::LONG_TERM);
@@ -1259,7 +1265,7 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     EXPECT_TRUE(client.is_connected());
 
     // The paired server's record is untouched: it was never what this session ran on.
-    EXPECT_TRUE(client.record_store_->resolve_by_psk_id(paired_record.psk_id).has_value());
+    EXPECT_TRUE(client.record_store_->resolve_by_psk_id(paired_record.psk_id, PskCategory::LONG_TERM).has_value());
     EXPECT_EQ(persistence.persisted_psk_ids(), std::vector<std::string>{paired_record.psk_id});
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);

@@ -196,11 +196,23 @@ std::optional<Msg1CoreResult> run_msg1_core(const char* log_prefix, const Identi
         return std::nullopt;
     }
 
-    SS_LOGD(TAG, "%s: psk_id='%s'", log_prefix, psk_id);
+    // messaging.md "noise/handshake": the payload declares which category the server is using the
+    // referenced PSK as. A payload without one, or with a code outside the three defined, is a
+    // malformed payload, which connection.md "Failure Handling" makes a silent failure.
+    const char* psk_category_code = payload_doc["psk_category"] | "";
+    auto psk_category = psk_category_from_string(std::string(psk_category_code));
+    if (!psk_category.has_value()) {
+        SS_LOGE(TAG, "%s: msg1 payload psk_category missing or unknown ('%s')", log_prefix,
+                psk_category_code);
+        return std::nullopt;
+    }
 
-    auto resolved = record_store.resolve_by_psk_id(std::string(psk_id));
+    SS_LOGD(TAG, "%s: psk_id='%s' psk_category='%s'", log_prefix, psk_id, psk_category_code);
+
+    auto resolved = record_store.resolve_by_psk_id(std::string(psk_id), psk_category.value());
     if (!resolved.has_value()) {
-        SS_LOGW(TAG, "%s: unknown psk_id='%s', aborting", log_prefix, psk_id);
+        SS_LOGW(TAG, "%s: no '%s' PSK for psk_id='%s', aborting", log_prefix, psk_category_code,
+                psk_id);
         return std::nullopt;
     }
 

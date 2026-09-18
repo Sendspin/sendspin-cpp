@@ -704,6 +704,92 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     EXPECT_EQ(r2, HandshakeFrameResult::ABORT);
 }
 
+// =============================================================================
+// psk_category in the Noise message 1 payload
+// =============================================================================
+
+// Drives the handshake driver to Noise message 1 against a store holding one long-term record,
+// with the message 1 payload the caller supplies, and reports what the driver made of it. The
+// initiator always uses the record's PSK, so message 1 authenticates and the payload is the only
+// variable.
+HandshakeFrameResult run_msg1_with_payload(
+    const std::function<std::string(const std::string& psk_id)>& make_payload) {
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
+
+    std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+    platform_random_bytes(psk.data(), psk.size());
+    const std::string psk_id = psk_id_for(psk);
+
+    RecordStore rs(nullptr);
+    SendspinPairingRecord rec;
+    rec.psk_id = psk_id;
+    rec.psk = psk;
+    rec.server_id = server_id.peer_id();
+    rs.store_record_superseding(std::move(rec));
+
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    const std::string client_init = nh.build_client_init();
+    const std::string server_init_text = make_server_init(server_id.peer_id());
+    const std::string prologue_str = client_init + server_init_text;
+
+    EXPECT_EQ(nh.on_text_frame(server_init_text, [](const std::string&) { return true; }),
+              HandshakeFrameResult::NEED_MORE);
+
+    NoiseHandshakeState* init_hs_raw = build_initiator(
+        std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
+        server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
+        reinterpret_cast<const uint8_t*>(prologue_str.data()), prologue_str.size());
+    EXPECT_NE(init_hs_raw, nullptr);
+    if (init_hs_raw == nullptr) {
+        return HandshakeFrameResult::ABORT;
+    }
+    HsGuard guard(init_hs_raw);
+
+    const std::string msg1_text =
+        build_msg1_envelope_with_payload(init_hs_raw, make_payload(psk_id));
+    EXPECT_FALSE(msg1_text.empty());
+    return nh.on_text_frame(msg1_text, [](const std::string&) { return true; });
+}
+
+// connection.md "Pre-Shared Key": the psk_id is compared only against the candidates of the
+// declared category, so a psk_id the client holds as a long-term record is a lookup miss when the
+// server declares it as its pairing PSK. Without the scoping the same payload would resolve and
+// the connection would proceed with the activities the pairing category grants.
+TEST(NoiseHandshakeDriver, PskCategoryMismatchIsALookupMiss) {
+    EXPECT_EQ(run_msg1_with_payload([](const std::string& psk_id) {
+                  return R"({"psk_id":")" + psk_id + R"(","psk_category":"pr"})";
+              }),
+              HandshakeFrameResult::ABORT);
+}
+
+// Control: the same psk_id under the category the client actually holds it in completes.
+TEST(NoiseHandshakeDriver, MatchingPskCategoryCompletes) {
+    EXPECT_EQ(run_msg1_with_payload([](const std::string& psk_id) {
+                  return R"({"psk_id":")" + psk_id + R"(","psk_category":"lt"})";
+              }),
+              HandshakeFrameResult::COMPLETE);
+}
+
+// messaging.md "noise/handshake": a psk_category outside the three defined codes makes the payload
+// malformed, and connection.md "Failure Handling" makes that a silent failure. ABORT is how the
+// driver reports one: SendspinConnection closes the socket without sending anything.
+TEST(NoiseHandshakeDriver, UnknownPskCategoryAborts) {
+    EXPECT_EQ(run_msg1_with_payload([](const std::string& psk_id) {
+                  return R"({"psk_id":")" + psk_id + R"(","psk_category":"xx"})";
+              }),
+              HandshakeFrameResult::ABORT);
+}
+
+// A payload with no psk_category at all is malformed for the same reason: the category is not
+// optional, and guessing one would defeat the scoping above.
+TEST(NoiseHandshakeDriver, MissingPskCategoryAborts) {
+    EXPECT_EQ(run_msg1_with_payload([](const std::string& psk_id) {
+                  return R"({"psk_id":")" + psk_id + R"("})";
+              }),
+              HandshakeFrameResult::ABORT);
+}
+
 TEST(NoiseHandshakeDriver, MalformedServerInitAborts) {
     Identity client_id = Identity::generate().value();
     RecordStore rs(nullptr);

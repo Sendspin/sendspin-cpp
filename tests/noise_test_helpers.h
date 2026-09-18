@@ -147,21 +147,20 @@ inline NoiseHandshakeState* build_initiator(const std::string& suite_name,
     return hs;
 }
 
-/// @brief Write msg1 ({"psk_id":"..."} payload) on an initiator handshakestate and wrap the
-/// result in a `noise/handshake` JSON envelope, ready to feed to the responder driver.
-///
-/// @param hs      Initiator handshakestate positioned to write msg1 (from build_initiator()).
-/// @param psk_id  psk_id to advertise in the msg1 payload.
+/// @brief build_msg1_envelope() with the msg1 payload written out in full, for tests that need a
+/// payload the spec's shape does not cover (a missing field, a non-JSON body).
+/// @param hs           Initiator handshakestate positioned to write msg1.
+/// @param payload_json The exact payload bytes to encrypt into msg1.
 /// @return The envelope JSON text, or an empty string if the Noise write failed.
-inline std::string build_msg1_envelope(NoiseHandshakeState* hs, const std::string& psk_id) {
-    std::string psk_id_json = "{\"psk_id\":\"" + psk_id + "\"}";
+inline std::string build_msg1_envelope_with_payload(NoiseHandshakeState* hs,
+                                                    const std::string& payload_json) {
     std::vector<uint8_t> msg1_raw(4096);
     NoiseBuffer msg1_out;
     noise_buffer_set_output(msg1_out, msg1_raw.data(), msg1_raw.size());
     NoiseBuffer payload_in;
     noise_buffer_set_input(
-        payload_in, const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(psk_id_json.data())),
-        psk_id_json.size());
+        payload_in, const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(payload_json.data())),
+        payload_json.size());
     if (noise_handshakestate_write_message(hs, &msg1_out, &payload_in) != NOISE_ERROR_NONE) {
         return {};
     }
@@ -174,6 +173,21 @@ inline std::string build_msg1_envelope(NoiseHandshakeState* hs, const std::strin
     std::string out;
     serializeJson(doc, out);
     return out;
+}
+
+/// @brief Write msg1 ({"psk_id":..., "psk_category":...} payload) on an initiator handshakestate
+/// and wrap the result in a `noise/handshake` JSON envelope, ready to feed to the responder
+/// driver.
+///
+/// @param hs           Initiator handshakestate positioned to write msg1 (from build_initiator()).
+/// @param psk_id       psk_id to advertise in the msg1 payload.
+/// @param psk_category The category code to declare for it (messaging.md "noise/handshake"):
+///                     "lt", "pr", "sn", or a value the test wants the responder to reject.
+/// @return The envelope JSON text, or an empty string if the Noise write failed.
+inline std::string build_msg1_envelope(NoiseHandshakeState* hs, const std::string& psk_id,
+                                       const std::string& psk_category = "lt") {
+    return build_msg1_envelope_with_payload(
+        hs, "{\"psk_id\":\"" + psk_id + "\",\"psk_category\":\"" + psk_category + "\"}");
 }
 
 /// @brief Encrypt one Noise transport frame with a raw noise-c cipher state (appends the 16-byte
