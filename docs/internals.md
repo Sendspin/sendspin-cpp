@@ -218,6 +218,8 @@ The bump arena suits ArduinoJson's allocation pattern: during a parse the varian
 | Artwork image | `ArtworkRole::Impl::handle_binary()`: copies image data to a per-slot double buffer and enqueues a notification for the artwork decode thread |
 | Visualizer data (binary types 16-20) | `VisualizerRole::Impl::handle_binary()`: writes to visualizer ring buffer |
 
+An audio chunk is laid out per roles/player/v1.md "Audio Chunks (Binary)": the type byte, then bytes 1-8 the big-endian int64 playback timestamp in the server's clock, bytes 9-12 the big-endian uint32 `send_ahead`, and the encoded audio frame from byte 13. `send_ahead` reports the lead the server had in hand when it transmitted and carries no scheduling meaning, so `handle_binary()` parses past it; a chunk too short to hold the header is logged and dropped. Artwork and visualizer messages carry the 8-byte timestamp alone, with no `send_ahead`.
+
 ### Main Loop Processing
 
 `SendspinClient::loop()` (`src/client.cpp`) is a no-op while the client is stopped (a stopped client has no connections or threads, and the manager loop must not restart the WebSocket server). While started it runs the following steps **in order** on each tick; steps 3 onward are `SendspinClient::drain_inbox()`, which `stop()` also calls once so the clear callbacks are delivered synchronously:

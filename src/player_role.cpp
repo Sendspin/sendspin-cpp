@@ -54,6 +54,11 @@ static std::string encode_output_delay_blob(uint16_t delay_ms) {
 
 /// @brief Size of the big-endian 64-bit timestamp at the start of player binary messages.
 static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
+/// @brief Size of the big-endian 32-bit send_ahead that follows the timestamp in an audio chunk
+/// (roles/player/v1.md "Audio Chunks (Binary)"). The encoded audio starts after it.
+static constexpr size_t BINARY_SEND_AHEAD_SIZE = 4;
+/// @brief Bytes an audio chunk spends on its header, after the message type byte.
+static constexpr size_t AUDIO_CHUNK_HEADER_SIZE = BINARY_TIMESTAMP_SIZE + BINARY_SEND_AHEAD_SIZE;
 /// @brief Upper bound on the output delay, per roles/player/v1.md "Output delay": clients MUST
 /// clamp output_delay_ms to the range 0-5000.
 static constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000U;
@@ -293,17 +298,26 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     msg.player = player_state;
 }
 
+std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* data, size_t len) {
+    if (len < AUDIO_CHUNK_HEADER_SIZE) {
+        return std::nullopt;
+    }
+    return AudioChunk{.timestamp_us = be64_to_host(data),
+                      .audio = data + AUDIO_CHUNK_HEADER_SIZE,
+                      .audio_len = len - AUDIO_CHUNK_HEADER_SIZE};
+}
+
 SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) const {
     if (this->config.audio_formats.empty()) {
         return;
     }
-    if (len < BINARY_TIMESTAMP_SIZE) {
-        SS_LOGW(TAG, "Binary message too short for timestamp");
+    auto chunk = parse_audio_chunk(data, len);
+    if (!chunk.has_value()) {
+        SS_LOGW(TAG, "Binary message too short for the audio chunk header");
         return;
     }
-    int64_t timestamp = be64_to_host(data);
-    if (!this->send_audio_chunk(data + BINARY_TIMESTAMP_SIZE, len - BINARY_TIMESTAMP_SIZE,
-                                timestamp, CHUNK_TYPE_ENCODED_AUDIO, 0)) {
+    if (!this->send_audio_chunk(chunk->audio, chunk->audio_len, chunk->timestamp_us,
+                                CHUNK_TYPE_ENCODED_AUDIO, 0)) {
         SS_LOGW(TAG, "Failed to send audio chunk");
     }
 }

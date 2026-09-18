@@ -16,7 +16,7 @@
 /// in every client/state player object, and the supported-format list the spec constrains.
 ///
 /// The role's Impl is driven directly; the client is never started, so nothing here touches a
-/// socket or the sync task thread.
+/// socket or the sync task thread. The binary audio chunk header is parsed directly too.
 
 #include "player_role_impl.h"  // build_state_fields(); private access, see tests/CMakeLists.txt
 #include "protocol_messages.h"
@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
@@ -171,4 +172,65 @@ TEST(PlayerRoleTimingParameters, ReportedWhileOutputDelayIsNotAdjustable) {
               PlayerRoleConfig::pipeline_lead_time_ms(
                   PlayerRoleConfig::DEFAULT_EXTRA_STARTUP_SILENCE_MS));
     EXPECT_EQ(state.min_buffer_ms, PlayerRoleConfig::DEFAULT_MIN_BUFFER_MS);
+}
+
+// ============================================================================
+// Audio chunk header
+// ============================================================================
+
+// roles/player/v1.md "Audio Chunks (Binary)": bytes 1-8 timestamp, bytes 9-12 send_ahead, the
+// encoded audio frame from byte 13. The message type byte is already stripped here, so the
+// header is the first 12 bytes.
+TEST(PlayerAudioChunk, HeaderSplitsTimestampFromTheEncodedFrame) {
+    const std::vector<uint8_t> chunk = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x42, 0x40,  // timestamp = 1000000
+        0x00, 0x01, 0x86, 0xA0,                          // send_ahead = 100000
+        0xDE, 0xAD, 0xBE, 0xEF,                          // encoded audio
+    };
+
+    auto parsed = PlayerRole::Impl::parse_audio_chunk(chunk.data(), chunk.size());
+    ASSERT_TRUE(parsed.has_value());
+    // A parser reading the timestamp anywhere but bytes 0-7 would pick up send_ahead bytes.
+    EXPECT_EQ(parsed->timestamp_us, 1000000);
+    ASSERT_EQ(parsed->audio_len, 4u);
+    EXPECT_EQ(parsed->audio, chunk.data() + 12) << "the encoded frame starts past send_ahead";
+    EXPECT_EQ(std::vector<uint8_t>(parsed->audio, parsed->audio + parsed->audio_len),
+              (std::vector<uint8_t>{0xDE, 0xAD, 0xBE, 0xEF}));
+}
+
+// A negative timestamp round-trips as a signed value rather than a huge unsigned one.
+TEST(PlayerAudioChunk, TimestampIsSigned) {
+    const std::vector<uint8_t> chunk = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,  // timestamp = -2
+        0xFF, 0xFF, 0xFF, 0xFF,                          // send_ahead saturated
+        0x01,
+    };
+
+    auto parsed = PlayerRole::Impl::parse_audio_chunk(chunk.data(), chunk.size());
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->timestamp_us, -2);
+    EXPECT_EQ(parsed->audio_len, 1u);
+}
+
+// A chunk with a complete header but no audio after it is still a parsed header: the empty
+// frame is what the caller rejects, not the header length.
+TEST(PlayerAudioChunk, HeaderWithNoAudioParsesToAnEmptyFrame) {
+    const std::vector<uint8_t> chunk(12, 0x00);
+
+    auto parsed = PlayerRole::Impl::parse_audio_chunk(chunk.data(), chunk.size());
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->audio_len, 0u);
+}
+
+// A chunk too short to hold the 12-byte header is rejected. Eleven bytes is the interesting
+// case: it holds a whole timestamp, so a parser that only checked for the timestamp would
+// accept it and hand the codec three bytes of send_ahead.
+TEST(PlayerAudioChunk, ShortChunkIsRejected) {
+    const std::vector<uint8_t> chunk(16, 0x00);
+    for (size_t len = 0; len < 12; ++len) {
+        EXPECT_FALSE(PlayerRole::Impl::parse_audio_chunk(chunk.data(), len).has_value())
+            << "len=" << len;
+    }
+    // Control: one more byte makes the header complete.
+    EXPECT_TRUE(PlayerRole::Impl::parse_audio_chunk(chunk.data(), 12).has_value());
 }

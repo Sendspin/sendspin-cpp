@@ -579,8 +579,16 @@ public:
     }
 
     // Sends one player audio chunk: SENDSPIN_BINARY_PLAYER_AUDIO (4) with a zeroed PCM payload.
-    bool send_audio(int64_t timestamp_us, size_t payload_bytes) {
-        return this->send_binary(4, timestamp_us, std::string(payload_bytes, '\0'));
+    // roles/player/v1.md "Audio Chunks (Binary)" puts a big-endian uint32 send_ahead between the
+    // timestamp and the encoded audio.
+    bool send_audio(int64_t timestamp_us, size_t payload_bytes, uint32_t send_ahead_us = 0) {
+        std::string body;
+        body.reserve(4 + payload_bytes);
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            body.push_back(static_cast<char>((send_ahead_us >> shift) & 0xFF));
+        }
+        body.append(payload_bytes, '\0');
+        return this->send_binary(4, timestamp_us, body);
     }
 
     // What the client/pair-init that started the pairing attempt carried, and whether one

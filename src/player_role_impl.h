@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace sendspin {
@@ -38,10 +39,30 @@ enum class PlayerStreamCallbackType : uint8_t {
     STREAM_END,    // Stream ended normally
 };
 
+/// @brief One binary audio chunk, split into the parts roles/player/v1.md "Audio Chunks
+/// (Binary)" defines after the message type byte.
+struct AudioChunk {
+    /// Server clock time when the first sample should be output (bytes 1-8, big-endian int64).
+    int64_t timestamp_us{0};
+    /// Encoded audio frame, starting at byte 13. Points into the caller's buffer.
+    const uint8_t* audio{nullptr};
+    size_t audio_len{0};
+};
+
 /// @brief Private implementation of the player role
 struct PlayerRole::Impl {
     Impl(PlayerRoleConfig config, SendspinClient* client, SendspinPersistenceProvider* persistence);
     ~Impl();
+
+    /// @brief Splits one audio chunk's bytes (after the message type byte) into its timestamp
+    /// and its encoded audio frame.
+    ///
+    /// Bytes 9-12 carry `send_ahead`, the lead the server had in hand when it transmitted. It
+    /// carries no scheduling meaning, so the chunk is parsed past it rather than through it.
+    /// @param data Chunk bytes with the message type byte already stripped.
+    /// @param len  Number of bytes at @p data.
+    /// @return The split chunk, or nullopt when @p len is too short to hold the header.
+    static std::optional<AudioChunk> parse_audio_chunk(const uint8_t* data, size_t len);
 
     // ========================================
     // Event state
