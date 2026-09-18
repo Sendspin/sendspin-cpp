@@ -95,6 +95,7 @@ constexpr uint16_t ROLE_STATE_OBJECTS_TEST_PORT = 19016;
 constexpr uint16_t ROLE_ADDED_STATE_TEST_PORT = 19017;
 constexpr uint16_t METADATA_SCHEDULE_TEST_PORT = 19018;
 constexpr uint16_t METADATA_PENDING_TEST_PORT = 19019;
+constexpr uint16_t LOSE_CAPABILITY_TEST_PORT = 19041;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -1528,6 +1529,87 @@ TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing)
     pump_for(client, 100);
 }
 
+// messaging.md "server/activate", "Playback-capable connections": a later activation that changes
+// the activities so the connection is no longer playback-capable, without sending active_roles,
+// makes the client treat the persisted roles as empty. That is a role removal like any other, so
+// the roles it drops are torn down: here a session on a long-term record is re-handshaked onto the
+// Pairing PSK and activated for pairing alone, which a client without unpaired access may not
+// carry roles on. The activation is admissible, so the connection stays and the pairing it admits
+// begins -- after the teardown, not instead of it.
+TEST(EncryptedLifecycle, ActivateThatLosesPlaybackCapabilityRemovesTheRoles) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+
+    Identity server_identity = Identity::generate().value();
+    PairedPeer long_term_peer = make_paired_peer();
+    long_term_peer.record.server_id = server_identity.peer_id();
+    persistence.set_seeded_long_term_record(long_term_peer.record);
+    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xC5);
+    // Without unpaired access, messaging.md "server/activate" allows a pairing-PSK connection no
+    // activity set that includes playback, so declaring pairing alone is what takes this
+    // connection's playback capability away.
+    persistence.set_unpaired_access_enabled(false);
+
+    SendspinClientConfig config;
+    config.name = "Lost Capability Test Client";
+    config.server_port = LOSE_CAPABILITY_TEST_PORT;
+
+    struct ClearRecordingMetadataListener : MetadataRoleListener {
+        std::atomic<int> updates{0};
+        std::atomic<int> clears{0};
+        void on_metadata(const ServerMetadataStateObject& /*m*/) override {
+            this->updates.fetch_add(1);
+        }
+        void on_metadata_clear() override {
+            this->clears.fetch_add(1);
+        }
+    };
+    ClearRecordingMetadataListener metadata_listener;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    client.add_metadata().set_listener(&metadata_listener);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["metadata@v1"])";
+    // The post-rekey activate declares pairing alone and omits active_roles: the sticky set is
+    // what the client must narrow to empty on its own.
+    options.second_activities_json = R"(["pairing"])";
+    options.second_roles_json = "";
+    options.second_pairing_method = "pairing_psk";
+    options.withhold_pair_finalize_ack = true;
+    FakeEncryptedServer server(server_url(LOSE_CAPABILITY_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               long_term_peer.record.psk_id, long_term_peer.psk, options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "the initial long-term handshake never completed";
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Playing"}}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return metadata_listener.updates.load() == 1; }, 4000))
+        << "the metadata role never received its state while it was active";
+
+    ASSERT_TRUE(server.trigger_rehandshake(pairing_psk.psk_id, pairing_psk.psk, "pr"))
+        << "failed to start the in-band re-handshake onto the pairing PSK";
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return metadata_listener.clears.load() == 1; }, 4000))
+        << "losing playback capability left the role's state in place";
+    EXPECT_EQ(client.metadata()->get_track_duration_ms(), 0U);
+    EXPECT_TRUE(pump_until(
+        client, [&] { return server.pair_init().has_value(); }, 4000))
+        << "the activation that removed the roles must still enter the pairing it admits";
+    EXPECT_TRUE(client.is_connected()) << "an admissible activation closed the connection";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
 // The same combined activate arriving as the first one under NEW session keys, after the server
 // re-handshakes an already-admitted connection onto the Pairing PSK. The connection keeps the
 // admitted slot throughout, so this takes the already-admitted branch with is_first true.
@@ -1704,6 +1786,18 @@ TEST(EncryptedLifecycle, RehandshakeWithoutAnActivateIsDroppedByTheReproveWatchd
 // over a real socket is whatever the thread scheduler makes it.
 class HoldTestConnection : public SendspinConnection {
 public:
+    /// Applies the activation a real connection would have received before any role traffic
+    /// reaches it: the client acts on a role's messages only while that role is active
+    /// (messaging.md "server/activate"), so a connection with no applied activation would silence
+    /// every role this fixture drives.
+    HoldTestConnection() {
+        this->apply_server_activate({SendspinActivity::PLAYBACK},
+                                    std::vector<std::string>{"player@v1", "controller@v1",
+                                                             "metadata@v1", "color@v1",
+                                                             "artwork@v1", "visualizer@v1"},
+                                    std::nullopt, std::nullopt);
+    }
+
     void start() override {}
     void loop() override {}
     void disconnect(SendspinGoodbyeReason /*reason*/, std::function<void()> on_complete) override {

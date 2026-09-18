@@ -23,6 +23,7 @@
 /// and each later activation is sent as a plain application message.
 
 #include "artwork_role_impl.h"  // In-flight transfer state after a removal; private, see CMakeLists
+#include "connection_manager.h"  // Pending-activate flag, to queue an event ahead of a removal
 #include "color_role_impl.h"     // Held scheduled palette after a removal
 #include "crypto/constants.h"
 #include "metadata_role_impl.h"  // Held scheduled metadata state after a removal
@@ -38,6 +39,7 @@
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
 #include "sendspin/visualizer_role.h"
+#include "inbox.h"
 #include "sync_task.h"
 #include "visualizer_role_impl.h"
 
@@ -63,6 +65,10 @@ constexpr uint16_t ARTWORK_REMOVED_TEST_PORT = 19033;
 constexpr uint16_t VISUALIZER_REMOVED_TEST_PORT = 19034;
 constexpr uint16_t NO_CHANGE_TEST_PORT = 19035;
 constexpr uint16_t READD_TEST_PORT = 19036;
+constexpr uint16_t STALE_START_TEST_PORT = 19037;
+constexpr uint16_t STALE_START_CONTROL_TEST_PORT = 19038;
+constexpr uint16_t INACTIVE_TRAFFIC_TEST_PORT = 19039;
+constexpr uint16_t VERSION_REPLACED_TEST_PORT = 19040;
 
 /// Bound on every pump/wait: generous next to the loopback round trips involved, so the verdict
 /// comes from the predicate rather than the clock.
@@ -688,6 +694,288 @@ TEST(RoleDeactivation, ReAddedPlayerPublishesItsStateAndPlaysAgain) {
     EXPECT_TRUE(stream_audio_until(client, *server, player_listener, writes_before + 1))
         << "the re-added player role never played again";
     EXPECT_EQ(player_listener.stream_ends, 1);
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// ============================================================================
+// Events already queued when the removal lands
+// ============================================================================
+
+// A stream/start that reached the inbox before the activate that removes the role must not act
+// after it. The client applies the activation (and the teardown) in connection_manager_->loop(),
+// which runs ahead of the event drain in the same tick, so the queued START is drained with the
+// role already stopped: acting on it would fire on_stream_start() for a removed role and re-arm
+// the sync task, which then writes PCM from the chunks already in its ring.
+//
+// Nothing is pumped between the three sends, so the START is provably still in the ring when the
+// activate is applied: the test waits for the ring bit and the manager's pending-event flag
+// instead of for a duration.
+TEST(RoleDeactivation, StreamStartQueuedBeforeARemovalNeverStarts) {
+    CountingPlayerListener player_listener;
+
+    PairedClientBundle bundle(make_config(STALE_START_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_metadata();
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    options.first_roles_json = R"(["player@v1","metadata@v1"])";
+    auto server = connect_paired_server(bundle.peer, STALE_START_TEST_PORT, std::move(options));
+    ASSERT_TRUE(pump_until_synced(client));
+
+    // From here on the test thread does not pump: everything below queues up client-side.
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    constexpr size_t PCM_20MS_BYTES = 48000 / 50 * 2 * 2;
+    int64_t ts = platform_time_us() + 50 * 1000;
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(server->send_audio(ts, PCM_20MS_BYTES));
+        ts += 20 * 1000;
+    }
+    ASSERT_TRUE(server->send_app_json(activate_json(R"(["metadata@v1"])")));
+
+    // Both halves are in: the START sits in the event ring, the activate in the manager's pending
+    // events. The next loop() tick applies the activate first and drains the ring second.
+    ASSERT_TRUE(wait_until(
+        [&] {
+            return (client.player()->impl_->inbox->poll() & INBOX_TOPIC_EVENTS) != 0 &&
+                   client.connection_manager_->has_pending_events_.load();
+        },
+        PUMP_TIMEOUT_MS))
+        << "the stream/start and the activate never both arrived";
+
+    pump_for(client, SETTLE_MS);
+    EXPECT_EQ(player_listener.stream_starts, 0)
+        << "a stream/start queued before the removal started a stream for the removed role";
+    EXPECT_EQ(player_listener.audio_writes.load(), 0U)
+        << "PCM was written for a role the activation removed";
+    EXPECT_FALSE(client.player()->impl_->sync_task->is_running());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// Control for the case above: the same queued stream/start, and an activate that keeps the player,
+// starts the stream normally. Without this the teardown could pass its test by dropping every
+// queued event.
+TEST(RoleDeactivation, StreamStartQueuedBeforeAKeepingActivateStillStarts) {
+    CountingPlayerListener player_listener;
+
+    PairedClientBundle bundle(make_config(STALE_START_CONTROL_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_metadata();
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    options.first_roles_json = R"(["player@v1"])";
+    auto server =
+        connect_paired_server(bundle.peer, STALE_START_CONTROL_TEST_PORT, std::move(options));
+    ASSERT_TRUE(pump_until_synced(client));
+
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    constexpr size_t PCM_20MS_BYTES = 48000 / 50 * 2 * 2;
+    int64_t ts = platform_time_us() + 50 * 1000;
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(server->send_audio(ts, PCM_20MS_BYTES));
+        ts += 20 * 1000;
+    }
+    // Adds metadata, keeps the player: the queued START is for a role that is still active.
+    ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1","metadata@v1"])")));
+
+    ASSERT_TRUE(wait_until(
+        [&] {
+            return (client.player()->impl_->inbox->poll() & INBOX_TOPIC_EVENTS) != 0 &&
+                   client.connection_manager_->has_pending_events_.load();
+        },
+        PUMP_TIMEOUT_MS))
+        << "the stream/start and the activate never both arrived";
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return player_listener.stream_starts == 1; }, PUMP_TIMEOUT_MS))
+        << "an activation that removed nothing swallowed the queued stream/start";
+    EXPECT_TRUE(stream_audio_until(client, *server, player_listener, 1));
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// ============================================================================
+// Traffic for a role that is no longer active
+// ============================================================================
+
+// messaging.md "Communication" keeps a message the client implements recognized while its role is
+// inactive, and messaging.md "server/activate" expects each side to tolerate the other's
+// inactive-role traffic rather than close on it, "since the client may not yet have received the
+// role removal". So role traffic that arrives after a removal is parsed as usual and then not
+// acted on: without that gate the first message after a removal would put the role straight back
+// in service and the teardown would be a one-shot with nothing holding it.
+//
+// Every receive path is driven: server/state (metadata, color, controller), stream/start (player,
+// artwork, visualizer) and the binary IDs (audio, artwork image, visualizer frame). The controls
+// are the first half of the test, where the same traffic is applied while the roles are active.
+TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
+    CountingPlayerListener player_listener;
+    RecordingMetadataListener metadata_listener;
+    RecordingColorListener color_listener;
+    RecordingControllerListener controller_listener;
+    CountingVisualizerListener visualizer_listener;
+    RecordingArtworkListener artwork_listener;
+
+    PairedClientBundle bundle(make_config(INACTIVE_TRAFFIC_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_metadata().set_listener(&metadata_listener);
+    client.add_color().set_listener(&color_listener);
+    client.add_controller().set_listener(&controller_listener);
+    client.add_visualizer(make_visualizer_config()).set_listener(&visualizer_listener);
+    client.add_artwork(make_artwork_config()).set_listener(&artwork_listener);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    auto server =
+        connect_paired_server(bundle.peer, INACTIVE_TRAFFIC_TEST_PORT, std::move(options));
+    ASSERT_TRUE(pump_until_synced(client));
+
+    // Control: every path works while the roles are active.
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
+    ASSERT_TRUE(server->send_app_json(stream_start_artwork_json()));
+    ASSERT_TRUE(server->send_app_json(metadata_state_json(1, "Active")));
+    ASSERT_TRUE(server->send_app_json(color_state_json(1)));
+    ASSERT_TRUE(server->send_app_json(controller_state_json(11)));
+    ASSERT_TRUE(pump_until(
+        client,
+        [&] {
+            return player_listener.stream_starts == 1 && visualizer_listener.stream_starts == 1 &&
+                   metadata_listener.updates == 1 && color_listener.updates == 1 &&
+                   controller_listener.updates == 1;
+        },
+        PUMP_TIMEOUT_MS));
+    ASSERT_TRUE(stream_audio_until(client, *server, player_listener, 1));
+    ASSERT_TRUE(send_loudness_until(
+        client, *server, [&] { return visualizer_listener.loudness.load() >= 1; }));
+    ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), 32)));
+    ASSERT_TRUE(server->send_binary_body(artwork_part(32)));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return artwork_listener.decodes.load() == 1; }, PUMP_TIMEOUT_MS));
+
+    // Every role out.
+    ASSERT_TRUE(server->send_app_json(activate_json(R"([])")));
+    ASSERT_TRUE(pump_until(
+        client,
+        [&] {
+            return player_listener.stream_ends == 1 && visualizer_listener.stream_ends == 1 &&
+                   metadata_listener.clears == 1 && color_listener.clears == 1 &&
+                   controller_listener.clears == 1 && artwork_listener.clears == 1;
+        },
+        PUMP_TIMEOUT_MS));
+
+    const size_t writes_after_removal = player_listener.audio_writes.load();
+    const size_t loudness_after_removal = visualizer_listener.loudness.load();
+    // The sync task is idle and its ring drained, so anything the binary path still accepted for
+    // the removed player would show up here rather than at the audio output.
+    ASSERT_TRUE(pump_until(
+        client,
+        [&] { return client.player()->impl_->sync_task->encoded_ring_buffer_->is_empty(); },
+        PUMP_TIMEOUT_MS));
+
+    // The same traffic again, now for roles the server has removed.
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
+    ASSERT_TRUE(server->send_app_json(stream_start_artwork_json()));
+    ASSERT_TRUE(server->send_app_json(metadata_state_json(2, "Should Not Show")));
+    ASSERT_TRUE(server->send_app_json(color_state_json(2)));
+    ASSERT_TRUE(server->send_app_json(controller_state_json(99)));
+    constexpr size_t PCM_20MS_BYTES = 48000 / 50 * 2 * 2;
+    int64_t ts = platform_time_us() + 50 * 1000;
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(server->send_audio(ts, PCM_20MS_BYTES));
+        ts += 20 * 1000;
+    }
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(server->send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, platform_time_us(),
+                                        std::string("\x00\x10", 2)));
+    }
+    ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), 32)));
+    ASSERT_TRUE(server->send_binary_body(artwork_part(32)));
+    pump_for(client, SETTLE_MS);
+
+    EXPECT_EQ(player_listener.stream_starts, 1) << "a removed role's stream/start was acted on";
+    EXPECT_EQ(visualizer_listener.stream_starts, 1);
+    EXPECT_EQ(metadata_listener.updates, 1) << "a removed role's server/state was applied";
+    EXPECT_EQ(metadata_listener.last_title, "Active");
+    EXPECT_EQ(color_listener.updates, 1);
+    EXPECT_EQ(controller_listener.updates, 1);
+    EXPECT_EQ(client.controller()->get_controller_state().volume, 0);
+    EXPECT_EQ(player_listener.audio_writes.load(), writes_after_removal)
+        << "a removed role's audio chunks were played";
+    EXPECT_TRUE(client.player()->impl_->sync_task->encoded_ring_buffer_->is_empty())
+        << "a removed role's audio chunks were buffered";
+    EXPECT_EQ(visualizer_listener.loudness.load(), loudness_after_removal)
+        << "a removed role's frames were delivered";
+    EXPECT_EQ(artwork_listener.decodes.load(), 1U) << "a removed role's image was decoded";
+
+    // Recognized, not unknown: none of it is a protocol error, so the connection stays up.
+    EXPECT_FALSE(server->closed()) << "inactive-role traffic closed the connection";
+    EXPECT_TRUE(client.is_connected());
+
+    // Recognized also means the message's own rules still apply (messaging.md "Communication"):
+    // an artwork message that is malformed as a message is the protocol error the role closes on
+    // whether or not its role is active. Last, because it ends the connection.
+    ASSERT_TRUE(server->send_binary_body({SENDSPIN_BINARY_ARTWORK_IMAGE}));
+    EXPECT_TRUE(pump_until(
+        client, [&] { return !client.is_connected(); }, PUMP_TIMEOUT_MS))
+        << "a malformed artwork message was excused because its role was inactive";
+
+    pump_for(client, 100);
+}
+
+// ============================================================================
+// Removal without an explicit shrunken active_roles
+// ============================================================================
+
+// messaging.md "server/activate": "Role removal includes ... replacement of an active role
+// version". A server that activates a version this client does not implement leaves it with no
+// usable player, so the role is torn down exactly as an explicit drop would tear it down, while
+// the roles the activation leaves alone keep running.
+TEST(RoleDeactivation, ReplacingARoleVersionRemovesTheVersionInUse) {
+    CountingPlayerListener player_listener;
+    RecordingMetadataListener metadata_listener;
+
+    PairedClientBundle bundle(make_config(VERSION_REPLACED_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_metadata().set_listener(&metadata_listener);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    options.first_roles_json = R"(["player@v1","metadata@v1"])";
+    auto server =
+        connect_paired_server(bundle.peer, VERSION_REPLACED_TEST_PORT, std::move(options));
+    ASSERT_TRUE(pump_until_synced(client));
+
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    ASSERT_TRUE(server->send_app_json(metadata_state_json(1, "Before Replacement")));
+    ASSERT_TRUE(pump_until(
+        client,
+        [&] { return player_listener.stream_starts == 1 && metadata_listener.updates == 1; },
+        PUMP_TIMEOUT_MS));
+    ASSERT_TRUE(stream_audio_until(client, *server, player_listener, 1));
+
+    ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v2","metadata@v1"])")));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return player_listener.stream_ends == 1; }, PUMP_TIMEOUT_MS))
+        << "replacing player@v1 with a version the client does not implement left it running";
+    EXPECT_FALSE(client.player()->impl_->sync_task->is_running());
+    EXPECT_EQ(metadata_listener.clears, 0) << "a role the activation kept was torn down";
+    EXPECT_EQ(metadata_listener.last_title, "Before Replacement");
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

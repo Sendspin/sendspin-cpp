@@ -424,9 +424,14 @@ protected:
 };
 
 struct FakeEncryptedServerOptions {
-    // Sent in the FIRST server/activate, the one that follows client/hello.
+    // Sent in the FIRST server/activate, the one that follows client/hello. The role set is every
+    // role this library implements, matching a server that activates each role the client
+    // advertised: the client acts on a role's traffic only while that role is active
+    // (messaging.md "server/activate"), so a fixture that activated less would silence the role a
+    // test drives. A test that needs a narrower set names it.
     std::string first_activities_json{R"(["playback"])"};
-    std::string first_roles_json{R"(["player@v1"])"};
+    std::string first_roles_json{
+        R"(["player@v1","controller@v1","metadata@v1","color@v1","artwork@v1","visualizer@v1"])"};
     // The psk_category the server declares in its Noise message 1 payload. Unset means the
     // default for the psk_id (see default_psk_category_code); tests that hand the fixture a
     // pairing PSK set "pr".
@@ -436,9 +441,11 @@ struct FakeEncryptedServerOptions {
     // omitted (nullopt) for the normal playback admission path.
     std::optional<std::string> first_pairing_method;
     // Sent in the SECOND server/activate, the one connection.md "Re-handshake" makes the
-    // server's first message under the new keys after a trigger_rehandshake() call.
+    // server's first message under the new keys after a trigger_rehandshake() call. An empty
+    // roles string omits active_roles from the message (see send_activate_locked()).
     std::string second_activities_json{R"(["playback"])"};
-    std::string second_roles_json{R"(["player@v1"])"};
+    std::string second_roles_json{
+        R"(["player@v1","controller@v1","metadata@v1","color@v1","artwork@v1","visualizer@v1"])"};
     // Mirrors first_pairing_method for the SECOND server/activate: present only when it should
     // select a pairing method too (an in-band re-handshake onto a pairing PSK, mid-connection).
     std::optional<std::string> second_pairing_method;
@@ -902,7 +909,13 @@ private:
         const std::string& roles =
             first ? this->options_.first_roles_json : this->options_.second_roles_json;
         std::string activate = std::string(R"({"type":"server/activate","payload":{)") +
-                               R"("activities":)" + activities + R"(,"active_roles":)" + roles;
+                               R"("activities":)" + activities;
+        // An empty roles string means the activate omits active_roles entirely, which is the
+        // sticky form: messaging.md "server/activate" keeps the previous set unless the
+        // connection is no longer playback-capable, where the client narrows it to empty itself.
+        if (!roles.empty()) {
+            activate += R"(,"active_roles":)" + roles;
+        }
         const std::optional<std::string>& pairing_method =
             first ? this->options_.first_pairing_method : this->options_.second_pairing_method;
         if (pairing_method.has_value()) {
