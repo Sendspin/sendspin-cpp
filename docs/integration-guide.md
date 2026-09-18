@@ -131,7 +131,7 @@ artwork_config.preferred_formats = {
 auto& artwork = client.add_artwork(std::move(artwork_config));
 ```
 
-The slot/channel number for each entry is its position (index) in `preferred_formats`; the first entry is slot 0, the second slot 1, and so on. Up to `ARTWORK_MAX_SLOTS` (4) entries are supported.
+The slot/channel number for each entry is its position (index) in `preferred_formats`; the first entry is slot 0, the second slot 1, and so on. Up to `ARTWORK_MAX_SLOTS` (4) entries are supported. The client reports these channels to the server in its `client/state` artwork object, which is sent once the server activates the role.
 
 ### Visualizer Role (Audio Visualization)
 

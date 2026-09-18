@@ -864,7 +864,8 @@ TEST(Protocol, FormatClientStateArtworkChannels) {
     EXPECT_STREQ(channels[1]["format"], "png");
     EXPECT_EQ(channels[1]["width"].as<int>(), 64);
     EXPECT_EQ(channels[1]["height"].as<int>(), 48);
-    // The pre-rename dimension keys are gone; a server reading them would find nothing.
+    // messaging.md "Forward compatibility": a channel carries no key the spec does not define for
+    // it, so the dimensions travel under these names only.
     EXPECT_TRUE(channels[0]["media_width"].isUnbound());
     EXPECT_TRUE(channels[0]["media_height"].isUnbound());
 }

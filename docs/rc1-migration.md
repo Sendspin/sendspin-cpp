@@ -124,8 +124,8 @@ Exit: baseline lines 3-6 gone in tolerant mode.
 ### Phase 3: the flip
 
 Lands as one reviewed series; interop is verified only at its end, in strict mode. Phase 3a (the
-binary transport and the post-re-handshake and activation behavior) has landed; the rest is
-phase 3b, which moves the hello and verifies strict-mode interop.
+binary transport and the post-re-handshake and activation behavior) and phase 3b (the hello and
+the role `client/state` objects) have both landed.
 
 Done (3a):
 
@@ -144,7 +144,7 @@ Done (3a):
   `['playback', 'pairing']` activate routes the pairing entry path with its playback side left
   running, and pairing no longer quiesces playback.
 
-Remaining (3b):
+Done (3b):
 
 - D5: `supported_commands` leaves `player@v1_support`; `client/state` always reports `volume`,
   `mute` and (when adjustable) `set_output_delay`.
@@ -212,6 +212,14 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
 - `PlayerRoleConfig::required_lead_time_ms` is `std::optional<uint16_t>`: unset reports the
   pipeline-derived lead, a value overrides it. A consumer that assigned a plain integer still
   compiles; one that read the field needs `value_or`.
+- `VisualizerRoleConfig` splits into `support` (buffer capacity) and `stream` (types, rate cap,
+  spectrum), so a consumer setting `config.support.types` moves to `config.stream.types`.
+  `VisualizerRole::request_format()` and `VisualizerFormatRequest` are gone with no replacement.
+- `MetadataRoleListener::on_metadata()` and `ColorRoleListener::on_color()` keep their signatures
+  and state structs, but each call now carries the server's full state: a field the server left
+  out of that message is absent rather than held over from an earlier one, and a metadata state
+  without `progress` reports no position. A consumer that relied on the old carry-over sees
+  fields it used to keep go empty.
 
 ## Verified conformant (no work)
 
