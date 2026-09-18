@@ -66,8 +66,9 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   supported-format validation, driven through the role's `Impl` without a server.
 - `test_visualizer_role.cpp`: `decode_visualizer_message()` and the visualizer role's
   negotiation and dispatch.
-- `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: decode thread, slot
-  gating, `frame_done()` acks, and stream restart/clear.
+- `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: announce/part/cancel
+  transfers and the messages and sequences that close the connection, the per-channel image cap,
+  decode thread, slot gating, `frame_done()` acks, and stream restart/clear.
 - `test_connection_lifecycle.cpp`: the connection nursery (prove-then-admit) over real loopback
   sockets: junk probes, slow peers, capacity, and the liveness timeout.
 - `test_encrypted_lifecycle.cpp`: the Noise transport end to end over loopback: re-handshake,

@@ -164,9 +164,12 @@ Exit: strict-mode run pairs (Pairing PSK), plays and shows metadata with no reje
 
 ### Phase 4: artwork binary format
 
+Done:
+
 - E6: artwork announce / part / cancel transfers with `total_size`, one transfer in flight per
-  role, size cap, malformed-message and malformed-sequence closes. A zero `total_size` completes
-  immediately and clears the image.
+  role, the 65519 byte message cap, and the malformed-message and malformed-sequence closes. A
+  zero `total_size` completes immediately and clears the image. An announce or a cancel discards
+  the channel's pending image, which the per-channel slot epochs carry out.
 
 Exit: strict-mode run with the TUI client (artwork, visualizer, color enabled).
 
@@ -204,8 +207,14 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
 
 - Binary messages (audio, artwork, visualizer frames) that arrive between `server/activate` and
   admission are still dropped; only the JSON half of that window is held and replayed. A player
-  resynchronizes from the next chunk and artwork re-sends on its next frame, so the cost is
-  bounded, but a stream's first chunks can be lost this way.
+  resynchronizes from the next chunk, so the cost is bounded, but a stream's first chunks can be
+  lost this way. For artwork the window is now before the stream exists at all (the stream starts
+  from the `client/state` the client sends once admitted), so no transfer can be torn by it.
+- The artwork role refuses an image whose announced `total_size` exceeds the uncompressed size of
+  the channel's configured dimensions, tracking the transfer to its end with its bytes dropped.
+  `roles/artwork/v1.md` "Artwork (Binary)" allows this (it is the "unavailable client" path) but
+  sets no cap of its own, so a server that encodes an image far larger than the geometry it was
+  asked for sees the channel stay blank rather than an error.
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.
