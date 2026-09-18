@@ -225,6 +225,13 @@ std::unique_ptr<VisualizerRole::Impl> make_impl() {
     return impl;
 }
 
+// The teardown generation a handler would be handed by the receive gate on a role that has not
+// been torn down. The dispatch captures this value with its gate check and every point of effect
+// re-checks it, so a unit test driving a handler directly passes the live one.
+uint32_t live_generation(const VisualizerRole::Impl& impl) {
+    return impl.cleanup_generation.load(std::memory_order_acquire);
+}
+
 // Pops one entry from the ring buffer, or returns false if none is waiting.
 bool pop_entry(VisualizerRole::Impl& impl, std::vector<uint8_t>& out) {
     size_t size = 0;
@@ -248,7 +255,7 @@ TEST(VisualizerHandleBinary, ForwardsMessageVerbatim) {
     put_be64(data, 123456);
     put_be16(data, 0xABCD);
 
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
 
     std::vector<uint8_t> entry;
     ASSERT_TRUE(pop_entry(*impl, entry));
@@ -262,7 +269,7 @@ TEST(VisualizerHandleBinary, DropsMessageWithoutTimestamp) {
     auto impl = make_impl();
 
     std::vector<uint8_t> data(7, 0);  // fewer than the 8 timestamp bytes
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
 
     std::vector<uint8_t> entry;
     EXPECT_FALSE(pop_entry(*impl, entry));
@@ -275,7 +282,7 @@ TEST(VisualizerHandleBinary, DropsWhenStreamInactive) {
     std::vector<uint8_t> data;
     put_be64(data, 1);
     put_be16(data, 0);
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
 
     std::vector<uint8_t> entry;
     EXPECT_FALSE(pop_entry(*impl, entry));
@@ -290,7 +297,7 @@ TEST(VisualizerHandleBinary, ForwardsOversizedMessageWithoutCapping) {
     put_be16(data, 0x1111);
     data.insert(data.end(), 64, 0xEE);  // trailing bytes
 
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
 
     std::vector<uint8_t> entry;
     ASSERT_TRUE(pop_entry(*impl, entry));
@@ -308,16 +315,52 @@ TEST(VisualizerHandleBinary, DropsUnnegotiatedType) {
     put_be64(data, 1);
     put_be16(data, 0x0042);
 
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_BEAT, data.data(), data.size());
-    impl->handle_binary(21, data.data(), data.size());  // reserved type
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_BEAT, data.data(), data.size(), live_generation(*impl));
+    impl->handle_binary(21, data.data(), data.size(), live_generation(*impl));  // reserved type
 
     std::vector<uint8_t> entry;
     EXPECT_FALSE(pop_entry(*impl, entry));
 
     // Control: the negotiated type is still forwarded.
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
     ASSERT_TRUE(pop_entry(*impl, entry));
     EXPECT_EQ(entry[0], SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
+}
+
+// A teardown that lands after the receive gate admitted a message, while its handler is still
+// running, invalidates the whole handler: the generation the dispatch captured no longer matches,
+// so the stream is not re-armed for a role that has been stopped. Nothing here is timing-based:
+// the captured value is taken first and the teardown applied by hand, which is the interleaving
+// the network thread can otherwise produce on a live connection.
+TEST(VisualizerHandleBinary, HandlersRefuseAGenerationATeardownOvertook) {
+    auto impl = make_impl();
+    impl->stream_active = false;
+    impl->negotiated_types_mask = 0;
+    const uint32_t captured = live_generation(*impl);
+
+    impl->cleanup();
+
+    ServerVisualizerStreamObject stream;
+    stream.types = {VisualizerDataType::BEAT};
+    impl->handle_stream_start(stream, captured);
+    EXPECT_FALSE(impl->stream_active.load()) << "a stopped role was re-armed by a stale handler";
+    EXPECT_EQ(impl->negotiated_types_mask.load(), 0U);
+
+    std::vector<uint8_t> data;
+    put_be64(data, 1);
+    data.push_back(0x01);
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_BEAT, data.data(), data.size(), captured);
+    std::vector<uint8_t> entry;
+    EXPECT_FALSE(pop_entry(*impl, entry)) << "a stale frame reached the ring";
+
+    // Control: the same calls with the generation the role now reports are applied.
+    impl->handle_stream_start(stream, live_generation(*impl));
+    EXPECT_TRUE(impl->stream_active.load());
+    ASSERT_TRUE(pop_entry(*impl, entry));  // the stream/start boundary marker
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_BEAT, data.data(), data.size(),
+                        live_generation(*impl));
+    ASSERT_TRUE(pop_entry(*impl, entry));
+    EXPECT_EQ(entry[0], SENDSPIN_BINARY_VISUALIZER_BEAT);
 }
 
 TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
@@ -327,7 +370,7 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 
     ServerVisualizerStreamObject stream;
     stream.types = {VisualizerDataType::BEAT};
-    impl->handle_stream_start(stream);
+    impl->handle_stream_start(stream, live_generation(*impl));
 
     // stream/start enqueues a 1-byte boundary marker; consume it first.
     std::vector<uint8_t> entry;
@@ -338,11 +381,11 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
     put_be64(data, 1);
     data.push_back(0x01);
 
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_BEAT, data.data(), data.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_BEAT, data.data(), data.size(), live_generation(*impl));
     ASSERT_TRUE(pop_entry(*impl, entry));
     EXPECT_EQ(entry[0], SENDSPIN_BINARY_VISUALIZER_BEAT);
 
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
     EXPECT_FALSE(pop_entry(*impl, entry));
 }
 
@@ -354,7 +397,7 @@ TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
 TEST(VisualizerClearMarker, StreamClearEnqueuesMarker) {
     auto impl = make_impl();
 
-    impl->handle_stream_clear();
+    impl->handle_stream_clear(live_generation(*impl));
 
     // The marker is a single 0xFF byte, outside the visualizer wire-type range.
     std::vector<uint8_t> entry;
@@ -369,14 +412,14 @@ TEST(VisualizerClearMarker, DiscardPreservesPostClearFrames) {
     std::vector<uint8_t> pre;
     put_be64(pre, 1);
     put_be16(pre, 0x0001);
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, pre.data(), pre.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, pre.data(), pre.size(), live_generation(*impl));
 
-    impl->handle_stream_clear();
+    impl->handle_stream_clear(live_generation(*impl));
 
     std::vector<uint8_t> post;
     put_be64(post, 2);
     put_be16(post, 0x0002);
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, post.data(), post.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, post.data(), post.size(), live_generation(*impl));
 
     impl->discard_to_clear_marker();
 
@@ -396,8 +439,8 @@ TEST(VisualizerClearMarker, DiscardDrainsToEmptyWithoutMarker) {
     std::vector<uint8_t> data;
     put_be64(data, 1);
     put_be16(data, 0x0001);
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size());
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
 
     impl->discard_to_clear_marker();
 

@@ -87,11 +87,13 @@ struct PlayerRole::Impl {
     bool start();
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
-    void handle_binary(const uint8_t* data, size_t len) const;
-    void handle_stream_start(const ServerPlayerStreamObject& player_obj) const;
-    void handle_stream_end() const;
-    void handle_stream_clear() const;
-    void handle_server_command(const ServerCommandMessage& cmd) const;
+    // Each handler takes the teardown generation the receive gate captured when it admitted the
+    // message and re-checks it where it takes effect; see accepts().
+    void handle_binary(const uint8_t* data, size_t len, uint32_t generation) const;
+    void handle_stream_start(const ServerPlayerStreamObject& player_obj, uint32_t generation) const;
+    void handle_stream_end(uint32_t generation) const;
+    void handle_stream_clear(uint32_t generation) const;
+    void handle_server_command(const ServerCommandMessage& cmd, uint32_t generation) const;
     void on_stream_ring_event(PlayerStreamCallbackType event);
     // True if this tick has drainable player work. The command-slot bit covers server
     // volume/mute/output-delay commands; the state-slot bit covers client-state updates from
@@ -106,6 +108,18 @@ struct PlayerRole::Impl {
                !this->awaiting_sync_idle_events.empty();
     }
     void drain_events();
+    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
+    ///
+    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
+    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
+    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
+    /// the gate and hands it back here at each point of effect, so a teardown inside that window
+    /// invalidates the whole handler instead of only the part that ran before it.
+    /// @param generation The counter value captured when the message was admitted.
+    bool accepts(uint32_t generation) const {
+        return generation == this->cleanup_generation.load(std::memory_order_acquire);
+    }
+
     /// @brief Stops the role and discards its state. Main loop only.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
@@ -132,7 +146,9 @@ struct PlayerRole::Impl {
     bool send_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
                           uint8_t chunk_type, uint32_t timeout_ms) const;
     void enqueue_state_update(SendspinClientState state) const;
-    void enqueue_stream_event(PlayerStreamCallbackType event) const;
+    /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
+    /// against the live counter before dispatching it.
+    void enqueue_stream_event(PlayerStreamCallbackType event, uint32_t generation) const;
     void load_output_delay();
     void persist_output_delay() const;
     uint16_t get_effective_output_delay_ms() const;

@@ -73,7 +73,11 @@ void ColorRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::COLOR);
 }
 
-void ColorRole::Impl::handle_server_state(const ServerColorStateObject& color) const {
+void ColorRole::Impl::handle_server_state(const ServerColorStateObject& color,
+                                          uint32_t generation) const {
+    if (!this->accepts(generation)) {
+        return;
+    }
     // messaging.md "server/state": each included color object is the role's full palette, never
     // an overlay on the one before it. Two can arrive between main-loop ticks, so the slot keeps
     // the oldest undrained palette alongside the newest (see coalesce_color_states).
@@ -141,6 +145,8 @@ void ColorRole::Impl::handle_cleared_event() const {
 }
 
 void ColorRole::Impl::cleanup() {
+    // Bumped first: it invalidates any handler the gate already admitted (see accepts()).
+    this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
     this->event_state->slot.reset();
     this->color = {};
     this->held_state.reset();

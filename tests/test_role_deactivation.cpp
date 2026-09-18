@@ -543,6 +543,10 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
                    controller_listener.updates == 1 && player_listener.stream_starts == 1;
         },
         PUMP_TIMEOUT_MS));
+    // What the receive gate would hand a metadata handler admitted right now, kept for the
+    // overtaken-handler check at the end.
+    const uint32_t metadata_generation =
+        client.metadata()->impl_->cleanup_generation.load(std::memory_order_acquire);
 
     // The scheduled updates behind the current states: due so far in the future that they are
     // still pending when the removal lands.
@@ -587,6 +591,28 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     EXPECT_EQ(player_listener.stream_ends, 0) << "a role the activation kept was torn down";
     EXPECT_TRUE(stream_audio_until(client, *server, player_listener, 1))
         << "the player stopped playing when the state roles were removed";
+
+    // The gate is checked once on the network thread while the handler it admits runs on, so a
+    // teardown can land in between. The handler re-checks the generation the gate captured, which
+    // a state admitted before this removal no longer carries: driving it directly is the same call
+    // the network thread would make, with the interleaving forced rather than raced for.
+    ServerMetadataStateObject overtaken;
+    overtaken.timestamp = 1;
+    overtaken.title = "Overtaken By The Removal";
+    client.metadata()->impl_->handle_server_state(std::move(overtaken), metadata_generation);
+    pump_for(client, SETTLE_MS);
+    EXPECT_EQ(metadata_listener.updates, 1) << "a state a teardown overtook was applied";
+
+    // Control: the same call carrying the generation the role reports now is applied, so the
+    // refusal above came from the stale generation and nothing else.
+    ServerMetadataStateObject current;
+    current.timestamp = 1;
+    current.title = "Current Generation";
+    client.metadata()->impl_->handle_server_state(
+        std::move(current),
+        client.metadata()->impl_->cleanup_generation.load(std::memory_order_acquire));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return metadata_listener.updates == 2; }, PUMP_TIMEOUT_MS));
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

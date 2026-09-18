@@ -485,7 +485,8 @@ bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
 // Stream lifecycle (network thread)
 // ============================================================================
 
-void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream) {
+void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& stream,
+                                            uint32_t generation) {
     if (stream.channels.has_value()) {
         const auto& server_channels = stream.channels.value();
         if (server_channels.size() != this->artwork_channels.size()) {
@@ -516,8 +517,6 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         }
     }
 
-    this->stream_active = true;
-
     // Unlike the other lifecycle handlers, no display_slot.reset() here: it would discard the
     // pending display of every channel, including the unchanged ones this stream/start must
     // leave alone. It is not needed either, because a display published by the decode thread
@@ -547,6 +546,13 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         // Protocol messages are serialized on the network thread, so this runs before any of the
         // new stream's handle_binary() calls.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+        // The stream is marked active inside this lock: cleanup() bumps the generation before
+        // taking the same lock to discard, so a teardown that overtook this handler is seen
+        // here, and one that lands afterwards clears what this sets.
+        if (!this->accepts(generation)) {
+            return;
+        }
+        this->stream_active = true;
         const uint8_t changed = this->changed_channel_mask(stream);
         this->streamed_channels = stream.channels;
         this->transfer = ArtworkTransfer{};
@@ -596,25 +602,24 @@ bool ArtworkRole::Impl::same_channel(const ServerArtworkChannelObject& a,
            a.height == b.height;
 }
 
-void ArtworkRole::Impl::handle_stream_end() {
+void ArtworkRole::Impl::handle_stream_end(uint32_t generation) {
     this->stream_active = false;
     this->discard_all_pending();
 
-    this->enqueue_stream_event(ArtworkEventType::STREAM_END);
+    this->enqueue_stream_event(ArtworkEventType::STREAM_END, generation);
 }
 
-void ArtworkRole::Impl::handle_stream_clear() {
+void ArtworkRole::Impl::handle_stream_clear(uint32_t generation) {
     this->stream_active = false;
     this->discard_all_pending();
 
-    this->enqueue_stream_event(ArtworkEventType::STREAM_CLEAR);
+    this->enqueue_stream_event(ArtworkEventType::STREAM_CLEAR, generation);
 }
 
-void ArtworkRole::Impl::enqueue_stream_event(ArtworkEventType event) const {
+void ArtworkRole::Impl::enqueue_stream_event(ArtworkEventType event, uint32_t generation) const {
     push_event_or_log(this->inbox, InboxEventType::ARTWORK_STREAM, static_cast<uint8_t>(event), TAG,
                       event == ArtworkEventType::STREAM_END ? "STREAM_END" : "STREAM_CLEAR",
-                      /*error_level=*/false,
-                      this->cleanup_generation.load(std::memory_order_acquire));
+                      /*error_level=*/false, generation);
 }
 
 // ============================================================================
@@ -780,14 +785,16 @@ void ArtworkRole::Impl::cleanup() {
     // need no per-event ring reset either way: on the connection-loss path
     // SendspinClient::cleanup_connection_state()'s inbox.reset_events() has already wiped them,
     // and on the deactivation path, which leaves the ring alone for the roles that stay active,
-    // they sit ahead of the STREAM_END pushed below and are delivered in order.
+    // they carry the generation this teardown just left behind and the drain discards them (see
+    // event_is_current()).
     this->held_display_mask = 0;
     this->held_display_clear = 0;
     this->event_state->display_slot.reset();
 
     // Enqueue a clean STREAM_END - handle_stream_ring_event() will fire the on_image_clear()
     // callbacks (enqueue_stream_event() logs if the ring is too full to take it).
-    this->enqueue_stream_event(ArtworkEventType::STREAM_END);
+    this->enqueue_stream_event(ArtworkEventType::STREAM_END,
+                               this->cleanup_generation.load(std::memory_order_acquire));
 }
 
 // ============================================================================

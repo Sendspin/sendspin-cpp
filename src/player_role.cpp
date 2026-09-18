@@ -310,8 +310,9 @@ std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* dat
                       .audio_len = len - AUDIO_CHUNK_HEADER_SIZE};
 }
 
-SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) const {
-    if (this->config.audio_formats.empty()) {
+SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len,
+                                            uint32_t generation) const {
+    if (this->config.audio_formats.empty() || !this->accepts(generation)) {
         return;
     }
     auto chunk = parse_audio_chunk(data, len);
@@ -331,10 +332,11 @@ SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) con
     }
 }
 
-void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj) const {
+void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj,
+                                           uint32_t generation) const {
     if (this->config.audio_formats.empty()) {
         // No audio formats, just defer stream start callback
-        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START);
+        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation);
         return;
     }
 
@@ -381,7 +383,15 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
 
     if (!header_sent) {
         this->sync_task->signal_stream_end();
-        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END);
+        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
+        return;
+    }
+
+    // The codec-header send above blocks for up to HEADER_SEND_TIMEOUT_MS, which is the widest
+    // window a teardown can land in between the receive gate and this publication. One that did
+    // land has already ended the stream and queued its own STREAM_END, so publishing here would
+    // re-arm the sync task on the header just written with nothing behind it.
+    if (!this->accepts(generation)) {
         return;
     }
 
@@ -390,20 +400,24 @@ void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& playe
     // high_performance_requested_for_playback main-thread-only. The params write and the event push
     // are two separate Inbox lock acquisitions, not one critical section: the mutex orders the
     // write before the push for visibility, but a concurrent main-thread cleanup() can slip its
-    // stream_params_slot.reset() between them. If that happens the drain takes START and finds the
-    // slot empty, so take() returns false and current_stream_params keeps its prior value (see
-    // stream_params_slot.take() in drain_events()). That window is benign: the same teardown
-    // enqueues a STREAM_END right behind this START.
+    // stream_params_slot.reset() between them. That teardown also bumped the generation this
+    // START is stamped with, so the drain discards the START and the stale params sit unread
+    // until the next stream replaces them; if instead the START wins the race, the drain takes
+    // it, finds the slot empty and keeps the prior params (see stream_params_slot.take() in
+    // drain_events()).
     this->event_state->stream_params_slot.write(player_obj);
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation);
 }
 
-void PlayerRole::Impl::handle_stream_end() const {
+void PlayerRole::Impl::handle_stream_end(uint32_t generation) const {
     this->sync_task->signal_stream_end();
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
 }
 
-void PlayerRole::Impl::handle_stream_clear() const {
+void PlayerRole::Impl::handle_stream_clear(uint32_t generation) const {
+    if (!this->accepts(generation)) {
+        return;
+    }
     // stream/clear is a seek within the active stream: the server flushes our buffered audio and
     // immediately resumes sending new audio with the same codec/params (no new stream/start). Tell
     // the sync task to discard buffered audio, then enqueue a marker so it knows exactly where the
@@ -420,8 +434,9 @@ void PlayerRole::Impl::handle_stream_clear() const {
     }
 }
 
-void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) const {
-    if (!cmd.player.has_value()) {
+void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd,
+                                             uint32_t generation) const {
+    if (!cmd.player.has_value() || !this->accepts(generation)) {
         SS_LOGV(TAG, "Server command has no player commands");
         return;
     }
@@ -604,17 +619,19 @@ void PlayerRole::Impl::cleanup() {
     this->sync_task->signal_stream_end();
 
     // Discard stale slot content. Stale ring-borne events (an in-flight STREAM_START/STREAM_END
-    // queued before this teardown) need no per-queue ring reset either way: on the connection-loss
-    // path SendspinClient::cleanup_connection_state()'s inbox.reset_events() has already wiped
-    // them, and on the deactivation path, which leaves the ring alone for the roles that stay
-    // active, they sit ahead of the STREAM_END pushed below and are delivered in order.
+    // queued before this teardown) need no per-queue ring reset either way: on the
+    // connection-loss path SendspinClient::cleanup_connection_state()'s inbox.reset_events() has
+    // already wiped them, and on the deactivation path, which leaves the ring alone for the roles
+    // that stay active, they carry the generation this teardown just left behind and the drain
+    // discards them (see event_is_current()).
     this->event_state->stream_params_slot.reset();
     this->event_state->command_slot.reset();
     this->event_state->state_slot.reset();
 
     // Enqueue a clean STREAM_END - drain_events() will fire the callback (enqueue_stream_event()
     // logs if the ring is too full to take it)
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END);
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END,
+                               this->cleanup_generation.load(std::memory_order_acquire));
 
     // Clear awaiting events too (main-thread only, no mutex needed)
     this->awaiting_sync_idle_events.clear();
@@ -648,7 +665,8 @@ void PlayerRole::Impl::enqueue_state_update(SendspinClientState state) const {
     this->event_state->state_slot.write(state);
 }
 
-void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event) const {
+void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event,
+                                            uint32_t generation) const {
     // A dropped STREAM_START would leave the sync task waiting for its start signal forever;
     // a dropped STREAM_END would leave the consumer believing the stream is still active. Both
     // wedge the stream, so log the drop at ERROR (the helper defaults to WARN, which suits the
@@ -656,7 +674,7 @@ void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event) cons
     push_event_or_log(
         this->inbox, InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(event), TAG,
         event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END",
-        /*error_level=*/true, this->cleanup_generation.load(std::memory_order_acquire));
+        /*error_level=*/true, generation);
 }
 
 void PlayerRole::Impl::load_output_delay() {

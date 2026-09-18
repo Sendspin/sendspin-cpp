@@ -252,8 +252,10 @@ void VisualizerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
 // Binary handling (network thread)
 // ============================================================================
 
-void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* data, size_t len) {
-    if (!this->stream_active || !this->drain_task || !this->drain_task->ring_buffer.is_created()) {
+void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* data, size_t len,
+                                         uint32_t generation) {
+    if (!this->accepts(generation) || !this->stream_active || !this->drain_task ||
+        !this->drain_task->ring_buffer.is_created()) {
         return;
     }
 
@@ -293,7 +295,11 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
 // Stream lifecycle (network thread)
 // ============================================================================
 
-void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObject& stream) {
+void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObject& stream,
+                                               uint32_t generation) {
+    if (!this->accepts(generation)) {
+        return;
+    }
     // Cache stream config for handle_binary (same thread) and the drain thread
     uint8_t bin_count = 0;
     uint8_t types_mask = 0;
@@ -320,10 +326,10 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
     // same shared Inbox mutex, in this order, so a consumer that later takes the START event is
     // guaranteed to observe this config (see config_slot.take() in handle_stream_ring_event()).
     this->event_state->config_slot.write(stream);
-    this->enqueue_stream_event(VisualizerEventType::STREAM_START);
+    this->enqueue_stream_event(VisualizerEventType::STREAM_START, generation);
 }
 
-void VisualizerRole::Impl::handle_stream_end() {
+void VisualizerRole::Impl::handle_stream_end(uint32_t generation) {
     this->stream_active = false;
     this->negotiated_types_mask = 0;
 
@@ -334,19 +340,20 @@ void VisualizerRole::Impl::handle_stream_end() {
         this->drain_task->ring_buffer.wake_receiver();
     }
 
-    this->enqueue_stream_event(VisualizerEventType::STREAM_END);
+    this->enqueue_stream_event(VisualizerEventType::STREAM_END, generation);
 }
 
-void VisualizerRole::Impl::handle_stream_clear() const {
+void VisualizerRole::Impl::handle_stream_clear(uint32_t generation) const {
     // Per spec, stream/clear discards buffered data but the stream stays active; data
     // received after this message continues to flow. The marker separates the two: a blind
     // flush would race this thread and drop post-clear frames it has already enqueued.
     this->signal_clear_marker();
 
-    this->enqueue_stream_event(VisualizerEventType::STREAM_CLEAR);
+    this->enqueue_stream_event(VisualizerEventType::STREAM_CLEAR, generation);
 }
 
-void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event) const {
+void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event,
+                                                uint32_t generation) const {
     const char* name = "STREAM_CLEAR";
     if (event == VisualizerEventType::STREAM_START) {
         name = "STREAM_START";
@@ -354,8 +361,7 @@ void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event) const
         name = "STREAM_END";
     }
     push_event_or_log(this->inbox, InboxEventType::VISUALIZER_STREAM, static_cast<uint8_t>(event),
-                      TAG, name, /*error_level=*/false,
-                      this->cleanup_generation.load(std::memory_order_acquire));
+                      TAG, name, /*error_level=*/false, generation);
 }
 
 // ============================================================================
@@ -407,12 +413,14 @@ void VisualizerRole::Impl::cleanup() {
     // reset either way: on the connection-loss path
     // SendspinClient::cleanup_connection_state()'s inbox.reset_events() has already wiped them,
     // and on the deactivation path, which leaves the ring alone for the roles that stay active,
-    // they sit ahead of the STREAM_END pushed below and are delivered in order.
+    // they carry the generation this teardown just left behind and the drain discards them (see
+    // event_is_current()).
     this->event_state->config_slot.reset();
 
     // Enqueue a clean STREAM_END - handle_stream_ring_event() will fire the callback
     // (enqueue_stream_event() logs if the ring is too full to take it).
-    this->enqueue_stream_event(VisualizerEventType::STREAM_END);
+    this->enqueue_stream_event(VisualizerEventType::STREAM_END,
+                               this->cleanup_generation.load(std::memory_order_acquire));
 }
 
 // ============================================================================

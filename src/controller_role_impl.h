@@ -20,6 +20,7 @@
 #include "inbox.h"
 #include "sendspin/controller_role.h"
 
+#include <atomic>
 #include <memory>
 
 namespace sendspin {
@@ -46,13 +47,25 @@ struct ControllerRole::Impl {
 
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerStateControllerObject&& state) const;
+    void handle_server_state(ServerStateControllerObject&& state, uint32_t generation) const;
     // True if a controller-state delta is waiting in the inbox slot.
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & INBOX_TOPIC_CONTROLLER) != 0;
     }
     void drain_events();
     void handle_cleared_event() const;
+    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
+    ///
+    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
+    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
+    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
+    /// the gate and hands it back here at each point of effect, so a teardown inside that window
+    /// invalidates the whole handler instead of only the part that ran before it.
+    /// @param generation The counter value captured when the message was admitted.
+    bool accepts(uint32_t generation) const {
+        return generation == this->cleanup_generation.load(std::memory_order_acquire);
+    }
+
     /// @brief Stops the role and discards its state. Main loop only.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
@@ -73,6 +86,11 @@ struct ControllerRole::Impl {
     // ========================================
 
     // Struct fields
+    /// @brief Teardown generation, bumped by cleanup(). The receive gate captures it when it
+    /// admits a message and every point of effect re-checks it (see accepts()), so state written
+    /// by a handler a teardown overtook is refused. Atomic because the network thread reads it.
+    std::atomic<uint32_t> cleanup_generation{0};
+
     ServerStateControllerObject controller_state{};
 
     // Pointer fields

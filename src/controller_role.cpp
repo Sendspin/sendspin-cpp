@@ -65,7 +65,11 @@ void ControllerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::CONTROLLER);
 }
 
-void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& state) const {
+void ControllerRole::Impl::handle_server_state(ServerStateControllerObject&& state,
+                                               uint32_t generation) const {
+    if (!this->accepts(generation)) {
+        return;
+    }
     this->event_state->slot.write(std::move(state));
 }
 
@@ -88,6 +92,8 @@ void ControllerRole::Impl::handle_cleared_event() const {
 }
 
 void ControllerRole::Impl::cleanup() {
+    // Bumped first: it invalidates any handler the gate already admitted (see accepts()).
+    this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
     this->event_state->slot.reset();
     this->controller_state = {};
 

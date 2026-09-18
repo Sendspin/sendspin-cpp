@@ -21,6 +21,7 @@
 #include "protocol_messages.h"
 #include "sendspin/color_role.h"
 
+#include <atomic>
 #include <memory>
 #include <optional>
 
@@ -63,7 +64,7 @@ struct ColorRole::Impl {
     // Takes a const reference, unlike the metadata and controller overloads: a
     // ServerColorStateObject holds only optional RGB triples and a timestamp, so there is nothing
     // for an rvalue reference to move out of.
-    void handle_server_state(const ServerColorStateObject& color) const;
+    void handle_server_state(const ServerColorStateObject& color, uint32_t generation) const;
     // True if a slot palette needs taking, or a palette already held from a prior tick (see
     // held_state) is still waiting out its server-clock deadline -- the deadline itself sets no
     // inbox bit, so held_state must be polled every tick until it fires.
@@ -76,6 +77,18 @@ struct ColorRole::Impl {
     /// Applies the held palette and fires the listener once its server-clock deadline has passed.
     void apply_due_state();
     void handle_cleared_event() const;
+    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
+    ///
+    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
+    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
+    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
+    /// the gate and hands it back here at each point of effect, so a teardown inside that window
+    /// invalidates the whole handler instead of only the part that ran before it.
+    /// @param generation The counter value captured when the message was admitted.
+    bool accepts(uint32_t generation) const {
+        return generation == this->cleanup_generation.load(std::memory_order_acquire);
+    }
+
     /// @brief Stops the role and discards its state. Main loop only.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
@@ -90,6 +103,11 @@ struct ColorRole::Impl {
     // ========================================
 
     // Struct fields
+    /// @brief Teardown generation, bumped by cleanup(). The receive gate captures it when it
+    /// admits a message and every point of effect re-checks it (see accepts()), so state written
+    /// by a handler a teardown overtook is refused. Atomic because the network thread reads it.
+    std::atomic<uint32_t> cleanup_generation{0};
+
     ServerColorStateObject color{};
     // Palette taken from the inbox slot, awaiting its server-clock deadline. Main-thread only:
     // written and read exclusively from drain_events()/cleanup() on the loop thread.

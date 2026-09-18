@@ -124,7 +124,11 @@ void MetadataRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::METADATA);
 }
 
-void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject&& metadata) const {
+void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject&& metadata,
+                                             uint32_t generation) const {
+    if (!this->accepts(generation)) {
+        return;
+    }
     // messaging.md "server/state": each included metadata object is the role's full state, never
     // an overlay on the one before it. Two can arrive between main-loop ticks, so the slot keeps
     // the oldest undrained state alongside the newest (see coalesce_metadata_states).
@@ -196,6 +200,8 @@ void MetadataRole::Impl::handle_cleared_event() const {
 }
 
 void MetadataRole::Impl::cleanup() {
+    // Bumped first: it invalidates any handler the gate already admitted (see accepts()).
+    this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
     this->event_state->slot.reset();
     this->metadata = {};
     this->held_state.reset();

@@ -101,11 +101,25 @@ struct VisualizerRole::Impl {
     bool start();
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
-    void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len);
-    void handle_stream_start(const ServerVisualizerStreamObject& stream);
-    void handle_stream_end();
-    void handle_stream_clear() const;
+    // Each handler takes the teardown generation the receive gate captured when it admitted the
+    // message and re-checks it where it takes effect; see accepts().
+    void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len, uint32_t generation);
+    void handle_stream_start(const ServerVisualizerStreamObject& stream, uint32_t generation);
+    void handle_stream_end(uint32_t generation);
+    void handle_stream_clear(uint32_t generation) const;
     void handle_stream_ring_event(VisualizerEventType event) const;
+    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
+    ///
+    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
+    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
+    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
+    /// the gate and hands it back here at each point of effect, so a teardown inside that window
+    /// invalidates the whole handler instead of only the part that ran before it.
+    /// @param generation The counter value captured when the message was admitted.
+    bool accepts(uint32_t generation) const {
+        return generation == this->cleanup_generation.load(std::memory_order_acquire);
+    }
+
     /// @brief Stops the role and discards its state. Main loop only.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
@@ -127,7 +141,9 @@ struct VisualizerRole::Impl {
     void flush_ring_buffer() const;
     void signal_clear_marker() const;
     void discard_to_clear_marker() const;
-    void enqueue_stream_event(VisualizerEventType event) const;
+    /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
+    /// against the live counter before dispatching it.
+    void enqueue_stream_event(VisualizerEventType event, uint32_t generation) const;
 
     static void drain_thread_func(VisualizerRole::Impl* self);
 

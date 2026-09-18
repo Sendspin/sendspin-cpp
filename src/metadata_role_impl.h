@@ -21,6 +21,7 @@
 #include "protocol_messages.h"
 #include "sendspin/metadata_role.h"
 
+#include <atomic>
 #include <memory>
 #include <optional>
 
@@ -60,7 +61,7 @@ struct MetadataRole::Impl {
 
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerMetadataStateObject&& metadata) const;
+    void handle_server_state(ServerMetadataStateObject&& metadata, uint32_t generation) const;
     // True if a slot state needs taking, or a state already held from a prior tick (see
     // held_state) is still waiting out its server-clock deadline -- the deadline itself sets no
     // inbox bit, so held_state must be polled every tick until it fires.
@@ -73,6 +74,18 @@ struct MetadataRole::Impl {
     /// Applies the held state and fires the listener once its server-clock deadline has passed.
     void apply_due_state();
     void handle_cleared_event() const;
+    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
+    ///
+    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
+    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
+    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
+    /// the gate and hands it back here at each point of effect, so a teardown inside that window
+    /// invalidates the whole handler instead of only the part that ran before it.
+    /// @param generation The counter value captured when the message was admitted.
+    bool accepts(uint32_t generation) const {
+        return generation == this->cleanup_generation.load(std::memory_order_acquire);
+    }
+
     /// @brief Stops the role and discards its state. Main loop only.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
@@ -94,6 +107,11 @@ struct MetadataRole::Impl {
     // ========================================
 
     // Struct fields
+    /// @brief Teardown generation, bumped by cleanup(). The receive gate captures it when it
+    /// admits a message and every point of effect re-checks it (see accepts()), so state written
+    /// by a handler a teardown overtook is refused. Atomic because the network thread reads it.
+    std::atomic<uint32_t> cleanup_generation{0};
+
     ServerMetadataStateObject metadata{};
     // State taken from the inbox slot, awaiting its server-clock deadline. Main-thread only:
     // written and read exclusively from drain_events()/cleanup() on the loop thread.

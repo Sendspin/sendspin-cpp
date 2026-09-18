@@ -193,9 +193,11 @@ struct ArtworkRole::Impl {
     /// @return false when the message is a protocol error per roles/artwork/v1.md "Artwork
     /// (Binary)" and the caller MUST close the connection; true when it was processed or ignored.
     bool handle_binary(uint8_t slot, const uint8_t* data, size_t len);
-    void handle_stream_start(const ServerArtworkStreamObject& stream);
-    void handle_stream_end();
-    void handle_stream_clear();
+    // The lifecycle handlers take the teardown generation the receive gate captured when it
+    // admitted the message and re-check it where they take effect; see accepts().
+    void handle_stream_start(const ServerArtworkStreamObject& stream, uint32_t generation);
+    void handle_stream_end(uint32_t generation);
+    void handle_stream_clear(uint32_t generation);
     void handle_stream_ring_event(ArtworkEventType event);
     // True if this tick has drainable artwork work. The display-slot bit covers newly decoded
     // images; a nonzero held_display_mask means displays folded in on a prior tick are still
@@ -206,6 +208,18 @@ struct ArtworkRole::Impl {
         return (pending_bits & INBOX_TOPIC_ARTWORK_DISPLAY) != 0 || this->held_display_mask != 0;
     }
     void drain_events();
+    /// @brief Whether an effect the receive gate admitted at `generation` may still be applied
+    ///
+    /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
+    /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
+    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
+    /// the gate and hands it back here at each point of effect, so a teardown inside that window
+    /// invalidates the whole handler instead of only the part that ran before it.
+    /// @param generation The counter value captured when the message was admitted.
+    bool accepts(uint32_t generation) const {
+        return generation == this->cleanup_generation.load(std::memory_order_acquire);
+    }
+
     /// @brief Stops the role and discards its state. Main loop only.
     ///
     /// Shared by the two paths that take the role out of service: a connection being torn down
@@ -230,7 +244,9 @@ struct ArtworkRole::Impl {
     /// @return true if a running thread was signalled, false if none was running.
     bool signal_stop() const;
     void stop() const;
-    void enqueue_stream_event(ArtworkEventType event) const;
+    /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
+    /// against the live counter before dispatching it.
+    void enqueue_stream_event(ArtworkEventType event, uint32_t generation) const;
     // Merges a single-slot display delta into the accumulated cross-thread update. Called under
     // the Inbox mutex via InboxSlot::merge() (see process_notification), so it must stay a pure
     // data operation with no callbacks into application code. `delta` carries exactly one slot's

@@ -126,10 +126,19 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
 /// the role removal" -- the client's mirror of that is not to act on what the server sent before
 /// it learned of one.
 ///
+/// The verdict is paired with the role's teardown generation, captured here and carried into the
+/// handler: this gate is checked once, on the network thread, while the effect it admits lands
+/// later, and the deactivation path (unlike a lost connection) never quiesces the network thread.
+/// Each point of effect re-checks the captured value, so a teardown inside that window invalidates
+/// the whole handler. See Impl::accepts() on each role.
+///
 /// Runs on the network thread, so it reads the connection's atomic role mask. `conn` is never null
 /// at the dispatch points: the admission gate ahead of them returns first.
 /// @param conn The connection the message arrived on.
 /// @param role The role that owns the message.
+/// @param generation The role's live teardown counter, read by the caller with the same load this
+///                   returns to it.
+/// @return true when the role's handling may run.
 bool role_accepts_traffic(const SendspinConnection* conn, SendspinRole role) {
     if (conn->is_role_active(role)) {
         return true;
@@ -1300,21 +1309,27 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
 #ifdef SENDSPIN_ENABLE_PLAYER
             if (this->player_ && stream_msg.player.has_value() &&
                 role_accepts_traffic(conn, SendspinRole::PLAYER)) {
-                this->player_->impl_->handle_stream_start(stream_msg.player.value());
+                this->player_->impl_->handle_stream_start(
+                    stream_msg.player.value(),
+                    this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
             if (this->artwork_ && stream_msg.artwork.has_value() &&
                 role_accepts_traffic(conn, SendspinRole::ARTWORK)) {
-                this->artwork_->impl_->handle_stream_start(stream_msg.artwork.value());
+                this->artwork_->impl_->handle_stream_start(
+                    stream_msg.artwork.value(),
+                    this->artwork_->impl_->cleanup_generation.load(std::memory_order_acquire));
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
             if (this->visualizer_ && stream_msg.visualizer.has_value() &&
                 role_accepts_traffic(conn, SendspinRole::VISUALIZER)) {
-                this->visualizer_->impl_->handle_stream_start(stream_msg.visualizer.value());
+                this->visualizer_->impl_->handle_stream_start(
+                    stream_msg.visualizer.value(),
+                    this->visualizer_->impl_->cleanup_generation.load(std::memory_order_acquire));
             }
 #endif
             break;
@@ -1344,21 +1359,25 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
 #ifdef SENDSPIN_ENABLE_PLAYER
                 if (this->player_ && end_player &&
                     role_accepts_traffic(conn, SendspinRole::PLAYER)) {
-                    this->player_->impl_->handle_stream_end();
+                    this->player_->impl_->handle_stream_end(
+                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
                 }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
                 if (this->artwork_ && end_artwork &&
                     role_accepts_traffic(conn, SendspinRole::ARTWORK)) {
-                    this->artwork_->impl_->handle_stream_end();
+                    this->artwork_->impl_->handle_stream_end(
+                        this->artwork_->impl_->cleanup_generation.load(std::memory_order_acquire));
                 }
 #endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
                 if (this->visualizer_ && end_visualizer &&
                     role_accepts_traffic(conn, SendspinRole::VISUALIZER)) {
-                    this->visualizer_->impl_->handle_stream_end();
+                    this->visualizer_->impl_->handle_stream_end(
+                        this->visualizer_->impl_->cleanup_generation.load(
+                            std::memory_order_acquire));
                 }
 #endif
             }
@@ -1389,21 +1408,25 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
 #ifdef SENDSPIN_ENABLE_PLAYER
                 if (this->player_ && clear_player &&
                     role_accepts_traffic(conn, SendspinRole::PLAYER)) {
-                    this->player_->impl_->handle_stream_clear();
+                    this->player_->impl_->handle_stream_clear(
+                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
                 }
 #endif
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
                 if (this->artwork_ && clear_artwork &&
                     role_accepts_traffic(conn, SendspinRole::ARTWORK)) {
-                    this->artwork_->impl_->handle_stream_clear();
+                    this->artwork_->impl_->handle_stream_clear(
+                        this->artwork_->impl_->cleanup_generation.load(std::memory_order_acquire));
                 }
 #endif
 
 #ifdef SENDSPIN_ENABLE_VISUALIZER
                 if (this->visualizer_ && clear_visualizer &&
                     role_accepts_traffic(conn, SendspinRole::VISUALIZER)) {
-                    this->visualizer_->impl_->handle_stream_clear();
+                    this->visualizer_->impl_->handle_stream_clear(
+                        this->visualizer_->impl_->cleanup_generation.load(
+                            std::memory_order_acquire));
                 }
 #endif
             }
@@ -1511,7 +1534,10 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                 role_accepts_traffic(conn, SendspinRole::CONTROLLER)) {
                 ServerStateControllerObject controller_state;
                 if (process_server_state_controller(root, &controller_state)) {
-                    this->controller_->impl_->handle_server_state(std::move(controller_state));
+                    this->controller_->impl_->handle_server_state(
+                        std::move(controller_state),
+                        this->controller_->impl_->cleanup_generation.load(
+                            std::memory_order_acquire));
                 }
             }
 #endif
@@ -1520,7 +1546,9 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             if (this->metadata_ != nullptr && role_accepts_traffic(conn, SendspinRole::METADATA)) {
                 ServerMetadataStateObject metadata_state;
                 if (process_server_state_metadata(root, &metadata_state)) {
-                    this->metadata_->impl_->handle_server_state(std::move(metadata_state));
+                    this->metadata_->impl_->handle_server_state(
+                        std::move(metadata_state),
+                        this->metadata_->impl_->cleanup_generation.load(std::memory_order_acquire));
                 }
             }
 #endif
@@ -1529,7 +1557,9 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             if (this->color_ != nullptr && role_accepts_traffic(conn, SendspinRole::COLOR)) {
                 ServerColorStateObject color_state;
                 if (process_server_state_color(root, &color_state)) {
-                    this->color_->impl_->handle_server_state(color_state);
+                    this->color_->impl_->handle_server_state(
+                        color_state,
+                        this->color_->impl_->cleanup_generation.load(std::memory_order_acquire));
                 }
             }
 #endif
@@ -1540,7 +1570,9 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             if (this->player_ && role_accepts_traffic(conn, SendspinRole::PLAYER)) {
                 ServerCommandMessage cmd_msg;
                 if (process_server_command_message(root, &cmd_msg)) {
-                    this->player_->impl_->handle_server_command(cmd_msg);
+                    this->player_->impl_->handle_server_command(
+                        cmd_msg,
+                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
                 }
             }
 #endif
@@ -1755,7 +1787,9 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, con
         binary_type <= SENDSPIN_BINARY_VISUALIZER_LAST) {
 #ifdef SENDSPIN_ENABLE_VISUALIZER
         if (this->visualizer_ && role_accepts_traffic(conn, SendspinRole::VISUALIZER)) {
-            this->visualizer_->impl_->handle_binary(binary_type, data, data_len);
+            this->visualizer_->impl_->handle_binary(
+                binary_type, data, data_len,
+                this->visualizer_->impl_->cleanup_generation.load(std::memory_order_acquire));
         }
 #endif
         return;
@@ -1767,7 +1801,9 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, con
             if (this->player_ && role_accepts_traffic(conn, SendspinRole::PLAYER)) {
                 uint8_t slot = get_binary_slot(binary_type);
                 if (slot == 0) {
-                    this->player_->impl_->handle_binary(data, data_len);
+                    this->player_->impl_->handle_binary(
+                        data, data_len,
+                        this->player_->impl_->cleanup_generation.load(std::memory_order_acquire));
                 } else {
                     SS_LOGW(TAG, "Unknown player binary slot %d", slot);
                 }
