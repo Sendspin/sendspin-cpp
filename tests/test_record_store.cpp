@@ -366,6 +366,55 @@ TEST(RecordStore, CapacityEvictsRatherThanRefusingANewPairing) {
         << "only one record is evicted per pairing";
 }
 
+// The recency order is RAM-only. mark_record_used() runs on the first activate of every
+// long-term session, so persisting the reorder would rewrite the whole records blob per
+// connection; only the durable `used` flag's first flip is written.
+TEST(RecordStore, RecencyReorderIsNotPersisted) {
+    RejectingPersistenceProvider provider;
+    provider.reject = false;
+    RecordStore store(&provider, /*initial_unpaired_access_enabled=*/false,
+                      RecordStore::MIN_MAX_RECORDS);
+    ASSERT_TRUE(store.store_record_superseding(make_client_record("server-A")));
+    ASSERT_TRUE(store.store_record_superseding(make_client_record("server-B")));
+    const std::string psk_a = store.record_by_server_id("server-A")->psk_id;
+    const std::string psk_b = store.record_by_server_id("server-B")->psk_id;
+
+    // Fill the store, then touch the fillers so A and B sit at the front, oldest first.
+    std::vector<std::string> filler_psk_ids;
+    for (size_t i = store.records_snapshot().size(); i < RecordStore::MIN_MAX_RECORDS; ++i) {
+        auto record = make_client_record("filler-" + std::to_string(i));
+        filler_psk_ids.push_back(record.psk_id);
+        ASSERT_TRUE(store.store_record_superseding(std::move(record)));
+    }
+    store.mark_record_used(psk_a);
+    store.mark_record_used(psk_b);
+    for (const std::string& filler : filler_psk_ids) {
+        store.mark_record_used(filler);
+    }
+    const int writes_after_first_touches = provider.save_attempts;
+
+    // Two servers taking turns: each activate moves the other's record off the back. Every
+    // record's `used` flag is already set, so nothing durable changes and nothing is written.
+    for (int i = 0; i < 10; ++i) {
+        store.mark_record_used(psk_a);
+        store.mark_record_used(psk_b);
+    }
+    EXPECT_EQ(provider.save_attempts, writes_after_first_touches)
+        << "a reorder alone must not rewrite the records blob";
+
+    // Control: the reorder still happened in RAM. A and B were the two oldest records when the
+    // alternation began, and every touch moved them further back, so a pairing at capacity now
+    // takes the oldest filler instead. Without the rotate, A would still be at the front and
+    // would be the one evicted.
+    auto outcome = store.resolve_pairing_outcome("server-new");
+    ASSERT_TRUE(store.store_record_superseding(outcome.record));
+    EXPECT_EQ(store.record_by_server_id("filler-2"), nullptr)
+        << "the RAM-only order must still drive eviction";
+    EXPECT_NE(store.record_by_server_id("server-A"), nullptr)
+        << "a record used since it was stored must not be the victim";
+    EXPECT_NE(store.record_by_server_id("server-B"), nullptr);
+}
+
 // mark_record_used() is the recency signal: a record touched by a session must outlive an
 // untouched one stored before it.
 TEST(RecordStore, EvictionFollowsUseRecency) {

@@ -337,7 +337,7 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
 
 bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_use) {
     // records_ runs least-recently-used first (mark_record_used moves a touched record to the
-    // back), so the first record no open connection is resolving against is the victim
+    // back, in RAM), so the first record no open connection is resolving against is the victim
     // pairing.md "Pairing records" leaves to the implementation. A record backing an open
     // connection, provisional or admitted, is off limits there: evicting it would strand a
     // live session on a PSK this store no longer holds.
@@ -458,21 +458,28 @@ void RecordStore::mark_record_used(const std::string& psk_id) {
     }
 
     // Move the record to the back, making records_ least-recently-used first for eviction
-    // (see evict_one_locked). A record already at the back only needs the flag.
-    const bool becomes_used = !this->records_[idx].used;
+    // (see evict_one_locked).
     const size_t last = this->records_.size() - 1;
-    const bool moves = idx != last;
-    if (!becomes_used && !moves) {
-        return;
-    }
-    this->records_[idx].used = true;
-    if (moves) {
+    if (idx != last) {
         std::rotate(this->records_.begin() + static_cast<ptrdiff_t>(idx),
                     this->records_.begin() + static_cast<ptrdiff_t>(idx) + 1, this->records_.end());
     }
-    // Best-effort: a rejected write here is not reported, since both the flag and the recency
-    // order are advisory bookkeeping rather than a revocation whose durability the caller
-    // depends on.
+
+    // The recency order stays in RAM. This runs on the first activate of EVERY long-term
+    // session, so persisting the reorder would rewrite the whole records blob per connection in
+    // steady state: two servers taking turns would each push the other off the back and write
+    // again, which on ESP is an NVS erase cycle per connection for bookkeeping this function
+    // itself treats as advisory. The order is rebuilt from use as sessions come and go, so what
+    // a reboot loses is the ordering among records nothing has connected on yet since, which
+    // only decides which of two equally idle records is evicted first.
+    //
+    // The `used` flag is durable, so its first flip is written.
+    if (this->records_.back().used) {
+        return;
+    }
+    this->records_.back().used = true;
+    // Best-effort: a rejected write here is not reported, since the flag is advisory
+    // bookkeeping rather than a revocation whose durability the caller depends on.
     this->persist_records_locked();
 }
 

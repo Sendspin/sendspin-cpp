@@ -30,8 +30,13 @@ item against the current code before acting on it; line numbers drift as phases 
   fire, because the setting cannot change while the client runs.
 - Record eviction order is least recently used, which the spec leaves to the implementation.
   Recency is the order of `RecordStore::records_`, which `mark_record_used()` moves a touched
-  record to the back of; no new field or timestamp is stored, and the order persists with the
-  records themselves.
+  record to the back of; no new field or timestamp is stored.
+- That reorder stays in RAM: it runs on the first activate of every long-term session, so
+  persisting it would rewrite the records blob once per connection in steady state, which on ESP
+  is an NVS erase cycle for bookkeeping the code treats as advisory. Only the durable `used`
+  flag's first flip is written. Recency therefore does not survive a reboot: the order is rebuilt
+  from use as sessions come and go, and until then it only decides which of two equally idle
+  records is evicted first.
 - Operator cancellation of a pairing window arrives through a new
   `SendspinClient::cancel_pairing_window()`, the counterpart to the existing
   `confirm_pairing_window()`. It is a runtime action, not pairing configuration, so it does not

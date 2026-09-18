@@ -235,9 +235,9 @@ public:
     /// @brief Flag the record at psk_id as used and make it the most recently used one.
     ///
     /// `records_` is kept in least-recently-used-first order by moving the touched record to the
-    /// back, which is the order eviction reads (see store_record_superseding). A record that has
-    /// never been used keeps the position it was stored in, so an unused record is always a
-    /// better victim than a used one paired at the same time. No-op if absent.
+    /// back, which is the order eviction reads (see store_record_superseding). The reorder stays
+    /// in RAM; only the first flip of the durable `used` flag is persisted, so recency across a
+    /// reboot is approximate (see the definition for why). No-op if absent.
     void mark_record_used(const std::string& psk_id);
 
     // ========================================
