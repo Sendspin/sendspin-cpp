@@ -175,6 +175,38 @@ TEST(PlayerRoleTimingParameters, ReportedWhileOutputDelayIsNotAdjustable) {
 }
 
 // ============================================================================
+// Supported commands in client/state
+// ============================================================================
+
+// roles/player/v1.md "client/state player object": supported_commands lists what the server may
+// send. The role applies a volume or mute command on any output, so both are reported whether or
+// not the output delay can be changed.
+TEST(PlayerRoleSupportedCommands, VolumeAndMuteAreAlwaysReported) {
+    SendspinClient client(make_client_config("player-commands-fixed-delay"));
+    auto& player = client.add_player(make_player_config());
+
+    ClientPlayerStateObject state = build_player_state(player);
+    EXPECT_EQ(state.supported_commands, (std::vector<SendspinPlayerCommand>{
+                                            SendspinPlayerCommand::VOLUME,
+                                            SendspinPlayerCommand::MUTE,
+                                        }));
+}
+
+// An adjustable output delay adds set_output_delay to the same list rather than replacing it.
+TEST(PlayerRoleSupportedCommands, AdjustableOutputDelayAddsItsCommand) {
+    SendspinClient client(make_client_config("player-commands-adjustable-delay"));
+    auto& player = client.add_player(make_player_config());
+    player.set_output_delay_adjustable(true);
+
+    ClientPlayerStateObject state = build_player_state(player);
+    EXPECT_EQ(state.supported_commands, (std::vector<SendspinPlayerCommand>{
+                                            SendspinPlayerCommand::VOLUME,
+                                            SendspinPlayerCommand::MUTE,
+                                            SendspinPlayerCommand::SET_OUTPUT_DELAY,
+                                        }));
+}
+
+// ============================================================================
 // Audio chunk header
 // ============================================================================
 

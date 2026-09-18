@@ -424,7 +424,6 @@ inline std::optional<SendspinPlayerCommand> player_command_from_string(const std
 struct PlayerSupportObject {
     std::vector<AudioSupportedFormatObject> supported_formats{};
     size_t buffer_capacity{};
-    std::vector<SendspinPlayerCommand> supported_commands{};
 };
 
 /// @brief Player state reported by the client to the server in client/state messages

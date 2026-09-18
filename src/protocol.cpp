@@ -949,11 +949,6 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         }
         root["payload"]["player@v1_support"]["buffer_capacity"] =
             msg->player_v1_support.value().buffer_capacity;
-        JsonArray commands_list =
-            root["payload"]["player@v1_support"]["supported_commands"].to<JsonArray>();
-        for (const auto& cmd : msg->player_v1_support.value().supported_commands) {
-            commands_list.add(to_cstr(cmd));
-        }
     }
 
     if (msg->artwork_v1_support.has_value()) {
@@ -1005,12 +1000,11 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
         root["payload"]["player"]["output_delay_ms"] = player_state.output_delay_ms;
         root["payload"]["player"]["required_lead_time_ms"] = player_state.required_lead_time_ms;
         root["payload"]["player"]["min_buffer_ms"] = player_state.min_buffer_ms;
-        if (!player_state.supported_commands.empty()) {
-            JsonArray commands_list =
-                root["payload"]["player"]["supported_commands"].to<JsonArray>();
-            for (const auto& cmd : player_state.supported_commands) {
-                commands_list.add(to_cstr(cmd));
-            }
+        // roles/player/v1.md "client/state player object": supported_commands is a required key
+        // that is empty when the player accepts no commands, so the array is emitted even then.
+        JsonArray commands_list = root["payload"]["player"]["supported_commands"].to<JsonArray>();
+        for (const auto& cmd : player_state.supported_commands) {
+            commands_list.add(to_cstr(cmd));
         }
     }
 

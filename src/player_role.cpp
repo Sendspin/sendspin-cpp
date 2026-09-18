@@ -269,7 +269,6 @@ void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
         .buffer_capacity = this->config.audio_buffer_capacity *
                            (AUDIO_BUFFER_ADVERTISE_DENOMINATOR - 1) /
                            AUDIO_BUFFER_ADVERTISE_DENOMINATOR,
-        .supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE},
     };
     msg.player_v1_support = player_support;
 }
@@ -292,8 +291,12 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
         std::max(this->config.required_lead_time_ms.value_or(0),
                  PlayerRoleConfig::pipeline_lead_time_ms(this->config.extra_startup_silence_ms));
     player_state.min_buffer_ms = this->config.min_buffer_ms;
+    // roles/player/v1.md "client/state player object": the commands the server may send. The
+    // role always applies a server volume or mute command, and accepts a delay change only for
+    // an output whose delay is adjustable.
+    player_state.supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE};
     if (adjustable) {
-        player_state.supported_commands = {SendspinPlayerCommand::SET_OUTPUT_DELAY};
+        player_state.supported_commands.push_back(SendspinPlayerCommand::SET_OUTPUT_DELAY);
     }
     msg.player = player_state;
 }

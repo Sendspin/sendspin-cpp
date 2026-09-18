@@ -774,6 +774,57 @@ TEST(Protocol, FormatClientStatePlayerCarriesTimingFields) {
     EXPECT_EQ(doc["payload"]["player"]["min_buffer_ms"].as<uint16_t>(), 560);
 }
 
+// roles/player/v1.md "client/hello player@v1 support object" lists only supported_formats and
+// buffer_capacity; the commands the player accepts are reported in client/state instead.
+TEST(Protocol, FormatClientHelloPlayerSupportOmitsSupportedCommands) {
+    ClientHelloMessage msg;
+    msg.name = "Speaker";
+    msg.supported_roles.push_back(SendspinRole::PLAYER);
+    PlayerSupportObject support{};
+    support.supported_formats = {{SendspinCodecFormat::FLAC, 2, 44100, 16}};
+    support.buffer_capacity = 4096;
+    msg.player_v1_support = support;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+    EXPECT_TRUE(doc["payload"]["player@v1_support"]["supported_commands"].isUnbound());
+    // Control: the support object is there, with the two fields the spec defines for it.
+    EXPECT_EQ(doc["payload"]["player@v1_support"]["buffer_capacity"].as<int>(), 4096);
+    EXPECT_STREQ(doc["payload"]["player@v1_support"]["supported_formats"][0]["codec"], "flac");
+}
+
+// roles/player/v1.md "client/state player object": supported_commands is a required key whose
+// value is the (possibly empty) list of commands the player accepts.
+TEST(Protocol, FormatClientStatePlayerCarriesSupportedCommands) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+    ClientPlayerStateObject player{};
+    player.supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE,
+                                 SendspinPlayerCommand::SET_OUTPUT_DELAY};
+    msg.player = player;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    JsonArrayConst commands = doc["payload"]["player"]["supported_commands"].as<JsonArrayConst>();
+    ASSERT_EQ(commands.size(), 3u);
+    EXPECT_STREQ(commands[0], "volume");
+    EXPECT_STREQ(commands[1], "mute");
+    EXPECT_STREQ(commands[2], "set_output_delay");
+}
+
+// Control: a player that accepts no command reports the key as an empty array rather than
+// dropping it, which a server reads as a player whose state it must not try to set.
+TEST(Protocol, FormatClientStatePlayerEmptySupportedCommandsIsStillEmitted) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+    msg.player = ClientPlayerStateObject{};
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    ASSERT_TRUE(doc["payload"]["player"]["supported_commands"].is<JsonArrayConst>());
+    EXPECT_EQ(doc["payload"]["player"]["supported_commands"].as<JsonArrayConst>().size(), 0u);
+}
+
 // Control: zero is a value the server must see reported, not a reason to omit the key. A
 // serializer that skipped falsy timing fields would pass the test above and fail this one.
 TEST(Protocol, FormatClientStatePlayerReportsZeroTimingFields) {
