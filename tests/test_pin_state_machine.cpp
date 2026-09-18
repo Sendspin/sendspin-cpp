@@ -635,6 +635,19 @@ protected:
         this->client_->connection_manager_->schedule_activate(std::move(event));
     }
 
+    /// Put the injected connection into, or out of, the state
+    /// SendspinConnection::handle_noise_rehandshake() leaves it in after a session swap: awaiting
+    /// its next server/activate, with the re-proving stamp refreshed. The real call needs a live
+    /// Noise transport this harness has none of, and the flags are what the loop() scans under
+    /// test actually read. first_activate_received_ is private; per this file's access policy the
+    /// write routes through here.
+    void set_awaiting_activate(FakeConnection* conn, bool awaiting) {
+        if (awaiting) {
+            conn->set_provisional_time_us(platform_time_us());
+        }
+        conn->first_activate_received_.store(!awaiting, std::memory_order_release);
+    }
+
     /// Read the standing pairing-window deadline (0 = closed) through the private-access seam.
     int64_t window_deadline() {
         return this->client_->connection_manager_->pairing_window_open_until_us_;
@@ -1026,6 +1039,41 @@ TEST_F(PinStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     ASSERT_FALSE(conn->has_activity(SendspinActivity::PAIRING));
     EXPECT_GE(conn->time_message_send_count_, before_leave)
         << "time sync must not stall when the connection leaves pairing either";
+}
+
+// =============================================================================
+// The attempt timeout inside the re-handshake window
+// =============================================================================
+
+// connection.md "Re-handshake": between Noise message 1 and the new server/activate the client
+// starts no application message but the handshake, and a pair/abort would be one. pairing.md
+// "Entering and leaving pairing" has an expired attempt send pair/abort; the narrower MUST NOT
+// wins for the length of the window, and the abort waits for the activation instead.
+TEST_F(PinStateMachineTest, AttemptTimeoutAbortWaitsForThePostRekeyActivate) {
+    FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-rekey-timeout");
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+    const size_t frames_before = conn->sent_text_.size();
+
+    // The attempt's deadline expires while the connection awaits an activation, exactly as it
+    // would between a server's Noise message 1 and the activate that follows the swap.
+    this->set_awaiting_activate(conn, true);
+    conn->pin_session().attempt_deadline_us = platform_time_us() - 1;
+
+    for (int i = 0; i < 5; ++i) {
+        this->client_->loop();
+    }
+    EXPECT_EQ(conn->sent_text_.size(), frames_before)
+        << "pair/abort must not be sent while the connection awaits a server/activate";
+    EXPECT_EQ(conn->pin_session().step, SendspinConnection::PinStep::AWAIT_SERVER_PAIR_INIT)
+        << "the attempt is held, not abandoned";
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
+
+    // Control: the same expired deadline aborts on the next tick once the activation has landed,
+    // so the hold is the window and not something that swallowed the timeout outright.
+    this->set_awaiting_activate(conn, false);
+    this->client_->loop();
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "attempt_timeout");
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
 }
 
 // =============================================================================

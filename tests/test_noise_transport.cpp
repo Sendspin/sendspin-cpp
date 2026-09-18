@@ -1165,6 +1165,32 @@ TEST(FragmentSequence, OverCapMessageIsDiscardedWithoutClosing) {
     EXPECT_EQ(rx.last_message_, (std::vector<uint8_t>{'{', '}'}));
 }
 
+TEST(FragmentSequence, FirstFragmentInsideADiscardedSequenceCloses) {
+    // Discarding a message does not end its sequence, so a first fragment arriving inside one is
+    // the same malformed sequence it would be for a buffered message. This is the case the
+    // discard-instead-of-reset behavior makes reachable: resetting on the over-cap frame would
+    // have made this look like a legitimate fresh message.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    const size_t chunk = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) - 2;
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, 0xAA});
+    size_t data_len = 1;
+    while (data_len + chunk <= MAX_REASSEMBLED_MESSAGE_BYTES) {
+        rx.inject_fragment(0, std::vector<uint8_t>(chunk, 'X'));
+        data_len += chunk;
+    }
+    rx.inject_fragment(0, std::vector<uint8_t>(chunk, 'X'));  // over the cap: now discarding
+    ASSERT_FALSE(rx.closed());
+
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
+
+    EXPECT_TRUE(rx.closed())
+        << "a first fragment inside a discarded sequence is still a malformed sequence";
+    EXPECT_EQ(rx.json_dispatched_, 0);
+}
+
 // =============================================================================
 // Pre-authentication receive-buffer cap (prepare_receive_buffer)
 // =============================================================================
@@ -1481,6 +1507,54 @@ TEST(NoiseTransport, FragmentBoundaryExactLimit) {
     ASSERT_EQ(conn.sent_binary_.size(), 2u);
     EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG);
     EXPECT_EQ(conn.sent_binary_[1].size(), 6u + TAG);
+}
+
+// The frame sizes above pin where the split falls, but not what the header bytes are. Decrypt the
+// emitted frames and assert the layout messaging.md "Fragmentation" specifies, byte by byte, so a
+// transposed flags/orig_type or a wrong flag bit fails a layout test rather than showing up as an
+// unrelated failure elsewhere.
+TEST(NoiseTransport, FragmentHeaderBytesMatchTheWireFormat) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+
+    TestConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
+    const size_t first_cap = maxp - 3;
+    const size_t cont_cap = maxp - 2;
+
+    // One byte past what two frames carry, so there is a first, a middle and a last fragment and
+    // every flags combination the send path emits appears exactly once.
+    const std::string json(first_cap + cont_cap + 1, 'A');
+    ASSERT_EQ(conn.send_encrypted_text(json), SsErr::OK);
+    ASSERT_EQ(conn.sent_binary_.size(), 3u);
+
+    std::vector<std::vector<uint8_t>> frames;
+    for (const auto& ct : conn.sent_binary_) {
+        auto pt = raw_decrypt(r->initiator.recv_cs, ct);
+        ASSERT_FALSE(pt.empty());
+        frames.push_back(std::move(pt));
+    }
+
+    // First fragment: [1][FIRST][orig_type][data...]
+    EXPECT_EQ(frames[0][0], MSG_TYPE_FRAGMENT);
+    EXPECT_EQ(frames[0][1], FRAGMENT_FLAG_FIRST) << "the first fragment sets bit 1 and not bit 0";
+    EXPECT_EQ(frames[0][2], MSG_TYPE_JSON_BODY) << "orig_type is byte 2, after the flags";
+    EXPECT_EQ(frames[0][3], 'A') << "the data starts at byte 3";
+    EXPECT_EQ(frames[0].size(), 3 + first_cap);
+
+    // Middle fragment: [1][0][data...], no orig_type.
+    EXPECT_EQ(frames[1][0], MSG_TYPE_FRAGMENT);
+    EXPECT_EQ(frames[1][1], 0u) << "a middle fragment is neither first nor last";
+    EXPECT_EQ(frames[1][2], 'A') << "a continuation's data starts at byte 2";
+    EXPECT_EQ(frames[1].size(), 2 + cont_cap);
+
+    // Last fragment: [1][LAST][data...]
+    EXPECT_EQ(frames[2][0], MSG_TYPE_FRAGMENT);
+    EXPECT_EQ(frames[2][1], FRAGMENT_FLAG_LAST) << "the last fragment sets bit 0 and not bit 1";
+    EXPECT_EQ(frames[2][2], 'A');
+    EXPECT_EQ(frames[2].size(), 3u);
 }
 
 // The first and continuation frames have different caps: the first spends three plaintext bytes

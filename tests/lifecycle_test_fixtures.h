@@ -638,6 +638,12 @@ public:
         return this->client_state_count_.load();
     }
 
+    /// pair/abort reasons the client sent, in arrival order.
+    std::vector<std::string> pair_abort_reasons() const {
+        std::lock_guard<std::mutex> lock(this->pair_mutex_);
+        return this->pair_abort_reasons_;
+    }
+
 private:
     void on_message(const ix::WebSocketMessagePtr& msg) {
         if (msg->type == ix::WebSocketMessageType::Close ||
@@ -789,6 +795,12 @@ private:
             return;
         }
 
+        if (std::strcmp(type, "pair/abort") == 0) {
+            std::lock_guard<std::mutex> plock(this->pair_mutex_);
+            this->pair_abort_reasons_.emplace_back(doc["payload"]["reason"] | "");
+            return;
+        }
+
         if (std::strcmp(type, "client/leave") == 0) {
             this->client_leave_count_.fetch_add(1);
             return;
@@ -888,6 +900,7 @@ private:
     std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> learned_psk_;
     std::optional<std::string> learned_psk_id_;
     std::vector<std::string> controller_commands_;
+    std::vector<std::string> pair_abort_reasons_;
     std::optional<PairInitRecord> pair_init_;
     bool pair_init_preceded_finalize_{false};
 

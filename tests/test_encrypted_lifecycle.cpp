@@ -52,12 +52,14 @@
 #include <functional>
 #include <memory>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -83,6 +85,11 @@ constexpr uint16_t LEAVE_TEST_PORT = 19007;
 constexpr uint16_t LEAVE_REPROVE_TEST_PORT = 19008;
 constexpr uint16_t LEAVE_PAIRING_TEST_PORT = 19009;
 constexpr uint16_t REKEY_ROLE_SEND_TEST_PORT = 19010;
+constexpr uint16_t REPROVE_REHANDSHAKE_TEST_PORT = 19011;
+constexpr uint16_t COMBINED_FIRST_TEST_PORT = 19012;
+constexpr uint16_t COMBINED_REKEY_TEST_PORT = 19013;
+constexpr uint16_t COMBINED_METHOD_TEST_PORT = 19014;
+constexpr uint16_t RESELECT_PAIRING_TEST_PORT = 19015;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -270,6 +277,68 @@ private:
 // ============================================================================
 // Tests
 // ============================================================================
+
+// Counts the player's stream lifecycle callbacks and audio writes; the write itself is a sink.
+class CountingPlayerListener : public PlayerRoleListener {
+public:
+    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
+        this->audio_writes.fetch_add(1);
+        return length;
+    }
+    void on_stream_start() override {
+        this->stream_starts.fetch_add(1);
+    }
+    void on_stream_end() override {
+        this->stream_ends.fetch_add(1);
+    }
+
+    std::atomic<size_t> audio_writes{0};
+    std::atomic<int> stream_starts{0};
+    std::atomic<int> stream_ends{0};
+};
+
+// Feeds 20 ms PCM chunks stamped a little ahead of now until the listener has written at least
+// `target` times, so the sync task has something to schedule.
+bool stream_audio_until(SendspinClient& client, FakeEncryptedServer& server,
+                        CountingPlayerListener& listener, size_t target) {
+    constexpr size_t PCM_20MS_BYTES = 48000 / 50 * 2 * 2;
+    int64_t next_ts = platform_time_us() + 50 * 1000;
+    return pump_until(
+        client,
+        [&] {
+            if (listener.audio_writes.load() >= target) {
+                return true;
+            }
+            server.send_audio(next_ts, PCM_20MS_BYTES);
+            next_ts += 20 * 1000;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // real-time pacing
+            return false;
+        },
+        6000);
+}
+
+PlayerRoleConfig make_pcm_player_config() {
+    PlayerRoleConfig player_cfg;
+    player_cfg.audio_formats.push_back({SendspinCodecFormat::PCM, 2, 48000, 16});
+    player_cfg.audio_buffer_capacity = 64 * 1024;
+    return player_cfg;
+}
+
+// Seeds a client whose Pairing PSK is configured and whose unpaired access is on, which is what
+// messaging.md "server/activate" requires before a pairing-PSK connection may declare playback.
+SendspinPairingPsk seed_pairing_psk(PairingCapturePersistenceProvider& persistence, uint8_t base) {
+    std::array<uint8_t, 32> psk_bytes{};
+    for (size_t i = 0; i < psk_bytes.size(); ++i) {
+        psk_bytes[i] = static_cast<uint8_t>(base + i);
+    }
+    SendspinPairingPsk psk;
+    psk.psk_id = psk_id_for(psk_bytes);
+    psk.psk = psk_bytes;
+    persistence.set_configured_pairing_psk(psk);
+    persistence.set_unpaired_access_enabled(true);
+    return psk;
+}
+
 
 // Full encrypted lifecycle: accept -> Noise handshake -> hello -> server/activate -> operational,
 // then a server-initiated in-band re-handshake on the ADMITTED connection -> the connection must
@@ -977,21 +1046,16 @@ TEST(EncryptedLifecycle, LeaveWaitsForTheActivateThatFollowsAReHandshake) {
 TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
-    std::array<uint8_t, 32> pairing_psk_bytes{};
-    for (size_t i = 0; i < pairing_psk_bytes.size(); ++i) {
-        pairing_psk_bytes[i] = static_cast<uint8_t>(0xB0 + i);
-    }
-    SendspinPairingPsk configured_pairing_psk;
-    configured_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
-    configured_pairing_psk.psk = pairing_psk_bytes;
-    persistence.set_configured_pairing_psk(configured_pairing_psk);
-    persistence.set_unpaired_access_enabled(true);
+    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xB0);
 
     SendspinClientConfig config;
     config.name = "Playback With Pairing Test Client";
     config.server_port = LEAVE_PAIRING_TEST_PORT;
+    config.time_burst_interval_ms = 100;  // Converge the filter promptly so audio can schedule.
 
+    CountingPlayerListener player_listener;
     SendspinClient client(config);
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     auto& controller = client.add_controller();
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
@@ -1002,12 +1066,13 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
     FakeEncryptedServerOptions options;
     options.psk_category = "pr";
     options.suppress_activate = true;  // Every activate in this test is sent by hand.
+    options.answer_time = true;        // The player needs a converged filter to schedule audio.
     // Holding the attempt in flight keeps the connection on the activation it was admitted with,
     // instead of rewinding it to await the post-pairing rekey's activate.
     options.withhold_pair_finalize_ack = true;
     FakeEncryptedServer server(server_url(LEAVE_PAIRING_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
-                               configured_pairing_psk.psk_id, pairing_psk_bytes, options);
+                               pairing_psk.psk_id, pairing_psk.psk, options);
 
     ASSERT_TRUE(pump_until(
         client, [&] { return server.client_hello_count() > 0; }, 4000));
@@ -1015,9 +1080,19 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
     // Playback first, on the Pairing PSK: allowed because unpaired access is enabled.
     ASSERT_TRUE(server.send_app_json(
         R"({"type":"server/activate","payload":{"activities":["playback"],)"
-        R"("active_roles":["controller@v1"]}})"));
+        R"("active_roles":["player@v1","controller@v1"]}})"));
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected(); }, 4000));
+
+    // A real player stream, so "streams stay open" is observed rather than argued.
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":48000,)"
+        R"("channels":2,"bit_depth":16}}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return player_listener.stream_starts.load() == 1; }, 6000));
+    ASSERT_TRUE(stream_audio_until(client, server, player_listener, 1))
+        << "audio never reached the player before the pairing activate";
+
     controller.send_command({.command = SendspinControllerCommand::PLAY});
     ASSERT_TRUE(pump_until(
         client, [&] { return server.controller_commands().size() == 1; }, 4000));
@@ -1025,13 +1100,21 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
     ASSERT_TRUE(pump_until(
         client, [&] { return server.client_leave_count() == 1; }, 4000));
 
-    // The same connection now also declares pairing, keeping its role.
+    // The same connection now also declares pairing, keeping its roles.
+    const size_t writes_before = player_listener.audio_writes.load();
     ASSERT_TRUE(server.send_app_json(
         R"({"type":"server/activate","payload":{"activities":["playback","pairing"],)"
-        R"("active_roles":["controller@v1"],"pairing":{"method":"pairing_psk"}}})"));
+        R"("active_roles":["player@v1","controller@v1"],"pairing":{"method":"pairing_psk"}}})"));
     ASSERT_TRUE(pump_until(
         client, [&] { return server.pair_init().has_value(); }, 4000))
         << "a combined playback+pairing activate must enter the pairing path";
+
+    // pairing.md "Entering and leaving pairing": the stream stays open and keeps playing, and no
+    // stream/end or clear was synthesized for the activate.
+    EXPECT_EQ(player_listener.stream_starts.load(), 1);
+    EXPECT_EQ(player_listener.stream_ends.load(), 0) << "adding pairing must not end the stream";
+    EXPECT_TRUE(stream_audio_until(client, server, player_listener, writes_before + 1))
+        << "audio must keep reaching the player across the pairing activate";
 
     EXPECT_TRUE(client.is_connected())
         << "adding pairing must not take the connection out of its operational state";
@@ -1044,6 +1127,61 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
     EXPECT_TRUE(pump_until(
         client, [&] { return server.client_leave_count() == 2; }, 4000))
         << "adding pairing must not affect group membership";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// pairing.md "Entering and leaving pairing" admits one pairing attempt per pairing
+// server/activate. A server that abandons an attempt by sending another activate that itself
+// selects pairing has started a new one, and is waiting for the client/pair-init that opens it,
+// so the client must end the old attempt and start the new one rather than only going
+// operational.
+TEST(EncryptedLifecycle, AnActivateThatReselectsPairingStartsTheNewAttempt) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xA0);
+
+    SendspinClientConfig config;
+    config.name = "Reselect Pairing Test Client";
+    config.server_port = RESELECT_PAIRING_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServerOptions options;
+    options.psk_category = "pr";
+    options.first_activities_json = R"(["pairing"])";
+    options.first_roles_json = R"([])";
+    options.first_pairing_method = "pairing_psk";
+    // The attempt is left in flight so the second activate arrives as a leftover one.
+    options.withhold_pair_finalize_ack = true;
+    FakeEncryptedServer server(server_url(RESELECT_PAIRING_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               pairing_psk.psk_id, pairing_psk.psk, options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.pair_init().has_value(); }, 4000))
+        << "the first attempt never started";
+    ASSERT_EQ(server.pair_init()->pairing_index, 1U);
+
+    // A second pairing activate on the same connection, while the first attempt is still in
+    // flight: it admits a new attempt, whose pairing_index is the one it counted.
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["pairing"],)"
+        R"("active_roles":[],"pairing":{"method":"pairing_psk"}}})"));
+
+    EXPECT_TRUE(pump_until(
+        client, [&] { return server.pair_init()->pairing_index == 2U; }, 4000))
+        << "an activate that selects pairing again must start the attempt it admits, not leave "
+           "the server waiting for a client/pair-init that never comes";
+    EXPECT_TRUE(server.pair_abort_reasons().empty()) << "re-selecting pairing is not an abort";
+    EXPECT_TRUE(server.pair_init_preceded_finalize())
+        << "the new attempt opens with client/pair-init, like any other";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1157,6 +1295,233 @@ TEST(EncryptedLifecycle, RoleTrafficWaitsForTheActivateThatFollowsAReHandshake) 
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+// A FIRST server/activate of ['playback', 'pairing'] is the new row of the messaging.md
+// "server/activate" table. It has to do both things: announce the connection operational with its
+// roles (pairing.md "Entering and leaving pairing" leaves active_roles untouched) and start the
+// pairing attempt it admits, with the pairing_index that activate counted.
+TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xD0);
+
+    SendspinClientConfig config;
+    config.name = "Initial Combined Activate Test Client";
+    config.server_port = COMBINED_FIRST_TEST_PORT;
+
+    SendspinClient client(config);
+    auto& controller = client.add_controller();
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServerOptions options;
+    options.psk_category = "pr";
+    options.first_activities_json = R"(["playback","pairing"])";
+    options.first_roles_json = R"(["controller@v1"])";
+    options.first_pairing_method = "pairing_psk";
+    // Holding the attempt in flight keeps the connection on the activation it was admitted with,
+    // instead of rewinding it to await the post-pairing rekey's activate.
+    options.withhold_pair_finalize_ack = true;
+    FakeEncryptedServer server(server_url(COMBINED_FIRST_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               pairing_psk.psk_id, pairing_psk.psk, options);
+
+    // The pairing half: the attempt starts, and its pairing_index is the one the activate
+    // counted. A client that does not recognize the combined set as a pairing activate never
+    // bumps the counter and reports 0 here.
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.pair_init().has_value(); }, 4000))
+        << "a first combined activate must enter the pairing path";
+    EXPECT_EQ(server.pair_init()->pairing_index, 1U)
+        << "the combined activate must be counted like any other pairing server/activate";
+
+    // The playback half: the connection is operational and publishes client/state, which only
+    // the operational path does.
+    EXPECT_TRUE(client.is_connected())
+        << "a first combined activate must announce the connection operational";
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.client_state_count() > 0; }, 4000))
+        << "a first combined activate must publish client/state";
+
+    // ...and its role is active, which is what active_roles surviving the pairing activity means
+    // in practice.
+    controller.send_command({.command = SendspinControllerCommand::PLAY});
+    EXPECT_TRUE(pump_until(
+        client, [&] { return !server.controller_commands().empty(); }, 4000))
+        << "the roles the combined activate declared must be active";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// The same combined activate arriving as the first one under NEW session keys, after the server
+// re-handshakes an already-admitted connection onto the Pairing PSK. The connection keeps the
+// admitted slot throughout, so this takes the already-admitted branch with is_first true.
+TEST(EncryptedLifecycle, CombinedActivateAfterARehandshakeGoesOperationalAndEntersPairing) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+
+    Identity server_identity = Identity::generate().value();
+    PairedPeer long_term_peer = make_paired_peer();
+    long_term_peer.record.server_id = server_identity.peer_id();
+    persistence.set_seeded_long_term_record(long_term_peer.record);
+    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xE0);
+
+    SendspinClientConfig config;
+    config.name = "Combined Rekey Activate Test Client";
+    config.server_port = COMBINED_REKEY_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    FakeEncryptedServerOptions options;
+    options.second_activities_json = R"(["playback","pairing"])";
+    options.second_roles_json = R"(["controller@v1"])";
+    options.second_pairing_method = "pairing_psk";
+    options.withhold_pair_finalize_ack = true;
+    FakeEncryptedServer server(server_url(COMBINED_REKEY_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               long_term_peer.record.psk_id, long_term_peer.psk, options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "the initial long-term handshake never completed";
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.client_state_count() > 0; }, 2000));
+    const int state_count_before_rekey = server.client_state_count();
+
+    ASSERT_TRUE(server.trigger_rehandshake(pairing_psk.psk_id, pairing_psk.psk, "pr"))
+        << "failed to start the in-band re-handshake onto the pairing PSK";
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.pair_init().has_value(); }, 4000))
+        << "the post-rekey combined activate must enter the pairing path";
+    EXPECT_EQ(server.pair_init()->pairing_index, 1U)
+        << "a re-handshake resets the counter, so the activate that follows it is the first";
+
+    EXPECT_TRUE(client.is_connected())
+        << "the post-rekey combined activate must bring the connection back operational";
+    EXPECT_TRUE(pump_until(
+        client, [&] { return server.client_state_count() > state_count_before_rekey; }, 4000))
+        << "the post-rekey combined activate must publish client/state";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// The pairing-method rules apply to a combined activate exactly as they do to a pairing-only one:
+// messaging.md "server/activate" requires pairing.method to be 'pairing_psk' if and only if the
+// matched PSK is the Pairing PSK, and answers a method the client does not offer with
+// pair/abort reason method_not_supported, leaving the connection open.
+TEST(EncryptedLifecycle, CombinedActivateWithAnUnofferedMethodAborts) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xF0);
+
+    SendspinClientConfig config;
+    config.name = "Combined Method Test Client";
+    config.server_port = COMBINED_METHOD_TEST_PORT;
+    // No PIN display, so dynamic_pin is never offered; on the Pairing PSK it is also the wrong
+    // category, which is the first half of the same rule.
+    config.pin_display_supported = false;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServerOptions options;
+    options.psk_category = "pr";
+    options.first_activities_json = R"(["playback","pairing"])";
+    options.first_roles_json = R"(["controller@v1"])";
+    options.first_pairing_method = "dynamic_pin";
+    FakeEncryptedServer server(server_url(COMBINED_METHOD_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               pairing_psk.psk_id, pairing_psk.psk, options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return !server.pair_abort_reasons().empty(); }, 4000))
+        << "a combined activate naming an unoffered method must be answered with pair/abort";
+    EXPECT_EQ(server.pair_abort_reasons().front(), "method_not_supported");
+    EXPECT_FALSE(server.pair_init().has_value()) << "no attempt may start on a refused method";
+
+    // The connection stays open, as the spec's third rejection rule requires.
+    pump_for(client, 200);
+    EXPECT_FALSE(server.closed());
+    EXPECT_FALSE(server.goodbye_reason().has_value());
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// scan_reprove_watchdog() is the only guard against a server that rekeys an admitted connection
+// and then never activates it: connection.md "Re-handshake" makes server/activate the server's
+// first message under the new keys, and nothing else re-proves the connection. The deadline is
+// driven by forcing the stamp into the past rather than by waiting REPROVE_TIMEOUT_US (30 s).
+TEST(EncryptedLifecycle, RehandshakeWithoutAnActivateIsDroppedByTheReproveWatchdog) {
+    SendspinClientConfig config;
+    config.name = "Reprove Rehandshake Test Client";
+    config.server_port = REPROVE_REHANDSHAKE_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.suppress_activate = true;  // The post-rekey activate is the one that never comes.
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(REPROVE_REHANDSHAKE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server->client_hello_count() > 0; }, 4000));
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["player@v1"]}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+
+    ASSERT_TRUE(server->trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return !client.is_connected(); }, 4000))
+        << "the connection never rewound to awaiting its post-rekey activate";
+
+    // The state the watchdog keys on, as handle_noise_rehandshake() left it: the hello flags
+    // carried over the swap, only the activation rewound, and the stamp was refreshed.
+    auto* conn = client.connection_manager_->current();
+    ASSERT_NE(conn, nullptr);
+    EXPECT_TRUE(conn->is_handshake_complete()) << "neither hello is re-sent, so both flags stand";
+    EXPECT_FALSE(conn->is_operational());
+    ASSERT_NE(conn->get_provisional_time_us(), 0)
+        << "the re-handshake must restamp the re-proving deadline";
+
+    // Control: a connection still inside the deadline is held, not reaped.
+    pump_for(client, 100);
+    EXPECT_NE(client.connection_manager_->current(), nullptr)
+        << "a connection still inside REPROVE_TIMEOUT must be given time to be activated";
+
+    conn->set_provisional_time_us(platform_time_us() - REPROVE_TIMEOUT_US - 1);
+    EXPECT_TRUE(pump_until(
+        client, [&] { return client.connection_manager_->current() == nullptr; }, 4000))
+        << "a server that rekeys and never activates must be dropped, not left wedged";
+
+    // connection.md "Re-handshake" allows no application message between Noise message 1 and the
+    // new activation, so the close carries no client/goodbye. Waiting for the socket to close
+    // first means a goodbye that was sent has had its chance to arrive.
+    EXPECT_TRUE(wait_until([&] { return server->closed(); }, 4000))
+        << "the dropped connection was never closed";
+    EXPECT_FALSE(server->goodbye_reason().has_value())
+        << "the re-proving watchdog must close without a goodbye";
 }
 
 // =============================================================================
