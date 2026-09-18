@@ -617,6 +617,19 @@ When a connection is lost (`on_connection_lost`):
 
 `disable_message_dispatch()` is the first step because it's an atomic flag that the network thread checks before invoking any callback. This prevents stale messages from a dead connection from racing into freshly-reset role queues.
 
+### Role Removal on a Later Activation
+
+`server/activate` may be re-sent at any time to move the active role set. `ConnectionManager::process_activate_event()` copies the connection's roles before `apply_server_activate()` writes the new ones, and for the admitted connection it hands both sets to `SendspinClient::apply_role_removals()`. A role is *removed* when the versioned name this library implements (`player@v1`, `metadata@v1`, ...) was in the old set and is not in the new one, which covers an explicit drop, the implicit clearing of the roles when an activation leaves the connection no longer playback-capable, and messaging.md "server/activate"'s "replacement of an active role version".
+
+Each removed role runs its own `cleanup()`, the same teardown a lost connection runs: the player ends the stream and returns the sync task to idle, the artwork and visualizer roles drop their in-flight transfers and buffered frames and clear their channels, and the metadata, color and controller roles drop their current state and any held scheduled update. That is exactly what messaging.md "server/activate" asks for on removal ("stop its remaining output, clear its buffers ... immediately discard the current state and any pending scheduled update"). The player applies no ducking or other temporary output effect of its own, so the clause about releasing them is satisfied by the stream ending; the consumer's own output is stopped through `on_stream_end()`.
+
+Two things differ from the connection-loss path, both because the connection survives:
+
+- The inbox event ring is **not** reset first. `cleanup_connection_state()` wipes it because every role is going down together; here the roles that stay active must keep their queued lifecycle events, so the removed role's synthetic `STREAM_END`/`CLEARED` is simply appended behind whatever is already queued for it and delivered in order.
+- The role can be added back. A later activation that re-adds it publishes a `client/state` carrying its object again (the `roles_changed` publish in the same function), which is what lets the server start its stream a second time; the role itself comes back through its ordinary start path.
+
+Callbacks follow the same rule as every other teardown: `apply_role_removals()` runs under `conn_ptr_mutex_`, so it queues the clear and stream-end events on the inbox and `loop()` fires the listener after the manager returns.
+
 ### Client Start and Stop
 
 `SendspinClient::start()` loads persisted state, starts the threaded roles (player sync task, visualizer drain, artwork decode; a failure part-way stops the ones that did start), and calls `ConnectionManager::start()`, which opens admission (`accepting_`) and creates the `SendspinWsServer` on first use. The server itself is started by the manager's `loop()` once the network provider reports ready, so `is_started()` means "running", not "listening".

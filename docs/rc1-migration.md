@@ -187,10 +187,23 @@ Exit: strict-mode run with the TUI client (artwork, visualizer, color enabled).
 
 ### Phase 6: new behavior
 
-- C5: when a later `server/activate` removes a role, stop its output, clear its buffers, discard
-  its `server/state` and any pending scheduled update. Today `cleanup()` runs only on disconnect.
-- D4: optional player `format` preference in `client/state`, if wanted.
-- C7: `server_transmitted` on `stream/start` / `stream/clear`, only if something consumes it.
+Done:
+
+- C5: a later `server/activate` that removes a role tears that role down where the activation is
+  applied. The removed families are diffed at the activation choke point and each one runs the
+  `cleanup()` the disconnect path runs, so a removed stream role stops its output and drops its
+  buffers and a removed state role drops its current state and any held scheduled update. The
+  connection and the roles that stay active are untouched, and a re-added role comes back through
+  its ordinary start path behind the `client/state` the activation publishes.
+
+Not implemented, deliberately:
+
+- D4: the optional player `format` preference in `client/state`. The field is optional and the
+  client accepts every format it advertises, so declaring one would only narrow what the server
+  may send.
+- C7: `server_transmitted` on `stream/start` / `stream/clear`. Nothing consumes it: the time
+  filter is fed by the `client/time` / `server/time` burst, and a one-sample offset from a stream
+  message would not improve it.
 
 ### After
 
@@ -213,6 +226,14 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   with its bytes dropped. `roles/artwork/v1.md` "Artwork (Binary)" allows this (it is the
   "unavailable client" path) but sets no cap of its own, so a server that encodes an image larger
   than the channel's budget sees the channel keep its previous image rather than an error.
+- The two places that read `active_roles` judge a role differently. Role removal compares the
+  exact versioned name the library implements, as messaging.md "server/activate" requires
+  ("replacement of an active role version" is a removal), while the send gate
+  (`SendspinConnection::is_role_active()`, used by `send_text()` and the `client/state` builders)
+  matches the family. A server that activates `player@v2` on a client that advertised only
+  `player@v1` therefore tears the player down and then still reports a player object. No
+  conformant server can produce that set (the version has to be one the client advertised), so
+  this only shows up against a server that activates a version it was never offered.
 - A device that offers `dynamic_pairing_code` without implementing the pairing-window gesture
   (`pairing_window_supported` false) has no way to clear a standing round limit, which
   `pairing.md` "Rounds" says only a deliberate operator action clears. Its attempts then sit at

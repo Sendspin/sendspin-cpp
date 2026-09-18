@@ -177,6 +177,15 @@ auto& color = client.add_color();
 
 ## Step 3: Implement Listener Interfaces
 
+A role you add is configured and ready, but only the server decides which roles a session actually
+uses, and it may change that set at any time. When an activation removes a role, the library tears
+that role down on the spot: a stream role stops its output, drops its buffers, and reports the end
+(`on_stream_end()`, `on_visualizer_stream_end()`, `on_image_clear()` for every slot), and a state
+role drops its state and reports the clear (`on_metadata_clear()`, `on_color_clear()`,
+`on_controller_state_clear()`). The connection stays up and the other roles keep running. A clear
+callback is therefore not proof that the server is gone; treat it as "this role has nothing to
+show" and make it idempotent. If the server adds the role back later, the role resumes normally.
+
 ### PlayerRoleListener (Required if Using Player Role)
 
 The `on_audio_write` method is one of only two pure virtual (required) methods in the library;
@@ -321,13 +330,13 @@ struct MyArtworkListener : ArtworkRoleListener {
 };
 ```
 
-**Knowing when there is no artwork.** Artwork stays valid until the server replaces or clears it, and the artwork role is independent of the metadata role, so a track change alone sends nothing: the next track of the same album keeps showing the image already delivered. When an item genuinely has no artwork, the server clears that channel and `on_image_clear()` fires for that slot alone, scheduled to its server timestamp like a display (`display_offset_ms` included) so it lands on the item boundary. `on_image_clear()` also fires for every configured slot on stream end, stream clear, and disconnect.
+**Knowing when there is no artwork.** Artwork stays valid until the server replaces or clears it, and the artwork role is independent of the metadata role, so a track change alone sends nothing: the next track of the same album keeps showing the image already delivered. When an item genuinely has no artwork, the server clears that channel and `on_image_clear()` fires for that slot alone, scheduled to its server timestamp like a display (`display_offset_ms` included) so it lands on the item boundary. `on_image_clear()` also fires for every configured slot on stream end, stream clear, disconnect, and a `server/activate` that takes the artwork role out of the session's active roles.
 
 | What happened | What the listener sees |
 | --- | --- |
 | Artwork unchanged (e.g. next track of the same album) | nothing; the current image stays valid |
 | Item has no artwork | `on_image_clear(slot)` for that slot |
-| Stream ended, cleared, or connection lost | `on_image_clear(slot)` for every configured slot |
+| Stream ended or cleared, connection lost, or the role deactivated | `on_image_clear(slot)` for every configured slot |
 
 **Cross-fades with back-pressure (opt-in).** By default the role decodes and displays every frame as it arrives. A slot can instead opt into a back-pressure gate by setting `ImageSlotPreference::require_frame_done`. With the gate on, the role keeps at most one un-acked *delivery* (a frame or a clear) in flight for that slot. Call `ArtworkRole::frame_done(slot)` from the main loop exactly once for every `on_image_display()` and `on_image_clear()` that slot receives -- e.g. once a cross-fade animation finishes. An extra call is a harmless no-op, but a missed one wedges the slot: there is no timeout, the acknowledgment is the contract.
 
@@ -401,7 +410,8 @@ struct MyColorListener : ColorRoleListener {
         // accent, on_dark, on_light...
     }
 
-    // Called when the connection is lost and cached colors are dropped.
+    // Called when the cached colors are dropped: the connection was lost, or a
+    // server/activate took the color role out of the session's active roles.
     // Reset any displayed colors to a neutral or default state.
     void on_color_clear() override {
         reset_to_defaults();
