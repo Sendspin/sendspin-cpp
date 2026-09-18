@@ -897,189 +897,272 @@ TEST(NoiseHandshakeDriver, WrongVersionAborts) {
 }
 
 // =============================================================================
-// dispatch_noise_plaintext: reassembly state machine edge cases
+// accept_plaintext: fragment sequence rules (messaging.md "Fragmentation")
 // =============================================================================
 
-TEST(NoiseTransportDispatch, NonFragmentMidReassemblyClosesConnection) {
-    // Deliver FRAGMENT_MORE, then a non-fragment (type 0x00) frame while reassembly is in
-    // flight. Per spec "Malformed sequences" this is a protocol error: the connection must be
-    // closed, not just have its reassembly state discarded.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
+/// A receiver connection wired to a loopback handshake, with a helper that encrypts one
+/// plaintext frame with the peer's send cipher and feeds it in as if it had arrived off the
+/// wire. Tracks how many complete messages of each kind were dispatched.
+class FragmentReceiver {
+public:
+    explicit FragmentReceiver(LoopbackResult& r) : server_send_(r.initiator.send_cs) {
+        this->conn_.set_noise_session(std::move(r.responder_session));
+        this->conn_.on_json_message_cb = [this](SendspinConnection* /*c*/, const char* d, size_t n,
+                                                int64_t /*t*/) {
+            ++this->json_dispatched_;
+            this->last_message_.assign(d, d + n);
+        };
+        this->conn_.on_binary_message_cb = [this](SendspinConnection* /*c*/, uint8_t* d, size_t n) {
+            ++this->binary_dispatched_;
+            this->last_message_.assign(d, d + n);
+        };
+    }
 
-    TestConnection conn;
-
-    // inject_binary_payload() decrypts before dispatch_noise_plaintext() runs (via
-    // dispatch_completed_message()), so this test drives that state machine by injecting frames
-    // pre-encrypted for the NoiseSession installed below. conn holds the responder session, so
-    // frames must be encrypted with the matching initiator cipher (r->initiator.send_cs) for
-    // conn's decrypt to succeed.
-
-    // Create a "fragment-more" frame: [0x02, orig_type=0x00, data...]
-    auto plaintext_frag_more =
-        std::vector<uint8_t>{0x02, 0x00, 0xAA, 0xBB, 0xCC};  // FRAGMENT_MORE, orig=JSON, 3 bytes
-    std::vector<uint8_t> ct1 = raw_encrypt(r->initiator.send_cs, plaintext_frag_more);
-    ASSERT_FALSE(ct1.empty());
-
-    conn.set_noise_session(std::move(r->responder_session));
-
-    int json_dispatched = 0;
-    conn.on_json_message_cb = [&json_dispatched](SendspinConnection* /*c*/, const char* /*data*/,
-                                                  size_t /*len*/, int64_t /*ts*/) {
-        ++json_dispatched;
-    };
-
-    // Inject first fragment
-    conn.inject_binary_payload(ct1.data(), ct1.size());
-
-    // Now inject a non-fragment frame (type=0x00 = JSON). This should abort reassembly.
-    std::vector<uint8_t> plaintext_json = {0x00, 'H', 'i'};  // JSON body type
-    std::vector<uint8_t> ct2 = raw_encrypt(r->initiator.send_cs, plaintext_json);
-    ASSERT_FALSE(ct2.empty());
-
-    conn.inject_binary_payload(ct2.data(), ct2.size());
-
-    // The JSON dispatch should NOT have fired (the non-fragment frame is dropped, not
-    // dispatched), and the connection must have been closed silently: torn down via
-    // close_transport_now(), not disconnect() (see close_silently()'s doc comment: the network
-    // thread cannot safely call disconnect() on host/ESP outbound transports), with no
-    // application-level message sent as part of the close itself.
-    EXPECT_EQ(json_dispatched, 0);
-    EXPECT_EQ(conn.close_transport_now_calls_, 1);
-    EXPECT_TRUE(conn.disconnect_calls_.empty());
-    EXPECT_TRUE(conn.sent_text_.empty());
-    EXPECT_TRUE(conn.sent_binary_.empty());
-}
-
-TEST(NoiseTransportDispatch, FragmentEndWithoutStartClosesConnection) {
-    // A fragment-end frame with no fragmented message in flight is a spec "Malformed
-    // sequences" protocol error: the connection must be closed, not merely have the stray
-    // frame dropped.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-
-    // Send FRAGMENT_END without a preceding FRAGMENT_MORE
-    std::vector<uint8_t> plaintext_frag_end = {0x03, 'A', 'B'};  // FRAGMENT_END + data
-    std::vector<uint8_t> ct = raw_encrypt(r->initiator.send_cs, plaintext_frag_end);
-    ASSERT_FALSE(ct.empty());
-
-    conn.set_noise_session(std::move(r->responder_session));
-
-    int dispatched = 0;
-    conn.on_json_message_cb = [&dispatched](SendspinConnection* /*c*/, const char* /*d*/,
-                                             size_t /*l*/, int64_t /*t*/) { ++dispatched; };
-    conn.on_binary_message_cb = [&dispatched](SendspinConnection* /*c*/, uint8_t* /*d*/,
-                                               size_t /*l*/) { ++dispatched; };
-
-    conn.inject_binary_payload(ct.data(), ct.size());
-    EXPECT_EQ(dispatched, 0) << "FRAGMENT_END without prior FRAGMENT_MORE must not be dispatched";
-    EXPECT_EQ(conn.close_transport_now_calls_, 1)
-        << "FRAGMENT_END without prior FRAGMENT_MORE is a malformed sequence and must close";
-    EXPECT_TRUE(conn.disconnect_calls_.empty());
-    EXPECT_TRUE(conn.sent_text_.empty());
-    EXPECT_TRUE(conn.sent_binary_.empty());
-}
-
-TEST(NoiseTransportDispatch, BenignMidReassemblyDoesNotClose) {
-    // A normal, in-progress fragment reassembly (just the FRAGMENT_MORE start frame, no
-    // FRAGMENT_END yet) is the benign "no complete message yet" state and must NOT close the
-    // connection; only the three enumerated malformed sequences (fragment-end with nothing in
-    // flight, a non-fragment frame while one is in flight, and orig_type 2/3) do.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    int dispatched = 0;
-    conn.on_json_message_cb = [&dispatched](SendspinConnection* /*c*/, const char* /*d*/,
-                                             size_t /*l*/, int64_t /*t*/) { ++dispatched; };
-
-    // FRAGMENT_MORE start: [0x02, orig_type=0x00, data...]. A valid start of a fragmented
-    // JSON message, no FRAGMENT_END yet.
-    std::vector<uint8_t> plaintext_frag_more{0x02, 0x00, 0xAA, 0xBB, 0xCC};
-    std::vector<uint8_t> ct = raw_encrypt(r->initiator.send_cs, plaintext_frag_more);
-    ASSERT_FALSE(ct.empty());
-
-    conn.inject_binary_payload(ct.data(), ct.size());
-
-    EXPECT_EQ(dispatched, 0) << "mid-reassembly: no complete message yet";
-    EXPECT_TRUE(conn.disconnect_calls_.empty())
-        << "a benign mid-reassembly frame must not close the connection";
-    EXPECT_EQ(conn.close_transport_now_calls_, 0)
-        << "a benign mid-reassembly frame must not close the connection";
-}
-
-TEST(NoiseTransportDispatch, ReassemblyOverCapDropsWithoutClosing) {
-    // A fragmented message whose reassembled size would exceed MAX_REASSEMBLED_MESSAGE_BYTES
-    // must be dropped (reassembly reset) without closing the connection: exceeding the cap is
-    // not itself a malformed sequence (a legitimate peer could simply be sending an oversized
-    // image), so accept_plaintext() leaves msg.malformed false and the connection stays open.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    int dispatched = 0;
-    conn.on_json_message_cb = [&dispatched](SendspinConnection* /*c*/, const char* /*d*/,
-                                             size_t /*l*/, int64_t /*t*/) { ++dispatched; };
-
-    // Encrypts one fragment frame ([type_byte][body]) with the initiator send cipher and
-    // injects it into the connection as if it had just arrived off the wire.
-    auto send_fragment = [&](uint8_t type_byte, const std::vector<uint8_t>& body) {
-        std::vector<uint8_t> plaintext;
-        plaintext.reserve(1 + body.size());
-        plaintext.push_back(type_byte);
-        plaintext.insert(plaintext.end(), body.begin(), body.end());
-        std::vector<uint8_t> ct = raw_encrypt(r->initiator.send_cs, plaintext);
+    /// Injects one already-shaped plaintext frame.
+    void inject(const std::vector<uint8_t>& plaintext) {
+        std::vector<uint8_t> ct = raw_encrypt(this->server_send_, plaintext);
         ASSERT_FALSE(ct.empty());
-        conn.inject_binary_payload(ct.data(), ct.size());
-    };
+        this->conn_.inject_binary_payload(ct.data(), ct.size());
+    }
 
-    // Fills a fresh reassembly to just under the cap: a FRAGMENT_MORE start frame, then
-    // continuation frames at the largest size a single Noise frame allows
-    // (MAX_TRANSPORT_PLAINTEXT bytes of plaintext, one of which is the type byte) while the
-    // next one still fits under the cap.
-    const size_t chunk = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) - 1;
-    auto fill_to_just_under_cap = [&] {
-        // FRAGMENT_MORE start: [orig_type=0x00, 1 data byte] -> reasm_len_ starts at 2.
-        send_fragment(MSG_TYPE_FRAGMENT_MORE, {MSG_TYPE_JSON_BODY, 0xAA});
-        size_t reasm_len = 2;
-        while (reasm_len - 1 + chunk <= MAX_REASSEMBLED_MESSAGE_BYTES) {
-            send_fragment(MSG_TYPE_FRAGMENT_MORE, std::vector<uint8_t>(chunk, 'X'));
-            reasm_len += chunk;
-        }
-    };
+    /// Injects a type-1 fragment frame: [1][flags][orig_type?][data].
+    void inject_fragment(uint8_t flags, const std::vector<uint8_t>& tail) {
+        std::vector<uint8_t> pt;
+        pt.reserve(2 + tail.size());
+        pt.push_back(MSG_TYPE_FRAGMENT);
+        pt.push_back(flags);
+        pt.insert(pt.end(), tail.begin(), tail.end());
+        this->inject(pt);
+    }
 
-    // A FRAGMENT_MORE continuation frame pushes the total past the cap.
-    fill_to_just_under_cap();
-    send_fragment(MSG_TYPE_FRAGMENT_MORE, std::vector<uint8_t>(chunk, 'X'));
+    bool closed() const {
+        return this->conn_.close_transport_now_calls_ > 0;
+    }
 
-    EXPECT_EQ(dispatched, 0) << "over-cap reassembly must not dispatch a complete message";
-    EXPECT_EQ(conn.close_transport_now_calls_, 0)
-        << "exceeding the reassembly cap drops the message but must not close the connection";
-    EXPECT_TRUE(conn.disconnect_calls_.empty());
+    TestConnection conn_;
+    NoiseCipherState* server_send_;
+    std::vector<uint8_t> last_message_;
+    int json_dispatched_{0};
+    int binary_dispatched_{0};
+};
 
-    // The dropped reassembly must not wedge the connection: a fresh, ordinary message still
-    // dispatches normally afterward.
-    send_fragment(MSG_TYPE_JSON_BODY, {'{', '}'});
-    EXPECT_EQ(dispatched, 1) << "connection must still be usable after the drop";
+TEST(FragmentSequence, SingleFragmentCarryingBothFlagsDispatches) {
+    // Control for every malformed case below: one frame with FIRST and LAST set is a complete,
+    // well-formed fragmented message and must dispatch its orig_type payload intact.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
 
-    // The FRAGMENT_END branch carries its own copy of the over-cap check: a final frame that
-    // pushes the total past the cap must also drop without closing.
-    fill_to_just_under_cap();
-    send_fragment(MSG_TYPE_FRAGMENT_END, std::vector<uint8_t>(chunk, 'X'));
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST,
+                       {SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA, 0xBB});
 
-    EXPECT_EQ(dispatched, 1) << "over-cap fragment-end must not dispatch a complete message";
-    EXPECT_EQ(conn.close_transport_now_calls_, 0)
-        << "exceeding the reassembly cap on fragment-end must not close the connection";
-    EXPECT_TRUE(conn.disconnect_calls_.empty());
+    EXPECT_FALSE(rx.closed());
+    EXPECT_EQ(rx.binary_dispatched_, 1);
+    EXPECT_EQ(rx.last_message_,
+              (std::vector<uint8_t>{SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA, 0xBB}));
+}
 
-    send_fragment(MSG_TYPE_JSON_BODY, {'{', '}'});
-    EXPECT_EQ(dispatched, 2) << "connection must still be usable after the fragment-end drop";
+TEST(FragmentSequence, MultiFragmentMessageDispatchesOnTheLastFragment) {
+    // Control: the flags, not a distinct message ID, decide where the message ends. Nothing
+    // dispatches until the fragment carrying bit 0 arrives, and then the concatenated data is
+    // handed over behind its orig_type.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {SENDSPIN_BINARY_PLAYER_AUDIO, 0x01});
+    EXPECT_EQ(rx.binary_dispatched_, 0) << "mid-reassembly: no complete message yet";
+    EXPECT_FALSE(rx.closed()) << "a benign mid-reassembly frame must not close the connection";
+
+    rx.inject_fragment(0, {0x02});
+    EXPECT_EQ(rx.binary_dispatched_, 0);
+
+    rx.inject_fragment(FRAGMENT_FLAG_LAST, {0x03});
+    EXPECT_EQ(rx.binary_dispatched_, 1);
+    EXPECT_EQ(rx.last_message_,
+              (std::vector<uint8_t>{SENDSPIN_BINARY_PLAYER_AUDIO, 0x01, 0x02, 0x03}));
+    EXPECT_FALSE(rx.closed());
+}
+
+TEST(FragmentSequence, FirstFragmentWhileOneIsInFlightCloses) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
+    ASSERT_FALSE(rx.closed());
+
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
+
+    EXPECT_TRUE(rx.closed()) << "a first fragment while one is in flight is a malformed sequence";
+    EXPECT_EQ(rx.json_dispatched_, 0);
+    EXPECT_TRUE(rx.conn_.disconnect_calls_.empty());
+    EXPECT_TRUE(rx.conn_.sent_text_.empty());
+    EXPECT_TRUE(rx.conn_.sent_binary_.empty());
+}
+
+TEST(FragmentSequence, NonFirstFragmentWithNoneInFlightCloses) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    rx.inject_fragment(FRAGMENT_FLAG_LAST, {'A', 'B'});
+
+    EXPECT_TRUE(rx.closed()) << "a non-first fragment with none in flight is a malformed sequence";
+    EXPECT_EQ(rx.json_dispatched_, 0);
+    EXPECT_EQ(rx.binary_dispatched_, 0);
+    EXPECT_TRUE(rx.conn_.disconnect_calls_.empty());
+    EXPECT_TRUE(rx.conn_.sent_text_.empty());
+    EXPECT_TRUE(rx.conn_.sent_binary_.empty());
+}
+
+TEST(FragmentSequence, NonFragmentMessageWhileOneIsInFlightCloses) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
+    ASSERT_FALSE(rx.closed());
+
+    rx.inject({MSG_TYPE_JSON_BODY, 'H', 'i'});
+
+    EXPECT_TRUE(rx.closed())
+        << "a non-fragment binary message while one is in flight is a malformed sequence";
+    EXPECT_EQ(rx.json_dispatched_, 0) << "the interloping message must not be dispatched either";
+}
+
+TEST(FragmentSequence, ReservedFlagBitCloses) {
+    // Bits 2-7 are reserved and MUST be zero. Each is checked on its own so the mask cannot be
+    // narrowed to a single bit and still pass.
+    for (int bit = 2; bit < 8; ++bit) {
+        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+        ASSERT_TRUE(r.has_value());
+        FragmentReceiver rx(*r);
+
+        const uint8_t flags =
+            static_cast<uint8_t>(FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST | (1u << bit));
+        rx.inject_fragment(flags, {MSG_TYPE_JSON_BODY, '{', '}'});
+
+        EXPECT_TRUE(rx.closed()) << "reserved flag bit " << bit << " must close the connection";
+        EXPECT_EQ(rx.json_dispatched_, 0) << "reserved flag bit " << bit;
+    }
+}
+
+TEST(FragmentSequence, OrigTypeOfOneCloses) {
+    // Fragments do not nest: a first fragment naming the fragment ID as its orig_type is a
+    // malformed sequence.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_FRAGMENT, 0xAA});
+
+    EXPECT_TRUE(rx.closed());
+    EXPECT_EQ(rx.binary_dispatched_, 0);
+}
+
+TEST(FragmentSequence, FragmentFrameWithoutFlagsByteCloses) {
+    // A fragment frame that stops before its flags byte cannot be placed in the sequence at
+    // all, so it is handled like the enumerated malformed sequences.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    rx.inject({MSG_TYPE_FRAGMENT});
+
+    EXPECT_TRUE(rx.closed());
+    EXPECT_EQ(rx.binary_dispatched_, 0);
+}
+
+TEST(FragmentSequence, FirstFragmentWithoutOrigTypeCloses) {
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {});
+
+    EXPECT_TRUE(rx.closed());
+    EXPECT_EQ(rx.binary_dispatched_, 0);
+}
+
+TEST(FragmentSequence, ReservedOrigTypeIsDiscardedWithoutReassembly) {
+    // The ignore rules let the receiver throw away the data of a message whose orig_type it does
+    // not implement. IDs 2-3 are reserved, so nothing can implement them: the message is never
+    // dispatched, the connection stays open, and the sequence is still tracked to its last
+    // fragment, which is what lets the following message be accepted as a fresh first fragment.
+    for (uint8_t orig_type = MSG_TYPE_RESERVED_FIRST; orig_type <= MSG_TYPE_RESERVED_LAST;
+         ++orig_type) {
+        auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+        ASSERT_TRUE(r.has_value());
+        FragmentReceiver rx(*r);
+
+        rx.inject_fragment(FRAGMENT_FLAG_FIRST, {orig_type, 0xAA});
+        rx.inject_fragment(0, {0xBB});
+        rx.inject_fragment(FRAGMENT_FLAG_LAST, {0xCC});
+
+        EXPECT_FALSE(rx.closed()) << "orig_type " << static_cast<int>(orig_type)
+                                  << " is unimplemented, not malformed";
+        EXPECT_EQ(rx.binary_dispatched_, 0) << "a discarded message must not be dispatched";
+        EXPECT_EQ(rx.json_dispatched_, 0);
+
+        // The sequence ended with that last fragment, so the next message starts cleanly.
+        rx.inject_fragment(FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST,
+                           {SENDSPIN_BINARY_PLAYER_AUDIO, 0x11});
+        EXPECT_EQ(rx.binary_dispatched_, 1);
+        EXPECT_EQ(rx.last_message_,
+                  (std::vector<uint8_t>{SENDSPIN_BINARY_PLAYER_AUDIO, 0x11}));
+    }
+}
+
+TEST(FragmentSequence, DiscardedSequenceStillEnforcesTheMalformedRules) {
+    // A discarded message is still in flight: a non-fragment message arriving inside it is the
+    // same malformed sequence it would be for a buffered one.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_RESERVED_FIRST, 0xAA});
+    ASSERT_FALSE(rx.closed());
+
+    rx.inject({MSG_TYPE_JSON_BODY, 'H', 'i'});
+
+    EXPECT_TRUE(rx.closed());
+    EXPECT_EQ(rx.json_dispatched_, 0);
+}
+
+TEST(FragmentSequence, OverCapMessageIsDiscardedWithoutClosing) {
+    // Outgrowing MAX_REASSEMBLED_MESSAGE_BYTES is not one of the enumerated malformed sequences
+    // (a legitimate peer could simply be sending an oversized image), so the rest of the message
+    // is discarded, the connection stays open, and the sequence runs to its last fragment.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    // Continuation frames at the largest size a single Noise frame allows: its plaintext is
+    // MAX_TRANSPORT_PLAINTEXT bytes, two of which are the fragment type and flags.
+    const size_t chunk = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) - 2;
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, 0xAA});
+    size_t data_len = 1;
+    while (data_len + chunk <= MAX_REASSEMBLED_MESSAGE_BYTES) {
+        rx.inject_fragment(0, std::vector<uint8_t>(chunk, 'X'));
+        data_len += chunk;
+    }
+    ASSERT_FALSE(rx.closed());
+
+    // This one pushes the total past the cap.
+    rx.inject_fragment(0, std::vector<uint8_t>(chunk, 'X'));
+    EXPECT_FALSE(rx.closed()) << "exceeding the reassembly cap must not close the connection";
+    EXPECT_EQ(rx.json_dispatched_, 0);
+
+    rx.inject_fragment(FRAGMENT_FLAG_LAST, {'Z'});
+    EXPECT_EQ(rx.json_dispatched_, 0) << "the over-cap message must never be dispatched";
+    EXPECT_FALSE(rx.closed());
+
+    // The connection is not wedged: the next message reassembles normally.
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
+    rx.inject_fragment(FRAGMENT_FLAG_LAST, {'}'});
+    EXPECT_EQ(rx.json_dispatched_, 1) << "connection must still be usable after the discard";
+    EXPECT_EQ(rx.last_message_, (std::vector<uint8_t>{'{', '}'}));
 }
 
 // =============================================================================
@@ -1191,8 +1274,8 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
 // raw_encrypt() (from noise_test_helpers.h) encrypts one plaintext frame with the "server" send
 // cipher (advances its nonce).
 
-/// Split a type-prefixed plaintext into wire fragment frames, matching wire.py _fragment()
-/// and SendspinConnection::fragment_and_send().
+/// Split a type-prefixed plaintext into wire fragment frames, per messaging.md
+/// "Fragmentation" and matching NoiseTransport::fragment_and_send_locked().
 static std::vector<std::vector<uint8_t>> server_fragment_frames(
     const std::vector<uint8_t>& plaintext) {
     std::vector<std::vector<uint8_t>> frames;
@@ -1204,13 +1287,15 @@ static std::vector<std::vector<uint8_t>> server_fragment_frames(
     const uint8_t orig_type = plaintext[0];
     const uint8_t* data = plaintext.data() + 1;
     const size_t data_len = plaintext.size() - 1;
-    const size_t first_cap = maxp - 2;
-    const size_t cont_cap = maxp - 1;
+    const size_t first_cap = maxp - 3;
+    const size_t cont_cap = maxp - 2;
 
     const size_t first_chunk = std::min(data_len, first_cap);
     std::vector<uint8_t> first;
-    first.reserve(2 + first_chunk);
-    first.push_back(MSG_TYPE_FRAGMENT_MORE);
+    first.reserve(3 + first_chunk);
+    first.push_back(MSG_TYPE_FRAGMENT);
+    first.push_back(static_cast<uint8_t>(
+        FRAGMENT_FLAG_FIRST | ((first_chunk == data_len) ? FRAGMENT_FLAG_LAST : 0)));
     first.push_back(orig_type);
     first.insert(first.end(), data, data + first_chunk);
     frames.push_back(std::move(first));
@@ -1220,8 +1305,9 @@ static std::vector<std::vector<uint8_t>> server_fragment_frames(
         const size_t chunk = std::min(data_len - offset, cont_cap);
         const bool is_last = (offset + chunk >= data_len);
         std::vector<uint8_t> cont;
-        cont.reserve(1 + chunk);
-        cont.push_back(is_last ? MSG_TYPE_FRAGMENT_END : MSG_TYPE_FRAGMENT_MORE);
+        cont.reserve(2 + chunk);
+        cont.push_back(MSG_TYPE_FRAGMENT);
+        cont.push_back(is_last ? FRAGMENT_FLAG_LAST : 0);
         cont.insert(cont.end(), data + offset, data + offset + chunk);
         frames.push_back(std::move(cont));
         offset += chunk;
@@ -1373,18 +1459,18 @@ TEST(NoiseTransport, FragmentBoundaryExactLimit) {
     // json of maxp bytes -> plaintext (maxp + 1) -> exactly two frames.
     //
     // Assert each frame's exact size, not just the frame count: the split point is wire format
-    // (wire.py _fragment()), so an off-by-one in fragment_and_send's first_cap/cont_cap would
-    // still emit two frames that this transport happily reassembles, while a peer running the
-    // reference implementation would disagree about where the boundary falls.
+    // (messaging.md "Fragmentation"), so an off-by-one in fragment_and_send_locked's
+    // first_cap/cont_cap would still emit two frames that this transport happily reassembles,
+    // while a conforming peer would disagree about where the boundary falls.
     //
-    // First frame is [FRAGMENT_MORE, orig_type, data[:first_cap]], so its plaintext fills the cap
-    // exactly at 2 + (maxp - 2) == maxp. That leaves data_len - (maxp - 2) == 2 bytes for the
-    // continuation frame, whose plaintext is [FRAGMENT_END, those 2 bytes] == 3 bytes.
+    // First frame is [1, flags, orig_type, data[:first_cap]], so its plaintext fills the cap
+    // exactly at 3 + (maxp - 3) == maxp. That leaves data_len - (maxp - 3) == 3 bytes for the
+    // continuation frame, whose plaintext is [1, flags, those 3 bytes] == 5 bytes.
     EXPECT_EQ(conn.send_encrypted_text(std::string(maxp, 'A')), SsErr::OK);
     ASSERT_EQ(conn.sent_binary_.size(), 2u);
     EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG)
         << "first fragment must fill MAX_TRANSPORT_PLAINTEXT exactly";
-    EXPECT_EQ(conn.sent_binary_[1].size(), 3u + TAG)
+    EXPECT_EQ(conn.sent_binary_[1].size(), 5u + TAG)
         << "continuation must carry exactly the bytes the first frame's cap left over";
 
     conn.sent_binary_.clear();
@@ -1394,12 +1480,12 @@ TEST(NoiseTransport, FragmentBoundaryExactLimit) {
     EXPECT_EQ(conn.send_encrypted_text(std::string(maxp + 1, 'A')), SsErr::OK);
     ASSERT_EQ(conn.sent_binary_.size(), 2u);
     EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG);
-    EXPECT_EQ(conn.sent_binary_[1].size(), 4u + TAG);
+    EXPECT_EQ(conn.sent_binary_[1].size(), 6u + TAG);
 }
 
-// The first and continuation frames have different caps: the first spends two plaintext bytes on
-// [FRAGMENT_MORE, orig_type] while continuations spend one on the fragment type alone. A two-frame
-// message never fills a continuation, so cont_cap is only observable once a third frame is needed.
+// The first and continuation frames have different caps: the first spends three plaintext bytes
+// on [1, flags, orig_type] while continuations spend two on [1, flags]. A two-frame message never
+// fills a continuation, so cont_cap is only observable once a third frame is needed.
 TEST(NoiseTransport, FragmentContinuationCapAtThreeFrames) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
@@ -1409,8 +1495,8 @@ TEST(NoiseTransport, FragmentContinuationCapAtThreeFrames) {
 
     const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
     constexpr size_t TAG = 16;
-    const size_t first_cap = maxp - 2;  // first frame: [FRAGMENT_MORE, orig_type, data...]
-    const size_t cont_cap = maxp - 1;   // continuation: [FRAGMENT_MORE|END, data...]
+    const size_t first_cap = maxp - 3;  // first frame: [1, flags, orig_type, data...]
+    const size_t cont_cap = maxp - 2;   // continuation: [1, flags, data...]
 
     // json length == data_len, since plaintext is [0x00] + json. One byte past what two frames
     // can carry, so the run is first_cap + cont_cap + 1 and the tail lands in a third frame.
@@ -1420,8 +1506,8 @@ TEST(NoiseTransport, FragmentContinuationCapAtThreeFrames) {
     ASSERT_EQ(conn.sent_binary_.size(), 3u);
     EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG) << "first frame fills first_cap";
     EXPECT_EQ(conn.sent_binary_[1].size(), maxp + TAG) << "middle frame fills cont_cap";
-    EXPECT_EQ(conn.sent_binary_[2].size(), 2u + TAG)
-        << "tail carries the single leftover byte plus its fragment type";
+    EXPECT_EQ(conn.sent_binary_[2].size(), 3u + TAG)
+        << "tail carries the single leftover byte behind its fragment type and flags";
 }
 
 // =============================================================================
@@ -1478,7 +1564,7 @@ TEST(NoiseTransport, SendBinary_GrowingSizesUpToMaxTransportPlaintextRoundTrip) 
 
     for (size_t len : lens) {
         std::vector<uint8_t> data(len);
-        data[0] = 0x01;  // arbitrary non-JSON role type byte
+        data[0] = SENDSPIN_BINARY_PLAYER_AUDIO;  // arbitrary non-JSON role type byte
         for (size_t i = 1; i < len; ++i) {
             data[i] = static_cast<uint8_t>(i);
         }
@@ -1491,6 +1577,25 @@ TEST(NoiseTransport, SendBinary_GrowingSizesUpToMaxTransportPlaintextRoundTrip) 
         ASSERT_EQ(pt.size(), len) << "len=" << len;
         EXPECT_EQ(pt, data) << "len=" << len;
     }
+}
+
+TEST(NoiseTransport, SendBinaryRejectsTheFragmentMessageType) {
+    // messaging.md "Fragmentation" reserves ID 1 for the transport and forbids it as an
+    // orig_type, so a role message may never claim it. Nothing reaches the wire.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+
+    TestConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    const std::vector<uint8_t> fragment_typed = {MSG_TYPE_FRAGMENT, 0xAA, 0xBB};
+    EXPECT_EQ(conn.test_send_binary(fragment_typed.data(), fragment_typed.size()), SsErr::FAIL);
+    EXPECT_TRUE(conn.sent_binary_.empty());
+
+    // Control: the same payload behind a role type byte is sent.
+    const std::vector<uint8_t> role_typed = {SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA, 0xBB};
+    EXPECT_EQ(conn.test_send_binary(role_typed.data(), role_typed.size()), SsErr::OK);
+    EXPECT_EQ(conn.sent_binary_.size(), 1u);
 }
 
 // =============================================================================

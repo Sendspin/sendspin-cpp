@@ -67,11 +67,11 @@ public:
     struct CompleteMessage {
         uint8_t* data{nullptr};
         size_t len{0};
-        /// True when this (empty) result is a spec "Malformed sequences" protocol error: a
-        /// fragment-end frame with no fragmented message in flight, a non-fragment frame while
-        /// one is in flight, or a reassembled orig_type of 2 or 3, rather than the benign "no
-        /// complete message yet" mid-reassembly state. The caller MUST close the connection
-        /// when this is true.
+        /// True when this (empty) result is a messaging.md "Malformed sequences" protocol
+        /// error: a first fragment while one is in flight, a non-first fragment with none in
+        /// flight, a non-fragment message while one is in flight, a nonzero reserved flag bit,
+        /// or an orig_type of 1, rather than the benign "no complete message yet"
+        /// mid-reassembly state. The caller MUST close the connection when this is true.
         bool malformed{false};
     };
 
@@ -137,12 +137,12 @@ public:
     size_t decrypt_in_place(uint8_t* ciphertext, size_t len);
 
     /// @brief Routes one decrypted plaintext frame through the fragment state machine.
-    /// Non-fragment frames are returned directly; fragment frames are buffered until the
-    /// terminating MSG_TYPE_FRAGMENT_END produces the reassembled message.
+    /// Non-fragment frames are returned directly; type-1 fragment frames are buffered until one
+    /// carrying FRAGMENT_FLAG_LAST produces the reassembled message.
     /// @param plaintext  Decrypted frame bytes (type byte first).
     /// @param len        Plaintext length.
     /// @return The complete message (type byte first), or {nullptr, 0} if the frame was
-    ///         consumed by reassembly or dropped as malformed.
+    ///         consumed by reassembly, discarded, or dropped as malformed.
     CompleteMessage accept_plaintext(uint8_t* plaintext, size_t len);
 
     /// @brief Sets memory placement for the fragmentation and reassembly buffers (ESP-IDF
@@ -202,6 +202,7 @@ private:
     void reasm_reset() {
         this->reasm_len_ = 0;
         this->reasm_in_progress_ = false;
+        this->reasm_discarding_ = false;
     }
 
     // Struct fields
@@ -240,15 +241,24 @@ private:
     std::unique_ptr<NoiseSession> session_;
 
     // size_t fields
-    /// Bytes used in reasm_buf_ (including the leading orig_type byte). Network thread only.
+    /// Bytes used in reasm_buf_ (including the leading orig_type byte), 0 while the in-flight
+    /// message is being discarded. Network thread only.
     size_t reasm_len_{0};
 
     // 8-bit fields
     /// Memory placement for reasm_buf_ and the fragmentation frame buffer.
     MemoryLocation buffer_location_{MemoryLocation::PREFER_EXTERNAL};
 
-    /// True when a fragmented message is being reassembled. Network thread only.
+    /// True while a fragmented message is in flight, whether it is being reassembled or
+    /// discarded. This is the flag the malformed-sequence rules key off. Network thread only.
     bool reasm_in_progress_{false};
+
+    /// True when the in-flight message's data is being thrown away rather than buffered: its
+    /// orig_type is a reserved ID nothing implements, it outgrew
+    /// MAX_REASSEMBLED_MESSAGE_BYTES, or the buffer could not be grown for it. The sequence is
+    /// still tracked to its last fragment; the message is simply never dispatched. Network
+    /// thread only.
+    bool reasm_discarding_{false};
 };
 
 }  // namespace sendspin

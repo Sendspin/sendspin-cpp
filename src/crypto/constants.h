@@ -94,10 +94,26 @@ static constexpr size_t MAX_REASSEMBLED_MESSAGE_BYTES = 1UL * 1024UL * 1024UL;
 /// @brief Type byte: the plaintext is a JSON body (UTF-8, strip the type byte).
 static constexpr uint8_t MSG_TYPE_JSON_BODY = 0;
 
-/// @brief Type byte: fragment-more, a non-final fragment of a larger message.
-static constexpr uint8_t MSG_TYPE_FRAGMENT_MORE = 2;
+/// @brief Type byte: one fragment of a larger message (messaging.md "Fragmentation").
+/// A fragment frame is [1][flags][orig_type][data] when it opens a message and [1][flags][data]
+/// otherwise.
+static constexpr uint8_t MSG_TYPE_FRAGMENT = 1;
 
-/// @brief Type byte: fragment-end, the final fragment of a larger message.
-static constexpr uint8_t MSG_TYPE_FRAGMENT_END = 3;
+/// @brief Fragment flags bit 0: this is the last fragment of the message.
+static constexpr uint8_t FRAGMENT_FLAG_LAST = 0x01;
+
+/// @brief Fragment flags bit 1: this is the first fragment of the message. A single-fragment
+/// message sets both bits.
+static constexpr uint8_t FRAGMENT_FLAG_FIRST = 0x02;
+
+/// @brief Fragment flags bits 2-7, which messaging.md "Fragmentation" reserves and requires to
+/// be zero. A frame setting any of them is a malformed sequence.
+static constexpr uint8_t FRAGMENT_FLAGS_RESERVED = 0xFC;
+
+/// @brief First and last binary message ID that "Binary Message ID Structure" reserves for
+/// future transport use. No role is ever assigned one, so a fragmented message claiming a
+/// reserved ID as its orig_type is an unimplemented message the receiver ignores.
+static constexpr uint8_t MSG_TYPE_RESERVED_FIRST = 2;
+static constexpr uint8_t MSG_TYPE_RESERVED_LAST = 3;
 
 }  // namespace sendspin

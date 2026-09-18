@@ -75,14 +75,15 @@ SsErr NoiseTransport::encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_cap
 }
 
 SsErr NoiseTransport::fragment_and_send_locked(const uint8_t* plaintext, size_t plaintext_len) {
-    // Matches wire.py _fragment() exactly.
-    // plaintext[0] = orig_type; plaintext[1..] = data.
+    // messaging.md "Fragmentation": every fragment is a type-1 message. The first carries
+    // [1][flags][orig_type][data] and the rest [1][flags][data], with flags bit 1 marking the
+    // first fragment and bit 0 the last. plaintext[0] = orig_type; plaintext[1..] = data.
     const uint8_t orig_type = plaintext[0];
     const uint8_t* data = plaintext + 1;
     const size_t data_len = plaintext_len - 1;
 
-    const size_t first_cap = MAX_TRANSPORT_PLAINTEXT - 2;  // 65517
-    const size_t cont_cap = MAX_TRANSPORT_PLAINTEXT - 1;   // 65518
+    const size_t first_cap = MAX_TRANSPORT_PLAINTEXT - 3;  // 65516
+    const size_t cont_cap = MAX_TRANSPORT_PLAINTEXT - 2;   // 65517
 
     // Buffer reused for each frame (plaintext + 16-byte tag room). ~64 KB, so placed per
     // buffer_location_ (PSRAM-preferring by default on ESP) rather than internal RAM.
@@ -92,12 +93,14 @@ SsErr NoiseTransport::fragment_and_send_locked(const uint8_t* plaintext, size_t 
         return SsErr::FAIL;
     }
 
-    // First frame: [MSG_TYPE_FRAGMENT_MORE, orig_type, data[:first_cap]]
+    // First frame: [1][FIRST (| LAST)][orig_type][data[:first_cap]]
     size_t first_chunk = (data_len < first_cap) ? data_len : first_cap;
-    frame_buf.data()[0] = MSG_TYPE_FRAGMENT_MORE;
-    frame_buf.data()[1] = orig_type;
-    std::memcpy(frame_buf.data() + 2, data, first_chunk);
-    size_t first_frame_len = 2 + first_chunk;
+    frame_buf.data()[0] = MSG_TYPE_FRAGMENT;
+    frame_buf.data()[1] = static_cast<uint8_t>(
+        FRAGMENT_FLAG_FIRST | ((first_chunk == data_len) ? FRAGMENT_FLAG_LAST : 0));
+    frame_buf.data()[2] = orig_type;
+    std::memcpy(frame_buf.data() + 3, data, first_chunk);
+    size_t first_frame_len = 3 + first_chunk;
 
     SsErr err =
         this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), first_frame_len);
@@ -111,9 +114,10 @@ SsErr NoiseTransport::fragment_and_send_locked(const uint8_t* plaintext, size_t 
         size_t chunk = (data_len - offset < cont_cap) ? (data_len - offset) : cont_cap;
         bool is_last = (offset + chunk >= data_len);
 
-        frame_buf.data()[0] = is_last ? MSG_TYPE_FRAGMENT_END : MSG_TYPE_FRAGMENT_MORE;
-        std::memcpy(frame_buf.data() + 1, data + offset, chunk);
-        size_t cont_frame_len = 1 + chunk;
+        frame_buf.data()[0] = MSG_TYPE_FRAGMENT;
+        frame_buf.data()[1] = is_last ? FRAGMENT_FLAG_LAST : 0;
+        std::memcpy(frame_buf.data() + 2, data + offset, chunk);
+        size_t cont_frame_len = 2 + chunk;
 
         err =
             this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), cont_frame_len);
@@ -174,6 +178,12 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
         return SsErr::INVALID_STATE;
     }
     if (len == 0) {
+        return SsErr::FAIL;
+    }
+    // messaging.md "Fragmentation": a sender MUST NOT use 1 as orig_type, and the transport owns
+    // that ID outright, so a role may never claim it for a message of its own.
+    if (data[0] == MSG_TYPE_FRAGMENT) {
+        SS_LOGE(TAG, "send_binary: message type 1 belongs to the fragmentation layer");
         return SsErr::FAIL;
     }
 
@@ -237,96 +247,120 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         return {};
     }
 
-    const uint8_t type_byte = plaintext[0];
-
-    if (type_byte == MSG_TYPE_FRAGMENT_MORE) {
-        // Fragment frame: begin or continue reassembly. reasm_buf_ accumulates the final
-        // message shape directly ([orig_type][data...]), so completion needs no staging copy.
-        if (!this->reasm_in_progress_) {
-            // Start of a new fragmented message: pt[1] = orig_type, pt[2..] = data
-            if (len < 2) {
-                SS_LOGW(TAG, "fragment-more start: frame too short (%zu bytes)", len);
-                this->reasm_reset();
-                return {};
-            }
-            if (!this->reasm_reserve(len - 1)) {
-                return {};
-            }
-            std::memcpy(this->reasm_buf_.data(), plaintext + 1, len - 1);
-            this->reasm_len_ = len - 1;  // [orig_type] + (len - 2) data bytes
-            this->reasm_in_progress_ = true;
-        } else {
-            // Continuation frame: pt[1..] = data
-            const size_t new_data = len - 1;
-            if (this->reasm_len_ - 1 + new_data > MAX_REASSEMBLED_MESSAGE_BYTES) {
-                SS_LOGW(TAG, "fragmented message exceeds %zu bytes; discarding",
-                        static_cast<size_t>(MAX_REASSEMBLED_MESSAGE_BYTES));
-                this->reasm_reset();
-                return {};
-            }
-            if (!this->reasm_reserve(this->reasm_len_ + new_data)) {
-                this->reasm_reset();
-                return {};
-            }
-            std::memcpy(this->reasm_buf_.data() + this->reasm_len_, plaintext + 1, new_data);
-            this->reasm_len_ += new_data;
-        }
-        return {};
-    }
-
-    if (type_byte == MSG_TYPE_FRAGMENT_END) {
-        if (!this->reasm_in_progress_) {
-            // Spec "Malformed sequences": a fragment-end frame with no fragmented message in
-            // flight is a protocol error; the caller must close the connection.
-            SS_LOGW(TAG, "fragment-end with no fragmented message in flight; malformed sequence");
-            return {nullptr, 0, true};
-        }
-        const size_t new_data = len - 1;
-        if (this->reasm_len_ - 1 + new_data > MAX_REASSEMBLED_MESSAGE_BYTES) {
-            SS_LOGW(TAG, "fragmented message exceeds %zu bytes on end; discarding",
-                    static_cast<size_t>(MAX_REASSEMBLED_MESSAGE_BYTES));
-            this->reasm_reset();
-            return {};
-        }
-        if (!this->reasm_reserve(this->reasm_len_ + new_data)) {
-            this->reasm_reset();
-            return {};
-        }
-        std::memcpy(this->reasm_buf_.data() + this->reasm_len_, plaintext + 1, new_data);
-        this->reasm_len_ += new_data;
-        this->reasm_in_progress_ = false;
-
-        // The reassembled message's type byte must be a terminal type, never a fragment
-        // type. A peer that nests a fragment type is malformed; drop it rather than
-        // re-entering the fragment state machine (matches wire.py, which dispatches the
-        // reassembled bytes directly instead of re-decoding them).
-        const uint8_t orig_type = this->reasm_buf_.data()[0];
-        if (orig_type == MSG_TYPE_FRAGMENT_MORE || orig_type == MSG_TYPE_FRAGMENT_END) {
-            // Spec "Malformed sequences": an orig_type of 2 or 3 is a protocol error; the
-            // caller must close the connection.
-            SS_LOGW(TAG, "reassembled message has fragment orig_type=%d; malformed sequence",
-                    static_cast<int>(orig_type));
+    if (plaintext[0] != MSG_TYPE_FRAGMENT) {
+        // messaging.md "Malformed sequences": a non-fragment binary message received while a
+        // fragmented message is in flight is a protocol error; the caller must close.
+        if (this->reasm_in_progress_) {
+            SS_LOGW(TAG,
+                    "non-fragment frame (type=%d) while a fragmented message is in flight; "
+                    "malformed sequence",
+                    static_cast<int>(plaintext[0]));
             this->reasm_reset();
             return {nullptr, 0, true};
         }
-
-        // reasm_buf_ already holds [orig_type][data...]; the returned pointer stays valid
-        // until the next accept_plaintext() call (the next fragment start overwrites it).
-        return {this->reasm_buf_.data(), this->reasm_len_};
+        return {plaintext, len};
     }
 
-    // Spec "Malformed sequences": a non-fragment frame while a fragmented message is in flight
-    // is a protocol error; the caller must close the connection.
-    if (this->reasm_in_progress_) {
-        SS_LOGW(TAG,
-                "non-fragment frame (type=%d) while a fragmented message is in flight; "
-                "malformed sequence",
-                static_cast<int>(type_byte));
+    // A fragment frame with no flags byte carries no place in the sequence at all, so it cannot
+    // be tracked; treat it like the enumerated malformed sequences and close.
+    if (len < 2) {
+        SS_LOGW(TAG, "fragment frame missing its flags byte; malformed sequence");
         this->reasm_reset();
         return {nullptr, 0, true};
     }
 
-    return {plaintext, len};
+    const uint8_t flags = plaintext[1];
+    if ((flags & FRAGMENT_FLAGS_RESERVED) != 0) {
+        // messaging.md "Malformed sequences": a nonzero reserved flag bit.
+        SS_LOGW(TAG, "fragment flags 0x%02x set a reserved bit; malformed sequence",
+                static_cast<unsigned>(flags));
+        this->reasm_reset();
+        return {nullptr, 0, true};
+    }
+
+    const uint8_t* data = nullptr;
+    size_t data_len = 0;
+
+    if ((flags & FRAGMENT_FLAG_FIRST) != 0) {
+        // messaging.md "Malformed sequences": a first fragment received while a fragmented
+        // message is in flight.
+        if (this->reasm_in_progress_) {
+            SS_LOGW(TAG, "first fragment while a fragmented message is in flight; "
+                         "malformed sequence");
+            this->reasm_reset();
+            return {nullptr, 0, true};
+        }
+        if (len < 3) {
+            SS_LOGW(TAG, "first fragment missing its orig_type; malformed sequence");
+            return {nullptr, 0, true};
+        }
+        const uint8_t orig_type = plaintext[2];
+        // messaging.md "Malformed sequences": an orig_type of 1. Fragments do not nest.
+        if (orig_type == MSG_TYPE_FRAGMENT) {
+            SS_LOGW(TAG, "first fragment declares orig_type 1; malformed sequence");
+            return {nullptr, 0, true};
+        }
+        // The ignore rules let a receiver discard the data of a message whose orig_type it does
+        // not implement instead of allocating for it, as long as it keeps tracking the sequence.
+        // "Binary Message ID Structure" reserves IDs 2-3, so no message can ever carry one.
+        this->reasm_in_progress_ = true;
+        this->reasm_discarding_ =
+            (orig_type >= MSG_TYPE_RESERVED_FIRST && orig_type <= MSG_TYPE_RESERVED_LAST);
+        this->reasm_len_ = 0;
+        if (!this->reasm_discarding_) {
+            // reasm_buf_ accumulates the final message shape directly ([orig_type][data...]),
+            // so completion needs no staging copy.
+            if (this->reasm_reserve(1)) {
+                this->reasm_buf_.data()[0] = orig_type;
+                this->reasm_len_ = 1;
+            } else {
+                this->reasm_discarding_ = true;
+            }
+        }
+        data = plaintext + 3;
+        data_len = len - 3;
+    } else {
+        // messaging.md "Malformed sequences": a non-first fragment received with none in flight.
+        if (!this->reasm_in_progress_) {
+            SS_LOGW(TAG, "continuation fragment with no fragmented message in flight; "
+                         "malformed sequence");
+            return {nullptr, 0, true};
+        }
+        data = plaintext + 2;
+        data_len = len - 2;
+    }
+
+    if (!this->reasm_discarding_) {
+        if (this->reasm_len_ - 1 + data_len > MAX_REASSEMBLED_MESSAGE_BYTES) {
+            SS_LOGW(TAG, "fragmented message exceeds %zu bytes; discarding the rest of it",
+                    static_cast<size_t>(MAX_REASSEMBLED_MESSAGE_BYTES));
+            this->reasm_discarding_ = true;
+        } else if (!this->reasm_reserve(this->reasm_len_ + data_len)) {
+            this->reasm_discarding_ = true;
+        } else {
+            std::memcpy(this->reasm_buf_.data() + this->reasm_len_, data, data_len);
+            this->reasm_len_ += data_len;
+        }
+        if (this->reasm_discarding_) {
+            // Nothing to dispatch any more, but the sequence is still tracked to its last
+            // fragment so the malformed-sequence rules keep applying to the frames that follow.
+            this->reasm_len_ = 0;
+        }
+    }
+
+    if ((flags & FRAGMENT_FLAG_LAST) == 0) {
+        return {};
+    }
+
+    const bool discarded = this->reasm_discarding_;
+    const size_t complete_len = this->reasm_len_;
+    this->reasm_reset();
+    if (discarded) {
+        return {};
+    }
+    // reasm_buf_ holds [orig_type][data...]; the returned pointer stays valid until the next
+    // accept_plaintext() call (the next first fragment overwrites it).
+    return {this->reasm_buf_.data(), complete_len};
 }
 
 bool NoiseTransport::grow_buffer(PlatformBuffer& buf, size_t needed, size_t cap, const char* what) {
