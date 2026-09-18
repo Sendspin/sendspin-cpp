@@ -224,7 +224,12 @@ bool PlayerRole::Impl::start() {
 
     this->load_output_delay();
 
+    // A player with no listener has nowhere to write audio, so the sync task is not started and
+    // the role reports state and takes commands without ever playing. Unlike a format list no
+    // server can serve, this is not spec-invalid and is a legitimate intermediate state for a
+    // consumer that wires its output separately, so it warns where the format list fails.
     if (!this->listener) {
+        SS_LOGW(TAG, "Player has no listener: no audio will be played");
         return true;
     }
     // Init once (event flags, ring buffer); the thread is created on every start(), including a
