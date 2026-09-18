@@ -1014,7 +1014,7 @@ TEST(Protocol, ClientHelloPairMethodsAreKeyedByMethod) {
     EXPECT_TRUE(methods["pairing_psk"]["method"].isUnbound());
     // Each descriptor keeps its own values under its own key.
     EXPECT_STREQ(methods["pairing_psk"]["locations"][0], "device");
-    EXPECT_TRUE(methods["static_pin"]["locations"].isUnbound());
+    EXPECT_TRUE(methods["static_pairing_code"]["locations"].isUnbound());
 }
 
 // supported_pair_methods: the field itself is REQUIRED on the wire even when there are no
@@ -1264,10 +1264,10 @@ TEST(Protocol, PairMethodFromString) {
               SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     EXPECT_EQ(pair_method_from_string("static_pairing_code"),
               SendspinPairMethod::STATIC_PAIRING_CODE);
+    // An identifier the client does not know names no method at all, so a server offering only
+    // that one offers nothing this client can enter.
     EXPECT_FALSE(pair_method_from_string("invalid_method").has_value());
-    // The pre-1.0 identifiers name nothing: a server still using them offers no method at all.
-    EXPECT_FALSE(pair_method_from_string("dynamic_pin").has_value());
-    EXPECT_FALSE(pair_method_from_string("static_pin").has_value());
+    EXPECT_FALSE(pair_method_from_string("").has_value());
 }
 
 // ============================================================================

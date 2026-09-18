@@ -106,7 +106,7 @@ public:
     /// @brief Begin a CPace run, sampling a scalar and computing the public share.
     ///
     /// @param role     INITIATOR (A) or RESPONDER (B)
-    /// @param prs      Password-related string (PIN ASCII digits for Sendspin)
+    /// @param prs      Password-related string (the pairing code's bytes for Sendspin)
     /// @param sid      Session identifier
     /// @param ci       Channel identifier (empty for Sendspin)
     /// @param ad       This side's associated data (empty for Sendspin)

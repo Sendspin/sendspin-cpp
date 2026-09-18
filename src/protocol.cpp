@@ -1160,8 +1160,8 @@ std::string format_client_pair_finalize_wrapped_message(
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
-    // Encode the 48-byte wrapped PSK as 64-char base64url (no padding). PIN flows only (spec
-    // "PSK Wrapping"); exactly one of long_term_psk/wrapped_psk is present per message.
+    // Encode the 48-byte wrapped PSK as 64-char base64url (no padding). Pairing-code flows only
+    // (pairing.md "Wrapping"); exactly one of long_term_psk/wrapped_psk is present per message.
     root["payload"]["wrapped_psk"] = b64url_encode(wrapped_psk.data(), wrapped_psk.size());
 
     std::string output;
@@ -1203,7 +1203,7 @@ bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
 }
 
 // ============================================================================
-// Dynamic-PIN pairing protocol functions
+// Pairing-code protocol functions
 // ============================================================================
 
 bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* payload) {

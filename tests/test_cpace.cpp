@@ -15,7 +15,7 @@
 // CPace-X25519-SHA512 known-answer tests and round-trip tests.
 //
 // All expected bytes were extracted by running the Python reference:
-//   aiosendspin/.venv/bin/python3 importing aiosendspin.noise.cpace / pin
+//   aiosendspin/.venv/bin/python3 importing aiosendspin.noise.cpace
 //   with fixed inputs (see comments per test).
 //
 // Official IETF draft-irtf-cfrg-cpace test vectors were not available offline;

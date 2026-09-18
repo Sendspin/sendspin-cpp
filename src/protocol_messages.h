@@ -836,7 +836,7 @@ struct PairAbortMessage {
 };
 
 // ============================================================================
-// Dynamic-PIN pairing message structs (server -> client)
+// Pairing-code message structs (server -> client)
 // ============================================================================
 
 /// @brief Parsed server/pair-init payload.
@@ -1000,8 +1000,8 @@ std::string format_client_command_message(const ClientCommandControllerObject& c
 /// @return JSON string for the client/pair-finalize message.
 std::string format_client_pair_finalize_message(const std::array<uint8_t, 32>& psk);
 
-/// @brief Formats a client/pair-finalize message carrying wrapped_psk (PIN flows only; see
-/// spec "PSK Wrapping"). wrapped_psk is 48 raw bytes, base64url-encoded (no padding, 64
+/// @brief Formats a client/pair-finalize message carrying wrapped_psk (pairing-code flows only;
+/// see pairing.md "Wrapping"). wrapped_psk is 48 raw bytes, base64url-encoded (no padding, 64
 /// chars).
 /// @param wrapped_psk 48-byte wrapped PSK (ciphertext || tag) to embed in the message.
 /// @return JSON string for the client/pair-finalize message.
@@ -1020,7 +1020,7 @@ std::string format_pair_abort_message(PairAbortReason reason);
 bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg);
 
 // ============================================================================
-// Dynamic-PIN pairing protocol functions
+// Pairing-code protocol functions
 // ============================================================================
 
 /// @brief Parses a server/pair-init JSON message into the provided struct.
@@ -1054,7 +1054,7 @@ bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPaylo
 std::string format_client_pair_pending_message(uint32_t pairing_index);
 
 /// @brief Formats a client/pair-init message as a JSON string.
-/// Starts the dynamic-PIN attempt; carries commit_B = SHA-256(LABEL || nonce_B) and the
+/// Starts the dynamic-pairing-code attempt; carries commit_B = SHA-256(LABEL || nonce_B) and the
 /// required pairing_index counter (spec "Pairing index").
 /// @param commit_b 32-byte commit_B value to embed (base64url-encoded on the wire).
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
@@ -1064,7 +1064,8 @@ std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commi
                                             uint32_t pairing_index);
 
 /// @brief Formats a client/pair-init message with only pairing_index.
-/// The form used by every flow that carries no commit_B: static PIN, sent after the operator
+/// The form used by every flow that carries no commit_B: the static pairing code, sent after the
+/// operator
 /// confirms the pairing-window gesture and before starting CPace RESPONDER, and Pairing PSK,
 /// sent immediately before client/pair-finalize (pairing.md "Pairing PSK Flow").
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise

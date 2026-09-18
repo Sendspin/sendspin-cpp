@@ -1010,11 +1010,11 @@ protected:
 // Dynamic pairing code: happy path
 // =============================================================================
 
-TEST_F(PairingStateMachineTest, DynamicPinHappyPath) {
+TEST_F(PairingStateMachineTest, DynamicCodeHappyPath) {
     FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-1");
 
     // client/pair-init(commit_B) was emitted, and on_pairing_started + on_display_pairing_code
-    // have NOT fired yet (display only happens after server/pair-init supplies pin_length).
+    // have NOT fired yet (the code is only derived once server/pair-init supplies nonce_A).
     ASSERT_EQ(conn->sent_text_.size(), 1u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED));
@@ -1342,7 +1342,7 @@ TEST_F(PairingStateMachineTest, AttemptTimeoutAbortWaitsForThePostRekeyActivate)
 // Dynamic pairing code: attempt timeout
 // =============================================================================
 
-TEST_F(PairingStateMachineTest, DynamicPinAttemptTimeout) {
+TEST_F(PairingStateMachineTest, DynamicCodeAttemptTimeout) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-3", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     this->enter_pairing(conn);
@@ -1368,8 +1368,8 @@ TEST_F(PairingStateMachineTest, DynamicPinAttemptTimeout) {
 // Spec "Protocol Errors": "a malformed or missing field ... is a protocol error: the detecting
 // side closes the WebSocket without sending any application-level error message, and persists
 // nothing." This pins that behavior for the MALFORMED case in
-// ConnectionManager::handle_pin_pairing_message: no pair/abort, and the connection closes.
-TEST_F(PairingStateMachineTest, DynamicPinMalformedFrameDuringSessionClosesSilently) {
+// ConnectionManager::handle_pairing_message: no pair/abort, and the connection closes.
+TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSilently) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-4", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     this->enter_pairing(conn);
@@ -1398,7 +1398,7 @@ TEST_F(PairingStateMachineTest, DynamicPinMalformedFrameDuringSessionClosesSilen
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
 }
 
-TEST_F(PairingStateMachineTest, DynamicPinMalformedFrameWithNoActiveSessionIsIgnored) {
+TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameWithNoActiveSessionIsIgnored) {
     // A connection with no active pairing-code session (pairing_session().step == IDLE) at all: a stray
     // malformed pairing frame must not tear anything down.
     FakeConnection* conn =
@@ -1427,8 +1427,8 @@ TEST_F(PairingStateMachineTest, DynamicPinMalformedFrameWithNoActiveSessionIsIgn
 // any application-level error message, and persists nothing. A derive() failure happens on the
 // peer's raw share BEFORE the code-derived generator can even be compared, so it can never be
 // produced by an operator simply mistyping the code (that produces a well-formed shared secret
-// that only fails the confirm-tag check exercised by DynamicPinMismatchAborts above).
-TEST_F(PairingStateMachineTest, DynamicPinDeriveFailureOnPairAuthClosesSilently) {
+// that only fails the confirm-tag check exercised by DynamicCodeMismatchAsksForAnotherRound above).
+TEST_F(PairingStateMachineTest, DynamicCodeDeriveFailureOnPairAuthClosesSilently) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-7", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     this->enter_pairing(conn);
@@ -1735,7 +1735,7 @@ TEST_F(PairingStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
 // Static pairing code: happy path
 // =============================================================================
 
-TEST_F(PairingStateMachineTest, StaticPinHappyPath) {
+TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
     this->configure_static_pairing_code("13572468");
 
     FakeConnection* conn =
@@ -1804,7 +1804,7 @@ TEST_F(PairingStateMachineTest, StaticPinHappyPath) {
 // connection, not only the first, or a later one is silently dropped as an ordinary "subsequent
 // activate" and the pairing window never opens. Mirrors the reference's _handle_server_activate,
 // which runs pairing on any pairing activate, not only the first.
-TEST_F(PairingStateMachineTest, SubsequentActivateEntersStaticPinPairing) {
+TEST_F(PairingStateMachineTest, SubsequentActivateEntersStaticCodePairing) {
     this->configure_static_pairing_code("13572468");
 
     FakeConnection* conn = this->inject_provisional_current_connection("server-static-sub");
@@ -1815,7 +1815,7 @@ TEST_F(PairingStateMachineTest, SubsequentActivateEntersStaticPinPairing) {
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
     EXPECT_TRUE(conn->sent_text_.empty());
 
-    // Subsequent activate: [pairing] + static_pin -> must enter pairing, send
+    // Subsequent activate: [pairing] + static_pairing_code -> must enter pairing, send
     // client/pair-pending, and prompt for the window gesture.
     this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
                         SendspinPairMethod::STATIC_PAIRING_CODE);
@@ -1936,7 +1936,7 @@ TEST_F(PairingStateMachineTest, PairingActivateWithoutMethodIsAborted) {
 // Static pairing code: mismatch
 // =============================================================================
 
-TEST_F(PairingStateMachineTest, StaticPinMismatchRecordsFailureAndAborts) {
+TEST_F(PairingStateMachineTest, StaticCodeMismatchRecordsFailureAndAborts) {
     this->configure_static_pairing_code("13572468");
     FakeConnection* conn =
         this->inject_current_connection("server-static-2", SendspinPairMethod::STATIC_PAIRING_CODE);
@@ -2135,7 +2135,7 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupSta
 // The clear is folded into SendspinClient::on_handshake_complete(), the one place every
 // "connection is now operational" path converges, so no operational-entry path can leave a
 // stale pairing session or pending record behind.
-TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPinSession) {
+TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingSession) {
     this->configure_static_pairing_code("13572468");
     FakeConnection* conn =
         this->inject_current_connection("server-leftover", SendspinPairMethod::STATIC_PAIRING_CODE);
@@ -2229,7 +2229,7 @@ TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
 
     // First activate: empty activities -> connection goes operational (first_activate_received()
     // becomes true), no pairing. Needed so the next two activates are genuinely "subsequent" and
-    // take the same real arbitration path SubsequentActivateEntersStaticPinPairing exercises,
+    // take the same real arbitration path SubsequentActivateEntersStaticCodePairing exercises,
     // rather than the nursery-promotion path (which this lightweight harness does not model).
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
     this->client_->loop();
@@ -2342,7 +2342,7 @@ TEST_F(PairingStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
 // must eventually drop the connection rather than leave it wedged non-operational forever. The
 // nursery reaper cannot cover this: the connection is current_connection_, never a nursery member.
 // Forces the deadline into the past instead of sleeping REPROVE_TIMEOUT_US (30 s) in a unit test,
-// matching the attempt_deadline_us pattern (e.g. DynamicPinAttemptTimeout above).
+// matching the attempt_deadline_us pattern (e.g. DynamicCodeAttemptTimeout above).
 TEST_F(PairingStateMachineTest, ReproveWatchdogDropsConnectionAfterFinalizeAckGoesSilent) {
     FakeConnection* conn =
         this->inject_current_connection("server-reprove-silent", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
@@ -2368,13 +2368,13 @@ TEST_F(PairingStateMachineTest, ReproveWatchdogDropsConnectionAfterFinalizeAckGo
 // mid-pairing, awaiting a human to press a physical gesture with no fixed deadline of its
 // own, must survive even though its provisional_time_us_ is stale by far more than
 // REPROVE_TIMEOUT_US.
-TEST_F(PairingStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingHumanPinGesture) {
+TEST_F(PairingStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingOperatorGesture) {
     this->configure_static_pairing_code("13572468");
     FakeConnection* conn =
-        this->inject_current_connection("server-reprove-pin-wait", SendspinPairMethod::STATIC_PAIRING_CODE);
+        this->inject_current_connection("server-reprove-gesture-wait", SendspinPairMethod::STATIC_PAIRING_CODE);
 
     // inject_current_connection() does not run a real hello handshake (see the comment on
-    // LeftoverActivateDiscardsPendingRecordAndPinSession above), so is_handshake_complete(),
+    // LeftoverActivateDiscardsPendingRecordAndPairingSession above), so is_handshake_complete(),
     // and therefore is_operational(), would otherwise stay false regardless of pairing state.
     // Set it explicitly so this test exercises the same !is_operational() gate a real connection
     // would, and so a false pass (the watchdog skipping this connection only because
@@ -2383,7 +2383,8 @@ TEST_F(PairingStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingHuma
     conn->set_server_hello_received(true);
     ASSERT_TRUE(conn->is_operational());
 
-    // static_pin is always gesture-gated (spec: Pairing Window), so with no window open this
+    // The static pairing code is always gesture-gated (pairing.md "Pairing Window"), so with
+    // no window open this
     // attempt waits for a human to press a button. AWAIT_PAIRING_WINDOW leaves attempt_deadline_us
     // at 0 (see handle_enter_pairing): the wait has no fixed deadline of its own.
     this->enter_pairing(conn);
@@ -2403,12 +2404,12 @@ TEST_F(PairingStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingHuma
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 }
 
-// The finalize-ack window above also has to defuse scan_pin_attempt_timeout(): pin_session_ is
+// The finalize-ack window above also has to defuse scan_pairing_attempt_timeout(): the pairing session is
 // only reset by clear_pairing_state(), which runs once the post-rekey server/activate lands, not
-// by note_pairing_finalize_ack() itself. So pin_session_.step and its attempt_deadline_us are
+// by note_pairing_finalize_ack() itself. So its step and attempt_deadline_us are
 // still exactly what PAIR_CONFIRM left them while the rekey is in flight, and a slow rekey can
 // let that deadline elapse for an exchange that already succeeded.
-TEST_F(PairingStateMachineTest, PinAttemptTimeoutScanSuppressedDuringFinalizeAckWindow) {
+TEST_F(PairingStateMachineTest, PairingAttemptTimeoutScanSuppressedDuringFinalizeAckWindow) {
     FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-finalize-window");
 
     CodeEmissionResult display;
@@ -2426,7 +2427,7 @@ TEST_F(PairingStateMachineTest, PinAttemptTimeoutScanSuppressedDuringFinalizeAck
 
     // Simulate: the server acked client/pair-finalize (the SERVER_PAIR_FINALIZE handler in
     // client.cpp calls this on success) and is now expected to rekey via an in-band
-    // re-handshake. pin_session_ is untouched by this call.
+    // re-handshake. The pairing session is untouched by this call.
     conn->note_pairing_finalize_ack();
     ASSERT_TRUE(conn->is_pairing_finalized());
     ASSERT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_FINALIZE);

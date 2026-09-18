@@ -26,6 +26,7 @@
 /// Options:
 ///   -u URL    Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)
 ///   -p PORT   Listen on PORT (default: 8928)
+///   -s CODE   Offer the static pairing code CODE (8 digits) instead of the dynamic one
 ///   -l LEVEL  Set log level: none, error, warn, info (default), debug, verbose
 ///   -v        Verbose logging (same as -l verbose)
 ///   -q        Quiet logging (same as -l error)
@@ -33,6 +34,7 @@
 
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/persistence_codec.h"
 #include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
@@ -62,6 +64,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -130,8 +133,23 @@ private:
 
 static std::atomic<bool> running{true};
 
+/// The pairing-window gesture and its cancellation, relayed from a signal handler: SIGUSR1 opens
+/// the window pairing.md "Pairing Window" gates every static_pairing_code attempt on, SIGUSR2
+/// closes it. A headless example has no button to press, and a signal is the one thing a handler
+/// may safely set, so the main loop below turns the flags into the client calls.
+static std::atomic<bool> window_gesture{false};
+static std::atomic<bool> window_cancel{false};
+
 static void signal_handler(int /*sig*/) {
     running.store(false);
+}
+
+static void window_signal_handler(int sig) {
+    if (sig == SIGUSR1) {
+        window_gesture.store(true);
+    } else {
+        window_cancel.store(true);
+    }
 }
 
 static void print_usage(const char* prog) {
@@ -140,6 +158,9 @@ static void print_usage(const char* prog) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -u URL        Connect to a WebSocket URL (e.g. ws://192.168.1.10:8928/sendspin)\n");
     fprintf(stderr, "  -p PORT       Listen on PORT (default: %u)\n", DEFAULT_SENDSPIN_PORT);
+    fprintf(stderr, "  -s CODE       Offer the static pairing code CODE (8 digits) instead of\n");
+    fprintf(stderr, "                the dynamic one; SIGUSR1 is the pairing-window gesture and\n");
+    fprintf(stderr, "                SIGUSR2 cancels it\n");
     fprintf(stderr, "  -l LEVEL      Log level: none, error, warn, info (default), debug, verbose\n");
     fprintf(stderr, "  -v            Verbose logging (same as -l verbose)\n");
     fprintf(stderr, "  -q            Quiet logging (same as -l error)\n");
@@ -170,16 +191,28 @@ int main(int argc, char* argv[]) {
     // Set up signal handler for clean shutdown
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
+    std::signal(SIGUSR1, window_signal_handler);
+    std::signal(SIGUSR2, window_signal_handler);
 
     // Parse command line options
     LogLevel log_level = LogLevel::INFO;
     std::string connect_url;
+    std::string static_pairing_code;
     uint16_t server_port = DEFAULT_SENDSPIN_PORT;
     int opt;
-    while ((opt = getopt(argc, argv, "u:p:l:vqh")) != -1) {
+    while ((opt = getopt(argc, argv, "u:p:s:l:vqh")) != -1) {
         switch (opt) {
             case 'u':
                 connect_url = optarg;
+                break;
+            case 's':
+                static_pairing_code = optarg;
+                if (static_pairing_code.size() != 8 ||
+                    static_pairing_code.find_first_not_of("0123456789") != std::string::npos) {
+                    fprintf(stderr, "Static pairing code must be exactly 8 digits: %s\n", optarg);
+                    print_usage(argv[0]);
+                    return 1;
+                }
                 break;
             case 'p':
                 if (!parse_port(optarg, server_port)) {
@@ -223,11 +256,20 @@ int main(int argc, char* argv[]) {
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
     config.server_port = server_port;
-    // The example prints the pairing code to the terminal, so the client can advertise the
-    // dynamic_pairing_code method alongside the mandatory pairing_psk one. A terminal is a
-    // display but cannot render a QR code, so only the digits format is offered.
-    config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
-    config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
+    if (static_pairing_code.empty()) {
+        // The example prints the pairing code to the terminal, so the client can advertise the
+        // dynamic_pairing_code method alongside the mandatory pairing_psk one. A terminal is a
+        // display but cannot render a QR code, so only the digits format is offered.
+        config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+        config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
+    } else {
+        // A device offers at most one pairing-code method (messaging.md "client/hello"), and one
+        // with an out-channel offers the dynamic code, so offering the static one means leaving
+        // the out-channel unset. Every static_pairing_code attempt is gesture-gated
+        // (pairing.md "Pairing Window"), which SIGUSR1 stands in for here.
+        config.pairing_window_supported = true;
+        config.static_pairing_code_locations = {"device"};
+    }
 
     // Create audio output and client
 #ifdef SENDSPIN_HAS_PORTAUDIO
@@ -238,6 +280,27 @@ int main(int argc, char* argv[]) {
     // restarts. Path: $HOME/.sendspin.json (regenerated if the file is absent).
     const std::string persistence_path = FilePersistenceProvider::default_path(".sendspin.json");
     FilePersistenceProvider persistence_provider(persistence_path);
+
+    // The static pairing code and the pairing config are provisioned state the store reads once
+    // at start(), so they are written before the client is built.
+    if (!static_pairing_code.empty()) {
+        persistence_provider.save_blob(
+            persistence_keys::STATIC_PAIRING_CODE,
+            reinterpret_cast<const uint8_t*>(static_pairing_code.data()),
+            static_pairing_code.size());
+        SendspinPairingConfig pairing_config;
+        if (auto blob = persistence_provider.load_blob(persistence_keys::PAIR_CONFIG)) {
+            std::string_view text(reinterpret_cast<const char*>(blob->data()), blob->size());
+            if (auto decoded = decode_pairing_config(text)) {
+                pairing_config = decoded.value();
+            }
+        }
+        pairing_config.static_pairing_code_enabled = true;
+        const std::string encoded = encode_pairing_config(pairing_config);
+        persistence_provider.save_blob(persistence_keys::PAIR_CONFIG,
+                                       reinterpret_cast<const uint8_t*>(encoded.data()),
+                                       encoded.size());
+    }
 
     SendspinClient client(std::move(config));
     client.set_persistence_provider(&persistence_provider);
@@ -366,12 +429,13 @@ int main(int argc, char* argv[]) {
         }
 
         void on_open_pairing_window() override {
-            // The pairing-window gesture is not implemented in the basic_client example, so
-            // pairing_window_supported stays false and this never fires.
+            fprintf(stderr,
+                    "\n>>> Pairing window gesture required: send SIGUSR1 to this process to "
+                    "allow the attempt (SIGUSR2 cancels it).\n\n");
         }
 
         void on_close_pairing_window() override {
-            // See on_open_pairing_window().
+            fprintf(stderr, ">>> Pairing window prompt dismissed\n");
         }
     };
 
@@ -444,6 +508,14 @@ int main(int argc, char* argv[]) {
     // Main loop
     int tick = 0;
     while (running.load()) {
+        if (window_gesture.exchange(false)) {
+            fprintf(stderr, ">>> Pairing window gesture received\n");
+            client.confirm_pairing_window();
+        }
+        if (window_cancel.exchange(false)) {
+            fprintf(stderr, ">>> Pairing window cancelled\n");
+            client.cancel_pairing_window();
+        }
         client.loop();
 #ifdef SENDSPIN_HAS_PORTAUDIO
         // Sync audio sink volume periodically (catches all volume change sources)

@@ -28,6 +28,14 @@ item against the current code before acting on it; line numbers drift as phases 
   the `pairing.md` "Unpaired Access" rule that a client which stops admitting unpaired access
   closes the connections relying on it with `client/goodbye` reason `pairing_required` cannot
   fire, because the setting cannot change while the client runs.
+- Record eviction order is least recently used, which the spec leaves to the implementation.
+  Recency is the order of `RecordStore::records_`, which `mark_record_used()` moves a touched
+  record to the back of; no new field or timestamp is stored, and the order persists with the
+  records themselves.
+- Operator cancellation of a pairing window arrives through a new
+  `SendspinClient::cancel_pairing_window()`, the counterpart to the existing
+  `confirm_pairing_window()`. It is a runtime action, not pairing configuration, so it does not
+  cross the construction-time rule above.
 
 ## Conformance oracle
 
@@ -93,8 +101,7 @@ concurrently: they share ports).
 - A8: the shared-PSK / record-mode storage variant in `record_store`, and the
   "record without a `server_id`" acceptance paths.
 - `trust_level` in `client/hello`.
-- B8: the persisted failure-counter escalation model (its replacement, the round limit, lands in
-  phase 5).
+- B8: the persisted failure-counter escalation model, replaced by the round limit.
 - B12: whatever `SendspinPairingConfig` fields lose their meaning. Reading an old blob must not
   fail.
 
@@ -173,20 +180,6 @@ Done:
 
 Exit: strict-mode run with the TUI client (artwork, visualizer, color enabled).
 
-### Phase 5: pairing codes
-
-- B5/B7: `dynamic_pairing_code`, `static_pairing_code`, `pairing_code_mismatch`; drop
-  `pin_length_unacceptable`.
-- B6: derive label `sendspin-pairing-code-derive-v1`, fixed 6 digits; `qr_code` format and the
-  version-1 pairing token.
-- B3: CPace `sid` gains the big-endian uint32 `round`.
-- B2: `wrapped_nonce_B` sealed under `SHA-256("sendspin-pair-nonce-wrap-v1" || sid || ISK)`.
-- B4: `client/pair-retry` rounds with the 20-round limit.
-- B9: evict a record at capacity, never one backing an open connection.
-- B10: the pairing window closes on its fifth failed attempt.
-
-Exit: strict-mode dynamic and static code pairing against the harness.
-
 ### Phase 6: new behavior
 
 - C5: when a later `server/activate` removes a role, stop its output, clear its buffers, discard
@@ -215,6 +208,11 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   with its bytes dropped. `roles/artwork/v1.md` "Artwork (Binary)" allows this (it is the
   "unavailable client" path) but sets no cap of its own, so a server that encodes an image larger
   than the channel's budget sees the channel keep its previous image rather than an error.
+- A device that offers `dynamic_pairing_code` without implementing the pairing-window gesture
+  (`pairing_window_supported` false) has no way to clear a standing round limit, which
+  `pairing.md` "Rounds" says only a deliberate operator action clears. Its attempts then sit at
+  `client/pair-pending` until the server cancels them. The library logs loudly when it reaches
+  that state; the fix is for such a device to implement the gesture callbacks.
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.

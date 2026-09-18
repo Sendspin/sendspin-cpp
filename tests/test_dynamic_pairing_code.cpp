@@ -69,8 +69,8 @@ static std::string b64url(const std::array<uint8_t, N>& a) {
     return b64url_encode(a.data(), a.size());
 }
 
-/// Build the wire JSON for server/pair-init from raw values. Per the current spec the payload
-/// carries ONLY nonce_A (pin_length arrives in the activation's pairing object).
+/// Build the wire JSON for server/pair-init from raw values. The payload carries ONLY nonce_A
+/// (the emission format arrives in the activation's pairing object).
 static std::string make_pair_init_json(const std::string& nonce_a_b64) {
     return std::string(R"({"type":"server/pair-init","payload":{"nonce_A":")") + nonce_a_b64 +
            R"("}})";
@@ -581,7 +581,7 @@ TEST(StaticPairingCode, ClientHelloLocationsHint) {
 // the client (RESPONDER) against a stand-in server (INITIATOR) using the SAME 8-digit code.
 TEST(StaticPairingCodeCPace, RoundTripWithMatchingStaticCode) {
     const auto sid = make_test_sid();
-    const auto prs = to_bytes("13572468");  // 8 decimal digits, per STATIC_PIN_DIGITS.
+    const auto prs = to_bytes("13572468");  // 8 decimal digits, per STATIC_PAIRING_CODE_DIGITS.
 
     // Initiator stands in for the server; responder is the client, per
     // handle_pairing_window_confirmed().
@@ -591,7 +591,7 @@ TEST(StaticPairingCodeCPace, RoundTripWithMatchingStaticCode) {
     EXPECT_TRUE(result.verify_ba);
 }
 
-TEST(StaticPairingCodeCPace, RoundTripMismatchedStaticPinFails) {
+TEST(StaticPairingCodeCPace, RoundTripMismatchedStaticCodeFails) {
     const auto sid = make_test_sid();
     const auto prs_a = to_bytes("13572468");
     const auto prs_b = to_bytes("99999999");

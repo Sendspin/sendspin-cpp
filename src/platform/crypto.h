@@ -399,7 +399,7 @@ inline void platform_random_bytes(uint8_t* out, size_t len) {
     if (err != NOISE_ERROR_NONE || rng == nullptr) {
         // Fail closed: there is no safe fallback for a CSPRNG failure. Returning without
         // writing `out` would leave a predictable (often all-zero) value, which is fatal for
-        // key/nonce generation (e.g. a CPace scalar or a PIN nonce). Abort instead.
+        // key/nonce generation (e.g. a CPace scalar or a pairing-code nonce). Abort instead.
         abort();
     }
     noise_randstate_generate(rng, out, len);

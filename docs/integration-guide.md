@@ -487,7 +487,7 @@ for each of these:
 | `persistence_keys::KEYPAIR` | 32 raw bytes: the static X25519 private key. No codec. |
 | `persistence_keys::RECORDS` | The WHOLE `SendspinPairingRecord` array as one codec blob (`encode_pairing_records()` / `decode_pairing_records()` in `sendspin/persistence_codec.h`). Stays present (possibly as an empty array) once any record has ever existed. |
 | `persistence_keys::PAIRING_PSK` | The accepted `SendspinPairingPsk` as one codec blob (`encode_pairing_psk()` / `decode_pairing_psk()`). |
-| `persistence_keys::STATIC_PIN` | Raw UTF-8 bytes: the configured static PIN string. |
+| `persistence_keys::STATIC_PAIRING_CODE` | Raw UTF-8 bytes: the configured static pairing code (8 decimal digits). |
 | `persistence_keys::PAIR_CONFIG` | The `SendspinPairingConfig` as one codec blob (`encode_pairing_config()` / `decode_pairing_config()`). |
 | `persistence_keys::LAST_PLAYED` | Raw UTF-8 bytes: the `server_id` (base64url public key) of the last server that played audio. |
 | `persistence_keys::OUTPUT_DELAY` | ASCII decimal string (e.g. `"150"`): the player's output delay in milliseconds. Chosen over raw `uint16_t` bytes for debuggability and to avoid an endianness dependency. |
@@ -517,9 +517,13 @@ The library's built-in `RecordStore` caps the number of long-term records it wil
 `SendspinClientConfig::max_pairing_records`, which defaults to
 `SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS` (12). An encoded record is roughly 250
 bytes, so the default keeps the serialized `RECORDS` blob comfortably under a typical NVS
-entry's ~4 KB limit. Once the cap is reached a new pairing fails; replacing a record already
-held for a given `psk_id` or `server_id` is unaffected, since that never grows the store. Raise
-or lower the cap by setting `max_pairing_records` before calling `start()`:
+entry's ~4 KB limit. A pairing at the cap evicts the least recently used record that no open
+connection is resolving against, since a pairing never fails for lack of record storage;
+replacing a record already held for a given `psk_id` or `server_id` evicts nothing, because that
+never grows the store. An evicted server's next handshake lands in the Sentinel fallback, where
+it can offer its operator re-pairing. The protocol requires room for at least 5 records, so a
+smaller configured cap is raised to that floor. Raise or lower the cap by setting
+`max_pairing_records` before calling `start()`:
 
 ```cpp
 SendspinClientConfig config;
@@ -581,7 +585,7 @@ struct MyClientListener : SendspinClientListener {
     }
 
     // Called when a server begins a pairing exchange, once per attempt and whatever
-    // the method (Pairing-PSK, dynamic PIN, or static PIN).
+    // the method (Pairing PSK, dynamic pairing code, or static pairing code).
     // server_id is the base64url public key of the server initiating pairing.
     void on_pairing_started(const std::string& server_id) override {
         printf("Pairing started with server %s\n", server_id.c_str());
@@ -610,21 +614,24 @@ struct MyClientListener : SendspinClientListener {
         update_trust_indicator(paired);
     }
 
-    // Dynamic-PIN pairing: display/clear a server-issued PIN. Only invoked when
-    // SendspinClientConfig::pin_display_supported is true.
-    void on_display_pairing_pin(const std::string& pin) override {
-        show_pin_on_display(pin);
+    // Dynamic pairing code: emit/withdraw the code the device derived. Only invoked when
+    // SendspinClientConfig::pairing_code_out_channels and pairing_code_formats are both
+    // non-empty. `format` says what `code` is: six decimal digits, or a pairing token to
+    // render as a QR code.
+    void on_display_pairing_code(const std::string& code,
+                                 SendspinPairingCodeFormat format) override {
+        show_pairing_code_on_display(code, format);
     }
-    void on_clear_pairing_pin() override {
-        clear_pin_from_display();
+    void on_clear_pairing_code() override {
+        clear_pairing_code_from_display();
     }
 
-    // PIN pairing: prompt/dismiss the operator pairing-window gesture for a gesture-gated
-    // attempt (static PIN: every attempt; dynamic PIN: when the session PIN is shorter than
-    // 6 digits). Confirm the gesture by
-    // calling client.confirm_pairing_window() (thread-safe) once the operator performs it;
-    // calling it with no attempt waiting opens a standing 5-minute pairing window that admits
-    // the next attempt without a further gesture.
+    // Prompt/dismiss the operator pairing-window gesture for a gesture-gated attempt (every
+    // static pairing code attempt, and a dynamic one held back by the round limit). Confirm the
+    // gesture by calling client.confirm_pairing_window() (thread-safe) once the operator
+    // performs it; calling it with no attempt waiting opens a standing 5-minute pairing window
+    // that admits the next attempt without a further gesture.
+    // client.cancel_pairing_window() closes an open window again.
     void on_open_pairing_window() override {
         prompt_pairing_button_press();
     }
@@ -693,7 +700,7 @@ Restarting is `start()` again; start, stop, and start again can be repeated inde
 - An outbound `connect_to()` connection's transport stop, which is synchronous (`esp_websocket_client_stop()` / `ix::WebSocket::stop()`).
 - A listener callback already running on a role thread: the join cannot interrupt it. `on_audio_write()` is bounded by its `timeout_ms`; `on_image_decode()` has no bound.
 
-A pairing attempt in flight is cut short the same way: `on_clear_pairing_pin()` and `on_close_pairing_window()` fire from inside `stop()` for a prompt that was still showing, and a long-term record a `server/pair-finalize` had staged is persisted before `stop()` returns. The identity and record store survive the stop, so a restarted client keeps its `client_id`, its pairing token, and every record.
+A pairing attempt in flight is cut short the same way: `on_clear_pairing_code()` and `on_close_pairing_window()` fire from inside `stop()` for a prompt that was still showing, and a long-term record a `server/pair-finalize` had staged is persisted before `stop()` returns. The identity and record store survive the stop, so a restarted client keeps its `client_id`, its pairing token, and every record.
 
 Listener callbacks fire from inside `stop()`, after every role and the group state have been reset, so a callback that reads the client through its getters sees the stopped state. One that calls `start()` gets `false` and starts nothing; one that calls `stop()`, `connect_to()`, or `disconnect()` is ignored. `is_started()` reads `false` throughout and is safe to call from any thread. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
 
@@ -790,42 +797,53 @@ After pairing completes, `on_pairing_succeeded` fires and the long-term record i
 by the library as a `persistence_keys::RECORDS` blob. Subsequent boots load that same blob;
 no further provisioning is needed.
 
-#### PIN pairing
+#### Pairing-code pairing
 
-The library also supports PIN-based pairing (dynamic and static), gated by
-`SendspinClientConfig::pin_display_supported` / `pairing_window_supported` and the
-`SendspinClientListener::on_display_pairing_pin` / `on_clear_pairing_pin` /
-`on_open_pairing_window` / `on_close_pairing_window` callbacks documented in Step 3 above.
-A method is advertised only when the platform capability flag is set: a client that leaves
-`pin_display_supported` false never offers `dynamic_pin`, whatever the stored pairing config
-says, and the server is then limited to the pairing-token flow.
+The library also supports the two pairing-code methods, gated by
+`SendspinClientConfig::pairing_code_out_channels` / `pairing_code_formats` /
+`pairing_window_supported` and the `SendspinClientListener::on_display_pairing_code` /
+`on_clear_pairing_code` / `on_open_pairing_window` / `on_close_pairing_window` callbacks
+documented in Step 3 above. A method is advertised only when the platform can carry it: a client
+that names no out-channel and no format never offers `dynamic_pairing_code`, whatever the stored
+pairing config says, and the server is then limited to the remaining methods.
 
-Some PIN attempts are **gesture-gated**: the client answers the pairing activation with
-`client/pair-pending` and withholds `client/pair-init` until a pairing window is open. Static
-PIN gates every attempt; dynamic PIN gates an attempt only when the session's PIN length is
-below 6 digits. The window opens on the operator gesture (`confirm_pairing_window()`), it lives
-for 5 minutes, and it admits exactly one attempt. A gesture performed before the activation
-arrives leaves the window standing open, so the next attempt within its lifetime proceeds
-without a prompt.
+A client offers at most one pairing-code method, and one with an out-channel offers the dynamic
+code, so a device that means to offer `static_pairing_code` leaves `pairing_code_out_channels`
+empty.
 
-The gating rules apply to dynamic PIN even on a device that leaves
-`pairing_window_supported` false. On such a device the `on_open_pairing_window` prompt cannot
-fire, so a gated attempt sends `client/pair-pending`, logs a warning, and waits for the
-server's own timeout to cancel it. A device that offers `dynamic_pin` should therefore set
-`pairing_window_supported` and implement the gesture callbacks.
+A **dynamic pairing code** is derived per attempt from the Noise handshake hash and both sides'
+nonces, and emitted through `on_display_pairing_code` as either six decimal digits or a pairing
+token to render as a QR code, whichever format the server selected from those advertised. If the
+operator types a code the device did not emit, the client asks for another round
+(`client/pair-retry`) and keeps the same code on screen. After 20 rounds without a successful
+verification the attempt ends and further attempts are held back until an operator gesture.
+
+A **static pairing code** is the fixed 8-digit value the device shipped with, and every attempt
+is **gesture-gated**: the client answers the pairing activation with `client/pair-pending` and
+withholds `client/pair-init` until a pairing window is open. The window opens on the operator
+gesture (`confirm_pairing_window()`) and lives for 5 minutes. It keeps admitting attempts on the
+connection that carried its first, and closes on a completed pairing, on the fifth attempt whose
+verification failed, when that connection drops, on `cancel_pairing_window()`, or on expiry. A
+gesture performed before the activation arrives leaves the window standing open, so the next
+attempt within its lifetime proceeds without a prompt.
+
+A device that leaves `pairing_window_supported` false cannot show the `on_open_pairing_window`
+prompt, so a gated attempt sends `client/pair-pending`, logs a warning, and waits for the
+server's own timeout to cancel it. A device that offers either pairing-code method should
+therefore set `pairing_window_supported` and implement the gesture callbacks.
 
 #### The locations hint
 
-`SendspinClientConfig::pairing_psk_locations` and `static_pin_locations` tell a server where
-the operator can find each secret (`"device"`, `"leaflet"`, `"operator"`), and ride out as the
-`locations` hint on the matching `client/hello` pair-method descriptor. Only the application
+`SendspinClientConfig::pairing_psk_locations` and `static_pairing_code_locations` tell a server
+where the operator can find each secret (`"device"`, `"leaflet"`, `"operator"`), and ride out as
+the `locations` hint on the matching `client/hello` pair-method descriptor. Only the application
 knows where its secrets were published, so an empty value omits the hint rather than guessing:
-a PIN on the device label is `{"device"}`, a pairing token in the box is `{"leaflet"}`, and a
+a code on the device label is `{"device"}`, a pairing token in the box is `{"leaflet"}`, and a
 secret an operator provisioned out of band is `{"operator"}`.
 
 The secrets themselves come from the persistence provider (`persistence_keys::PAIRING_PSK` and
-`STATIC_PIN`), read once at `start()`, so a provisioning tool that replaces one also updates
-these config values in the same pass.
+`STATIC_PAIRING_CODE`), read once at `start()`, so a provisioning tool that replaces one also
+updates these config values in the same pass.
 
 ### Trust Levels
 
@@ -892,8 +910,8 @@ if (blob.has_value()) {
 This is why the read-modify-write step matters: the provider is a byte store and does not
 validate what it is handed, so saving a bare, default-constructed `SendspinPairingConfig`
 *will* be written and *will* take effect on the next boot -- silently resetting every policy
-field (`pairing_psk_enabled`, `dynamic_pin_enabled`, `static_pin_enabled`,
-`dynamic_pin_min_length`) to the struct's compiled-in defaults rather than merely failing to change `unpaired_access_enabled`. A bare write also does not count
+field (`pairing_psk_enabled`, `dynamic_pairing_code_enabled`, `static_pairing_code_enabled`)
+to the struct's compiled-in defaults rather than merely failing to change `unpaired_access_enabled`. A bare write also does not count
 as a first boot (the config blob still decodes), so `initial_unpaired_access_enabled` is not
 reapplied either. Before the first `start()` there is no stored config to modify, so use the
 seed instead.
@@ -1161,8 +1179,9 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `manufacturer` | `std::optional<std::string>` | unset | Manufacturer name (e.g., `"ESPHome"`); sent in `client/hello` only when set |
 | `software_version` | `std::optional<std::string>` | unset | Software version string; sent in `client/hello` only when set |
 | `mac_address` | `std::optional<std::string>` | auto-detected | MAC address of the network interface, lowercase colon-separated (e.g., `"aa:bb:cc:dd:ee:ff"`), sent in `client/hello`. Left unset, the library auto-detects it. ESP-IDF uses the default network interface (Wi-Fi or Ethernet). Host uses a best-effort from the active routable interface. Set explicitly to override (recommended on multi-homed hosts). |
-| `pin_display_supported` | `bool` | `false` | Set to `true` when the application implements `on_display_pairing_pin` / `on_clear_pairing_pin` on its `SendspinClientListener`. When `false`, dynamic-PIN pairing is not advertised even if enabled in `SendspinPairingConfig`. |
-| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, static-PIN pairing is not advertised even if a static PIN is configured. Dynamic-PIN devices should also set it: short-PIN dynamic attempts are gesture-gated through the same callbacks, and without them such an attempt stalls until the server cancels it. |
+| `pairing_code_out_channels` | `std::vector<SendspinPairingCodeChannel>` | `{}` | Where the device can emit a dynamic pairing code: `DISPLAY`, `SPEAKER`. Advertised as the descriptor's `out_channels`. Empty (or an empty `pairing_code_formats`) means the device cannot emit one, so `dynamic_pairing_code` is not advertised even if enabled in `SendspinPairingConfig`. |
+| `pairing_code_formats` | `std::vector<SendspinPairingCodeFormat>` | `{}` | How the device can render a dynamic pairing code: `DIGITS` (six decimal digits), `QR_CODE` (a pairing token to render). Advertised as the descriptor's `formats`; the server picks one from this list. |
+| `pairing_window_supported` | `bool` | `false` | Set to `true` when the application implements `on_open_pairing_window` / `on_close_pairing_window` on its `SendspinClientListener`. When `false`, `static_pairing_code` is not advertised even if a static pairing code is configured. Dynamic-pairing-code devices should also set it: an attempt held back by the round limit is gesture-gated through the same callbacks, and without them such an attempt stalls until the server cancels it. |
 | `max_pairing_records` | `size_t` | `12` | Maximum number of long-term pairing records `RecordStore` retains. See [Record capacity](#record-capacity). |
 | `httpd_psram_stack` | `bool` | `false` | Allocate HTTP server task stack in PSRAM (ESP-IDF only) |
 | `httpd_priority` | `unsigned` | `5` | FreeRTOS priority for the HTTP server task (ESP-IDF only) |
@@ -1179,7 +1198,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 | `websocket_payload_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the per-connection WebSocket payload reassembly buffer (sized to the largest incoming frame, holds raw audio chunks delivered by httpd). `PREFER_EXTERNAL` tries SPIRAM first and falls back to internal RAM; `PREFER_INTERNAL` does the reverse. Use `PREFER_INTERNAL` on devices with slow PSRAM (e.g., plain ESP32) to avoid stuttering. ESP-IDF only; ignored on host. |
 | `noise_buffer_location` | `MemoryLocation` | `PREFER_EXTERNAL` | Memory placement for the Noise transport's fragment reassembly buffer and the ~64 KB fragmentation frame buffer. The reassembly buffer grows with the largest fragmented message received (e.g. album artwork) and retains its capacity for the life of the connection, so keeping it in SPIRAM protects internal RAM. Independent of `websocket_payload_location` (which covers the raw WebSocket frame buffer). ESP-IDF only; ignored on host. |
 | `pairing_psk_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the pairing token the device shipped with: any of `"device"`, `"leaflet"`, `"operator"`. Advertised as the informational `locations` hint on the `pairing_psk` descriptor in `client/hello`; empty omits the hint, see [The locations hint](#the-locations-hint). |
-| `static_pin_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static PIN the device shipped with, same values as above. Advertised on the `static_pin` descriptor in `client/hello`; empty omits the hint. |
+| `static_pairing_code_locations` | `std::vector<std::string>` | `{}` | Where the operator can find the static pairing code the device shipped with, same values as above. Advertised on the `static_pairing_code` descriptor in `client/hello`; empty omits the hint. |
 | `initial_unpaired_access_enabled` | `bool` | `false` | First-boot default for unpaired (Sentinel) access. Applies only on a genuine first boot; see [Unpaired Access](#unpaired-access). |
 | `json_arena_size` | `size_t` | `2048` | Size in bytes of a fixed internal-RAM scratch buffer used to parse incoming JSON protocol messages, instead of the default PSRAM. Costs this many bytes of internal RAM permanently but removes PSRAM traffic from the network task on every message. Messages too large for the budget fall back to PSRAM; the default covers steady-state traffic (including the FLAC stream-start header), while large track-metadata messages may spill over (but those arrive only once per song). Set to `0` to disable and keep PSRAM-only behaviour. On host there is no PSRAM distinction, so the arena is just a fixed scratch buffer for the parse (still used, harmless). |
 
@@ -1292,8 +1311,7 @@ successful in-band re-handshake. See [Trust Levels](#trust-levels).
 | `ATTEMPT_TIMEOUT` | Pairing timed out waiting for the next step |
 | `CONCURRENT_ATTEMPT` | The server rejected pairing because another pairing is in progress |
 | `METHOD_NOT_SUPPORTED` | The proposed pairing method is not supported by the client |
-| `PIN_LENGTH_UNACCEPTABLE` | The PIN length requirement is out of the accepted range |
-| `PIN_MISMATCH` | The PIN entered does not match |
+| `PAIRING_CODE_MISMATCH` | The pairing code entered does not match the one this client emitted |
 | `USER_CANCELLED` | The pairing was cancelled by the user (on the server side) |
 | `UNKNOWN` | Unrecognized abort reason from the server |
 

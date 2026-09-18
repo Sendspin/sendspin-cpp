@@ -77,11 +77,11 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
   inside `stop()`, re-entrancy from callbacks, role start rollback, and the high-performance
   hold.
 - `test_client_teardown.cpp`: destroying a running client joins every threaded role.
-- `test_crypto.cpp`, `test_cpace.cpp`, `test_pin.cpp`, `test_psk_wrap.cpp`,
+- `test_crypto.cpp`, `test_cpace.cpp`, `test_pairing_code.cpp`, `test_psk_wrap.cpp`,
   `test_pairing_token.cpp`, `test_noise_transport.cpp`, `test_noise_rehandshake.cpp`,
-  `test_admission.cpp`, `test_record_store.cpp`, `test_dynamic_pin.cpp`,
-  `test_pin_state_machine.cpp`, `test_persistence_codec.cpp`: the encryption and pairing units,
-  from the primitives up to the record store and the PIN state machine.
+  `test_admission.cpp`, `test_record_store.cpp`, `test_dynamic_pairing_code.cpp`,
+  `test_pairing_state_machine.cpp`, `test_persistence_codec.cpp`: the encryption and pairing
+  units, from the primitives up to the record store and the pairing state machine.
 
 The loopback tests share `lifecycle_test_fixtures.h`: `FakeEncryptedServer` and
 `FakeOutboundEncryptedServer` play a Sendspin server as the Noise initiator over a real socket,
