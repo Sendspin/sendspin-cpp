@@ -2273,6 +2273,47 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBounded) {
               "Title " + std::to_string(SendspinConnection::MAX_HELD_MESSAGES - 1));
 }
 
+// The role mask has two writers: the network thread ORs in a just-parsed activation's roles, and
+// the main loop republishes the applied set a tick later. Applying one activation must not erase
+// the bits of another that has already been delivered, or the receive gate drops exactly the
+// traffic a server sends immediately behind its activate.
+TEST(RoleMask, ApplyingAnActivationKeepsADeliveredOneSRoleBits) {
+    HoldTestConnection conn;
+    const std::vector<SendspinActivity> playback{SendspinActivity::PLAYBACK};
+    const std::vector<std::string> metadata_only{"metadata@v1"};
+
+    conn.apply_server_activate(playback, metadata_only, std::nullopt, std::nullopt);
+    ASSERT_FALSE(conn.is_role_active(SendspinRole::PLAYER));
+
+    // A second activation adds the player and is parsed on the network thread...
+    conn.note_activated_roles({"metadata@v1", "player@v1"});
+    ASSERT_TRUE(conn.is_role_active(SendspinRole::PLAYER));
+    // ...while the main loop is still applying one that neither adds nor removes it.
+    conn.apply_server_activate(playback, metadata_only, std::nullopt, std::nullopt);
+
+    EXPECT_TRUE(conn.is_role_active(SendspinRole::PLAYER))
+        << "the delivered activation's role bit was erased by an application it had nothing to "
+           "do with";
+    EXPECT_TRUE(conn.is_role_active(SendspinRole::METADATA));
+}
+
+// Control: applying an activation that does take a role out clears its bit, so the test above is
+// not passing on a mask nothing can ever clear.
+TEST(RoleMask, ApplyingAnActivationClearsTheRolesItRemoves) {
+    HoldTestConnection conn;
+    const std::vector<SendspinActivity> playback{SendspinActivity::PLAYBACK};
+
+    conn.apply_server_activate(playback, std::vector<std::string>{"metadata@v1", "player@v1"},
+                               std::nullopt, std::nullopt);
+    ASSERT_TRUE(conn.is_role_active(SendspinRole::PLAYER));
+
+    conn.apply_server_activate(playback, std::vector<std::string>{"metadata@v1"}, std::nullopt,
+                               std::nullopt);
+
+    EXPECT_FALSE(conn.is_role_active(SendspinRole::PLAYER));
+    EXPECT_TRUE(conn.is_role_active(SendspinRole::METADATA));
+}
+
 // The other half of the same guard: the hold has two budgets, and the byte one is what keeps the
 // memcpy inside the MAX_HELD_BYTES allocation. A peer whose role states are large runs out of
 // bytes long before it runs out of slots, so the count cap above cannot stand in for this one.

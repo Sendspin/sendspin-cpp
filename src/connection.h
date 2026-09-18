@@ -704,42 +704,29 @@ public:
         this->active_role_mask_.fetch_or(active_role_mask(active_roles), std::memory_order_acq_rel);
     }
 
-    /// @brief Rebuilds the active-role mask from the roles that are actually applied.
+    /// @brief Takes back the mask bits a refused activation added.
     ///
     /// Main-loop only. note_activated_roles() adds a just-received activation's roles on the
     /// network thread, before admissibility is judged. An activation the main loop then rejects
     /// while keeping the connection open never reaches apply_server_activate(), so the bits it
     /// added are taken back here; otherwise the receive gate would go on admitting traffic for a
     /// role this client never activated.
-    void restore_role_mask() {
-        this->active_role_mask_.store(active_role_mask(this->active_roles_),
-                                      std::memory_order_release);
+    /// @param refused_roles The active_roles of the refused activation (empty when it named none).
+    void withdraw_activated_roles(const std::vector<std::string>& refused_roles) {
+        this->publish_role_mask(active_role_mask(refused_roles));
     }
 
     /// @brief Returns true if `role` is active on this connection, judged on the exact versioned
     /// name this library implements.
     ///
-    /// Reads an atomic mask rebuilt by apply_server_activate(), so the receive path may call it
-    /// from the network thread while the main loop applies an activation; active_roles_ itself is
-    /// main-loop-only and must not be walked from there.
+    /// The one activation test in the library: the receive gate, the send gate, the client/state
+    /// role objects and role removal all go through it, so no two of them can disagree about
+    /// whether a role is active. Reads an atomic mask rebuilt by apply_server_activate(), so the
+    /// receive path may call it from the network thread while the main loop applies an
+    /// activation; active_roles_ itself is main-loop-only and must not be walked from there.
     /// @param role The role to test.
     bool is_role_active(SendspinRole role) const {
         return (this->active_role_mask_.load(std::memory_order_acquire) & role_mask_bit(role)) != 0;
-    }
-
-    /// @brief Returns true if any active role is in the given family (e.g., "player" matches
-    /// the active role "player@v1").
-    /// @param family Role family name without the "@vN" version suffix.
-    bool is_role_active(const std::string& family) const {
-        for (const auto& role : this->active_roles_) {
-            auto at = role.find('@');
-            // compare() against the prefix rather than substr(): this runs on every role-
-            // originated send, and a temporary string per active role is not worth a name check.
-            if (at != std::string::npos && role.compare(0, at, family) == 0) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /// @brief Returns true if the given activity is in the current activity set.
@@ -772,13 +759,16 @@ public:
                                const std::optional<SendspinPairMethod>& pairing_method,
                                const std::optional<SendspinPairingCodeFormat>& pairing_format) {
         this->activities_ = activities;
+        const uint16_t previous = active_role_mask(this->active_roles_);
         if (active_roles.has_value()) {
             this->active_roles_ = active_roles.value();
         }
         // Republished on every activation, sticky set included, so the mask the receive path reads
-        // cannot drift from active_roles_.
-        this->active_role_mask_.store(active_role_mask(this->active_roles_),
-                                      std::memory_order_release);
+        // cannot drift from active_roles_. Only the roles this activation takes out are withdrawn:
+        // a later activation whose bits the network thread has already OR'd in is not this one's
+        // to erase.
+        this->publish_role_mask(
+            static_cast<uint16_t>(previous & ~active_role_mask(this->active_roles_)));
         bool has_pairing = false;
         for (const auto& a : activities) {
             if (a == SendspinActivity::PAIRING) {
@@ -982,6 +972,27 @@ public:
 
 protected:
     // ========================================
+    // Active-role mask
+    // ========================================
+
+    /// @brief Republishes the active-role mask: clears `withdrawn`, then sets what is applied.
+    ///
+    /// Main-loop only, and the only writer of the mask outside note_activated_roles(). Both steps
+    /// are read-modify-writes because the network thread ORs a newly arrived activation's roles
+    /// in without waiting for the main loop: a plain store of the applied set would erase the
+    /// bits of an activation that is delivered but not yet applied, and the receive gate would
+    /// then drop exactly the traffic a server sends immediately behind its activate. A bit this
+    /// step neither applies nor withdraws is left alone, for its own activation's publish to
+    /// decide.
+    /// @param withdrawn Bits this step takes back (the roles it removed, or a refusal's roles).
+    void publish_role_mask(uint16_t withdrawn) {
+        this->active_role_mask_.fetch_and(static_cast<uint16_t>(~withdrawn),
+                                          std::memory_order_acq_rel);
+        this->active_role_mask_.fetch_or(active_role_mask(this->active_roles_),
+                                         std::memory_order_acq_rel);
+    }
+
+    // ========================================
     // Noise transport helpers (connection.cpp)
     // ========================================
 
@@ -1119,8 +1130,9 @@ protected:
     std::vector<std::string> active_roles_{};
 
     /// active_roles_ as a bitmask of the roles this library implements, so the network thread can
-    /// test a role without reading the vector the main loop rewrites. Written only by
-    /// apply_server_activate().
+    /// test a role without reading the vector the main loop rewrites. Written by
+    /// note_activated_roles() on the network thread and through publish_role_mask() on the main
+    /// loop, never with a plain store: the two writers overlap.
     std::atomic<uint16_t> active_role_mask_{0};
 
     /// Pairing method from the pairing object of the last pairing server/activate; nullopt

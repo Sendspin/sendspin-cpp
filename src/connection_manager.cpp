@@ -55,9 +55,12 @@ static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * U
 /// network thread added for it when it parsed the message (see
 /// SendspinConnection::note_activated_roles()) are taken back in the same step, so the receive
 /// gate cannot be widened by an activation the client refused.
-/// @param conn The connection the refused activation arrived on.
-static void refuse_activate(SendspinConnection* conn) {
-    conn->restore_role_mask();
+/// @param event The activation being refused.
+static void refuse_activate(const ServerActivateEvent& event) {
+    static const std::vector<std::string> NO_ROLES{};
+    SendspinConnection* conn = event.conn.get();
+    conn->withdraw_activated_roles(event.active_roles.has_value() ? event.active_roles.value()
+                                                                  : NO_ROLES);
     conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
 }
 
@@ -737,7 +740,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                 "for server_id=%s; replying pair/abort(method_not_supported), "
                 "connection stays open",
                 event.conn->get_server_id().c_str());
-        refuse_activate(event.conn.get());
+        refuse_activate(event);
         return;
     }
 
@@ -772,7 +775,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                     "server_id=%s; replying pair/abort(method_not_supported), "
                     "connection stays open",
                     to_cstr(method), event.conn->get_server_id().c_str());
-            refuse_activate(event.conn.get());
+            refuse_activate(event);
             return;
         }
 
@@ -788,7 +791,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                     "dynamic_pairing_code on server_id=%s; replying "
                     "pair/abort(method_not_supported), connection stays open",
                     event.conn->get_server_id().c_str());
-            refuse_activate(event.conn.get());
+            refuse_activate(event);
             return;
         }
     }

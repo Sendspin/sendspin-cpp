@@ -1002,9 +1002,13 @@ void SendspinClient::send_text(const std::string& text, const std::string& role_
     if (!conn->first_activate_received()) {
         return;
     }
-    // The role's own gate, matching the one publish_client_state() applies to each role object:
-    // a role that the server has not activated, or has removed, drives no traffic of its own.
-    if (!conn->is_role_active(role_family)) {
+    // The role's own gate, matching the one publish_client_state() applies to each role object
+    // and the one the receive path applies to inbound traffic: a role that the server has not
+    // activated, or has removed, drives no traffic of its own. The family names the role this
+    // library implements, and the test is on that exact versioned name, so a server that
+    // activated a version this client never offered silences the role in both directions.
+    const std::optional<SendspinRole> role = role_for_family(role_family);
+    if (!role.has_value() || !conn->is_role_active(role.value())) {
         SS_LOGD(TAG, "Dropping a %s message: the role is not active on this connection",
                 role_family.c_str());
         return;
@@ -1867,17 +1871,17 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     // active role's object is included, so the first state after a server/activate carries them
     // all.
 #ifdef SENDSPIN_ENABLE_PLAYER
-    if (this->player_ && conn->is_role_active("player")) {
+    if (this->player_ && conn->is_role_active(SendspinRole::PLAYER)) {
         this->player_->impl_->build_state_fields(state_msg);
     }
 #endif
 #ifdef SENDSPIN_ENABLE_ARTWORK
-    if (this->artwork_ && conn->is_role_active("artwork")) {
+    if (this->artwork_ && conn->is_role_active(SendspinRole::ARTWORK)) {
         this->artwork_->impl_->build_state_fields(state_msg);
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-    if (this->visualizer_ && conn->is_role_active("visualizer")) {
+    if (this->visualizer_ && conn->is_role_active(SendspinRole::VISUALIZER)) {
         this->visualizer_->impl_->build_state_fields(state_msg);
     }
 #endif

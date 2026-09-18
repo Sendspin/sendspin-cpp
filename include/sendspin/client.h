@@ -701,11 +701,16 @@ public:
     ///
     /// Dropped unless that role is active on the connection: messaging.md "server/activate"
     /// tolerates inactive-role objects on the server side precisely because a client that has
-    /// received the role removal stops sending them. Also held, like client/state, while a
-    /// re-handshake awaits the server/activate that follows it.
+    /// received the role removal stops sending them. The family names the version this library
+    /// implements, and the activation test is on that exact versioned name, the same test the
+    /// receive path applies. Also held, like client/state, while a re-handshake awaits the
+    /// server/activate that follows it.
+    ///
+    /// Callable from any thread: the gate reads the connection's published role mask, not the
+    /// main-loop-only role set.
     /// @param text The text message to send
     /// @param role_family Role family the message belongs to, without the version suffix
-    ///                    ("controller", "visualizer"), matched against the active roles
+    ///                    ("controller", "visualizer")
     void send_text(const std::string& text, const std::string& role_family);
 
     /// @brief Acquires a ref-counted high-performance networking request
