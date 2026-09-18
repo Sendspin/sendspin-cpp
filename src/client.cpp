@@ -1505,20 +1505,25 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                 bool stored_record = false;
                 if (record.has_value() && this->record_store_ != nullptr) {
                     const std::string psk_id = record->psk_id;
-                    // store_record_superseding() mutates RAM only; it fails only when the store
-                    // is at capacity, which fails the pairing closed: the server rekeys onto
-                    // this PSK regardless (it already acked pair-finalize), and since the client
-                    // does not hold it, the follow-up re-handshake fails to resolve the psk_id
-                    // and drops the connection (noise_handshake.cpp) -- or, if the server never
-                    // sends it, the re-prove watchdog re-armed below does. A provider that later
-                    // rejects the deferred write no longer fails the pairing: the record works
-                    // for this boot and persist_records() warns that it will not survive a
-                    // reboot.
+                    // store_record_superseding() mutates RAM only. At capacity it evicts the
+                    // least recently used record rather than failing, since a pairing never
+                    // fails for lack of record storage (pairing.md "Pairing records"); the
+                    // psk_ids of every open connection are handed over so none of them is the
+                    // victim. It can still fail closed if nothing is evictable, which the
+                    // connection budget rules out: the server rekeys onto this PSK regardless
+                    // (it already acked pair-finalize), and since the client does not hold it,
+                    // the follow-up re-handshake fails to resolve the psk_id and drops the
+                    // connection (noise_handshake.cpp) -- or, if the server never sends it, the
+                    // re-prove watchdog re-armed below does. A provider that later rejects the
+                    // deferred write no longer fails the pairing: the record works for this boot
+                    // and persist_records() warns that it will not survive a reboot.
                     //
                     // The superseding form is correct here and only here: this PSK replaces
                     // whatever this server held before, so the prior record for the same
                     // server_id must be retired or the old PSK stays valid forever.
-                    if (this->record_store_->store_record_superseding(std::move(record.value()))) {
+                    if (this->record_store_->store_record_superseding(
+                            std::move(record.value()),
+                            this->connection_manager_->open_connection_psk_ids())) {
                         SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
                                 psk_id.c_str());
                         stored_record = true;
@@ -1936,6 +1941,10 @@ void SendspinClient::note_close_pairing_window() {
 
 void SendspinClient::confirm_pairing_window() {
     this->connection_manager_->schedule_pairing_window_confirm();
+}
+
+void SendspinClient::cancel_pairing_window() {
+    this->connection_manager_->schedule_pairing_window_cancel();
 }
 
 }  // namespace sendspin

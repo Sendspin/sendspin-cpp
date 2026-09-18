@@ -679,6 +679,17 @@ protected:
         this->client_->connection_manager_->pairing_window_open_until_us_ = deadline_us;
     }
 
+    /// Read the connection the open window is bound to (nullptr until it admits its first
+    /// attempt), through the private-access seam.
+    const SendspinConnection* window_connection() {
+        return this->client_->connection_manager_->pairing_window_conn_;
+    }
+
+    /// Read the window's failed-attempt count, through the private-access seam.
+    uint32_t window_failed_attempts() {
+        return this->client_->connection_manager_->pairing_window_failed_attempts_;
+    }
+
     RecordStore& record_store() { return *this->client_->record_store_; }
 
     /// Return the `locations` array on the client/hello descriptor for `method`, or nullopt when
@@ -856,6 +867,36 @@ protected:
         std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
         bogus_server_kc.fill(0xAB);
         this->schedule_pair_confirm(bogus_server_kc);
+    }
+
+    /// Run one whole static-pairing-code attempt on `conn` that the "server" fails deliberately.
+    /// `pairing_index` is the index this attempt's activate carries, which the sid binds and so
+    /// the stand-in must run under. Enters pairing, expects the attempt to start without a
+    /// further gesture (the window is open), drives the CPace exchange under the correct code,
+    /// and answers with a fabricated server_kc.
+    void drive_failed_static_attempt(FakeConnection* conn, const std::string& code,
+                                     uint32_t pairing_index) {
+        this->enter_pairing(conn);
+        this->client_->loop();
+        ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+
+        ServerStandIn server;
+        ASSERT_TRUE(server.start(pairing_code_digits_prs(code),
+                                 conn->pairing_session().handshake_hash, pairing_index,
+                                 /*round=*/1));
+
+        ServerPairingMessageEvent pair_auth_event;
+        pair_auth_event.conn = this->current_connection_sp();
+        pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
+        pair_auth_event.pake_msg_1 = server.initiator.public_share();
+        this->schedule_pairing_message_event(std::move(pair_auth_event));
+        this->client_->loop();
+        ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
+
+        std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
+        bogus_server_kc.fill(0xCD);
+        this->schedule_pair_confirm(bogus_server_kc);
+        ASSERT_EQ(last_pair_abort_reason(conn->sent_text_), "pairing_code_mismatch");
     }
 
     /// Verify the client/pair-confirm frame (second-to-last: client/pair-finalize follows
@@ -1488,8 +1529,10 @@ TEST_F(PairingStateMachineTest, StandingWindowAdmitsLaterGatedAttempt) {
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
     EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-pending"));
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_AUTH);
-    // Sending client/pair-init consumed the window (its lifetime runs until pair-init).
-    EXPECT_EQ(this->window_deadline(), 0);
+    // Starting an attempt does not spend the window: it runs for its own lifetime, and binds to
+    // the connection carrying this first attempt (pairing.md "Pairing Window").
+    EXPECT_GT(this->window_deadline(), 0);
+    EXPECT_EQ(this->window_connection(), conn);
 }
 
 // An expired standing window admits nothing: the gated attempt falls back to
@@ -1511,6 +1554,151 @@ TEST_F(PairingStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
     ASSERT_EQ(conn->sent_text_.size(), 1u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
+}
+
+// =============================================================================
+// pairing.md "Pairing Window": what closes an open window. Starting an attempt does not; a
+// completed pairing, the fifth failed attempt, the drop of the connection the window is bound
+// to, an operator cancellation and the lifetime expiry all do.
+// =============================================================================
+
+TEST_F(PairingStateMachineTest, WindowSurvivesFailedAttemptsUntilTheFifth) {
+    const std::string code = "13572468";
+    this->configure_static_pairing_code(code);
+
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    ASSERT_GT(this->window_deadline(), 0);
+
+    FakeConnection* conn =
+        this->inject_current_connection("server-window-fail", SendspinPairMethod::STATIC_PAIRING_CODE);
+
+    // The first four failures spend the window's budget without closing it: each following
+    // attempt starts straight away, with no second gesture.
+    for (uint32_t attempt = 1; attempt <= 4; ++attempt) {
+        ASSERT_NO_FATAL_FAILURE(this->drive_failed_static_attempt(conn, code, attempt));
+        EXPECT_GT(this->window_deadline(), 0) << "failure " << attempt << " must not close it";
+        EXPECT_EQ(this->window_failed_attempts(), attempt);
+    }
+
+    ASSERT_NO_FATAL_FAILURE(this->drive_failed_static_attempt(conn, code, 5));
+    EXPECT_EQ(this->window_deadline(), 0) << "the fifth failed attempt closes the window";
+
+    // With the window closed, the next attempt is withheld for a fresh gesture again.
+    conn->sent_text_.clear();
+    this->enter_pairing(conn);
+    this->client_->loop();
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
+    EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
+}
+
+TEST_F(PairingStateMachineTest, CompletedPairingClosesTheWindow) {
+    const std::string code = "13572468";
+    this->configure_static_pairing_code(code);
+
+    FakeConnection* conn =
+        this->inject_current_connection("server-window-done", SendspinPairMethod::STATIC_PAIRING_CODE);
+    this->enter_pairing(conn);
+    this->client_->loop();
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+    ASSERT_GT(this->window_deadline(), 0);
+
+    ServerStandIn server;
+    ASSERT_TRUE(server.start(pairing_code_digits_prs(code), conn->pairing_session().handshake_hash));
+    std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
+    ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
+    this->schedule_pair_confirm(server_kc);
+
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
+    EXPECT_EQ(this->window_deadline(), 0)
+        << "the gesture was consent to pair, and the pairing spent it";
+}
+
+TEST_F(PairingStateMachineTest, WindowClosesWhenItsConnectionDrops) {
+    this->configure_static_pairing_code("13572468");
+
+    FakeConnection* conn = this->inject_current_connection("server-window-drop",
+                                                           SendspinPairMethod::STATIC_PAIRING_CODE);
+    this->enter_pairing(conn);
+    this->client_->loop();
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    ASSERT_EQ(this->window_connection(), conn);
+
+    this->drop_connection(conn, SendspinGoodbyeReason::RESTART);
+
+    EXPECT_EQ(this->window_deadline(), 0);
+    EXPECT_EQ(this->window_connection(), nullptr);
+}
+
+TEST_F(PairingStateMachineTest, WindowAdmitsOnlyTheConnectionItIsBoundTo) {
+    this->configure_static_pairing_code("13572468");
+
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    FakeConnection* bound = this->inject_current_connection("server-window-bound",
+                                                            SendspinPairMethod::STATIC_PAIRING_CODE);
+    this->enter_pairing(bound);
+    this->client_->loop();
+    ASSERT_EQ(last_frame_type(bound->sent_text_), "client/pair-init");
+    ASSERT_EQ(this->window_connection(), bound);
+
+    // Hold the first connection alive so the second cannot reuse its address and pass the
+    // binding check by accident.
+    auto keep_alive = this->current_connection_sp();
+    FakeConnection* other = this->inject_current_connection("server-window-other",
+                                                            SendspinPairMethod::STATIC_PAIRING_CODE);
+    ASSERT_NE(other, bound);
+    this->enter_pairing(other);
+    this->client_->loop();
+
+    EXPECT_EQ(last_frame_type(other->sent_text_), "client/pair-pending")
+        << "a second server must not ride a gesture the operator made for another one";
+    EXPECT_EQ(other->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
+    EXPECT_GT(this->window_deadline(), 0) << "the window still belongs to the bound connection";
+}
+
+TEST_F(PairingStateMachineTest, OperatorCancellationClosesTheWindowAndEndsTheWaitingAttempt) {
+    this->configure_static_pairing_code("13572468");
+
+    FakeConnection* conn = this->inject_current_connection("server-window-cancel",
+                                                           SendspinPairMethod::STATIC_PAIRING_CODE);
+    this->enter_pairing(conn);
+    this->client_->loop();
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
+    ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
+
+    this->client_->cancel_pairing_window();
+    this->client_->loop();
+
+    EXPECT_EQ(this->window_deadline(), 0);
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "user_cancelled");
+    ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
+    EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
+}
+
+TEST_F(PairingStateMachineTest, OperatorCancellationClosesAStandingWindow) {
+    // Control for the test above: with no attempt waiting there is nothing to abort, but the
+    // standing window is still closed, so the next attempt waits for a fresh gesture.
+    this->configure_static_pairing_code("13572468");
+
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    ASSERT_GT(this->window_deadline(), 0);
+
+    this->client_->cancel_pairing_window();
+    this->client_->loop();
+    EXPECT_EQ(this->window_deadline(), 0);
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
+
+    FakeConnection* conn = this->inject_current_connection("server-window-recancel",
+                                                           SendspinPairMethod::STATIC_PAIRING_CODE);
+    this->enter_pairing(conn);
+    this->client_->loop();
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
 }
 
 // A gesture-gated attempt on a device with no pairing-window gesture UI

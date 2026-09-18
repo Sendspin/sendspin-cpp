@@ -132,6 +132,12 @@ public:
     /// so there is one source of truth for the number.
     static constexpr size_t DEFAULT_MAX_RECORDS = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS;
 
+    /// @brief Floor under any configured cap. pairing.md "Pairing records" requires room for at
+    /// least 5 records, and requires the client to cap its concurrently open paired connections
+    /// below that capacity so an evictable record always exists; connection_manager.h asserts
+    /// that this library's connection budget stays under this floor.
+    static constexpr size_t MIN_MAX_RECORDS = 5;
+
     /// @brief Construct and pre-provision the Pairing PSK.
     /// If a persistence provider is supplied, attempts to load saved records
     /// and pairing config first; generates fresh material only when absent.
@@ -139,7 +145,7 @@ public:
     /// @param initial_unpaired_access_enabled First-boot default for unpaired (Sentinel) access.
     ///        Applied only when no pairing config was loaded; a loaded config always wins.
     /// @param max_records Cap on the number of long-term records retained. Defaults to
-    ///        DEFAULT_MAX_RECORDS.
+    ///        DEFAULT_MAX_RECORDS and is raised to MIN_MAX_RECORDS when a caller asks for less.
     explicit RecordStore(SendspinPersistenceProvider* provider,
                          bool initial_unpaired_access_enabled = false,
                          size_t max_records = DEFAULT_MAX_RECORDS);
@@ -200,9 +206,21 @@ public:
     /// the handler returns but the provider contract only permits main-loop calls. The caller
     /// must arrange for persist_records() to run on the main loop afterwards (the client does
     /// this via INBOX_TOPIC_RECORDS); until that flush lands, the mutation is RAM-only.
-    /// @return true when the record is stored in RAM; false only when the store is at
-    /// capacity (nothing is retired then).
-    bool store_record_superseding(SendspinPairingRecord record);
+    ///
+    /// A pairing never fails for lack of record storage (pairing.md "Pairing records"): a
+    /// net-new record that arrives at capacity evicts the least recently used record that no
+    /// currently-open connection is resolving against. Recency is the order of `records_`,
+    /// which mark_record_used() moves a record to the back of, so the front is the least
+    /// recently used.
+    /// @param record The freshly paired record to store.
+    /// @param psk_ids_in_use psk_ids backing a currently-open connection, provisional or
+    ///        admitted, none of which may be evicted. The connection budget keeps this list
+    ///        shorter than the capacity (see RecordStore::MIN_MAX_RECORDS), so a victim always
+    ///        exists.
+    /// @return true when the record is stored in RAM; false only when every record at capacity
+    /// is in use, which the connection budget makes unreachable.
+    bool store_record_superseding(SendspinPairingRecord record,
+                                  const std::vector<std::string>& psk_ids_in_use = {});
 
     /// @brief Encode records_ and save it under persistence_keys::RECORDS. MAIN LOOP ONLY
     /// (calls the provider). The deferred flush half of store_record_superseding(); logs the
@@ -214,7 +232,12 @@ public:
     /// No-op if absent.
     void remove_record(const std::string& psk_id);
 
-    /// @brief Flag the record at psk_id as used. No-op if absent or already used.
+    /// @brief Flag the record at psk_id as used and make it the most recently used one.
+    ///
+    /// `records_` is kept in least-recently-used-first order by moving the touched record to the
+    /// back, which is the order eviction reads (see store_record_superseding). A record that has
+    /// never been used keeps the position it was stored in, so an unused record is always a
+    /// better victim than a used one paired at the same time. No-op if absent.
     void mark_record_used(const std::string& psk_id);
 
     // ========================================
@@ -284,10 +307,11 @@ public:
 
     /// @brief Mint a pairing outcome: a fresh PSK bound to server_id and the record holding it.
     ///
-    /// A re-pair for a server that already holds a record supersedes it in place, so it is not
-    /// subject to the capacity cap.
-    /// @return nullopt when the store is full and the record would be a net-new one.
-    [[nodiscard]] std::optional<PairingOutcome> resolve_pairing_outcome(
+    /// Minting cannot fail on a full store: a pairing never fails for lack of record storage
+    /// (pairing.md "Pairing records"). A re-pair supersedes the record its server already holds,
+    /// and a net-new record at capacity evicts one where it is stored, by
+    /// store_record_superseding().
+    [[nodiscard]] PairingOutcome resolve_pairing_outcome(
         const std::string& server_id, const std::optional<std::string>& label = std::nullopt);
 
 private:
@@ -336,6 +360,12 @@ private:
 
     /// @brief Find the index of a record by psk_id, or npos if absent.
     [[nodiscard]] size_t find_index(const std::string& psk_id) const;
+
+    /// @brief Drop the least recently used record no open connection is resolving against, to
+    /// make room for a net-new one. MUST be called with mutex_ already held.
+    /// @param psk_ids_in_use psk_ids that must not be evicted (see store_record_superseding).
+    /// @return true when a record was evicted.
+    bool evict_one_locked(const std::vector<std::string>& psk_ids_in_use);
 
     /// @brief Persist the current pairing config via the provider.
     /// @return True if the config was stored (or there is no provider, so there is nothing to

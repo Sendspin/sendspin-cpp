@@ -432,6 +432,10 @@ public:
     /// loop(). Thread-safe; called from SendspinClient::confirm_pairing_window().
     void schedule_pairing_window_confirm();
 
+    /// @brief Schedules a pairing-window cancellation for deferred processing in
+    /// loop(). Thread-safe; called from SendspinClient::cancel_pairing_window().
+    void schedule_pairing_window_cancel();
+
     // ========================================
     // Handoff support
     // ========================================
@@ -457,6 +461,10 @@ public:
     /// @param event The server/activate event to schedule (moved).
     void schedule_activate(ServerActivateEvent event);
 
+    /// @brief psk_ids backing a currently-open connection, provisional or admitted. Thread-safe.
+    /// These are the records a completed pairing must not evict (pairing.md "Pairing records").
+    [[nodiscard]] std::vector<std::string> open_connection_psk_ids() const;
+
 private:
     // ========================================
     // loop() decomposition
@@ -477,8 +485,9 @@ private:
         std::vector<ServerPairingMessageEvent> pairing_messages;
         std::vector<std::string> pairing_succeeded;
         bool pairing_window_confirm{false};
+        bool pairing_window_cancel{false};
 
-        /// @brief True if any queue above has an entry, or pairing_window_confirm is set.
+        /// @brief True if any queue above has an entry, or a window gesture is set.
         bool any() const;
     };
 
@@ -762,6 +771,16 @@ private:
     /// satisfies this; start() warns when a configured value does not.
     static constexpr size_t NURSERY_CAPACITY = 2;
 
+    /// @brief Maximum connections open at once: the admitted one plus a full nursery.
+    static constexpr size_t MAX_OPEN_CONNECTIONS = NURSERY_CAPACITY + 2;
+
+    // pairing.md "Pairing records" requires the client to cap its concurrently open paired
+    // connections below its record capacity, so that a completed pairing at capacity always has
+    // a record left to evict. The connection budget is fixed at compile time and the record
+    // capacity has a floor, so the cap is an invariant rather than a runtime check.
+    static_assert(MAX_OPEN_CONNECTIONS < RecordStore::MIN_MAX_RECORDS,
+                  "open connections must stay below the pairing-record capacity floor");
+
     // ========================================
     // Pairing main-loop handlers
     // ========================================
@@ -913,6 +932,25 @@ private:
     /// (SendspinClient::confirm_pairing_window()). Delegates to open_pairing_window().
     void handle_pairing_window_confirmed();
 
+    /// @brief Handle an operator cancellation on the main loop
+    /// (SendspinClient::cancel_pairing_window()): closes the window, and ends an attempt still
+    /// waiting on the gesture with pair/abort reason user_cancelled (pairing.md
+    /// "Pairing Window").
+    void handle_pairing_window_cancelled();
+
+    /// @brief Close the pairing window: clear its deadline, the connection it is bound to, and
+    /// its failed-attempt count. Idempotent, and silent when no window is open.
+    void close_pairing_window();
+
+    /// @brief Whether an open window admits an attempt on `conn`. The window admits attempts
+    /// only on the connection that carried its first (pairing.md "Pairing Window"), so a second
+    /// server cannot ride a gesture the operator made for another one.
+    [[nodiscard]] bool pairing_window_admits(const SendspinConnection* conn) const;
+
+    /// @brief Count one attempt under the current window whose server_kc verification failed,
+    /// closing the window on the fifth (pairing.md "Pairing Window").
+    void note_pairing_window_attempt_failed();
+
     // ========================================
     // Unpair main-loop handler
     // ========================================
@@ -941,10 +979,18 @@ private:
     std::vector<ServerPairingMessageEvent> pending_pairing_message_events_;
     std::vector<std::string> pending_pairing_succeeded_events_;  // server_ids to notify
     bool pending_pairing_window_confirm_{false};                 // Pairing-window gesture confirm
+    bool pending_pairing_window_cancel_{false};                  // Pairing-window operator cancel
     // Standing pairing window: platform_time_us() deadline until which the window admits one
     // pairing attempt; 0 = closed. Opened by the operator gesture, consumed when client/pair-init
     // is sent. Main-loop-only.
     int64_t pairing_window_open_until_us_{0};
+    // The connection carrying the window's first attempt, or nullptr while the window has
+    // admitted none. Compared, never dereferenced, and cleared whenever the window closes, so a
+    // released connection's address cannot be mistaken for a live one. Main-loop-only.
+    const SendspinConnection* pairing_window_conn_{nullptr};
+    // Attempts under the current window that ended in a failed server_kc verification. Reset
+    // when a window opens. Main-loop-only.
+    uint32_t pairing_window_failed_attempts_{0};
     // Dynamic-pairing-code rounds run since the last verified server_kc (pairing.md "Rounds").
     // Not partitioned by server_id or source address, and not persisted: the limit gates how
     // fast an attacker can guess within one boot, which a reboot does not shorten. Main-loop-only

@@ -67,7 +67,7 @@ std::optional<T> load_decode_wipe(SendspinPersistenceProvider& provider, const c
 
 RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                          bool initial_unpaired_access_enabled, size_t max_records)
-    : provider_(provider), max_records_(max_records) {
+    : provider_(provider), max_records_(std::max(max_records, MIN_MAX_RECORDS)) {
     // Try loading persisted records and config first. Every blob here (except the static
     // pairing code, which
     // is raw UTF-8 bytes) is a codec-encoded blob; the provider itself is a pure byte store, so
@@ -335,7 +335,28 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
     return nullptr;
 }
 
-bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
+bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_use) {
+    // records_ runs least-recently-used first (mark_record_used moves a touched record to the
+    // back), so the first record no open connection is resolving against is the victim
+    // pairing.md "Pairing records" leaves to the implementation. A record backing an open
+    // connection, provisional or admitted, is off limits there: evicting it would strand a
+    // live session on a PSK this store no longer holds.
+    for (size_t i = 0; i < this->records_.size(); ++i) {
+        const std::string& psk_id = this->records_[i].psk_id;
+        if (std::find(psk_ids_in_use.begin(), psk_ids_in_use.end(), psk_id) !=
+            psk_ids_in_use.end()) {
+            continue;
+        }
+        SS_LOGI(TAG, "Evicting record %s for server_id=%s to make room for a new pairing",
+                psk_id.c_str(), this->records_[i].server_id.c_str());
+        this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(i));
+        return true;
+    }
+    return false;
+}
+
+bool RecordStore::store_record_superseding(SendspinPairingRecord record,
+                                           const std::vector<std::string>& psk_ids_in_use) {
     // RAM-only: this runs on the NETWORK thread (the server/pair-finalize
     // ack handler), where the record must become resolvable before the handler returns (the
     // server's follow-up re-handshake is the next message on that thread) but the provider may
@@ -347,17 +368,18 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record) {
     const std::string incoming_psk_id = record.psk_id;
     const bool is_insert = (idx == static_cast<size_t>(-1));
 
-    // Capacity: exempt a replace by psk_id (never grows the store), and exempt an insert that
+    // Capacity: a replace by psk_id never grows the store, and neither does an insert that
     // supersedes an existing record for the same server_id, because the retire below drops that
-    // record in the same locked section, so the net occupancy does not change. Without this
-    // exemption a device that already holds the store's last free slot could never re-pair once
-    // the rest of the store filled up with other servers' records. This RAM-side rejection is
-    // the one way this function fails, and it fails closed: an unresolvable record drops the
-    // connection when the server rekeys onto it.
+    // record in the same locked section. Anything else is a genuine net-new record, which at
+    // capacity evicts one rather than failing the pairing (pairing.md "Pairing records").
     if (is_insert) {
         const bool will_supersede_existing = this->record_by_server_id(record.server_id) != nullptr;
-        if (!will_supersede_existing && !this->has_capacity_locked()) {
-            SS_LOGW(TAG, "Storage full (%zu/%zu); rejecting new pairing record %s",
+        if (!will_supersede_existing && !this->has_capacity_locked() &&
+            !this->evict_one_locked(psk_ids_in_use)) {
+            // Only reachable if every record at capacity backs an open connection, which the
+            // connection budget rules out (see MIN_MAX_RECORDS). Fails closed: an unresolvable
+            // record drops the connection when the server rekeys onto it.
+            SS_LOGW(TAG, "Storage full (%zu/%zu) and nothing evictable; rejecting record %s",
                     this->records_.size(), this->max_records_, incoming_psk_id.c_str());
             return false;
         }
@@ -430,13 +452,27 @@ void RecordStore::remove_record(const std::string& psk_id) {
 
 void RecordStore::mark_record_used(const std::string& psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
-    size_t idx = this->find_index(psk_id);
-    if (idx == static_cast<size_t>(-1) || this->records_[idx].used) {
+    const size_t idx = this->find_index(psk_id);
+    if (idx == static_cast<size_t>(-1)) {
+        return;
+    }
+
+    // Move the record to the back, making records_ least-recently-used first for eviction
+    // (see evict_one_locked). A record already at the back only needs the flag.
+    const bool becomes_used = !this->records_[idx].used;
+    const size_t last = this->records_.size() - 1;
+    const bool moves = idx != last;
+    if (!becomes_used && !moves) {
         return;
     }
     this->records_[idx].used = true;
-    // Best-effort: a rejected write here is not reported, since "used" is advisory bookkeeping
-    // rather than a revocation whose durability the caller depends on.
+    if (moves) {
+        std::rotate(this->records_.begin() + static_cast<ptrdiff_t>(idx),
+                    this->records_.begin() + static_cast<ptrdiff_t>(idx) + 1, this->records_.end());
+    }
+    // Best-effort: a rejected write here is not reported, since both the flag and the recency
+    // order are advisory bookkeeping rather than a revocation whose durability the caller
+    // depends on.
     this->persist_records_locked();
 }
 
@@ -444,28 +480,8 @@ void RecordStore::mark_record_used(const std::string& psk_id) {
 // Pairing outcome
 // ============================================================================
 
-std::optional<RecordStore::PairingOutcome> RecordStore::resolve_pairing_outcome(
+RecordStore::PairingOutcome RecordStore::resolve_pairing_outcome(
     const std::string& server_id, const std::optional<std::string>& label) {
-    // Hold mutex_ for the whole body rather than letting each step lock on its own. The
-    // capacity probe and the server_id probe must see one consistent view of records_, and
-    // record_by_server_id() iterates records_ directly: without this lock a network-thread
-    // store_record_superseding() (client.cpp's server/pair-finalize handler commits
-    // synchronously on that thread) can reallocate the vector mid-iteration.
-    std::lock_guard<std::mutex> lock(this->mutex_);
-
-    // A re-pair for a server_id that already holds a long-term record supersedes it in place
-    // (store_record_superseding() retires the old record in the same locked section that
-    // inserts the new one), so it does not grow the store and must not be blocked by the
-    // capacity check even when the store reports itself full. Without this, a device that
-    // already occupies the store's last slot could never re-pair once other servers filled
-    // the rest of it.
-    const bool replaces_existing = this->record_by_server_id(server_id) != nullptr;
-    if (!replaces_existing && !this->has_capacity_locked()) {
-        SS_LOGE(TAG, "Storage full (%zu/%zu); cannot pair with server_id=%s", this->records_.size(),
-                this->max_records_, server_id.c_str());
-        return std::nullopt;
-    }
-
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     platform_random_bytes(psk.data(), psk.size());
 

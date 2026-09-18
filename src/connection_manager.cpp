@@ -126,6 +126,11 @@ static constexpr int64_t PAIRING_ATTEMPT_TIMEOUT_US = 120LL * 1000LL * US_PER_MS
 /// silently.
 static constexpr int64_t WINDOW_LIFETIME_US = 300LL * 1000LL * US_PER_MS;
 
+/// @brief Attempts under one pairing window whose server_kc verification may fail before the
+/// window closes (pairing.md "Pairing Window"). The window is the operator's consent to a bounded
+/// run of guesses; the fifth failure spends it.
+static constexpr uint32_t WINDOW_FAILED_ATTEMPT_LIMIT = 5;
+
 /// @brief Rounds a dynamic pairing code may run since the last verified server_kc before the
 /// client stops retrying (pairing.md "Rounds"). Reaching it aborts the attempt with
 /// pairing_code_mismatch and holds further attempts behind a deliberate operator gesture, which
@@ -423,7 +428,7 @@ bool ConnectionManager::DrainedEvents::any() const {
     return !this->connected.empty() || !this->disconnected.empty() || !this->activates.empty() ||
            !this->pair_aborts.empty() || !this->server_unpairs.empty() ||
            !this->pairing_messages.empty() || !this->pairing_succeeded.empty() ||
-           this->pairing_window_confirm;
+           this->pairing_window_confirm || this->pairing_window_cancel;
 }
 
 PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
@@ -464,6 +469,8 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
         this->has_current_.store(false, std::memory_order_release);
         // A standing pairing window belongs to this run; a restart begins with it closed.
         this->pairing_window_open_until_us_ = 0;
+        this->pairing_window_conn_ = nullptr;
+        this->pairing_window_failed_attempts_ = 0;
         // Releases already queued (a handoff loser, a reaped entry) had their dispatch disabled
         // when they were queued; the shutdown goodbye replaces whatever reason they carried. One
         // queued without a reason has a transport that is already gone, and every transport's
@@ -540,6 +547,7 @@ ConnectionManager::DrainedEvents ConnectionManager::swap_out_pending_events() {
         ev.pairing_messages.swap(this->pending_pairing_message_events_);
         ev.pairing_succeeded.swap(this->pending_pairing_succeeded_events_);
         ev.pairing_window_confirm = std::exchange(this->pending_pairing_window_confirm_, false);
+        ev.pairing_window_cancel = std::exchange(this->pending_pairing_window_cancel_, false);
         this->has_pending_events_.store(false, std::memory_order_release);
     }
     return ev;
@@ -911,9 +919,14 @@ void ConnectionManager::drain_pairing_events(DrainedEvents& ev) {
         this->client_->note_pairing_succeeded(server_id);
     }
 
-    // ==== Pairing-window confirm deferred event ====
+    // ==== Pairing-window gesture deferred events ====
+    // Cancellation runs after confirmation so a cancel that arrived in the same tick wins: the
+    // operator's last action is the one that stands.
     if (ev.pairing_window_confirm) {
         this->handle_pairing_window_confirmed();
+    }
+    if (ev.pairing_window_cancel) {
+        this->handle_pairing_window_cancelled();
     }
 }
 
@@ -928,6 +941,30 @@ void ConnectionManager::drain_unpair_events(DrainedEvents& ev) {
         }
         this->handle_server_unpair(event.conn.get(), event);
     }
+}
+
+std::vector<std::string> ConnectionManager::open_connection_psk_ids() const {
+    // Called from the network thread (the server/pair-finalize ack handler) as well as the main
+    // loop, so it takes conn_ptr_mutex_ and copies. The lock order is conn_ptr_mutex_ before
+    // RecordStore::mutex_, matching every main-loop path that reaches the store while holding
+    // this lock; the caller passes the result into the store afterwards rather than holding
+    // both at once.
+    std::vector<std::string> psk_ids;
+    psk_ids.reserve(MAX_OPEN_CONNECTIONS);
+    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+    if (this->current_connection_) {
+        std::string psk_id = this->current_connection_->get_psk_id();
+        if (!psk_id.empty()) {
+            psk_ids.push_back(std::move(psk_id));
+        }
+    }
+    for (const auto& entry : this->nursery_) {
+        std::string psk_id = entry.conn->get_psk_id();
+        if (!psk_id.empty()) {
+            psk_ids.push_back(std::move(psk_id));
+        }
+    }
+    return psk_ids;
 }
 
 void ConnectionManager::loop_managed_connections() {
@@ -1253,6 +1290,13 @@ void ConnectionManager::schedule_pairing_window_confirm() {
     // (typically the application's UI thread relaying an operator gesture).
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->pending_pairing_window_confirm_ = true;
+    this->has_pending_events_.store(true, std::memory_order_release);
+}
+
+void ConnectionManager::schedule_pairing_window_cancel() {
+    // Called from SendspinClient::cancel_pairing_window(); same threading as the confirm above.
+    std::lock_guard<std::mutex> lock(this->conn_mutex_);
+    this->pending_pairing_window_cancel_ = true;
     this->has_pending_events_.store(true, std::memory_order_release);
 }
 
@@ -1602,6 +1646,13 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
 
     this->remove_hello_retry(conn);
 
+    // A pairing window admits attempts only on the connection carrying its first, so losing that
+    // connection closes it (pairing.md "Pairing Window"). Done before the branches below, which
+    // release the connection this address identifies.
+    if (conn == this->pairing_window_conn_) {
+        this->close_pairing_window();
+    }
+
     if (conn == this->current_connection_.get()) {
         // Dropping the admitted connection: block stale network-thread events and quiesce the
         // client's per-connection state (including the time burst). The slot stays empty; the next
@@ -1865,7 +1916,7 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
     // the limit asks a held-back attempt to send.
     const bool gesture_gated = !is_dynamic || this->pairing_round_limit_reached();
 
-    if (gesture_gated && !this->pairing_window_open()) {
+    if (gesture_gated && !this->pairing_window_admits(conn)) {
         // No window open: report the pending gesture with client/pair-pending and wait.
         // pair-pending does not start the attempt or its timeout (the server applies its
         // own timeout and cancels via server/activate), so no attempt deadline is armed
@@ -1908,26 +1959,10 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
 
 void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
                                                  const std::string& server_id) {
-    // resolve_pairing_outcome mints the long-term PSK and the record that holds it, or fails
-    // when the store has no room for a net-new record.
+    // resolve_pairing_outcome mints the long-term PSK and the record that holds it. It cannot
+    // fail: a pairing never fails for lack of record storage (pairing.md "Pairing records"),
+    // and room for the record is made where it is stored.
     auto outcome = this->client_->record_store_->resolve_pairing_outcome(server_id);
-    if (!outcome.has_value()) {
-        SS_LOGE(TAG,
-                "handle_enter_pairing: resolve_pairing_outcome failed for server_id=%s; "
-                "aborting pairing",
-                server_id.c_str());
-        // Send pair/abort(method_not_supported): closest reason for "cannot proceed".
-        // method_not_supported is used as the error path here because there is no distinct
-        // "store unavailable" reason in the protocol. abort_pairing_attempt() also queues
-        // note_pairing_failed() and drops the connection (drop_connection() handles both the
-        // current-slot cleanup, which also resets the time burst, and the deferred
-        // goodbye+release; flush_deferred_releases() runs at the end of the caller's locked
-        // block), matching every other pairing-failure path in this file.
-        this->abort_pairing_attempt(
-            conn, PairAbortReason::METHOD_NOT_SUPPORTED, PairingDropAction::CLOSE_WITH_GOODBYE,
-            SendspinPairAbortReason::METHOD_NOT_SUPPORTED, SendspinGoodbyeReason::UNAUTHORIZED);
-        return;
-    }
 
     // pairing.md "Pairing PSK Flow": after the pairing server/activate the client sends
     // client/pair-init followed immediately by client/pair-finalize, without waiting for a
@@ -1940,13 +1975,13 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint3
     SS_LOGI(TAG, "Sending client/pair-finalize for server_id=%s", server_id.c_str());
     // Named local rather than a temporary so the serialized message, which carries the raw
     // base64 long-term PSK, can be wiped once it has been handed to the transport.
-    std::string finalize_msg = format_client_pair_finalize_message(outcome->psk);
+    std::string finalize_msg = format_client_pair_finalize_message(outcome.psk);
     conn->send_app_json(finalize_msg, nullptr);
     secure_zero(finalize_msg.data(), finalize_msg.size());
 
     // Hold the pending record: committed to the RecordStore by the network-thread
     // server/pair-finalize handler on ack.
-    conn->set_pending_pairing_record(std::move(outcome->record));
+    conn->set_pending_pairing_record(std::move(outcome.record));
 
     this->client_->note_pairing_started(server_id);
 }
@@ -2073,10 +2108,14 @@ void ConnectionManager::local_abort_pairing(SendspinConnection* conn, PairAbortR
 void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
     // Runs on the main loop (caller holds conn_ptr_mutex_). The PairingSession was populated by
     // handle_enter_pairing; this sends the client/pair-init that starts the attempt and arms the
-    // attempt timeout that bounds it (pairing.md "Entering and leaving pairing"). Sending
-    // pair-init ends the pairing window's lifetime, so any standing window is consumed here
-    // whether the attempt was gated or not.
-    this->pairing_window_open_until_us_ = 0;
+    // attempt timeout that bounds it (pairing.md "Entering and leaving pairing").
+    //
+    // An open window is not spent by starting an attempt: it runs for its own lifetime and
+    // admits further attempts, but only on the connection carrying its first
+    // (pairing.md "Pairing Window"), which is bound here.
+    if (this->pairing_window_open() && this->pairing_window_conn_ == nullptr) {
+        this->pairing_window_conn_ = conn;
+    }
 
     auto& ps = conn->pairing_session();
     const std::string& server_id = conn->get_server_id();
@@ -2152,18 +2191,54 @@ bool ConnectionManager::pairing_window_open() const {
            platform_time_us() < this->pairing_window_open_until_us_;
 }
 
+bool ConnectionManager::pairing_window_admits(const SendspinConnection* conn) const {
+    return this->pairing_window_open() &&
+           (this->pairing_window_conn_ == nullptr || this->pairing_window_conn_ == conn);
+}
+
+void ConnectionManager::close_pairing_window() {
+    if (this->pairing_window_open_until_us_ == 0) {
+        return;
+    }
+    this->pairing_window_open_until_us_ = 0;
+    this->pairing_window_conn_ = nullptr;
+    this->pairing_window_failed_attempts_ = 0;
+    SS_LOGI(TAG, "Pairing window closed");
+}
+
+void ConnectionManager::note_pairing_window_attempt_failed() {
+    if (!this->pairing_window_open()) {
+        return;
+    }
+    ++this->pairing_window_failed_attempts_;
+    if (this->pairing_window_failed_attempts_ < WINDOW_FAILED_ATTEMPT_LIMIT) {
+        SS_LOGW(TAG, "Pairing window: %u of %u attempts failed verification",
+                static_cast<unsigned>(this->pairing_window_failed_attempts_),
+                static_cast<unsigned>(WINDOW_FAILED_ATTEMPT_LIMIT));
+        return;
+    }
+    SS_LOGW(TAG, "Pairing window: %u failed attempts; closing the window",
+            static_cast<unsigned>(WINDOW_FAILED_ATTEMPT_LIMIT));
+    this->close_pairing_window();
+}
+
 void ConnectionManager::open_pairing_window() {
     // Runs on the main loop (caller holds conn_ptr_mutex_). A pairing session only ever exists on
     // current_connection_: pairing only starts once a nursery entry has won promotion (see the
-    // pairing branch in promote_or_arbitrate_nursery_entry()). If an attempt is already waiting
-    // for the gesture, the freshly opened window is consumed by it immediately; otherwise the
-    // window stands open (pairing.md "Pairing Window") so a pairing activate arriving within its
-    // lifetime can proceed without a further gesture.
+    // pairing branch in promote_or_arbitrate_nursery_entry()).
+    //
+    // The window's lifetime runs from here and is not paused by the attempts it admits
+    // (pairing.md "Pairing Window"), so it is armed whether or not an attempt is waiting: one
+    // that is starts under it immediately, and otherwise the window stands open so a pairing
+    // activate arriving within its lifetime can proceed without a further gesture.
     //
     // The gesture is also the deliberate, manufacturer-defined operator action pairing.md
     // "Rounds" requires to clear a standing round limit, so it resets the count before anything
     // it admits can run.
     this->pairing_rounds_since_verified_kc_ = 0;
+    this->pairing_window_conn_ = nullptr;
+    this->pairing_window_failed_attempts_ = 0;
+    this->pairing_window_open_until_us_ = platform_time_us() + WINDOW_LIFETIME_US;
 
     SendspinConnection* conn = this->current_connection_.get();
     const bool awaiting =
@@ -2177,7 +2252,6 @@ void ConnectionManager::open_pairing_window() {
         return;
     }
 
-    this->pairing_window_open_until_us_ = platform_time_us() + WINDOW_LIFETIME_US;
     SS_LOGI(TAG, "Pairing window opened: standing open for %lld s awaiting a pairing attempt",
             static_cast<long long>(WINDOW_LIFETIME_US / (1000LL * US_PER_MS)));
 }
@@ -2187,6 +2261,22 @@ void ConnectionManager::handle_pairing_window_confirmed() {
         return;
     }
     this->open_pairing_window();
+}
+
+void ConnectionManager::handle_pairing_window_cancelled() {
+    // Runs on the main loop (caller holds conn_ptr_mutex_). Operator cancellation is one of the
+    // window's closing events (pairing.md "Pairing Window"). An attempt still withheld for the
+    // gesture has just lost the only thing that could admit it, so it ends here with the reason
+    // that says why; an attempt already under way runs to its own end, as it does on expiry.
+    this->close_pairing_window();
+
+    SendspinConnection* conn = this->current_connection_.get();
+    if (conn != nullptr &&
+        conn->pairing_session().step == SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW) {
+        SS_LOGI(TAG, "Pairing window cancelled: ending the waiting attempt for server_id=%s",
+                conn->get_server_id().c_str());
+        this->local_abort_pairing(conn, PairAbortReason::USER_CANCELLED);
+    }
 }
 
 void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
@@ -2433,6 +2523,9 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
                     ps.method == SendspinPairMethod::DYNAMIC_PAIRING_CODE
                         ? "round limit reached"
                         : "the static flow runs one round");
+            // The attempt ends on a failed verification, which is what a pairing window counts
+            // (pairing.md "Pairing Window"); a round that retries has not ended anything yet.
+            this->note_pairing_window_attempt_failed();
             this->local_abort_pairing(conn, PairAbortReason::PAIRING_CODE_MISMATCH);
             return;
         }
@@ -2504,24 +2597,20 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     ps.code_emitted = false;
     ps.window_shown = false;
 
+    // A completed pairing closes the window (pairing.md "Pairing Window"): the operator's
+    // gesture was consent to pair, and it has now been spent.
+    this->close_pairing_window();
+
     // Now run the same resolve_pairing_outcome path as pairing_psk, then send
     // client/pair-finalize. The server will respond with server/pair-finalize.
     auto outcome = store.resolve_pairing_outcome(server_id);
-    if (!outcome.has_value()) {
-        SS_LOGE(TAG,
-                "handle_pairing_message: resolve_pairing_outcome failed for "
-                "server_id=%s",
-                server_id.c_str());
-        this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
-        return;
-    }
 
     // The code-based flows carry the new PSK wrapped under the CPace output, not in the clear
     // (pairing.md "Wrapping"). K_wrap = SHA-256(PSK_WRAP_LABEL || sid || ISK); the PSK is
     // sealed with the connection's negotiated AEAD, a 12-byte all-zero nonce, and empty AD. The
     // label differs from the one nonce_B was sealed under, so the two fields never share a key.
     auto wrapped =
-        wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk_opt.value(), outcome->psk);
+        wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk_opt.value(), outcome.psk);
     if (!wrapped.has_value()) {
         SS_LOGE(TAG, "handle_pairing_message: wrapping the long-term PSK failed for server_id=%s",
                 server_id.c_str());
@@ -2537,7 +2626,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     std::string finalize_msg = format_client_pair_finalize_wrapped_message(wrapped.value());
     conn->send_app_json(finalize_msg, nullptr);
     secure_zero(finalize_msg.data(), finalize_msg.size());
-    conn->set_pending_pairing_record(std::move(outcome->record));
+    conn->set_pending_pairing_record(std::move(outcome.record));
 
     ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_FINALIZE;
 }

@@ -659,6 +659,13 @@ public:
     /// the deliberate operator action that clears a standing dynamic-pairing-code round limit.
     void confirm_pairing_window();
 
+    /// @brief Signals that the operator cancelled the pairing window.
+    /// Thread-safe. Closes any open window, one of the closing events pairing.md "Pairing Window"
+    /// defines, so the next gesture-gated attempt waits for a fresh gesture. An attempt still
+    /// withheld for that gesture ends with pair/abort reason user_cancelled; one already under
+    /// way runs to its own end.
+    void cancel_pairing_window();
+
     // ========================================
     // Listener and provider setters
     // ========================================

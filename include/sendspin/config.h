@@ -187,13 +187,14 @@ struct SendspinClientConfig {
     /// @brief Default maximum number of long-term pairing records the store retains. An encoded
     /// record is roughly 250 bytes (see persistence_codec.h's blob-size doc), so this default
     /// keeps the serialized "records" blob comfortably under a typical NVS entry's ~4 KB limit
-    /// even while a pairing supersede transiently persists one extra record. Past the cap a new
-    /// pairing fails; replacing a record already held for a given psk_id or server_id is
-    /// unaffected, since that never grows the store.
+    /// even while a pairing supersede transiently persists one extra record. Pairing at the cap
+    /// evicts the least recently used record rather than failing; replacing a record already
+    /// held for a given psk_id or server_id evicts nothing, since that never grows the store.
     static constexpr size_t DEFAULT_MAX_PAIRING_RECORDS = 12;
 
     /// @brief Maximum number of long-term pairing records the store will retain. See
-    /// DEFAULT_MAX_PAIRING_RECORDS for the rationale behind the default.
+    /// DEFAULT_MAX_PAIRING_RECORDS for the rationale behind the default. The protocol requires
+    /// room for at least 5, so a smaller value is raised to that floor.
     size_t max_pairing_records{DEFAULT_MAX_PAIRING_RECORDS};
 
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)

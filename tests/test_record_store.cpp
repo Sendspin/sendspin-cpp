@@ -264,14 +264,12 @@ TEST(RecordStore, StoreRecordSupersedesPriorRecordForSameServerId) {
     const std::string server_id = "server-repair";
 
     auto outcome1 = store.resolve_pairing_outcome(server_id);
-    ASSERT_TRUE(outcome1.has_value());
-    ASSERT_TRUE(store.store_record_superseding(outcome1->record));
-    const std::string first_psk_id = outcome1->record.psk_id;
+    ASSERT_TRUE(store.store_record_superseding(outcome1.record));
+    const std::string first_psk_id = outcome1.record.psk_id;
 
     auto outcome2 = store.resolve_pairing_outcome(server_id);
-    ASSERT_TRUE(outcome2.has_value());
-    ASSERT_TRUE(store.store_record_superseding(outcome2->record));
-    const std::string second_psk_id = outcome2->record.psk_id;
+    ASSERT_TRUE(store.store_record_superseding(outcome2.record));
+    const std::string second_psk_id = outcome2.record.psk_id;
 
     ASSERT_NE(first_psk_id, second_psk_id);
 
@@ -344,75 +342,152 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
 }
 
 // =============================================================================
-// Capacity enforcement (max_records_)
+// Capacity and eviction (pairing.md "Pairing records")
 // =============================================================================
 
-// Pairing DEFAULT_MAX_RECORDS distinct servers must succeed; the next net-new pairing must be
-// refused before a record is minted, and must not change what is stored.
-TEST(RecordStore, CapacityRejectsInsertPastDefaultCap) {
+// Pairing at capacity must not fail: the store evicts a record instead, and the new one lands.
+TEST(RecordStore, CapacityEvictsRatherThanRefusingANewPairing) {
     RecordStore store(nullptr);
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
         auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
-        ASSERT_TRUE(outcome.has_value()) << "pairing " << i << " should still fit";
-        ASSERT_TRUE(store.store_record_superseding(outcome->record));
+        ASSERT_TRUE(store.store_record_superseding(outcome.record));
     }
     ASSERT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
 
-    EXPECT_FALSE(store.resolve_pairing_outcome("server-overflow").has_value())
-        << "a net-new pairing must be refused once the store is at capacity";
-    EXPECT_EQ(store.record_by_server_id("server-overflow"), nullptr);
+    auto overflow = store.resolve_pairing_outcome("server-overflow");
+    EXPECT_TRUE(store.store_record_superseding(overflow.record))
+        << "a pairing never fails for lack of record storage";
+    EXPECT_NE(store.record_by_server_id("server-overflow"), nullptr);
     EXPECT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS)
-        << "a refused pairing must not change the record count";
+        << "eviction makes room rather than growing the store";
+    EXPECT_EQ(store.record_by_server_id("server-0"), nullptr)
+        << "the least recently used record is the one evicted";
+    EXPECT_NE(store.record_by_server_id("server-1"), nullptr)
+        << "only one record is evicted per pairing";
+}
+
+// mark_record_used() is the recency signal: a record touched by a session must outlive an
+// untouched one stored before it.
+TEST(RecordStore, EvictionFollowsUseRecency) {
+    RecordStore store(nullptr);
+    std::vector<std::string> psk_ids;
+    for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
+        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        psk_ids.push_back(outcome.record.psk_id);
+        ASSERT_TRUE(store.store_record_superseding(outcome.record));
+    }
+
+    // Touch the oldest record, which without this would be the next victim.
+    store.mark_record_used(psk_ids.front());
+
+    auto overflow = store.resolve_pairing_outcome("server-overflow");
+    ASSERT_TRUE(store.store_record_superseding(overflow.record));
+
+    EXPECT_NE(store.record_by_server_id("server-0"), nullptr)
+        << "a record used since it was stored is no longer the least recently used";
+    EXPECT_EQ(store.record_by_server_id("server-1"), nullptr)
+        << "the next-oldest untouched record is evicted in its place";
+}
+
+// A record backing a currently-open connection must never be evicted, even when it is the
+// least recently used one.
+TEST(RecordStore, EvictionSkipsRecordsBackingOpenConnections) {
+    RecordStore store(nullptr);
+    std::vector<std::string> psk_ids;
+    for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
+        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        psk_ids.push_back(outcome.record.psk_id);
+        ASSERT_TRUE(store.store_record_superseding(outcome.record));
+    }
+
+    auto overflow = store.resolve_pairing_outcome("server-overflow");
+    ASSERT_TRUE(store.store_record_superseding(overflow.record, {psk_ids.front()}));
+
+    EXPECT_NE(store.record_by_server_id("server-0"), nullptr)
+        << "the record an open connection resolves against must survive";
+    EXPECT_EQ(store.record_by_server_id("server-1"), nullptr)
+        << "the next evictable record is taken instead";
+}
+
+// Fails closed only when literally every record at capacity backs an open connection. The
+// connection budget makes this unreachable in the library (see ConnectionManager's static
+// assertion), so the store is driven here directly.
+TEST(RecordStore, NothingEvictableRejectsTheRecord) {
+    RecordStore store(nullptr);
+    std::vector<std::string> psk_ids;
+    for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
+        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        psk_ids.push_back(outcome.record.psk_id);
+        ASSERT_TRUE(store.store_record_superseding(outcome.record));
+    }
+
+    auto overflow = store.resolve_pairing_outcome("server-overflow");
+    EXPECT_FALSE(store.store_record_superseding(overflow.record, psk_ids));
+    EXPECT_EQ(store.record_by_server_id("server-overflow"), nullptr);
+    EXPECT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
 }
 
 // A supersede that replaces the record already held for a given server_id does not grow the
-// store, so it must succeed even when the store is otherwise completely full.
-TEST(RecordStore, CapacitySupersedeAtCapacityStillSucceeds) {
+// store, so it must succeed at capacity without evicting anything.
+TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
     RecordStore store(nullptr);
     const std::string existing_server = "server-existing";
 
     auto outcome0 = store.resolve_pairing_outcome(existing_server);
-    ASSERT_TRUE(outcome0.has_value());
-    ASSERT_TRUE(store.store_record_superseding(outcome0->record));
-    const std::string first_psk_id = outcome0->record.psk_id;
+    ASSERT_TRUE(store.store_record_superseding(outcome0.record));
+    const std::string first_psk_id = outcome0.record.psk_id;
 
     // Fill every remaining slot with other servers' records.
     for (size_t i = 1; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
         auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
-        ASSERT_TRUE(outcome.has_value());
-        ASSERT_TRUE(store.store_record_superseding(outcome->record));
+        ASSERT_TRUE(store.store_record_superseding(outcome.record));
     }
     ASSERT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
 
-    // Re-pairing the already-known server must still mint and store a fresh record: it
-    // supersedes its own prior record rather than growing the store past capacity.
     auto outcome1 = store.resolve_pairing_outcome(existing_server);
-    ASSERT_TRUE(outcome1.has_value())
-        << "resolve_pairing_outcome must mint a fresh record for a re-pair even at capacity";
-    EXPECT_TRUE(store.store_record_superseding(outcome1->record))
-        << "a supersede must not be blocked by the capacity cap";
+    EXPECT_TRUE(store.store_record_superseding(outcome1.record));
 
     EXPECT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS)
         << "a supersede must not grow the store";
     EXPECT_EQ(store.record_by_psk_id(first_psk_id), nullptr) << "the old record must be retired";
     const auto* found = store.record_by_server_id(existing_server);
     ASSERT_NE(found, nullptr);
-    EXPECT_EQ(found->psk_id, outcome1->record.psk_id);
+    EXPECT_EQ(found->psk_id, outcome1.record.psk_id);
+    for (size_t i = 1; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
+        EXPECT_NE(store.record_by_server_id("server-" + std::to_string(i)), nullptr)
+            << "no other server's record may be evicted by a supersede";
+    }
 }
 
 // A caller-supplied cap (the max_records constructor parameter, wired from
-// SendspinClientConfig::max_pairing_records) must be respected in place of the default.
+// SendspinClientConfig::max_pairing_records) must be respected in place of the default, above
+// the protocol's floor.
 TEST(RecordStore, CapacityCustomCapIsRespected) {
+    const size_t cap = RecordStore::MIN_MAX_RECORDS + 1;
+    RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, cap);
+
+    for (size_t i = 0; i < cap; ++i) {
+        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        ASSERT_TRUE(store.store_record_superseding(outcome.record));
+    }
+    EXPECT_EQ(store.records_snapshot().size(), cap);
+
+    auto overflow = store.resolve_pairing_outcome("server-overflow");
+    ASSERT_TRUE(store.store_record_superseding(overflow.record));
+    EXPECT_EQ(store.records_snapshot().size(), cap) << "the configured cap still bounds the store";
+}
+
+// pairing.md "Pairing records" requires room for at least 5 records, so a smaller configured cap
+// is raised to that floor rather than honoured.
+TEST(RecordStore, CapacityBelowTheProtocolFloorIsRaised) {
     RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/2);
 
-    for (const std::string& server_id : {std::string("server-A"), std::string("server-B")}) {
-        auto outcome = store.resolve_pairing_outcome(server_id);
-        ASSERT_TRUE(outcome.has_value());
-        ASSERT_TRUE(store.store_record_superseding(outcome->record));
+    for (size_t i = 0; i < RecordStore::MIN_MAX_RECORDS; ++i) {
+        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        ASSERT_TRUE(store.store_record_superseding(outcome.record));
     }
-
-    EXPECT_FALSE(store.resolve_pairing_outcome("server-C").has_value());
-    EXPECT_EQ(store.records_snapshot().size(), 2u);
+    EXPECT_EQ(store.records_snapshot().size(), RecordStore::MIN_MAX_RECORDS)
+        << "nothing may be evicted before the floor is reached";
 }
 
 // =============================================================================
@@ -1377,10 +1452,9 @@ TEST(RecordStore, ResolvePairingOutcomeNormal) {
     const std::string server_id = "server-pair-test";
     auto outcome = store.resolve_pairing_outcome(server_id, "My Hub");
 
-    ASSERT_TRUE(outcome.has_value()) << "resolve_pairing_outcome must succeed when storage available";
     // PSK must be non-zero (randomly generated).
     bool all_zero = true;
-    for (auto b : outcome->psk) {
+    for (auto b : outcome.psk) {
         if (b != 0) {
             all_zero = false;
             break;
@@ -1389,23 +1463,30 @@ TEST(RecordStore, ResolvePairingOutcomeNormal) {
     EXPECT_FALSE(all_zero) << "generated PSK should not be all-zero";
 
     // The record's server_id and label must match what was passed in.
-    EXPECT_EQ(outcome->record.server_id, server_id);
-    EXPECT_EQ(outcome->record.label, "My Hub");
+    EXPECT_EQ(outcome.record.server_id, server_id);
+    EXPECT_EQ(outcome.record.label, "My Hub");
 
     // psk_id must be set and match the PSK.
-    EXPECT_EQ(outcome->psk, outcome->record.psk);
-    EXPECT_EQ(outcome->record.psk_id, psk_id_for(outcome->psk));
+    EXPECT_EQ(outcome.psk, outcome.record.psk);
+    EXPECT_EQ(outcome.record.psk_id, psk_id_for(outcome.psk));
 }
 
-// Storage-exhausted case: a net-new record has nowhere to go, so the pairing cannot be minted.
-TEST(RecordStore, ResolvePairingOutcomeExhausted) {
-    RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/1);
-    ASSERT_TRUE(store.store_record_superseding(make_client_record("server-holding-the-slot")));
+// A full store still mints: a pairing never fails for lack of record storage
+// (pairing.md "Pairing records"), and room is made where the record is stored.
+TEST(RecordStore, ResolvePairingOutcomeMintsOnAFullStore) {
+    RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false,
+                      RecordStore::MIN_MAX_RECORDS);
+    for (size_t i = 0; i < RecordStore::MIN_MAX_RECORDS; ++i) {
+        ASSERT_TRUE(
+            store.store_record_superseding(make_client_record("server-" + std::to_string(i))));
+    }
 
-    auto outcome = store.resolve_pairing_outcome("server-exhausted");
+    auto outcome = store.resolve_pairing_outcome("server-new");
 
-    EXPECT_FALSE(outcome.has_value()) << "an exhausted store cannot mint a new pairing record";
-    EXPECT_EQ(store.record_by_server_id("server-exhausted"), nullptr);
+    EXPECT_EQ(outcome.record.server_id, "server-new");
+    EXPECT_EQ(outcome.record.psk_id, psk_id_for(outcome.psk));
+    EXPECT_EQ(store.record_by_server_id("server-new"), nullptr)
+        << "minting alone stores nothing";
 }
 
 // store_record after resolve_pairing_outcome (simulates the server/pair-finalize ack path).
@@ -1415,15 +1496,14 @@ TEST(RecordStore, ResolvePairingOutcomeThenStore) {
 
     const std::string server_id = "server-store-after";
     auto outcome = store.resolve_pairing_outcome(server_id);
-    ASSERT_TRUE(outcome.has_value());
 
     // Simulate the ack path: store the pending record.
-    store.store_record_superseding(outcome->record);
+    store.store_record_superseding(outcome.record);
 
     const auto* stored = store.record_by_server_id(server_id);
     ASSERT_NE(stored, nullptr) << "record must be retrievable by server_id after store";
-    EXPECT_EQ(stored->psk_id, outcome->record.psk_id);
-    EXPECT_EQ(stored->psk, outcome->psk);
+    EXPECT_EQ(stored->psk_id, outcome.record.psk_id);
+    EXPECT_EQ(stored->psk, outcome.psk);
 
     auto resolved = store.resolve_by_psk_id(stored->psk_id, PskCategory::LONG_TERM);
     ASSERT_TRUE(resolved.has_value());
@@ -1669,7 +1749,6 @@ TEST(RecordStoreConcurrency, ResolvePairingOutcomeDoesNotRaceRecordStores) {
                                                                                 SERVER_ID_SPACE));
         // Every resolve must mint a usable outcome, whether this server is new or is re-pairing
         // over its own record. A torn read of records_ would surface here as a miss.
-        ASSERT_TRUE(outcome.has_value());
     }
 
     writer.join();
