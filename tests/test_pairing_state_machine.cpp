@@ -810,6 +810,54 @@ protected:
         this->client_->loop();
     }
 
+    /// Read ConnectionManager::pairing_rounds_since_verified_kc_, the count the dynamic-code
+    /// round limit is measured against (pairing.md "Rounds"), through the private-access seam.
+    uint32_t rounds_since_verified_kc() {
+        return this->client_->connection_manager_->pairing_rounds_since_verified_kc_;
+    }
+
+    /// Force that same count, so a test can stand one round short of the limit without driving
+    /// every round before it. Tests whose subject IS the limit drive the rounds for real.
+    void set_rounds_since_verified_kc(uint32_t rounds) {
+        this->client_->connection_manager_->pairing_rounds_since_verified_kc_ = rounds;
+    }
+
+    /// Begin the next round of a dynamic attempt sitting in AWAIT_SERVER_PAIR_INIT after a
+    /// client/pair-retry. A retry round's server/pair-init carries no nonce_A: the binding
+    /// values, and so the pairing code the operator is looking at, do not move between rounds
+    /// (pairing.md "Rounds").
+    void schedule_retry_round_pair_init() {
+        ServerPairingMessageEvent event;
+        event.conn = this->current_connection_sp();
+        event.kind = PairingMessageKind::PAIR_INIT;
+        this->schedule_pairing_message_event(std::move(event));
+        this->client_->loop();
+    }
+
+    /// Run one whole round that the "server" fails deliberately: it starts CPace over the code
+    /// the device actually emitted, under `round`'s sid, so derive() succeeds and only the
+    /// confirmation tag is wrong, then answers with a fabricated server_kc. This is the shape a
+    /// mistyped code produces at this point in the exchange, as opposed to a low-order-point
+    /// derive() failure. Leaves the client wherever its round accounting put it: another
+    /// client/pair-retry, or the pair/abort that ends the attempt.
+    void drive_failed_round(FakeConnection* conn, const CodeEmissionResult& display,
+                            uint32_t round) {
+        ServerStandIn server;
+        ASSERT_TRUE(server.start(display.prs, display.handshake_hash, /*pairing_index=*/1, round));
+
+        ServerPairingMessageEvent pair_auth_event;
+        pair_auth_event.conn = this->current_connection_sp();
+        pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
+        pair_auth_event.pake_msg_1 = server.initiator.public_share();
+        this->schedule_pairing_message_event(std::move(pair_auth_event));
+        this->client_->loop();
+        ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
+
+        std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
+        bogus_server_kc.fill(0xAB);
+        this->schedule_pair_confirm(bogus_server_kc);
+    }
+
     /// Verify the client/pair-confirm frame (second-to-last: client/pair-finalize follows
     /// immediately) carries client_kc and, only in the dynamic flow, wrapped_nonce_B; then
     /// verify the last frame is client/pair-finalize. `expect_wrapped_nonce` distinguishes the
@@ -1004,42 +1052,153 @@ TEST_F(PairingStateMachineTest, AbortAfterConfirmDoesNotReclearAlreadyWithdrawnC
 }
 
 // =============================================================================
-// Dynamic pairing code: code mismatch (bad server_kc)
+// pairing.md "Rounds": a server_kc that does not verify means the operator entered a code this
+// device did not emit. The dynamic flow answers with another round rather than ending the
+// attempt, each round runs its own CPace under its own sid, and the attempt only fails once the
+// round limit is reached.
 // =============================================================================
 
-TEST_F(PairingStateMachineTest, DynamicPinMismatchAborts) {
+TEST_F(PairingStateMachineTest, DynamicCodeMismatchAsksForAnotherRound) {
     FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-2");
 
     CodeEmissionResult display;
     ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/2, display));
+    const int emissions_before_retry = this->listener_.count(PairingEventKind::DISPLAY_CODE);
 
-    // Simulated server uses the CORRECT pin to complete the CPace handshake (so derive()
-    // succeeds), but then sends a bogus server_kc so verify() fails (a genuine code mismatch,
-    // as opposed to a low-order-point derive() failure). This diverges from drive_pair_auth()'s
-    // happy path (which calls derive()+tag() to get a real server_kc), so PAIR_AUTH is driven
-    // inline here rather than through that helper.
+    ASSERT_NO_FATAL_FAILURE(this->drive_failed_round(conn, display, /*round=*/1));
+
+    // The attempt continues: client/pair-retry, no pair/abort, and nothing that would end the
+    // attempt locally.
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-retry");
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "")
+        << "a retryable mismatch must not send pair/abort";
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::SUCCEEDED));
+    EXPECT_EQ(conn->disconnect_count_, 0);
+    EXPECT_TRUE(conn->is_pairing_in_progress())
+        << "the attempt survives a failed round, so its in-progress flag must stand";
+
+    // The operator keeps looking at the same code, so it is neither withdrawn nor re-emitted
+    // (pairing.md "Client verification").
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::CLEAR_CODE));
+    EXPECT_EQ(this->listener_.count(PairingEventKind::DISPLAY_CODE), emissions_before_retry);
+
+    EXPECT_EQ(this->rounds_since_verified_kc(), 1u);
+}
+
+TEST_F(PairingStateMachineTest, RetryRoundRunsTheNextRoundsSid) {
+    FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-retry-sid");
+
+    CodeEmissionResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/3, display));
+    ASSERT_NO_FATAL_FAILURE(this->drive_failed_round(conn, display, /*round=*/1));
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-retry");
+
+    // Round 2: the server sends server/pair-init again, without nonce_A, and runs CPace under
+    // the sid whose round counter now reads 2.
+    this->schedule_retry_round_pair_init();
     ServerStandIn server;
-    ASSERT_TRUE(server.start(display.prs, display.handshake_hash));
+    ASSERT_TRUE(server.start(display.prs, display.handshake_hash, /*pairing_index=*/1,
+                             /*round=*/2));
 
-    ServerPairingMessageEvent pair_auth_event;
-    pair_auth_event.conn = this->current_connection_sp();
-    pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
-    pair_auth_event.pake_msg_1 = server.initiator.public_share();
-    this->schedule_pairing_message_event(std::move(pair_auth_event));
-    this->client_->loop();
-    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
+    std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
+    ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
+    this->schedule_pair_confirm(server_kc);
 
-    std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
-    bogus_server_kc.fill(0xAB);
-    this->schedule_pair_confirm(bogus_server_kc);
+    // Only a second round derived over the round-2 sid produces a server_kc this client
+    // verifies, so reaching pair-confirm at all is the assertion: the sid moved with the round.
+    ASSERT_NO_FATAL_FAILURE(
+        this->verify_pair_confirm_frame(conn->sent_text_, /*expect_wrapped_nonce=*/true));
+    ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_nonce_opens_commit(conn->sent_text_, server));
+    ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_psk_finalize(conn->sent_text_, server));
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 
-    // Device must abort with pairing_code_mismatch and fire the failure callbacks:
-    // on_pairing_failed AND on_clear_pairing_code both survive cleanup_connection_state().
+    // The verified server_kc is what the round limit counts back from.
+    EXPECT_EQ(this->rounds_since_verified_kc(), 0u);
+}
+
+TEST_F(PairingStateMachineTest, RetryRoundRejectsAReplayOfTheFirstRoundsSid) {
+    // Control for RetryRoundRunsTheNextRoundsSid: the same second round, with the same correct
+    // pairing code, fails when the server reuses round 1's sid. Without the round in the sid the
+    // two runs would agree and this would confirm.
+    FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-replay-sid");
+
+    CodeEmissionResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/4, display));
+    ASSERT_NO_FATAL_FAILURE(this->drive_failed_round(conn, display, /*round=*/1));
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-retry");
+
+    this->schedule_retry_round_pair_init();
+    ServerStandIn server;
+    ASSERT_TRUE(server.start(display.prs, display.handshake_hash, /*pairing_index=*/1,
+                             /*round=*/1));
+
+    std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
+    ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
+    this->schedule_pair_confirm(server_kc);
+
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-retry");
+    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-confirm"));
+    EXPECT_EQ(this->rounds_since_verified_kc(), 2u);
+}
+
+TEST_F(PairingStateMachineTest, RoundLimitEndsTheAttemptWithPairingCodeMismatch) {
+    FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-round-limit");
+
+    CodeEmissionResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/5, display));
+
+    // Round 1 already ran to its server/pair-init above; every later round opens with the
+    // retry-round server/pair-init the client's client/pair-retry asks for.
+    uint32_t round = 1;
+    for (;; ++round) {
+        ASSERT_NO_FATAL_FAILURE(this->drive_failed_round(conn, display, round));
+        if (last_frame_type(conn->sent_text_) != "client/pair-retry") {
+            break;
+        }
+        ASSERT_LT(round, 64u) << "the client must stop retrying at some point";
+        this->schedule_retry_round_pair_init();
+    }
+
+    // pairing.md "Rounds" caps a dynamic pairing code at 20 rounds since the last verified
+    // server_kc, so the twentieth failure is the one that ends the attempt.
+    EXPECT_EQ(round, 20u);
+    EXPECT_EQ(this->rounds_since_verified_kc(), 20u);
     EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "pairing_code_mismatch");
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::PAIRING_CODE_MISMATCH);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_CODE));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::SUCCEEDED));
+    EXPECT_EQ(conn->disconnect_count_, 0)
+        << "pairing_code_mismatch leaves the connection open (pairing.md 'pair/abort')";
+}
+
+TEST_F(PairingStateMachineTest, StandingRoundLimitHoldsTheNextAttemptForAGesture) {
+    // A dynamic attempt is normally ungated. Once the round limit stands, pairing.md "Rounds"
+    // requires a deliberate operator action before another attempt may run, which is the same
+    // gesture the pairing window is opened by.
+    FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-gate-control");
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init")
+        << "control: without a standing limit the attempt starts unprompted";
+    ASSERT_FALSE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
+
+    this->set_rounds_since_verified_kc(20);
+    conn->sent_text_.clear();
+    this->enter_pairing(conn);
+    this->client_->loop();
+
+    // pairing.md "Rounds": while the limit holds an attempt back the client says so with
+    // client/pair-pending, and starts nothing until the gesture admits it.
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
+    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-init"));
+    ASSERT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
+
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+
+    EXPECT_EQ(this->rounds_since_verified_kc(), 0u)
+        << "the gesture clears the standing limit before what it admits can run";
+    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 }
 
 // =============================================================================
@@ -1054,23 +1213,15 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     CodeEmissionResult display;
     ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/9, display));
 
-    ServerStandIn server;
-    ASSERT_TRUE(server.start(display.prs, display.handshake_hash));
-
-    ServerPairingMessageEvent pair_auth_event;
-    pair_auth_event.conn = this->current_connection_sp();
-    pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
-    pair_auth_event.pake_msg_1 = server.initiator.public_share();
-    this->schedule_pairing_message_event(std::move(pair_auth_event));
-    this->client_->loop();
-    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-auth");
+    // Stand at the round limit so the wrong server_kc below ends the attempt instead of asking
+    // for another round: the abort, not the retry, is what this test needs to keep traffic
+    // flowing across.
+    this->set_rounds_since_verified_kc(20);
 
     // Wrong server_kc: a genuine code mismatch (not concurrent_attempt), so
     // local_abort_pairing keeps the connection open (PairingDropAction::KEEP_OPEN) instead
     // of closing it.
-    std::array<uint8_t, CPACE_TAG_SIZE> bogus_server_kc{};
-    bogus_server_kc.fill(0xCD);
-    this->schedule_pair_confirm(bogus_server_kc);
+    ASSERT_NO_FATAL_FAILURE(this->drive_failed_round(conn, display, /*round=*/1));
 
     ASSERT_EQ(last_pair_abort_reason(conn->sent_text_), "pairing_code_mismatch");
     ASSERT_EQ(conn->disconnect_count_, 0) << "pairing_code_mismatch must leave the connection open";
@@ -1637,6 +1788,12 @@ TEST_F(PairingStateMachineTest, StaticPinMismatchRecordsFailureAndAborts) {
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::PAIRING_CODE_MISMATCH);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::SUCCEEDED));
+
+    // Rounds belong to the dynamic pairing code alone (pairing.md "Rounds"): a static code the
+    // operator mistyped is the same code on the next round, so the first failure is the last.
+    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/pair-retry"));
+    EXPECT_EQ(this->rounds_since_verified_kc(), 0u)
+        << "the static flow runs no rounds to count";
 }
 
 // =============================================================================

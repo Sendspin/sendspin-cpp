@@ -536,7 +536,8 @@ public:
         AWAIT_PAIRING_WINDOW,        ///< Gesture-gated attempt: client/pair-pending was sent and
                                      ///< client/pair-init waits for a pairing window to open.
         AWAIT_SERVER_PAIR_INIT,      ///< dynamic pairing code only: sent client/pair-init
-                                     ///< (commit_B); waiting for server/pair-init.
+                                     ///< (commit_B) or client/pair-retry; waiting for the
+                                     ///< round's server/pair-init.
         AWAIT_SERVER_PAIR_AUTH,      ///< CPace RESPONDER started; waiting for server/pair-auth.
         AWAIT_SERVER_PAIR_CONFIRM,   ///< Sent client/pair-auth and derived; waiting for
                                      ///< server/pair-confirm.
@@ -545,11 +546,15 @@ public:
     };
 
     /// @brief All pairing-code session state (main-loop-only; never touched by network thread).
-    /// Shared by both code-based methods; `method` selects the gating policy and the
-    /// pair-confirm wire shape.
+    /// Shared by both code-based methods; `method` selects the gating policy, whether the
+    /// attempt runs further rounds, and the pair-confirm wire shape.
     struct PairingSession {
         CPace cpace;
         std::array<uint8_t, 32> nonce_b{};
+        /// nonce_A from the attempt's first server/pair-init. pairing.md "Rounds" keeps the
+        /// binding values, and so the pairing code, unchanged across an attempt's rounds, and a
+        /// later round's server/pair-init carries no nonce, so the first round's value stays here.
+        std::array<uint8_t, 32> nonce_a{};
         std::array<uint8_t, 32> handshake_hash{};
         /// The pairing code as CPace consumes it (PRS, pairing.md "PAKE"): the six or eight ASCII
         /// digits, or the 24 raw bytes of the qr_code emission format.

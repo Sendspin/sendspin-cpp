@@ -196,7 +196,7 @@ struct ServerUnpairEvent {
 
 /// @brief Which server-to-client pairing-code message arrived.
 enum class PairingMessageKind : uint8_t {
-    PAIR_INIT,     ///< server/pair-init: nonce_A
+    PAIR_INIT,     ///< server/pair-init: begins a round, carrying nonce_A in the first
     PAIR_AUTH,     ///< server/pair-auth: pake_msg_1
     PAIR_CONFIRM,  ///< server/pair-confirm: server_kc
     MALFORMED,     ///< a pairing message failed to parse; a spec Protocol Error when a
@@ -213,7 +213,9 @@ struct ServerPairingMessageEvent {
     PairingMessageKind kind{};                 ///< Which pairing message arrived
 
     // server/pair-init fields
-    std::array<uint8_t, 32> nonce_a{};  ///< nonce_A decoded from the wire
+    /// nonce_A decoded from the wire; absent after the attempt's first round
+    /// (pairing.md "Server -> Client: server/pair-init").
+    std::optional<std::array<uint8_t, 32>> nonce_a{};
 
     // server/pair-auth fields
     std::array<uint8_t, 32> pake_msg_1{};  ///< Server CPace public share
@@ -843,8 +845,9 @@ private:
     /// @param event The parsed server pairing message.
     void handle_pairing_message(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
-    /// @brief Handles PairingMessageKind::PAIR_INIT: derives the pairing code, emits it, and
-    /// starts CPace as RESPONDER. Dynamic pairing code only; a PAIR_INIT while
+    /// @brief Handles PairingMessageKind::PAIR_INIT: begins a round (pairing.md "Rounds"),
+    /// deriving and emitting the pairing code in the attempt's first one, and starts a fresh
+    /// CPace run as RESPONDER. Dynamic pairing code only; a PAIR_INIT while
     /// ps.method == STATIC_PAIRING_CODE is a wrong-step protocol violation.
     /// @param conn The connection that received the message.
     /// @param event The parsed server pairing message; nonce_a is used here.
@@ -857,9 +860,9 @@ private:
     /// @param event The parsed server pairing message; pake_msg_1 is used here.
     void handle_pair_auth(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
-    /// @brief Handles PairingMessageKind::PAIR_CONFIRM: verifies server_kc, sends
-    /// client/pair-confirm, resolves the pairing outcome, and sends the CPace-wrapped
-    /// client/pair-finalize.
+    /// @brief Handles PairingMessageKind::PAIR_CONFIRM: verifies server_kc, then either sends
+    /// client/pair-confirm plus the CPace-wrapped client/pair-finalize, or asks for another
+    /// round with client/pair-retry, or aborts at the round limit (pairing.md "Rounds").
     /// @param conn The connection that received the message.
     /// @param event The parsed server pairing message; server_kc is used here.
     void handle_pair_confirm(SendspinConnection* conn, const ServerPairingMessageEvent& event);
@@ -896,8 +899,15 @@ private:
 
     /// @brief Open the pairing window on the main loop (operator gesture). If an attempt is
     /// already waiting in AWAIT_PAIRING_WINDOW, the window admits it immediately; otherwise it
-    /// stands open for WINDOW_LIFETIME (5 minutes) awaiting a pairing activate.
+    /// stands open for WINDOW_LIFETIME (5 minutes) awaiting a pairing activate. The gesture is
+    /// also the deliberate operator action that clears a standing round limit
+    /// (pairing.md "Rounds"), so it resets the round count.
     void open_pairing_window();
+
+    /// @brief Whether the dynamic-pairing-code round limit currently holds attempts back:
+    /// PAIRING_ROUND_LIMIT rounds have run since the last verified server_kc
+    /// (pairing.md "Rounds"). Main-loop-only.
+    [[nodiscard]] bool pairing_round_limit_reached() const;
 
     /// @brief Handle a confirmed pairing-window gesture on the main loop
     /// (SendspinClient::confirm_pairing_window()). Delegates to open_pairing_window().
@@ -935,6 +945,11 @@ private:
     // pairing attempt; 0 = closed. Opened by the operator gesture, consumed when client/pair-init
     // is sent. Main-loop-only.
     int64_t pairing_window_open_until_us_{0};
+    // Dynamic-pairing-code rounds run since the last verified server_kc (pairing.md "Rounds").
+    // Not partitioned by server_id or source address, and not persisted: the limit gates how
+    // fast an attacker can guess within one boot, which a reboot does not shorten. Main-loop-only
+    // (every round begins and ends in a main-loop pairing handler).
+    uint32_t pairing_rounds_since_verified_kc_{0};
 
     // Pointer fields
     SendspinClient* client_;

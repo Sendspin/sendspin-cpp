@@ -110,18 +110,25 @@ TEST(DynamicPairingCode, ParseServerPairInitValid) {
     EXPECT_EQ(payload.nonce_a, nonce_a);
 }
 
-TEST(DynamicPairingCode, ParseServerPairInitMissingNonce) {
-    expect_parse_rejects<ServerPairInitPayload>(process_server_pair_init_message,
-                                                 R"({"type":"server/pair-init","payload":{}})");
+// A retry round's server/pair-init carries no nonce_A: the binding values do not move between
+// rounds (pairing.md "Rounds"), so an absent field parses to an absent value rather than being
+// rejected. Which rounds may omit it is the state machine's business, not the parser's.
+TEST(DynamicPairingCode, ParseServerPairInitWithoutNonceYieldsNoNonce) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/pair-init","payload":{}})", doc, root));
+
+    ServerPairInitPayload payload;
+    ASSERT_TRUE(process_server_pair_init_message(root, &payload));
+    EXPECT_FALSE(payload.nonce_a.has_value());
 }
 
-// A pre-resync server that still sends pin_length alongside nonce_A parses fine: the extra
-// field is simply ignored (the session pin_length came from the activation).
-TEST(DynamicPairingCode, ParseServerPairInitExtraFormatIgnored) {
+// An unrecognized extra field alongside nonce_A parses fine: it is simply ignored.
+TEST(DynamicPairingCode, ParseServerPairInitExtraFieldIgnored) {
     std::array<uint8_t, 32> nonce_a{};
     const std::string json =
         std::string(R"({"type":"server/pair-init","payload":{"nonce_A":")") + b64url(nonce_a) +
-        R"(","pin_length":6}})";
+        R"(","unrecognized_field":6}})";
 
     JsonDocument doc;
     JsonObject root;

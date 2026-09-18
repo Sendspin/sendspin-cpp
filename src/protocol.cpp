@@ -1207,25 +1207,27 @@ bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
 // ============================================================================
 
 bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* payload) {
-    // Required field: nonce_A (base64url, 43 chars -> 32 bytes). The session pin_length is not
-    // carried here; it arrived in the activation's pairing object.
-    if (!root["payload"]["nonce_A"].is<const char*>()) {
-        SS_LOGE(TAG, "server/pair-init: missing nonce_A");
-        return false;
-    }
-
-    if (payload == nullptr) {
+    // nonce_A (base64url, 43 chars -> 32 bytes) is present in the attempt's first round only, so
+    // an absent field parses to an absent value; the state machine decides whether that is right
+    // for the round it is in (pairing.md "Rounds"). A present field that does not decode to 32
+    // bytes is malformed, like any other.
+    payload->nonce_a = std::nullopt;
+    JsonVariantConst nonce_var = root["payload"]["nonce_A"];
+    if (nonce_var.isUnbound() || nonce_var.isNull()) {
         return true;
     }
-
-    const std::string nonce_a_b64 = root["payload"]["nonce_A"].as<std::string>();
-    auto nonce_a_bytes = b64url_decode(nonce_a_b64);
-    if (!nonce_a_bytes.has_value() || nonce_a_bytes->size() != 32) {
-        SS_LOGE(TAG, "server/pair-init: nonce_A is not 32 bytes");
+    if (!nonce_var.is<const char*>()) {
+        SS_LOGE(TAG, "server/pair-init: nonce_A is not a string");
         return false;
     }
-    std::memcpy(payload->nonce_a.data(), nonce_a_bytes->data(), 32);
-
+    auto decoded = b64url_decode(nonce_var.as<std::string>());
+    if (!decoded.has_value() || decoded->size() != 32) {
+        SS_LOGE(TAG, "server/pair-init: nonce_A is not 32 base64url-encoded bytes");
+        return false;
+    }
+    std::array<uint8_t, 32> nonce_a{};
+    std::memcpy(nonce_a.data(), decoded->data(), nonce_a.size());
+    payload->nonce_a = nonce_a;
     return true;
 }
 
@@ -1303,6 +1305,20 @@ std::string format_client_pair_init_message(uint32_t pairing_index) {
     // commit_B belongs to the dynamic pairing code flow only; pairing_index is required on
     // every client/pair-init (pairing.md "client/pair-init").
     root["payload"]["pairing_index"] = pairing_index;
+
+    std::string output;
+    serializeJson(doc, output);
+    return output;
+}
+
+std::string format_client_pair_retry_message() {
+    JsonDocument doc = make_json_document();
+    JsonObject root = doc.to<JsonObject>();
+
+    root["type"] = "client/pair-retry";
+    // Empty payload, emitted explicitly so the message carries the object every other pairing
+    // message does (pairing.md "Client -> Server: client/pair-retry").
+    root["payload"].to<JsonObject>();
 
     std::string output;
     serializeJson(doc, output);

@@ -1373,6 +1373,20 @@ TEST(Protocol, FormatClientPairFinalizeNonZeroPsk) {
 }
 
 // format_pair_abort_message: produces the correct wire shape for every reason.
+// format_client_pair_retry_message: the message that asks for another round carries an empty
+// payload object and nothing else (pairing.md "Client -> Server: client/pair-retry"). The
+// binding values are unchanged across rounds, so a field naming any of them would be wrong, not
+// merely redundant.
+TEST(Protocol, FormatClientPairRetryWireShape) {
+    const std::string out = format_client_pair_retry_message();
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, out));
+    EXPECT_STREQ(doc["type"], "client/pair-retry");
+    ASSERT_TRUE(doc["payload"].is<JsonObject>());
+    EXPECT_EQ(doc["payload"].as<JsonObjectConst>().size(), 0u);
+    EXPECT_EQ(doc.as<JsonObjectConst>().size(), 2u);
+}
+
 TEST(Protocol, FormatPairAbortWireShape) {
     const PairAbortReason reasons[] = {
         PairAbortReason::METHOD_NOT_SUPPORTED,

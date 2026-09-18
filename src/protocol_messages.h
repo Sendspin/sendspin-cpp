@@ -840,11 +840,13 @@ struct PairAbortMessage {
 // ============================================================================
 
 /// @brief Parsed server/pair-init payload.
-/// Carries only nonce_A (32 raw bytes, base64url-encoded on the wire, 43 chars); the session
-/// pin_length arrives earlier, in the activation's pairing object. Sent by the server in
-/// response to client/pair-init (which carried commit_B).
+/// Begins a round of the Dynamic Pairing Code Flow. Carries nonce_A (32 raw bytes,
+/// base64url-encoded on the wire, 43 chars) in the attempt's first round only; a round opened by
+/// client/pair-retry reuses the binding values already in hand and carries none
+/// (pairing.md "Server -> Client: server/pair-init").
 struct ServerPairInitPayload {
-    std::array<uint8_t, 32> nonce_a{};  ///< 32-byte server nonce decoded from base64url.
+    /// 32-byte server nonce decoded from base64url, absent after the first round.
+    std::optional<std::array<uint8_t, 32>> nonce_a;
 };
 
 /// @brief Parsed server/pair-auth payload.
@@ -1069,6 +1071,13 @@ std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commi
 ///                      handshake.
 /// @return JSON string for the client/pair-init message with only pairing_index set.
 std::string format_client_pair_init_message(uint32_t pairing_index);
+
+/// @brief Formats a client/pair-retry message as a JSON string.
+/// Sent in place of client/pair-confirm when server_kc fails to verify and the client admits
+/// another round (pairing.md "Client -> Server: client/pair-retry"). The payload is empty: the
+/// attempt, its pairing code and its running attempt timeout all carry over.
+/// @return JSON string for the client/pair-retry message.
+std::string format_client_pair_retry_message();
 
 /// @brief Formats a client/pair-auth message as a JSON string.
 /// Sent in response to server/pair-auth; carries the client's CPace public share.

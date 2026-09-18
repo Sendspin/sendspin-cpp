@@ -126,6 +126,12 @@ static constexpr int64_t PAIRING_ATTEMPT_TIMEOUT_US = 120LL * 1000LL * US_PER_MS
 /// silently.
 static constexpr int64_t WINDOW_LIFETIME_US = 300LL * 1000LL * US_PER_MS;
 
+/// @brief Rounds a dynamic pairing code may run since the last verified server_kc before the
+/// client stops retrying (pairing.md "Rounds"). Reaching it aborts the attempt with
+/// pairing_code_mismatch and holds further attempts behind a deliberate operator gesture, which
+/// bounds an online guessing attacker to this many tries per gesture.
+static constexpr uint32_t PAIRING_ROUND_LIMIT = 20;
+
 /// @brief CPace sid label (pairing.md "PAKE"):
 /// sid = LABEL || h || pairing_index || round, each counter a big-endian uint32.
 static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
@@ -1852,9 +1858,12 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
         ps.prs = pairing_code_digits_prs(store.static_pairing_code().value());
     }
 
-    // Gesture gating (pairing.md "Pairing Window"): the static pairing code gates every attempt
-    // on an operator gesture; the dynamic one runs ungated.
-    const bool gesture_gated = !is_dynamic;
+    // Gesture gating: the static pairing code gates every attempt on an operator gesture
+    // (pairing.md "Pairing Window"); the dynamic one runs ungated until the round limit stands,
+    // which holds attempts back until the same deliberate operator action clears it
+    // (pairing.md "Rounds"). Both wait the same way, sending client/pair-pending, which is what
+    // the limit asks a held-back attempt to send.
+    const bool gesture_gated = !is_dynamic || this->pairing_round_limit_reached();
 
     if (gesture_gated && !this->pairing_window_open()) {
         // No window open: report the pending gesture with client/pair-pending and wait.
@@ -2134,6 +2143,10 @@ bool ConnectionManager::start_pake_round(SendspinConnection* conn) {
     return true;
 }
 
+bool ConnectionManager::pairing_round_limit_reached() const {
+    return this->pairing_rounds_since_verified_kc_ >= PAIRING_ROUND_LIMIT;
+}
+
 bool ConnectionManager::pairing_window_open() const {
     return this->pairing_window_open_until_us_ != 0 &&
            platform_time_us() < this->pairing_window_open_until_us_;
@@ -2144,8 +2157,14 @@ void ConnectionManager::open_pairing_window() {
     // current_connection_: pairing only starts once a nursery entry has won promotion (see the
     // pairing branch in promote_or_arbitrate_nursery_entry()). If an attempt is already waiting
     // for the gesture, the freshly opened window is consumed by it immediately; otherwise the
-    // window stands open (spec: Pairing Window) so a pairing activate arriving within its
+    // window stands open (pairing.md "Pairing Window") so a pairing activate arriving within its
     // lifetime can proceed without a further gesture.
+    //
+    // The gesture is also the deliberate, manufacturer-defined operator action pairing.md
+    // "Rounds" requires to clear a standing round limit, so it resets the count before anything
+    // it admits can run.
+    this->pairing_rounds_since_verified_kc_ = 0;
+
     SendspinConnection* conn = this->current_connection_.get();
     const bool awaiting =
         conn != nullptr &&
@@ -2266,38 +2285,67 @@ void ConnectionManager::handle_pair_init(SendspinConnection* conn,
         return;
     }
 
-    // Derive the code both formats share: the digest over the handshake hash and the two
-    // binding nonces (pairing.md "Pairing code derivation").
-    auto digest = pairing_code_digest(ps.handshake_hash.data(), ps.handshake_hash.size(),
-                                      event.nonce_a.data(), event.nonce_a.size(), ps.nonce_b.data(),
-                                      ps.nonce_b.size());
-    if (!digest.has_value()) {
-        SS_LOGE(TAG, "handle_pairing_message: pairing-code derivation failed for server_id=%s",
-                server_id.c_str());
-        this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+    // pairing.md "Server -> Client: server/pair-init" carries nonce_A in the attempt's first
+    // round only: the binding values, and so the pairing code, are unchanged across the rounds
+    // that follow. A first round without it cannot derive a code, and a later round that carries
+    // one is a message no conformant server sends, so both are protocol errors
+    // (pairing.md "Protocol Errors"): close without a pair/abort and persist nothing. Ignoring a
+    // late nonce would be no safer, since it must not move the code the operator already holds.
+    const bool first_round = ps.round == 0;
+    if (first_round != event.nonce_a.has_value()) {
+        SS_LOGW(TAG,
+                "handle_pairing_message: server/pair-init %s nonce_A in round %u for "
+                "server_id=%s; closing per pairing.md Protocol Errors (no pair/abort sent)",
+                event.nonce_a.has_value() ? "carries an unexpected" : "is missing its",
+                static_cast<unsigned>(ps.round + 1), server_id.c_str());
+        this->abort_pairing_attempt(conn, /*wire_abort_reason=*/std::nullopt,
+                                    PairingDropAction::CLOSE_SILENTLY,
+                                    SendspinPairAbortReason::UNKNOWN);
         return;
     }
 
-    // The emission format decides both what the operator receives and what CPace consumes as
-    // PRS: the six ASCII digits, or the 24 raw digest bytes the version-1 pairing token carries
-    // (pairing.md "Pairing code derivation", "QR-code emission").
-    std::string emitted;
-    if (ps.format == SendspinPairingCodeFormat::QR_CODE) {
-        auto code = pairing_code_qr_bytes(digest.value());
-        ps.prs.assign(code.begin(), code.end());
-        emitted = format_pairing_code_token(code);
-    } else {
-        std::string digits = pairing_code_digits(digest.value());
-        ps.prs = pairing_code_digits_prs(digits);
-        emitted = std::move(digits);
+    if (first_round) {
+        ps.nonce_a = event.nonce_a.value();
+
+        // Derive the code both formats share: the digest over the handshake hash and the two
+        // binding nonces (pairing.md "Pairing code derivation").
+        auto digest = pairing_code_digest(ps.handshake_hash.data(), ps.handshake_hash.size(),
+                                          ps.nonce_a.data(), ps.nonce_a.size(), ps.nonce_b.data(),
+                                          ps.nonce_b.size());
+        if (!digest.has_value()) {
+            SS_LOGE(TAG, "handle_pairing_message: pairing-code derivation failed for server_id=%s",
+                    server_id.c_str());
+            this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+            return;
+        }
+
+        // The emission format decides both what the operator receives and what CPace consumes as
+        // PRS: the six ASCII digits, or the 24 raw digest bytes the version-1 pairing token
+        // carries (pairing.md "Pairing code derivation", "QR-code emission").
+        std::string emitted;
+        if (ps.format == SendspinPairingCodeFormat::QR_CODE) {
+            auto code = pairing_code_qr_bytes(digest.value());
+            ps.prs.assign(code.begin(), code.end());
+            emitted = format_pairing_code_token(code);
+        } else {
+            std::string digits = pairing_code_digits(digest.value());
+            ps.prs = pairing_code_digits_prs(digits);
+            emitted = std::move(digits);
+        }
+
+        // Emit the code to the operator (deferred to loop() via note_display_pairing_code).
+        // Record that one is being emitted so the abort/cleanup paths know to withdraw it. A
+        // later round re-emits nothing: the code has not changed, so an emission that persists
+        // (a display) is already showing the right one (pairing.md "Client verification").
+        this->client_->note_display_pairing_code(emitted, ps.format);
+        ps.code_emitted = true;
     }
 
-    // Emit the code to the operator (deferred to loop() via note_display_pairing_code). Record
-    // that one is being emitted so the abort/cleanup paths know to withdraw it.
-    this->client_->note_display_pairing_code(emitted, ps.format);
-    ps.code_emitted = true;
+    // The round counts from the moment its code is being emitted, whatever becomes of it
+    // (pairing.md "Rounds").
+    ++ps.round;
+    ++this->pairing_rounds_since_verified_kc_;
 
-    ps.round = 1;
     if (!this->start_pake_round(conn)) {
         return;
     }
@@ -2371,15 +2419,38 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
         return;
     }
 
-    // Verify server_kc (server confirmation tag).
+    // Verify server_kc (server confirmation tag). A failure means the operator entered a
+    // different code than the one this client emitted, which the Dynamic Pairing Code Flow
+    // answers with another round rather than ending the attempt (pairing.md "Rounds").
     if (!ps.cpace.verify(event.server_kc.data(), event.server_kc.size())) {
+        const bool can_retry = ps.method == SendspinPairMethod::DYNAMIC_PAIRING_CODE &&
+                               !this->pairing_round_limit_reached();
+        if (!can_retry) {
+            SS_LOGW(TAG,
+                    "handle_pairing_message: server_kc verification failed (pairing-code "
+                    "mismatch) for server_id=%s; aborting (%s)",
+                    server_id.c_str(),
+                    ps.method == SendspinPairMethod::DYNAMIC_PAIRING_CODE
+                        ? "round limit reached"
+                        : "the static flow runs one round");
+            this->local_abort_pairing(conn, PairAbortReason::PAIRING_CODE_MISMATCH);
+            return;
+        }
+
+        // A retry keeps the attempt, its pairing code and its running attempt timeout in place;
+        // the server answers with a fresh server/pair-init that begins the next round, which
+        // carries no nonce because the binding values do not move.
         SS_LOGW(TAG,
-                "handle_pairing_message: server_kc verification failed "
-                "(pairing-code mismatch) for server_id=%s",
-                server_id.c_str());
-        this->local_abort_pairing(conn, PairAbortReason::PAIRING_CODE_MISMATCH);
+                "handle_pairing_message: server_kc verification failed (pairing-code mismatch) "
+                "for server_id=%s after round %u; sending client/pair-retry",
+                server_id.c_str(), static_cast<unsigned>(ps.round));
+        conn->send_app_json(format_client_pair_retry_message(), nullptr);
+        ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT;
         return;
     }
+
+    // A verified server_kc is what the round limit counts back from (pairing.md "Rounds").
+    this->pairing_rounds_since_verified_kc_ = 0;
 
     // Compute client_kc (our confirmation tag).
     auto client_kc_opt = ps.cpace.tag();
