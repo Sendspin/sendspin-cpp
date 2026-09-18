@@ -531,12 +531,15 @@ private:
     /// @brief Aborts a dynamic-PIN exchange on the current connection that has stalled past
     /// PIN_ATTEMPT_TIMEOUT_US. Suppressed once the pairing is finalized: the PIN session is
     /// only reset at the post-rekey activate, and the deadline elapsing inside that window
-    /// must not abort a completed pairing. Acquires conn_ptr_mutex_ internally.
+    /// must not abort a completed pairing. Also held while the connection awaits a
+    /// server/activate, since connection.md "Re-handshake" lets the client start no application
+    /// message there. Acquires conn_ptr_mutex_ internally.
     void scan_pin_attempt_timeout();
 
     /// @brief Drops the current connection if it has failed to re-prove itself (after an in-band
-    /// re-handshake or a pairing-finalize rekey) within REPROVE_TIMEOUT_US. Acquires
-    /// conn_ptr_mutex_ internally.
+    /// re-handshake or a pairing-finalize rekey) within REPROVE_TIMEOUT_US. Closes without a
+    /// goodbye: one of those windows starts at Noise message 1, where connection.md
+    /// "Re-handshake" allows no application message. Acquires conn_ptr_mutex_ internally.
     void scan_reprove_watchdog();
 
     // ========================================

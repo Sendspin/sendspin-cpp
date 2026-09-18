@@ -316,6 +316,12 @@ SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len) con
         SS_LOGW(TAG, "Binary message too short for the audio chunk header");
         return;
     }
+    if (chunk->audio_len == 0) {
+        // A complete header carrying no frame is nothing to decode, and send_audio_chunk()
+        // would log it as an argument error rather than as the empty chunk it is.
+        SS_LOGW(TAG, "Audio chunk carries no encoded frame");
+        return;
+    }
     if (!this->send_audio_chunk(chunk->audio, chunk->audio_len, chunk->timestamp_us,
                                 CHUNK_TYPE_ENCODED_AUDIO, 0)) {
         SS_LOGW(TAG, "Failed to send audio chunk");

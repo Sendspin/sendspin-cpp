@@ -278,6 +278,8 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         return {nullptr, 0, true};
     }
 
+    // Every path below that reports a malformed sequence clears the reassembly state first, so
+    // the connection the caller is about to close cannot be left holding one.
     const uint8_t* data = nullptr;
     size_t data_len = 0;
 
@@ -292,12 +294,14 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         }
         if (len < 3) {
             SS_LOGW(TAG, "first fragment missing its orig_type; malformed sequence");
+            this->reasm_reset();
             return {nullptr, 0, true};
         }
         const uint8_t orig_type = plaintext[2];
         // messaging.md "Malformed sequences": an orig_type of 1. Fragments do not nest.
         if (orig_type == MSG_TYPE_FRAGMENT) {
             SS_LOGW(TAG, "first fragment declares orig_type 1; malformed sequence");
+            this->reasm_reset();
             return {nullptr, 0, true};
         }
         // The ignore rules let a receiver discard the data of a message whose orig_type it does
@@ -324,6 +328,7 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         if (!this->reasm_in_progress_) {
             SS_LOGW(TAG, "continuation fragment with no fragmented message in flight; "
                          "malformed sequence");
+            this->reasm_reset();
             return {nullptr, 0, true};
         }
         data = plaintext + 2;

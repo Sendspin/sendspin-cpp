@@ -516,7 +516,7 @@ After transport is active, the server may initiate a new KKpsk2 handshake to rot
 3. Atomically swaps the active `NoiseSession` under a per-connection mutex (`session_mutex_` in `NoiseTransport`).
 4. Resets `first_activate_received_`, so the connection goes momentarily non-operational while it waits for the `server/activate` that connection.md "Re-handshake" makes the server's first message under the new keys. Neither `server/hello` nor `client/hello` is re-sent, so the hello flags carry over untouched and that activation alone restores the connection. The re-proving watchdog (`REPROVE_TIMEOUT_US`, `scan_reprove_watchdog()`) drops a connection whose server rekeys and then never activates it.
 
-The client sends nothing but the handshake between Noise message 1 and that activation: `client/time`, `client/state`, `client/leave` and role-originated sends all gate on `first_activate_received()`.
+The client starts no application message between Noise message 1 and that activation, as connection.md "Re-handshake" requires. `client/time` gates on `is_operational()`; `client/state`, `client/leave`, role-originated sends through `send_text()` and the dynamic-PIN attempt-timeout `pair/abort` in `scan_pin_attempt_timeout()` all gate on `first_activate_received()`. A held attempt-timeout abort fires on the tick after the activation arrives, or never, because `scan_reprove_watchdog()` closed the connection first; that watchdog closes without a goodbye for the same reason.
 
 This is the mechanism that upgrades a Pairing-PSK connection to a long-term PSK immediately after pairing finalizes.
 

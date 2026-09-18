@@ -123,18 +123,32 @@ Exit: baseline lines 3-6 gone in tolerant mode.
 
 ### Phase 3: the flip
 
-Lands as one reviewed series; interop is verified only at its end, in strict mode.
+Lands as one reviewed series; interop is verified only at its end, in strict mode. Phase 3a (the
+binary transport and the post-re-handshake and activation behavior) has landed; the rest is
+phase 3b, which moves the hello and verifies strict-mode interop.
+
+Done (3a):
+
+- A6: no `server/hello` / `client/hello` after a re-handshake; the next message is
+  `server/activate`, and the client starts no application message until it arrives.
+- A4/A5: fragmentation is message ID `1` with a flags byte (bit 1 first, bit 0 last, bits 2-7
+  zero), `orig_type` only on the first fragment. Malformed sequences close the connection: first
+  while in flight, non-first with none in flight, non-fragment while in flight, nonzero reserved
+  bit, `orig_type` of `1`. IDs 2-3 are reserved, and a fragmented message claiming one is
+  discarded without buffering.
+- D1: audio chunks carry `send_ahead` (big-endian uint32) at bytes 9-12; audio starts at byte 13.
+  The value is parsed past, not consumed.
+- A1/B11: `activities_allowed()` implements the category-to-activities table as written, so a
+  long-term PSK no longer admits `['pairing']` and the Pairing PSK admits the empty set,
+  `['playback']` and `['playback', 'pairing']` under unpaired access. A combined
+  `['playback', 'pairing']` activate routes the pairing entry path with its playback side left
+  running, and pairing no longer quiesces playback.
+
+Remaining (3b):
 
 - D5: `supported_commands` leaves `player@v1_support`; `client/state` always reports `volume`,
   `mute` and (when adjustable) `set_output_delay`.
 - B13: `supported_pair_methods` as an object keyed by method identifier.
-- A6: no `server/hello` / `client/hello` after a re-handshake; the next message is
-  `server/activate`.
-- A4/A5: fragmentation is message ID `1` with a flags byte (bit 1 first, bit 0 last, bits 2-7
-  zero), `orig_type` only on the first fragment. Malformed sequences close the connection: first
-  while in flight, non-first with none in flight, non-fragment while in flight, nonzero reserved
-  bit, `orig_type` of `1`. IDs 2-3 become reserved.
-- D1: audio chunks carry `send_ahead` (big-endian uint32) at bytes 9-12; audio starts at byte 13.
 - C3: `ClientStateMessage` gains `artwork` and `visualizer` objects, built per role like the
   player's `build_state_fields`.
 - E7/E8: artwork channels move from `artwork@v1_support` (deleted) to `client/state`, with the
@@ -145,12 +159,6 @@ Lands as one reviewed series; interop is verified only at its end, in strict mod
 - E1/E2: metadata and color `server/state` objects are full state. Drop the tri-state delta types
   and cross-message merging; an included object replaces the current or pending state. An omitted
   `progress` clears the position.
-- A1/B11: drop `MANAGEMENT` from admission; accept `['playback', 'pairing']` and route the
-  pairing entry path for it; pairing no longer quiesces playback. Two rows of the
-  category-to-activities table are still wrong and are corrected in the same pass: a long-term
-  PSK must not admit `['pairing']` (today `activities_allowed()` accepts it for every category),
-  and a Pairing PSK must admit the empty set, plus `['playback']` when unpaired access is
-  enabled (today it admits only `['pairing']`).
 
 Exit: strict-mode run pairs (Pairing PSK), plays and shows metadata with no rejection.
 
@@ -211,4 +219,6 @@ The controller role, visualizer binary layouts (IDs 16-20), metadata progress ma
 scheduled-update gating, the `client/goodbye` reason set, the 30 second provisional timeout, the
 activity-rank arbitration and last-playback tiebreak, the stored-`server_id` post-match check,
 arrival time taken after decrypt and reassembly, `available: true` gated on time-filter
-convergence, `stream/clear` buffer discard, mid-stream format switches.
+convergence, `stream/clear` buffer discard, mid-stream format switches, and, since phase 3a, the
+fragmentation wire format, the audio chunk header, the post-re-handshake sequence and the
+category-to-activities table.

@@ -764,9 +764,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         const bool selects_pairing = is_pairing_selection_activate(activities, pairing_method);
 
         // The pairing-selection check runs on every activate, first or not, and takes
-        // priority over the operational branch: mirrors the reference's
-        // _handle_server_activate, which checks self.is_pairing before resuming time
-        // sync or sending client/state, on every activate. This matters because a
+        // priority over the plain operational branch. This matters because a
         // server rehandshaking an already-admitted connection onto the pairing PSK
         // resets first_activate_received_, so the resulting pairing activate arrives
         // looking like a first activate; routing it into the operational branch would
@@ -778,12 +776,16 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
             // ==== Pairing leftover activate ====
             // Pairing was in progress and the server sent another server/activate
             // instead of server/pair-finalize: it abandoned pairing without
-            // finalizing. This fires even when the new activate itself selects pairing
-            // again: that combination is not special-cased and takes this same branch,
-            // matching prior behavior. Mirrors the reference's leftover branch: the
-            // activate was already applied normally above; going operational discards
-            // any pending record and resets the PIN session structurally (see the
-            // comment on SendspinClient::on_handshake_complete()).
+            // finalizing. The activate was already applied normally above; going
+            // operational discards any pending record and resets the PIN session
+            // structurally (see the comment on
+            // SendspinClient::on_handshake_complete()).
+            // pairing.md "Entering and leaving pairing" admits one pairing attempt per
+            // pairing server/activate, so an activate that selects pairing again ends
+            // the abandoned attempt and starts the one it admits, rather than only
+            // going operational: its pairing_index was already counted, and a server
+            // that sent it is waiting for the client/pair-init that opens the new
+            // attempt.
             // Two paths reset first_activate_received_ on an already-admitted
             // connection: an in-band re-handshake (handle_noise_rehandshake(), which
             // also clears pairing_in_progress_, so that path always reaches here with
@@ -798,6 +800,13 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                     "state and going operational for server_id=%s",
                     event.conn->get_server_id().c_str());
             this->client_->on_handshake_complete(event.conn.get());
+            if (selects_pairing) {
+                SS_LOGI(TAG,
+                        "Leftover activate selects pairing again (%s): starting the "
+                        "attempt it admits for server_id=%s",
+                        to_cstr(pairing_method.value()), event.conn->get_server_id().c_str());
+                this->handle_enter_pairing(event.conn.get());
+            }
         } else if (selects_pairing) {
             // ==== Activate selects pairing ====
             // Reached both when the operator initiates pairing on an already-
@@ -1008,8 +1017,8 @@ void ConnectionManager::scan_hello_and_nursery() {
 
 void ConnectionManager::scan_pin_attempt_timeout() {
     // ==== Dynamic-PIN attempt timeout ====
-    // Abort a dynamic-PIN exchange that has stalled past PIN_ATTEMPT_TIMEOUT_US (mirrors the
-    // reference's per-attempt timeout). local_abort_pin_pairing also clears the displayed PIN.
+    // Abort a dynamic-PIN exchange that has stalled past PIN_ATTEMPT_TIMEOUT_US (pairing.md
+    // "Entering and leaving pairing"). local_abort_pin_pairing also clears the displayed PIN.
     // Only the current connection can host a PIN session (see the pairing branch in
     // promote_or_arbitrate_nursery_entry()).
     std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
@@ -1019,6 +1028,16 @@ void ConnectionManager::scan_pin_attempt_timeout() {
         // attempt_deadline_us keeps counting down against an exchange that has already succeeded.
         // Skip the scan for that window so a slow rekey cannot abort a completed pairing.
         if (this->current_connection_->is_pairing_finalized()) {
+            return;
+        }
+        // connection.md "Re-handshake": between Noise message 1 and the new server/activate the
+        // client starts no application message but the handshake, which a pair/abort would be.
+        // first_activate_received() is false for exactly that window, so the abort waits for the
+        // activation; if it never comes, scan_reprove_watchdog() closes the connection instead
+        // and the attempt ends with it. pairing.md "Entering and leaving pairing" bounds an
+        // attempt with a timeout "on expiry it sends pair/abort"; the re-handshake rule is the
+        // narrower MUST NOT, and the wait it imposes is bounded by REPROVE_TIMEOUT_US.
+        if (!this->current_connection_->first_activate_received()) {
             return;
         }
         const auto& ps = this->current_connection_->pin_session();
@@ -1062,8 +1081,15 @@ void ConnectionManager::scan_reprove_watchdog() {
                     "(server_id=%s); dropping",
                     static_cast<int>(REPROVE_TIMEOUT_US / US_PER_SECOND),
                     this->current_connection_->get_server_id().c_str());
-            this->drop_connection(this->current_connection_.get(),
-                                  SendspinGoodbyeReason::ANOTHER_SERVER);
+            // Closed without a goodbye. One of the two windows this reaps starts at Noise
+            // message 1, and connection.md "Re-handshake" lets the client start no application
+            // message there but the handshake; the other ends at a rekey the peer has already
+            // failed to perform. No goodbye reason describes either, and the peer learns the
+            // same thing from the close. close_silently() tears the transport down here (it is
+            // non-blocking on every platform), so the nullopt release below has nothing left to
+            // send and only has to let the connection go.
+            this->current_connection_->close_silently(SendspinGoodbyeReason::ANOTHER_SERVER);
+            this->drop_connection(this->current_connection_.get(), std::nullopt);
         }
     }
 }

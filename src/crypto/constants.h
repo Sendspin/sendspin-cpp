@@ -82,9 +82,10 @@ static constexpr size_t MAX_HANDSHAKE_MESSAGE_BYTES = 512;
 /// @brief Per-connection reassembly buffer cap: 1 MiB.
 /// The largest legitimate fragmented message is album artwork (a single JPEG/PNG image);
 /// typical artwork payloads for embedded display targets are well under 1 MiB. The cap bounds
-/// how much heap an authenticated peer can force this connection to reserve; capacity is
-/// retained at the high-water mark for the connection's life, so the cap is also the
-/// worst-case steady-state pin.
+/// how large a message an authenticated peer can force this connection to reassemble. The
+/// buffer behind it grows geometrically and keeps its capacity for the connection's life, so
+/// the worst-case steady-state pin is the first doubling that clears the cap, up to just under
+/// 2 MiB.
 static constexpr size_t MAX_REASSEMBLED_MESSAGE_BYTES = 1UL * 1024UL * 1024UL;
 
 // ============================================================================
