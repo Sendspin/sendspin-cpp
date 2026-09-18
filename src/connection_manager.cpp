@@ -48,6 +48,19 @@ static const char* const TAG = "sendspin.conn_mgr";
 static constexpr int64_t WS_SERVER_START_RETRY_MS = 5000LL;
 static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * US_PER_MS;
 
+/// @brief Refuses an activation the client cannot act on, leaving the connection open
+///
+/// pairing.md "Client <-> Server: pair/abort" answers a method or format the client does not offer
+/// with pair/abort rather than a close, so the activation is never applied. The role bits the
+/// network thread added for it when it parsed the message (see
+/// SendspinConnection::note_activated_roles()) are taken back in the same step, so the receive
+/// gate cannot be widened by an activation the client refused.
+/// @param conn The connection the refused activation arrived on.
+static void refuse_activate(SendspinConnection* conn) {
+    conn->restore_role_mask();
+    conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
+}
+
 /// @brief Transport-establishment progress of a nursery connection, used for reap diagnostics
 ///
 /// Derived on demand from the connection's proven flags rather than stored, so it can never go
@@ -724,8 +737,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                 "for server_id=%s; replying pair/abort(method_not_supported), "
                 "connection stays open",
                 event.conn->get_server_id().c_str());
-        event.conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED),
-                                  nullptr);
+        refuse_activate(event.conn.get());
         return;
     }
 
@@ -760,8 +772,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                     "server_id=%s; replying pair/abort(method_not_supported), "
                     "connection stays open",
                     to_cstr(method), event.conn->get_server_id().c_str());
-            event.conn->send_app_json(
-                format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
+            refuse_activate(event.conn.get());
             return;
         }
 
@@ -777,8 +788,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                     "dynamic_pairing_code on server_id=%s; replying "
                     "pair/abort(method_not_supported), connection stays open",
                     event.conn->get_server_id().c_str());
-            event.conn->send_app_json(
-                format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
+            refuse_activate(event.conn.get());
             return;
         }
     }

@@ -704,6 +704,18 @@ public:
         this->active_role_mask_.fetch_or(active_role_mask(active_roles), std::memory_order_acq_rel);
     }
 
+    /// @brief Rebuilds the active-role mask from the roles that are actually applied.
+    ///
+    /// Main-loop only. note_activated_roles() adds a just-received activation's roles on the
+    /// network thread, before admissibility is judged. An activation the main loop then rejects
+    /// while keeping the connection open never reaches apply_server_activate(), so the bits it
+    /// added are taken back here; otherwise the receive gate would go on admitting traffic for a
+    /// role this client never activated.
+    void restore_role_mask() {
+        this->active_role_mask_.store(active_role_mask(this->active_roles_),
+                                      std::memory_order_release);
+    }
+
     /// @brief Returns true if `role` is active on this connection, judged on the exact versioned
     /// name this library implements.
     ///

@@ -96,6 +96,7 @@ constexpr uint16_t ROLE_ADDED_STATE_TEST_PORT = 19017;
 constexpr uint16_t METADATA_SCHEDULE_TEST_PORT = 19018;
 constexpr uint16_t METADATA_PENDING_TEST_PORT = 19019;
 constexpr uint16_t LOSE_CAPABILITY_TEST_PORT = 19041;
+constexpr uint16_t REFUSED_ACTIVATE_TEST_PORT = 19042;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -1524,6 +1525,97 @@ TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing)
     EXPECT_TRUE(pump_until(
         client, [&] { return !server.controller_commands().empty(); }, 4000))
         << "the roles the combined activate declared must be active";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// A refused activation activates nothing, so it must not widen what the client will receive
+// either. The receive gate reads a mask the network thread adds an activation's roles to as it
+// parses the message, before the main loop judges admissibility; an activation answered with
+// pair/abort (pairing.md "Client <-> Server: pair/abort") keeps the connection but never reaches
+// the apply step, so those bits have to be taken back with the refusal.
+TEST(EncryptedLifecycle, RefusedActivateDoesNotWidenTheReceiveGate) {
+    TestNetworkProvider network;
+    PairingCapturePersistenceProvider persistence;
+    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xC9);
+
+    SendspinClientConfig config;
+    config.name = "Refused Activate Gate Test Client";
+    config.server_port = REFUSED_ACTIVATE_TEST_PORT;
+    // No out-channel, so dynamic_pairing_code is never offered and an activation selecting it is
+    // refused while the connection stays open.
+    config.pairing_code_out_channels.clear();
+
+    struct CountingControllerListener : ControllerRoleListener {
+        std::atomic<int> updates{0};
+        void on_controller_state(const ServerStateControllerObject& /*state*/) override {
+            this->updates.fetch_add(1);
+        }
+    };
+    CountingControllerListener controller_listener;
+    struct CountingMetadataListener : MetadataRoleListener {
+        std::atomic<int> updates{0};
+        void on_metadata(const ServerMetadataStateObject& /*m*/) override {
+            this->updates.fetch_add(1);
+        }
+    };
+    CountingMetadataListener metadata_listener;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    client.add_controller().set_listener(&controller_listener);
+    client.add_metadata().set_listener(&metadata_listener);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    Identity server_identity = Identity::generate().value();
+    FakeEncryptedServerOptions options;
+    options.psk_category = "pr";
+    options.first_activities_json = R"(["playback"])";
+    options.first_roles_json = R"(["metadata@v1"])";
+    FakeEncryptedServer server(server_url(REFUSED_ACTIVATE_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
+                               pairing_psk.psk_id, pairing_psk.psk, options);
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "the unpaired-access playback connection never came up";
+
+    // A later activation that names the controller role and selects a method the client does not
+    // offer: refused with pair/abort, connection kept, nothing activated.
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback","pairing"],)"
+        R"("active_roles":["metadata@v1","controller@v1"],)"
+        R"("pairing":{"method":"dynamic_pairing_code","format":"digits"}}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return !server.pair_abort_reasons().empty(); }, 4000))
+        << "an activation naming an unoffered method must be answered with pair/abort";
+    EXPECT_FALSE(server.closed());
+
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/state","payload":{"controller":{"supported_commands":["play"],)"
+        R"("volume":42,"muted":false,"repeat":"off","shuffle":false}}})"));
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Still Active"}}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return metadata_listener.updates.load() == 1; }, 4000))
+        << "the role the refused activation did not touch must keep receiving";
+    EXPECT_EQ(controller_listener.updates.load(), 0)
+        << "a refused activation left the controller role able to receive";
+
+    // Control: an activation the client accepts puts the same role in service, and the same state
+    // is applied.
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["metadata@v1","controller@v1"]}})"));
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/state","payload":{"controller":{"supported_commands":["play"],)"
+        R"("volume":42,"muted":false,"repeat":"off","shuffle":false}}})"));
+    EXPECT_TRUE(pump_until(
+        client, [&] { return controller_listener.updates.load() == 1; }, 4000))
+        << "an accepted activation must put the role in service";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
