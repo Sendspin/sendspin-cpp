@@ -676,6 +676,10 @@ public:
 
     /// @brief Sends a role-originated text message over the active connection
     ///
+    /// Every message sent on a role's behalf carries the role it belongs to, so the activation
+    /// gate below cannot be forgotten at a call site. The client's own messages (hello, state,
+    /// time, goodbye, leave, pairing) do not come through here.
+    ///
     /// Dropped unless that role is active on the connection: messaging.md "server/activate"
     /// tolerates inactive-role objects on the server side precisely because a client that has
     /// received the role removal stops sending them. Also suppressed while the connection's last

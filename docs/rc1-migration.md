@@ -190,6 +190,18 @@ Exit: strict-mode dynamic and static code pairing against the harness.
 - Run the docs-sync, house-patterns, embedded-review and test-standards reviews, then update the
   ESPHome hub.
 
+## Residual gaps
+
+Known and accepted for now, recorded so they are not rediscovered as surprises:
+
+- Binary messages (audio, artwork, visualizer frames) that arrive between `server/activate` and
+  admission are still dropped; only the JSON half of that window is held and replayed. A player
+  resynchronizes from the next chunk and artwork re-sends on its next frame, so the cost is
+  bounded, but a stream's first chunks can be lost this way.
+- `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
+  started gating on activation. It is a public method under "Role services", so a consumer calling
+  it directly must pass the role the message belongs to.
+
 ## Verified conformant (no work)
 
 The controller role, visualizer binary layouts (IDs 16-20), metadata progress math and
