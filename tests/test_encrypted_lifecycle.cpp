@@ -115,7 +115,20 @@ public:
         this->seeded_long_term_record_ = std::move(record);
     }
 
+    /// Seeds the stored pairing config. A configured Pairing PSK counts as provisioned material,
+    /// so SendspinClientConfig's first-boot unpaired-access seed no longer applies and the stored
+    /// config is the only way to turn unpaired access on. Must be called before start().
+    void set_unpaired_access_enabled(bool enabled) {
+        this->unpaired_access_enabled_ = enabled;
+    }
+
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        if (key == persistence_keys::PAIR_CONFIG) {
+            SendspinPairingConfig config;
+            config.unpaired_access_enabled = this->unpaired_access_enabled_;
+            std::string encoded = encode_pairing_config(config);
+            return std::vector<uint8_t>(encoded.begin(), encoded.end());
+        }
         if (key == persistence_keys::PAIRING_PSK && this->configured_pairing_psk_.has_value()) {
             std::string encoded = encode_pairing_psk(this->configured_pairing_psk_.value());
             return std::vector<uint8_t>(encoded.begin(), encoded.end());
@@ -174,6 +187,7 @@ private:
     bool reject_pairing_records_{false};
     std::optional<SendspinPairingPsk> configured_pairing_psk_;
     std::optional<SendspinPairingRecord> seeded_long_term_record_;
+    bool unpaired_access_enabled_{false};
 };
 
 // Records on_trust_changed / on_pairing_succeeded notifications so the pairing-flow test can
@@ -955,10 +969,12 @@ TEST(EncryptedLifecycle, LeaveWaitsForTheActivateThatFollowsAReHandshake) {
     pump_for(client, 100);
 }
 
-// A connection whose activation declares a pairing activity carries no group playback to leave,
-// and pairing.md "Entering and leaving pairing" leaves the exchange to run undisturbed until the
-// server sends the activate that ends it. client/leave is refused there, like client/state.
-TEST(EncryptedLifecycle, LeaveIsRefusedWhilePairing) {
+// pairing.md "Entering and leaving pairing": pairing runs alongside playback, and a
+// server/activate that adds 'pairing' does not by itself affect active_roles, streams or group
+// membership. messaging.md "server/activate" lists ['playback', 'pairing'] as an allowed set for
+// the Pairing PSK when unpaired access is enabled, so such an activation must both enter the
+// pairing path and leave the playback side of the connection running.
+TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
     std::array<uint8_t, 32> pairing_psk_bytes{};
@@ -969,12 +985,14 @@ TEST(EncryptedLifecycle, LeaveIsRefusedWhilePairing) {
     configured_pairing_psk.psk_id = psk_id_for(pairing_psk_bytes);
     configured_pairing_psk.psk = pairing_psk_bytes;
     persistence.set_configured_pairing_psk(configured_pairing_psk);
+    persistence.set_unpaired_access_enabled(true);
 
     SendspinClientConfig config;
-    config.name = "Leave Pairing Test Client";
+    config.name = "Playback With Pairing Test Client";
     config.server_port = LEAVE_PAIRING_TEST_PORT;
 
     SendspinClient client(config);
+    auto& controller = client.add_controller();
     client.set_network_provider(&network);
     client.set_persistence_provider(&persistence);
     ASSERT_TRUE(client.start());
@@ -982,22 +1000,50 @@ TEST(EncryptedLifecycle, LeaveIsRefusedWhilePairing) {
 
     Identity server_identity = Identity::generate().value();
     FakeEncryptedServerOptions options;
-    options.first_activities_json = R"(["pairing"])";
-    options.first_roles_json = R"([])";
-    options.first_pairing_method = "pairing_psk";
     options.psk_category = "pr";
+    options.suppress_activate = true;  // Every activate in this test is sent by hand.
+    // Holding the attempt in flight keeps the connection on the activation it was admitted with,
+    // instead of rewinding it to await the post-pairing rekey's activate.
+    options.withhold_pair_finalize_ack = true;
     FakeEncryptedServer server(server_url(LEAVE_PAIRING_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                configured_pairing_psk.psk_id, pairing_psk_bytes, options);
 
-    // The pairing activate has been applied by the time the attempt reaches pair-finalize.
     ASSERT_TRUE(pump_until(
-        client, [&] { return server.learned_psk_id().has_value(); }, 4000));
+        client, [&] { return server.client_hello_count() > 0; }, 4000));
 
+    // Playback first, on the Pairing PSK: allowed because unpaired access is enabled.
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["controller@v1"]}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+    controller.send_command({.command = SendspinControllerCommand::PLAY});
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.controller_commands().size() == 1; }, 4000));
     client.leave();
-    pump_for(client, 50);
-    EXPECT_EQ(server.client_leave_count(), 0)
-        << "client/leave was sent on a connection whose activation declares pairing";
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.client_leave_count() == 1; }, 4000));
+
+    // The same connection now also declares pairing, keeping its role.
+    ASSERT_TRUE(server.send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback","pairing"],)"
+        R"("active_roles":["controller@v1"],"pairing":{"method":"pairing_psk"}}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.pair_init().has_value(); }, 4000))
+        << "a combined playback+pairing activate must enter the pairing path";
+
+    EXPECT_TRUE(client.is_connected())
+        << "adding pairing must not take the connection out of its operational state";
+    controller.send_command({.command = SendspinControllerCommand::PAUSE});
+    ASSERT_TRUE(pump_until(
+        client, [&] { return server.controller_commands().size() == 2; }, 4000))
+        << "adding pairing must not stop an active role's traffic";
+    EXPECT_EQ(server.controller_commands().back(), "pause");
+    client.leave();
+    EXPECT_TRUE(pump_until(
+        client, [&] { return server.client_leave_count() == 2; }, 4000))
+        << "adding pairing must not affect group membership";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

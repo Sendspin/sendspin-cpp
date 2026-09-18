@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Unit tests for the admission/trust enforcement and arbitration functions.
-// Mirrors the reference decision logic in:
-//   aiosendspin/aiosendspin/client/connection.py:_activities_allowed/_admissible
-//   aiosendspin/aiosendspin/client/client.py:_activity_rank/_should_admit_connection
+// Unit tests for the admission/trust enforcement and arbitration functions: the allowed-activity
+// -set table and rejection order in messaging.md "server/activate", and the priority rules in
+// connection.md "Multiple servers (server-initiated)".
 
 #include "admission.h"
 #include "protocol_messages.h"
@@ -43,13 +42,20 @@ static const auto PB = SendspinActivity::PLAYBACK;
 static const auto PR = SendspinActivity::PAIRING;
 
 // ============================================================================
-// activities_allowed tests: exhaustive over PskCategory x activity_set x unpaired_access
+// activities_allowed: every row of the messaging.md "server/activate" table, over
+// PskCategory x activity set x unpaired_access
 // ============================================================================
 
-// SENTINEL category
+// SENTINEL row: [], ['pairing'], and (on unpaired access) ['playback'], ['playback', 'pairing'].
 TEST(ActivitiesAllowed, SentinelEmpty_IsAllowed) {
     EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(), false));
     EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(), true));
+}
+
+TEST(ActivitiesAllowed, SentinelPairing_IsAllowed) {
+    // Pairing is what the Sentinel PSK exists for, so unpaired access does not gate it.
+    EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(PR), false));
+    EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(PR), true));
 }
 
 TEST(ActivitiesAllowed, SentinelPlayback_OnlyWithUnpairedAccess) {
@@ -57,19 +63,36 @@ TEST(ActivitiesAllowed, SentinelPlayback_OnlyWithUnpairedAccess) {
     EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(PB), true));
 }
 
-TEST(ActivitiesAllowed, SentinelPairing_OnlyExactlyPairing) {
-    // {PAIRING} is ok for Sentinel (handled by the "only {PAIRING}" path)
-    EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(PR), false));
-    EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(PR), true));
-}
-
-TEST(ActivitiesAllowed, SentinelPairingPlayback_NotAllowed) {
-    // {PAIRING, PLAYBACK} is not ok: pairing must be alone
+TEST(ActivitiesAllowed, SentinelPlaybackPairing_OnlyWithUnpairedAccess) {
     EXPECT_FALSE(activities_allowed(PskCategory::SENTINEL, acts(PR, PB), false));
-    EXPECT_FALSE(activities_allowed(PskCategory::SENTINEL, acts(PR, PB), true));
+    EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(PR, PB), true));
+    // Order is not significant: the members are an unordered set.
+    EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(PB, PR), true));
 }
 
-// LONG_TERM category
+// PAIRING row (the Pairing PSK): identical to the Sentinel row.
+TEST(ActivitiesAllowed, PairingCatEmpty_IsAllowed) {
+    EXPECT_TRUE(activities_allowed(PskCategory::PAIRING, acts(), false));
+    EXPECT_TRUE(activities_allowed(PskCategory::PAIRING, acts(), true));
+}
+
+TEST(ActivitiesAllowed, PairingCatPairing_IsAllowed) {
+    EXPECT_TRUE(activities_allowed(PskCategory::PAIRING, acts(PR), false));
+    EXPECT_TRUE(activities_allowed(PskCategory::PAIRING, acts(PR), true));
+}
+
+TEST(ActivitiesAllowed, PairingCatPlayback_OnlyWithUnpairedAccess) {
+    EXPECT_FALSE(activities_allowed(PskCategory::PAIRING, acts(PB), false));
+    EXPECT_TRUE(activities_allowed(PskCategory::PAIRING, acts(PB), true));
+}
+
+TEST(ActivitiesAllowed, PairingCatPlaybackPairing_OnlyWithUnpairedAccess) {
+    EXPECT_FALSE(activities_allowed(PskCategory::PAIRING, acts(PR, PB), false));
+    EXPECT_TRUE(activities_allowed(PskCategory::PAIRING, acts(PR, PB), true));
+}
+
+// LONG_TERM row: [] or ['playback'], and nothing that declares pairing. A paired server has no
+// use for a pairing activity, and unpaired access does not enter into it.
 TEST(ActivitiesAllowed, LongTermEmpty_IsAllowed) {
     EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(), false));
     EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(), true));
@@ -80,48 +103,50 @@ TEST(ActivitiesAllowed, LongTermPlayback_IsAllowed) {
     EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(PB), true));
 }
 
-TEST(ActivitiesAllowed, LongTermPairing_OnlyExactlyPairing) {
-    // {PAIRING} alone is allowed (by the general "only {PAIRING}" check)
-    EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(PR), false));
+TEST(ActivitiesAllowed, LongTermPairing_NotAllowed) {
+    EXPECT_FALSE(activities_allowed(PskCategory::LONG_TERM, acts(PR), false));
+    EXPECT_FALSE(activities_allowed(PskCategory::LONG_TERM, acts(PR), true));
 }
 
-TEST(ActivitiesAllowed, LongTermPairingPlayback_NotAllowed) {
+TEST(ActivitiesAllowed, LongTermPlaybackPairing_NotAllowed) {
     EXPECT_FALSE(activities_allowed(PskCategory::LONG_TERM, acts(PR, PB), false));
-}
-
-// PAIRING category (the Pairing PSK)
-TEST(ActivitiesAllowed, PairingCatPairing_IsAllowed) {
-    EXPECT_TRUE(activities_allowed(PskCategory::PAIRING, acts(PR), false));
-    EXPECT_TRUE(activities_allowed(PskCategory::PAIRING, acts(PR), true));
-}
-
-TEST(ActivitiesAllowed, PairingCatEmpty_NotAllowed) {
-    // PAIRING category admits only {PAIRING}; falls through to "return false"
-    EXPECT_FALSE(activities_allowed(PskCategory::PAIRING, acts(), false));
-    EXPECT_FALSE(activities_allowed(PskCategory::PAIRING, acts(), true));
-}
-
-TEST(ActivitiesAllowed, PairingCatPlayback_NotAllowed) {
-    EXPECT_FALSE(activities_allowed(PskCategory::PAIRING, acts(PB), false));
-    EXPECT_FALSE(activities_allowed(PskCategory::PAIRING, acts(PB), true));
-}
-
-TEST(ActivitiesAllowed, PairingCatPairingPlayback_NotAllowed) {
-    EXPECT_FALSE(activities_allowed(PskCategory::PAIRING, acts(PR, PB), false));
+    EXPECT_FALSE(activities_allowed(PskCategory::LONG_TERM, acts(PR, PB), true));
 }
 
 // ============================================================================
-// admissible tests: checks the has_roles interaction
+// is_playback_capable: activities extended with 'playback' must also be an allowed set
+// ============================================================================
+
+TEST(PlaybackCapable, LongTermIsCapableUntilItDeclaresPairing) {
+    EXPECT_TRUE(is_playback_capable(PskCategory::LONG_TERM, acts(), false));
+    EXPECT_TRUE(is_playback_capable(PskCategory::LONG_TERM, acts(PB), false));
+    // ['pairing'] extended with playback is ['playback', 'pairing'], which the long-term row
+    // does not list, so such a connection may carry no roles.
+    EXPECT_FALSE(is_playback_capable(PskCategory::LONG_TERM, acts(PR), false));
+}
+
+TEST(PlaybackCapable, UnpairedCategoriesTrackUnpairedAccess) {
+    for (PskCategory cat : {PskCategory::SENTINEL, PskCategory::PAIRING}) {
+        EXPECT_FALSE(is_playback_capable(cat, acts(), false));
+        EXPECT_FALSE(is_playback_capable(cat, acts(PR), false));
+        EXPECT_TRUE(is_playback_capable(cat, acts(), true));
+        EXPECT_TRUE(is_playback_capable(cat, acts(PR), true));
+        EXPECT_TRUE(is_playback_capable(cat, acts(PR, PB), true));
+    }
+}
+
+// ============================================================================
+// admissible: the allowed-set check plus the playback-capable requirement on active_roles
 // ============================================================================
 
 TEST(Admissible, SentinelEmptyNoRoles_Admissible) {
     EXPECT_TRUE(admissible(PskCategory::SENTINEL, acts(), false, false));
 }
 
-TEST(Admissible, SentinelEmptyHasRoles_NotAdmissible) {
-    // {} + has_roles requires playback-capable, but SENTINEL+{PLAYBACK} requires unpaired_access
+TEST(Admissible, SentinelEmptyHasRoles_RequiresUnpairedAccess) {
+    // [] is allowed either way, but roles need the connection to be playback-capable, and
+    // ['playback'] is a Sentinel set only on unpaired access.
     EXPECT_FALSE(admissible(PskCategory::SENTINEL, acts(), true, false));
-    // with unpaired_access=true: {} is allowed, then {} | {PB} = {PB} is also allowed
     EXPECT_TRUE(admissible(PskCategory::SENTINEL, acts(), true, true));
 }
 
@@ -131,9 +156,16 @@ TEST(Admissible, SentinelPlaybackNoRoles_RequiresUnpairedAccess) {
 }
 
 TEST(Admissible, SentinelPlaybackHasRoles_RequiresUnpairedAccess) {
-    // {PB} + has_roles: {PB} | {PB} = {PB} still requires unpaired_access
     EXPECT_FALSE(admissible(PskCategory::SENTINEL, acts(PB), true, false));
     EXPECT_TRUE(admissible(PskCategory::SENTINEL, acts(PB), true, true));
+}
+
+TEST(Admissible, SentinelPairingHasRoles_RequiresUnpairedAccess) {
+    // ['pairing'] is allowed with unpaired access off, but roles on it are not: the connection
+    // would not be playback-capable.
+    EXPECT_TRUE(admissible(PskCategory::SENTINEL, acts(PR), false, false));
+    EXPECT_FALSE(admissible(PskCategory::SENTINEL, acts(PR), true, false));
+    EXPECT_TRUE(admissible(PskCategory::SENTINEL, acts(PR), true, true));
 }
 
 TEST(Admissible, LongTermPlaybackNoRoles_Admissible) {
@@ -145,25 +177,30 @@ TEST(Admissible, LongTermPlaybackHasRoles_Admissible) {
     EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(PB), true, false));
 }
 
-TEST(Admissible, LongTermPairing_AdmissibleOnlyWithoutRoles) {
-    // {PAIRING} allowed; {PAIRING} | {PB} = {PB, PAIRING} not allowed (pairing must be alone)
-    EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(PR), false, false));
+TEST(Admissible, LongTermEmptyHasRoles_Admissible) {
+    // A long-term connection is playback-capable even while idle, so it may hold roles.
+    EXPECT_TRUE(admissible(PskCategory::LONG_TERM, acts(), true, false));
+}
+
+TEST(Admissible, LongTermPairing_NotAdmissible) {
+    EXPECT_FALSE(admissible(PskCategory::LONG_TERM, acts(PR), false, false));
     EXPECT_FALSE(admissible(PskCategory::LONG_TERM, acts(PR), true, false));
 }
 
-TEST(Admissible, PairingCatPairing_AdmissibleOnlyWithoutRoles) {
-    // {PAIRING} allowed; + has_roles: {PAIRING}|{PB} = {PB, PAIRING} not allowed
+TEST(Admissible, PairingCatEmpty_Admissible) {
+    EXPECT_TRUE(admissible(PskCategory::PAIRING, acts(), false, false));
+}
+
+TEST(Admissible, PairingCatPairing_AdmissibleAndCarriesRolesOnUnpairedAccess) {
     EXPECT_TRUE(admissible(PskCategory::PAIRING, acts(PR), false, false));
     EXPECT_FALSE(admissible(PskCategory::PAIRING, acts(PR), true, false));
+    EXPECT_TRUE(admissible(PskCategory::PAIRING, acts(PR), true, true));
 }
 
-TEST(Admissible, PairingCatEmpty_NotAdmissible) {
-    EXPECT_FALSE(admissible(PskCategory::PAIRING, acts(), false, false));
-}
-
-TEST(Admissible, PairingCatPlayback_NotAdmissible) {
-    EXPECT_FALSE(admissible(PskCategory::PAIRING, acts(PB), false, false));
-    EXPECT_FALSE(admissible(PskCategory::PAIRING, acts(PB), true, false));
+TEST(Admissible, PairingCatPlaybackPairing_RequiresUnpairedAccess) {
+    // The combined set a server declares when it pairs a client mid-playback.
+    EXPECT_FALSE(admissible(PskCategory::PAIRING, acts(PR, PB), true, false));
+    EXPECT_TRUE(admissible(PskCategory::PAIRING, acts(PR, PB), true, true));
 }
 
 // ============================================================================
@@ -198,14 +235,23 @@ TEST(RejectReason, SentinelEmptyHasRolesNoUnpaired_PairingRequired) {
               SendspinGoodbyeReason::PAIRING_REQUIRED);
 }
 
-TEST(RejectReason, LongTermPairingPlayback_Unauthorized) {
-    // {PAIRING, PLAYBACK} is not allowed at all for LONG_TERM, not just with unpaired_access.
-    EXPECT_EQ(reject_reason_for(PskCategory::LONG_TERM, acts(PR, PB), false, false),
-              SendspinGoodbyeReason::UNAUTHORIZED);
+TEST(RejectReason, PairingCatPlaybackNoUnpaired_PairingRequired) {
+    // The Pairing PSK gates playback on unpaired access exactly as the Sentinel PSK does, so it
+    // reaches the same first rule.
+    EXPECT_EQ(reject_reason_for(PskCategory::PAIRING, acts(PB), false, false),
+              SendspinGoodbyeReason::PAIRING_REQUIRED);
+    EXPECT_EQ(reject_reason_for(PskCategory::PAIRING, acts(PR, PB), false, false),
+              SendspinGoodbyeReason::PAIRING_REQUIRED);
 }
 
-TEST(RejectReason, PairingCatPlayback_Unauthorized) {
-    EXPECT_EQ(reject_reason_for(PskCategory::PAIRING, acts(PB), false, false),
+TEST(RejectReason, LongTermPairing_Unauthorized) {
+    // Pairing is not a long-term activity set under any setting, so enabling unpaired access
+    // would not have admitted it: this is a permanent refusal.
+    EXPECT_EQ(reject_reason_for(PskCategory::LONG_TERM, acts(PR), false, false),
+              SendspinGoodbyeReason::UNAUTHORIZED);
+    EXPECT_EQ(reject_reason_for(PskCategory::LONG_TERM, acts(PR, PB), false, false),
+              SendspinGoodbyeReason::UNAUTHORIZED);
+    EXPECT_EQ(reject_reason_for(PskCategory::LONG_TERM, acts(PR), false, true),
               SendspinGoodbyeReason::UNAUTHORIZED);
 }
 

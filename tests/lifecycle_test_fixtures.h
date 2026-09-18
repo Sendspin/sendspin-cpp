@@ -450,6 +450,10 @@ struct FakeEncryptedServerOptions {
     // (so its psk_id/category are resolved) and the hello exchange, but never proves itself, so
     // it stays in the nursery instead of being promoted.
     bool suppress_activate{false};
+    // When true, client/pair-finalize is recorded but never acked, so the pairing attempt stays
+    // in flight and the connection keeps the activation it was admitted on. Tests that need to
+    // observe a connection mid-attempt set this; the pairing flows themselves leave it off.
+    bool withhold_pair_finalize_ack{false};
     // When true, every client/time is answered with a server/time whose clock is the client's
     // own (both sides read platform_time_us(), so the offset is ~0 and audio timestamps mean
     // what they say). Off by default: a peer that never answers keeps the time burst open, which
@@ -778,7 +782,9 @@ private:
                     this->learned_psk_ = psk;
                     this->learned_psk_id_ = psk_id_for(psk);
                 }
-                this->send_encrypted_locked(R"({"type":"server/pair-finalize","payload":{}})");
+                if (!this->options_.withhold_pair_finalize_ack) {
+                    this->send_encrypted_locked(R"({"type":"server/pair-finalize","payload":{}})");
+                }
             }
             return;
         }

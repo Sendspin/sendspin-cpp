@@ -632,8 +632,8 @@ public:
     /// update_state() instead.
     ///
     /// Only meaningful while the group is playing: a client in a stopped group keeps its
-    /// grouping by staying. Ignored, with a log, unless a connection is admitted and has sent
-    /// its first server/activate, and while that activation declares a pairing activity.
+    /// grouping by staying. Ignored, with a log, unless a connection is admitted and its latest
+    /// server/activate has arrived.
     void leave();
 
     // ========================================
@@ -682,8 +682,8 @@ public:
     ///
     /// Dropped unless that role is active on the connection: messaging.md "server/activate"
     /// tolerates inactive-role objects on the server side precisely because a client that has
-    /// received the role removal stops sending them. Also suppressed while the connection's last
-    /// activation declares a pairing activity, like client/state.
+    /// received the role removal stops sending them. Also held, like client/state, while a
+    /// re-handshake awaits the server/activate that follows it.
     /// @param text The text message to send
     /// @param role_family Role family the message belongs to, without the version suffix
     ///                    ("controller", "visualizer"), matched against the active roles

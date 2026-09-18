@@ -159,14 +159,15 @@ static std::vector<uint8_t> pake_ad_server() {
     return std::vector<uint8_t>(PAKE_AD_SERVER, PAKE_AD_SERVER + sizeof(PAKE_AD_SERVER) - 1);
 }
 
-/// @brief Whether an applied server/activate selects the pairing flow: exactly one activity
-/// (PAIRING) together with a pairing.method the client recognizes. Shared by every site that
-/// must route such an activate into ConnectionManager::handle_enter_pairing() instead of the
-/// operational path (SendspinClient::on_handshake_complete()).
+/// @brief Whether an applied server/activate selects the pairing flow: the PAIRING activity
+/// together with a pairing.method the client recognizes. Shared by every site that must route
+/// such an activate into ConnectionManager::handle_enter_pairing(). PLAYBACK may ride along
+/// (messaging.md "server/activate" allows ['playback', 'pairing']); when it does, the connection
+/// also takes the operational path (SendspinClient::on_handshake_complete()) rather than
+/// instead of it.
 static bool is_pairing_selection_activate(const std::vector<SendspinActivity>& activities,
                                           const std::optional<SendspinPairMethod>& pairing_method) {
-    if (activities.size() != 1 || activities[0] != SendspinActivity::PAIRING ||
-        !pairing_method.has_value()) {
+    if (!contains_activity(activities, SendspinActivity::PAIRING) || !pairing_method.has_value()) {
         return false;
     }
     return pairing_method.value() == SendspinPairMethod::PAIRING_PSK ||
@@ -631,14 +632,13 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // connection and a fresh handshake will reset the counter anyway), so that a
     // rejected activate does not leave the client permanently behind the server's own
     // count. handle_enter_pairing() reads this value; it must not bump again.
-    const bool is_pairing_activate =
-        event.activities.size() == 1 && event.activities[0] == SendspinActivity::PAIRING;
+    const bool is_pairing_activate = contains_activity(event.activities, SendspinActivity::PAIRING);
     if (is_pairing_activate) {
         event.conn->bump_pairing_index();
     }
 
     // ==== Pairing-method admissibility (spec "pair/abort") ====
-    // Structurally admissible ('pairing' alone is always an allowed activity set),
+    // Structurally admissible already (the activity set passed the table above),
     // but a pairing activate additionally carries a pairing object whose method must
     // (a) match the matched PSK's category (pairing_psk iff the matched PSK IS the
     // Pairing PSK) and (b) currently be offered per the LIVE pairing config, which
@@ -806,6 +806,14 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
             // when the server first rehandshakes the connection onto the pairing PSK
             // (is_first true: see the priority comment above).
             if (!is_first || event.conn->is_handshake_complete()) {
+                // pairing.md "Entering and leaving pairing": adding 'pairing' does not by
+                // itself affect active_roles, streams or group membership. An activate that
+                // declares both purposes therefore runs the operational path as well as the
+                // pairing one, and in that order: going operational clears stale pairing
+                // state, so it has to precede the attempt this activate admits.
+                if (is_first && contains_activity(activities, SendspinActivity::PLAYBACK)) {
+                    this->client_->on_handshake_complete(event.conn.get());
+                }
                 SS_LOGI(TAG,
                         "Activate selects pairing (%s): entering pairing for "
                         "server_id=%s",
@@ -1665,21 +1673,25 @@ std::vector<NurseryEntry>::iterator ConnectionManager::promote_or_arbitrate_nurs
     this->note_playback_activity(this->current_connection_.get());
 
     // ==== Pairing branch ====
-    // If the winning activate declares only the PAIRING activity with a supported
-    // pairing.method, enter the pairing flow instead of the normal operational path. The
-    // connection still occupies current_connection_ (so admission.h's "in-flight pairing is not
-    // displaced" rule applies), but is not announced to the client as operational until pairing
-    // finishes and the post-finalize re-handshake completes.
+    // If the winning activate declares the PAIRING activity with a supported pairing.method,
+    // enter the pairing flow. The connection still occupies current_connection_ (so admission.h's
+    // "in-flight pairing is not displaced" rule applies). An activate declaring pairing alone is
+    // not announced to the client as operational until pairing finishes and the post-finalize
+    // re-handshake completes; one that also declares playback is announced first, because
+    // pairing.md "Entering and leaving pairing" leaves active_roles and streams untouched and
+    // going operational is what clears any stale pairing state before the new attempt.
     const auto& activities = this->current_connection_->get_activities();
     const auto& pairing_method = this->current_connection_->get_pairing_method();
+    const bool selects_pairing = is_pairing_selection_activate(activities, pairing_method);
 
-    if (is_pairing_selection_activate(activities, pairing_method)) {
+    if (!selects_pairing || contains_activity(activities, SendspinActivity::PLAYBACK)) {
+        this->client_->on_handshake_complete(this->current_connection_.get());
+    }
+    if (selects_pairing) {
         SS_LOGI(TAG, "Pairing activate received (%s): entering pairing for server_id=%s",
                 to_cstr(pairing_method.value()),
                 this->current_connection_->get_server_id().c_str());
         this->handle_enter_pairing(this->current_connection_.get());
-    } else {
-        this->client_->on_handshake_complete(this->current_connection_.get());
     }
 
     SS_LOGI(TAG, "Connection admitted: server_id=%s",
@@ -1711,7 +1723,8 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
         return;
     }
 
-    // Quiesce: suppress time sync and client/state while pairing is in progress.
+    // An attempt is in flight from here until it finalizes or aborts: pairing messages are only
+    // routed while it is (pairing.md "Entering and leaving pairing"). Playback is untouched.
     conn->set_pairing_in_progress(true);
 
     // The pairing server/activate counter (spec "Pairing index") was already bumped by the caller

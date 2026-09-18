@@ -16,9 +16,9 @@
 /// @brief Pure functions for server/activate trust enforcement and multi-server admission
 /// arbitration.
 ///
-/// Ports the Python reference:
-///   aiosendspin/aiosendspin/client/connection.py:_activities_allowed/_admissible
-///   aiosendspin/aiosendspin/client/client.py:_activity_rank/_should_admit_connection
+/// Implements the allowed-activity-set table and the rejection order in messaging.md
+/// "server/activate", and the priority arbitration in connection.md "Multiple servers
+/// (server-initiated)".
 ///
 /// All functions are pure (no side effects, no connection state mutations) so they can be
 /// unit-tested independently of the network layer. The admission handler in
@@ -54,21 +54,39 @@ inline bool contains_activity(const std::vector<SendspinActivity>& activities,
     return false;
 }
 
-/// @brief Whether `activities` is an allowed set for the matched PSK category.
+/// @brief Whether an activity set built from the two defined activities is allowed for the
+/// matched PSK category.
 ///
-/// Ports `_activities_allowed` from
-/// aiosendspin/aiosendspin/client/connection.py.
+/// The table in messaging.md "server/activate":
 ///
-/// What the code does today, in the order it decides:
-///   - PAIRING present in activities -> allowed for ANY category, and only as {PAIRING}.
-///   - LONG_TERM category -> the empty set or {PLAYBACK}.
-///   - SENTINEL category -> the empty set is ok; {PLAYBACK} is ok IFF unpaired_access.
-///   - PAIRING category -> nothing beyond the {PAIRING} the first branch already took.
+///   | PSK matched  | Allowed activity sets                                             |
+///   |--------------|-------------------------------------------------------------------|
+///   | long-term    | [] or ['playback']                                                |
+///   | pairing      | [], ['pairing'], ['playback']*, ['playback', 'pairing']*          |
+///   | Sentinel     | [], ['pairing'], ['playback']*, ['playback', 'pairing']*          |
 ///
-/// The first branch does not consult the category, so a long-term PSK can declare {PAIRING} and
-/// a Pairing PSK cannot declare the empty set or {PLAYBACK}. Both differ from the spec's
-/// category table in "server/activate"; see docs/rc1-migration.md, phase 3.
+///   * only when the client has unpaired access enabled.
 ///
+/// So a long-term PSK admits playback and nothing else, while the two unpaired categories admit
+/// pairing outright and playback only on unpaired access. Members are unordered and unique, so
+/// the set is characterized by which of the two activities it contains.
+///
+/// @param category       PSK category matched during the Noise handshake.
+/// @param has_playback   Whether the set contains 'playback'.
+/// @param has_pairing    Whether the set contains 'pairing'.
+/// @param unpaired_access  Whether unpaired (Sentinel) access is enabled in the record store.
+/// @return true if the activity set is allowed for the given category/config.
+inline bool activity_set_allowed(PskCategory category, bool has_playback, bool has_pairing,
+                                 bool unpaired_access) {
+    if (category == PskCategory::LONG_TERM) {
+        return !has_pairing;
+    }
+    // Pairing PSK and Sentinel share a row: pairing is always theirs to declare, and playback
+    // rides along only on unpaired access.
+    return !has_playback || unpaired_access;
+}
+
+/// @brief activity_set_allowed() for a declared activity list.
 /// @param category    PSK category matched during the Noise handshake.
 /// @param activities  Activities declared in the server/activate message.
 /// @param unpaired_access  Whether unpaired (Sentinel) access is enabled in the record store.
@@ -76,35 +94,9 @@ inline bool contains_activity(const std::vector<SendspinActivity>& activities,
 inline bool activities_allowed(PskCategory category,
                                const std::vector<SendspinActivity>& activities,
                                bool unpaired_access) {
-    if (contains_activity(activities, SendspinActivity::PAIRING)) {
-        // Pairing is exclusive: nothing else may ride along with it.
-        return activities.size() == 1;
-    }
-
-    if (category == PskCategory::LONG_TERM) {
-        // The empty set or {PLAYBACK} (spec "server/activate": a long-term PSK admits no other
-        // activity).
-        for (const auto& a : activities) {
-            if (a != SendspinActivity::PLAYBACK) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    if (category == PskCategory::SENTINEL) {
-        if (activities.empty()) {
-            return true;
-        }
-        // {PLAYBACK} only, and only when unpaired_access is enabled.
-        if (activities.size() == 1 && activities[0] == SendspinActivity::PLAYBACK) {
-            return unpaired_access;
-        }
-        return false;
-    }
-
-    // PAIRING category: only {PAIRING} is valid, already handled above -> false for anything else.
-    return false;
+    return activity_set_allowed(category, contains_activity(activities, SendspinActivity::PLAYBACK),
+                                contains_activity(activities, SendspinActivity::PAIRING),
+                                unpaired_access);
 }
 
 /// @brief Whether a connection declaring `activities` is "playback-capable": `activities`
@@ -123,23 +115,17 @@ inline bool activities_allowed(PskCategory category,
 inline bool is_playback_capable(PskCategory category,
                                 const std::vector<SendspinActivity>& activities,
                                 bool unpaired_access) {
-    if (contains_activity(activities, SendspinActivity::PLAYBACK)) {
-        return activities_allowed(category, activities, unpaired_access);
-    }
-    std::vector<SendspinActivity> with_playback = activities;
-    with_playback.push_back(SendspinActivity::PLAYBACK);
-    return activities_allowed(category, with_playback, unpaired_access);
+    return activity_set_allowed(category, /*has_playback=*/true,
+                                contains_activity(activities, SendspinActivity::PAIRING),
+                                unpaired_access);
 }
 
 /// @brief Whether `activities`/`active_roles` satisfy the matched PSK's structural constraints.
 ///
-/// Ports `_admissible` from
-/// aiosendspin/aiosendspin/client/connection.py.
-///
-/// A non-empty active_roles set requires that the connection be "playback-capable": activities |
-/// {PLAYBACK} must also be allowed. This catches e.g. a Sentinel
-/// connection with has_roles=true and activities={} (empty), which would attempt to
-/// use role protocol without being allowed playback.
+/// Per messaging.md "Playback-capable connections", only a playback-capable connection may carry
+/// a non-empty active_roles, and it may do so even when PLAYBACK is not currently declared. This
+/// catches e.g. a Sentinel connection with has_roles=true and unpaired access disabled, which
+/// would attempt to use role protocol without being allowed playback.
 ///
 /// @param category        PSK category matched during the Noise handshake.
 /// @param activities      Activities declared in the server/activate message.
@@ -151,26 +137,16 @@ inline bool admissible(PskCategory category, const std::vector<SendspinActivity>
     if (!activities_allowed(category, activities, unpaired_access)) {
         return false;
     }
-    if (!has_roles) {
-        return true;
-    }
-    // Non-empty active_roles requires playback-capable activities.
-    // Build activities | {PLAYBACK}.
-    if (contains_activity(activities, SendspinActivity::PLAYBACK)) {
-        // activities already includes PLAYBACK -> same check.
-        return true;
-    }
-    std::vector<SendspinActivity> with_playback = activities;
-    with_playback.push_back(SendspinActivity::PLAYBACK);
-    return activities_allowed(category, with_playback, unpaired_access);
+    return !has_roles || is_playback_capable(category, activities, unpaired_access);
 }
 
 /// @brief Goodbye reason to close an inadmissible server/activate with.
 ///
-/// Separates "you are not paired yet" from "you may never do this". The activate would have
-/// been admissible had unpaired access been enabled, so the server is told pairing is what is
-/// missing; anything else is a permanent refusal. Only the Sentinel PSK can reach the
-/// pairing_required case, since unpaired_access gates that category alone.
+/// Separates "you are not paired yet" from "you may never do this", by the first-rule-wins order
+/// messaging.md "server/activate" gives: an activation that enabling unpaired access would have
+/// admitted is answered with pairing_required, anything else with unauthorized. Only an unpaired
+/// session can reach the pairing_required case, because unpaired_access is what gates the
+/// playback rows of the pairing-PSK and Sentinel categories and nothing in the long-term row.
 ///
 /// Callers must only use this for an activate that admissible() already rejected: for an
 /// admissible one the return value is meaningless.
@@ -183,8 +159,7 @@ inline bool admissible(PskCategory category, const std::vector<SendspinActivity>
 inline SendspinGoodbyeReason inadmissible_reject_reason(
     PskCategory category, const std::vector<SendspinActivity>& activities, bool has_roles,
     bool unpaired_access) {
-    if (category == PskCategory::SENTINEL && !unpaired_access &&
-        admissible(category, activities, has_roles, /*unpaired_access=*/true)) {
+    if (!unpaired_access && admissible(category, activities, has_roles, /*unpaired_access=*/true)) {
         return SendspinGoodbyeReason::PAIRING_REQUIRED;
     }
     return SendspinGoodbyeReason::UNAUTHORIZED;
@@ -196,10 +171,8 @@ inline SendspinGoodbyeReason inadmissible_reject_reason(
 
 /// @brief Rank a connection by its highest activity.
 ///
-/// Ports `_activity_rank` from
-/// aiosendspin/aiosendspin/client/client.py.
-///
-/// playback=2 > pairing=1 > none=0.
+/// connection.md "Multiple servers (server-initiated)" ranks playback above pairing and an empty
+/// set lowest, so playback=2 > pairing=1 > none=0. A connection declaring both ranks as playback.
 ///
 /// @param activities Activities declared by the connection.
 /// @return Integer rank (0-2).
@@ -224,10 +197,7 @@ inline int activity_rank(const std::vector<SendspinActivity>& activities) {
 
 /// @brief Whether the incoming connection should displace the currently admitted one.
 ///
-/// Ports `_should_admit_connection` from
-/// aiosendspin/aiosendspin/client/client.py.
-///
-/// Rules (from the reference):
+/// Rules, from connection.md "Multiple servers (server-initiated)":
 ///   1. If no currently admitted connection -> admit.
 ///   2. An in-flight pairing (admitted rank 1) is NOT displaced by incoming rank 1 or 2.
 ///   3. Higher incoming rank displaces.

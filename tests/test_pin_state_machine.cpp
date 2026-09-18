@@ -960,13 +960,12 @@ TEST_F(PinStateMachineTest, DynamicPinMismatchAborts) {
 }
 
 // =============================================================================
-// Regression: non-pairing traffic must stay suppressed in the retry window between a local
-// abort and the server's next server/activate (the connection stays open on pin_mismatch, so
-// the server still has it parked in its pairing state; see client.cpp's has_activity(PAIRING)
-// gates and pairing.md "Entering and leaving pairing").
+// pairing.md "Entering and leaving pairing": pairing runs alongside playback, so a declared
+// 'pairing' activity suppresses nothing. Traffic keeps flowing across an attempt and across the
+// retry window between a local abort and the server's next server/activate.
 // =============================================================================
 
-TEST_F(PinStateMachineTest, TrafficSuppressedAfterLocalAbortUntilNextActivate) {
+TEST_F(PinStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     FakeConnection* conn = this->enter_dynamic_pin_pairing("server-dyn-suppress");
 
     PinDisplayResult display;
@@ -1008,33 +1007,25 @@ TEST_F(PinStateMachineTest, TrafficSuppressedAfterLocalAbortUntilNextActivate) {
 
     // A fresh SendspinTimeBurst starts its first burst immediately (last_burst_complete_time_
     // defaults to 0, so the inter-burst wait is trivially satisfied), so any tick that reaches
-    // time_burst_->loop() sends. is_pairing_in_progress() is already false after the local
-    // abort above, so only the declared-PAIRING-activity gate in client.cpp's loop() keeps
-    // these ticks from calling conn->send_time_message() while the server still has the
-    // connection parked in its pairing state.
+    // time_burst_->loop() sends. The connection still declares 'pairing', which must not stop it:
+    // a player keeps its timeline across an attempt and can only do that with a converging filter.
     for (int i = 0; i < 5; ++i) {
         this->client_->loop();
     }
-    EXPECT_EQ(conn->time_message_send_count_, 0)
-        << "client/time must stay suppressed while activities still declare PAIRING";
+    EXPECT_GT(conn->time_message_send_count_, 0)
+        << "client/time must keep flowing while activities declare pairing";
 
-    // client/state must likewise stay suppressed (publish_client_state carries the identical
-    // has_activity(PAIRING) gate).
     this->client_->update_state(SendspinClientState::SYNCHRONIZED);
-    EXPECT_FALSE(any_frame_of_type(conn->sent_text_, "client/state"));
+    EXPECT_TRUE(any_frame_of_type(conn->sent_text_, "client/state"))
+        << "client/state must keep flowing while activities declare pairing";
 
-    // The server sends its next activate, leaving pairing (empty activities/active_roles, the
-    // same shape SubsequentActivateEntersDynamicPinPairing uses to go operational). Traffic must
-    // resume immediately: apply_server_activate() runs synchronously inside this same loop()
-    // call, before the time-burst gate re-checks has_activity(PAIRING).
+    // The activate that leaves pairing changes nothing about any of this.
+    const int before_leave = conn->time_message_send_count_;
     this->post_activate({}, std::vector<std::string>{}, std::nullopt);
     this->client_->loop();
     ASSERT_FALSE(conn->has_activity(SendspinActivity::PAIRING));
-    EXPECT_GT(conn->time_message_send_count_, 0)
-        << "time sync must resume once the connection leaves pairing";
-
-    this->client_->update_state(SendspinClientState::SYNCHRONIZED);
-    EXPECT_TRUE(any_frame_of_type(conn->sent_text_, "client/state"));
+    EXPECT_GE(conn->time_message_send_count_, before_leave)
+        << "time sync must not stall when the connection leaves pairing either";
 }
 
 // =============================================================================

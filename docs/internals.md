@@ -239,9 +239,10 @@ An audio chunk is laid out per roles/player/v1.md "Audio Chunks (Binary)": the t
    ├─ flush_deferred_releases()   (early-returns without locking when deferred_size_ is 0)
    └─ Tick the platform ws_server (ESP: reap stalled upgrades; host: no-op)
 
-2. time_burst_->loop(conn)  (requires conn != nullptr && conn->is_operational()
-                             && !conn->is_pairing_in_progress(), so it is also skipped
-                             mid-pairing and before the first server/activate)
+2. time_burst_->loop(conn)  (requires conn != nullptr && conn->is_operational(), so it is
+                             skipped before the first server/activate and while a
+                             re-handshake awaits the next one; a pairing attempt does not
+                             stop it)
    ├─ Send next time message if ready
    ├─ Acquire/release high-performance networking around burst
    └─ Notify listener of sync error when burst completes
@@ -521,7 +522,7 @@ This is the mechanism that upgrades a Pairing-PSK connection to a long-term PSK 
 
 ### Pairing Flow (Pairing-PSK Method)
 
-When the server's `server/activate` declares `activities=["pairing"]` with a `pairing` object naming `method=pairing_psk`, `promote_or_arbitrate_nursery_entry()` (or the subsequent-activate branch in the main activate-event loop, for an already-operational connection) calls `handle_enter_pairing()` instead of `on_handshake_complete()`:
+When the server's `server/activate` declares a `pairing` activity with a `pairing` object naming `method=pairing_psk`, `promote_or_arbitrate_nursery_entry()` (or the subsequent-activate branch in the main activate-event loop, for an already-operational connection) calls `handle_enter_pairing()`. pairing.md "Entering and leaving pairing" runs pairing alongside playback, so nothing is quiesced for it: streams stay open, active roles keep driving their own traffic, and time sync keeps running. An activation that declares `playback` as well goes operational first and then enters pairing, because going operational is what clears any stale pairing state; one that declares pairing alone is not announced as operational until the attempt finishes and the post-finalize re-handshake activates the connection again.
 
 ```api
 Server -> Client: server/activate (activities=["pairing"], method=pairing_psk)
@@ -550,16 +551,18 @@ PIN specifics, per the current spec: the session `pin_length` arrives in the act
 
 The `server/activate` handler in `ConnectionManager::drain_lifecycle_events()` (called from `loop()`) evaluates each activate against `RecordStore::unpaired_access_enabled()` and the connection's resolved `PskCategory`, via the pure functions in `src/admission.h`:
 
-- Any activity set that contains `pairing` is admitted only when it is exactly `{pairing}`.
-- `LONG_TERM`: the empty set or `{playback}`.
-- `PAIRING`: only `{pairing}`.
-- `SENTINEL`: the empty set always; `{playback}` only when `unpaired_access_enabled` is true; nothing else.
+The allowed sets are the table in messaging.md "server/activate":
+
+- `LONG_TERM`: the empty set or `{playback}`. A paired server has no pairing activity to declare.
+- `PAIRING` and `SENTINEL`: the empty set and `{pairing}` always; `{playback}` and `{playback, pairing}` only when `unpaired_access_enabled` is true.
+
+Only a *playback-capable* connection may carry a non-empty `active_roles`: one whose activities extended with `playback` are also an allowed set. That holds even while `playback` is not currently declared, so an idle long-term connection keeps its roles, and a pairing-PSK connection holds them only under unpaired access.
 
 `unpaired_access_enabled` is persisted in `SendspinPairingConfig`. Its value on a device that has never persisted a pairing config comes from `SendspinClientConfig::initial_unpaired_access_enabled`, which the first-boot seed then persists. `RecordStore`'s constructor applies that seed only when `!loaded_config && !previously_provisioned`, where `previously_provisioned` means any surviving record or Pairing PSK. `!loaded_config` alone is not evidence of a first boot and gating on it would fail open: the provider interface cannot distinguish "never stored" from "stored but unreadable", so a device whose config blob was lost or corrupted while its records survived would otherwise re-seed unpaired access ON. Any surviving provisioned material vetoes the seed; a store that lost everything is indistinguishable from a factory-fresh device, so the seed does apply there.
 
-A rejected activate closes the connection with `SendspinGoodbyeReason::PAIRING_REQUIRED` when it would have been admissible had unpaired access been enabled (a Sentinel connection requesting `{playback}` while unpaired access is off), and `SendspinGoodbyeReason::UNAUTHORIZED` otherwise.
+A rejected activate closes the connection with `SendspinGoodbyeReason::PAIRING_REQUIRED` when it would have been admissible had unpaired access been enabled (an unpaired connection requesting `{playback}` while unpaired access is off), and `SendspinGoodbyeReason::UNAUTHORIZED` otherwise. That order is the one messaging.md "server/activate" gives; a long-term connection declaring `pairing` never reaches the first rule, because no setting would admit it.
 
-Multi-server admission arbitration (deciding whether an incoming connection displaces the current one) ranks each side by its highest activity (`activity_rank()` in `admission.h`: playback=2, pairing=1, none=0) and applies `should_admit_connection()`'s rules, described in [Handshake and Handoff](#handshake-and-handoff) above.
+Multi-server admission arbitration (deciding whether an incoming connection displaces the current one) ranks each side by its highest activity (`activity_rank()` in `admission.h`: playback=2, pairing=1, none=0, so a connection declaring both ranks as playback) and applies `should_admit_connection()`'s rules, described in [Handshake and Handoff](#handshake-and-handoff) above.
 
 ## Connection Lifecycle
 
