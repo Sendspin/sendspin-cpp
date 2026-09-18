@@ -126,18 +126,17 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
 /// the role removal" -- the client's mirror of that is not to act on what the server sent before
 /// it learned of one.
 ///
-/// The verdict is paired with the role's teardown generation, captured here and carried into the
-/// handler: this gate is checked once, on the network thread, while the effect it admits lands
-/// later, and the deactivation path (unlike a lost connection) never quiesces the network thread.
-/// Each point of effect re-checks the captured value, so a teardown inside that window invalidates
-/// the whole handler. See Impl::accepts() on each role.
+/// A true verdict is only half the gate. The caller pairs it with the role's teardown generation,
+/// loaded right after this returns and passed into the handler: the gate runs once, on the network
+/// thread, while the effect it admits lands later, and the deactivation path (unlike a lost
+/// connection) never quiesces the network thread. Each point of effect re-checks the captured
+/// value, so a teardown inside that window invalidates the whole handler. See Impl::accepts() on
+/// each role.
 ///
 /// Runs on the network thread, so it reads the connection's atomic role mask. `conn` is never null
 /// at the dispatch points: the admission gate ahead of them returns first.
 /// @param conn The connection the message arrived on.
 /// @param role The role that owns the message.
-/// @param generation The role's live teardown counter, read by the caller with the same load this
-///                   returns to it.
 /// @return true when the role's handling may run.
 bool role_accepts_traffic(const SendspinConnection* conn, SendspinRole role) {
     if (conn->is_role_active(role)) {

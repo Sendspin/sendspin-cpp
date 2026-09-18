@@ -212,6 +212,24 @@ Not implemented, deliberately:
 - Run the docs-sync, house-patterns, embedded-review and test-standards reviews, then update the
   ESPHome hub.
 
+## To raise upstream
+
+Disagreements between the spec text and its neighbours found while migrating; the client follows
+the spec text in each case.
+
+- aiosendspin strict mode closes on a `client/state` or `client/command` that carries an object
+  for a role it has just removed (`server/connection.py`, "carried a ... object for an inactive
+  role"). `messaging.md` "client/state" says servers MUST ignore such objects "without closing
+  solely for their presence, since the client may not yet have received the role removal". The
+  window is real: a state sent before the removing `server/activate` arrives is in flight either
+  way. Seen in about half of the `--repair-after` harness runs.
+- `messaging.md` "Fragmentation" lists the malformed sequences exhaustively, but a truncated
+  fragment frame (a first fragment with no `orig_type` byte) is in none of them. The client closes
+  the connection for it.
+- `pairing.md` "Entering and leaving pairing" has an expired attempt send `pair/abort`, while
+  `connection.md` "Re-handshake" forbids any client message between Noise message 1 and the new
+  `server/activate`. The client holds the abort until the activation arrives.
+
 ## Residual gaps
 
 Known and accepted for now, recorded so they are not rediscovered as surprises:
