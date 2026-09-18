@@ -762,10 +762,12 @@ observes pairing via `SendspinClientListener` callbacks:
    bad CPace share), which are reported as `UNKNOWN` and close the transport without sending a
    `client/goodbye`.
 
-   A persistence provider that rejects the long-term record is NOT reported through this
-   callback: neither `on_pairing_succeeded` nor `on_pairing_failed` fires, the record is not
-   retained, and the connection drops when the server rekeys onto the PSK the client never
-   stored. Surface that failure from the provider itself.
+   A persistence provider that rejects the durable write does not fail the pairing:
+   `on_pairing_succeeded` fires, the record is authoritative for the rest of this boot, and a
+   warning says it will not survive a reboot. Surface that failure from the provider itself if
+   the application needs to act on it. The record is dropped outright, with neither callback
+   firing, only when the store is at capacity with nothing evictable, which the connection budget
+   rules out (`MAX_OPEN_CONNECTIONS` is below the records floor).
 
    Either way, do not treat this callback as a disconnect notification; poll `is_connected()`
    if the application needs to track that.

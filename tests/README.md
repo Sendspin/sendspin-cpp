@@ -54,7 +54,7 @@ a watchdog report rather than a flaky elapsed-time assertion.
 Each `test_*.cpp` file covers one unit of cross-platform logic:
 
 - `test_protocol.cpp`: wire-protocol parsing/formatting: enum round-trips, message dispatch, the
-  tri-state metadata/color deltas, and the hand-rolled `client/time` formatter checked against
+  full-state metadata/color objects, and the hand-rolled `client/time` formatter checked against
   `snprintf`.
 - `test_time_filter.cpp`: `SendspinTimeFilter` invariants (monotonic-timestamp rejection, reset,
   offset round-trip, convergence).
