@@ -2273,6 +2273,36 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBounded) {
               "Title " + std::to_string(SendspinConnection::MAX_HELD_MESSAGES - 1));
 }
 
+// The other half of the same guard: the hold has two budgets, and the byte one is what keeps the
+// memcpy inside the MAX_HELD_BYTES allocation. A peer whose role states are large runs out of
+// bytes long before it runs out of slots, so the count cap above cannot stand in for this one.
+TEST(EncryptedLifecycle, HeldRoleTrafficIsBoundedByBytesBeforeMessages) {
+    HoldTestClient bundle("Held Byte Budget Test Client");
+
+    HoldTestConnection conn;
+    conn.note_activate_delivered();
+    // Each message is just over a third of the byte budget, so the third one exceeds it while
+    // the count is still 3 of MAX_HELD_MESSAGES.
+    const size_t title_len = SendspinConnection::MAX_HELD_BYTES / 3;
+    for (int i = 0; i < 3; ++i) {
+        bundle.deliver(conn,
+                       metadata_state_json(i + 1, std::string(title_len,
+                                                              static_cast<char>('a' + i))));
+    }
+
+    ASSERT_LT(3u, SendspinConnection::MAX_HELD_MESSAGES)
+        << "the byte budget must be the one that runs out first for this test to mean anything";
+    EXPECT_EQ(conn.held_count_, 2u) << "the message past the byte budget was held anyway";
+    EXPECT_LE(conn.held_bytes_, SendspinConnection::MAX_HELD_BYTES)
+        << "the hold wrote past the buffer it allocated";
+
+    bundle.client_ref().admit_connection(&conn);
+    bundle.pump();
+    EXPECT_EQ(bundle.listener.updates.load(), 1);
+    EXPECT_EQ(bundle.listener.last_title, std::string(title_len, 'b'))
+        << "the last state inside the byte budget is the one that must replay";
+}
+
 // Control: the replay runs every held type's real handler to completion. One message of each
 // type, replayed in one admission, so a handler that throws the replay off (or blocks in it)
 // takes the metadata message behind it down with it.
