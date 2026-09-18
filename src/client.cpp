@@ -1181,11 +1181,12 @@ void SendspinClient::admit_connection(SendspinConnection* conn) {
     // connection (dispatching live, after everything held), or already held its message and is
     // drained below. Nothing can land between the last replay and the flag.
     std::lock_guard<std::mutex> lock(this->json_processing_mutex_);
-    for (auto& held : conn->take_pre_admission_messages()) {
-        SS_LOGD(TAG, "Replaying a role message held until admission (%zu bytes)", held.json.size());
-        this->dispatch_json_message(conn, held.json.data(), held.json.size(), held.arrival_us,
-                                    JsonMessageOrigin::ADMISSION_REPLAY);
-    }
+    conn->replay_pre_admission_messages(
+        [this, conn](const char* data, size_t len, int64_t arrival_us) {
+            SS_LOGD(TAG, "Replaying a role message held until admission (%zu bytes)", len);
+            this->dispatch_json_message(conn, data, len, arrival_us,
+                                        JsonMessageOrigin::ADMISSION_REPLAY);
+        });
     // Last: the binary path reads this flag without the mutex, so audio chunks start being
     // dispatched on the network thread only once the replay above has finished writing to the
     // roles it feeds.

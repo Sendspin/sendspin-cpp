@@ -22,8 +22,8 @@
 #include "time_filter.h"
 
 #include <cstddef>
+#include <cstring>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -464,22 +464,31 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
 
 bool SendspinConnection::hold_pre_admission_message(const char* data, size_t len,
                                                     int64_t arrival_us) {
-    std::lock_guard<std::mutex> lock(this->held_messages_mutex_);
-    if (this->held_messages_.size() >= MAX_HELD_MESSAGES ||
-        this->held_messages_bytes_ + len > MAX_HELD_BYTES) {
+    if (this->held_count_ >= MAX_HELD_MESSAGES || this->held_bytes_ + len > MAX_HELD_BYTES) {
         return false;
     }
-    this->held_messages_.push_back(HeldMessage{std::string(data, len), arrival_us});
-    this->held_messages_bytes_ += len;
+    if (this->held_messages_.data() == nullptr && !this->held_messages_.allocate(MAX_HELD_BYTES)) {
+        SS_LOGW(TAG, "Failed to allocate the pre-admission hold buffer");
+        return false;
+    }
+    std::memcpy(this->held_messages_.data() + this->held_bytes_, data, len);
+    this->held_extents_[this->held_count_] = {this->held_bytes_, len, arrival_us};
+    this->held_bytes_ += len;
+    ++this->held_count_;
     return true;
 }
 
-std::vector<SendspinConnection::HeldMessage> SendspinConnection::take_pre_admission_messages() {
-    std::vector<HeldMessage> taken;
-    std::lock_guard<std::mutex> lock(this->held_messages_mutex_);
-    taken.swap(this->held_messages_);
-    this->held_messages_bytes_ = 0;
-    return taken;
+void SendspinConnection::replay_pre_admission_messages(const HeldMessageVisitor& visit) {
+    const size_t count = this->held_count_;
+    // Cleared before the visits so a message the visitor somehow routes back here cannot be
+    // replayed twice or read from a buffer this call is already draining.
+    this->held_count_ = 0;
+    this->held_bytes_ = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const HeldMessageExtent& extent = this->held_extents_[i];
+        visit(reinterpret_cast<const char*>(this->held_messages_.data()) + extent.offset,
+              extent.length, extent.arrival_us);
+    }
 }
 
 // ============================================================================

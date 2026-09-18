@@ -258,17 +258,21 @@ struct SendspinClientConfig {
     /// retains its capacity, so PREFER_EXTERNAL keeps it out of internal RAM.
     MemoryLocation noise_buffer_location{MemoryLocation::PREFER_EXTERNAL};
 
+    /// @brief Default arena size: one steady-state protocol message, including the FLAC
+    /// stream-start header.
+    static constexpr size_t DEFAULT_JSON_ARENA_SIZE = 2048;
+
     /// @brief Size in bytes of an internal-RAM scratch arena for parsing incoming JSON messages.
     /// When non-zero, the JSON document used to parse each incoming protocol message is allocated
     /// from a fixed internal-RAM buffer of this size instead of PSRAM, cutting PSRAM traffic on the
     /// network task; messages too large for the budget fall back to PSRAM. Costs this many bytes of
-    /// internal RAM permanently. The default (2048) covers the steady-state protocol traffic,
+    /// internal RAM permanently. The default covers the steady-state protocol traffic,
     /// including the FLAC stream-start header; large track-metadata messages may exceed it and fall
     /// back to PSRAM, but those arrive only once per song. Set to 0 to disable the arena and keep
     /// the PSRAM-only behaviour. Smaller values just fall back more often. On host there is no
     /// PSRAM distinction, so the arena is a fixed scratch buffer for the parse (still allocated and
     /// used; harmless).
-    size_t json_arena_size{2048};
+    size_t json_arena_size{DEFAULT_JSON_ARENA_SIZE};
 };
 
 // ============================================================================
