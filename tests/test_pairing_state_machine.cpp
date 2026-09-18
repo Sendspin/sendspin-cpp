@@ -679,6 +679,22 @@ protected:
         this->client_->connection_manager_->pairing_window_open_until_us_ = deadline_us;
     }
 
+    /// Deliver the server's server/pair-finalize ack for `conn`, the way
+    /// SendspinClient::process_json_message()'s SERVER_PAIR_FINALIZE handler does on the network
+    /// thread: commit the pending record and schedule the pairing-succeeded note. Routed through
+    /// the private-access seam rather than a fake transport, since this harness never installs a
+    /// real Noise session to decrypt a frame through.
+    void deliver_pair_finalize_ack(FakeConnection* conn) {
+        auto record = conn->take_pending_pairing_record();
+        ASSERT_TRUE(record.has_value()) << "no record was staged for the ack to commit";
+        ASSERT_TRUE(this->client_->record_store_->store_record_superseding(
+            std::move(record.value()),
+            this->client_->connection_manager_->open_connection_psk_ids()));
+        this->client_->connection_manager_->schedule_pairing_succeeded(conn->get_server_id());
+        conn->note_pairing_finalize_ack();
+        this->client_->loop();
+    }
+
     /// Read the connection the open window is bound to (nullptr until it admits its first
     /// attempt), through the private-access seam.
     const SendspinConnection* window_connection() {
@@ -1049,6 +1065,43 @@ TEST_F(PairingStateMachineTest, DynamicCodeHappyPath) {
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_CODE));
     EXPECT_LT(this->listener_.first_index_of(PairingEventKind::DISPLAY_CODE),
              this->listener_.first_index_of(PairingEventKind::CLEAR_CODE));
+    EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
+}
+
+// The qr_code emission format, driven the whole way: the code the operator carries is a
+// version-1 pairing token over the digest's first bytes, and CPace consumes those raw bytes as
+// PRS rather than the token's text (pairing.md "Pairing code derivation", "PAKE").
+TEST_F(PairingStateMachineTest, DynamicCodeQrFormatHappyPath) {
+    FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-qr",
+                                                            SendspinPairingCodeFormat::QR_CODE);
+
+    CodeEmissionResult display;
+    ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/7, display));
+
+    // What the application is handed is the token, tagged as the format the server asked for.
+    EXPECT_EQ(this->listener_.last_emitted_format(), SendspinPairingCodeFormat::QR_CODE);
+    ASSERT_TRUE(this->listener_.last_emitted_code().has_value());
+    const std::string emitted = this->listener_.last_emitted_code().value();
+    EXPECT_EQ(emitted.rfind("SP:1", 0), 0u) << "a qr_code pairing code is a version-1 token";
+    EXPECT_EQ(emitted.size(), 43u);
+    EXPECT_EQ(emitted.find('='), std::string::npos) << "the token carries no base32 padding";
+
+    // The server derives the same 24 bytes and runs CPace over them, not over the token text.
+    EXPECT_EQ(display.prs.size(), QR_PAIRING_CODE_SIZE);
+    EXPECT_NE(display.prs, pairing_code_digits_prs(emitted))
+        << "the token's characters are not the PRS";
+    ServerStandIn server;
+    ASSERT_TRUE(server.start(display.prs, display.handshake_hash));
+
+    std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
+    ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
+    this->schedule_pair_confirm(server_kc);
+
+    ASSERT_NO_FATAL_FAILURE(
+        this->verify_pair_confirm_frame(conn->sent_text_, /*expect_wrapped_nonce=*/true));
+    ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_nonce_opens_commit(conn->sent_text_, server));
+    ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_psk_finalize(conn->sent_text_, server));
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_CODE));
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 }
 
@@ -1690,8 +1743,13 @@ TEST_F(PairingStateMachineTest, CompletedPairingClosesTheWindow) {
     this->schedule_pair_confirm(server_kc);
 
     ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-finalize");
+    EXPECT_GT(this->window_deadline(), 0)
+        << "the attempt is not a pairing until the server acks it: a server/activate arriving "
+           "here instead would persist nothing";
+
+    ASSERT_NO_FATAL_FAILURE(this->deliver_pair_finalize_ack(conn));
     EXPECT_EQ(this->window_deadline(), 0)
-        << "the gesture was consent to pair, and the pairing spent it";
+        << "the gesture was consent to pair, and the completed pairing spent it";
 }
 
 TEST_F(PairingStateMachineTest, WindowClosesWhenItsConnectionDrops) {

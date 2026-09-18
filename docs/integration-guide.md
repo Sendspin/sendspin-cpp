@@ -822,7 +822,8 @@ A **static pairing code** is the fixed 8-digit value the device shipped with, an
 is **gesture-gated**: the client answers the pairing activation with `client/pair-pending` and
 withholds `client/pair-init` until a pairing window is open. The window opens on the operator
 gesture (`confirm_pairing_window()`) and lives for 5 minutes. It keeps admitting attempts on the
-connection that carried its first, and closes on a completed pairing, on the fifth attempt whose
+connection that carried its first, and closes on a completed pairing (the server's
+`server/pair-finalize` ack, the point at which the record is stored), on the fifth attempt whose
 verification failed, when that connection drops, on `cancel_pairing_window()`, or on expiry. A
 gesture performed before the activation arrives leaves the window standing open, so the next
 attempt within its lifetime proceeds without a prompt.

@@ -955,6 +955,17 @@ void ConnectionManager::drain_pairing_events(DrainedEvents& ev) {
     // (SendspinClient::schedule_pairing_succeeded); only ever targets the current
     // connection for the same reason as ev.pairing_messages above.
     for (const auto& server_id : ev.pairing_succeeded) {
+        // A completed pairing closes the pairing window (pairing.md "Pairing Window"). The
+        // pairing is complete here and not a message earlier: pairing.md "Entering and leaving
+        // pairing" has a client that sent client/pair-finalize and then received server/activate
+        // in place of server/pair-finalize persist nothing, so the attempt only becomes a
+        // pairing when that ack arrives and the record is stored, which is what schedules this
+        // event. The window is closed only when it is the one this connection's attempt ran
+        // under: an attempt it never admitted has not spent the operator's gesture.
+        if (this->pairing_window_conn_ != nullptr &&
+            this->pairing_window_conn_ == this->current_connection_.get()) {
+            this->close_pairing_window();
+        }
         this->client_->note_pairing_succeeded(server_id);
     }
 
@@ -2645,10 +2656,6 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     this->dismiss_pairing_ui(ps.code_emitted, ps.window_shown);
     ps.code_emitted = false;
     ps.window_shown = false;
-
-    // A completed pairing closes the window (pairing.md "Pairing Window"): the operator's
-    // gesture was consent to pair, and it has now been spent.
-    this->close_pairing_window();
 
     // Now run the same resolve_pairing_outcome path as pairing_psk, then send
     // client/pair-finalize. The server will respond with server/pair-finalize.
