@@ -555,6 +555,26 @@ public:
         return this->send_binary(4, timestamp_us, std::string(payload_bytes, '\0'));
     }
 
+    // What the client/pair-init that started the pairing attempt carried, and whether one
+    // arrived at all before client/pair-finalize (pairing.md "Pairing PSK Flow" has the client
+    // send pair-init immediately before pair-finalize). Absent until a pair-init arrives.
+    struct PairInitRecord {
+        uint32_t pairing_index{};
+        bool has_commit_b{};
+    };
+
+    std::optional<PairInitRecord> pair_init() const {
+        std::lock_guard<std::mutex> lock(this->pair_mutex_);
+        return this->pair_init_;
+    }
+
+    // Whether a client/pair-init had already arrived when client/pair-finalize did. False both
+    // when no finalize has arrived and when one arrived with no init before it.
+    bool pair_init_preceded_finalize() const {
+        std::lock_guard<std::mutex> lock(this->pair_mutex_);
+        return this->pair_init_preceded_finalize_;
+    }
+
     // Number of client/state messages received so far. Used to prove a client/state was, or was
     // not, sent before some later event (e.g. client/pair-finalize): a real server awaiting
     // pair-finalize treats an intervening client/state as a protocol error and hard-drops the
@@ -693,7 +713,20 @@ private:
             return;
         }
 
+        if (std::strcmp(type, "client/pair-init") == 0) {
+            PairInitRecord record;
+            record.pairing_index = doc["payload"]["pairing_index"] | 0U;
+            record.has_commit_b = doc["payload"]["commit_B"].is<const char*>();
+            std::lock_guard<std::mutex> plock(this->pair_mutex_);
+            this->pair_init_ = record;
+            return;
+        }
+
         if (std::strcmp(type, "client/pair-finalize") == 0) {
+            {
+                std::lock_guard<std::mutex> plock(this->pair_mutex_);
+                this->pair_init_preceded_finalize_ = this->pair_init_.has_value();
+            }
             // The client generated a fresh long-term PSK and is handing it to us to store
             // server-side; ack it so the client commits its own pending record. Capture the PSK
             // (and its derived psk_id) so the test can later trigger the post-pairing in-band
@@ -781,6 +814,8 @@ private:
     mutable std::mutex pair_mutex_;
     std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> learned_psk_;
     std::optional<std::string> learned_psk_id_;
+    std::optional<PairInitRecord> pair_init_;
+    bool pair_init_preceded_finalize_{false};
 
     std::atomic<int> client_state_count_{0};
     std::atomic<bool> got_client_time_{false};

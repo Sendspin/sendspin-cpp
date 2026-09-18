@@ -1787,7 +1787,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     }
 
     // ==== Pairing-PSK branch ====
-    this->handle_enter_pairing_psk(conn, server_id);
+    this->handle_enter_pairing_psk(conn, pairing_index, server_id);
 }
 
 void ConnectionManager::handle_enter_pairing_pin(SendspinConnection* conn, uint32_t pairing_index,
@@ -1874,7 +1874,7 @@ void ConnectionManager::handle_enter_pairing_pin(SendspinConnection* conn, uint3
     this->client_->note_pairing_started(server_id);
 }
 
-void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn,
+void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
                                                  const std::string& server_id) {
     // resolve_pairing_outcome mints the long-term PSK and the record that holds it, or fails
     // when the store has no room for a net-new record.
@@ -1896,6 +1896,13 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn,
             SendspinPairAbortReason::METHOD_NOT_SUPPORTED, SendspinGoodbyeReason::UNAUTHORIZED);
         return;
     }
+
+    // pairing.md "Pairing PSK Flow": after the pairing server/activate the client sends
+    // client/pair-init followed immediately by client/pair-finalize, without waiting for a
+    // server response. pair-init starts the attempt and carries the pairing index alone; the
+    // PSK flow has no PAKE round and so no commit_B.
+    SS_LOGI(TAG, "Sending client/pair-init (pairing_psk) for server_id=%s", server_id.c_str());
+    conn->send_app_json(format_client_pair_init_message(pairing_index), nullptr);
 
     // Send client/pair-finalize with the long-term PSK (base64url-encoded, 43 chars).
     SS_LOGI(TAG, "Sending client/pair-finalize for server_id=%s", server_id.c_str());

@@ -1086,10 +1086,10 @@ std::string format_client_pair_pending_message(uint32_t pairing_index);
 std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commit_b,
                                             uint32_t pairing_index);
 
-/// @brief Formats a client/pair-init message with only pairing_index (static PIN).
-/// Static PIN carries no commit_B (mirrors the reference's ClientPairInitPayload with omit_none:
-/// commit_B is unset). Sent after the operator confirms the pairing-window gesture, before
-/// starting CPace RESPONDER.
+/// @brief Formats a client/pair-init message with only pairing_index.
+/// The form used by every flow that carries no commit_B: static PIN, sent after the operator
+/// confirms the pairing-window gesture and before starting CPace RESPONDER, and Pairing PSK,
+/// sent immediately before client/pair-finalize (pairing.md "Pairing PSK Flow").
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
 ///                      handshake.
 /// @return JSON string for the client/pair-init message with only pairing_index set.

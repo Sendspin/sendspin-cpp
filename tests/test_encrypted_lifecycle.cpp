@@ -504,6 +504,17 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
         client, [&] { return server.learned_psk_id().has_value(); }, 4000))
         << "client/pair-finalize (with a freshly generated long_term_psk) was never observed";
 
+    // pairing.md "Pairing PSK Flow": the client sends client/pair-init immediately before
+    // client/pair-finalize. The init starts the attempt and carries the index of the pairing
+    // activate that admitted it; commit_B belongs to the dynamic pairing code flow, so this one
+    // must not carry it.
+    EXPECT_TRUE(server.pair_init_preceded_finalize())
+        << "client/pair-finalize was sent without a preceding client/pair-init";
+    auto pair_init = server.pair_init();
+    ASSERT_TRUE(pair_init.has_value());
+    EXPECT_EQ(pair_init->pairing_index, 1U);
+    EXPECT_FALSE(pair_init->has_commit_b);
+
     // handle_enter_pairing's Pairing-PSK branch must fire on_pairing_started, exactly like the
     // PIN branches do, so the started/succeeded/failed callback trio stays method-agnostic.
     ASSERT_TRUE(listener.pairing_started_server_id().has_value())
@@ -652,6 +663,16 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     ASSERT_TRUE(pump_until(
         client, [&] { return server.learned_psk_id().has_value(); }, 4000))
         << "client/pair-finalize was never sent for the post-rehandshake pairing activate";
+
+    // The re-pairing activate starts its attempt the same way: pair-init first, then the
+    // finalize (pairing.md "Pairing PSK Flow"). Its pairing index counts the pairing activates
+    // since the re-handshake that preceded it, which reset the counter.
+    EXPECT_TRUE(server.pair_init_preceded_finalize())
+        << "client/pair-finalize was sent without a preceding client/pair-init";
+    auto repair_init = server.pair_init();
+    ASSERT_TRUE(repair_init.has_value());
+    EXPECT_EQ(repair_init->pairing_index, 1U);
+    EXPECT_FALSE(repair_init->has_commit_b);
 
     // The primary regression check: no client/state must have reached the server before (or
     // instead of) client/pair-finalize. handle_enter_pairing() never publishes client/state;

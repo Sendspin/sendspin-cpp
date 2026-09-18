@@ -1409,8 +1409,8 @@ std::string format_client_pair_init_message(uint32_t pairing_index) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-init";
-    // Static PIN: no commit_B, but pairing_index is required on every client/pair-init (spec
-    // "PAKE").
+    // commit_B belongs to the dynamic pairing code flow only; pairing_index is required on
+    // every client/pair-init (pairing.md "client/pair-init").
     root["payload"]["pairing_index"] = pairing_index;
 
     std::string output;

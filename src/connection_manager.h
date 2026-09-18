@@ -792,7 +792,8 @@ private:
     /// and sends client/pair-finalize with the long-term PSK in the clear.
     /// @param conn The connection entering pairing.
     /// @param server_id conn->get_server_id(), captured by handle_enter_pairing().
-    void handle_enter_pairing_psk(SendspinConnection* conn, const std::string& server_id);
+    void handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
+                                  const std::string& server_id);
 
     /// @brief Handles a pair/abort event on the main loop.
     /// Cleans up pairing state. Per spec "pair/abort", only closes the connection for reason
