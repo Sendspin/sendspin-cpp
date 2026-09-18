@@ -133,7 +133,14 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
     HandshakeFrameResult result = this->noise_handshake_->on_text_frame(text, send_fn);
 
     if (result == HandshakeFrameResult::ABORT) {
-        SS_LOGW(TAG, "Noise handshake aborted; closing connection");
+        const std::string& server_error = this->noise_handshake_->server_error_reason();
+        if (server_error.empty()) {
+            SS_LOGW(TAG, "Noise handshake aborted; closing connection");
+        } else {
+            SS_LOGW(TAG,
+                    "Noise handshake aborted by server/error (reason='%s'); closing connection",
+                    server_error.c_str());
+        }
         // Discard handshake state, then close per spec Failure Handling: a handshake-phase
         // failure closes the WebSocket without sending any application-level message.
         this->noise_handshake_.reset();

@@ -283,10 +283,30 @@ std::string NoiseHandshake::build_client_init() {
     return text;
 }
 
+bool NoiseHandshake::take_server_error(const std::string& text, const char* log_context) {
+    JsonDocument doc = make_json_document();
+    if (deserializeJson(doc, text) || doc.isNull()) {
+        return false;
+    }
+    if (std::strcmp(doc["type"] | "", "server/error") != 0) {
+        return false;
+    }
+    // The handshake aborts either way; recognizing the message is what turns that abort from "the
+    // peer sent something unparseable" into the server's own account of why it refused.
+    this->server_error_reason_ = doc["payload"]["reason"] | "";
+    SS_LOGE(TAG, "%s: server/error, reason='%s'; the server refused the connection", log_context,
+            this->server_error_reason_.c_str());
+    return true;
+}
+
 HandshakeFrameResult NoiseHandshake::on_text_frame(
     const std::string& text, const std::function<bool(const std::string&)>& send_fn) {
     switch (this->state_) {
         case State::WAIT_SERVER_INIT:
+            if (this->take_server_error(text, "awaiting server/init")) {
+                this->state_ = State::ABORTED;
+                return HandshakeFrameResult::ABORT;
+            }
             if (!this->handle_server_init(text)) {
                 this->state_ = State::ABORTED;
                 return HandshakeFrameResult::ABORT;
@@ -295,6 +315,10 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
             return HandshakeFrameResult::NEED_MORE;
 
         case State::WAIT_MSG1:
+            if (this->take_server_error(text, "awaiting noise/handshake msg1")) {
+                this->state_ = State::ABORTED;
+                return HandshakeFrameResult::ABORT;
+            }
             if (!this->handle_msg1(text, send_fn)) {
                 this->state_ = State::ABORTED;
                 return HandshakeFrameResult::ABORT;

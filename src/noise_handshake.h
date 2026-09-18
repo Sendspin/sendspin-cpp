@@ -154,6 +154,16 @@ public:
     HandshakeFrameResult on_text_frame(const std::string& text,
                                        const std::function<bool(const std::string&)>& send_fn);
 
+    /// @brief The reason carried by a server/error received during the handshake, or empty.
+    ///
+    /// messaging.md "server/error": the server sends one in place of server/init when it cannot
+    /// accept our client/init. The message is unauthenticated, so connection.md "Failure Handling"
+    /// makes the reason a hint for logging and operator display, which is what the connection does
+    /// with it when it closes over the resulting ABORT.
+    const std::string& server_error_reason() const {
+        return this->server_error_reason_;
+    }
+
     /// @brief Take ownership of the handshake result (only valid after COMPLETE).
     std::optional<NoiseHandshakeResult> take_result() {
         return std::move(this->result_);
@@ -167,6 +177,12 @@ private:
         COMPLETE,          ///< handshake done
         ABORTED,           ///< terminal error
     };
+
+    /// @brief Recognizes a cleartext server/error, recording and logging the reason it carries.
+    /// @param text        The received cleartext frame.
+    /// @param log_context Handshake state to name in the log line.
+    /// @return true if the frame was a server/error, which aborts the handshake.
+    bool take_server_error(const std::string& text, const char* log_context);
 
     /// @brief Parse and validate the server/init text frame.
     bool handle_server_init(const std::string& text);
@@ -184,6 +200,9 @@ private:
 
     /// server_id decoded from server/init (43-char base64url).
     std::string server_id_;
+
+    /// Reason from a received server/error; empty until one arrives. See server_error_reason().
+    std::string server_error_reason_;
 
     /// Exact bytes of the server/init frame we received (retained for prologue).
     std::string server_init_text_;

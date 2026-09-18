@@ -790,6 +790,56 @@ TEST(NoiseHandshakeDriver, MissingPskCategoryAborts) {
               HandshakeFrameResult::ABORT);
 }
 
+// messaging.md "server/error": the server sends it in place of server/init when it cannot accept
+// our client/init, then closes. The handshake aborts, and the reason it carries is logged rather
+// than the frame being treated as an unparseable server/init.
+TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingServerInitAborts) {
+    Identity client_id = Identity::generate().value();
+    RecordStore rs(nullptr);
+
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    nh.build_client_init();
+
+    auto r = nh.on_text_frame(R"({"type":"server/error","payload":{"reason":"unsupported_suite"}})",
+                              [](const std::string&) { return true; });
+    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
+    EXPECT_EQ(nh.server_error_reason(), "unsupported_suite");
+}
+
+// Control: the same abort from a frame that is not a server/error leaves no reason to report, so
+// the connection does not attribute a generic failure to the server.
+TEST(NoiseHandshakeDriver, AbortWithoutServerErrorReportsNoReason) {
+    Identity client_id = Identity::generate().value();
+    RecordStore rs(nullptr);
+
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    nh.build_client_init();
+
+    auto r = nh.on_text_frame(R"({"type":"server/init","payload":{"version":99}})",
+                              [](const std::string&) { return true; });
+    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
+    EXPECT_TRUE(nh.server_error_reason().empty());
+}
+
+// The same frame after server/init, while the client is waiting for Noise message 1, is refused
+// the same way instead of being read as a handshake message.
+TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
+    RecordStore rs(nullptr);
+
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    nh.build_client_init();
+    ASSERT_EQ(nh.on_text_frame(make_server_init(server_id.peer_id()),
+                               [](const std::string&) { return true; }),
+              HandshakeFrameResult::NEED_MORE);
+
+    auto r = nh.on_text_frame(R"({"type":"server/error","payload":{"reason":"malformed"}})",
+                              [](const std::string&) { return true; });
+    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
+    EXPECT_EQ(nh.server_error_reason(), "malformed");
+}
+
 TEST(NoiseHandshakeDriver, MalformedServerInitAborts) {
     Identity client_id = Identity::generate().value();
     RecordStore rs(nullptr);
