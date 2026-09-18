@@ -29,6 +29,18 @@ namespace sendspin {
 class SendspinClient;
 struct ClientHelloMessage;
 
+/// @brief Metadata states handed to the main loop but not yet drained
+///
+/// messaging.md "server/state" lets a server bring a client up to date and then schedule the next
+/// update straight after it, so two states can land between two main-loop ticks: the one that
+/// describes what is playing now, and the one timed to the next track. Both are kept, in arrival
+/// order, so the current one is still applied on the tick that also takes the scheduled one.
+/// A third state arriving in the same window replaces `newest`, which no observer has seen.
+struct PendingMetadataStates {
+    std::optional<ServerMetadataStateObject> oldest;
+    std::optional<ServerMetadataStateObject> newest;
+};
+
 /// @brief Private implementation of the metadata role
 struct MetadataRole::Impl {
     explicit Impl(SendspinClient* client);
@@ -39,7 +51,7 @@ struct MetadataRole::Impl {
     // ========================================
 
     struct EventState {
-        InboxSlot<ServerMetadataStateObject> slot;
+        InboxSlot<PendingMetadataStates> slot;
     };
 
     // ========================================
@@ -56,6 +68,10 @@ struct MetadataRole::Impl {
         return (pending_bits & INBOX_TOPIC_METADATA) != 0 || this->held_state.has_value();
     }
     void drain_events();
+    /// Whether a state's server-clock deadline has passed on the synchronized client clock.
+    bool state_is_due(int64_t timestamp) const;
+    /// Applies the held state and fires the listener once its server-clock deadline has passed.
+    void apply_due_state();
     void handle_cleared_event() const;
     void cleanup();
 

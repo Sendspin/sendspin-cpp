@@ -25,6 +25,24 @@ static const char* const TAG = "sendspin.metadata";
 
 namespace sendspin {
 
+namespace {
+
+/// @brief Folds a newly arrived state into the states the main loop has not taken yet
+///
+/// `incoming` always carries exactly one state, in `oldest`. The first one to arrive after a
+/// drain keeps that place; every later one becomes `newest`, so the pair the main loop takes is
+/// the oldest undrained state and the most recent one (see PendingMetadataStates). Runs under the
+/// Inbox mutex, so it stays a pure data operation.
+void coalesce_metadata_states(PendingMetadataStates& current, PendingMetadataStates&& incoming) {
+    if (!current.oldest.has_value()) {
+        current.oldest = std::move(incoming.oldest);
+        return;
+    }
+    current.newest = std::move(incoming.oldest);
+}
+
+}  // namespace
+
 // ============================================================================
 // Impl constructor / destructor
 // ============================================================================
@@ -107,49 +125,66 @@ void MetadataRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
 }
 
 void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject&& metadata) const {
-    // messaging.md "server/state": each included metadata object is the role's full state, so a
-    // newer one replaces an undrained older one outright rather than overlaying it.
-    this->event_state->slot.write(std::move(metadata));
+    // messaging.md "server/state": each included metadata object is the role's full state, never
+    // an overlay on the one before it. Two can arrive between main-loop ticks, so the slot keeps
+    // the oldest undrained state alongside the newest (see coalesce_metadata_states).
+    PendingMetadataStates arrival;
+    arrival.oldest = std::move(metadata);
+    this->event_state->slot.merge(coalesce_metadata_states, std::move(arrival));
+}
+
+bool MetadataRole::Impl::state_is_due(int64_t timestamp) const {
+    // get_client_time returns 0 when there is no current connection. Without a connection we
+    // cannot honor the server-clock deadline, so a state is due at once rather than starving the
+    // listener.
+    const int64_t client_ts = this->client->get_client_time(timestamp);
+    return client_ts == 0 || client_ts <= platform_time_us();
+}
+
+void MetadataRole::Impl::apply_due_state() {
+    if (!this->held_state.has_value() || !this->state_is_due(this->held_state->timestamp)) {
+        return;
+    }
+
+    this->metadata = std::move(this->held_state.value());
+    this->held_state.reset();
+    if (this->listener) {
+        this->listener->on_metadata(this->metadata);
+    }
 }
 
 void MetadataRole::Impl::drain_events() {
     // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex --
     // see inbox.h), so the server-clock deadline gate is split in two: take() unconditionally
-    // moves any pending slot value into held_state, then the deadline is evaluated below with no
+    // moves the pending states into held_state, then each deadline is evaluated below with no
     // lock held at all.
     //
     // roles/metadata/v1.md "Scheduled metadata updates": a state whose timestamp is still in the
     // future is the pending update and a newer one replaces it, while a past or present one is
     // applied at once and discards the pending update. Both fall out of replacing held_state with
-    // whatever the slot holds.
-    ServerMetadataStateObject metadata{};
-    if (this->event_state->slot.take(metadata)) {
-        this->held_state = std::move(metadata);
+    // each taken state in arrival order, applying whatever is due in between.
+    PendingMetadataStates taken;
+    if (this->event_state->slot.take(taken)) {
+        const bool collapses =
+            taken.newest.has_value() && this->state_is_due(taken.newest->timestamp);
+        if (taken.oldest.has_value() && !collapses) {
+            // The older state is applied on its own while the one behind it is still scheduled.
+            // Two states that are both due collapse instead: the older would be superseded
+            // within this tick, so no listener could observe it.
+            this->held_state = std::move(taken.oldest);
+            this->apply_due_state();
+        }
+        if (taken.newest.has_value()) {
+            this->held_state = std::move(taken.newest);
+        }
     }
 
-    if (!this->held_state.has_value()) {
-        return;
-    }
-
-    // A future-dated state is held across ticks below without any topic bit set (take() above
-    // cleared it). It is re-evaluated against its deadline on later ticks only because
-    // needs_drain() ORs in held_state.has_value() alongside the INBOX_TOPIC_METADATA bit test, so
-    // this drain_events() keeps running each tick until the deadline fires. Dropping that OR term
+    // A future-dated state is held across ticks without any topic bit set (take() above cleared
+    // it). It is re-evaluated against its deadline on later ticks only because needs_drain() ORs
+    // in held_state.has_value() alongside the INBOX_TOPIC_METADATA bit test, so this
+    // drain_events() keeps running each tick until the deadline fires. Dropping that OR term
     // would strand the state until an unrelated new state re-set the topic bit.
-    //
-    // get_client_time returns 0 when there is no current connection. Without a connection we
-    // cannot honor the server-clock deadline, so fire immediately rather than starving the
-    // listener.
-    int64_t client_ts = this->client->get_client_time(this->held_state->timestamp);
-    if (client_ts != 0 && client_ts > platform_time_us()) {
-        return;
-    }
-
-    this->metadata = std::move(this->held_state.value());
-    if (this->listener) {
-        this->listener->on_metadata(this->metadata);
-    }
-    this->held_state.reset();
+    this->apply_due_state();
 }
 
 void MetadataRole::Impl::handle_cleared_event() const {

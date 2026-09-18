@@ -29,6 +29,18 @@ namespace sendspin {
 class SendspinClient;
 struct ClientHelloMessage;
 
+/// @brief Color palettes handed to the main loop but not yet drained
+///
+/// messaging.md "server/state" lets a server bring a client up to date and then schedule the next
+/// update straight after it, so two palettes can land between two main-loop ticks: the one for
+/// what is playing now, and the one timed to the next track. Both are kept, in arrival order, so
+/// the current one is still applied on the tick that also takes the scheduled one. A third
+/// palette arriving in the same window replaces `newest`, which no observer has seen.
+struct PendingColorStates {
+    std::optional<ServerColorStateObject> oldest;
+    std::optional<ServerColorStateObject> newest;
+};
+
 /// @brief Private implementation of the color role
 struct ColorRole::Impl {
     explicit Impl(SendspinClient* client);
@@ -39,7 +51,7 @@ struct ColorRole::Impl {
     // ========================================
 
     struct EventState {
-        InboxSlot<ServerColorStateObject> slot;
+        InboxSlot<PendingColorStates> slot;
     };
 
     // ========================================
@@ -59,6 +71,10 @@ struct ColorRole::Impl {
         return (pending_bits & INBOX_TOPIC_COLOR) != 0 || this->held_state.has_value();
     }
     void drain_events();
+    /// Whether a palette's server-clock deadline has passed on the synchronized client clock.
+    bool state_is_due(int64_t timestamp) const;
+    /// Applies the held palette and fires the listener once its server-clock deadline has passed.
+    void apply_due_state();
     void handle_cleared_event() const;
     void cleanup();
 
