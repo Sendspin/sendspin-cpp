@@ -1148,7 +1148,29 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
     // server). Serialize the shared arena and the parse itself; JSON control messages are
     // infrequent, so contention is negligible.
     std::lock_guard<std::mutex> lock(this->json_processing_mutex_);
+    this->dispatch_json_message(conn, data, len, timestamp);
+}
 
+void SendspinClient::admit_connection(SendspinConnection* conn) {
+    // Runs on the main loop, from ConnectionManager::set_current_connection(). Holding
+    // json_processing_mutex_ across both steps is what makes the replay exact: a network thread
+    // that reaches the dispatch gate meanwhile either blocks here and then sees an admitted
+    // connection (dispatching live, after everything held), or already held its message and is
+    // drained below. Nothing can land between the last replay and the flag.
+    std::lock_guard<std::mutex> lock(this->json_processing_mutex_);
+    for (auto& held : conn->take_pre_admission_messages()) {
+        SS_LOGD(TAG, "Replaying a role message held until admission (%zu bytes)", held.json.size());
+        this->dispatch_json_message(conn, held.json.data(), held.json.size(), held.arrival_us,
+                                    JsonMessageOrigin::ADMISSION_REPLAY);
+    }
+    // Last: the binary path reads this flag without the mutex, so audio chunks start being
+    // dispatched on the network thread only once the replay above has finished writing to the
+    // roles it feeds.
+    conn->set_admitted(true);
+}
+
+void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char* data, size_t len,
+                                           int64_t timestamp, JsonMessageOrigin origin) {
     // Reuse the internal-RAM scratch arena if configured. Safe to reset here: the JsonDocument
     // from the previous call was already destroyed when that call returned.
     if (this->json_arena_) {
@@ -1165,12 +1187,24 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
 
     SendspinServerToClientMessageType message_type = determine_message_type(root);
 
-    // Admission gate for role-bound traffic. Dropped silently rather than closing the
-    // connection: a nursery member that is still racing toward promotion, or one that just lost
-    // arbitration, is not misbehaving, and the establish/re-prove watchdogs already reap a
-    // connection that never gets admitted.
-    if (requires_admitted_connection(message_type) && (conn == nullptr || !conn->is_admitted())) {
-        SS_LOGW(TAG, "Ignoring role message from a connection that is not admitted (server_id=%s)",
+    // Admission gate for role-bound traffic. The connection is not closed over it: a nursery
+    // member that is still racing toward promotion, or one that just lost arbitration, is not
+    // misbehaving, and the establish/re-prove watchdogs already reap a connection that never
+    // gets admitted.
+    //
+    // A server starts sending role traffic as soon as it has sent its server/activate, while
+    // admission is decided a tick later on the main loop, so the messages in that window are
+    // held for replay at admission (see admit_connection()) rather than dropped: a one-shot
+    // server/state is never repeated. A connection that is never admitted replays nothing.
+    if (origin == JsonMessageOrigin::NETWORK && requires_admitted_connection(message_type) &&
+        (conn == nullptr || !conn->is_admitted())) {
+        if (conn != nullptr && conn->activate_delivered() &&
+            conn->hold_pre_admission_message(data, len, timestamp)) {
+            SS_LOGD(TAG, "Holding a role message until admission (server_id=%s)",
+                    conn->get_server_id().c_str());
+            return;
+        }
+        SS_LOGW(TAG, "Dropping role message from a connection that is not admitted (server_id=%s)",
                 conn != nullptr ? conn->get_server_id().c_str() : "?");
         return;
     }
@@ -1319,6 +1353,10 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                     // enforcement, and admission arbitration) on the main thread.
                     SS_LOGD(TAG, "server/activate received (activities_count=%zu)",
                             activate_msg.activities.size());
+                    // Before the handoff: role traffic the server sends behind this activate
+                    // must be held rather than dropped, and it can arrive on this thread the
+                    // moment the activate leaves it (see the admission gate above).
+                    conn->note_activate_delivered();
                     this->connection_manager_->schedule_activate(
                         {conn->shared_from_this(), std::move(activate_msg.activities),
                          std::move(activate_msg.active_roles), activate_msg.pairing_method,

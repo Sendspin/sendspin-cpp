@@ -23,7 +23,10 @@
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace sendspin {
 
@@ -446,6 +449,30 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
 
     SS_LOGW(TAG, "Binary frame before the Noise handshake started; dropping");
     this->reset_websocket_payload();
+}
+
+// ============================================================================
+// Pre-admission message hold
+// ============================================================================
+
+bool SendspinConnection::hold_pre_admission_message(const char* data, size_t len,
+                                                    int64_t arrival_us) {
+    std::lock_guard<std::mutex> lock(this->held_messages_mutex_);
+    if (this->held_messages_.size() >= MAX_HELD_MESSAGES ||
+        this->held_messages_bytes_ + len > MAX_HELD_BYTES) {
+        return false;
+    }
+    this->held_messages_.push_back(HeldMessage{std::string(data, len), arrival_us});
+    this->held_messages_bytes_ += len;
+    return true;
+}
+
+std::vector<SendspinConnection::HeldMessage> SendspinConnection::take_pre_admission_messages() {
+    std::vector<HeldMessage> taken;
+    std::lock_guard<std::mutex> lock(this->held_messages_mutex_);
+    taken.swap(this->held_messages_);
+    this->held_messages_bytes_ = 0;
+    return taken;
 }
 
 // ============================================================================

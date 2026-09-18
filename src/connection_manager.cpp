@@ -1465,7 +1465,9 @@ void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnectio
         this->current_connection_->set_admitted(false);
     }
     if (conn != nullptr) {
-        conn->set_admitted(true);
+        // Admitting also replays the role messages this connection held while it was proving
+        // itself, which is why it goes through the client rather than setting the flag here.
+        this->client_->admit_connection(conn.get());
     }
     this->has_current_.store(conn != nullptr, std::memory_order_release);
     this->current_connection_ = std::move(conn);

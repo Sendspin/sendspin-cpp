@@ -24,10 +24,12 @@
 // since the project's own NoiseSession class only implements the responder side, matching the
 // "client is always the Noise responder" invariant.
 
+#include "connection.h"
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/crypto.h"
+#include "platform/logging.h"
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
@@ -44,6 +46,8 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
+#include <memory>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -835,6 +839,98 @@ TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
     pump_for(client, 100);
 }
 
+// =============================================================================
+// Pre-admission hold harness
+// =============================================================================
+
+// A SendspinConnection that exists only to carry the admission flags and the held-message queue:
+// nothing is sent, and no transport is ever attached. It lets a test open the window between a
+// server/activate reaching the dispatch path and the main loop admitting the connection, which
+// over a real socket is whatever the thread scheduler makes it.
+class HoldTestConnection : public SendspinConnection {
+public:
+    void start() override {}
+    void loop() override {}
+    void disconnect(SendspinGoodbyeReason /*reason*/, std::function<void()> on_complete) override {
+        if (on_complete) {
+            on_complete();
+        }
+    }
+    void close_transport_now() override {}
+    bool is_connected() const override {
+        return true;
+    }
+    SsErr send_text_message(const std::string& /*msg*/, SendCompleteCallback cb,
+                            bool /*allow_before_hello*/) override {
+        if (cb) {
+            cb(true);
+        }
+        return SsErr::OK;
+    }
+    SsErr send_binary_message(const uint8_t* /*data*/, size_t /*len*/, SendCompleteCallback cb,
+                              bool /*allow_before_hello*/) override {
+        if (cb) {
+            cb(true);
+        }
+        return SsErr::OK;
+    }
+    bool send_time_message() override {
+        return true;
+    }
+};
+
+class RecordingMetadataListener : public MetadataRoleListener {
+public:
+    std::atomic<int> updates{0};
+    std::string last_title;
+    void on_metadata(const ServerMetadataStateObject& m) override {
+        this->last_title = m.title.value_or("");
+        this->updates.fetch_add(1);
+    }
+};
+
+// A started client with a metadata role, and the one entry point the hold tests need: hand a JSON
+// message to the dispatch path as the connection's network thread would.
+class HoldTestClient {
+public:
+    explicit HoldTestClient(const char* name) {
+        SendspinClientConfig config;
+        config.name = name;
+        // No listening port is used: every message is delivered directly.
+        config.server_port = 0;
+        this->client_storage = std::make_unique<SendspinClient>(std::move(config));
+        this->client_storage->set_network_provider(&this->network);
+        this->client_storage->add_metadata().set_listener(&this->listener);
+        EXPECT_TRUE(this->client_storage->start());
+    }
+
+    ~HoldTestClient() {
+        this->client_storage->stop();
+    }
+
+    void deliver(SendspinConnection& conn, const std::string& json) {
+        this->client_storage->process_json_message(&conn, json.data(), json.size(),
+                                                   platform_time_us());
+    }
+
+    void pump() {
+        pump_for(*this->client_storage, 20);
+    }
+
+    SendspinClient& client_ref() {
+        return *this->client_storage;
+    }
+
+    TestNetworkProvider network;
+    RecordingMetadataListener listener;
+    std::unique_ptr<SendspinClient> client_storage;
+};
+
+std::string metadata_state_json(int timestamp, const std::string& title) {
+    return R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
+           std::to_string(timestamp) + R"(,"title":")" + title + R"("}}})";
+}
+
 // Role-bound traffic from a connection that has finished the Noise handshake but has NOT been
 // admitted must be ignored.
 //
@@ -895,6 +991,106 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+// Control: the harness itself delivers. An admitted connection's role message reaches the
+// metadata listener through the same dispatch entry point the hold tests use.
+TEST(EncryptedLifecycle, RoleTrafficFromAnAdmittedConnectionIsApplied) {
+    HoldTestClient bundle("Admitted Role Traffic Test Client");
+
+    HoldTestConnection conn;
+    bundle.client_ref().admit_connection(&conn);
+    bundle.deliver(conn, metadata_state_json(1, "Admitted"));
+    bundle.pump();
+    EXPECT_EQ(bundle.listener.updates.load(), 1);
+    EXPECT_EQ(bundle.listener.last_title, "Admitted");
+}
+
+// A connection that never sends a server/activate is not a peer whose role traffic is worth
+// keeping: the message above stays dropped even once that connection reaches the admitted slot.
+// This is the boundary of the hold in the test below.
+TEST(EncryptedLifecycle, RoleTrafficBeforeAnyActivateIsNotReplayedAtAdmission) {
+    HoldTestClient bundle("Pre-Activate Role Traffic Test Client");
+
+    HoldTestConnection conn;
+    bundle.deliver(conn, metadata_state_json(1, "Before Any Activate"));
+    bundle.pump();
+    ASSERT_EQ(bundle.listener.updates.load(), 0);
+
+    bundle.client_ref().admit_connection(&conn);
+    bundle.pump();
+    EXPECT_EQ(bundle.listener.updates.load(), 0)
+        << "role traffic that preceded every server/activate must not be replayed (last_title='"
+        << bundle.listener.last_title << "')";
+}
+
+// A server starts sending role traffic as soon as it has sent its server/activate, while the
+// client decides admission on its next loop() tick. The traffic in that window is held and
+// replayed at admission: a one-shot server/state (an artwork channel set, a colour palette) is
+// never repeated, so dropping it loses that state for the whole session.
+//
+// Driven through the dispatch entry point rather than over a socket so the window is the test's
+// to open and close: the role message is handed over while the connection is unadmitted, and
+// admission happens only when the test says so.
+TEST(EncryptedLifecycle, RoleTrafficBetweenActivateAndAdmissionIsReplayed) {
+    HoldTestClient bundle("Post-Activate Role Traffic Test Client");
+
+    HoldTestConnection conn;
+    // What the network thread does when it hands a server/activate to the main loop.
+    conn.note_activate_delivered();
+
+    bundle.deliver(conn, metadata_state_json(1, "Held Through Admission"));
+    bundle.pump();
+    ASSERT_EQ(bundle.listener.updates.load(), 0)
+        << "an unadmitted connection must not drive the roles, held or not";
+
+    bundle.client_ref().admit_connection(&conn);
+    bundle.pump();
+    EXPECT_EQ(bundle.listener.updates.load(), 1)
+        << "the role message held across admission was never applied";
+    EXPECT_EQ(bundle.listener.last_title, "Held Through Admission");
+}
+
+// Several held messages replay in arrival order, so the last state the server sent in the window
+// is the one that stands. They land in the metadata role's collapsing slot, which merges them
+// into the single update the listener sees, exactly as it would for live traffic arriving between
+// two loop() ticks.
+TEST(EncryptedLifecycle, HeldRoleTrafficIsReplayedInArrivalOrder) {
+    HoldTestClient bundle("Held Order Test Client");
+
+    HoldTestConnection conn;
+    conn.note_activate_delivered();
+    bundle.deliver(conn, metadata_state_json(1, "First"));
+    bundle.deliver(conn, metadata_state_json(2, "Second"));
+
+    bundle.client_ref().admit_connection(&conn);
+    bundle.pump();
+    EXPECT_EQ(bundle.listener.updates.load(), 1);
+    EXPECT_EQ(bundle.listener.last_title, "Second")
+        << "the held messages were replayed out of order";
+}
+
+// Control: the hold is bounded. A peer that sits unadmitted and keeps sending role traffic gets
+// its excess dropped rather than growing the queue without limit, and the messages inside the
+// budget still replay.
+TEST(EncryptedLifecycle, HeldRoleTrafficIsBounded) {
+    HoldTestClient bundle("Held Budget Test Client");
+
+    HoldTestConnection conn;
+    conn.note_activate_delivered();
+    const size_t over_budget = SendspinConnection::MAX_HELD_MESSAGES + 3;
+    for (size_t i = 0; i < over_budget; ++i) {
+        bundle.deliver(conn, metadata_state_json(static_cast<int>(i) + 1,
+                                                 "Title " + std::to_string(i)));
+    }
+
+    bundle.client_ref().admit_connection(&conn);
+    bundle.pump();
+    // The last title to survive the merge is the last one that fit the budget: everything the
+    // peer sent past it was dropped rather than queued.
+    EXPECT_EQ(bundle.listener.updates.load(), 1);
+    EXPECT_EQ(bundle.listener.last_title,
+              "Title " + std::to_string(SendspinConnection::MAX_HELD_MESSAGES - 1));
 }
 
 // Seeds a set of LONG_TERM records and keeps the persisted "records" array up to date, so an

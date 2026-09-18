@@ -702,6 +702,9 @@ private:
     // ========================================
 
     /// @brief Processes a JSON message from a connection
+    ///
+    /// Called on the connection's network thread. Takes the JSON processing mutex and hands off
+    /// to dispatch_json_message().
     /// @param conn The connection that received the message
     /// @param data Pointer to the raw JSON text (not null-terminated; valid for the duration of the
     /// call only)
@@ -709,6 +712,32 @@ private:
     /// @param timestamp Receive timestamp in microseconds
     void process_json_message(SendspinConnection* conn, const char* data, size_t len,
                               int64_t timestamp);
+
+    /// @brief Where a dispatched JSON message came from.
+    enum class JsonMessageOrigin : uint8_t {
+        NETWORK,           ///< Live traffic, subject to the admission gate
+        ADMISSION_REPLAY,  ///< A message held until admission, whose gate has already been passed
+    };
+
+    /// @brief Parses and routes one JSON message. The caller holds json_processing_mutex_.
+    /// @param conn The connection that received the message
+    /// @param data Pointer to the raw JSON text (not null-terminated; valid for the duration of the
+    /// call only)
+    /// @param len Length of the JSON text in bytes
+    /// @param timestamp Receive timestamp in microseconds
+    /// @param origin Whether the admission gate still applies to this message
+    void dispatch_json_message(SendspinConnection* conn, const char* data, size_t len,
+                               int64_t timestamp,
+                               JsonMessageOrigin origin = JsonMessageOrigin::NETWORK);
+
+    /// @brief Replays the connection's held role messages and marks it admitted.
+    ///
+    /// Main loop only; ConnectionManager::set_current_connection() is the only caller. The
+    /// replay and the flag happen under one hold of json_processing_mutex_ so the role traffic a
+    /// server sent between its server/activate and this admission is applied exactly once, in
+    /// arrival order, ahead of anything that arrives afterwards.
+    /// @param conn The connection entering the admitted slot
+    void admit_connection(SendspinConnection* conn);
 
     /// @brief Processes a binary message from a connection
     /// Every binary message is role-bound, so this is dropped unless `conn` holds the admitted

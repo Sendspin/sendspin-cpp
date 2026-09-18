@@ -181,10 +181,55 @@ public:
     }
 
     /// @brief Mark this connection as occupying (or vacating) the admitted slot.
-    /// ConnectionManager::set_current_connection() is the only caller.
+    /// ConnectionManager::set_current_connection() is the only caller, through
+    /// SendspinClient::admit_connection() when admitting.
     void set_admitted(bool admitted) {
         this->admitted_.store(admitted, std::memory_order_release);
     }
+
+    /// @brief Notes that a server/activate from this connection reached the dispatch path.
+    ///
+    /// Distinct from first_activate_received(), which the main loop sets once it has APPLIED an
+    /// activate. This one is set by the network thread the moment one is handed off, and is what
+    /// tells the dispatch gate that role traffic arriving now belongs to an activation the main
+    /// loop has not resolved yet (see hold_pre_admission_message()). Never cleared: a connection
+    /// that has sent one activate is a peer whose later role traffic is worth holding.
+    void note_activate_delivered() {
+        this->activate_delivered_.store(true, std::memory_order_release);
+    }
+
+    /// @brief Whether a server/activate from this connection has reached the dispatch path.
+    bool activate_delivered() const {
+        return this->activate_delivered_.load(std::memory_order_acquire);
+    }
+
+    /// @brief One role message received before this connection was admitted, with the arrival
+    /// time the live path would have processed it with.
+    struct HeldMessage {
+        std::string json;
+        int64_t arrival_us{};
+    };
+
+    /// @brief Holds a role message that arrived before admission, for replay at admission.
+    ///
+    /// A server sends role traffic as soon as it has sent its server/activate, but admission is
+    /// decided on the main loop one tick later, so the messages in between would otherwise be
+    /// lost (a one-shot server/state carries state that is never repeated). Holding them here
+    /// keeps the admission gate: a connection that never wins admission never replays anything,
+    /// and its held messages die with it. Only messages that follow an activate are held; role
+    /// traffic from a peer that has not activated anything is dropped where it always was.
+    ///
+    /// Called on the network thread from SendspinClient's dispatch path, which holds
+    /// json_processing_mutex_; the replay runs under the same mutex, so the queue is never
+    /// drained mid-append and the replay cannot interleave with live dispatch.
+    /// @param data Raw JSON text (not null-terminated).
+    /// @param len Length of the JSON text in bytes.
+    /// @param arrival_us Receive timestamp in microseconds.
+    /// @return true if the message was held, false if the budget is full and it was not.
+    bool hold_pre_admission_message(const char* data, size_t len, int64_t arrival_us);
+
+    /// @brief Takes the held role messages, in arrival order, leaving the queue empty.
+    std::vector<HeldMessage> take_pre_admission_messages();
 
     // ========================================
     // Noise transport
@@ -1106,10 +1151,29 @@ protected:
     /// read from the main loop via is_noise_handshake_complete()).
     std::atomic<bool> noise_handshake_complete_{false};
 
+    /// True once a server/activate from this connection reached the dispatch path (network
+    /// thread), read by the same thread's gate and, on the main loop, nowhere. Separate from
+    /// first_activate_received_, which tracks activates the main loop has applied.
+    std::atomic<bool> activate_delivered_{false};
+
     /// True while this connection occupies the manager's admitted (current) slot. Written only
     /// by ConnectionManager::set_current_connection() on the main loop; read on the network
     /// thread by the role-dispatch gate. See is_admitted().
     std::atomic<bool> admitted_{false};
+
+    /// Role messages received before admission, replayed in order when the connection is
+    /// admitted. See hold_pre_admission_message().
+    ///
+    /// The budget covers the burst a server sends between its server/activate and the client's
+    /// next loop() tick: one role message per role the server can state-update at once, each
+    /// within one steady-state protocol message's worth of bytes
+    /// (SendspinClientConfig::json_arena_size's default). Anything past that is dropped with a
+    /// warning rather than letting an unadmitted peer grow this without bound.
+    static constexpr size_t MAX_HELD_MESSAGES = 4;
+    static constexpr size_t MAX_HELD_BYTES = 4 * 2048;
+    std::mutex held_messages_mutex_;
+    std::vector<HeldMessage> held_messages_;
+    size_t held_messages_bytes_{0};
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).
     /// Written from the transport connected callback (network thread), read by the manager's
