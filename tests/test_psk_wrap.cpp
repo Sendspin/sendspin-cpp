@@ -15,11 +15,12 @@
 // Wrapping (pairing.md "Wrapping") tests: K_wrap derivation and wrap_value/unwrap_value
 // round-trips.
 //
-// The K_wrap KAT below is independently re-derived via a small Python script (see the comment
-// on PskWrap.KWrapKat) rather than taken from aiosendspin, since aiosendspin predates this
-// construction change; the wrap/unwrap round-trip tests are self-consistency checks against our
-// own implementation (there is no independent reference for the AEAD step at KAT granularity
-// without re-implementing ChaCha20-Poly1305/AES-GCM by hand).
+// The two K_wrap KATs below were produced twice and compared: once from the spec formula written
+// out directly in Python (see the comment on each test) and once by running aiosendspin's
+// reference implementation (aiosendspin/noise/pairing.py: _wrap_key over _pake_sid) over the
+// same sid and ISK. The wrap/unwrap round-trip tests are self-consistency checks against our own
+// implementation (there is no independent reference for the AEAD step at KAT granularity without
+// re-implementing ChaCha20-Poly1305/AES-GCM by hand).
 
 #include "crypto/psk_wrap.h"
 #include "platform/crypto.h"
@@ -44,18 +45,21 @@ std::array<uint8_t, CPACE_ISK_SIZE> make_fixed_isk() {
     return isk;
 }
 
-std::vector<uint8_t> make_fixed_sid() {
-    // A representative sid: LABEL || 32-byte handshake hash || 4-byte BE counter (spec "PAKE").
+std::vector<uint8_t> make_fixed_sid(uint32_t round = 1) {
+    // A representative sid: LABEL || 32-byte handshake hash || 4-byte BE pairing_index ||
+    // 4-byte BE round (pairing.md "PAKE"), with pairing_index 1.
     std::vector<uint8_t> sid;
     const char* label = "sendspin-pair-pake-v1";
     sid.insert(sid.end(), label, label + std::strlen(label));
     for (uint8_t i = 0; i < 32; ++i) {
         sid.push_back(i);
     }
-    sid.push_back(0x00);
-    sid.push_back(0x00);
-    sid.push_back(0x00);
-    sid.push_back(0x01);
+    for (uint32_t counter : {uint32_t{1}, round}) {
+        sid.push_back(static_cast<uint8_t>((counter >> 24) & 0xFF));
+        sid.push_back(static_cast<uint8_t>((counter >> 16) & 0xFF));
+        sid.push_back(static_cast<uint8_t>((counter >> 8) & 0xFF));
+        sid.push_back(static_cast<uint8_t>(counter & 0xFF));
+    }
     return sid;
 }
 
@@ -65,13 +69,14 @@ std::vector<uint8_t> make_fixed_sid() {
 // K_wrap KAT
 // =============================================================================
 
-// K_wrap = SHA-256("sendspin-pair-psk-wrap-v1" || sid || isk), independently re-derived via:
+// K_wrap = SHA-256(label || sid || isk), re-derived via:
 //   python3 -c "
 //     import hashlib
-//     label = b'sendspin-pair-psk-wrap-v1'
-//     sid = b'sendspin-pair-pake-v1' + bytes(range(32)) + bytes([0,0,0,1])
+//     sid = (b'sendspin-pair-pake-v1' + bytes(range(32))
+//            + (1).to_bytes(4,'big') + (1).to_bytes(4,'big'))
 //     isk = bytes(range(64))
-//     print(hashlib.sha256(label + sid + isk).hexdigest())"
+//     print(hashlib.sha256(b'sendspin-pair-psk-wrap-v1' + sid + isk).hexdigest())
+//     print(hashlib.sha256(b'sendspin-pair-nonce-wrap-v1' + sid + isk).hexdigest())"
 // derive_wrap_key() returns std::optional<std::array<uint8_t, 32>>: a failed
 // SHA-256 computation must not silently produce an all-zero K_wrap, since wrap_value() would then
 // seal the freshly minted PSK under a publicly derivable key. noise-c has no hook to force that
@@ -83,7 +88,42 @@ TEST(PskWrap, KWrapKat) {
     auto k_wrap = derive_wrap_key(PSK_WRAP_LABEL, sid, isk);
     ASSERT_TRUE(k_wrap.has_value());
     EXPECT_EQ(to_hex(k_wrap.value()),
-              "cc733464487dfca4f0dc6af4f355440ccbc5bd25a5b1c0f6475db440463d2ca1");
+              "79069f5664638a5263d07188893fb3e38dd1983b603a100e5dccb28ec327967a");
+}
+
+TEST(PskWrap, NonceWrapKeyKat) {
+    const auto sid = make_fixed_sid();
+    const auto isk = make_fixed_isk();
+    auto k_wrap = derive_wrap_key(NONCE_WRAP_LABEL, sid, isk);
+    ASSERT_TRUE(k_wrap.has_value());
+    EXPECT_EQ(to_hex(k_wrap.value()),
+              "7172ccfe4f3d6d71bddb9731344518bbe4b41a2c676a0832f1426056747c31c9");
+}
+
+// The two labels are what keeps the PSK and the commitment opening off one key. Both are sealed
+// under the same sid and ISK with an all-zero AEAD nonce, so a shared key would be a two-time
+// pad: an observer XORing the two ciphertexts would recover nonce_B xor the PSK, and with the
+// PSK revealed at the end of a successful pairing, nonce_B itself.
+TEST(PskWrap, TheTwoWrapLabelsProduceDifferentKeys) {
+    const auto sid = make_fixed_sid();
+    const auto isk = make_fixed_isk();
+    auto psk_key = derive_wrap_key(PSK_WRAP_LABEL, sid, isk);
+    auto nonce_key = derive_wrap_key(NONCE_WRAP_LABEL, sid, isk);
+    ASSERT_TRUE(psk_key.has_value());
+    ASSERT_TRUE(nonce_key.has_value());
+    EXPECT_NE(psk_key.value(), nonce_key.value());
+}
+
+// pairing.md "PAKE" puts the round number in the sid, so each round of an attempt wraps under
+// its own key even though the pairing code, the handshake hash and the pairing_index are all
+// unchanged across the attempt.
+TEST(PskWrap, DifferentRoundsProduceDifferentKeys) {
+    const auto isk = make_fixed_isk();
+    auto round_1 = derive_wrap_key(PSK_WRAP_LABEL, make_fixed_sid(1), isk);
+    auto round_2 = derive_wrap_key(PSK_WRAP_LABEL, make_fixed_sid(2), isk);
+    ASSERT_TRUE(round_1.has_value());
+    ASSERT_TRUE(round_2.has_value());
+    EXPECT_NE(round_1.value(), round_2.value());
 }
 
 // =============================================================================
@@ -116,8 +156,7 @@ TEST(PskWrap, DifferentSidsProduceDifferentWrappedPsk) {
     }
 
     auto sid_a = make_fixed_sid();
-    auto sid_b = make_fixed_sid();
-    sid_b.back() = 0x02;  // Different pairing_index counter.
+    auto sid_b = make_fixed_sid(/*round=*/2);
 
     auto wrapped_a = wrap_value(PSK_WRAP_LABEL, "ChaChaPoly", sid_a, isk, psk);
     auto wrapped_b = wrap_value(PSK_WRAP_LABEL, "ChaChaPoly", sid_b, isk, psk);
@@ -125,8 +164,8 @@ TEST(PskWrap, DifferentSidsProduceDifferentWrappedPsk) {
     ASSERT_TRUE(wrapped_b.has_value());
     EXPECT_NE(wrapped_a.value(), wrapped_b.value());
 
-    // Unwrapping with the wrong sid's key must fail (AEAD authentication failure), matching the
-    // spec's "a wrapped_psk that fails to decrypt" protocol-error case.
+    // Unwrapping with the wrong sid's key must fail (AEAD authentication failure), matching
+    // pairing.md "Protocol Errors"'s "a wrapped_psk that fails to decrypt" case.
     auto unwrap_with_wrong_sid = unwrap_value(PSK_WRAP_LABEL, "ChaChaPoly", sid_b, isk, wrapped_a.value());
     EXPECT_FALSE(unwrap_with_wrong_sid.has_value());
 }

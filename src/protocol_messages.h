@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "crypto/psk_wrap.h"
 #include "sendspin/color_role.h"
 #include "sendspin/config.h"
 #include "sendspin/controller_role.h"
@@ -1076,15 +1077,18 @@ std::string format_client_pair_init_message(uint32_t pairing_index);
 std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_msg_2);
 
 /// @brief Formats a client/pair-confirm message as a JSON string.
-/// Sent in response to server/pair-confirm; carries client_kc and nonce_B.
-/// @param client_kc 64-byte client CPace confirmation tag (base64url-encoded on the wire).
-/// @param nonce_b   32-byte client nonce (base64url-encoded on the wire).
+/// Sent in response to server/pair-confirm in the Dynamic Pairing Code Flow; carries client_kc
+/// and the sealed opening of the commitment sent earlier as commit_B.
+/// @param client_kc       64-byte client CPace confirmation tag (base64url-encoded on the wire).
+/// @param wrapped_nonce_b 48-byte wrapping of nonce_B (base64url-encoded on the wire, 64 chars);
+///                        see pairing.md "Wrapping".
 /// @return JSON string for the client/pair-confirm message.
-std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
-                                               const std::array<uint8_t, 32>& nonce_b);
+std::string format_client_pair_confirm_message(
+    const std::array<uint8_t, 64>& client_kc,
+    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b);
 
-/// @brief Formats a client/pair-confirm message with no nonce (static PIN).
-/// Static PIN carries client_kc only (no nonce_B opening, since there is no commit_B to open).
+/// @brief Formats a client/pair-confirm message with no commitment opening (the Static Pairing
+/// Code Flow, which sends no commit_B and so has nothing to open).
 /// @param client_kc 64-byte client CPace confirmation tag (base64url-encoded on the wire).
 /// @return JSON string for the client/pair-confirm message with client_kc only.
 std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc);

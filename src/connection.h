@@ -560,6 +560,10 @@ public:
         /// verbatim for the CPace sid, so both stay consistent even if the connection's running
         /// counter advances again before the PAKE steps run.
         uint32_t pairing_index{0};
+        /// Number of the round within this attempt, 1 for the first, feeding the CPace sid
+        /// (pairing.md "PAKE"). 0 until the attempt's first round begins; always 1 in the Static
+        /// Pairing Code Flow, which runs a single round.
+        uint32_t round{0};
         SendspinPairMethod method{SendspinPairMethod::DYNAMIC_PAIRING_CODE};
         /// Emission format the server selected; meaningful for DYNAMIC_PAIRING_CODE only.
         SendspinPairingCodeFormat format{SendspinPairingCodeFormat::DIGITS};

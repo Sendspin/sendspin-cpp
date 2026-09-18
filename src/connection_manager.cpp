@@ -127,7 +127,7 @@ static constexpr int64_t PAIRING_ATTEMPT_TIMEOUT_US = 120LL * 1000LL * US_PER_MS
 static constexpr int64_t WINDOW_LIFETIME_US = 300LL * 1000LL * US_PER_MS;
 
 /// @brief CPace sid label (pairing.md "PAKE"):
-/// sid = LABEL || h || pairing_index, the counter a big-endian uint32.
+/// sid = LABEL || h || pairing_index || round, each counter a big-endian uint32.
 static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
 
 /// @brief CPace ADa/ADb (spec "PAKE"): distinct associated data per side fixes a reflected-MAC
@@ -144,18 +144,22 @@ static void append_be32(std::vector<uint8_t>& out, uint32_t value) {
     out.push_back(static_cast<uint8_t>(value & 0xFF));
 }
 
-/// @brief Build the CPace sid for a pairing attempt (pairing.md "PAKE"):
-/// LABEL || h (32 bytes) || pairing_index, the counter a big-endian uint32.
+/// @brief Build the CPace sid for one round of a pairing attempt (pairing.md "PAKE"):
+/// LABEL || h (32 bytes) || pairing_index || round, the counters big-endian uint32.
+/// Binding the round in means every round of an attempt runs its own CPace transcript, so a
+/// retry cannot replay the previous round's shares or reuse its wrap keys.
 /// @param handshake_hash The Noise handshake hash the attempt is bound to.
 /// @param pairing_index The pairing_index captured for this attempt
 ///        (SendspinConnection::PairingSession::pairing_index).
+/// @param round The round number within the attempt, 1 for the first.
 static std::vector<uint8_t> build_pake_sid(const std::array<uint8_t, 32>& handshake_hash,
-                                           uint32_t pairing_index) {
+                                           uint32_t pairing_index, uint32_t round) {
     std::vector<uint8_t> sid;
-    sid.reserve(sizeof(PAKE_SID_LABEL) - 1 + 32 + 4);
+    sid.reserve(sizeof(PAKE_SID_LABEL) - 1 + 32 + 4 + 4);
     sid.insert(sid.end(), PAKE_SID_LABEL, PAKE_SID_LABEL + sizeof(PAKE_SID_LABEL) - 1);
     sid.insert(sid.end(), handshake_hash.begin(), handshake_hash.end());
     append_be32(sid, pairing_index);
+    append_be32(sid, round);
     return sid;
 }
 
@@ -2102,6 +2106,8 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
             server_id.c_str());
     conn->send_app_json(format_client_pair_init_message(ps.pairing_index), nullptr);
 
+    // The static flow has no rounds: its single CPace run is round 1 (pairing.md "PAKE").
+    ps.round = 1;
     if (!this->start_pake_round(conn)) {
         return;
     }
@@ -2111,9 +2117,10 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
 bool ConnectionManager::start_pake_round(SendspinConnection* conn) {
     // Runs on the main loop (caller holds conn_ptr_mutex_). Both code-based flows run the same
     // CPace exchange over the attempt's PRS and sid (pairing.md "PAKE"); only the point at which
-    // the PRS becomes known differs, so the start lives here rather than in each caller.
+    // the PRS becomes known differs, so the start lives here rather than in each caller. The
+    // caller has already set ps.round to the number of the round this run belongs to.
     auto& ps = conn->pairing_session();
-    std::vector<uint8_t> sid = build_pake_sid(ps.handshake_hash, ps.pairing_index);
+    std::vector<uint8_t> sid = build_pake_sid(ps.handshake_hash, ps.pairing_index, ps.round);
 
     // ADb = "client" (our own AD), ADa = "server" (peer's AD): pairing.md "PAKE".
     if (!ps.cpace.start(CPaceRole::RESPONDER, ps.prs, sid, {}, pake_ad_client(),
@@ -2290,6 +2297,7 @@ void ConnectionManager::handle_pair_init(SendspinConnection* conn,
     this->client_->note_display_pairing_code(emitted, ps.format);
     ps.code_emitted = true;
 
+    ps.round = 1;
     if (!this->start_pake_round(conn)) {
         return;
     }
@@ -2382,14 +2390,35 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
         return;
     }
 
+    // Both wrapped fields are sealed under the same CPace run (pairing.md "Wrapping"), so the
+    // AEAD and the ISK are resolved once here, before the first of them is sent.
+    const char* cipher_name = aead_cipher_name_from_noise_suite(conn->get_noise_suite_name());
+    auto isk_opt = ps.cpace.isk();
+    if (cipher_name == nullptr || !isk_opt.has_value()) {
+        SS_LOGE(TAG, "handle_pairing_message: cannot wrap (cipher=%s, isk=%s) for server_id=%s",
+                cipher_name != nullptr ? cipher_name : "unknown",
+                isk_opt.has_value() ? "present" : "missing", server_id.c_str());
+        this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+        return;
+    }
+
     // Send client/pair-confirm: the dynamic flow carries client_kc plus the sealed opening of
     // commit_B, the static flow client_kc alone (pairing.md "Client -> Server:
     // client/pair-confirm").
     if (ps.method == SendspinPairMethod::STATIC_PAIRING_CODE) {
         conn->send_app_json(format_client_pair_confirm_message(client_kc_opt.value()), nullptr);
     } else {
-        conn->send_app_json(format_client_pair_confirm_message(client_kc_opt.value(), ps.nonce_b),
-                            nullptr);
+        auto wrapped_nonce =
+            wrap_value(NONCE_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk_opt.value(), ps.nonce_b);
+        if (!wrapped_nonce.has_value()) {
+            SS_LOGE(TAG, "handle_pairing_message: wrapping nonce_B failed for server_id=%s",
+                    server_id.c_str());
+            this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+            return;
+        }
+        conn->send_app_json(
+            format_client_pair_confirm_message(client_kc_opt.value(), wrapped_nonce.value()),
+            nullptr);
     }
 
     // Withdraw the emitted code and/or dismiss the pairing-window prompt now that the exchange
@@ -2418,18 +2447,8 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
 
     // The code-based flows carry the new PSK wrapped under the CPace output, not in the clear
     // (pairing.md "Wrapping"). K_wrap = SHA-256(PSK_WRAP_LABEL || sid || ISK); the PSK is
-    // sealed with the connection's negotiated AEAD, a 12-byte all-zero nonce, and empty AD.
-    const char* cipher_name = aead_cipher_name_from_noise_suite(conn->get_noise_suite_name());
-    auto isk_opt = ps.cpace.isk();
-    if (cipher_name == nullptr || !isk_opt.has_value()) {
-        SS_LOGE(TAG,
-                "handle_pairing_message: cannot wrap PSK (cipher=%s, isk=%s) for "
-                "server_id=%s",
-                cipher_name != nullptr ? cipher_name : "unknown",
-                isk_opt.has_value() ? "present" : "missing", server_id.c_str());
-        this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
-        return;
-    }
+    // sealed with the connection's negotiated AEAD, a 12-byte all-zero nonce, and empty AD. The
+    // label differs from the one nonce_B was sealed under, so the two fields never share a key.
     auto wrapped =
         wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk_opt.value(), outcome->psk);
     if (!wrapped.has_value()) {

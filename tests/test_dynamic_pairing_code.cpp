@@ -16,6 +16,7 @@
 // round-trip over the sid and associated data pairing.md "PAKE" defines.
 
 #include "crypto/cpace.h"
+#include "crypto/psk_wrap.h"
 #include "platform/base64.h"
 #include "protocol_messages.h"
 #include "record_store.h"
@@ -286,11 +287,13 @@ TEST(DynamicPairingCode, FormatClientPairAuthWireShape) {
 
 TEST(DynamicPairingCode, FormatClientPairConfirmWireShape) {
     std::array<uint8_t, 64> client_kc{};
-    std::array<uint8_t, 32> nonce_b{};
+    std::array<uint8_t, WRAPPED_VALUE_SIZE> wrapped_nonce{};
     for (int i = 0; i < 64; ++i) client_kc[i] = static_cast<uint8_t>(i);
-    for (int i = 0; i < 32; ++i) nonce_b[i] = static_cast<uint8_t>(i + 100);
+    for (size_t i = 0; i < wrapped_nonce.size(); ++i) {
+        wrapped_nonce[i] = static_cast<uint8_t>(i + 100);
+    }
 
-    const std::string out = format_client_pair_confirm_message(client_kc, nonce_b);
+    const std::string out = format_client_pair_confirm_message(client_kc, wrapped_nonce);
 
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_confirm produced invalid JSON";
@@ -309,16 +312,19 @@ TEST(DynamicPairingCode, FormatClientPairConfirmWireShape) {
         EXPECT_EQ((*kc_decoded)[i], client_kc[i]) << "client_kc mismatch at index " << i;
     }
 
-    // nonce_B: 32 bytes -> 43-char base64url without padding.
-    ASSERT_TRUE(doc["payload"]["nonce_B"].is<const char*>());
-    const std::string nb_b64 = doc["payload"]["nonce_B"].as<std::string>();
-    EXPECT_EQ(nb_b64.size(), 43u);
+    // wrapped_nonce_B: 48 bytes -> 64-char base64url without padding (pairing.md
+    // "Client -> Server: client/pair-confirm"). The unwrapped field name must never appear:
+    // the opening only ever crosses the wire sealed.
+    EXPECT_TRUE(doc["payload"]["nonce_B"].isUnbound());
+    ASSERT_TRUE(doc["payload"]["wrapped_nonce_B"].is<const char*>());
+    const std::string nb_b64 = doc["payload"]["wrapped_nonce_B"].as<std::string>();
+    EXPECT_EQ(nb_b64.size(), 64u);
 
     auto nb_decoded = b64url_decode(nb_b64);
     ASSERT_TRUE(nb_decoded.has_value());
-    ASSERT_EQ(nb_decoded->size(), 32u);
-    for (size_t i = 0; i < 32; ++i) {
-        EXPECT_EQ((*nb_decoded)[i], nonce_b[i]) << "nonce_B mismatch at index " << i;
+    ASSERT_EQ(nb_decoded->size(), WRAPPED_VALUE_SIZE);
+    for (size_t i = 0; i < WRAPPED_VALUE_SIZE; ++i) {
+        EXPECT_EQ((*nb_decoded)[i], wrapped_nonce[i]) << "wrapped_nonce_B mismatch at index " << i;
     }
 }
 
@@ -328,17 +334,19 @@ TEST(DynamicPairingCode, FormatClientPairConfirmWireShape) {
 
 namespace {
 
-// Build a SID = "sendspin-pair-pake-v1" (21 bytes) || 32 zero bytes || 4-byte BE counter
-// (spec "PAKE": the sid includes the pairing_index counter).
-static std::vector<uint8_t> make_test_sid(uint32_t counter = 0) {
+// Build a sid = "sendspin-pair-pake-v1" (21 bytes) || 32 zero bytes || 4-byte BE pairing_index
+// || 4-byte BE round (pairing.md "PAKE").
+static std::vector<uint8_t> make_test_sid(uint32_t pairing_index = 0, uint32_t round = 1) {
     const char* prefix = "sendspin-pair-pake-v1";
     const size_t prefix_len = 21;
     std::vector<uint8_t> sid(prefix_len + 32, 0);
     std::memcpy(sid.data(), prefix, prefix_len);
-    sid.push_back(static_cast<uint8_t>((counter >> 24) & 0xFF));
-    sid.push_back(static_cast<uint8_t>((counter >> 16) & 0xFF));
-    sid.push_back(static_cast<uint8_t>((counter >> 8) & 0xFF));
-    sid.push_back(static_cast<uint8_t>(counter & 0xFF));
+    for (uint32_t counter : {pairing_index, round}) {
+        sid.push_back(static_cast<uint8_t>((counter >> 24) & 0xFF));
+        sid.push_back(static_cast<uint8_t>((counter >> 16) & 0xFF));
+        sid.push_back(static_cast<uint8_t>((counter >> 8) & 0xFF));
+        sid.push_back(static_cast<uint8_t>(counter & 0xFF));
+    }
     return sid;
 }
 
@@ -407,8 +415,8 @@ static CPaceRoundTripResult run_cpace_round_trip(const std::vector<uint8_t>& prs
 
 }  // namespace
 
-TEST(DynamicPinCPace, RoundTripWithMatchingPassword) {
-    const auto sid = make_test_sid(/*counter=*/1);
+TEST(DynamicPairingCodeCPace, RoundTripWithMatchingPassword) {
+    const auto sid = make_test_sid(/*pairing_index=*/1);
     const auto prs = to_bytes("123456");
 
     // Initiator (A = server role in the protocol) and responder (B = client role in the
@@ -419,14 +427,14 @@ TEST(DynamicPinCPace, RoundTripWithMatchingPassword) {
     EXPECT_TRUE(result.verify_ab);
     EXPECT_TRUE(result.verify_ba);
 
-    // Both sides agree on ISK and sid, needed for PSK Wrapping (spec "PSK Wrapping").
+    // Both sides agree on ISK and sid, needed for the wrapping (pairing.md "Wrapping").
     ASSERT_TRUE(result.isk_a.has_value());
     ASSERT_TRUE(result.isk_b.has_value());
     EXPECT_EQ(result.isk_a.value(), result.isk_b.value());
     EXPECT_EQ(result.initiator_sid, sid);
 }
 
-TEST(DynamicPinCPace, RoundTripMismatchedPasswordFails) {
+TEST(DynamicPairingCodeCPace, RoundTripMismatchedPasswordFails) {
     const auto sid = make_test_sid();
     const auto prs_a = to_bytes("123456");
     const auto prs_b = to_bytes("999999");
@@ -438,7 +446,7 @@ TEST(DynamicPinCPace, RoundTripMismatchedPasswordFails) {
     EXPECT_FALSE(result.verify_ba);
 }
 
-TEST(DynamicPinCPace, MismatchedAssociatedDataFailsVerify) {
+TEST(DynamicPairingCodeCPace, MismatchedAssociatedDataFailsVerify) {
     // Distinct ADa/ADb values prevent a reflected-MAC issue (spec "PAKE"): if a side uses the
     // WRONG associated data (e.g. swapped, or both sides use the same AD instead of distinct
     // "server"/"client" values), confirmation must fail even with a matching password.

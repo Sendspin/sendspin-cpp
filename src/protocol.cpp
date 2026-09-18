@@ -1321,14 +1321,19 @@ std::string format_client_pair_auth_message(const std::array<uint8_t, 32>& pake_
     return output;
 }
 
-std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& client_kc,
-                                               const std::array<uint8_t, 32>& nonce_b) {
+std::string format_client_pair_confirm_message(
+    const std::array<uint8_t, 64>& client_kc,
+    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped_nonce_b) {
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-confirm";
     root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
-    root["payload"]["nonce_B"] = b64url_encode(nonce_b.data(), nonce_b.size());
+    // The commitment opening crosses the wire sealed under the CPace output, never in the clear
+    // (pairing.md "Wrapping"): an observer that cannot complete the PAKE learns nothing about
+    // nonce_B, and so cannot reconstruct the pairing code from the handshake it watched.
+    root["payload"]["wrapped_nonce_B"] =
+        b64url_encode(wrapped_nonce_b.data(), wrapped_nonce_b.size());
 
     std::string output;
     serializeJson(doc, output);
@@ -1340,7 +1345,7 @@ std::string format_client_pair_confirm_message(const std::array<uint8_t, 64>& cl
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-confirm";
-    // Static PIN: no nonce_B opening (there was no commit_B to open).
+    // The static flow sends no commit_B, so it has no opening to wrap.
     root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
 
     std::string output;

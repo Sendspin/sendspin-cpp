@@ -131,9 +131,9 @@ public:
         return this->canned_hash_;
     }
 
-    /// Report a canned Noise suite name without an active Noise session, so PSK Wrapping
-    /// (spec "PSK Wrapping") can resolve an AEAD cipher during the PAIR_CONFIRM step. Overrides the
-    /// virtual base implementation (see connection.h).
+    /// Report a canned Noise suite name without an active Noise session, so the wrapping
+    /// (pairing.md "Wrapping") can resolve an AEAD cipher during the PAIR_CONFIRM step.
+    /// Overrides the virtual base implementation (see connection.h).
     const std::string& get_noise_suite_name() const override {
         return this->canned_suite_name_;
     }
@@ -364,20 +364,24 @@ std::string last_pair_abort_reason(const std::vector<std::string>& sent_text) {
 // Server-side ("stand-in initiator") frame builders, mirroring test_dynamic_pairing_code.cpp
 // =============================================================================
 
-/// Build the SID CPace expects: "sendspin-pair-pake-v1" (21 bytes, no NUL) || 32-byte hash ||
-/// 4-byte big-endian pairing_index counter (spec "PAKE"). `counter` must equal the pairing_index
-/// the client captured for this attempt (SendspinConnection::bump_pairing_index(), which returns
-/// 1 for the first pairing server/activate on a fresh connection, the value every single-
-/// enter_pairing() test in this file uses).
-std::vector<uint8_t> make_sid(const std::array<uint8_t, 32>& handshake_hash, uint32_t counter = 1) {
+/// Build the sid CPace expects: "sendspin-pair-pake-v1" (21 bytes, no NUL) || 32-byte hash ||
+/// 4-byte big-endian pairing_index || 4-byte big-endian round (pairing.md "PAKE").
+/// `pairing_index` must equal the one the client captured for this attempt
+/// (SendspinConnection::bump_pairing_index(), which returns 1 for the first pairing
+/// server/activate on a fresh connection, the value every single-enter_pairing() test in this
+/// file uses); `round` is 1 for an attempt's first round.
+std::vector<uint8_t> make_sid(const std::array<uint8_t, 32>& handshake_hash,
+                              uint32_t pairing_index = 1, uint32_t round = 1) {
     static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
     std::vector<uint8_t> sid;
     sid.insert(sid.end(), PAKE_SID_LABEL, PAKE_SID_LABEL + sizeof(PAKE_SID_LABEL) - 1);
     sid.insert(sid.end(), handshake_hash.begin(), handshake_hash.end());
-    sid.push_back(static_cast<uint8_t>((counter >> 24) & 0xFF));
-    sid.push_back(static_cast<uint8_t>((counter >> 16) & 0xFF));
-    sid.push_back(static_cast<uint8_t>((counter >> 8) & 0xFF));
-    sid.push_back(static_cast<uint8_t>(counter & 0xFF));
+    for (uint32_t counter : {pairing_index, round}) {
+        sid.push_back(static_cast<uint8_t>((counter >> 24) & 0xFF));
+        sid.push_back(static_cast<uint8_t>((counter >> 16) & 0xFF));
+        sid.push_back(static_cast<uint8_t>((counter >> 8) & 0xFF));
+        sid.push_back(static_cast<uint8_t>(counter & 0xFF));
+    }
     return sid;
 }
 
@@ -398,18 +402,18 @@ std::vector<uint8_t> ad_client() {
 /// answer either the dynamic or static pairing-code device flow.
 struct ServerStandIn {
     CPace initiator;
-    std::string prs_pin;
+    std::vector<uint8_t> prs;
 
-    /// Start the initiator for a given PRS (code ASCII bytes) and SID (label || handshake hash ||
-    /// pairing_index counter). `counter` defaults to 1, matching the pairing_index every
-    /// single-enter_pairing() test in this file captures.
-    bool start(const std::string& pin, const std::array<uint8_t, 32>& handshake_hash,
-              uint32_t counter = 1) {
-        this->prs_pin = pin;
+    /// Start the initiator over the PRS the operator entered and the sid for one round (label
+    /// || handshake hash || pairing_index || round). `pairing_index` defaults to 1, matching
+    /// what every single-enter_pairing() test in this file captures; `round` to the first round.
+    bool start(const std::vector<uint8_t>& prs, const std::array<uint8_t, 32>& handshake_hash,
+               uint32_t pairing_index = 1, uint32_t round = 1) {
+        this->prs = prs;
         const std::vector<uint8_t> empty;
-        return this->initiator.start(CPaceRole::INITIATOR, ascii_bytes(pin),
-                                     make_sid(handshake_hash, counter), empty, ad_server(),
-                                     ad_client());
+        return this->initiator.start(CPaceRole::INITIATOR, prs,
+                                     make_sid(handshake_hash, pairing_index, round), empty,
+                                     ad_server(), ad_client());
     }
 };
 
@@ -807,28 +811,70 @@ protected:
     }
 
     /// Verify the client/pair-confirm frame (second-to-last: client/pair-finalize follows
-    /// immediately) carries client_kc and, only for dynamic pairing code, nonce_B; then verify the last
-    /// frame is client/pair-finalize. `expect_nonce_b` distinguishes the dynamic pairing-code flow
-    /// (which opens nonce_B alongside the confirm) from static pairing-code (which never opens a nonce).
+    /// immediately) carries client_kc and, only in the dynamic flow, wrapped_nonce_B; then
+    /// verify the last frame is client/pair-finalize. `expect_wrapped_nonce` distinguishes the
+    /// dynamic flow (which opens its commitment alongside the confirm) from the static one
+    /// (which sends no commit_B and so has nothing to open).
     /// Callers assert the frame count first, since the required minimum differs by flow.
-    void verify_pair_confirm_frame(const std::vector<std::string>& sent_text, bool expect_nonce_b) {
+    void verify_pair_confirm_frame(const std::vector<std::string>& sent_text,
+                                   bool expect_wrapped_nonce) {
         JsonDocument confirm_doc;
         JsonObject confirm_root;
         const std::string& confirm_frame = sent_text[sent_text.size() - 2];
         ASSERT_TRUE(parse_json(confirm_frame, confirm_doc, confirm_root));
         EXPECT_STREQ(confirm_root["type"], "client/pair-confirm");
         EXPECT_TRUE(confirm_root["payload"]["client_kc"].is<const char*>());
-        if (expect_nonce_b) {
-            EXPECT_TRUE(confirm_root["payload"]["nonce_B"].is<const char*>())
-                << "dynamic pairing code pair-confirm must open nonce_B";
+        // The opening never crosses the wire in the clear under any name (pairing.md
+        // "Wrapping"), so the plain nonce_B field must be absent in both flows.
+        EXPECT_TRUE(confirm_root["payload"]["nonce_B"].isUnbound())
+            << "nonce_B must never be sent unwrapped";
+        if (expect_wrapped_nonce) {
+            EXPECT_TRUE(confirm_root["payload"]["wrapped_nonce_B"].is<const char*>())
+                << "the dynamic flow's pair-confirm must carry wrapped_nonce_B";
         } else {
-            EXPECT_TRUE(confirm_root["payload"]["nonce_B"].isUnbound())
-                << "static pairing code pair-confirm must NOT carry nonce_B";
+            EXPECT_TRUE(confirm_root["payload"]["wrapped_nonce_B"].isUnbound())
+                << "the static flow's pair-confirm must NOT carry wrapped_nonce_B";
         }
         EXPECT_EQ(last_frame_type(sent_text), "client/pair-finalize");
     }
 
-    /// Verify PSK Wrapping (spec "PSK Wrapping"): the last captured frame must be
+    /// Verify the sealed commitment opening (pairing.md "Wrapping"): the client/pair-confirm
+    /// frame's wrapped_nonce_B must unwrap, under the key `server` derives independently from
+    /// its own sid and ISK, to the preimage of the commit_B the attempt opened with. A
+    /// successful decrypt proves the client used the nonce-wrap label and this round's key; the
+    /// commitment check proves it sealed the nonce it actually committed to, which is the
+    /// binding the server re-derives the pairing code from.
+    void verify_wrapped_nonce_opens_commit(const std::vector<std::string>& sent_text,
+                                           const ServerStandIn& server) {
+        // Frame 0 is the client/pair-init that carried commit_B; the confirm is second to last.
+        ASSERT_GE(sent_text.size(), 2u);
+        JsonDocument init_doc;
+        JsonObject init_root;
+        ASSERT_TRUE(parse_json(sent_text.front(), init_doc, init_root));
+        ASSERT_STREQ(init_root["type"], "client/pair-init");
+        auto commit_b = b64url_decode(std::string(init_root["payload"]["commit_B"] | ""));
+        ASSERT_TRUE(commit_b.has_value());
+
+        JsonDocument confirm_doc;
+        JsonObject confirm_root;
+        ASSERT_TRUE(parse_json(sent_text[sent_text.size() - 2], confirm_doc, confirm_root));
+        auto wrapped_bytes =
+            b64url_decode(std::string(confirm_root["payload"]["wrapped_nonce_B"] | ""));
+        ASSERT_TRUE(wrapped_bytes.has_value());
+        ASSERT_EQ(wrapped_bytes->size(), WRAPPED_VALUE_SIZE);
+        std::array<uint8_t, WRAPPED_VALUE_SIZE> wrapped{};
+        std::memcpy(wrapped.data(), wrapped_bytes->data(), WRAPPED_VALUE_SIZE);
+
+        ASSERT_TRUE(server.initiator.isk().has_value());
+        auto nonce_b = unwrap_value(NONCE_WRAP_LABEL, "ChaChaPoly", server.initiator.sid(),
+                                    server.initiator.isk().value(), wrapped);
+        ASSERT_TRUE(nonce_b.has_value()) << "server-side unwrap of wrapped_nonce_B failed";
+        EXPECT_TRUE(pairing_code_verify_commit(nonce_b->data(), nonce_b->size(), commit_b->data(),
+                                               commit_b->size()))
+            << "the revealed nonce does not open the commitment sent in client/pair-init";
+    }
+
+    /// Verify the sealed PSK (pairing.md "Wrapping"): the last captured frame must be
     /// client/pair-finalize carrying wrapped_psk (never long_term_psk in a code flow), and
     /// `server` (using its own independently-derived ISK/sid, exactly as a real server would)
     /// must be able to unwrap it. A successful AEAD decrypt here proves the client used the
@@ -892,20 +938,22 @@ TEST_F(PairingStateMachineTest, DynamicPinHappyPath) {
 
     // Simulated server (INITIATOR) starts CPace with the same derived code.
     ServerStandIn server;
-    ASSERT_TRUE(server.start(display.emitted, display.handshake_hash));
+    ASSERT_TRUE(server.start(display.prs, display.handshake_hash));
 
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
 
     this->schedule_pair_confirm(server_kc);
 
-    // Device must emit client/pair-confirm (with client_kc + nonce_B) then client/pair-finalize.
+    // Device must emit client/pair-confirm (client_kc + wrapped_nonce_B) then
+    // client/pair-finalize.
     ASSERT_GE(conn->sent_text_.size(), 4u);
     ASSERT_NO_FATAL_FAILURE(
-        this->verify_pair_confirm_frame(conn->sent_text_, /*expect_nonce_b=*/true));
+        this->verify_pair_confirm_frame(conn->sent_text_, /*expect_wrapped_nonce=*/true));
 
-    // PSK Wrapping round-trip (spec "PSK Wrapping"): see verify_wrapped_psk_finalize()'s doc
-    // comment for the rationale.
+    // Wrapping round-trips (pairing.md "Wrapping"): see each helper's doc comment for the
+    // rationale.
+    ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_nonce_opens_commit(conn->sent_text_, server));
     ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_psk_finalize(conn->sent_text_, server));
 
     // Success callbacks: on_clear_pairing_code fires (display -> clear ordering).
@@ -926,7 +974,7 @@ TEST_F(PairingStateMachineTest, AbortAfterConfirmDoesNotReclearAlreadyWithdrawnC
     ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/1, display));
 
     ServerStandIn server;
-    ASSERT_TRUE(server.start(display.emitted, display.handshake_hash));
+    ASSERT_TRUE(server.start(display.prs, display.handshake_hash));
 
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
@@ -971,7 +1019,7 @@ TEST_F(PairingStateMachineTest, DynamicPinMismatchAborts) {
     // happy path (which calls derive()+tag() to get a real server_kc), so PAIR_AUTH is driven
     // inline here rather than through that helper.
     ServerStandIn server;
-    ASSERT_TRUE(server.start(display.emitted, display.handshake_hash));
+    ASSERT_TRUE(server.start(display.prs, display.handshake_hash));
 
     ServerPairingMessageEvent pair_auth_event;
     pair_auth_event.conn = this->current_connection_sp();
@@ -1007,7 +1055,7 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/9, display));
 
     ServerStandIn server;
-    ASSERT_TRUE(server.start(display.emitted, display.handshake_hash));
+    ASSERT_TRUE(server.start(display.prs, display.handshake_hash));
 
     ServerPairingMessageEvent pair_auth_event;
     pair_auth_event.conn = this->current_connection_sp();
@@ -1384,19 +1432,20 @@ TEST_F(PairingStateMachineTest, StaticPinHappyPath) {
     EXPECT_EQ(init_root["payload"]["pairing_index"].as<uint32_t>(), 1u);
 
     ServerStandIn server;
-    ASSERT_TRUE(server.start("13572468", handshake_hash));
+    ASSERT_TRUE(server.start(pairing_code_digits_prs("13572468"), handshake_hash));
 
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
 
     this->schedule_pair_confirm(server_kc);
 
-    // client/pair-confirm must carry client_kc and NO nonce_B (static pairing code never opens a nonce).
+    // client/pair-confirm must carry client_kc and no opening: the static flow sends no
+    // commit_B, so there is nothing to open.
     ASSERT_GE(conn->sent_text_.size(), 2u);
     ASSERT_NO_FATAL_FAILURE(
-        this->verify_pair_confirm_frame(conn->sent_text_, /*expect_nonce_b=*/false));
+        this->verify_pair_confirm_frame(conn->sent_text_, /*expect_wrapped_nonce=*/false));
 
-    // PSK Wrapping round-trip (spec "PSK Wrapping"), static pairing-code flavor: see
+    // PSK wrapping round-trip (pairing.md "Wrapping"), static flavor: see
     // verify_wrapped_psk_finalize()'s doc comment for the rationale.
     ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_psk_finalize(conn->sent_text_, server));
 
@@ -1563,7 +1612,7 @@ TEST_F(PairingStateMachineTest, StaticPinMismatchRecordsFailureAndAborts) {
 
     // Server uses the CORRECT static pairing code so derive() succeeds, then lies about server_kc.
     ServerStandIn server;
-    ASSERT_TRUE(server.start("13572468", handshake_hash));
+    ASSERT_TRUE(server.start(pairing_code_digits_prs("13572468"), handshake_hash));
 
     auto current_conn_sp = this->current_connection_sp();
     ServerPairingMessageEvent pair_auth_event;
@@ -2021,7 +2070,7 @@ TEST_F(PairingStateMachineTest, PinAttemptTimeoutScanSuppressedDuringFinalizeAck
     ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/3, display));
 
     ServerStandIn server;
-    ASSERT_TRUE(server.start(display.emitted, display.handshake_hash));
+    ASSERT_TRUE(server.start(display.prs, display.handshake_hash));
 
     std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
     ASSERT_NO_FATAL_FAILURE(this->drive_pair_auth(conn, server, server_kc));
