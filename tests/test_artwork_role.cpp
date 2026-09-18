@@ -245,13 +245,30 @@ ArtworkRoleConfig make_single_slot_config(bool gated) {
     return config;
 }
 
-// Builds a one-slot ArtworkRoleConfig whose channel is large enough that its derived image cap
-// (see ArtworkRole::Impl::slot_image_cap) admits an image spanning several maximum-sized
-// messages, which the 100x100 channels above are far too small for.
+// A deliberately small per-channel image budget, so a test can cross it without building a
+// 128 KiB image.
+constexpr size_t SMALL_IMAGE_CAP = 2048;
+
+// Builds a one-slot ArtworkRoleConfig whose channel holds at most `max_image_bytes`.
+ArtworkRoleConfig make_capped_slot_config(uint32_t max_image_bytes) {
+    ArtworkRoleConfig config;
+    config.preferred_formats.push_back({.source = SendspinImageSource::ALBUM,
+                                        .format = SendspinImageFormat::JPEG,
+                                        .width = 100,
+                                        .height = 100,
+                                        .max_image_bytes = max_image_bytes});
+    return config;
+}
+
+// Builds a one-slot ArtworkRoleConfig whose channel budgets enough bytes to hold an image
+// spanning several maximum-sized messages.
 ArtworkRoleConfig make_large_slot_config() {
     ArtworkRoleConfig config;
-    config.preferred_formats.push_back(
-        {SendspinImageSource::ALBUM, SendspinImageFormat::PNG, 512, 512, false});
+    config.preferred_formats.push_back({.source = SendspinImageSource::ALBUM,
+                                        .format = SendspinImageFormat::PNG,
+                                        .width = 512,
+                                        .height = 512,
+                                        .max_image_bytes = 256U * 1024U});
     return config;
 }
 
@@ -729,19 +746,20 @@ TEST(ArtworkMalformedMessage, ShapeRulesApplyWithNoStreamActive) {
 // end (roles/artwork/v1.md "Artwork (Binary)" on unavailable clients)
 // ============================================================================
 
-TEST(ArtworkImageCap, DerivedFromTheChannelDimensions) {
-    // Four bytes per pixel plus the header allowance: large enough for any encoding of the
-    // geometry the client asked for, and derived from it rather than from a fixed budget.
-    EXPECT_EQ(ArtworkRole::Impl::slot_image_cap(100, 100), 100U * 100U * 4U + 4096U);
-    EXPECT_EQ(ArtworkRole::Impl::slot_image_cap(0, 0), 4096U);
-    // The multiply must be done in size_t: 4096x4096x4 overflows a uint16 or a uint32 product of
-    // the dimensions alone.
-    EXPECT_EQ(ArtworkRole::Impl::slot_image_cap(4096, 4096), 4096U * 4096U * 4U + 4096U);
+TEST(ArtworkImageCap, IsTheChannelsConfiguredBudget) {
+    auto impl = make_impl(make_capped_slot_config(SMALL_IMAGE_CAP));
+    EXPECT_EQ(impl->image_cap(0), SMALL_IMAGE_CAP);
+    // A channel the role never declared holds nothing, whatever the declared ones budgeted.
+    EXPECT_EQ(impl->image_cap(1), 0U);
+
+    // An unset budget is the documented default rather than nothing.
+    auto defaulted = make_impl(make_single_slot_config(false));
+    EXPECT_EQ(defaulted->image_cap(0), ARTWORK_DEFAULT_MAX_IMAGE_BYTES);
 }
 
 TEST(ArtworkImageCap, ImageOverTheCapIsDiscardedAndItsSequenceTracked) {
     RecordingListener listener;
-    auto impl = make_impl(make_single_slot_config(false));
+    auto impl = make_impl(make_capped_slot_config(SMALL_IMAGE_CAP));
     impl->listener = &listener;
     ASSERT_TRUE(impl->start());
     impl->handle_stream_start(ServerArtworkStreamObject{});
@@ -749,20 +767,36 @@ TEST(ArtworkImageCap, ImageOverTheCapIsDiscardedAndItsSequenceTracked) {
     // "clients discarding image data MUST still process announces and cancels and count each
     // part's data bytes toward total_size": the transfer runs to its end holding nothing, so the
     // announce that follows it is legal rather than a second announce in flight.
-    const uint32_t over_cap =
-        static_cast<uint32_t>(ArtworkRole::Impl::slot_image_cap(100, 100) + 1);
-    ASSERT_TRUE(feed(*impl, 0, announce_body(1, over_cap)));
-    for (uint32_t sent = 0; sent < over_cap;) {
-        const uint32_t take = std::min<uint32_t>(60000, over_cap - sent);
-        ASSERT_TRUE(feed(*impl, 0, part_body(make_image('A', take))));
-        sent += take;
-    }
+    ASSERT_TRUE(send_image(*impl, 0, make_image('A', SMALL_IMAGE_CAP + 1), /*parts=*/3));
     EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
 
-    // Control: an image within the cap on the same channel is delivered.
-    EXPECT_TRUE(send_image(*impl, 0, make_image('B', 20)));
+    // Control: an image of exactly the cap on the same channel is delivered.
+    EXPECT_TRUE(send_image(*impl, 0, make_image('B', SMALL_IMAGE_CAP), /*parts=*/3));
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    EXPECT_EQ(listener.decodes[0].payload.size(), SMALL_IMAGE_CAP);
     EXPECT_EQ(listener.decode_marker_at(0), 'B');
+}
+
+TEST(ArtworkImageCap, RoleWithNoListenerHoldsNothing) {
+    auto impl = make_impl(make_single_slot_config(false));
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    // Nowhere to deliver an image, so the role takes the discarding path rather than allocating
+    // a buffer for it, while still following the transfer to its end.
+    EXPECT_TRUE(send_image(*impl, 0, make_image('A', 4096), /*parts=*/2));
+    {
+        std::lock_guard<std::mutex> lock(impl->drain_task->slot_mutex);
+        EXPECT_EQ(impl->drain_task->slot_buffers[0].buffers[0].data(), nullptr);
+        EXPECT_EQ(impl->drain_task->slot_buffers[0].buffers[1].data(), nullptr);
+    }
+
+    // Control: with a listener the same image is held and delivered.
+    RecordingListener listener;
+    impl->listener = &listener;
+    EXPECT_TRUE(send_image(*impl, 0, make_image('B', 4096), /*parts=*/2));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    EXPECT_EQ(listener.decodes[0].payload.size(), 4096U);
 }
 
 TEST(ArtworkImageCap, ChannelTheRoleDidNotConfigureHoldsNothing) {
@@ -780,6 +814,127 @@ TEST(ArtworkImageCap, ChannelTheRoleDidNotConfigureHoldsNothing) {
     // Control: the same image on a declared channel decodes.
     EXPECT_TRUE(send_image(*impl, 1, make_image('B', 20)));
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
+}
+
+// ============================================================================
+// stream/start scopes the pending-image discard to the channels it reconfigured
+// (roles/artwork/v1.md "Artwork (Binary)")
+// ============================================================================
+
+namespace {
+
+// A stream/start artwork object with two channels; `width` is what the test varies to make a
+// channel's configuration differ from the one in force.
+ServerArtworkStreamObject two_channel_stream(uint16_t channel0_width, uint16_t channel1_width) {
+    ServerArtworkChannelObject channel0;
+    channel0.source = SendspinImageSource::ALBUM;
+    channel0.format = SendspinImageFormat::JPEG;
+    channel0.width = channel0_width;
+    channel0.height = 100;
+    ServerArtworkChannelObject channel1 = channel0;
+    channel1.source = SendspinImageSource::ARTIST;
+    channel1.width = channel1_width;
+
+    ServerArtworkStreamObject stream;
+    stream.channels = std::vector<ServerArtworkChannelObject>{channel0, channel1};
+    return stream;
+}
+
+// Decodes an image on `slot` and leaves its display undrained, which is the "pending image" a
+// stream/start either keeps or discards.
+void leave_pending_image(ArtworkRole::Impl& impl, RecordingListener& listener, uint8_t slot,
+                         uint8_t marker, size_t already_decoded) {
+    ASSERT_TRUE(send_image(impl, slot, make_image(marker, 20)));
+    listener.wait_until([&] { return listener.decodes.size() > already_decoded; });
+}
+
+}  // namespace
+
+TEST(ArtworkStreamStart, UnchangedChannelKeepsItsPendingImage) {
+    RecordingListener listener;
+    auto impl = make_impl(make_two_ungated_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(two_channel_stream(100, 100));
+
+    leave_pending_image(*impl, listener, 1, 'A', 0);
+
+    // Channel 0's geometry changes, channel 1's entry is identical. The server cancels and
+    // re-sends only for the channel it changed, so discarding channel 1's pending image here
+    // would lose an image nothing re-sends.
+    impl->handle_stream_start(two_channel_stream(200, 100));
+
+    poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
+    EXPECT_EQ(listener.clear_count(), 0U);
+}
+
+TEST(ArtworkStreamStart, ChangedChannelDropsItsPendingImage) {
+    RecordingListener listener;
+    auto impl = make_impl(make_two_ungated_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(two_channel_stream(100, 100));
+
+    leave_pending_image(*impl, listener, 1, 'A', 0);
+
+    // The same stream/start, this time changing channel 1 itself: its pending image is encoded
+    // for a configuration that no longer applies, and the server re-sends it.
+    impl->handle_stream_start(two_channel_stream(100, 200));
+
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW));
+}
+
+TEST(ArtworkStreamStart, EveryChannelDropsItsPendingImageWhenAllChange) {
+    RecordingListener listener;
+    auto impl = make_impl(make_two_ungated_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(two_channel_stream(100, 100));
+
+    leave_pending_image(*impl, listener, 0, 'A', 0);
+    leave_pending_image(*impl, listener, 1, 'B', 1);
+
+    impl->handle_stream_start(two_channel_stream(200, 200));
+
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW));
+}
+
+TEST(ArtworkStreamStart, ChannelTheNewArrayDropsCountsAsChanged) {
+    RecordingListener listener;
+    auto impl = make_impl(make_two_ungated_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(two_channel_stream(100, 100));
+
+    leave_pending_image(*impl, listener, 1, 'A', 0);
+
+    // "A channel the array does not cover ... is not streamed": truncating the array stops
+    // streaming channel 1, which is as much a change as reconfiguring it.
+    ServerArtworkStreamObject truncated = two_channel_stream(100, 100);
+    truncated.channels->pop_back();
+    impl->handle_stream_start(truncated);
+
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW));
+}
+
+TEST(ArtworkStreamStart, StreamWithNoChannelArrayDropsEveryPendingImage) {
+    RecordingListener listener;
+    auto impl = make_impl(make_two_ungated_slot_config());
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(two_channel_stream(100, 100));
+
+    leave_pending_image(*impl, listener, 1, 'A', 0);
+
+    // With no channel array there is nothing to compare, so every channel is treated as
+    // reconfigured rather than assumed unchanged.
+    impl->handle_stream_start(ServerArtworkStreamObject{});
+
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW));
 }
 
 // ============================================================================

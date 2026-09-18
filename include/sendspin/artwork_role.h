@@ -44,8 +44,8 @@ class SendspinClient;
 ///  - A payload -- a frame, or the server's per-channel clear for that slot -- arriving while a
 ///    delivery is un-acked is buffered latest-wins and delivered only after frame_done(slot), and
 ///    then owes its own frame_done(). It waits behind the outstanding delivery rather than
-///    replacing it, so a consumer is never interrupted mid-presentation. A delivery that has not
-///    yet reached on_image_display() is the exception: the server announcing a newer image
+///    replacing it, so a consumer presenting a delivery is never interrupted. A delivery that has
+///    not yet reached on_image_display() is the exception: the server announcing a newer image
 ///    replaces it outright (see the last paragraph), and the buffered payload follows once that
 ///    release reopens the gate.
 ///  - A stream end or stream clear is a lifecycle event, not a payload, so it is never buffered:
@@ -117,9 +117,9 @@ public:
  * configurable format and resolution preferences.
  *
  * The server may replace or cancel an image it has sent but whose display time has not arrived,
- * in which case that image is dropped and its on_image_display() never fires. An image the
- * server declares larger than the uncompressed size of the slot's configured dimensions is
- * refused rather than buffered, so a slot's memory is bounded by what the consumer asked for.
+ * in which case that image is dropped and its on_image_display() never fires. An image the server
+ * declares larger than the slot's ImageSlotPreference::max_image_bytes is refused rather than
+ * buffered, so a slot's memory is bounded by the budget the consumer set for it.
  *
  * A slot may opt into a back-pressure gate via ImageSlotPreference::require_frame_done: see
  * the ArtworkRoleListener class comment for the ack contract. Call frame_done() once the

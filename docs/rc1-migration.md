@@ -210,11 +210,11 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   resynchronizes from the next chunk, so the cost is bounded, but a stream's first chunks can be
   lost this way. For artwork the window is now before the stream exists at all (the stream starts
   from the `client/state` the client sends once admitted), so no transfer can be torn by it.
-- The artwork role refuses an image whose announced `total_size` exceeds the uncompressed size of
-  the channel's configured dimensions, tracking the transfer to its end with its bytes dropped.
-  `roles/artwork/v1.md` "Artwork (Binary)" allows this (it is the "unavailable client" path) but
-  sets no cap of its own, so a server that encodes an image far larger than the geometry it was
-  asked for sees the channel stay blank rather than an error.
+- The artwork role refuses an image whose announced `total_size` exceeds the channel's configured
+  `ImageSlotPreference::max_image_bytes` (128 KiB by default), tracking the transfer to its end
+  with its bytes dropped. `roles/artwork/v1.md` "Artwork (Binary)" allows this (it is the
+  "unavailable client" path) but sets no cap of its own, so a server that encodes an image larger
+  than the channel's budget sees the channel keep its previous image rather than an error.
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.

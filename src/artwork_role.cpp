@@ -42,11 +42,6 @@ static constexpr uint8_t ARTWORK_FLAG_CANCEL = 0x01;
 static constexpr uint8_t ARTWORK_FLAG_ANNOUNCE = 0x02;
 static constexpr uint8_t ARTWORK_FLAGS_RESERVED = 0xFC;
 
-/// @brief Bytes allowed on top of an image cap for container headers and per-row filter bytes
-/// (see ArtworkRole::Impl::slot_image_cap). One byte per row of an image up to 4096 pixels wide,
-/// which is wider than any artwork channel a display client asks for.
-static constexpr size_t IMAGE_HEADER_ALLOWANCE = 4096;
-
 /// @brief Fallback wakeup interval for the decode thread's blocking queue receive. Stop and
 /// parked-slot rechecks wake the receive immediately via wake_receiver(), so this is only a
 /// safety net against a missed wake: long enough to keep an idle thread asleep, short enough
@@ -97,8 +92,14 @@ ArtworkRole::Impl::Impl(ArtworkRoleConfig config, SendspinClient* client)
                 this->config.preferred_formats.size(), ARTWORK_MAX_SLOTS);
         this->config.preferred_formats.resize(ARTWORK_MAX_SLOTS);
     }
-    for (const auto& pref : this->config.preferred_formats) {
+    for (size_t i = 0; i < this->config.preferred_formats.size(); ++i) {
+        const auto& pref = this->config.preferred_formats[i];
         this->artwork_channels.push_back({pref.source, pref.format, pref.width, pref.height});
+        // Said once here rather than once per refused image: a channel budgeted 0 bytes is
+        // announced to the server like any other but can never hold what the server sends.
+        if (pref.max_image_bytes == 0 && pref.source != SendspinImageSource::NONE) {
+            SS_LOGW(TAG, "Artwork channel %zu holds no image: max_image_bytes is 0", i);
+        }
     }
     this->drain_task->notify_queue.create(8);
 }
@@ -243,16 +244,13 @@ void ArtworkRole::Impl::wake_drain_thread() const {
 // Binary handling (network thread)
 // ============================================================================
 
-size_t ArtworkRole::Impl::slot_image_cap(uint16_t width, uint16_t height) {
-    return static_cast<size_t>(width) * static_cast<size_t>(height) * 4U + IMAGE_HEADER_ALLOWANCE;
-}
-
-size_t ArtworkRole::Impl::image_cap(uint8_t slot) const {
+uint32_t ArtworkRole::Impl::image_cap(uint8_t slot) const {
+    // A channel the role never declared is one it never asked for an image on, so it holds
+    // nothing; every other channel holds what its consumer budgeted for it.
     if (slot >= this->config.preferred_formats.size()) {
         return 0;
     }
-    const auto& pref = this->config.preferred_formats[slot];
-    return slot_image_cap(pref.width, pref.height);
+    return this->config.preferred_formats[slot].max_image_bytes;
 }
 
 SendspinImageFormat ArtworkRole::Impl::image_format(uint8_t slot) const {
@@ -269,7 +267,8 @@ void ArtworkRole::Impl::enqueue_notification(const ArtworkNotification& notif) c
     }
 }
 
-void ArtworkRole::Impl::bump_all_epochs() {
+void ArtworkRole::Impl::discard_all_pending() {
+    this->streamed_channels.reset();
     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
     this->transfer = ArtworkTransfer{};
     for (auto& epoch : this->slot_epochs) {
@@ -315,11 +314,17 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
 
     // "During an active stream, unavailable clients SHOULD discard otherwise valid image data and
     // MUST NOT close solely for its arrival": an image the role will not hold is refused here,
-    // before a byte of it is allocated, and the transfer runs to its end holding nothing.
-    const size_t cap = this->image_cap(slot);
-    if (total_size > cap) {
-        SS_LOGW(TAG, "Artwork image of %" PRIu32 " bytes for slot %u exceeds its %zu byte cap",
-                total_size, slot, cap);
+    // before a byte of it is allocated, and the transfer runs to its end holding nothing. A role
+    // with no listener has nowhere to put an image either, so it takes the same path rather than
+    // allocating for a delivery nobody receives.
+    const uint32_t cap = this->image_cap(slot);
+    if (total_size > cap || this->listener == nullptr) {
+        if (this->listener != nullptr) {
+            SS_LOGW(TAG,
+                    "Artwork image of %" PRIu32 " bytes for slot %u exceeds its %" PRIu32
+                    " byte cap",
+                    total_size, slot, cap);
+        }
         this->transfer = ArtworkTransfer{.timestamp = timestamp,
                                          .total_size = total_size,
                                          .in_flight = true,
@@ -513,27 +518,40 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
 
     this->stream_active = true;
 
-    // Bump every channel's epoch so any notification still in the queue from a prior stream is
-    // recognized as stale by the decode thread and skipped, rather than draining the whole
-    // notify queue here (which could wrongly discard this new stream's first image if it was
-    // already queued before this handler ran).
-    this->bump_all_epochs();
+    // "A stream/start that changes a channel's configuration likewise discards that channel's
+    // pending image, and the server re-sends the image if it still applies." The discard is
+    // scoped to the channels whose configuration this stream/start changed: a channel the server
+    // left alone keeps the image it already scheduled, which the server will neither cancel nor
+    // re-send. Bumping those channels' epochs is the discard (see slot_epochs), and it also makes
+    // any notification still queued for them stale to the decode thread.
+    const uint8_t changed = this->changed_channel_mask(stream);
+    this->streamed_channels = stream.channels;
 
-    // Discard any pending display from a prior stream that has not yet been folded into the
-    // main thread's held_display_mask (see drain_events()). A display already folded into the
-    // holds is not reachable from here, but it carries the epoch it was decoded under
-    // (held_display_epoch), so the epoch bump above makes the main-loop deadline check drop it.
-    this->event_state->display_slot.reset();
-
+    // Unlike the other lifecycle handlers, no display_slot.reset() here: it would discard the
+    // pending display of every channel, including the unchanged ones this stream/start must
+    // leave alone. It is not needed either, because a display published by the decode thread
+    // carries the epoch it was decoded under, so drain_events() drops the ones whose channel
+    // moved on whether or not they have been folded into the main-thread holds yet.
     {
-        // Release any DECODE_DELIVERED ack gate: display_slot was just reset and the epoch was
-        // just bumped, so that decode's eventual display can no longer fire, and leaving the
-        // gate armed would wedge the slot forever. PRESENTED must stay armed here: the consumer
-        // may still be mid-fade on the previous stream's last delivery, and its buffers must not
-        // be disturbed until frame_done() is called. Protocol messages are serialized on the
-        // network thread, so this runs before any of the new stream's handle_binary() calls.
+        // Any transfer in flight ends here whatever changed: the server MUST cancel a transfer
+        // before a stream/start that changes its channel, and one still in flight across a
+        // stream/start that did not change its channel would be carrying bytes for a
+        // configuration nothing re-announces.
+        //
+        // Release a changed channel's DECODE_DELIVERED ack gate: its epoch was just bumped, so
+        // that decode's eventual display can no longer fire, and leaving the gate armed would
+        // wedge the slot forever. PRESENTED must stay armed: that delivery has already reached
+        // the consumer, which may still be mid-fade on it and owes the frame_done() that says so.
+        // Protocol messages are serialized on the network thread, so this runs before any of the
+        // new stream's handle_binary() calls.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-        for (auto& sb : this->drain_task->slot_buffers) {
+        this->transfer = ArtworkTransfer{};
+        for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+            if ((changed & static_cast<uint8_t>(1U << slot)) == 0) {
+                continue;
+            }
+            this->slot_epochs[slot].fetch_add(1, std::memory_order_relaxed);
+            auto& sb = this->drain_task->slot_buffers[slot];
             sb.has_parked = false;
             if (sb.ack_state == SlotAckState::DECODE_DELIVERED) {
                 sb.ack_state = SlotAckState::IDLE;
@@ -542,16 +560,47 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
     }
 }
 
+uint8_t ArtworkRole::Impl::changed_channel_mask(const ServerArtworkStreamObject& stream) const {
+    constexpr uint8_t ALL_CHANNELS = (1U << ARTWORK_MAX_SLOTS) - 1U;
+    // Without a channel array on one side or the other there is nothing to compare, so every
+    // channel counts as changed. That covers the first stream/start of a connection, where no
+    // channel has a pending image to lose anyway.
+    if (!this->streamed_channels.has_value() || !stream.channels.has_value()) {
+        return ALL_CHANNELS;
+    }
+    const auto& before = this->streamed_channels.value();
+    const auto& now = stream.channels.value();
+
+    uint8_t changed = 0;
+    for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
+        // "The channels array is positional from channel 0 and never longer than 4. A channel the
+        // array does not cover ... is not streamed", so a channel one array covers and the other
+        // does not has changed, as has one whose source, format, width or height differs.
+        const bool had = slot < before.size();
+        const bool has = slot < now.size();
+        if (had != has || (had && !same_channel(before[slot], now[slot]))) {
+            changed |= static_cast<uint8_t>(1U << slot);
+        }
+    }
+    return changed;
+}
+
+bool ArtworkRole::Impl::same_channel(const ServerArtworkChannelObject& a,
+                                     const ServerArtworkChannelObject& b) {
+    return a.source == b.source && a.format == b.format && a.width == b.width &&
+           a.height == b.height;
+}
+
 void ArtworkRole::Impl::handle_stream_end() {
     this->stream_active = false;
-    this->bump_all_epochs();
+    this->discard_all_pending();
 
     this->enqueue_stream_event(ArtworkEventType::STREAM_END);
 }
 
 void ArtworkRole::Impl::handle_stream_clear() {
     this->stream_active = false;
-    this->bump_all_epochs();
+    this->discard_all_pending();
 
     this->enqueue_stream_event(ArtworkEventType::STREAM_CLEAR);
 }
@@ -715,7 +764,7 @@ void ArtworkRole::Impl::drain_events() {
 
 void ArtworkRole::Impl::cleanup() {
     this->stream_active = false;
-    this->bump_all_epochs();
+    this->discard_all_pending();
 
     // Stale ring-borne events (an in-flight STREAM_END/STREAM_CLEAR queued before this cleanup)
     // are already discarded by SendspinClient::cleanup_connection_state()'s inbox.reset_events()

@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -250,25 +251,27 @@ struct ArtworkRole::Impl {
     static uint32_t display_lateness_ms(int64_t client_ts, int64_t overdue_us);
     // True if `slot` is within range and configured with require_frame_done.
     bool ack_enabled(uint8_t slot) const;
-    // Largest encoded image the role will hold for a channel of `width` by `height` pixels: the
-    // uncompressed 4-bytes-per-pixel size of the dimensions the client itself asked for, plus an
-    // allowance for container headers and per-row filter bytes. No encoding of that geometry is
-    // larger in practice, so the bound never rejects an image the server was asked for, while an
-    // implausible `total_size` is refused before a byte of it is allocated. Pure and static for
-    // direct unit testing.
-    static size_t slot_image_cap(uint16_t width, uint16_t height);
-    // slot_image_cap() for a configured slot; 0 for a slot the role declared no channel for, so
+    // Largest encoded image the role will hold for `slot`: the channel's configured
+    // ImageSlotPreference::max_image_bytes, or 0 for a slot the role declared no channel for, so
     // an image the role never asked for is never held.
-    size_t image_cap(uint8_t slot) const;
+    uint32_t image_cap(uint8_t slot) const;
     // Format the decode callback reports for `slot`: the one the channel was configured with, so
     // the array index stays authoritative for slot mapping (see the Impl constructor).
     SendspinImageFormat image_format(uint8_t slot) const;
     // Discards the slot's pending image by bumping its epoch, and abandons the in-flight transfer
     // if it is that slot's. Both a cancel message and a fresh announce need exactly this.
     void discard_pending(uint8_t slot);
-    // Discards every channel's pending image: bumps all the epochs and drops any transfer in
-    // flight. A stream start, end or clear and a disconnect each end whatever was in flight.
-    void bump_all_epochs();
+    // Discards every channel's pending image: bumps all the epochs, drops any transfer in flight,
+    // and forgets the streamed configuration so the next stream/start compares against nothing.
+    // A stream end or clear and a disconnect each end the whole stream this way; a stream/start
+    // discards only the channels it changed (see changed_channel_mask()).
+    void discard_all_pending();
+    // Which channels this stream/start changed the configuration of, as a slot bitmask. Every
+    // channel counts as changed when either side has no channel array to compare.
+    uint8_t changed_channel_mask(const ServerArtworkStreamObject& stream) const;
+    // True if two stream/start channel entries declare the same configuration.
+    static bool same_channel(const ServerArtworkChannelObject& a,
+                             const ServerArtworkChannelObject& b);
     // Outcome of one transfer message. MALFORMED is the protocol error handle_binary() reports to
     // its caller; COMPLETED means the notification it filled in is ready to enqueue.
     enum class TransferOutcome : uint8_t {
@@ -303,6 +306,10 @@ struct ArtworkRole::Impl {
     std::vector<ArtworkChannelFormatObject> artwork_channels;
     // The role's single image transfer in flight; guarded by DrainTask::slot_mutex.
     ArtworkTransfer transfer;
+    // The channel array of the stream/start in force, kept so the next one can be compared
+    // against it: only the channels whose configuration changes lose their pending image.
+    // Network-thread only, plus cleanup() on the main loop, like `transfer`.
+    std::optional<std::vector<ServerArtworkChannelObject>> streamed_channels;
 
     // Pointer fields
     SendspinClient* client;

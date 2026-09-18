@@ -401,13 +401,17 @@ enum class SendspinImageSource : uint8_t {
     NONE,    // No image
 };
 
+/// @brief Default ImageSlotPreference::max_image_bytes: 128 KiB per artwork channel, which holds
+/// any JPEG a 320x320 channel receives (a photographic one runs an order of magnitude under it,
+/// and a worst-case noisy one about 78 KB) with room for a larger channel, and bounds a
+/// four-channel role at 1 MiB of image buffers.
+static constexpr uint32_t ARTWORK_DEFAULT_MAX_IMAGE_BYTES = 128U * 1024U;
+
 /// @brief Preference for an image slot's format and resolution
 struct ImageSlotPreference {
     SendspinImageSource source{};
     SendspinImageFormat format{};
-    /// @brief Pixel dimensions the server delivers this channel's images at. They also bound the
-    /// memory the channel can cost: the role refuses an image the server declares larger than the
-    /// uncompressed size of these dimensions instead of buffering it.
+    /// @brief Pixel dimensions the server delivers this channel's images at.
     uint16_t width{};
     uint16_t height{};
 
@@ -427,6 +431,20 @@ struct ImageSlotPreference {
     /// PlayerRoleConfig::fixed_delay_us. Best-effort: an image that arrives or decodes after the
     /// offset deadline fires as soon as it is ready, same as any past-timestamp display.
     int32_t display_offset_ms{0};
+
+    /// @brief Largest encoded image this channel will hold, in bytes. An image the server
+    /// announces as larger is refused before any of it is allocated: the transfer is followed to
+    /// its end with its bytes dropped (which the protocol requires of a client that discards
+    /// image data) and the channel keeps whatever it was showing, so a server that encodes far
+    /// larger than the geometry it was asked for leaves the channel unchanged rather than
+    /// exhausting the heap. The default is a per-channel budget, not an upper bound on any
+    /// possible encoding: at the dimensions a display client of this class asks for (320x320 and
+    /// below) a JPEG runs well under it, while a high-entropy PNG at the same size can exceed
+    /// it. Raise it for a channel whose images are genuinely larger; the role logs every image it
+    /// refuses, with the cap it was measured against. Two buffers are held per channel, so the
+    /// role's image memory is bounded by twice this value per configured channel. A channel with
+    /// 0 here holds nothing at all.
+    uint32_t max_image_bytes{ARTWORK_DEFAULT_MAX_IMAGE_BYTES};
 };
 
 /// @brief Configuration for the artwork role

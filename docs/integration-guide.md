@@ -133,6 +133,8 @@ auto& artwork = client.add_artwork(std::move(artwork_config));
 
 The slot/channel number for each entry is its position (index) in `preferred_formats`; the first entry is slot 0, the second slot 1, and so on. Up to `ARTWORK_MAX_SLOTS` (4) entries are supported. The client reports these channels to the server in its `client/state` artwork object, which is sent once the server activates the role.
 
+Each image arrives as several binary messages that the role reassembles, so `on_image_decode()` fires once per complete image, never per message. `ImageSlotPreference::max_image_bytes` is the channel's memory budget: the role refuses an image the server announces as larger than that (the channel keeps what it was showing and the refusal is logged) and holds two buffers per channel, so the role's image memory is bounded by twice that value per configured channel. The default, 128 KiB, suits the channel sizes a display client of this class asks for; raise it for a channel whose images are genuinely larger.
+
 ### Visualizer Role (Audio Visualization)
 
 Receives real-time beat, loudness, dominant-frequency, onset, and spectrum data synchronized to playback.
@@ -331,7 +333,7 @@ struct MyArtworkListener : ArtworkRoleListener {
 
 Payloads and stream-level clears reach the gate differently:
 
-- A **frame or per-channel clear** arriving while a delivery is un-acked is buffered latest-wins and delivered only after `frame_done(slot)`, and then owes its own `frame_done()`. It waits behind the outstanding delivery rather than replacing it, so a consumer is never interrupted mid-fade.
+- A **frame or per-channel clear** arriving while a delivery is un-acked is buffered latest-wins and delivered only after `frame_done(slot)`, and then owes its own `frame_done()`. It waits behind the outstanding delivery rather than replacing it, so a consumer presenting a delivery is never interrupted. The exception is a delivery that has not reached `on_image_display()` yet: the server announcing a newer image for the slot replaces it outright, its display never fires, and the gate reopens for the buffered payload.
 - A **stream end or stream clear** is a lifecycle event, not a payload, so it is never buffered: it fires `on_image_clear()` immediately for every configured slot, discards anything buffered, and replaces whatever delivery was outstanding. Exactly one `frame_done()` is owed afterward whatever was in flight.
 
 Pair the gate with `ImageSlotPreference::display_offset_ms` to start a fade before the track boundary (positive fires the display early, mirroring `PlayerRoleConfig::fixed_delay_us`), and use `lateness_ms` to shorten the fade so it still ends on schedule:
@@ -1231,6 +1233,7 @@ Each entry in `preferred_formats` is an `ImageSlotPreference`. The slot/channel 
 | `height` | `uint16_t` | Desired image height in pixels |
 | `require_frame_done` | `bool` | Opt-in back-pressure gate (default `false`). When set, the role delivers at most one un-acked frame or clear at a time for this slot; the consumer must call `ArtworkRole::frame_done(slot)` to release the gate. See [ArtworkRoleListener](#artworkrolelistener). |
 | `display_offset_ms` | `int32_t` | Shifts the display deadline (default `0`). Positive fires `on_image_display()` earlier (mirroring `PlayerRoleConfig::fixed_delay_us`), negative delays it; lets a cross-fade straddle the track boundary. |
+| `max_image_bytes` | `uint32_t` | Largest encoded image this channel holds, in bytes (default 128 KiB). A larger image is refused: the transfer is followed to its end with its bytes dropped and the channel keeps what it was showing. `0` holds nothing at all. |
 
 ---
 
