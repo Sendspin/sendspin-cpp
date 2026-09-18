@@ -25,6 +25,11 @@ checklists in `.claude/skills/` apply these standards to a diff.
   the build, push, and log-on-drop sequence.
 - A bounded queue or ring that drops an item never drops it silently: log at
   least a warning at the drop site.
+- An event whose delivery must not survive its producer being torn down
+  carries the producer's teardown generation and is checked against it at the
+  drain (`push_event_or_log()` / `event_is_current()`), rather than relying on
+  the ring being reset: a teardown that leaves other producers running cannot
+  reset it.
 - Callback dispatch must tolerate re-entrant teardown: a listener callback may
   call back into the client. See "Re-entrant Teardown During Callback
   Dispatch" in `docs/internals.md` for the guard patterns in use.

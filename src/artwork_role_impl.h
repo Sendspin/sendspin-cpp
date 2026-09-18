@@ -339,6 +339,12 @@ struct ArtworkRole::Impl {
     // the main-thread holds to cancel it. Main-thread only; see held_display_ts.
     uint32_t held_display_epoch[ARTWORK_MAX_SLOTS]{};
 
+    /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event queued
+    /// afterwards. At the drain an event whose stamp no longer matches is discarded, so an event
+    /// queued before a teardown cannot act after it (see event_is_current() in inbox.h). Atomic
+    /// because enqueue_stream_event() reads it from the network thread.
+    std::atomic<uint32_t> cleanup_generation{0};
+
     /// @brief Per-channel delivery epoch, bumped whenever the channel's pending image is
     /// discarded: by a stream start/end/clear or cleanup (every channel at once), and by a cancel
     /// message or a fresh announce (that channel alone, per roles/artwork/v1.md "Artwork

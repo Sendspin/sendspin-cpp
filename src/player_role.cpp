@@ -549,7 +549,8 @@ void PlayerRole::Impl::drain_events() {
                     // it first keeps start/end paired even when the batch is abandoned below.
                     this->stream_active = true;
                     if (this->listener) {
-                        const uint32_t generation = this->cleanup_generation;
+                        const uint32_t generation =
+                            this->cleanup_generation.load(std::memory_order_relaxed);
                         this->listener->on_stream_start();
                         // on_stream_start() may re-enter connection teardown, whose cleanup()
                         // already ended the stream, cleared this vector, and enqueued a fresh
@@ -557,7 +558,8 @@ void PlayerRole::Impl::drain_events() {
                         // stream, so abandon the batch instead (the clamp below then erases
                         // nothing from the already-cleared vector). stream_active stays true so the
                         // enqueued STREAM_END still delivers a paired on_stream_end().
-                        if (this->cleanup_generation != generation) {
+                        if (this->cleanup_generation.load(std::memory_order_relaxed) !=
+                            generation) {
                             teardown_reentered = true;
                             break;
                         }
@@ -590,9 +592,12 @@ void PlayerRole::Impl::drain_events() {
 }
 
 void PlayerRole::Impl::cleanup() {
-    // Flag the teardown for a drain_events() frame that may be on the call stack right now (a
-    // listener callback re-entering teardown); see the STREAM_START branch there.
-    this->cleanup_generation++;
+    // Flag the teardown before anything else: it tells a drain_events() frame that may be on the
+    // call stack right now (a listener callback re-entering teardown) that the stream is gone --
+    // see the STREAM_START branch there -- and it stamps every event queued from here on, so the
+    // STREAM_END below is delivered while the START of a stream this teardown just ended is
+    // discarded at the drain (see event_is_current()).
+    this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
 
     // End the current stream: the sync task drains and returns to idle. (Not signal_stream_clear():
     // that path is a seek within a live stream and expects a marker to follow.)
@@ -651,7 +656,7 @@ void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event) cons
     push_event_or_log(
         this->inbox, InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(event), TAG,
         event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END",
-        /*error_level=*/true);
+        /*error_level=*/true, this->cleanup_generation.load(std::memory_order_acquire));
 }
 
 void PlayerRole::Impl::load_output_delay() {

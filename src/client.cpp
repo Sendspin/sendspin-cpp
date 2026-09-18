@@ -572,7 +572,11 @@ void SendspinClient::drain_inbox() {
                     // latest-wins state slot, not this ring; see PlayerRole::Impl::EventState.
                     case InboxEventType::PLAYER_STREAM: {
 #ifdef SENDSPIN_ENABLE_PLAYER
-                        if (this->player_) {
+                        if (this->player_ &&
+                            event_is_current(event.epoch,
+                                             this->player_->impl_->cleanup_generation.load(
+                                                 std::memory_order_acquire),
+                                             TAG, "a player stream event")) {
                             this->player_->impl_->on_stream_ring_event(
                                 static_cast<PlayerStreamCallbackType>(event.code));
                         }
@@ -622,7 +626,11 @@ void SendspinClient::drain_inbox() {
                     // to a main-thread-only Impl method keyed on the role-local enum.
                     case InboxEventType::ARTWORK_STREAM: {
 #ifdef SENDSPIN_ENABLE_ARTWORK
-                        if (this->artwork_) {
+                        if (this->artwork_ &&
+                            event_is_current(event.epoch,
+                                             this->artwork_->impl_->cleanup_generation.load(
+                                                 std::memory_order_acquire),
+                                             TAG, "an artwork stream event")) {
                             this->artwork_->impl_->handle_stream_ring_event(
                                 static_cast<ArtworkEventType>(event.code));
                         }
@@ -631,7 +639,11 @@ void SendspinClient::drain_inbox() {
                     }
                     case InboxEventType::VISUALIZER_STREAM: {
 #ifdef SENDSPIN_ENABLE_VISUALIZER
-                        if (this->visualizer_) {
+                        if (this->visualizer_ &&
+                            event_is_current(event.epoch,
+                                             this->visualizer_->impl_->cleanup_generation.load(
+                                                 std::memory_order_acquire),
+                                             TAG, "a visualizer stream event")) {
                             this->visualizer_->impl_->handle_stream_ring_event(
                                 static_cast<VisualizerEventType>(event.code));
                         }

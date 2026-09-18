@@ -86,7 +86,12 @@ struct TimeResponsePayload {
 /// POD; copied in and out of the ring by value.
 struct InboxEvent {
     InboxEventType type{};
-    uint8_t code{0};           // Role-local enum value; 0 when unused
+    uint8_t code{0};  // Role-local enum value; 0 when unused
+    /// Teardown generation of the producing role at push time, 0 for events that have none.
+    /// The consumer compares it against the role's current generation and drops a mismatch, so an
+    /// event queued before a teardown cannot act after it (see event_is_current()). Occupies
+    /// padding the struct already had, so the ring does not grow.
+    uint32_t epoch{0};
     TimeResponsePayload time;  // Valid only when type == InboxEventType::TIME_RESPONSE
 };
 
@@ -257,12 +262,15 @@ private:
 /// pattern stays uniform across roles. `what` names the dropped event in the log line; `code`
 /// carries the role-local enum value (0 when unused). `error_level` logs the drop at ERROR rather
 /// than WARN: use it for events whose loss wedges the stream (player START/END), not for the
-/// idempotent CLEARED events whose loss leaves merely recoverable stale state.
+/// idempotent CLEARED events whose loss leaves merely recoverable stale state. `epoch` stamps the
+/// producing role's teardown generation onto the event; a role whose events must not outlive a
+/// teardown passes it and the consumer checks it with event_is_current().
 inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, const char* tag,
-                              const char* what, bool error_level = false) {
+                              const char* what, bool error_level = false, uint32_t epoch = 0) {
     InboxEvent event{};
     event.type = type;
     event.code = code;
+    event.epoch = epoch;
     if (inbox == nullptr || !inbox->push_event(event)) {
         if (error_level) {
             SS_LOGE(tag, "Inbox event ring full; dropping %s", what);
@@ -270,6 +278,27 @@ inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, c
             SS_LOGW(tag, "Inbox event ring full; dropping %s", what);
         }
     }
+}
+
+/// @brief Whether a ring event is still current for the role that produced it
+///
+/// The consumer half of push_event_or_log()'s `epoch`. A role bumps its teardown generation when
+/// it is stopped (a lost connection, or a server/activate that removes the role), so an event the
+/// ring still holds from before that teardown carries the older generation and must not be acted
+/// on: delivering a stream START queued before a teardown would re-arm the producer the teardown
+/// just stopped. Logs the discard; a role's events are few and this runs only on the main loop.
+/// @param event_epoch Epoch carried by the drained event.
+/// @param role_epoch The producing role's current teardown generation.
+/// @param tag Log tag of the consumer.
+/// @param what Names the discarded event in the log line.
+/// @return true when the event may be dispatched.
+inline bool event_is_current(uint32_t event_epoch, uint32_t role_epoch, const char* tag,
+                             const char* what) {
+    if (event_epoch == role_epoch) {
+        return true;
+    }
+    SS_LOGD(tag, "Discarding %s queued before the role was stopped", what);
+    return false;
 }
 
 // ============================================================================

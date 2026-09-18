@@ -155,10 +155,13 @@ struct PlayerRole::Impl {
     std::unique_ptr<SyncTask> sync_task;
 
     // 32-bit fields
-    // Bumped by cleanup() so a drain_events() listener callback that re-enters connection
-    // teardown is detected when control returns: the STREAM_START tail must not re-arm the
-    // sync task for a stream cleanup() just ended. Main-thread only.
-    uint32_t cleanup_generation{0};
+    // Bumped by cleanup(), stamped onto every stream event queued afterwards, and serving two
+    // purposes. At the drain it decides whether a ring event is still current: an event queued
+    // before the teardown must not act after it, or a STREAM_START would re-arm the sync task for
+    // a stream that is gone. Within drain_events() it also detects a listener callback that
+    // re-entered teardown while the STREAM_START tail was running. Atomic because
+    // enqueue_stream_event() reads it from the network thread.
+    std::atomic<uint32_t> cleanup_generation{0};
 
     // 16-bit fields
     std::atomic<uint16_t> output_delay_ms{0};
