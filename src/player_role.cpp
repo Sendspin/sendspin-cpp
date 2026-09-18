@@ -598,16 +598,17 @@ void PlayerRole::Impl::cleanup() {
     // that path is a seek within a live stream and expects a marker to follow.)
     this->sync_task->signal_stream_end();
 
-    // Discard stale slot content from the dead connection. Stale ring-borne events (an
-    // in-flight STREAM_START/STREAM_END queued before this cleanup) are already discarded by
-    // SendspinClient::cleanup_connection_state()'s inbox.reset_events() call, which runs before
-    // any role's cleanup() -- so there is no per-queue ring reset to do here.
+    // Discard stale slot content. Stale ring-borne events (an in-flight STREAM_START/STREAM_END
+    // queued before this teardown) need no per-queue ring reset either way: on the connection-loss
+    // path SendspinClient::cleanup_connection_state()'s inbox.reset_events() has already wiped
+    // them, and on the deactivation path, which leaves the ring alone for the roles that stay
+    // active, they sit ahead of the STREAM_END pushed below and are delivered in order.
     this->event_state->stream_params_slot.reset();
     this->event_state->command_slot.reset();
     this->event_state->state_slot.reset();
 
-    // Enqueue a clean STREAM_END - drain_events() will fire the callback (the ring was just
-    // reset above us, so this push should not fail; enqueue_stream_event() logs if it somehow does)
+    // Enqueue a clean STREAM_END - drain_events() will fire the callback (enqueue_stream_event()
+    // logs if the ring is too full to take it)
     this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END);
 
     // Clear awaiting events too (main-thread only, no mutex needed)

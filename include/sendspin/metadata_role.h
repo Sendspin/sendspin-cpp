@@ -58,10 +58,13 @@ public:
     /// @brief Called when metadata is updated by the server
     virtual void on_metadata(const ServerMetadataStateObject& /*metadata*/) {}
 
-    /// @brief Called when the connection to the server is lost and cached metadata is dropped
+    /// @brief Called when the cached metadata is dropped: the connection to the server was lost,
+    /// or a server/activate took the metadata role out of the session's active roles
     ///
     /// Implementations should clear any displayed track metadata (title, artist, artwork URL,
-    /// progress, etc.) since the previous server's state is no longer valid.
+    /// progress, etc.) since the previous state is no longer valid. Idempotent by contract: a
+    /// second clear with nothing to clear must be a no-op. A role removed from an active session
+    /// can be added back by a later activation, which resumes with a fresh on_metadata().
     virtual void on_metadata_clear() {}
 };
 

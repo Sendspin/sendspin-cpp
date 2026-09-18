@@ -98,11 +98,14 @@ public:
     /// @brief Called when the server sends updated controller state
     virtual void on_controller_state(const ServerStateControllerObject& /*state*/) {}
 
-    /// @brief Called when the connection to the server is lost and cached controller state is
-    /// dropped
+    /// @brief Called when the cached controller state is dropped: the connection to the server was
+    /// lost, or a server/activate took the controller role out of the session's active roles
     ///
     /// Implementations should clear any displayed controller state (volume, mute, repeat,
-    /// shuffle, supported commands) since the previous server's state is no longer valid.
+    /// shuffle, supported commands) since the previous state is no longer valid. Idempotent by
+    /// contract: a second clear with nothing to clear must be a no-op. A role removed from an
+    /// active session can be added back by a later activation, which resumes with a fresh
+    /// on_controller_state().
     virtual void on_controller_state_clear() {}
 };
 

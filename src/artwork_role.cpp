@@ -766,17 +766,17 @@ void ArtworkRole::Impl::cleanup() {
     this->stream_active = false;
     this->discard_all_pending();
 
-    // Stale ring-borne events (an in-flight STREAM_END/STREAM_CLEAR queued before this cleanup)
-    // are already discarded by SendspinClient::cleanup_connection_state()'s inbox.reset_events()
-    // call, which runs before any role's cleanup() -- so there is no per-event ring reset to do
-    // here.
+    // Stale ring-borne events (an in-flight STREAM_END/STREAM_CLEAR queued before this teardown)
+    // need no per-event ring reset either way: on the connection-loss path
+    // SendspinClient::cleanup_connection_state()'s inbox.reset_events() has already wiped them,
+    // and on the deactivation path, which leaves the ring alone for the roles that stay active,
+    // they sit ahead of the STREAM_END pushed below and are delivered in order.
     this->held_display_mask = 0;
     this->held_display_clear = 0;
     this->event_state->display_slot.reset();
 
     // Enqueue a clean STREAM_END - handle_stream_ring_event() will fire the on_image_clear()
-    // callbacks (the ring was just reset above us, so this push should not fail;
-    // enqueue_stream_event() logs if it somehow does).
+    // callbacks (enqueue_stream_event() logs if the ring is too full to take it).
     this->enqueue_stream_event(ArtworkEventType::STREAM_END);
 }
 

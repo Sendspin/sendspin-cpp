@@ -834,6 +834,21 @@ private:
     /// @param conn The connection that completed the handshake
     void on_handshake_complete(SendspinConnection* conn);
 
+    /// @brief Tears down every role the activation just took out of active_roles
+    ///
+    /// messaging.md "server/activate" has the client stop a removed stream role's output and clear
+    /// its buffers, and discard a removed state role's current state and pending scheduled update,
+    /// as part of applying the activation. Roles that stay active at the same version are
+    /// untouched.
+    ///
+    /// Called by ConnectionManager on the main loop while conn_ptr_mutex_ is held, for the
+    /// admitted connection only, so the teardown obeys the same rule as the disconnect path: it
+    /// queues its listener callbacks on the inbox instead of calling them here.
+    /// @param roles_before The active roles the activation replaces
+    /// @param roles_after The active roles the activation established
+    void apply_role_removals(const std::vector<std::string>& roles_before,
+                             const std::vector<std::string>& roles_after);
+
     /// @brief Queue an on_pairing_started notification for delivery from loop()
     /// Called by ConnectionManager while conn_ptr_mutex_ is held; the callback itself fires
     /// later from loop() so it runs unlocked. Main loop only.

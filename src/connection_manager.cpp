@@ -817,6 +817,16 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     }
 
     if (event.conn.get() == this->current_connection_.get()) {
+        // messaging.md "server/activate": a role this activation took out of active_roles stops
+        // its output and drops its state as part of applying the activation, so the teardown runs
+        // before the branches below act on the new activation. Only the admitted connection has
+        // roles driving anything, and only its role set can shrink: a nursery entry sees one
+        // activate and has no prior set. roles_changed covers additions too, which have nothing to
+        // remove.
+        if (roles_changed) {
+            this->client_->apply_role_removals(roles_before, event.conn->get_active_roles());
+        }
+
         // Already admitted: no arbitration needed. is_first can still be true here
         // after an in-band re-handshake reset first_activate_received_; both branches
         // below that act on an is_first activate wait for the post-swap hello to have

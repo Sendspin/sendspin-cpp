@@ -73,6 +73,13 @@ struct MetadataRole::Impl {
     /// Applies the held state and fires the listener once its server-clock deadline has passed.
     void apply_due_state();
     void handle_cleared_event() const;
+    /// @brief Stops the role and discards its state. Main loop only.
+    ///
+    /// Shared by the two paths that take the role out of service: a connection being torn down
+    /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
+    /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
+    /// the inbox rather than fired here, because both callers run under the connection manager's
+    /// conn_ptr_mutex_.
     void cleanup();
 
     // ========================================

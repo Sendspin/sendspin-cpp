@@ -61,10 +61,13 @@ public:
     /// @brief Called when the color palette is updated by the server
     virtual void on_color(const ServerColorStateObject& /*color*/) {}
 
-    /// @brief Called when the connection to the server is lost and cached colors are dropped
+    /// @brief Called when the cached colors are dropped: the connection to the server was lost,
+    /// or a server/activate took the color role out of the session's active roles
     ///
     /// Implementations should reset any displayed colors to a neutral or default state since the
-    /// previous server's palette is no longer valid.
+    /// previous palette is no longer valid. Idempotent by contract: a second clear with nothing to
+    /// clear must be a no-op. A role removed from an active session can be added back by a later
+    /// activation, which resumes with a fresh on_color().
     virtual void on_color_clear() {}
 };
 

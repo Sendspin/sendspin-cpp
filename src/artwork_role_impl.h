@@ -206,6 +206,13 @@ struct ArtworkRole::Impl {
         return (pending_bits & INBOX_TOPIC_ARTWORK_DISPLAY) != 0 || this->held_display_mask != 0;
     }
     void drain_events();
+    /// @brief Stops the role and discards its state. Main loop only.
+    ///
+    /// Shared by the two paths that take the role out of service: a connection being torn down
+    /// (SendspinClient::cleanup_connection_state()) and a server/activate that removes the role
+    /// from active_roles (SendspinClient::apply_role_removals()). Listener callbacks are queued on
+    /// the inbox rather than fired here, because both callers run under the connection manager's
+    /// conn_ptr_mutex_.
     void cleanup();
 
     // ========================================

@@ -89,6 +89,9 @@ public:
     virtual void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) {}
 
     /// @brief Called when a visualizer stream ends. Fires on the main loop thread
+    ///
+    /// Also fires when a server/activate takes the visualizer role out of the session's active
+    /// roles, which discards the buffered frames along with the stream.
     virtual void on_visualizer_stream_end() {}
 
     /// @brief Called when a visualizer stream is cleared. Fires on the main loop thread

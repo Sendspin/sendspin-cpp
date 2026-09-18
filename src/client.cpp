@@ -114,6 +114,39 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
     return configured;
 }
 
+/// @brief Whether a versioned role name is in an active_roles set.
+/// @param active_roles The set to search, as the server wrote it.
+/// @param role The role to look for, compared against its full versioned name ("player@v1").
+///
+/// The comparison is on the exact versioned name this library implements, not the family, because
+/// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
+/// version that was active.
+bool role_in(const std::vector<std::string>& active_roles, SendspinRole role) {
+    const char* name = to_cstr(role);
+    for (const auto& active : active_roles) {
+        if (active == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// @brief Whether an activation drops `role` out of the active set, logging the transition.
+///
+/// Every role's teardown decision passes through here, so the log line exists once rather than
+/// once per role.
+/// @param before The active roles the activation replaces.
+/// @param after The active roles the activation established.
+/// @param role The role to test.
+bool role_removed(const std::vector<std::string>& before, const std::vector<std::string>& after,
+                  SendspinRole role) {
+    if (!role_in(before, role) || role_in(after, role)) {
+        return false;
+    }
+    SS_LOGI(TAG, "server/activate removed %s: stopping the role", to_cstr(role));
+    return true;
+}
+
 }  // namespace
 
 /// @brief Deferred event state for time responses and group updates on the main thread
@@ -547,17 +580,18 @@ void SendspinClient::drain_inbox() {
                         break;
                     }
                     // CONTROLLER_CLEARED / METADATA_CLEARED / COLOR_CLEARED: pushed by each
-                    // role's cleanup() in place of the old boolean coalescing flag. At most one
-                    // CLEARED per role is ever pending when this drain runs: cleanup() is called
-                    // only from cleanup_connection_state(), which first calls inbox.reset_events()
-                    // (wiping the whole ring) before any role re-pushes its CLEARED, and that path
-                    // runs only on the main loop (under conn_ptr_mutex_ from
-                    // ConnectionManager::drop_connection, or directly from stop()), so it cannot
-                    // interleave with itself. So even a back-to-back disconnect/reconnect
-                    // coalesces to a single CLEARED -- the reset_events() ordering is what
-                    // guarantees it, not clear-callback idempotency. (Callbacks are idempotent by
-                    // contract anyway; see on_controller_state_clear() / on_metadata_clear() /
-                    // on_color_clear().)
+                    // role's cleanup() in place of the old boolean coalescing flag. Through
+                    // cleanup_connection_state() at most one CLEARED per role is ever pending when
+                    // this drain runs: that path first calls inbox.reset_events() (wiping the
+                    // whole ring) before any role re-pushes its CLEARED, and it runs only on the
+                    // main loop (under conn_ptr_mutex_ from ConnectionManager::drop_connection, or
+                    // directly from stop()), so it cannot interleave with itself. Even a
+                    // back-to-back disconnect/reconnect therefore coalesces to a single CLEARED.
+                    // apply_role_removals() deliberately leaves the ring alone, so a server that
+                    // removes, re-adds and removes a role again between two ticks does queue two;
+                    // the callbacks are idempotent by contract (see on_controller_state_clear() /
+                    // on_metadata_clear() / on_color_clear()), so they deliver as two no-op-second
+                    // clears.
                     case InboxEventType::CONTROLLER_CLEARED: {
 #ifdef SENDSPIN_ENABLE_CONTROLLER
                         if (this->controller_) {
@@ -1903,6 +1937,59 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
         this->event_state_->pairing_notes.push_back(
             {.type = PairingNoteType::TRUST_CHANGED, .trust = trust});
     }
+}
+
+void SendspinClient::apply_role_removals(const std::vector<std::string>& roles_before,
+                                         const std::vector<std::string>& roles_after) {
+    // messaging.md "server/activate", "When applying a server/activate, the client MUST": every
+    // removed server-to-client stream role stops its remaining output and clears its buffers, even
+    // where an earlier stream/end had let buffered data finish, and every removed role with a
+    // server/state object discards its current state and any pending scheduled update.
+    //
+    // That is exactly what each role's cleanup() does, so deactivation runs the same teardown the
+    // disconnect path runs. Only the surroundings differ: the connection survives, so the inbox
+    // ring is not reset first (the roles that stay active keep their queued lifecycle events) and
+    // the role may be re-added later. Coming back is the role's ordinary start path -- a role
+    // whose state object the server needs again is carried by the client/state the activation
+    // publishes, and a stream role re-arms on the next stream/start.
+#ifdef SENDSPIN_ENABLE_PLAYER
+    // The player's only output effect is the PCM it writes through
+    // PlayerRoleListener::on_audio_write(); it applies no ducking or other temporary effect for
+    // the spec's "release temporary output effects" clause to release. cleanup() returns the sync
+    // task to idle, so the writes stop, and the deferred on_stream_end() tells the consumer to
+    // stop the output it drives itself.
+    if (this->player_ && role_removed(roles_before, roles_after, SendspinRole::PLAYER)) {
+        this->player_->impl_->cleanup();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    if (this->controller_ && role_removed(roles_before, roles_after, SendspinRole::CONTROLLER)) {
+        this->controller_->impl_->cleanup();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
+    if (this->metadata_ && role_removed(roles_before, roles_after, SendspinRole::METADATA)) {
+        this->metadata_->impl_->cleanup();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_COLOR
+    if (this->color_ && role_removed(roles_before, roles_after, SendspinRole::COLOR)) {
+        this->color_->impl_->cleanup();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_ARTWORK
+    // roles/artwork/v1.md "Server -> Client: Artwork (Binary)" clears the current image and
+    // discards the pending one for the whole role, which is what cleanup() carries out per
+    // channel.
+    if (this->artwork_ && role_removed(roles_before, roles_after, SendspinRole::ARTWORK)) {
+        this->artwork_->impl_->cleanup();
+    }
+#endif
+#ifdef SENDSPIN_ENABLE_VISUALIZER
+    if (this->visualizer_ && role_removed(roles_before, roles_after, SendspinRole::VISUALIZER)) {
+        this->visualizer_->impl_->cleanup();
+    }
+#endif
 }
 
 void SendspinClient::note_pairing_started(const std::string& server_id) {
