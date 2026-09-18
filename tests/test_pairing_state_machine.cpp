@@ -1369,6 +1369,84 @@ TEST_F(PairingStateMachineTest, DynamicCodeAttemptTimeout) {
 // side closes the WebSocket without sending any application-level error message, and persists
 // nothing." This pins that behavior for the MALFORMED case in
 // ConnectionManager::handle_pairing_message: no pair/abort, and the connection closes.
+// =============================================================================
+// pairing.md "Sequence violations": a pairing message out of sequence for the selected method
+// and the current state is a protocol error, and "Protocol Errors" closes the connection
+// without any application-level message. No pair/abort names a reason for it.
+// =============================================================================
+
+TEST_F(PairingStateMachineTest, StaticCodeAttemptClosesOnServerPairInit) {
+    // server/pair-init belongs to the dynamic flow alone: the static flow runs from
+    // client/pair-init straight to server/pair-auth.
+    this->configure_static_pairing_code("13572468");
+    FakeConnection* conn = this->inject_current_connection("server-static-seq",
+                                                           SendspinPairMethod::STATIC_PAIRING_CODE);
+    this->enter_pairing(conn);
+    this->client_->loop();
+    this->client_->confirm_pairing_window();
+    this->client_->loop();
+    ASSERT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+    const size_t frames_before = conn->sent_text_.size();
+
+    ServerPairingMessageEvent pair_init_event;
+    pair_init_event.conn = this->current_connection_sp();
+    pair_init_event.kind = PairingMessageKind::PAIR_INIT;
+    pair_init_event.nonce_a = std::array<uint8_t, 32>{};
+    this->schedule_pairing_message_event(std::move(pair_init_event));
+    this->client_->loop();
+
+    EXPECT_EQ(conn->sent_text_.size(), frames_before)
+        << "a sequence violation sends no application-level message, pair/abort included";
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "");
+    EXPECT_EQ(conn->disconnect_count_, 0) << "the close carries no client/goodbye either";
+    EXPECT_EQ(this->current_connection(), nullptr);
+    EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::IDLE);
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
+}
+
+TEST_F(PairingStateMachineTest, OutOfSequenceServerPairAuthClosesSilently) {
+    // server/pair-auth while the attempt is still waiting for server/pair-init.
+    FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-seq-auth");
+    ASSERT_EQ(conn->pairing_session().step,
+              SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT);
+    const size_t frames_before = conn->sent_text_.size();
+
+    ServerPairingMessageEvent pair_auth_event;
+    pair_auth_event.conn = this->current_connection_sp();
+    pair_auth_event.kind = PairingMessageKind::PAIR_AUTH;
+    pair_auth_event.pake_msg_1 = std::array<uint8_t, 32>{};
+    this->schedule_pairing_message_event(std::move(pair_auth_event));
+    this->client_->loop();
+
+    EXPECT_EQ(conn->sent_text_.size(), frames_before)
+        << "a sequence violation sends no application-level message, pair/abort included";
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "");
+    EXPECT_EQ(conn->disconnect_count_, 0);
+    EXPECT_EQ(this->current_connection(), nullptr);
+    EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::IDLE);
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
+}
+
+TEST_F(PairingStateMachineTest, OutOfSequenceServerPairConfirmClosesSilently) {
+    // server/pair-confirm before the exchange has produced anything to confirm.
+    FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-seq-confirm");
+    ASSERT_EQ(conn->pairing_session().step,
+              SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT);
+    const size_t frames_before = conn->sent_text_.size();
+
+    std::array<uint8_t, CPACE_TAG_SIZE> server_kc{};
+    this->schedule_pair_confirm(server_kc);
+
+    EXPECT_EQ(conn->sent_text_.size(), frames_before)
+        << "a sequence violation sends no application-level message, pair/abort included";
+    EXPECT_EQ(last_pair_abort_reason(conn->sent_text_), "")
+        << "in particular not pairing_code_mismatch: nothing was verified";
+    EXPECT_EQ(conn->disconnect_count_, 0);
+    EXPECT_EQ(this->current_connection(), nullptr);
+    EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::IDLE);
+    EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
+}
+
 TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSilently) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-4", SendspinPairMethod::DYNAMIC_PAIRING_CODE);

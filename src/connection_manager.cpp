@@ -2101,6 +2101,26 @@ void ConnectionManager::local_abort_pairing(SendspinConnection* conn, PairAbortR
         to_public_abort_reason(reason), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
 }
 
+void ConnectionManager::close_on_sequence_violation(SendspinConnection* conn,
+                                                    const char* message_type) {
+    // pairing.md "Sequence violations": a pairing message out of sequence for the selected
+    // method and the current state is a protocol error, and "Protocol Errors" has the detecting
+    // side close the WebSocket without sending any application-level message. No pair/abort
+    // goes out, and clear_pairing_state() inside abort_pairing_attempt() drops the pending
+    // record, so nothing is persisted. SendspinPairAbortReason has no dedicated protocol-error
+    // value and none of the wire-facing reasons describe this, so the local-only UNKNOWN is
+    // what the listener hears.
+    const auto& ps = conn->pairing_session();
+    SS_LOGW(TAG,
+            "handle_pairing_message: %s out of sequence (step=%d method=%s) for server_id=%s; "
+            "closing per pairing.md Protocol Errors (no pair/abort sent)",
+            message_type, static_cast<int>(ps.step), to_cstr(ps.method),
+            conn->get_server_id().c_str());
+    this->abort_pairing_attempt(conn, /*wire_abort_reason=*/std::nullopt,
+                                PairingDropAction::CLOSE_SILENTLY,
+                                SendspinPairAbortReason::UNKNOWN);
+}
+
 // ============================================================================
 // Pairing-window main-loop handlers
 // ============================================================================
@@ -2363,15 +2383,11 @@ void ConnectionManager::handle_pair_init(SendspinConnection* conn,
 
     // Step 1: server/pair-init received. This step belongs to the dynamic pairing code alone;
     // the static flow goes straight from client/pair-init to server/pair-auth (pairing.md
-    // "Static Pairing Code Flow"). A PAIR_INIT while ps.method == STATIC_PAIRING_CODE is a
-    // protocol violation, handled by the same wrong-step abort as an out-of-order message.
+    // "Static Pairing Code Flow"), so a PAIR_INIT while ps.method == STATIC_PAIRING_CODE is out
+    // of sequence exactly as an out-of-order message is.
     if (ps.method != SendspinPairMethod::DYNAMIC_PAIRING_CODE ||
         ps.step != SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT) {
-        SS_LOGW(TAG,
-                "handle_pairing_message: PAIR_INIT in wrong step=%d method=%s for "
-                "server_id=%s",
-                static_cast<int>(ps.step), to_cstr(ps.method), server_id.c_str());
-        this->local_abort_pairing(conn, PairAbortReason::ATTEMPT_TIMEOUT);
+        this->close_on_sequence_violation(conn, "server/pair-init");
         return;
     }
 
@@ -2449,9 +2465,7 @@ void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
 
     // Step 2: server/pair-auth received. Expect step AWAIT_SERVER_PAIR_AUTH.
     if (ps.step != SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_AUTH) {
-        SS_LOGW(TAG, "handle_pairing_message: PAIR_AUTH in wrong step=%d for server_id=%s",
-                static_cast<int>(ps.step), server_id.c_str());
-        this->local_abort_pairing(conn, PairAbortReason::ATTEMPT_TIMEOUT);
+        this->close_on_sequence_violation(conn, "server/pair-auth");
         return;
     }
 
@@ -2501,11 +2515,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
 
     // Step 3: server/pair-confirm received. Expect step AWAIT_SERVER_PAIR_CONFIRM.
     if (ps.step != SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_CONFIRM) {
-        SS_LOGW(TAG,
-                "handle_pairing_message: PAIR_CONFIRM in wrong step=%d for "
-                "server_id=%s",
-                static_cast<int>(ps.step), server_id.c_str());
-        this->local_abort_pairing(conn, PairAbortReason::ATTEMPT_TIMEOUT);
+        this->close_on_sequence_violation(conn, "server/pair-confirm");
         return;
     }
 

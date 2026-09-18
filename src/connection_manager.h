@@ -893,6 +893,13 @@ private:
     /// @param reason The abort reason to send.
     void local_abort_pairing(SendspinConnection* conn, PairAbortReason reason);
 
+    /// @brief End an attempt whose peer sent a pairing message out of sequence: close the
+    /// connection without any application-level message and persist nothing
+    /// (pairing.md "Sequence violations", "Protocol Errors").
+    /// @param conn The connection that sent the out-of-sequence message.
+    /// @param message_type The message type as it appears on the wire, for the log.
+    void close_on_sequence_violation(SendspinConnection* conn, const char* message_type);
+
     // ========================================
     // Pairing-window main-loop handlers
     // ========================================
