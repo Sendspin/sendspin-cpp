@@ -35,9 +35,8 @@ using RgbColor = std::array<uint8_t, 3>;
 
 /// @brief Audio-derived color palette received from the server
 ///
-/// Each color field is `nullopt` when the server has not provided that color,
-/// or has explicitly cleared it. The server guarantees WCAG contrast on the
-/// background_dark/background_light variants when present.
+/// Each color field is `nullopt` when the palette the server sent does not carry that color. The
+/// server guarantees WCAG contrast on the background_dark/background_light variants when present.
 struct ServerColorStateObject {
     int64_t timestamp{};
     /// @brief Background color suitable for dark mode; safe contrast with white text and on_dark
@@ -72,9 +71,10 @@ public:
 /**
  * @brief Color role that receives audio-derived colors from the server
  *
- * Maintains a local shadow of the server's color palette. Incoming color deltas are merged into
- * the shadow and delivered to the listener on the main loop thread once the synchronized client
- * clock reaches the update's `timestamp` (or immediately if there is no active connection).
+ * Maintains a local shadow of the server's color palette. Each palette the server sends carries
+ * the full state, so it replaces the shadow outright and a color it leaves out has no value. The
+ * palette is delivered to the listener on the main loop thread once the synchronized client clock
+ * reaches its `timestamp` (or immediately if there is no active connection).
  *
  * Usage:
  * 1. Implement ColorRoleListener to receive color updates

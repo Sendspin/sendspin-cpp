@@ -141,54 +141,58 @@ TEST(Protocol, ServerTimeRejectsMissingFields) {
 }
 
 // ============================================================================
-// Metadata tri-state delta parse + merge
+// Metadata and color full-state parsing
 //
-// Each field is std::optional<std::optional<T>>:
-//   absent on the wire  -> outer nullopt -> merge leaves the field alone
-//   explicit JSON null   -> outer engaged, inner nullopt -> merge clears the field
-//   value                -> outer + inner engaged -> merge overwrites
+// messaging.md "server/state": every message carries the full state of each role object it
+// includes, so an included object replaces what the client held; a field it omits has no value.
 // ============================================================================
 
-TEST(Protocol, MetadataValueUpdate) {
+TEST(Protocol, MetadataObjectIsParsedIntoState) {
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"metadata":)"
-                      R"({"timestamp":123,"title":"Song","artist":"Band"}}})",
+                      R"({"timestamp":123,"title":"Song","artist":"Band","year":1999,"track":4,)"
+                      R"("progress":{"track_progress":1000,"track_duration":240000,)"
+                      R"("playback_speed":1000}}}})",
                       doc, root));
 
-    ServerMetadataStateDelta delta;
-    ASSERT_TRUE(process_server_state_metadata(root, &delta));
+    ServerMetadataStateObject metadata;
+    ASSERT_TRUE(process_server_state_metadata(root, &metadata));
 
-    ServerMetadataStateObject current;
-    apply_metadata_state_deltas(&current, delta);
-
-    EXPECT_EQ(current.timestamp, 123);
-    ASSERT_TRUE(current.title.has_value());
-    EXPECT_EQ(current.title.value(), "Song");
-    ASSERT_TRUE(current.artist.has_value());
-    EXPECT_EQ(current.artist.value(), "Band");
+    EXPECT_EQ(metadata.timestamp, 123);
+    ASSERT_TRUE(metadata.title.has_value());
+    EXPECT_EQ(metadata.title.value(), "Song");
+    ASSERT_TRUE(metadata.artist.has_value());
+    EXPECT_EQ(metadata.artist.value(), "Band");
+    EXPECT_EQ(metadata.year.value_or(0), 1999);
+    EXPECT_EQ(metadata.track.value_or(0), 4);
+    ASSERT_TRUE(metadata.progress.has_value());
+    EXPECT_EQ(metadata.progress->track_progress, 1000u);
+    EXPECT_EQ(metadata.progress->track_duration, 240000u);
+    EXPECT_EQ(metadata.progress->playback_speed, 1000u);
 }
 
-TEST(Protocol, MetadataNullClearsAndAbsentPreserves) {
-    // Start with both fields already populated.
-    ServerMetadataStateObject current;
-    current.title = "Song";
-    current.artist = "Band";
+// A field the object omits has no value, whatever the target struct held before: the parse starts
+// from an empty state rather than overlaying the object on the previous one.
+TEST(Protocol, MetadataObjectReplacesEveryFieldItOmits) {
+    ServerMetadataStateObject metadata;
+    metadata.title = "Old title";
+    metadata.artist = "Old artist";
+    metadata.progress = MetadataProgressObject{5000, 240000, 1000};
 
-    // Delta sets title to null (clear) and omits artist (preserve).
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"metadata":)"
-                      R"({"timestamp":200,"title":null}}})",
+                      R"({"timestamp":200,"artist":"New artist"}}})",
                       doc, root));
+    ASSERT_TRUE(process_server_state_metadata(root, &metadata));
 
-    ServerMetadataStateDelta delta;
-    ASSERT_TRUE(process_server_state_metadata(root, &delta));
-    apply_metadata_state_deltas(&current, delta);
-
-    EXPECT_FALSE(current.title.has_value());  // explicit null cleared it
-    ASSERT_TRUE(current.artist.has_value());  // absent left it untouched
-    EXPECT_EQ(current.artist.value(), "Band");
+    EXPECT_EQ(metadata.timestamp, 200);
+    ASSERT_TRUE(metadata.artist.has_value());
+    EXPECT_EQ(metadata.artist.value(), "New artist");
+    EXPECT_FALSE(metadata.title.has_value());
+    // roles/metadata/v1.md "server/state metadata object": omitting progress clears the position.
+    EXPECT_FALSE(metadata.progress.has_value());
 }
 
 TEST(Protocol, MetadataMissingTimestampIsRejected) {
@@ -198,39 +202,33 @@ TEST(Protocol, MetadataMissingTimestampIsRejected) {
         parse(R"({"type":"server/state","payload":{"metadata":{"title":"X"}}})", doc, root));
 
     // The malformed metadata section is reported as absent rather than partially applied.
-    ServerMetadataStateDelta delta;
-    EXPECT_FALSE(process_server_state_metadata(root, &delta));
+    ServerMetadataStateObject metadata;
+    metadata.title = "Kept";
+    EXPECT_FALSE(process_server_state_metadata(root, &metadata));
+    // A rejected object leaves the caller's state untouched, so nothing half-parsed is displayed.
+    ASSERT_TRUE(metadata.title.has_value());
+    EXPECT_EQ(metadata.title.value(), "Kept");
 }
 
-// ============================================================================
-// Color parsing: range validation + tri-state merge
-// ============================================================================
-
-TEST(Protocol, ColorRangeValidationAndMerge) {
-    // Pre-populate accent and on_dark so we can observe "preserve" vs "clear".
-    ServerColorStateObject current;
-    current.accent = RgbColor{1, 2, 3};
-    current.on_dark = RgbColor{9, 9, 9};
+TEST(Protocol, ColorObjectIsParsedIntoStateAndValidatesRanges) {
+    ServerColorStateObject color;
+    color.accent = RgbColor{1, 2, 3};
+    color.on_dark = RgbColor{9, 9, 9};
 
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"color":{"timestamp":7,)"
-                      R"("primary":[10,20,30],"accent":[300,0,0],"on_dark":null}}})",
+                      R"("primary":[10,20,30],"accent":[300,0,0]}}})",
                       doc, root));
+    ASSERT_TRUE(process_server_state_color(root, &color));
 
-    ServerColorStateDelta delta;
-    ASSERT_TRUE(process_server_state_color(root, &delta));
-    apply_color_state_deltas(&current, delta);
-
-    ASSERT_TRUE(current.primary.has_value());
-    EXPECT_EQ(current.primary.value(), (RgbColor{10, 20, 30}));
-
-    // accent had an out-of-range component (300) -> treated as absent -> preserved.
-    ASSERT_TRUE(current.accent.has_value());
-    EXPECT_EQ(current.accent.value(), (RgbColor{1, 2, 3}));
-
-    // on_dark was explicit null -> cleared.
-    EXPECT_FALSE(current.on_dark.has_value());
+    EXPECT_EQ(color.timestamp, 7);
+    ASSERT_TRUE(color.primary.has_value());
+    EXPECT_EQ(color.primary.value(), (RgbColor{10, 20, 30}));
+    // accent had an out-of-range component (300), so the whole color is dropped, and the palette
+    // it arrived in replaced the previous one: neither accent nor the omitted on_dark survives.
+    EXPECT_FALSE(color.accent.has_value());
+    EXPECT_FALSE(color.on_dark.has_value());
 }
 
 // ============================================================================
@@ -443,20 +441,19 @@ TEST(Protocol, StreamStartDropsSpectrumWithoutValidConfig) {
     EXPECT_EQ(ok.visualizer->spectrum->n_disp_bins, 32);
 }
 
-// The refactored color parser reads each component as a uint8, so a non-integer (or out-of-range)
-// component fails the type check and the whole color is treated as absent.
+// The color parser reads each component as a uint8, so a non-integer (or out-of-range) component
+// fails the type check and the whole color is left without a value.
 TEST(Protocol, ColorRejectsNonIntegerComponent) {
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"color":)"
                       R"({"timestamp":1,"primary":[10,"x",30]}}})",
                       doc, root));
-    ServerColorStateDelta delta;
-    ASSERT_TRUE(process_server_state_color(root, &delta));
-
-    ServerColorStateObject current;
-    apply_color_state_deltas(&current, delta);
-    EXPECT_FALSE(current.primary.has_value());  // malformed component -> whole color dropped
+    ServerColorStateObject color;
+    ASSERT_TRUE(process_server_state_color(root, &color));
+    EXPECT_FALSE(color.primary.has_value());  // malformed component -> whole color dropped
+    // Control: the object still parsed, so its timestamp is there.
+    EXPECT_EQ(color.timestamp, 1);
 }
 
 // supported_commands is validated element-by-element. The controller role is frozen at v1, so an

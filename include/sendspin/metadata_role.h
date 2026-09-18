@@ -69,11 +69,12 @@ public:
  * @brief Metadata role that receives track metadata and playback progress from the server
  *
  * Maintains a local shadow of the server's metadata state, including track title, artist,
- * album, artwork URL, and playback progress. Incoming metadata deltas
- * are merged into the shadow and delivered to the listener on the main loop thread once the
- * synchronized client clock reaches the update's `timestamp` (or immediately if there is no
- * active connection). Progress is interpolated locally using the server timestamp so callers
- * always get a current value.
+ * album, artwork URL, and playback progress. Each metadata state the server sends carries the
+ * full state, so it replaces the shadow outright: a field it leaves out has no value, and a
+ * state without `progress` clears the position. The state is delivered to the listener on the
+ * main loop thread once the synchronized client clock reaches its `timestamp` (or immediately if
+ * there is no active connection). Progress is interpolated locally using the server timestamp so
+ * callers always get a current value.
  *
  * Usage:
  * 1. Implement MetadataRoleListener to receive metadata updates

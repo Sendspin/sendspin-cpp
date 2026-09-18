@@ -39,9 +39,7 @@ struct ColorRole::Impl {
     // ========================================
 
     struct EventState {
-        // Stores the wire-level delta type so accumulated clears (inner-nullopt) survive
-        // cross-thread merging until drain_events applies them to the merged state.
-        InboxSlot<ServerColorStateDelta> slot;
+        InboxSlot<ServerColorStateObject> slot;
     };
 
     // ========================================
@@ -51,14 +49,14 @@ struct ColorRole::Impl {
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
     // Takes a const reference, unlike the metadata and controller overloads: a
-    // ServerColorStateDelta is trivially copyable (see merge_color_state_delta), so there is
-    // nothing for an rvalue reference to move out of.
-    void handle_server_state(const ServerColorStateDelta& delta) const;
-    // True if a slot delta needs folding in, or a delta already held from a prior tick (see
-    // held_delta) is still waiting out its server-clock deadline -- the deadline itself sets no
-    // inbox bit, so held_delta must be polled every tick until it fires.
+    // ServerColorStateObject holds only optional RGB triples and a timestamp, so there is nothing
+    // for an rvalue reference to move out of.
+    void handle_server_state(const ServerColorStateObject& color) const;
+    // True if a slot palette needs taking, or a palette already held from a prior tick (see
+    // held_state) is still waiting out its server-clock deadline -- the deadline itself sets no
+    // inbox bit, so held_state must be polled every tick until it fires.
     bool needs_drain(uint32_t pending_bits) const {
-        return (pending_bits & INBOX_TOPIC_COLOR) != 0 || this->held_delta.has_value();
+        return (pending_bits & INBOX_TOPIC_COLOR) != 0 || this->held_state.has_value();
     }
     void drain_events();
     void handle_cleared_event() const;
@@ -70,9 +68,9 @@ struct ColorRole::Impl {
 
     // Struct fields
     ServerColorStateObject color{};
-    // Delta accumulated from the inbox slot, awaiting its server-clock deadline. Main-thread
-    // only: written and read exclusively from drain_events()/cleanup() on the loop thread.
-    std::optional<ServerColorStateDelta> held_delta;
+    // Palette taken from the inbox slot, awaiting its server-clock deadline. Main-thread only:
+    // written and read exclusively from drain_events()/cleanup() on the loop thread.
+    std::optional<ServerColorStateObject> held_state;
 
     // Pointer fields
     SendspinClient* client;

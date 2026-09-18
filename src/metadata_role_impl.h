@@ -39,7 +39,7 @@ struct MetadataRole::Impl {
     // ========================================
 
     struct EventState {
-        InboxSlot<ServerMetadataStateDelta> slot;
+        InboxSlot<ServerMetadataStateObject> slot;
     };
 
     // ========================================
@@ -48,12 +48,12 @@ struct MetadataRole::Impl {
 
     void attach_inbox(Inbox& inbox);
     void build_hello_fields(ClientHelloMessage& msg);
-    void handle_server_state(ServerMetadataStateDelta&& delta) const;
-    // True if a slot delta needs folding in, or a delta already held from a prior tick (see
-    // held_delta) is still waiting out its server-clock deadline -- the deadline itself sets no
-    // inbox bit, so held_delta must be polled every tick until it fires.
+    void handle_server_state(ServerMetadataStateObject&& metadata) const;
+    // True if a slot state needs taking, or a state already held from a prior tick (see
+    // held_state) is still waiting out its server-clock deadline -- the deadline itself sets no
+    // inbox bit, so held_state must be polled every tick until it fires.
     bool needs_drain(uint32_t pending_bits) const {
-        return (pending_bits & INBOX_TOPIC_METADATA) != 0 || this->held_delta.has_value();
+        return (pending_bits & INBOX_TOPIC_METADATA) != 0 || this->held_state.has_value();
     }
     void drain_events();
     void handle_cleared_event() const;
@@ -72,9 +72,9 @@ struct MetadataRole::Impl {
 
     // Struct fields
     ServerMetadataStateObject metadata{};
-    // Delta accumulated from the inbox slot, awaiting its server-clock deadline. Main-thread
-    // only: written and read exclusively from drain_events()/cleanup() on the loop thread.
-    std::optional<ServerMetadataStateDelta> held_delta;
+    // State taken from the inbox slot, awaiting its server-clock deadline. Main-thread only:
+    // written and read exclusively from drain_events()/cleanup() on the loop thread.
+    std::optional<ServerMetadataStateObject> held_state;
 
     // Pointer fields
     SendspinClient* client;

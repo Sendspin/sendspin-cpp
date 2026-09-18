@@ -227,46 +227,36 @@ static bool process_server_player_command_object(const JsonObject player_object,
     return true;
 }
 
-// Parses a single string field into a tri-state delta entry. Absent on the wire leaves `out`
-// untouched; explicit `null` writes outer-engaged + inner-`nullopt` (clear); a string writes
-// outer-engaged + inner-engaged. A present value that is neither a string nor null is logged and
-// skipped (treated as absent).
+// Parses a single string field of a server/state metadata object. A field the object does not
+// carry has no value, so `out` is left at its default (empty). A present value that is not a
+// string is logged and skipped, which leaves the field without a value as well.
 static void parse_metadata_string_field(JsonVariantConst var, const char* name,
-                                        std::optional<std::optional<std::string>>* out) {
+                                        std::optional<std::string>* out) {
     if (var.is<const char*>()) {
         *out = var.as<std::string>();
-    } else if (var.isNull() && !var.isUnbound()) {
-        *out = std::optional<std::string>{};
-    } else if (!var.isUnbound()) {
-        SS_LOGW(TAG, "Ignoring field '%s': expected string or null", name);
+    } else if (!var.isUnbound() && !var.isNull()) {
+        SS_LOGW(TAG, "Ignoring field '%s': expected string", name);
     }
 }
 
-// Parses a single uint16 field into a tri-state delta entry. Same semantics as above; a present
-// value that is neither a uint16 (0-65535) nor null is logged and skipped.
+// Parses a single uint16 field of a server/state metadata object. Same semantics as above; a
+// present value that is not a uint16 (0-65535) is logged and skipped.
 static void parse_metadata_uint16_field(JsonVariantConst var, const char* name,
-                                        std::optional<std::optional<uint16_t>>* out) {
+                                        std::optional<uint16_t>* out) {
     if (var.is<uint16_t>()) {
         *out = var.as<uint16_t>();
-    } else if (var.isNull() && !var.isUnbound()) {
-        *out = std::optional<uint16_t>{};
-    } else if (!var.isUnbound()) {
-        SS_LOGW(TAG, "Ignoring field '%s': expected integer in [0, 65535] or null", name);
+    } else if (!var.isUnbound() && !var.isNull()) {
+        SS_LOGW(TAG, "Ignoring field '%s': expected integer in [0, 65535]", name);
     }
 }
 
-// Parses a single `[R, G, B]` color field into a tri-state delta entry. Absent leaves `out`
-// untouched (outer nullopt); explicit `null` writes outer-engaged + inner-nullopt (clear); a
-// 3-element array of 0-255 integers writes the color. Any malformed value is logged and skipped
-// (treated as absent). Each component is read as a uint8, so its type check is also its range
-// check.
+// Parses a single `[R, G, B]` color field of a server/state color object. A field the object does
+// not carry has no value, so `out` is left at its default (empty); a malformed value is logged and
+// skipped, which leaves the field without a value as well. Each component is read as a uint8, so
+// its type check is also its range check.
 static void parse_color_field(JsonVariantConst var, const char* name,
-                              std::optional<std::optional<RgbColor>>* out) {
-    if (var.isUnbound()) {
-        return;
-    }
-    if (var.isNull()) {
-        *out = std::optional<RgbColor>{};
+                              std::optional<RgbColor>* out) {
+    if (var.isUnbound() || var.isNull()) {
         return;
     }
     if (!var.is<JsonArrayConst>()) {
@@ -540,8 +530,8 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
 // function that fills a caller-owned struct directly, so only one section's storage is live at a
 // time and nothing is materialized twice.
 
-bool process_server_state_metadata(JsonObject root, ServerMetadataStateDelta* metadata_delta) {
-    if (metadata_delta == nullptr || !root["payload"]["metadata"].is<JsonObject>()) {
+bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* metadata) {
+    if (metadata == nullptr || !root["payload"]["metadata"].is<JsonObject>()) {
         return false;
     }
     const JsonObject metadata_object = root["payload"]["metadata"];
@@ -551,20 +541,24 @@ bool process_server_state_metadata(JsonObject root, ServerMetadataStateDelta* me
         SS_LOGE(TAG, "Invalid metadata state object: missing timestamp");
         return false;
     }
-    metadata_delta->timestamp = metadata_object["timestamp"].as<int64_t>();
+    // messaging.md "server/state": every message carries the full state of each role object it
+    // includes, so an included metadata object is parsed into a fresh state rather than overlaid
+    // on what came before. A field the object omits has no value.
+    *metadata = ServerMetadataStateObject{};
+    metadata->timestamp = metadata_object["timestamp"].as<int64_t>();
 
-    parse_metadata_string_field(metadata_object["title"], "title", &metadata_delta->title);
-    parse_metadata_string_field(metadata_object["artist"], "artist", &metadata_delta->artist);
+    parse_metadata_string_field(metadata_object["title"], "title", &metadata->title);
+    parse_metadata_string_field(metadata_object["artist"], "artist", &metadata->artist);
     parse_metadata_string_field(metadata_object["album_artist"], "album_artist",
-                                &metadata_delta->album_artist);
-    parse_metadata_string_field(metadata_object["album"], "album", &metadata_delta->album);
+                                &metadata->album_artist);
+    parse_metadata_string_field(metadata_object["album"], "album", &metadata->album);
     parse_metadata_string_field(metadata_object["artwork_url"], "artwork_url",
-                                &metadata_delta->artwork_url);
-    parse_metadata_uint16_field(metadata_object["year"], "year", &metadata_delta->year);
-    parse_metadata_uint16_field(metadata_object["track"], "track", &metadata_delta->track);
+                                &metadata->artwork_url);
+    parse_metadata_uint16_field(metadata_object["year"], "year", &metadata->year);
+    parse_metadata_uint16_field(metadata_object["track"], "track", &metadata->track);
 
-    // Parse progress object: a present object engages inner, explicit null clears, absent leaves
-    // outer nullopt.
+    // roles/metadata/v1.md "server/state metadata object": omitting progress clears the client's
+    // position, which falls out of the full-state parse above leaving it without a value.
     if (metadata_object["progress"].is<JsonObject>()) {
         JsonObject progress_object = metadata_object["progress"];
         MetadataProgressObject progress{};
@@ -580,16 +574,14 @@ bool process_server_state_metadata(JsonObject root, ServerMetadataStateDelta* me
                 read_uint_field<uint32_t>(progress_object["playback_speed"], "playback_speed")) {
             progress.playback_speed = *v;
         }
-        metadata_delta->progress = progress;
-    } else if (!metadata_object["progress"].isUnbound() && metadata_object["progress"].isNull()) {
-        metadata_delta->progress = std::optional<MetadataProgressObject>{};
+        metadata->progress = progress;
     }
 
     return true;
 }
 
-bool process_server_state_color(JsonObject root, ServerColorStateDelta* color_delta) {
-    if (color_delta == nullptr || !root["payload"]["color"].is<JsonObject>()) {
+bool process_server_state_color(JsonObject root, ServerColorStateObject* color) {
+    if (color == nullptr || !root["payload"]["color"].is<JsonObject>()) {
         return false;
     }
     const JsonObject color_object = root["payload"]["color"];
@@ -598,16 +590,18 @@ bool process_server_state_color(JsonObject root, ServerColorStateDelta* color_de
         SS_LOGE(TAG, "Invalid color state object: missing timestamp");
         return false;
     }
-    color_delta->timestamp = color_object["timestamp"].as<int64_t>();
+    // messaging.md "server/state": an included color object carries the full palette, so it is
+    // parsed into a fresh state and a color it omits has no value.
+    *color = ServerColorStateObject{};
+    color->timestamp = color_object["timestamp"].as<int64_t>();
 
-    parse_color_field(color_object["background_dark"], "background_dark",
-                      &color_delta->background_dark);
+    parse_color_field(color_object["background_dark"], "background_dark", &color->background_dark);
     parse_color_field(color_object["background_light"], "background_light",
-                      &color_delta->background_light);
-    parse_color_field(color_object["primary"], "primary", &color_delta->primary);
-    parse_color_field(color_object["accent"], "accent", &color_delta->accent);
-    parse_color_field(color_object["on_dark"], "on_dark", &color_delta->on_dark);
-    parse_color_field(color_object["on_light"], "on_light", &color_delta->on_light);
+                      &color->background_light);
+    parse_color_field(color_object["primary"], "primary", &color->primary);
+    parse_color_field(color_object["accent"], "accent", &color->accent);
+    parse_color_field(color_object["on_dark"], "on_dark", &color->on_dark);
+    parse_color_field(color_object["on_light"], "on_light", &color->on_light);
 
     return true;
 }
@@ -804,73 +798,6 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
     }
 
     return true;
-}
-
-void apply_metadata_state_deltas(ServerMetadataStateObject* current,
-                                 const ServerMetadataStateDelta& delta) {
-    if (current == nullptr) {
-        return;
-    }
-
-    current->timestamp = delta.timestamp;
-
-    // For each field, an outer-engaged delta entry overwrites the merged optional with the inner
-    // optional verbatim, so an inner-`nullopt` (explicit `null` on the wire) clears the merged
-    // field.
-    if (delta.title.has_value()) {
-        current->title = *delta.title;
-    }
-    if (delta.artist.has_value()) {
-        current->artist = *delta.artist;
-    }
-    if (delta.album_artist.has_value()) {
-        current->album_artist = *delta.album_artist;
-    }
-    if (delta.album.has_value()) {
-        current->album = *delta.album;
-    }
-    if (delta.artwork_url.has_value()) {
-        current->artwork_url = *delta.artwork_url;
-    }
-    if (delta.year.has_value()) {
-        current->year = *delta.year;
-    }
-    if (delta.track.has_value()) {
-        current->track = *delta.track;
-    }
-    if (delta.progress.has_value()) {
-        current->progress = *delta.progress;
-    }
-}
-
-void apply_color_state_deltas(ServerColorStateObject* current, const ServerColorStateDelta& delta) {
-    if (current == nullptr) {
-        return;
-    }
-
-    current->timestamp = delta.timestamp;
-
-    // For each field, an outer-engaged delta entry overwrites the merged optional with the inner
-    // optional verbatim, so an inner-`nullopt` (explicit `null` on the wire) clears the merged
-    // field.
-    if (delta.background_dark.has_value()) {
-        current->background_dark = *delta.background_dark;
-    }
-    if (delta.background_light.has_value()) {
-        current->background_light = *delta.background_light;
-    }
-    if (delta.primary.has_value()) {
-        current->primary = *delta.primary;
-    }
-    if (delta.accent.has_value()) {
-        current->accent = *delta.accent;
-    }
-    if (delta.on_dark.has_value()) {
-        current->on_dark = *delta.on_dark;
-    }
-    if (delta.on_light.has_value()) {
-        current->on_light = *delta.on_light;
-    }
 }
 
 // Message formatting

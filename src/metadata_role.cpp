@@ -25,47 +25,6 @@ static const char* const TAG = "sendspin.metadata";
 
 namespace sendspin {
 
-namespace {
-
-/// @brief Merges an incoming wire delta into an accumulated delta using field-overlay semantics
-///
-/// For each field, an outer-engaged incoming entry overwrites the accumulated entry verbatim;
-/// absent (outer-nullopt) incoming fields leave the accumulated entry untouched, so pending
-/// clears (inner-nullopt) from earlier deltas survive until applied. Shared by both merge sites
-/// so they cannot drift: cross-thread, merging a network-thread delta into the inbox slot
-/// (handle_server_state); and main-thread, folding a freshly taken slot value into the held delta
-/// (MetadataRole::Impl::drain_events).
-void merge_metadata_state_delta(ServerMetadataStateDelta& current,
-                                ServerMetadataStateDelta&& incoming) {
-    current.timestamp = incoming.timestamp;
-    if (incoming.title.has_value()) {
-        current.title = std::move(incoming.title);
-    }
-    if (incoming.artist.has_value()) {
-        current.artist = std::move(incoming.artist);
-    }
-    if (incoming.album_artist.has_value()) {
-        current.album_artist = std::move(incoming.album_artist);
-    }
-    if (incoming.album.has_value()) {
-        current.album = std::move(incoming.album);
-    }
-    if (incoming.artwork_url.has_value()) {
-        current.artwork_url = std::move(incoming.artwork_url);
-    }
-    if (incoming.year.has_value()) {
-        current.year = incoming.year;
-    }
-    if (incoming.track.has_value()) {
-        current.track = incoming.track;
-    }
-    if (incoming.progress.has_value()) {
-        current.progress = incoming.progress;
-    }
-}
-
-}  // namespace
-
 // ============================================================================
 // Impl constructor / destructor
 // ============================================================================
@@ -147,55 +106,50 @@ void MetadataRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
     msg.supported_roles.push_back(SendspinRole::METADATA);
 }
 
-void MetadataRole::Impl::handle_server_state(ServerMetadataStateDelta&& delta) const {
-    // Merge incoming wire delta into the accumulated delta in the inbox slot; see
-    // merge_metadata_state_delta for the field-overlay semantics.
-    this->event_state->slot.merge(merge_metadata_state_delta, std::move(delta));
+void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject&& metadata) const {
+    // messaging.md "server/state": each included metadata object is the role's full state, so a
+    // newer one replaces an undrained older one outright rather than overlaying it.
+    this->event_state->slot.write(std::move(metadata));
 }
 
 void MetadataRole::Impl::drain_events() {
     // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex --
     // see inbox.h), so the server-clock deadline gate is split in two: take() unconditionally
-    // moves any pending slot value into held_delta (folding it in if a delta is already held),
-    // then the deadline is evaluated below with no lock held at all.
+    // moves any pending slot value into held_state, then the deadline is evaluated below with no
+    // lock held at all.
     //
-    // Caveat: merged deltas carry only the newest timestamp, so a past-valid field merged under a
-    // later future-valid update gets held back until the later deadline. Accepted since
-    // overlapping fields are last-writer-wins anyway. This applies identically regardless of
-    // which merge site folded the fields together -- cross-thread in the slot (handle_server_state)
-    // or here, folding a taken slot value into held_delta.
-    ServerMetadataStateDelta delta{};
-    if (this->event_state->slot.take(delta)) {
-        if (this->held_delta.has_value()) {
-            merge_metadata_state_delta(*this->held_delta, std::move(delta));
-        } else {
-            this->held_delta = std::move(delta);
-        }
+    // roles/metadata/v1.md "Scheduled metadata updates": a state whose timestamp is still in the
+    // future is the pending update and a newer one replaces it, while a past or present one is
+    // applied at once and discards the pending update. Both fall out of replacing held_state with
+    // whatever the slot holds.
+    ServerMetadataStateObject metadata{};
+    if (this->event_state->slot.take(metadata)) {
+        this->held_state = std::move(metadata);
     }
 
-    if (!this->held_delta.has_value()) {
+    if (!this->held_state.has_value()) {
         return;
     }
 
-    // A future-dated delta is held across ticks below without any topic bit set (take() above
+    // A future-dated state is held across ticks below without any topic bit set (take() above
     // cleared it). It is re-evaluated against its deadline on later ticks only because
-    // needs_drain() ORs in held_delta.has_value() alongside the INBOX_TOPIC_METADATA bit test, so
+    // needs_drain() ORs in held_state.has_value() alongside the INBOX_TOPIC_METADATA bit test, so
     // this drain_events() keeps running each tick until the deadline fires. Dropping that OR term
-    // would strand the delta until an unrelated new delta re-set the topic bit.
+    // would strand the state until an unrelated new state re-set the topic bit.
     //
     // get_client_time returns 0 when there is no current connection. Without a connection we
     // cannot honor the server-clock deadline, so fire immediately rather than starving the
     // listener.
-    int64_t client_ts = this->client->get_client_time(this->held_delta->timestamp);
+    int64_t client_ts = this->client->get_client_time(this->held_state->timestamp);
     if (client_ts != 0 && client_ts > platform_time_us()) {
         return;
     }
 
-    apply_metadata_state_deltas(&this->metadata, *this->held_delta);
+    this->metadata = std::move(this->held_state.value());
     if (this->listener) {
         this->listener->on_metadata(this->metadata);
     }
-    this->held_delta.reset();
+    this->held_state.reset();
 }
 
 void MetadataRole::Impl::handle_cleared_event() const {
@@ -209,7 +163,7 @@ void MetadataRole::Impl::handle_cleared_event() const {
 void MetadataRole::Impl::cleanup() {
     this->event_state->slot.reset();
     this->metadata = {};
-    this->held_delta.reset();
+    this->held_state.reset();
 
     push_event_or_log(this->inbox, InboxEventType::METADATA_CLEARED, 0, TAG,
                       "metadata cleared event");

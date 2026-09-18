@@ -1568,8 +1568,12 @@ class RecordingMetadataListener : public MetadataRoleListener {
 public:
     std::atomic<int> updates{0};
     std::string last_title;
+    std::string last_artist;
+    bool last_had_progress{false};
     void on_metadata(const ServerMetadataStateObject& m) override {
         this->last_title = m.title.value_or("");
+        this->last_artist = m.artist.value_or("");
+        this->last_had_progress = m.progress.has_value();
         this->updates.fetch_add(1);
     }
 };
@@ -1683,6 +1687,32 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+// messaging.md "server/state": each metadata object carries the role's full state, so what a
+// later object leaves out is gone rather than carried forward from the object before it. The
+// state the listener sees for a resent title-only update therefore has no artist and no position.
+TEST(EncryptedLifecycle, MetadataStateReplacesRatherThanMerges) {
+    HoldTestClient bundle("Metadata Full State Test Client");
+
+    HoldTestConnection conn;
+    bundle.client_ref().admit_connection(&conn);
+    bundle.deliver(
+        conn,
+        R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"First",)"
+        R"("artist":"Band","progress":{"track_progress":0,"track_duration":1000,)"
+        R"("playback_speed":1000}}}})");
+    bundle.pump();
+    ASSERT_EQ(bundle.listener.updates.load(), 1);
+    EXPECT_EQ(bundle.listener.last_artist, "Band");
+    EXPECT_TRUE(bundle.listener.last_had_progress);
+
+    bundle.deliver(conn, metadata_state_json(2, "Second"));
+    bundle.pump();
+    ASSERT_EQ(bundle.listener.updates.load(), 2);
+    EXPECT_EQ(bundle.listener.last_title, "Second");
+    EXPECT_EQ(bundle.listener.last_artist, "") << "an omitted artist must not carry forward";
+    EXPECT_FALSE(bundle.listener.last_had_progress) << "an omitted progress clears the position";
 }
 
 // Control: the harness itself delivers. An admitted connection's role message reaches the

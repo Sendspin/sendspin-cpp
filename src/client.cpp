@@ -1443,18 +1443,18 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
 
 #ifdef SENDSPIN_ENABLE_METADATA
             if (this->metadata_ != nullptr) {
-                ServerMetadataStateDelta metadata_delta;
-                if (process_server_state_metadata(root, &metadata_delta)) {
-                    this->metadata_->impl_->handle_server_state(std::move(metadata_delta));
+                ServerMetadataStateObject metadata_state;
+                if (process_server_state_metadata(root, &metadata_state)) {
+                    this->metadata_->impl_->handle_server_state(std::move(metadata_state));
                 }
             }
 #endif
 
 #ifdef SENDSPIN_ENABLE_COLOR
             if (this->color_ != nullptr) {
-                ServerColorStateDelta color_delta;
-                if (process_server_state_color(root, &color_delta)) {
-                    this->color_->impl_->handle_server_state(color_delta);
+                ServerColorStateObject color_state;
+                if (process_server_state_color(root, &color_state)) {
+                    this->color_->impl_->handle_server_state(color_state);
                 }
             }
 #endif
