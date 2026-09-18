@@ -92,14 +92,31 @@ enum class ConnectionTrust : uint8_t {
 /// Mirrors the wire values in the Sendspin pairing protocol.
 /// Carried by SendspinClientListener::on_pairing_failed().
 enum class SendspinPairAbortReason : uint8_t {
-    ATTEMPT_TIMEOUT,          // Server did not complete the exchange in time.
-    CONCURRENT_ATTEMPT,       // Another pairing attempt is already in progress.
-    METHOD_NOT_SUPPORTED,     // The selected pairing method is not available.
-    PIN_LENGTH_UNACCEPTABLE,  // Proposed PIN length is outside the accepted range.
-    PIN_MISMATCH,             // PIN verification failed.
-    USER_CANCELLED,           // User or application cancelled the pairing.
-    UNKNOWN,                  // Unrecognized reason from the wire, or a client-local abort
-                              // with no wire equivalent (e.g. a protocol error).
+    ATTEMPT_TIMEOUT,        // Server did not complete the exchange in time.
+    CONCURRENT_ATTEMPT,     // Another pairing attempt is already in progress.
+    METHOD_NOT_SUPPORTED,   // The selected pairing method or emission format is not available.
+    PAIRING_CODE_MISMATCH,  // PAKE key confirmation failed.
+    USER_CANCELLED,         // User or application cancelled the pairing.
+    UNKNOWN,                // Unrecognized reason from the wire, or a client-local abort
+                            // with no wire equivalent (e.g. a protocol error).
+};
+
+/// @brief Out-channel through which a client conveys a dynamic pairing code to the operator.
+///
+/// Advertised as `out_channels` on the `dynamic_pairing_code` descriptor in client/hello
+/// (pairing.md "client/hello pair-method descriptor").
+enum class SendspinPairingCodeChannel : uint8_t {
+    DISPLAY,  // The code is shown on a display.
+    SPEAKER,  // The code is spoken through an audio output.
+};
+
+/// @brief Emission format of a dynamic pairing code (pairing.md "Dynamic Pairing Code Flow").
+///
+/// Advertised as `formats` on the `dynamic_pairing_code` descriptor in client/hello; the server
+/// picks one of them in the pairing activation's `format` field.
+enum class SendspinPairingCodeFormat : uint8_t {
+    DIGITS,   // Six decimal digits the operator types into the server.
+    QR_CODE,  // A pairing token the operator scans from a rendered QR code.
 };
 
 }  // namespace sendspin

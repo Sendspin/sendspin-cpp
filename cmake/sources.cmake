@@ -8,7 +8,7 @@ function(sendspin_get_sources BASE_DIR)
         ${BASE_DIR}/src/crypto/constants.cpp
         ${BASE_DIR}/src/crypto/keys.cpp
         ${BASE_DIR}/src/crypto/cpace.cpp
-        ${BASE_DIR}/src/crypto/pin.cpp
+        ${BASE_DIR}/src/crypto/pairing_code.cpp
         ${BASE_DIR}/src/crypto/psk_wrap.cpp
         ${BASE_DIR}/src/crypto/pairing_token.cpp
 

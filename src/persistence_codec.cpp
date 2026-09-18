@@ -258,9 +258,11 @@ std::string encode_pairing_config(const SendspinPairingConfig& c) {
     doc["v"] = RECORD_CODEC_VERSION;
     doc["pairing_psk_enabled"] = c.pairing_psk_enabled;
     doc["unpaired_access_enabled"] = c.unpaired_access_enabled;
-    doc["dynamic_pin_enabled"] = c.dynamic_pin_enabled;
-    doc["static_pin_enabled"] = c.static_pin_enabled;
-    doc["dynamic_pin_min_length"] = c.dynamic_pin_min_length;
+    // The stored key strings are "dynamic_pin_enabled" / "static_pin_enabled": this blob is a
+    // storage format in its own right, fixed independently of the protocol's field names, so the
+    // keys stay put while the struct's fields follow the spec's terminology.
+    doc["dynamic_pin_enabled"] = c.dynamic_pairing_code_enabled;
+    doc["static_pin_enabled"] = c.static_pairing_code_enabled;
     std::string out;
     serializeJson(doc, out);
     return out;
@@ -280,14 +282,13 @@ std::optional<SendspinPairingConfig> decode_pairing_config(std::string_view byte
         cfg.unpaired_access_enabled = obj["unpaired_access_enabled"].as<bool>();
     }
     if (obj["dynamic_pin_enabled"].is<bool>()) {
-        cfg.dynamic_pin_enabled = obj["dynamic_pin_enabled"].as<bool>();
+        cfg.dynamic_pairing_code_enabled = obj["dynamic_pin_enabled"].as<bool>();
     }
     if (obj["static_pin_enabled"].is<bool>()) {
-        cfg.static_pin_enabled = obj["static_pin_enabled"].as<bool>();
+        cfg.static_pairing_code_enabled = obj["static_pin_enabled"].as<bool>();
     }
-    if (obj["dynamic_pin_min_length"].is<int>()) {
-        cfg.dynamic_pin_min_length = obj["dynamic_pin_min_length"].as<int>();
-    }
+    // A blob written by an older build may carry further keys; they are ignored, the same way a
+    // missing key leaves the struct's default in place.
     return cfg;
 }
 

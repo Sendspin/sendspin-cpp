@@ -60,7 +60,7 @@ static std::string read_file(const std::string& path) {
 /// Write content atomically via a temp file then rename.
 ///
 /// This file can hold the device's static private key, long-term PSKs, the Pairing
-/// PSK, and the static PIN, so the temp file is created owner-only (0600) from the
+/// PSK, and the static pairing code, so the temp file is created owner-only (0600) from the
 /// moment it exists rather than chmod'd afterward: a post-write chmod would leave
 /// the secret readable by other local accounts for the duration of the write.
 /// std::ofstream has no portable way to specify a creation mode, so the temp file is

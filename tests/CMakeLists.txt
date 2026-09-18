@@ -36,15 +36,15 @@ add_executable(sendspin_tests
     test_artwork_role.cpp
     test_crypto.cpp
     test_cpace.cpp
-    test_pin.cpp
+    test_pairing_code.cpp
     test_psk_wrap.cpp
     test_pairing_token.cpp
     test_record_store.cpp
     test_noise_transport.cpp
     test_noise_rehandshake.cpp
     test_admission.cpp
-    test_dynamic_pin.cpp
-    test_pin_state_machine.cpp
+    test_dynamic_pairing_code.cpp
+    test_pairing_state_machine.cpp
     test_persistence_codec.cpp
     test_client_teardown.cpp
     test_client_lifecycle.cpp
@@ -83,13 +83,13 @@ endif()
 target_compile_features(sendspin_tests PRIVATE cxx_std_20)
 target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
 
-# test_pin_state_machine.cpp is a white-box integration harness: its fixture injects fake
+# test_pairing_state_machine.cpp is a white-box integration harness: its fixture injects fake
 # connections into ConnectionManager's private state and drives private lifecycle methods
 # directly. Disabling access checking for that one translation unit keeps every test seam
 # out of the production headers (no friend declarations); access control is a compile-time
 # check only, so this has no ABI effect. GCC and Clang both support the flag, and the test
 # suite is host-only. The fixture's accessor methods document each seam and why it exists.
-set_source_files_properties(test_pin_state_machine.cpp PROPERTIES
+set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
 # test_encrypted_lifecycle.cpp uses it for one read: the unpair tests assert that the matched

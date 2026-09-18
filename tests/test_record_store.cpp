@@ -1069,16 +1069,16 @@ TEST(FilePersistenceProvider, ClearPairingPskAndStaticPinReportSuccess) {
     EXPECT_TRUE(provider.erase_blob(persistence_keys::PAIRING_PSK));
     EXPECT_FALSE(provider.load_blob(persistence_keys::PAIRING_PSK).has_value());
 
-    std::string pin = "12345678";
-    ASSERT_TRUE(provider.save_blob(persistence_keys::STATIC_PIN,
-                                   reinterpret_cast<const uint8_t*>(pin.data()), pin.size()));
-    ASSERT_TRUE(provider.load_blob(persistence_keys::STATIC_PIN).has_value());
-    EXPECT_TRUE(provider.erase_blob(persistence_keys::STATIC_PIN));
-    EXPECT_FALSE(provider.load_blob(persistence_keys::STATIC_PIN).has_value());
+    std::string code = "12345678";
+    ASSERT_TRUE(provider.save_blob(persistence_keys::STATIC_PAIRING_CODE,
+                                   reinterpret_cast<const uint8_t*>(code.data()), code.size()));
+    ASSERT_TRUE(provider.load_blob(persistence_keys::STATIC_PAIRING_CODE).has_value());
+    EXPECT_TRUE(provider.erase_blob(persistence_keys::STATIC_PAIRING_CODE));
+    EXPECT_FALSE(provider.load_blob(persistence_keys::STATIC_PAIRING_CODE).has_value());
 
     // Clearing what is already absent is still success.
     EXPECT_TRUE(provider.erase_blob(persistence_keys::PAIRING_PSK));
-    EXPECT_TRUE(provider.erase_blob(persistence_keys::STATIC_PIN));
+    EXPECT_TRUE(provider.erase_blob(persistence_keys::STATIC_PAIRING_CODE));
 
     // And a key that was NEVER touched at all is likewise a no-op success.
     EXPECT_TRUE(provider.erase_blob("never-used-key"));
@@ -1106,7 +1106,8 @@ TEST(FilePersistenceProvider, PairingConfigRoundTrip) {
     SendspinPairingConfig cfg;
     cfg.pairing_psk_enabled = false;
     cfg.unpaired_access_enabled = true;
-    cfg.dynamic_pin_min_length = 8;
+    cfg.dynamic_pairing_code_enabled = false;
+    cfg.static_pairing_code_enabled = true;
 
     std::string encoded = encode_pairing_config(cfg);
     EXPECT_TRUE(provider.save_blob(persistence_keys::PAIR_CONFIG,
@@ -1120,20 +1121,21 @@ TEST(FilePersistenceProvider, PairingConfigRoundTrip) {
     ASSERT_TRUE(loaded.has_value());
     EXPECT_EQ(loaded->pairing_psk_enabled, false);
     EXPECT_EQ(loaded->unpaired_access_enabled, true);
-    EXPECT_EQ(loaded->dynamic_pin_min_length, 8);
+    EXPECT_EQ(loaded->dynamic_pairing_code_enabled, false);
+    EXPECT_EQ(loaded->static_pairing_code_enabled, true);
 }
 
 // The persistence file holds plaintext secrets (static private key, long-term PSKs,
-// Pairing PSK, static PIN), so it must never be group/world readable regardless of
+// Pairing PSK, static pairing code), so it must never be group/world readable regardless of
 // the process umask. This is host-only POSIX, matching how
 // examples/common/file_persistence_provider.cpp itself creates the file.
 TEST(FilePersistenceProvider, PersistedFileIsOwnerOnly) {
     TempFile tmp;
     FilePersistenceProvider provider(tmp.path());
 
-    std::string pin = "1234";
-    EXPECT_TRUE(provider.save_blob(persistence_keys::STATIC_PIN,
-                                   reinterpret_cast<const uint8_t*>(pin.data()), pin.size()));
+    std::string code = "1234";
+    EXPECT_TRUE(provider.save_blob(persistence_keys::STATIC_PAIRING_CODE,
+                                   reinterpret_cast<const uint8_t*>(code.data()), code.size()));
 
     struct stat st{};
     ASSERT_EQ(::stat(tmp.path().c_str(), &st), 0);
@@ -1533,29 +1535,29 @@ TEST(PlayerRoleOutputDelay, InvalidPersistedValueIsTreatedAsAbsent) {
 }
 
 // ============================================================================
-// Static PIN load-time validation
+// Static pairing code load-time validation
 // ============================================================================
 
-// A STATIC_PIN blob that is not 8 decimal digits is rejected at load, exactly as RECORDS and
-// PAIRING_PSK are rejected by their decoders. Accepting it would leave the device advertising
-// static_pin while feeding garbage PRS bytes to the PAKE.
-TEST(RecordStore, RejectsMalformedStoredStaticPin) {
+// A STATIC_PAIRING_CODE blob that is not 8 decimal digits is rejected at load, exactly as
+// RECORDS and PAIRING_PSK are rejected by their decoders. Accepting it would leave the device advertising
+// static_pairing_code while feeding garbage PRS bytes to the PAKE.
+TEST(RecordStore, RejectsMalformedStoredStaticPairingCode) {
     for (const std::string& bad : {std::string("abcdefgh"), std::string("1234"),
                                    std::string("123456789"), std::string("1234567x")}) {
         InMemoryPersistenceProvider provider;
-        provider.seed_blob(persistence_keys::STATIC_PIN, to_bytes(bad));
+        provider.seed_blob(persistence_keys::STATIC_PAIRING_CODE, to_bytes(bad));
         RecordStore store(&provider);
-        EXPECT_FALSE(store.static_pin().has_value())
-            << "stored static PIN '" << bad << "' should have been rejected at load";
+        EXPECT_FALSE(store.static_pairing_code().has_value())
+            << "stored static pairing code '" << bad << "' should have been rejected at load";
     }
 }
 
-TEST(RecordStore, AcceptsValidStoredStaticPin) {
+TEST(RecordStore, AcceptsValidStoredStaticPairingCode) {
     InMemoryPersistenceProvider provider;
-    provider.seed_blob(persistence_keys::STATIC_PIN, to_bytes("12345678"));
+    provider.seed_blob(persistence_keys::STATIC_PAIRING_CODE, to_bytes("12345678"));
     RecordStore store(&provider);
-    ASSERT_TRUE(store.static_pin().has_value());
-    EXPECT_EQ(store.static_pin().value(), "12345678");
+    ASSERT_TRUE(store.static_pairing_code().has_value());
+    EXPECT_EQ(store.static_pairing_code().value(), "12345678");
 }
 
 TEST(SendspinClientIdentity, ConnectToBeforeStartServerIsRefused) {

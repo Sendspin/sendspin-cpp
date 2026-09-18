@@ -19,6 +19,7 @@
 
 #include "sendspin/persistence_codec.h"
 
+#include <ArduinoJson.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -304,29 +305,43 @@ TEST(PersistenceCodec, ConfigRoundTrip) {
     SendspinPairingConfig c;
     c.pairing_psk_enabled = false;
     c.unpaired_access_enabled = true;
-    c.dynamic_pin_enabled = false;
-    c.static_pin_enabled = true;
-    c.dynamic_pin_min_length = 8;
+    c.dynamic_pairing_code_enabled = false;
+    c.static_pairing_code_enabled = true;
 
     std::string blob = encode_pairing_config(c);
     auto decoded = decode_pairing_config(blob);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->pairing_psk_enabled, c.pairing_psk_enabled);
     EXPECT_EQ(decoded->unpaired_access_enabled, c.unpaired_access_enabled);
-    EXPECT_EQ(decoded->dynamic_pin_enabled, c.dynamic_pin_enabled);
-    EXPECT_EQ(decoded->static_pin_enabled, c.static_pin_enabled);
-    EXPECT_EQ(decoded->dynamic_pin_min_length, c.dynamic_pin_min_length);
+    EXPECT_EQ(decoded->dynamic_pairing_code_enabled, c.dynamic_pairing_code_enabled);
+    EXPECT_EQ(decoded->static_pairing_code_enabled, c.static_pairing_code_enabled);
+}
+
+// The two pairing-code flags are stored under the key strings the blob format froze them at,
+// which are independent of the protocol's field names (see persistence_codec.h).
+TEST(PersistenceCodec, ConfigUsesTheStoredKeyNames) {
+    SendspinPairingConfig c;
+    c.dynamic_pairing_code_enabled = false;
+    c.static_pairing_code_enabled = true;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, encode_pairing_config(c)));
+    ASSERT_TRUE(doc["dynamic_pin_enabled"].is<bool>());
+    ASSERT_TRUE(doc["static_pin_enabled"].is<bool>());
+    EXPECT_FALSE(doc["dynamic_pin_enabled"].as<bool>());
+    EXPECT_TRUE(doc["static_pin_enabled"].as<bool>());
 }
 
 // A config blob written by an older build carries keys this codec no longer knows. They are
 // ignored like any other unknown field, and the fields it does know still come through.
 TEST(PersistenceCodec, ConfigDecodeIgnoresUnknownFields) {
     auto decoded = decode_pairing_config(
-        R"({"v":1,"static_pin_enabled":true,"dynamic_pin_min_length":8,)"
-        R"("pairing_psk_rotated":true,"static_pin_rotated":true,"whatever":[1,2]})");
+        R"({"v":1,"static_pin_enabled":true,"dynamic_pin_enabled":false,)"
+        R"("dynamic_pin_min_length":8,"pairing_psk_rotated":true,"whatever":[1,2]})");
     ASSERT_TRUE(decoded.has_value());
-    EXPECT_TRUE(decoded->static_pin_enabled);
-    EXPECT_EQ(decoded->dynamic_pin_min_length, 8);
+    EXPECT_TRUE(decoded->static_pairing_code_enabled);
+    // Control: a key this codec does know still comes through from the same blob.
+    EXPECT_FALSE(decoded->dynamic_pairing_code_enabled);
 }
 
 TEST(PersistenceCodec, ConfigDecodeMissingFieldsTakeDefaults) {
@@ -335,9 +350,8 @@ TEST(PersistenceCodec, ConfigDecodeMissingFieldsTakeDefaults) {
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->pairing_psk_enabled, defaults.pairing_psk_enabled);
     EXPECT_EQ(decoded->unpaired_access_enabled, defaults.unpaired_access_enabled);
-    EXPECT_EQ(decoded->dynamic_pin_enabled, defaults.dynamic_pin_enabled);
-    EXPECT_EQ(decoded->static_pin_enabled, defaults.static_pin_enabled);
-    EXPECT_EQ(decoded->dynamic_pin_min_length, defaults.dynamic_pin_min_length);
+    EXPECT_EQ(decoded->dynamic_pairing_code_enabled, defaults.dynamic_pairing_code_enabled);
+    EXPECT_EQ(decoded->static_pairing_code_enabled, defaults.static_pairing_code_enabled);
 }
 
 TEST(PersistenceCodec, ConfigDecodeRejectsParseFailure) {

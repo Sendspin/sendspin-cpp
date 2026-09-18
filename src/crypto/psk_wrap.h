@@ -13,16 +13,18 @@
 // limitations under the License.
 
 /// @file psk_wrap.h
-/// @brief PSK Wrapping (spec "PSK Wrapping"): seals the new Sendspin PSK under a key derived from
-/// the CPace output so `client/pair-finalize` in the PIN flows carries `wrapped_psk` instead of the
-/// PSK in the clear.
+/// @brief Wrapping (pairing.md "Wrapping"): seals the two values a code-based pairing reveals
+/// only under the CPace output, so `client/pair-finalize` carries `wrapped_psk` instead of the
+/// new long-term PSK in the clear, and `client/pair-confirm` carries `wrapped_nonce_B` instead
+/// of the commitment opening.
 ///
-/// K_wrap = SHA-256("sendspin-pair-psk-wrap-v1" || sid || ISK)
+/// K_wrap = SHA-256(label || sid || ISK)
 ///
-/// where `sid` is the CPace session id (see cpace.h CPace::sid(), spec "PAKE") and `ISK` is the
-/// 64-byte CPace intermediate session key (see cpace.h CPace::isk()). The 32-byte PSK is then
-/// sealed with the AEAD of the connection's negotiated cipher suite, a 12-byte all-zero nonce,
-/// and empty associated data: wrapped_psk is the 48-byte ciphertext-plus-tag.
+/// with a distinct label per field, where `sid` is the CPace session id (see cpace.h
+/// CPace::sid(), pairing.md "PAKE") and `ISK` is the 64-byte CPace intermediate session key (see
+/// cpace.h CPace::isk()). The 32-byte value is then sealed with the AEAD of the connection's
+/// negotiated cipher suite, a 12-byte all-zero nonce, and empty associated data: the field
+/// carries the 48-byte ciphertext-plus-tag.
 
 #pragma once
 
@@ -37,36 +39,44 @@
 
 namespace sendspin {
 
-/// @brief Size in bytes of a wrapped PSK (32-byte PSK + 16-byte AEAD tag).
-static constexpr size_t WRAPPED_PSK_SIZE = 32 + 16;
+/// @brief Size in bytes of a wrapped 32-byte value (the value + a 16-byte AEAD tag). Both
+/// `wrapped_psk` and `wrapped_nonce_B` seal exactly 32 bytes, so one size covers both.
+static constexpr size_t WRAPPED_VALUE_SIZE = 32 + 16;
 
-/// @brief Domain-separation label for K_wrap. See PSK Wrapping in the spec's Pairing section.
+/// @brief Domain-separation label for the `wrapped_psk` key (pairing.md "Wrapping").
 static constexpr std::string_view PSK_WRAP_LABEL{"sendspin-pair-psk-wrap-v1"};
 
-/// @brief Derive K_wrap = SHA-256(PSK_WRAP_LABEL || sid || isk).
+/// @brief Domain-separation label for the `wrapped_nonce_B` key (pairing.md "Wrapping"). Distinct
+/// from PSK_WRAP_LABEL so the two fields of one attempt never share a key, which the all-zero
+/// AEAD nonce would otherwise make a two-time pad.
+static constexpr std::string_view NONCE_WRAP_LABEL{"sendspin-pair-nonce-wrap-v1"};
+
+/// @brief Derive K_wrap = SHA-256(label || sid || isk).
 /// Returns std::nullopt if the underlying SHA-256 computation fails (e.g. noise-c allocation
 /// failure); callers must not treat this as a recoverable all-zero key.
-std::optional<std::array<uint8_t, 32>> derive_psk_wrap_key(
-    const std::vector<uint8_t>& sid, const std::array<uint8_t, CPACE_ISK_SIZE>& isk);
+std::optional<std::array<uint8_t, 32>> derive_wrap_key(
+    std::string_view label, const std::vector<uint8_t>& sid,
+    const std::array<uint8_t, CPACE_ISK_SIZE>& isk);
 
-/// @brief Seal a 32-byte PSK under K_wrap using the named AEAD cipher ("ChaChaPoly"), a
+/// @brief Seal a 32-byte value under K_wrap using the named AEAD cipher ("ChaChaPoly"), a
 /// 12-byte all-zero nonce, and empty associated data.
+/// @param label       Per-field wrap label (PSK_WRAP_LABEL or NONCE_WRAP_LABEL).
 /// @param cipher_name Noise-c cipher name for the connection's negotiated suite.
 /// @param sid         CPace session id (see CPace::sid()).
 /// @param isk         CPace intermediate session key (see CPace::isk()).
-/// @param psk         32-byte PSK to wrap.
-/// @return 48-byte wrapped_psk (ciphertext || tag), or nullopt on a cipher failure.
-std::optional<std::array<uint8_t, WRAPPED_PSK_SIZE>> wrap_psk(
-    const char* cipher_name, const std::vector<uint8_t>& sid,
-    const std::array<uint8_t, CPACE_ISK_SIZE>& isk, const std::array<uint8_t, 32>& psk);
+/// @param value       32-byte value to wrap.
+/// @return The 48-byte wrapped field (ciphertext || tag), or nullopt on a cipher failure.
+std::optional<std::array<uint8_t, WRAPPED_VALUE_SIZE>> wrap_value(
+    std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,
+    const std::array<uint8_t, CPACE_ISK_SIZE>& isk, const std::array<uint8_t, 32>& value);
 
-/// @brief Open a wrapped_psk sealed by wrap_psk(), recovering the 32-byte PSK.
+/// @brief Open a field sealed by wrap_value(), recovering the 32-byte value.
 /// Kept for parity with aiosendspin's reference Python implementation; used by tests.
-/// @return The 32-byte PSK, or nullopt if the cipher is unrecognized or AEAD authentication
+/// @return The 32-byte value, or nullopt if the cipher is unrecognized or AEAD authentication
 /// fails (wrong key or corrupted input, which the spec treats as a protocol error).
-std::optional<std::array<uint8_t, 32>> unwrap_psk(
-    const char* cipher_name, const std::vector<uint8_t>& sid,
+std::optional<std::array<uint8_t, 32>> unwrap_value(
+    std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,
     const std::array<uint8_t, CPACE_ISK_SIZE>& isk,
-    const std::array<uint8_t, WRAPPED_PSK_SIZE>& wrapped);
+    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped);
 
 }  // namespace sendspin

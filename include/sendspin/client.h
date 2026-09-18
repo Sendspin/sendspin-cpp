@@ -88,8 +88,8 @@ public:
     /// @brief Called when a server begins a pairing exchange
     ///
     /// server_id is the base64url public key of the server entering pairing. Fires once per
-    /// attempt regardless of the selected method (Pairing-PSK, dynamic PIN, or static PIN);
-    /// the exchange completes when on_pairing_succeeded or on_pairing_failed fires.
+    /// attempt regardless of the selected method (Pairing PSK, dynamic pairing code, or static
+    /// pairing code); the exchange completes when on_pairing_succeeded or on_pairing_failed fires.
     /// Fires on the main loop.
     virtual void on_pairing_started(const std::string& /*server_id*/) {}
 
@@ -118,29 +118,38 @@ public:
     ///   ConnectionTrust::NONE:  Sentinel or Pairing PSK (unpaired access)
     virtual void on_trust_changed(ConnectionTrust /*trust*/) {}
 
-    /// @brief Called when a dynamic-PIN should be displayed to the user.
+    /// @brief Called when a dynamic pairing code should be emitted to the operator.
     ///
-    /// pin is the zero-padded decimal PIN string (e.g., "042735").  Fires on the main loop.
-    /// Called at most once per pairing attempt; always followed by on_clear_pairing_pin when
-    /// the attempt concludes (success, failure, or abort).
-    /// Only called when SendspinClientConfig::pin_display_supported is true.
-    virtual void on_display_pairing_pin(const std::string& /*pin*/) {}
+    /// `code` carries the code in the format the server selected, and `format` names it:
+    ///   DIGITS:  the six contiguous decimal digits (e.g. "042735"). pairing.md "Pairing Code
+    ///            Presentation" asks for a `3-3` grouping when the code is shown or spoken; the
+    ///            grouping is presentation-only, so the separator is the application's to add.
+    ///   QR_CODE: the version-1 pairing token (e.g. "SP:14DQ..."), to be rendered verbatim as a
+    ///            QR code with no URI scheme or wrapper around it.
+    /// Fires on the main loop, at most once per pairing attempt: the code is unchanged across
+    /// the attempt's rounds, so an emission that persists (a display) keeps standing. Always
+    /// followed by on_clear_pairing_code when the attempt concludes (success, failure, or abort).
+    /// Only called when SendspinClientConfig::pairing_code_out_channels and
+    /// ::pairing_code_formats are both non-empty.
+    virtual void on_display_pairing_code(const std::string& /*code*/,
+                                         SendspinPairingCodeFormat /*format*/) {}
 
-    /// @brief Called to clear the dynamic PIN from the display.
+    /// @brief Called to withdraw the emitted dynamic pairing code.
     ///
-    /// Fires on the main loop after every pairing attempt that triggered on_display_pairing_pin,
-    /// regardless of outcome.  Always called after on_display_pairing_pin, never before it.
-    virtual void on_clear_pairing_pin() {}
+    /// Fires on the main loop after every pairing attempt that triggered
+    /// on_display_pairing_code, regardless of outcome. Always called after
+    /// on_display_pairing_code, never before it.
+    virtual void on_clear_pairing_code() {}
 
-    /// @brief Called when the operator must perform the device pairing-window gesture to allow
-    /// a gesture-gated PIN pairing attempt (static PIN: every attempt; dynamic PIN: when the
-    /// session PIN is shorter than 6 digits).
+    /// @brief Called when the operator must perform the device pairing-window gesture to allow a
+    /// gesture-gated pairing attempt (pairing.md "Pairing Window"): every static_pairing_code
+    /// attempt, and a dynamic_pairing_code attempt held back by the round limit.
     ///
     /// Fires on the main loop. Only called when SendspinClientConfig::pairing_window_supported
-    /// is true; a device offering dynamic_pin should therefore also implement this gesture UI,
-    /// or a short-PIN attempt stalls until the server cancels it. Always followed by
-    /// on_close_pairing_window when the attempt concludes. The application confirms the gesture
-    /// by calling SendspinClient::confirm_pairing_window().
+    /// is true; a device offering dynamic_pairing_code should therefore also implement this
+    /// gesture UI, or an attempt held back by the round limit stalls until the server cancels it.
+    /// Always followed by on_close_pairing_window when the attempt concludes. The application
+    /// confirms the gesture by calling SendspinClient::confirm_pairing_window().
     virtual void on_open_pairing_window() {}
 
     /// @brief Called to dismiss the pairing-window prompt after every attempt that triggered
@@ -239,7 +248,8 @@ public:
 ///   codec in `sendspin/persistence_codec.h` (`encode_pairing_records()` /
 ///   `decode_pairing_records()`, `encode_pairing_psk()` / `decode_pairing_psk()`,
 ///   `encode_pairing_config()` / `decode_pairing_config()` respectively).
-/// - `KEYPAIR`, `STATIC_PIN`, and `LAST_PLAYED` hold raw bytes: see each constant's comment.
+/// - `KEYPAIR`, `STATIC_PAIRING_CODE`, and `LAST_PLAYED` hold raw bytes: see each constant's
+///   comment.
 /// - `OUTPUT_DELAY` holds an ASCII decimal string rather than raw uint16_t bytes, for
 ///   debuggability and to avoid an endianness dependency; decode it with a bounds check and
 ///   treat an invalid value as absent.
@@ -256,8 +266,10 @@ inline constexpr const char* RECORDS = "records";
 /// Codec blob: the accepted `SendspinPairingPsk` (`encode_pairing_psk()` / `decode_pairing_psk()`).
 inline constexpr const char* PAIRING_PSK = "pairing_psk";
 
-/// Raw UTF-8 bytes: the configured static PIN string.
-inline constexpr const char* STATIC_PIN = "static_pin";
+/// Raw UTF-8 bytes: the configured static pairing code (8 decimal digits). The stored key string
+/// is `static_pin`: this keyspace is a storage format in its own right, fixed independently of
+/// the protocol field names.
+inline constexpr const char* STATIC_PAIRING_CODE = "static_pin";
 
 /// Codec blob: the `SendspinPairingConfig` (`encode_pairing_config()` / `decode_pairing_config()`).
 inline constexpr const char* PAIR_CONFIG = "pair_config";
@@ -374,7 +386,7 @@ public:
     /// sends to complete, then closes the server and every connection regardless, joins the role
     /// threads, resets every role, and delivers the roles' clear callbacks (on_stream_end(),
     /// on_image_clear(), on_metadata_clear(), ...) before returning. A pairing prompt still
-    /// showing is dismissed the same way (on_clear_pairing_pin() / on_close_pairing_window()),
+    /// showing is dismissed the same way (on_clear_pairing_code() / on_close_pairing_window()),
     /// and a pairing record staged by a pair-finalize is persisted first. No-op when stopped.
     /// Calling start() afterwards restarts the client on the same identity and record store
     /// (both are rebuilt only if the persistence provider changed in between); start, stop, and
@@ -641,10 +653,10 @@ public:
     // ========================================
 
     /// @brief Signals that the operator performed the device pairing-window gesture.
-    /// Thread-safe. Opens a pairing window: a gesture-gated PIN attempt already waiting (static
-    /// PIN always; dynamic PIN when the session PIN is short) proceeds immediately; otherwise the
-    /// window stands open for 5 minutes and admits the next pairing attempt without a further
-    /// gesture.
+    /// Thread-safe. Opens a pairing window (pairing.md "Pairing Window"): a gesture-gated attempt
+    /// already waiting proceeds immediately; otherwise the window stands open for 5 minutes and
+    /// admits pairing attempts on one connection without a further gesture. The gesture is also
+    /// the deliberate operator action that clears a standing dynamic-pairing-code round limit.
     void confirm_pairing_window();
 
     // ========================================
@@ -830,13 +842,13 @@ private:
     /// Same deferral as note_pairing_started. Main loop only.
     void note_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason);
 
-    /// @brief Queue an on_display_pairing_pin notification for delivery from loop().
+    /// @brief Queue an on_display_pairing_code notification for delivery from loop().
     /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
-    void note_display_pin(const std::string& pin);
+    void note_display_pairing_code(const std::string& code, SendspinPairingCodeFormat format);
 
-    /// @brief Queue an on_clear_pairing_pin notification for delivery from loop().
+    /// @brief Queue an on_clear_pairing_code notification for delivery from loop().
     /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
-    void note_clear_pin();
+    void note_clear_pairing_code();
 
     /// @brief Queue an on_open_pairing_window notification for delivery from loop().
     /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.

@@ -106,13 +106,14 @@ struct SendspinPairingPsk {
 struct SendspinPairingConfig {
     bool pairing_psk_enabled{true};
     bool unpaired_access_enabled{false};
-    /// @brief When true, the client advertises dynamic_pin as a supported pair method.
-    bool dynamic_pin_enabled{true};
-    /// @brief When true, the client advertises static_pin as a supported pair method (also
-    /// requires a configured static PIN and platform pairing-window support).
-    bool static_pin_enabled{false};
-    /// @brief Minimum PIN length the client will accept; server chooses within [min, MAX].
-    int dynamic_pin_min_length{6};
+    /// @brief When true, the client advertises dynamic_pairing_code as a supported pair method
+    /// (also requires a configured out-channel and emission format).
+    bool dynamic_pairing_code_enabled{true};
+    /// @brief When true, the client advertises static_pairing_code as a supported pair method
+    /// (also requires a configured static pairing code and platform pairing-window support).
+    /// A client that offers dynamic_pairing_code offers that method instead: messaging.md
+    /// "client/hello" permits at most one pairing-code method in supported_pair_methods.
+    bool static_pairing_code_enabled{false};
 };
 
 // ============================================================================
@@ -141,16 +142,25 @@ struct SendspinClientConfig {
     /// interface).
     std::optional<std::string> mac_address{};
 
-    /// @brief When true, the platform can display a dynamic PIN to the user.
-    /// Set this to true when the application implements on_display_pairing_pin /
-    /// on_clear_pairing_pin callbacks on its SendspinClientListener. When false,
-    /// dynamic_pin is not advertised even if dynamic_pin_enabled is set in the config.
-    bool pin_display_supported{false};
+    /// @brief Channels through which this device can emit a dynamic pairing code to the operator.
+    /// Advertised as `out_channels` on the dynamic_pairing_code descriptor in client/hello
+    /// (pairing.md "client/hello pair-method descriptor"). Set this alongside
+    /// `pairing_code_formats` when the application implements the on_display_pairing_code /
+    /// on_clear_pairing_code callbacks on its SendspinClientListener. Empty leaves
+    /// dynamic_pairing_code unadvertised even when the pairing config enables it.
+    std::vector<SendspinPairingCodeChannel> pairing_code_out_channels{};
+
+    /// @brief Emission formats this device can render a dynamic pairing code in, in the order
+    /// advertised as `formats` on the dynamic_pairing_code descriptor. DIGITS suits any display
+    /// or speaker; QR_CODE requires a display able to render a QR code from the pairing token the
+    /// listener receives. Empty leaves dynamic_pairing_code unadvertised.
+    std::vector<SendspinPairingCodeFormat> pairing_code_formats{};
 
     /// @brief When true, the platform implements the operator pairing-window gesture.
     /// Set this to true when the application implements on_open_pairing_window /
     /// on_close_pairing_window callbacks on its SendspinClientListener. When false,
-    /// static_pin is not advertised even if a static PIN is configured and enabled.
+    /// static_pairing_code is not advertised even if a static pairing code is configured and
+    /// enabled, and a dynamic attempt held back by the round limit has no way to resume.
     bool pairing_window_supported{false};
 
     /// @brief Where the operator can find the Pairing PSK the device shipped with (as a pairing
@@ -158,10 +168,10 @@ struct SendspinClientConfig {
     /// `locations` hint on the pairing_psk descriptor in client/hello; empty = omit the hint.
     std::vector<std::string> pairing_psk_locations{};
 
-    /// @brief Where the operator can find the static PIN the device shipped with: any of
+    /// @brief Where the operator can find the static pairing code the device shipped with: any of
     /// "device", "leaflet", "operator". Advertised as the informational `locations` hint on the
-    /// static_pin descriptor in client/hello; empty = omit the hint.
-    std::vector<std::string> static_pin_locations{};
+    /// static_pairing_code descriptor in client/hello; empty = omit the hint.
+    std::vector<std::string> static_pairing_code_locations{};
 
     /// @brief First-boot default for unpaired (Sentinel) access.
     /// Seeds `SendspinPairingConfig::unpaired_access_enabled` only on a genuine first boot; the

@@ -223,9 +223,11 @@ int main(int argc, char* argv[]) {
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
     config.server_port = server_port;
-    // The example prints a dynamic PIN to the terminal, so the client can advertise the
-    // dynamic_pin pairing method alongside the mandatory pairing_psk one.
-    config.pin_display_supported = true;
+    // The example prints the pairing code to the terminal, so the client can advertise the
+    // dynamic_pairing_code method alongside the mandatory pairing_psk one. A terminal is a
+    // display but cannot render a QR code, so only the digits format is offered.
+    config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+    config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
 
     // Create audio output and client
 #ifdef SENDSPIN_HAS_PORTAUDIO
@@ -343,21 +345,33 @@ int main(int argc, char* argv[]) {
                     static_cast<int>(reason));
         }
 
-        void on_display_pairing_pin(const std::string& pin) override {
-            fprintf(stderr, "\n>>> Pairing PIN: %s\n", pin.c_str());
-            fprintf(stderr, "    Enter this PIN on the server to finish pairing.\n\n");
+        void on_display_pairing_code(const std::string& code,
+                                     SendspinPairingCodeFormat format) override {
+            if (format == SendspinPairingCodeFormat::QR_CODE) {
+                // This example never offers qr_code (a terminal cannot render one), so a server
+                // can only select digits; print the token verbatim if one ever arrives anyway.
+                fprintf(stderr, "\n>>> Pairing token: %s\n", code.c_str());
+                fprintf(stderr, "    Scan or paste this into the server to finish pairing.\n\n");
+                return;
+            }
+            // pairing.md "Pairing Code Presentation" asks for a 3-3 grouping; the separator is
+            // presentation only and never part of the code the operator types.
+            fprintf(stderr, "\n>>> Pairing code: %s-%s\n", code.substr(0, 3).c_str(),
+                    code.substr(3).c_str());
+            fprintf(stderr, "    Enter this code on the server to finish pairing.\n\n");
         }
 
-        void on_clear_pairing_pin() override {
-            fprintf(stderr, ">>> Pairing PIN cleared\n");
+        void on_clear_pairing_code() override {
+            fprintf(stderr, ">>> Pairing code withdrawn\n");
         }
 
         void on_open_pairing_window() override {
-            // Static-PIN pairing window not supported in the basic_client example.
+            // The pairing-window gesture is not implemented in the basic_client example, so
+            // pairing_window_supported stays false and this never fires.
         }
 
         void on_close_pairing_window() override {
-            // Static-PIN pairing window not supported in the basic_client example.
+            // See on_open_pairing_window().
         }
     };
 
@@ -397,8 +411,8 @@ int main(int argc, char* argv[]) {
     fprintf(stderr, "Persistence: %s\n", persistence_path.c_str());
 
     // The pairing token carries the client_id and the Pairing PSK together. Paste it into a
-    // server that asks for one to pair via the pairing_psk method; pairing with a PIN instead
-    // needs nothing from here (the PIN is printed when the server starts that flow).
+    // server that asks for one to pair via the pairing_psk method; pairing with a code instead
+    // needs nothing from here (the code is printed when the server starts that flow).
     auto token = client.pairing_token();
     if (token.has_value()) {
         fprintf(stderr, "Pairing token: %s\n", token->c_str());

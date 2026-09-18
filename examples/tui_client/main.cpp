@@ -474,9 +474,11 @@ int main(int argc, char* argv[]) {
     config.manufacturer = "sendspin-cpp";
     config.software_version = "0.1.0";
     config.server_port = server_port;
-    // The TUI shows a dynamic PIN in the pairing status line, so the client can advertise the
-    // dynamic_pin pairing method alongside the mandatory pairing_psk one.
-    config.pin_display_supported = true;
+    // The TUI shows the pairing code in its pairing status line, so the client can advertise
+    // the dynamic_pairing_code method alongside the mandatory pairing_psk one. A text TUI
+    // cannot render a QR code, so only the digits format is offered.
+    config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+    config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
 
     // Create audio output
 #ifdef SENDSPIN_HAS_PORTAUDIO
@@ -731,24 +733,32 @@ int main(int argc, char* argv[]) {
             state.pairing_status = "Pairing failed";
         }
 
-        void on_display_pairing_pin(const std::string& pin) override {
+        void on_display_pairing_code(const std::string& code,
+                                     SendspinPairingCodeFormat format) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            state.pairing_status = "PIN " + pin;
+            // Only digits are offered above, so a code that arrives is six digits; pairing.md
+            // "Pairing Code Presentation" asks for the 3-3 grouping shown here, which is
+            // presentation only and never part of what the operator types.
+            state.pairing_status = format == SendspinPairingCodeFormat::DIGITS
+                                       ? "Code " + code.substr(0, 3) + "-" + code.substr(3)
+                                       : "Token " + code;
         }
 
-        void on_clear_pairing_pin() override {
+        void on_clear_pairing_code() override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            if (state.pairing_status.rfind("PIN ", 0) == 0) {
+            if (state.pairing_status.rfind("Code ", 0) == 0 ||
+                state.pairing_status.rfind("Token ", 0) == 0) {
                 state.pairing_status = "Pairing...";
             }
         }
 
         void on_open_pairing_window() override {
-            // Static-PIN pairing window not supported in the tui_client example.
+            // The pairing-window gesture is not implemented in the tui_client example, so
+            // pairing_window_supported stays false and this never fires.
         }
 
         void on_close_pairing_window() override {
-            // Static-PIN pairing window not supported in the tui_client example.
+            // See on_open_pairing_window().
         }
     };
 
@@ -931,7 +941,8 @@ int main(int argc, char* argv[]) {
     // client_id is base64url(static X25519 public key), 43 chars.
     //
     // Also expose the formatted Pairing PSK token: a server that only offers the mandatory
-    // pairing_psk method (dynamic_pin is optional) needs this pasted in by the operator, so
+    // pairing_psk method (dynamic_pairing_code is optional) needs this pasted in by the
+    // operator, so
     // without showing it here a user could not pair against such a server at all. Mirrors
     // basic_client's startup banner, just routed into TUI state instead of stderr since the
     // TUI owns the terminal.

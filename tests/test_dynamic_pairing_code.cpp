@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Dynamic-PIN and static-PIN unit tests: wire messages, PIN lockout, and CPace
-// round-trip. Validates against the aiosendspin Python reference behaviour.
+// Pairing-code unit tests for both code-based methods: wire messages and the CPace
+// round-trip over the sid and associated data pairing.md "PAKE" defines.
 
 #include "crypto/cpace.h"
 #include "platform/base64.h"
@@ -93,7 +93,7 @@ static std::string make_pair_confirm_json(const std::string& server_kc_b64) {
 // process_server_pair_init_message
 // ============================================================================
 
-TEST(DynamicPin, ParseServerPairInitValid) {
+TEST(DynamicPairingCode, ParseServerPairInitValid) {
     std::array<uint8_t, 32> nonce_a{};
     for (int i = 0; i < 32; ++i) nonce_a[i] = static_cast<uint8_t>(i);
 
@@ -109,14 +109,14 @@ TEST(DynamicPin, ParseServerPairInitValid) {
     EXPECT_EQ(payload.nonce_a, nonce_a);
 }
 
-TEST(DynamicPin, ParseServerPairInitMissingNonce) {
+TEST(DynamicPairingCode, ParseServerPairInitMissingNonce) {
     expect_parse_rejects<ServerPairInitPayload>(process_server_pair_init_message,
                                                  R"({"type":"server/pair-init","payload":{}})");
 }
 
 // A pre-resync server that still sends pin_length alongside nonce_A parses fine: the extra
 // field is simply ignored (the session pin_length came from the activation).
-TEST(DynamicPin, ParseServerPairInitExtraPinLengthIgnored) {
+TEST(DynamicPairingCode, ParseServerPairInitExtraFormatIgnored) {
     std::array<uint8_t, 32> nonce_a{};
     const std::string json =
         std::string(R"({"type":"server/pair-init","payload":{"nonce_A":")") + b64url(nonce_a) +
@@ -130,7 +130,7 @@ TEST(DynamicPin, ParseServerPairInitExtraPinLengthIgnored) {
     EXPECT_TRUE(process_server_pair_init_message(root, &payload));
 }
 
-TEST(DynamicPin, ParseServerPairInitWrongNonceLength) {
+TEST(DynamicPairingCode, ParseServerPairInitWrongNonceLength) {
     // Encode only 16 bytes (wrong size).
     std::array<uint8_t, 16> short_nonce{};
     const std::string nonce_b64 = b64url_encode(short_nonce.data(), short_nonce.size());
@@ -138,7 +138,7 @@ TEST(DynamicPin, ParseServerPairInitWrongNonceLength) {
                                                  make_pair_init_json(nonce_b64));
 }
 
-TEST(DynamicPin, ParseServerPairInitInvalidBase64) {
+TEST(DynamicPairingCode, ParseServerPairInitInvalidBase64) {
     expect_parse_rejects<ServerPairInitPayload>(
         process_server_pair_init_message,
         R"({"type":"server/pair-init","payload":{"nonce_A":"!!!not_base64!!!"}})");
@@ -148,7 +148,7 @@ TEST(DynamicPin, ParseServerPairInitInvalidBase64) {
 // process_server_pair_auth_message
 // ============================================================================
 
-TEST(DynamicPin, ParseServerPairAuthValid) {
+TEST(DynamicPairingCode, ParseServerPairAuthValid) {
     std::array<uint8_t, 32> pake_msg_1{};
     for (int i = 0; i < 32; ++i) pake_msg_1[i] = static_cast<uint8_t>(i + 10);
 
@@ -163,12 +163,12 @@ TEST(DynamicPin, ParseServerPairAuthValid) {
     EXPECT_EQ(payload.pake_msg_1, pake_msg_1);
 }
 
-TEST(DynamicPin, ParseServerPairAuthMissingField) {
+TEST(DynamicPairingCode, ParseServerPairAuthMissingField) {
     expect_parse_rejects<ServerPairAuthPayload>(process_server_pair_auth_message,
                                                  R"({"type":"server/pair-auth","payload":{}})");
 }
 
-TEST(DynamicPin, ParseServerPairAuthWrongFieldLength) {
+TEST(DynamicPairingCode, ParseServerPairAuthWrongFieldLength) {
     // 16 bytes instead of 32.
     std::array<uint8_t, 16> short_share{};
     const std::string b64 = b64url_encode(short_share.data(), short_share.size());
@@ -176,7 +176,7 @@ TEST(DynamicPin, ParseServerPairAuthWrongFieldLength) {
                                                  make_pair_auth_json(b64));
 }
 
-TEST(DynamicPin, ParseServerPairAuthInvalidBase64) {
+TEST(DynamicPairingCode, ParseServerPairAuthInvalidBase64) {
     expect_parse_rejects<ServerPairAuthPayload>(
         process_server_pair_auth_message,
         R"({"type":"server/pair-auth","payload":{"pake_msg_1":"!!!not_valid!!!"}})");
@@ -186,7 +186,7 @@ TEST(DynamicPin, ParseServerPairAuthInvalidBase64) {
 // process_server_pair_confirm_message
 // ============================================================================
 
-TEST(DynamicPin, ParseServerPairConfirmValid) {
+TEST(DynamicPairingCode, ParseServerPairConfirmValid) {
     std::array<uint8_t, 64> server_kc{};
     for (int i = 0; i < 64; ++i) server_kc[i] = static_cast<uint8_t>(i);
 
@@ -201,12 +201,12 @@ TEST(DynamicPin, ParseServerPairConfirmValid) {
     EXPECT_EQ(payload.server_kc, server_kc);
 }
 
-TEST(DynamicPin, ParseServerPairConfirmMissingField) {
+TEST(DynamicPairingCode, ParseServerPairConfirmMissingField) {
     expect_parse_rejects<ServerPairConfirmPayload>(
         process_server_pair_confirm_message, R"({"type":"server/pair-confirm","payload":{}})");
 }
 
-TEST(DynamicPin, ParseServerPairConfirmWrongFieldLength) {
+TEST(DynamicPairingCode, ParseServerPairConfirmWrongFieldLength) {
     // 32 bytes instead of 64.
     std::array<uint8_t, 32> short_kc{};
     const std::string b64 = b64url_encode(short_kc.data(), short_kc.size());
@@ -214,7 +214,7 @@ TEST(DynamicPin, ParseServerPairConfirmWrongFieldLength) {
                                                     make_pair_confirm_json(b64));
 }
 
-TEST(DynamicPin, ParseServerPairConfirmInvalidBase64) {
+TEST(DynamicPairingCode, ParseServerPairConfirmInvalidBase64) {
     expect_parse_rejects<ServerPairConfirmPayload>(
         process_server_pair_confirm_message,
         R"({"type":"server/pair-confirm","payload":{"server_kc":"!!!not_valid!!!"}})");
@@ -224,7 +224,7 @@ TEST(DynamicPin, ParseServerPairConfirmInvalidBase64) {
 // format_client_pair_init_message
 // ============================================================================
 
-TEST(DynamicPin, FormatClientPairInitWireShape) {
+TEST(DynamicPairingCode, FormatClientPairInitWireShape) {
     std::array<uint8_t, 32> commit_b{};
     for (int i = 0; i < 32; ++i) commit_b[i] = static_cast<uint8_t>(i);
 
@@ -257,7 +257,7 @@ TEST(DynamicPin, FormatClientPairInitWireShape) {
 // format_client_pair_auth_message
 // ============================================================================
 
-TEST(DynamicPin, FormatClientPairAuthWireShape) {
+TEST(DynamicPairingCode, FormatClientPairAuthWireShape) {
     std::array<uint8_t, 32> pake_msg_2{};
     for (int i = 0; i < 32; ++i) pake_msg_2[i] = static_cast<uint8_t>(i + 64);
 
@@ -284,7 +284,7 @@ TEST(DynamicPin, FormatClientPairAuthWireShape) {
 // format_client_pair_confirm_message
 // ============================================================================
 
-TEST(DynamicPin, FormatClientPairConfirmWireShape) {
+TEST(DynamicPairingCode, FormatClientPairConfirmWireShape) {
     std::array<uint8_t, 64> client_kc{};
     std::array<uint8_t, 32> nonce_b{};
     for (int i = 0; i < 64; ++i) client_kc[i] = static_cast<uint8_t>(i);
@@ -468,17 +468,21 @@ TEST(DynamicPinCPace, MismatchedAssociatedDataFailsVerify) {
 }
 
 // ============================================================================
-// client/hello dynamic_pin method descriptor fields
+// client/hello dynamic_pairing_code descriptor fields
 // ============================================================================
 
-TEST(DynamicPin, ClientHelloDynamicPinDescriptorOutChannels) {
+// pairing.md "client/hello pair-method descriptor": the dynamic descriptor carries
+// out_channels and formats, both required and non-empty, and no locations hint.
+TEST(DynamicPairingCode, ClientHelloDescriptorCarriesChannelsAndFormats) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
-    PairMethodDescriptor dyn_pin;
-    dyn_pin.method = SendspinPairMethod::DYNAMIC_PIN;
-    dyn_pin.out_channels = std::vector<std::string>{"display"};
-    dyn_pin.min_pin_length = 6;
-    msg.supported_pair_methods.push_back(std::move(dyn_pin));
+    PairMethodDescriptor dynamic_desc;
+    dynamic_desc.method = SendspinPairMethod::DYNAMIC_PAIRING_CODE;
+    dynamic_desc.out_channels = std::vector<SendspinPairingCodeChannel>{
+        SendspinPairingCodeChannel::DISPLAY, SendspinPairingCodeChannel::SPEAKER};
+    dynamic_desc.formats = std::vector<SendspinPairingCodeFormat>{
+        SendspinPairingCodeFormat::DIGITS, SendspinPairingCodeFormat::QR_CODE};
+    msg.supported_pair_methods.push_back(std::move(dynamic_desc));
 
     const std::string out = format_client_hello_message(&msg);
     JsonDocument doc;
@@ -486,92 +490,36 @@ TEST(DynamicPin, ClientHelloDynamicPinDescriptorOutChannels) {
 
     JsonObjectConst methods = doc["payload"]["supported_pair_methods"].as<JsonObjectConst>();
     ASSERT_EQ(methods.size(), 1u);
-    JsonVariantConst descriptor = methods["dynamic_pin"];
+    JsonVariantConst descriptor = methods["dynamic_pairing_code"];
     ASSERT_FALSE(descriptor.isUnbound());
 
     JsonArrayConst ch = descriptor["out_channels"].as<JsonArrayConst>();
-    ASSERT_EQ(ch.size(), 1u);
+    ASSERT_EQ(ch.size(), 2u);
     EXPECT_STREQ(ch[0], "display");
+    EXPECT_STREQ(ch[1], "speaker");
 
-    EXPECT_EQ(descriptor["min_pin_length"].as<int>(), 6);
+    JsonArrayConst formats = descriptor["formats"].as<JsonArrayConst>();
+    ASSERT_EQ(formats.size(), 2u);
+    EXPECT_STREQ(formats[0], "digits");
+    EXPECT_STREQ(formats[1], "qr_code");
 
-    // locked_out is not part of the wire format; it must never be emitted. locations is a
-    // static_pin/pairing_psk hint, absent for dynamic_pin.
-    EXPECT_TRUE(descriptor["locked_out"].isUnbound());
+    // locations is a static_pairing_code / pairing_psk hint: a per-session code has no resting
+    // place for the operator to look it up in, so the dynamic descriptor never carries one.
     EXPECT_TRUE(descriptor["locations"].isUnbound());
 }
 
 // ============================================================================
-// Static-PIN wire messages
+// client/hello static_pairing_code descriptor fields
 // ============================================================================
 
-// format_client_pair_init_message(pairing_index) (single-arg overload): static PIN sends no
-// commit_B, but pairing_index is required on every client/pair-init (spec "Pairing index"). Mirrors
-// ClientPairInitPayload() with omit_none in the reference (aiosendspin/noise/models.py,
-// ClientPairInitPayload) and run_static_pin_client's
-// `ClientPairInitMessage(payload=ClientPairInitPayload())` (aiosendspin/noise/pairing.py),
-// extended with the required pairing_index field.
-TEST(StaticPin, FormatClientPairInitEmptyWireShape) {
-    const std::string out = format_client_pair_init_message(/*pairing_index=*/1);
-
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, out))
-        << "format_client_pair_init (static) produced invalid JSON";
-
-    EXPECT_STREQ(doc["type"], "client/pair-init");
-
-    ASSERT_TRUE(doc["payload"].is<JsonObjectConst>());
-    JsonObjectConst payload_obj = doc["payload"].as<JsonObjectConst>();
-    EXPECT_EQ(payload_obj.size(), 1u)
-        << "static client/pair-init payload must carry only pairing_index";
-    EXPECT_TRUE(doc["payload"]["commit_B"].isUnbound()) << "commit_B must be absent for static PIN";
-    ASSERT_TRUE(doc["payload"]["pairing_index"].is<uint32_t>());
-    EXPECT_EQ(doc["payload"]["pairing_index"].as<uint32_t>(), 1u);
-}
-
-// format_client_pair_confirm_message() (client_kc-only overload): static PIN carries client_kc
-// but NO nonce_B. Mirrors ClientPairConfirmPayload with nonce_B omitted
-// (aiosendspin/noise/models.py, ClientPairConfirmPayload) and run_static_pin_client's
-// `ClientPairConfirmMessage(payload=ClientPairConfirmPayload(client_kc=...))`
-// (aiosendspin/noise/pairing.py).
-TEST(StaticPin, FormatClientPairConfirmNoNonceWireShape) {
-    std::array<uint8_t, 64> client_kc{};
-    for (int i = 0; i < 64; ++i) client_kc[i] = static_cast<uint8_t>(i + 5);
-
-    const std::string out = format_client_pair_confirm_message(client_kc);
-
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, out))
-        << "format_client_pair_confirm (static) produced invalid JSON";
-
-    EXPECT_STREQ(doc["type"], "client/pair-confirm");
-
-    ASSERT_TRUE(doc["payload"]["client_kc"].is<const char*>());
-    const std::string kc_b64 = doc["payload"]["client_kc"].as<std::string>();
-    EXPECT_EQ(kc_b64.size(), 86u) << "base64url of 64 bytes without padding is 86 chars";
-
-    auto decoded = b64url_decode(kc_b64);
-    ASSERT_TRUE(decoded.has_value());
-    ASSERT_EQ(decoded->size(), 64u);
-    for (size_t i = 0; i < 64; ++i) {
-        EXPECT_EQ((*decoded)[i], client_kc[i]) << "client_kc mismatch at index " << i;
-    }
-
-    EXPECT_TRUE(doc["payload"]["nonce_B"].isUnbound()) << "nonce_B must be absent for static PIN";
-}
-
-// ============================================================================
-// client/hello static_pin method descriptor fields
-// ============================================================================
-
-// static_pin carries neither out_channels nor min_pin_length (those are set only for
-// DYNAMIC_PIN); its only optional hint is locations. locked_out is never emitted.
-TEST(StaticPin, ClientHelloStaticPinDescriptorShape) {
+// The static descriptor carries neither out_channels nor formats (those belong to the dynamic
+// method); its only optional hint is locations.
+TEST(StaticPairingCode, ClientHelloDescriptorShape) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
-    PairMethodDescriptor static_pin_desc;
-    static_pin_desc.method = SendspinPairMethod::STATIC_PIN;
-    msg.supported_pair_methods.push_back(std::move(static_pin_desc));
+    PairMethodDescriptor static_desc;
+    static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
+    msg.supported_pair_methods.push_back(std::move(static_desc));
 
     const std::string out = format_client_hello_message(&msg);
     JsonDocument doc;
@@ -579,26 +527,23 @@ TEST(StaticPin, ClientHelloStaticPinDescriptorShape) {
 
     JsonObjectConst methods = doc["payload"]["supported_pair_methods"].as<JsonObjectConst>();
     ASSERT_EQ(methods.size(), 1u);
-    JsonVariantConst descriptor = methods["static_pin"];
+    JsonVariantConst descriptor = methods["static_pairing_code"];
     ASSERT_FALSE(descriptor.isUnbound());
 
-    // locked_out is never emitted; out_channels and min_pin_length are absent for static_pin,
-    // and so is locations when the descriptor sets none.
-    EXPECT_TRUE(descriptor["locked_out"].isUnbound());
     EXPECT_TRUE(descriptor["out_channels"].isUnbound());
-    EXPECT_TRUE(descriptor["min_pin_length"].isUnbound());
+    EXPECT_TRUE(descriptor["formats"].isUnbound());
     EXPECT_TRUE(descriptor["locations"].isUnbound());
 }
 
-// The locations hint ('device' | 'leaflet' | 'operator') serializes for static_pin (and
+// The locations hint ('device' | 'leaflet' | 'operator') serializes for static_pairing_code (and
 // pairing_psk) descriptors that set it.
-TEST(StaticPin, ClientHelloStaticPinLocationsHint) {
+TEST(StaticPairingCode, ClientHelloLocationsHint) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
-    PairMethodDescriptor static_pin_desc;
-    static_pin_desc.method = SendspinPairMethod::STATIC_PIN;
-    static_pin_desc.locations = std::vector<std::string>{"device", "leaflet"};
-    msg.supported_pair_methods.push_back(std::move(static_pin_desc));
+    PairMethodDescriptor static_desc;
+    static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
+    static_desc.locations = std::vector<std::string>{"device", "leaflet"};
+    msg.supported_pair_methods.push_back(std::move(static_desc));
 
     const std::string out = format_client_hello_message(&msg);
     JsonDocument doc;
@@ -606,20 +551,20 @@ TEST(StaticPin, ClientHelloStaticPinLocationsHint) {
 
     JsonObjectConst methods = doc["payload"]["supported_pair_methods"].as<JsonObjectConst>();
     ASSERT_EQ(methods.size(), 1u);
-    JsonArrayConst locations = methods["static_pin"]["locations"].as<JsonArrayConst>();
+    JsonArrayConst locations = methods["static_pairing_code"]["locations"].as<JsonArrayConst>();
     ASSERT_EQ(locations.size(), 2u);
     EXPECT_STREQ(locations[0], "device");
     EXPECT_STREQ(locations[1], "leaflet");
 }
 
 // ============================================================================
-// CPace round-trip using the static-PIN SID construction
+// CPace round-trip using the static pairing-code sid construction
 // ============================================================================
 
-// The static-PIN SID construction is identical to dynamic PIN's (see make_test_sid() above);
-// only the PRS source differs (a preconfigured static PIN vs a derived one). This exercises
-// the client (RESPONDER) against a stand-in server (INITIATOR) using the SAME 8-digit PIN.
-TEST(StaticPinCPace, RoundTripWithMatchingStaticPin) {
+// The static pairing-code sid construction is identical to dynamic pairing code's (see make_test_sid() above);
+// only the PRS source differs (a preconfigured static pairing code vs a derived one). This exercises
+// the client (RESPONDER) against a stand-in server (INITIATOR) using the SAME 8-digit code.
+TEST(StaticPairingCodeCPace, RoundTripWithMatchingStaticCode) {
     const auto sid = make_test_sid();
     const auto prs = to_bytes("13572468");  // 8 decimal digits, per STATIC_PIN_DIGITS.
 
@@ -631,7 +576,7 @@ TEST(StaticPinCPace, RoundTripWithMatchingStaticPin) {
     EXPECT_TRUE(result.verify_ba);
 }
 
-TEST(StaticPinCPace, RoundTripMismatchedStaticPinFails) {
+TEST(StaticPairingCodeCPace, RoundTripMismatchedStaticPinFails) {
     const auto sid = make_test_sid();
     const auto prs_a = to_bytes("13572468");
     const auto prs_b = to_bytes("99999999");

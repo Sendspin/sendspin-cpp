@@ -19,6 +19,7 @@
 #include "crypto/keys.h"
 #include "crypto/pairing_token.h"
 #include "inbox.h"
+#include "pairing_offers.h"
 #include "platform/compiler.h"
 #include "platform/crypto.h"
 #include "platform/json_arena.h"
@@ -69,8 +70,8 @@ enum class PairingNoteType : uint8_t {
     PAIRING_SUCCEEDED,
     TRUST_CHANGED,
     PAIRING_FAILED,
-    DISPLAY_PIN,
-    CLEAR_PIN,
+    DISPLAY_PAIRING_CODE,
+    CLEAR_PAIRING_CODE,
     OPEN_PAIRING_WINDOW,
     CLOSE_PAIRING_WINDOW,
     COUNT,  ///< Not a note type; bounds the dispatch walk. Keep last.
@@ -80,17 +81,21 @@ enum class PairingNoteType : uint8_t {
 /// dispatched from loop()
 struct PairingNote {
     PairingNoteType type{};
-    /// server_id for PAIRING_STARTED/SUCCEEDED/FAILED; PIN text for DISPLAY_PIN; empty otherwise.
+    /// server_id for PAIRING_STARTED/SUCCEEDED/FAILED; the emitted code for
+    /// DISPLAY_PAIRING_CODE; empty otherwise.
     std::string text;
     SendspinPairAbortReason reason{};  ///< Valid only for PAIRING_FAILED.
     ConnectionTrust trust{};           ///< Valid only for TRUST_CHANGED.
+    /// Emission format of `text`; valid only for DISPLAY_PAIRING_CODE.
+    SendspinPairingCodeFormat format{};
 };
 
 /// @brief True for note types that coalesce to at most one callback per tick, keeping the
-/// single-flag semantics of the window/PIN-clear notifications (two note_clear_pin() calls in one
-/// tick still fire on_clear_pairing_pin once)
+/// single-flag semantics of the window and code-withdrawal notifications (two
+/// note_clear_pairing_code() calls in one tick still fire on_clear_pairing_code once)
 constexpr bool is_coalesced_note(PairingNoteType type) {
-    return type == PairingNoteType::CLEAR_PIN || type == PairingNoteType::OPEN_PAIRING_WINDOW ||
+    return type == PairingNoteType::CLEAR_PAIRING_CODE ||
+           type == PairingNoteType::OPEN_PAIRING_WINDOW ||
            type == PairingNoteType::CLOSE_PAIRING_WINDOW;
 }
 
@@ -98,7 +103,8 @@ constexpr bool is_coalesced_note(PairingNoteType type) {
 /// @param configured Where the application published the secret, from the client config.
 /// @return The hint to advertise, or nullopt to omit the field.
 ///
-/// The hint is informational (spec: "client/hello pair-method descriptor"): the application is
+/// The hint is informational (pairing.md "client/hello pair-method descriptor"): the application
+/// is
 /// the only thing that knows where its secret was published, so an unset value means the client
 /// has nothing to say rather than a default worth sending.
 std::optional<std::vector<std::string>> locations_hint(const std::vector<std::string>& configured) {
@@ -336,11 +342,11 @@ void SendspinClient::stop() {
     this->group_state_ = GroupUpdateObject{};
     this->state_ = SendspinClientState::SYNCHRONIZED;
 
-    // A pairing attempt cut short by the stop leaves its PIN or pairing-window prompt showing.
+    // A pairing attempt cut short by the stop leaves its code or pairing-window prompt showing.
     // Queue the dismissals now, after cleanup_connection_state() wiped the pending notes, so the
     // drain below delivers them (same ordering rule as the ConnectionManager drop paths).
-    if (pairing_ui.pin_was_displayed) {
-        this->note_clear_pin();
+    if (pairing_ui.code_was_emitted) {
+        this->note_clear_pairing_code();
     }
     if (pairing_ui.window_was_shown) {
         this->note_close_pairing_window();
@@ -671,11 +677,11 @@ void SendspinClient::drain_inbox() {
                             case PairingNoteType::PAIRING_FAILED:
                                 this->listener_->on_pairing_failed(note.text, note.reason);
                                 break;
-                            case PairingNoteType::DISPLAY_PIN:
-                                this->listener_->on_display_pairing_pin(note.text);
+                            case PairingNoteType::DISPLAY_PAIRING_CODE:
+                                this->listener_->on_display_pairing_code(note.text, note.format);
                                 break;
-                            case PairingNoteType::CLEAR_PIN:
-                                this->listener_->on_clear_pairing_pin();
+                            case PairingNoteType::CLEAR_PAIRING_CODE:
+                                this->listener_->on_clear_pairing_code();
                                 break;
                             case PairingNoteType::OPEN_PAIRING_WINDOW:
                                 this->listener_->on_open_pairing_window();
@@ -990,10 +996,11 @@ void SendspinClient::cleanup_connection_state() {
     this->event_state_->inbox.reset_events();
     this->event_state_->group_slot.reset();
 
-    // Also wipes any not-yet-dispatched pairing/PIN listener notifications. Callers that need a
+    // Also wipes any not-yet-dispatched pairing listener notifications. Callers that need a
     // notification to survive teardown (e.g. handle_pair_abort's on_pairing_failed /
-    // on_clear_pairing_pin) must call the corresponding note_*() AFTER cleanup_connection_state()
-    // returns, never before; see the ConnectionManager pairing/PIN handlers.
+    // on_clear_pairing_code) must call the corresponding note_*() AFTER
+    // cleanup_connection_state() returns, never before; see the ConnectionManager pairing
+    // handlers.
     this->event_state_->pairing_notes.clear();
 
     // The trust level is per-connection state: with no active connection there is nothing to
@@ -1054,35 +1061,34 @@ std::string SendspinClient::build_hello_message() {
     device_info.mac_address = interface_mac;
     msg.device_info = device_info;
 
-    // Advertise supported pair methods from the record store. pairing_psk needs an actual
-    // Pairing PSK behind it (normally auto-provisioned on first boot): advertising the method
-    // without one offers a server a flow whose handshake could only miss.
-    if (this->record_store_ && this->record_store_->pairing_psk_enabled() &&
-        this->record_store_->pairing_psk().has_value()) {
+    // Advertise the pairing methods the client currently offers (pairing.md "client/hello
+    // pair-method descriptor"). offers_*() is the single source both this and the
+    // server/activate admissibility check read, so a method advertised here is one an
+    // activation can select.
+    if (this->record_store_ && offers_pairing_psk(this->config_, *this->record_store_)) {
         PairMethodDescriptor psk_desc;
         psk_desc.method = SendspinPairMethod::PAIRING_PSK;
         psk_desc.locations = locations_hint(this->config_.pairing_psk_locations);
         msg.supported_pair_methods.push_back(std::move(psk_desc));
     }
-    // Advertise dynamic_pin when enabled and the platform can display a PIN.
-    if (this->config_.pin_display_supported && this->record_store_ &&
-        this->record_store_->dynamic_pin_enabled()) {
-        PairMethodDescriptor dyn_pin;
-        dyn_pin.method = SendspinPairMethod::DYNAMIC_PIN;
-        dyn_pin.out_channels = std::vector<std::string>{"display"};
-        dyn_pin.min_pin_length = this->record_store_->dynamic_pin_min_length();
-        msg.supported_pair_methods.push_back(std::move(dyn_pin));
+    // The dynamic pairing code's descriptor carries the channels the code is emitted through and
+    // the formats it can be rendered in, both required and non-empty; it has no `locations`,
+    // since a per-session code has no resting place for the operator to look it up in.
+    if (this->record_store_ && offers_dynamic_pairing_code(this->config_, *this->record_store_)) {
+        PairMethodDescriptor dynamic_desc;
+        dynamic_desc.method = SendspinPairMethod::DYNAMIC_PAIRING_CODE;
+        dynamic_desc.out_channels = this->config_.pairing_code_out_channels;
+        dynamic_desc.formats = this->config_.pairing_code_formats;
+        msg.supported_pair_methods.push_back(std::move(dynamic_desc));
     }
-    // Advertise static_pin when enabled, the platform supports the pairing-window gesture, and a
-    // static PIN is configured. out_channels and min_pin_length are set only for DYNAMIC_PIN, so
-    // static_pin carries neither; locations is its only optional hint.
-    if (this->config_.pairing_window_supported && this->record_store_ &&
-        this->record_store_->static_pin_enabled() &&
-        this->record_store_->static_pin().has_value()) {
-        PairMethodDescriptor static_pin_desc;
-        static_pin_desc.method = SendspinPairMethod::STATIC_PIN;
-        static_pin_desc.locations = locations_hint(this->config_.static_pin_locations);
-        msg.supported_pair_methods.push_back(std::move(static_pin_desc));
+    // The static pairing code's descriptor carries only its `locations` hint. It is offered only
+    // when the dynamic code is not: messaging.md "client/hello" permits at most one pairing-code
+    // method here.
+    if (this->record_store_ && offers_static_pairing_code(this->config_, *this->record_store_)) {
+        PairMethodDescriptor static_desc;
+        static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
+        static_desc.locations = locations_hint(this->config_.static_pairing_code_locations);
+        msg.supported_pair_methods.push_back(std::move(static_desc));
     }
 
     msg.unpaired_access_enabled =
@@ -1379,7 +1385,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     this->connection_manager_->schedule_activate(
                         {conn->shared_from_this(), std::move(activate_msg.activities),
                          std::move(activate_msg.active_roles), activate_msg.pairing_method,
-                         activate_msg.pairing_pin_length});
+                         activate_msg.pairing_format});
                 }
             }
             break;
@@ -1573,23 +1579,23 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             break;
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_INIT: {
-            // server/pair-init: nonce_A from the server (the session pin_length arrived in the
-            // activation's pairing object). Parse on the network thread; PIN state machine runs
+            // server/pair-init: nonce_A from the server (the emission format arrived in the
+            // activation's pairing object). Parse on the network thread; the state machine runs
             // on the main loop.
             if (conn != nullptr) {
                 ServerPairInitPayload payload;
                 if (process_server_pair_init_message(root, &payload)) {
                     ServerPairingMessageEvent event;
                     event.conn = conn->shared_from_this();
-                    event.kind = PinPairingMessageKind::PAIR_INIT;
+                    event.kind = PairingMessageKind::PAIR_INIT;
                     event.nonce_a = payload.nonce_a;
-                    this->connection_manager_->schedule_pin_pairing_message(std::move(event));
+                    this->connection_manager_->schedule_pairing_message(std::move(event));
                 } else {
-                    SS_LOGW(TAG, "Malformed server/pair-init; aborting any active PIN pairing");
+                    SS_LOGW(TAG, "Malformed server/pair-init; aborting any active code pairing");
                     ServerPairingMessageEvent event;
                     event.conn = conn->shared_from_this();
-                    event.kind = PinPairingMessageKind::MALFORMED;
-                    this->connection_manager_->schedule_pin_pairing_message(std::move(event));
+                    event.kind = PairingMessageKind::MALFORMED;
+                    this->connection_manager_->schedule_pairing_message(std::move(event));
                 }
             }
             break;
@@ -1601,15 +1607,15 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                 if (process_server_pair_auth_message(root, &payload)) {
                     ServerPairingMessageEvent event;
                     event.conn = conn->shared_from_this();
-                    event.kind = PinPairingMessageKind::PAIR_AUTH;
+                    event.kind = PairingMessageKind::PAIR_AUTH;
                     event.pake_msg_1 = payload.pake_msg_1;
-                    this->connection_manager_->schedule_pin_pairing_message(std::move(event));
+                    this->connection_manager_->schedule_pairing_message(std::move(event));
                 } else {
-                    SS_LOGW(TAG, "Malformed server/pair-auth; aborting any active PIN pairing");
+                    SS_LOGW(TAG, "Malformed server/pair-auth; aborting any active code pairing");
                     ServerPairingMessageEvent event;
                     event.conn = conn->shared_from_this();
-                    event.kind = PinPairingMessageKind::MALFORMED;
-                    this->connection_manager_->schedule_pin_pairing_message(std::move(event));
+                    event.kind = PairingMessageKind::MALFORMED;
+                    this->connection_manager_->schedule_pairing_message(std::move(event));
                 }
             }
             break;
@@ -1621,15 +1627,15 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                 if (process_server_pair_confirm_message(root, &payload)) {
                     ServerPairingMessageEvent event;
                     event.conn = conn->shared_from_this();
-                    event.kind = PinPairingMessageKind::PAIR_CONFIRM;
+                    event.kind = PairingMessageKind::PAIR_CONFIRM;
                     event.server_kc = payload.server_kc;
-                    this->connection_manager_->schedule_pin_pairing_message(std::move(event));
+                    this->connection_manager_->schedule_pairing_message(std::move(event));
                 } else {
-                    SS_LOGW(TAG, "Malformed server/pair-confirm; aborting any active PIN pairing");
+                    SS_LOGW(TAG, "Malformed server/pair-confirm; aborting any active code pairing");
                     ServerPairingMessageEvent event;
                     event.conn = conn->shared_from_this();
-                    event.kind = PinPairingMessageKind::MALFORMED;
-                    this->connection_manager_->schedule_pin_pairing_message(std::move(event));
+                    event.kind = PairingMessageKind::MALFORMED;
+                    this->connection_manager_->schedule_pairing_message(std::move(event));
                 }
             }
             break;
@@ -1868,12 +1874,12 @@ void SendspinClient::persist_last_played_server(const std::string& server_id) {
 
 void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
     // Entering the operational state structurally ends any pairing exchange: discard the pending
-    // pairing record and reset the PIN session so a stale attempt timeout can never fire a stray
-    // pair/abort on an operational connection. Folding this in here, the one place every
+    // pairing record and reset the pairing session so a stale attempt timeout can never fire a
+    // stray pair/abort on an operational connection. Folding this in here, the one place every
     // "connection is now operational" path converges (normal activate, leftover activate, and
     // winning promotion), makes it impossible for a future PAIRING/REKEYING transition to leave a
-    // stale PIN session behind. Safe because on_handshake_complete() only ever runs on the main
-    // loop, where the main-loop-only pin_session_ may be touched. Idempotent no-op for a
+    // stale pairing session behind. Safe because on_handshake_complete() only ever runs on the
+    // main loop, where the main-loop-only pairing_session_ may be touched. Idempotent no-op for a
     // connection that never paired.
     if (conn != nullptr) {
         conn->clear_pairing_state();
@@ -1910,12 +1916,14 @@ void SendspinClient::note_pairing_failed(const std::string& server_id,
         {.type = PairingNoteType::PAIRING_FAILED, .text = server_id, .reason = reason});
 }
 
-void SendspinClient::note_display_pin(const std::string& pin) {
-    this->event_state_->push_pairing_note({.type = PairingNoteType::DISPLAY_PIN, .text = pin});
+void SendspinClient::note_display_pairing_code(const std::string& code,
+                                               SendspinPairingCodeFormat format) {
+    this->event_state_->push_pairing_note(
+        {.type = PairingNoteType::DISPLAY_PAIRING_CODE, .text = code, .format = format});
 }
 
-void SendspinClient::note_clear_pin() {
-    this->event_state_->push_pairing_note({.type = PairingNoteType::CLEAR_PIN});
+void SendspinClient::note_clear_pairing_code() {
+    this->event_state_->push_pairing_note({.type = PairingNoteType::CLEAR_PAIRING_CODE});
 }
 
 void SendspinClient::note_open_pairing_window() {

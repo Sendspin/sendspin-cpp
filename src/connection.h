@@ -498,10 +498,10 @@ public:
         return this->pairing_method_;
     }
 
-    /// @brief Returns the session PIN length from the pairing object of the last pairing
-    /// server/activate (present only for dynamic_pin, validated on receipt).
-    const std::optional<int>& get_pairing_pin_length() const {
-        return this->pairing_pin_length_;
+    /// @brief Returns the emission format from the pairing object of the last pairing
+    /// server/activate (present only for dynamic_pairing_code, validated on receipt).
+    const std::optional<SendspinPairingCodeFormat>& get_pairing_format() const {
+        return this->pairing_format_;
     }
 
     /// @brief Returns the count of pairing server/activate messages received since the last
@@ -524,20 +524,19 @@ public:
     }
 
     // ========================================
-    // PIN pairing state (dynamic and static)
+    // Pairing-code session state (dynamic and static)
     // ========================================
 
-    /// @brief Steps in the PIN PAKE state machine (main-loop-only).
-    /// Shared by both dynamic-PIN and static-PIN pairing; AWAIT_SERVER_PAIR_INIT is exclusive
-    /// to dynamic PIN (see PinSession::method), the remaining steps (AWAIT_SERVER_PAIR_AUTH
+    /// @brief Steps in the pairing-code PAKE state machine (main-loop-only).
+    /// Shared by both code-based methods; AWAIT_SERVER_PAIR_INIT is exclusive to the dynamic
+    /// pairing code (see PairingSession::method), the remaining steps (AWAIT_SERVER_PAIR_AUTH
     /// onward) are common to both.
-    enum class PinStep : uint8_t {
-        IDLE,                        ///< No PIN session active.
-        AWAIT_PAIRING_WINDOW,        ///< Gesture-gated attempt (static PIN always; dynamic PIN when
-                                     ///< pin_length < 6): client/pair-pending was sent
-                                     ///< and client/pair-init waits for a pairing window to open.
-        AWAIT_SERVER_PAIR_INIT,      ///< dynamic PIN only: sent client/pair-init (commit_B);
-                                     ///< waiting for server/pair-init.
+    enum class PairingStep : uint8_t {
+        IDLE,                        ///< No pairing-code session active.
+        AWAIT_PAIRING_WINDOW,        ///< Gesture-gated attempt: client/pair-pending was sent and
+                                     ///< client/pair-init waits for a pairing window to open.
+        AWAIT_SERVER_PAIR_INIT,      ///< dynamic pairing code only: sent client/pair-init
+                                     ///< (commit_B); waiting for server/pair-init.
         AWAIT_SERVER_PAIR_AUTH,      ///< CPace RESPONDER started; waiting for server/pair-auth.
         AWAIT_SERVER_PAIR_CONFIRM,   ///< Sent client/pair-auth and derived; waiting for
                                      ///< server/pair-confirm.
@@ -545,39 +544,41 @@ public:
                                      ///< server/pair-finalize.
     };
 
-    /// @brief All PIN-pairing session state (main-loop-only; never touched by network thread).
-    /// Shared by both dynamic-PIN and static-PIN pairing; `method` selects the gating policy
-    /// and pair-confirm wire shape (only dynamic PIN has a failure counter).
-    struct PinSession {
+    /// @brief All pairing-code session state (main-loop-only; never touched by network thread).
+    /// Shared by both code-based methods; `method` selects the gating policy and the
+    /// pair-confirm wire shape.
+    struct PairingSession {
         CPace cpace;
         std::array<uint8_t, 32> nonce_b{};
         std::array<uint8_t, 32> handshake_hash{};
-        std::string static_pin_value;  ///< static PIN captured at pairing start (static PIN only).
+        /// The pairing code as CPace consumes it (PRS, pairing.md "PAKE"): the six or eight ASCII
+        /// digits, or the 24 raw bytes of the qr_code emission format.
+        std::vector<uint8_t> prs;
         int64_t attempt_deadline_us{0};  ///< platform_time_us() deadline for the whole attempt.
-        int pin_length{0};
         /// pairing_index captured when this attempt entered pairing (see
         /// SendspinConnection::bump_pairing_index()). Sent on client/pair-init and reused
-        /// verbatim for the CPace sid counter, so both stay consistent even if the connection's
-        /// running counter advances again before the PAKE steps run.
+        /// verbatim for the CPace sid, so both stay consistent even if the connection's running
+        /// counter advances again before the PAKE steps run.
         uint32_t pairing_index{0};
-        SendspinPairMethod method{
-            SendspinPairMethod::DYNAMIC_PIN};  ///< Which PIN method this session is running.
-        PinStep step{PinStep::IDLE};
-        bool pin_displayed{false};  ///< True once a PIN was surfaced via on_display_pairing_pin.
-        bool window_shown{false};   ///< True once on_open_pairing_window was surfaced, so
-                                    ///< abort/teardown knows to fire on_close_pairing_window.
+        SendspinPairMethod method{SendspinPairMethod::DYNAMIC_PAIRING_CODE};
+        /// Emission format the server selected; meaningful for DYNAMIC_PAIRING_CODE only.
+        SendspinPairingCodeFormat format{SendspinPairingCodeFormat::DIGITS};
+        PairingStep step{PairingStep::IDLE};
+        bool code_emitted{false};  ///< True once a code was surfaced via on_display_pairing_code.
+        bool window_shown{false};  ///< True once on_open_pairing_window was surfaced, so
+                                   ///< abort/teardown knows to fire on_close_pairing_window.
     };
 
-    /// @brief Return the current PIN session state. Main-loop-only.
-    PinSession& pin_session() {
-        return this->pin_session_;
+    /// @brief Return the current pairing-code session state. Main-loop-only.
+    PairingSession& pairing_session() {
+        return this->pairing_session_;
     }
 
     /// @brief Return the Noise handshake hash, or nullopt if no active transport session.
     ///
     /// Safe to call from the main loop during a pairing flow because the NoiseTransport session
     /// is only written on the network thread at handshake COMPLETE (before any server/activate
-    /// that can trigger pairing) or at re-handshake swap. During a DYNAMIC_PIN pairing activation
+    /// that can trigger pairing) or at re-handshake swap. During a pairing-code activation
     /// the transport session is stable and active.
     ///
     /// Virtual so a fake connection can report a canned hash without an active Noise session;
@@ -636,8 +637,8 @@ public:
         this->pairing_in_progress_.store(false, std::memory_order_release);
         this->pairing_finalized_.store(false, std::memory_order_release);
         this->pending_pairing_slot_.reset();
-        // Reset the dynamic-PIN session (main-loop-only fields; no lock needed).
-        this->pin_session_ = PinSession{};
+        // Reset the pairing-code session (main-loop-only fields; no lock needed).
+        this->pairing_session_ = PairingSession{};
     }
 
     /// @brief Re-arm the provisional timeout after the server acks server/pair-finalize.
@@ -688,12 +689,12 @@ public:
     ///                       Ignored (stored as nullopt) unless `activities` includes PAIRING
     ///                       (spec: "A client ignores this field when activities does not
     ///                       include 'pairing'").
-    /// @param pairing_pin_length Session PIN length from the pairing object (dynamic_pin only);
-    ///                           stored under the same PAIRING-activity condition.
+    /// @param pairing_format Emission format from the pairing object (dynamic_pairing_code
+    ///                       only); stored under the same PAIRING-activity condition.
     void apply_server_activate(const std::vector<SendspinActivity>& activities,
                                const std::optional<std::vector<std::string>>& active_roles,
                                const std::optional<SendspinPairMethod>& pairing_method,
-                               const std::optional<int>& pairing_pin_length) {
+                               const std::optional<SendspinPairingCodeFormat>& pairing_format) {
         this->activities_ = activities;
         if (active_roles.has_value()) {
             this->active_roles_ = active_roles.value();
@@ -706,7 +707,7 @@ public:
             }
         }
         this->pairing_method_ = has_pairing ? pairing_method : std::nullopt;
-        this->pairing_pin_length_ = has_pairing ? pairing_pin_length : std::nullopt;
+        this->pairing_format_ = has_pairing ? pairing_format : std::nullopt;
         this->first_activate_received_.store(true, std::memory_order_release);
         // activities_ is fresh again, so the post-finalize staleness window is over.
         this->pairing_finalized_.store(false, std::memory_order_release);
@@ -1042,16 +1043,16 @@ protected:
     /// the main loop (apply_server_activate runs in ConnectionManager::loop()).
     std::optional<SendspinPairMethod> pairing_method_{};
 
-    /// Session PIN length from the same pairing object (dynamic_pin only); nullopt outside a
-    /// pairing activation. Same main-loop-only contract as pairing_method_.
-    std::optional<int> pairing_pin_length_{};
+    /// Emission format from the same pairing object (dynamic_pairing_code only); nullopt outside
+    /// a pairing activation. Same main-loop-only contract as pairing_method_.
+    std::optional<SendspinPairingCodeFormat> pairing_format_{};
 
     // ========================================
     // Pairing state members
     // ========================================
 
-    /// Dynamic-PIN PAKE session (all fields are main-loop-only; no lock needed).
-    PinSession pin_session_{};
+    /// Pairing-code PAKE session (all fields are main-loop-only; no lock needed).
+    PairingSession pairing_session_{};
 
     /// True while a Pairing-PSK exchange is in progress on this connection.
     /// Written on the main loop (enter/abort) and by the network thread
@@ -1078,7 +1079,7 @@ protected:
 
     /// Count of pairing server/activate messages received since the last Noise handshake (or
     /// re-handshake) (spec "Pairing index"). Feeds both the wire `pairing_index` field on
-    /// client/pair-init and the CPace `sid` counter (see PinSession::pairing_index, captured at
+    /// client/pair-init and the CPace `sid` (see PairingSession::pairing_index, captured at
     /// handle_enter_pairing() so a later PAKE step reuses the exact value client/pair-init sent).
     /// Written on the main loop (bump_pairing_index(), each pairing server/activate) and on the
     /// network thread (reset_pairing_index(), at handshake/re-handshake completion); atomic for

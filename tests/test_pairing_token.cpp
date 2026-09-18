@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Pairing Token (spec "Pairing Token") tests.
+// Pairing Token (pairing.md "Pairing Token") tests.
 //
-// The reference vector below is taken verbatim from the spec's README.md "Pairing Token"
-// section (client_key = 0x00..0x1f, pairing_psk = 0xe0..0xff), not independently re-derived by
-// us: it is the spec's own worked example, so reproducing it exactly is the correctness bar.
+// Both reference vectors below are taken verbatim from pairing.md, not independently re-derived
+// here: they are the specification's own worked examples, so reproducing them exactly is the
+// correctness bar. The version-0 vector is in "Pairing PSK Flow" (client_key = 0x00..0x1f,
+// pairing_psk = 0xe0..0xff); the version-1 vector is in "QR-code emission"
+// (code = 0xe0..0xf7).
 
+#include "crypto/pairing_code.h"
 #include "crypto/pairing_token.h"
 
 #include <gtest/gtest.h>
@@ -52,13 +55,13 @@ std::array<uint8_t, 32> make_pairing_psk() {
 // Spec reference vector
 // =============================================================================
 
-TEST(PairingToken, SpecReferenceVector) {
+TEST(PairingToken, PskSpecReferenceVector) {
     const auto client_key = make_client_key();
     const auto pairing_psk = make_pairing_psk();
 
     const std::string token = format_pairing_token(client_key, pairing_psk);
 
-    // From the spec README.md's "Pairing Token" section, verbatim.
+    // From pairing.md "Pairing PSK Flow", verbatim.
     const std::string expected =
         "SP:0AAAQEAYEAUDAOCAJBIFQYDIOB4IBCEQTCQKRMFYYDENBWHA5DYP6BYPC4PSOLZXH5DU6V97M5XXO74HR6LZ7"
         "J5PW674PT6X37T6757Y";
@@ -69,14 +72,14 @@ TEST(PairingToken, SpecReferenceVector) {
 // Structural invariants, over inputs the reference vector above does not cover
 //
 // Length / "SP:0" prefix / alphabet / absence of the digit '2' are already pinned byte-for-byte
-// by SpecReferenceVector for its own input, so asserting them again on that same token proves
+// by PskSpecReferenceVector for its own input, so asserting them again on that same token proves
 // nothing. They are checked here against other inputs, where they are not implied.
 // =============================================================================
 
 namespace {
 
 void expect_well_formed_token(const std::string& token) {
-    EXPECT_EQ(token.size(), PAIRING_TOKEN_LENGTH);
+    EXPECT_EQ(token.size(), PAIRING_PSK_TOKEN_LENGTH);
     EXPECT_EQ(token.size(), 107u);
     ASSERT_GE(token.size(), 4u);
     EXPECT_EQ(token.substr(0, 4), "SP:0");
@@ -85,8 +88,8 @@ void expect_well_formed_token(const std::string& token) {
         const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || c == ':';
         EXPECT_TRUE(ok) << "unexpected character '" << c << "' in token";
     }
-    // ...and the body never contains the digit '2' (transliterated to '9' per the spec's
-    // "Pairing Token" section).
+    // ...and the body never contains the digit '2' (transliterated to '9' per pairing.md
+    // "Pairing Token").
     for (size_t i = 4; i < token.size(); ++i) {
         EXPECT_NE(token[i], '2') << "position " << i;
     }
@@ -113,4 +116,64 @@ TEST(PairingToken, DifferentKeysProduceDifferentTokens) {
     const std::string token_a = format_pairing_token(client_key_a, pairing_psk);
     const std::string token_b = format_pairing_token(client_key_b, pairing_psk);
     EXPECT_NE(token_a, token_b);
+}
+
+// =============================================================================
+// Version-1 tokens (the qr_code emission format)
+// =============================================================================
+
+namespace {
+
+std::array<uint8_t, QR_PAIRING_CODE_SIZE> make_qr_code() {
+    std::array<uint8_t, QR_PAIRING_CODE_SIZE> code{};
+    for (size_t i = 0; i < code.size(); ++i) {
+        code[i] = static_cast<uint8_t>(0xE0 + i);
+    }
+    return code;
+}
+
+}  // namespace
+
+TEST(PairingCodeToken, SpecReferenceVector) {
+    // From pairing.md "QR-code emission", verbatim, for code = 0xe0 0xe1 ... 0xf7.
+    EXPECT_EQ(format_pairing_code_token(make_qr_code()),
+              "SP:14DQ6FY7E4XTOP9HJ5LV6Z3PO57YPD4XT6T97N5Y");
+}
+
+TEST(PairingCodeToken, WellFormedAcrossVariedInputs) {
+    // Length, version character and alphabet, over inputs the reference vector does not cover.
+    std::array<uint8_t, QR_PAIRING_CODE_SIZE> zero{};
+    std::array<uint8_t, QR_PAIRING_CODE_SIZE> ones{};
+    ones.fill(0xFF);
+    for (const auto& code : {zero, ones}) {
+        const std::string token = format_pairing_code_token(code);
+        EXPECT_EQ(token.size(), PAIRING_CODE_TOKEN_LENGTH);
+        EXPECT_EQ(token.size(), 43u);
+        ASSERT_GE(token.size(), 4u);
+        EXPECT_EQ(token.substr(0, 4), "SP:1");
+        for (char c : token) {
+            const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || c == ':';
+            EXPECT_TRUE(ok) << "unexpected character '" << c << "' in token";
+        }
+        for (size_t i = 4; i < token.size(); ++i) {
+            EXPECT_NE(token[i], '2') << "position " << i;
+        }
+    }
+}
+
+TEST(PairingCodeToken, DifferentCodesProduceDifferentTokens) {
+    auto code_a = make_qr_code();
+    auto code_b = code_a;
+    code_b[0] ^= 0xFF;
+    EXPECT_NE(format_pairing_code_token(code_a), format_pairing_code_token(code_b));
+}
+
+TEST(PairingCodeToken, CarriesADifferentVersionThanThePskToken) {
+    // The two versions must not collide: a server reading operator input decides which payload it
+    // holds from this one character (pairing.md "Pairing Token").
+    EXPECT_NE(PAIRING_PSK_TOKEN_VERSION, PAIRING_CODE_TOKEN_VERSION);
+    std::array<uint8_t, 32> zero{};
+    std::array<uint8_t, QR_PAIRING_CODE_SIZE> zero_code{};
+    EXPECT_EQ(format_pairing_token(zero, zero).substr(0, 4), "SP:0");
+    EXPECT_EQ(format_pairing_code_token(zero_code).substr(0, 4), "SP:1");
 }

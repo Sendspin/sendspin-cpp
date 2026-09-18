@@ -176,9 +176,9 @@ inline std::optional<SendspinActivity> activity_from_string(const std::string& s
 
 /// @brief Pairing method on the wire (advertised in client/hello, selected in server/activate).
 enum class SendspinPairMethod : uint8_t {
-    PAIRING_PSK,  // Out-of-band distributed Pairing PSK
-    DYNAMIC_PIN,  // Dynamic PIN via PAKE
-    STATIC_PIN,   // Static PIN via PAKE
+    PAIRING_PSK,           // Out-of-band distributed Pairing PSK
+    DYNAMIC_PAIRING_CODE,  // Per-session pairing code via PAKE
+    STATIC_PAIRING_CODE,   // Fixed pairing code via PAKE
 };
 
 /// @brief Converts a SendspinPairMethod value to its protocol wire string.
@@ -188,10 +188,10 @@ inline const char* to_cstr(SendspinPairMethod method) {
     switch (method) {
         case SendspinPairMethod::PAIRING_PSK:
             return "pairing_psk";
-        case SendspinPairMethod::DYNAMIC_PIN:
-            return "dynamic_pin";
-        case SendspinPairMethod::STATIC_PIN:
-            return "static_pin";
+        case SendspinPairMethod::DYNAMIC_PAIRING_CODE:
+            return "dynamic_pairing_code";
+        case SendspinPairMethod::STATIC_PAIRING_CODE:
+            return "static_pairing_code";
         default:
             return "unknown";
     }
@@ -204,27 +204,66 @@ inline std::optional<SendspinPairMethod> pair_method_from_string(const std::stri
     if (str == "pairing_psk") {
         return SendspinPairMethod::PAIRING_PSK;
     }
-    if (str == "dynamic_pin") {
-        return SendspinPairMethod::DYNAMIC_PIN;
+    if (str == "dynamic_pairing_code") {
+        return SendspinPairMethod::DYNAMIC_PAIRING_CODE;
     }
-    if (str == "static_pin") {
-        return SendspinPairMethod::STATIC_PIN;
+    if (str == "static_pairing_code") {
+        return SendspinPairMethod::STATIC_PAIRING_CODE;
     }
     return std::nullopt;
 }
 
-/// @brief Reason a pairing attempt was aborted.
-/// Mirrors PairAbortReason in aiosendspin/models/types.py.
-/// The C++ client only EMITS method_not_supported (and potentially user_cancelled /
-/// attempt_timeout). The PIN-specific reasons are parsed when received but never emitted
-/// by the Pairing-PSK flow.
+/// @brief Converts a pairing-code emission format to its protocol wire string.
+/// @param format The format to convert.
+/// @return Null-terminated protocol string ("digits" or "qr_code").
+inline const char* to_cstr(SendspinPairingCodeFormat format) {
+    switch (format) {
+        case SendspinPairingCodeFormat::DIGITS:
+            return "digits";
+        case SendspinPairingCodeFormat::QR_CODE:
+            return "qr_code";
+        default:
+            return "unknown";
+    }
+}
+
+/// @brief Parses a wire string into a pairing-code emission format.
+/// @param str The string to parse.
+/// @return The matching enum value, or std::nullopt if unrecognized.
+inline std::optional<SendspinPairingCodeFormat> pairing_code_format_from_string(
+    const std::string& str) {
+    if (str == "digits") {
+        return SendspinPairingCodeFormat::DIGITS;
+    }
+    if (str == "qr_code") {
+        return SendspinPairingCodeFormat::QR_CODE;
+    }
+    return std::nullopt;
+}
+
+/// @brief Converts a pairing-code out-channel to its protocol wire string.
+/// @param channel The channel to convert.
+/// @return Null-terminated protocol string ("display" or "speaker").
+inline const char* to_cstr(SendspinPairingCodeChannel channel) {
+    switch (channel) {
+        case SendspinPairingCodeChannel::DISPLAY:
+            return "display";
+        case SendspinPairingCodeChannel::SPEAKER:
+            return "speaker";
+        default:
+            return "unknown";
+    }
+}
+
+/// @brief Reason a pairing attempt was aborted (pairing.md "Client <-> Server: pair/abort").
+/// The Pairing PSK flow emits only method_not_supported; pairing_code_mismatch is emitted by the
+/// code-based flows, and every reason is parsed when the server sends it.
 enum class PairAbortReason : uint8_t {
-    ATTEMPT_TIMEOUT,          // attempt_timeout
-    CONCURRENT_ATTEMPT,       // concurrent_attempt
-    METHOD_NOT_SUPPORTED,     // method_not_supported
-    PIN_LENGTH_UNACCEPTABLE,  // pin_length_unacceptable
-    PIN_MISMATCH,             // pin_mismatch
-    USER_CANCELLED,           // user_cancelled
+    ATTEMPT_TIMEOUT,        // attempt_timeout
+    CONCURRENT_ATTEMPT,     // concurrent_attempt
+    METHOD_NOT_SUPPORTED,   // method_not_supported
+    PAIRING_CODE_MISMATCH,  // pairing_code_mismatch
+    USER_CANCELLED,         // user_cancelled
 };
 
 /// @brief Converts a PairAbortReason to its wire string.
@@ -238,10 +277,8 @@ inline const char* to_cstr(PairAbortReason reason) {
             return "concurrent_attempt";
         case PairAbortReason::METHOD_NOT_SUPPORTED:
             return "method_not_supported";
-        case PairAbortReason::PIN_LENGTH_UNACCEPTABLE:
-            return "pin_length_unacceptable";
-        case PairAbortReason::PIN_MISMATCH:
-            return "pin_mismatch";
+        case PairAbortReason::PAIRING_CODE_MISMATCH:
+            return "pairing_code_mismatch";
         case PairAbortReason::USER_CANCELLED:
             return "user_cancelled";
         default:
@@ -260,10 +297,8 @@ inline SendspinPairAbortReason to_public_abort_reason(PairAbortReason reason) {
             return SendspinPairAbortReason::CONCURRENT_ATTEMPT;
         case PairAbortReason::METHOD_NOT_SUPPORTED:
             return SendspinPairAbortReason::METHOD_NOT_SUPPORTED;
-        case PairAbortReason::PIN_LENGTH_UNACCEPTABLE:
-            return SendspinPairAbortReason::PIN_LENGTH_UNACCEPTABLE;
-        case PairAbortReason::PIN_MISMATCH:
-            return SendspinPairAbortReason::PIN_MISMATCH;
+        case PairAbortReason::PAIRING_CODE_MISMATCH:
+            return SendspinPairAbortReason::PAIRING_CODE_MISMATCH;
         case PairAbortReason::USER_CANCELLED:
             return SendspinPairAbortReason::USER_CANCELLED;
         default:
@@ -284,11 +319,8 @@ inline std::optional<PairAbortReason> pair_abort_reason_from_string(const std::s
     if (str == "method_not_supported") {
         return PairAbortReason::METHOD_NOT_SUPPORTED;
     }
-    if (str == "pin_length_unacceptable") {
-        return PairAbortReason::PIN_LENGTH_UNACCEPTABLE;
-    }
-    if (str == "pin_mismatch") {
-        return PairAbortReason::PIN_MISMATCH;
+    if (str == "pairing_code_mismatch") {
+        return PairAbortReason::PAIRING_CODE_MISMATCH;
     }
     if (str == "user_cancelled") {
         return PairAbortReason::USER_CANCELLED;
@@ -713,19 +745,20 @@ inline std::optional<VisualizerSpectrumScale> visualizer_spectrum_scale_from_str
 
 /// @brief A pairing method descriptor for client/hello supported_pair_methods.
 /// Optional fields are omitted from the wire when not set (omit_none semantics). The methods are
-/// held as a list rather than a map because the wire object has at most three keys and the
+/// held as a list rather than a map because the wire object has at most two keys and the
 /// descriptor names its own: `method` is serialized as the key this descriptor sits under, not as
 /// a field of it (pairing.md "client/hello pair-method descriptor").
 struct PairMethodDescriptor {
     SendspinPairMethod method{SendspinPairMethod::PAIRING_PSK};
-    /// @brief For methods with output channels (e.g., dynamic_pin: ["display"]).
-    /// Absent for pairing_psk.
-    std::optional<std::vector<std::string>> out_channels;
-    /// @brief Minimum PIN length the client will accept. Absent for non-PIN methods.
-    std::optional<int> min_pin_length;
+    /// @brief Channels the dynamic pairing code is conveyed through. Required and non-empty on
+    /// the dynamic_pairing_code descriptor, absent on the others.
+    std::optional<std::vector<SendspinPairingCodeChannel>> out_channels;
+    /// @brief Emission formats the client offers. Required and non-empty on the
+    /// dynamic_pairing_code descriptor, absent on the others.
+    std::optional<std::vector<SendspinPairingCodeFormat>> formats;
     /// @brief Where the operator can find the method's configured secret:
-    /// 'device' | 'leaflet' | 'operator'. Informational hint for static_pin and
-    /// pairing_psk only; absent for dynamic_pin.
+    /// 'device' | 'leaflet' | 'operator'. Informational hint for static_pairing_code and
+    /// pairing_psk only; absent for dynamic_pairing_code, whose code has no resting place.
     std::optional<std::vector<std::string>> locations;
 };
 
@@ -767,10 +800,11 @@ struct ServerActivateMessage {
     /// From payload.pairing.method: the pairing method the server picked. nullopt when the
     /// message carries no pairing object or names an unrecognized method string.
     std::optional<SendspinPairMethod> pairing_method;
-    /// From payload.pairing.pin_length: the session PIN digit count. Required on the wire
-    /// when pairing_method is dynamic_pin; validated against [min_pin_length, 12] on receipt
-    /// of the activation (not at server/pair-init, which carries only nonce_A).
-    std::optional<int> pairing_pin_length;
+    /// From payload.pairing.format: the emission format the server picked for a dynamic pairing
+    /// code. nullopt when the message carries no format or names an unrecognized one; required
+    /// on the wire when pairing_method is dynamic_pairing_code, absent otherwise
+    /// (messaging.md "server/activate").
+    std::optional<SendspinPairingCodeFormat> pairing_format;
 };
 
 /// @brief Parsed group/update message containing the group state delta

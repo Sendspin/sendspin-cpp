@@ -20,17 +20,18 @@
 
 namespace sendspin {
 
-std::optional<std::array<uint8_t, 32>> derive_psk_wrap_key(
-    const std::vector<uint8_t>& sid, const std::array<uint8_t, CPACE_ISK_SIZE>& isk) {
-    const auto* label = reinterpret_cast<const uint8_t*>(PSK_WRAP_LABEL.data());
-    size_t label_len = PSK_WRAP_LABEL.size();
+std::optional<std::array<uint8_t, 32>> derive_wrap_key(
+    std::string_view label_view, const std::vector<uint8_t>& sid,
+    const std::array<uint8_t, CPACE_ISK_SIZE>& isk) {
+    const auto* label = reinterpret_cast<const uint8_t*>(label_view.data());
+    size_t label_len = label_view.size();
 
     Sha256 h;
     if (!h.ok()) {
         // noise_hashstate_new_by_name() failed (allocation failure or missing algorithm); h is
         // a no-op in this state and finalize() would silently yield an all-zero digest. Returning
-        // that as K_wrap would let wrap_psk() seal the freshly minted PSK under a publicly
-        // derivable key, defeating PSK Wrapping (spec "PSK Wrapping"), so fail loudly instead.
+        // that as K_wrap would let wrap_value() seal the sealed value under a publicly derivable
+        // key, defeating the wrapping (pairing.md "Wrapping"), so fail loudly instead.
         return std::nullopt;
     }
     h.update(label, label_len);
@@ -43,37 +44,37 @@ std::optional<std::array<uint8_t, 32>> derive_psk_wrap_key(
     return digest;
 }
 
-std::optional<std::array<uint8_t, WRAPPED_PSK_SIZE>> wrap_psk(
-    const char* cipher_name, const std::vector<uint8_t>& sid,
-    const std::array<uint8_t, CPACE_ISK_SIZE>& isk, const std::array<uint8_t, 32>& psk) {
+std::optional<std::array<uint8_t, WRAPPED_VALUE_SIZE>> wrap_value(
+    std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,
+    const std::array<uint8_t, CPACE_ISK_SIZE>& isk, const std::array<uint8_t, 32>& value) {
     if (cipher_name == nullptr) {
         return std::nullopt;
     }
-    auto k_wrap = derive_psk_wrap_key(sid, isk);
+    auto k_wrap = derive_wrap_key(label, sid, isk);
     if (!k_wrap.has_value()) {
         return std::nullopt;
     }
-    auto ct =
-        aead_oneshot_encrypt(cipher_name, k_wrap->data(), k_wrap->size(), psk.data(), psk.size());
+    auto ct = aead_oneshot_encrypt(cipher_name, k_wrap->data(), k_wrap->size(), value.data(),
+                                   value.size());
     // K_wrap has done its job. Wiped here, before the branches, so every exit path below is
     // covered by the one call. The ciphertext it produced is not secret.
     secure_zero_container(k_wrap.value());
-    if (!ct.has_value() || ct->size() != WRAPPED_PSK_SIZE) {
+    if (!ct.has_value() || ct->size() != WRAPPED_VALUE_SIZE) {
         return std::nullopt;
     }
-    std::array<uint8_t, WRAPPED_PSK_SIZE> out{};
-    std::memcpy(out.data(), ct->data(), WRAPPED_PSK_SIZE);
+    std::array<uint8_t, WRAPPED_VALUE_SIZE> out{};
+    std::memcpy(out.data(), ct->data(), WRAPPED_VALUE_SIZE);
     return out;
 }
 
-std::optional<std::array<uint8_t, 32>> unwrap_psk(
-    const char* cipher_name, const std::vector<uint8_t>& sid,
+std::optional<std::array<uint8_t, 32>> unwrap_value(
+    std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,
     const std::array<uint8_t, CPACE_ISK_SIZE>& isk,
-    const std::array<uint8_t, WRAPPED_PSK_SIZE>& wrapped) {
+    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped) {
     if (cipher_name == nullptr) {
         return std::nullopt;
     }
-    auto k_wrap = derive_psk_wrap_key(sid, isk);
+    auto k_wrap = derive_wrap_key(label, sid, isk);
     if (!k_wrap.has_value()) {
         return std::nullopt;
     }
@@ -85,7 +86,7 @@ std::optional<std::array<uint8_t, 32>> unwrap_psk(
     }
     std::array<uint8_t, 32> out{};
     std::memcpy(out.data(), pt->data(), 32);
-    // `pt` holds the recovered PSK; the caller gets its own copy in `out`, so wipe this one.
+    // `pt` holds the recovered value; the caller gets its own copy in `out`, so wipe this one.
     // The caller owns wiping `out` once it has stored the PSK.
     secure_zero_container(pt.value());
     return out;

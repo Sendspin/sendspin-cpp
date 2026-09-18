@@ -13,19 +13,23 @@
 // limitations under the License.
 
 /// @file pairing_token.h
-/// @brief Pairing Token encoder (spec's "Pairing Token" section): the single "SP:"-prefixed,
-/// versioned, base32 string that distributes a client's static public key and its Sendspin Pairing
-/// PSK together for the Pairing PSK flow, so an operator can transfer both by copy/paste or QR
-/// scan.
+/// @brief Pairing Token encoder (pairing.md "Pairing Token"): the single "SP:"-prefixed,
+/// versioned, base32 string that carries a pairing secret from the client to the server, so an
+/// operator can transfer it by copy/paste or QR scan.
 ///
 /// token   = "SP:" || version || body
-/// payload = client_key (32 bytes) || pairing_psk (32 bytes)
 /// body    = RFC 4648 base32(payload), '=' padding stripped, then every '2' -> '9'
 ///
+/// Two versions carry two payloads:
+///   '0': client_key (32 bytes) || pairing_psk (32 bytes), for the Pairing PSK Flow.
+///   '1': the 24-byte dynamic pairing code, for the `qr_code` emission format.
+///
 /// This client only ever generates tokens (the server decodes them), so no decoder is provided
-/// here; see the spec's "Pairing Token" section for the (server-side) decode algorithm.
+/// here; see pairing.md "Pairing Token" for the (server-side) decode algorithm.
 
 #pragma once
+
+#include "pairing_code.h"
 
 #include <array>
 #include <cstdint>
@@ -33,11 +37,19 @@
 
 namespace sendspin {
 
-/// @brief Pairing-token format version implemented here (the spec's version '0').
-static constexpr char PAIRING_TOKEN_VERSION = '0';
+/// @brief Pairing-token version carrying a Pairing PSK with the client identity.
+static constexpr char PAIRING_PSK_TOKEN_VERSION = '0';
 
 /// @brief Length in characters of a version-0 pairing token ("SP:" + version + 103-char body).
-static constexpr size_t PAIRING_TOKEN_LENGTH = 107;
+static constexpr size_t PAIRING_PSK_TOKEN_LENGTH = 107;
+
+/// @brief Pairing-token version carrying a dynamic pairing code in the `qr_code` format.
+static constexpr char PAIRING_CODE_TOKEN_VERSION = '1';
+
+/// @brief Length in characters of a version-1 pairing token ("SP:" + version + 39-char body:
+/// base32 of the 24-byte code, whose 192 bits need exactly 39 characters once the single
+/// padding character is stripped).
+static constexpr size_t PAIRING_CODE_TOKEN_LENGTH = 43;
 
 /// @brief Build a version-0 pairing token from a client's static public key and its Sendspin
 /// Pairing PSK.
@@ -47,5 +59,11 @@ static constexpr size_t PAIRING_TOKEN_LENGTH = 107;
 /// @return The 107-character token string (e.g. "SP:0AAAQ...").
 std::string format_pairing_token(const std::array<uint8_t, 32>& client_key,
                                  const std::array<uint8_t, 32>& pairing_psk);
+
+/// @brief Build a version-1 pairing token carrying a dynamic pairing code, the form the
+/// `qr_code` emission format presents (pairing.md "QR-code emission").
+/// @param code The 24-byte pairing code taken from the derivation digest.
+/// @return The 43-character token string (e.g. "SP:14DQ...").
+std::string format_pairing_code_token(const std::array<uint8_t, QR_PAIRING_CODE_SIZE>& code);
 
 }  // namespace sendspin

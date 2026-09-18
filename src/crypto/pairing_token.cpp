@@ -65,24 +65,17 @@ std::string base32_encode(const uint8_t* data, size_t len) {
     return out;
 }
 
-}  // namespace
-
-std::string format_pairing_token(const std::array<uint8_t, 32>& client_key,
-                                 const std::array<uint8_t, 32>& pairing_psk) {
-    std::vector<uint8_t> payload;
-    payload.reserve(64);
-    payload.insert(payload.end(), client_key.begin(), client_key.end());
-    payload.insert(payload.end(), pairing_psk.begin(), pairing_psk.end());
-
-    std::string body = base32_encode(payload.data(), payload.size());
+/// @brief Wrap a payload as a pairing token of the given version: the "SP:" prefix, the version
+/// character, and the base32 body with its padding stripped and every '2' transliterated to '9'
+/// (pairing.md "Pairing Token"). Shared by both versions so their bodies cannot diverge.
+std::string format_token(char version, const uint8_t* payload, size_t payload_len) {
+    std::string body = base32_encode(payload, payload_len);
 
     size_t pad_start = body.find('=');
     if (pad_start != std::string::npos) {
         body.resize(pad_start);
     }
 
-    // Transliterate every '2' to '9' (the two characters that could otherwise be confused when
-    // handwritten or misread; see the spec's "Pairing Token" section).
     for (char& c : body) {
         if (c == '2') {
             c = '9';
@@ -92,9 +85,25 @@ std::string format_pairing_token(const std::array<uint8_t, 32>& client_key,
     std::string token;
     token.reserve(3 + 1 + body.size());
     token += "SP:";
-    token += PAIRING_TOKEN_VERSION;
+    token += version;
     token += body;
     return token;
+}
+
+}  // namespace
+
+std::string format_pairing_token(const std::array<uint8_t, 32>& client_key,
+                                 const std::array<uint8_t, 32>& pairing_psk) {
+    std::vector<uint8_t> payload;
+    payload.reserve(64);
+    payload.insert(payload.end(), client_key.begin(), client_key.end());
+    payload.insert(payload.end(), pairing_psk.begin(), pairing_psk.end());
+
+    return format_token(PAIRING_PSK_TOKEN_VERSION, payload.data(), payload.size());
+}
+
+std::string format_pairing_code_token(const std::array<uint8_t, QR_PAIRING_CODE_SIZE>& code) {
+    return format_token(PAIRING_CODE_TOKEN_VERSION, code.data(), code.size());
 }
 
 }  // namespace sendspin

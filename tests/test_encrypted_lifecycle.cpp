@@ -513,14 +513,15 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
 
 // The hello must advertise a pairing method the server can actually start. pairing_psk is the
 // client-mandatory method and its PSK is auto-provisioned by the RecordStore on first boot, so it
-// is advertised even though nothing was persisted here; dynamic_pin joins it because this client
-// declares pin_display_supported. A client that advertises neither leaves a server (and its
-// operator) with no way into pairing at all.
+// is advertised even though nothing was persisted here; dynamic_pairing_code joins it because
+// this client declares an out-channel and an emission format. A client that advertises neither
+// leaves a server (and its operator) with no way into pairing at all.
 TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
     SendspinClientConfig config;
     config.name = "Pair Methods Test Client";
     config.server_port = PAIR_METHODS_TEST_PORT;
-    config.pin_display_supported = true;
+    config.pairing_code_out_channels = {SendspinPairingCodeChannel::DISPLAY};
+    config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
 
     PairedClientBundle bundle(config);
     SendspinClient& client = bundle.client();
@@ -541,8 +542,10 @@ TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
     };
     EXPECT_TRUE(advertises("pairing_psk"))
         << "pairing_psk is client-mandatory and its PSK is auto-provisioned";
-    EXPECT_TRUE(advertises("dynamic_pin")) << "pin_display_supported was set on this client";
-    EXPECT_FALSE(advertises("static_pin")) << "no static PIN or pairing window on this client";
+    EXPECT_TRUE(advertises("dynamic_pairing_code"))
+        << "an out-channel and an emission format were configured on this client";
+    EXPECT_FALSE(advertises("static_pairing_code"))
+        << "no static pairing code or pairing window on this client";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -620,7 +623,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     EXPECT_FALSE(pair_init->has_commit_b);
 
     // handle_enter_pairing's Pairing-PSK branch must fire on_pairing_started, exactly like the
-    // PIN branches do, so the started/succeeded/failed callback trio stays method-agnostic.
+    // pairing-code branches do, so the started/succeeded/failed callback trio stays method-agnostic.
     ASSERT_TRUE(listener.pairing_started_server_id().has_value())
         << "on_pairing_started was never fired for the pairing-token (Pairing-PSK) flow";
     EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());
@@ -1595,9 +1598,9 @@ TEST(EncryptedLifecycle, CombinedActivateWithAnUnofferedMethodAborts) {
     SendspinClientConfig config;
     config.name = "Combined Method Test Client";
     config.server_port = COMBINED_METHOD_TEST_PORT;
-    // No PIN display, so dynamic_pin is never offered; on the Pairing PSK it is also the wrong
-    // category, which is the first half of the same rule.
-    config.pin_display_supported = false;
+    // No out-channel, so dynamic_pairing_code is never offered; on the Pairing PSK it is also
+    // the wrong category, which is the first half of the same rule.
+    config.pairing_code_out_channels.clear();
 
     SendspinClient client(config);
     client.set_network_provider(&network);
@@ -1610,7 +1613,7 @@ TEST(EncryptedLifecycle, CombinedActivateWithAnUnofferedMethodAborts) {
     options.psk_category = "pr";
     options.first_activities_json = R"(["playback","pairing"])";
     options.first_roles_json = R"(["controller@v1"])";
-    options.first_pairing_method = "dynamic_pin";
+    options.first_pairing_method = "dynamic_pairing_code";
     FakeEncryptedServer server(server_url(COMBINED_METHOD_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                pairing_psk.psk_id, pairing_psk.psk, options);

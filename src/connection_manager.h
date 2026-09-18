@@ -69,8 +69,9 @@ static constexpr int64_t NURSERY_ESTABLISH_TIMEOUT_US = seconds_to_us(NURSERY_ES
 /// tick from loop()), which is gated on
 /// !current_connection_->is_operational(). current_connection_ is never non-operational for any
 /// other reason: a nursery entry is only ever promoted once it is already operational (see
-/// promote_or_arbitrate_nursery_entry()), and an in-progress PIN-pairing PAKE exchange keeps
-/// is_operational() true throughout (that flow has its own timeouts, PIN_ATTEMPT_TIMEOUT_US and
+/// promote_or_arbitrate_nursery_entry()), and an in-progress pairing-code PAKE exchange keeps
+/// is_operational() true throughout (that flow has its own timeouts,
+/// PAIRING_ATTEMPT_TIMEOUT_US and
 /// pairing_window_open(); see connection_manager.cpp). Shares NURSERY_ESTABLISH_TIMEOUT_S's value
 /// by design (same "reach the next protocol milestone within a bounded window" semantics) but is
 /// named separately because it applies to the current slot, not the nursery.
@@ -190,25 +191,26 @@ struct ServerUnpairEvent {
 };
 
 // ============================================================================
-// Dynamic-PIN pairing deferred events
+// Pairing-code deferred events
 // ============================================================================
 
-/// @brief Which server-to-client PIN pairing message arrived.
-enum class PinPairingMessageKind : uint8_t {
+/// @brief Which server-to-client pairing-code message arrived.
+enum class PairingMessageKind : uint8_t {
     PAIR_INIT,     ///< server/pair-init: nonce_A
     PAIR_AUTH,     ///< server/pair-auth: pake_msg_1
     PAIR_CONFIRM,  ///< server/pair-confirm: server_kc
-    MALFORMED,     ///< a pairing message failed to parse; a spec Protocol Error when a PIN
-                   ///< session is active (silent close, no pair/abort), ignored otherwise
+    MALFORMED,     ///< a pairing message failed to parse; a spec Protocol Error when a
+                   ///< pairing-code session is active (silent close, no pair/abort), ignored
+                   ///< otherwise
 };
 
-/// @brief Deferred server PIN pairing message event.
+/// @brief Deferred server pairing-code message event.
 ///
 /// Parsed on the network thread; the PAKE state machine (CPace, nonces, hash) runs
-/// on the main loop only, so all PIN message processing is deferred here.
+/// on the main loop only, so all pairing-message processing is deferred here.
 struct ServerPairingMessageEvent {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection that received the message
-    PinPairingMessageKind kind{};              ///< Which PIN message arrived
+    PairingMessageKind kind{};                 ///< Which pairing message arrived
 
     // server/pair-init fields
     std::array<uint8_t, 32> nonce_a{};  ///< nonce_A decoded from the wire
@@ -240,20 +242,22 @@ struct ServerActivateEvent {
     std::vector<SendspinActivity> activities;  ///< Activities declared by this activate
     std::optional<std::vector<std::string>> active_roles;  ///< nullopt = sticky/keep prior set
     std::optional<SendspinPairMethod> pairing_method;      ///< From the pairing object's method
-    std::optional<int> pairing_pin_length;                 ///< From the pairing object's pin_length
+    /// From the pairing object's format (dynamic_pairing_code only).
+    std::optional<SendspinPairingCodeFormat> pairing_format;
 };
 
-/// @brief Pairing-UI display flags snapshotted from a connection's PinSession.
+/// @brief Pairing-UI display flags snapshotted from a connection's PairingSession.
 ///
-/// conn->pin_session().pin_displayed / .window_shown are the sole record of whether a PIN or
-/// pairing-window prompt is still showing, and every path that ends a pairing attempt clears
+/// conn->pairing_session().code_emitted / .window_shown are the sole record of whether a pairing
+/// code or pairing-window prompt is still showing, and every path that ends a pairing attempt
+/// clears
 /// that state (cleanup_connection_state() on the current-slot drop path,
 /// clear_pairing_state()) before it gets a chance to dismiss the prompt. Capture the flags
 /// BEFORE that cleanup runs, then dismiss afterward (dismiss_pairing_ui(), or the client's
 /// note_*() calls on the stop() path) so the dismissal still happens even though the flags it
 /// would have read are already gone.
 struct PairingUiSnapshot {
-    bool pin_was_displayed;
+    bool code_was_emitted;
     bool window_was_shown;
 };
 
@@ -349,8 +353,8 @@ public:
     /// cleanup is the caller's job: this only detaches connections. Main-loop thread only.
     /// @param reason The goodbye reason sent to every connected peer.
     /// @return The pairing prompts the dropped connections left showing. The caller dismisses
-    ///         them (SendspinClient::note_clear_pin() / note_close_pairing_window()) AFTER its
-    ///         own cleanup_connection_state(), which would otherwise wipe the queued notes.
+    ///         them (SendspinClient::note_clear_pairing_code() / note_close_pairing_window()) AFTER
+    ///         its own cleanup_connection_state(), which would otherwise wipe the queued notes.
     PairingUiSnapshot stop(SendspinGoodbyeReason reason);
 
     /// @brief Drives connection state: starts server when network ready, processes lifecycle
@@ -406,9 +410,9 @@ public:
     /// @param event The server/unpair event to schedule (moved).
     void schedule_server_unpair(ServerUnpairEvent&& event);
 
-    /// @brief Schedules a dynamic-PIN pairing message event for deferred processing in loop().
+    /// @brief Schedules a pairing-code message event for deferred processing in loop().
     /// @param event The server pairing message event to schedule (moved).
-    void schedule_pin_pairing_message(ServerPairingMessageEvent&& event);
+    void schedule_pairing_message(ServerPairingMessageEvent&& event);
 
     /// @brief Schedules an on_pairing_succeeded notification for deferred delivery in loop().
     ///
@@ -422,7 +426,7 @@ public:
     /// @param server_id The base64url public key of the newly paired server (moved).
     void schedule_pairing_succeeded(std::string server_id);
 
-    /// @brief Schedules a static-PIN pairing-window confirmation for deferred processing in
+    /// @brief Schedules a pairing-window confirmation for deferred processing in
     /// loop(). Thread-safe; called from SendspinClient::confirm_pairing_window().
     void schedule_pairing_window_confirm();
 
@@ -468,7 +472,7 @@ private:
         std::vector<ServerActivateEvent> activates;
         std::vector<PairAbortEvent> pair_aborts;
         std::vector<ServerUnpairEvent> server_unpairs;
-        std::vector<ServerPairingMessageEvent> pin_messages;
+        std::vector<ServerPairingMessageEvent> pairing_messages;
         std::vector<std::string> pairing_succeeded;
         bool pairing_window_confirm{false};
 
@@ -497,7 +501,7 @@ private:
     void drain_lifecycle_events(DrainedEvents& ev);
 
     /// @brief Applies one server/activate event: trust enforcement, pairing_index bump,
-    /// pairing-method admissibility, pin_length validation, then applies the activate's state
+    /// pairing-method and emission-format admissibility, then applies the activate's state
     /// and dispatches (arbitration for a nursery entry, or the already-admitted-connection
     /// branches: leftover-pairing cleanup, first-activate handshake completion, or entering
     /// pairing on a subsequent activate). No-op if event.conn is null, or if the connection is
@@ -506,7 +510,7 @@ private:
     /// @param event The server/activate event to process.
     void process_activate_event(ServerActivateEvent& event);
 
-    /// @brief Applies pair/abort events, then dynamic-PIN pairing events, then
+    /// @brief Applies pair/abort events, then pairing-code message events, then
     /// pairing-succeeded events, then pairing storage-failure events, then a pairing-window
     /// confirm, in that order. Caller must hold conn_ptr_mutex_.
     /// @param ev Drained events from swap_out_pending_events(); consumed in place.
@@ -528,13 +532,13 @@ private:
     /// nursery_size_ hint says there is something to scan.
     void scan_hello_and_nursery();
 
-    /// @brief Aborts a dynamic-PIN exchange on the current connection that has stalled past
-    /// PIN_ATTEMPT_TIMEOUT_US. Suppressed once the pairing is finalized: the PIN session is
+    /// @brief Aborts a pairing-code exchange on the current connection that has stalled past
+    /// PAIRING_ATTEMPT_TIMEOUT_US. Suppressed once the pairing is finalized: the session is
     /// only reset at the post-rekey activate, and the deadline elapsing inside that window
     /// must not abort a completed pairing. Also held while the connection awaits a
     /// server/activate, since connection.md "Re-handshake" lets the client start no application
     /// message there. Acquires conn_ptr_mutex_ internally.
-    void scan_pin_attempt_timeout();
+    void scan_pairing_attempt_timeout();
 
     /// @brief Drops the current connection if it has failed to re-prove itself (after an in-band
     /// re-handshake or a pairing-finalize rekey) within REPROVE_TIMEOUT_US. Closes without a
@@ -766,15 +770,16 @@ private:
     /// @param conn The connection entering pairing.
     void handle_enter_pairing(SendspinConnection* conn);
 
-    /// @brief Runs the dynamic-PIN or static-PIN branch of handle_enter_pairing(): populates the
-    /// PinSession, applies gesture gating (spec "Pairing Window"), and either sends
+    /// @brief Runs the pairing-code branch of handle_enter_pairing(): populates the
+    /// PairingSession, applies gesture gating (pairing.md "Pairing Window"), and either sends
     /// client/pair-pending and waits for a window, or starts the attempt immediately.
     /// @param conn The connection entering pairing.
     /// @param pairing_index Current pairing_index counter, captured by handle_enter_pairing().
     /// @param server_id conn->get_server_id(), captured by handle_enter_pairing().
-    /// @param selected_method The selected method; DYNAMIC_PIN or STATIC_PIN.
-    void handle_enter_pairing_pin(SendspinConnection* conn, uint32_t pairing_index,
-                                  const std::string& server_id, SendspinPairMethod selected_method);
+    /// @param selected_method The selected method; DYNAMIC_PAIRING_CODE or STATIC_PAIRING_CODE.
+    void handle_enter_pairing_code(SendspinConnection* conn, uint32_t pairing_index,
+                                   const std::string& server_id,
+                                   SendspinPairMethod selected_method);
 
     /// @brief Runs the Pairing-PSK branch of handle_enter_pairing(): resolves the pairing outcome
     /// and sends client/pair-finalize with the long-term PSK in the clear.
@@ -791,17 +796,17 @@ private:
     /// @param reason The abort reason.
     void handle_pair_abort(SendspinConnection* conn, PairAbortReason reason);
 
-    /// @brief Fires on_clear_pairing_pin and/or on_open_pairing_window's counterpart for a
+    /// @brief Fires on_clear_pairing_code and/or on_open_pairing_window's counterpart for a
     /// pairing UI element that was left showing. Caller must hold conn_ptr_mutex_.
-    /// @param pin_was_displayed Whether a dynamic-PIN value was on screen; if true, queues
-    ///        on_clear_pairing_pin.
+    /// @param code_was_emitted Whether a pairing code was being emitted; if true, queues
+    ///        on_clear_pairing_code.
     /// @param window_was_shown Whether the pairing-window gesture prompt was open; if true,
     ///        queues on_close_pairing_window.
-    void dismiss_pairing_ui(bool pin_was_displayed, bool window_was_shown);
+    void dismiss_pairing_ui(bool code_was_emitted, bool window_was_shown);
 
     /// @brief Shared cleanup for every path that locally ends a pairing attempt on `conn`.
     ///
-    /// Captures the PIN-display / pairing-window flags before clear_pairing_state() resets
+    /// Captures the code-emission / pairing-window flags before clear_pairing_state() resets
     /// them, optionally sends a wire pair/abort, clears the pairing state, optionally drops the
     /// connection, then queues on_pairing_failed and dismisses any pairing UI left showing (via
     /// dismiss_pairing_ui()). When `drop_action` is not KEEP_OPEN, drop_connection() -> the
@@ -829,64 +834,69 @@ private:
         std::optional<std::string> server_id_override = std::nullopt);
 
     // ========================================
-    // Dynamic-PIN pairing main-loop handlers
+    // Pairing-code main-loop handlers
     // ========================================
 
-    /// @brief Handle a dynamic-PIN server message on the main loop.
-    /// Advances the PinStep state machine for the connection.
+    /// @brief Handle a server pairing-code message on the main loop.
+    /// Advances the PairingStep state machine for the connection.
     /// @param conn The connection that received the message.
-    /// @param event The parsed server PIN pairing message.
-    void handle_pin_pairing_message(SendspinConnection* conn,
-                                    const ServerPairingMessageEvent& event);
+    /// @param event The parsed server pairing message.
+    void handle_pairing_message(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
-    /// @brief Handles PinPairingMessageKind::PAIR_INIT: derives the PIN, displays it, and starts
-    /// CPace as RESPONDER. Dynamic-PIN only; a PAIR_INIT while ps.method == STATIC_PIN is a
-    /// wrong-step protocol violation.
+    /// @brief Handles PairingMessageKind::PAIR_INIT: derives the pairing code, emits it, and
+    /// starts CPace as RESPONDER. Dynamic pairing code only; a PAIR_INIT while
+    /// ps.method == STATIC_PAIRING_CODE is a wrong-step protocol violation.
     /// @param conn The connection that received the message.
-    /// @param event The parsed server PIN pairing message; nonce_a is used here.
+    /// @param event The parsed server pairing message; nonce_a is used here.
     void handle_pair_init(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
-    /// @brief Handles PinPairingMessageKind::PAIR_AUTH: sends client/pair-auth (pake_msg_2), then
+    /// @brief Handles PairingMessageKind::PAIR_AUTH: sends client/pair-auth (pake_msg_2), then
     /// derives the MAC key from the server's share (pake_msg_1). A derive failure is a spec
-    /// Protocol Errors close (no pair/abort, no failure-counter increment), not a PIN mismatch.
+    /// Protocol Errors close (no pair/abort), not a pairing-code mismatch.
     /// @param conn The connection that received the message.
-    /// @param event The parsed server PIN pairing message; pake_msg_1 is used here.
+    /// @param event The parsed server pairing message; pake_msg_1 is used here.
     void handle_pair_auth(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
-    /// @brief Handles PinPairingMessageKind::PAIR_CONFIRM: verifies server_kc (updating the
-    /// dynamic-PIN failure counter), sends client/pair-confirm, resolves the pairing outcome, and
-    /// sends the CPace-wrapped client/pair-finalize.
+    /// @brief Handles PairingMessageKind::PAIR_CONFIRM: verifies server_kc, sends
+    /// client/pair-confirm, resolves the pairing outcome, and sends the CPace-wrapped
+    /// client/pair-finalize.
     /// @param conn The connection that received the message.
-    /// @param event The parsed server PIN pairing message; server_kc is used here.
+    /// @param event The parsed server pairing message; server_kc is used here.
     void handle_pair_confirm(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
-    /// @brief Abort the current PIN-pairing session: send pair/abort, notify, and close the
+    /// @brief Abort the current pairing-code session: send pair/abort, notify, and close the
     /// connection only for reason concurrent_attempt (spec "pair/abort"; every other reason leaves
     /// the connection open).
     /// @param conn The connection to abort.
     /// @param reason The abort reason to send.
-    void local_abort_pin_pairing(SendspinConnection* conn, PairAbortReason reason);
+    void local_abort_pairing(SendspinConnection* conn, PairAbortReason reason);
 
     // ========================================
     // Pairing-window main-loop handlers
     // ========================================
 
-    /// @brief Start the prepared PIN attempt on `conn`: send client/pair-init (with commit_B for
-    /// dynamic PIN, bare plus CPace start for static PIN), advance the PinStep, and arm the
-    /// attempt timeout. Sending client/pair-init ends the pairing window's lifetime, so this
-    /// also consumes any standing window.
-    /// The PinSession must already be populated by handle_enter_pairing.
+    /// @brief Start the prepared attempt on `conn`: send client/pair-init (with commit_B for a
+    /// dynamic pairing code, bare plus CPace start for a static one), advance the PairingStep,
+    /// and arm the attempt timeout. The PairingSession must already be populated by
+    /// handle_enter_pairing.
     /// @param conn The connection whose session starts.
-    void start_pin_attempt(SendspinConnection* conn);
+    void start_pairing_attempt(SendspinConnection* conn);
 
-    /// @brief Return true if a standing pairing window is open (opened by an operator gesture and
-    /// neither consumed by a client/pair-init nor past its 5-minute lifetime). Main-loop-only.
+    /// @brief Start the CPace exchange for the current round: build the sid and start the
+    /// RESPONDER run over the session's PRS (pairing.md "PAKE"), advancing the step to
+    /// AWAIT_SERVER_PAIR_AUTH. Aborts the attempt and returns false when CPace refuses to start.
+    /// @param conn The connection whose session runs the exchange.
+    /// @return true when the round started.
+    bool start_pake_round(SendspinConnection* conn);
+
+    /// @brief Return true if a pairing window is open (opened by an operator gesture, not yet
+    /// closed by one of pairing.md "Pairing Window"'s closing events, and within its 5-minute
+    /// lifetime). Main-loop-only.
     [[nodiscard]] bool pairing_window_open() const;
 
     /// @brief Open the pairing window on the main loop (operator gesture). If an attempt is
-    /// already waiting in
-    /// AWAIT_PAIRING_WINDOW, the window is consumed immediately by starting it; otherwise the
-    /// window stands open for WINDOW_LIFETIME (5 minutes) awaiting a pairing activate.
+    /// already waiting in AWAIT_PAIRING_WINDOW, the window admits it immediately; otherwise it
+    /// stands open for WINDOW_LIFETIME (5 minutes) awaiting a pairing activate.
     void open_pairing_window();
 
     /// @brief Handle a confirmed pairing-window gesture on the main loop
@@ -918,7 +928,7 @@ private:
     std::vector<ServerActivateEvent> pending_activate_events_;  // Deferred server/activate events
     std::vector<PairAbortEvent> pending_pair_abort_events_;     // Deferred pair/abort events
     std::vector<ServerUnpairEvent> pending_server_unpair_events_;
-    std::vector<ServerPairingMessageEvent> pending_pin_pairing_events_;
+    std::vector<ServerPairingMessageEvent> pending_pairing_message_events_;
     std::vector<std::string> pending_pairing_succeeded_events_;  // server_ids to notify
     bool pending_pairing_window_confirm_{false};                 // Pairing-window gesture confirm
     // Standing pairing window: platform_time_us() deadline until which the window admits one

@@ -41,8 +41,10 @@
 /// - Pairing PSK: `{"v":1,"psk_id":"...","psk":"<base64url>","label":"..."}`, with "label"
 ///   omitted when absent.
 /// - Pairing config: `{"v":1,"pairing_psk_enabled":bool,"unpaired_access_enabled":bool,
-///   "dynamic_pin_enabled":bool,"static_pin_enabled":bool,
-///   "dynamic_pin_min_length":int}`.
+///   "dynamic_pin_enabled":bool,"static_pin_enabled":bool}`. The last two keys carry
+///   `SendspinPairingConfig::dynamic_pairing_code_enabled` and `static_pairing_code_enabled`:
+///   the stored names are part of the storage format, which is fixed independently of the
+///   protocol's field names. Keys this version does not define are ignored on read.
 ///
 /// `psk` is base64url (RFC 4648 section 5, no `=` padding) and always decodes to exactly 32
 /// bytes.
@@ -72,7 +74,8 @@
 ///
 /// The storage key is not a provider's choice: it is one of the fixed constants in
 /// `persistence_keys` (sendspin/client.h): `RECORDS`, `PAIRING_PSK`, and `PAIR_CONFIG` for the
-/// three struct types this header encodes, plus `KEYPAIR`, `STATIC_PIN`, `LAST_PLAYED`, and
+/// three struct types this header encodes, plus `KEYPAIR`, `STATIC_PAIRING_CODE`,
+/// `LAST_PLAYED`, and
 /// `OUTPUT_DELAY` for the raw-byte / ASCII-decimal keys the library also persists. Every key is
 /// at most 12 characters, comfortably under a typical NVS key's 15-character limit; see
 /// `persistence_keys`'s doc comment for the full list and what each one holds.

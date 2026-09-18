@@ -1000,7 +1000,7 @@ TEST(Protocol, ClientHelloPairMethodsAreKeyedByMethod) {
     psk_desc.locations = std::vector<std::string>{"device"};
     msg.supported_pair_methods.push_back(std::move(psk_desc));
     PairMethodDescriptor static_desc;
-    static_desc.method = SendspinPairMethod::STATIC_PIN;
+    static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
     msg.supported_pair_methods.push_back(std::move(static_desc));
 
     JsonDocument doc;
@@ -1008,7 +1008,7 @@ TEST(Protocol, ClientHelloPairMethodsAreKeyedByMethod) {
     JsonObjectConst methods = doc["payload"]["supported_pair_methods"].as<JsonObjectConst>();
     ASSERT_EQ(methods.size(), 2u);
     ASSERT_TRUE(methods["pairing_psk"].is<JsonObjectConst>());
-    ASSERT_TRUE(methods["static_pin"].is<JsonObjectConst>());
+    ASSERT_TRUE(methods["static_pairing_code"].is<JsonObjectConst>());
     // The key replaces the field: a descriptor that also named itself would look like an
     // unrecognized field to a server reading the descriptor.
     EXPECT_TRUE(methods["pairing_psk"]["method"].isUnbound());
@@ -1137,9 +1137,9 @@ TEST(Protocol, ServerActivateActiveRolesAbsentIsNullopt) {
         << "absent active_roles must be nullopt (sticky)";
 }
 
-// The spec nests the pairing parameters: payload.pairing = {method, pin_length?, languages?}.
-// The parser must accept this nested form; the flat payload.selected_pair_method field is not
-// part of the current wire format.
+// messaging.md "server/activate" nests the pairing parameters: payload.pairing =
+// {method, format?, languages?}. The parser must accept this nested form; the flat
+// payload.selected_pair_method field is not part of the current wire format.
 TEST(Protocol, ServerActivateWithPairingObject) {
     JsonDocument doc;
     JsonObject root;
@@ -1151,25 +1151,49 @@ TEST(Protocol, ServerActivateWithPairingObject) {
     ASSERT_TRUE(process_server_activate_message(root, &msg));
     ASSERT_TRUE(msg.pairing_method.has_value());
     EXPECT_EQ(msg.pairing_method.value(), SendspinPairMethod::PAIRING_PSK);
-    EXPECT_FALSE(msg.pairing_pin_length.has_value());
+    EXPECT_FALSE(msg.pairing_format.has_value());
 }
 
-// dynamic_pin activations carry pin_length (and optionally languages) inside the pairing
-// object; languages is an informational hint and deliberately unparsed, but must not break
-// parsing of its siblings.
-TEST(Protocol, ServerActivatePairingObjectCarriesPinLength) {
+// dynamic_pairing_code activations carry the emission format (and optionally languages) inside
+// the pairing object; languages is an informational hint and deliberately unparsed, but must not
+// break parsing of its siblings.
+TEST(Protocol, ServerActivatePairingObjectCarriesFormat) {
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(
-        R"({"type":"server/activate","payload":{"activities":["pairing"],"pairing":{"method":"dynamic_pin","pin_length":6,"languages":["ca","es","en"]}}})",
+        R"({"type":"server/activate","payload":{"activities":["pairing"],"pairing":{"method":"dynamic_pairing_code","format":"digits","languages":["ca","es","en"]}}})",
         doc, root));
 
     ServerActivateMessage msg;
     ASSERT_TRUE(process_server_activate_message(root, &msg));
     ASSERT_TRUE(msg.pairing_method.has_value());
-    EXPECT_EQ(msg.pairing_method.value(), SendspinPairMethod::DYNAMIC_PIN);
-    ASSERT_TRUE(msg.pairing_pin_length.has_value());
-    EXPECT_EQ(msg.pairing_pin_length.value(), 6);
+    EXPECT_EQ(msg.pairing_method.value(), SendspinPairMethod::DYNAMIC_PAIRING_CODE);
+    ASSERT_TRUE(msg.pairing_format.has_value());
+    EXPECT_EQ(msg.pairing_format.value(), SendspinPairingCodeFormat::DIGITS);
+}
+
+// The qr_code emission format parses the same way, and an unrecognized format name yields no
+// format at all rather than a silently defaulted one: the activation is then not admissible
+// (messaging.md "server/activate").
+TEST(Protocol, ServerActivatePairingObjectFormatValues) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":["pairing"],"pairing":{"method":"dynamic_pairing_code","format":"qr_code"}}})",
+        doc, root));
+    ServerActivateMessage msg;
+    ASSERT_TRUE(process_server_activate_message(root, &msg));
+    ASSERT_TRUE(msg.pairing_format.has_value());
+    EXPECT_EQ(msg.pairing_format.value(), SendspinPairingCodeFormat::QR_CODE);
+
+    JsonDocument doc2;
+    JsonObject root2;
+    ASSERT_TRUE(parse(
+        R"({"type":"server/activate","payload":{"activities":["pairing"],"pairing":{"method":"dynamic_pairing_code","format":"morse"}}})",
+        doc2, root2));
+    ServerActivateMessage msg2;
+    ASSERT_TRUE(process_server_activate_message(root2, &msg2));
+    EXPECT_FALSE(msg2.pairing_format.has_value());
 }
 
 // payload.selected_pair_method is not part of the current wire format: a server sending only
@@ -1230,15 +1254,20 @@ TEST(Protocol, ActivityFromString) {
 
 TEST(Protocol, PairMethodToString) {
     EXPECT_STREQ(to_cstr(SendspinPairMethod::PAIRING_PSK), "pairing_psk");
-    EXPECT_STREQ(to_cstr(SendspinPairMethod::DYNAMIC_PIN), "dynamic_pin");
-    EXPECT_STREQ(to_cstr(SendspinPairMethod::STATIC_PIN), "static_pin");
+    EXPECT_STREQ(to_cstr(SendspinPairMethod::DYNAMIC_PAIRING_CODE), "dynamic_pairing_code");
+    EXPECT_STREQ(to_cstr(SendspinPairMethod::STATIC_PAIRING_CODE), "static_pairing_code");
 }
 
 TEST(Protocol, PairMethodFromString) {
     EXPECT_EQ(pair_method_from_string("pairing_psk"), SendspinPairMethod::PAIRING_PSK);
-    EXPECT_EQ(pair_method_from_string("dynamic_pin"), SendspinPairMethod::DYNAMIC_PIN);
-    EXPECT_EQ(pair_method_from_string("static_pin"), SendspinPairMethod::STATIC_PIN);
+    EXPECT_EQ(pair_method_from_string("dynamic_pairing_code"),
+              SendspinPairMethod::DYNAMIC_PAIRING_CODE);
+    EXPECT_EQ(pair_method_from_string("static_pairing_code"),
+              SendspinPairMethod::STATIC_PAIRING_CODE);
     EXPECT_FALSE(pair_method_from_string("invalid_method").has_value());
+    // The pre-1.0 identifiers name nothing: a server still using them offers no method at all.
+    EXPECT_FALSE(pair_method_from_string("dynamic_pin").has_value());
+    EXPECT_FALSE(pair_method_from_string("static_pin").has_value());
 }
 
 // ============================================================================
@@ -1282,8 +1311,7 @@ TEST(Protocol, PairAbortReasonRoundTrip) {
         PairAbortReason::ATTEMPT_TIMEOUT,
         PairAbortReason::CONCURRENT_ATTEMPT,
         PairAbortReason::METHOD_NOT_SUPPORTED,
-        PairAbortReason::PIN_LENGTH_UNACCEPTABLE,
-        PairAbortReason::PIN_MISMATCH,
+        PairAbortReason::PAIRING_CODE_MISMATCH,
         PairAbortReason::USER_CANCELLED,
     };
     for (const auto reason : reasons) {
@@ -1367,8 +1395,7 @@ TEST(Protocol, PairAbortMessageParseRoundTrip) {
         PairAbortReason::ATTEMPT_TIMEOUT,
         PairAbortReason::CONCURRENT_ATTEMPT,
         PairAbortReason::METHOD_NOT_SUPPORTED,
-        PairAbortReason::PIN_LENGTH_UNACCEPTABLE,
-        PairAbortReason::PIN_MISMATCH,
+        PairAbortReason::PAIRING_CODE_MISMATCH,
         PairAbortReason::USER_CANCELLED,
     };
     for (const auto reason : reasons) {

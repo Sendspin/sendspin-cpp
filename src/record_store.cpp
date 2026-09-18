@@ -16,7 +16,7 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
-#include "crypto/pin.h"
+#include "crypto/pairing_code.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
 #include "sendspin/persistence_codec.h"
@@ -35,7 +35,8 @@ namespace sendspin {
 namespace {
 
 /// @brief Shared load -> string_view -> decode -> warn-on-failure -> secure_zero(blob) shape used
-/// by the RECORDS and PAIRING_PSK loaders below. STATIC_PIN (no decoder, no PSK bytes) and
+/// by the RECORDS and PAIRING_PSK loaders below. STATIC_PAIRING_CODE (no decoder, no PSK bytes)
+/// and
 /// PAIR_CONFIG (no PSK bytes) differ enough to stay direct.
 /// @param decode_fail_suffix Appended to the "Stored "%s" blob failed to decode; " warning, so
 ///        each caller keeps its own original message verbatim.
@@ -67,14 +68,15 @@ std::optional<T> load_decode_wipe(SendspinPersistenceProvider& provider, const c
 RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                          bool initial_unpaired_access_enabled, size_t max_records)
     : provider_(provider), max_records_(max_records) {
-    // Try loading persisted records and config first. Every blob here (except static_pin, which
+    // Try loading persisted records and config first. Every blob here (except the static
+    // pairing code, which
     // is raw UTF-8 bytes) is a codec-encoded blob; the provider itself is a pure byte store, so
     // decoding happens entirely on this side of the interface.
     bool loaded_config = false;
     if (this->provider_ != nullptr) {
         this->load_records_from_provider();
         this->load_pairing_psk_from_provider();
-        this->load_static_pin_from_provider();
+        this->load_static_pairing_code_from_provider();
         loaded_config = this->load_pairing_config_from_provider();
     }
 
@@ -120,22 +122,24 @@ void RecordStore::load_pairing_psk_from_provider() {
     }
 }
 
-void RecordStore::load_static_pin_from_provider() {
-    if (auto pin_blob = this->provider_->load_blob(persistence_keys::STATIC_PIN)) {
-        std::string loaded_pin(reinterpret_cast<const char*>(pin_blob->data()), pin_blob->size());
+void RecordStore::load_static_pairing_code_from_provider() {
+    if (auto code_blob = this->provider_->load_blob(persistence_keys::STATIC_PAIRING_CODE)) {
+        std::string loaded_code(reinterpret_cast<const char*>(code_blob->data()),
+                                code_blob->size());
         // Validate on load, the same way RECORDS and PAIRING_PSK are validated by their
-        // decoders: the PIN is provisioned into the store out of band, so this is the only
+        // decoders: the code is provisioned into the store out of band, so this is the only
         // place the library gets to check it.
-        // Accepting it would leave the device advertising static_pin while feeding malformed
-        // PRS bytes to the PAKE, which can only ever produce pin_mismatch, a pairing that
-        // deterministically fails with nothing in the logs pointing at storage.
-        if (is_valid_static_pin(loaded_pin)) {
-            this->static_pin_ = std::move(loaded_pin);
+        // Accepting it would leave the device advertising static_pairing_code while feeding
+        // malformed PRS bytes to the PAKE, which can only ever produce pairing_code_mismatch, a
+        // pairing that deterministically fails with nothing in the logs pointing at storage.
+        if (is_valid_static_pairing_code(loaded_code)) {
+            this->static_pairing_code_ = std::move(loaded_code);
         } else {
             SS_LOGW(TAG,
-                    "Stored \"%s\" blob is not a valid static PIN (%zu bytes); ignoring it, "
-                    "so static_pin pairing stays unavailable until one is set again",
-                    persistence_keys::STATIC_PIN, loaded_pin.size());
+                    "Stored \"%s\" blob is not a valid static pairing code (%zu bytes); "
+                    "ignoring it, so static_pairing_code pairing stays unavailable until one is "
+                    "set again",
+                    persistence_keys::STATIC_PAIRING_CODE, loaded_code.size());
         }
     }
 }
@@ -148,9 +152,8 @@ bool RecordStore::load_pairing_config_from_provider() {
         if (config.has_value()) {
             this->pairing_psk_enabled_ = config->pairing_psk_enabled;
             this->unpaired_access_enabled_ = config->unpaired_access_enabled;
-            this->dynamic_pin_enabled_ = config->dynamic_pin_enabled;
-            this->static_pin_enabled_ = config->static_pin_enabled;
-            this->dynamic_pin_min_length_ = config->dynamic_pin_min_length;
+            this->dynamic_pairing_code_enabled_ = config->dynamic_pairing_code_enabled;
+            this->static_pairing_code_enabled_ = config->static_pairing_code_enabled;
             return true;
         }
         SS_LOGW(TAG, "Stored \"%s\" blob failed to decode; ignoring",
@@ -193,13 +196,13 @@ void RecordStore::seed_first_boot_config(bool loaded_config, bool initial_unpair
     // Scope note: only unpaired_access_enabled_ is protected this way, and deliberately so. It
     // defaults to false, so declining to seed it can only ever withhold a permission; it
     // cannot break a working device. The sibling flags (pairing_psk_enabled_,
-    // dynamic_pin_enabled_) default to TRUE, so a config that fails to load does resurrect a
-    // pairing method an operator had turned off, and the write below persists that. Forcing
-    // those to false here is not a correct fix: a provider that seeds records or a Pairing PSK
-    // without implementing config persistence at all returns nullopt for exactly the same reason
-    // a damaged one does, and disabling pairing for it would break a legitimate integration.
-    // Closing that hole properly needs the provider interface to distinguish "never stored" from
-    // "could not be read" (a tri-state load result) rather than more guessing here.
+    // dynamic_pairing_code_enabled_) default to TRUE, so a config that fails to load does resurrect
+    // a pairing method an operator had turned off, and the write below persists that. Forcing those
+    // to false here is not a correct fix: a provider that seeds records or a Pairing PSK without
+    // implementing config persistence at all returns nullopt for exactly the same reason a damaged
+    // one does, and disabling pairing for it would break a legitimate integration. Closing that
+    // hole properly needs the provider interface to distinguish "never stored" from "could not be
+    // read" (a tri-state load result) rather than more guessing here.
     //
     // No lock needed here: the constructor runs before this object is reachable by any other
     // thread.
@@ -489,9 +492,8 @@ bool RecordStore::persist_config() {
     SendspinPairingConfig config;
     config.pairing_psk_enabled = this->pairing_psk_enabled_;
     config.unpaired_access_enabled = this->unpaired_access_enabled_;
-    config.dynamic_pin_enabled = this->dynamic_pin_enabled_;
-    config.static_pin_enabled = this->static_pin_enabled_;
-    config.dynamic_pin_min_length = this->dynamic_pin_min_length_;
+    config.dynamic_pairing_code_enabled = this->dynamic_pairing_code_enabled_;
+    config.static_pairing_code_enabled = this->static_pairing_code_enabled_;
     std::string encoded = encode_pairing_config(config);
     if (!this->provider_->save_blob(persistence_keys::PAIR_CONFIG,
                                     reinterpret_cast<const uint8_t*>(encoded.data()),

@@ -29,7 +29,7 @@
 #pragma once
 
 #include "crypto/constants.h"
-#include "crypto/pin.h"
+#include "crypto/pairing_code.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 
@@ -117,7 +117,8 @@ struct ResolvedPsk {
 ///     callers must not retain a returned pointer or reference across any mutation, and must
 ///     never call them from the network thread.
 ///   - The pairing config (`pairing_psk_enabled_`, `unpaired_access_enabled_`,
-///     `dynamic_pin_enabled_`, `static_pin_enabled_`, `dynamic_pin_min_length_`, `static_pin_`)
+///     `dynamic_pairing_code_enabled_`, `static_pairing_code_enabled_`,
+///     `static_pairing_code_`)
 ///     is construction-time state: seeded from the persisted blob and the client config by the
 ///     constructor, then read-only for the object's life, so no lock is needed even for the
 ///     network-thread read of `pairing_psk_enabled_` inside `resolve_by_psk_id`.
@@ -239,28 +240,23 @@ public:
         return this->unpaired_access_enabled_;
     }
 
-    /// @brief Return whether dynamic-PIN pairing is enabled.
-    [[nodiscard]] bool dynamic_pin_enabled() const {
-        return this->dynamic_pin_enabled_;
-    }
-
-    /// @brief Return the minimum PIN length the client will accept.
-    [[nodiscard]] int dynamic_pin_min_length() const {
-        return this->dynamic_pin_min_length_;
+    /// @brief Return whether dynamic-pairing-code pairing is enabled.
+    [[nodiscard]] bool dynamic_pairing_code_enabled() const {
+        return this->dynamic_pairing_code_enabled_;
     }
 
     // ========================================
-    // Static PIN
+    // Static pairing code
     // ========================================
 
-    /// @brief Return the configured static PIN, if any.
-    [[nodiscard]] const std::optional<std::string>& static_pin() const {
-        return this->static_pin_;
+    /// @brief Return the configured static pairing code, if any.
+    [[nodiscard]] const std::optional<std::string>& static_pairing_code() const {
+        return this->static_pairing_code_;
     }
 
-    /// @brief Return whether static-PIN pairing is enabled.
-    [[nodiscard]] bool static_pin_enabled() const {
-        return this->static_pin_enabled_;
+    /// @brief Return whether static-pairing-code pairing is enabled.
+    [[nodiscard]] bool static_pairing_code_enabled() const {
+        return this->static_pairing_code_enabled_;
     }
 
     // ========================================
@@ -309,8 +305,9 @@ private:
     /// psk_id if it disagrees with the loaded secret.
     void load_pairing_psk_from_provider();
 
-    /// @brief Load static_pin_ from the provider's STATIC_PIN blob, if present and valid.
-    void load_static_pin_from_provider();
+    /// @brief Load static_pairing_code_ from the provider's STATIC_PAIRING_CODE blob, if
+    /// present and valid.
+    void load_static_pairing_code_from_provider();
 
     /// @brief Load the pairing config fields from the provider's PAIR_CONFIG blob, if present.
     /// @return True if a valid config was loaded; the seeding helper below uses this (the
@@ -366,7 +363,8 @@ private:
 
     std::vector<SendspinPairingRecord> records_;
 
-    std::optional<std::string> static_pin_;  ///< Configured static PIN (8 decimal digits).
+    /// Configured static pairing code (8 decimal digits).
+    std::optional<std::string> static_pairing_code_;
 
     // Pointer fields
     SendspinPersistenceProvider* provider_{nullptr};
@@ -376,19 +374,10 @@ private:
     /// once at construction, then read-only.
     size_t max_records_{DEFAULT_MAX_RECORDS};
 
-    // 32-bit fields
-    int dynamic_pin_min_length_{PIN_DEFAULT_MIN_DIGITS};
-    // include/sendspin/config.h's SendspinPairingConfig::dynamic_pin_min_length hardcodes this
-    // same default as a literal (a public header cannot include this private one); keep the two
-    // in sync manually and let this assert catch drift.
-    static_assert(PIN_DEFAULT_MIN_DIGITS == 6,
-                  "update SendspinPairingConfig::dynamic_pin_min_length's default in "
-                  "include/sendspin/config.h to match");
-
     // 8-bit fields
-    bool dynamic_pin_enabled_{true};
+    bool dynamic_pairing_code_enabled_{true};
     bool pairing_psk_enabled_{true};
-    bool static_pin_enabled_{false};
+    bool static_pairing_code_enabled_{false};
     bool unpaired_access_enabled_{false};
 };
 

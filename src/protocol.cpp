@@ -401,7 +401,7 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
     // pairing object: required when 'pairing' is in activities, ignored otherwise (the
     // activities check lives in apply_server_activate, which nulls the method outside pairing).
     activate_msg->pairing_method = std::nullopt;
-    activate_msg->pairing_pin_length = std::nullopt;
+    activate_msg->pairing_format = std::nullopt;
     JsonVariantConst pairing_var = root["payload"]["pairing"];
     if (pairing_var.is<JsonObjectConst>()) {
         JsonVariantConst method_var = pairing_var["method"];
@@ -412,13 +412,20 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
                         method_var.as<const char*>());
             }
         }
-        if (pairing_var["pin_length"].is<int>()) {
-            activate_msg->pairing_pin_length = pairing_var["pin_length"].as<int>();
+        JsonVariantConst format_var = pairing_var["format"];
+        if (format_var.is<const char*>()) {
+            activate_msg->pairing_format =
+                pairing_code_format_from_string(format_var.as<std::string>());
+            if (!activate_msg->pairing_format.has_value()) {
+                SS_LOGW(TAG, "server/activate pairing object names an unknown format: %s",
+                        format_var.as<const char*>());
+            }
         }
-        // pairing.languages (BCP 47 tags, descending operator preference) is an informational
-        // hint for SPOKEN PIN emission only. This client emits PINs through the listener's
-        // display callback, so the hint is deliberately not parsed; a client adding speaker
-        // emission should parse it here and apply RFC 4647 Lookup matching.
+        // The server's `languages` (BCP 47 tags, descending operator preference) is an
+        // informational hint for SPOKEN pairing-code emission only (pairing.md "Digits
+        // emission"). This client hands the code to the listener as text and emits nothing
+        // itself, so the hint is deliberately not parsed; a client adding speaker emission
+        // should read it from server/hello and apply RFC 4647 Lookup matching.
     }
 
     return true;
@@ -844,11 +851,14 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
             if (desc.out_channels.has_value() && !desc.out_channels->empty()) {
                 JsonArray ch_arr = method_obj["out_channels"].to<JsonArray>();
                 for (const auto& ch : desc.out_channels.value()) {
-                    ch_arr.add(ch.c_str());
+                    ch_arr.add(to_cstr(ch));
                 }
             }
-            if (desc.min_pin_length.has_value()) {
-                method_obj["min_pin_length"] = desc.min_pin_length.value();
+            if (desc.formats.has_value() && !desc.formats->empty()) {
+                JsonArray fmt_arr = method_obj["formats"].to<JsonArray>();
+                for (const auto& fmt : desc.formats.value()) {
+                    fmt_arr.add(to_cstr(fmt));
+                }
             }
             if (desc.locations.has_value() && !desc.locations->empty()) {
                 JsonArray loc_arr = method_obj["locations"].to<JsonArray>();
