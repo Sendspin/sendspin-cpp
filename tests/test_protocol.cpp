@@ -745,6 +745,40 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
 // client/state field set
 // ============================================================================
 
+// roles/player/v1.md "client/state player object": output_delay_ms, required_lead_time_ms and
+// min_buffer_ms are always present in the player object, each under its own key. The three values
+// differ here so a serializer that emitted one of them under another's key would be caught.
+TEST(Protocol, FormatClientStatePlayerCarriesTimingFields) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+    ClientPlayerStateObject player{};
+    player.output_delay_ms = 120;
+    player.required_lead_time_ms = 340;
+    player.min_buffer_ms = 560;
+    msg.player = player;
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    EXPECT_EQ(doc["payload"]["player"]["output_delay_ms"].as<uint16_t>(), 120);
+    EXPECT_EQ(doc["payload"]["player"]["required_lead_time_ms"].as<uint16_t>(), 340);
+    EXPECT_EQ(doc["payload"]["player"]["min_buffer_ms"].as<uint16_t>(), 560);
+}
+
+// Control: zero is a value the server must see reported, not a reason to omit the key. A
+// serializer that skipped falsy timing fields would pass the test above and fail this one.
+TEST(Protocol, FormatClientStatePlayerReportsZeroTimingFields) {
+    ClientStateMessage msg;
+    msg.state = SendspinClientState::SYNCHRONIZED;
+    msg.player = ClientPlayerStateObject{};
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+    ASSERT_TRUE(doc["payload"]["player"]["required_lead_time_ms"].is<uint16_t>());
+    ASSERT_TRUE(doc["payload"]["player"]["min_buffer_ms"].is<uint16_t>());
+    EXPECT_EQ(doc["payload"]["player"]["required_lead_time_ms"].as<uint16_t>(), 0);
+    EXPECT_EQ(doc["payload"]["player"]["min_buffer_ms"].as<uint16_t>(), 0);
+}
+
 // spec "client/state": the client-level field is the boolean `available`, not a multi-valued
 // state string. SYNCHRONIZED must serialize to available:true, and no legacy top-level "state"
 // key may appear (a strict-mode server hard-rejects client/state carrying an unknown field).

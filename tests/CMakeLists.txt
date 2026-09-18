@@ -31,6 +31,7 @@ add_executable(sendspin_tests
     test_spsc_ring_buffer.cpp
     test_thread_safe_queue.cpp
     test_inbox.cpp
+    test_player_role.cpp
     test_visualizer_role.cpp
     test_artwork_role.cpp
     test_crypto.cpp
@@ -56,6 +57,10 @@ add_executable(sendspin_tests
 # test_client_lifecycle.cpp checks what a role's stop() left in its ring, which nothing on the
 # public surface reports; it reads the private members directly instead of adding a seam.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
+
+# test_player_role.cpp builds the client/state player object by calling the role's Impl directly,
+# which is the only way to see that object without a connected server.
+set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...) and
 # the src/crypto/ headers.

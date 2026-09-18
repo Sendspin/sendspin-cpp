@@ -62,6 +62,8 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_network_info.cpp`: local interface MAC lookup is well-formed or absent.
 - `test_spsc_ring_buffer.cpp`: ring buffer storage sizing and alignment.
 - `test_inbox.cpp`: `Inbox`/`InboxSlot` topic bits, event ring ordering, and slot binding.
+- `test_player_role.cpp`: the player's `client/state` timing parameters and the
+  supported-format validation, driven through the role's `Impl` without a server.
 - `test_visualizer_role.cpp`: `decode_visualizer_message()` and the visualizer role's
   negotiation and dispatch.
 - `test_artwork_role.cpp`: the artwork role's `Impl` driven directly: decode thread, slot

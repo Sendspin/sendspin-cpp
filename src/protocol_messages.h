@@ -432,6 +432,8 @@ struct ClientPlayerStateObject {
     uint8_t volume{};
     bool muted{};
     uint16_t output_delay_ms{};
+    uint16_t required_lead_time_ms{};
+    uint16_t min_buffer_ms{};
     std::vector<SendspinPlayerCommand> supported_commands{};
 };
 

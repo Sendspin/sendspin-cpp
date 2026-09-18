@@ -308,6 +308,36 @@ struct PlayerRoleConfig {
     /// Larger values trade longer startup latency for more underflow protection; 0 disables.
     uint16_t extra_startup_silence_ms{DEFAULT_EXTRA_STARTUP_SILENCE_MS};
 
+    /// @brief Default startup lead requested from the server: the sync task's 25 ms of
+    /// initial-sync priming silence, plus the extra startup silence it queues behind it, plus a
+    /// 75 ms allowance for codec init, the first decode, and the audio backend's own buffering
+    /// on an ESP32-class target.
+    static constexpr uint16_t DEFAULT_REQUIRED_LEAD_TIME_MS =
+        25U + DEFAULT_EXTRA_STARTUP_SILENCE_MS + 75U;
+
+    /// @brief Startup lead in milliseconds reported as `required_lead_time_ms` in every
+    /// client/state player object, measured from the server's transmission of a stream/start or
+    /// stream/clear to the playback timestamp of the first chunk that can be played in full
+    /// (roles/player/v1.md "client/state player object"). The server treats it as a hint and may
+    /// give less. This library reports the configured value rather than a measured one; raise it
+    /// alongside `extra_startup_silence_ms`, and to cover an output whose own startup latency the
+    /// default allowance does not reach.
+    uint16_t required_lead_time_ms{DEFAULT_REQUIRED_LEAD_TIME_MS};
+
+    /// @brief Default ongoing buffer requested from the server. Sized to ride out the
+    /// interference bursts a Wi-Fi client sees on a shared channel, and small enough that the
+    /// audio it represents fits the default `audio_buffer_capacity` many times over.
+    static constexpr uint16_t DEFAULT_MIN_BUFFER_MS = 500U;
+
+    /// @brief Ongoing buffer duration in milliseconds reported as `min_buffer_ms` in every
+    /// client/state player object: how much audio the player wants held ahead of playback during
+    /// a stream to absorb network jitter and decode timing variance
+    /// (roles/player/v1.md "client/state player object"). Mostly relevant for live streams, where
+    /// the server has little audio in hand. The audio it represents must fit
+    /// `audio_buffer_capacity` at the highest-bitrate format in `audio_formats`. This library
+    /// reports the configured value rather than one measured from chunk arrival delay.
+    uint16_t min_buffer_ms{DEFAULT_MIN_BUFFER_MS};
+
     bool psram_stack{false};  ///< Allocate sync task stack in PSRAM (ESP-IDF only)
 
     /// @brief Default FreeRTOS priority for the sync/decode task (ESP-IDF only).

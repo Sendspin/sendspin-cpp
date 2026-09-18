@@ -1003,6 +1003,8 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
         root["payload"]["player"]["volume"] = player_state.volume;
         root["payload"]["player"]["muted"] = player_state.muted;
         root["payload"]["player"]["output_delay_ms"] = player_state.output_delay_ms;
+        root["payload"]["player"]["required_lead_time_ms"] = player_state.required_lead_time_ms;
+        root["payload"]["player"]["min_buffer_ms"] = player_state.min_buffer_ms;
         if (!player_state.supported_commands.empty()) {
             JsonArray commands_list =
                 root["payload"]["player"]["supported_commands"].to<JsonArray>();

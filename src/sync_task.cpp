@@ -38,6 +38,9 @@ static constexpr int64_t HARD_SYNC_SETTLE_THRESHOLD_US =
     500;  // Tighter threshold used while settling after a hard sync
 static constexpr int64_t SOFT_SYNC_THRESHOLD_US = 100;
 
+/// @brief Silence fed to the sink to prime it before the first decoded chunk. It is part of the
+/// startup lead the player reports, so PlayerRoleConfig::DEFAULT_REQUIRED_LEAD_TIME_MS carries
+/// this number as a term and moves with it.
 static constexpr uint32_t INITIAL_SYNC_ZEROS_DURATION_MS = 25;
 
 static constexpr size_t SYNC_TASK_STACK_SIZE = 6192;  // Opus uses more stack than FLAC
