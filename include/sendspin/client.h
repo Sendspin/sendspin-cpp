@@ -758,6 +758,13 @@ private:
     /// replay and the flag happen under one hold of json_processing_mutex_ so the role traffic a
     /// server sent between its server/activate and this admission is applied exactly once, in
     /// arrival order, ahead of anything that arrives afterwards.
+    ///
+    /// THREADING: the caller holds ConnectionManager's conn_ptr_mutex_, so the lock order here is
+    /// conn_ptr_mutex_ then json_processing_mutex_, and nothing a replayed message dispatches may
+    /// reach back into the manager: get_client_time(), publish_state(), send_text(), leave() and
+    /// the current-connection accessors all take conn_ptr_mutex_ again, which does not nest. The
+    /// role handlers on this path only write to Inbox slots and role buffers, and a handler that
+    /// needs the connection or a listener defers it to drain_events() like every other.
     /// @param conn The connection entering the admitted slot
     void admit_connection(SendspinConnection* conn);
 

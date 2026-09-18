@@ -25,6 +25,7 @@
 // "client is always the Noise responder" invariant.
 
 #include "connection.h"
+#include "connection_manager.h"
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "lifecycle_test_fixtures.h"
@@ -34,6 +35,7 @@
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/controller_role.h"
+#include "sendspin/player_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/persistence_codec.h"
 #include "sendspin/types.h"
@@ -1006,6 +1008,13 @@ public:
         this->client_storage = std::make_unique<SendspinClient>(std::move(config));
         this->client_storage->set_network_provider(&this->network);
         this->client_storage->add_metadata().set_listener(&this->listener);
+        // The other roles a held message can be dispatched to, so the replay runs their real
+        // handlers. The player has no listener, so its sync task never starts and its stream
+        // handlers take the no-op path through an uninitialized ring.
+        PlayerRoleConfig player_config;
+        player_config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
+        this->client_storage->add_player(std::move(player_config));
+        this->client_storage->add_controller();
         EXPECT_TRUE(this->client_storage->start());
     }
 
@@ -1196,6 +1205,42 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBounded) {
     EXPECT_EQ(bundle.listener.updates.load(), 1);
     EXPECT_EQ(bundle.listener.last_title,
               "Title " + std::to_string(SendspinConnection::MAX_HELD_MESSAGES - 1));
+}
+
+// The replay runs inside ConnectionManager's conn_ptr_mutex_, because set_current_connection() is
+// what calls admit_connection(). Nothing a replayed message dispatches may reach back into the
+// manager: SendspinClient::get_client_time(), publish_state(), send_text() and the
+// current-connection accessors all take that mutex again, and it does not nest. Replaying one
+// message of every held type with the lock held exactly as production holds it is what keeps that
+// true as handlers change: a handler that reaches back hangs here, and the suite watchdog names
+// it.
+TEST(EncryptedLifecycle, ReplayedHandlersDoNotReEnterTheConnectionManager) {
+    HoldTestClient bundle("Replay Re-entry Test Client");
+
+    HoldTestConnection conn;
+    conn.note_activate_delivered();
+    for (const std::string& json :
+         {metadata_state_json(1, "Replayed"),
+          std::string(R"({"type":"server/state","payload":{"controller":{"playback_state":)"
+                      R"("playing"}}})"),
+          std::string(R"({"type":"server/command","payload":{"player":{"command":"volume",)"
+                      R"("volume":42}}})"),
+          std::string(R"({"type":"stream/start","payload":{"player":{"codec":"pcm",)"
+                      R"("sample_rate":44100,"channels":2,"bit_depth":16}}})"),
+          std::string(R"({"type":"stream/clear","payload":{}})"),
+          std::string(R"({"type":"stream/end","payload":{}})"),
+          std::string(R"({"type":"group/update","payload":{"group_name":"Kitchen"}})")}) {
+        bundle.deliver(conn, json);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(bundle.client_ref().connection_manager_->conn_ptr_mutex_);
+        bundle.client_ref().admit_connection(&conn);
+    }
+
+    bundle.pump();
+    EXPECT_EQ(bundle.listener.updates.load(), 1) << "the replay did not run to completion";
+    EXPECT_EQ(bundle.listener.last_title, "Replayed");
 }
 
 // Seeds a set of LONG_TERM records and keeps the persisted "records" array up to date, so an

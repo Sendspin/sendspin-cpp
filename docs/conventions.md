@@ -28,6 +28,14 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - Callback dispatch must tolerate re-entrant teardown: a listener callback may
   call back into the client. See "Re-entrant Teardown During Callback
   Dispatch" in `docs/internals.md` for the guard patterns in use.
+- A message handler on the receive path writes to Inbox slots and role buffers
+  and nothing else. It does not reach back into the client for the current
+  connection, the clock, or a state publish, and it does not call a listener:
+  those belong in `drain_events()`. Besides keeping the network thread cheap,
+  this is what lets the admission replay run the same handlers while the
+  connection manager's `conn_ptr_mutex_` is held (see
+  `SendspinClient::admit_connection()`), which would deadlock on the first such
+  call.
 
 ## Protocol validation
 
