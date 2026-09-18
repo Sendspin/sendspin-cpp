@@ -146,6 +146,45 @@ static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
 static constexpr char PAKE_AD_SERVER[] = "server";  // ADa
 static constexpr char PAKE_AD_CLIENT[] = "client";  // ADb
 
+/// @brief A CPace ISK held for the length of one handler and wiped when it goes out of scope.
+///
+/// CPace::isk() answers by value, so the caller owns a copy of the 64-byte secret that
+/// CPace::~CPace never sees. K_wrap is SHA-256(label || sid || ISK) and the sid is not secret,
+/// so a copy left in a dead stack frame is worth both wrap keys. Holding it here wipes it on
+/// every exit path, including the early returns between the two wraps, which is what the
+/// surrounding code already does for K_wrap itself and for every PSK-bearing struct.
+class ScopedIsk {
+public:
+    /// @param isk The ISK to take ownership of. Taken by value and wiped, so the caller's
+    ///        temporary does not outlive this copy.
+    explicit ScopedIsk(std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk)
+        : value_(std::move(isk)) {
+        if (isk.has_value()) {
+            // std::array moves by copying, so the argument still holds the bytes.
+            secure_zero_container(isk.value());
+        }
+    }
+
+    ScopedIsk(const ScopedIsk&) = delete;
+    ScopedIsk& operator=(const ScopedIsk&) = delete;
+
+    ~ScopedIsk() {
+        if (this->value_.has_value()) {
+            secure_zero_container(this->value_.value());
+        }
+    }
+
+    [[nodiscard]] bool has_value() const {
+        return this->value_.has_value();
+    }
+    [[nodiscard]] const std::array<uint8_t, CPACE_ISK_SIZE>& value() const {
+        return this->value_.value();
+    }
+
+private:
+    std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> value_;
+};
+
 /// @brief Append `value` to `out` as a big-endian uint32, the encoding pairing.md "PAKE" gives
 /// both of the sid's counters.
 static void append_be32(std::vector<uint8_t>& out, uint32_t value) {
@@ -2567,11 +2606,11 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     // Both wrapped fields are sealed under the same CPace run (pairing.md "Wrapping"), so the
     // AEAD and the ISK are resolved once here, before the first of them is sent.
     const char* cipher_name = aead_cipher_name_from_noise_suite(conn->get_noise_suite_name());
-    auto isk_opt = ps.cpace.isk();
-    if (cipher_name == nullptr || !isk_opt.has_value()) {
+    ScopedIsk isk(ps.cpace.isk());
+    if (cipher_name == nullptr || !isk.has_value()) {
         SS_LOGE(TAG, "handle_pairing_message: cannot wrap (cipher=%s, isk=%s) for server_id=%s",
                 cipher_name != nullptr ? cipher_name : "unknown",
-                isk_opt.has_value() ? "present" : "missing", server_id.c_str());
+                isk.has_value() ? "present" : "missing", server_id.c_str());
         this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
         return;
     }
@@ -2583,7 +2622,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
         conn->send_app_json(format_client_pair_confirm_message(client_kc_opt.value()), nullptr);
     } else {
         auto wrapped_nonce =
-            wrap_value(NONCE_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk_opt.value(), ps.nonce_b);
+            wrap_value(NONCE_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk.value(), ps.nonce_b);
         if (!wrapped_nonce.has_value()) {
             SS_LOGE(TAG, "handle_pairing_message: wrapping nonce_B failed for server_id=%s",
                     server_id.c_str());
@@ -2620,7 +2659,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     // sealed with the connection's negotiated AEAD, a 12-byte all-zero nonce, and empty AD. The
     // label differs from the one nonce_B was sealed under, so the two fields never share a key.
     auto wrapped =
-        wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk_opt.value(), outcome.psk);
+        wrap_value(PSK_WRAP_LABEL, cipher_name, ps.cpace.sid(), isk.value(), outcome.psk);
     if (!wrapped.has_value()) {
         SS_LOGE(TAG, "handle_pairing_message: wrapping the long-term PSK failed for server_id=%s",
                 server_id.c_str());

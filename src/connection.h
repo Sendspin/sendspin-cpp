@@ -22,6 +22,7 @@
 #include "crypto/keys.h"
 #include "noise_handshake.h"
 #include "noise_transport.h"
+#include "platform/crypto.h"
 #include "platform/memory.h"
 #include "platform/shadow_slot.h"
 #include "platform/types.h"
@@ -576,6 +577,29 @@ public:
         bool code_emitted{false};  ///< True once a code was surfaced via on_display_pairing_code.
         bool window_shown{false};  ///< True once on_open_pairing_window was surfaced, so
                                    ///< abort/teardown knows to fire on_close_pairing_window.
+
+        PairingSession() = default;
+
+        /// @brief Wipes the pairing code and both binding nonces on destruction, the same
+        /// discipline every PSK-bearing struct follows (see SendspinPairingRecord in config.h).
+        /// `prs` is the pairing code itself as CPace consumes it and lives on the heap, so
+        /// releasing that buffer unwiped would leave the code in freed memory after every
+        /// attempt, successful or not. `cpace` wipes its own scalar, MAC key and ISK here,
+        /// which is why clear_pairing_state() destroys this object rather than assigning over
+        /// it.
+        ~PairingSession() {
+            secure_zero_container(this->nonce_b);
+            secure_zero_container(this->nonce_a);
+            if (!this->prs.empty()) {
+                secure_zero(this->prs.data(), this->prs.size());
+            }
+        }
+
+        /// A session is per-connection state reached only by reference (pairing_session()), so
+        /// copying it is always a mistake: a copy would carry the code and the nonces into a
+        /// second buffer this destructor does not know about.
+        PairingSession(const PairingSession&) = delete;
+        PairingSession& operator=(const PairingSession&) = delete;
     };
 
     /// @brief Return the current pairing-code session state. Main-loop-only.
@@ -646,8 +670,13 @@ public:
         this->pairing_in_progress_.store(false, std::memory_order_release);
         this->pairing_finalized_.store(false, std::memory_order_release);
         this->pending_pairing_slot_.reset();
-        // Reset the pairing-code session (main-loop-only fields; no lock needed).
-        this->pairing_session_ = PairingSession{};
+        // Reset the pairing-code session (main-loop-only fields; no lock needed). Destroyed and
+        // rebuilt in place rather than assigned over: assignment would overwrite the secrets
+        // instead of wiping them, and would never run ~PairingSession or ~CPace, which is where
+        // the pairing code, the binding nonces, the CPace scalar and the ISK are actually
+        // erased.
+        std::destroy_at(&this->pairing_session_);
+        std::construct_at(&this->pairing_session_);
     }
 
     /// @brief Re-arm the provisional timeout after the server acks server/pair-finalize.
