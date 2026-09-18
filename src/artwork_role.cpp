@@ -268,8 +268,8 @@ void ArtworkRole::Impl::enqueue_notification(const ArtworkNotification& notif) c
 }
 
 void ArtworkRole::Impl::discard_all_pending() {
-    this->streamed_channels.reset();
     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+    this->streamed_channels.reset();
     this->transfer = ArtworkTransfer{};
     for (auto& epoch : this->slot_epochs) {
         epoch.fetch_add(1, std::memory_order_relaxed);
@@ -518,21 +518,23 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
 
     this->stream_active = true;
 
-    // "A stream/start that changes a channel's configuration likewise discards that channel's
-    // pending image, and the server re-sends the image if it still applies." The discard is
-    // scoped to the channels whose configuration this stream/start changed: a channel the server
-    // left alone keeps the image it already scheduled, which the server will neither cancel nor
-    // re-send. Bumping those channels' epochs is the discard (see slot_epochs), and it also makes
-    // any notification still queued for them stale to the decode thread.
-    const uint8_t changed = this->changed_channel_mask(stream);
-    this->streamed_channels = stream.channels;
-
     // Unlike the other lifecycle handlers, no display_slot.reset() here: it would discard the
     // pending display of every channel, including the unchanged ones this stream/start must
     // leave alone. It is not needed either, because a display published by the decode thread
     // carries the epoch it was decoded under, so drain_events() drops the ones whose channel
     // moved on whether or not they have been folded into the main-thread holds yet.
     {
+        // "A stream/start that changes a channel's configuration likewise discards that channel's
+        // pending image, and the server re-sends the image if it still applies." The discard is
+        // scoped to the channels whose configuration this stream/start changed: a channel the
+        // server left alone keeps the image it already scheduled, which the server will neither
+        // cancel nor re-send. Bumping those channels' epochs is the discard (see slot_epochs), and
+        // it also makes any notification still queued for them stale to the decode thread.
+        //
+        // The comparison and the store of the new array are inside the lock because
+        // streamed_channels is also cleared by cleanup(), which the main loop runs on a live
+        // connection when a server/activate removes the artwork role.
+        //
         // Any transfer in flight ends here whatever changed: the server MUST cancel a transfer
         // before a stream/start that changes its channel, and one still in flight across a
         // stream/start that did not change its channel would be carrying bytes for a
@@ -545,6 +547,8 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
         // Protocol messages are serialized on the network thread, so this runs before any of the
         // new stream's handle_binary() calls.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+        const uint8_t changed = this->changed_channel_mask(stream);
+        this->streamed_channels = stream.channels;
         this->transfer = ArtworkTransfer{};
         for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
             if ((changed & static_cast<uint8_t>(1U << slot)) == 0) {
@@ -561,6 +565,7 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
 }
 
 uint8_t ArtworkRole::Impl::changed_channel_mask(const ServerArtworkStreamObject& stream) const {
+    // Caller holds slot_mutex; see streamed_channels.
     constexpr uint8_t ALL_CHANNELS = (1U << ARTWORK_MAX_SLOTS) - 1U;
     // Without a channel array on one side or the other there is nothing to compare, so every
     // channel counts as changed. That covers the first stream/start of a connection, where no

@@ -274,7 +274,8 @@ struct ArtworkRole::Impl {
     // discards only the channels it changed (see changed_channel_mask()).
     void discard_all_pending();
     // Which channels this stream/start changed the configuration of, as a slot bitmask. Every
-    // channel counts as changed when either side has no channel array to compare.
+    // channel counts as changed when either side has no channel array to compare. Caller holds
+    // DrainTask::slot_mutex: it reads streamed_channels.
     uint8_t changed_channel_mask(const ServerArtworkStreamObject& stream) const;
     // True if two stream/start channel entries declare the same configuration.
     static bool same_channel(const ServerArtworkChannelObject& a,
@@ -315,7 +316,9 @@ struct ArtworkRole::Impl {
     ArtworkTransfer transfer;
     // The channel array of the stream/start in force, kept so the next one can be compared
     // against it: only the channels whose configuration changes lose their pending image.
-    // Network-thread only, plus cleanup() on the main loop, like `transfer`.
+    // Guarded by DrainTask::slot_mutex, like `transfer`: the network thread writes it from
+    // handle_stream_start() while the main loop can clear it from cleanup(), which a
+    // server/activate that removes the role runs on a live connection.
     std::optional<std::vector<ServerArtworkChannelObject>> streamed_channels;
 
     // Pointer fields
