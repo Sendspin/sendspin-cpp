@@ -489,6 +489,9 @@ void SendspinConnection::replay_pre_admission_messages(const HeldMessageVisitor&
         visit(reinterpret_cast<const char*>(this->held_messages_.data()) + extent.offset,
               extent.length, extent.arrival_us);
     }
+    // Nothing is held after admission, so the buffer goes back to the heap now rather than
+    // staying allocated for the rest of the session.
+    this->held_messages_ = PlatformBuffer{};
 }
 
 // ============================================================================

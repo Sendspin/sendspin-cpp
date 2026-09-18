@@ -1181,10 +1181,10 @@ protected:
     /// out first, the message is dropped with a warning rather than letting an unadmitted peer
     /// grow this without bound.
     ///
-    /// The buffer is allocated on the first hold and freed with the connection, so it costs
-    /// nothing on a connection that is admitted before the server says anything. Worst case is
-    /// one buffer per live connection, NURSERY_CAPACITY (2) plus the current slot, i.e. 24 KB of
-    /// SPIRAM-preferring heap, held only across the admission window.
+    /// The buffer is allocated on the first hold and freed by the replay (or with the
+    /// connection), so it costs nothing on a connection that is admitted before the server says
+    /// anything. Worst case is one buffer per live connection, NURSERY_CAPACITY (2) plus the
+    /// current slot, i.e. 24 KB of SPIRAM-preferring heap, held only across the admission window.
     static constexpr size_t MAX_HELD_MESSAGES = 8;
     static constexpr size_t MAX_HELD_BYTES = 4 * SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE;
     PlatformBuffer held_messages_;

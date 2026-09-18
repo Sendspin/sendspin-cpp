@@ -201,6 +201,9 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.
+- `PlayerRoleConfig::required_lead_time_ms` is `std::optional<uint16_t>`: unset reports the
+  pipeline-derived lead, a value overrides it. A consumer that assigned a plain integer still
+  compiles; one that read the field needs `value_or`.
 
 ## Verified conformant (no work)
 

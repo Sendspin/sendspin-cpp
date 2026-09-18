@@ -318,16 +318,24 @@ struct PlayerRoleConfig {
     /// Larger values trade longer startup latency for more underflow protection; 0 disables.
     uint16_t extra_startup_silence_ms{DEFAULT_EXTRA_STARTUP_SILENCE_MS};
 
+    /// @brief Silence the sync task feeds to the sink to prime it before the first decoded chunk.
+    static constexpr uint16_t INITIAL_SYNC_PRIMING_MS = 25U;
+
+    /// @brief Allowance for codec init, the first decode and the audio backend's own buffering
+    /// on an ESP32-class target.
+    static constexpr uint16_t PIPELINE_START_ALLOWANCE_MS = 75U;
+
     /// @brief Startup lead the decode pipeline itself spends before the first chunk can play in
-    /// full, for a given `extra_startup_silence_ms`: the sync task's 25 ms of initial-sync priming
-    /// silence, the extra startup silence, and a 75 ms allowance for codec init, the first decode
-    /// and the audio backend's own buffering on an ESP32-class target. A deliberate overestimate:
-    /// the extra silence replaces whatever priming silence is still unsent, so those two terms
-    /// overlap in part.
+    /// full, for a given `extra_startup_silence_ms`: the priming silence, the extra startup
+    /// silence, and the pipeline start allowance. A deliberate overestimate: the extra silence
+    /// replaces whatever priming silence is still unsent, so those two terms overlap in part.
     /// @param extra_startup_silence_ms The configured extra startup silence.
-    /// @return Lead time in milliseconds.
+    /// @return Lead time in milliseconds, saturated at the field's maximum.
     static constexpr uint16_t pipeline_lead_time_ms(uint16_t extra_startup_silence_ms) {
-        return static_cast<uint16_t>(25U + extra_startup_silence_ms + 75U);
+        constexpr uint32_t MAX = 65535U;
+        const uint32_t lead = static_cast<uint32_t>(INITIAL_SYNC_PRIMING_MS) +
+                              extra_startup_silence_ms + PIPELINE_START_ALLOWANCE_MS;
+        return static_cast<uint16_t>(lead < MAX ? lead : MAX);
     }
 
     /// @brief Startup lead in milliseconds reported as `required_lead_time_ms` in every
