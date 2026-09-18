@@ -1441,6 +1441,7 @@ TEST(PlayerRoleOutputDelay, PersistsAsAsciiDecimal) {
     client.set_persistence_provider(&provider);
 
     PlayerRoleConfig player_config;
+    player_config.audio_formats = {{SendspinCodecFormat::FLAC, 2, 44100, 16}};
     auto& player = client.add_player(player_config);
     ASSERT_TRUE(client.start());
     player.set_output_delay_adjustable(true);
@@ -1457,6 +1458,7 @@ TEST(PlayerRoleOutputDelay, PersistsAsAsciiDecimal) {
     SendspinClient client2(std::move(config2));
     client2.set_persistence_provider(&provider);
     PlayerRoleConfig player_config2;
+    player_config2.audio_formats = {{SendspinCodecFormat::FLAC, 2, 44100, 16}};
     auto& player2 = client2.add_player(player_config2);
     ASSERT_TRUE(client2.start());
     player2.set_output_delay_adjustable(true);
@@ -1476,6 +1478,7 @@ TEST(PlayerRoleOutputDelay, InvalidPersistedValueIsTreatedAsAbsent) {
     client.set_persistence_provider(&provider);
 
     PlayerRoleConfig player_config;
+    player_config.audio_formats = {{SendspinCodecFormat::FLAC, 2, 44100, 16}};
     player_config.initial_output_delay_ms = 77;
     auto& player = client.add_player(player_config);
     ASSERT_TRUE(client.start());

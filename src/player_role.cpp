@@ -20,6 +20,7 @@
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 
+#include <algorithm>
 #include <charconv>
 
 static const char* const TAG = "sendspin.player";
@@ -70,6 +71,18 @@ static int64_t be64_to_host(const uint8_t* bytes) {
 }
 
 namespace sendspin {
+
+/// @brief Reports whether every server can serve this format list.
+///
+/// roles/player/v1.md "client/hello player@v1 support object" requires supported_formats to be a
+/// non-empty list in which the player lists either flac or pcm, since those are the two codecs
+/// every server supports; opus alone leaves servers without opus unable to stream to the player.
+/// An empty list fails the same check, having no such entry.
+static bool audio_formats_are_serveable(const std::vector<AudioSupportedFormatObject>& formats) {
+    return std::any_of(formats.begin(), formats.end(), [](const AudioSupportedFormatObject& fmt) {
+        return fmt.codec == SendspinCodecFormat::FLAC || fmt.codec == SendspinCodecFormat::PCM;
+    });
+}
 
 // ============================================================================
 // Helpers
@@ -204,9 +217,14 @@ void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
 }
 
 bool PlayerRole::Impl::start() {
+    if (!audio_formats_are_serveable(this->config.audio_formats)) {
+        SS_LOGE(TAG, "PlayerRoleConfig::audio_formats must list a flac or pcm entry");
+        return false;
+    }
+
     this->load_output_delay();
 
-    if (this->config.audio_formats.empty() || !this->listener) {
+    if (!this->listener) {
         return true;
     }
     // Init once (event flags, ring buffer); the thread is created on every start(), including a

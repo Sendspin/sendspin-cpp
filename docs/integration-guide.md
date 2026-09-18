@@ -85,7 +85,7 @@ player_config.min_buffer_ms = 500;               // Ongoing buffer requested fro
 auto& player = client.add_player(std::move(player_config));
 ```
 
-Each `AudioSupportedFormatObject` declares a codec/channels/sample_rate/bit_depth combination. The server selects from these when establishing an audio stream.
+Each `AudioSupportedFormatObject` declares a codec/channels/sample_rate/bit_depth combination. The server selects from these when establishing an audio stream. The list must include at least one `FLAC` or `PCM` entry, since those are the codecs every server supports; `client.start()` fails and logs if it does not.
 
 The stream parameters negotiated by the server are available via `get_current_stream_params()`, which returns a `ServerPlayerStreamObject` with these fields:
 
@@ -1178,7 +1178,7 @@ Configuration passed to `client.add_player()`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports; advertised to the server during the hello handshake. The server selects one when establishing a stream. |
+| `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports, in priority order; advertised to the server during the hello handshake. The server selects one when establishing a stream. Must list at least one `FLAC` or `PCM` entry, the codecs every server supports; `start()` fails and logs otherwise. |
 | `audio_buffer_capacity` | `size_t` | `1000000` | Internal ring buffer size in bytes. Larger buffers absorb more jitter at the cost of memory. |
 | `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable output delay. |
 | `initial_output_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable output delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
