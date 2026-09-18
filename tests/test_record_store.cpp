@@ -1009,9 +1009,8 @@ TEST(FilePersistenceProvider, RecordWithoutServerIdIsSkipped) {
         << "the accepted record must not be warned about; got: " << logs;
 }
 
-// The clear_* revocations (Pairing PSK / static PIN) carry the same contract via erase_blob():
-// absent-or-erased both report success, so a fresh device never logs a spurious durability
-// warning on first clear.
+// erase_blob() reports success for an absent key as well as an erased one, so an application
+// wiping the library keyspace on a fresh device gets no spurious failure.
 TEST(FilePersistenceProvider, ClearPairingPskAndStaticPinReportSuccess) {
     TempFile tmp;
     FilePersistenceProvider provider(tmp.path());

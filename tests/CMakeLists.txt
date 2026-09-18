@@ -87,10 +87,10 @@ target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
 set_source_files_properties(test_pin_state_machine.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
-# test_encrypted_lifecycle.cpp needs it too: the unpair tests assert that the matched record left
-# the RecordStore itself, and the client exposes no accessor for its store. The alternative (a
-# second handshake on the revoked psk_id) would answer the same question through a timing-bound
-# reconnect instead of a direct read.
+# test_encrypted_lifecycle.cpp uses it for one read: the unpair tests assert that the matched
+# record left the RecordStore for the current boot, and the client exposes no accessor for its
+# store. The persisted half of the same removal is observable through the test's persistence
+# provider without the flag.
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

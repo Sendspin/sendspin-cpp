@@ -879,7 +879,7 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
 // Seeds a set of LONG_TERM records and keeps the persisted "records" array up to date, so an
 // unpair test can assert on what the store would come back with after a reboot as well as on
 // what it resolves right now. TestPersistenceProvider rejects writes on purpose (see its
-// comment), which is exactly what these tests need to observe.
+// comment), so it cannot show what a removal persists; this provider accepts them.
 class RecordsMirrorPersistenceProvider : public SendspinPersistenceProvider {
 public:
     explicit RecordsMirrorPersistenceProvider(std::vector<SendspinPairingRecord> records)

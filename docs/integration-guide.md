@@ -511,12 +511,10 @@ produces -- it is not something a provider hand-rolls its own version of.
   after a reboot), and a rejected write of a removal means the store still holds the old array
   and will hand the revoked record back at the next boot, silently making the revoked PSK valid
   again (the revoked record is always dropped from RAM regardless of the return value).
-- `erase_blob()` is only ever called for `persistence_keys::PAIRING_PSK` and
-  `persistence_keys::STATIC_PIN` (a removal from `RECORDS` re-saves the shrunken array instead,
-  so that key stays present). Absent counts as success. Same durability contract as a rejected
-  save: the in-memory effect of the clear always happens regardless of the return value, but a
-  `false` return means the cleared PSK/PIN may still be in the store and will resume
-  authenticating pairing attempts / admitting the static PIN after a reboot.
+- `erase_blob()` is not called by the library: every blob it owns is rewritten in place or left
+  alone (a removal from `RECORDS` re-saves the shrunken array, so that key stays present).
+  Implement it anyway so the store has a working delete for an application that wipes the
+  library keyspace itself, for example on a factory reset. Absent counts as success.
 
 #### Record capacity
 

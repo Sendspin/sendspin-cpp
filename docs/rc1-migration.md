@@ -24,7 +24,10 @@ item against the current code before acting on it; line numbers drift as phases 
   secrets themselves) is construction-time only: `RecordStore` reads it from the persistence
   provider at `start()` and never writes it back. With the management namespace gone the library
   has no runtime mutators for any of it, so a device changes its pairing policy by writing the
-  blobs and restarting. A public runtime API for it is possible later work.
+  blobs and restarting. A public runtime API for it is possible later work. Until one exists,
+  the `pairing.md` "Unpaired Access" rule that a client which stops admitting unpaired access
+  closes the connections relying on it with `client/goodbye` reason `pairing_required` cannot
+  fire, because the setting cannot change while the client runs.
 
 ## Conformance oracle
 
