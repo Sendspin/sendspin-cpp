@@ -105,6 +105,13 @@ set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
+# test_noise_transport.cpp uses it for one read: the reassembly buffer's capacity, which is the
+# only observable of the growth policy (the message that reaches the listener is the same either
+# way) and which NoiseTransport exposes nowhere, deliberately -- its size is an allocation
+# decision, not protocol state.
+set_source_files_properties(test_noise_transport.cpp PROPERTIES
+    COMPILE_OPTIONS "-fno-access-control")
+
 # test_cpace.cpp needs the same treatment for one reason: pinning CPace::derive()/tag()/isk()
 # against the reference vectors requires a known scalar, and start() always samples a fresh one
 # from the CSPRNG. The fixed-scalar KAT overwrites the private scalar_/public_share_ instead of

@@ -390,9 +390,13 @@ bool NoiseTransport::grow_buffer(PlatformBuffer& buf, size_t needed, size_t cap,
 }
 
 bool NoiseTransport::reasm_reserve(size_t needed) {
-    // Uncapped: fragmented messages are already size-limited by MAX_REASSEMBLED_MESSAGE_BYTES
-    // at the caller (accept_plaintext), before this is reached.
-    return this->grow_buffer(this->reasm_buf_, needed, 0, "reassembly");
+    // Capped at MAX_REASSEMBLED_MESSAGE_BYTES + 1: the caller's own size check (accept_plaintext)
+    // admits a `needed` of exactly that much, one byte of orig_type plus the largest message it
+    // will reassemble. Without the cap the doubling step above that admitted size would reserve
+    // ~2 MiB per connection, retained for the connection's life, which a peer picks by choosing
+    // its fragment sizes.
+    return this->grow_buffer(this->reasm_buf_, needed, MAX_REASSEMBLED_MESSAGE_BYTES + 1,
+                             "reassembly");
 }
 
 bool NoiseTransport::ensure_send_buf(size_t needed) {

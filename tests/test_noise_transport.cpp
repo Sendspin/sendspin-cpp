@@ -1165,6 +1165,37 @@ TEST(FragmentSequence, OverCapMessageIsDiscardedWithoutClosing) {
     EXPECT_EQ(rx.last_message_, (std::vector<uint8_t>{'{', '}'}));
 }
 
+TEST(FragmentSequence, ReassemblyBufferNeverGrowsPastTheCap) {
+    // The reassembly buffer grows geometrically and keeps its capacity for the connection's
+    // life, so the doubling is what decides the peak, not the message. A peer picks its fragment
+    // sizes: the largest message the cap admits arrives one small fragment past a buffer that is
+    // already nearly a full MAX_REASSEMBLED_MESSAGE_BYTES, which is where an unclamped double
+    // reserves ~2 MiB (~3 MiB in flight while the realloc copies), times MAX_OPEN_CONNECTIONS.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    const size_t chunk = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) - 2;
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, 0xAA});
+    size_t data_len = 1;
+    while (data_len + chunk <= MAX_REASSEMBLED_MESSAGE_BYTES) {
+        rx.inject_fragment(0, std::vector<uint8_t>(chunk, 'X'));
+        data_len += chunk;
+    }
+    // Everything the cap still has room for, which no full-size fragment could deliver. It
+    // reaches past the buffer the full fragments left behind, so the growth step runs on it.
+    const size_t tail = MAX_REASSEMBLED_MESSAGE_BYTES - data_len;
+    ASSERT_GT(tail, 0u) << "the fragment sizes no longer leave a partial fragment under the cap";
+    ASSERT_LT(tail, chunk);
+    rx.inject_fragment(FRAGMENT_FLAG_LAST, std::vector<uint8_t>(tail, 'X'));
+
+    EXPECT_FALSE(rx.closed());
+    EXPECT_EQ(rx.json_dispatched_, 1)
+        << "a message that fits the cap must still reassemble and dispatch";
+    EXPECT_LE(rx.conn_.noise_transport_.reasm_buf_.size(), MAX_REASSEMBLED_MESSAGE_BYTES + 1)
+        << "the reassembly buffer outgrew the largest message it will ever hold";
+}
+
 TEST(FragmentSequence, FirstFragmentInsideADiscardedSequenceCloses) {
     // Discarding a message does not end its sequence, so a first fragment arriving inside one is
     // the same malformed sequence it would be for a buffered message. This is the case the
