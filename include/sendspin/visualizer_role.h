@@ -159,7 +159,8 @@ public:
     /// @brief Requests a different stream format from the server via stream/request-format
     ///
     /// If a visualizer stream is active, the server responds with a stream/start carrying
-    /// the new configuration; otherwise it remembers the request for the next stream.
+    /// the new configuration; otherwise it remembers the request for the next stream. Sent only
+    /// while the server has visualizer@v1 among the connection's active roles.
     /// @param request Fields to change; omitted fields keep their current value
     void request_format(const VisualizerFormatRequest& request);
 

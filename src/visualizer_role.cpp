@@ -228,7 +228,7 @@ void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
 void VisualizerRole::Impl::request_format(const VisualizerFormatRequest& request) const {
     StreamRequestFormatMessage msg{};
     msg.visualizer = request;
-    this->client->send_text(format_stream_request_format_message(&msg));
+    this->client->send_text(format_stream_request_format_message(&msg), "visualizer");
 }
 
 // ============================================================================

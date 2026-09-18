@@ -659,9 +659,16 @@ public:
     /// @brief Publishes the current client state to the active connection
     void publish_state();
 
-    /// @brief Sends a text message over the active connection
+    /// @brief Sends a role-originated text message over the active connection
+    ///
+    /// Dropped unless that role is active on the connection: messaging.md "server/activate"
+    /// tolerates inactive-role objects on the server side precisely because a client that has
+    /// received the role removal stops sending them. Also suppressed while the connection's last
+    /// activation declares a pairing activity, like client/state.
     /// @param text The text message to send
-    void send_text(const std::string& text);
+    /// @param role_family Role family the message belongs to, without the version suffix
+    ///                    ("controller", "visualizer"), matched against the active roles
+    void send_text(const std::string& text, const std::string& role_family);
 
     /// @brief Acquires a ref-counted high-performance networking request
     void acquire_high_performance();

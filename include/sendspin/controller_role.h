@@ -155,6 +155,10 @@ public:
     void set_listener(ControllerRoleListener* listener);
 
     /// @brief Sends a controller command to the server
+    ///
+    /// Sent only while the server has controller@v1 among the connection's active roles; a
+    /// command issued before the first server/activate, or after one that removes the role, is
+    /// dropped rather than queued.
     /// @param cmd The command plus any command-specific parameters
     void send_command(const ClientCommandControllerObject& cmd);
 

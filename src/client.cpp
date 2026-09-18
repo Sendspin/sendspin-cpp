@@ -912,7 +912,7 @@ void SendspinClient::publish_state() {
     this->publish_client_state(this->connection_manager_->current());
 }
 
-void SendspinClient::send_text(const std::string& text) {
+void SendspinClient::send_text(const std::string& text, const std::string& role_family) {
     // Single choke point for every role-originated send that is not a protocol-internal pairing
     // message (controller commands, visualizer stream/request-format): pairing messages are sent
     // directly via SendspinConnection::send_app_json() from connection_manager.cpp and never
@@ -922,9 +922,17 @@ void SendspinClient::send_text(const std::string& text) {
     // well-behaved consumer would not be issuing role commands here anyway; this gate defends the
     // wire even if it does. See the loop() has_activity(PAIRING) gate for the spec rationale.
     auto* conn = this->connection_manager_->current();
-    if (conn != nullptr && conn->is_connected() && !conn->has_activity(SendspinActivity::PAIRING)) {
-        conn->send_app_json(text, nullptr);
+    if (conn == nullptr || !conn->is_connected() || conn->has_activity(SendspinActivity::PAIRING)) {
+        return;
     }
+    // The role's own gate, matching the one publish_client_state() applies to the player object:
+    // a role that the server has not activated, or has removed, drives no traffic of its own.
+    if (!conn->is_role_active(role_family)) {
+        SS_LOGD(TAG, "Dropping a %s message: the role is not active on this connection",
+                role_family.c_str());
+        return;
+    }
+    conn->send_app_json(text, nullptr);
 }
 
 void SendspinClient::acquire_high_performance() {

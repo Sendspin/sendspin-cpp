@@ -603,6 +603,13 @@ public:
         return this->pair_init_preceded_finalize_;
     }
 
+    // Number of client/command messages received so far, with the command each carried. Lets a
+    // test show that a role message was, or was not, sent while its role was inactive.
+    std::vector<std::string> controller_commands() const {
+        std::lock_guard<std::mutex> lock(this->pair_mutex_);
+        return this->controller_commands_;
+    }
+
     // Number of client/state messages received so far. Used to prove a client/state was, or was
     // not, sent before some later event (e.g. client/pair-finalize): a real server awaiting
     // pair-finalize treats an intervening client/state as a protocol error and hard-drops the
@@ -774,6 +781,12 @@ private:
             return;
         }
 
+        if (std::strcmp(type, "client/command") == 0) {
+            std::lock_guard<std::mutex> plock(this->pair_mutex_);
+            this->controller_commands_.push_back(doc["payload"]["controller"]["command"] | "");
+            return;
+        }
+
         if (std::strcmp(type, "client/state") == 0) {
             this->client_state_count_.fetch_add(1);
             return;
@@ -842,6 +855,7 @@ private:
     mutable std::mutex pair_mutex_;
     std::optional<std::array<uint8_t, NOISE_PSK_SIZE>> learned_psk_;
     std::optional<std::string> learned_psk_id_;
+    std::vector<std::string> controller_commands_;
     std::optional<PairInitRecord> pair_init_;
     bool pair_init_preceded_finalize_{false};
 

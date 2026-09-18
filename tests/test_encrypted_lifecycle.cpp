@@ -33,6 +33,7 @@
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/controller_role.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/persistence_codec.h"
 #include "sendspin/types.h"
@@ -75,6 +76,7 @@ constexpr uint16_t REVOCATION_SWEEP_TEST_PORT = 19002;
 constexpr uint16_t REACTIVATE_PAIRING_TEST_PORT = 19003;
 constexpr uint16_t UNPAIR_RECORD_TEST_PORT = 19004;
 constexpr uint16_t UNPAIR_SENTINEL_TEST_PORT = 19005;
+constexpr uint16_t INACTIVE_ROLE_SEND_TEST_PORT = 19006;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -841,6 +843,55 @@ TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
         << "An unauthenticated binary frame must close the connection, not be dispatched";
 
     ws.stop();
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// A role that the server has not activated drives no traffic of its own: messaging.md
+// "server/activate" has servers tolerate inactive-role objects only because a client that has
+// received the removal stops sending them. The client is admitted here with the player role
+// alone, so its controller commands must stay off the wire until an activate adds the role.
+TEST(EncryptedLifecycle, ControllerCommandsWaitForTheRoleToBeActive) {
+    SendspinClientConfig config;
+    config.name = "Inactive Role Send Test Client";
+    config.server_port = INACTIVE_ROLE_SEND_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    auto& controller = client.add_controller();
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["player@v1"])";
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(INACTIVE_ROLE_SEND_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000))
+        << "the connection never reached the admitted state";
+
+    controller.send_command({.command = SendspinControllerCommand::PLAY});
+    pump_for(client, 100);
+    EXPECT_TRUE(server->controller_commands().empty())
+        << "a controller command was sent while controller@v1 was not active";
+
+    // Control: the same command goes out once an activate adds the role, so the gate is refusing
+    // on activation rather than dropping controller commands outright.
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/activate","payload":{"activities":["playback"],)"
+        R"("active_roles":["player@v1","controller@v1"]}})"));
+    ASSERT_TRUE(pump_until(
+        client,
+        [&] {
+            controller.send_command({.command = SendspinControllerCommand::PLAY});
+            return !server->controller_commands().empty();
+        },
+        4000))
+        << "a controller command was dropped while controller@v1 was active";
+    EXPECT_EQ(server->controller_commands().front(), "play");
+
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
 }

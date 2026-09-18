@@ -938,6 +938,8 @@ controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .o
 
 Fields that do not match the command are ignored when the message is serialized. The server clamps seeks to the seekable range and ignores any command not present in the controller state's `supported_commands`.
 
+A command is sent only while the server has `controller@v1` among the connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued.
+
 ## Accessing Roles
 
 In addition to the references returned by `add_*()`, you can access roles at any time through the client's accessor methods. These return `nullptr` if the role was not added.
