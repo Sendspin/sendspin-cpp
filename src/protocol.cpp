@@ -220,8 +220,8 @@ static bool process_server_player_command_object(const JsonObject player_object,
         player_cmd->mute = v;
     }
 
-    if (auto v = read_uint_field<uint16_t>(player_object["static_delay_ms"], "static_delay_ms")) {
-        player_cmd->static_delay_ms = v;
+    if (auto v = read_uint_field<uint16_t>(player_object["output_delay_ms"], "output_delay_ms")) {
+        player_cmd->output_delay_ms = v;
     }
 
     return true;
@@ -1002,7 +1002,7 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
         const ClientPlayerStateObject& player_state = msg->player.value();
         root["payload"]["player"]["volume"] = player_state.volume;
         root["payload"]["player"]["muted"] = player_state.muted;
-        root["payload"]["player"]["static_delay_ms"] = player_state.static_delay_ms;
+        root["payload"]["player"]["output_delay_ms"] = player_state.output_delay_ms;
         if (!player_state.supported_commands.empty()) {
             JsonArray commands_list =
                 root["payload"]["player"]["supported_commands"].to<JsonArray>();

@@ -289,7 +289,7 @@ Three stages, processed in order:
 
 **1. Client state updates**: Takes from `state_slot` (latest-wins `InboxSlot`, written by the sync task). Calls `client_->update_state()`.
 
-**2. Server commands**: Takes from `command_slot`. Checks each field independently (volume, mute, static_delay) and fires the corresponding listener callback.
+**2. Server commands**: Takes from `command_slot`. Checks each field independently (volume, mute, output_delay) and fires the corresponding listener callback.
 
 **3. Stream lifecycle**: The most complex part:
 

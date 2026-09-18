@@ -39,7 +39,7 @@ class SendspinPersistenceProvider;
 enum class SendspinPlayerCommand : uint8_t {
     VOLUME,            // Set playback volume
     MUTE,              // Set mute state
-    SET_STATIC_DELAY,  // Set static playback delay
+    SET_OUTPUT_DELAY,  // Set the output delay
 };
 
 /// @brief Stream parameters sent by the server in stream/start messages
@@ -61,7 +61,7 @@ struct ServerPlayerCommandObject {
     SendspinPlayerCommand command{};
     std::optional<uint8_t> volume;
     std::optional<bool> mute;
-    std::optional<uint16_t> static_delay_ms;
+    std::optional<uint16_t> output_delay_ms;
 };
 
 /// @brief Parsed server/command message envelope, containing per-role command objects
@@ -73,7 +73,7 @@ struct ServerCommandMessage {
 ///
 /// THREAD SAFETY: on_audio_write() fires on the sync task's background thread.
 /// Implementations must be thread-safe for this method. on_stream_start(), on_stream_end(),
-/// on_volume_changed(), on_mute_changed(), and on_static_delay_changed()
+/// on_volume_changed(), on_mute_changed(), and on_output_delay_changed()
 /// fire on the main loop thread via drain_events(). The listener must outlive the role.
 class PlayerRoleListener {
 public:
@@ -103,8 +103,8 @@ public:
     /// @brief Called when the mute state is changed by the server. Fires on the main loop thread
     virtual void on_mute_changed(bool /*muted*/) {}
 
-    /// @brief Called when the static delay is changed by the server. Fires on the main loop thread
-    virtual void on_static_delay_changed(uint16_t /*delay_ms*/) {}
+    /// @brief Called when the output delay is changed by the server. Fires on the main loop thread
+    virtual void on_output_delay_changed(uint16_t /*delay_ms*/) {}
 };
 
 /**
@@ -171,22 +171,22 @@ public:
     /// @param muted true to mute, false to unmute
     void update_muted(bool muted);
 
-    /// @brief Updates the stored static delay preference and publishes client state to the server.
+    /// @brief Updates the stored output delay preference and publishes client state to the server.
     ///
     /// The value is always persisted (if a persistence provider is set), independent of
     /// adjustability. If adjustability is currently disabled, the stored value has no
     /// effect on sync timing until adjustability is re-enabled.
-    /// @param delay_ms Static delay in milliseconds
-    void update_static_delay(uint16_t delay_ms);
+    /// @param delay_ms Output delay in milliseconds
+    void update_output_delay(uint16_t delay_ms);
 
-    /// @brief Enables or disables the static delay adjustment command.
+    /// @brief Enables or disables the output delay adjustment command.
     ///
     /// When disabled, the stored delay is not applied to audio sync timing and is reported
     /// as 0 in client state, per the Sendspin spec (a delay that is not exposed as a knob
     /// must not be applied). The stored value is preserved and takes effect again if
     /// adjustability is re-enabled.
     /// @param adjustable true if the delay can be adjusted at runtime
-    void set_static_delay_adjustable(bool adjustable);
+    void set_output_delay_adjustable(bool adjustable);
 
     // ========================================
     // Queries
@@ -204,9 +204,9 @@ public:
     /// @return true if muted, false otherwise.
     bool get_muted() const;
 
-    /// @brief Returns the effective static delay in milliseconds
-    /// @return Static playback delay in milliseconds, or 0 if the delay is not adjustable.
-    uint16_t get_static_delay_ms() const;
+    /// @brief Returns the effective output delay in milliseconds
+    /// @return Output delay in milliseconds, or 0 if the delay is not adjustable.
+    uint16_t get_output_delay_ms() const;
 
     /// @brief Returns the current volume level
     /// @return Current volume level (0-100).

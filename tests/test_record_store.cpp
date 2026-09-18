@@ -1428,62 +1428,62 @@ TEST(RecordStore, RecordByPskIdCopyReturnsNulloptForAbsent) {
 }
 
 // =============================================================================
-// Player static delay: ASCII-decimal round-trip via persistence_keys::STATIC_DELAY
+// Player output delay: ASCII-decimal round-trip via persistence_keys::OUTPUT_DELAY
 // =============================================================================
 
-// update_static_delay() must persist an ASCII decimal string (not raw uint16_t bytes):
-// debuggable and endian-free, per persistence_keys::STATIC_DELAY's contract.
-TEST(PlayerRoleStaticDelay, PersistsAsAsciiDecimal) {
+// update_output_delay() must persist an ASCII decimal string (not raw uint16_t bytes):
+// debuggable and endian-free, per persistence_keys::OUTPUT_DELAY's contract.
+TEST(PlayerRoleOutputDelay, PersistsAsAsciiDecimal) {
     InMemoryPersistenceProvider provider;
     SendspinClientConfig config;
-    config.name = "static-delay-round-trip-test";
+    config.name = "output-delay-round-trip-test";
     SendspinClient client(std::move(config));
     client.set_persistence_provider(&provider);
 
     PlayerRoleConfig player_config;
     auto& player = client.add_player(player_config);
     ASSERT_TRUE(client.start());
-    player.set_static_delay_adjustable(true);
-    player.update_static_delay(1234);
+    player.set_output_delay_adjustable(true);
+    player.update_output_delay(1234);
 
-    auto blob = provider.blob(persistence_keys::STATIC_DELAY);
+    auto blob = provider.blob(persistence_keys::OUTPUT_DELAY);
     ASSERT_TRUE(blob.has_value());
     EXPECT_EQ(std::string(blob->begin(), blob->end()), "1234")
-        << "static_delay must persist as an ASCII decimal string";
+        << "output_delay must persist as an ASCII decimal string";
 
     // And it must load back correctly on a fresh PlayerRole over the same provider.
     SendspinClientConfig config2;
-    config2.name = "static-delay-round-trip-test-2";
+    config2.name = "output-delay-round-trip-test-2";
     SendspinClient client2(std::move(config2));
     client2.set_persistence_provider(&provider);
     PlayerRoleConfig player_config2;
     auto& player2 = client2.add_player(player_config2);
     ASSERT_TRUE(client2.start());
-    player2.set_static_delay_adjustable(true);
-    EXPECT_EQ(player2.get_static_delay_ms(), 1234u);
+    player2.set_output_delay_adjustable(true);
+    EXPECT_EQ(player2.get_output_delay_ms(), 1234u);
 }
 
-// An unparseable persisted static_delay blob (corrupt bytes, not decimal digits) must be
-// treated as though nothing were saved, falling back to PlayerRoleConfig::initial_static_delay_ms
+// An unparseable persisted output_delay blob (corrupt bytes, not decimal digits) must be
+// treated as though nothing were saved, falling back to PlayerRoleConfig::initial_output_delay_ms
 // rather than crashing or reinterpreting garbage as a number.
-TEST(PlayerRoleStaticDelay, InvalidPersistedValueIsTreatedAsAbsent) {
+TEST(PlayerRoleOutputDelay, InvalidPersistedValueIsTreatedAsAbsent) {
     InMemoryPersistenceProvider provider;
-    provider.seed_blob(persistence_keys::STATIC_DELAY, to_bytes("not-a-number"));
+    provider.seed_blob(persistence_keys::OUTPUT_DELAY, to_bytes("not-a-number"));
 
     SendspinClientConfig config;
-    config.name = "static-delay-invalid-test";
+    config.name = "output-delay-invalid-test";
     SendspinClient client(std::move(config));
     client.set_persistence_provider(&provider);
 
     PlayerRoleConfig player_config;
-    player_config.initial_static_delay_ms = 77;
+    player_config.initial_output_delay_ms = 77;
     auto& player = client.add_player(player_config);
     ASSERT_TRUE(client.start());
-    player.set_static_delay_adjustable(true);
+    player.set_output_delay_adjustable(true);
 
-    EXPECT_EQ(player.get_static_delay_ms(), 77u)
-        << "an unparseable static_delay blob must be treated as absent, falling back to "
-           "initial_static_delay_ms";
+    EXPECT_EQ(player.get_output_delay_ms(), 77u)
+        << "an unparseable output_delay blob must be treated as absent, falling back to "
+           "initial_output_delay_ms";
 }
 
 // ============================================================================

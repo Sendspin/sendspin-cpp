@@ -60,7 +60,7 @@ struct TuiSnapshot {
     std::optional<uint32_t> sample_rate;
     std::optional<uint8_t> bit_depth;
     std::optional<uint8_t> channels;
-    uint16_t static_delay_ms{0};
+    uint16_t output_delay_ms{0};
     bool connected{false};
     bool time_synced{false};
     std::string group_name;
@@ -113,7 +113,7 @@ static TuiSnapshot take_snapshot(TuiState& state) {
     snap.sample_rate = state.sample_rate;
     snap.bit_depth = state.bit_depth;
     snap.channels = state.channels;
-    snap.static_delay_ms = state.static_delay_ms;
+    snap.output_delay_ms = state.output_delay_ms;
     snap.connected = state.connected;
     snap.time_synced = state.time_synced;
     snap.group_name = state.group_name;
@@ -391,7 +391,7 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
         info_row("Rate:     ", rate_display, has_stream),
         info_row("Depth:    ", depth_display, has_stream),
         info_row("Channels: ", channels_display, has_stream),
-        info_row("Delay:    ", "+" + std::to_string(snap.static_delay_ms) + "ms", true),
+        info_row("Delay:    ", "+" + std::to_string(snap.output_delay_ms) + "ms", true),
         separator(),
         hbox({
             text("  "),
@@ -980,25 +980,25 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         return true;
     }
 
-    // Static delay increase
+    // Output delay increase
     if (event == Event::Character('.')) {
         {
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, ", / .");
         }
-        uint16_t delay = client.player()->get_static_delay_ms();
-        client.player()->update_static_delay(delay + 10);
+        uint16_t delay = client.player()->get_output_delay_ms();
+        client.player()->update_output_delay(delay + 10);
         return true;
     }
 
-    // Static delay decrease
+    // Output delay decrease
     if (event == Event::Character(',')) {
         {
             std::lock_guard<std::mutex> lock(state.mutex);
             set_highlight(state, ", / .");
         }
-        uint16_t delay = client.player()->get_static_delay_ms();
-        client.player()->update_static_delay(delay >= 10 ? delay - 10 : 0);
+        uint16_t delay = client.player()->get_output_delay_ms();
+        client.player()->update_output_delay(delay >= 10 ? delay - 10 : 0);
         return true;
     }
 
@@ -1030,7 +1030,7 @@ void update_polled_state(TuiState& state, SendspinClient& client) {
     state.track_duration_ms = client.metadata() ? client.metadata()->get_track_duration_ms() : 0;
     state.connected = client.is_connected();
     state.time_synced = client.is_time_synced();
-    state.static_delay_ms = client.player() ? client.player()->get_static_delay_ms() : 0;
+    state.output_delay_ms = client.player() ? client.player()->get_output_delay_ms() : 0;
     state.player_volume = client.player() ? client.player()->get_volume() : 0;
     state.player_muted = client.player() ? client.player()->get_muted() : false;
     state.group_name = client.get_group_state().group_name.value_or("");

@@ -549,7 +549,7 @@ int main(int argc, char* argv[]) {
     PlayerRoleConfig player_config;
     player_config.audio_formats = std::move(audio_formats);
     auto& player = client.add_player(std::move(player_config));
-    player.set_static_delay_adjustable(true);
+    player.set_output_delay_adjustable(true);
     auto& controller = client.add_controller();
     auto& metadata = client.add_metadata();
 
@@ -652,9 +652,9 @@ int main(int argc, char* argv[]) {
 #endif
         }
 
-        void on_static_delay_changed(uint16_t delay) override {
+        void on_output_delay_changed(uint16_t delay) override {
             std::lock_guard<std::mutex> lock(state.mutex);
-            state.static_delay_ms = delay;
+            state.output_delay_ms = delay;
         }
     };
 

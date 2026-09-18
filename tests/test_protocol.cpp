@@ -293,19 +293,19 @@ TEST(Protocol, PlayerCommandBooleanStrictness) {
 
 // Integer fields reject a float representation, even one with an integral value.
 TEST(Protocol, PlayerCommandRejectsFloatForInteger) {
-    auto valid = parse_player_command(R"({"command":"set_static_delay","static_delay_ms":250})");
+    auto valid = parse_player_command(R"({"command":"set_output_delay","output_delay_ms":250})");
     ASSERT_TRUE(valid.has_value());
-    ASSERT_TRUE(valid->static_delay_ms.has_value());
-    EXPECT_EQ(valid->static_delay_ms.value(), 250);
+    ASSERT_TRUE(valid->output_delay_ms.has_value());
+    EXPECT_EQ(valid->output_delay_ms.value(), 250);
 
-    auto fractional = parse_player_command(R"({"command":"set_static_delay","static_delay_ms":12.5})");
+    auto fractional = parse_player_command(R"({"command":"set_output_delay","output_delay_ms":12.5})");
     ASSERT_TRUE(fractional.has_value());
-    EXPECT_FALSE(fractional->static_delay_ms.has_value());
+    EXPECT_FALSE(fractional->output_delay_ms.has_value());
 
     auto integral_float =
-        parse_player_command(R"({"command":"set_static_delay","static_delay_ms":12.0})");
+        parse_player_command(R"({"command":"set_output_delay","output_delay_ms":12.0})");
     ASSERT_TRUE(integral_float.has_value());
-    EXPECT_FALSE(integral_float->static_delay_ms.has_value());
+    EXPECT_FALSE(integral_float->output_delay_ms.has_value());
 }
 
 // A malformed required scalar in stream/start (channels out of range) is dropped, leaving the player

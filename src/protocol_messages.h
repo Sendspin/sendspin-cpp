@@ -400,8 +400,8 @@ inline const char* to_cstr(SendspinPlayerCommand cmd) {
             return "volume";
         case SendspinPlayerCommand::MUTE:
             return "mute";
-        case SendspinPlayerCommand::SET_STATIC_DELAY:
-            return "set_static_delay";
+        case SendspinPlayerCommand::SET_OUTPUT_DELAY:
+            return "set_output_delay";
         default:
             return "unknown";
     }
@@ -414,8 +414,8 @@ inline std::optional<SendspinPlayerCommand> player_command_from_string(const std
     if (str == "mute") {
         return SendspinPlayerCommand::MUTE;
     }
-    if (str == "set_static_delay") {
-        return SendspinPlayerCommand::SET_STATIC_DELAY;
+    if (str == "set_output_delay") {
+        return SendspinPlayerCommand::SET_OUTPUT_DELAY;
     }
     return std::nullopt;
 }
@@ -431,7 +431,7 @@ struct PlayerSupportObject {
 struct ClientPlayerStateObject {
     uint8_t volume{};
     bool muted{};
-    uint16_t static_delay_ms{};
+    uint16_t output_delay_ms{};
     std::vector<SendspinPlayerCommand> supported_commands{};
 };
 

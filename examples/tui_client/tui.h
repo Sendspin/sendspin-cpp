@@ -71,7 +71,7 @@ struct TuiState {
     std::optional<uint32_t> sample_rate;
     std::optional<uint8_t> bit_depth;
     std::optional<uint8_t> channels;
-    uint16_t static_delay_ms{0};
+    uint16_t output_delay_ms{0};
 
     // Connection
     bool connected{false};

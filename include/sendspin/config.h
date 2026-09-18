@@ -297,7 +297,7 @@ struct PlayerRoleConfig {
     std::vector<AudioSupportedFormatObject> audio_formats{};
     size_t audio_buffer_capacity{DEFAULT_AUDIO_BUFFER_CAPACITY};
     int32_t fixed_delay_us{0};
-    uint16_t initial_static_delay_ms{0};
+    uint16_t initial_output_delay_ms{0};
 
     /// @brief Default extra silence (ms) inserted at stream start for decode-pipeline headroom
     static constexpr uint16_t DEFAULT_EXTRA_STARTUP_SILENCE_MS = 50U;

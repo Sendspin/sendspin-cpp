@@ -73,7 +73,7 @@ struct PlayerRole::Impl {
     void handle_server_command(const ServerCommandMessage& cmd) const;
     void on_stream_ring_event(PlayerStreamCallbackType event);
     // True if this tick has drainable player work. The command-slot bit covers server
-    // volume/mute/static-delay commands; the state-slot bit covers client-state updates from
+    // volume/mute/output-delay commands; the state-slot bit covers client-state updates from
     // the sync task; a non-empty awaiting_sync_idle_events is a main-thread-only flag set by
     // on_stream_ring_event() above during this tick's ring dispatch, or carried over from a
     // prior tick while a STREAM_END waits for the sync task to go idle. stream_params_slot's
@@ -95,7 +95,7 @@ struct PlayerRole::Impl {
 
     void update_volume(uint8_t volume);
     void update_muted(bool muted);
-    void update_static_delay(uint16_t delay_ms);
+    void update_output_delay(uint16_t delay_ms);
 
     // ========================================
     // Helpers
@@ -105,9 +105,9 @@ struct PlayerRole::Impl {
                           uint8_t chunk_type, uint32_t timeout_ms) const;
     void enqueue_state_update(SendspinClientState state) const;
     void enqueue_stream_event(PlayerStreamCallbackType event) const;
-    void load_static_delay();
-    void persist_static_delay() const;
-    uint16_t get_effective_static_delay_ms() const;
+    void load_output_delay();
+    void persist_output_delay() const;
+    uint16_t get_effective_output_delay_ms() const;
 
     // ========================================
     // Fields
@@ -133,7 +133,7 @@ struct PlayerRole::Impl {
     uint32_t cleanup_generation{0};
 
     // 16-bit fields
-    std::atomic<uint16_t> static_delay_ms{0};
+    std::atomic<uint16_t> output_delay_ms{0};
 
     // 8-bit fields
     bool high_performance_requested_for_playback{false};
@@ -141,7 +141,7 @@ struct PlayerRole::Impl {
     // True between the drained STREAM_START and STREAM_END callbacks (main-thread only); keeps
     // on_stream_end() from firing without a matching on_stream_start()
     bool stream_active{false};
-    std::atomic<bool> static_delay_adjustable{false};
+    std::atomic<bool> output_delay_adjustable{false};
     uint8_t volume{0};
 };
 

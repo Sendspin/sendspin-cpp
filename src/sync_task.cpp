@@ -594,7 +594,7 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
     } else if (sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) {
         int64_t client_timestamp =
             this->client_->get_client_time(sync_context.encoded_entry->timestamp) -
-            static_cast<int64_t>(this->player_impl_->get_effective_static_delay_ms()) * US_PER_MS -
+            static_cast<int64_t>(this->player_impl_->get_effective_output_delay_ms()) * US_PER_MS -
             this->player_impl_->config.fixed_delay_us;
 
         if (client_timestamp < sync_context.new_audio_client_playtime - HARD_SYNC_THRESHOLD_US) {

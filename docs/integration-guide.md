@@ -77,7 +77,7 @@ player_config.audio_formats = {
 };
 player_config.audio_buffer_capacity = 1000000;   // Ring buffer size in bytes (default: 1000000)
 player_config.fixed_delay_us = 0;                // Fixed delay offset in microseconds
-player_config.initial_static_delay_ms = 0;       // Initial user-adjustable delay
+player_config.initial_output_delay_ms = 0;       // Initial user-adjustable delay
 player_config.extra_startup_silence_ms = 50;     // Extra startup silence for decode headroom (default: 50)
 
 auto& player = client.add_player(std::move(player_config));
@@ -218,8 +218,8 @@ struct MyPlayerListener : PlayerRoleListener {
         my_audio_output.set_muted(muted);
     }
 
-    // Optional: Called when the server changes the static delay.
-    void on_static_delay_changed(uint16_t delay_ms) override { }
+    // Optional: Called when the server changes the output delay.
+    void on_output_delay_changed(uint16_t delay_ms) override { }
 };
 ```
 
@@ -495,7 +495,7 @@ for each of these:
 | `persistence_keys::STATIC_PIN` | Raw UTF-8 bytes: the configured static PIN string. |
 | `persistence_keys::PAIR_CONFIG` | The `SendspinPairingConfig` as one codec blob (`encode_pairing_config()` / `decode_pairing_config()`). |
 | `persistence_keys::LAST_PLAYED` | Raw UTF-8 bytes: the `server_id` (base64url public key) of the last server that played audio. |
-| `persistence_keys::STATIC_DELAY` | ASCII decimal string (e.g. `"150"`): the player's static delay in milliseconds. Chosen over raw `uint16_t` bytes for debuggability and to avoid an endianness dependency. |
+| `persistence_keys::OUTPUT_DELAY` | ASCII decimal string (e.g. `"150"`): the player's output delay in milliseconds. Chosen over raw `uint16_t` bytes for debuggability and to avoid an endianness dependency. |
 
 `sendspin/persistence_codec.h` is public so a custom provider (or a test) can inspect or seed
 the `RECORDS` / `PAIRING_PSK` / `PAIR_CONFIG` content in exactly the format the library itself
@@ -555,7 +555,7 @@ struct MyPersistenceProvider : SendspinPersistenceProvider {
 A provider backed by a single flat NVS namespace (as above) can often implement the whole
 interface generically, since every key is already sized to fit and the library handles
 serialization; a provider that needs different backing per key (e.g. a plaintext-secrets file
-plus separate flash-wear-optimized storage for `STATIC_DELAY`) can switch on `key` instead.
+plus separate flash-wear-optimized storage for `OUTPUT_DELAY`) can switch on `key` instead.
 
 ### SendspinClientListener (Optional)
 
@@ -966,11 +966,11 @@ Report local state changes back to the server:
 ```cpp
 player.update_volume(75);
 player.update_muted(false);
-player.update_static_delay(50);  // User-adjustable delay in ms
+player.update_output_delay(50);  // User-adjustable delay in ms
 
-// Enable/disable static delay adjustment by the server. When disabled, the stored delay
+// Enable/disable output delay adjustment by the server. When disabled, the stored delay
 // is not applied to sync timing and is reported as 0 in client state.
-player.set_static_delay_adjustable(true);
+player.set_output_delay_adjustable(true);
 ```
 
 ## Updating Client State
@@ -997,7 +997,7 @@ ConnectionTrust trust = client.get_current_trust();          // Active connectio
 // Player state
 uint8_t vol = player.get_volume();
 bool muted = player.get_muted();
-uint16_t delay = player.get_static_delay_ms();
+uint16_t delay = player.get_output_delay_ms();
 int32_t fixed = player.get_fixed_delay_us();
 auto& stream = player.get_current_stream_params();
 
@@ -1178,8 +1178,8 @@ Configuration passed to `client.add_player()`.
 |---|---|---|---|
 | `audio_formats` | `std::vector<AudioSupportedFormatObject>` | `{}` | Audio formats the player supports; advertised to the server during the hello handshake. The server selects one when establishing a stream. |
 | `audio_buffer_capacity` | `size_t` | `1000000` | Internal ring buffer size in bytes. Larger buffers absorb more jitter at the cost of memory. |
-| `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable static delay. |
-| `initial_static_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable static delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
+| `fixed_delay_us` | `int32_t` | `0` | Fixed platform-level delay offset in microseconds (e.g., a known I2S pipeline delay). Applied on top of the user-adjustable output delay. |
+| `initial_output_delay_ms` | `uint16_t` | `0` | Initial value for the user-adjustable output delay in milliseconds. Overridden by the persisted value if a `SendspinPersistenceProvider` is set. |
 | `extra_startup_silence_ms` | `uint16_t` | `50` | Extra silence inserted at stream start, after the first playback notification and before the first decoded chunk reaches the sink. Added on top of the initial-sync priming silence to give the decode pipeline more slack to stay ahead of the sink, preventing the initial-playback stutter caused by the decoder briefly falling behind. Larger values trade a longer startup delay for more underflow protection; set to `0` to disable. |
 | `psram_stack` | `bool` | `false` | Allocate sync/decode task stack in PSRAM (ESP-IDF only) |
 | `priority` | `unsigned` | `6` | FreeRTOS priority for the sync/decode task (ESP-IDF only). The default value, `6`, is one above the default `httpd_priority` (`5`). If you customize priorities, keep this above `httpd_priority` so the HTTP server task cannot starve the decoder during the initial burst of encoded audio that fills the buffer at stream start. |
@@ -1310,9 +1310,9 @@ Delivered via `SendspinClientListener::on_pairing_failed`.
 |---|---|
 | `VOLUME` | Volume adjustment from the server |
 | `MUTE` | Mute state change from the server |
-| `SET_STATIC_DELAY` | Static delay adjustment from the server |
+| `SET_OUTPUT_DELAY` | Output delay adjustment from the server |
 
-These represent commands the server can send to the player. The player advertises which commands it supports. Enable `SET_STATIC_DELAY` with `player.set_static_delay_adjustable(true)`.
+These represent commands the server can send to the player. The player advertises which commands it supports. Enable `SET_OUTPUT_DELAY` with `player.set_output_delay_adjustable(true)`.
 
 ### SendspinClientState
 

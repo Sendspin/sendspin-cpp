@@ -240,7 +240,7 @@ public:
 ///   `decode_pairing_records()`, `encode_pairing_psk()` / `decode_pairing_psk()`,
 ///   `encode_pairing_config()` / `decode_pairing_config()` respectively).
 /// - `KEYPAIR`, `STATIC_PIN`, and `LAST_PLAYED` hold raw bytes: see each constant's comment.
-/// - `STATIC_DELAY` holds an ASCII decimal string rather than raw uint16_t bytes, for
+/// - `OUTPUT_DELAY` holds an ASCII decimal string rather than raw uint16_t bytes, for
 ///   debuggability and to avoid an endianness dependency; decode it with a bounds check and
 ///   treat an invalid value as absent.
 namespace persistence_keys {
@@ -265,8 +265,10 @@ inline constexpr const char* PAIR_CONFIG = "pair_config";
 /// Raw UTF-8 bytes: the server_id (base64url public key) of the last server that played audio.
 inline constexpr const char* LAST_PLAYED = "last_played";
 
-/// ASCII decimal string (e.g. "150"): the player's static delay in milliseconds.
-inline constexpr const char* STATIC_DELAY = "static_delay";
+/// ASCII decimal string (e.g. "150"): the player's output delay in milliseconds. The stored key
+/// string is `static_delay`: this keyspace is a storage format in its own right, fixed
+/// independently of the protocol field names.
+inline constexpr const char* OUTPUT_DELAY = "static_delay";
 
 }  // namespace persistence_keys
 

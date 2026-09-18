@@ -24,12 +24,12 @@
 
 static const char* const TAG = "sendspin.player";
 
-/// @brief Parses the ASCII-decimal static-delay blob (persistence_keys::STATIC_DELAY).
+/// @brief Parses the ASCII-decimal output-delay blob (persistence_keys::OUTPUT_DELAY).
 /// @return The parsed value, or nullopt if the blob is empty, contains anything other than
 ///         decimal digits, or does not fit in a uint16_t. Chosen over raw uint16_t bytes for
 ///         debuggability and to avoid an endianness dependency; an invalid value is treated as
 ///         though nothing were saved rather than as an error.
-static std::optional<uint16_t> parse_static_delay_blob(const std::vector<uint8_t>& blob) {
+static std::optional<uint16_t> parse_output_delay_blob(const std::vector<uint8_t>& blob) {
     if (blob.empty()) {
         return std::nullopt;
     }
@@ -43,9 +43,9 @@ static std::optional<uint16_t> parse_static_delay_blob(const std::vector<uint8_t
     return value;
 }
 
-/// @brief Encodes a static-delay value as its ASCII-decimal blob for
-/// persistence_keys::STATIC_DELAY.
-static std::string encode_static_delay_blob(uint16_t delay_ms) {
+/// @brief Encodes an output-delay value as its ASCII-decimal blob for
+/// persistence_keys::OUTPUT_DELAY.
+static std::string encode_output_delay_blob(uint16_t delay_ms) {
     char buf[6];  // "65535" (5 digits) + headroom; std::to_chars never null-terminates.
     auto result = std::to_chars(buf, buf + sizeof(buf), delay_ms);
     return std::string(buf, result.ptr);
@@ -53,7 +53,9 @@ static std::string encode_static_delay_blob(uint16_t delay_ms) {
 
 /// @brief Size of the big-endian 64-bit timestamp at the start of player binary messages.
 static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
-static constexpr uint16_t MAX_STATIC_DELAY_MS = 5000U;
+/// @brief Upper bound on the output delay, per roles/player/v1.md "Output delay": clients MUST
+/// clamp output_delay_ms to the range 0-5000.
+static constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000U;
 static constexpr uint32_t HEADER_SEND_TIMEOUT_MS = 100U;
 // Denominator for the advertised buffer capacity fraction: advertises (N-1)/N of capacity
 static constexpr size_t AUDIO_BUFFER_ADVERTISE_DENOMINATOR = 5;
@@ -138,12 +140,12 @@ void PlayerRole::update_muted(bool muted) {
     this->impl_->update_muted(muted);
 }
 
-void PlayerRole::update_static_delay(uint16_t delay_ms) {
-    this->impl_->update_static_delay(delay_ms);
+void PlayerRole::update_output_delay(uint16_t delay_ms) {
+    this->impl_->update_output_delay(delay_ms);
 }
 
-void PlayerRole::set_static_delay_adjustable(bool adjustable) {
-    this->impl_->static_delay_adjustable.store(adjustable, std::memory_order_relaxed);
+void PlayerRole::set_output_delay_adjustable(bool adjustable) {
+    this->impl_->output_delay_adjustable.store(adjustable, std::memory_order_relaxed);
     this->impl_->client->publish_state();
 }
 
@@ -159,8 +161,8 @@ bool PlayerRole::get_muted() const {
     return this->impl_->muted;
 }
 
-uint16_t PlayerRole::get_static_delay_ms() const {
-    return this->impl_->get_effective_static_delay_ms();
+uint16_t PlayerRole::get_output_delay_ms() const {
+    return this->impl_->get_effective_output_delay_ms();
 }
 
 uint8_t PlayerRole::get_volume() const {
@@ -181,12 +183,12 @@ void PlayerRole::Impl::update_muted(bool muted) {
     this->client->publish_state();
 }
 
-void PlayerRole::Impl::update_static_delay(uint16_t delay_ms) {
-    if (delay_ms > MAX_STATIC_DELAY_MS) {
-        delay_ms = MAX_STATIC_DELAY_MS;
+void PlayerRole::Impl::update_output_delay(uint16_t delay_ms) {
+    if (delay_ms > MAX_OUTPUT_DELAY_MS) {
+        delay_ms = MAX_OUTPUT_DELAY_MS;
     }
-    this->static_delay_ms.store(delay_ms, std::memory_order_relaxed);
-    this->persist_static_delay();
+    this->output_delay_ms.store(delay_ms, std::memory_order_relaxed);
+    this->persist_output_delay();
     this->client->publish_state();
 }
 
@@ -202,7 +204,7 @@ void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
 }
 
 bool PlayerRole::Impl::start() {
-    this->load_static_delay();
+    this->load_output_delay();
 
     if (this->config.audio_formats.empty() || !this->listener) {
         return true;
@@ -252,11 +254,11 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     ClientPlayerStateObject player_state{};
     player_state.volume = this->volume;
     player_state.muted = this->muted;
-    bool adjustable = this->static_delay_adjustable.load(std::memory_order_relaxed);
-    player_state.static_delay_ms =
-        adjustable ? this->static_delay_ms.load(std::memory_order_relaxed) : 0;
+    bool adjustable = this->output_delay_adjustable.load(std::memory_order_relaxed);
+    player_state.output_delay_ms =
+        adjustable ? this->output_delay_ms.load(std::memory_order_relaxed) : 0;
     if (adjustable) {
-        player_state.supported_commands = {SendspinPlayerCommand::SET_STATIC_DELAY};
+        player_state.supported_commands = {SendspinPlayerCommand::SET_OUTPUT_DELAY};
     }
     msg.player = player_state;
 }
@@ -389,8 +391,8 @@ void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd) co
             if (dp.mute.has_value()) {
                 cp.mute = dp.mute;
             }
-            if (dp.static_delay_ms.has_value()) {
-                cp.static_delay_ms = dp.static_delay_ms;
+            if (dp.output_delay_ms.has_value()) {
+                cp.output_delay_ms = dp.output_delay_ms;
             }
         },
         cmd);
@@ -407,7 +409,7 @@ void PlayerRole::Impl::drain_events() {
         this->client->update_state(state);
     }
 
-    // --- Server command events (volume, mute, static delay) ---
+    // --- Server command events (volume, mute, output delay) ---
     // Check each field independently since multiple command types may have been
     // merged into one inbox slot between drain ticks.
     ServerCommandMessage cmd_msg{};
@@ -429,11 +431,11 @@ void PlayerRole::Impl::drain_events() {
                 }
             }
 
-            if (player_cmd.static_delay_ms.has_value()) {
-                this->update_static_delay(player_cmd.static_delay_ms.value());
+            if (player_cmd.output_delay_ms.has_value()) {
+                this->update_output_delay(player_cmd.output_delay_ms.value());
                 if (this->listener) {
-                    this->listener->on_static_delay_changed(
-                        this->static_delay_ms.load(std::memory_order_relaxed));
+                    this->listener->on_output_delay_changed(
+                        this->output_delay_ms.load(std::memory_order_relaxed));
                 }
             }
         }
@@ -598,53 +600,53 @@ void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event) cons
         /*error_level=*/true);
 }
 
-void PlayerRole::Impl::load_static_delay() {
+void PlayerRole::Impl::load_output_delay() {
     if (!this->persistence) {
         // No persistence provider - use initial value from config
-        if (this->config.initial_static_delay_ms > 0) {
-            this->static_delay_ms.store(this->config.initial_static_delay_ms,
+        if (this->config.initial_output_delay_ms > 0) {
+            this->output_delay_ms.store(this->config.initial_output_delay_ms,
                                         std::memory_order_relaxed);
-            SS_LOGI(TAG, "Using initial static delay from config: %u ms",
-                    this->config.initial_static_delay_ms);
+            SS_LOGI(TAG, "Using initial output delay from config: %u ms",
+                    this->config.initial_output_delay_ms);
         }
         return;
     }
 
     std::optional<uint16_t> delay;
-    if (auto blob = this->persistence->load_blob(persistence_keys::STATIC_DELAY)) {
-        delay = parse_static_delay_blob(blob.value());
+    if (auto blob = this->persistence->load_blob(persistence_keys::OUTPUT_DELAY)) {
+        delay = parse_output_delay_blob(blob.value());
     }
     if (delay.has_value()) {
-        if (delay.value() <= MAX_STATIC_DELAY_MS) {
-            this->static_delay_ms.store(delay.value(), std::memory_order_relaxed);
-            SS_LOGI(TAG, "Loaded static delay: %u ms", delay.value());
+        if (delay.value() <= MAX_OUTPUT_DELAY_MS) {
+            this->output_delay_ms.store(delay.value(), std::memory_order_relaxed);
+            SS_LOGI(TAG, "Loaded output delay: %u ms", delay.value());
         } else {
-            SS_LOGW(TAG, "Persisted static delay out of range (%u), ignoring", delay.value());
+            SS_LOGW(TAG, "Persisted output delay out of range (%u), ignoring", delay.value());
         }
-    } else if (this->config.initial_static_delay_ms > 0) {
-        this->static_delay_ms.store(this->config.initial_static_delay_ms,
+    } else if (this->config.initial_output_delay_ms > 0) {
+        this->output_delay_ms.store(this->config.initial_output_delay_ms,
                                     std::memory_order_relaxed);
-        SS_LOGI(TAG, "Using initial static delay from config: %u ms",
-                this->config.initial_static_delay_ms);
+        SS_LOGI(TAG, "Using initial output delay from config: %u ms",
+                this->config.initial_output_delay_ms);
     }
 }
 
-uint16_t PlayerRole::Impl::get_effective_static_delay_ms() const {
-    return this->static_delay_adjustable.load(std::memory_order_relaxed)
-               ? this->static_delay_ms.load(std::memory_order_relaxed)
+uint16_t PlayerRole::Impl::get_effective_output_delay_ms() const {
+    return this->output_delay_adjustable.load(std::memory_order_relaxed)
+               ? this->output_delay_ms.load(std::memory_order_relaxed)
                : 0;
 }
 
-void PlayerRole::Impl::persist_static_delay() const {
+void PlayerRole::Impl::persist_output_delay() const {
     if (this->persistence) {
-        uint16_t delay = this->static_delay_ms.load(std::memory_order_relaxed);
-        std::string encoded = encode_static_delay_blob(delay);
-        if (this->persistence->save_blob(persistence_keys::STATIC_DELAY,
+        uint16_t delay = this->output_delay_ms.load(std::memory_order_relaxed);
+        std::string encoded = encode_output_delay_blob(delay);
+        if (this->persistence->save_blob(persistence_keys::OUTPUT_DELAY,
                                          reinterpret_cast<const uint8_t*>(encoded.data()),
                                          encoded.size())) {
-            SS_LOGD(TAG, "Persisted static delay: %u ms", delay);
+            SS_LOGD(TAG, "Persisted output delay: %u ms", delay);
         } else {
-            SS_LOGW(TAG, "Failed to persist static delay");
+            SS_LOGW(TAG, "Failed to persist output delay");
         }
     }
 }
