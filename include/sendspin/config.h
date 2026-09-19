@@ -466,7 +466,15 @@ struct ArtworkRoleConfig {
     /// warning.
     std::vector<ImageSlotPreference> preferred_formats{};
     bool psram_stack{false};  ///< Allocate decode thread stack in PSRAM (ESP-IDF only)
-    unsigned priority{2};     ///< FreeRTOS priority for the decode thread (ESP-IDF only)
+
+    /// @brief Default FreeRTOS priority for the image decode thread (ESP-IDF only). Image
+    /// decoding is best-effort work with seconds of slack, so it sits below the network and
+    /// httpd tasks (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY) rather than competing with
+    /// them for the CPU.
+    static constexpr unsigned DEFAULT_ARTWORK_PRIORITY = 2U;
+
+    unsigned priority{DEFAULT_ARTWORK_PRIORITY};  ///< FreeRTOS priority for the decode thread
+                                                  ///< (ESP-IDF only)
 };
 
 // ============================================================================
@@ -528,7 +536,15 @@ struct VisualizerRoleConfig {
     /// @brief Stream configuration the client/state visualizer object carries
     VisualizerStreamConfig stream;
     bool psram_stack{false};  ///< Allocate drain thread stack in PSRAM (ESP-IDF only)
-    unsigned priority{2};     ///< FreeRTOS priority for the drain thread (ESP-IDF only)
+
+    /// @brief Default FreeRTOS priority for the visualization drain thread (ESP-IDF only).
+    /// Delivering visualization frames is best-effort work, so it sits below the network and
+    /// httpd tasks (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY) rather than competing with
+    /// them for the CPU.
+    static constexpr unsigned DEFAULT_VISUALIZER_PRIORITY = 2U;
+
+    unsigned priority{DEFAULT_VISUALIZER_PRIORITY};  ///< FreeRTOS priority for the drain thread
+                                                     ///< (ESP-IDF only)
 };
 
 }  // namespace sendspin
