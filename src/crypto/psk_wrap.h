@@ -51,9 +51,13 @@ static constexpr std::string_view PSK_WRAP_LABEL{"sendspin-pair-psk-wrap-v1"};
 /// AEAD nonce would otherwise make a two-time pad.
 static constexpr std::string_view NONCE_WRAP_LABEL{"sendspin-pair-nonce-wrap-v1"};
 
-/// @brief Derive K_wrap = SHA-256(label || sid || isk).
-/// Returns std::nullopt if the underlying SHA-256 computation fails (e.g. noise-c allocation
-/// failure); callers must not treat this as a recoverable all-zero key.
+/// @brief Derive K_wrap = SHA-256(label || sid || isk)
+/// @param label Per-field wrap label (PSK_WRAP_LABEL or NONCE_WRAP_LABEL).
+/// @param sid   CPace session id (see CPace::sid()).
+/// @param isk   CPace intermediate session key (see CPace::isk()).
+/// @return The 32-byte key, or std::nullopt if the underlying SHA-256 computation fails (e.g.
+///         noise-c allocation failure); callers must not treat that as a recoverable all-zero
+///         key.
 std::optional<std::array<uint8_t, 32>> derive_wrap_key(
     std::string_view label, const std::vector<uint8_t>& sid,
     const std::array<uint8_t, CPACE_ISK_SIZE>& isk);

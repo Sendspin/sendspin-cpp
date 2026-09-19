@@ -256,6 +256,9 @@ static void parse_metadata_uint16_field(JsonVariantConst var, const char* name,
 // its type check is also its range check.
 static void parse_color_field(JsonVariantConst var, const char* name,
                               std::optional<RgbColor>* out) {
+    // An explicit null is treated as an absent field rather than a wrong-typed one: the object
+    // carries no value for it either way, and roles/color/v1.md defines no null form to log
+    // against.
     if (var.isUnbound() || var.isNull()) {
         return;
     }

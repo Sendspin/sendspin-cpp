@@ -31,7 +31,7 @@ namespace {
 /// drain keeps that place; every later one becomes `newest`, so the pair the main loop takes is
 /// the oldest undrained palette and the most recent one (see PendingColorStates). Runs under the
 /// Inbox mutex, so it stays a pure data operation.
-void coalesce_color_states(PendingColorStates& current, PendingColorStates&& incoming) {
+void coalesce_color_states(PendingColorStates& current, const PendingColorStates& incoming) {
     if (!current.oldest.has_value()) {
         current.oldest = incoming.oldest;
         return;

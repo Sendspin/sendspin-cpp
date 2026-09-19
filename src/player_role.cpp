@@ -597,7 +597,8 @@ void PlayerRole::Impl::cleanup() {
     // (see the STREAM_START branch there), and it stamps every event queued from here on, so the
     // STREAM_END below is delivered while the START of a stream this teardown just ended is
     // discarded at the drain (see event_is_current()).
-    this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
+    const uint32_t generation =
+        this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
     // End the current stream: the sync task drains and returns to idle. (Not signal_stream_clear():
     // that path is a seek within a live stream and expects a marker to follow.)
@@ -615,8 +616,7 @@ void PlayerRole::Impl::cleanup() {
 
     // Enqueue a clean STREAM_END - drain_events() will fire the callback (enqueue_stream_event()
     // logs if the ring is too full to take it)
-    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END,
-                               this->cleanup_generation.load(std::memory_order_acquire));
+    this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_END, generation);
 
     // Clear awaiting events too (main-thread only, no mutex needed)
     this->awaiting_sync_idle_events.clear();

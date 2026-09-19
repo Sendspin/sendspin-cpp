@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 
 static const char* const TAG = "sendspin.artwork";
 
@@ -182,7 +183,7 @@ void ArtworkRole::Impl::release_idle_slot_buffers() const {
     // under this mutex, and it is released by the next call, once that decode has finished.
     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
     for (auto& sb : this->drain_task->slot_buffers) {
-        for (uint8_t i = 0; i < 2; ++i) {
+        for (uint8_t i = 0; i < std::size(sb.buffers); ++i) {
             if (sb.drain_active && sb.drain_buf_idx == i) {
                 continue;
             }
@@ -812,7 +813,8 @@ void ArtworkRole::Impl::drain_events() {
 void ArtworkRole::Impl::cleanup() {
     // Stamps every event queued from here on, so the STREAM_END below is delivered while an event
     // queued for the stream this teardown ends is discarded at the drain (see event_is_current()).
-    this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);
+    const uint32_t generation =
+        this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->stream_active = false;
     this->discard_all_pending();
 
@@ -832,8 +834,7 @@ void ArtworkRole::Impl::cleanup() {
 
     // Enqueue a clean STREAM_END - handle_stream_ring_event() will fire the on_image_clear()
     // callbacks (enqueue_stream_event() logs if the ring is too full to take it).
-    this->enqueue_stream_event(ArtworkEventType::STREAM_END,
-                               this->cleanup_generation.load(std::memory_order_acquire));
+    this->enqueue_stream_event(ArtworkEventType::STREAM_END, generation);
 }
 
 // ============================================================================

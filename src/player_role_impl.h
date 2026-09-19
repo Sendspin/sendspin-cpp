@@ -176,7 +176,8 @@ struct PlayerRole::Impl {
     // before the teardown must not act after it, or a STREAM_START would re-arm the sync task for
     // a stream that is gone. Within drain_events() it also detects a listener callback that
     // re-entered teardown while the STREAM_START tail was running. Atomic because the network
-    // thread reads it (see accepts()).
+    // thread reads it (see accepts()), which loads acquire to pair with the teardown's
+    // read-modify-write; the drain_events() reads are relaxed because they are same-thread.
     std::atomic<uint32_t> cleanup_generation{0};
 
     // 16-bit fields

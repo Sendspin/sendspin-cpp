@@ -223,8 +223,8 @@ private:
     /// send_msg2_and_swap). Grown on demand by ensure_send_buf() to fit each frame (geometric
     /// growth, same idiom as reasm_buf_/reasm_reserve()), capped at MAX_TRANSPORT_PLAINTEXT + 16
     /// bytes (largest plaintext that path ever handles, plus AEAD tag room). Typical traffic
-    /// (client/time, client/state, pairing JSON) settles at a working-set size well
-    /// under that ceiling instead of paying it on every connection. Guarded by session_mutex_:
+    /// (client/time, client/state, pairing JSON) settles at a working-set size well under that
+    /// ceiling instead of paying it on every connection. Guarded by session_mutex_:
     /// every caller fills and encrypts it while holding the lock, so concurrent
     /// send_json/send_binary/send_msg2_and_swap calls from different threads (any thread may
     /// call these; see the file comment) never touch it at the same time. Placed per

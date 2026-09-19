@@ -74,9 +74,8 @@
 ///
 /// The storage key is not a provider's choice: it is one of the fixed constants in
 /// `persistence_keys` (sendspin/client.h): `RECORDS`, `PAIRING_PSK`, and `PAIR_CONFIG` for the
-/// three struct types this header encodes, plus `KEYPAIR`, `STATIC_PAIRING_CODE`,
-/// `LAST_PLAYED`, and
-/// `OUTPUT_DELAY` for the raw-byte / ASCII-decimal keys the library also persists. Every key is
+/// three struct types this header encodes, plus `KEYPAIR`, `STATIC_PAIRING_CODE`, `LAST_PLAYED`
+/// and `OUTPUT_DELAY` for the raw-byte / ASCII-decimal keys the library also persists. Every key is
 /// at most 12 characters, comfortably under a typical NVS key's 15-character limit; see
 /// `persistence_keys`'s doc comment for the full list and what each one holds.
 ///

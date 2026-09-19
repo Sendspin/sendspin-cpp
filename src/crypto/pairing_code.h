@@ -62,7 +62,9 @@ static constexpr int STATIC_PAIRING_CODE_DIGITS = 8;
 // Pairing-code helpers
 // ============================================================================
 
-/// @brief Return whether `code` is exactly STATIC_PAIRING_CODE_DIGITS decimal digits.
+/// @brief Return whether `code` is exactly STATIC_PAIRING_CODE_DIGITS decimal digits
+/// @param code The configured static pairing code.
+/// @return true when the code is usable as a static pairing code.
 inline bool is_valid_static_pairing_code(const std::string& code) {
     if (code.size() != static_cast<size_t>(STATIC_PAIRING_CODE_DIGITS)) {
         return false;
@@ -75,15 +77,24 @@ inline bool is_valid_static_pairing_code(const std::string& code) {
     return true;
 }
 
-/// @brief Generate a fresh 32-byte CSPRNG nonce (nonce_A or nonce_B).
+/// @brief Generate a fresh 32-byte CSPRNG nonce (nonce_A or nonce_B)
+/// @return The nonce bytes.
 std::array<uint8_t, PAIRING_NONCE_SIZE> pairing_generate_nonce();
 
-/// @brief Compute the commitment commit_B = SHA-256(PAIRING_COMMIT_LABEL || nonce).
+/// @brief Compute the commitment commit_B = SHA-256(PAIRING_COMMIT_LABEL || nonce)
+/// @param nonce     The nonce to commit to.
+/// @param nonce_len Length of `nonce`, which must be PAIRING_NONCE_SIZE.
+/// @return The commitment bytes; all-zero when the hash fails.
 std::array<uint8_t, PAIRING_COMMIT_SIZE> pairing_code_commit(const uint8_t* nonce,
                                                              size_t nonce_len);
 
 /// @brief Return true if SHA-256(PAIRING_COMMIT_LABEL || nonce) equals commitment
-/// (constant-time).
+/// (constant-time)
+/// @param nonce          The revealed nonce.
+/// @param nonce_len      Length of `nonce`.
+/// @param commitment     The commitment the peer sent.
+/// @param commitment_len Length of `commitment`.
+/// @return true when the nonce opens the commitment.
 bool pairing_code_verify_commit(const uint8_t* nonce, size_t nonce_len, const uint8_t* commitment,
                                 size_t commitment_len);
 
@@ -92,6 +103,12 @@ bool pairing_code_verify_commit(const uint8_t* nonce, size_t nonce_len, const ui
 /// digest = SHA-256(PAIRING_CODE_DERIVE_LABEL || handshake_hash || nonce_a || nonce_b), the
 /// literal label's UTF-8 bytes followed by the three 32-byte raw values, in that order
 /// (pairing.md "Dynamic Pairing Code Flow").
+/// @param handshake_hash The Noise handshake hash.
+/// @param hash_len       Length of `handshake_hash`, which must be SHA256_DIGEST_SIZE.
+/// @param nonce_a        The server's nonce.
+/// @param nonce_a_len    Length of `nonce_a`, which must be PAIRING_NONCE_SIZE.
+/// @param nonce_b        The client's nonce.
+/// @param nonce_b_len    Length of `nonce_b`, which must be PAIRING_NONCE_SIZE.
 /// @return The 32-byte digest, or std::nullopt if any input has the wrong size or the hash fails.
 std::optional<std::array<uint8_t, 32>> pairing_code_digest(const uint8_t* handshake_hash,
                                                            size_t hash_len, const uint8_t* nonce_a,
@@ -100,17 +117,23 @@ std::optional<std::array<uint8_t, 32>> pairing_code_digest(const uint8_t* handsh
                                                            size_t nonce_b_len);
 
 /// @brief Reduce a pairing-code digest to the `digits` emission format: the digest read as an
-/// unsigned big-endian 256-bit integer modulo 10^6, left-padded to exactly six ASCII digits.
+/// unsigned big-endian 256-bit integer modulo 10^6, left-padded to exactly six ASCII digits
+/// @param digest The derivation digest.
+/// @return The six-digit code.
 std::string pairing_code_digits(const std::array<uint8_t, 32>& digest);
 
 /// @brief Take the `qr_code` emission format's pairing code from a digest: its first
-/// QR_PAIRING_CODE_SIZE bytes, raw.
+/// QR_PAIRING_CODE_SIZE bytes, raw
+/// @param digest The derivation digest.
+/// @return The raw pairing-code bytes.
 std::array<uint8_t, QR_PAIRING_CODE_SIZE> pairing_code_qr_bytes(
     const std::array<uint8_t, 32>& digest);
 
 /// @brief Return the bytes CPace consumes as PRS for a decimal pairing code: its ASCII digits
 /// (pairing.md "PAKE"). Shared by both the dynamic `digits` format and the static pairing code,
 /// which encode their codes identically.
+/// @param code The decimal pairing code.
+/// @return The code's ASCII digits, as CPace consumes them.
 inline std::vector<uint8_t> pairing_code_digits_prs(const std::string& code) {
     return std::vector<uint8_t>(code.begin(), code.end());
 }

@@ -104,9 +104,8 @@ constexpr bool is_coalesced_note(PairingNoteType type) {
 /// @return The hint to advertise, or nullopt to omit the field.
 ///
 /// The hint is informational (pairing.md "client/hello pair-method descriptor"): the application
-/// is
-/// the only thing that knows where its secret was published, so an unset value means the client
-/// has nothing to say rather than a default worth sending.
+/// is the only thing that knows where its secret was published, so an unset value means the
+/// client has nothing to say rather than a default worth sending.
 std::optional<std::vector<std::string>> locations_hint(const std::vector<std::string>& configured) {
     if (configured.empty()) {
         return std::nullopt;
@@ -992,9 +991,9 @@ void SendspinClient::publish_state() {
 
 void SendspinClient::send_text(const std::string& text, const std::string& role_family) {
     // Single choke point for every role-originated send that is not a protocol-internal pairing
-    // message (controller commands): pairing messages are sent
-    // directly via SendspinConnection::send_app_json() from connection_manager.cpp and never
-    // route through here. A declared PAIRING activity is not a gate: pairing.md "Entering and
+    // message (controller commands): pairing messages are sent directly via
+    // SendspinConnection::send_app_json() from connection_manager.cpp and never route through
+    // here. A declared PAIRING activity is not a gate: pairing.md "Entering and
     // leaving pairing" says an activate that adds it does not by itself affect active_roles, so
     // an active role keeps driving its own traffic across the attempt.
     //
