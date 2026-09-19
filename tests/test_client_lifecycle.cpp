@@ -662,7 +662,6 @@ TEST(ClientLifecycle, PublishStateOutlivesADropDuringTheSend) {
     client.stop();
 }
 
-
 // ============================================================================
 // Sync task connection pin
 // ============================================================================
@@ -753,14 +752,36 @@ void feed_marked_chunks(SyncTask& sync_task, int64_t first_timestamp, int count)
 /// so the first chunk is ahead of the sink's playhead rather than late enough to be skipped.
 constexpr int64_t PIN_CHUNK_LEAD_US = 250 * 1000;
 
+/// Keeps feeding marked chunks until the sink has decoded one. Each batch is stamped from a fresh
+/// read of the clock, so a batch the decoder skipped as late (the gate is
+/// HARD_SYNC_THRESHOLD_US behind the sink's playhead) is followed by one that is early again. A
+/// fixed number of chunks would instead leave a loaded machine with nothing left to decode, which
+/// hangs the waiter exactly the way a parked sync task does.
+class ChunkFeeder {
+public:
+    ChunkFeeder(SyncTask& sync_task, const VirtualSinkListener& listener)
+        : thread_([&sync_task, &listener] {
+              while (!listener.decoded()) {
+                  feed_marked_chunks(sync_task, platform_time_us() + PIN_CHUNK_LEAD_US, 4);
+                  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+              }
+          }) {}
+    ~ChunkFeeder() {
+        this->thread_.join();
+    }
+
+private:
+    std::thread thread_;
+};
+
 // The sync task resolves the current connection once, when the stream goes active, and converts
 // every chunk timestamp through that pin. So a chunk decodes while another thread owns
 // conn_ptr_mutex_, which is a lifetime lock and not a time-sync one. This thread holds that lock
-// for the whole decode, exactly as the main loop does inside ConnectionManager's lifecycle block
-// or a deferred NVS write; a per-chunk current_shared() would park the sync task on it and no fed
-// chunk would ever reach the sink. The wait has no timeout of its own, since no bound of this
-// test's could tell a parked task from a slow machine: the suite watchdog in tests/main.cpp names
-// it instead, the way PairFinalizeDoesNotDeadlockAgainstAnAdmission fails.
+// for the whole decode, exactly as the main loop does inside ConnectionManager's lifecycle block,
+// or as a network thread does in on_new_connection(); a per-chunk current_shared() would park the
+// sync task on it and no fed chunk would ever reach the sink. The wait has no timeout of its own,
+// since no bound of this test's could tell a parked task from a slow machine: the suite watchdog
+// in tests/main.cpp names it instead, the way PairFinalizeDoesNotDeadlockAgainstAnAdmission fails.
 TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
     VirtualSinkListener listener;
     auto config = make_config(SYNC_PIN_LOCK_TEST_PORT);
@@ -785,7 +806,7 @@ TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
 
     {
         std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        feed_marked_chunks(sync_task, platform_time_us() + PIN_CHUNK_LEAD_US, 8);
+        ChunkFeeder feeder(sync_task, listener);
         listener.wait_for_decoded();
     }
 
@@ -793,44 +814,108 @@ TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
     EXPECT_EQ(listener.stream_ends, 1);
 }
 
-// The pin lives exactly as long as the stream. While one is active the manager's slot and the
-// sync task hold the connection between them; once the stream ends the task has dropped its
-// reference before it reports idle, which is what the STREAM_END callback waits on, so the
-// manager is the only owner again and a later drop frees the connection on the flush that expects
-// to. A pin that is taken but never released leaves the count at two here.
-TEST(ClientLifecycle, TheStreamPinIsTakenForTheStreamAndReleasedAtItsEnd) {
+/// What the test learns about the pinned connection after it is gone; owned by the test, since
+/// the connection is what reports its own destruction.
+struct PinObservation {
+    std::thread::id destroyed_on{};
+    std::atomic<bool> destroyed{false};  // Published last: orders the id above for the reader
+};
+
+/// Connection stand-in that records where it was destroyed. Nothing is ever sent to it: the test
+/// drives the stream through the player's own handlers, so the connection exists only to be
+/// pinned and then freed.
+class PinnedConnection : public SendspinConnection {
+public:
+    explicit PinnedConnection(PinObservation* obs) : obs_(obs) {}
+    ~PinnedConnection() override {
+        this->obs_->destroyed_on = std::this_thread::get_id();
+        this->obs_->destroyed.store(true);
+    }
+
+    void start() override {}
+    void loop() override {}
+    void disconnect(SendspinGoodbyeReason, std::function<void()> on_complete) override {
+        if (on_complete) {
+            on_complete();
+        }
+    }
+    void close_transport_now() override {}
+    bool is_connected() const override {
+        return true;
+    }
+    bool send_time_message() override {
+        return true;
+    }
+    SsErr send_binary_message(const uint8_t*, size_t, SendCompleteCallback cb, bool) override {
+        if (cb) {
+            cb(true);
+        }
+        return SsErr::OK;
+    }
+    SsErr send_text_message(const std::string&, SendCompleteCallback cb, bool) override {
+        if (cb) {
+            cb(true);
+        }
+        return SsErr::OK;
+    }
+
+private:
+    PinObservation* obs_;
+};
+
+/// The stream the pin tests start: the format make_pcm_player_config() advertises.
+ServerPlayerStreamObject pin_stream_params() {
+    ServerPlayerStreamObject params;
+    params.codec = SendspinCodecFormat::PCM;
+    params.sample_rate = PIN_SAMPLE_RATE;
+    params.channels = 2;
+    params.bit_depth = 16;
+    return params;
+}
+
+// The pin lives exactly as long as the stream, and the sync task never destroys what it pinned.
+// The manager's own reference is dropped mid-stream, leaving the pin the only owner: the
+// connection is then alive for exactly as long as the task holds it, which is what the two
+// destroyed checks read, and use_count() cannot say (a transient current_shared() copy of any
+// other caller would count too). The task hands the pin back instead of resetting it, so the
+// destructor runs on the thread that pumps loop() - on device the audio thread would otherwise
+// join the transport inside ~SendspinConnection.
+TEST(ClientLifecycle, TheStreamPinIsReleasedAtStreamEndAndFreedOnTheMainLoop) {
     CountingPlayerListener listener;
-    PairedClientBundle bundle(make_config(SYNC_PIN_RELEASE_TEST_PORT));
-    SendspinClient& client = bundle.client();
+    TestNetworkProvider network;
+    SendspinClient client(make_config(SYNC_PIN_RELEASE_TEST_PORT));
+    client.set_network_provider(&network);
     client.add_player(make_pcm_player_config()).set_listener(&listener);
+    ASSERT_TRUE(client.start());
 
-    ASSERT_TRUE(bundle.start());
-    auto server = connect_paired_server(bundle.peer, SYNC_PIN_RELEASE_TEST_PORT);
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS));
+    PinObservation observation;
+    {
+        auto conn = std::make_shared<PinnedConnection>(&observation);
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        client.connection_manager_->current_connection_ = std::move(conn);
+    }
 
-    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
-    SyncTask& sync_task = *client.player_->impl_->sync_task;
+    PlayerRole::Impl& impl = *client.player_->impl_;
+    impl.handle_stream_start(pin_stream_params(), impl.cleanup_generation.load());
+    SyncTask& sync_task = *impl.sync_task;
     ASSERT_TRUE(pump_until(
         client, [&] { return sync_task.is_running(); }, FIXTURE_PUMP_TIMEOUT_MS));
 
-    // Sampled on the main loop between pumps, so no transient current_shared() copy of any other
-    // caller is outstanding: the manager's slot and the stream's pin are the only two owners.
     {
         std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        EXPECT_EQ(client.connection_manager_->current_connection_.use_count(), 2)
-            << "the sync task did not pin the connection for the stream";
+        client.connection_manager_->current_connection_.reset();
     }
+    EXPECT_FALSE(observation.destroyed.load())
+        << "the sync task did not pin the connection for the stream";
 
-    ASSERT_TRUE(server->send_app_json(R"({"type":"stream/end","payload":{}})"));
+    impl.handle_stream_end(impl.cleanup_generation.load());
     ASSERT_TRUE(pump_until(
         client, [&] { return listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
-
-    {
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        EXPECT_EQ(client.connection_manager_->current_connection_.use_count(), 1)
-            << "the stream's pin outlived the stream";
-    }
+    ASSERT_TRUE(pump_until(
+        client, [&] { return observation.destroyed.load(); }, FIXTURE_PUMP_TIMEOUT_MS))
+        << "the stream's pin outlived the stream";
+    EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
+        << "the connection was destroyed on the sync task's thread, not on the loop";
 
     client.stop();
 }
@@ -855,12 +940,7 @@ TEST(ClientLifecycle, AStreamStartedWithNoConnectionDecodesNothingAndTheNextOneP
     // No server has connected, so the manager's slot is empty. Drive the stream the way the
     // receive path would, since without a connection there is nothing to carry a stream/start.
     PlayerRole::Impl& impl = *client.player_->impl_;
-    ServerPlayerStreamObject stream_params;
-    stream_params.codec = SendspinCodecFormat::PCM;
-    stream_params.sample_rate = PIN_SAMPLE_RATE;
-    stream_params.channels = 2;
-    stream_params.bit_depth = 16;
-    impl.handle_stream_start(stream_params, impl.cleanup_generation.load());
+    impl.handle_stream_start(pin_stream_params(), impl.cleanup_generation.load());
     SyncTask& sync_task = *impl.sync_task;
     ASSERT_TRUE(pump_until(
         client, [&] { return sync_task.is_running(); }, FIXTURE_PUMP_TIMEOUT_MS));
