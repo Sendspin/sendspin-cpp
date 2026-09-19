@@ -463,6 +463,9 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
 bool SendspinConnection::hold_pre_admission_message(const char* data, size_t len,
                                                     int64_t arrival_us) {
     if (this->held_count_ >= MAX_HELD_MESSAGES || this->held_bytes_ + len > MAX_HELD_BYTES) {
+        SS_LOGW(TAG,
+                "Pre-admission hold budget spent (%zu/%zu messages, %zu+%zu/%zu bytes); dropping",
+                this->held_count_, MAX_HELD_MESSAGES, this->held_bytes_, len, MAX_HELD_BYTES);
         return false;
     }
     if (this->held_messages_.data() == nullptr && !this->held_messages_.allocate(MAX_HELD_BYTES)) {
