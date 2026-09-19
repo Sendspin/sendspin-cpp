@@ -55,7 +55,7 @@ static std::string encode_output_delay_blob(uint16_t delay_ms) {
 /// @brief Size of the big-endian 64-bit timestamp at the start of player binary messages.
 static constexpr size_t BINARY_TIMESTAMP_SIZE = 8;
 /// @brief Size of the big-endian 32-bit send_ahead that follows the timestamp in an audio chunk
-/// (roles/player/v1.md "Audio Chunks (Binary)"). The encoded audio starts after it.
+/// (roles/player/v1.md "Audio Chunks (Binary)")
 static constexpr size_t BINARY_SEND_AHEAD_SIZE = 4;
 /// @brief Bytes an audio chunk spends on its header, after the message type byte.
 static constexpr size_t AUDIO_CHUNK_HEADER_SIZE = BINARY_TIMESTAMP_SIZE + BINARY_SEND_AHEAD_SIZE;
@@ -81,8 +81,7 @@ namespace sendspin {
 ///
 /// roles/player/v1.md "client/hello player@v1 support object" requires supported_formats to be a
 /// non-empty list in which the player lists either flac or pcm, since those are the two codecs
-/// every server supports; opus alone leaves servers without opus unable to stream to the player.
-/// An empty list fails the same check, having no such entry.
+/// every server supports.
 static bool audio_formats_are_serveable(const std::vector<AudioSupportedFormatObject>& formats) {
     return std::any_of(formats.begin(), formats.end(), [](const AudioSupportedFormatObject& fmt) {
         return fmt.codec == SendspinCodecFormat::FLAC || fmt.codec == SendspinCodecFormat::PCM;
@@ -231,8 +230,8 @@ bool PlayerRole::Impl::start() {
 
     // A player with no listener has nowhere to write audio, so the sync task is not started and
     // the role reports state and takes commands without ever playing. Unlike a format list no
-    // server can serve, this is not spec-invalid and is a legitimate intermediate state for a
-    // consumer that wires its output separately, so it warns where the format list fails.
+    // server can serve, this is a legitimate intermediate state for a consumer that wires its
+    // output separately.
     if (!this->listener) {
         SS_LOGW(TAG, "Player has no listener: no audio will be played");
         return true;
@@ -283,9 +282,7 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
         std::max(this->config.required_lead_time_ms.value_or(0),
                  PlayerRoleConfig::pipeline_lead_time_ms(this->config.extra_startup_silence_ms));
     player_state.min_buffer_ms = this->config.min_buffer_ms;
-    // roles/player/v1.md "client/state player object": the commands the server may send. The
-    // role always applies a server volume or mute command, and accepts a delay change only for
-    // an output whose delay is adjustable.
+    // roles/player/v1.md "client/state player object": the commands the server may send.
     player_state.supported_commands = {SendspinPlayerCommand::VOLUME, SendspinPlayerCommand::MUTE};
     if (adjustable) {
         player_state.supported_commands.push_back(SendspinPlayerCommand::SET_OUTPUT_DELAY);
@@ -593,10 +590,9 @@ void PlayerRole::Impl::drain_events() {
 
 void PlayerRole::Impl::cleanup() {
     // Flag the teardown before anything else: it tells a drain_events() frame that may be on the
-    // call stack right now (a listener callback re-entering teardown) that the stream is gone
-    // (see the STREAM_START branch there), and it stamps every event queued from here on, so the
-    // STREAM_END below is delivered while the START of a stream this teardown just ended is
-    // discarded at the drain (see event_is_current()).
+    // call stack right now (a listener callback re-entering teardown) that the stream is gone,
+    // and it stamps every event queued from here on, so the STREAM_END below is delivered while
+    // a START this teardown just invalidated is discarded (see cleanup_generation).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
@@ -621,8 +617,7 @@ void PlayerRole::Impl::cleanup() {
     // Clear awaiting events too (main-thread only, no mutex needed)
     this->awaiting_sync_idle_events.clear();
 
-    // Deferred: cleanup() runs under ConnectionManager::conn_ptr_mutex_ on both the role-removal
-    // and the connection-loss path, and a listener callback must not run there.
+    // Deferred: cleanup() runs under ConnectionManager::conn_ptr_mutex_ on both paths.
     if (this->high_performance_requested_for_playback) {
         this->client->release_high_performance_deferred();
         this->high_performance_requested_for_playback = false;

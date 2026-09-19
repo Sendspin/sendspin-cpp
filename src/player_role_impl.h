@@ -59,9 +59,8 @@ struct PlayerRole::Impl {
     /// @brief Splits one audio chunk's bytes (after the message type byte) into its timestamp
     /// and its encoded audio frame.
     ///
-    /// Spec bytes 9-12 carry `send_ahead`, the lead the server had in hand when it transmitted.
-    /// It
-    /// carries no scheduling meaning, so the chunk is parsed past it rather than through it.
+    /// Spec bytes 9-12 carry `send_ahead`, the lead the server had in hand when it transmitted;
+    /// it carries no scheduling meaning, so the chunk is parsed past it.
     /// @param data Chunk bytes with the message type byte already stripped.
     /// @param len  Number of bytes at @p data.
     /// @return The split chunk, or nullopt when @p len is too short to hold the header.
@@ -115,8 +114,7 @@ struct PlayerRole::Impl {
     ///
     /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
     /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
-    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
-    /// the gate and hands it back here at each point of effect, so a teardown inside that window
+    /// lost connection, never quiesces the network thread). Re-checking at each point of effect
     /// invalidates the whole handler instead of only the part that ran before it.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
@@ -174,13 +172,13 @@ struct PlayerRole::Impl {
     std::unique_ptr<SyncTask> sync_task;
 
     // 32-bit fields
-    // Bumped by cleanup(), stamped onto every stream event queued afterwards, and serving two
-    // purposes. At the drain it decides whether a ring event is still current: an event queued
-    // before the teardown must not act after it, or a STREAM_START would re-arm the sync task for
-    // a stream that is gone. Within drain_events() it also detects a listener callback that
-    // re-entered teardown while the STREAM_START tail was running. Atomic because the network
-    // thread reads it (see accepts()), which loads acquire to pair with the teardown's
-    // read-modify-write; the drain_events() reads are relaxed because they are same-thread.
+    // Bumped by cleanup() and stamped onto every stream event queued afterwards. At the drain it
+    // decides whether a ring event is still current: a STREAM_START queued before the teardown
+    // must not re-arm the sync task for a stream that is gone. Within drain_events() it also
+    // detects a listener callback that re-entered teardown while the STREAM_START tail was running.
+    // Atomic because the network thread reads it (see accepts()), which loads acquire to pair with
+    // the teardown's read-modify-write; the drain_events() reads are relaxed because they are
+    // same-thread.
     std::atomic<uint32_t> cleanup_generation{0};
 
     // 16-bit fields

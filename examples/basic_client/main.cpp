@@ -142,8 +142,8 @@ static std::atomic<bool> running{true};
 
 /// The pairing-window gesture and its cancellation, relayed from a signal handler: SIGUSR1 opens
 /// the window pairing.md "Pairing Window" gates every static_pairing_code attempt on, SIGUSR2
-/// closes it. A headless example has no button to press, and a signal is the one thing a handler
-/// may safely set, so the main loop below turns the flags into the client calls.
+/// closes it. A headless example has no button to press, and a flag is the one thing a signal
+/// handler may safely set.
 static std::atomic<bool> window_gesture{false};
 static std::atomic<bool> window_cancel{false};
 
@@ -427,7 +427,7 @@ int main(int argc, char* argv[]) {
                                      SendspinPairingCodeFormat format) override {
             if (format == SendspinPairingCodeFormat::QR_CODE) {
                 // This example never offers qr_code (a terminal cannot render one), so a server
-                // can only select digits; print the token verbatim if one ever arrives anyway.
+                // can only select digits.
                 fprintf(stderr, "\n>>> Pairing token: %s\n", code.c_str());
                 fprintf(stderr, "    Scan or paste this into the server to finish pairing.\n\n");
                 return;

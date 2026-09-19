@@ -112,8 +112,7 @@ struct VisualizerRole::Impl {
     ///
     /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
     /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
-    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
-    /// the gate and hands it back here at each point of effect, so a teardown inside that window
+    /// lost connection, never quiesces the network thread). Re-checking at each point of effect
     /// invalidates the whole handler instead of only the part that ran before it.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
@@ -164,9 +163,9 @@ struct VisualizerRole::Impl {
 
     // Atomic fields (written by network thread, read by drain thread / cleanup)
     /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event queued
-    /// afterwards. At the drain an event whose stamp no longer matches is discarded, so an event
-    /// queued before a teardown cannot act after it (see event_is_current() in inbox.h). Atomic
-    /// because the network thread reads it (see accepts()).
+    /// afterwards. At the drain an event whose stamp no longer matches is discarded, so it cannot
+    /// act after the teardown (see event_is_current() in inbox.h). Atomic because the network
+    /// thread reads it (see accepts()).
     std::atomic<uint32_t> cleanup_generation{0};
 
     std::atomic<uint8_t> spectrum_bin_count{0};

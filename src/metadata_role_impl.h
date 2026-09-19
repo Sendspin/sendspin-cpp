@@ -33,10 +33,9 @@ struct ClientHelloMessage;
 /// @brief Metadata states handed to the main loop but not yet drained
 ///
 /// messaging.md "server/state" lets a server bring a client up to date and then schedule the next
-/// update straight after it, so two states can land between two main-loop ticks: the one that
-/// describes what is playing now, and the one timed to the next track. Both are kept, in arrival
-/// order, so the current one is still applied on the tick that also takes the scheduled one.
-/// A third state arriving in the same window replaces `newest`, which no observer has seen.
+/// update straight after it, so two states can land between two main-loop ticks. Both are kept,
+/// in arrival order, so the current one is still applied on the tick that also takes the
+/// scheduled one. A third state in the same window replaces `newest`, which no observer has seen.
 struct PendingMetadataStates {
     std::optional<ServerMetadataStateObject> oldest;
     std::optional<ServerMetadataStateObject> newest;
@@ -78,8 +77,7 @@ struct MetadataRole::Impl {
     ///
     /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
     /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
-    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
-    /// the gate and hands it back here at each point of effect, so a teardown inside that window
+    /// lost connection, never quiesces the network thread). Re-checking at each point of effect
     /// invalidates the whole handler instead of only the part that ran before it.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
@@ -119,9 +117,8 @@ struct MetadataRole::Impl {
     MetadataRoleListener* listener{nullptr};
 
     // 32-bit fields
-    /// @brief Teardown generation, bumped by cleanup(). The receive gate captures it when it
-    /// admits a message and every point of effect re-checks it (see accepts()), so state written
-    /// by a handler a teardown overtook is refused. Atomic because the network thread reads it.
+    /// @brief Teardown generation, bumped by cleanup() and re-checked at every point of effect
+    /// (see accepts()). Atomic because the network thread reads it.
     std::atomic<uint32_t> cleanup_generation{0};
 };
 

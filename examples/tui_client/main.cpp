@@ -780,8 +780,7 @@ int main(int argc, char* argv[]) {
         TuiState& state;
         explicit TuiArtworkListener(TuiState& s) : state(s) {}
 
-        // Fires on the decode thread. A TUI has nothing to decode the image into, so it records
-        // what arrived and leaves the bytes alone.
+        // Fires on the decode thread. A TUI has nothing to decode the image into.
         void on_image_decode(uint8_t slot, const uint8_t* /*data*/, size_t length,
                              SendspinImageFormat /*format*/) override {
             std::lock_guard<std::mutex> lock(state.mutex);

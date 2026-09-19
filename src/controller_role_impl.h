@@ -58,8 +58,7 @@ struct ControllerRole::Impl {
     ///
     /// The gate in SendspinClient's role dispatch is checked once, on the network thread, while the
     /// handler it admits runs on: a teardown can land in between (the deactivation path, unlike a
-    /// lost connection, never quiesces the network thread). The dispatch captures this counter with
-    /// the gate and hands it back here at each point of effect, so a teardown inside that window
+    /// lost connection, never quiesces the network thread). Re-checking at each point of effect
     /// invalidates the whole handler instead of only the part that ran before it.
     /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
@@ -95,9 +94,8 @@ struct ControllerRole::Impl {
     ControllerRoleListener* listener{nullptr};
 
     // 32-bit fields
-    /// @brief Teardown generation, bumped by cleanup(). The receive gate captures it when it
-    /// admits a message and every point of effect re-checks it (see accepts()), so state written
-    /// by a handler a teardown overtook is refused. Atomic because the network thread reads it.
+    /// @brief Teardown generation, bumped by cleanup() and re-checked at every point of effect
+    /// (see accepts()). Atomic because the network thread reads it.
     std::atomic<uint32_t> cleanup_generation{0};
 };
 

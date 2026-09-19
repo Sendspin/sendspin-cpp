@@ -402,7 +402,7 @@ void VisualizerRole::Impl::handle_stream_ring_event(VisualizerEventType event) c
 
 void VisualizerRole::Impl::cleanup() {
     // Stamps every event queued from here on, so the STREAM_END below is delivered while an event
-    // queued for the stream this teardown ends is discarded at the drain (see event_is_current()).
+    // queued for the stream this teardown ends is discarded (see cleanup_generation).
     const uint32_t generation =
         this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     this->stream_active = false;

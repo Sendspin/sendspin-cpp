@@ -462,9 +462,9 @@ static Element render_info_panels(const TuiSnapshot& snap, int terminal_width) {
     return hbox({playback_panel | flex, stream_panel | flex, server_panel | flex});
 }
 
-// Artwork channels and the audio-derived palette, side by side. Artwork images are reported by
-// size rather than drawn: a terminal has no pixels to put them in, and the size plus the channel
-// they arrived on is what tells an integrator the transfer worked.
+// Artwork images are reported by size rather than drawn: a terminal has no pixels to put them
+// in, and the size plus the channel they arrived on is what tells an integrator the transfer
+// worked.
 static Element render_artwork_and_color(const TuiSnapshot& snap) {
     Elements artwork_rows;
     for (size_t channel = 0; channel < snap.artwork_channels.size(); ++channel) {

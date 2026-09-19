@@ -30,9 +30,8 @@ namespace {
 /// @brief Folds a newly arrived state into the states the main loop has not taken yet
 ///
 /// `incoming` always carries exactly one state, in `oldest`. The first one to arrive after a
-/// drain keeps that place; every later one becomes `newest`, so the pair the main loop takes is
-/// the oldest undrained state and the most recent one (see PendingMetadataStates). Runs under the
-/// Inbox mutex, so it stays a pure data operation.
+/// drain keeps that place; every later one becomes `newest` (see PendingMetadataStates). Runs
+/// under the Inbox mutex, so it stays a pure data operation.
 void coalesce_metadata_states(PendingMetadataStates& current, PendingMetadataStates&& incoming) {
     if (!current.oldest.has_value()) {
         current.oldest = std::move(incoming.oldest);
@@ -130,8 +129,7 @@ void MetadataRole::Impl::handle_server_state(ServerMetadataStateObject&& metadat
         return;
     }
     // messaging.md "server/state": each included metadata object is the role's full state, never
-    // an overlay on the one before it. Two can arrive between main-loop ticks, so the slot keeps
-    // the oldest undrained state alongside the newest (see coalesce_metadata_states).
+    // an overlay on the one before it (see coalesce_metadata_states).
     PendingMetadataStates arrival;
     arrival.oldest = std::move(metadata);
     this->event_state->slot.merge(coalesce_metadata_states, std::move(arrival));
@@ -172,7 +170,6 @@ void MetadataRole::Impl::drain_events() {
         const bool collapses =
             taken.newest.has_value() && this->state_is_due(taken.newest->timestamp);
         if (taken.oldest.has_value() && !collapses) {
-            // The older state is applied on its own while the one behind it is still scheduled.
             // Two states that are both due collapse instead: the older would be superseded
             // within this tick, so no listener could observe it.
             this->held_state = std::move(taken.oldest);

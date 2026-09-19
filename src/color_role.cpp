@@ -28,9 +28,8 @@ namespace {
 /// @brief Folds a newly arrived palette into the palettes the main loop has not taken yet
 ///
 /// `incoming` always carries exactly one palette, in `oldest`. The first one to arrive after a
-/// drain keeps that place; every later one becomes `newest`, so the pair the main loop takes is
-/// the oldest undrained palette and the most recent one (see PendingColorStates). Runs under the
-/// Inbox mutex, so it stays a pure data operation.
+/// drain keeps that place; every later one becomes `newest` (see PendingColorStates). Runs under
+/// the Inbox mutex, so it stays a pure data operation.
 void coalesce_color_states(PendingColorStates& current, const PendingColorStates& incoming) {
     if (!current.oldest.has_value()) {
         current.oldest = incoming.oldest;
@@ -79,8 +78,7 @@ void ColorRole::Impl::handle_server_state(const ServerColorStateObject& color,
         return;
     }
     // messaging.md "server/state": each included color object is the role's full palette, never
-    // an overlay on the one before it. Two can arrive between main-loop ticks, so the slot keeps
-    // the oldest undrained palette alongside the newest (see coalesce_color_states).
+    // an overlay on the one before it (see coalesce_color_states).
     PendingColorStates arrival;
     arrival.oldest = color;
     this->event_state->slot.merge(coalesce_color_states, arrival);
@@ -117,7 +115,6 @@ void ColorRole::Impl::drain_events() {
         const bool collapses =
             taken.newest.has_value() && this->state_is_due(taken.newest->timestamp);
         if (taken.oldest.has_value() && !collapses) {
-            // The older palette is applied on its own while the one behind it is still scheduled.
             // Two palettes that are both due collapse instead: the older would be superseded
             // within this tick, so no listener could observe it.
             this->held_state = taken.oldest;
