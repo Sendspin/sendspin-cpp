@@ -1039,6 +1039,12 @@ TEST(ArtworkFrameDoneGate, SupersedeKeepsNewestParked) {
         listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
         << "a gated image was decoded; decodes: " << listener.decode_count();
     send_frame(*impl, 0, 'C');
+    // C is held by the same gate, so this window is also how the test knows C reached the park
+    // slot before the gate reopens: the supersede has already happened when frame_done() runs,
+    // and a first-wins park would have dropped C rather than replaced B.
+    EXPECT_TRUE(
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "a gated image was decoded; decodes: " << listener.decode_count();
 
     impl->frame_done(0);
     listener.wait_until([&] { return listener.decodes.size() >= 2; });
@@ -1251,10 +1257,12 @@ TEST(ArtworkChannelClear, GatedClearSupersedesParkedClear) {
     // A is displayed, so it is the current image and neither clear's announce can discard it.
     poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
 
-    // Two clears arrive back to back while A is un-acked. Both park, and the second must overwrite
-    // the first (latest-wins) rather than queue behind it, so the consumer is asked to clear once
-    // rather than twice. Each clear is held by the gate, which is also how the test knows the
-    // decode thread parked the first one before the second arrives to supersede it.
+    // Two clears arrive back to back while A is un-acked. Both park, and the park slot holds one
+    // notification, so the two collapse into a single delivery: the consumer is asked to clear
+    // once rather than twice. Which of the two survives is not observable here (on_image_clear
+    // carries only the slot); SupersedeKeepsNewestParked pins latest-wins. Each clear is held by
+    // the gate, which is also how the test knows the decode thread parked the first one before
+    // the second arrives.
     send_clear(*impl, 0, /*timestamp=*/1);
     EXPECT_TRUE(
         poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW))
