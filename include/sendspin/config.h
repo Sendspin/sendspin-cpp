@@ -475,6 +475,8 @@ struct ArtworkRoleConfig {
     /// httpd tasks (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY) rather than competing with
     /// them for the CPU.
     static constexpr unsigned DEFAULT_ARTWORK_PRIORITY = 2U;
+    static_assert(DEFAULT_ARTWORK_PRIORITY < SendspinClientConfig::DEFAULT_HTTPD_PRIORITY,
+                  "The artwork decode thread must stay below the httpd task");
 
     unsigned priority{DEFAULT_ARTWORK_PRIORITY};
     ///< (ESP-IDF only)
@@ -545,6 +547,8 @@ struct VisualizerRoleConfig {
     /// httpd tasks (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY) rather than competing with
     /// them for the CPU.
     static constexpr unsigned DEFAULT_VISUALIZER_PRIORITY = 2U;
+    static_assert(DEFAULT_VISUALIZER_PRIORITY < SendspinClientConfig::DEFAULT_HTTPD_PRIORITY,
+                  "The visualization drain thread must stay below the httpd task");
 
     unsigned priority{DEFAULT_VISUALIZER_PRIORITY};
     ///< (ESP-IDF only)
