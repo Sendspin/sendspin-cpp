@@ -92,10 +92,22 @@ TEST(PairingCodeCommit, WrongNonceSizeReturnsNullopt) {
     EXPECT_TRUE(pairing_code_commit(nonce.data(), nonce.size()).has_value());
 }
 
-TEST(PairingCodeCommit, WrongCommitmentSizeFailsVerify) {
+// Either length argument fails the verify. The nonce clause cannot be seen on its own from here:
+// pairing_code_commit() rejects the same length, so removing the clause leaves this call
+// returning false anyway; this pins the composed contract rather than that one line.
+TEST(PairingCodeCommit, WrongArgumentSizesFailVerify) {
     auto nonce = pairing_generate_nonce();
+    auto commitment = pairing_code_commit(nonce.data(), nonce.size());
+    ASSERT_TRUE(commitment.has_value());
+
     std::array<uint8_t, 16> short_commit{};
     EXPECT_FALSE(pairing_code_verify_commit(nonce.data(), nonce.size(), short_commit.data(), 16));
+    std::array<uint8_t, 16> short_nonce{};
+    EXPECT_FALSE(pairing_code_verify_commit(short_nonce.data(), short_nonce.size(),
+                                            commitment->data(), commitment->size()));
+    // Control: both arguments at their defined lengths verify.
+    EXPECT_TRUE(pairing_code_verify_commit(nonce.data(), nonce.size(), commitment->data(),
+                                           commitment->size()));
 }
 
 TEST(PairingCodeCommit, Kat) {
