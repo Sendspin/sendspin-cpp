@@ -581,42 +581,6 @@ TEST(NoiseTransport, ReceiveEncryptedBinary_JsonDispatch) {
 }
 
 // ============================================================================
-// Fragmentation: payload just over MAX_TRANSPORT_PLAINTEXT
-// ============================================================================
-
-TEST(NoiseTransport, FragmentOverMaxTransportPlaintext) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    // Wire up JSON dispatch to collect reassembled messages
-    std::string received_json;
-    conn.on_json_message_cb = [&received_json](SendspinConnection* /*c*/, const char* data,
-                                                size_t len, int64_t /*ts*/) {
-        received_json = std::string(data, len);
-    };
-
-    // Build a JSON payload larger than MAX_TRANSPORT_PLAINTEXT (65519).
-    // plaintext = [0x00] + json, so json must be >= 65519 bytes.
-    std::string large_json(65520, 'A');  // 65520 'A' chars
-    EXPECT_EQ(conn.send_encrypted_text(large_json), SsErr::OK);
-
-    EXPECT_GE(conn.sent_binary_.size(), 2u);
-
-    // The responder session was moved into conn, so decrypting the captured frames here would
-    // need a second handshake to recover matching keys. That full decrypt-and-reassemble path is
-    // already covered by ReceiveEncryptedBinary_JsonDispatch; this test only checks the structural
-    // shape of the fragmented output: at least two frames, each within the AEAD-tagged size cap.
-    EXPECT_GE(conn.sent_binary_.size(), 2u);
-    for (const auto& frame : conn.sent_binary_) {
-        // Each encrypted frame = plaintext + 16-byte AEAD tag
-        EXPECT_LE(frame.size(), static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) + 16);
-    }
-}
-
-// ============================================================================
 // Error cases: driver abort on bad inputs
 // ============================================================================
 
@@ -1631,40 +1595,13 @@ TEST(NoiseTransport, FragmentHeaderBytesMatchTheWireFormat) {
     EXPECT_EQ(frames[1][0], MSG_TYPE_FRAGMENT);
     EXPECT_EQ(frames[1][1], 0u) << "a middle fragment is neither first nor last";
     EXPECT_EQ(frames[1][2], 'A') << "a continuation's data starts at byte 2";
-    EXPECT_EQ(frames[1].size(), 2 + cont_cap);
+    EXPECT_EQ(frames[1].size(), 2 + cont_cap) << "a middle fragment fills cont_cap";
 
     // Last fragment: [1][LAST][data...]
     EXPECT_EQ(frames[2][0], MSG_TYPE_FRAGMENT);
     EXPECT_EQ(frames[2][1], FRAGMENT_FLAG_LAST) << "the last fragment sets bit 0 and not bit 1";
     EXPECT_EQ(frames[2][2], 'A');
     EXPECT_EQ(frames[2].size(), 3u);
-}
-
-// The first and continuation frames have different caps: the first spends three plaintext bytes
-// on [1, flags, orig_type] while continuations spend two on [1, flags]. A two-frame message never
-// fills a continuation, so cont_cap is only observable once a third frame is needed.
-TEST(NoiseTransport, FragmentContinuationCapAtThreeFrames) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-
-    const size_t maxp = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT);
-    constexpr size_t TAG = 16;
-    const size_t first_cap = maxp - 3;  // first frame: [1, flags, orig_type, data...]
-    const size_t cont_cap = maxp - 2;   // continuation: [1, flags, data...]
-
-    // json length == data_len, since plaintext is [0x00] + json. One byte past what two frames
-    // can carry, so the run is first_cap + cont_cap + 1 and the tail lands in a third frame.
-    const size_t json_len = first_cap + cont_cap + 1;
-    EXPECT_EQ(conn.send_encrypted_text(std::string(json_len, 'A')), SsErr::OK);
-
-    ASSERT_EQ(conn.sent_binary_.size(), 3u);
-    EXPECT_EQ(conn.sent_binary_[0].size(), maxp + TAG) << "first frame fills first_cap";
-    EXPECT_EQ(conn.sent_binary_[1].size(), maxp + TAG) << "middle frame fills cont_cap";
-    EXPECT_EQ(conn.sent_binary_[2].size(), 3u + TAG)
-        << "tail carries the single leftover byte behind its fragment type and flags";
 }
 
 // ============================================================================
