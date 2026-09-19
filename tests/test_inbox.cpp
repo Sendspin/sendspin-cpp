@@ -31,54 +31,33 @@ bool has_bit(uint32_t bits, uint32_t bit) {
     return (bits & bit) != 0;
 }
 
-TEST(InboxSlot, WriteTakeRoundtrip) {
+// One slot's whole lifecycle: a clean slot holds nothing and sets no bit, a write publishes the
+// value under this slot's topic bit alone, a take hands the value back and clears that bit, and
+// reset drops both. The steps are one behavior because each is only meaningful against the state
+// the previous one left.
+TEST(InboxSlot, SlotLifecycle) {
     Inbox inbox;
     InboxSlot<int> slot(inbox, INBOX_TOPIC_GROUP);
+    InboxSlot<int> other(inbox, INBOX_TOPIC_CONTROLLER);
+
+    int value = -1;
+    EXPECT_FALSE(slot.take(value)) << "a clean slot handed out content";
+    EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
 
     slot.write(42);
+    other.write(7);
+    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
 
-    int value = 0;
     ASSERT_TRUE(slot.take(value));
     EXPECT_EQ(value, 42);
-}
-
-TEST(InboxSlot, TakeOnCleanSlotReturnsFalseWithNoBitSet) {
-    Inbox inbox;
-    InboxSlot<int> slot(inbox, INBOX_TOPIC_GROUP);
-
-    int value = -1;
-    EXPECT_FALSE(slot.take(value));
     EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-}
-
-TEST(InboxSlot, ResetClearsContentAndBit) {
-    Inbox inbox;
-    InboxSlot<int> slot(inbox, INBOX_TOPIC_GROUP);
+    // Draining one slot leaves every other topic's bit standing, so the main loop still visits it.
+    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_CONTROLLER));
 
     slot.write(99);
-    ASSERT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-
     slot.reset();
     EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-
-    int value = -1;
-    EXPECT_FALSE(slot.take(value));
-}
-
-TEST(InboxSlot, DrainingOneSlotLeavesOtherSlotBitSet) {
-    Inbox inbox;
-    InboxSlot<int> group_slot(inbox, INBOX_TOPIC_GROUP);
-    InboxSlot<int> controller_slot(inbox, INBOX_TOPIC_CONTROLLER);
-
-    group_slot.write(1);
-    controller_slot.write(2);
-    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_CONTROLLER));
-
-    int value = 0;
-    ASSERT_TRUE(group_slot.take(value));
-    EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_CONTROLLER));
+    EXPECT_FALSE(slot.take(value)) << "reset left content behind";
 }
 
 TEST(Inbox, RingPreservesFifoOrder) {

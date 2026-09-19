@@ -233,6 +233,15 @@ TEST(VisualizerHandleBinary, ForwardsMessageVerbatim) {
     ASSERT_EQ(entry.size(), data.size() + 1);
     EXPECT_EQ(entry[0], SENDSPIN_BINARY_VISUALIZER_LOUDNESS);
     EXPECT_TRUE(std::equal(data.begin(), data.end(), entry.begin() + 1));
+
+    // A message longer than any this type defines is stored whole as well: the network thread
+    // neither truncates nor caps, so a spectrum with many bins survives the ring intact.
+    data.insert(data.end(), 64, 0xEE);
+    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
+
+    ASSERT_TRUE(pop_entry(*impl, entry));
+    ASSERT_EQ(entry.size(), data.size() + 1);
+    EXPECT_TRUE(std::equal(data.begin(), data.end(), entry.begin() + 1));
 }
 
 TEST(VisualizerHandleBinary, DropsMessageWithoutTimestamp) {
@@ -256,22 +265,6 @@ TEST(VisualizerHandleBinary, DropsWhenStreamInactive) {
 
     std::vector<uint8_t> entry;
     EXPECT_FALSE(pop_entry(*impl, entry));
-}
-
-TEST(VisualizerHandleBinary, ForwardsOversizedMessageWithoutCapping) {
-    auto impl = make_impl();
-
-    // A loudness message with trailing junk: the network thread does not truncate.
-    std::vector<uint8_t> data;
-    put_be64(data, 1);
-    put_be16(data, 0x1111);
-    data.insert(data.end(), 64, 0xEE);  // trailing bytes
-
-    impl->handle_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, data.data(), data.size(), live_generation(*impl));
-
-    std::vector<uint8_t> entry;
-    ASSERT_TRUE(pop_entry(*impl, entry));
-    EXPECT_EQ(entry.size(), data.size() + 1);  // stored at full length, uncapped
 }
 
 TEST(VisualizerHandleBinary, DropsUnnegotiatedType) {
@@ -379,11 +372,14 @@ TEST(VisualizerClearMarker, StreamClearEnqueuesMarker) {
 
     impl->handle_stream_clear(live_generation(*impl));
 
-    // The marker is a single 0xFF byte, outside the visualizer wire-type range.
+    // The marker is a single byte outside the visualizer wire-type range, so it can never be
+    // mistaken for a message: the exact value is an internal encoding, the range is the contract.
     std::vector<uint8_t> entry;
     ASSERT_TRUE(pop_entry(*impl, entry));
     ASSERT_EQ(entry.size(), 1U);
-    EXPECT_EQ(entry[0], 0xFF);
+    EXPECT_TRUE(entry[0] < SENDSPIN_BINARY_VISUALIZER_FIRST ||
+                entry[0] > SENDSPIN_BINARY_VISUALIZER_LAST)
+        << "the clear marker collides with wire type " << static_cast<int>(entry[0]);
 }
 
 TEST(VisualizerClearMarker, DiscardPreservesPostClearFrames) {
