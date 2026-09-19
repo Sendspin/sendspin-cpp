@@ -27,12 +27,14 @@
 #include "fake_persistence.h"
 #include "lifecycle_test_fixtures.h"
 #include "platform/time.h"
+#include "player_role_impl.h"  // Sync task pin; private access, see tests/CMakeLists.txt
 #include "protocol_messages.h"  // SENDSPIN_BINARY_VISUALIZER_LOUDNESS
 #include "sendspin/client.h"
 #include "sendspin/config.h"
 #include "sendspin/metadata_role.h"
 #include "sendspin/player_role.h"
 #include "sendspin/visualizer_role.h"
+#include "sync_task.h"
 #include "visualizer_role_impl.h"  // Ring state after stop(); private access, see tests/CMakeLists.txt
 
 #include <gtest/gtest.h>
@@ -42,6 +44,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -70,6 +73,9 @@ constexpr uint16_t VISUALIZER_TEST_PORT = 19018;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 19019;
 constexpr uint16_t PROVIDER_TEST_PORT = 19020;
 constexpr uint16_t PUBLISH_STATE_TEST_PORT = 19021;
+constexpr uint16_t SYNC_PIN_LOCK_TEST_PORT = 19022;
+constexpr uint16_t SYNC_PIN_RELEASE_TEST_PORT = 19023;
+constexpr uint16_t SYNC_PIN_NULL_TEST_PORT = 19024;
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
@@ -652,6 +658,234 @@ TEST(ClientLifecycle, PublishStateOutlivesADropDuringTheSend) {
         << "the connection was destroyed while its own send was running";
     EXPECT_TRUE(rv.destroyed) << "the publish leaked the connection past its own call";
     EXPECT_EQ(rv.sent.size(), 1u) << "the client/state never reached the connection";
+
+    client.stop();
+}
+
+
+// ============================================================================
+// Sync task connection pin
+// ============================================================================
+
+// 48 kHz stereo 16-bit, the format make_pcm_player_config() advertises.
+constexpr uint32_t PIN_SAMPLE_RATE = 48000;
+constexpr size_t PIN_FRAME_BYTES = 4;
+constexpr size_t PIN_CHUNK_BYTES = PIN_SAMPLE_RATE / 50 * PIN_FRAME_BYTES;  // 20 ms
+/// Byte every chunk these tests feed is filled with, so a write the sink takes can be told apart
+/// from the silence the sync task emits while priming or filling a hard-sync gap. PCM decoding is
+/// a copy, so the pattern survives into the sink.
+constexpr uint8_t PIN_AUDIO_MARK = 0x7F;
+
+/// Stands in for an audio sink. Every write is reported back through
+/// PlayerRole::notify_audio_played() with the time those frames finish, which is what moves the
+/// sync task out of initial-sync priming and into the per-chunk LOAD_CHUNK cycle; a listener that
+/// never reports progress leaves it priming forever and no chunk is ever loaded. The write itself
+/// is paced so the sink stays slower than a test thread filling the ring.
+class VirtualSinkListener : public PlayerRoleListener {
+public:
+    size_t on_audio_write(uint8_t* data, size_t length, uint32_t /*timeout_ms*/) override {
+        const bool marked = std::any_of(data, data + length, [](uint8_t b) { return b != 0; });
+        const auto frames = static_cast<uint32_t>(length / PIN_FRAME_BYTES);
+        const int64_t now = platform_time_us();
+        if (this->playhead_us_ < now) {
+            this->playhead_us_ = now;
+        }
+        this->playhead_us_ +=
+            static_cast<int64_t>(frames) * 1000000 / static_cast<int64_t>(PIN_SAMPLE_RATE);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (this->player_ != nullptr && frames > 0) {
+            this->player_->notify_audio_played(frames, this->playhead_us_);
+        }
+        if (marked && !this->decoded_seen_.exchange(true)) {
+            this->first_decoded_.set_value();
+        }
+        return length;
+    }
+    void on_stream_start() override {
+        ++this->stream_starts;
+    }
+    void on_stream_end() override {
+        ++this->stream_ends;
+    }
+
+    void attach(PlayerRole& player) {
+        this->player_ = &player;
+    }
+    /// True once a write carried PIN_AUDIO_MARK, i.e. a fed chunk was converted and decoded.
+    bool decoded() const {
+        return this->decoded_seen_.load();
+    }
+    /// Parks until the first decoded chunk reaches the sink. No timeout: the point of the caller
+    /// is that a regression never gets here.
+    void wait_for_decoded() {
+        this->first_decoded_.get_future().wait();
+    }
+    /// Re-arms decoded() for a second stream on the same listener.
+    void rearm() {
+        this->decoded_seen_.store(false);
+        this->first_decoded_ = std::promise<void>();
+    }
+
+    int stream_starts{0};
+    int stream_ends{0};
+
+private:
+    PlayerRole* player_{nullptr};
+    std::atomic<bool> decoded_seen_{false};
+    std::promise<void> first_decoded_;
+    int64_t playhead_us_{0};  // Sync-task thread only
+};
+
+/// Writes `count` marked 20 ms chunks straight into the sync task's encoded ring, stamped from
+/// `first_timestamp` onward. Bypasses the server so a test can feed audio while it holds a lock
+/// the client's own loop needs.
+void feed_marked_chunks(SyncTask& sync_task, int64_t first_timestamp, int count) {
+    const std::vector<uint8_t> chunk(PIN_CHUNK_BYTES, PIN_AUDIO_MARK);
+    int64_t timestamp = first_timestamp;
+    for (int i = 0; i < count; ++i) {
+        sync_task.write_audio_chunk(chunk.data(), chunk.size(), timestamp,
+                                    CHUNK_TYPE_ENCODED_AUDIO, 0);
+        timestamp += 20 * 1000;
+    }
+}
+
+/// The lead the fed chunks are stamped with: past the pipeline's own priming and startup silence,
+/// so the first chunk is ahead of the sink's playhead rather than late enough to be skipped.
+constexpr int64_t PIN_CHUNK_LEAD_US = 250 * 1000;
+
+// The sync task resolves the current connection once, when the stream goes active, and converts
+// every chunk timestamp through that pin. So a chunk decodes while another thread owns
+// conn_ptr_mutex_, which is a lifetime lock and not a time-sync one. This thread holds that lock
+// for the whole decode, exactly as the main loop does inside ConnectionManager's lifecycle block
+// or a deferred NVS write; a per-chunk current_shared() would park the sync task on it and no fed
+// chunk would ever reach the sink. The wait has no timeout of its own, since no bound of this
+// test's could tell a parked task from a slow machine: the suite watchdog in tests/main.cpp names
+// it instead, the way PairFinalizeDoesNotDeadlockAgainstAnAdmission fails.
+TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
+    VirtualSinkListener listener;
+    auto config = make_config(SYNC_PIN_LOCK_TEST_PORT);
+    config.time_burst_interval_ms = 100;  // Sync promptly after the connect
+    PairedClientBundle bundle(std::move(config));
+    SendspinClient& client = bundle.client();
+    PlayerRole& player = client.add_player(make_pcm_player_config());
+    player.set_listener(&listener);
+    listener.attach(player);
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    ASSERT_TRUE(bundle.start());
+    auto server = connect_paired_server(bundle.peer, SYNC_PIN_LOCK_TEST_PORT, options);
+    ASSERT_TRUE(pump_until_synced(client));
+
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    SyncTask& sync_task = *client.player_->impl_->sync_task;
+    ASSERT_TRUE(pump_until(
+        client, [&] { return sync_task.is_running(); }, FIXTURE_PUMP_TIMEOUT_MS))
+        << "the sync task never reached its active state, so it never resolved a pin";
+
+    {
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        feed_marked_chunks(sync_task, platform_time_us() + PIN_CHUNK_LEAD_US, 8);
+        listener.wait_for_decoded();
+    }
+
+    client.stop();
+    EXPECT_EQ(listener.stream_ends, 1);
+}
+
+// The pin lives exactly as long as the stream. While one is active the manager's slot and the
+// sync task hold the connection between them; once the stream ends the task has dropped its
+// reference before it reports idle, which is what the STREAM_END callback waits on, so the
+// manager is the only owner again and a later drop frees the connection on the flush that expects
+// to. A pin that is taken but never released leaves the count at two here.
+TEST(ClientLifecycle, TheStreamPinIsTakenForTheStreamAndReleasedAtItsEnd) {
+    CountingPlayerListener listener;
+    PairedClientBundle bundle(make_config(SYNC_PIN_RELEASE_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
+
+    ASSERT_TRUE(bundle.start());
+    auto server = connect_paired_server(bundle.peer, SYNC_PIN_RELEASE_TEST_PORT);
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS));
+
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    SyncTask& sync_task = *client.player_->impl_->sync_task;
+    ASSERT_TRUE(pump_until(
+        client, [&] { return sync_task.is_running(); }, FIXTURE_PUMP_TIMEOUT_MS));
+
+    // Sampled on the main loop between pumps, so no transient current_shared() copy of any other
+    // caller is outstanding: the manager's slot and the stream's pin are the only two owners.
+    {
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        EXPECT_EQ(client.connection_manager_->current_connection_.use_count(), 2)
+            << "the sync task did not pin the connection for the stream";
+    }
+
+    ASSERT_TRUE(server->send_app_json(R"({"type":"stream/end","payload":{}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
+
+    {
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        EXPECT_EQ(client.connection_manager_->current_connection_.use_count(), 1)
+            << "the stream's pin outlived the stream";
+    }
+
+    client.stop();
+}
+
+// A stream that goes active with no current connection pins nothing, which reads as "not time
+// synced" for the rest of that stream: LOAD_CHUNK waits and no fed chunk is ever converted or
+// decoded, the same as a get_client_time() with no connection behind it. The check lands after
+// on_stream_end(), which the player holds until the sync task is idle, so the task is provably
+// done with the stream rather than merely slow. The pin is resolved again at the next stream, so
+// the one that follows the connect plays the same chunks through.
+TEST(ClientLifecycle, AStreamStartedWithNoConnectionDecodesNothingAndTheNextOnePlays) {
+    VirtualSinkListener listener;
+    auto config = make_config(SYNC_PIN_NULL_TEST_PORT);
+    config.time_burst_interval_ms = 100;
+    PairedClientBundle bundle(std::move(config));
+    SendspinClient& client = bundle.client();
+    PlayerRole& player = client.add_player(make_pcm_player_config());
+    player.set_listener(&listener);
+    listener.attach(player);
+    ASSERT_TRUE(bundle.start());
+
+    // No server has connected, so the manager's slot is empty. Drive the stream the way the
+    // receive path would, since without a connection there is nothing to carry a stream/start.
+    PlayerRole::Impl& impl = *client.player_->impl_;
+    ServerPlayerStreamObject stream_params;
+    stream_params.codec = SendspinCodecFormat::PCM;
+    stream_params.sample_rate = PIN_SAMPLE_RATE;
+    stream_params.channels = 2;
+    stream_params.bit_depth = 16;
+    impl.handle_stream_start(stream_params, impl.cleanup_generation.load());
+    SyncTask& sync_task = *impl.sync_task;
+    ASSERT_TRUE(pump_until(
+        client, [&] { return sync_task.is_running(); }, FIXTURE_PUMP_TIMEOUT_MS));
+    ASSERT_EQ(listener.stream_starts, 1);
+
+    feed_marked_chunks(sync_task, platform_time_us() + PIN_CHUNK_LEAD_US, 8);
+    impl.handle_stream_end(impl.cleanup_generation.load());
+    ASSERT_TRUE(pump_until(
+        client, [&] { return listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
+    EXPECT_FALSE(listener.decoded())
+        << "a stream with no connection behind it converted and decoded a chunk";
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    auto server = connect_paired_server(bundle.peer, SYNC_PIN_NULL_TEST_PORT, options);
+    ASSERT_TRUE(pump_until_synced(client));
+
+    listener.rearm();
+    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return sync_task.is_running(); }, FIXTURE_PUMP_TIMEOUT_MS));
+    feed_marked_chunks(sync_task, platform_time_us() + PIN_CHUNK_LEAD_US, 8);
+    EXPECT_TRUE(pump_until(
+        client, [&] { return listener.decoded(); }, FIXTURE_PUMP_TIMEOUT_MS))
+        << "the second stream never resolved a pin of its own";
 
     client.stop();
 }
