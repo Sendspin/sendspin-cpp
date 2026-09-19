@@ -1939,8 +1939,8 @@ TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
 // pairing when the operator later triggers a SUBSEQUENT activate declaring [pairing].
 // ConnectionManager::loop() must enter pairing on ANY pairing activate on an already-admitted
 // connection, not only the first, or a later one is silently dropped as an ordinary "subsequent
-// activate" and the pairing window never opens. Mirrors the reference's _handle_server_activate,
-// which runs pairing on any pairing activate, not only the first.
+// activate" and the pairing window never opens (messaging.md "server/activate": an activate may
+// be re-sent to change the pairing parameters).
 TEST_F(PairingStateMachineTest, SubsequentActivateEntersStaticCodePairing) {
     this->configure_static_pairing_code("13572468");
 

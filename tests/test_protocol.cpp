@@ -1139,7 +1139,7 @@ TEST(Protocol, ServerActivateActiveRolesAbsentIsNullopt) {
 
 // messaging.md "server/activate" nests the pairing parameters: payload.pairing =
 // {method, format?, languages?}. The parser must accept this nested form; the flat
-// payload.selected_pair_method field is not part of the current wire format.
+// payload.selected_pair_method field is not one this wire format defines.
 TEST(Protocol, ServerActivateWithPairingObject) {
     JsonDocument doc;
     JsonObject root;
@@ -1196,9 +1196,9 @@ TEST(Protocol, ServerActivatePairingObjectFormatValues) {
     EXPECT_FALSE(msg2.pairing_format.has_value());
 }
 
-// payload.selected_pair_method is not part of the current wire format: a server sending only
+// payload.selected_pair_method is not a field this wire format defines: a server sending only
 // that flat field yields no usable method.
-TEST(Protocol, ServerActivateLegacyFlatSelectedPairMethodIgnored) {
+TEST(Protocol, ServerActivateFlatSelectedPairMethodIgnored) {
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(

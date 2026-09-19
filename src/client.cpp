@@ -604,7 +604,7 @@ void SendspinClient::drain_inbox() {
                         break;
                     }
                     // CONTROLLER_CLEARED / METADATA_CLEARED / COLOR_CLEARED: pushed by each
-                    // role's cleanup() in place of the old boolean coalescing flag. Through
+                    // role's cleanup(). Through
                     // cleanup_connection_state() at most one CLEARED per role is ever pending when
                     // this drain runs: that path first calls inbox.reset_events() (wiping the
                     // whole ring) before any role re-pushes its CLEARED, and it runs only on the

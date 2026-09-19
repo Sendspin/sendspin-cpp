@@ -693,7 +693,7 @@ private:
     void on_connection_lost(SendspinConnection* conn);
     /// @brief Decides whether an incoming connection should be admitted over the current one.
     ///
-    /// Ports admission.h::should_admit_connection (activity-priority arbitration: playback >
+    /// Applies admission.h::should_admit_connection (activity-priority arbitration: playback >
     /// pairing > empty, with last-played-server_id as the empty/empty tiebreak and an
     /// in-flight pairing immune to displacement by incoming pairing/playback). Trust enforcement
     /// (admission.h::admissible) is applied separately, before this is ever consulted, in

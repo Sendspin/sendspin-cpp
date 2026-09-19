@@ -684,9 +684,9 @@ public:
     /// After the server acks pair-finalize it rekeys via an in-band re-handshake. Re-arming the
     /// provisional timer means ConnectionManager::loop()'s re-proving-deadline check
     /// (REPROVE_TIMEOUT_US, gated on this connection being current and !is_operational()) will
-    /// drop the connection if the server acks but never re-handshakes (mirrors the reference's
-    /// post-pairing timeout). Runs on the network thread; provisional_time_us_ is atomic.
-    /// Implemented in connection.cpp to avoid pulling platform/time.h into this header.
+    /// drop the connection if the server acks but never re-handshakes. Runs on the network thread;
+    /// provisional_time_us_ is atomic. Implemented in connection.cpp to avoid pulling
+    /// platform/time.h into this header.
     void note_pairing_finalize_ack();
 
     /// @brief ORs the roles a just-received server/activate names into the active-role mask.

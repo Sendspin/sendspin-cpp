@@ -647,13 +647,11 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 // token-pair a client that is already admitted and operational (LONG_TERM trust). The server
 // does this by in-band re-handshaking the LIVE connection onto the Pairing PSK, which resets
 // first_activate_received_ exactly like any other re-handshake, then sends a fresh
-// server/activate declaring ["pairing"] with pairing.method=pairing_psk. Because that activate
-// looks like a FIRST activate (is_first true), it used to fall into the operational branch of
-// ConnectionManager::drain_lifecycle_events() instead of handle_enter_pairing(): the client
-// resumed time sync and sent client/state, which a real server awaiting client/pair-finalize
-// treats as a protocol error and hard-drops the connection for. The fix makes the
-// pairing-selection check run on every activate (first or not) and take priority over the
-// operational branch, mirroring the reference client's _handle_server_activate.
+// server/activate declaring ["pairing"] with pairing.method=pairing_psk. That activate looks
+// like a FIRST activate (is_first true), so the pairing-selection check must run on every
+// activate, first or not, and take priority over the operational branch: routing it into the
+// operational branch resumes time sync and sends client/state, which a server awaiting
+// client/pair-finalize treats as a protocol error and hard-drops the connection for.
 TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFinalize) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
@@ -1429,8 +1427,8 @@ TEST(EncryptedLifecycle, RoleTrafficWaitsForTheActivateThatFollowsAReHandshake) 
     pump_for(client, 100);
 }
 
-// A FIRST server/activate of ['playback', 'pairing'] is the new row of the messaging.md
-// "server/activate" table. It has to do both things: announce the connection operational with its
+// A FIRST server/activate of ['playback', 'pairing'] is one of the sets the messaging.md
+// "server/activate" table allows. It has to do both things: announce the connection operational with its
 // roles (pairing.md "Entering and leaving pairing" leaves active_roles untouched) and start the
 // pairing attempt it admits, with the pairing_index that activate counted.
 TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing) {

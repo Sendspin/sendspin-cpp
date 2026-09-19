@@ -825,8 +825,9 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                                       event.pairing_format);
     const bool roles_changed = roles_before != event.conn->get_active_roles();
 
-    // First activate on a long-term PSK: mark the record used (reference parity).
-    // Safe here because RecordStore mutations stay on the main loop.
+    // First activate on a long-term PSK: mark the record used, which is what keeps the store's
+    // least-recently-used order meaningful. Safe here because RecordStore mutations stay on the
+    // main loop.
     //
     // Read the psk_id ONCE into a local. is_first is true again after every in-band
     // re-handshake (see the comment below), and a server may start the next
@@ -1805,7 +1806,7 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
 
 bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* current,
                                                     const SendspinConnection* new_conn) const {
-    // Ports admission.h::should_admit_connection (activity-priority arbitration). `current` may
+    // Applies admission.h::should_admit_connection (activity-priority arbitration). `current` may
     // be null (nothing admitted yet); the pure function's has_admitted=false path always admits.
     const bool has_current = current != nullptr;
     // An incumbent whose pair-finalize has already been acked still reports the pre-finalize
