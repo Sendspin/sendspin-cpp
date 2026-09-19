@@ -15,6 +15,7 @@
 #include "sync_task.h"
 
 #include "audio_utils.h"
+#include "connection.h"
 #include "constants.h"
 #include "platform/logging.h"
 #include "platform/thread.h"
@@ -215,10 +216,11 @@ SyncTaskState SyncTask::handle_initial_sync(SyncContext& sync_context) {
 }
 
 SyncTaskState SyncTask::handle_load_chunk(SyncContext& sync_context) {
-    if (!this->client_->is_time_synced()) {
+    if (this->stream_connection_ == nullptr || !this->stream_connection_->is_time_synced()) {
         // Wait for the time filter to receive its first measurement before processing audio chunks.
         // Without a valid time offset, server timestamps can't be correctly converted to client
-        // timestamps.
+        // timestamps. A stream that began with no current connection has no filter to wait on and
+        // stays here until it ends; the next stream resolves the pin again.
         std::this_thread::sleep_for(std::chrono::milliseconds(WAIT_FOR_TIME_SYNC_MS));
         return SyncTaskState::LOAD_CHUNK;
     }
@@ -590,8 +592,10 @@ DecodeResult SyncTask::decode_chunk(SyncContext& sync_context) {
             }
         }
     } else if (sync_context.decoder->get_current_codec() != SendspinCodecFormat::UNSUPPORTED) {
+        // An encoded-audio chunk only reaches here through handle_load_chunk(), which returns
+        // early unless the stream pin is live, so the pin is non-null.
         int64_t client_timestamp =
-            this->client_->get_client_time(sync_context.encoded_entry->timestamp) -
+            this->stream_connection_->get_client_time(sync_context.encoded_entry->timestamp) -
             static_cast<int64_t>(this->player_impl_->get_effective_output_delay_ms()) * US_PER_MS -
             this->player_impl_->config.fixed_delay_us;
 
@@ -889,6 +893,16 @@ void SyncTask::thread_entry(void* params) {
 
         this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
 
+        // Pin the connection whose time filter converts this stream's timestamps. The filter is
+        // created once per connection (SendspinConnection::init_time_filter()) and never replaced,
+        // and the admitted slot cannot be handed to another server without ending this stream
+        // first: ConnectionManager::drop_connection() runs cleanup_connection_state() on the
+        // outgoing connection before a promotion installs the successor. An in-band re-handshake
+        // keeps the same connection object. Holding it for the stream keeps the per-chunk
+        // conversion off conn_ptr_mutex_, and keeping a dropped connection alive a little longer
+        // is what the deferred-release design already expects (see DeferredRelease).
+        this_task->stream_connection_ = this_task->client_->pin_current_connection();
+
         this_task->player_impl_->enqueue_state_update(SendspinClientState::SYNCHRONIZED);
 
         // Decode the initial codec header
@@ -931,6 +945,11 @@ void SyncTask::thread_entry(void* params) {
                     break;
             }
         }
+
+        // Release the stream's pin before the task reports idle, so a connection dropped during
+        // the stream is freed on the next flush rather than outliving it. Every outer-loop exit
+        // below this point goes through here.
+        this_task->stream_connection_.reset();
 
         // Return any borrowed ring buffer entry
         if (sync_context.encoded_entry != nullptr) {

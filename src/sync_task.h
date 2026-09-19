@@ -33,6 +33,7 @@
 namespace sendspin {
 
 class SendspinClient;
+class SendspinConnection;
 
 /// @brief Timing feedback from the audio output: frames played and the finish timestamp
 struct PlaybackProgress {
@@ -280,6 +281,11 @@ protected:
     SendspinClient* client_{nullptr};
     std::unique_ptr<SendspinAudioRingBuffer> encoded_ring_buffer_;
     PlayerRole::Impl* player_impl_{nullptr};
+    /// The connection whose time filter converts this stream's timestamps, resolved once when the
+    /// stream goes active and released when it ends. Sync-thread only, so it needs no lock; the
+    /// per-chunk conversion then touches only the filter's own mutex. Null when no connection was
+    /// current at stream start, which reads as "not time synced" for the rest of that stream.
+    std::shared_ptr<SendspinConnection> stream_connection_;
 };
 
 }  // namespace sendspin

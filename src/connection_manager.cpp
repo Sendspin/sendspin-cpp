@@ -1261,9 +1261,9 @@ void ConnectionManager::loop() {
     }
 
     // Perform the provider writes the locked handlers decided on, outside the lock: an NVS commit
-    // under it would stall the sync task, which takes it per audio chunk through
-    // current_shared(). Ahead of the two flushes below so the blob is settled on flash before a
-    // session is told to leave or an admission replays.
+    // under it would stall every other manager entry point, including the role drains that
+    // resolve the current connection through current_shared(). Ahead of the two flushes below so
+    // the blob is settled on flash before a session is told to leave or an admission replays.
     this->flush_pending_record_ops();
 
     // Admit the connection the promotion scan installed, outside the lock: the replay takes

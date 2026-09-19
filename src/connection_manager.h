@@ -157,8 +157,13 @@ struct NurseryEntry {
 /// the manager lock: the join can deadlock against a transport callback waiting on that same lock,
 /// and any block stalls every other manager entry point. Locked sections only queue releases;
 /// flush_deferred_releases() performs them lock-free.
+///
+/// A role thread may still hold its own reference when the flush drops this one (the sync task
+/// pins the connection whose time filter its stream uses). The destructor then runs on that
+/// thread instead, which is equally fine: the transport thread it joins is never a role thread,
+/// and a role thread holds no manager lock while it releases.
 struct DeferredRelease {
-    std::shared_ptr<SendspinConnection> conn;      ///< Sole remaining manager reference
+    std::shared_ptr<SendspinConnection> conn;      ///< The manager's last reference
     std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: transport gone, just release
 };
 
@@ -166,7 +171,7 @@ struct DeferredRelease {
 /// been dropped
 ///
 /// The provider write is an NVS commit on ESP: tens of milliseconds during which nothing else
-/// may enter the manager, and the sync task takes conn_ptr_mutex_ per audio chunk through
+/// may enter the manager, including the role drains that resolve the current connection through
 /// current_shared(). Locked sections therefore only decide WHICH record (or server_id) the write
 /// covers, or, for PERSIST_RECORDS, apply the RAM half and stage the array write that owes it;
 /// flush_pending_record_ops() performs the writes with no lock held.
@@ -420,10 +425,11 @@ public:
     }
 
     /// @brief Returns a shared_ptr to the current connection. Thread-safe.
-    /// Role threads (sync task, artwork/visualizer drains) must use this instead of current():
+    /// Role threads (the artwork/visualizer/metadata drains) must use this instead of current():
     /// the shared_ptr keeps the connection alive for the duration of the caller's use even if the
     /// main loop concurrently drops or replaces the current connection. It takes conn_ptr_mutex_
-    /// under the same lock order as current().
+    /// under the same lock order as current(). The sync task resolves it once per stream through
+    /// SendspinClient::pin_current_connection() rather than once per audio chunk.
     /// @return Shared pointer to the current connection, or nullptr if none.
     std::shared_ptr<SendspinConnection> current_shared() const {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);

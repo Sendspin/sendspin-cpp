@@ -916,8 +916,9 @@ bool SendspinClient::is_connected() const {
 }
 
 bool SendspinClient::is_time_synced() const {
-    // current_shared(): called from role threads (sync task, drain threads), so the shared_ptr
-    // must keep the connection alive while it is dereferenced.
+    // current_shared(): called from role threads (the artwork/visualizer/metadata drains), so the
+    // shared_ptr must keep the connection alive while it is dereferenced. The sync task does not
+    // come through here; it holds its own pin for the stream (pin_current_connection()).
     auto conn = this->connection_manager_->current_shared();
     return conn != nullptr && conn->is_time_synced();
 }
@@ -926,6 +927,10 @@ int64_t SendspinClient::get_client_time(int64_t server_time) const {
     // current_shared(): called from role threads; see is_time_synced().
     auto conn = this->connection_manager_->current_shared();
     return conn != nullptr ? conn->get_client_time(server_time) : 0;
+}
+
+std::shared_ptr<SendspinConnection> SendspinClient::pin_current_connection() const {
+    return this->connection_manager_->current_shared();
 }
 
 std::optional<ServerInformationObject> SendspinClient::get_server_information() const {
