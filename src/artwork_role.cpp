@@ -14,6 +14,7 @@
 
 #include "artwork_role_impl.h"
 #include "constants.h"
+#include "crypto/constants.h"
 #include "platform/logging.h"
 #include "platform/thread.h"
 #include "platform/time.h"
@@ -30,8 +31,8 @@ static const char* const TAG = "sendspin.artwork";
 // ============================================================================
 
 /// @brief Largest artwork message, in bytes, per roles/artwork/v1.md "Artwork (Binary)": one
-/// Noise transport message without fragmentation.
-static constexpr size_t ARTWORK_MAX_MESSAGE_SIZE = 65519;
+/// Noise transport message without fragmentation, so it is that bound.
+static constexpr size_t ARTWORK_MAX_MESSAGE_SIZE = sendspin::MAX_TRANSPORT_PLAINTEXT;
 
 /// @brief Size of an announce message: type, flags, the 8-byte timestamp, the 4-byte total_size
 static constexpr size_t ARTWORK_ANNOUNCE_SIZE = 14;
