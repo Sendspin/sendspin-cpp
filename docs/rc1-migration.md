@@ -244,19 +244,12 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   with its bytes dropped. `roles/artwork/v1.md` "Artwork (Binary)" allows this (it is the
   "unavailable client" path) but sets no cap of its own, so a server that encodes an image larger
   than the channel's budget sees the channel keep its previous image rather than an error.
-- A device that offers `dynamic_pairing_code` without implementing the pairing-window gesture
-  (`pairing_window_supported` false) has no way to clear a standing round limit, which
-  `pairing.md` "Rounds" says only a deliberate operator action clears. Its attempts then sit at
-  `client/pair-pending` until the server cancels them. The library logs loudly when it reaches
-  that state; the fix is for such a device to implement the gesture callbacks.
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.
-- `SendspinImageFormat::BMP` is still offered by the public artwork config, but
-  `roles/artwork/v1.md` "client/state artwork object" defines only `'jpeg' | 'png'`, and a server
-  flags a client that declares it. The enumerator survives only so a consumer that names it still
-  compiles; a client that configures a BMP channel is not conformant. Remove it with the next
-  public API break.
+- `SendspinImageFormat::BMP` is gone: `roles/artwork/v1.md` "client/state artwork object" defines
+  only `'jpeg' | 'png'`, and a server flags a client that declares anything else. A consumer that
+  named the enumerator moves its channel to `JPEG` or `PNG`.
 - `PlayerRoleConfig::required_lead_time_ms` is `std::optional<uint16_t>`: unset reports the
   pipeline-derived lead, a value overrides it. A consumer that assigned a plain integer still
   compiles; one that read the field needs `value_or`.

@@ -41,8 +41,8 @@ namespace sendspin {
 static constexpr uint32_t INBOX_TOPIC_EVENTS = 1U << 0;                // Shared event ring
 static constexpr uint32_t INBOX_TOPIC_GROUP = 1U << 1;                 // Group update slot
 static constexpr uint32_t INBOX_TOPIC_CONTROLLER = 1U << 2;            // Controller state slot
-static constexpr uint32_t INBOX_TOPIC_METADATA = 1U << 3;              // Metadata delta slot
-static constexpr uint32_t INBOX_TOPIC_COLOR = 1U << 4;                 // Color delta slot
+static constexpr uint32_t INBOX_TOPIC_METADATA = 1U << 3;              // Metadata state slot
+static constexpr uint32_t INBOX_TOPIC_COLOR = 1U << 4;                 // Color state slot
 static constexpr uint32_t INBOX_TOPIC_PLAYER_COMMAND = 1U << 5;        // Player command slot
 static constexpr uint32_t INBOX_TOPIC_PLAYER_STREAM_PARAMS = 1U << 6;  // Player stream params slot
 static constexpr uint32_t INBOX_TOPIC_VISUALIZER_CONFIG = 1U << 7;     // Visualizer config slot

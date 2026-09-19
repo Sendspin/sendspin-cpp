@@ -655,8 +655,6 @@ inline const char* to_cstr(SendspinImageFormat format) {
             return "jpeg";
         case SendspinImageFormat::PNG:
             return "png";
-        case SendspinImageFormat::BMP:
-            return "bmp";
         default:
             return "jpeg";
     }
@@ -668,9 +666,6 @@ inline std::optional<SendspinImageFormat> image_format_from_string(const std::st
     }
     if (str == "png") {
         return SendspinImageFormat::PNG;
-    }
-    if (str == "bmp") {
-        return SendspinImageFormat::BMP;
     }
     return std::nullopt;
 }

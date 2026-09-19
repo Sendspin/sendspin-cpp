@@ -800,7 +800,7 @@ private:
 
     /// @brief Processes a binary message from a connection
     /// Every binary message is role-bound, so this is dropped unless `conn` holds the admitted
-    /// slot; see the admission gate in process_json_message() for why finishing the Noise
+    /// slot; see the admission gate in dispatch_json_message() for why finishing the Noise
     /// handshake is not enough on its own.
     /// @param conn The connection the message arrived on
     /// @param payload Pointer to the raw binary data

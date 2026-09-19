@@ -844,8 +844,11 @@ attempt within its lifetime proceeds without a prompt.
 
 A device that leaves `pairing_window_supported` false cannot show the `on_open_pairing_window`
 prompt, so a gated attempt sends `client/pair-pending`, logs a warning, and waits for the
-server's own timeout to cancel it. A device that offers either pairing-code method should
-therefore set `pairing_window_supported` and implement the gesture callbacks.
+server's own timeout to cancel it. For a `dynamic_pairing_code` device that also means a standing
+round limit can never be cleared: `pairing.md` "Rounds" has only a deliberate operator action
+clear it, and the gesture is that action, so every later attempt sits at `client/pair-pending`
+until the server gives up. A device that offers either pairing-code method should therefore set
+`pairing_window_supported` and implement the gesture callbacks.
 
 #### The locations hint
 
@@ -1189,7 +1192,7 @@ X25519 keypair and read back via `client.client_id()` after `start()`.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `name` | `std::string` | — | Friendly display name shown in the Sendspin UI |
+| `name` | `std::string` | (none) | Friendly display name shown in the Sendspin UI |
 | `product_name` | `std::optional<std::string>` | unset | Device product name; sent in `client/hello` only when set |
 | `manufacturer` | `std::optional<std::string>` | unset | Manufacturer name (e.g., `"ESPHome"`); sent in `client/hello` only when set |
 | `software_version` | `std::optional<std::string>` | unset | Software version string; sent in `client/hello` only when set |
@@ -1262,7 +1265,7 @@ Each entry in `preferred_formats` is an `ImageSlotPreference`. The slot/channel 
 | Field | Type | Description |
 |---|---|---|
 | `source` | `SendspinImageSource` | Image source (`ALBUM` or `ARTIST`) |
-| `format` | `SendspinImageFormat` | Image format (`JPEG`, `PNG`, or `BMP`) |
+| `format` | `SendspinImageFormat` | Image format (`JPEG` or `PNG`) |
 | `width` | `uint16_t` | Desired image width in pixels |
 | `height` | `uint16_t` | Desired image height in pixels |
 | `require_frame_done` | `bool` | Opt-in back-pressure gate (default `false`). When set, the role delivers at most one un-acked frame or clear at a time for this slot; the consumer must call `ArtworkRole::frame_done(slot)` to release the gate. See [ArtworkRoleListener](#artworkrolelistener). |
@@ -1413,7 +1416,6 @@ These represent commands the server can send to the player. The player advertise
 |---|---|
 | `JPEG` | JPEG image |
 | `PNG` | PNG image |
-| `BMP` | BMP image |
 
 ### SendspinImageSource
 

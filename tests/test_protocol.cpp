@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Unit tests for the wire-protocol parsing/formatting in protocol.cpp. This is the highest-value
-// surface to test: lots of subtle branching (tri-state optional deltas, range validation,
+// surface to test: lots of subtle branching (optional-field handling, range validation,
 // malformed-input handling) where a bug is silent rather than a crash, plus a hand-rolled int64
 // formatter that we can check against snprintf as a free correctness oracle.
 

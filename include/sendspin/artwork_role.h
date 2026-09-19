@@ -69,7 +69,7 @@ public:
     /// @param slot The artwork slot index.
     /// @param data Pointer to the encoded image data.
     /// @param length Length of the encoded image data in bytes.
-    /// @param format Image format (JPEG, PNG, BMP).
+    /// @param format Image format (JPEG or PNG).
     virtual void on_image_decode(uint8_t /*slot*/, const uint8_t* /*data*/, size_t /*length*/,
                                  SendspinImageFormat /*format*/) {}
 

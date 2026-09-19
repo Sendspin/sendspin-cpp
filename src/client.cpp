@@ -1621,7 +1621,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     // the follow-up re-handshake fails to resolve the psk_id and drops the
                     // connection (noise_handshake.cpp) -- or, if the server never sends it, the
                     // re-prove watchdog re-armed below does. A provider that later rejects the
-                    // deferred write no longer fails the pairing: the record works for this boot
+                    // deferred write does not fail the pairing: the record works for this boot
                     // and persist_records() warns that it will not survive a reboot.
                     //
                     // The superseding form is correct here and only here: this PSK replaces

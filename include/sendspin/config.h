@@ -399,10 +399,11 @@ struct PlayerRoleConfig {
 // ============================================================================
 
 /// @brief Image format for artwork
+/// roles/artwork/v1.md "client/state artwork object" defines exactly these two; a server flags a
+/// client that declares anything else.
 enum class SendspinImageFormat : uint8_t {
     JPEG,  // JPEG compressed image
     PNG,   // PNG image
-    BMP,   // BMP image
 };
 
 /// @brief Source type for an artwork image
@@ -431,8 +432,8 @@ struct ImageSlotPreference {
     /// (on_image_decode() followed by on_image_display()) or a clear (on_image_clear()). While a
     /// delivery is un-acked, any newer payload that arrives is buffered latest-wins and only
     /// delivered once the consumer calls ArtworkRole::frame_done(slot) from the main loop (e.g.
-    /// after a cross-fade animation completes). Defaults to false, which preserves today's
-    /// behavior of decoding and displaying every frame as it arrives.
+    /// after a cross-fade animation completes). Defaults to false: every frame is decoded and
+    /// displayed as it arrives.
     bool require_frame_done{false};
 
     /// @brief Fires on_image_display() this many milliseconds before the server's display
