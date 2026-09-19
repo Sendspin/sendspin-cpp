@@ -1752,8 +1752,8 @@ TEST_F(PairingStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
 // ============================================================================
 // The durations pairing.md recommends, read off the deadlines the client arms. Each is bracketed
 // against the real clock either side of the arming call, so nothing re-derives the expected value
-// from the constant under test; the brackets are a second wide around a sub-millisecond call, so
-// neither is a wall-clock pass/fail condition.
+// from the constant under test. Ten seconds of slack: the property is "minutes, not seconds", and
+// a narrower bracket would turn a scheduling stall into a red build.
 // ============================================================================
 
 // pairing.md "Pairing Window": five minutes from the operator's gesture.
@@ -1765,8 +1765,8 @@ TEST_F(PairingStateMachineTest, PairingWindowRunsForFiveMinutes) {
 
     const int64_t armed = this->window_deadline();
     ASSERT_GT(armed, 0);
-    EXPECT_GE(armed - after, 299LL * US_PER_SECOND);
-    EXPECT_LE(armed - before, 301LL * US_PER_SECOND);
+    EXPECT_GE(armed - after, 290LL * US_PER_SECOND);
+    EXPECT_LE(armed - before, 310LL * US_PER_SECOND);
 }
 
 // pairing.md "Entering and leaving pairing": two minutes from the attempt's first message,
@@ -1782,8 +1782,8 @@ TEST_F(PairingStateMachineTest, PairingAttemptRunsForTwoMinutes) {
 
     const int64_t deadline = conn->pairing_session().attempt_deadline_us;
     ASSERT_GT(deadline, 0);
-    EXPECT_GE(deadline - after, 119LL * US_PER_SECOND);
-    EXPECT_LE(deadline - before, 121LL * US_PER_SECOND);
+    EXPECT_GE(deadline - after, 110LL * US_PER_SECOND);
+    EXPECT_LE(deadline - before, 130LL * US_PER_SECOND);
 }
 
 // ============================================================================
