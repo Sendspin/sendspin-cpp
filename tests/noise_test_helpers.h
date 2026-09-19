@@ -176,8 +176,7 @@ inline std::string build_msg1_envelope_with_payload(NoiseHandshakeState* hs,
 }
 
 /// @brief Write msg1 ({"psk_id":..., "psk_category":...} payload) on an initiator handshakestate
-/// and wrap the result in a `noise/handshake` JSON envelope, ready to feed to the responder
-/// driver.
+/// and wrap the result in a `noise/handshake` JSON envelope.
 ///
 /// @param hs           Initiator handshakestate positioned to write msg1 (from build_initiator()).
 /// @param psk_id       psk_id to advertise in the msg1 payload.

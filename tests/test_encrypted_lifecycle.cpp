@@ -115,12 +115,8 @@ public:
     // load_blob(RECORDS) is not overridden beyond the base class's nullopt default: "starts with
     // no pairing records" above, so restating it here would be a no-op override.
 
-    // Optionally pre-seed an accepted Pairing PSK (messaging.md "server/activate" section:
-    // pairing.method
-    // MUST be 'pairing_psk' if and only if the matched PSK IS the Pairing PSK; the client
-    // enforces this via ConnectionManager::loop()'s pairing-method admissibility check).
-    // The Pairing PSK Flow test below needs the fake server to connect using this PSK directly
-    // (matching PskCategory::PAIRING immediately), not the Sentinel PSK, so this must be set
+    // Optionally pre-seed an accepted Pairing PSK, so a fake server can connect on it directly
+    // (matching PskCategory::PAIRING immediately) rather than on the Sentinel PSK. Must be set
     // before start() reads it into the RecordStore.
     void set_configured_pairing_psk(SendspinPairingPsk psk) {
         this->configured_pairing_psk_ = std::move(psk);
@@ -192,8 +188,7 @@ public:
         this->reject_pairing_records_ = reject;
     }
 
-    // Number of RECORDS writes rejected because of the flag above:
-    // proves the deferred flush was actually attempted, since a rejected write captures nothing.
+    // Proves the deferred flush was attempted: a rejected write captures nothing.
     int rejected_record_saves() const {
         std::lock_guard<std::mutex> lock(this->mutex_);
         return this->rejected_record_saves_;
@@ -953,8 +948,7 @@ TEST(EncryptedLifecycle, LeaveIsSentOnlyOnAnActivatedConnection) {
 
 // An in-band re-handshake rewinds the connection to awaiting its next server/activate while it
 // keeps the admitted slot, and connection.md "Re-handshake" allows nothing but that activation
-// until it
-// arrives. client/leave waits for it, and goes out once it lands.
+// until it arrives, so client/leave waits for it.
 TEST(EncryptedLifecycle, LeaveWaitsForTheActivateThatFollowsAReHandshake) {
     SendspinClientConfig config;
     config.name = "Leave Reprove Test Client";
@@ -1429,9 +1423,8 @@ TEST(EncryptedLifecycle, RoleTrafficWaitsForTheActivateThatFollowsAReHandshake) 
 
 // A FIRST server/activate of ['playback', 'pairing'] is one of the sets the messaging.md
 // "server/activate" table allows. It has to do both things: announce the connection operational
-// with its
-// roles (pairing.md "Entering and leaving pairing" leaves active_roles untouched) and start the
-// pairing attempt it admits, with the pairing_index that activate counted.
+// with its roles (pairing.md "Entering and leaving pairing" leaves active_roles untouched) and
+// start the pairing attempt it admits, with the pairing_index that activate counted.
 TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
@@ -1934,14 +1927,11 @@ std::string metadata_state_json(int timestamp, const std::string& title) {
 }
 
 // Role-bound traffic from a connection that has finished the Noise handshake but has NOT been
-// admitted must be ignored.
-//
-// Completing the handshake is not authorization: the Sentinel PSK is a spec constant that
-// resolves for every peer, so any peer on the network can reach handshake-complete and sit in
-// the nursery. Whether its PSK category may drive playback at all is
-// decided by admission when server/activate arrives. Before the gate, a peer could simply send
-// stream/state traffic ahead of server/activate (or never send one) and drive the roles anyway for
-// the whole nursery establish window.
+// admitted must be ignored. The Sentinel PSK is a spec constant that resolves for every peer, so
+// any peer on the network can reach handshake-complete and sit in the nursery; whether its PSK
+// category may drive playback is decided by admission when server/activate arrives. Without the
+// gate, a peer could drive the roles by sending traffic ahead of server/activate, or never
+// sending one, for the whole nursery establish window.
 TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     SendspinClientConfig config;
     config.name = "Pre-Admission Role Traffic Test Client";
@@ -1996,8 +1986,7 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
 }
 
 // messaging.md "server/state": each metadata object carries the role's full state, so what a
-// later object leaves out is gone rather than carried forward from the object before it. The
-// state the listener sees for a resent title-only update therefore has no artist and no position.
+// later object leaves out is gone rather than carried forward from the object before it.
 TEST(EncryptedLifecycle, MetadataStateReplacesRatherThanMerges) {
     HoldTestClient bundle("Metadata Full State Test Client");
 
@@ -2119,10 +2108,9 @@ TEST(EncryptedLifecycle, ANewerScheduledMetadataStateReplacesThePendingOne) {
 }
 
 // The color role schedules its palettes exactly as the metadata role schedules its states, so it
-// is held to the same two rules. First: an immediate palette and a scheduled one that land in the
-// same tick are both kept, and the one describing what is playing now is applied rather than
-// skipped in favor of the one timed to the next track (roles/color/v1.md "Scheduled color
-// updates").
+// is held to the same two rules (roles/color/v1.md "Scheduled color updates"). First: an immediate
+// palette and a scheduled one landing in the same tick are both kept, and the immediate one is
+// applied.
 TEST(EncryptedLifecycle, ImmediateColorSurvivesAScheduledPaletteInTheSameTick) {
     RecordingColorListener listener;
 
@@ -2294,9 +2282,8 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAnyActivateIsNotReplayedAtAdmission) {
 // replayed at admission: a one-shot server/state (an artwork channel set, a colour palette) is
 // never repeated, so dropping it loses that state for the whole session.
 //
-// Driven through the dispatch entry point rather than over a socket so the window is the test's
-// to open and close: the role message is handed over while the connection is unadmitted, and
-// admission happens only when the test says so.
+// Driven through the dispatch entry point rather than over a socket, so the test opens and closes
+// the unadmitted window itself instead of racing the scheduler for it.
 TEST(EncryptedLifecycle, RoleTrafficBetweenActivateAndAdmissionIsReplayed) {
     HoldTestClient bundle("Post-Activate Role Traffic Test Client");
 

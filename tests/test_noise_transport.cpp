@@ -622,7 +622,6 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     Identity server_id = Identity::generate().value();
     Identity other_server = Identity::generate().value();  // A different server
 
-    // PSK bound to other_server, not server_id
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};
     platform_random_bytes(psk.data(), psk.size());
     std::string psk_id_val = psk_id_for(psk);
@@ -646,7 +645,7 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     auto r1 = nh.on_text_frame(server_init_text, [](const std::string&) { return true; });
     EXPECT_EQ(r1, HandshakeFrameResult::NEED_MORE);
 
-    // Build initiator, using psk (matching the stored PSK)
+    // The initiator uses the stored PSK, so only the counterparty binding differs.
     NoiseHandshakeState* init_hs_raw =
         build_initiator(std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
                            server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
@@ -657,7 +656,6 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id_val);
     ASSERT_FALSE(msg1_text.empty());
 
-    // Should abort because PSK is bound to other_server, not server_id
     auto r2 = nh.on_text_frame(msg1_text, [](const std::string&) { return true; });
     EXPECT_EQ(r2, HandshakeFrameResult::ABORT);
 }
@@ -671,8 +669,7 @@ struct Msg1Outcome {
     HandshakeFrameResult result{HandshakeFrameResult::ABORT};
     /// Category of the PSK the driver bound, when the handshake completed.
     std::optional<PskCategory> category;
-    /// Whether the peer that sent message 1 could read the message 2 that came back, i.e. whether
-    /// both sides mixed in the same PSK.
+    /// Whether the peer that sent message 1 could read the message 2 that came back.
     bool peer_read_msg2{false};
 };
 
@@ -1273,11 +1270,9 @@ TEST(ReceiveBufferCap, ExactlyAtCapAccepted) {
 TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
     // A fatal initial-handshake error (here: a psk_category outside the three the protocol
     // defines, which messaging.md "noise/handshake" makes a malformed payload) must close the
-    // connection. An unresolvable psk_id is not such an error: it takes the Sentinel Fallback. This drives the full chain through dispatch_completed_message() ->
-    // handle_noise_handshake_text(), using the same fake-connection pattern (TestConnection,
-    // disconnect_calls_) as the other dispatch tests above. This differs from the
-    // NoiseHandshakeDriver.*Aborts tests, which call NoiseHandshake::on_text_frame() directly
-    // and only prove the state machine returns ABORT, not that the connection actually closes.
+    // connection. An unresolvable psk_id is not such an error: it takes the Sentinel Fallback.
+    // Driven through dispatch_completed_message() -> handle_noise_handshake_text(), unlike the
+    // NoiseHandshakeDriver.*Aborts tests, which only prove the state machine returns ABORT.
     Identity client_id = Identity::generate().value();
     Identity server_id = Identity::generate().value();
     RecordStore rs(nullptr);

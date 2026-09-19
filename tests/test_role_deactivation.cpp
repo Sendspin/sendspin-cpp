@@ -189,9 +189,8 @@ std::vector<uint8_t> artwork_part(size_t length) {
 
 // An activation that drops player@v1 stops the player: the sync task leaves the stream (so no
 // further PCM is written, buffered or not) and the consumer is told through on_stream_end().
-// The roles the same activation keeps are untouched, which is what "State for roles that remain
-// active at the same version is unchanged" means in practice: the visualizer keeps delivering
-// frames and the metadata state stays put.
+// The roles the same activation keeps are untouched: messaging.md "server/activate", "State for
+// roles that remain active at the same version is unchanged".
 TEST(RoleDeactivation, RemovedPlayerStopsTheStreamAndLeavesTheOtherRolesAlone) {
     CountingPlayerListener player_listener;
     CountingVisualizerListener visualizer_listener;
@@ -737,9 +736,8 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeAKeepingActivateStillStarts) {
 // acted on: without that gate the first message after a removal would put the role straight back
 // in service and the teardown would be a one-shot with nothing holding it.
 //
-// Every receive path is driven: server/state (metadata, color, controller), stream/start (player,
-// artwork, visualizer) and the binary IDs (audio, artwork image, visualizer frame). The controls
-// are the first half of the test, where the same traffic is applied while the roles are active.
+// Every receive path is driven. The controls are the first half of the test, where the same
+// traffic is applied while the roles are active.
 TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     CountingPlayerListener player_listener;
     RecordingMetadataListener metadata_listener;

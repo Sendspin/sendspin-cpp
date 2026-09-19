@@ -156,8 +156,7 @@ inline bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
 /// A fresh long-term pairing record, the PSK behind it, and the server identity the record is
 /// bound to, so a test can seed the client's RecordStore and hand the same PSK and identity to a
 /// fake server. The record carries that identity's peer_id because every long-term PSK is
-/// checked against the server it was minted for (connection.md "Pre-Shared Key"), so a fake server
-/// running under any other identity is refused at the handshake. The resulting connection
+/// checked against the server it was minted for (connection.md "Pre-Shared Key"). The connection
 /// resolves to PskCategory::LONG_TERM, which admits the empty activity set and {playback}.
 struct PairedPeer {
     SendspinPairingRecord record;
@@ -430,10 +429,9 @@ protected:
 
 struct FakeEncryptedServerOptions {
     // Sent in the FIRST server/activate, the one that follows client/hello. The role set is every
-    // role this library implements, matching a server that activates each role the client
-    // advertised: the client acts on a role's traffic only while that role is active
-    // (messaging.md "server/activate"), so a fixture that activated less would silence the role a
-    // test drives. A test that needs a narrower set names it.
+    // role this library implements: the client acts on a role's traffic only while that role is
+    // active (messaging.md "server/activate"), so a narrower default would silence the role a test
+    // drives. A test that needs one names it.
     std::string first_activities_json{R"(["playback"])"};
     std::string first_roles_json{
         R"(["player@v1","controller@v1","metadata@v1","color@v1","artwork@v1","visualizer@v1"])"};
@@ -442,8 +440,7 @@ struct FakeEncryptedServerOptions {
     // pairing PSK set "pr".
     std::optional<std::string> psk_category;
     // Present only when the first server/activate should select a pairing method (e.g.
-    // "pairing_psk"), emitted as the nested payload.pairing object per the current spec;
-    // omitted (nullopt) for the normal playback admission path.
+    // "pairing_psk"), emitted as the nested payload.pairing object.
     std::optional<std::string> first_pairing_method;
     // Sent in the SECOND server/activate, the one connection.md "Re-handshake" makes the
     // server's first message under the new keys after a trigger_rehandshake() call. An empty
@@ -533,7 +530,6 @@ public:
         return this->client_hello_count_.load();
     }
 
-    /// How many server/activate messages this fixture has sent.
     int activate_count() const {
         return this->activate_count_.load();
     }
@@ -647,13 +643,12 @@ public:
         return this->pair_init_preceded_finalize_;
     }
 
-    // Number of client/leave messages received so far.
     int client_leave_count() const {
         return this->client_leave_count_.load();
     }
 
-    // Number of client/command messages received so far, with the command each carried. Lets a
-    // test show that a role message was, or was not, sent while its role was inactive.
+    // The command each client/command carried, in arrival order. Lets a test show that a role
+    // message was, or was not, sent while its role was inactive.
     std::vector<std::string> controller_commands() const {
         std::lock_guard<std::mutex> lock(this->pair_mutex_);
         return this->controller_commands_;
@@ -1115,10 +1110,9 @@ private:
 // ============================================================================
 //
 // One copy of each, because a per-file copy is where two suites quietly start disagreeing about
-// what the library does. Counts that a listener updates from the main loop are plain ints: every
-// callback here except on_audio_write() and on_loudness() is fired from SendspinClient::loop(),
-// which in these suites is the test thread itself, so there is nothing to synchronize with. The
-// two that a role thread reaches are atomic.
+// what the library does. Every callback here except on_audio_write() and on_loudness() is fired
+// from SendspinClient::loop(), which in these suites is the test thread itself, so its counts are
+// plain ints; those two are reached from a role thread and are atomic.
 
 /// Counts the player lifecycle callbacks and audio writes; the write itself is a sink.
 class CountingPlayerListener : public PlayerRoleListener {
@@ -1238,7 +1232,6 @@ inline PlayerRoleConfig make_pcm_player_config() {
 /// rather than the clock; a real hang is caught by the suite watchdog in main.cpp.
 inline constexpr int FIXTURE_PUMP_TIMEOUT_MS = 6000;
 
-/// Opens a fake server for a peer the client is already paired with.
 inline std::unique_ptr<FakeEncryptedServer> connect_paired_server(
     const PairedPeer& peer, uint16_t port, FakeEncryptedServerOptions options = {}) {
     return std::make_unique<FakeEncryptedServer>(

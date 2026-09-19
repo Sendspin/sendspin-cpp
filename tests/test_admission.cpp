@@ -46,7 +46,7 @@ static const auto PR = SendspinActivity::PAIRING;
 // PskCategory x activity set x unpaired_access
 // ============================================================================
 
-// SENTINEL row: [], ['pairing'], and (on unpaired access) ['playback'], ['playback', 'pairing'].
+// SENTINEL row.
 TEST(ActivitiesAllowed, SentinelEmpty_IsAllowed) {
     EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(), false));
     EXPECT_TRUE(activities_allowed(PskCategory::SENTINEL, acts(), true));
@@ -91,8 +91,8 @@ TEST(ActivitiesAllowed, PairingCatPlaybackPairing_OnlyWithUnpairedAccess) {
     EXPECT_TRUE(activities_allowed(PskCategory::PAIRING, acts(PR, PB), true));
 }
 
-// LONG_TERM row: [] or ['playback'], and nothing that declares pairing. A paired server has no
-// use for a pairing activity, and unpaired access does not enter into it.
+// LONG_TERM row: a paired server has no use for a pairing activity, and unpaired access does not
+// enter into it.
 TEST(ActivitiesAllowed, LongTermEmpty_IsAllowed) {
     EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(), false));
     EXPECT_TRUE(activities_allowed(PskCategory::LONG_TERM, acts(), true));

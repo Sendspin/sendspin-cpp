@@ -352,8 +352,7 @@ TEST(NoiseRehandshake, RehandshakeWithDifferentPsk_ChaChaPoly) {
     platform_random_bytes(new_psk.data(), new_psk.size());
     std::string new_psk_id = psk_id_for(new_psk);
 
-    // Store the new PSK, the way a re-pair does: it is bound to the same server as the original,
-    // which supersedes that earlier record.
+    // Store the new PSK the way a re-pair does: bound to the same server as the original.
     RecordStore rs(nullptr);
     SendspinPairingRecord rec;
     rec.psk_id = new_psk_id;
