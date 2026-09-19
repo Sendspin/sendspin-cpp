@@ -327,7 +327,7 @@ int main(int argc, char* argv[]) {
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     // Added for its side effect: the client offers the role and accepts server/state for it.
-    (void) client.add_controller();
+    (void)client.add_controller();
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
     auto& metadata = client.add_metadata();

@@ -709,10 +709,9 @@ static Element render_server_selector(const TuiSnapshot& snap) {
 
 // Shown until the client is paired: the Pairing PSK token an operator pastes into a server
 // that only offers the mandatory pairing_psk method (dynamic_pairing_code needs nothing shown
-// here; the code itself appears in the Server panel's pairing status row instead). Wrapped
-// across
-// the full terminal width since the token (107 chars) does not fit any of the three info
-// panels above.
+// here; the code itself appears in the Server panel's pairing status row instead). Wrapped across
+// the full terminal width since the token (107 chars) does not fit any of the three info panels
+// above.
 static Element render_pairing_token(const TuiSnapshot& snap) {
     return window(text(" Pairing Token ") | bold,
                   vbox({

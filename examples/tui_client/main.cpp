@@ -564,16 +564,16 @@ int main(int argc, char* argv[]) {
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     // Added for its side effect: the client offers the role and accepts server/state for it.
-    (void) client.add_controller();
+    (void)client.add_controller();
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
     auto& metadata = client.add_metadata();
 #endif
 
+#ifdef SENDSPIN_ENABLE_ARTWORK
     // Artwork channels: album art on channel 0, artist image on channel 1. The TUI reports what
     // arrives rather than drawing it, so the sizes are the small ones a display of this kind asks
     // for.
-#ifdef SENDSPIN_ENABLE_ARTWORK
     ArtworkRoleConfig artwork_config;
     artwork_config.preferred_formats = {
         {SendspinImageSource::ALBUM, SendspinImageFormat::JPEG, 320, 320},
@@ -588,7 +588,7 @@ int main(int argc, char* argv[]) {
 #endif
 
 #ifdef SENDSPIN_ENABLE_COLOR
-    auto& color_role = client.add_color();
+    auto& color = client.add_color();
 #endif
 
     // Visualizer support (disabled with -V flag)
@@ -942,7 +942,7 @@ int main(int argc, char* argv[]) {
     artwork.set_listener(&artwork_listener);
 #endif
 #ifdef SENDSPIN_ENABLE_COLOR
-    color_role.set_listener(&color_listener);
+    color.set_listener(&color_listener);
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     if (vis_role) {
@@ -960,11 +960,10 @@ int main(int argc, char* argv[]) {
     // client_id is base64url(static X25519 public key), 43 chars.
     //
     // Also expose the formatted Pairing PSK token: a server that only offers the mandatory
-    // pairing_psk method (dynamic_pairing_code is optional) needs this pasted in by the
-    // operator, so
-    // without showing it here a user could not pair against such a server at all. Mirrors
-    // basic_client's startup banner, just routed into TUI state instead of stderr since the
-    // TUI owns the terminal.
+    // pairing_psk method (dynamic_pairing_code is optional) needs this pasted in by the operator,
+    // so without showing it here a user could not pair against such a server at all. The same
+    // thing basic_client prints in its startup banner, routed into TUI state instead of stderr
+    // since the TUI owns the terminal.
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         state.client_id = client.client_id();

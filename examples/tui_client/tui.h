@@ -112,12 +112,15 @@ struct TuiState {
     // Artwork: what the server last delivered per channel, in configuration order
     struct ArtworkChannelStatus {
         std::string wanted;       ///< The source, format and size this channel asks for
-        size_t image_bytes{0};    ///< Encoded size of the image on display, 0 when none is
+        size_t image_bytes{0};    ///< Encoded size of the most recently delivered image, 0 after
+                                  ///< a clear
         uint32_t images{0};       ///< Images delivered to this channel so far
     };
     std::vector<ArtworkChannelStatus> artwork_channels;
 
-    // Colors derived from the current audio, as [R, G, B]
+    // Colors derived from the current audio, as [R, G, B]. Spelled out rather than using
+    // sendspin::RgbColor so this state compiles with SENDSPIN_ENABLE_COLOR=OFF, where the color
+    // role's public header is not part of the build.
     bool color_received{false};
     std::optional<std::array<uint8_t, 3>> color_primary;
     std::optional<std::array<uint8_t, 3>> color_accent;
