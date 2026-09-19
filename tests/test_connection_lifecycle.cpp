@@ -275,7 +275,8 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     ASSERT_GE(probe_fd, 0);
     pump_for(client, 200);  // give the transport time to accept it; the probe never reaches the
                             // manager (junk is closed inside the transport layer)
-    EXPECT_FALSE(client.is_connected());
+    EXPECT_FALSE(client.is_connected())
+        << "a raw TCP probe must never become the current connection";
 
     // A real server connects while the probe is held: it must establish promptly, not after the
     // probe's deadline.
@@ -295,7 +296,8 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     ::close(probe_fd);
 
     // The established connection must have been untouched by the probe reap.
-    EXPECT_TRUE(client.is_connected());
+    EXPECT_TRUE(client.is_connected())
+        << "reaping the held probe must not disturb the established connection";
 }
 
 // An outbound connect_to() through a slow network (upgrade stalled ~8 s, past every short
@@ -377,7 +379,8 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
-    EXPECT_FALSE(real_server.closed());
+    EXPECT_FALSE(real_server.closed())
+        << "the real server must be admitted, not rejected while an outbound attempt is in flight";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -429,9 +432,10 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
 
     // The displaced incumbent is released with a goodbye, not left dangling.
     pump_until(client, [&] { return server_a.closed(); });
-    EXPECT_EQ(server_a.goodbye_reason().value_or(""), "another_server");
-    EXPECT_FALSE(server_b.closed());
-    EXPECT_TRUE(client.is_connected());
+    EXPECT_EQ(server_a.goodbye_reason().value_or(""), "another_server")
+        << "a displaced incumbent must be told why it was released";
+    EXPECT_FALSE(server_b.closed()) << "the preferred server must keep the slot it won";
+    EXPECT_TRUE(client.is_connected()) << "the handoff must leave a current connection behind";
 }
 
 // Delivery-at-upgrade contract: raw TCP probes never reach the manager, so even enough of them to
@@ -462,7 +466,8 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
 
     // The transport layer closes the probes on its own (host: IX 3 s handshake timeout).
     pump_until(client, [&] { return socket_closed(probe1) && socket_closed(probe2); });
-    EXPECT_TRUE(client.is_connected());
+    EXPECT_TRUE(client.is_connected())
+        << "closing the probes must not disturb the established connection";
 
     ::close(probe1);
     ::close(probe2);
@@ -494,10 +499,14 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
     FakeEncryptedServer late(server_url(REJECT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                              late_identity, bundle.peer.record.psk_id, bundle.peer.psk);
     pump_until(client, [&] { return late.closed(); });
-    EXPECT_EQ(late.goodbye_reason().value_or(""), "another_server");
-    EXPECT_FALSE(client.is_connected());
-    EXPECT_FALSE(mute_a.closed());
-    EXPECT_FALSE(mute_b.closed());
+    EXPECT_EQ(late.goodbye_reason().value_or(""), "another_server")
+        << "a newcomer rejected at accept must still be told why";
+    EXPECT_FALSE(client.is_connected())
+        << "a rejected newcomer must not become the current connection";
+    EXPECT_FALSE(mute_a.closed())
+        << "a peer holding a nursery slot must not be evicted for a newcomer";
+    EXPECT_FALSE(mute_b.closed())
+        << "a peer holding a nursery slot must not be evicted for a newcomer";
 }
 
 // ============================================================================
@@ -569,8 +578,10 @@ TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
 
     pump_until(client, [&] { return !client.is_connected(); });
     pump_until(client, [&] { return silent.closed(); });
-    EXPECT_EQ(silent.goodbye_reason().value_or(""), "restart");
-    EXPECT_FALSE(client.get_server_information().has_value());
+    EXPECT_EQ(silent.goodbye_reason().value_or(""), "restart")
+        << "a peer dropped for liveness must be told to restart";
+    EXPECT_FALSE(client.get_server_information().has_value())
+        << "a dropped peer must not be left as the current connection";
 }
 
 // Control for the test above: a peer that answers time messages stays current past the timeout.
@@ -587,9 +598,11 @@ TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
     pump_until(client, [&] { return live.got_client_time(); });
 
     pump_for(client, 1200);  // Four liveness windows
-    EXPECT_TRUE(client.is_connected());
-    EXPECT_FALSE(live.closed());
-    EXPECT_FALSE(live.goodbye_reason().has_value());
+    EXPECT_TRUE(client.is_connected())
+        << "an answering peer must stay current past its liveness timeout";
+    EXPECT_FALSE(live.closed()) << "an answering peer must not be closed";
+    EXPECT_FALSE(live.goodbye_reason().has_value())
+        << "an answering peer must not be sent a goodbye";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -611,9 +624,11 @@ TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
     pump_until(client, [&] { return silent.got_client_time(); });
 
     pump_for(client, 300);  // Several time messages go unanswered
-    EXPECT_TRUE(client.is_connected());
-    EXPECT_FALSE(silent.closed());
-    EXPECT_FALSE(silent.goodbye_reason().has_value());
+    EXPECT_TRUE(client.is_connected())
+        << "a disabled liveness check must keep a silent peer current";
+    EXPECT_FALSE(silent.closed()) << "a disabled liveness check must not close a silent peer";
+    EXPECT_FALSE(silent.goodbye_reason().has_value())
+        << "a disabled liveness check must not send a goodbye";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
