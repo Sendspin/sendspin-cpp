@@ -349,6 +349,36 @@ TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
     EXPECT_EQ(ok.player->channels.value(), 2);
 }
 
+// A stream/start carrying a malformed section is rejected whole, so a well-formed section beside
+// it does not start a stream of its own: the client's caller breaks on the false return and
+// applies nothing. Without that rule a server could start half the stream it asked for.
+TEST(Protocol, StreamStartWithAMalformedPlayerDropsAValidArtworkSection) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"player":{"codec":"pcm",)"
+                      R"("sample_rate":44100,"channels":300,"bit_depth":16},)"
+                      R"("artwork":{"channels":[{"source":"album","format":"jpeg",)"
+                      R"("width":100,"height":100}]}}})",
+                      doc, root));
+    StreamStartMessage msg;
+    EXPECT_FALSE(process_stream_start_message(root, &msg));
+    EXPECT_FALSE(msg.player.has_value());
+    EXPECT_FALSE(msg.artwork.has_value())
+        << "the artwork section survived a message the parser rejected";
+
+    // Control: the same artwork section alone is accepted and carried through.
+    JsonDocument doc_ok;
+    JsonObject root_ok;
+    ASSERT_TRUE(parse(R"({"type":"stream/start","payload":{"artwork":{"channels":)"
+                      R"([{"source":"album","format":"jpeg","width":100,"height":100}]}}})",
+                      doc_ok, root_ok));
+    StreamStartMessage ok;
+    EXPECT_TRUE(process_stream_start_message(root_ok, &ok));
+    ASSERT_TRUE(ok.artwork.has_value());
+    ASSERT_TRUE(ok.artwork->channels.has_value());
+    EXPECT_EQ(ok.artwork->channels->size(), 1u);
+}
+
 // Enum fields are validated against the known wire strings: a recognized value is applied, an
 // unrecognized one is dropped (leaving the field untouched) rather than clearing or storing garbage.
 TEST(Protocol, GroupUpdatePlaybackStateValidation) {
@@ -1091,7 +1121,8 @@ TEST(Protocol, ServerActivateActivitiesOnly) {
     ASSERT_TRUE(process_server_activate_message(root, &msg));
     ASSERT_EQ(msg.activities.size(), 1u);
     EXPECT_EQ(msg.activities[0], SendspinActivity::PLAYBACK);
-    EXPECT_FALSE(msg.active_roles.has_value());
+    EXPECT_FALSE(msg.active_roles.has_value())
+        << "absent active_roles must be nullopt (sticky)";
     EXPECT_FALSE(msg.pairing_method.has_value());
 }
 
@@ -1133,19 +1164,6 @@ TEST(Protocol, ServerActivateWithActiveRoles) {
     ASSERT_EQ(msg.active_roles->size(), 2u);
     EXPECT_EQ((*msg.active_roles)[0], "player@v1");
     EXPECT_EQ((*msg.active_roles)[1], "metadata@v1");
-}
-
-// active_roles absent -> nullopt (sticky: caller should keep previous set).
-TEST(Protocol, ServerActivateActiveRolesAbsentIsNullopt) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(
-        R"({"type":"server/activate","payload":{"activities":["playback"]}})", doc, root));
-
-    ServerActivateMessage msg;
-    ASSERT_TRUE(process_server_activate_message(root, &msg));
-    EXPECT_FALSE(msg.active_roles.has_value())
-        << "absent active_roles must be nullopt (sticky)";
 }
 
 // messaging.md "server/activate" nests the pairing parameters: payload.pairing =
