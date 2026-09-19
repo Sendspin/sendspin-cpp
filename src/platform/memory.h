@@ -334,12 +334,12 @@ public:
     /// @param size Number of bytes to allocate.
     /// @return Pointer to the allocated memory, or nullptr on failure.
     void* allocate(size_t size) override {
-        void* raw = platform_malloc(kHeaderSize + size);
+        void* raw = platform_malloc(HEADER_SIZE + size);
         if (raw == nullptr) {
             return nullptr;
         }
         *static_cast<size_t*>(raw) = size;
-        return static_cast<uint8_t*>(raw) + kHeaderSize;
+        return static_cast<uint8_t*>(raw) + HEADER_SIZE;
     }
 
     /// @brief Wipes the block (recovering its size from the header allocate()/reallocate() wrote)
@@ -349,9 +349,9 @@ public:
         if (ptr == nullptr) {
             return;
         }
-        uint8_t* raw = static_cast<uint8_t*>(ptr) - kHeaderSize;
+        uint8_t* raw = static_cast<uint8_t*>(ptr) - HEADER_SIZE;
         const size_t size = *reinterpret_cast<size_t*>(raw);
-        secure_zero(raw, kHeaderSize + size);
+        secure_zero(raw, HEADER_SIZE + size);
         platform_free(raw);
     }
 
@@ -364,7 +364,7 @@ public:
         if (ptr == nullptr) {
             return this->allocate(new_size);
         }
-        uint8_t* raw = static_cast<uint8_t*>(ptr) - kHeaderSize;
+        uint8_t* raw = static_cast<uint8_t*>(ptr) - HEADER_SIZE;
         const size_t old_size = *reinterpret_cast<size_t*>(raw);
 
         void* new_ptr = this->allocate(new_size);
@@ -385,8 +385,8 @@ public:
 
 private:
     /// Header size: rounded up to alignof(std::max_align_t) so the pointer handed back to
-    /// ArduinoJson (raw + kHeaderSize) keeps whatever alignment platform_malloc() guarantees.
-    static constexpr size_t kHeaderSize =
+    /// ArduinoJson (raw + HEADER_SIZE) keeps whatever alignment platform_malloc() guarantees.
+    static constexpr size_t HEADER_SIZE =
         alignof(std::max_align_t) >= sizeof(size_t) ? alignof(std::max_align_t) : sizeof(size_t);
 };
 
