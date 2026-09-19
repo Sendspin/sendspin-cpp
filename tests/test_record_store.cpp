@@ -87,7 +87,7 @@ static SendspinPairingPsk make_pairing_psk(const std::optional<std::string>& lab
 /// note_record_used() and persists the array only when the durable flag flipped.
 static void touch_record(RecordStore& store, const std::string& psk_id) {
     if (store.note_record_used(psk_id)) {
-        (void) store.persist_records();
+        (void) store.persist_records(/*report_rejection=*/false);
     }
 }
 
@@ -104,8 +104,8 @@ static std::vector<uint8_t> to_bytes(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
-/// Decodes a raw blob as a pairing-records array; ASSERT-fails the calling test on decode
-/// failure (helper, not itself a TEST).
+/// Decodes a raw blob as a pairing-records array, or nullopt when the blob is absent or does
+/// not decode.
 static std::optional<std::vector<SendspinPairingRecord>> decode_records_blob(
     const std::optional<std::vector<uint8_t>>& blob) {
     if (!blob.has_value()) {
@@ -198,6 +198,43 @@ TEST(RecordStore, FirstBootPskIdIsSentinelPskIdResolvable) {
     EXPECT_EQ(resolved->category, PskCategory::SENTINEL);
     EXPECT_EQ(resolved->psk_id, SENTINEL_PSK_ID);
     EXPECT_EQ(resolved->psk, SENTINEL_PSK);
+}
+
+namespace {
+
+/// Seeds a provider with a Pairing PSK plus a pairing config carrying the pairing_psk gate.
+void seed_pairing_psk_under_gate(InMemoryPersistenceProvider& provider,
+                                 const SendspinPairingPsk& psk, bool pairing_psk_enabled) {
+    provider.seed_blob(persistence_keys::PAIRING_PSK, to_bytes(encode_pairing_psk(psk)));
+    SendspinPairingConfig cfg;
+    cfg.pairing_psk_enabled = pairing_psk_enabled;
+    provider.seed_blob(persistence_keys::PAIR_CONFIG, to_bytes(encode_pairing_config(cfg)));
+}
+
+}  // namespace
+
+// connection.md "Pre-Shared Key": when the stored pairing config disables pairing_psk, a
+// handshake referencing the Pairing PSK fails as a lookup miss, exactly as if no Pairing PSK
+// were configured. The store still holds the PSK; only the admission gate is closed.
+TEST(RecordStore, DisabledPairingPskResolvesAsAMiss) {
+    SendspinPairingPsk psk = make_pairing_psk();
+
+    InMemoryPersistenceProvider disabled_provider;
+    seed_pairing_psk_under_gate(disabled_provider, psk, /*pairing_psk_enabled=*/false);
+    RecordStore disabled(&disabled_provider);
+
+    ASSERT_TRUE(disabled.pairing_psk().has_value());
+    ASSERT_EQ(disabled.pairing_psk()->psk_id, psk.psk_id) << "the seeded PSK is still held";
+    EXPECT_FALSE(disabled.resolve_by_psk_id(psk.psk_id, PskCategory::PAIRING).has_value());
+
+    // Control: the same seeded PSK under a config that leaves the method enabled.
+    InMemoryPersistenceProvider enabled_provider;
+    seed_pairing_psk_under_gate(enabled_provider, psk, /*pairing_psk_enabled=*/true);
+    RecordStore enabled(&enabled_provider);
+
+    auto resolved = enabled.resolve_by_psk_id(psk.psk_id, PskCategory::PAIRING);
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->psk, psk.psk);
 }
 
 // ============================================================================
@@ -340,6 +377,31 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
     RecordStore rebooted(&provider);
     EXPECT_TRUE(rebooted.resolve_by_psk_id(original.psk_id, PskCategory::LONG_TERM).has_value());
     EXPECT_FALSE(rebooted.resolve_by_psk_id(replacement.psk_id, PskCategory::LONG_TERM).has_value());
+}
+
+// find_index() keys the store on psk_id, so a record whose psk_id is already held replaces that
+// record in place instead of adding a second entry for the same credential. Reached here with a
+// different server_id, because the supersede-by-server_id retire below would otherwise clean up
+// a duplicate and hide the branch.
+TEST(RecordStore, StoreRecordReplacesTheRecordHoldingTheSamePskId) {
+    RecordStore store(nullptr);
+
+    SendspinPairingRecord first = make_client_record("server-A", "first");
+    ASSERT_TRUE(store.store_record_superseding(first, {}));
+
+    SendspinPairingRecord second = first;
+    second.server_id = "server-B";
+    second.label = "second";
+    ASSERT_TRUE(store.store_record_superseding(second, {}));
+
+    EXPECT_EQ(store.records_.size(), 1u) << "one record per psk_id";
+    const auto* found = store.record_by_psk_id(first.psk_id);
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->server_id, "server-B");
+    ASSERT_TRUE(found->label.has_value());
+    EXPECT_EQ(found->label.value(), "second");
+    EXPECT_EQ(store.record_by_server_id("server-A"), nullptr)
+        << "the replaced record must not stay bound to its old server_id";
 }
 
 // ============================================================================
@@ -833,6 +895,39 @@ TEST(RecordStore, RemoveRecordIsSilentWhenTheProviderAcceptsTheDelete) {
     ASSERT_EQ(provider.remove_attempts.size(), 1u);
     EXPECT_EQ(logs.find(REBOOT_WARNING), std::string::npos)
         << "a delete the store accepted is durable and must not warn; got: " << logs;
+}
+
+// ConnectionManager::flush_pending_record_ops() passes report_rejection=false for a batch that
+// carries only the advisory `used` flag: it runs on the first activate of every long-term
+// session, the flag is rebuilt from use, and a store that is full or read-only would otherwise
+// warn once per connection. A durable change in the same store still reports the rejection.
+TEST(RecordStore, RejectedUsedFlagFlushIsSilentWhileADurableOneWarns) {
+    RejectingPersistenceProvider provider;
+    RecordStore store(&provider);
+
+    SendspinPairingRecord rec = make_client_record("server-A");
+    ASSERT_TRUE(store.store_record_superseding(rec, {}));
+    ASSERT_TRUE(store.note_record_used(rec.psk_id));
+
+    std::string used_logs;
+    {
+        StderrCapture capture;
+        EXPECT_FALSE(store.persist_records(/*report_rejection=*/false));
+        used_logs = capture.release();
+    }
+    EXPECT_EQ(used_logs.find(REBOOT_WARNING), std::string::npos)
+        << "a rejected used-flag flush must stay silent; got: " << used_logs;
+
+    // Control: the same rejected write for a durable change is reported.
+    std::string durable_logs;
+    {
+        StderrCapture capture;
+        EXPECT_FALSE(store.persist_records());
+        durable_logs = capture.release();
+    }
+    EXPECT_NE(durable_logs.find(REBOOT_WARNING), std::string::npos)
+        << "a rejected durable flush must be reported; got: " << durable_logs;
+    EXPECT_EQ(provider.save_attempts, 2) << "both flushes reached the provider";
 }
 
 // Same contract on the pairing/supersede path, which persists through the deferred
