@@ -404,7 +404,7 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
     return true;
 }
 
-bool RecordStore::persist_records() {
+bool RecordStore::persist_records(bool report_rejection) {
     std::string encoded;
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -413,15 +413,16 @@ bool RecordStore::persist_records() {
     if (this->save_encoded_records(encoded)) {
         return true;
     }
-    // One warning covers every RAM-only change the rejected blob leaves behind: a freshly paired
-    // record dies at the next reboot, and a record this write would have dropped (retired by a
-    // supersede, revoked by note_record_removed()) is valid again after one. Nothing is retried:
-    // a provider that cannot write will not start writing because it is asked again, and the RAM
-    // state stays authoritative for this boot either way.
-    SS_LOGW(TAG,
-            "Provider rejected the pairing-record write; the store's contents are RAM-only for "
-            "this boot: a just-paired record will not survive a reboot, and a record this write "
-            "would have dropped will be valid again after a reboot");
+    // One warning covers every durable change the rejected blob leaves RAM-only. Nothing is
+    // retried: a provider that cannot write will not start writing because it is asked again,
+    // and the RAM state stays authoritative for this boot either way. A batch carrying only the
+    // advisory `used` flag asks for silence instead (see report_rejection).
+    if (report_rejection) {
+        SS_LOGW(TAG,
+                "Provider rejected the pairing-record write; the store's contents are RAM-only "
+                "for this boot: records added since the last accepted write will not survive a "
+                "reboot, and records dropped since it will be valid again after one");
+    }
     return false;
 }
 

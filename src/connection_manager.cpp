@@ -1684,6 +1684,8 @@ void ConnectionManager::flush_pending_record_ops() {
     // once expresses the same final state in one NVS erase cycle instead of one per op. The
     // last-played value is a different key and keeps its own write.
     bool records_dirty = false;
+    // A pairing or a revocation, as opposed to the advisory `used` flag.
+    bool durable_change = false;
     for (const auto& op : ops) {
         switch (op.kind) {
             case PendingRecordOp::Kind::MARK_USED:
@@ -1691,6 +1693,7 @@ void ConnectionManager::flush_pending_record_ops() {
                 break;
             case PendingRecordOp::Kind::PERSIST_RECORDS:
                 records_dirty = true;
+                durable_change = true;
                 break;
             case PendingRecordOp::Kind::LAST_PLAYED:
                 this->client_->write_last_played_server(op.value);
@@ -1698,7 +1701,10 @@ void ConnectionManager::flush_pending_record_ops() {
         }
     }
     if (records_dirty) {
-        this->client_->record_store_->persist_records();
+        // A batch that carries only the `used` flag stays silent on a rejected write: the flag
+        // is advisory bookkeeping, rebuilt from use, and this runs on the first activate of
+        // every long-term session.
+        this->client_->record_store_->persist_records(durable_change);
     }
 }
 

@@ -201,11 +201,15 @@ public:
                                   const std::vector<std::string>& psk_ids_in_use = {});
 
     /// @brief Encode records_ and save it under persistence_keys::RECORDS. MAIN LOOP ONLY
-    /// (calls the provider). The deferred flush half of store_record_superseding() and
-    /// note_record_removed(); logs the durability warning itself on a rejected write, so callers
-    /// may ignore the return value.
+    /// (calls the provider). The deferred flush half of store_record_superseding(),
+    /// note_record_removed() and note_record_used(); logs the durability warning itself on a
+    /// rejected write, so callers may ignore the return value.
+    /// @param report_rejection Whether a rejected write is worth a warning. False for a write
+    ///        that only carries the advisory `used` flag, which is rebuilt from use and whose
+    ///        rejection would otherwise be reported on the first activate of every long-term
+    ///        session on a device whose store is full or read-only.
     /// @return true on success (or when there is no provider); false on a rejected write.
-    bool persist_records();
+    bool persist_records(bool report_rejection = true);
 
     /// @brief Erase the long-term record identified by psk_id from RAM, leaving the durable half
     /// to a later persist_records(). No-op if absent.
