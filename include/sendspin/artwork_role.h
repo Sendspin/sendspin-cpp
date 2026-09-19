@@ -157,8 +157,11 @@ public:
  *
  * MyArtworkListener listener;
  * ArtworkRoleConfig config;
- * config.preferred_formats = {{SendspinImageSource::ALBUM,
- *                            SendspinImageFormat::JPEG, 240, 240, true}};
+ * config.preferred_formats = {{.source = SendspinImageSource::ALBUM,
+ *                              .format = SendspinImageFormat::JPEG,
+ *                              .width = 240,
+ *                              .height = 240,
+ *                              .require_frame_done = true}};
  * auto& artwork = client.add_artwork(config);
  * listener.artwork_role = &artwork;
  * artwork.set_listener(&listener);
