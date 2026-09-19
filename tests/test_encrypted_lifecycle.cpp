@@ -2878,6 +2878,8 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     pump_until(client, [&] { return client.is_connected(); });
 
     ASSERT_TRUE(server.send_app_json(R"({"type":"server/unpair","payload":{}})"));
+    // Must-not-happen window: the drop an acted-on unpair would perform runs on the main loop a
+    // tick or two after the message, so the session is pumped well past that before it is read.
     pump_for(client, 500);
 
     EXPECT_FALSE(server.closed())

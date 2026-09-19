@@ -137,6 +137,11 @@ inline void pump_until(SendspinClient& client, const std::function<bool()>& pred
 
 /// Pumps client.loop() for a fixed window. Only for spacing events or "must not happen" checks:
 /// a window that is too short can miss a regression, never fail a correct run.
+///
+/// The window every encrypted-lifecycle test ends on, right after disconnect(), is the spacing
+/// kind: it gives the queued client/goodbye a few ticks to reach the fake server before the
+/// client is destroyed, so the peer sees the close the wire would carry. Nothing is asserted
+/// after it, and a test that does assert on the goodbye waits for it instead.
 inline void pump_for(SendspinClient& client, int duration_ms) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(duration_ms);
     while (std::chrono::steady_clock::now() < deadline) {
