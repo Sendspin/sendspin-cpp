@@ -152,6 +152,16 @@ public:
         this->buffer_location_ = location;
     }
 
+    /// @brief Tracks whether the owning connection holds the admitted slot, which selects the
+    /// reassembly cap (MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES until it does).
+    ///
+    /// Written by SendspinConnection::set_admitted() on the main loop; read on the network
+    /// thread by accept_plaintext(), same arrangement as the connection's own admitted_ flag.
+    /// @param admitted Whether the connection now occupies the admitted slot.
+    void set_admitted(bool admitted) {
+        this->admitted_.store(admitted, std::memory_order_release);
+    }
+
 private:
     /// @brief Encrypt one frame and emit it via the frame sink. Caller must hold session_mutex_,
     /// which excludes a concurrent re-handshake session swap from racing the encrypt.
@@ -217,6 +227,9 @@ private:
     /// True once a transport session exists. See is_active().
     std::atomic<bool> active_{false};
 
+    /// True while the owning connection holds the admitted slot. See set_admitted().
+    std::atomic<bool> admitted_{false};
+
     /// Emits one encrypted frame as a binary WS frame.
     FrameSink frame_sink_;
 
@@ -258,7 +271,7 @@ private:
     MemoryLocation buffer_location_{MemoryLocation::PREFER_EXTERNAL};
 
     /// True when the in-flight message's data is being thrown away rather than buffered: its
-    /// orig_type is a reserved ID nothing implements, it outgrew MAX_REASSEMBLED_MESSAGE_BYTES,
+    /// orig_type is a reserved ID nothing implements, it outgrew the reassembly cap in force,
     /// or the buffer could not be grown for it. The sequence is still tracked to its last
     /// fragment, but the message is never dispatched. Network thread only.
     bool reasm_discarding_{false};

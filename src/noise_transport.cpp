@@ -322,9 +322,14 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
     }
 
     if (!this->reasm_discarding_) {
-        if (this->reasm_len_ - 1 + data_len > MAX_REASSEMBLED_MESSAGE_BYTES) {
-            SS_LOGW(TAG, "fragmented message exceeds %zu bytes; discarding the rest of it",
-                    static_cast<size_t>(MAX_REASSEMBLED_MESSAGE_BYTES));
+        // Before admission every peer on the network can reach this path with nothing but the
+        // Sentinel PSK, and nothing that legitimately arrives then is large, so the tighter cap
+        // applies until the connection wins the admitted slot.
+        const size_t cap = this->admitted_.load(std::memory_order_acquire)
+                               ? MAX_REASSEMBLED_MESSAGE_BYTES
+                               : MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES;
+        if (this->reasm_len_ - 1 + data_len > cap) {
+            SS_LOGW(TAG, "fragmented message exceeds %zu bytes; discarding the rest of it", cap);
             this->reasm_discarding_ = true;
         } else if (!this->reasm_reserve(this->reasm_len_ + data_len)) {
             this->reasm_discarding_ = true;

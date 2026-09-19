@@ -939,6 +939,12 @@ public:
         return this->conn_.close_transport_now_calls_ > 0;
     }
 
+    /// Gives the connection the admitted slot, which lifts the reassembly cap from
+    /// MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES to MAX_REASSEMBLED_MESSAGE_BYTES.
+    void admit() {
+        this->conn_.set_admitted(true);
+    }
+
     TestConnection conn_;
     NoiseCipherState* server_send_;
     std::vector<uint8_t> last_message_;
@@ -1137,6 +1143,7 @@ TEST(FragmentSequence, OverCapMessageIsDiscardedWithoutClosing) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     FragmentReceiver rx(*r);
+    rx.admit();  // MAX_REASSEMBLED_MESSAGE_BYTES is the admitted connection's cap.
 
     // Continuation frames at the largest size a single Noise frame allows: its plaintext is
     // MAX_TRANSPORT_PLAINTEXT bytes, two of which are the fragment type and flags.
@@ -1174,6 +1181,7 @@ TEST(FragmentSequence, ReassemblyBufferNeverGrowsPastTheCap) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     FragmentReceiver rx(*r);
+    rx.admit();  // MAX_REASSEMBLED_MESSAGE_BYTES is the admitted connection's cap.
 
     const size_t chunk = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) - 2;
     rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, 0xAA});
@@ -1196,6 +1204,41 @@ TEST(FragmentSequence, ReassemblyBufferNeverGrowsPastTheCap) {
         << "the reassembly buffer outgrew the largest message it will ever hold";
 }
 
+TEST(FragmentSequence, PreAdmissionMessageOverTheTightCapIsDiscarded) {
+    // Every peer on the network holds the Sentinel PSK, so a connection that has not won the
+    // admitted slot must not be able to pin MAX_REASSEMBLED_MESSAGE_BYTES in its nursery slot.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    FragmentReceiver rx(*r);
+
+    const size_t chunk = 4096;
+    const size_t chunks = MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES / chunk + 1;
+    ASSERT_LT(chunk * chunks, MAX_REASSEMBLED_MESSAGE_BYTES)
+        << "the message must be over the pre-admission cap but under the admitted one";
+
+    auto send_message = [&] {
+        rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY});
+        for (size_t i = 0; i + 1 < chunks; ++i) {
+            rx.inject_fragment(0, std::vector<uint8_t>(chunk, 'X'));
+        }
+        rx.inject_fragment(FRAGMENT_FLAG_LAST, std::vector<uint8_t>(chunk, 'X'));
+    };
+
+    send_message();
+    EXPECT_FALSE(rx.closed()) << "exceeding the pre-admission cap must not close the connection";
+    EXPECT_EQ(rx.json_dispatched_, 0)
+        << "a message over the pre-admission cap was reassembled and dispatched";
+
+    // Control: the same message on the same connection, once it holds the admitted slot.
+    rx.admit();
+    send_message();
+    EXPECT_FALSE(rx.closed());
+    EXPECT_EQ(rx.json_dispatched_, 1)
+        << "the admitted connection must reassemble a message the 1 MiB cap admits";
+    EXPECT_EQ(rx.last_message_.size(), chunk * chunks) << "the JSON body is the message minus "
+                                                          "its orig_type byte";
+}
+
 TEST(FragmentSequence, FirstFragmentInsideADiscardedSequenceCloses) {
     // Discarding a message does not end its sequence, so a first fragment arriving inside one is
     // the same malformed sequence it would be for a buffered message. This is the case the
@@ -1204,6 +1247,7 @@ TEST(FragmentSequence, FirstFragmentInsideADiscardedSequenceCloses) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     FragmentReceiver rx(*r);
+    rx.admit();  // MAX_REASSEMBLED_MESSAGE_BYTES is the admitted connection's cap.
 
     const size_t chunk = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) - 2;
     rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, 0xAA});
@@ -1379,6 +1423,9 @@ static void run_fragment_reassemble_receive(const std::string& suite) {
 
     TestConnection conn;
     conn.set_noise_session(std::move(r->responder_session));
+    // A message this size is role traffic, which only flows on an admitted connection; before
+    // admission the far smaller MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES applies.
+    conn.set_admitted(true);
 
     std::string received;
     int calls = 0;
@@ -1420,6 +1467,7 @@ TEST(NoiseTransport, FragmentReassembleBinaryReceive) {
 
     TestConnection conn;
     conn.set_noise_session(std::move(r->responder_session));
+    conn.set_admitted(true);  // See run_fragment_reassemble_receive().
 
     std::vector<uint8_t> got;
     int calls = 0;

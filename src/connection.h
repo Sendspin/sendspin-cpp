@@ -188,6 +188,9 @@ public:
     /// @param admitted Whether this connection now occupies the admitted slot.
     void set_admitted(bool admitted) {
         this->admitted_.store(admitted, std::memory_order_release);
+        // The transport keeps its own copy: its reassembly cap is tighter until the connection
+        // is admitted, and it is read on the network thread.
+        this->noise_transport_.set_admitted(admitted);
     }
 
     /// @brief Notes that a server/activate from this connection reached the dispatch path.
