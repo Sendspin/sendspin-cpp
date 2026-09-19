@@ -499,3 +499,66 @@ TEST(VisualizerConfigReporting, StateIsReportedWithNoRequestedTypes) {
     EXPECT_TRUE(state.visualizer->types.empty());
     EXPECT_FALSE(state.visualizer->spectrum.has_value());
 }
+
+// ============================================================================
+// start(): a stream configuration the spec forbids refuses to run
+// ============================================================================
+
+namespace {
+
+// A visualizer Impl carrying the given stream configuration, bound to an inbox and otherwise
+// startable (the ring buffer is created from a real capacity).
+std::unique_ptr<VisualizerRole::Impl> make_impl_with_stream(VisualizerStreamConfig stream) {
+    static std::deque<Inbox> inboxes;
+
+    VisualizerRoleConfig config;
+    config.support.buffer_capacity = 4096;
+    config.stream = std::move(stream);
+    auto impl = std::make_unique<VisualizerRole::Impl>(std::move(config), nullptr);
+    inboxes.emplace_back();
+    impl->attach_inbox(inboxes.back());
+    return impl;
+}
+
+}  // namespace
+
+// roles/visualizer/v1.md "client/state visualizer object": a types list carrying 'spectrum'
+// without a spectrum object is a protocol error the server closes the connection for, so the role
+// refuses the configuration rather than letting the consumer discover it as a disconnect.
+TEST(VisualizerStartValidation, SpectrumTypeWithoutSpectrumConfigRefusesToStart) {
+    auto impl = make_impl_with_stream(VisualizerStreamConfig{
+        .types = {VisualizerDataType::SPECTRUM},
+        .rate_max = 25,
+    });
+
+    EXPECT_FALSE(impl->start());
+}
+
+// Same section: rate_max is a positive integer, so asking for data at a rate of zero is equally
+// spec-invalid.
+TEST(VisualizerStartValidation, ZeroRateMaxWithRequestedTypesRefusesToStart) {
+    auto impl = make_impl_with_stream(VisualizerStreamConfig{
+        .types = {VisualizerDataType::BEAT},
+        .rate_max = 0,
+    });
+
+    EXPECT_FALSE(impl->start());
+}
+
+// Control: the same shape with the spectrum object present and a positive rate starts.
+TEST(VisualizerStartValidation, ValidStreamConfigStarts) {
+    auto impl = make_impl_with_stream(VisualizerStreamConfig{
+        .types = {VisualizerDataType::SPECTRUM},
+        .rate_max = 25,
+        .spectrum =
+            VisualizerSpectrumConfig{
+                .n_disp_bins = 16,
+                .scale = VisualizerSpectrumScale::LOG,
+                .f_min = 20,
+                .f_max = 20000,
+            },
+    });
+
+    EXPECT_TRUE(impl->start());
+    impl->stop();
+}

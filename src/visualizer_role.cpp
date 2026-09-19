@@ -132,20 +132,6 @@ VisualizerRole::Impl::Impl(VisualizerRoleConfig config, SendspinClient* client)
             this->drain_task->ring_buffer.create(capacity, this->drain_task->ring_storage.data());
         }
     }
-
-    // roles/visualizer/v1.md "client/state visualizer object": rate_max is a positive integer, and
-    // a types list containing 'spectrum' without a spectrum object is a protocol error the server
-    // closes the connection for. The configuration is reported as given, so a mismatch is named
-    // here rather than discovered as an unexplained disconnect.
-    const VisualizerStreamConfig& stream = this->config.stream;
-    if (stream.rate_max == 0 && !stream.types.empty()) {
-        SS_LOGW(TAG, "Visualizer configured with rate_max 0 while requesting data types");
-    }
-    if (!stream.spectrum.has_value() &&
-        std::find(stream.types.begin(), stream.types.end(), VisualizerDataType::SPECTRUM) !=
-            stream.types.end()) {
-        SS_LOGW(TAG, "Visualizer requests the spectrum type without a spectrum configuration");
-    }
 }
 
 VisualizerRole::Impl::~Impl() {
@@ -175,6 +161,22 @@ void VisualizerRole::Impl::attach_inbox(Inbox& inbox) {
 }
 
 bool VisualizerRole::Impl::start() {
+    // roles/visualizer/v1.md "client/state visualizer object": rate_max is a positive integer,
+    // and a types list containing 'spectrum' without a spectrum object is a protocol error the
+    // server SHOULD close the connection for. The configuration is reported as given, so a
+    // config the spec forbids refuses to start here rather than being discovered as an
+    // unexplained disconnect, the same posture the player takes on its format list.
+    const VisualizerStreamConfig& stream = this->config.stream;
+    if (stream.rate_max == 0 && !stream.types.empty()) {
+        SS_LOGE(TAG, "VisualizerStreamConfig::rate_max must be positive while types are requested");
+        return false;
+    }
+    if (!stream.spectrum.has_value() &&
+        std::find(stream.types.begin(), stream.types.end(), VisualizerDataType::SPECTRUM) !=
+            stream.types.end()) {
+        SS_LOGE(TAG, "VisualizerStreamConfig::spectrum is required to request the spectrum type");
+        return false;
+    }
     if (!this->drain_task || !this->drain_task->ring_buffer.is_created()) {
         SS_LOGE(TAG, "Failed to start visualizer: drain task not initialized");
         return false;
@@ -344,7 +346,10 @@ void VisualizerRole::Impl::handle_stream_end(uint32_t generation) {
 }
 
 void VisualizerRole::Impl::handle_stream_clear(uint32_t generation) const {
-    // Per spec, stream/clear discards buffered data but the stream stays active; data
+    if (!this->accepts(generation)) {
+        return;
+    }
+    // messaging.md "stream/clear" discards buffered data but the stream stays active; data
     // received after this message continues to flow. The marker separates the two: a blind
     // flush would race this thread and drop post-clear frames it has already enqueued.
     this->signal_clear_marker();
