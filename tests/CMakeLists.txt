@@ -43,6 +43,7 @@ add_executable(sendspin_tests
     test_noise_transport.cpp
     test_noise_rehandshake.cpp
     test_admission.cpp
+    test_pairing_offers.cpp
     test_dynamic_pairing_code.cpp
     test_pairing_state_machine.cpp
     test_persistence_codec.cpp
