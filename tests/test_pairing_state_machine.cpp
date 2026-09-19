@@ -2036,69 +2036,67 @@ TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
 // Entered from a SUBSEQUENT activate
 // ============================================================================
 
-// A device that first goes operational on an empty server/activate must still enter static
-// pairing-code
-// pairing when the operator later triggers a SUBSEQUENT activate declaring [pairing].
+// A device that first goes operational on an empty server/activate must still enter pairing
+// when the operator later triggers a SUBSEQUENT activate declaring [pairing].
 // ConnectionManager::loop() must enter pairing on ANY pairing activate on an already-admitted
 // connection, not only the first, or a later one is silently dropped as an ordinary "subsequent
-// activate" and the pairing window never opens (messaging.md "server/activate": an activate may
-// be re-sent to change the pairing parameters).
-TEST_F(PairingStateMachineTest, SubsequentActivateEntersStaticCodePairing) {
-    this->configure_static_pairing_code("13572468");
+// activate" and the attempt never starts (messaging.md "server/activate": an activate may be
+// re-sent to change the pairing parameters). This holds for both pairing-code methods; what
+// each method does once entered is the business of StaticCodeHappyPath / DynamicCodeHappyPath.
+TEST_F(PairingStateMachineTest, SubsequentActivateEntersPairingForEitherCodeMethod) {
+    struct Row {
+        const char* name;
+        SendspinPairMethod method;
+        std::optional<SendspinPairingCodeFormat> format;
+        bool gesture_gated;
+        SendspinConnection::PairingStep expected_step;
+        const char* expected_frame;
+    };
+    const Row rows[] = {
+        // The static flow is gesture-gated, so it stops at the window prompt.
+        {"static_pairing_code", SendspinPairMethod::STATIC_PAIRING_CODE, std::nullopt, true,
+         SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW, "client/pair-pending"},
+        // The dynamic flow is not, so it sends commit_B immediately.
+        {"dynamic_pairing_code", SendspinPairMethod::DYNAMIC_PAIRING_CODE,
+         SendspinPairingCodeFormat::DIGITS, false,
+         SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT, "client/pair-init"},
+    };
 
-    FakeConnection* conn = this->inject_provisional_current_connection("server-static-sub");
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        if (row.method == SendspinPairMethod::STATIC_PAIRING_CODE) {
+            this->configure_static_pairing_code("13572468");
+        } else {
+            this->init_client(/*pairing_code_emission_supported=*/true,
+                              /*pairing_window_supported=*/true);
+        }
+        FakeConnection* conn = this->inject_provisional_current_connection("server-sub");
 
-    // First activate: empty activities -> connection goes operational, no pairing.
-    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
-    EXPECT_FALSE(this->listener_.fired(PairingEventKind::OPEN_WINDOW));
-    EXPECT_TRUE(conn->sent_text_.empty());
+        // The listener accumulates across rows, so each row reads its own event counts as
+        // deltas over what the previous row left behind.
+        const int started_before = this->listener_.count(PairingEventKind::STARTED);
+        const int windows_before = this->listener_.count(PairingEventKind::OPEN_WINDOW);
 
-    // Subsequent activate: [pairing] + static_pairing_code -> must enter pairing, send
-    // client/pair-pending, and prompt for the window gesture.
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
-                        SendspinPairMethod::STATIC_PAIRING_CODE);
-    this->client_->loop();
+        // First activate: empty activities -> connection goes operational, no pairing.
+        this->post_activate({}, std::vector<std::string>{}, std::nullopt);
+        this->client_->loop();
+        EXPECT_EQ(this->listener_.count(PairingEventKind::STARTED), started_before);
+        EXPECT_TRUE(conn->sent_text_.empty());
 
-    EXPECT_TRUE(this->listener_.fired(PairingEventKind::OPEN_WINDOW))
-        << "a subsequent pairing activate must open the operator pairing window";
-    EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED));
-    EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
-    ASSERT_EQ(conn->sent_text_.size(), 1u);
-    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending")
-        << "only client/pair-pending is sent until the operator confirms";
+        // Subsequent activate declaring [pairing] -> must enter pairing.
+        this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{}, row.method,
+                            row.format);
+        this->client_->loop();
 
-    // Confirming the window sends the empty client/pair-init, proving the flow is live.
-    this->client_->confirm_pairing_window();
-    this->client_->loop();
-    ASSERT_EQ(conn->sent_text_.size(), 2u);
-    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
-}
-
-// Dynamic flavor: a subsequent activate declaring [pairing] + dynamic_pairing_code on an
-// already-operational connection must enter pairing and send client/pair-init (commit_B)
-// immediately (the dynamic flow is not gesture-gated, unlike the static one above).
-TEST_F(PairingStateMachineTest, SubsequentActivateEntersDynamicCodePairing) {
-    FakeConnection* conn = this->inject_provisional_current_connection("server-dyn-sub");
-
-    // First activate: empty activities -> connection goes operational, no pairing.
-    this->post_activate({}, std::vector<std::string>{}, std::nullopt);
-    this->client_->loop();
-    EXPECT_FALSE(this->listener_.fired(PairingEventKind::STARTED));
-    EXPECT_TRUE(conn->sent_text_.empty());
-
-    // Subsequent activate: [pairing] + dynamic_pairing_code (with the emission format from the
-    // pairing object) -> must enter pairing.
-    this->post_activate({SendspinActivity::PAIRING}, std::vector<std::string>{},
-                        SendspinPairMethod::DYNAMIC_PAIRING_CODE,
-                        SendspinPairingCodeFormat::DIGITS);
-    this->client_->loop();
-
-    EXPECT_TRUE(this->listener_.fired(PairingEventKind::STARTED))
-        << "a subsequent pairing activate must start the dynamic pairing-code flow";
-    EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT);
-    ASSERT_EQ(conn->sent_text_.size(), 1u);
-    EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+        EXPECT_EQ(this->listener_.count(PairingEventKind::STARTED), started_before + 1)
+            << "a subsequent pairing activate must start the attempt";
+        EXPECT_EQ(this->listener_.count(PairingEventKind::OPEN_WINDOW),
+                  windows_before + (row.gesture_gated ? 1 : 0))
+            << "only a gesture-gated method opens the operator pairing window";
+        EXPECT_EQ(conn->pairing_session().step, row.expected_step);
+        ASSERT_EQ(conn->sent_text_.size(), 1u);
+        EXPECT_EQ(last_frame_type(conn->sent_text_), row.expected_frame);
+    }
 }
 
 // The client checks the emission format on receipt of the ACTIVATION (server/pair-init carries
