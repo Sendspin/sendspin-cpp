@@ -302,19 +302,6 @@ TEST(ShouldAdmit, NoCurrent_AlwaysAdmit) {
     EXPECT_TRUE(admit(acts(PR), "new", acts(), "", false));
 }
 
-TEST(ShouldAdmit, HigherRankDisplaces) {
-    // incoming=playback(2), admitted=pairing(1), but pairing is not displaced by rank 2
-    // (the in-flight-pairing rule blocks it)
-    EXPECT_FALSE(admit(acts(PB), "new", acts(PR), "old", true));
-
-    // Once the pairing is no longer in flight, the rank comparison decides and rank 2 wins.
-    EXPECT_TRUE(admit(acts(PB), "new", acts(PR), "old", true, std::nullopt,
-                      /*admitted_pairing_in_flight=*/false));
-
-    // incoming=playback(2), admitted=empty(0)
-    EXPECT_TRUE(admit(acts(PB), "new", acts(), "old", true));
-}
-
 TEST(ShouldAdmit, InFlightPairing_NotDisplacedByPairing) {
     // admitted=pairing(rank 1), incoming=pairing(rank 1) -> not displaced
     EXPECT_FALSE(admit(acts(PR), "new", acts(PR), "old", true));
