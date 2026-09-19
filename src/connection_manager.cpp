@@ -135,12 +135,18 @@ static PairingUiSnapshot snapshot_pairing_ui(SendspinConnection* conn) {
 /// (pairing.md "Entering and leaving pairing" recommends 2 minutes). It spans every round of the
 /// attempt: a retry keeps the running deadline rather than re-arming it. On expiry the attempt is
 /// aborted with reason attempt_timeout and the emitted code is withdrawn.
-static constexpr int64_t PAIRING_ATTEMPT_TIMEOUT_US = 120LL * 1000LL * US_PER_MS;
+static constexpr double PAIRING_ATTEMPT_TIMEOUT_S = 120.0;
+
+/// @brief Attempt deadline in microseconds (derived from PAIRING_ATTEMPT_TIMEOUT_S).
+static constexpr int64_t PAIRING_ATTEMPT_TIMEOUT_US = seconds_to_us(PAIRING_ATTEMPT_TIMEOUT_S);
 
 /// @brief Lifetime of an open pairing window, measured from opening and not paused during an
 /// attempt (pairing.md "Pairing Window" recommends 5 minutes). On expiry the window closes
 /// silently.
-static constexpr int64_t WINDOW_LIFETIME_US = 300LL * 1000LL * US_PER_MS;
+static constexpr double WINDOW_LIFETIME_S = 300.0;
+
+/// @brief Window lifetime in microseconds (derived from WINDOW_LIFETIME_S).
+static constexpr int64_t WINDOW_LIFETIME_US = seconds_to_us(WINDOW_LIFETIME_S);
 
 /// @brief Attempts under one pairing window whose server_kc verification may fail before the
 /// window closes (pairing.md "Pairing Window"): the window is the operator's consent to a bounded
@@ -175,10 +181,9 @@ class ScopedIsk {
 public:
     /// @brief Takes ownership of an ISK and wipes the caller's copy
     /// @param isk Taken by value, so the caller's temporary does not outlive this copy.
-    explicit ScopedIsk(std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk)
-        : value_(std::move(isk)) {
+    explicit ScopedIsk(std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk) : value_(isk) {
         if (isk.has_value()) {
-            // std::array moves by copying, so the argument still holds the bytes.
+            // The bytes were copied, so the argument still holds them.
             secure_zero_container(isk.value());
         }
     }
@@ -2630,7 +2635,7 @@ void ConnectionManager::open_pairing_window() {
     }
 
     SS_LOGI(TAG, "Pairing window opened: standing open for %lld s awaiting a pairing attempt",
-            static_cast<long long>(WINDOW_LIFETIME_US / (1000LL * US_PER_MS)));
+            static_cast<long long>(WINDOW_LIFETIME_S));
 }
 
 bool ConnectionManager::pairing_round_limit_reached() const {
