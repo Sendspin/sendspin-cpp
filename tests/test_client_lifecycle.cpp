@@ -975,7 +975,7 @@ TEST(ClientLifecycle, TheStreamPinKeepsTheConnectionAliveUntilStreamEnd) {
 // release is queued ahead of the hand-back, so that flush has to take an entry from in front of
 // it and leave this one behind.
 //
-// Both reads are of the thread the destructor ran on, kept for the reason the test above gives:
+// Both reads are about which thread ran the destructor, kept for the reason the test above gives:
 // nothing a caller or peer observes distinguishes it.
 TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandBackForTheLoop) {
     PinObservation observation;  // Outlives the client (see the test above)
