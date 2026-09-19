@@ -59,7 +59,7 @@ inline void secure_zero_psk(std::array<uint8_t, 32>& psk) {
 struct SendspinPairingRecord {
     std::string psk_id;
     std::array<uint8_t, 32> psk{};
-    std::string server_id;  ///< peer_id form.
+    std::string server_id;
     std::optional<std::string> label;
     bool used{false};
 
