@@ -538,6 +538,9 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
     // released here (see DeferredRelease): the goodbyes below run outside the lock, and a
     // rejection for a peer delivered during the wait can take the lock meanwhile.
     std::vector<std::shared_ptr<SendspinConnection>> to_goodbye;
+    // Queued releases that are owed no goodbye. They are moved out of the queue rather than
+    // destroyed inside it: a destructor can join a transport thread, which must not run here.
+    std::vector<std::shared_ptr<SendspinConnection>> to_release;
     PairingUiSnapshot ui{false, false};
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
@@ -570,13 +573,18 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
         this->hello_retries_.clear();
         // A standing pairing window belongs to this run; a restart begins with it closed.
         this->close_pairing_window();
-        // Releases already queued (a handoff loser, a reaped entry) had their dispatch disabled
-        // when they were queued; the shutdown goodbye replaces whatever reason they carried. One
-        // queued without a reason has a transport that is already gone, and every transport's
-        // disconnect() completes immediately on a disconnected connection, so it needs no
-        // separate path.
+        // A queued release that carries a reason (a handoff loser, a reaped entry) had its
+        // dispatch disabled when it was queued; the shutdown goodbye replaces whatever reason it
+        // carried. A reason-less entry is owed no goodbye: either its transport is already gone
+        // (on_connection_lost()), or a role handed its reference back while the connection is
+        // still in one of the slots swept above, which goodbye it once. Sending here would put a
+        // second goodbye on that live connection's wire.
         for (auto& release : this->deferred_releases_) {
-            to_goodbye.push_back(std::move(release.conn));
+            if (release.goodbye.has_value()) {
+                to_goodbye.push_back(std::move(release.conn));
+            } else {
+                to_release.push_back(std::move(release.conn));
+            }
         }
         this->deferred_releases_.clear();
         this->refresh_deferred_size_hint();

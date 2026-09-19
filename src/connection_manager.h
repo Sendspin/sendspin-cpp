@@ -164,8 +164,8 @@ struct NurseryEntry {
 /// loop. The join inside it would otherwise land on the audio thread, adding the transport
 /// teardown to a stack sized for Opus decode and stalling playback for as long as the join takes.
 struct DeferredRelease {
-    std::shared_ptr<SendspinConnection> conn;      ///< The manager's last reference
-    std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: transport gone, just release
+    std::shared_ptr<SendspinConnection> conn;  ///< A reference to drop; not necessarily the last
+    std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: no goodbye owed, just release
 };
 
 /// @brief A persistence-provider write decided under conn_ptr_mutex_ and performed after it has
