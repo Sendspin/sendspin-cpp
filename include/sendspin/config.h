@@ -453,8 +453,11 @@ struct ImageSlotPreference {
     /// below) a JPEG runs well under it, while a high-entropy PNG at the same size can exceed
     /// it. Raise it for a channel whose images are genuinely larger; the role logs every image it
     /// refuses, with the cap it was measured against. Two buffers are held per channel, so the
-    /// role's image memory is bounded by twice this value per configured channel. A channel with
-    /// 0 here holds nothing at all.
+    /// role's image memory is bounded by twice this value per configured channel, and only while
+    /// the role is running: a buffer grows to the largest image its channel received and is
+    /// handed back when the role is torn down (a stop, a disconnect, or a server/activate that
+    /// removes the role), then re-allocated by the next transfer. A channel with 0 here holds
+    /// nothing at all.
     uint32_t max_image_bytes{ARTWORK_DEFAULT_MAX_IMAGE_BYTES};
 };
 

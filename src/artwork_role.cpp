@@ -158,6 +158,36 @@ void ArtworkRole::Impl::stop() const {
     // Joined, so this is the queue's only consumer: discard notifications the old thread never
     // took, so a restart does not decode the previous session's images.
     this->drain_task->notify_queue.reset();
+
+    // ...and the only reader of the image buffers, so every one of them is idle now, whatever
+    // the last decode left behind.
+    {
+        std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+        for (auto& sb : this->drain_task->slot_buffers) {
+            sb.drain_active = false;
+        }
+    }
+    this->release_idle_slot_buffers();
+}
+
+void ArtworkRole::Impl::release_idle_slot_buffers() const {
+    // Two buffers per slot, each grown to the largest image that channel ever received and held
+    // until the role is destroyed unless they are handed back here: 2 * max_image_bytes per
+    // configured channel, 1 MiB at the defaults. A stopped or deactivated role is not showing
+    // anything, so it holds nothing; the next stream/start re-announces every channel and
+    // begin_transfer() allocates once per channel, off any timing-critical path.
+    //
+    // The buffer the decode thread is reading is left alone: drain_active/drain_buf_idx name it
+    // under this mutex, and it is released by the next call, once that decode has finished.
+    std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
+    for (auto& sb : this->drain_task->slot_buffers) {
+        for (uint8_t i = 0; i < 2; ++i) {
+            if (sb.drain_active && sb.drain_buf_idx == i) {
+                continue;
+            }
+            sb.buffers[i] = PlatformBuffer{};
+        }
+    }
 }
 
 void ArtworkRole::Impl::build_hello_fields(ClientHelloMessage& msg) const {
@@ -790,6 +820,10 @@ void ArtworkRole::Impl::cleanup() {
     this->held_display_mask = 0;
     this->held_display_clear = 0;
     this->event_state->display_slot.reset();
+
+    // discard_all_pending() bumped every slot epoch, so no transfer is in flight and nothing
+    // that is still decoding can deliver: the image buffers go back to the heap.
+    this->release_idle_slot_buffers();
 
     // Enqueue a clean STREAM_END - handle_stream_ring_event() will fire the on_image_clear()
     // callbacks (enqueue_stream_event() logs if the ring is too full to take it).

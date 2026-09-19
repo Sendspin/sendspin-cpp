@@ -244,6 +244,10 @@ struct ArtworkRole::Impl {
     /// @return true if a running thread was signalled, false if none was running.
     bool signal_stop() const;
     void stop() const;
+    /// @brief Hands back every per-slot image buffer that the decode thread is not reading.
+    /// Main thread, under slot_mutex. Called where the role stops holding an image at all: the
+    /// teardown in cleanup() and the thread join in stop().
+    void release_idle_slot_buffers() const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it.
     void enqueue_stream_event(ArtworkEventType event, uint32_t generation) const;

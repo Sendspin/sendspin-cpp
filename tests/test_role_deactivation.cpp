@@ -69,6 +69,7 @@ constexpr uint16_t STALE_START_TEST_PORT = 19037;
 constexpr uint16_t STALE_START_CONTROL_TEST_PORT = 19038;
 constexpr uint16_t INACTIVE_TRAFFIC_TEST_PORT = 19039;
 constexpr uint16_t VERSION_REPLACED_TEST_PORT = 19040;
+constexpr uint16_t ARTWORK_BUFFERS_TEST_PORT = 19041;
 
 /// Bound on every pump/wait: generous next to the loopback round trips involved, so the verdict
 /// comes from the predicate rather than the clock.
@@ -502,6 +503,45 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+// The image buffers are the role's memory, not the session's: they grow to the largest image a
+// channel received and would otherwise stay allocated for the client's life, a megabyte at the
+// defaults, on a device that is no longer showing artwork. A stop hands them back.
+TEST(RoleDeactivation, StoppingTheArtworkRoleReleasesItsImageBuffers) {
+    constexpr uint32_t IMAGE_BYTES = 64;
+    RecordingArtworkListener artwork_listener;
+
+    PairedClientBundle bundle(make_config(ARTWORK_BUFFERS_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    client.add_artwork(make_artwork_config()).set_listener(&artwork_listener);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+    options.first_roles_json = R"(["artwork@v1"])";
+    auto server = connect_paired_server(bundle.peer, ARTWORK_BUFFERS_TEST_PORT, std::move(options));
+    ASSERT_TRUE(pump_until_synced(client));
+
+    ASSERT_TRUE(server->send_app_json(stream_start_artwork_json()));
+    ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), IMAGE_BYTES)));
+    ASSERT_TRUE(server->send_binary_body(artwork_part(IMAGE_BYTES)));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return artwork_listener.decodes.load() == 1; }, PUMP_TIMEOUT_MS))
+        << "the image never decoded, so no buffer was ever claimed";
+
+    auto* drain = client.artwork()->impl_->drain_task.get();
+    ASSERT_NE(drain, nullptr);
+    ASSERT_NE(drain->slot_buffers[0].buffers[0].data(), nullptr)
+        << "the decoded image left no buffer behind to release";
+
+    client.stop();
+
+    for (auto& sb : drain->slot_buffers) {
+        for (const auto& buf : sb.buffers) {
+            EXPECT_EQ(buf.data(), nullptr) << "a stopped artwork role is still holding an image";
+        }
+    }
 }
 
 // ============================================================================
