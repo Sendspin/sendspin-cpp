@@ -1504,7 +1504,9 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
             this->push_nursery_entry(NurseryEntry{std::move(conn), /*inbound=*/true});
         }
     }
-    this->flush_deferred_releases();
+    // On the network/httpd thread: a rejection queued just above leaves on this thread, and a
+    // role's hand-over waits for loop().
+    this->flush_deferred_releases_off_loop();
 }
 
 // ============================================================================
@@ -1773,9 +1775,10 @@ void ConnectionManager::drop_connections_using_psk_id(const std::string& psk_id,
 }
 
 void ConnectionManager::queue_deferred_release(std::shared_ptr<SendspinConnection> conn,
-                                               std::optional<SendspinGoodbyeReason> reason) {
+                                               std::optional<SendspinGoodbyeReason> reason,
+                                               bool main_loop_only) {
     // Note: caller must hold conn_ptr_mutex_ and call flush_deferred_releases() after dropping it
-    this->deferred_releases_.push_back({std::move(conn), reason});
+    this->deferred_releases_.push_back({std::move(conn), reason, main_loop_only});
     this->refresh_deferred_size_hint();
 }
 
@@ -1785,12 +1788,21 @@ void ConnectionManager::release_from_role_thread(std::shared_ptr<SendspinConnect
     }
     // No goodbye: the manager already sent one if the connection was dropped, and a role thread
     // never speaks for the session. One lock take per stream, on the role thread, and no flush
-    // here (see the header): the destructor must run on the main loop.
+    // here (see the header). Main-loop-only, so a network thread flushing in on_new_connection()
+    // does not take the destructor this hand-over exists to relocate.
     std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-    this->queue_deferred_release(std::move(conn), std::nullopt);
+    this->queue_deferred_release(std::move(conn), std::nullopt, /*main_loop_only=*/true);
 }
 
 void ConnectionManager::flush_deferred_releases() {
+    this->flush_deferred_releases(/*on_main_loop=*/true);
+}
+
+void ConnectionManager::flush_deferred_releases_off_loop() {
+    this->flush_deferred_releases(/*on_main_loop=*/false);
+}
+
+void ConnectionManager::flush_deferred_releases(bool on_main_loop) {
     // Note: caller must NOT hold conn_ptr_mutex_ (see DeferredRelease)
     //
     // Lock-free early return: deferred_size_ mirrors deferred_releases_.size() and is refreshed
@@ -1812,14 +1824,34 @@ void ConnectionManager::flush_deferred_releases() {
     // past the next tick. release_from_role_thread() is the one push site that deliberately does
     // not call this function on its own thread, since the point of the hand-over is to keep the
     // destructor off that thread; it relies on those per-tick calls and on the one
-    // SendspinClient::stop() makes after joining the role threads.
+    // SendspinClient::stop() makes after joining the role threads. Its entries are skipped
+    // entirely when on_main_loop is false, which is what keeps that destructor off the
+    // network/httpd thread that flushes inside on_new_connection().
     if (this->deferred_size_.load(std::memory_order_acquire) == 0) {
         return;
     }
     std::vector<DeferredRelease> releases;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        releases.swap(this->deferred_releases_);
+        if (on_main_loop) {
+            releases.swap(this->deferred_releases_);
+        } else {
+            // Compact the main-loop-only entries down in place and take the rest. The hint stays
+            // nonzero for whatever is left, so the next loop() flush performs it.
+            size_t kept = 0;
+            for (size_t i = 0; i < this->deferred_releases_.size(); ++i) {
+                DeferredRelease& release = this->deferred_releases_[i];
+                if (release.main_loop_only) {
+                    if (kept != i) {
+                        this->deferred_releases_[kept] = std::move(release);
+                    }
+                    ++kept;
+                } else {
+                    releases.push_back(std::move(release));
+                }
+            }
+            this->deferred_releases_.resize(kept);
+        }
         this->refresh_deferred_size_hint();
     }
     for (auto& release : releases) {

@@ -160,12 +160,15 @@ struct NurseryEntry {
 ///
 /// A role thread that holds its own reference (the sync task pins the connection whose time
 /// filter its stream uses) does not destroy it either: it hands the reference back through
-/// release_from_role_thread(), which queues it here, so the destructor always runs on the main
-/// loop. The join inside it would otherwise land on the audio thread, adding the transport
-/// teardown to a stack sized for Opus decode and stalling playback for as long as the join takes.
+/// release_from_role_thread(), which queues it here with main_loop_only set. The join inside the
+/// destructor would otherwise land on the audio thread, adding the transport teardown to a stack
+/// sized for Opus decode and stalling playback for as long as the join takes.
 struct DeferredRelease {
     std::shared_ptr<SendspinConnection> conn;  ///< A reference to drop; not necessarily the last
     std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: no goodbye owed, just release
+    /// true: perform only on the main loop. A network-thread flush leaves the entry queued rather
+    /// than moving the destructor it was queued to relocate onto another borrowed stack.
+    bool main_loop_only{false};
 };
 
 /// @brief A persistence-provider write decided under conn_ptr_mutex_ and performed after it has
@@ -444,23 +447,34 @@ public:
     ///
     /// A role thread that outlives the manager's own reference (the sync task's stream pin) would
     /// otherwise run ~SendspinConnection itself, which joins the transport thread: see
-    /// DeferredRelease. The reference is queued instead and destroyed by the next
-    /// flush_deferred_releases(), so this is the one deferred-release push site that does not
-    /// flush on its own thread. loop() flushes twice per tick, and SendspinClient::stop() flushes
-    /// once more after it has joined the role threads, so a hand-over can outlive its stream by
-    /// at most one tick and never outlives the run.
-    /// @param conn The reference to hand over; empty on return (moved from). Null is a no-op.
+    /// DeferredRelease. The reference is queued instead, as a main-loop-only entry, and destroyed
+    /// by the next flush_deferred_releases(); this is the one deferred-release push site that
+    /// does not flush on its own thread. loop() flushes twice per tick, and
+    /// SendspinClient::stop() flushes once more after it has joined the role threads, so a
+    /// hand-over can outlive its stream by at most one tick and never outlives the run.
+    /// @param conn The reference to hand over; taken by value, so callers should move. Null is a
+    ///        no-op.
     void release_from_role_thread(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Performs the queued goodbye sends and connection releases from deferred_releases_.
-    /// Caller must NOT hold conn_ptr_mutex_ (see DeferredRelease). Safe to call from any thread;
-    /// a queued release is performed exactly once. Called after every locked section that can
-    /// queue a release, by loop() as a backstop, and by SendspinClient::stop() after the role
-    /// threads are joined (see release_from_role_thread()).
+    /// Call on the main loop only: it performs every queued entry, including the main-loop-only
+    /// hand-overs (see flush_deferred_releases_off_loop()). Caller must NOT hold conn_ptr_mutex_
+    /// (see DeferredRelease). A queued release is performed exactly once. Called after every
+    /// locked section that can queue a release, by loop() as a backstop, and by
+    /// SendspinClient::stop() after the role threads are joined.
     ///
     /// Early-returns without locking when deferred_size_ reads 0; see the definition for the
     /// soundness argument.
     void flush_deferred_releases();
+
+    /// @brief Performs the queued releases that any thread may perform, leaving the
+    /// main-loop-only ones for loop().
+    ///
+    /// The network-thread counterpart of flush_deferred_releases(), for on_new_connection(),
+    /// whose own rejections (a surplus peer that is owed a goodbye) must still leave on the
+    /// thread that took them rather than wait a tick. A skipped entry keeps deferred_size_
+    /// nonzero, so the next loop() flush picks it up.
+    void flush_deferred_releases_off_loop();
 
     /// @brief psk_ids backing a currently-open connection, provisional or admitted. Thread-safe.
     /// These are the records a completed pairing must not evict (pairing.md "Pairing Records").
@@ -652,6 +666,10 @@ private:
     /// drift from the container. Caller must hold conn_ptr_mutex_.
     void refresh_nursery_size_hint();
 
+    /// @brief Shared body of the two flush entry points.
+    /// @param on_main_loop false leaves the main-loop-only entries queued (see DeferredRelease).
+    void flush_deferred_releases(bool on_main_loop);
+
     /// @brief Refreshes deferred_size_ from deferred_releases_.size(). Every deferred_releases_
     /// mutation site calls this immediately afterward, in the same critical section, so the hint
     /// atomic can never drift from the container. Caller must hold conn_ptr_mutex_.
@@ -739,10 +757,13 @@ private:
     /// drift from deferred_releases_.size(). Caller must hold conn_ptr_mutex_ and call
     /// flush_deferred_releases() after dropping it.
     /// @param conn The connection to release; empty on return (moved from).
-    /// @param reason The goodbye reason to send before closing, or nullopt when the transport is
-    ///        already gone so no goodbye should be attempted.
+    /// @param reason The goodbye reason to send before closing, or nullopt when no goodbye is
+    ///        owed (the transport is gone, or another entry covers it).
+    /// @param main_loop_only true to keep the entry queued until a main-loop flush reaches it
+    ///        (see DeferredRelease).
     void queue_deferred_release(std::shared_ptr<SendspinConnection> conn,
-                                std::optional<SendspinGoodbyeReason> reason);
+                                std::optional<SendspinGoodbyeReason> reason,
+                                bool main_loop_only = false);
 
     // ========================================
     // Hello handshake
