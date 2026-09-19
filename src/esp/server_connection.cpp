@@ -169,8 +169,6 @@ SsErr SendspinServerConnection::queue_async_send(const uint8_t* data, size_t len
     // Single allocation: the AsyncRespArg header immediately followed by the payload bytes.
     void* block = platform_malloc(sizeof(AsyncRespArg) + len);
     if (block == nullptr) {
-        // SS_LOGE requires a compile-time literal format string (it is concatenated with the log
-        // prefix at compile time), so the differing wording is an if/else rather than a ternary.
         if (is_text) {
             SS_LOGE(TAG, "Failed to allocate AsyncRespArg for message send");
         } else {
