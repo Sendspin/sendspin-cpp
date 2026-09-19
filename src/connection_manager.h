@@ -760,7 +760,8 @@ private:
     /// flush_deferred_releases() after dropping it.
     /// @param conn The connection to release; empty on return (moved from).
     /// @param reason The goodbye reason to send before closing, or nullopt when no goodbye is
-    ///        owed (the transport is gone, or another entry covers it).
+    ///        owed (the transport is gone, the close is deliberately silent, or another entry
+    ///        covers it).
     /// @param main_loop_only true to keep the entry queued until a main-loop flush reaches it
     ///        (see DeferredRelease).
     void queue_deferred_release(std::shared_ptr<SendspinConnection> conn,

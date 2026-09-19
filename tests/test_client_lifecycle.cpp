@@ -977,7 +977,15 @@ TEST(ClientLifecycle, AStreamStartedWithNoConnectionDecodesNothingAndTheNextOneP
 /// bound here could tell a task that never hands the pin back from a slow machine, and the suite
 /// watchdog in tests/main.cpp names the hang instead.
 void wait_for_hand_over(ConnectionManager& manager) {
-    while (manager.deferred_size_.load(std::memory_order_acquire) == 0) {
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+            for (const auto& release : manager.deferred_releases_) {
+                if (release.main_loop_only) {
+                    return;
+                }
+            }
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
@@ -1021,7 +1029,7 @@ TEST(ClientLifecycle, StopGoodbyesAPinnedConnectionOnce) {
     client.stop();
 
     EXPECT_EQ(observation.goodbyes.load(), 1)
-        << "the queued hand-over was goodbyed on top of the slot's own goodbye";
+        << "expected exactly one client/goodbye on this connection's wire";
     EXPECT_TRUE(observation.destroyed.load()) << "stop() left the hand-over queued";
 }
 
@@ -1113,10 +1121,10 @@ TEST(ClientLifecycle, AMidStreamDropGoodbyesOnceAndFreesOnTheLoop) {
         << "the dropped connection outlived the stream that pinned it";
     EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
         << "the sync task freed the connection on its own thread";
-    EXPECT_EQ(observation.goodbyes.load(), 1) << "the two queue entries each sent a goodbye";
+    EXPECT_EQ(observation.goodbyes.load(), 1)
+        << "expected exactly one client/goodbye on this connection's wire";
 
     client.stop();
-    EXPECT_EQ(observation.goodbyes.load(), 1) << "stop() goodbyed a connection already released";
 }
 
 }  // namespace

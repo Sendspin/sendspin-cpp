@@ -914,8 +914,10 @@ void SyncTask::thread_entry(void* params) {
         // conversion off conn_ptr_mutex_, and keeping a dropped connection alive a little longer
         // is what the deferred-release design already expects (see DeferredRelease). Resolved
         // before TASK_RUNNING is published, so a reader that sees the task running sees a stream
-        // whose pin is settled; nothing under the manager lock waits for TASK_RUNNING, so taking
-        // it here cannot stall the main loop.
+        // whose pin is settled. The lock wait therefore sits inside the window where the task
+        // reads neither idle nor running, which is safe because every STREAM_END producer sets
+        // COMMAND_STREAM_END before enqueuing the event, so the sync-idle gate that reads
+        // is_running() can only release an end the task is already commanded to honour.
         this_task->stream_connection_ = this_task->conn_manager_->current_shared();
 
         this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
@@ -963,10 +965,11 @@ void SyncTask::thread_entry(void* params) {
             }
         }
 
-        // Return any borrowed ring buffer entry. Ahead of the pin hand-over below, which blocks
+        // Return any borrowed ring buffer entry ahead of the pin hand-over below, which blocks
         // on the manager lock: a network thread can be parked on ring space for as long as
-        // HEADER_SEND_TIMEOUT_MS and this task is its only drainer, so the task holds nothing of
-        // its own when it takes that lock.
+        // HEADER_SEND_TIMEOUT_MS and this task is its only drainer. The stream-start pin above
+        // takes the same lock with the codec header still borrowed; that is not a cycle either,
+        // since no path takes conn_ptr_mutex_ and then blocks on ring space.
         if (sync_context.encoded_entry != nullptr) {
             this_task->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
             sync_context.encoded_entry = nullptr;

@@ -576,9 +576,11 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
         // A queued release that carries a reason (a handoff loser, a reaped entry) had its
         // dispatch disabled when it was queued; the shutdown goodbye replaces whatever reason it
         // carried. A reason-less entry is owed no goodbye: its transport is already gone
-        // (on_connection_lost()), or it is a role's hand-over, whose connection is either still
-        // in a slot swept above or already carried by its own goodbye entry here. Either way it
-        // is goodbyed exactly once, and sending again would put a second frame on a live wire.
+        // (on_connection_lost()), the close is deliberately silent (abort_pairing_attempt() with
+        // CLOSE_SILENTLY, pairing.md "Protocol Errors"), or it is a role's hand-over, whose
+        // connection is either still in a slot swept above or already carried by its own goodbye
+        // entry here. Either way it is goodbyed at most once, and sending here would put a frame
+        // on a live wire that is owed none.
         for (auto& release : this->deferred_releases_) {
             if (release.goodbye.has_value()) {
                 to_goodbye.push_back(std::move(release.conn));
