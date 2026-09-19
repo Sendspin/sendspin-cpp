@@ -417,7 +417,9 @@ struct ImageSlotPreference {
     /// @brief Default max_image_bytes: 128 KiB per artwork channel, which holds any JPEG a
     /// 320x320 channel receives (a photographic one runs an order of magnitude under it, and a
     /// worst-case noisy one about 78 KB) with room for a larger channel, and bounds a
-    /// four-channel role at 1 MiB of image buffers.
+    /// four-channel role at 1 MiB of image buffers. That budget assumes PSRAM: on a part without
+    /// it, lower this per channel to what internal RAM can spare, or the first announce of an
+    /// image the heap cannot hold is refused and the channel shows nothing.
     static constexpr uint32_t DEFAULT_MAX_IMAGE_BYTES = 128U * 1024U;
 
     SendspinImageSource source{};
