@@ -161,7 +161,7 @@ TEST(GoodbyeWait, BoundElapsesWhenACompletionNeverArrives) {
 // would) wait() reports success, and with nothing registered it never blocks.
 TEST(GoodbyeWait, CompletionsSatisfyTheWait) {
     GoodbyeWait idle;
-    EXPECT_TRUE(idle.wait(GOODBYE_FLUSH_TIMEOUT_MS));
+    EXPECT_TRUE(idle.wait(UINT32_MAX)) << "a wait with nothing registered must not block";
 
     GoodbyeWait wait;
     wait.add_pending();
@@ -1002,6 +1002,10 @@ TEST(ClientLifecycle, StopGoodbyesAPinnedConnectionOnce) {
 // alone, or the destructor it relocated lands on another borrowed stack. Here a peer arrives
 // while the pin is queued; admission is closed first, so the peer is rejected and its goodbye
 // proves the network-thread flush ran before anything is asserted.
+//
+// A goodbye-bearing release is queued ahead of the hand-over, so the off-loop flush takes an
+// entry from in front of it and has to compact it down: an entry left at its old index is
+// dropped by the resize, on the network thread, which is the whole point of skipping it.
 TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandOverForTheLoop) {
     PinObservation observation;  // Outlives the client (see the stop test)
     CountingPlayerListener listener;
@@ -1010,18 +1014,21 @@ TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandOverForTheLoop) {
     client.add_player(make_pcm_player_config()).set_listener(&listener);
     ASSERT_TRUE(bundle.start());
 
-    pin_stream_on(client, std::make_shared<PinnedConnection>(&observation));
+    auto pinned = std::make_shared<PinnedConnection>(&observation);
+    SendspinConnection* dropped = pinned.get();
+    pin_stream_on(client, std::move(pinned));
+
+    {
+        // Drop the slot's reference, with a goodbye, so this entry is queued first and the
+        // hand-over behind it is the only reference left: whoever performs that entry runs the
+        // destructor. Nothing flushes until the rejection below, which is off the main loop.
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        client.connection_manager_->drop_connection(dropped, SendspinGoodbyeReason::ANOTHER_SERVER);
+    }
 
     PlayerRole::Impl& impl = *client.player_->impl_;
     impl.handle_stream_end(impl.cleanup_generation.load());
     wait_for_hand_over(*client.connection_manager_);
-
-    {
-        // Drop the slot's reference so the queued hand-over is the only one left: whoever
-        // performs that entry runs the destructor.
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        client.connection_manager_->current_connection_.reset();
-    }
 
     {
         // Take the rejection branch of on_new_connection() with one peer, rather than filling

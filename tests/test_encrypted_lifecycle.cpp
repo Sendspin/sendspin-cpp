@@ -1749,7 +1749,7 @@ public:
     explicit HoldTestClient(const char* name) {
         SendspinClientConfig config;
         config.name = name;
-        // No listening port is used: every message is delivered directly.
+        // Port 0: an ephemeral listener nothing connects to; every message is delivered directly.
         config.server_port = 0;
         this->client_storage = std::make_unique<SendspinClient>(std::move(config));
         this->client_storage->set_network_provider(&this->network);
@@ -2266,6 +2266,13 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBoundedByBytesBeforeMessages) {
     EXPECT_EQ(bundle.listener.updates, 1);
     EXPECT_EQ(bundle.listener.last_title, std::string(title_len, 'b'))
         << "the last state inside the byte budget is the one that must replay";
+
+    // The replay also ends the hold: both budgets read empty again and the MAX_HELD_BYTES
+    // allocation goes back to the heap rather than staying held for the rest of the session.
+    EXPECT_EQ(conn.held_count_, 0u) << "the replay left the held messages countable again";
+    EXPECT_EQ(conn.held_bytes_, 0u) << "the replay left the byte budget spent";
+    EXPECT_EQ(conn.held_messages_.size(), 0u)
+        << "the hold buffer stayed allocated after the replay";
 }
 
 // Control: the replay runs every held type's real handler to completion. One message of each
@@ -2547,7 +2554,7 @@ TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteTheBlobOnce) {
         std::vector<SendspinPairingRecord>{used_record, unpairing_record});
     SendspinClientConfig config;
     config.name = "Coalesced Record Write Test Client";
-    // No listening port is used: the manager is driven directly.
+    // Port 0: an ephemeral listener nothing connects to; the manager is driven directly.
     config.server_port = 0;
 
     SendspinClient client(config);
@@ -2596,7 +2603,7 @@ TEST(EncryptedLifecycle, AMarkUsedOpThatFlipsNothingWritesNoBlob) {
         std::vector<SendspinPairingRecord>{used_record});
     SendspinClientConfig config;
     config.name = "Repeat Mark Used Test Client";
-    // No listening port is used: the manager is driven directly.
+    // Port 0: an ephemeral listener nothing connects to; the manager is driven directly.
     config.server_port = 0;
 
     SendspinClient client(config);
@@ -2644,7 +2651,7 @@ TEST(EncryptedLifecycle, StopFlushesARecordOpStagedAfterTheLastTick) {
         std::vector<SendspinPairingRecord>{used_record});
     SendspinClientConfig config;
     config.name = "Stop Flushes Staged Record Op Test Client";
-    // No listening port is used: the manager is driven directly.
+    // Port 0: an ephemeral listener nothing connects to; the manager is driven directly.
     config.server_port = 0;
 
     SendspinClient client(config);
