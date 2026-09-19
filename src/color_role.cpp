@@ -105,11 +105,15 @@ void ColorRole::Impl::apply_due_state() {
 }
 
 void ColorRole::Impl::drain_events() {
+    // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex;
+    // see inbox.h), so the server-clock deadline gate is split in two: take() unconditionally
+    // moves the pending palettes into held_state, then each deadline is evaluated below with no
+    // lock held at all.
+    //
     // roles/color/v1.md "Scheduled color updates": a palette whose timestamp is still in the
     // future is the pending update and a newer one replaces it, while a past or present one is
     // applied at once and discards the pending update. Both fall out of replacing held_state with
-    // each taken palette in arrival order, applying whatever is due in between. No lock is held
-    // while a deadline is evaluated (the slot value was already taken).
+    // each taken palette in arrival order, applying whatever is due in between.
     PendingColorStates taken;
     if (this->event_state->slot.take(taken)) {
         const bool collapses =
