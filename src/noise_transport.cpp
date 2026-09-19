@@ -323,7 +323,8 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
 
     if (!this->reasm_discarding_) {
         // Before admission every peer on the network can reach this path with nothing but the
-        // Sentinel PSK, and nothing that legitimately arrives then is large, so the tighter cap
+        // Sentinel PSK, and nothing that legitimately arrives then approaches the tighter cap
+        // (the pre-admission JSON hold budget, MAX_HELD_BYTES, is half of it), so that cap
         // applies until the connection wins the admitted slot.
         const size_t cap = this->admitted_.load(std::memory_order_acquire)
                                ? MAX_REASSEMBLED_MESSAGE_BYTES

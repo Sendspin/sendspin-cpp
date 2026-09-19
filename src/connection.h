@@ -1075,6 +1075,9 @@ protected:
     /// letting an unadmitted peer grow held_messages_ without bound.
     static constexpr size_t MAX_HELD_MESSAGES = 8;
     static constexpr size_t MAX_HELD_BYTES = 4 * SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE;
+    static_assert(MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES == 2 * MAX_HELD_BYTES,
+                  "the pre-admission reassembly cap is stated as twice the pre-admission hold "
+                  "budget; keep the two derivations in step");
 
     // Struct fields
 

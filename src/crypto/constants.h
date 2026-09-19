@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include "sendspin/config.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -91,12 +93,18 @@ static constexpr size_t MAX_HANDSHAKE_MESSAGE_BYTES = 512;
 static constexpr size_t MAX_REASSEMBLED_MESSAGE_BYTES = 1UL * 1024UL * 1024UL;
 
 /// @brief Reassembly cap that applies until the connection is admitted: 16 KiB.
-/// The only messages that legitimately precede admission are server/hello, server/activate and
-/// pairing JSON, none of which needs fragmenting at all; 16 KiB leaves room for a verbose hello
+/// What legitimately precedes admission is server/hello, server/activate, pairing JSON, and the
+/// role JSON a server sends between its own server/activate and this client's admission decision,
+/// which SendspinConnection::hold_pre_admission_message() holds under a total budget of
+/// MAX_HELD_BYTES (8 KiB). Twice that whole budget is far above any single one of those messages,
 /// while denying a peer holding only the Sentinel PSK the 1 MiB it could otherwise pin per
-/// nursery slot. Role traffic, the reason MAX_REASSEMBLED_MESSAGE_BYTES is as large as it is,
-/// only flows once the connection is admitted.
-static constexpr size_t MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES = 16UL * 1024UL;
+/// nursery slot. The traffic that makes MAX_REASSEMBLED_MESSAGE_BYTES as large as it is (player
+/// audio chunks, artwork parts) is binary, and is dispatched only once the connection is admitted
+/// (requires_admitted_connection()).
+/// Derived from the same root as MAX_HELD_BYTES; SendspinConnection static_asserts the 2x
+/// relation, which a header dependency here cannot express.
+static constexpr size_t MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES =
+    8 * SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE;
 
 // ============================================================================
 // Binary message type bytes (first byte of decrypted plaintext)

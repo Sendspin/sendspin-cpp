@@ -250,7 +250,10 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   admission are still dropped; only the JSON half of that window is held and replayed. A player
   resynchronizes from the next chunk, so the cost is bounded, but a stream's first chunks can be
   lost this way. For artwork the window is now before the stream exists at all (the stream starts
-  from the `client/state` the client sends once admitted), so no transfer can be torn by it.
+  from the `client/state` the client sends once admitted), so no transfer can be torn by it. A
+  fragmented message that starts in the window and outgrows the 16 KiB pre-admission reassembly
+  cap is discarded before its last fragment arrives, so it is lost even when admission lands
+  first.
 - The artwork role refuses an image whose announced `total_size` exceeds the channel's configured
   `ImageSlotPreference::max_image_bytes` (128 KiB by default), tracking the transfer to its end
   with its bytes dropped. `roles/artwork/v1.md` "Artwork (Binary)" allows this (it is the
