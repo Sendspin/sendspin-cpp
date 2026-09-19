@@ -189,11 +189,12 @@ public:
 ///
 /// Re-entrancy: implementations must NOT call back into the library (SendspinClient or any of
 /// its objects) from inside load_blob/save_blob/erase_blob. Every call is made from the middle
-/// of a library step that is part-way through updating the state the call is about, and the
-/// library is not re-entrant there. No internal lock is held across the call: the record store
-/// encodes its blob under its mutex and saves after dropping it, and the connection manager
-/// stages the writes its lifecycle handlers decide on and performs them once `conn_ptr_mutex_`
-/// is dropped.
+/// of a library step that is part-way through updating the state the call is about: `stop()`
+/// called from inside `save_blob()` during the connection manager's staged-write flush, for one,
+/// destroys the manager while that flush is still walking its staged ops. No internal lock is held
+/// across the call: the record store encodes its blob under its mutex and saves after dropping it,
+/// and the connection manager stages the writes its lifecycle handlers decide on and performs them
+/// once `conn_ptr_mutex_` is dropped.
 ///
 /// Blocking: an implementation must perform one bounded storage operation and return, not add
 /// blocking of its own (a synchronous retry loop, a multi-second fsync chain). The main loop is
@@ -877,12 +878,14 @@ private:
     /// @brief Loads the last played server_id from persistence
     void load_last_played_server();
 
-    /// @brief Persists the server_id as the last played server
+    /// @brief Persists the server_id as the last played server, RAM half and write together.
+    /// For a caller that holds no manager lock (the group-update drain); the connection manager
+    /// uses note_last_played_server() / write_last_played_server() separately.
     void persist_last_played_server(const std::string& server_id);
 
     /// @brief Applies the handoff preference in RAM, the half a caller holding
     /// ConnectionManager::conn_ptr_mutex_ may run: arbitration reads last_played_server_id_
-    /// under that lock, so the RAM update must not be deferred with the write.
+    /// later in that same locked block, so the RAM update must not be deferred with the write.
     /// @return true when the value actually changed, so the caller owes a
     ///         write_last_played_server() once its locks are dropped.
     bool note_last_played_server(const std::string& server_id);

@@ -238,8 +238,8 @@ An image larger than `ArtworkRole::Impl::image_cap()` for its channel is not hel
    ├─ Process close/disconnect events (on_connection_lost)
    ├─ Promotion scan: establish nursery connections whose hello handshake completed
    │  (handoff decisions against the incumbent)
-   ├─ flush_pending_record_ops(): perform the persistence writes the handlers above decided
-   │  on (mark-used, record removal, last-played), unlocked
+   ├─ flush_pending_record_ops(): perform the persistence writes the activate, unpair, and
+   │  promotion handlers decided on (records blob, last-played), unlocked
    ├─ flush_pending_admission(): admit the connection the promotion scan installed, unlocked
    ├─ Call loop() on the current and nursery connections   (only when has_current_ or nursery_size_)
    ├─ Check per-connection hello retry timers   (only when nursery_size_)

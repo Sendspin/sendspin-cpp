@@ -577,7 +577,8 @@ bool RecordStore::persist_config() {
 // main loop by the client via INBOX_TOPIC_RECORDS; one flush write covers the insert and the
 // retire together.
 //
-// Precondition: the caller holds mutex_.
+// Preconditions: encode_records_locked() with mutex_ held, save_encoded_records() with it
+// dropped.
 std::string RecordStore::encode_records_locked() const {
     if (this->provider_ == nullptr) {
         return {};

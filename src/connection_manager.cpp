@@ -1906,8 +1906,9 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     if (server_id.empty()) {
         return;
     }
-    // The RAM half updates here, because should_switch_to_new_server() reads
-    // last_played_server_id_ under this same lock; only the durable write is staged.
+    // The RAM half updates here, because the promotion scan's should_switch_to_new_server()
+    // reads last_played_server_id_ later in this same locked block; only the durable write is
+    // staged.
     if (this->client_->note_last_played_server(server_id)) {
         this->stage_record_op(PendingRecordOp::Kind::LAST_PLAYED, server_id);
     }
