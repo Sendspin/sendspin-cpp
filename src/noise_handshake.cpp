@@ -80,9 +80,8 @@ static std::string serialize_noise_handshake(const std::vector<uint8_t>& noise_b
 namespace {
 
 /// @brief Parse a JSON envelope and verify its "type" field, logging and returning nullopt on
-/// any failure (parse error or type mismatch). Shared by handle_server_init (server/init) and
-/// run_msg1_core (noise/handshake msg1): both deserialize an envelope, check its "type" against
-/// what they expect, and log+fail identically otherwise.
+/// any failure (parse error or type mismatch). Used by run_rehandshake_msg1, which receives the
+/// raw envelope text rather than a parsed document.
 /// @param text           Raw JSON envelope text.
 /// @param expected_type  Required value of the envelope's "type" field.
 /// @param log_context    Prefix used for the failure log line (caller's function name).
