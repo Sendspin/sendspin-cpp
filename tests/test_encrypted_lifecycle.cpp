@@ -2434,6 +2434,17 @@ public:
         return this->last_played_;
     }
 
+    /// @brief Whether the record the store would load carries the durable used flag.
+    [[nodiscard]] bool persisted_used(const std::string& psk_id) const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        for (const auto& record : this->records_) {
+            if (record.psk_id == psk_id) {
+                return record.used;
+            }
+        }
+        return false;
+    }
+
     /// @brief The psk_ids the store would load on the next boot.
     [[nodiscard]] std::vector<std::string> persisted_psk_ids() const {
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -2613,6 +2624,44 @@ TEST(EncryptedLifecycle, AMarkUsedOpThatFlipsNothingWritesNoBlob) {
     EXPECT_TRUE(marked->used) << "the RAM flag must still be set";
 
     client.stop();
+}
+
+// A record op staged after the last tick has no tick left to carry it: stop() flushes once on
+// the way down, or the write is lost. The op staged here is the one a real session stages last,
+// the MARK_USED of a long-term activate, and what is asserted is the blob the next boot loads
+// rather than the RAM flag the same flush also sets.
+TEST(EncryptedLifecycle, StopFlushesARecordOpStagedAfterTheLastTick) {
+    Identity used_identity = Identity::generate().value();
+    SendspinPairingRecord used_record = make_record_for(used_identity);
+
+    TestNetworkProvider network;
+    RecordsMirrorPersistenceProvider persistence(
+        std::vector<SendspinPairingRecord>{used_record});
+    SendspinClientConfig config;
+    config.name = "Stop Flushes Staged Record Op Test Client";
+    // No listening port is used: the manager is driven directly.
+    config.server_port = 0;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    ConnectionManager& manager = *client.connection_manager_;
+
+    const size_t saves_before = persistence.records_saves();
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.stage_record_op(PendingRecordOp::Kind::MARK_USED, used_record.psk_id);
+    }
+    ASSERT_EQ(persistence.records_saves(), saves_before)
+        << "staging under the lock must not write on its own";
+
+    client.stop();
+
+    EXPECT_EQ(persistence.records_saves() - saves_before, 1u)
+        << "the op staged after the last tick never reached the provider";
+    EXPECT_TRUE(persistence.persisted_used(used_record.psk_id))
+        << "the blob stop() wrote must carry the staged flip";
 }
 
 // The last-played server_id lives under its own key, so a tick that stages only that write must
