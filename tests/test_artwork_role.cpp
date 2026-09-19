@@ -463,6 +463,8 @@ TEST(ArtworkTransfer, CancelAbandonsTheTransferInFlight) {
 
     // The abandoned image never reaches the listener, and the announce that follows is accepted:
     // the cancel ended the transfer rather than leaving it in flight.
+    // Control: the next announce is accepted and its image decoded, so the drop above is the
+    // stream end releasing the transfer and not the slot refusing every image afterwards.
     EXPECT_TRUE(send_image(*impl, 0, make_image('B', 40)));
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
     EXPECT_EQ(listener.decode_marker_at(0), 'B');
@@ -942,8 +944,8 @@ void expect_transfer_dropped_by(const std::function<void(ArtworkRole::Impl&)>& e
 
 // roles/artwork/v1.md "Stream lifecycle": a transfer in flight belongs to the stream that
 // announced it. Every way that stream can end drops it, so the next stream starts from a fresh
-// announce instead of closing the connection over a second announce in flight. Each row also
-// asserts the follow-up image is decoded, which is the accepting half of the same behavior.
+// announce instead of closing the connection over a second announce in flight. Every row runs the
+// accepting control marked in expect_transfer_dropped_by() alongside its own drop.
 TEST(ArtworkTransfer, EveryEndOfTheStreamDropsTheTransferInFlight) {
     struct Row {
         const char* name;

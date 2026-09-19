@@ -1659,12 +1659,20 @@ TEST(NoiseTransport, SendsBeforeTheSessionExistsReportInvalidState) {
 TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
     struct Row {
         const char* name;
-        std::vector<uint8_t> noise_bytes;
+        bool well_formed;                  // build message 1 with a real initiator
+        std::vector<uint8_t> noise_bytes;  // the frame's noise bytes when it is not well formed
+        HandshakeFrameResult expected;
     };
     const Row rows[] = {
-        {"empty noise bytes", {}},
+        {"empty noise bytes", false, {}, HandshakeFrameResult::ABORT},
         // Well-formed base64url, but fails Noise authentication as message 1.
-        {"garbage of a plausible length", std::vector<uint8_t>(64, 0xAB)},
+        {"garbage of a plausible length", false, std::vector<uint8_t>(64, 0xAB),
+         HandshakeFrameResult::ABORT},
+        // Control: a message 1 a real initiator wrote over the same prologue completes, so the
+        // aborts above are the driver reading the bytes rather than refusing every message 1.
+        // The store holds no record, so the driver takes the Sentinel fallback; that is a message
+        // 2 concern, since KKpsk2 mixes the PSK after message 1 is read.
+        {"a well formed message 1", true, {}, HandshakeFrameResult::COMPLETE},
     };
 
     for (const Row& row : rows) {
@@ -1674,13 +1682,30 @@ TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
         RecordStore rs(nullptr);
 
         NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
-        nh.build_client_init();
+        const std::string client_init = nh.build_client_init();
+        const std::string server_init_text = make_server_init(server_id.peer_id());
         auto send_fn = [](const std::string&) { return true; };
-        ASSERT_EQ(nh.on_text_frame(make_server_init(server_id.peer_id()), send_fn),
-                  HandshakeFrameResult::NEED_MORE);
+        ASSERT_EQ(nh.on_text_frame(server_init_text, send_fn), HandshakeFrameResult::NEED_MORE);
 
-        EXPECT_EQ(nh.on_text_frame(make_noise_handshake_envelope(row.noise_bytes), send_fn),
-                  HandshakeFrameResult::ABORT);
+        if (!row.well_formed) {
+            EXPECT_EQ(nh.on_text_frame(make_noise_handshake_envelope(row.noise_bytes), send_fn),
+                      row.expected);
+            continue;
+        }
+
+        const std::string prologue_str = client_init + server_init_text;
+        std::array<uint8_t, NOISE_PSK_SIZE> psk{};
+        platform_random_bytes(psk.data(), psk.size());
+        NoiseHandshakeState* init_hs_raw = build_initiator(
+            std::string(NOISE_SUITE_CHACHAPOLY), server_id.private_bytes.data(),
+            server_id.public_bytes.data(), client_id.public_bytes.data(), psk.data(),
+            reinterpret_cast<const uint8_t*>(prologue_str.data()), prologue_str.size());
+        ASSERT_NE(init_hs_raw, nullptr);
+        HsGuard guard(init_hs_raw);
+
+        const std::string msg1_text = build_msg1_envelope(init_hs_raw, psk_id_for(psk));
+        ASSERT_FALSE(msg1_text.empty());
+        EXPECT_EQ(nh.on_text_frame(msg1_text, send_fn), row.expected);
     }
 }
 
