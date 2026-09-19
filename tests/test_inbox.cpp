@@ -224,6 +224,48 @@ TEST(Inbox, TimeResponsePayloadRoundtrips) {
     EXPECT_EQ(out[0].time.source_id, 42u);
 }
 
+// The epoch a producer stamps must reach the consumer per event, not per ring: it is what
+// event_is_current() compares against, and an epoch that did not survive the round trip would
+// read as 0, which is the fail-open direction ("the role was never torn down").
+TEST(Inbox, EventEpochRoundtripsPerEvent) {
+    Inbox inbox;
+
+    for (uint32_t epoch : {7U, 0U, 8U}) {
+        InboxEvent event{};
+        event.type = InboxEventType::PLAYER_STREAM;
+        event.epoch = epoch;
+        ASSERT_TRUE(inbox.push_event(event)) << "epoch=" << epoch;
+    }
+
+    InboxEvent out[3];
+    ASSERT_EQ(inbox.take_events(out, 3), 3u);
+    EXPECT_EQ(out[0].epoch, 7u);
+    EXPECT_EQ(out[1].epoch, 0u);
+    EXPECT_EQ(out[2].epoch, 8u);
+}
+
+// push_event_or_log() stamps the epoch its caller passes, and event_is_current() dispatches only
+// the event whose epoch still matches the role's teardown generation. Together they are the
+// discard that keeps a lifecycle event queued before a teardown from acting after it.
+TEST(Inbox, OnlyTheEventStampedWithTheCurrentGenerationIsDispatched) {
+    Inbox inbox;
+
+    push_event_or_log(&inbox, InboxEventType::PLAYER_STREAM, /*code=*/1, "test", "STREAM_START",
+                      /*epoch=*/4);
+    push_event_or_log(&inbox, InboxEventType::PLAYER_STREAM, /*code=*/2, "test", "STREAM_END",
+                      /*epoch=*/5);
+
+    InboxEvent out[2];
+    ASSERT_EQ(inbox.take_events(out, 2), 2u);
+    EXPECT_EQ(out[0].epoch, 4u);
+    EXPECT_EQ(out[1].epoch, 5u);
+
+    // The role has since been torn down once, so its generation is 5.
+    EXPECT_FALSE(event_is_current(out[0].epoch, /*role_epoch=*/5, "test", "STREAM_START"));
+    // Control: the event queued after that teardown is dispatched.
+    EXPECT_TRUE(event_is_current(out[1].epoch, /*role_epoch=*/5, "test", "STREAM_END"));
+}
+
 // Concurrency smoke test: one producer thread interleaves slot merges and event pushes while the
 // main thread polls and drains until it has observed everything the producer sent. Overflow
 // (drop-newest) is allowed to happen: the producer only counts pushes that actually succeeded,
