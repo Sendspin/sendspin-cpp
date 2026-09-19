@@ -527,13 +527,10 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
             to_goodbye.push_back(std::move(entry.conn));
         }
         this->nursery_.clear();
-        this->nursery_size_.store(0, std::memory_order_release);
+        this->refresh_nursery_size_hint();
         this->hello_retries_.clear();
-        this->has_current_.store(false, std::memory_order_release);
         // A standing pairing window belongs to this run; a restart begins with it closed.
-        this->pairing_window_open_until_us_ = 0;
-        this->pairing_window_conn_ = nullptr;
-        this->pairing_window_failed_attempts_ = 0;
+        this->close_pairing_window();
         // Releases already queued (a handoff loser, a reaped entry) had their dispatch disabled
         // when they were queued; the shutdown goodbye replaces whatever reason they carried. One
         // queued without a reason has a transport that is already gone, and every transport's
@@ -543,7 +540,7 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
             to_goodbye.push_back(std::move(release.conn));
         }
         this->deferred_releases_.clear();
-        this->deferred_size_.store(0, std::memory_order_release);
+        this->refresh_deferred_size_hint();
     }
 
     // Goodbye every connection and wait, bounded, for the sends to complete. Every count is
