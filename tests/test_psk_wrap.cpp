@@ -173,13 +173,22 @@ TEST(PskWrap, DifferentSidsProduceDifferentWrappedPsk) {
     EXPECT_FALSE(unwrap_with_wrong_sid.has_value());
 }
 
+// nullptr is what aead_cipher_name_from_noise_suite() returns for a suite this build does not
+// expect, so the two functions compose into this call. wrap_value()'s own nullptr guard cannot
+// be seen from here: noise_cipherstate_new_by_name() rejects nullptr as well, so this pins the
+// composed contract rather than that one line.
 TEST(PskWrap, UnknownCipherNameFails) {
     const auto sid = make_fixed_sid();
     const auto isk = make_fixed_isk();
     std::array<uint8_t, 32> psk{};
 
-    auto wrapped = wrap_value(PSK_WRAP_LABEL, "NotACipher", sid, isk, psk);
-    EXPECT_FALSE(wrapped.has_value());
+    EXPECT_FALSE(wrap_value(PSK_WRAP_LABEL, "NotACipher", sid, isk, psk).has_value());
+    EXPECT_FALSE(wrap_value(PSK_WRAP_LABEL, nullptr, sid, isk, psk).has_value());
+    // Control: the cipher name the negotiated suite yields wraps.
+    const char* negotiated =
+        aead_cipher_name_from_noise_suite("Noise_KKpsk2_25519_ChaChaPoly_SHA256");
+    ASSERT_NE(negotiated, nullptr);
+    EXPECT_TRUE(wrap_value(PSK_WRAP_LABEL, negotiated, sid, isk, psk).has_value());
 }
 
 // ============================================================================

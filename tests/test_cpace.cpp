@@ -593,6 +593,47 @@ TEST(CPaceDeriveRejects, WrongSizePeerShare) {
     EXPECT_FALSE(side.derive(short_share.data(), 16));
 }
 
+// verify() is the one entry point fed an attacker-supplied length: without the guard,
+// constant_time_equal() reads CPACE_TAG_SIZE bytes out of whatever the peer sent.
+TEST(CPaceDeriveRejects, ShortPeerTagIsRejected) {
+    const std::vector<uint8_t> prs(reinterpret_cast<const uint8_t*>("pinpin"),
+                                   reinterpret_cast<const uint8_t*>("pinpin") + 6);
+    const std::vector<uint8_t> sid(32, 0xAA);
+    const std::vector<uint8_t> ci, ad;
+
+    CPace side_a, side_b;
+    ASSERT_TRUE(side_a.start(CPaceRole::INITIATOR, prs, sid, ci, ad, ad));
+    ASSERT_TRUE(side_b.start(CPaceRole::RESPONDER, prs, sid, ci, ad, ad));
+    ASSERT_TRUE(side_b.derive(side_a.public_share().data(), CPACE_SHARE_SIZE));
+    ASSERT_TRUE(side_a.derive(side_b.public_share().data(), CPACE_SHARE_SIZE));
+
+    auto tag_b = side_b.tag();
+    ASSERT_TRUE(tag_b.has_value());
+    EXPECT_FALSE(side_a.verify(tag_b->data(), CPACE_TAG_SIZE - 1));
+    // Control: the same tag at its full length verifies.
+    EXPECT_TRUE(side_a.verify(tag_b->data(), CPACE_TAG_SIZE));
+}
+
+// A CPace that never started has no scalar, so a derive against a peer share would compute
+// against zeroed state rather than failing.
+TEST(CPaceDeriveRejects, DeriveBeforeStartIsRejected) {
+    const std::vector<uint8_t> prs(reinterpret_cast<const uint8_t*>("pinpin"),
+                                   reinterpret_cast<const uint8_t*>("pinpin") + 6);
+    const std::vector<uint8_t> sid(32, 0xAB);
+    const std::vector<uint8_t> ci, ad;
+
+    CPace peer;
+    ASSERT_TRUE(peer.start(CPaceRole::INITIATOR, prs, sid, ci, ad, ad));
+
+    CPace unstarted;
+    EXPECT_FALSE(unstarted.derive(peer.public_share().data(), CPACE_SHARE_SIZE));
+
+    // Control: the same peer share on a started side derives.
+    CPace started;
+    ASSERT_TRUE(started.start(CPaceRole::RESPONDER, prs, sid, ci, ad, ad));
+    EXPECT_TRUE(started.derive(peer.public_share().data(), CPACE_SHARE_SIZE));
+}
+
 TEST(CPaceDeriveRejects, TagBeforeDeriveReturnsNullopt) {
     const std::vector<uint8_t> prs(1, 0x01);
     const std::vector<uint8_t> sid(32, 0x01);

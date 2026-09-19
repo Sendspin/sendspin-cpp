@@ -131,6 +131,31 @@ TEST(HmacSha512, Rfc4231Case2) {
               "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737");
 }
 
+// The long-key branch (key_len > 128 is hashed down to 64 bytes first). Currently dead in
+// production - CPace's mac_key is 64 bytes - but hmac_sha512() claims generic HMAC.
+TEST(HmacSha512, Rfc4231Case6) {
+    std::vector<uint8_t> key(131, 0xaa);
+    const char* data = "Test Using Larger Than Block-Size Key - Hash Key First";
+    auto mac = hmac_sha512(key.data(), key.size(), reinterpret_cast<const uint8_t*>(data),
+                           std::strlen(data));
+    EXPECT_EQ(to_hex(mac),
+              "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f352"
+              "6b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598");
+}
+
+// The boundary the long-key branch sits on: a key of exactly one block is used as-is, not
+// hashed down. RFC 4231 publishes no 128-byte-key vector, so this one is from python3's
+// hmac/hashlib.
+TEST(HmacSha512, BlockSizeKeyIsUsedWithoutHashing) {
+    std::vector<uint8_t> key(128, 0xaa);
+    const char* data = "Test With Block-Size Key";
+    auto mac = hmac_sha512(key.data(), key.size(), reinterpret_cast<const uint8_t*>(data),
+                           std::strlen(data));
+    EXPECT_EQ(to_hex(mac),
+              "4206e8e8e2fed7d9926855f269ff05c91c237818870fc2abef28de17446840db"
+              "44c74687799d4f9a9bdea312ae948d3792ed1b2a172af39828304d5249afdc74");
+}
+
 // ============================================================================
 // SHA-256 (Sha256 class / sha256_oneshot) KATs
 //
