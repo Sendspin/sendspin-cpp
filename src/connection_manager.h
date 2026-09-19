@@ -369,13 +369,13 @@ public:
     /// Implemented as a short driver over the named private steps in the "loop() decomposition"
     /// section below; each step keeps its own locking.
     ///
-    /// Tick cost: every step after the ws_server start-retry check is gated on one of the atomic
-    /// hints in "Atomic fields" below (has_pending_events_, nursery_size_, has_current_,
-    /// deferred_size_), so an idle tick only pays for the atomic loads it needs to decide there
-    /// is nothing to do. Steady state: connected and idle (no pending events, empty nursery)
-    /// costs exactly one conn_ptr_mutex_ acquisition (the current/nursery copy ahead of the
-    /// conn->loop() calls) plus a handful of atomic loads; disconnected and idle costs zero
-    /// mutex acquisitions.
+    /// Tick cost: most steps are gated on one of the atomic hints in "Atomic fields" below
+    /// (has_pending_events_, nursery_size_, has_current_, deferred_size_), so they pay only the
+    /// atomic loads needed to decide there is nothing to do. flush_pending_admission(),
+    /// scan_pairing_attempt_timeout(), and scan_reprove_watchdog() take conn_ptr_mutex_
+    /// unconditionally, so an idle tick costs three acquisitions while disconnected and five
+    /// while connected (adding the current/nursery copy ahead of the conn->loop() calls and the
+    /// liveness check).
     void loop();
 
     // ========================================
