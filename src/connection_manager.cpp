@@ -51,14 +51,13 @@ static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * U
 /// @brief Stands in for an active_roles set the server left out or the client refuses to keep.
 static const std::vector<std::string> EMPTY_ROLES{};
 
-/// @brief Refuses an activation the client cannot act on, leaving the connection open
+/// @brief Refuses an activation the client cannot act on
 ///
 /// pairing.md "Client <-> Server: pair/abort" answers a method or format the client does not offer
 /// with pair/abort rather than a close, so the activation is never applied. The role bits the
 /// network thread added for it when it parsed the message (see
 /// SendspinConnection::note_activated_roles()) are taken back in the same step, so the receive
 /// gate cannot be widened by an activation the client refused.
-/// @param event The activation being refused.
 static void refuse_activate(const ServerActivateEvent& event) {
     SendspinConnection* conn = event.conn.get();
     conn->withdraw_activated_roles(event.active_roles.has_value() ? event.active_roles.value()
@@ -135,8 +134,7 @@ static PairingUiSnapshot snapshot_pairing_ui(SendspinConnection* conn) {
 /// @brief Overall deadline for a pairing-code attempt, bounding it from its first message
 /// (pairing.md "Entering and leaving pairing" recommends 2 minutes). It spans every round of the
 /// attempt: a retry keeps the running deadline rather than re-arming it. On expiry the attempt is
-/// aborted with reason attempt_timeout and the emitted code is withdrawn, rather than hanging
-/// until the transport eventually drops.
+/// aborted with reason attempt_timeout and the emitted code is withdrawn.
 static constexpr int64_t PAIRING_ATTEMPT_TIMEOUT_US = 120LL * 1000LL * US_PER_MS;
 
 /// @brief Lifetime of an open pairing window, measured from opening and not paused during an
@@ -145,8 +143,8 @@ static constexpr int64_t PAIRING_ATTEMPT_TIMEOUT_US = 120LL * 1000LL * US_PER_MS
 static constexpr int64_t WINDOW_LIFETIME_US = 300LL * 1000LL * US_PER_MS;
 
 /// @brief Attempts under one pairing window whose server_kc verification may fail before the
-/// window closes (pairing.md "Pairing Window"). The window is the operator's consent to a bounded
-/// run of guesses; the fifth failure spends it.
+/// window closes (pairing.md "Pairing Window"): the window is the operator's consent to a bounded
+/// run of guesses.
 static constexpr uint32_t WINDOW_FAILED_ATTEMPT_LIMIT = 5;
 
 /// @brief Rounds a dynamic pairing code may run since the last verified server_kc before the
@@ -170,14 +168,13 @@ namespace {
 ///
 /// CPace::isk() answers by value, so the caller owns a copy of the 64-byte secret that
 /// CPace::~CPace never sees. K_wrap is SHA-256(label || sid || ISK) and the sid is not secret,
-/// so a copy left in a dead stack frame is worth both wrap keys. Holding it here wipes it on
-/// every exit path, including the early returns between the two wraps, which is what the
-/// surrounding code already does for K_wrap itself and for every PSK-bearing struct.
+/// so a copy left in a dead stack frame is worth both wrap keys. The scope guard covers the
+/// early returns between the two wraps, as the surrounding code already does for K_wrap itself
+/// and for every PSK-bearing struct.
 class ScopedIsk {
 public:
     /// @brief Takes ownership of an ISK and wipes the caller's copy
-    /// @param isk The ISK to take ownership of. Taken by value and wiped, so the caller's
-    ///        temporary does not outlive this copy.
+    /// @param isk Taken by value, so the caller's temporary does not outlive this copy.
     explicit ScopedIsk(std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk)
         : value_(std::move(isk)) {
         if (isk.has_value()) {
@@ -254,9 +251,8 @@ static std::vector<uint8_t> pake_ad_server() {
 /// @brief Whether an applied server/activate selects the pairing flow: the PAIRING activity
 /// together with a pairing.method the client recognizes. Shared by every site that must route
 /// such an activate into ConnectionManager::handle_enter_pairing(). PLAYBACK may ride along
-/// (messaging.md "server/activate" allows ['playback', 'pairing']); when it does, the connection
-/// also takes the operational path (SendspinClient::on_handshake_complete()) rather than
-/// instead of it.
+/// (messaging.md "server/activate" allows ['playback', 'pairing']), and the connection then also
+/// takes the operational path (SendspinClient::on_handshake_complete()).
 static bool is_pairing_selection_activate(const std::vector<SendspinActivity>& activities,
                                           const std::optional<SendspinPairMethod>& pairing_method) {
     if (!contains_activity(activities, SendspinActivity::PAIRING) || !pairing_method.has_value()) {
@@ -918,8 +914,8 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                 // pairing.md "Entering and leaving pairing": adding 'pairing' does not by
                 // itself affect active_roles, streams or group membership. An activate that
                 // declares both purposes therefore runs the operational path as well as the
-                // pairing one, and in that order: going operational clears stale pairing
-                // state, so it has to precede the attempt this activate admits.
+                // pairing one, and first: going operational clears stale pairing state the
+                // new attempt must not inherit.
                 if (is_first && contains_activity(activities, SendspinActivity::PLAYBACK)) {
                     this->client_->on_handshake_complete(event.conn.get());
                 }
@@ -937,9 +933,9 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         // active_roles must be told about in an update that includes that role's object, and the
         // server MUST NOT send that role's binary data until it has.
         // publish_client_state() builds an object for every role active on the connection, so one
-        // publish serves an added role and, equally, drops the object of a removed one. A first
-        // activate publishes through on_handshake_complete(); this covers every later one that
-        // moves the set.
+        // publish serves an added role and drops the object of a removed one. A first activate
+        // publishes through on_handshake_complete(); this covers every later one that moves the
+        // set.
         if (roles_changed && !is_first && event.conn->is_operational()) {
             this->client_->publish_client_state(event.conn.get());
         }
@@ -1055,9 +1051,8 @@ void ConnectionManager::loop_managed_connections() {
 
 void ConnectionManager::scan_hello_and_nursery() {
     // Both scans operate purely on nursery membership: a hello is only ever sent while its
-    // connection is proving itself, and a connection that has left the nursery has no further
-    // hello to send. The nursery_size_ hint therefore covers the retry scan too, and the scan's
-    // own lazy erase covers a connection dropped by an earlier event this same tick.
+    // connection is proving itself. The nursery_size_ hint therefore covers the retry scan too,
+    // and the scan's own lazy erase covers a connection dropped by an earlier event this tick.
     if (this->nursery_size_.load(std::memory_order_acquire) > 0) {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
 
@@ -1087,7 +1082,7 @@ void ConnectionManager::scan_hello_and_nursery() {
                 SendspinConnection* rc = retry.conn.get();
 
                 // Drop retries whose connection has left the nursery: it was promoted (its hello
-                // completed) or released, and either way there is nothing left to retry.
+                // completed) or released.
                 if (this->find_in_nursery(rc) == this->nursery_.end()) {
                     it = this->hello_retries_.erase(it);
                     continue;
@@ -1195,8 +1190,7 @@ void ConnectionManager::scan_reprove_watchdog() {
     // promote_or_arbitrate_nursery_entry()), and an in-progress pairing-code PAKE exchange keeps
     // is_operational() true throughout (that flow has its own timeouts: the
     // PAIRING_ATTEMPT_TIMEOUT_US check above, and pairing_window_open() while a gesture is
-    // awaited). Gating on !is_operational() here therefore reaps exactly the re-proving window and
-    // never a legitimate pairing wait. The provisional_time_us_ != 0 guard additionally excludes a
+    // awaited). The provisional_time_us_ != 0 guard additionally excludes a
     // connection that was never stamped, keeping the check inert for anything that reaches
     // current_connection_ by a route that skips both admission paths.
     std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
@@ -1214,8 +1208,7 @@ void ConnectionManager::scan_reprove_watchdog() {
             // message there but the handshake; the other ends at a rekey the peer has already
             // failed to perform. No goodbye reason describes either, and the peer learns the
             // same thing from the close. close_silently() tears the transport down here (it is
-            // non-blocking on every platform), so the nullopt release below has nothing left to
-            // send and only has to let the connection go.
+            // non-blocking on every platform), so the nullopt release below has nothing to send.
             this->current_connection_->close_silently(SendspinGoodbyeReason::ANOTHER_SERVER);
             this->drop_connection(this->current_connection_.get(), std::nullopt);
         }
@@ -1283,7 +1276,6 @@ void ConnectionManager::loop() {
         this->ws_server_->tick();
     }
 
-    // Abort a pairing-code exchange that has stalled past its attempt timeout.
     this->scan_pairing_attempt_timeout();
     // Send the goodbye and release the connection if the timeout check above aborted one.
     this->flush_deferred_releases();
@@ -1794,9 +1786,9 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
     if (auto it = this->find_in_nursery(conn); it != this->nursery_.end()) {
         // Dropping an unproven connection: no client-state cleanup (it was never admitted). Code
         // sessions only ever exist on the current connection (see the pairing-events comment
-        // above, in loop()), but dismiss any prompt defensively for symmetry with the other
-        // drop paths in case that invariant is ever relaxed. Snapshot before release for the same
-        // reason as the current-slot path above (see PairingUiSnapshot).
+        // above, in loop()), but dismiss any prompt defensively, for symmetry with the other
+        // drop paths. Snapshot before release for the same reason as the current-slot path above
+        // (see PairingUiSnapshot).
         const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
         this->release_nursery_entry(it, goodbye);
         this->dismiss_pairing_ui(ui.code_was_emitted, ui.window_was_shown);
@@ -1888,13 +1880,12 @@ std::vector<NurseryEntry>::iterator ConnectionManager::promote_or_arbitrate_nurs
     this->note_playback_activity(this->current_connection_.get());
 
     // ==== Pairing branch ====
-    // If the winning activate declares the PAIRING activity with a supported pairing.method,
-    // enter the pairing flow. The connection still occupies current_connection_ (so admission.h's
-    // "in-flight pairing is not displaced" rule applies). An activate declaring pairing alone is
-    // not announced to the client as operational until pairing finishes and the post-finalize
-    // re-handshake completes; one that also declares playback is announced first, because
-    // pairing.md "Entering and leaving pairing" leaves active_roles and streams untouched and
-    // going operational is what clears any stale pairing state before the new attempt.
+    // The connection still occupies current_connection_ (so admission.h's "in-flight pairing is
+    // not displaced" rule applies). An activate declaring pairing alone is not announced to the
+    // client as operational until pairing finishes and the post-finalize re-handshake completes;
+    // one that also declares playback is announced first, because pairing.md "Entering and
+    // leaving pairing" leaves active_roles and streams untouched and going operational is what
+    // clears any stale pairing state before the new attempt.
     const auto& activities = this->current_connection_->get_activities();
     const auto& pairing_method = this->current_connection_->get_pairing_method();
     const bool selects_pairing = is_pairing_selection_activate(activities, pairing_method);
@@ -1944,14 +1935,11 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
 
     // The pairing server/activate counter (pairing.md "Pairing index") was already bumped by the
     // caller at the point this activate was received (see the activate-events loop in
-    // drain_lifecycle_events(): every pairing server/activate counts there, whether or not it turns
-    // out to be admissible, so a method_not_supported rejection does not desync the count from the
-    // server's). Do NOT bump
-    // again here: this handler can also be reached well after reception (the "subsequent activate
-    // transitions into pairing" branch applies the activate first, then calls this), so bumping
-    // here would double-count or use a stale value. The current value is captured into the
-    // pairing session below for the code-based branches (sent as pairing_index and reused for
-    // the CPace sid).
+    // drain_lifecycle_events()). Do NOT bump again here: this handler can also be reached well
+    // after reception (the "subsequent activate transitions into pairing" branch applies the
+    // activate first, then calls this), so bumping here would double-count or use a stale value.
+    // The current value is captured into the pairing session below for the code-based branches
+    // (sent as pairing_index and reused for the CPace sid).
     const uint32_t pairing_index = conn->get_pairing_index();
 
     const std::string& server_id = conn->get_server_id();
@@ -2038,12 +2026,11 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
         conn->send_app_json(format_client_pair_pending_message(ps.pairing_index), nullptr);
 
         // Surface the pairing-window prompt to the operator, but only when the platform
-        // actually implements the gesture UI (on_open_pairing_window's contract is that it
-        // fires only when pairing_window_supported is true). A device that never offers
+        // implements the gesture UI (on_open_pairing_window's contract is that it fires only
+        // when pairing_window_supported is true). A device that never offers
         // static_pairing_code without that flag (see offers_static_pairing_code()) cannot reach
         // this branch, but a stored config that outlives a capability change could; the attempt
-        // then has no way to proceed and waits for the server's own timeout to cancel it. Log
-        // loudly so the stall is diagnosable.
+        // then has no way to proceed and waits for the server's own timeout to cancel it.
         if (this->client_->config_.pairing_window_supported) {
             this->client_->note_open_pairing_window();
             ps.window_shown = true;
@@ -2060,7 +2047,7 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
     }
 
     // Not gated, or a standing window is already open: start the attempt immediately
-    // (start_pairing_attempt consumes the window; its lifetime runs until pair-init is sent).
+    // (start_pairing_attempt binds an open window to this connection; it does not spend it).
     this->start_pairing_attempt(conn);
     this->client_->note_pairing_started(server_id);
 }
@@ -2103,8 +2090,7 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
 
     // A pair/abort that arrives after the receiver (us) has already ended the attempt (locally
     // aborted, or the server itself left pairing via a leftover server/activate) has no effect
-    // (pairing.md "pair/abort": "A pair/abort received after the receiver has itself ended the
-    // attempt has no effect"). is_pairing_in_progress() is cleared by clear_pairing_state() on
+    // (pairing.md "pair/abort"). is_pairing_in_progress() is cleared by clear_pairing_state() on
     // every path that ends an attempt, so it is the right proxy for "already ended" here.
     if (!conn->is_pairing_in_progress()) {
         SS_LOGI(TAG,
@@ -2117,11 +2103,10 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
     SS_LOGW(TAG, "pair/abort received for server_id=%s reason=%s", conn->get_server_id().c_str(),
             to_cstr(reason));
 
-    // Clean up pairing state. Per pairing.md "pair/abort", the sender of pair/abort closes the
-    // connection only for reason concurrent_attempt; every other reason leaves the connection open
-    // so the server can re-activate pairing (or resume normal operation) on the same connection. We
-    // mirror that here: only concurrent_attempt drops the connection on our side too (the server,
-    // as sender, is closing its side regardless; closing here just avoids waiting on the TCP
+    // Clean up pairing state. pairing.md "pair/abort": the sender closes the connection only for
+    // reason concurrent_attempt, leaving it open on every other reason so the server can
+    // re-activate pairing (or resume normal operation) on it. Mirrored here (the server, as
+    // sender, is closing its side regardless; closing here just avoids waiting on the TCP
     // teardown). No wire pair/abort is sent: this one already arrived from the server.
     this->abort_pairing_attempt(
         conn, /*wire_abort_reason=*/std::nullopt,
@@ -2130,8 +2115,8 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
         to_public_abort_reason(reason), SendspinGoodbyeReason::CONCURRENT_ATTEMPT);
 }
 
-/// @brief Fires on_clear_pairing_code and/or on_open_pairing_window's counterpart for a pairing UI
-/// element that was left showing. Caller must hold conn_ptr_mutex_.
+/// @brief Dismisses whichever pairing UI element was left showing. Caller must hold
+/// conn_ptr_mutex_.
 void ConnectionManager::dismiss_pairing_ui(bool code_was_emitted, bool window_was_shown) {
     if (code_was_emitted) {
         this->client_->note_clear_pairing_code();
@@ -2191,9 +2176,8 @@ void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
         return;
     }
 
-    // pairing.md "Entering and leaving pairing": after the client has aborted an attempt it
-    // silently
-    // discard pairing messages received before the next server/activate." is_pairing_in_progress()
+    // pairing.md "Entering and leaving pairing": a client that has aborted an attempt silently
+    // discards pairing messages received before the next server/activate. is_pairing_in_progress()
     // is cleared by clear_pairing_state() on every path that ends an attempt (local abort, received
     // pair/abort, leftover activate), so a pairing message that races the abort and lands here
     // after the fact is discarded without re-aborting (which would otherwise fire on every stray,
@@ -2241,8 +2225,7 @@ void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
             // message, and persists nothing." This is the one pairing-abort path that must NOT
             // send pair/abort and must close unconditionally, so it cannot route through
             // local_abort_pairing() (which always sends pair/abort and only closes for
-            // concurrent_attempt); it calls abort_pairing_attempt() directly instead, with no
-            // wire_abort_reason and drop_action forced CLOSE_SILENTLY.
+            // concurrent_attempt).
             SS_LOGW(TAG,
                     "handle_pairing_message: malformed pairing frame during code pairing for "
                     "server_id=%s; closing per pairing.md Protocol Errors (no pair/abort sent)",
@@ -2376,13 +2359,6 @@ void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
                 "peer share) for server_id=%s; closing per pairing.md Protocol Errors "
                 "(no pair/abort sent)",
                 server_id.c_str());
-        // clear_pairing_state() drops any pending pairing record, so nothing is
-        // persisted; drop_connection() with goodbye=std::nullopt closes the transport
-        // without sending a client/goodbye (or any other application-level message).
-        // SendspinPairAbortReason has no dedicated "protocol error" value and none of
-        // the wire-facing reasons fit (no pair/abort was received or sent); UNKNOWN is
-        // reused here as the closest available local-only fit, matching the MALFORMED
-        // case in handle_pairing_message().
         this->abort_pairing_attempt(conn, /*wire_abort_reason=*/std::nullopt,
                                     PairingDropAction::CLOSE_SILENTLY,
                                     SendspinPairAbortReason::UNKNOWN);
@@ -2419,7 +2395,7 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
                         ? "round limit reached"
                         : "the static flow runs one round");
             // The attempt ends on a failed verification, which is what a pairing window counts
-            // (pairing.md "Pairing Window"); a round that retries has not ended anything yet.
+            // (pairing.md "Pairing Window").
             this->note_pairing_window_attempt_failed();
             this->local_abort_pairing(conn, PairAbortReason::PAIRING_CODE_MISMATCH);
             return;
@@ -2481,13 +2457,11 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
     }
 
     // Withdraw the emitted code and/or dismiss the pairing-window prompt now that the exchange
-    // succeeded; each is a no-op unless this attempt actually raised it (see
-    // code_emitted / window_shown above). Reset both flags immediately after: they are
-    // the sole record of "does a prompt still need dismissing", and clear_pairing_state()
-    // does NOT run on this success path (only on abort), so anything that inspects them
-    // later (e.g. abort_pairing_attempt()) must see that the UI was already dismissed here,
-    // not fire on_clear_pairing_code/on_close_pairing_window a second time for the same
-    // attempt.
+    // succeeded; each is a no-op unless this attempt raised it (see code_emitted / window_shown
+    // above). Reset both flags immediately after: they are the sole record of "does a prompt
+    // still need dismissing", and clear_pairing_state() does NOT run on this success path (only
+    // on abort), so a later inspection (e.g. abort_pairing_attempt()) must not dismiss the same
+    // attempt's UI twice.
     this->dismiss_pairing_ui(ps.code_emitted, ps.window_shown);
     ps.code_emitted = false;
     ps.window_shown = false;
@@ -2523,15 +2497,9 @@ void ConnectionManager::handle_pair_confirm(SendspinConnection* conn,
 }
 
 void ConnectionManager::local_abort_pairing(SendspinConnection* conn, PairAbortReason reason) {
-    // Runs on the main loop (caller holds conn_ptr_mutex_). Aborts the pairing-code session
-    // locally:
-    //   1. Send pair/abort to the server.
-    //   2. Withdraw the emitted code and clear the pairing state on the connection.
-    //   3. Close the connection, but ONLY for reason concurrent_attempt (pairing.md "pair/abort":
-    //      every other reason (attempt_timeout, method_not_supported, pairing_code_mismatch,
-    //      user_cancelled) leaves the connection open).
-    //   4. Queue on_pairing_failed (and on_clear_pairing_code, if a code was emitted) for
-    //      delivery from loop().
+    // Runs on the main loop (caller holds conn_ptr_mutex_). Ends the pairing-code session with a
+    // pair/abort on the wire; per pairing.md "pair/abort" only concurrent_attempt also closes the
+    // connection.
     if (conn == nullptr) {
         return;
     }
@@ -2553,9 +2521,8 @@ void ConnectionManager::close_on_sequence_violation(SendspinConnection* conn,
     // method and the current state is a protocol error, and "Protocol Errors" has the detecting
     // side close the WebSocket without sending any application-level message. No pair/abort
     // goes out, and clear_pairing_state() inside abort_pairing_attempt() drops the pending
-    // record, so nothing is persisted. SendspinPairAbortReason has no dedicated protocol-error
-    // value and none of the wire-facing reasons describe this, so the local-only UNKNOWN is
-    // what the listener hears.
+    // record, so nothing is persisted. SendspinPairAbortReason has no protocol-error value, so
+    // the listener hears the local-only UNKNOWN.
     const auto& ps = conn->pairing_session();
     SS_LOGW(TAG,
             "handle_pairing_message: %s out of sequence (step=%d method=%s) for server_id=%s; "
@@ -2614,8 +2581,8 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
         return;
     }
 
-    // Send client/pair-init with just pairing_index (the static flow carries no commit_B).
-    // pairing_index is required on every client/pair-init (pairing.md "Pairing index").
+    // pairing_index is required on every client/pair-init (pairing.md "Pairing index"); the
+    // static flow carries no commit_B.
     SS_LOGI(TAG, "Sending client/pair-init (static_pairing_code) for server_id=%s",
             server_id.c_str());
     conn->send_app_json(format_client_pair_init_message(ps.pairing_index), nullptr);
@@ -2659,9 +2626,8 @@ void ConnectionManager::open_pairing_window() {
     // pairing branch in promote_or_arbitrate_nursery_entry()).
     //
     // The window's lifetime runs from here and is not paused by the attempts it admits
-    // (pairing.md "Pairing Window"), so it is armed whether or not an attempt is waiting: one
-    // that is starts under it immediately, and otherwise the window stands open so a pairing
-    // activate arriving within its lifetime can proceed without a further gesture.
+    // (pairing.md "Pairing Window"), so it is armed whether or not an attempt is waiting: with
+    // none waiting it stands open for a pairing activate arriving within its lifetime.
     //
     // The gesture is also the deliberate, manufacturer-defined operator action pairing.md
     // "Rounds" requires to clear a standing round limit, so it resets the count before anything
