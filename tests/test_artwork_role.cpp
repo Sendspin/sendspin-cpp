@@ -784,6 +784,32 @@ TEST(ArtworkImageCap, ImageOverTheCapIsDiscardedAndItsSequenceTracked) {
     EXPECT_EQ(listener.decode_marker_at(0), 'B');
 }
 
+// A channel that budgets nothing of its own holds images up to the documented default, and not
+// one byte more. The size is spelled out rather than taken from
+// ImageSlotPreference::DEFAULT_MAX_IMAGE_BYTES, so that a change to the constant moves this test
+// and not just the images it builds.
+TEST(ArtworkImageCap, AnUnsetBudgetIsTheDocumentedDefault) {
+    constexpr size_t DEFAULT_CAP = 128U * 1024U;
+    static_assert(DEFAULT_CAP == ImageSlotPreference::DEFAULT_MAX_IMAGE_BYTES,
+                  "the documented per-channel default changed");
+
+    RecordingListener listener;
+    auto impl = make_impl(make_single_slot_config(false));
+    impl->listener = &listener;
+    ASSERT_TRUE(impl->start());
+    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+
+    ASSERT_TRUE(send_image(*impl, 0, make_image('A', DEFAULT_CAP + 1), /*parts=*/3));
+    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW))
+        << "an image was decoded; decodes: " << listener.decode_count();
+
+    // Control: an image of exactly the default is delivered whole.
+    ASSERT_TRUE(send_image(*impl, 0, make_image('B', DEFAULT_CAP), /*parts=*/3));
+    listener.wait_until([&] { return listener.decodes.size() >= 1; });
+    EXPECT_EQ(listener.decodes[0].payload.size(), DEFAULT_CAP);
+    EXPECT_EQ(listener.decode_marker_at(0), 'B');
+}
+
 TEST(ArtworkImageCap, RoleWithNoListenerHoldsNothing) {
     auto impl = make_impl(make_single_slot_config(false));
     ASSERT_TRUE(impl->start());
