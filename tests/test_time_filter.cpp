@@ -31,7 +31,10 @@ TEST(TimeFilter, HasUpdateTracksWhetherAnEstimateExists) {
     SendspinTimeFilter filter;
     EXPECT_FALSE(filter.has_update());
 
+    // One measurement is enough: the client trusts converted timestamps from the first reply on.
     filter.update(/*measurement=*/1000, /*max_error=*/100, /*time_added=*/5000);
+    EXPECT_TRUE(filter.has_update());
+
     filter.update(/*measurement=*/1000, /*max_error=*/100, /*time_added=*/6000);
     EXPECT_TRUE(filter.has_update());
 
