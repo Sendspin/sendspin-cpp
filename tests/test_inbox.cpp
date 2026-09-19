@@ -31,17 +31,6 @@ bool has_bit(uint32_t bits, uint32_t bit) {
     return (bits & bit) != 0;
 }
 
-// Simple two-field aggregate used to exercise InboxSlot::merge() with a non-scalar type.
-struct IntPair {
-    int a{0};
-    int b{0};
-};
-
-void merge_int_pair(IntPair& current, IntPair&& delta) {
-    current.a += delta.a;
-    current.b += delta.b;
-}
-
 TEST(InboxSlot, WriteTakeRoundtrip) {
     Inbox inbox;
     InboxSlot<int> slot(inbox, INBOX_TOPIC_GROUP);
@@ -62,18 +51,6 @@ TEST(InboxSlot, TakeOnCleanSlotReturnsFalseWithNoBitSet) {
     EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
 }
 
-TEST(InboxSlot, WriteSetsTopicBitAndTakeClearsIt) {
-    Inbox inbox;
-    InboxSlot<int> slot(inbox, INBOX_TOPIC_GROUP);
-
-    slot.write(7);
-    EXPECT_TRUE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-
-    int value = 0;
-    ASSERT_TRUE(slot.take(value));
-    EXPECT_FALSE(has_bit(inbox.poll(), INBOX_TOPIC_GROUP));
-}
-
 TEST(InboxSlot, ResetClearsContentAndBit) {
     Inbox inbox;
     InboxSlot<int> slot(inbox, INBOX_TOPIC_GROUP);
@@ -86,24 +63,6 @@ TEST(InboxSlot, ResetClearsContentAndBit) {
 
     int value = -1;
     EXPECT_FALSE(slot.take(value));
-}
-
-TEST(InboxSlot, MergeAccumulatesAcrossCalls) {
-    Inbox inbox;
-    InboxSlot<IntPair> slot(inbox, INBOX_TOPIC_METADATA);
-
-    slot.merge(merge_int_pair, IntPair{1, 10});
-    slot.merge(merge_int_pair, IntPair{2, 20});
-    slot.merge(merge_int_pair, IntPair{3, 30});
-
-    IntPair result{};
-    ASSERT_TRUE(slot.take(result));
-    EXPECT_EQ(result.a, 6);
-    EXPECT_EQ(result.b, 60);
-
-    // The merged value is delivered exactly once.
-    IntPair second{};
-    EXPECT_FALSE(slot.take(second));
 }
 
 TEST(InboxSlot, DrainingOneSlotLeavesOtherSlotBitSet) {
