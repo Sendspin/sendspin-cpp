@@ -371,10 +371,10 @@ private:
 
     /// @brief Persist the current pairing config via the provider.
     /// @return True if the config was stored (or there is no provider, so there is nothing to
-    ///         store); false only when a provider actively rejected the write. Nearly every
-    ///         caller ignores this: a rejected config write is warned about and the change
-    ///         stays RAM-only for the boot. First-boot provisioning is the exception: it must
-    ///         not go on to persist a record the config cannot reference.
+    ///         store); false only when a provider actively rejected the write. The sole caller
+    ///         discards it: a rejected config write is warned about and the change stays
+    ///         RAM-only for the boot, and first-boot provisioning goes on to write the Pairing
+    ///         PSK either way so the device is usable now.
     bool persist_config();
 
     /// @brief Encode records_ (the WHOLE array) for persistence_keys::RECORDS.

@@ -1663,10 +1663,6 @@ TEST(SendspinClientIdentity, ConnectToBeforeStartServerIsRefused) {
         << "connect_to() before start() must not produce a live connection";
 }
 
-// Ordering makes a crash between the two provisioning writes self-healing, but a provider that
-// rejects PAIR_CONFIG while accepting RECORDS would reach the same orphaned state by another
-// route. The record write is skipped when the config write is refused, so the next boot is a
-// clean first boot rather than a re-provisioning one that appends alongside an orphan.
 // ============================================================================
 // PSK zeroization on destruction
 // ============================================================================
