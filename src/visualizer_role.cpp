@@ -21,6 +21,7 @@
 #include "visualizer_role_impl.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstring>
 
 static const char* const TAG = "sendspin.visualizer";
@@ -311,6 +312,31 @@ void VisualizerRole::Impl::handle_stream_start(const ServerVisualizerStreamObjec
             has_spectrum = true;
         }
         types_mask |= 1U << (wire_type_for(type) - SENDSPIN_BINARY_VISUALIZER_FIRST);
+    }
+    if (has_spectrum) {
+        // roles/visualizer/v1.md "Server -> Client: stream/start": the spectrum object is present
+        // when types includes 'spectrum' and MUST match the requested configuration. The object is
+        // reported to the listener as the server sent it, so a mismatch is logged, not rejected.
+        const std::optional<VisualizerSpectrumConfig>& requested = this->config.stream.spectrum;
+        if (!stream.spectrum.has_value()) {
+            SS_LOGW(TAG, "Visualizer stream/start requests the spectrum type with no spectrum "
+                         "object; spectrum frames will be dropped");
+        } else if (requested.has_value()) {
+            const VisualizerSpectrumConfig& srv = stream.spectrum.value();
+            if (srv.n_disp_bins != requested->n_disp_bins) {
+                SS_LOGW(TAG, "Spectrum bin count mismatch: server %" PRIu8 ", expected %" PRIu8,
+                        srv.n_disp_bins, requested->n_disp_bins);
+            }
+            if (srv.scale != requested->scale) {
+                SS_LOGW(TAG, "Spectrum scale mismatch");
+            }
+            if (srv.f_min != requested->f_min || srv.f_max != requested->f_max) {
+                SS_LOGW(TAG,
+                        "Spectrum frequency range mismatch: server %" PRIu16 "-%" PRIu16
+                        ", expected %" PRIu16 "-%" PRIu16,
+                        srv.f_min, srv.f_max, requested->f_min, requested->f_max);
+            }
+        }
     }
     if (has_spectrum && stream.spectrum.has_value()) {
         bin_count = stream.spectrum->n_disp_bins;
