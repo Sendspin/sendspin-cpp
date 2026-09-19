@@ -41,6 +41,21 @@ std::array<uint8_t, 32> make_psk(uint8_t seed) {
     return psk;
 }
 
+/// The minimal record object every decoder in this file accepts, used as the Control beside the
+/// rejection cases that malform the blob around it.
+std::string well_formed_record_entry() {
+    return R"({"server_id":"srv-ok","psk_id":"rec-ok","psk":")" +
+           base64url_encode(make_psk(0x11).data(), 32) + R"("})";
+}
+
+std::string well_formed_record_blob() {
+    return well_formed_record_entry();
+}
+
+std::string well_formed_records_blob() {
+    return R"({"v":1,"records":[)" + well_formed_record_entry() + "]}";
+}
+
 }  // namespace
 
 // ============================================================================
@@ -125,28 +140,47 @@ TEST(PersistenceCodec, RecordDecodeBestEffortOnFutureVersion) {
 
 TEST(PersistenceCodec, RecordDecodeRejectsParseFailure) {
     EXPECT_FALSE(decode_pairing_record("not json").has_value());
+    // Control: well-formed JSON for the same decoder.
+    EXPECT_TRUE(decode_pairing_record(well_formed_record_blob()).has_value());
 }
 
 TEST(PersistenceCodec, RecordDecodeRejectsMissingPskId) {
-    std::string blob =
-        R"({"v":1,"psk":")" + base64url_encode(make_psk(0x60).data(), 32) + R"("})";
-    EXPECT_FALSE(decode_pairing_record(blob).has_value());
+    const std::string tail =
+        R"(,"psk":")" + base64url_encode(make_psk(0x60).data(), 32) + R"("})";
+    EXPECT_FALSE(decode_pairing_record(R"({"v":1,"server_id":"srv-rec-6")" + tail).has_value());
+    // Control: the same blob carrying a psk_id decodes.
+    EXPECT_TRUE(
+        decode_pairing_record(R"({"v":1,"server_id":"srv-rec-6","psk_id":"rec-6")" + tail)
+            .has_value());
 }
 
 TEST(PersistenceCodec, RecordDecodeRejectsEmptyPskId) {
-    std::string blob = R"({"v":1,"psk_id":"","psk":")" +
-                       base64url_encode(make_psk(0x61).data(), 32) + R"("})";
-    EXPECT_FALSE(decode_pairing_record(blob).has_value());
+    const std::string tail =
+        R"(","psk":")" + base64url_encode(make_psk(0x61).data(), 32) + R"("})";
+    EXPECT_FALSE(
+        decode_pairing_record(R"({"v":1,"server_id":"srv-rec-6a","psk_id":")" + tail).has_value());
+    // Control: the same blob with a non-empty psk_id decodes.
+    EXPECT_TRUE(
+        decode_pairing_record(R"({"v":1,"server_id":"srv-rec-6a","psk_id":"rec-6a)" + tail)
+            .has_value());
 }
 
 TEST(PersistenceCodec, RecordDecodeRejectsMissingPsk) {
-    std::string blob = R"({"v":1,"psk_id":"rec-6"})";
-    EXPECT_FALSE(decode_pairing_record(blob).has_value());
+    const std::string head = R"({"v":1,"server_id":"srv-rec-6b","psk_id":"rec-6b")";
+    EXPECT_FALSE(decode_pairing_record(head + "}").has_value());
+    // Control: the same blob carrying a psk decodes.
+    EXPECT_TRUE(decode_pairing_record(head + R"(,"psk":")" +
+                                      base64url_encode(make_psk(0x6B).data(), 32) + R"("})")
+                    .has_value());
 }
 
 TEST(PersistenceCodec, RecordDecodeRejectsBadBase64) {
-    std::string blob = R"({"v":1,"psk_id":"rec-7","psk":"not!!valid!!base64"})";
-    EXPECT_FALSE(decode_pairing_record(blob).has_value());
+    const std::string head = R"({"v":1,"server_id":"srv-rec-7","psk_id":"rec-7","psk":")";
+    EXPECT_FALSE(decode_pairing_record(head + R"(not!!valid!!base64"})").has_value());
+    // Control: the same blob with a decodable psk.
+    EXPECT_TRUE(decode_pairing_record(head + base64url_encode(make_psk(0x70).data(), 32) +
+                                      R"("})")
+                    .has_value());
 }
 
 TEST(PersistenceCodec, RecordDecodeWrongTypedUsedFallsBackToFalse) {
@@ -164,10 +198,16 @@ TEST(PersistenceCodec, RecordDecodeWrongTypedUsedFallsBackToFalse) {
 }
 
 TEST(PersistenceCodec, RecordDecodeRejectsWrongLengthPsk) {
+    const std::string head = R"({"v":1,"server_id":"srv-rec-8","psk_id":"rec-8","psk":")";
     std::array<uint8_t, 16> short_psk{};
-    std::string blob = R"({"v":1,"server_id":"srv-rec-8","psk_id":"rec-8","psk":")" +
-                       base64url_encode(short_psk.data(), short_psk.size()) + R"("})";
-    EXPECT_FALSE(decode_pairing_record(blob).has_value());
+    EXPECT_FALSE(
+        decode_pairing_record(head + base64url_encode(short_psk.data(), short_psk.size()) +
+                              R"("})")
+            .has_value());
+    // Control: the same blob with a 32-byte psk.
+    EXPECT_TRUE(decode_pairing_record(head + base64url_encode(make_psk(0x80).data(), 32) +
+                                      R"("})")
+                    .has_value());
 }
 
 // ============================================================================
@@ -215,16 +255,22 @@ TEST(PersistenceCodec, RecordsArrayEmptyRoundTrip) {
     EXPECT_TRUE(decoded->empty());
 }
 
+// One Control serves the three array-shape rejections below: they differ only in how the
+// wrapper is malformed, and the same well-formed wrapper is what each must still accept.
 TEST(PersistenceCodec, RecordsArrayDecodeRejectsParseFailure) {
     EXPECT_FALSE(decode_pairing_records("{not json").has_value());
+    // Control: see well_formed_records_blob().
+    EXPECT_TRUE(decode_pairing_records(well_formed_records_blob()).has_value());
 }
 
 TEST(PersistenceCodec, RecordsArrayDecodeRejectsMissingRecordsField) {
     EXPECT_FALSE(decode_pairing_records(R"({"v":1})").has_value());
+    EXPECT_TRUE(decode_pairing_records(well_formed_records_blob()).has_value());
 }
 
 TEST(PersistenceCodec, RecordsArrayDecodeRejectsNonArrayRecordsField) {
     EXPECT_FALSE(decode_pairing_records(R"({"v":1,"records":"oops"})").has_value());
+    EXPECT_TRUE(decode_pairing_records(well_formed_records_blob()).has_value());
 }
 
 TEST(PersistenceCodec, RecordsArraySkipsCorruptEntryKeepsGoodOnes) {
@@ -280,21 +326,32 @@ TEST(PersistenceCodec, PskRoundTripWithoutLabel) {
 }
 
 TEST(PersistenceCodec, PskDecodeRejectsBadBase64) {
-    std::string blob = R"({"v":1,"psk_id":"psk-3","psk":"!!!not-base64!!!"})";
-    EXPECT_FALSE(decode_pairing_psk(blob).has_value());
+    const std::string head = R"({"v":1,"psk_id":"psk-3","psk":")";
+    EXPECT_FALSE(decode_pairing_psk(head + R"(!!!not-base64!!!"})").has_value());
+    // Control: the same blob with a decodable psk.
+    EXPECT_TRUE(
+        decode_pairing_psk(head + base64url_encode(make_psk(0x73).data(), 32) + R"("})")
+            .has_value());
 }
 
 TEST(PersistenceCodec, PskDecodeRejectsWrongLengthPsk) {
+    const std::string head = R"({"v":1,"psk_id":"psk-4","psk":")";
     std::array<uint8_t, 10> short_psk{};
-    std::string blob = R"({"v":1,"psk_id":"psk-4","psk":")" +
-                       base64url_encode(short_psk.data(), short_psk.size()) + R"("})";
-    EXPECT_FALSE(decode_pairing_psk(blob).has_value());
+    EXPECT_FALSE(
+        decode_pairing_psk(head + base64url_encode(short_psk.data(), short_psk.size()) + R"("})")
+            .has_value());
+    // Control: the same blob with a 32-byte psk.
+    EXPECT_TRUE(
+        decode_pairing_psk(head + base64url_encode(make_psk(0x74).data(), 32) + R"("})")
+            .has_value());
 }
 
 TEST(PersistenceCodec, PskDecodeRejectsMissingPskId) {
-    std::string blob =
-        R"({"v":1,"psk":")" + base64url_encode(make_psk(0x90).data(), 32) + R"("})";
-    EXPECT_FALSE(decode_pairing_psk(blob).has_value());
+    const std::string tail =
+        R"("psk":")" + base64url_encode(make_psk(0x90).data(), 32) + R"("})";
+    EXPECT_FALSE(decode_pairing_psk(R"({"v":1,)" + tail).has_value());
+    // Control: the same blob carrying a psk_id decodes.
+    EXPECT_TRUE(decode_pairing_psk(R"({"v":1,"psk_id":"psk-5",)" + tail).has_value());
 }
 
 // ============================================================================
@@ -354,12 +411,48 @@ TEST(PersistenceCodec, ConfigDecodeMissingFieldsTakeDefaults) {
     EXPECT_EQ(decoded->static_pairing_code_enabled, defaults.static_pairing_code_enabled);
 }
 
+// Both root-shape rejections below share one Control: a well-formed object root, which is
+// the only thing either of them must still accept.
+// ArduinoJson's as<bool>() coerces any non-boolean variant to true, a "false" STRING included,
+// so an unguarded read of a corrupt config blob would turn a disabled pairing method back on -
+// including unpaired_access_enabled, which defaults to false and so is invisible to
+// ConfigDecodeMissingFieldsTakeDefaults. Every wrong-typed field must keep its struct default.
+TEST(PersistenceCodec, ConfigDecodeWrongTypedFieldsTakeDefaults) {
+    const SendspinPairingConfig defaults;
+    for (const char* key : {"pairing_psk_enabled", "unpaired_access_enabled", "dynamic_pin_enabled",
+                            "static_pin_enabled"}) {
+        for (const char* corrupt : {R"("false")", R"("yes")", R"("")", "[1,2]", "{}", "1"}) {
+            std::string blob = std::string(R"({"v":1,")") + key + R"(":)" + corrupt + "}";
+            auto decoded = decode_pairing_config(blob);
+            ASSERT_TRUE(decoded.has_value()) << blob;
+            EXPECT_EQ(decoded->pairing_psk_enabled, defaults.pairing_psk_enabled) << blob;
+            EXPECT_EQ(decoded->unpaired_access_enabled, defaults.unpaired_access_enabled) << blob;
+            EXPECT_EQ(decoded->dynamic_pairing_code_enabled, defaults.dynamic_pairing_code_enabled)
+                << blob;
+            EXPECT_EQ(decoded->static_pairing_code_enabled, defaults.static_pairing_code_enabled)
+                << blob;
+        }
+    }
+
+    // Control: a real boolean on each of the same four keys comes through.
+    auto decoded = decode_pairing_config(
+        R"({"v":1,"pairing_psk_enabled":false,"unpaired_access_enabled":true,)"
+        R"("dynamic_pin_enabled":false,"static_pin_enabled":true})");
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_FALSE(decoded->pairing_psk_enabled);
+    EXPECT_TRUE(decoded->unpaired_access_enabled);
+    EXPECT_FALSE(decoded->dynamic_pairing_code_enabled);
+    EXPECT_TRUE(decoded->static_pairing_code_enabled);
+}
+
 TEST(PersistenceCodec, ConfigDecodeRejectsParseFailure) {
     EXPECT_FALSE(decode_pairing_config("{{{not json").has_value());
+    EXPECT_TRUE(decode_pairing_config(R"({"v":1})").has_value());
 }
 
 TEST(PersistenceCodec, ConfigDecodeRejectsNonObjectRoot) {
     EXPECT_FALSE(decode_pairing_config("[1,2,3]").has_value());
+    EXPECT_TRUE(decode_pairing_config(R"({"v":1})").has_value());
 }
 
 // ============================================================================
@@ -391,6 +484,8 @@ TEST(PersistenceCodec, Base64UrlDecodeToleratesPadding) {
 
 TEST(PersistenceCodec, Base64UrlDecodeRejectsInvalidCharacters) {
     EXPECT_FALSE(base64url_decode("not*valid+base64/url").has_value());
+    // Control: the url-safe alphabet over the same length decodes.
+    EXPECT_TRUE(base64url_decode("notXvalidXbase64Xurl").has_value());
 }
 
 TEST(PersistenceCodec, Base64UrlEmptyRoundTrip) {
