@@ -570,6 +570,7 @@ public:
     /// This is base64url(X25519 public key), 43 chars: the Sendspin client_id.
     /// Generated on first boot and persisted via the persistence provider.
     /// Empty until start() is called.
+    /// Main loop only. start() rewrites the value, so do not cache a c_str() across a restart.
     [[nodiscard]] const std::string& client_id() const {
         return this->client_id_;
     }

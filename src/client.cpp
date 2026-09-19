@@ -1111,6 +1111,8 @@ void SendspinClient::cleanup_connection_state() {
 }
 
 std::string SendspinClient::build_hello_message() {
+    // Reached only from ConnectionManager::send_hello_message(), so only for a connection, so
+    // only after a successful start(): record_store_ exists and is dereferenced unguarded below.
     ClientHelloMessage msg;
     msg.name = this->config_.name;
 
@@ -1129,7 +1131,7 @@ std::string SendspinClient::build_hello_message() {
     // pairing.md "client/hello pair-method descriptor". offers_*() is the single source both this
     // and the server/activate admissibility check read, so a method advertised here is one an
     // activation can select.
-    if (this->record_store_ && offers_pairing_psk(this->config_, *this->record_store_)) {
+    if (offers_pairing_psk(this->config_, *this->record_store_)) {
         PairMethodDescriptor psk_desc;
         psk_desc.method = SendspinPairMethod::PAIRING_PSK;
         psk_desc.locations = locations_hint(this->config_.pairing_psk_locations);
@@ -1137,7 +1139,7 @@ std::string SendspinClient::build_hello_message() {
     }
     // out_channels and formats are both required and non-empty. No `locations`: a per-session code
     // has no resting place for the operator to look it up in.
-    if (this->record_store_ && offers_dynamic_pairing_code(this->config_, *this->record_store_)) {
+    if (offers_dynamic_pairing_code(this->config_, *this->record_store_)) {
         PairMethodDescriptor dynamic_desc;
         dynamic_desc.method = SendspinPairMethod::DYNAMIC_PAIRING_CODE;
         dynamic_desc.out_channels = this->config_.pairing_code_out_channels;
@@ -1146,15 +1148,14 @@ std::string SendspinClient::build_hello_message() {
     }
     // Offered only when the dynamic code is not: messaging.md "client/hello" permits at most one
     // pairing-code method.
-    if (this->record_store_ && offers_static_pairing_code(this->config_, *this->record_store_)) {
+    if (offers_static_pairing_code(this->config_, *this->record_store_)) {
         PairMethodDescriptor static_desc;
         static_desc.method = SendspinPairMethod::STATIC_PAIRING_CODE;
         static_desc.locations = locations_hint(this->config_.static_pairing_code_locations);
         msg.supported_pair_methods.push_back(std::move(static_desc));
     }
 
-    msg.unpaired_access_enabled =
-        this->record_store_ != nullptr && this->record_store_->unpaired_access_enabled();
+    msg.unpaired_access_enabled = this->record_store_->unpaired_access_enabled();
 
     // Let each role add its fields to the hello message
 #ifdef SENDSPIN_ENABLE_PLAYER
@@ -1209,10 +1210,24 @@ namespace {
 /// messages may touch a role.
 ///
 /// False for the establishment and trust-negotiation traffic a connection must be able to send
-/// before it is admitted (hello, activate, in-band re-handshake), and for the pairing messages,
-/// which carry their own gating on the main loop.
+/// before it is admitted (hello, activate, time, in-band re-handshake), and for the pairing
+/// messages, which carry their own gating on the main loop. Those are listed one by one, and the
+/// default gates, so a message type added later is refused from an unadmitted connection until
+/// someone decides otherwise here.
 bool requires_admitted_connection(SendspinServerToClientMessageType type) {
     switch (type) {
+        case SendspinServerToClientMessageType::SERVER_HELLO:
+        case SendspinServerToClientMessageType::SERVER_ACTIVATE:
+        case SendspinServerToClientMessageType::SERVER_TIME:
+        case SendspinServerToClientMessageType::NOISE_HANDSHAKE:
+        case SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE:
+        case SendspinServerToClientMessageType::PAIR_ABORT:
+        case SendspinServerToClientMessageType::SERVER_UNPAIR:
+        case SendspinServerToClientMessageType::SERVER_PAIR_INIT:
+        case SendspinServerToClientMessageType::SERVER_PAIR_AUTH:
+        case SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM:
+        case SendspinServerToClientMessageType::UNKNOWN:
+            return false;
         case SendspinServerToClientMessageType::SERVER_STATE:
         case SendspinServerToClientMessageType::SERVER_COMMAND:
         case SendspinServerToClientMessageType::STREAM_START:
@@ -1221,7 +1236,7 @@ bool requires_admitted_connection(SendspinServerToClientMessageType type) {
         case SendspinServerToClientMessageType::GROUP_UPDATE:
             return true;
         default:
-            return false;
+            return true;
     }
 }
 
@@ -1841,13 +1856,9 @@ SS_HOT void SendspinClient::process_binary_message(SendspinConnection* conn, con
 // ============================================================================
 
 void SendspinClient::publish_client_state(SendspinConnection* conn) {
-    if (conn == nullptr || !conn->is_connected() || !conn->is_handshake_complete()) {
-        return;
-    }
-
-    // Gate on receipt of the first server/activate: before that we do not yet know which
-    // activities/roles this connection is admitted for.
-    if (!conn->first_activate_received()) {
+    // is_operational() also covers the first server/activate: before that we do not yet know
+    // which activities and roles this connection is admitted for.
+    if (conn == nullptr || !conn->is_connected() || !conn->is_operational()) {
         return;
     }
 
