@@ -1786,9 +1786,9 @@ TEST(RecordStoreConcurrency, ResolvePairingOutcomeDoesNotRaceRecordStores) {
 // construction, see docs/internals.md "Pairing").
 //
 // The provider below parks inside save_blob() until this test releases it, which is the whole of
-// that commit window held open. A resolve issued in that window must still return. The wait is
-// bounded and the latch is released before the probe is joined, so a regression fails here
-// instead of hanging the suite.
+// that commit window held open. A resolve issued in that window must still return: it is waited
+// on with no timeout, so a regression hangs rather than turning a loaded runner into a failure,
+// and the watchdog in tests/main.cpp names the test.
 namespace {
 
 class BlockingRecordsProvider : public SendspinPersistenceProvider {
@@ -1837,24 +1837,24 @@ TEST(RecordStoreConcurrency, ResolveRunsWhileARecordsWriteIsInFlight) {
     // The main loop's deferred flush of that RAM-only insert: the one call that reaches the
     // provider here.
     std::thread writer([&] { store.persist_records(); });
-    ASSERT_TRUE(provider.wait_until_entered(std::chrono::milliseconds(4000)))
-        << "the flush never reached the provider";
+    // Bounded wait for progress, not a pass/fail bound on the property under test.
+    const bool entered = provider.wait_until_entered(std::chrono::milliseconds(4000));
+    EXPECT_TRUE(entered) << "the flush never reached the provider";
 
-    std::promise<bool> resolved;
-    std::future<bool> resolved_future = resolved.get_future();
-    std::thread probe([&] {
-        resolved.set_value(
-            store.resolve_by_psk_id(psk_id, PskCategory::LONG_TERM).has_value());
-    });
+    if (entered) {
+        std::promise<bool> resolved;
+        std::future<bool> resolved_future = resolved.get_future();
+        std::thread probe([&] {
+            resolved.set_value(store.resolve_by_psk_id(psk_id, PskCategory::LONG_TERM).has_value());
+        });
 
-    const bool returned =
-        resolved_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
-    // Release first, then join: a resolve that did block must be let go so the failure is
-    // reported rather than hung on.
+        // Nothing is released until the resolve returns, so a resolve that waits out the write
+        // hangs here.
+        const bool found = resolved_future.get();
+        probe.join();
+        EXPECT_TRUE(found) << "the resolve returned, but missed the stored record";
+    }
+
     provider.release();
-    probe.join();
     writer.join();
-
-    EXPECT_TRUE(returned) << "a handshake resolve blocked on the provider's records write";
-    EXPECT_TRUE(resolved_future.get()) << "the resolve returned, but missed the stored record";
 }

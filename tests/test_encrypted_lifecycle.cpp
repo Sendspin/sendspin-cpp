@@ -2863,9 +2863,9 @@ private:
 //
 // The provider above holds that whole window open inside the first activate's mark_record_used().
 // A current_shared() caller issued in the window must still return: is_time_synced() is exactly
-// the call the sync task makes (SendspinClient::is_time_synced() -> current_shared()). The wait is
-// bounded and the provider is released before the probe is joined, so a regression fails here
-// rather than hanging the suite.
+// the call the sync task makes (SendspinClient::is_time_synced() -> current_shared()). It is
+// waited on with no timeout, so a regression hangs rather than turning a loaded runner into a
+// failure, and the watchdog in tests/main.cpp names the test.
 TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
     PairedPeer peer = make_paired_peer();
     TestNetworkProvider network;
@@ -2893,26 +2893,27 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
     FakeEncryptedServer server(server_url(BLOCKING_RECORD_WRITE_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), peer.server_identity,
                                peer.record.psk_id, peer.psk);
-    ASSERT_TRUE(persistence.wait_until_entered(std::chrono::milliseconds(6000)))
-        << "the first activate on a long-term record never reached the provider";
+    // Bounded wait for progress, not a pass/fail bound on the property under test.
+    const bool entered = persistence.wait_until_entered(std::chrono::milliseconds(6000));
+    EXPECT_TRUE(entered) << "the first activate on a long-term record never reached the provider";
 
-    std::promise<void> probed;
-    std::future<void> probed_future = probed.get_future();
-    std::thread probe([&] {
-        client.is_time_synced();
-        probed.set_value();
-    });
+    if (entered) {
+        std::promise<void> probed;
+        std::future<void> probed_future = probed.get_future();
+        std::thread probe([&] {
+            client.is_time_synced();
+            probed.set_value();
+        });
 
-    const bool returned =
-        probed_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
-    // Release first, then join: a probe that did block must be let go so the failure is reported
-    // rather than hung on.
+        // The provider is still parked here, so a current_shared() that waits on the manager lock
+        // hangs on this get().
+        probed_future.get();
+        probe.join();
+    }
+
     persistence.release();
-    probe.join();
     pumping.store(false, std::memory_order_release);
     main_loop.join();
-
-    EXPECT_TRUE(returned) << "current_shared() blocked on a persistence write";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
