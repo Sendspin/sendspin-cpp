@@ -15,6 +15,7 @@
 #include "protocol_messages.h"
 #include "visualizer_role_impl.h"
 
+#include "log_capture.h"
 #include "test_util.h"
 
 #include <gtest/gtest.h>
@@ -23,6 +24,8 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -571,4 +574,87 @@ TEST(VisualizerStartValidation, ValidStreamConfigStarts) {
 
     EXPECT_TRUE(impl->start());
     impl->stop();
+}
+
+// ============================================================================
+// stream/start spectrum mismatch reporting
+// ============================================================================
+
+namespace {
+
+// The spectrum layout the role below asks for; each case serves a copy with one field changed.
+VisualizerSpectrumConfig requested_spectrum() {
+    return VisualizerSpectrumConfig{
+        .n_disp_bins = 16,
+        .scale = VisualizerSpectrumScale::LOG,
+        .f_min = 20,
+        .f_max = 20000,
+    };
+}
+
+// Runs a stream/start carrying `served` (nullopt serves the spectrum type with no spectrum
+// object) against a role configured for requested_spectrum(), and returns what it logged.
+std::string stream_start_log(std::optional<VisualizerSpectrumConfig> served) {
+    auto impl = make_impl_with_stream(VisualizerStreamConfig{
+        .types = {VisualizerDataType::SPECTRUM},
+        .rate_max = 25,
+        .spectrum = requested_spectrum(),
+    });
+
+    ServerVisualizerStreamObject stream;
+    stream.types = {VisualizerDataType::SPECTRUM};
+    stream.spectrum = std::move(served);
+
+    StderrCapture capture;
+    impl->handle_stream_start(stream, live_generation(*impl));
+    return capture.release();
+}
+
+}  // namespace
+
+// roles/visualizer/v1.md "Server -> Client: stream/start": the spectrum object is present when
+// types includes 'spectrum' and MUST match the requested configuration. The object is reported to
+// the listener as the server sent it, so a mismatch has no effect other than the log line: the
+// line is the only place an inverted comparison or a swapped operand shows up.
+TEST(VisualizerSpectrumMismatch, BinCountMismatchNamesServedAndRequested) {
+    VisualizerSpectrumConfig served = requested_spectrum();
+    served.n_disp_bins = 8;
+
+    const std::string log = stream_start_log(served);
+    EXPECT_NE(log.find("bin count mismatch: server 8, expected 16"), std::string::npos) << log;
+}
+
+TEST(VisualizerSpectrumMismatch, ScaleMismatchIsReported) {
+    VisualizerSpectrumConfig served = requested_spectrum();
+    served.scale = VisualizerSpectrumScale::LIN;
+
+    const std::string log = stream_start_log(served);
+    EXPECT_NE(log.find("Spectrum scale mismatch"), std::string::npos) << log;
+}
+
+// One branch covers both bounds, so each is served wrong on its own: a check that read f_max
+// twice would still pass on one of them.
+TEST(VisualizerSpectrumMismatch, EitherFrequencyBoundIsReported) {
+    VisualizerSpectrumConfig low = requested_spectrum();
+    low.f_min = 40;
+    EXPECT_NE(stream_start_log(low).find("frequency range mismatch: server 40-20000, expected "
+                                         "20-20000"),
+              std::string::npos);
+
+    VisualizerSpectrumConfig high = requested_spectrum();
+    high.f_max = 16000;
+    EXPECT_NE(stream_start_log(high).find("frequency range mismatch: server 20-16000, expected "
+                                          "20-20000"),
+              std::string::npos);
+}
+
+TEST(VisualizerSpectrumMismatch, SpectrumTypeWithNoSpectrumObjectIsReported) {
+    const std::string log = stream_start_log(std::nullopt);
+    EXPECT_NE(log.find("no spectrum object"), std::string::npos) << log;
+}
+
+// Control: a served spectrum equal to the requested one reports nothing, so the four cases above
+// pin the comparisons rather than a warning the role emits either way.
+TEST(VisualizerSpectrumMismatch, MatchingSpectrumReportsNothing) {
+    EXPECT_EQ(stream_start_log(requested_spectrum()), "");
 }
