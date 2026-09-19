@@ -322,6 +322,10 @@ public:
     /// @param cb      Optional send-complete callback (best-effort; see send_text_message).
     /// @param allow_before_hello  Passed through to send_text_message on the pre-noise path.
     /// @return SsErr::OK if queued/sent, error code otherwise.
+    /// @note The encrypted path blocks on the Noise session mutex, which the network thread also
+    ///       holds across its own sends. On an ESP outbound connection that send blocks for up to
+    ///       WEBSOCKET_SEND_TIMEOUT_MS, so a call from loop() can stall that long (and for a
+    ///       fragmented message, once per frame, since the lock spans the whole fragment loop).
     SsErr send_app_json(const std::string& json, SendCompleteCallback cb = nullptr,
                         bool allow_before_hello = false);
 
@@ -383,10 +387,11 @@ public:
 
     /// @brief Sends a client/time synchronization message
     ///
-    /// The transport implementation captures `client_transmitted` as close to the actual wire
-    /// send as possible (e.g., inside the httpd worker on ESP server, just before
-    /// `httpd_ws_send_frame_async`) and serializes the JSON inline. This eliminates the queue
-    /// latency variance that a hub-thread timestamp would introduce.
+    /// The transport implementation captures `client_transmitted` on the sending task and
+    /// serializes the JSON inline, which eliminates the queue latency variance that a hub-thread
+    /// timestamp would introduce. On the ESP server the stamp is taken in the httpd worker; a
+    /// cleartext frame then goes to the wire from that worker, while an encrypted one is posted
+    /// back to the same task, costing one more queue hop after the stamp.
     ///
     /// @return true if the message was queued/sent successfully, false otherwise.
     virtual bool send_time_message() = 0;
@@ -960,8 +965,8 @@ public:
         this->websocket_payload_location_ = location;
     }
 
-    /// @brief Sets the memory location preference for the Noise transport's fragment
-    /// reassembly and fragmentation buffers.
+    /// @brief Sets the memory location preference for the Noise transport's buffers: fragment
+    /// reassembly, the fragmentation frame buffer, and the reused send buffer.
     /// @param location PREFER_EXTERNAL (SPIRAM-first) or PREFER_INTERNAL (internal-RAM-first).
     /// @note Must be called before the handshake completes; takes effect on the next allocation.
     void set_noise_buffer_location(MemoryLocation location) {
