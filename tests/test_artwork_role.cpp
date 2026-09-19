@@ -17,6 +17,7 @@
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 #include <ArduinoJson.h>
+#include "log_capture.h"
 #include "test_util.h"
 
 #include <gtest/gtest.h>
@@ -29,6 +30,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1780,4 +1782,86 @@ TEST(ArtworkDisplayLateness, HugeLatenessSaturatesAtUint32Max) {
     // A pathological far-past deadline can exceed UINT32_MAX ms (~49 days); the ms value must
     // saturate there rather than wrap when narrowed to uint32_t.
     EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, INT64_MAX), UINT32_MAX);
+}
+
+// ============================================================================
+// stream/start channel mismatch reporting
+// ============================================================================
+
+namespace {
+
+// The channel a single-slot role asks for; each case serves a copy with one field changed.
+ServerArtworkChannelObject requested_channel() {
+    ServerArtworkChannelObject channel;
+    channel.source = SendspinImageSource::ALBUM;
+    channel.format = SendspinImageFormat::JPEG;
+    channel.width = 100;
+    channel.height = 100;
+    return channel;
+}
+
+// Runs a stream/start carrying `served` against a role configured for one ALBUM/JPEG 100x100
+// channel, and returns what it logged.
+std::string channel_stream_start_log(std::vector<ServerArtworkChannelObject> served) {
+    auto impl = make_impl(make_single_slot_config(false));
+
+    ServerArtworkStreamObject stream;
+    stream.channels = std::move(served);
+
+    StderrCapture capture;
+    impl->handle_stream_start(stream, live_generation(*impl));
+    return capture.release();
+}
+
+}  // namespace
+
+// roles/artwork/v1.md "stream/start artwork object": the server reports what it will actually
+// stream per channel, which need not be what the client asked for. The role streams it either
+// way, so each mismatch is a log line and nothing else - which is why the operand rename that
+// reached these width and height comparisons changed them with nothing watching.
+TEST(ArtworkChannelMismatch, SourceMismatchIsReported) {
+    ServerArtworkChannelObject served = requested_channel();
+    served.source = SendspinImageSource::ARTIST;
+
+    const std::string log = channel_stream_start_log({served});
+    EXPECT_NE(log.find("channel 0 source mismatch"), std::string::npos) << log;
+}
+
+TEST(ArtworkChannelMismatch, FormatMismatchIsReported) {
+    ServerArtworkChannelObject served = requested_channel();
+    served.format = SendspinImageFormat::PNG;
+
+    const std::string log = channel_stream_start_log({served});
+    EXPECT_NE(log.find("channel 0 format mismatch"), std::string::npos) << log;
+}
+
+TEST(ArtworkChannelMismatch, WidthMismatchNamesServedAndRequested) {
+    ServerArtworkChannelObject served = requested_channel();
+    served.width = 200;
+
+    const std::string log = channel_stream_start_log({served});
+    EXPECT_NE(log.find("channel 0 width mismatch: server 200, expected 100"), std::string::npos)
+        << log;
+}
+
+TEST(ArtworkChannelMismatch, HeightMismatchNamesServedAndRequested) {
+    ServerArtworkChannelObject served = requested_channel();
+    served.height = 200;
+
+    const std::string log = channel_stream_start_log({served});
+    EXPECT_NE(log.find("channel 0 height mismatch: server 200, expected 100"), std::string::npos)
+        << log;
+}
+
+// A server streaming a different number of channels than the role declared is reported once for
+// the array, not per channel: the channels the two do share still compare field by field.
+TEST(ArtworkChannelMismatch, ChannelCountMismatchIsReported) {
+    const std::string log = channel_stream_start_log({requested_channel(), requested_channel()});
+    EXPECT_NE(log.find("channel count mismatch: server sent 2, expected 1"), std::string::npos) << log;
+}
+
+// Control: a channel array that matches what the role asked for reports nothing, so the cases
+// above pin the comparisons rather than a warning the role emits either way.
+TEST(ArtworkChannelMismatch, MatchingChannelReportsNothing) {
+    EXPECT_EQ(channel_stream_start_log({requested_channel()}), "");
 }
