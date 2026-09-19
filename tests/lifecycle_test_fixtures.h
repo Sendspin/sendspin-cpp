@@ -156,7 +156,7 @@ inline bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
 /// A fresh long-term pairing record, the PSK behind it, and the server identity the record is
 /// bound to, so a test can seed the client's RecordStore and hand the same PSK and identity to a
 /// fake server. The record carries that identity's peer_id because every long-term PSK is
-/// checked against the server it was minted for (spec "Pre-Shared Key"), so a fake server
+/// checked against the server it was minted for (connection.md "Pre-Shared Key"), so a fake server
 /// running under any other identity is refused at the handshake. The resulting connection
 /// resolves to PskCategory::LONG_TERM, which admits the empty activity set and {playback}.
 struct PairedPeer {

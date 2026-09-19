@@ -132,7 +132,7 @@ public:
     /// so there is one source of truth for the number.
     static constexpr size_t DEFAULT_MAX_RECORDS = SendspinClientConfig::DEFAULT_MAX_PAIRING_RECORDS;
 
-    /// @brief Floor under any configured cap. pairing.md "Pairing records" requires room for at
+    /// @brief Floor under any configured cap. pairing.md "Pairing Records" requires room for at
     /// least 5 records, and requires the client to cap its concurrently open paired connections
     /// below that capacity so an evictable record always exists; connection_manager.h asserts
     /// that this library's connection budget stays under this floor.
@@ -207,7 +207,7 @@ public:
     /// must arrange for persist_records() to run on the main loop afterwards (the client does
     /// this via INBOX_TOPIC_RECORDS); until that flush lands, the mutation is RAM-only.
     ///
-    /// A pairing never fails for lack of record storage (pairing.md "Pairing records"): a
+    /// A pairing never fails for lack of record storage (pairing.md "Pairing Records"): a
     /// net-new record that arrives at capacity evicts the least recently used record that no
     /// currently-open connection is resolving against. Recency is the order of `records_`,
     /// which mark_record_used() moves a record to the back of, so the front is the least
@@ -308,7 +308,7 @@ public:
     /// @brief Mint a pairing outcome: a fresh PSK bound to server_id and the record holding it.
     ///
     /// Minting cannot fail on a full store: a pairing never fails for lack of record storage
-    /// (pairing.md "Pairing records"). A re-pair supersedes the record its server already holds,
+    /// (pairing.md "Pairing Records"). A re-pair supersedes the record its server already holds,
     /// and a net-new record at capacity evicts one where it is stored, by
     /// store_record_superseding().
     [[nodiscard]] PairingOutcome resolve_pairing_outcome(

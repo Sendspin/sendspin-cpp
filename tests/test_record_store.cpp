@@ -342,7 +342,7 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
 }
 
 // =============================================================================
-// Capacity and eviction (pairing.md "Pairing records")
+// Capacity and eviction (pairing.md "Pairing Records")
 // =============================================================================
 
 // Pairing at capacity must not fail: the store evicts a record instead, and the new one lands.
@@ -526,7 +526,7 @@ TEST(RecordStore, CapacityCustomCapIsRespected) {
     EXPECT_EQ(store.records_snapshot().size(), cap) << "the configured cap still bounds the store";
 }
 
-// pairing.md "Pairing records" requires room for at least 5 records, so a smaller configured cap
+// pairing.md "Pairing Records" requires room for at least 5 records, so a smaller configured cap
 // is raised to that floor rather than honoured.
 TEST(RecordStore, CapacityBelowTheProtocolFloorIsRaised) {
     RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/2);
@@ -1138,7 +1138,7 @@ TEST(FilePersistenceProvider, PairingRecordRoundTrip) {
 }
 
 // A stored record with no server_id could never satisfy the post-match server check, so the
-// decoder skips it and keeps the rest of the blob (spec "Pre-Shared Key").
+// decoder skips it and keeps the rest of the blob (connection.md "Pre-Shared Key").
 TEST(FilePersistenceProvider, RecordWithoutServerIdIsSkipped) {
     TempFile tmp;
     FilePersistenceProvider provider(tmp.path());
@@ -1521,7 +1521,7 @@ TEST(RecordStore, ResolvePairingOutcomeNormal) {
 }
 
 // A full store still mints: a pairing never fails for lack of record storage
-// (pairing.md "Pairing records"), and room is made where the record is stored.
+// (pairing.md "Pairing Records"), and room is made where the record is stored.
 TEST(RecordStore, ResolvePairingOutcomeMintsOnAFullStore) {
     RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false,
                       RecordStore::MIN_MAX_RECORDS);

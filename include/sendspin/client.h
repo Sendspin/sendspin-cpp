@@ -573,7 +573,7 @@ public:
         return this->client_id_;
     }
 
-    /// @brief Builds the pairing token (spec's "Pairing Token" section) for a Sendspin Pairing
+    /// @brief Builds the pairing token (pairing.md "Pairing Token") for a Sendspin Pairing
     /// PSK: the single "SP:"-prefixed, base32 string that carries this client's static public key
     /// alongside `pairing_psk`, for an operator to transfer into a server via copy/paste or QR
     /// code to begin the Pairing PSK flow. Clients offering `pairing_psk` SHOULD surface this

@@ -965,7 +965,7 @@ void SendspinClient::update_state(SendspinClientState state) {
 }
 
 void SendspinClient::leave() {
-    // messaging.md "Client to Server: client/leave". Not a role message, so it does not route
+    // messaging.md "client/leave". Not a role message, so it does not route
     // through send_text(): leaving the group is a client-level act that no role activation gates.
     // The activation gate is the one every outbound message shares, since nothing may be sent
     // before the connection is admitted and its server/activate has arrived. Admission does not
@@ -1522,9 +1522,9 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
                     // Close the WebSocket silently (do not leave a half-swapped session).
                     // UNAUTHORIZED is the closest available reason for a crypto failure, though
-                    // close_silently() never actually transmits it (spec "Failure Handling":
-                    // close without any application-level message). This handler runs on the
-                    // network thread, so disconnect() here would be the same
+                    // close_silently() never actually transmits it (connection.md "Failure
+                    // Handling": close without any application-level message). This handler runs on
+                    // the network thread, so disconnect() here would be the same
                     // join-the-calling-thread deadlock/std::terminate() hazard close_silently()
                     // was added to avoid; see close_transport_now()'s doc comment in
                     // connection.h.
@@ -1636,7 +1636,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     const std::string psk_id = record->psk_id;
                     // store_record_superseding() mutates RAM only. At capacity it evicts the
                     // least recently used record rather than failing, since a pairing never
-                    // fails for lack of record storage (pairing.md "Pairing records"); the
+                    // fails for lack of record storage (pairing.md "Pairing Records"); the
                     // psk_ids of every open connection are handed over so none of them is the
                     // victim. It can still fail closed if nothing is evictable, which the
                     // connection budget rules out: the server rekeys onto this PSK regardless
@@ -1890,9 +1890,9 @@ void SendspinClient::publish_client_state(SendspinConnection* conn) {
     ClientStateMessage state_msg;
     state_msg.state = this->state_;
 
-    // spec "client/state": a role object is included only while that role is active, and every
-    // active role's object is included, so the first state after a server/activate carries them
-    // all.
+    // messaging.md "client/state": a role object is included only while that role is active.
+    // This client goes further and includes every active role's object on every update, so the
+    // first state after a server/activate carries them all.
 #ifdef SENDSPIN_ENABLE_PLAYER
     if (this->player_ && conn->is_role_active(SendspinRole::PLAYER)) {
         this->player_->impl_->build_state_fields(state_msg);

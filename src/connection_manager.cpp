@@ -688,7 +688,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
 
     // Compute the effective active_roles (sticky: nullopt keeps the prior set), except
     // when this activate omits active_roles and its activities are no longer
-    // playback-capable: spec "Playback-capable connections" says the client treats the
+    // playback-capable: messaging.md "Playback-capable connections" says the client treats the
     // persisted roles as empty in that case rather than rejecting the message (a later
     // activate can legally narrow activities without re-sending an empty active_roles).
     const bool playback_capable =
@@ -716,7 +716,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         return;
     }
 
-    // ==== pairing_index counter (spec "Pairing index") ====
+    // ==== pairing_index counter (pairing.md "Pairing index") ====
     // "the number of pairing server/activate messages received since the last Noise
     // handshake" is a RAW MESSAGE COUNT, not an accepted-attempt count: the server
     // counts every pairing activate it sends, including ones the client goes on to
@@ -731,7 +731,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         event.conn->bump_pairing_index();
     }
 
-    // ==== Pairing-method admissibility (spec "pair/abort") ====
+    // ==== Pairing-method admissibility (pairing.md "pair/abort") ====
     // Structurally admissible already (the activity set passed the table above),
     // but a pairing activate additionally carries a pairing object whose method must
     // (a) match the matched PSK's category (pairing_psk iff the matched PSK IS the
@@ -812,7 +812,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // Pass the same active_roles the admissibility check above used: when the message
     // omitted active_roles but the connection is no longer playback-capable, that is
     // effective_roles == EMPTY_ROLES, and it must be applied (not left sticky) so the
-    // persisted active_roles_ is actually cleared (spec "Playback-capable connections").
+    // persisted active_roles_ is actually cleared (messaging.md "Playback-capable connections").
     const std::optional<std::vector<std::string>> active_roles_to_apply =
         event.active_roles.has_value()
             ? event.active_roles
@@ -933,8 +933,8 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         }
 
         // messaging.md "client/state": a role that defines a state object and becomes active in
-        // active_roles must be told about in an update that includes that role's object, and
-        // "stream/start" has the server wait for that update before starting the role's stream.
+        // active_roles must be told about in an update that includes that role's object, and the
+        // server MUST NOT send that role's binary data until it has.
         // publish_client_state() builds an object for every role active on the connection, so one
         // publish serves an added role and, equally, drops the object of a removed one. A first
         // activate publishes through on_handshake_complete(); this covers every later one that
@@ -1941,8 +1941,8 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     // routed while it is (pairing.md "Entering and leaving pairing"). Playback is untouched.
     conn->set_pairing_in_progress(true);
 
-    // The pairing server/activate counter (spec "Pairing index") was already bumped by the caller
-    // at the point this activate was received (see the activate-events loop in
+    // The pairing server/activate counter (pairing.md "Pairing index") was already bumped by the
+    // caller at the point this activate was received (see the activate-events loop in
     // drain_lifecycle_events(): every pairing server/activate counts there, whether or not it turns
     // out to be admissible, so a method_not_supported rejection does not desync the count from the
     // server's). Do NOT bump
@@ -2067,7 +2067,7 @@ void ConnectionManager::handle_enter_pairing_code(SendspinConnection* conn, uint
 void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
                                                  const std::string& server_id) {
     // resolve_pairing_outcome mints the long-term PSK and the record that holds it. It cannot
-    // fail: a pairing never fails for lack of record storage (pairing.md "Pairing records"),
+    // fail: a pairing never fails for lack of record storage (pairing.md "Pairing Records"),
     // and room for the record is made where it is stored.
     auto outcome = this->client_->record_store_->resolve_pairing_outcome(server_id);
 
@@ -2102,9 +2102,9 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
 
     // A pair/abort that arrives after the receiver (us) has already ended the attempt (locally
     // aborted, or the server itself left pairing via a leftover server/activate) has no effect
-    // (spec "pair/abort": "A pair/abort received after the receiver has itself ended the attempt
-    // has no effect"). is_pairing_in_progress() is cleared by clear_pairing_state() on every path
-    // that ends an attempt, so it is the right proxy for "already ended" here.
+    // (pairing.md "pair/abort": "A pair/abort received after the receiver has itself ended the
+    // attempt has no effect"). is_pairing_in_progress() is cleared by clear_pairing_state() on
+    // every path that ends an attempt, so it is the right proxy for "already ended" here.
     if (!conn->is_pairing_in_progress()) {
         SS_LOGI(TAG,
                 "pair/abort (reason=%s) received for server_id=%s after the attempt already "
@@ -2116,9 +2116,9 @@ void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortRea
     SS_LOGW(TAG, "pair/abort received for server_id=%s reason=%s", conn->get_server_id().c_str(),
             to_cstr(reason));
 
-    // Clean up pairing state. Per spec "pair/abort", the sender of pair/abort closes the connection
-    // only for reason concurrent_attempt; every other reason leaves the connection open so the
-    // server can re-activate pairing (or resume normal operation) on the same connection. We
+    // Clean up pairing state. Per pairing.md "pair/abort", the sender of pair/abort closes the
+    // connection only for reason concurrent_attempt; every other reason leaves the connection open
+    // so the server can re-activate pairing (or resume normal operation) on the same connection. We
     // mirror that here: only concurrent_attempt drops the connection on our side too (the server,
     // as sender, is closing its side regardless; closing here just avoids waiting on the TCP
     // teardown). No wire pair/abort is sent: this one already arrived from the server.
@@ -2235,8 +2235,8 @@ void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
                 return;
             }
 
-            // Spec Protocol Errors: "a malformed or missing field ... is a protocol error: the
-            // detecting side closes the WebSocket without sending any application-level error
+            // pairing.md "Protocol Errors": "a malformed or missing field ... is a protocol error:
+            // the detecting side closes the WebSocket without sending any application-level error
             // message, and persists nothing." This is the one pairing-abort path that must NOT
             // send pair/abort and must close unconditionally, so it cannot route through
             // local_abort_pairing() (which always sends pair/abort and only closes for
@@ -2755,8 +2755,8 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
         return;
     }
 
-    // Only a session running on a long-term record is paired at all (spec "server/unpair": if
-    // the session is unpaired, ignore the message), so a pairing or Sentinel handshake has
+    // Only a session running on a long-term record is paired at all (messaging.md "server/unpair":
+    // if the session is unpaired, ignore the message), so a pairing or Sentinel handshake has
     // nothing to drop.
     if (event.psk_category != PskCategory::LONG_TERM) {
         SS_LOGD(TAG, "server/unpair ignored (non-LONG_TERM category, server_id=%s)",
@@ -2767,7 +2767,7 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
     SS_LOGI(TAG, "server/unpair: dropping record and disconnecting (server_id=%s, psk_id=%s)",
             conn->get_server_id().c_str(), event.matched_psk_id.c_str());
 
-    // Drop the matched pairing record (spec "server/unpair").
+    // Drop the matched pairing record (messaging.md "server/unpair").
     if (this->client_->record_store_ != nullptr) {
         this->client_->record_store_->remove_record(event.matched_psk_id);
     }

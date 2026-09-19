@@ -204,8 +204,8 @@ inline uint16_t active_role_mask(const std::vector<std::string>& active_roles) {
 }
 
 /// @brief Activity declared in a server/activate message.
-/// A connection declares a SET of activities rather than a single reason (spec "server/activate").
-/// Mirrors Activity in aiosendspin/models/types.py.
+/// A connection declares a SET of activities rather than a single reason (messaging.md
+/// "server/activate"). Mirrors Activity in aiosendspin/models/types.py.
 enum class SendspinActivity : uint8_t {
     PLAYBACK,  // Active or upcoming playback
     PAIRING,   // A pairing exchange
@@ -852,7 +852,7 @@ struct ServerHelloMessage {
 
 /// @brief Parsed server/activate message that follows server/hello.
 /// Declares the server's current activity set and active roles for this connection
-/// (spec "server/activate").
+/// (messaging.md "server/activate").
 struct ServerActivateMessage {
     std::vector<SendspinActivity> activities{};
     std::optional<std::vector<std::string>> active_roles;  // sticky: nullopt = keep prior set
@@ -1113,7 +1113,7 @@ std::string format_client_pair_pending_message(uint32_t pairing_index);
 
 /// @brief Formats a client/pair-init message as a JSON string.
 /// Starts the dynamic-pairing-code attempt; carries commit_B = SHA-256(LABEL || nonce_B) and the
-/// required pairing_index counter (spec "Pairing index").
+/// required pairing_index counter (pairing.md "Pairing index").
 /// @param commit_b 32-byte commit_B value to embed (base64url-encoded on the wire).
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
 ///                      handshake (see SendspinConnection::get_pairing_index()).

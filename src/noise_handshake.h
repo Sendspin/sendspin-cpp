@@ -190,6 +190,9 @@ private:
     bool handle_server_init(JsonObjectConst root, const std::string& text);
 
     /// @brief Authenticate and respond to the parsed noise/handshake msg1 frame.
+    /// @param root    Parsed envelope.
+    /// @param send_fn Sends the msg2 frame back to the peer.
+    /// @return true when msg1 authenticated and msg2 was sent.
     bool handle_msg1(JsonObjectConst root, const std::function<bool(const std::string&)>& send_fn);
 
     // Struct fields
@@ -199,11 +202,11 @@ private:
     /// Result available after COMPLETE.
     std::optional<NoiseHandshakeResult> result_;
 
-    /// server_id decoded from server/init (43-char base64url).
-    std::string server_id_;
-
     /// Reason from a received server/error; empty until one arrives. See server_error_reason().
     std::string server_error_reason_;
+
+    /// server_id decoded from server/init (43-char base64url).
+    std::string server_id_;
 
     /// Exact bytes of the server/init frame we received (retained for prologue).
     std::string server_init_text_;

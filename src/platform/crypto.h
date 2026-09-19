@@ -462,7 +462,7 @@ private:
 // AEAD (one-shot, explicit key + nonce)
 // ============================================================================
 //
-// Used for spec "PSK Wrapping": the client seals the new PSK under a key derived from the
+// Used for pairing.md "Wrapping": the client seals the new PSK under a key derived from the
 // CPace output using the AEAD of the connection's negotiated cipher suite (always ChaChaPoly;
 // see NOISE_SUITE_CHACHAPOLY in crypto/constants.h), a 12-byte all-zero nonce, and empty
 // associated data. This is independent of the Noise transport's own monotonic-counter nonces

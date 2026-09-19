@@ -262,7 +262,7 @@ TEST(DynamicPairingCode, FormatClientPairInitWireShape) {
         EXPECT_EQ((*decoded)[i], commit_b[i]) << "decoded byte mismatch at index " << i;
     }
 
-    // pairing_index is required on every client/pair-init (spec "Pairing index").
+    // pairing_index is required on every client/pair-init (pairing.md "Pairing index").
     ASSERT_TRUE(doc["payload"]["pairing_index"].is<uint32_t>());
     EXPECT_EQ(doc["payload"]["pairing_index"].as<uint32_t>(), 3u);
 }
@@ -370,7 +370,7 @@ static std::vector<uint8_t> to_bytes(const char* s) {
                                 reinterpret_cast<const uint8_t*>(s) + len);
 }
 
-// ADa = "server" (initiator's own AD), ADb = "client" (responder's own AD); per spec "PAKE".
+// ADa = "server" (initiator's own AD), ADb = "client" (responder's own AD); per pairing.md "PAKE".
 static std::vector<uint8_t> ad_server() {
     return to_bytes("server");
 }
@@ -460,7 +460,7 @@ TEST(DynamicPairingCodeCPace, RoundTripMismatchedPasswordFails) {
 }
 
 TEST(DynamicPairingCodeCPace, MismatchedAssociatedDataFailsVerify) {
-    // Distinct ADa/ADb values prevent a reflected-MAC issue (spec "PAKE"): if a side uses the
+    // Distinct ADa/ADb values prevent a reflected-MAC issue (pairing.md "PAKE"): if a side uses the
     // WRONG associated data (e.g. swapped, or both sides use the same AD instead of distinct
     // "server"/"client" values), confirmation must fail even with a matching password.
     const auto sid = make_test_sid();

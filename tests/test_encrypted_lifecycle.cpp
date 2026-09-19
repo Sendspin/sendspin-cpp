@@ -115,7 +115,7 @@ public:
     // load_blob(RECORDS) is not overridden beyond the base class's nullopt default: "starts with
     // no pairing records" above, so restating it here would be a no-op override.
 
-    // Optionally pre-seed an accepted Pairing PSK (spec's "server/activate" section: pairing.method
+    // Optionally pre-seed an accepted Pairing PSK (messaging.md "server/activate" section: pairing.method
     // MUST be 'pairing_psk' if and only if the matched PSK IS the Pairing PSK; the client
     // enforces this via ConnectionManager::loop()'s pairing-method admissibility check).
     // The Pairing PSK Flow test below needs the fake server to connect using this PSK directly
@@ -2596,7 +2596,7 @@ SendspinPairingRecord make_record_for(const Identity& identity) {
 
 // server/unpair revokes the credential itself, not just the session: the matched record must be
 // gone from the store AND from the persisted blob, or the server pairs its way back in at the
-// next boot (spec "server/unpair").
+// next boot (messaging.md "server/unpair").
 //
 // Only the matched record goes: a client paired with several servers keeps the others, which is
 // the difference between honouring an unpair and wiping the device.
@@ -2651,7 +2651,7 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
 }
 
 // An unpaired session has no record to revoke, so server/unpair on one is ignored outright: it
-// must not drop the session and must not touch stored records (spec "server/unpair": if the
+// must not drop the session and must not touch stored records (messaging.md "server/unpair": if the
 // session is unpaired, ignore the message).
 TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     Identity sentinel_identity = Identity::generate().value();
@@ -2697,7 +2697,7 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
 }
 
 // server/unpair must drop the record AND end every live session running on it, not just the
-// session that asked (spec "server/unpair").
+// session that asked (messaging.md "server/unpair").
 //
 // A connection resolves its psk_id and PSK category once, at Noise-handshake completion, and never
 // re-checks them against the RecordStore, so deleting the record alone does not stop a second
@@ -2710,7 +2710,7 @@ TEST(EncryptedLifecycle, UnpairDropsEverySessionOnTheRecord) {
     const std::string psk_id = psk_id_for(psk);
 
     // One server identity, two transports: the record's stored server_id must match the peer on
-    // both, since every long-term PSK is bound to its server (spec "Pre-Shared Key").
+    // both, since every long-term PSK is bound to its server (connection.md "Pre-Shared Key").
     Identity identity = Identity::generate().value();
 
     SendspinPairingRecord record;

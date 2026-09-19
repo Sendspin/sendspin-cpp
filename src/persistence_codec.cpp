@@ -86,8 +86,8 @@ std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj) {
     rec.psk_id = std::move(core->psk_id);
     rec.psk = core->psk;
     // A record whose PSK is not bound to a server can never satisfy the post-match server_id
-    // check (spec "Pre-Shared Key"), so it is not a usable record: reject it here rather than
-    // load a credential no handshake could ever accept.
+    // check (connection.md "Pre-Shared Key"), so it is not a usable record: reject it here rather
+    // than load a credential no handshake could ever accept.
     if (!obj["server_id"].is<const char*>()) {
         return std::nullopt;
     }
@@ -207,8 +207,8 @@ std::optional<std::vector<SendspinPairingRecord>> decode_pairing_records(std::st
         }
         // A record the codec cannot accept is skipped so the rest of the blob still loads. Name
         // the case a stored blob can actually hit: a record written before every PSK carried the
-        // server it was minted for (spec "Pre-Shared Key"), which nothing can match a handshake
-        // against now.
+        // server it was minted for (connection.md "Pre-Shared Key"), which nothing can match a
+        // handshake against now.
         const bool has_server_id =
             obj["server_id"].is<const char*>() && obj["server_id"].as<const char*>()[0] != '\0';
         if (obj["psk_id"].is<const char*>() && !has_server_id) {

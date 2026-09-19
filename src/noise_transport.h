@@ -164,9 +164,9 @@ private:
     ///
     /// Caller must hold session_mutex_ for the WHOLE call, and it stays held across every
     /// frame. The fragments of one logical message must reach the wire consecutively: a peer
-    /// that sees a non-fragment frame between them treats it as a spec "Malformed sequences"
-    /// protocol error and closes the connection (see accept_plaintext()). Releasing the lock
-    /// between frames would let a concurrent send_json()/send_binary() on another thread
+    /// that sees a non-fragment frame between them treats it as a messaging.md "Malformed
+    /// sequences" protocol error and closes the connection (see accept_plaintext()). Releasing the
+    /// lock between frames would let a concurrent send_json()/send_binary() on another thread
     /// interleave exactly such a frame.
     SsErr fragment_and_send_locked(const uint8_t* plaintext, size_t plaintext_len);
 

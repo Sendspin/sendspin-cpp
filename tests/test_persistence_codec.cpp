@@ -86,7 +86,7 @@ TEST(PersistenceCodec, RecordRoundTripWithoutOptionalFields) {
 }
 
 // A record with no server_id could never satisfy the post-match server check, so it is not a
-// usable credential and the decoder rejects it (spec "Pre-Shared Key").
+// usable credential and the decoder rejects it (connection.md "Pre-Shared Key").
 TEST(PersistenceCodec, RecordDecodeRejectsMissingServerId) {
     const std::string head = R"({"v":1,"psk_id":"rec-9","psk":")" +
                              base64url_encode(make_psk(0x21).data(), 32);

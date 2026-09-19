@@ -900,7 +900,7 @@ TEST(Protocol, FormatClientStateOmitsArtworkWhenUnset) {
     EXPECT_TRUE(doc["payload"]["artwork"].isUnbound());
 }
 
-// spec "client/state": the client-level field is the boolean `available`, not a multi-valued
+// messaging.md "client/state": the client-level field is the boolean `available`, not a multi-valued
 // state string. SYNCHRONIZED must serialize to available:true, and no legacy top-level "state"
 // key may appear (a strict-mode server hard-rejects client/state carrying an unknown field).
 TEST(Protocol, FormatClientStateSynchronizedIsAvailableTrue) {
@@ -957,7 +957,7 @@ TEST(Protocol, ClientHelloNoClientIdOrVersion) {
 }
 
 // The hello carries no trust field: the server learns the client's trust from the PSK the Noise
-// handshake matched (spec "client/hello").
+// handshake matched (messaging.md "client/hello").
 TEST(Protocol, ClientHelloOmitsTrustLevel) {
     ClientHelloMessage msg;
     msg.name = "TestDevice";
@@ -1018,7 +1018,7 @@ TEST(Protocol, ClientHelloPairMethodsAreKeyedByMethod) {
 }
 
 // supported_pair_methods: the field itself is REQUIRED on the wire even when there are no
-// methods to advertise (spec's "client/hello" section): it must be emitted as an empty object,
+// methods to advertise (messaging.md "client/hello" section): it must be emitted as an empty object,
 // not omitted, since every client is expected to implement at least pairing_psk.
 TEST(Protocol, ClientHelloNoSupportedPairMethods) {
     ClientHelloMessage msg;

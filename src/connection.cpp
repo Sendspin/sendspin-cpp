@@ -164,7 +164,7 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
         // which cannot be true before the Noise transport is active) see these values.
         this->set_noise_handshake_result(outcome->server_id, outcome->resolved_psk.category,
                                          outcome->resolved_psk.psk_id);
-        // Reset the pairing server/activate counter (spec "Pairing index"): a fresh handshake
+        // Reset the pairing server/activate counter (pairing.md "Pairing index"): a fresh handshake
         // starts a fresh count for the pairing_index / CPace-sid counter.
         this->reset_pairing_index();
         // Install the cipher session; send_app_json() routes encrypted from here on.
@@ -257,8 +257,8 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
         this->psk_id_ = result->resolved_psk.psk_id;
     }
 
-    // Reset the pairing server/activate counter (spec "Pairing index"): a re-handshake starts a
-    // fresh count for the pairing_index / CPace-sid counter, same as an initial handshake.
+    // Reset the pairing server/activate counter (pairing.md "Pairing index"): a re-handshake starts
+    // a fresh count for the pairing_index / CPace-sid counter, same as an initial handshake.
     this->reset_pairing_index();
 
     // connection.md "Re-handshake": neither server/hello nor client/hello is re-sent, so the
@@ -444,8 +444,8 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
         // the whole Noise/PSK/admission chain bypassed. The TEXT branch above already refuses
         // the same trick by routing pre-handshake text into the handshake driver.
         //
-        // Treated as a handshake-phase failure per spec "Failure Handling": close the WebSocket
-        // without sending any application-level message.
+        // Treated as a handshake-phase failure per connection.md "Failure Handling": close the
+        // WebSocket without sending any application-level message.
         SS_LOGW(TAG, "Binary frame before the Noise handshake completed; closing connection");
         this->reset_websocket_payload();
         this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);

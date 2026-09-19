@@ -211,9 +211,9 @@ void RecordStore::seed_first_boot_config(bool loaded_config, bool initial_unpair
 
 void RecordStore::provision_pairing_psk_if_needed() {
     // Pairing PSK provisioning: pairing_psk is the one pairing method every client must
-    // implement (spec "client/hello"), so a client with no Pairing PSK would advertise a method it
-    // cannot complete. Generate one when absent and persist it; the operator transfers it to a
-    // server as a pairing token (SendspinClient::pairing_token()). The key is stable across
+    // implement (messaging.md "client/hello"), so a client with no Pairing PSK would advertise a
+    // method it cannot complete. Generate one when absent and persist it; the operator transfers it
+    // to a server as a pairing token (SendspinClient::pairing_token()). The key is stable across
     // reboots once persisted; if persistence fails it is RAM-only for this boot, so a token
     // printed then will not survive a reboot (a warning is logged when this happens).
     if (!this->pairing_psk_.has_value()) {
@@ -278,8 +278,8 @@ std::optional<ResolvedPsk> RecordStore::resolve_by_psk_id_locked(const std::stri
         }
         case PskCategory::PAIRING: {
             // Excluded from the candidate set when pairing_psk is disabled in the live pairing
-            // config (spec "Pre-Shared Key"): a handshake referencing it then fails as a lookup
-            // miss, exactly as if no Pairing PSK were configured at all.
+            // config (connection.md "Pre-Shared Key"): a handshake referencing it then fails as a
+            // lookup miss, exactly as if no Pairing PSK were configured at all.
             if (this->pairing_psk_.has_value() && this->pairing_psk_->psk_id == psk_id &&
                 this->pairing_psk_enabled_) {
                 ResolvedPsk r;
@@ -338,7 +338,7 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
 bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_use) {
     // records_ runs least-recently-used first (mark_record_used moves a touched record to the
     // back, in RAM), so the first record no open connection is resolving against is the victim
-    // pairing.md "Pairing records" leaves to the implementation. A record backing an open
+    // pairing.md "Pairing Records" leaves to the implementation. A record backing an open
     // connection, provisional or admitted, is off limits there: evicting it would strand a
     // live session on a PSK this store no longer holds.
     for (size_t i = 0; i < this->records_.size(); ++i) {
@@ -371,7 +371,7 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
     // Capacity: a replace by psk_id never grows the store, and neither does an insert that
     // supersedes an existing record for the same server_id, because the retire below drops that
     // record in the same locked section. Anything else is a genuine net-new record, which at
-    // capacity evicts one rather than failing the pairing (pairing.md "Pairing records").
+    // capacity evicts one rather than failing the pairing (pairing.md "Pairing Records").
     if (is_insert) {
         const bool will_supersede_existing = this->record_by_server_id(record.server_id) != nullptr;
         if (!will_supersede_existing && !this->has_capacity_locked() &&

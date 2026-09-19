@@ -306,7 +306,8 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         }
         // The ignore rules let a receiver discard the data of a message whose orig_type it does
         // not implement instead of allocating for it, as long as it keeps tracking the sequence.
-        // "Binary Message ID Structure" reserves IDs 2-3, so no message can ever carry one.
+        // messaging.md "Binary Message ID Structure" reserves IDs 2-3, so no message can ever
+        // carry one.
         this->reasm_in_progress_ = true;
         this->reasm_discarding_ =
             (orig_type >= MSG_TYPE_RESERVED_FIRST && orig_type <= MSG_TYPE_RESERVED_LAST);

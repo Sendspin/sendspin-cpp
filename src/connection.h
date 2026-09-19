@@ -257,7 +257,7 @@ public:
 
     /// @brief Return the full Noise suite name supplied at init_noise_handshake() (e.g.
     /// "Noise_KKpsk2_25519_ChaChaPoly_SHA256"), or an empty string if none was set.
-    /// Used to select the AEAD cipher for spec "PSK Wrapping" (see
+    /// Used to select the AEAD cipher for pairing.md "Wrapping" (see
     /// platform/crypto.h aead_cipher_name_from_noise_suite()).
     ///
     /// Virtual so a fake connection can report a canned suite name without an active Noise
@@ -409,8 +409,8 @@ public:
 
     /// @brief Closes the connection without sending any application-level message.
     ///
-    /// Spec "Failure Handling": handshake-phase failures, an AEAD failure once in transport
-    /// mode, and malformed fragment sequences all close the WebSocket without sending a
+    /// connection.md "Failure Handling": handshake-phase failures, an AEAD failure once in
+    /// transport mode, and malformed fragment sequences all close the WebSocket without sending a
     /// client/goodbye (or any other application-level message). Every call site is reached from
     /// dispatch_completed_message() on the network thread, so this routes to
     /// close_transport_now() (non-blocking on every platform) instead of disconnect() (which is
@@ -1212,7 +1212,7 @@ protected:
     ShadowSlot<std::optional<SendspinPairingRecord>> pending_pairing_slot_{};
 
     /// Count of pairing server/activate messages received since the last Noise handshake (or
-    /// re-handshake) (spec "Pairing index"). Feeds both the wire `pairing_index` field on
+    /// re-handshake) (pairing.md "Pairing index"). Feeds both the wire `pairing_index` field on
     /// client/pair-init and the CPace `sid` (see PairingSession::pairing_index, captured at
     /// handle_enter_pairing() so a later PAKE step reuses the exact value client/pair-init sent).
     /// Written on the main loop (bump_pairing_index(), each pairing server/activate) and on the

@@ -785,7 +785,7 @@ private:
     /// @brief Maximum connections open at once: the admitted one plus a full nursery.
     static constexpr size_t MAX_OPEN_CONNECTIONS = NURSERY_CAPACITY + 2;
 
-    // pairing.md "Pairing records" requires the client to cap its concurrently open paired
+    // pairing.md "Pairing Records" requires the client to cap its concurrently open paired
     // connections below its record capacity, so that a completed pairing at capacity always has
     // a record left to evict. The connection budget is fixed at compile time and the record
     // capacity has a floor, so the cap is an invariant rather than a runtime check.
@@ -821,7 +821,7 @@ private:
                                   const std::string& server_id);
 
     /// @brief Handles a pair/abort event on the main loop.
-    /// Cleans up pairing state. Per spec "pair/abort", only closes the connection for reason
+    /// Cleans up pairing state. Per pairing.md "pair/abort", only closes the connection for reason
     /// concurrent_attempt; every other reason leaves it open. A pair/abort that arrives after the
     /// attempt has already ended (is_pairing_in_progress() false) is silently ignored (stale).
     /// @param conn The connection on which the abort arrived.
@@ -898,8 +898,8 @@ private:
     void handle_pair_confirm(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
     /// @brief Abort the current pairing-code session: send pair/abort, notify, and close the
-    /// connection only for reason concurrent_attempt (spec "pair/abort"; every other reason leaves
-    /// the connection open).
+    /// connection only for reason concurrent_attempt (pairing.md "pair/abort"; every other reason
+    /// leaves the connection open).
     /// @param conn The connection to abort.
     /// @param reason The abort reason to send.
     void local_abort_pairing(SendspinConnection* conn, PairAbortReason reason);

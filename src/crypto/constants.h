@@ -111,8 +111,8 @@ static constexpr uint8_t FRAGMENT_FLAG_FIRST = 0x02;
 /// be zero. A frame setting any of them is a malformed sequence.
 static constexpr uint8_t FRAGMENT_FLAGS_RESERVED = 0xFC;
 
-/// @brief First and last binary message ID that "Binary Message ID Structure" reserves for
-/// future transport use. No role is ever assigned one, so a fragmented message claiming a
+/// @brief First and last binary message ID that messaging.md "Binary Message ID Structure"
+/// reserves for future use. No role is ever assigned one, so a fragmented message claiming a
 /// reserved ID as its orig_type is an unimplemented message the receiver ignores.
 static constexpr uint8_t MSG_TYPE_RESERVED_FIRST = 2;
 static constexpr uint8_t MSG_TYPE_RESERVED_LAST = 3;

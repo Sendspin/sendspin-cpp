@@ -53,7 +53,8 @@ inline void secure_zero_psk(std::array<uint8_t, 32>& psk) {
 
 /// @brief A long-term pairing record stored on behalf of the client.
 /// Every long-term PSK is persisted alongside the `server_id` of the server it was minted for,
-/// and a handshake that matches the record must come from that server (spec "Pre-Shared Key").
+/// and a handshake that matches the record must come from that server (connection.md "Pre-Shared
+/// Key").
 struct SendspinPairingRecord {
     std::string psk_id;
     std::array<uint8_t, 32> psk{};

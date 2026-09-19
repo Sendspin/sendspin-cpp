@@ -62,7 +62,8 @@ static constexpr size_t CPACE_SHARE_SIZE = 32;
 static constexpr size_t CPACE_TAG_SIZE = 64;
 
 /// @brief Size of the CPace intermediate session key (ISK, raw SHA-512 output) in bytes.
-/// See spec "PSK Wrapping": ISK feeds K_wrap = SHA-256("sendspin-pair-psk-wrap-v1" || sid || ISK).
+/// See pairing.md "Wrapping": ISK feeds K_wrap = SHA-256("sendspin-pair-psk-wrap-v1" || sid ||
+/// ISK).
 static constexpr size_t CPACE_ISK_SIZE = 64;
 
 // ============================================================================

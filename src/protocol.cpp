@@ -841,9 +841,9 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
     }
     // pairing.md "client/hello pair-method descriptor": supported_pair_methods is an object keyed
     // by pairing method identifier, each value the method's descriptor. It is REQUIRED on the wire
-    // (spec "client/hello": every client implements at least pairing_psk, so the field can never
-    // be legitimately absent), so the object is emitted even in a degenerate configuration with
-    // every method disabled.
+    // (messaging.md "client/hello": every client implements at least pairing_psk, so the field can
+    // never be legitimately absent), so the object is emitted even in a degenerate configuration
+    // with every method disabled.
     {
         JsonObject methods_obj = root["payload"]["supported_pair_methods"].to<JsonObject>();
         for (const auto& desc : msg->supported_pair_methods) {
@@ -906,8 +906,8 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/state";
-    // spec "client/state": the payload's client-level field is the boolean `available`, not a
-    // multi-valued state string. `available` is true only once the client is operational and
+    // messaging.md "client/state": the payload's client-level field is the boolean `available`, not
+    // a multi-valued state string. `available` is true only once the client is operational and
     // ready to participate in playback (SYNCHRONIZED); every other internal state (ERROR,
     // EXTERNAL_SOURCE) reports false, matching "External Source Handling"'s available:false
     // contract for a client whose output the server cannot currently use.
