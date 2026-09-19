@@ -799,6 +799,14 @@ private:
         ADMISSION_REPLAY,  ///< A message held until admission, whose gate has already been passed
     };
 
+    /// @brief Defers a pairing message that failed to parse to the main loop.
+    ///
+    /// Shared by the three server/pair-* arms of dispatch_json_message(), which differ only in
+    /// the payload they parse.
+    /// @param conn The connection that received the message
+    /// @param type_name Wire type name of the message that failed to parse
+    void schedule_malformed_pairing_message(SendspinConnection* conn, const char* type_name);
+
     /// @brief Parses and routes one JSON message. The caller holds json_processing_mutex_.
     /// @param origin Whether the admission gate still applies to this message
     void dispatch_json_message(SendspinConnection* conn, const char* data, size_t len,

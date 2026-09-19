@@ -1026,6 +1026,10 @@ void SendspinClient::release_high_performance() {
 void SendspinClient::release_high_performance_deferred() {
     if (this->high_performance_releases_pending_ < UINT8_MAX) {
         ++this->high_performance_releases_pending_;
+    } else {
+        // flush_high_performance_releases() drains this every loop() tick, so saturating means
+        // the main loop stopped running; the platform stays pinned in high-performance mode.
+        SS_LOGE(TAG, "High-performance release counter saturated; dropping a release");
     }
 }
 
@@ -1244,8 +1248,9 @@ void SendspinClient::process_json_message(SendspinConnection* conn, const char* 
                                           int64_t timestamp) {
     // Two connections can deliver JSON concurrently on their own network threads (current +
     // pending during a handoff, or an outbound connect_to() transport alongside the inbound
-    // server). Serialize the shared arena and the parse itself; JSON control messages are
-    // infrequent, so contention is negligible.
+    // server). Serialize the shared arena, the parse, and the handlers it dispatches to. The
+    // hold spans the in-band re-handshake's X25519 work and its msg2 send, which conventions.md
+    // "Threading and cross-thread state" sanctions: the swap must stay ordered with decrypt.
     std::lock_guard<std::mutex> lock(this->json_processing_mutex_);
     this->dispatch_json_message(conn, data, len, timestamp);
 }
@@ -1268,6 +1273,15 @@ void SendspinClient::admit_connection(SendspinConnection* conn) {
     // dispatched on the network thread only once the replay above has finished writing to the
     // roles it feeds.
     conn->set_admitted(true);
+}
+
+void SendspinClient::schedule_malformed_pairing_message(SendspinConnection* conn,
+                                                        const char* type_name) {
+    SS_LOGW(TAG, "Malformed %s; aborting any active code pairing", type_name);
+    ServerPairingMessageEvent event;
+    event.conn = conn->shared_from_this();
+    event.kind = PairingMessageKind::MALFORMED;
+    this->connection_manager_->schedule_pairing_message(std::move(event));
 }
 
 void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char* data, size_t len,
@@ -1618,7 +1632,10 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                 auto record = conn->take_pending_pairing_record();
                 bool stored_record = false;
                 if (record.has_value() && this->record_store_ != nullptr) {
-                    const std::string psk_id = record->psk_id;
+                    // Logged before the store takes ownership of the record; a rejection warns
+                    // from inside store_record_superseding().
+                    SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
+                            record->psk_id.c_str());
                     // store_record_superseding() mutates RAM only. At capacity it evicts the
                     // least recently used record rather than failing, since a pairing never
                     // fails for lack of record storage (pairing.md "Pairing Records"); the
@@ -1638,8 +1655,6 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     if (this->record_store_->store_record_superseding(
                             std::move(record.value()),
                             this->connection_manager_->open_connection_psk_ids())) {
-                        SS_LOGI(TAG, "server/pair-finalize: storing pairing record (psk_id=%s)",
-                                psk_id.c_str());
                         stored_record = true;
                     }
                 } else {
@@ -1707,11 +1722,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     event.nonce_a = payload.nonce_a;
                     this->connection_manager_->schedule_pairing_message(std::move(event));
                 } else {
-                    SS_LOGW(TAG, "Malformed server/pair-init; aborting any active code pairing");
-                    ServerPairingMessageEvent event;
-                    event.conn = conn->shared_from_this();
-                    event.kind = PairingMessageKind::MALFORMED;
-                    this->connection_manager_->schedule_pairing_message(std::move(event));
+                    this->schedule_malformed_pairing_message(conn, "server/pair-init");
                 }
             }
             break;
@@ -1727,11 +1738,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     event.pake_msg_1 = payload.pake_msg_1;
                     this->connection_manager_->schedule_pairing_message(std::move(event));
                 } else {
-                    SS_LOGW(TAG, "Malformed server/pair-auth; aborting any active code pairing");
-                    ServerPairingMessageEvent event;
-                    event.conn = conn->shared_from_this();
-                    event.kind = PairingMessageKind::MALFORMED;
-                    this->connection_manager_->schedule_pairing_message(std::move(event));
+                    this->schedule_malformed_pairing_message(conn, "server/pair-auth");
                 }
             }
             break;
@@ -1747,11 +1754,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     event.server_kc = payload.server_kc;
                     this->connection_manager_->schedule_pairing_message(std::move(event));
                 } else {
-                    SS_LOGW(TAG, "Malformed server/pair-confirm; aborting any active code pairing");
-                    ServerPairingMessageEvent event;
-                    event.conn = conn->shared_from_this();
-                    event.kind = PairingMessageKind::MALFORMED;
-                    this->connection_manager_->schedule_pairing_message(std::move(event));
+                    this->schedule_malformed_pairing_message(conn, "server/pair-confirm");
                 }
             }
             break;
