@@ -127,8 +127,10 @@ VisualizerRole::Impl::Impl(VisualizerRoleConfig config, SendspinClient* client)
     // buffer_capacity is the total RAM budget for the ring buffer. Each entry carries an
     // 8-byte ItemHeader aligned to 8 bytes, so with the small visualizer entries roughly a
     // third of this storage holds actual wire data and the rest is per-entry overhead.
+    // The storage is written once per frame off the network thread and drained on a task of its
+    // own, so it prefers SPIRAM like the artwork image buffers.
     size_t capacity = this->visualizer_support.buffer_capacity;
-    if (this->drain_task->ring_storage.allocate(capacity)) {
+    if (this->drain_task->ring_storage.allocate(capacity, MemoryLocation::PREFER_EXTERNAL)) {
         this->drain_task->ring_buffer.create(capacity, this->drain_task->ring_storage.data());
     }
 }
@@ -177,7 +179,10 @@ bool VisualizerRole::Impl::start() {
         return false;
     }
     if (!this->drain_task || !this->drain_task->ring_buffer.is_created()) {
-        SS_LOGE(TAG, "Failed to start visualizer: drain task not initialized");
+        SS_LOGE(TAG,
+                "Failed to start visualizer: no ring buffer for a "
+                "VisualizerSupportObject::buffer_capacity of %zu bytes",
+                this->visualizer_support.buffer_capacity);
         return false;
     }
     if (this->drain_task->drain_thread.joinable()) {
