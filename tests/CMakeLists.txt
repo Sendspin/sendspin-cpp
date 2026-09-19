@@ -59,10 +59,11 @@ add_executable(sendspin_tests
 # test_client_lifecycle.cpp checks what a role's stop() left in its ring, which nothing on the
 # public surface reports, and installs a stand-in connection in ConnectionManager's admitted slot
 # (and drops it mid-publish) to pin publish_state()'s hold on it; it reads the private members
-# directly instead of adding a seam. The sync-task pin tests additionally drive the task's encoded
-# ring directly, hold conn_ptr_mutex_ across a decode, call PlayerRole::Impl's stream handlers to
-# run a stream with no connection behind it, and read deferred_size_ (to catch the hand-over
-# before a flush) and close accepting_ (to take on_new_connection()'s rejection branch).
+# directly instead of adding a seam. Reached: SendspinClient::connection_manager_, player_ and
+# each role's impl_ (the sync task and the visualizer's drain ring); ConnectionManager's
+# conn_ptr_mutex_, current_connection_, drop_connection(), accepting_ (closed to take
+# on_new_connection()'s rejection branch) and deferred_releases_, whose queued entries the
+# hand-over tests read directly - size, conn and goodbye - to catch a release before a flush.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
@@ -113,18 +114,27 @@ target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
 set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
-# test_encrypted_lifecycle.cpp reaches private state in three places, none of which has a public
-# surface to use instead:
-#   - RecordStore::resolve_by_psk_id(), for the unpair tests: whether the matched record still
-#     resolves for the current boot is what "revoked" means, and the client exposes no accessor
-#     for its store. (The persisted half of the same removal is observable through the test's
-#     persistence provider without the flag.)
-#   - ConnectionManager::current(), to name the connection a handoff test expects in the admitted
-#     slot rather than inferring it from side effects.
+# test_encrypted_lifecycle.cpp is a white-box integration harness: it drives the client's and the
+# manager's private lifecycle, record-op and dispatch entry points against a real loopback server,
+# none of which has a public surface to use instead. Reached:
+#   - SendspinClient::connection_manager_ and record_store_, the two owners the rest of the file
+#     works through: the store answers whether an unpaired record still resolves for this boot,
+#     which is what "revoked" means, and its record_by_psk_id() reports the last-used flip. (The
+#     persisted half of the same removal is observable through the test's persistence provider
+#     without the flag.)
+#   - SendspinClient::process_json_message() and admit_connection(), to deliver traffic to a
+#     stand-in connection and admit it on the test thread, which is how the hold/replay tests
+#     place messages on either side of admission.
 #   - ConnectionManager::conn_ptr_mutex_ and SendspinClient::json_processing_mutex_, taken and
 #     probed directly by the lock-order test: holding the manager lock exactly where loop() holds
 #     it is what makes an admission that reaches for the JSON lock hang the test instead of a
 #     device.
+#   - ConnectionManager::stage_record_op(), pending_record_ops_ and flush_pending_record_ops(),
+#     plus set_current_connection()/flush_pending_admission() and handle_server_unpair(): the
+#     staging half and its flush are separate steps on purpose, and only a test that takes them
+#     apart can show what one tick coalesces.
+#   - SendspinConnection::last_receive_time_us_, held_count_ and held_bytes_, the hold buffer's
+#     accounting and the liveness stamp a stand-in connection has no transport to set.
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

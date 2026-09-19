@@ -60,25 +60,27 @@ using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local c
 
 namespace {
 
-// Distinct ports per test so a lingering socket from one scenario cannot bleed into the next
-// (test_connection_lifecycle.cpp uses 18941-18985, test_encrypted_lifecycle.cpp 18991-19003).
-constexpr uint16_t RESTART_TEST_PORT = 19011;
-constexpr uint16_t NURSERY_GOODBYE_TEST_PORT = 19012;
-constexpr uint16_t STREAM_TEST_PORT = 19013;
-constexpr uint16_t CALLBACK_TEST_PORT = 19014;
-constexpr uint16_t DESTRUCTOR_TEST_PORT = 19015;
-constexpr uint16_t ROLLBACK_TEST_PORT = 19016;
-constexpr uint16_t HIGH_PERF_TEST_PORT = 19017;
-constexpr uint16_t VISUALIZER_TEST_PORT = 19018;
-constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 19019;
-constexpr uint16_t PROVIDER_TEST_PORT = 19020;
-constexpr uint16_t PUBLISH_STATE_TEST_PORT = 19021;
-constexpr uint16_t SYNC_PIN_LOCK_TEST_PORT = 19022;
-constexpr uint16_t SYNC_PIN_RELEASE_TEST_PORT = 19023;
-constexpr uint16_t SYNC_PIN_NULL_TEST_PORT = 19024;
-constexpr uint16_t SYNC_PIN_STOP_TEST_PORT = 19025;
-constexpr uint16_t SYNC_PIN_DROP_TEST_PORT = 19026;
-constexpr uint16_t SYNC_PIN_MIDSTREAM_TEST_PORT = 19027;
+// Distinct ports per test so a lingering socket from one scenario cannot bleed into the next,
+// and disjoint from every other file's block: test_connection_lifecycle.cpp uses 18941-18985,
+// test_encrypted_lifecycle.cpp 18991-19019 and 19041-19046, test_role_deactivation.cpp
+// 19031-19051.
+constexpr uint16_t RESTART_TEST_PORT = 19061;
+constexpr uint16_t NURSERY_GOODBYE_TEST_PORT = 19062;
+constexpr uint16_t STREAM_TEST_PORT = 19063;
+constexpr uint16_t CALLBACK_TEST_PORT = 19064;
+constexpr uint16_t DESTRUCTOR_TEST_PORT = 19065;
+constexpr uint16_t ROLLBACK_TEST_PORT = 19066;
+constexpr uint16_t HIGH_PERF_TEST_PORT = 19067;
+constexpr uint16_t VISUALIZER_TEST_PORT = 19068;
+constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 19069;
+constexpr uint16_t PROVIDER_TEST_PORT = 19070;
+constexpr uint16_t PUBLISH_STATE_TEST_PORT = 19071;
+constexpr uint16_t SYNC_PIN_LOCK_TEST_PORT = 19072;
+constexpr uint16_t SYNC_PIN_RELEASE_TEST_PORT = 19073;
+constexpr uint16_t SYNC_PIN_NULL_TEST_PORT = 19074;
+constexpr uint16_t SYNC_PIN_STOP_TEST_PORT = 19075;
+constexpr uint16_t SYNC_PIN_DROP_TEST_PORT = 19076;
+constexpr uint16_t SYNC_PIN_MIDSTREAM_TEST_PORT = 19077;
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;

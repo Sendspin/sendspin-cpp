@@ -1791,11 +1791,6 @@ public:
     std::unique_ptr<SendspinClient> client_storage;
 };
 
-std::string metadata_state_json(int timestamp, const std::string& title) {
-    return R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
-           std::to_string(timestamp) + R"(,"title":")" + title + R"("}}})";
-}
-
 // Role-bound traffic from a connection that has finished the Noise handshake but has NOT been
 // admitted must be ignored. The Sentinel PSK is a spec constant that resolves for every peer, so
 // any peer on the network can reach handshake-complete and sit in the nursery; whether its PSK
