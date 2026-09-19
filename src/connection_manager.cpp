@@ -58,8 +58,19 @@ static const std::vector<std::string> EMPTY_ROLES{};
 /// network thread added for it when it parsed the message (see
 /// SendspinConnection::note_activated_roles()) are taken back in the same step, so the receive
 /// gate cannot be widened by an activation the client refused.
-static void refuse_activate(const ServerActivateEvent& event) {
+///
+/// Answering here rather than ignoring the activate matters: a server that never hears back sits
+/// waiting for the device forever, with nothing on either side to explain the stall. Every refusal
+/// logs through this one format string.
+/// @param event The activation being refused.
+/// @param why What the activation asked for that the client cannot act on.
+/// @param method The pairing method the activation named, for the diagnostic.
+static void refuse_activate(const ServerActivateEvent& event, const char* why, const char* method) {
     SendspinConnection* conn = event.conn.get();
+    SS_LOGW(TAG,
+            "server/activate %s (pairing.method=%s) for server_id=%s; replying "
+            "pair/abort(method_not_supported), connection stays open",
+            why, method, conn->get_server_id().c_str());
     conn->withdraw_activated_roles(event.active_roles.has_value() ? event.active_roles.value()
                                                                   : EMPTY_ROLES);
     conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
@@ -736,16 +747,9 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // A pairing activate that names NO usable method (pairing object absent, or a
     // method string this client does not recognize; process_server_activate_message
     // logs the raw value) cannot start any flow.
-    // Answering pair/abort here rather than ignoring the activate matters: a server
-    // that never hears back sits waiting for the device forever, with nothing on
-    // either side to explain the stall.
     if (is_pairing_activate && !event.pairing_method.has_value()) {
-        SS_LOGW(TAG,
-                "server/activate declares pairing with no usable pairing.method "
-                "for server_id=%s; replying pair/abort(method_not_supported), "
-                "connection stays open",
-                event.conn->get_server_id().c_str());
-        refuse_activate(event);
+        refuse_activate(event, "declares pairing with no usable pairing.method",
+                        "absent or unrecognized");
         return;
     }
 
@@ -773,12 +777,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                 break;
         }
         if (!category_ok || !offered) {
-            SS_LOGW(TAG,
-                    "server/activate selects unsupported pairing method (%s) for "
-                    "server_id=%s; replying pair/abort(method_not_supported), "
-                    "connection stays open",
-                    to_cstr(method), event.conn->get_server_id().c_str());
-            refuse_activate(event);
+            refuse_activate(event, "selects an unsupported pairing method", to_cstr(method));
             return;
         }
 
@@ -789,12 +788,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         // open (pairing.md "Client <-> Server: pair/abort").
         if (method == SendspinPairMethod::DYNAMIC_PAIRING_CODE &&
             !offers_pairing_code_format(this->client_->config_, event.pairing_format)) {
-            SS_LOGW(TAG,
-                    "server/activate names no usable pairing.format for "
-                    "dynamic_pairing_code on server_id=%s; replying "
-                    "pair/abort(method_not_supported), connection stays open",
-                    event.conn->get_server_id().c_str());
-            refuse_activate(event);
+            refuse_activate(event, "names no usable pairing.format", to_cstr(method));
             return;
         }
     }
