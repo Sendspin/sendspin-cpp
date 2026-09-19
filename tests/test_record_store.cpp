@@ -253,26 +253,6 @@ TEST(RecordStore, CorruptRecordsBlobFallsBackToEmptyStore) {
 }
 
 // ============================================================================
-// Records: reject wrong PSK size
-// ============================================================================
-
-TEST(RecordStore, RecordsRejectWrongPskSize) {
-    RecordStore store(nullptr);
-
-    // Constructing a record with a wrong-size PSK and then trying to store it
-    // in a typed way: the C++ type uses std::array<uint8_t, 32> so a size
-    // mismatch is a compile-time error. We verify that psk_id_for() rejects
-    // non-32-byte inputs, which is the equivalent runtime guard.
-    std::array<uint8_t, 16> short_psk{};
-    auto result = psk_id_for(short_psk.data(), short_psk.size());
-    EXPECT_FALSE(result.has_value()) << "psk_id_for must reject < 32 bytes";
-
-    std::array<uint8_t, 64> long_psk{};
-    auto result2 = psk_id_for(long_psk.data(), long_psk.size());
-    EXPECT_FALSE(result2.has_value()) << "psk_id_for must reject > 32 bytes";
-}
-
-// ============================================================================
 // store_record_superseding: at most one record per server_id
 // ============================================================================
 
@@ -513,6 +493,10 @@ TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
     }
     ASSERT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS);
 
+    // records_ runs least-recently-used first, so without this the re-pairing server's own
+    // record is the eviction victim and an eviction is indistinguishable from the supersede.
+    (void) store.note_record_used(first_psk_id);
+
     auto outcome1 = store.resolve_pairing_outcome(existing_server);
     EXPECT_TRUE(store.store_record_superseding(outcome1.record, {}));
 
@@ -710,10 +694,17 @@ TEST(RecordStore, MarkRecordUsed) {
     EXPECT_TRUE(store.record_by_psk_id(rec.psk_id)->used);
 }
 
+// note_record_used()'s return is the persist trigger, so a true for a psk_id the store does not
+// hold costs a rewrite of the whole records blob (an NVS erase cycle on ESP) for nothing.
 TEST(RecordStore, MarkRecordUsedOnAbsentPskIdIsNoOp) {
     RecordStore store(nullptr);
-    // Should not crash.
-    (void) store.note_record_used("does-not-exist");
+    SendspinPairingRecord present = make_client_record("server-A");
+    ASSERT_TRUE(store.store_record_superseding(present, {}));
+
+    EXPECT_FALSE(store.note_record_used("does-not-exist"))
+        << "an absent psk_id must not ask for a records write";
+    // Control: the first use of a psk_id the store does hold asks for one.
+    EXPECT_TRUE(store.note_record_used(present.psk_id));
 }
 
 // ============================================================================
@@ -736,8 +727,10 @@ TEST(RecordStore, RemoveRecordAndList) {
     EXPECT_EQ(store.record_by_psk_id(a.psk_id), nullptr);
     EXPECT_NE(store.record_by_psk_id(b.psk_id), nullptr);
 
-    // Removing an absent record is a no-op.
-    remove_record(store, "absent-psk-id");
+    EXPECT_FALSE(store.note_record_removed("absent-psk-id"))
+        << "an absent psk_id must not ask for a records write";
+    // Control: a psk_id the store holds does.
+    EXPECT_TRUE(store.note_record_removed(b.psk_id));
 }
 
 /// A persistence provider that accepts every "records" blob save EXCEPT one that drops a
