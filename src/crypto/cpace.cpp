@@ -94,11 +94,11 @@ std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, 
 // decode_u: clear the top bit per RFC 7748
 // ============================================================================
 
-std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len) {
-    assert(len == 32);  // caller must pass a 32-byte little-endian value
+std::array<uint8_t, CPACE_FIELD_BYTES> cpace_decode_u(const uint8_t* value, size_t len) {
+    assert(len == CPACE_FIELD_BYTES);  // caller must pass a 32-byte little-endian value
     (void)len;
-    std::array<uint8_t, 32> u{};
-    std::memcpy(u.data(), value, 32);
+    std::array<uint8_t, CPACE_FIELD_BYTES> u{};
+    std::memcpy(u.data(), value, CPACE_FIELD_BYTES);
     u[31] &= 0x7F;  // clear unused top bit (RFC 7748 Curve25519 encoding)
     return u;
 }
@@ -114,7 +114,8 @@ std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len) {
 // Returns the 32-byte little-endian encoding.
 // ============================================================================
 
-std::array<uint8_t, 32> cpace_elligator2(const std::array<uint8_t, 32>& r_le) {
+std::array<uint8_t, CPACE_FIELD_BYTES> cpace_elligator2(
+    const std::array<uint8_t, CPACE_FIELD_BYTES>& r_le) {
     using namespace field25519;
 
     static constexpr uint64_t A_CONST = 486662;
@@ -192,13 +193,14 @@ std::array<uint8_t, 32> cpace_elligator2(const std::array<uint8_t, 32>& r_le) {
 // calculate_generator: draft-irtf-cfrg-cpace-21
 // ============================================================================
 
-std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs_len,
-                                                  const uint8_t* ci, size_t ci_len,
-                                                  const uint8_t* sid, size_t sid_len) {
+std::array<uint8_t, CPACE_FIELD_BYTES> cpace_calculate_generator(const uint8_t* prs, size_t prs_len,
+                                                                 const uint8_t* ci, size_t ci_len,
+                                                                 const uint8_t* sid,
+                                                                 size_t sid_len) {
     auto gen_str = cpace_generator_string(prs, prs_len, ci, ci_len, sid, sid_len);
     auto hash = sha512_oneshot(gen_str.data(), gen_str.size());
     // Take first 32 bytes as the Elligator2 input.
-    auto u = cpace_decode_u(hash.data(), 32);
+    auto u = cpace_decode_u(hash.data(), CPACE_FIELD_BYTES);
     return cpace_elligator2(u);
 }
 
@@ -209,7 +211,8 @@ std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs
 // The clamping is done by the underlying x25519() call in dh-curve25519.c.
 // ============================================================================
 
-bool x25519_scalar_mult(const uint8_t scalar[32], const uint8_t point[32], uint8_t out[32]) {
+bool x25519_scalar_mult(const uint8_t scalar[X25519_KEY_SIZE], const uint8_t point[X25519_KEY_SIZE],
+                        uint8_t out[X25519_KEY_SIZE]) {
     DhState dh_priv;
     if (!dh_priv.valid()) {
         return false;
@@ -220,17 +223,17 @@ bool x25519_scalar_mult(const uint8_t scalar[32], const uint8_t point[32], uint8
     }
 
     // Set private scalar (noise-c stores it as-is; clamping happens in calculate()).
-    int err = noise_dhstate_set_keypair_private(dh_priv.get(), scalar, 32);
+    int err = noise_dhstate_set_keypair_private(dh_priv.get(), scalar, X25519_KEY_SIZE);
     if (err != NOISE_ERROR_NONE) {
         return false;
     }
 
-    err = noise_dhstate_set_public_key(dh_pub.get(), point, 32);
+    err = noise_dhstate_set_public_key(dh_pub.get(), point, X25519_KEY_SIZE);
     if (err != NOISE_ERROR_NONE) {
         return false;
     }
 
-    err = noise_dhstate_calculate(dh_priv.get(), dh_pub.get(), out, 32);
+    err = noise_dhstate_calculate(dh_priv.get(), dh_pub.get(), out, X25519_KEY_SIZE);
 
     return err == NOISE_ERROR_NONE;
 }

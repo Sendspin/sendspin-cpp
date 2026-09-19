@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "keys.h"
 #include "pairing_code.h"
 
 #include <array>
@@ -57,8 +58,8 @@ static constexpr size_t PAIRING_CODE_TOKEN_LENGTH = 43;
 ///                     is the client_id).
 /// @param pairing_psk  32-byte raw Sendspin Pairing PSK.
 /// @return The 107-character token string (e.g. "SP:0AAAQ...").
-std::string format_pairing_token(const std::array<uint8_t, 32>& client_key,
-                                 const std::array<uint8_t, 32>& pairing_psk);
+std::string format_pairing_token(const std::array<uint8_t, X25519_KEY_SIZE>& client_key,
+                                 const std::array<uint8_t, NOISE_PSK_SIZE>& pairing_psk);
 
 /// @brief Build a version-1 pairing token carrying a dynamic pairing code, the form the
 /// `qr_code` emission format presents (pairing.md "Dynamic Pairing Code Flow").

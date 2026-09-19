@@ -91,8 +91,8 @@ std::string format_token(char version, const uint8_t* payload, size_t payload_le
 
 }  // namespace
 
-std::string format_pairing_token(const std::array<uint8_t, 32>& client_key,
-                                 const std::array<uint8_t, 32>& pairing_psk) {
+std::string format_pairing_token(const std::array<uint8_t, X25519_KEY_SIZE>& client_key,
+                                 const std::array<uint8_t, NOISE_PSK_SIZE>& pairing_psk) {
     std::vector<uint8_t> payload;
     payload.reserve(64);
     payload.insert(payload.end(), client_key.begin(), client_key.end());

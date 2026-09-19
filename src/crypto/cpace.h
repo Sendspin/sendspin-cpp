@@ -25,6 +25,8 @@
 
 #pragma once
 
+#include "keys.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -173,7 +175,7 @@ private:
 };
 
 // ============================================================================
-// Low-level CPace building blocks (exposed for testing)
+// Low-level CPace building blocks
 // ============================================================================
 
 /// @brief Encode a length in CPace's variable-length prefix format.
@@ -191,19 +193,22 @@ std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, 
 
 /// @brief Elligator2 map: r -> x-coordinate on Curve25519 (draft-irtf-cfrg-cpace-21).
 /// Input r is an integer value (already reduced mod p).  Returns 32 bytes (little-endian).
-std::array<uint8_t, 32> cpace_elligator2(const std::array<uint8_t, 32>& r_le);
+std::array<uint8_t, CPACE_FIELD_BYTES> cpace_elligator2(
+    const std::array<uint8_t, CPACE_FIELD_BYTES>& r_le);
 
 /// @brief Decode a 32-byte little-endian value, clearing the top bit.  Mirrors _decode_u.
-std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len);
+std::array<uint8_t, CPACE_FIELD_BYTES> cpace_decode_u(const uint8_t* value, size_t len);
 
 /// @brief Compute the CPace generator point.  Mirrors draft-irtf-cfrg-cpace-21
 /// `calculate_generator`.
-std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs_len,
-                                                  const uint8_t* ci, size_t ci_len,
-                                                  const uint8_t* sid, size_t sid_len);
+std::array<uint8_t, CPACE_FIELD_BYTES> cpace_calculate_generator(const uint8_t* prs, size_t prs_len,
+                                                                 const uint8_t* ci, size_t ci_len,
+                                                                 const uint8_t* sid,
+                                                                 size_t sid_len);
 
 /// @brief X25519 scalar multiplication (RFC 7748, with clamping).
 /// Returns false (all-zero output) if the dhstate allocation fails.
-bool x25519_scalar_mult(const uint8_t scalar[32], const uint8_t point[32], uint8_t out[32]);
+bool x25519_scalar_mult(const uint8_t scalar[X25519_KEY_SIZE], const uint8_t point[X25519_KEY_SIZE],
+                        uint8_t out[X25519_KEY_SIZE]);
 
 }  // namespace sendspin
