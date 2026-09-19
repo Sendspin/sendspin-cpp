@@ -19,7 +19,6 @@
 
 #include <cstring>
 #include <utility>
-#include <vector>
 
 namespace sendspin {
 
@@ -74,13 +73,8 @@ SsErr NoiseTransport::encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_cap
     return this->frame_sink_(buf, ct_len);
 }
 
-SsErr NoiseTransport::fragment_and_send_locked(const uint8_t* plaintext, size_t plaintext_len) {
-    // messaging.md "Fragmentation": every fragment is a type-1 message, the first also carrying
-    // orig_type. plaintext[0] = orig_type; plaintext[1..] = data.
-    const uint8_t orig_type = plaintext[0];
-    const uint8_t* data = plaintext + 1;
-    const size_t data_len = plaintext_len - 1;
-
+SsErr NoiseTransport::fragment_and_send_locked(uint8_t orig_type, const uint8_t* data,
+                                               size_t data_len) {
     const size_t first_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_FIRST_HEADER_SIZE;
     const size_t cont_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_CONT_HEADER_SIZE;
 
@@ -162,13 +156,10 @@ SsErr NoiseTransport::send_json(const char* json, size_t len) {
 
     // Need fragmentation. Rare (large messages only) and unbounded in size (up to
     // MAX_REASSEMBLED_MESSAGE_BYTES), so it is not a candidate for the fixed-size reused
-    // send_buf_; fragment_and_send_locked() allocates its own frame buffer instead. The
-    // plaintext is staged before taking the lock so only the encrypt+send loop is serialized.
-    std::vector<uint8_t> plaintext(plaintext_len);
-    plaintext[0] = MSG_TYPE_JSON_BODY;
-    std::memcpy(plaintext.data() + 1, json, len);
+    // send_buf_; fragment_and_send_locked() allocates its own frame buffer instead.
     std::lock_guard<std::mutex> lock(this->session_mutex_);
-    return this->fragment_and_send_locked(plaintext.data(), plaintext_len);
+    return this->fragment_and_send_locked(MSG_TYPE_JSON_BODY,
+                                          reinterpret_cast<const uint8_t*>(json), len);
 }
 
 SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
@@ -191,7 +182,7 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
     }
 
     std::lock_guard<std::mutex> lock(this->session_mutex_);
-    return this->fragment_and_send_locked(data, len);
+    return this->fragment_and_send_locked(data[0], data + 1, len - 1);
 }
 
 SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,

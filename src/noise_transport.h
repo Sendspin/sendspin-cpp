@@ -161,7 +161,14 @@ private:
     SsErr encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity, size_t plaintext_len);
 
     /// @brief Fragment a plaintext > MAX_TRANSPORT_PLAINTEXT into multiple frames and
-    /// encrypt+send each one. Implements messaging.md "Fragmentation".
+    /// encrypt+send each one. Implements messaging.md "Fragmentation": every fragment is a
+    /// type-1 message, the first also carrying orig_type.
+    ///
+    /// The plaintext is passed as its type byte plus the payload rather than as one contiguous
+    /// buffer, so no caller has to stage a copy of a message this large.
+    /// @param orig_type  Type byte of the message being fragmented.
+    /// @param data       Payload bytes following the type byte.
+    /// @param data_len   Length of data.
     ///
     /// Caller must hold session_mutex_ for the WHOLE call, and it stays held across every
     /// frame. The fragments of one logical message must reach the wire consecutively: a peer
@@ -169,7 +176,7 @@ private:
     /// sequences" protocol error and closes the connection (see accept_plaintext()). Releasing the
     /// lock between frames would let a concurrent send_json()/send_binary() on another thread
     /// interleave exactly such a frame.
-    SsErr fragment_and_send_locked(const uint8_t* plaintext, size_t plaintext_len);
+    SsErr fragment_and_send_locked(uint8_t orig_type, const uint8_t* data, size_t data_len);
 
     /// @brief Fills send_buf_ with an optional prefix followed by data, then encrypts and
     /// sends it. Caller must hold session_mutex_ for the whole call: this fills send_buf_ and
