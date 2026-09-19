@@ -41,8 +41,7 @@ std::array<uint8_t, 32> make_psk(uint8_t seed) {
     return psk;
 }
 
-/// The minimal record object every decoder in this file accepts, used as the Control beside the
-/// rejection cases that malform the blob around it.
+/// The minimal record object the record decoder accepts.
 std::string well_formed_record_entry() {
     return R"({"server_id":"srv-ok","psk_id":"rec-ok","psk":")" +
            base64url_encode(make_psk(0x11).data(), 32) + R"("})";
@@ -134,49 +133,37 @@ TEST(PersistenceCodec, RecordDecodeBestEffortOnFutureVersion) {
     EXPECT_TRUE(decoded->used);
 }
 
-TEST(PersistenceCodec, RecordDecodeRejectsParseFailure) {
-    EXPECT_FALSE(decode_pairing_record("not json").has_value());
-    // Control: well-formed JSON for the same decoder.
-    EXPECT_TRUE(decode_pairing_record(well_formed_record_entry()).has_value());
-}
+// The record decoder's malformed-blob family: each row malforms one required field of the
+// well-formed entry the Control row carries.
+TEST(PersistenceCodec, RecordDecodeRejectsMalformedBlobs) {
+    const std::string good_psk = base64url_encode(make_psk(0x60).data(), 32);
+    const std::array<uint8_t, 16> short_psk{};
+    const std::string short_b64 = base64url_encode(short_psk.data(), short_psk.size());
 
-TEST(PersistenceCodec, RecordDecodeRejectsMissingPskId) {
-    const std::string tail =
-        R"(,"psk":")" + base64url_encode(make_psk(0x60).data(), 32) + R"("})";
-    EXPECT_FALSE(decode_pairing_record(R"({"v":1,"server_id":"srv-rec-6")" + tail).has_value());
-    // Control: the same blob carrying a psk_id decodes.
-    EXPECT_TRUE(
-        decode_pairing_record(R"({"v":1,"server_id":"srv-rec-6","psk_id":"rec-6")" + tail)
-            .has_value());
-}
+    struct Row {
+        const char* name;
+        std::string blob;
+        bool expect_ok;
+    };
+    const Row rows[] = {
+        {"not-json", "not json", false},
+        {"missing-psk_id", R"({"v":1,"server_id":"srv","psk":")" + good_psk + R"("})", false},
+        {"empty-psk_id", R"({"v":1,"server_id":"srv","psk_id":"","psk":")" + good_psk + R"("})",
+         false},
+        {"missing-psk", R"({"v":1,"server_id":"srv","psk_id":"rec"})", false},
+        {"psk-not-base64", R"({"v":1,"server_id":"srv","psk_id":"rec","psk":"not!!base64!!"})",
+         false},
+        {"psk-wrong-length",
+         R"({"v":1,"server_id":"srv","psk_id":"rec","psk":")" + short_b64 + R"("})", false},
+        // Control: the same object with every required field well formed.
+        {"all-fields-present",
+         R"({"v":1,"server_id":"srv","psk_id":"rec","psk":")" + good_psk + R"("})", true},
+    };
 
-TEST(PersistenceCodec, RecordDecodeRejectsEmptyPskId) {
-    const std::string tail =
-        R"(","psk":")" + base64url_encode(make_psk(0x61).data(), 32) + R"("})";
-    EXPECT_FALSE(
-        decode_pairing_record(R"({"v":1,"server_id":"srv-rec-6a","psk_id":")" + tail).has_value());
-    // Control: the same blob with a non-empty psk_id decodes.
-    EXPECT_TRUE(
-        decode_pairing_record(R"({"v":1,"server_id":"srv-rec-6a","psk_id":"rec-6a)" + tail)
-            .has_value());
-}
-
-TEST(PersistenceCodec, RecordDecodeRejectsMissingPsk) {
-    const std::string head = R"({"v":1,"server_id":"srv-rec-6b","psk_id":"rec-6b")";
-    EXPECT_FALSE(decode_pairing_record(head + "}").has_value());
-    // Control: the same blob carrying a psk decodes.
-    EXPECT_TRUE(decode_pairing_record(head + R"(,"psk":")" +
-                                      base64url_encode(make_psk(0x6B).data(), 32) + R"("})")
-                    .has_value());
-}
-
-TEST(PersistenceCodec, RecordDecodeRejectsBadBase64) {
-    const std::string head = R"({"v":1,"server_id":"srv-rec-7","psk_id":"rec-7","psk":")";
-    EXPECT_FALSE(decode_pairing_record(head + R"(not!!valid!!base64"})").has_value());
-    // Control: the same blob with a decodable psk.
-    EXPECT_TRUE(decode_pairing_record(head + base64url_encode(make_psk(0x70).data(), 32) +
-                                      R"("})")
-                    .has_value());
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(decode_pairing_record(row.blob).has_value(), row.expect_ok);
+    }
 }
 
 TEST(PersistenceCodec, RecordDecodeWrongTypedUsedFallsBackToFalse) {
@@ -191,19 +178,6 @@ TEST(PersistenceCodec, RecordDecodeWrongTypedUsedFallsBackToFalse) {
         ASSERT_TRUE(decoded.has_value()) << blob;
         EXPECT_FALSE(decoded->used) << blob;
     }
-}
-
-TEST(PersistenceCodec, RecordDecodeRejectsWrongLengthPsk) {
-    const std::string head = R"({"v":1,"server_id":"srv-rec-8","psk_id":"rec-8","psk":")";
-    std::array<uint8_t, 16> short_psk{};
-    EXPECT_FALSE(
-        decode_pairing_record(head + base64url_encode(short_psk.data(), short_psk.size()) +
-                              R"("})")
-            .has_value());
-    // Control: the same blob with a 32-byte psk.
-    EXPECT_TRUE(decode_pairing_record(head + base64url_encode(make_psk(0x80).data(), 32) +
-                                      R"("})")
-                    .has_value());
 }
 
 // ============================================================================
@@ -251,22 +225,27 @@ TEST(PersistenceCodec, RecordsArrayEmptyRoundTrip) {
     EXPECT_TRUE(decoded->empty());
 }
 
-// One Control serves the three array-shape rejections below: they differ only in how the
-// wrapper is malformed, and the same well-formed wrapper is what each must still accept.
-TEST(PersistenceCodec, RecordsArrayDecodeRejectsParseFailure) {
-    EXPECT_FALSE(decode_pairing_records("{not json").has_value());
-    // Control: see well_formed_records_blob().
-    EXPECT_TRUE(decode_pairing_records(well_formed_records_blob()).has_value());
-}
+// The array wrapper's malformed-shape family. Entry-level corruption is a different rule
+// (RecordsArraySkipsCorruptEntryKeepsGoodOnes): a bad wrapper loses the whole blob, a bad entry
+// loses only itself.
+TEST(PersistenceCodec, RecordsArrayDecodeRejectsMalformedWrapper) {
+    struct Row {
+        const char* name;
+        std::string blob;
+        bool expect_ok;
+    };
+    const Row rows[] = {
+        {"not-json", "{not json", false},
+        {"missing-records-field", R"({"v":1})", false},
+        {"records-not-an-array", R"({"v":1,"records":"oops"})", false},
+        // Control: see well_formed_records_blob().
+        {"well-formed-wrapper", well_formed_records_blob(), true},
+    };
 
-TEST(PersistenceCodec, RecordsArrayDecodeRejectsMissingRecordsField) {
-    EXPECT_FALSE(decode_pairing_records(R"({"v":1})").has_value());
-    EXPECT_TRUE(decode_pairing_records(well_formed_records_blob()).has_value());
-}
-
-TEST(PersistenceCodec, RecordsArrayDecodeRejectsNonArrayRecordsField) {
-    EXPECT_FALSE(decode_pairing_records(R"({"v":1,"records":"oops"})").has_value());
-    EXPECT_TRUE(decode_pairing_records(well_formed_records_blob()).has_value());
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(decode_pairing_records(row.blob).has_value(), row.expect_ok);
+    }
 }
 
 TEST(PersistenceCodec, RecordsArraySkipsCorruptEntryKeepsGoodOnes) {
@@ -321,33 +300,30 @@ TEST(PersistenceCodec, PskRoundTripWithoutLabel) {
     EXPECT_FALSE(decoded->label.has_value());
 }
 
-TEST(PersistenceCodec, PskDecodeRejectsBadBase64) {
-    const std::string head = R"({"v":1,"psk_id":"psk-3","psk":")";
-    EXPECT_FALSE(decode_pairing_psk(head + R"(!!!not-base64!!!"})").has_value());
-    // Control: the same blob with a decodable psk.
-    EXPECT_TRUE(
-        decode_pairing_psk(head + base64url_encode(make_psk(0x73).data(), 32) + R"("})")
-            .has_value());
-}
+// The pairing-PSK decoder's malformed-blob family, over the same required fields as a record
+// minus server_id.
+TEST(PersistenceCodec, PskDecodeRejectsMalformedBlobs) {
+    const std::string good_psk = base64url_encode(make_psk(0x73).data(), 32);
+    const std::array<uint8_t, 10> short_psk{};
+    const std::string short_b64 = base64url_encode(short_psk.data(), short_psk.size());
 
-TEST(PersistenceCodec, PskDecodeRejectsWrongLengthPsk) {
-    const std::string head = R"({"v":1,"psk_id":"psk-4","psk":")";
-    std::array<uint8_t, 10> short_psk{};
-    EXPECT_FALSE(
-        decode_pairing_psk(head + base64url_encode(short_psk.data(), short_psk.size()) + R"("})")
-            .has_value());
-    // Control: the same blob with a 32-byte psk.
-    EXPECT_TRUE(
-        decode_pairing_psk(head + base64url_encode(make_psk(0x74).data(), 32) + R"("})")
-            .has_value());
-}
+    struct Row {
+        const char* name;
+        std::string blob;
+        bool expect_ok;
+    };
+    const Row rows[] = {
+        {"psk-not-base64", R"({"v":1,"psk_id":"psk","psk":"!!!not-base64!!!"})", false},
+        {"psk-wrong-length", R"({"v":1,"psk_id":"psk","psk":")" + short_b64 + R"("})", false},
+        {"missing-psk_id", R"({"v":1,"psk":")" + good_psk + R"("})", false},
+        // Control: the same object with both required fields well formed.
+        {"all-fields-present", R"({"v":1,"psk_id":"psk","psk":")" + good_psk + R"("})", true},
+    };
 
-TEST(PersistenceCodec, PskDecodeRejectsMissingPskId) {
-    const std::string tail =
-        R"("psk":")" + base64url_encode(make_psk(0x90).data(), 32) + R"("})";
-    EXPECT_FALSE(decode_pairing_psk(R"({"v":1,)" + tail).has_value());
-    // Control: the same blob carrying a psk_id decodes.
-    EXPECT_TRUE(decode_pairing_psk(R"({"v":1,"psk_id":"psk-5",)" + tail).has_value());
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(decode_pairing_psk(row.blob).has_value(), row.expect_ok);
+    }
 }
 
 // ============================================================================
@@ -407,8 +383,6 @@ TEST(PersistenceCodec, ConfigDecodeMissingFieldsTakeDefaults) {
     EXPECT_EQ(decoded->static_pairing_code_enabled, defaults.static_pairing_code_enabled);
 }
 
-// Both root-shape rejections below share one Control: a well-formed object root, which is
-// the only thing either of them must still accept.
 // ArduinoJson's as<bool>() coerces any non-boolean variant to true, a "false" STRING included,
 // so an unguarded read of a corrupt config blob would turn a disabled pairing method back on -
 // including unpaired_access_enabled, which defaults to false and so is invisible to
@@ -441,14 +415,26 @@ TEST(PersistenceCodec, ConfigDecodeWrongTypedFieldsTakeDefaults) {
     EXPECT_TRUE(decoded->static_pairing_code_enabled);
 }
 
-TEST(PersistenceCodec, ConfigDecodeRejectsParseFailure) {
-    EXPECT_FALSE(decode_pairing_config("{{{not json").has_value());
-    EXPECT_TRUE(decode_pairing_config(R"({"v":1})").has_value());
-}
+// The config decoder's malformed-root family. Field-level corruption is a different rule
+// (ConfigDecodeWrongTypedFieldsTakeDefaults): a bad root loses the blob, a bad field takes its
+// struct default.
+TEST(PersistenceCodec, ConfigDecodeRejectsMalformedRoot) {
+    struct Row {
+        const char* name;
+        std::string blob;
+        bool expect_ok;
+    };
+    const Row rows[] = {
+        {"not-json", "{{{not json", false},
+        {"array-root", "[1,2,3]", false},
+        // Control: an object root, which is all this decoder requires.
+        {"object-root", R"({"v":1})", true},
+    };
 
-TEST(PersistenceCodec, ConfigDecodeRejectsNonObjectRoot) {
-    EXPECT_FALSE(decode_pairing_config("[1,2,3]").has_value());
-    EXPECT_TRUE(decode_pairing_config(R"({"v":1})").has_value());
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(decode_pairing_config(row.blob).has_value(), row.expect_ok);
+    }
 }
 
 // ============================================================================
