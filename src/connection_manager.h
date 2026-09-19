@@ -365,9 +365,9 @@ public:
     /// ready. Main-loop thread only.
     void start();
 
-    /// @brief Synchronous teardown: goodbyes every managed connection, waits up to
-    /// GOODBYE_FLUSH_TIMEOUT_MS per goodbye for the sends to complete, then stops the WebSocket
-    /// server and releases every connection regardless
+    /// @brief Synchronous teardown: applies any staged persistence write, goodbyes every managed
+    /// connection, waits up to GOODBYE_FLUSH_TIMEOUT_MS per goodbye for the sends to complete,
+    /// then stops the WebSocket server and releases every connection regardless
     ///
     /// Closes admission first, so a peer delivered during the wait is rejected with a goodbye.
     /// Blocks on the transports' own teardown as well as the flush bound: the host server joins
@@ -655,15 +655,18 @@ private:
     /// @param value The psk_id or server_id it covers.
     void stage_record_op(PendingRecordOp::Kind kind, std::string value);
 
-    /// @brief Performs the writes staged by the locked handlers, in staging order, so a second
-    /// op on the same record always lands after the first. Caller must NOT hold conn_ptr_mutex_
-    /// (see PendingRecordOp).
+    /// @brief Applies the staged ops' RAM halves in staging order, so a second op on the same
+    /// record always lands after the first, then performs at most one records write and one
+    /// last-played write. Caller must NOT hold conn_ptr_mutex_ (see PendingRecordOp).
     ///
     /// Called unconditionally once per tick, like flush_pending_admission() and
-    /// flush_deferred_releases(): a staging site added outside loop()'s lifecycle block must not
-    /// be able to leave a write sitting in the vector, which for a revocation would mean a
-    /// credential silently surviving the reboot. Early-returns without locking when
-    /// pending_record_ops_size_ reads 0, so an idle tick pays one acquire-load.
+    /// flush_deferred_releases() beside it, so it is not coupled to loop()'s lifecycle-block
+    /// gate, and again from stop(), which is the last chance a staged write gets. It does not
+    /// cover a staging site added LATER in loop() than this call: that op waits for the next
+    /// tick or the stop, and a manager destroyed without a stop() logs what it drops. Keep
+    /// staging sites ahead of this call, or add a second call the way flush_deferred_releases()
+    /// does. Early-returns without locking when pending_record_ops_size_ reads 0, so an idle
+    /// tick pays one acquire-load.
     void flush_pending_record_ops();
 
     /// @brief Sets has_pending_events_, the lock-free gate loop() polls before acquiring

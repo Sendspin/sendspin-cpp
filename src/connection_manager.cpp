@@ -328,6 +328,13 @@ ConnectionManager::~ConnectionManager() {
         this->has_current_.store(false, std::memory_order_release);
         this->refresh_nursery_size_hint();
         this->refresh_deferred_size_hint();
+        // Reached only when the manager is destroyed without a stop(), which flushes: a staged
+        // revocation dropped here comes back at the next boot, so it does not go silently
+        // (docs/conventions.md, "Threading and cross-thread state").
+        if (!this->pending_record_ops_.empty()) {
+            SS_LOGW(TAG, "Dropping %zu staged persistence write(s) on destruction",
+                    this->pending_record_ops_.size());
+        }
     }
     // Locals and the swapped-out events release here, outside both locks. Queued goodbyes are
     // skipped on destruction; shutdown drops slots without a send.
@@ -523,6 +530,10 @@ void ConnectionManager::DrainedEvents::clear() {
 }
 
 PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
+    // Nothing calls loop() again after this, so a write staged late in the last tick is applied
+    // here or never.
+    this->flush_pending_record_ops();
+
     // Close admission and detach every managed connection under the lock. Nothing is sent or
     // released here (see DeferredRelease): the goodbyes below run outside the lock, and a
     // rejection for a peer delivered during the wait can take the lock meanwhile.
@@ -1669,8 +1680,8 @@ void ConnectionManager::flush_pending_record_ops() {
     //
     // Lock-free early return on the same terms as flush_deferred_releases(): the hint mirrors
     // pending_record_ops_.size() and is refreshed only under conn_ptr_mutex_, at every push and
-    // at the swap below, so observing 0 means the vector was empty as of that acquire-load. A
-    // staged op is performed exactly once, by whichever call swaps it out.
+    // at the swap below, so observing 0 means the vector was empty as of that acquire-load. The
+    // swap takes ownership, so an op cannot be performed twice by loop()'s call and stop()'s.
     if (this->pending_record_ops_size_.load(std::memory_order_acquire) == 0) {
         return;
     }
