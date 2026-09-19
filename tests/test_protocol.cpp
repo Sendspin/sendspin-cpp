@@ -1043,11 +1043,11 @@ TEST(Protocol, ServerHelloSlimParse) {
     EXPECT_EQ(msg.name, "MySpeaker");
 }
 
-// server/hello parses successfully when only name is present; the optional fields may be absent.
+// server/hello parses successfully when only name is present.
 TEST(Protocol, ServerHelloParsesWithOnlyName) {
     JsonDocument doc;
     JsonObject root;
-    // Optional fields (connection_reason, active_roles, version, server_id) are absent.
+    // Only `name` is parsed; any other payload key is ignored.
     ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"X"}})", doc, root));
 
     ServerHelloMessage msg;

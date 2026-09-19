@@ -12,8 +12,9 @@ item against the current code before acting on it; line numbers drift as phases 
 
 - The persisted blob shapes stay as they are. The `static_delay` persistence key is NOT renamed
   or migrated; only wire names and the public API move to `output_delay`.
-- `min_buffer_ms` and `required_lead_time_ms` are fixed values set in `PlayerRoleConfig`. The
-  `send_ahead` field is parsed past but not consumed. Measured values are later work.
+- `min_buffer_ms` is a fixed `PlayerRoleConfig` value; `required_lead_time_ms` is optional and
+  defaults to the pipeline-derived lead. The `send_ahead` field is parsed past but not consumed.
+  Measured values are later work.
 - Artwork channel config and visualizer `types`/`rate_max`/`spectrum` stay construction-time
   config. They are sent once, in the role's `client/state` object, instead of in `client/hello`.
 - `VisualizerRole::request_format()` and `VisualizerFormatRequest` are deleted with no
@@ -101,8 +102,11 @@ concurrently: they share ports).
 
 ### Phase 1: deletions
 
+Done:
+
 - A9/B1: the `management/*` message family, `SendspinActivity::MANAGEMENT`, `src/management.h`,
-  `tests/test_management.cpp`. Keep the `server/unpair` handling (`handle_unpair`), relocated.
+  `tests/test_management.cpp`. Keep the `server/unpair` handling, relocated as
+  `handle_server_unpair`.
 - A8: the shared-PSK / record-mode storage variant in `record_store`, and the
   "record without a `server_id`" acceptance paths.
 - `trust_level` in `client/hello`.
@@ -113,6 +117,8 @@ concurrently: they share ports).
 Exit: tolerant-mode run unchanged from the baseline.
 
 ### Phase 2: fixes that do not depend on the legacy switch
+
+Done:
 
 - D2: `static_delay_ms` / `set_static_delay` become `output_delay_ms` / `set_output_delay` on the
   wire (both directions) and in the public API. Persistence key unchanged.
@@ -252,11 +258,13 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   task rather than the main loop. ESP on-device check: build the component with `-fstack-usage`
   at the shipped optimization level and read `dispatch_json_message` out of `client.cpp.su`
   (and `handle_pairing_message` out of `connection_manager.cpp.su`, whose confirm branch holds
-  three ~72-byte ISK copies live at once, deliberately). More than a few hundred bytes over the
-  pre-rc1 frame calls for moving each pairing case's parse-and-push into an out-of-line helper
-  that fills a caller-owned struct, the shape `begin_transfer()` uses in `artwork_role.cpp`.
-- The host suites bound their positive waits with `pump_until(pred, 6000)` at 165 sites, which
-  makes elapsed time part of the verdict where the conventions want a named hang from the suite
+  one ~72-byte ISK copy, `ScopedIsk::value_`, plus the constructor's by-value parameter while it
+  is inlined). More than a few hundred bytes over the pre-rc1 frame calls for moving each pairing
+  case's parse-and-push into an out-of-line helper that fills a caller-owned struct, the shape
+  `begin_transfer()` uses in `artwork_role.cpp`.
+- The host suites bound their positive waits with a `pump_until(pred, <ms>)` deadline at about
+  154 sites (mostly 4000 ms, 46 of them via `FIXTURE_PUMP_TIMEOUT_MS` = 6000), which makes
+  elapsed time part of the verdict where the conventions want a named hang from the suite
   watchdog instead. Pre-existing and unchanged by the rc1 work, which leans on the idiom harder
   than `main` did; the fix is an unbounded form for the positive waits, keeping the bounded one
   for the must-not-happen windows where the bound is the point.
