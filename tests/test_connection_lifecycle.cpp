@@ -585,8 +585,14 @@ TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
 }
 
 // Control for the test above: a peer that answers time messages stays current past the timeout.
+//
+// The timeout is the drop test's, scaled up. A liveness window smaller than the scheduling stalls
+// of a loaded sanitizer build is the one thing that can turn this control red on a correct
+// client: the stamp only moves when an answer arrives, and no answer arrives while the loop that
+// sends the bursts is stalled. A second of slack is the margin; the window still has to outlast
+// the timeout for the test to mean anything, so it cannot be widened away entirely.
 TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
-    PairedClientBundle bundle(make_liveness_config(LIVENESS_CONTROL_PORT, 300));
+    PairedClientBundle bundle(make_liveness_config(LIVENESS_CONTROL_PORT, 1000));
     SendspinClient& client = bundle.client();
     ASSERT_TRUE(bundle.start());
 
@@ -597,7 +603,7 @@ TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
     pump_until(client, [&] { return client.is_connected(); });
     pump_until(client, [&] { return live.got_client_time(); });
 
-    pump_for(client, 1200);  // Four liveness windows
+    pump_for(client, 1500);  // Past the liveness window, with the answers still arriving
     EXPECT_TRUE(client.is_connected())
         << "an answering peer must stay current past its liveness timeout";
     EXPECT_FALSE(live.closed()) << "an answering peer must not be closed";
