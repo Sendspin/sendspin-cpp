@@ -873,6 +873,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         return true;
     }
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     // Play/Pause
     if (event == Event::Character(' ')) {
         SendspinPlaybackState current;
@@ -931,7 +932,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             {.command = SendspinControllerCommand::SEEK_RELATIVE, .offset_ms = SEEK_STEP_MS});
         return true;
     }
+#endif
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     // Player volume up
     if (event == Event::ArrowUp) {
         {
@@ -955,7 +958,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         client.player()->update_volume(new_vol);
         return true;
     }
+#endif
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     // Group volume up
     if (event == Event::Character(']')) {
         {
@@ -981,7 +986,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
             {.command = SendspinControllerCommand::VOLUME, .volume = new_vol});
         return true;
     }
+#endif
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     // Player mute toggle
     if (event == Event::Character('m')) {
         {
@@ -991,7 +998,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         client.player()->update_muted(!client.player()->get_muted());
         return true;
     }
+#endif
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     // Group mute toggle
     if (event == Event::Character('M')) {
         {
@@ -1052,7 +1061,9 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         client.controller()->send_command({.command = SendspinControllerCommand::SWITCH});
         return true;
     }
+#endif
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     // Output delay increase
     if (event == Event::Character('.')) {
         {
@@ -1074,6 +1085,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
         client.player()->update_output_delay(delay >= 10 ? delay - 10 : 0);
         return true;
     }
+#endif
 
     // Quit
     if (event == Event::Character('q') || event == Event::Character('Q')) {
@@ -1095,19 +1107,24 @@ Component create_tui_component(SendspinClient& client, TuiState& state,
 
 void update_polled_state(TuiState& state, SendspinClient& client) {
     std::lock_guard<std::mutex> lock(state.mutex);
+#ifdef SENDSPIN_ENABLE_METADATA
     uint32_t new_progress = client.metadata() ? client.metadata()->get_track_progress_ms() : 0;
     if (new_progress != state.track_progress_ms) {
         state.track_progress_ms = new_progress;
         state.progress_updated_at = std::chrono::steady_clock::now();
     }
     state.track_duration_ms = client.metadata() ? client.metadata()->get_track_duration_ms() : 0;
+#endif
     state.connected = client.is_connected();
     state.time_synced = client.is_time_synced();
+#ifdef SENDSPIN_ENABLE_PLAYER
     state.output_delay_ms = client.player() ? client.player()->get_output_delay_ms() : 0;
     state.player_volume = client.player() ? client.player()->get_volume() : 0;
     state.player_muted = client.player() ? client.player()->get_muted() : false;
+#endif
     state.group_name = client.get_group_state().group_name.value_or("");
 
+#ifdef SENDSPIN_ENABLE_CONTROLLER
     if (client.controller()) {
         auto& cs = client.controller()->get_controller_state();
         state.group_volume = cs.volume;
@@ -1115,6 +1132,7 @@ void update_polled_state(TuiState& state, SendspinClient& client) {
         state.repeat_mode = cs.repeat;
         state.shuffle = cs.shuffle;
     }
+#endif
 }
 
 }  // namespace sendspin

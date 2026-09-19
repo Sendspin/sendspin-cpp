@@ -36,7 +36,12 @@
 #include "sendspin/types.h"
 #include "sendspin/visualizer_role.h"
 #include "file_persistence_provider.h"
-#ifdef SENDSPIN_HAS_PORTAUDIO
+// The audio sink exists to feed the player, so it follows the player's compile gate as well as
+// PortAudio's availability.
+#if defined(SENDSPIN_HAS_PORTAUDIO) && defined(SENDSPIN_ENABLE_PLAYER)
+#define TUI_CLIENT_HAS_AUDIO_SINK
+#endif
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
 #include "portaudio_sink.h"
 #endif
 
@@ -481,7 +486,7 @@ int main(int argc, char* argv[]) {
     config.pairing_code_formats = {SendspinPairingCodeFormat::DIGITS};
 
     // Create audio output
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
     PortAudioSink audio_sink;
 
     // Validate explicitly requested formats against PortAudio device capabilities
@@ -529,7 +534,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-#else
+#elif defined(SENDSPIN_ENABLE_PLAYER)
     if (audio_formats.empty()) {
         audio_formats = {
             {SendspinCodecFormat::FLAC, 2, 44100, 16}, {SendspinCodecFormat::FLAC, 2, 48000, 16},
@@ -551,15 +556,19 @@ int main(int argc, char* argv[]) {
     client.set_persistence_provider(&persistence_provider);
 
     // Add roles
+#ifdef SENDSPIN_ENABLE_PLAYER
     PlayerRoleConfig player_config;
     player_config.audio_formats = std::move(audio_formats);
     auto& player = client.add_player(std::move(player_config));
     player.set_output_delay_adjustable(true);
-    auto& controller = client.add_controller();
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    // Added for its side effect: the client offers the role and accepts server/state for it.
+    (void) client.add_controller();
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     auto& metadata = client.add_metadata();
-
-    // Suppress unused variable warning
-    (void)controller;
+#endif
 
     // Artwork channels: album art on channel 0, artist image on channel 1. The TUI reports what
     // arrives rather than drawing it, so the sizes are the small ones a display of this kind asks
@@ -608,10 +617,11 @@ int main(int argc, char* argv[]) {
 
     // --- Listener implementations ---
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     struct TuiPlayerListener : PlayerRoleListener {
         TuiState& state;
         PlayerRole& player;
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
         PortAudioSink& sink;
         TuiPlayerListener(TuiState& s, PlayerRole& p, PortAudioSink& a)
             : state(s), player(p), sink(a) {}
@@ -620,7 +630,7 @@ int main(int argc, char* argv[]) {
 #endif
 
         size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
             return sink.write(data, length, timeout_ms);
 #else
             return null_audio_write(data, length, timeout_ms);
@@ -637,7 +647,7 @@ int main(int argc, char* argv[]) {
                 state.channels = params.channels;
                 state.streaming = true;
             }
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
             auto& params = player.get_current_stream_params();
             if (params.sample_rate.has_value() && params.channels.has_value() &&
                 params.bit_depth.has_value()) {
@@ -655,7 +665,7 @@ int main(int argc, char* argv[]) {
                 state.bit_depth = std::nullopt;
                 state.channels = std::nullopt;
             }
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
             sink.clear();
 #endif
         }
@@ -665,7 +675,7 @@ int main(int argc, char* argv[]) {
                 std::lock_guard<std::mutex> lock(state.mutex);
                 state.player_volume = vol;
             }
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
             sink.set_volume(vol);
 #endif
         }
@@ -675,7 +685,7 @@ int main(int argc, char* argv[]) {
                 std::lock_guard<std::mutex> lock(state.mutex);
                 state.player_muted = muted;
             }
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
             sink.set_muted(muted);
 #endif
         }
@@ -685,7 +695,9 @@ int main(int argc, char* argv[]) {
             state.output_delay_ms = delay;
         }
     };
+#endif
 
+#ifdef SENDSPIN_ENABLE_METADATA
     struct TuiMetadataListener : MetadataRoleListener {
         TuiState& state;
         explicit TuiMetadataListener(TuiState& s) : state(s) {}
@@ -697,6 +709,7 @@ int main(int argc, char* argv[]) {
             state.album = md.album.value_or("");
         }
     };
+#endif
 
     struct TuiClientListener : SendspinClientListener {
         TuiState& state;
@@ -894,15 +907,17 @@ int main(int argc, char* argv[]) {
 #endif
 
     // Create and wire listeners
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
     TuiPlayerListener player_listener(state, player, audio_sink);
     audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
         player.notify_audio_played(frames, timestamp);
     };
-#else
+#elif defined(SENDSPIN_ENABLE_PLAYER)
     TuiPlayerListener player_listener(state, player);
 #endif
+#ifdef SENDSPIN_ENABLE_METADATA
     TuiMetadataListener metadata_listener(state);
+#endif
     TuiClientListener client_listener(state);
 #ifdef SENDSPIN_ENABLE_ARTWORK
     TuiArtworkListener artwork_listener(state);
@@ -915,8 +930,12 @@ int main(int argc, char* argv[]) {
 #endif
     HostNetworkProvider network_provider;
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     player.set_listener(&player_listener);
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     metadata.set_listener(&metadata_listener);
+#endif
     client.set_listener(&client_listener);
     client.set_network_provider(&network_provider);
 #ifdef SENDSPIN_ENABLE_ARTWORK
@@ -1087,7 +1106,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 update_polled_state(state, client);
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef TUI_CLIENT_HAS_AUDIO_SINK
                 // Sync audio sink volume with client state every poll cycle.
                 // This catches all volume sources: key presses (update_volume),
                 // server commands (on_volume_changed), and polling updates.

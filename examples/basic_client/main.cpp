@@ -40,7 +40,12 @@
 #include "sendspin/player_role.h"
 #include "sendspin/types.h"
 #include "file_persistence_provider.h"
-#ifdef SENDSPIN_HAS_PORTAUDIO
+// The audio sink exists to feed the player, so it follows the player's compile gate as well as
+// PortAudio's availability.
+#if defined(SENDSPIN_HAS_PORTAUDIO) && defined(SENDSPIN_ENABLE_PLAYER)
+#define BASIC_CLIENT_HAS_AUDIO_SINK
+#endif
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
 #include "portaudio_sink.h"
 #endif
 
@@ -74,7 +79,9 @@ static constexpr uint16_t DEFAULT_SENDSPIN_PORT = SendspinClientConfig::DEFAULT_
 static const char* SENDSPIN_PATH = "/sendspin";
 
 // Tracks total audio bytes received (used when PortAudio is unavailable)
+#if defined(SENDSPIN_ENABLE_PLAYER) && !defined(BASIC_CLIENT_HAS_AUDIO_SINK)
 static size_t null_audio_total_bytes = 0;
+#endif
 
 #ifdef SENDSPIN_HAS_MDNS
 // Manages mDNS service advertisement via dns_sd.h
@@ -272,7 +279,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Create audio output and client
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
     PortAudioSink audio_sink;
 #endif
 
@@ -306,6 +313,7 @@ int main(int argc, char* argv[]) {
     client.set_persistence_provider(&persistence_provider);
 
     // Add roles
+#ifdef SENDSPIN_ENABLE_PLAYER
     PlayerRoleConfig player_config;
     player_config.audio_formats = {
         {SendspinCodecFormat::FLAC, 2, 44100, 16},
@@ -316,23 +324,27 @@ int main(int argc, char* argv[]) {
     };
     auto& player = client.add_player(std::move(player_config));
     player.set_output_delay_adjustable(true);
-    auto& controller = client.add_controller();
+#endif
+#ifdef SENDSPIN_ENABLE_CONTROLLER
+    // Added for its side effect: the client offers the role and accepts server/state for it.
+    (void) client.add_controller();
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     auto& metadata = client.add_metadata();
-
-    // Suppress unused variable warnings for roles used only for their side effects
-    (void)controller;
+#endif
 
     // --- Listener implementations ---
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     struct BasicPlayerListener : PlayerRoleListener {
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
         PortAudioSink& sink;
         PlayerRole& player;
         BasicPlayerListener(PortAudioSink& s, PlayerRole& p) : sink(s), player(p) {}
 #endif
 
         size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) override {
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
             return sink.write(data, length, timeout_ms);
 #else
             (void)data;
@@ -344,7 +356,7 @@ int main(int argc, char* argv[]) {
 
         void on_stream_start() override {
             fprintf(stderr, ">>> Stream started\n");
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
             auto& params = player.get_current_stream_params();
             if (params.sample_rate.has_value() && params.channels.has_value() &&
                 params.bit_depth.has_value()) {
@@ -357,17 +369,19 @@ int main(int argc, char* argv[]) {
 
         void on_stream_end() override {
             fprintf(stderr, ">>> Stream ended\n");
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
             sink.clear();
 #endif
         }
 
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
         void on_volume_changed(uint8_t vol) override { sink.set_volume(vol); }
         void on_mute_changed(bool muted) override { sink.set_muted(muted); }
 #endif
     };
+#endif
 
+#ifdef SENDSPIN_ENABLE_METADATA
     struct BasicMetadataListener : MetadataRoleListener {
         void on_metadata(const ServerMetadataStateObject& md) override {
             if (md.title.has_value()) {
@@ -376,6 +390,7 @@ int main(int argc, char* argv[]) {
             }
         }
     };
+#endif
 
     struct BasicClientListener : SendspinClientListener {
         void on_time_sync_updated(float error) override {
@@ -443,20 +458,26 @@ int main(int argc, char* argv[]) {
         bool is_network_ready() override { return true; }
     };
 
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
     BasicPlayerListener player_listener(audio_sink, player);
     audio_sink.on_frames_played = [&player](uint32_t frames, int64_t timestamp) {
         player.notify_audio_played(frames, timestamp);
     };
-#else
+#elif defined(SENDSPIN_ENABLE_PLAYER)
     BasicPlayerListener player_listener;
 #endif
+#ifdef SENDSPIN_ENABLE_METADATA
     BasicMetadataListener metadata_listener;
+#endif
     BasicClientListener client_listener;
     HostNetworkProvider network_provider;
 
+#ifdef SENDSPIN_ENABLE_PLAYER
     player.set_listener(&player_listener);
+#endif
+#ifdef SENDSPIN_ENABLE_METADATA
     metadata.set_listener(&metadata_listener);
+#endif
     client.set_listener(&client_listener);
     client.set_network_provider(&network_provider);
 
@@ -517,7 +538,7 @@ int main(int argc, char* argv[]) {
             client.cancel_pairing_window();
         }
         client.loop();
-#ifdef SENDSPIN_HAS_PORTAUDIO
+#ifdef BASIC_CLIENT_HAS_AUDIO_SINK
         // Sync audio sink volume periodically (catches all volume change sources)
         if (++tick % 25 == 0) {
             audio_sink.set_volume(player.get_volume());
@@ -535,7 +556,7 @@ int main(int argc, char* argv[]) {
 #endif
     client.stop();
 
-#ifndef SENDSPIN_HAS_PORTAUDIO
+#if defined(SENDSPIN_ENABLE_PLAYER) && !defined(BASIC_CLIENT_HAS_AUDIO_SINK)
     fprintf(stderr, "Total audio bytes received: %zu\n", null_audio_total_bytes);
 #endif
     return 0;
