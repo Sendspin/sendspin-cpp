@@ -1128,13 +1128,13 @@ void update_polled_state(TuiState& state, SendspinClient& client) {
 
 void apply_pending_player_commands(TuiState& state, SendspinClient& client) {
 #ifdef SENDSPIN_ENABLE_PLAYER
+    if (client.player() == nullptr) {
+        return;
+    }
     PendingPlayerCommands pending;
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         pending = state.pending_player;
-    }
-    if (client.player() == nullptr) {
-        return;
     }
     if (pending.volume.has_value()) {
         client.player()->update_volume(pending.volume.value());
