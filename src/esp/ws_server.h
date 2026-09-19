@@ -67,7 +67,7 @@ struct PendingUpgrade {
  * CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT wherever it exists. tick() reaps sessions still
  * undelivered after WS_UPGRADE_TIMEOUT_US; httpd has no handshake timeout of its own and
  * max_open_sockets is small, so a held-open raw TCP probe would otherwise pin a socket slot
- * indefinitely (the ESP variant of issue #75).
+ * indefinitely.
  *
  * Capabilities:
  * - Accepts incoming WebSocket connections on a configurable dedicated port

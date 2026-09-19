@@ -55,7 +55,7 @@ constexpr int64_t seconds_to_us(double s) {
 /// (outbound, before DNS/TCP resolve)
 ///
 /// Reaps peers that connect and then stall before becoming operational, and outbound sockets whose
-/// transport never delivers a close (host IXWebSocket, issue #75). Sockets that never upgrade are
+/// transport never delivers a close (host IXWebSocket). Sockets that never upgrade are
 /// closed in the platform layer before the manager sees them (ESP ws_server tick() at
 /// WS_UPGRADE_TIMEOUT_US; host IXWebSocket's 3 s handshake timeout).
 static constexpr double NURSERY_ESTABLISH_TIMEOUT_S = 30.0;

@@ -43,10 +43,9 @@ static const char* const TAG = "sendspin.ws_server";
 /// @brief Deadline for an accepted session to complete its WebSocket upgrade
 ///
 /// httpd has no handshake timeout of its own and max_open_sockets is small, so a raw TCP probe
-/// held open without ever speaking WebSocket would pin a socket slot indefinitely (the ESP variant
-/// of issue #75). Pre-upgrade sockets are a transport concern the manager never sees, so the bound
-/// lives here. The host build has no equivalent: IXWebSocket applies its own 3 s server-side
-/// handshake timeout.
+/// held open without ever speaking WebSocket would pin a socket slot indefinitely. Pre-upgrade
+/// sockets are a transport concern the manager never sees, so the bound lives here. The host build
+/// has no equivalent: IXWebSocket applies its own 3 s server-side handshake timeout.
 static constexpr int64_t WS_UPGRADE_TIMEOUT_US = 5LL * 1000 * 1000;
 
 SendspinWsServer::~SendspinWsServer() {

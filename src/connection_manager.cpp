@@ -880,7 +880,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
             // An activate arriving in the ack-to-rekey window therefore lands in this
             // branch with is_first true; that is the desired outcome for it too (the
             // server abandoned the finalize choreography, so clear pairing and go
-            // operational), and matches the pre-restructure behavior of that window.
+            // operational).
             SS_LOGI(TAG,
                     "Subsequent activate during pairing (leftover): clearing pairing "
                     "state and going operational for server_id=%s",
@@ -1116,9 +1116,9 @@ void ConnectionManager::scan_hello_and_nursery() {
 
         // Nursery tick: reap connections that miss the establish deadline. This is the only
         // release path for peers that connect and then stall without completing the hello, and
-        // for outbound sockets whose transport never delivers a close (host IXWebSocket, issue
-        // #75). Hello arming is event-driven (admission for inbound, connected event for
-        // outbound), so the tick only ever reaps.
+        // for outbound sockets whose transport never delivers a close (host IXWebSocket). Hello
+        // arming is event-driven (admission for inbound, connected event for outbound), so the
+        // tick only ever reaps.
         {
             const int64_t now_us = platform_time_us();
             for (auto it = this->nursery_.begin(); it != this->nursery_.end();) {
