@@ -295,6 +295,21 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   never entered; nothing short of a production seam makes the entry observable.
   `ClientLifecycle.TheStreamAfterAConnectResolvesThePinAgainAndPlays` pins the per-stream pin
   resolution around it, not the gate.
+- `SyncTask::reset_context()`'s backstop `release_stream_pin()` is unreachable: every outer-loop
+  path into it has already released the pin in `thread_entry()`, so deleting the call leaves the
+  suite green. It stays as a backstop for a path that does not exist today; no test is wanted,
+  since a test that appeared to cover it would have to fabricate a state the task cannot enter.
+- `ConnectionLifecycle.AnsweringPeerSurvivesLivenessTimeout` watches a bounded window that a
+  scheduling stall can fail on a correct client: the liveness stamp only moves when an answer
+  arrives, and no answer arrives while the loop sending the bursts is stalled. The window is the
+  1000 ms timeout plus 500 ms of slack, and it has to outlast the timeout for the control to mean
+  anything, so it cannot be widened away. A stall longer than that margin is a red build with
+  nothing wrong.
+- `ScopedIsk`'s destructor wipe (`src/connection_manager.cpp`) is unreachable from any test: the
+  class lives in an unnamed namespace inside the `.cpp`, and `-fno-access-control` widens access,
+  not linkage. Nothing observes a stack frame after it is dead in any case, so the wipe is
+  asserted by reading. Moving the class to a private header would make its constructor half
+  testable; the destructor half stays a gap either way.
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.
