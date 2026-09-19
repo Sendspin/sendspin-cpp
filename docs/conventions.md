@@ -19,8 +19,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
   end, cleared, connection events). Latest-wins state (player state, metadata,
   progress) belongs on a collapsing `InboxSlot`, never the ring: a flood of
   state updates must not be able to evict a lifecycle event.
-- State published between two non-main-loop threads uses a `ShadowSlot`
-  (`src/platform/shadow_slot.h`).
+- State published from one writer thread to one reader thread uses a
+  `ShadowSlot` (`src/platform/shadow_slot.h`), whichever side (if either) the
+  main loop is on. State the main loop *reads* goes through the Inbox instead.
 - Event producers push through `push_event_or_log()` rather than hand-rolling
   the build, push, and log-on-drop sequence.
 - A bounded queue or ring that drops an item never drops it silently: log at
@@ -33,12 +34,17 @@ checklists in `.claude/skills/` apply these standards to a diff.
 - Callback dispatch must tolerate re-entrant teardown: a listener callback may
   call back into the client. See "Re-entrant Teardown During Callback
   Dispatch" in `docs/internals.md` for the guard patterns in use.
-- A message handler on the receive path writes to Inbox slots and role buffers
-  and nothing else. It does not reach back into the client for the current
-  connection, the clock, or a state publish, and it does not call a listener:
-  those belong in `drain_events()`. That keeps the network thread cheap and
-  keeps the admission replay, which runs the same handlers, as short as the
-  live path.
+- A message handler on the receive path writes to Inbox slots, role buffers,
+  the connection it was handed, and the connection manager's deferred-event
+  queues, and nothing else. It does not reach back into the client for the
+  current connection or the clock, does not publish state, and does not call a
+  listener: those belong on the main-loop drain. That keeps the network thread
+  cheap and keeps the admission replay, which runs the same handlers, as short
+  as the live path. Two handlers go further and state why at their site:
+  `noise/handshake` runs the re-handshake and its `msg2` send inline because it
+  must stay ordered with decrypt on the same thread, and `server/pair-finalize`
+  commits the pairing record to RAM inline because the re-handshake that
+  follows it resolves that psk_id on this same thread.
 - The client holds exactly one lock order, and every site that takes two locks
   cites it: `SendspinClient::json_processing_mutex_`, then
   `ConnectionManager::conn_ptr_mutex_`, then the leaves

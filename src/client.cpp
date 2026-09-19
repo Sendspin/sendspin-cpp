@@ -1499,7 +1499,9 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             // In-band re-handshake initiated by the server. This runs on the
             // network thread (same thread as decrypt), so no lock is needed on this side; the
             // NoiseTransport session mutex is only acquired inside handle_noise_rehandshake for
-            // the encrypt + swap.
+            // the encrypt + swap. Running the handshake and the msg2 send inline is the
+            // sanctioned exception to the receive-path rule (conventions.md "Threading and
+            // cross-thread state"): the swap must stay ordered with decrypt on this thread.
             if (conn != nullptr) {
                 SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
                 std::string msg1_json(data, len);
@@ -1601,7 +1603,9 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             break;
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE: {
-            // server/pair-finalize: server acked our client/pair-finalize.
+            // server/pair-finalize: server acked our client/pair-finalize. The sanctioned
+            // exception to the receive-path rule (conventions.md "Threading and cross-thread
+            // state"), for the reason below.
             // Commit the pending pairing record to RAM synchronously HERE (network thread), NOT
             // deferred to the main loop: the server rekeys onto the new long-term PSK immediately
             // after this ack, and its re-handshake msg1 (the next message on this same thread)
