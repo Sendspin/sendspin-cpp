@@ -187,10 +187,17 @@ public:
     /// set_current_connection(), drop_connection(), and stop().
     /// @param admitted Whether this connection now occupies the admitted slot.
     void set_admitted(bool admitted) {
-        this->admitted_.store(admitted, std::memory_order_release);
         // The transport keeps its own copy: its reassembly cap is tighter until the connection
-        // is admitted, and it is read on the network thread.
-        this->noise_transport_.set_admitted(admitted);
+        // is admitted, and it is read on the network thread. Widen that cap before the dispatch
+        // gate opens and narrow it only after the gate closes, so the network thread never sees
+        // a gate wider than the cap behind it.
+        if (admitted) {
+            this->noise_transport_.set_admitted(true);
+        }
+        this->admitted_.store(admitted, std::memory_order_release);
+        if (!admitted) {
+            this->noise_transport_.set_admitted(false);
+        }
     }
 
     /// @brief Notes that a server/activate from this connection reached the dispatch path.
