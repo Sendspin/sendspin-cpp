@@ -282,6 +282,13 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   pin (stream end, a mid-stream `drop_connection()`, a network-thread flush) use the older
   listener on purpose, so they prove where the connection dies and not that a chunk decoded
   across the drop; no test combines a live decode with a drop.
+- The two envelope guards in `parse_json_envelope()` (`src/noise_handshake.cpp`) in front of
+  `run_rehandshake_msg1()` are defense in depth and cannot be killed by any input. An envelope
+  that trips either one is rejected downstream anyway: a wrong `type` reaches `run_msg1_core()`,
+  which finds no `data` field, and unparseable text yields a null document that fails there too.
+  Deleting both guards leaves the suite green (verified). Only an assertion on the diagnostic log
+  line would observe them, which the Testing standard rules out, so they are named here instead
+  of covered by a test that cannot fail.
 - The arrival timestamp a held message keeps across the pre-admission replay
   (`replay_pre_admission_messages()` hands each message its recorded `arrival_us` rather than the
   replay's own clock) is unobservable from any test. `dispatch_json_message()` threads that

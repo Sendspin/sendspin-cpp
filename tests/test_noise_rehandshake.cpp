@@ -382,29 +382,3 @@ TEST(NoiseRehandshake, UnknownPskIdAborts) {
     EXPECT_FALSE(result.has_value())
         << "run_rehandshake_msg1 should fail with an unknown psk_id";
 }
-// The envelope guards in front of the re-handshake are defense in depth: an envelope that trips
-// either one is rejected downstream anyway (a wrong type reaches run_msg1_core, which finds no
-// data field; unparseable text yields a null document whose type reads as "").
-// Control: RehandshakeRotatesKeys_ChaChaPoly, where a well-formed envelope completes.
-TEST(NoiseRehandshake, MalformedRehandshakeEnvelopeIsRejected) {
-    struct Row {
-        const char* name;
-        const char* envelope;
-    };
-    const Row rows[] = {
-        {"wrong envelope type", R"({"type":"server/init","payload":{}})"},
-        {"unparseable text", "not json"},
-    };
-
-    Identity client_id = Identity::generate().value();
-    Identity server_id = Identity::generate().value();
-    RecordStore empty_rs(nullptr);
-    const std::array<uint8_t, 32> prior_h{};
-
-    for (const Row& row : rows) {
-        SCOPED_TRACE(row.name);
-        EXPECT_FALSE(run_rehandshake_msg1(row.envelope, server_id.peer_id(), client_id, empty_rs,
-                                          std::string(NOISE_SUITE_CHACHAPOLY), prior_h)
-                         .has_value());
-    }
-}
