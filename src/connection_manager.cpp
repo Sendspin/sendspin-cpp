@@ -2122,16 +2122,13 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
                                               std::optional<PairAbortReason> wire_abort_reason,
                                               PairingDropAction drop_action,
                                               SendspinPairAbortReason public_reason,
-                                              SendspinGoodbyeReason goodbye_reason,
-                                              std::optional<std::string> server_id_override) {
+                                              SendspinGoodbyeReason goodbye_reason) {
     // Runs on the main loop (caller holds conn_ptr_mutex_).
     //
     // Capture the deferred-notification inputs BEFORE clear_pairing_state() resets the pairing
     // session and before the connection is possibly released (server_id is copied so it survives
-    // any tear-down). server_id_override lets a caller substitute a value captured earlier
-    // instead of reading the connection's current state.
-    const std::string server_id =
-        server_id_override.has_value() ? server_id_override.value() : conn->get_server_id();
+    // any tear-down).
+    const std::string server_id = conn->get_server_id();
     // Snapshot before clear_pairing_state()/drop_connection() clear it (see PairingUiSnapshot).
     const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
 

@@ -866,14 +866,10 @@ private:
     /// @param public_reason      Reason delivered to the application via on_pairing_failed.
     /// @param goodbye_reason     Goodbye reason passed to drop_connection() when drop_action is
     ///        CLOSE_WITH_GOODBYE; read only then, so callers for the other actions omit it.
-    /// @param server_id_override When set, passed to on_pairing_failed instead of
-    ///        conn->get_server_id(), for callers whose server_id was captured before the
-    ///        connection's current state could change.
     void abort_pairing_attempt(
         SendspinConnection* conn, std::optional<PairAbortReason> wire_abort_reason,
         PairingDropAction drop_action, SendspinPairAbortReason public_reason,
-        SendspinGoodbyeReason goodbye_reason = SendspinGoodbyeReason::UNAUTHORIZED,
-        std::optional<std::string> server_id_override = std::nullopt);
+        SendspinGoodbyeReason goodbye_reason = SendspinGoodbyeReason::UNAUTHORIZED);
 
     // ========================================
     // Pairing-code main-loop handlers

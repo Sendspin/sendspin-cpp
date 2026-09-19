@@ -310,12 +310,12 @@ size_t RecordStore::find_index(const std::string& psk_id) const {
             return i;
         }
     }
-    return static_cast<size_t>(-1);
+    return NPOS;
 }
 
 const SendspinPairingRecord* RecordStore::record_by_psk_id(const std::string& psk_id) const {
     size_t idx = this->find_index(psk_id);
-    if (idx == static_cast<size_t>(-1)) {
+    if (idx == NPOS) {
         return nullptr;
     }
     return &this->records_[idx];
@@ -358,7 +358,7 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
 
     size_t idx = this->find_index(record.psk_id);
     const std::string incoming_psk_id = record.psk_id;
-    const bool is_insert = (idx == static_cast<size_t>(-1));
+    const bool is_insert = (idx == NPOS);
 
     // Capacity: a replace by psk_id never grows the store, and neither does an insert that
     // supersedes an existing record for the same server_id, because the retire below drops that
@@ -424,7 +424,7 @@ bool RecordStore::persist_records() {
 void RecordStore::remove_record(const std::string& psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     size_t idx = this->find_index(psk_id);
-    if (idx == static_cast<size_t>(-1)) {
+    if (idx == NPOS) {
         return;
     }
     this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(idx));
@@ -444,7 +444,7 @@ void RecordStore::remove_record(const std::string& psk_id) {
 void RecordStore::mark_record_used(const std::string& psk_id) {
     std::lock_guard<std::mutex> lock(this->mutex_);
     const size_t idx = this->find_index(psk_id);
-    if (idx == static_cast<size_t>(-1)) {
+    if (idx == NPOS) {
         return;
     }
 

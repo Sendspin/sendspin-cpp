@@ -108,15 +108,14 @@ struct ResolvedPsk {
 ///
 /// Thread-safety:
 ///   - `records_` and `pairing_psk_` are guarded by `mutex_`. ALL cross-thread access
-///     must go through `resolve_by_psk_id`, the `*_snapshot` / `*_copy` variants, or the one
-///     network-thread mutator, `store_record_superseding` (RAM-only there; its deferred
-///     provider flush, `persist_records`, is main-loop-only).
+///     must go through `resolve_by_psk_id` or the one network-thread mutator,
+///     `store_record_superseding` (RAM-only there; its deferred provider flush,
+///     `persist_records`, is main-loop-only).
 ///   - One exception: `pairing_psk_` is provisioned by the constructor and never written
 ///     again, so the reference getter `pairing_psk()` reads it without the lock.
-///   - The pointer/reference-returning getters (`record_by_psk_id`, `record_by_server_id`)
-///     are for internal-locked or single-threaded (main-loop-only) use ONLY;
-///     callers must not retain a returned pointer or reference across any mutation, and must
-///     never call them from the network thread.
+///   - The pointer-returning record lookups (`record_by_psk_id`, `record_by_server_id`) are
+///     private locked-context helpers; callers must not retain a returned pointer across any
+///     mutation.
 ///   - The pairing config (`pairing_psk_enabled_`, `unpaired_access_enabled_`,
 ///     `dynamic_pairing_code_enabled_`, `static_pairing_code_enabled_`, `static_pairing_code_`)
 ///     is construction-time state: seeded from the persisted blob and the client config by the
@@ -168,30 +167,6 @@ public:
     // ========================================
     // Long-term record management
     // ========================================
-
-    /// @brief Return the long-term record identified by psk_id, if any.
-    [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(const std::string& psk_id) const;
-
-    /// @brief Return the record bound to server_id, if any.
-    [[nodiscard]] const SendspinPairingRecord* record_by_server_id(
-        const std::string& server_id) const;
-
-    /// @brief Return a locked copy of all long-term records (thread-safe).
-    /// Safe to call from any thread; iterates under mutex_ so the copy is consistent.
-    [[nodiscard]] std::vector<SendspinPairingRecord> records_snapshot() const {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        return this->records_;
-    }
-
-    /// @brief Return a locked copy of the record identified by psk_id, if any (thread-safe).
-    /// Calls the unlocked record_by_psk_id helper while holding mutex_; no recursion since
-    /// record_by_psk_id does not lock. Returns nullopt when the psk_id is not found.
-    [[nodiscard]] std::optional<SendspinPairingRecord> record_by_psk_id_copy(
-        const std::string& psk_id) const {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        const SendspinPairingRecord* r = record_by_psk_id(psk_id);
-        return r ? std::optional<SendspinPairingRecord>(*r) : std::nullopt;
-    }
 
     /// @brief Store a long-term record in RAM, replacing any record with the same psk_id and
     /// retiring any OTHER record bound to the same server_id.
@@ -354,7 +329,18 @@ private:
     [[nodiscard]] std::optional<ResolvedPsk> resolve_by_psk_id_locked(const std::string& psk_id,
                                                                       PskCategory category) const;
 
-    /// @brief Find the index of a record by psk_id, or npos if absent.
+    /// @brief Return the long-term record identified by psk_id, if any. MUST be called with
+    /// mutex_ already held; the returned pointer does not survive a mutation of records_.
+    [[nodiscard]] const SendspinPairingRecord* record_by_psk_id(const std::string& psk_id) const;
+
+    /// @brief Return the record bound to server_id, if any. Same locking rules as above.
+    [[nodiscard]] const SendspinPairingRecord* record_by_server_id(
+        const std::string& server_id) const;
+
+    /// @brief Sentinel find_index() returns for a psk_id the store does not hold.
+    static constexpr size_t NPOS = static_cast<size_t>(-1);
+
+    /// @brief Find the index of a record by psk_id, or NPOS if absent.
     [[nodiscard]] size_t find_index(const std::string& psk_id) const;
 
     /// @brief Drop the least recently used record no open connection is resolving against, to

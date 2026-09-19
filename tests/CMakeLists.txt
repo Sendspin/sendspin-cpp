@@ -72,6 +72,11 @@ set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTION
 # which is the only way to see that object without a connected server.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
+# test_record_store.cpp reads records_ directly and calls the store's private locked-context
+# lookups (record_by_psk_id, record_by_server_id); the store deliberately exposes no copying
+# accessor for them, since nothing in the library needs one.
+set_source_files_properties(test_record_store.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
+
 # Reach the library's private headers (protocol_messages.h, time_filter.h, ...) and
 # the src/crypto/ headers.
 # The public include/ dir and ArduinoJson propagate transitively from `sendspin`.

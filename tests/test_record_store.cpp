@@ -227,7 +227,7 @@ TEST(RecordStore, CorruptRecordsBlobFallsBackToEmptyStore) {
     RecordStore store(&provider);
 
     // First-boot provisioning must have run as if nothing were stored.
-    EXPECT_TRUE(store.records_snapshot().empty());
+    EXPECT_TRUE(store.records_.empty());
     EXPECT_TRUE(store.pairing_psk().has_value());
 }
 
@@ -289,7 +289,7 @@ TEST(RecordStore, StoreRecordSupersedesPriorRecordForSameServerId) {
     ASSERT_NE(found, nullptr);
     EXPECT_EQ(found->psk_id, second_psk_id);
     int count = 0;
-    for (const auto& r : store.records_snapshot()) {
+    for (const auto& r : store.records_) {
         if (r.server_id == server_id) {
             count++;
         }
@@ -352,13 +352,13 @@ TEST(RecordStore, CapacityEvictsRatherThanRefusingANewPairing) {
         auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
-    ASSERT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
+    ASSERT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS);
 
     auto overflow = store.resolve_pairing_outcome("server-overflow");
     EXPECT_TRUE(store.store_record_superseding(overflow.record, {}))
         << "a pairing never fails for lack of record storage";
     EXPECT_NE(store.record_by_server_id("server-overflow"), nullptr);
-    EXPECT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS)
+    EXPECT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS)
         << "eviction makes room rather than growing the store";
     EXPECT_EQ(store.record_by_server_id("server-0"), nullptr)
         << "the least recently used record is the one evicted";
@@ -381,7 +381,7 @@ TEST(RecordStore, RecencyReorderIsNotPersisted) {
 
     // Fill the store, then touch the fillers so A and B sit at the front, oldest first.
     std::vector<std::string> filler_psk_ids;
-    for (size_t i = store.records_snapshot().size(); i < RecordStore::MIN_MAX_RECORDS; ++i) {
+    for (size_t i = store.records_.size(); i < RecordStore::MIN_MAX_RECORDS; ++i) {
         auto record = make_client_record("filler-" + std::to_string(i));
         filler_psk_ids.push_back(record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(std::move(record), {}));
@@ -472,7 +472,7 @@ TEST(RecordStore, NothingEvictableRejectsTheRecord) {
     auto overflow = store.resolve_pairing_outcome("server-overflow");
     EXPECT_FALSE(store.store_record_superseding(overflow.record, psk_ids));
     EXPECT_EQ(store.record_by_server_id("server-overflow"), nullptr);
-    EXPECT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
+    EXPECT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS);
 }
 
 // A supersede that replaces the record already held for a given server_id does not grow the
@@ -490,12 +490,12 @@ TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
         auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
-    ASSERT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS);
+    ASSERT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS);
 
     auto outcome1 = store.resolve_pairing_outcome(existing_server);
     EXPECT_TRUE(store.store_record_superseding(outcome1.record, {}));
 
-    EXPECT_EQ(store.records_snapshot().size(), RecordStore::DEFAULT_MAX_RECORDS)
+    EXPECT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS)
         << "a supersede must not grow the store";
     EXPECT_EQ(store.record_by_psk_id(first_psk_id), nullptr) << "the old record must be retired";
     const auto* found = store.record_by_server_id(existing_server);
@@ -518,11 +518,11 @@ TEST(RecordStore, CapacityCustomCapIsRespected) {
         auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
-    EXPECT_EQ(store.records_snapshot().size(), cap);
+    EXPECT_EQ(store.records_.size(), cap);
 
     auto overflow = store.resolve_pairing_outcome("server-overflow");
     ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
-    EXPECT_EQ(store.records_snapshot().size(), cap) << "the configured cap still bounds the store";
+    EXPECT_EQ(store.records_.size(), cap) << "the configured cap still bounds the store";
 }
 
 // pairing.md "Pairing Records" requires room for at least 5 records, so a smaller configured cap
@@ -534,7 +534,7 @@ TEST(RecordStore, CapacityBelowTheProtocolFloorIsRaised) {
         auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
-    EXPECT_EQ(store.records_snapshot().size(), RecordStore::MIN_MAX_RECORDS)
+    EXPECT_EQ(store.records_.size(), RecordStore::MIN_MAX_RECORDS)
         << "nothing may be evicted before the floor is reached";
 }
 
@@ -1557,46 +1557,19 @@ TEST(RecordStore, ResolvePairingOutcomeThenStore) {
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
 }
 
-// records_snapshot() returns a thread-safe copy of every long-term record.
-TEST(RecordStore, RecordsSnapshotReturnsAllRecords) {
+// Two records stored for different servers are both retained.
+TEST(RecordStore, StoresRecordsForDistinctServers) {
     RecordStore store(nullptr);
-    ASSERT_TRUE(store.records_snapshot().empty());
+    ASSERT_TRUE(store.records_.empty());
 
     SendspinPairingRecord a = make_client_record("server-A");
     SendspinPairingRecord b = make_client_record("server-B");
     store.store_record_superseding(a, {});
     store.store_record_superseding(b, {});
 
-    auto snap = store.records_snapshot();
-    EXPECT_EQ(snap.size(), 2u);
-
-    // The snapshot must contain both added records.
-    bool found_a = false;
-    bool found_b = false;
-    for (const auto& r : snap) {
-        if (r.psk_id == a.psk_id) found_a = true;
-        if (r.psk_id == b.psk_id) found_b = true;
-    }
-    EXPECT_TRUE(found_a);
-    EXPECT_TRUE(found_b);
-}
-
-TEST(RecordStore, RecordByPskIdCopyReturnsValueForPresent) {
-    RecordStore store(nullptr);
-    SendspinPairingRecord rec = make_client_record("server-copy-test");
-    store.store_record_superseding(rec, {});
-
-    auto copy = store.record_by_psk_id_copy(rec.psk_id);
-    ASSERT_TRUE(copy.has_value());
-    EXPECT_EQ(copy->psk_id, rec.psk_id);
-    EXPECT_EQ(copy->server_id, "server-copy-test");
-    EXPECT_EQ(copy->psk, rec.psk);
-}
-
-TEST(RecordStore, RecordByPskIdCopyReturnsNulloptForAbsent) {
-    RecordStore store(nullptr);
-    auto copy = store.record_by_psk_id_copy("nonexistent-psk-id");
-    EXPECT_FALSE(copy.has_value());
+    EXPECT_EQ(store.records_.size(), 2u);
+    EXPECT_NE(store.record_by_psk_id(a.psk_id), nullptr);
+    EXPECT_NE(store.record_by_psk_id(b.psk_id), nullptr);
 }
 
 // ============================================================================
