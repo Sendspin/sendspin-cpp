@@ -120,7 +120,7 @@ TEST(PlayerRoleTimingParameters, ConfiguredValuesAreReported) {
 // The numbers are spelled out rather than re-derived with pipeline_lead_time_ms(): that is the
 // production formula, so re-running it here would report whatever the terms became. 150 is 25 ms
 // of sync priming, 50 ms of default extra startup silence and 75 ms of pipeline start allowance
-// -- the lead this client asks every server for.
+// of pipeline start allowance, the lead this client asks every server for.
 TEST(PlayerRoleTimingParameters, DefaultsAreReported) {
     SendspinClient client(make_client_config("player-timing-default"));
     auto& player = client.add_player(make_player_config());

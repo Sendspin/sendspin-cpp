@@ -41,7 +41,7 @@ class SendspinClient;
 ///
 /// For an ack-enabled slot, at most one un-acked delivery is ever in flight. The two ways a clear
 /// reaches the gate differ, so they are worth keeping apart:
-///  - A payload -- a frame, or the server's per-channel clear for that slot -- arriving while a
+///  - A payload (a frame, or the server's per-channel clear for that slot) arriving while a
 ///    delivery is un-acked is buffered latest-wins and delivered only after frame_done(slot), and
 ///    then owes its own frame_done(). It waits behind the outstanding delivery rather than
 ///    replacing it, so a consumer presenting a delivery is never interrupted. A delivery that has
@@ -51,7 +51,7 @@ class SendspinClient;
 ///  - A stream end or stream clear is a lifecycle event, not a payload, so it is never buffered:
 ///    it fires on_image_clear() immediately for every configured slot, discards anything buffered,
 ///    and replaces whatever delivery was outstanding. Exactly one frame_done() is owed afterward
-///    whatever was in flight -- including when it lands on an un-acked per-channel clear, which
+///    whatever was in flight, including when it lands on an un-acked per-channel clear, which
 ///    fires on_image_clear() again and still owes exactly one ack.
 ///
 /// A frame that was decoded but never displayed is released automatically whenever its display

@@ -123,7 +123,7 @@ std::optional<std::vector<std::string>> locations_hint(const std::vector<std::st
 /// connection is never closed for it, and only the role's own handling is skipped. messaging.md
 /// "server/activate" expects exactly this of both sides, since it has servers ignore inactive-role
 /// objects "without closing solely for their presence, since the client may not yet have received
-/// the role removal" -- the client's mirror of that is not to act on what the server sent before
+/// the role removal": the client's mirror of that is not to act on what the server sent before
 /// it learned of one.
 ///
 /// A true verdict is only half the gate. The caller pairs it with the role's teardown generation,
@@ -1642,7 +1642,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
                     // connection budget rules out: the server rekeys onto this PSK regardless
                     // (it already acked pair-finalize), and since the client does not hold it,
                     // the follow-up re-handshake fails to resolve the psk_id and drops the
-                    // connection (noise_handshake.cpp) -- or, if the server never sends it, the
+                    // connection (noise_handshake.cpp), or, if the server never sends it, the
                     // re-prove watchdog re-armed below does. A provider that later rejects the
                     // deferred write does not fail the pairing: the record works for this boot
                     // and persist_records() warns that it will not survive a reboot.
@@ -2057,7 +2057,7 @@ void SendspinClient::apply_role_removals(const std::vector<std::string>& roles_b
     // That is exactly what each role's cleanup() does, so deactivation runs the same teardown the
     // disconnect path runs. Only the surroundings differ: the connection survives, so the inbox
     // ring is not reset first (the roles that stay active keep their queued lifecycle events) and
-    // the role may be re-added later. Coming back is the role's ordinary start path -- a role
+    // the role may be re-added later. Coming back is the role's ordinary start path: a role
     // whose state object the server needs again is carried by the client/state the activation
     // publishes, and a stream role re-arms on the next stream/start.
 #ifdef SENDSPIN_ENABLE_PLAYER

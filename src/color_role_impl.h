@@ -66,7 +66,7 @@ struct ColorRole::Impl {
     // for an rvalue reference to move out of.
     void handle_server_state(const ServerColorStateObject& color, uint32_t generation) const;
     // True if a slot palette needs taking, or a palette already held from a prior tick (see
-    // held_state) is still waiting out its server-clock deadline -- the deadline itself sets no
+    // held_state) is still waiting out its server-clock deadline: the deadline itself sets no
     // inbox bit, so held_state must be polled every tick until it fires.
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & INBOX_TOPIC_COLOR) != 0 || this->held_state.has_value();

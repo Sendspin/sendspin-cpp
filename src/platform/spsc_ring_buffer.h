@@ -186,7 +186,7 @@ public:
     ///
     /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
     /// collapse into one, and a wake that races an arriving item may be absorbed by that
-    /// item's delivery -- so callers must re-check their stop/command state after every
+    /// item's delivery, so callers must re-check their stop/command state after every
     /// receive() return, not only after nullptr returns. Safe to call from any thread.
     void wake_receiver() {
         xSemaphoreGive(this->items_or_wake_sem_);
@@ -410,7 +410,7 @@ public:
     ///
     /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
     /// collapse into one, and a wake that races an arriving item may be absorbed by that
-    /// item's delivery -- so callers must re-check their stop/command state after every
+    /// item's delivery, so callers must re-check their stop/command state after every
     /// receive() return, not only after nullptr returns. Safe to call from any thread.
     void wake_receiver() {
         {
@@ -475,7 +475,7 @@ private:
             return this->write_offset_;
         }
 
-        // Need to wrap -- insert dummy to fill tail
+        // Need to wrap: insert dummy to fill tail
         size_t tail_space = this->storage_size_ - this->write_offset_;
         if (tail_space >= sizeof(ItemHeader)) {
             if (this->free_bytes_ >= tail_space + total && total <= this->storage_size_) {
@@ -510,7 +510,7 @@ private:
                 --this->items_waiting_;
                 return this->storage_ + this->read_offset_ + sizeof(ItemHeader);
             }
-            // ACQUIRED but not yet committed -- wait
+            // ACQUIRED but not yet committed: wait
             break;
         }
         return nullptr;

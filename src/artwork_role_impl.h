@@ -70,8 +70,8 @@ enum class SlotAckState : uint8_t {
 ///
 /// `data_length == 0` marks the protocol's empty image (an announce with `total_size` 0), which
 /// clears the channel. It names no buffer, so `buffer_idx`/`generation` are unused and left at 0;
-/// everything else about it -- queue ordering, the ack gate, and the timestamp-scheduled hand-off
-/// to the main loop -- matches a frame. See handle_binary().
+/// everything else about it (queue ordering, the ack gate, and the timestamp-scheduled hand-off
+/// to the main loop) matches a frame. See handle_binary().
 struct ArtworkNotification {
     uint8_t slot;
     uint8_t buffer_idx;
@@ -201,7 +201,7 @@ struct ArtworkRole::Impl {
     void handle_stream_ring_event(ArtworkEventType event);
     // True if this tick has drainable artwork work. The display-slot bit covers newly decoded
     // images; a nonzero held_display_mask means displays folded in on a prior tick are still
-    // waiting out their server-clock deadlines (see held_display_ts) -- the deadline itself sets
+    // waiting out their server-clock deadlines (see held_display_ts): the deadline itself sets
     // no inbox bit, so a nonzero mask must be polled every tick until each slot fires or is
     // dropped for a stream-epoch mismatch.
     bool needs_drain(uint32_t pending_bits) const {

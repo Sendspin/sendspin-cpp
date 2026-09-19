@@ -265,7 +265,7 @@ private:
         ServiceKey key{name, regtype, domain};
 
         if (flags & kDNSServiceFlagsAdd) {
-            // Service appeared -- resolve it
+            // Service appeared: resolve it
             auto* ctx = new ResolveContext{browser, key, name, 0, ""};
 
             DNSServiceRef resolve_ref = nullptr;

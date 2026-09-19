@@ -695,7 +695,7 @@ public:
     /// already active for the receive gate when the traffic that legitimately follows it arrives:
     /// messaging.md "server/state" has the server send a re-added role's state promptly, and it
     /// does not wait for the client's next main-loop tick. Removals are deliberately not applied
-    /// here -- they take effect in apply_server_activate() on the main loop, in the same step that
+    /// here: they take effect in apply_server_activate() on the main loop, in the same step that
     /// tears the removed roles down, so the gate and the teardown always agree on when a role
     /// stopped.
     /// @param active_roles The active_roles of the activate just received (empty when it omitted

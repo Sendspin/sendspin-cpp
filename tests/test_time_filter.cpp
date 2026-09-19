@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Unit tests for the SendspinTimeFilter Kalman filter. We don't try to prove the filter is
-// "optimal" -- instead we pin down the behavioral invariants a refactor could silently break:
+// "optimal": instead we pin down the behavioral invariants a refactor could silently break:
 // monotonic-timestamp rejection, reset semantics, the offset/inverse round-trip, and convergence
 // toward a constant offset.
 

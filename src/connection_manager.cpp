@@ -1614,7 +1614,7 @@ void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnectio
         this->current_connection_->set_admitted(false);
     }
     // Admitting replays the role messages this connection held while it was proving itself, so
-    // it goes through the client rather than setting the flag here -- and it runs outside this
+    // it goes through the client rather than setting the flag here, and it runs outside this
     // lock, in flush_pending_admission(). Staging it on every assignment, including the null
     // one, is what keeps the staged pointer and the slot the same connection: a slot cleared
     // before the flush has nothing to admit.

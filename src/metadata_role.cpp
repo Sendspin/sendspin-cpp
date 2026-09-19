@@ -158,8 +158,8 @@ void MetadataRole::Impl::apply_due_state() {
 }
 
 void MetadataRole::Impl::drain_events() {
-    // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex --
-    // see inbox.h), so the server-clock deadline gate is split in two: take() unconditionally
+    // InboxSlot has no take_if (a deadline predicate must not run under the shared Inbox mutex; see
+    // inbox.h), so the server-clock deadline gate is split in two: take() unconditionally
     // moves the pending states into held_state, then each deadline is evaluated below with no
     // lock held at all.
     //

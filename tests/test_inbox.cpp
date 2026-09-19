@@ -226,7 +226,7 @@ TEST(Inbox, TimeResponsePayloadRoundtrips) {
 
 // Concurrency smoke test: one producer thread interleaves slot merges and event pushes while the
 // main thread polls and drains until it has observed everything the producer sent. Overflow
-// (drop-newest) is allowed to happen -- the producer only counts pushes that actually succeeded,
+// (drop-newest) is allowed to happen: the producer only counts pushes that actually succeeded,
 // so the assertions hold whether or not the ring ever fills up under scheduling pressure.
 TEST(Inbox, ConcurrentProducerDrainedWithoutLossOrDuplication) {
     constexpr int kIterations = 10000;
@@ -303,7 +303,7 @@ TEST(Inbox, ConcurrentProducerDrainedWithoutLossOrDuplication) {
             // producer_done == true here (acquire) synchronizes-with that store and makes all of
             // the producer's prior pending_ writes visible to the poll() sequenced after it. A
             // bit set right before the producer finished is therefore guaranteed to be seen by
-            // this re-poll -- release/acquire publishes every prior write, not just the flag.
+            // this re-poll: release/acquire publishes every prior write, not just the flag.
             if (producer_done.load(std::memory_order_acquire) && inbox.poll() == 0) {
                 break;
             }

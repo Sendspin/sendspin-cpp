@@ -599,7 +599,7 @@ public:
 
     // Sends one role binary message whose body is already laid out: `body` is the decrypted
     // payload verbatim, starting with its type byte. For the roles whose wire layout is not
-    // [type][timestamp][payload] -- artwork puts a flags byte before the timestamp, and its parts
+    // [type][timestamp][payload]: artwork puts a flags byte before the timestamp, and its parts
     // and cancels carry no timestamp at all (roles/artwork/v1.md "Artwork (Binary)").
     bool send_binary_body(const std::vector<uint8_t>& body) {
         std::lock_guard<std::mutex> lock(this->crypto_mutex_);

@@ -270,7 +270,7 @@ void VisualizerRole::Impl::handle_binary(uint8_t binary_type, const uint8_t* dat
     }
 
     // Forward the raw message verbatim: [wire_type][server_ts(8)][payload]. Like the player and
-    // artwork roles, the network thread stays dumb -- it records the message and hands it to the
+    // artwork roles, the network thread stays dumb: it records the message and hands it to the
     // drain thread, which owns all structural validation and per-type truncation. The only other
     // check here is that a timestamp is present, since the drain thread needs it to schedule the
     // entry. No size cap is applied: the ring buffer records each entry's length, so an oversized
@@ -499,8 +499,8 @@ void VisualizerRole::Impl::flush_ring_buffer() const {
 
 void VisualizerRole::Impl::signal_clear_marker() const {
     // Network-thread side of a clear boundary. Set the flag before enqueueing the marker (like
-    // PlayerRole::handle_stream_clear) so the drain thread starts discarding -- freeing ring
-    // space -- while we wait for the marker slot.
+    // PlayerRole::handle_stream_clear) so the drain thread starts discarding (freeing
+    // ring space) while we wait for the marker slot.
     if (!this->drain_task || !this->drain_task->ring_buffer.is_created()) {
         return;
     }
@@ -659,7 +659,7 @@ void VisualizerRole::Impl::drain_thread_func(VisualizerRole::Impl* self) {
 
         // Decode and deliver. The network thread forwards messages verbatim, so decode validates
         // each payload's length before reading. Copy out of the slot, release it via the guard,
-        // then deliver -- so a slow listener callback never blocks the network producer.
+        // then deliver, so a slow listener callback never blocks the network producer.
         const uint8_t* payload = raw + ENTRY_TYPE_SIZE + TIMESTAMP_SIZE;
         size_t payload_len = item_size - ENTRY_TYPE_SIZE - TIMESTAMP_SIZE;
 

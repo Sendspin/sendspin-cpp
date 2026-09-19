@@ -1587,7 +1587,7 @@ TEST(EncryptedLifecycle, RefusedActivateDoesNotWidenTheReceiveGate) {
 // the roles it drops are torn down: here a session on a long-term record is re-handshaked onto the
 // Pairing PSK and activated for pairing alone, which a client without unpaired access may not
 // carry roles on. The activation is admissible, so the connection stays and the pairing it admits
-// begins -- after the teardown, not instead of it.
+// begins: after the teardown, not instead of it.
 TEST(EncryptedLifecycle, ActivateThatLosesPlaybackCapabilityRemovesTheRoles) {
     TestNetworkProvider network;
     PairingCapturePersistenceProvider persistence;
@@ -2463,7 +2463,7 @@ TEST(EncryptedLifecycle, EveryHeldMessageTypeReplaysThroughItsHandler) {
 // (docs/conventions.md, "Threading and cross-thread state"). The live receive path fixes that
 // order: a server/pair-finalize handler runs under the JSON lock and asks the manager for the
 // open connections' psk_ids. Admission is the other half of the pair, and it takes the JSON lock
-// to replay, so it must not run under conn_ptr_mutex_ -- which is why set_current_connection()
+// to replay, so it must not run under conn_ptr_mutex_, which is why set_current_connection()
 // only stages it and flush_pending_admission() performs it after the lock is dropped.
 //
 // Driving both halves at once pins that. The pairing connection's network thread is parked

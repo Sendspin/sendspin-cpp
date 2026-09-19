@@ -321,7 +321,7 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
     const uint32_t total_size = be32_to_host(body + 1 + 8);
 
     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-    // "The server MUST NOT announce an image, on any channel, while a transfer is in flight" --
+    // "The server MUST NOT announce an image, on any channel, while a transfer is in flight":
     // one of the malformed sequences the client closes on.
     if (this->transfer.in_flight) {
         SS_LOGW(TAG, "Artwork announce for slot %u while slot %u is mid-transfer", slot,
@@ -672,7 +672,7 @@ void ArtworkRole::Impl::handle_stream_ring_event(ArtworkEventType event) {
                 // A clear is itself a delivery that must be acked: it may drive a fade-out, and
                 // it supersedes any un-acked frame for the slot, so exactly one frame_done() is
                 // owed afterward regardless of what ack_state held before. Drop any notification
-                // parked behind an un-acked frame -- it is superseded by the clear. Released
+                // parked behind an un-acked frame: it is superseded by the clear. Released
                 // before firing the callbacks below so a listener calling frame_done() from
                 // inside on_image_clear() does not deadlock on this same mutex.
                 std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
@@ -899,7 +899,7 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
 
         // Ack gate: a slot with require_frame_done set allows only one un-acked delivery in
         // flight. If one is already outstanding, park this (newer) notification instead of
-        // decoding it now -- overwriting any previously parked notification is latest-wins by
+        // decoding it now: overwriting any previously parked notification is latest-wins by
         // design. Otherwise arm the gate (DECODE_DELIVERED) before decoding, so any later
         // notification for this slot parks instead of decoding concurrently with this un-acked
         // delivery. Arming gates on ack_enabled() alone, matching drain_events() and
@@ -966,7 +966,7 @@ void ArtworkRole::Impl::drain_thread_func(ArtworkRole::Impl* self) {
         // Replay any parked notification whose slot's gate has reopened (ack_state back to
         // IDLE via frame_done() or an epoch-mismatch release in drain_events()).
         // process_notification() revalidates the notification itself, so a since-stale
-        // generation/epoch is simply skipped -- correct, since a fresher notification is either
+        // generation/epoch is simply skipped: correct, since a fresher notification is either
         // already queued or has itself been freshly parked. Loop until no parked slot is ready
         // so one wakeup can drain several slots without waiting on separate receive timeouts.
         while (true) {

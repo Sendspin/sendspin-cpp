@@ -498,7 +498,7 @@ void PlayerRole::Impl::drain_events() {
     // --- Process awaiting sync idle events ---
     // Stream lifecycle arrivals (STREAM_START/STREAM_END) are appended directly to
     // awaiting_sync_idle_events by on_stream_ring_event(), called from the ring drain in
-    // SendspinClient::loop() before role drain_events() runs each tick -- so every event pushed
+    // SendspinClient::loop() before role drain_events() runs each tick, so every event pushed
     // this tick is already in the vector below in FIFO arrival order.
     if (!this->awaiting_sync_idle_events.empty()) {
         bool sync_idle = !this->sync_task->is_running();
@@ -593,8 +593,8 @@ void PlayerRole::Impl::drain_events() {
 
 void PlayerRole::Impl::cleanup() {
     // Flag the teardown before anything else: it tells a drain_events() frame that may be on the
-    // call stack right now (a listener callback re-entering teardown) that the stream is gone --
-    // see the STREAM_START branch there -- and it stamps every event queued from here on, so the
+    // call stack right now (a listener callback re-entering teardown) that the stream is gone
+    // (see the STREAM_START branch there), and it stamps every event queued from here on, so the
     // STREAM_END below is delivered while the START of a stream this teardown just ended is
     // discarded at the drain (see event_is_current()).
     this->cleanup_generation.fetch_add(1, std::memory_order_acq_rel);

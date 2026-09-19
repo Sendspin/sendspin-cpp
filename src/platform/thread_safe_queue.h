@@ -150,7 +150,7 @@ public:
     ///
     /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
     /// collapse into one, and a wake that races an arriving item may be absorbed by that
-    /// item's delivery -- so callers must re-check their stop/command state after every
+    /// item's delivery, so callers must re-check their stop/command state after every
     /// receive() return, not only after false returns. Safe to call from any thread.
     void wake_receiver() {
         xSemaphoreGive(this->items_or_wake_sem_);
@@ -313,7 +313,7 @@ public:
     ///
     /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
     /// collapse into one, and a wake that races an arriving item may be absorbed by that
-    /// item's delivery -- so callers must re-check their stop/command state after every
+    /// item's delivery, so callers must re-check their stop/command state after every
     /// receive() return, not only after false returns. Safe to call from any thread.
     void wake_receiver() {
         {

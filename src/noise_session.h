@@ -103,7 +103,7 @@ public:
     /// @brief Bind (or rebind) the pre-shared key on this handshake state.
     ///
     /// Responder-only. Must be called before `write_msg2_and_split`, i.e. before the
-    /// "psk" token is processed -- for KKpsk2 that token is in msg2, so this may be
+    /// "psk" token is processed: for KKpsk2 that token is in msg2, so this may be
     /// called any time after construction and up through immediately before
     /// `write_msg2_and_split`, including after `read_msg1`. Calling it more than once
     /// simply replaces the previously bound key.

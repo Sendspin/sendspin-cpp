@@ -115,7 +115,7 @@ set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
 
 # test_noise_transport.cpp uses it for one read: the reassembly buffer's capacity, which is the
 # only observable of the growth policy (the message that reaches the listener is the same either
-# way) and which NoiseTransport exposes nowhere, deliberately -- its size is an allocation
+# way) and which NoiseTransport exposes nowhere, deliberately: its size is an allocation
 # decision, not protocol state.
 set_source_files_properties(test_noise_transport.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
