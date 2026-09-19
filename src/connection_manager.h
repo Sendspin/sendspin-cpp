@@ -615,8 +615,15 @@ private:
     /// are both main-loop-only and happen in the same call, so the staged slot cannot go stale.
     void flush_pending_admission();
 
-    /// @brief Appends `item` to a pending_*_events_ queue and sets has_pending_events_ in the
-    /// same critical section, so loop()'s lock-free gate can never miss a pushed event. Every
+    /// @brief Sets has_pending_events_, the lock-free gate loop() polls before acquiring
+    /// conn_mutex_. The atomic's only writer outside swap_out_pending_events(), so a pending
+    /// event can never be queued without arming the gate. Caller must hold conn_mutex_.
+    void mark_pending() {
+        this->has_pending_events_.store(true, std::memory_order_release);
+    }
+
+    /// @brief Appends `item` to a pending_*_events_ queue and arms the gate (mark_pending()) in
+    /// the same critical section, so loop() can never miss a pushed event. Every
     /// pending_*_events_ push in this class goes through this one template instead of a per-queue
     /// single-use method. Caller must hold conn_mutex_.
     /// @tparam Container Type of a pending_*_events_ member (deduced).
@@ -626,7 +633,7 @@ private:
     template <typename Container, typename T>
     void queue_pending(Container& container, T&& item) {
         container.push_back(std::forward<T>(item));
-        this->has_pending_events_.store(true, std::memory_order_release);
+        this->mark_pending();
     }
 
     /// @brief Releases a nursery entry: erases it, prunes its hello retry, and queues the
@@ -1054,9 +1061,8 @@ private:
     // mutex-protected containers/pointer above; see the "Tick cost" note on loop())
 
     /// True while any pending_*_events_ queue holds an unswapped entry or a pairing-window
-    /// gesture flag is set. Set under conn_mutex_ by every queue_pending() push and by the
-    /// pairing-window gesture schedulers; cleared under conn_mutex_ once
-    /// swap_out_pending_events() has swapped every queue and flag out. Lets loop() skip the
+    /// gesture flag is set. Set under conn_mutex_ by mark_pending(); cleared under conn_mutex_
+    /// once swap_out_pending_events() has swapped every queue and flag out. Lets loop() skip the
     /// conn_mutex_ acquisition entirely when nothing is pending.
     std::atomic<bool> has_pending_events_{false};
 

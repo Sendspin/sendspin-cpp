@@ -80,6 +80,8 @@ public:
     /// @brief Sends a text message to the server
     /// @param message The message string to send.
     /// @param cb Callback invoked after send completes.
+    /// @param allow_before_hello Ignored: this transport sends synchronously, so the
+    ///        pre-hello gate does not apply.
     /// @return SsErr::OK if queued successfully, error code otherwise.
     SsErr send_text_message(const std::string& message, SendCompleteCallback cb,
                             bool allow_before_hello) override;
@@ -92,6 +94,8 @@ public:
     /// @param data   Pointer to the binary payload bytes.
     /// @param len    Number of bytes to send.
     /// @param cb     Optional completion callback.
+    /// @param allow_before_hello Ignored: this transport sends synchronously, so the
+    ///        pre-hello gate does not apply.
     /// @return SsErr::OK if sent successfully, error code otherwise.
     SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
                               bool allow_before_hello) override;

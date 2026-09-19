@@ -119,8 +119,8 @@ struct TuiState {
     std::vector<ArtworkChannelStatus> artwork_channels;
 
     // Colors derived from the current audio, as [R, G, B]. Spelled out rather than using
-    // sendspin::RgbColor so this state compiles with SENDSPIN_ENABLE_COLOR=OFF, where the color
-    // role's public header is not part of the build.
+    // sendspin::RgbColor so this state depends on no role type and needs no
+    // SENDSPIN_ENABLE_COLOR guard.
     bool color_received{false};
     std::optional<std::array<uint8_t, 3>> color_primary;
     std::optional<std::array<uint8_t, 3>> color_accent;

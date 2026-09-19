@@ -190,7 +190,6 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
         NOISE_USE_CUSTOM_RAND=0
     )
 
-    # noise-c is a C library; don't apply sendspin's -Werror or pedantic flags.
     set_target_properties(noise_c PROPERTIES C_STANDARD 99)
 
     target_link_libraries(${TARGET_LIB} PUBLIC noise_c)

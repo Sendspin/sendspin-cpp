@@ -1375,14 +1375,14 @@ void ConnectionManager::schedule_pairing_window_confirm() {
     // (typically the application's UI thread relaying an operator gesture).
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->pending_pairing_window_confirm_ = true;
-    this->has_pending_events_.store(true, std::memory_order_release);
+    this->mark_pending();
 }
 
 void ConnectionManager::schedule_pairing_window_cancel() {
     // Called from SendspinClient::cancel_pairing_window(); same threading as the confirm above.
     std::lock_guard<std::mutex> lock(this->conn_mutex_);
     this->pending_pairing_window_cancel_ = true;
-    this->has_pending_events_.store(true, std::memory_order_release);
+    this->mark_pending();
 }
 
 // ============================================================================
