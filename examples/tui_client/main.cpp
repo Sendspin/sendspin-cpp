@@ -1017,6 +1017,9 @@ int main(int argc, char* argv[]) {
         int tick = 0;
         int vis_refresh_counter = 0;
         while (running.load()) {
+            // The key handler runs on the FTXUI thread and cannot call the main-loop-only
+            // PlayerRole setters itself, so it queues them here instead.
+            apply_pending_player_commands(state, client);
             client.loop();
 
             bool vis_showing;

@@ -934,27 +934,23 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
 #endif
 
 #ifdef SENDSPIN_ENABLE_PLAYER
-    // Player volume up
+    // Player volume up. The setter is main loop only, so the new value is queued for the client
+    // thread; the base is the last queued value so held keys accumulate rather than collapsing
+    // onto a value the client thread has not applied yet.
     if (event == Event::ArrowUp) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            set_highlight(state, "Up/Dn");
-        }
-        uint8_t vol = client.player()->get_volume();
-        uint8_t new_vol = static_cast<uint8_t>(std::min(100, vol + 5));
-        client.player()->update_volume(new_vol);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        set_highlight(state, "Up/Dn");
+        int vol = state.pending_player.volume.value_or(client.player()->get_volume());
+        state.pending_player.volume = static_cast<uint8_t>(std::min(100, vol + 5));
         return true;
     }
 
     // Player volume down
     if (event == Event::ArrowDown) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            set_highlight(state, "Up/Dn");
-        }
-        uint8_t vol = client.player()->get_volume();
-        uint8_t new_vol = static_cast<uint8_t>(std::max(0, vol - 5));
-        client.player()->update_volume(new_vol);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        set_highlight(state, "Up/Dn");
+        int vol = state.pending_player.volume.value_or(client.player()->get_volume());
+        state.pending_player.volume = static_cast<uint8_t>(std::max(0, vol - 5));
         return true;
     }
 #endif
@@ -990,11 +986,10 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
 #ifdef SENDSPIN_ENABLE_PLAYER
     // Player mute toggle
     if (event == Event::Character('m')) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            set_highlight(state, "m");
-        }
-        client.player()->update_muted(!client.player()->get_muted());
+        std::lock_guard<std::mutex> lock(state.mutex);
+        set_highlight(state, "m");
+        state.pending_player.muted =
+            !state.pending_player.muted.value_or(client.player()->get_muted());
         return true;
     }
 #endif
@@ -1065,23 +1060,21 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
 #ifdef SENDSPIN_ENABLE_PLAYER
     // Output delay increase
     if (event == Event::Character('.')) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            set_highlight(state, ", / .");
-        }
-        uint16_t delay = client.player()->get_output_delay_ms();
-        client.player()->update_output_delay(delay + 10);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        set_highlight(state, ", / .");
+        uint16_t delay =
+            state.pending_player.output_delay_ms.value_or(client.player()->get_output_delay_ms());
+        state.pending_player.output_delay_ms = static_cast<uint16_t>(delay + 10);
         return true;
     }
 
     // Output delay decrease
     if (event == Event::Character(',')) {
-        {
-            std::lock_guard<std::mutex> lock(state.mutex);
-            set_highlight(state, ", / .");
-        }
-        uint16_t delay = client.player()->get_output_delay_ms();
-        client.player()->update_output_delay(delay >= 10 ? delay - 10 : 0);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        set_highlight(state, ", / .");
+        uint16_t delay =
+            state.pending_player.output_delay_ms.value_or(client.player()->get_output_delay_ms());
+        state.pending_player.output_delay_ms = static_cast<uint16_t>(delay >= 10 ? delay - 10 : 0);
         return true;
     }
 #endif
@@ -1131,6 +1124,32 @@ void update_polled_state(TuiState& state, SendspinClient& client) {
         state.repeat_mode = cs.repeat;
         state.shuffle = cs.shuffle;
     }
+#endif
+}
+
+void apply_pending_player_commands(TuiState& state, SendspinClient& client) {
+#ifdef SENDSPIN_ENABLE_PLAYER
+    PendingPlayerCommands pending;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        pending = state.pending_player;
+        state.pending_player = PendingPlayerCommands{};
+    }
+    if (client.player() == nullptr) {
+        return;
+    }
+    if (pending.volume.has_value()) {
+        client.player()->update_volume(pending.volume.value());
+    }
+    if (pending.muted.has_value()) {
+        client.player()->update_muted(pending.muted.value());
+    }
+    if (pending.output_delay_ms.has_value()) {
+        client.player()->update_output_delay(pending.output_delay_ms.value());
+    }
+#else
+    (void)state;
+    (void)client;
 #endif
 }
 

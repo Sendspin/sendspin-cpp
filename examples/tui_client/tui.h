@@ -41,6 +41,17 @@ struct DiscoveredServer {
     std::string path;  ///< WebSocket path from TXT record (e.g., "/sendspin")
 };
 
+/// @brief PlayerRole setter calls the key handler hands to the client thread.
+///
+/// PlayerRole::update_volume(), update_muted() and update_output_delay() are main-loop only, and
+/// the key handler runs on the FTXUI thread. Each field is the value the client thread applies on
+/// its next iteration; latest keypress wins.
+struct PendingPlayerCommands {
+    std::optional<uint8_t> volume;
+    std::optional<bool> muted;
+    std::optional<uint16_t> output_delay_ms;
+};
+
 /// @brief Shared state between SendspinClient callbacks and the TUI render thread.
 /// All fields are protected by the mutex.
 struct TuiState {
@@ -128,6 +139,9 @@ struct TuiState {
 
     // Tab state
     bool show_visualizer{false};
+
+    // Player setters the key handler defers to the client thread
+    PendingPlayerCommands pending_player;
 };
 
 /// @brief Creates the FTXUI component tree with rendering and key handling.
@@ -141,5 +155,11 @@ ftxui::Component create_tui_component(SendspinClient& client, TuiState& state,
 /// @brief Polls client state that doesn't have callbacks (progress, controller state, etc.).
 /// Called periodically from the background thread.
 void update_polled_state(TuiState& state, SendspinClient& client);
+
+/// @brief Applies the PlayerRole setters the key handler deferred. Client thread only, before
+/// SendspinClient::loop().
+/// @param state Shared TUI state holding the pending values.
+/// @param client The SendspinClient owning the player role.
+void apply_pending_player_commands(TuiState& state, SendspinClient& client);
 
 }  // namespace sendspin
