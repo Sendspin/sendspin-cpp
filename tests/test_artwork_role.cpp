@@ -412,7 +412,8 @@ TEST(ArtworkTransfer, AnnounceThenPartsCompletesOneImage) {
     EXPECT_EQ(listener.decodes[0].payload, image);
     // One image is one delivery, however many messages carried it.
     EXPECT_TRUE(
-        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "another image was decoded; decodes: " << listener.decode_count();
     poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
     EXPECT_EQ(listener.clear_count(), 0U);
 }
@@ -427,7 +428,8 @@ TEST(ArtworkTransfer, TransferDeliversNothingUntilItCompletes) {
     const std::vector<uint8_t> image = make_image('A', 100);
     ASSERT_TRUE(feed(*impl, 0, announce_body(1, 100)));
     ASSERT_TRUE(feed(*impl, 0, part_body({image.begin(), image.begin() + 60})));
-    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW))
+        << "an image was decoded; decodes: " << listener.decode_count();
 
     // Control: the part that takes the accumulated data to total_size completes the transfer.
     ASSERT_TRUE(feed(*impl, 0, part_body({image.begin() + 60, image.end()})));
@@ -469,7 +471,8 @@ TEST(ArtworkTransfer, CancelAbandonsTheTransferInFlight) {
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
     EXPECT_EQ(listener.decode_marker_at(0), 'B');
     EXPECT_TRUE(
-        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "another image was decoded; decodes: " << listener.decode_count();
 }
 
 TEST(ArtworkTransfer, CancelDiscardsThePendingImage) {
@@ -485,7 +488,8 @@ TEST(ArtworkTransfer, CancelDiscardsThePendingImage) {
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
     ASSERT_TRUE(feed(*impl, 0, {FLAG_CANCEL}));
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW))
+        << "an image was displayed; displays: " << listener.display_count();
     // "the current image is unaffected": a cancel is not itself a delivery, so it clears nothing.
     EXPECT_EQ(listener.clear_count(), 0U);
 
@@ -515,7 +519,8 @@ TEST(ArtworkTransfer, AnnounceDiscardsThePendingImage) {
     // One display, B's: A's was discarded before it could fire.
     poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.display_count() >= 2; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 2; }, NEGATIVE_WINDOW))
+        << "another image was displayed; displays: " << listener.display_count();
 }
 
 TEST(ArtworkTransfer, AnnounceTimestampAndSizeAreReadFromTheAnnounce) {
@@ -632,7 +637,8 @@ TEST(ArtworkMalformedSequence, SequenceRulesOnlyApplyWithinAnActiveStream) {
     EXPECT_TRUE(feed(*impl, 0, part_body(make_image('A', 20))));
     EXPECT_TRUE(feed(*impl, 0, {FLAG_CANCEL}));
     EXPECT_TRUE(
-        listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW))
+        << "an image was decoded; decodes: " << listener.decode_count();
 }
 
 // ============================================================================
@@ -778,7 +784,8 @@ TEST(ArtworkImageCap, ImageOverTheCapIsDiscardedAndItsSequenceTracked) {
     // part's data bytes toward total_size": the transfer runs to its end holding nothing, so the
     // announce that follows it is legal rather than a second announce in flight.
     ASSERT_TRUE(send_image(*impl, 0, make_image('A', SMALL_IMAGE_CAP + 1), /*parts=*/3));
-    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW))
+        << "an image was decoded; decodes: " << listener.decode_count();
 
     // Control: an image of exactly the cap on the same channel is delivered.
     EXPECT_TRUE(send_image(*impl, 0, make_image('B', SMALL_IMAGE_CAP), /*parts=*/3));
@@ -819,7 +826,8 @@ TEST(ArtworkImageCap, ChannelTheRoleDidNotConfigureHoldsNothing) {
     // Channel 2 was never declared in client/state, so the role holds no image for it and does
     // not close on its arrival either.
     EXPECT_TRUE(send_image(*impl, 2, make_image('A', 20)));
-    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW))
+        << "an image was decoded; decodes: " << listener.decode_count();
 
     // Control: the same image on a declared channel decodes.
     EXPECT_TRUE(send_image(*impl, 1, make_image('B', 20)));
@@ -892,7 +900,8 @@ TEST(ArtworkStreamStart, ChangedChannelDropsItsPendingImage) {
     impl->handle_stream_start(two_channel_stream(100, 200), live_generation(*impl));
 
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW))
+        << "an image was displayed; displays: " << listener.display_count();
 }
 
 TEST(ArtworkStreamStart, EveryChannelDropsItsPendingImageWhenAllChange) {
@@ -908,7 +917,8 @@ TEST(ArtworkStreamStart, EveryChannelDropsItsPendingImageWhenAllChange) {
     impl->handle_stream_start(two_channel_stream(200, 200), live_generation(*impl));
 
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW))
+        << "an image was displayed; displays: " << listener.display_count();
 }
 
 TEST(ArtworkStreamStart, ChannelTheNewArrayDropsCountsAsChanged) {
@@ -927,7 +937,8 @@ TEST(ArtworkStreamStart, ChannelTheNewArrayDropsCountsAsChanged) {
     impl->handle_stream_start(truncated, live_generation(*impl));
 
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW))
+        << "an image was displayed; displays: " << listener.display_count();
 }
 
 TEST(ArtworkStreamStart, StreamWithNoChannelArrayDropsEveryPendingImage) {
@@ -944,7 +955,8 @@ TEST(ArtworkStreamStart, StreamWithNoChannelArrayDropsEveryPendingImage) {
     impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
 
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW))
+        << "an image was displayed; displays: " << listener.display_count();
 }
 
 // ============================================================================
@@ -973,7 +985,8 @@ void expect_transfer_dropped_by(const std::function<void(ArtworkRole::Impl&)>& e
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
     EXPECT_EQ(listener.decode_marker_at(0), 'B');
     EXPECT_TRUE(
-        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "another image was decoded; decodes: " << listener.decode_count();
 }
 
 }  // namespace
@@ -1034,7 +1047,8 @@ TEST(ArtworkFrameDoneGate, GateHoldsSecondFrame) {
 
     send_frame(*impl, 0, 'B');
     EXPECT_TRUE(
-        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "another image was decoded; decodes: " << listener.decode_count();
 
     impl->frame_done(0);
     listener.wait_until([&] { return listener.decodes.size() >= 2; });
@@ -1056,7 +1070,8 @@ TEST(ArtworkFrameDoneGate, GateHoldsThroughDisplay) {
     // The gate must still be held after the display fires: only frame_done() releases it.
     send_frame(*impl, 0, 'B');
     EXPECT_TRUE(
-        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "another image was decoded; decodes: " << listener.decode_count();
 
     impl->frame_done(0);
     listener.wait_until([&] { return listener.decodes.size() >= 2; });
@@ -1086,7 +1101,8 @@ TEST(ArtworkFrameDoneGate, SupersedeKeepsNewestParked) {
 
     // Only one more decode fires, and it is the newest (C); B was superseded while parked.
     EXPECT_TRUE(
-        listener.never_within([&] { return listener.decodes.size() >= 3; }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return listener.decodes.size() >= 3; }, NEGATIVE_WINDOW))
+        << "another image was decoded; decodes: " << listener.decode_count();
     EXPECT_EQ(listener.decode_marker_at(1), 'C');
     EXPECT_FALSE(listener.has_decoded_marker(0, 'B'));
 }
@@ -1120,7 +1136,8 @@ TEST(ArtworkFrameDoneGate, ClearIsADeliveryAndDropsParked) {
     // The clear itself owes an ack; acking it must NOT resurrect the dropped, parked B.
     impl->frame_done(0);
     EXPECT_TRUE(
-        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "another image was decoded; decodes: " << listener.decode_count();
 
     // A fresh stream's frame decodes normally: the gate is IDLE again.
     impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
@@ -1147,7 +1164,8 @@ TEST(ArtworkFrameDoneGate, ClearGateHoldsNextStreamFirstFrame) {
     impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
     send_frame(*impl, 0, 'B');
     EXPECT_TRUE(
-        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "another image was decoded; decodes: " << listener.decode_count();
 
     impl->frame_done(0);
     listener.wait_until([&] { return listener.decodes.size() >= 2; });
@@ -1171,7 +1189,8 @@ TEST(ArtworkChannelClear, EmptyPayloadFiresClearWithoutDecoding) {
     poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
     EXPECT_EQ(listener.clear_at(0), 0);
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW))
+        << "another clear was delivered; clears: " << listener.clear_count();
     // There are no image bytes, so nothing may reach the decode callback, and nothing may be
     // presented as a frame either.
     EXPECT_EQ(listener.decode_count(), 0U);
@@ -1196,7 +1215,8 @@ TEST(ArtworkChannelClear, ClearAfterDisplayedFrameFiresAgain) {
     send_clear(*impl, 0);
     poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW))
+        << "another clear was delivered; clears: " << listener.clear_count();
     EXPECT_EQ(listener.display_count(), 1U);
     EXPECT_EQ(listener.decode_count(), 1U);
 }
@@ -1214,7 +1234,8 @@ TEST(ArtworkChannelClear, ClearOnlyAffectsItsOwnSlot) {
     poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
     EXPECT_EQ(listener.clear_at(0), 1);
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW))
+        << "another clear was delivered; clears: " << listener.clear_count();
 
     // Slot 0's gate was never armed by slot 1's clear, so its frame decodes without any ack.
     send_frame(*impl, 0, 'A');
@@ -1241,14 +1262,16 @@ TEST(ArtworkChannelClear, GatedClearParksBehindUnackedFrame) {
     wait_slot_state(
         *impl, [&] { return impl->drain_task->slot_buffers[0].has_parked; });
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW))
+        << "a clear was delivered; clears: " << listener.clear_count();
 
     // Only acking A releases the parked clear.
     impl->frame_done(0);
     poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
     EXPECT_EQ(listener.clear_at(0), 0);
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW))
+        << "another clear was delivered; clears: " << listener.clear_count();
 }
 
 TEST(ArtworkChannelClear, GatedClearOwesExactlyOneAck) {
@@ -1261,12 +1284,14 @@ TEST(ArtworkChannelClear, GatedClearOwesExactlyOneAck) {
     send_clear(*impl, 0);
     poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW))
+        << "another clear was delivered; clears: " << listener.clear_count();
 
     // The clear is a delivery like any frame, so it holds the gate until it is acked.
     send_frame(*impl, 0, 'A');
     EXPECT_TRUE(
-        listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW))
+        << "an image was decoded; decodes: " << listener.decode_count();
 
     impl->frame_done(0);
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
@@ -1300,7 +1325,8 @@ TEST(ArtworkChannelClear, GatedClearSupersedesParkedClear) {
     impl->frame_done(0);
     poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW))
+        << "another clear was delivered; clears: " << listener.clear_count();
 }
 
 TEST(ArtworkChannelClear, StreamEndOnTopOfUnackedChannelClearFiresAgain) {
@@ -1324,7 +1350,8 @@ TEST(ArtworkChannelClear, StreamEndOnTopOfUnackedChannelClearFiresAgain) {
     // releases the gate for the next stream's first frame.
     impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
     send_frame(*impl, 0, 'A');
-    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW));
+    EXPECT_TRUE(listener.never_within([&] { return !listener.decodes.empty(); }, NEGATIVE_WINDOW))
+        << "an image was decoded; decodes: " << listener.decode_count();
 
     impl->frame_done(0);
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
@@ -1343,7 +1370,8 @@ TEST(ArtworkChannelClear, ClearIgnoredWithoutActiveStream) {
     // guard rather than short-circuiting ahead of it.
     send_clear(*impl, 0);
     EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW));
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW))
+        << "a clear was delivered; clears: " << listener.clear_count();
     EXPECT_EQ(listener.clear_count(), 0U);
 }
 
@@ -1412,7 +1440,8 @@ TEST(ArtworkFrameDoneGate, RestartKeepsPresentedGate) {
 
     send_frame(*impl, 0, 'B');
     EXPECT_TRUE(
-        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "another image was decoded; decodes: " << listener.decode_count();
 
     impl->frame_done(0);
     listener.wait_until([&] { return listener.decodes.size() >= 2; });
@@ -1476,7 +1505,9 @@ TEST(ArtworkRestart, StopDiscardsQueuedFramesAndStartDecodesNewOnes) {
 
     ASSERT_TRUE(impl->start());
     // B was discarded with the old session, not replayed by the new thread.
-    EXPECT_TRUE(listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW));
+    EXPECT_TRUE(
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "another image was decoded; decodes: " << listener.decode_count();
 
     // The new thread decodes: the stop command did not survive the restart.
     send_frame(*impl, 1, 'C');
@@ -1857,7 +1888,8 @@ TEST(ArtworkChannelMismatch, HeightMismatchNamesServedAndRequested) {
 // the array, not per channel: the channels the two do share still compare field by field.
 TEST(ArtworkChannelMismatch, ChannelCountMismatchIsReported) {
     const std::string log = channel_stream_start_log({requested_channel(), requested_channel()});
-    EXPECT_NE(log.find("channel count mismatch: server sent 2, expected 1"), std::string::npos) << log;
+    EXPECT_NE(log.find("channel count mismatch: server sent 2, expected 1"), std::string::npos)
+        << log;
 }
 
 // Control: a channel array that matches what the role asked for reports nothing, so the cases
