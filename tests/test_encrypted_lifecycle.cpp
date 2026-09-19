@@ -2639,6 +2639,52 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
     pump_for(client, 100);
 }
 
+// The revocation itself is not deferred, only its blob write. handle_server_unpair() erases the
+// record under conn_ptr_mutex_, so a Noise re-handshake on the revoked psk_id, which resolves
+// against the store on the network thread, misses it from that instant rather than for as long as
+// the writes staged ahead of it take to commit (an NVS commit each, tens of milliseconds, on ESP).
+//
+// Driving the handler directly is what pins that: the resolve below sits between the locked
+// section and flush_pending_record_ops(), which is exactly the window a staged erase would still
+// be resolvable in.
+TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
+    HoldTestClient bundle("Unpair Revocation Window Test Client");
+    SendspinClient& client = bundle.client_ref();
+    ConnectionManager& manager = *client.connection_manager_;
+
+    SendspinPairingRecord record;
+    record.psk_id = "unpair-window-psk-id";
+    record.psk.fill(0x3C);
+    record.server_id = "unpair-window-server";
+    ASSERT_TRUE(client.record_store_->store_record_superseding(record, {}));
+
+    HoldTestConnection conn;
+    ServerUnpairEvent event;
+    event.matched_psk_id = record.psk_id;
+    event.psk_category = PskCategory::LONG_TERM;
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.handle_server_unpair(&conn, event);
+    }
+
+    // The handshake thread's lookup, with nothing flushed yet.
+    std::optional<ResolvedPsk> resolved;
+    std::thread network([&] {
+        resolved = client.record_store_->resolve_by_psk_id(record.psk_id, PskCategory::LONG_TERM);
+    });
+    network.join();
+    EXPECT_FALSE(resolved.has_value())
+        << "the revoked record still resolved a handshake before the flush ran";
+
+    // Control: only the RAM half ran under the lock. The durable half is still owed, so this is
+    // a split rather than a provider write smuggled into the locked section.
+    EXPECT_EQ(manager.pending_record_ops_.size(), 1u)
+        << "the records-blob write must still be staged at this point";
+
+    manager.flush_pending_record_ops();
+    manager.flush_deferred_releases();
+}
+
 // An unpaired session has no record to revoke, so server/unpair on one is ignored outright: it
 // must not drop the session and must not touch stored records (messaging.md "server/unpair": if the
 // session is unpaired, ignore the message).

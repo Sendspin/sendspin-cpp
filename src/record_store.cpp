@@ -413,27 +413,35 @@ bool RecordStore::persist_records() {
     if (this->save_encoded_records(encoded)) {
         return true;
     }
-    // One warning covers both halves of a deferred supersede: the freshly paired record is
-    // RAM-only (the pairing dies at the next reboot), and any record it retired is only gone
-    // from RAM (the store still holds the old array, so the retired PSK is valid again after a
-    // reboot). Nothing is retried: a provider that cannot write will not start writing because
-    // it is asked again, and the RAM state stays authoritative for this boot either way.
+    // One warning covers every RAM-only change the rejected blob leaves behind: a freshly paired
+    // record dies at the next reboot, and a record this write would have dropped (retired by a
+    // supersede, revoked by note_record_removed()) is valid again after one. Nothing is retried:
+    // a provider that cannot write will not start writing because it is asked again, and the RAM
+    // state stays authoritative for this boot either way.
     SS_LOGW(TAG,
             "Provider rejected the pairing-record write; the store's contents are RAM-only for "
-            "this boot: a just-paired record will not survive a reboot, and any record it "
-            "superseded will be valid again after a reboot");
+            "this boot: a just-paired record will not survive a reboot, and a record this write "
+            "would have dropped will be valid again after a reboot");
     return false;
 }
 
+bool RecordStore::note_record_removed(const std::string& psk_id) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    const size_t idx = this->find_index(psk_id);
+    if (idx == NPOS) {
+        return false;
+    }
+    this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(idx));
+    return true;
+}
+
 void RecordStore::remove_record(const std::string& psk_id) {
+    if (!this->note_record_removed(psk_id)) {
+        return;
+    }
     std::string encoded;
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
-        size_t idx = this->find_index(psk_id);
-        if (idx == NPOS) {
-            return;
-        }
-        this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(idx));
         encoded = this->encode_records_locked();
     }
     // Erased from RAM regardless of the store's answer: the operator (or the pairing exchange)

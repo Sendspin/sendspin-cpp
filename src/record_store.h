@@ -201,12 +201,23 @@ public:
                                   const std::vector<std::string>& psk_ids_in_use = {});
 
     /// @brief Encode records_ and save it under persistence_keys::RECORDS. MAIN LOOP ONLY
-    /// (calls the provider). The deferred flush half of store_record_superseding(); logs the
-    /// durability warning itself on a rejected write, so callers may ignore the return value.
+    /// (calls the provider). The deferred flush half of store_record_superseding() and
+    /// note_record_removed(); logs the durability warning itself on a rejected write, so callers
+    /// may ignore the return value.
     /// @return true on success (or when there is no provider); false on a rejected write.
     bool persist_records();
 
-    /// @brief Remove the long-term record identified by psk_id.
+    /// @brief Erase the long-term record identified by psk_id from RAM, leaving the durable half
+    /// to a later persist_records(). No-op if absent.
+    ///
+    /// For a revocation that must take effect before the caller's own lock is dropped: this takes
+    /// only mutex_, the innermost lock, so a network-thread resolve_by_psk_id() misses the record
+    /// from here on even though the blob is written later.
+    /// @param psk_id The record to erase.
+    /// @return true when a record was erased, and the array therefore needs persisting.
+    [[nodiscard]] bool note_record_removed(const std::string& psk_id);
+
+    /// @brief Remove the long-term record identified by psk_id and persist the array.
     /// No-op if absent.
     void remove_record(const std::string& psk_id);
 

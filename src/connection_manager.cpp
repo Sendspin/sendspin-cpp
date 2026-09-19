@@ -1252,8 +1252,8 @@ void ConnectionManager::loop() {
 
         // Perform the provider writes those handlers decided on, outside the lock: an NVS commit
         // under it would stall the sync task, which takes it per audio chunk through
-        // current_shared(). Ahead of the two flushes below so a revoked record is gone before
-        // its session is told to leave, and so the store is settled before an admission replays.
+        // current_shared(). Ahead of the two flushes below so the blob is settled on flash before
+        // a session is told to leave or an admission replays.
         this->flush_pending_record_ops();
     }
 
@@ -1671,8 +1671,8 @@ void ConnectionManager::flush_pending_record_ops() {
             case PendingRecordOp::Kind::MARK_USED:
                 this->client_->record_store_->mark_record_used(op.value);
                 break;
-            case PendingRecordOp::Kind::REMOVE:
-                this->client_->record_store_->remove_record(op.value);
+            case PendingRecordOp::Kind::PERSIST_RECORDS:
+                this->client_->record_store_->persist_records();
                 break;
             case PendingRecordOp::Kind::LAST_PLAYED:
                 this->client_->write_last_played_server(op.value);
@@ -2774,10 +2774,15 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
     SS_LOGI(TAG, "server/unpair: dropping record and disconnecting (server_id=%s, psk_id=%s)",
             conn->get_server_id().c_str(), event.matched_psk_id.c_str());
 
-    // Drop the matched pairing record (messaging.md "server/unpair"). Staged: the removal ends
-    // in a provider write (see PendingRecordOp), and the flush runs before the goodbyes below
-    // are sent, so the credential is gone by the time the peer learns the session ended.
-    this->stage_record_op(PendingRecordOp::Kind::REMOVE, event.matched_psk_id);
+    // Drop the matched pairing record (messaging.md "server/unpair"). The RAM erase runs here,
+    // under this lock, because a re-handshake on the revoked psk_id resolves against the store on
+    // the network thread and must miss it from this instant: deferring it would leave the
+    // credential usable for the length of the writes staged ahead of it. RecordStore::mutex_ is
+    // the innermost lock (docs/conventions.md, "Threading and cross-thread state"), so taking it
+    // here is in order. Only the blob write is staged (see PendingRecordOp).
+    if (this->client_->record_store_->note_record_removed(event.matched_psk_id)) {
+        this->stage_record_op(PendingRecordOp::Kind::PERSIST_RECORDS, {});
+    }
 
     // Any OTHER session running on the same record is no longer trusted either; see
     // drop_connections_using_psk_id(). `conn` itself is excluded and dropped below with the

@@ -171,13 +171,14 @@ struct DeferredRelease {
 /// covers; flush_pending_record_ops() performs it, in staging order, with no lock held.
 struct PendingRecordOp {
     enum class Kind : uint8_t {
-        MARK_USED,    ///< RecordStore::mark_record_used(psk_id)
-        REMOVE,       ///< RecordStore::remove_record(psk_id)
-        LAST_PLAYED,  ///< SendspinClient::write_last_played_server(server_id); the RAM half ran
-                      ///< under the lock (see note_playback_activity())
+        MARK_USED,        ///< RecordStore::mark_record_used(psk_id)
+        PERSIST_RECORDS,  ///< RecordStore::persist_records(); the RAM half ran under the lock
+                          ///< (see handle_server_unpair())
+        LAST_PLAYED,      ///< SendspinClient::write_last_played_server(server_id); the RAM half
+                          ///< ran under the lock (see note_playback_activity())
     };
     Kind kind{Kind::MARK_USED};
-    std::string value;  ///< psk_id for MARK_USED/REMOVE, server_id for LAST_PLAYED
+    std::string value;  ///< psk_id for MARK_USED, server_id for LAST_PLAYED, unused otherwise
 };
 
 /// @brief Disposition for the connection once abort_pairing_attempt() ends a pairing attempt.
