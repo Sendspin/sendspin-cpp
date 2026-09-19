@@ -336,31 +336,23 @@ TEST(VisualizerHandleBinary, HandlersRefuseAGenerationATeardownOvertook) {
     EXPECT_EQ(entry[0], SENDSPIN_BINARY_VISUALIZER_BEAT);
 }
 
-// roles/visualizer/v1.md "Server -> Client: stream/start": the served spectrum object, not the
-// requested one, governs how many bins each frame carries, and a stream that names the spectrum
-// type without a spectrum object delivers no spectrum at all. The count handle_stream_start
-// caches is only observable through the drain thread, which needs a live client and time sync, so
-// the rows read it back out of the Impl and run the decode the drain runs with it.
-TEST(VisualizerSpectrumWiring, StreamStartCachesTheServedBinCount) {
+// roles/visualizer/v1.md "Server -> Client: stream/start": a stream that names the spectrum type
+// without a spectrum object has no bin count, so its frames are not deliverable. No wire input
+// reaches this: parse_server_message() drops a visualizer object that advertises spectrum with no
+// valid spectrum config, so the cached count is read out of the Impl and run through the decode
+// the drain thread runs. That the served object governs the count is asserted where a consumer
+// sees it, in ClientLifecycle.TheServedSpectrumBinCountGovernsTheDeliveredFrame.
+TEST(VisualizerSpectrumWiring, TheSpectrumTypeWithNoSpectrumObjectDeliversNothing) {
     struct Row {
         const char* name;
-        std::optional<uint8_t> served_bins;  // nullopt: types names spectrum with no object
+        bool has_object;
         VisualizerDelivery::Kind expected_kind;
-        std::vector<uint16_t> expected_bins;
     };
     const Row rows[] = {
-        {"Control: the served count matches the requested one",
-         4,
-         VisualizerDelivery::Kind::SPECTRUM,
-         {10, 20, 30, 40}},
-        {"a served count below the requested one still governs",
-         2,
-         VisualizerDelivery::Kind::SPECTRUM,
-         {10, 20}},
-        {"the spectrum type with no spectrum object drops every frame",
-         std::nullopt,
-         VisualizerDelivery::Kind::NONE,
-         {}},
+        {"Control: a stream carrying the spectrum object delivers its frames", true,
+         VisualizerDelivery::Kind::SPECTRUM},
+        {"the spectrum type with no spectrum object drops every frame", false,
+         VisualizerDelivery::Kind::NONE},
     };
 
     // Four bins on the wire, the requested count.
@@ -374,11 +366,8 @@ TEST(VisualizerSpectrumWiring, StreamStartCachesTheServedBinCount) {
 
         ServerVisualizerStreamObject stream;
         stream.types = {VisualizerDataType::SPECTRUM};
-        if (row.served_bins.has_value()) {
-            stream.spectrum = VisualizerSpectrumConfig{.n_disp_bins = row.served_bins.value(),
-                                                       .scale = VisualizerSpectrumScale::MEL,
-                                                       .f_min = 40,
-                                                       .f_max = 16000};
+        if (row.has_object) {
+            stream.spectrum = impl->config.stream.spectrum;
         }
         impl->handle_stream_start(stream, live_generation(*impl));
 
@@ -387,9 +376,6 @@ TEST(VisualizerSpectrumWiring, StreamStartCachesTheServedBinCount) {
                                              payload.size(), impl->spectrum_bin_count,
                                              impl->tracks_downbeats, bins);
         EXPECT_EQ(out.kind, row.expected_kind);
-        if (out.kind == VisualizerDelivery::Kind::SPECTRUM) {
-            EXPECT_EQ(bins, row.expected_bins);
-        }
     }
 }
 

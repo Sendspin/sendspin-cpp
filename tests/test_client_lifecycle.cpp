@@ -80,6 +80,7 @@ constexpr uint16_t SYNC_PIN_RELEASE_TEST_PORT = 19073;
 constexpr uint16_t SYNC_PIN_STOP_TEST_PORT = 19075;
 constexpr uint16_t SYNC_PIN_DROP_TEST_PORT = 19076;
 constexpr uint16_t SYNC_PIN_MIDSTREAM_TEST_PORT = 19077;
+constexpr uint16_t VISUALIZER_SPECTRUM_TEST_PORT = 19078;
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
@@ -469,6 +470,84 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     pump_until_synced(client);
     ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
     send_loudness_until(client, *server, 0, [&] { return listener.loudness.load() >= 1; });
+    client.stop();
+}
+
+/// Records the bins of the last spectrum frame the drain thread delivered.
+class RecordingSpectrumListener : public VisualizerRoleListener {
+public:
+    void on_spectrum(int64_t /*client_timestamp*/, const std::vector<uint16_t>& bins) override {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->bins_ = bins;
+        this->frames.fetch_add(1);
+    }
+
+    std::vector<uint16_t> last_bins() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->bins_;
+    }
+
+    std::atomic<size_t> frames{0};
+
+private:
+    mutable std::mutex mutex_;
+    std::vector<uint16_t> bins_;
+};
+
+/// A visualizer stream/start serving `served_bins` spectrum bins.
+std::string stream_start_spectrum_json(unsigned served_bins) {
+    return R"({"type":"stream/start","payload":{"visualizer":{"types":["spectrum"],)"
+           R"("rate_max":30,"spectrum":{"n_disp_bins":)" +
+           std::to_string(served_bins) +
+           R"(,"scale":"mel","f_min":40,"f_max":16000}}}})";
+}
+
+// Pumps until pred() holds, sending one four-bin spectrum frame per iteration stamped at the
+// current time. A frame can be lost to the ring's documented wake race right after a
+// stream/start (see send_loudness_until), so frames keep coming until one is delivered.
+void send_spectrum_until(SendspinClient& client, FakeEncryptedServer& server,
+                         const std::function<bool()>& pred) {
+    const std::string four_bins("\x00\x0A\x00\x14\x00\x1E\x00\x28", 8);
+    pump_until(client, [&] {
+        if (pred()) {
+            return true;
+        }
+        server.send_binary(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, platform_time_us(), four_bins);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return false;
+    });
+}
+
+// roles/visualizer/v1.md "Server -> Client: stream/start": the served spectrum object, not the
+// requested one, governs how many bins each frame carries. The negotiated count is what the
+// drain thread decodes with, so it is pinned where a consumer sees it: a stream that serves two
+// bins to a client that asked for four hands on_spectrum the first two of each wire frame.
+TEST(ClientLifecycle, TheServedSpectrumBinCountGovernsTheDeliveredFrame) {
+    RecordingSpectrumListener listener;
+    auto config = make_config(VISUALIZER_SPECTRUM_TEST_PORT);
+    config.time_burst_interval_ms = 100;  // Sync promptly: the drain thread needs client time
+    PairedClientBundle bundle(std::move(config));
+    SendspinClient& client = bundle.client();
+
+    VisualizerRoleConfig visualizer;
+    visualizer.stream.types = {VisualizerDataType::SPECTRUM};
+    visualizer.support.buffer_capacity = 4096;
+    visualizer.stream.rate_max = 30;
+    visualizer.stream.spectrum = VisualizerSpectrumConfig{
+        .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
+    client.add_visualizer(std::move(visualizer)).set_listener(&listener);
+
+    FakeEncryptedServerOptions options;
+    options.answer_time = true;
+
+    ASSERT_TRUE(bundle.start());
+    auto server = connect_paired_server(bundle.peer, VISUALIZER_SPECTRUM_TEST_PORT, options);
+    pump_until_synced(client);
+    ASSERT_TRUE(server->send_app_json(stream_start_spectrum_json(2)));
+
+    send_spectrum_until(client, *server, [&] { return listener.frames.load() >= 1; });
+    EXPECT_EQ(listener.last_bins(), (std::vector<uint16_t>{10, 20}));
+
     client.stop();
 }
 
