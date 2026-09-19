@@ -1328,8 +1328,11 @@ std::vector<std::string> ConnectionManager::open_connection_psk_ids() const {
 // ============================================================================
 
 void ConnectionManager::set_last_played_server_id(const std::string& server_id) {
-    this->last_played_server_id_ = server_id;
-    this->has_last_played_server_ = !server_id.empty();
+    if (server_id.empty()) {
+        this->last_played_server_id_.reset();
+    } else {
+        this->last_played_server_id_ = server_id;
+    }
 }
 
 // ============================================================================
@@ -1817,7 +1820,6 @@ bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* cu
         /*admitted_server_id=*/has_current ? current->get_server_id() : std::string{},
         /*has_admitted=*/has_current,
         /*last_playback_server_id=*/this->last_played_server_id_,
-        /*has_last_playback=*/this->has_last_played_server_,
         /*admitted_pairing_in_flight=*/pairing_in_flight);
 }
 

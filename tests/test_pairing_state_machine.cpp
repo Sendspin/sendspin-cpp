@@ -583,15 +583,14 @@ protected:
         this->client_->connection_manager_->on_connection_lost(conn);
     }
 
-    /// Seam for arbitration checks: should_switch_to_new_server() and the last-playback fields
+    /// Seam for arbitration checks: should_switch_to_new_server() and the last-playback field
     /// are private to ConnectionManager.
-    /// @param last_playback_server_id Sets last_played_server_id_; empty clears the has-value
-    ///        flag, so rule 5's tiebreak is only armed when a non-empty id is passed.
+    /// @param last_playback_server_id Sets last_played_server_id_; empty leaves it unset, so
+    ///        rule 5's tiebreak is only armed when a non-empty id is passed.
     bool would_switch_to(SendspinConnection* current, SendspinConnection* incoming,
                          const std::string& last_playback_server_id) {
         auto& mgr = *this->client_->connection_manager_;
-        mgr.last_played_server_id_ = last_playback_server_id;
-        mgr.has_last_played_server_ = !last_playback_server_id.empty();
+        mgr.set_last_played_server_id(last_playback_server_id);
         return mgr.should_switch_to_new_server(current, incoming);
     }
 

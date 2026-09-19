@@ -453,8 +453,8 @@ public:
     void set_last_played_server_id(const std::string& server_id);
 
     /// @brief Returns the current last-played server_id. Main loop only.
-    /// @return The server_id string of the last-played server, or empty if unset.
-    const std::string& last_played_server_id() const {
+    /// @return The server_id of the last-played server, or nullopt if unset.
+    const std::optional<std::string>& last_played_server_id() const {
         return this->last_played_server_id_;
     }
 
@@ -1020,7 +1020,8 @@ private:
     std::unique_ptr<SendspinWsServer> ws_server_;
 
     // String fields
-    std::string last_played_server_id_;  ///< server_id of the last-played server (empty if unset).
+    /// server_id of the last-played server; nullopt if unset.
+    std::optional<std::string> last_played_server_id_;
 
     // 64-bit fields
     /// From resolve_liveness_timeout_ms(), in microseconds; 0 or negative disables the check.
@@ -1045,7 +1046,6 @@ private:
     uint32_t pairing_window_failed_attempts_{0};
 
     // 8-bit fields
-    bool has_last_played_server_{false};
     /// True between start() and stop(). Written and read only under conn_ptr_mutex_ (the read is
     /// on_new_connection(), on the network thread), so a peer delivered after stop() closed
     /// admission is rejected rather than admitted into a nursery stop() has already emptied.

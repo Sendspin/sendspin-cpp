@@ -30,6 +30,7 @@
 #include "protocol_messages.h"
 #include "record_store.h"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -206,20 +207,18 @@ inline int activity_rank(const std::vector<SendspinActivity>& activities) {
 /// @param admitted_activities    Activities of the currently admitted connection.
 /// @param admitted_server_id     server_id of the currently admitted connection.
 /// @param has_admitted           Whether there is an admitted connection at all.
-/// @param last_playback_server_id  The last-playback server_id (empty if unset).
-/// @param has_last_playback      Whether last_playback_server_id has been set.
+/// @param last_playback_server_id  The last-playback server_id, or nullopt if unset.
 /// @param admitted_pairing_in_flight  Whether the admitted connection's pairing exchange is still
-///        in flight. Defaults to true, the plain reading of rule 2. Pass false only when the
-///        admitted side declares PAIRING but has already been acked with server/pair-finalize,
-///        so rule 2 stops shielding a pairing that has finished.
+///        in flight. True is the plain reading of rule 2. Pass false only when the admitted side
+///        declares PAIRING but has already been acked with server/pair-finalize, so rule 2 stops
+///        shielding a pairing that has finished.
 /// @return true if the incoming connection should become the admitted one.
 inline bool should_admit_connection(const std::vector<SendspinActivity>& incoming_activities,
                                     const std::string& incoming_server_id,
                                     const std::vector<SendspinActivity>& admitted_activities,
                                     const std::string& admitted_server_id, bool has_admitted,
-                                    const std::string& last_playback_server_id,
-                                    bool has_last_playback,
-                                    bool admitted_pairing_in_flight = true) {
+                                    const std::optional<std::string>& last_playback_server_id,
+                                    bool admitted_pairing_in_flight) {
     if (!has_admitted) {
         return true;
     }
@@ -247,11 +246,11 @@ inline bool should_admit_connection(const std::vector<SendspinActivity>& incomin
     // Equal rank.
     if (incoming_rank == 0) {
         // Both-empty: resolve by last_playback server_id.
-        if (!has_last_playback) {
+        if (!last_playback_server_id.has_value()) {
             return false;
         }
-        return (incoming_server_id == last_playback_server_id &&
-                admitted_server_id != last_playback_server_id);
+        return (incoming_server_id == *last_playback_server_id &&
+                admitted_server_id != *last_playback_server_id);
     }
 
     // Equal non-zero rank -> admit the incoming connection.

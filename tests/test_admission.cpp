@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -289,11 +290,10 @@ static bool admit(const std::vector<SendspinActivity>& incoming_acts,
                   const std::string& incoming_id,
                   const std::vector<SendspinActivity>& admitted_acts,
                   const std::string& admitted_id, bool has_admitted,
-                  const std::string& last_playback = "", bool has_last = false,
+                  const std::optional<std::string>& last_playback = std::nullopt,
                   bool admitted_pairing_in_flight = true) {
     return should_admit_connection(incoming_acts, incoming_id, admitted_acts, admitted_id,
-                                   has_admitted, last_playback, has_last,
-                                   admitted_pairing_in_flight);
+                                   has_admitted, last_playback, admitted_pairing_in_flight);
 }
 
 TEST(ShouldAdmit, NoCurrent_AlwaysAdmit) {
@@ -308,7 +308,7 @@ TEST(ShouldAdmit, HigherRankDisplaces) {
     EXPECT_FALSE(admit(acts(PB), "new", acts(PR), "old", true));
 
     // Once the pairing is no longer in flight, the rank comparison decides and rank 2 wins.
-    EXPECT_TRUE(admit(acts(PB), "new", acts(PR), "old", true, "", false,
+    EXPECT_TRUE(admit(acts(PB), "new", acts(PR), "old", true, std::nullopt,
                       /*admitted_pairing_in_flight=*/false));
 
     // incoming=playback(2), admitted=empty(0)
@@ -338,34 +338,34 @@ TEST(ShouldAdmit, EqualNonZeroRank_Admits) {
     EXPECT_TRUE(admit(acts(PB), "new", acts(PB), "old", true));
 
     // Both pairing(1), with the admitted pairing already finished -> admit incoming
-    EXPECT_TRUE(admit(acts(PR), "new", acts(PR), "old", true, "", false,
+    EXPECT_TRUE(admit(acts(PR), "new", acts(PR), "old", true, std::nullopt,
                       /*admitted_pairing_in_flight=*/false));
 }
 
 TEST(ShouldAdmit, BothEmpty_ResolvesByLastPlayback_IncomingMatches) {
     // incoming matches last_playback, admitted does not -> admit
-    EXPECT_TRUE(admit(acts(), "server_a", acts(), "server_b", true, "server_a", true));
+    EXPECT_TRUE(admit(acts(), "server_a", acts(), "server_b", true, "server_a"));
 }
 
 TEST(ShouldAdmit, BothEmpty_ResolvesByLastPlayback_AdmittedMatches) {
     // admitted matches last_playback, incoming does not -> keep admitted
-    EXPECT_FALSE(admit(acts(), "server_b", acts(), "server_a", true, "server_a", true));
+    EXPECT_FALSE(admit(acts(), "server_b", acts(), "server_a", true, "server_a"));
 }
 
 TEST(ShouldAdmit, BothEmpty_NeitherMatchesLastPlayback) {
     // Neither matches -> keep admitted
-    EXPECT_FALSE(admit(acts(), "server_c", acts(), "server_b", true, "server_a", true));
+    EXPECT_FALSE(admit(acts(), "server_c", acts(), "server_b", true, "server_a"));
 }
 
 TEST(ShouldAdmit, BothEmpty_NoLastPlayback_KeepAdmitted) {
-    // No last_playback -> keep admitted (has_last=false)
-    EXPECT_FALSE(admit(acts(), "new", acts(), "old", true, "", false));
+    // No last_playback -> keep admitted
+    EXPECT_FALSE(admit(acts(), "new", acts(), "old", true, std::nullopt));
 }
 
 TEST(ShouldAdmit, BothEmpty_BothMatchLastPlayback) {
     // Both match: admitted already has last_playback; incoming also matches but admitted is not
     // != last_playback, so condition fails -> keep admitted
-    EXPECT_FALSE(admit(acts(), "server_a", acts(), "server_a", true, "server_a", true));
+    EXPECT_FALSE(admit(acts(), "server_a", acts(), "server_a", true, "server_a"));
 }
 
 TEST(ShouldAdmit, PlaybackDisplacesEmpty) {
@@ -385,10 +385,10 @@ TEST(ShouldAdmitConnection, FinalizedPairingNoLongerBlocksHigherRankedIncoming) 
     const std::vector<SendspinActivity> admitted{SendspinActivity::PAIRING};   // rank 1
 
     EXPECT_FALSE(should_admit_connection(incoming, "server-new", admitted, "server-pairing", true,
-                                         "", false, /*admitted_pairing_in_flight=*/true))
+                                         std::nullopt, /*admitted_pairing_in_flight=*/true))
         << "a pairing still in flight must not be displaced";
     EXPECT_TRUE(should_admit_connection(incoming, "server-new", admitted, "server-pairing", true,
-                                        "", false, /*admitted_pairing_in_flight=*/false))
+                                        std::nullopt, /*admitted_pairing_in_flight=*/false))
         << "a pairing that already finalized must not keep blocking a rank-2 incoming";
 }
 
@@ -402,7 +402,7 @@ TEST(ShouldAdmitConnection, FinalizedPairingIsNotEvictedByRankZeroLastPlaybackPe
 
     // "server-old" is the last playback server, which is exactly the input rule 5 keys on.
     EXPECT_FALSE(should_admit_connection(incoming, "server-old", admitted, "server-paired", true,
-                                         "server-old", true,
+                                         "server-old",
                                          /*admitted_pairing_in_flight=*/false))
         << "a rank-0 peer must not displace a rank-1 connection, finalized or not: rank still "
            "decides, and rule 5 applies only when BOTH sides are rank 0";
