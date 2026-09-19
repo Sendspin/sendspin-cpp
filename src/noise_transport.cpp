@@ -204,8 +204,7 @@ SsErr NoiseTransport::send_msg2_and_swap(const std::string& msg2_text,
     const size_t plaintext_len = 1 + msg2_text.size();
     if (plaintext_len > MAX_TRANSPORT_PLAINTEXT) {
         // The handshake msg2 JSON is never expected to approach this size; reject rather than
-        // overflow the fixed-size send_buf_ (mirrors wire.py, which never fragments handshake
-        // control messages).
+        // overflow the fixed-size send_buf_.
         SS_LOGE(TAG, "send_msg2_and_swap: msg2 plaintext too large (%zu bytes)", plaintext_len);
         return SsErr::FAIL;
     }

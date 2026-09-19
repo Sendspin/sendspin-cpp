@@ -161,7 +161,7 @@ private:
     SsErr encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_capacity, size_t plaintext_len);
 
     /// @brief Fragment a plaintext > MAX_TRANSPORT_PLAINTEXT into multiple frames and
-    /// encrypt+send each one. Matches wire.py `_fragment` exactly.
+    /// encrypt+send each one. Implements messaging.md "Fragmentation".
     ///
     /// Caller must hold session_mutex_ for the WHOLE call, and it stays held across every
     /// frame. The fragments of one logical message must reach the wire consecutively: a peer

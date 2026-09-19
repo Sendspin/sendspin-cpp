@@ -15,7 +15,7 @@
 /// @file noise_session.h
 /// @brief Noise KKpsk2 session wrapper (handshake + transport cipher states).
 ///
-/// Mirrors `aiosendspin/noise/session.py` (`NoiseSession`).
+/// Implements the Noise pattern of connection.md "Pattern".
 ///
 /// Key design choice: deferred PSK binding.
 /// In KKpsk2 the PSK is mixed only during msg2, so msg1 (which carries

@@ -15,7 +15,7 @@
 /// @file keys.h
 /// @brief Sendspin key helpers: PSK-ID derivation and X25519 Identity.
 ///
-/// Mirrors `aiosendspin/noise/keys.py` exactly:
+/// Both values are fixed by connection.md "Pre-Shared Key" and "Identities":
 ///   - `psk_id_for(psk)` = base64url(SHA-256(PSK_ID_LABEL || psk))
 ///   - `Identity` holds a 32-byte X25519 keypair; `peer_id` = base64url(pubkey).
 
@@ -59,7 +59,7 @@ static constexpr size_t PEER_ID_SIZE = 43;
 
 /// @brief Sendspin static X25519 identity: a long-term keypair.
 ///
-/// Mirrors Python `Identity` in `aiosendspin/noise/keys.py`.
+/// See connection.md "Identities".
 /// The `peer_id` property returns `base64url(public_bytes)`, which is the
 /// Sendspin `client_id` / `server_id` wire representation.
 struct Identity {
@@ -87,7 +87,7 @@ struct Identity {
     [[nodiscard]] std::string peer_id() const;
 
     /// @brief The base64url-encoded private key (for persistence).
-    /// Kept for parity with aiosendspin's reference Python implementation; used by tests.
+    /// Used by tests.
     [[nodiscard]] std::string private_b64u() const;
 
     // ========================================

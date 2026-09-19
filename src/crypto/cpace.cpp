@@ -31,7 +31,7 @@ namespace sendspin {
 // psk_wrap) can share one implementation.
 
 // ============================================================================
-// LV encoding: mirrors cpace.py _prepend_len / _lv_cat
+// LV encoding: draft-irtf-cfrg-cpace-21 prepend_len / lv_cat
 // ============================================================================
 
 std::vector<uint8_t> cpace_prepend_len(const uint8_t* data, size_t len) {
@@ -60,7 +60,7 @@ std::vector<uint8_t> cpace_lv_cat(std::initializer_list<std::pair<const uint8_t*
 }
 
 // ============================================================================
-// Generator string: mirrors cpace.py _generator_string
+// Generator string: draft-irtf-cfrg-cpace-21 generator_string
 // ============================================================================
 
 std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, const uint8_t* ci,
@@ -91,7 +91,7 @@ std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, 
 }
 
 // ============================================================================
-// _decode_u: mirrors cpace.py _decode_u (clear top bit per RFC 7748)
+// decode_u: clear the top bit per RFC 7748
 // ============================================================================
 
 std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len) {
@@ -104,7 +104,7 @@ std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len) {
 }
 
 // ============================================================================
-// Elligator2 map: mirrors cpace.py _elligator2
+// Elligator2 map (draft-irtf-cfrg-cpace-21)
 //
 // Given r (mod p), computes the Curve25519 x-coordinate:
 //   v = -A * (1 + Z*r^2)^(-1) mod p       (A=486662, Z=2)
@@ -189,7 +189,7 @@ std::array<uint8_t, 32> cpace_elligator2(const std::array<uint8_t, 32>& r_le) {
 }
 
 // ============================================================================
-// _calculate_generator: mirrors cpace.py _calculate_generator
+// calculate_generator: draft-irtf-cfrg-cpace-21
 // ============================================================================
 
 std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs_len,
@@ -203,7 +203,7 @@ std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs
 }
 
 // ============================================================================
-// x25519_scalar_mult: mirrors cpace.py _scalar_mult
+// x25519_scalar_mult: draft-irtf-cfrg-cpace-21 scalar_mult
 //
 // Uses noise-c's dhstate to perform RFC 7748 X25519 WITH scalar clamping.
 // The clamping is done by the underlying x25519() call in dh-curve25519.c.

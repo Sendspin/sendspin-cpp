@@ -209,7 +209,7 @@ inline uint16_t active_role_mask(const std::vector<std::string>& active_roles) {
 
 /// @brief Activity declared in a server/activate message.
 /// A connection declares a SET of activities rather than a single reason (messaging.md
-/// "server/activate"). Mirrors Activity in aiosendspin/models/types.py.
+/// "server/activate").
 enum class SendspinActivity : uint8_t {
     PLAYBACK,  // Active or upcoming playback
     PAIRING,   // A pairing exchange

@@ -15,8 +15,7 @@
 /// @file record_store.h
 /// @brief In-memory client pairing record store.
 ///
-/// Mirrors the client side of `aiosendspin/noise/trust_store.py`
-/// (`InMemoryClientPairingStore`). Holds records in memory, calls the
+/// Holds the client records of pairing.md "Pairing Records" in memory, calls the
 /// `SendspinPersistenceProvider` for durability, and resolves `psk_id` ->
 /// PSK for the Noise handshake layer.
 ///
@@ -50,7 +49,7 @@ namespace sendspin {
 // ============================================================================
 
 /// @brief Which kind of PSK was matched during a handshake.
-/// Mirrors `PskCategory` in `aiosendspin/noise/trust_store.py`.
+/// The three categories of connection.md "Pre-Shared Key".
 enum class PskCategory : uint8_t {
     LONG_TERM,  ///< Per-pair long-term PSK from a successful pairing.
     PAIRING,    ///< Pairing PSK distributed out-of-band to admit a new server.
@@ -80,7 +79,6 @@ inline std::optional<PskCategory> psk_category_from_string(const std::string& co
 // ============================================================================
 
 /// @brief A PSK selected during a handshake, with its trust metadata.
-/// Mirrors `ResolvedPsk` in `aiosendspin/noise/trust_store.py`.
 struct ResolvedPsk {
     std::string psk_id;
     std::array<uint8_t, NOISE_PSK_SIZE> psk{};

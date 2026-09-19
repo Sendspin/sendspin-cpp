@@ -700,7 +700,8 @@ private:
     bool should_switch_to_new_server(const SendspinConnection* current,
                                      const SendspinConnection* new_conn) const;
     /// @brief Updates last_played_server_id when the ADMITTED (current) connection carries the
-    /// PLAYBACK activity. Mirrors note_playback_activity in aiosendspin/client/client.py.
+    /// PLAYBACK activity, per the last-playback server of connection.md "Multiple servers
+    /// (server-initiated)".
     /// No-op if conn is not the current connection, or does not declare PLAYBACK.
     /// Caller must hold conn_ptr_mutex_.
     /// @param conn The connection to check (typically the connection an activate just applied to).

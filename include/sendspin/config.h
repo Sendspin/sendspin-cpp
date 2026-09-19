@@ -85,7 +85,7 @@ struct SendspinPairingRecord {
 };
 
 /// @brief An accepted Pairing PSK the client stores for admitting a server.
-/// Mirrors `PairingPsk` in trust_store.py.
+/// See pairing.md "Pairing PSK Flow".
 struct SendspinPairingPsk {
     std::string psk_id;
     std::array<uint8_t, 32> psk{};

@@ -39,7 +39,7 @@ namespace sendspin {
 static std::string serialize_client_init(const std::string& client_id,
                                          const std::string& suite_name) {
     // suite_name is the full name (e.g. NOISE_SUITE_CHACHAPOLY = "Noise_KKpsk2_25519_..."); the
-    // wire value is the suffix after "Noise_KKpsk2_" (session.py NoiseCipherSuite.value). Strip
+    // wire value is the suffix after "Noise_KKpsk2_" (connection.md "Cipher Suites"). Strip
     // that prefix to produce the wire suite string.
     static constexpr const char* PREFIX = "Noise_KKpsk2_";
     constexpr size_t PREFIX_LEN = std::char_traits<char>::length(PREFIX);

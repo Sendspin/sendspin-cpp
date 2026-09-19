@@ -15,8 +15,8 @@
 /// @file constants.h
 /// @brief Sendspin Noise-protocol constants: Sentinel PSK, PSK-ID label, suite names.
 ///
-/// These mirror `aiosendspin/noise/constants.py` exactly.  Any change to these
-/// values is a breaking wire-protocol change.
+/// The values are fixed by connection.md "Pre-Shared Key" and "Cipher Suites".  Any change
+/// to these values is a breaking wire-protocol change.
 
 #pragma once
 

@@ -15,7 +15,7 @@
 /// @file cpace.h
 /// @brief CPace-X25519-SHA512 PAKE with explicit mutual confirmation.
 ///
-/// Mirrors `aiosendspin/noise/cpace.py` exactly.  The Sendspin server is
+/// Implements pairing.md "PAKE" (draft-irtf-cfrg-cpace-21).  The Sendspin server is
 /// role A (INITIATOR); the client is role B (RESPONDER).  Both roles are
 /// implemented so the primitive is fully testable and round-trip tests can
 /// play either side.
@@ -37,7 +37,7 @@
 namespace sendspin {
 
 // ============================================================================
-// Constants (mirrors cpace.py)
+// Constants (draft-irtf-cfrg-cpace-21)
 // ============================================================================
 
 /// @brief DSI string for generator derivation.
@@ -177,31 +177,32 @@ private:
 // ============================================================================
 
 /// @brief Encode a length in CPace's variable-length prefix format.
-/// Mirrors cpace.py _prepend_len.
+/// Mirrors draft-irtf-cfrg-cpace-21 `prepend_len`.
 std::vector<uint8_t> cpace_prepend_len(const uint8_t* data, size_t len);
 
-/// @brief Concatenate LV-encoded parts.  Mirrors cpace.py _lv_cat(*parts).
+/// @brief Concatenate LV-encoded parts.  Mirrors draft-irtf-cfrg-cpace-21 `lv_cat`.
 /// Each element of parts is (data_ptr, data_len).
 std::vector<uint8_t> cpace_lv_cat(std::initializer_list<std::pair<const uint8_t*, size_t>> parts);
 
-/// @brief Compute the CPace generator string.  Mirrors cpace.py _generator_string.
+/// @brief Compute the CPace generator string.  Mirrors draft-irtf-cfrg-cpace-21
+/// `generator_string`.
 std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, const uint8_t* ci,
                                             size_t ci_len, const uint8_t* sid, size_t sid_len);
 
-/// @brief Elligator2 map: r -> x-coordinate on Curve25519.  Mirrors cpace.py _elligator2.
+/// @brief Elligator2 map: r -> x-coordinate on Curve25519 (draft-irtf-cfrg-cpace-21).
 /// Input r is an integer value (already reduced mod p).  Returns 32 bytes (little-endian).
 std::array<uint8_t, 32> cpace_elligator2(const std::array<uint8_t, 32>& r_le);
 
 /// @brief Decode a 32-byte little-endian value, clearing the top bit.  Mirrors _decode_u.
 std::array<uint8_t, 32> cpace_decode_u(const uint8_t* value, size_t len);
 
-/// @brief Compute the CPace generator point.  Mirrors cpace.py _calculate_generator.
+/// @brief Compute the CPace generator point.  Mirrors draft-irtf-cfrg-cpace-21
+/// `calculate_generator`.
 std::array<uint8_t, 32> cpace_calculate_generator(const uint8_t* prs, size_t prs_len,
                                                   const uint8_t* ci, size_t ci_len,
                                                   const uint8_t* sid, size_t sid_len);
 
 /// @brief X25519 scalar multiplication (RFC 7748, with clamping).
-/// Mirrors cpace.py _scalar_mult.
 /// Returns false (all-zero output) if the dhstate allocation fails.
 bool x25519_scalar_mult(const uint8_t scalar[32], const uint8_t point[32], uint8_t out[32]);
 

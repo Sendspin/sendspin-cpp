@@ -15,8 +15,7 @@
 /// @file noise_handshake.h
 /// @brief Noise KKpsk2 cleartext init exchange + handshake state machine.
 ///
-/// Mirrors `aiosendspin/noise/driver.py` `run_handshake_client` /
-/// `_exchange_as_responder` for the Sendspin client (always the Noise responder).
+/// The Sendspin client is always the Noise responder (connection.md "Pattern").
 ///
 /// Protocol sequence (all pre-transport frames are WS TEXT):
 ///   1. Send  `client/init` (TEXT)

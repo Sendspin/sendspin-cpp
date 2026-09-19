@@ -1824,8 +1824,8 @@ bool ConnectionManager::should_switch_to_new_server(const SendspinConnection* cu
 
 void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     // Note: caller must hold conn_ptr_mutex_
-    // Mirrors note_playback_activity in aiosendspin/client/client.py: only the ADMITTED
-    // (current) connection updates last_played_server_id, and only when it carries PLAYBACK.
+    // connection.md "Multiple servers (server-initiated)": only the ADMITTED (current)
+    // connection updates last_played_server_id, and only when it carries PLAYBACK.
     if (conn == nullptr || conn != this->current_connection_.get()) {
         return;
     }
