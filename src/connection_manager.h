@@ -405,6 +405,11 @@ public:
         return this->current_connection_;
     }
 
+    /// @brief psk_ids backing a currently-open connection, provisional or admitted. Thread-safe.
+    /// These are the records a completed pairing must not evict (pairing.md "Pairing Records").
+    /// Takes conn_ptr_mutex_ under the same lock order as current().
+    [[nodiscard]] std::vector<std::string> open_connection_psk_ids() const;
+
     /// @brief Schedules a pair/abort event for deferred processing in loop().
     /// @param event The pair-abort event to schedule (moved).
     void schedule_pair_abort(PairAbortEvent event);
@@ -461,10 +466,6 @@ public:
     /// the main loop instead, matching every other cross-thread mutation in this class.
     /// @param event The server/activate event to schedule (moved).
     void schedule_activate(ServerActivateEvent event);
-
-    /// @brief psk_ids backing a currently-open connection, provisional or admitted. Thread-safe.
-    /// These are the records a completed pairing must not evict (pairing.md "Pairing records").
-    [[nodiscard]] std::vector<std::string> open_connection_psk_ids() const;
 
 private:
     // ========================================
