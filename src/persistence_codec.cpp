@@ -84,8 +84,8 @@ std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj, const cha
 /// @brief Parses a pairing record from a JSON object (a top-level record blob, or one entry of
 /// a records array). Ignores an entry-local "v", if present.
 /// @param obj    The object to read.
-/// @param reason Set to the rejection reason when the parse fails; untouched on success. The
-///        caller logs it verbatim, so every rejection path sets it.
+/// @param reason Set to the rejection reason when the parse fails; untouched on success. Every
+///        rejection path sets it, for the callers that log it.
 /// @return The record, or nullopt when the object is not a usable one.
 std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj, const char** reason) {
     auto core = parse_psk_id_and_psk(obj, reason);
@@ -108,6 +108,8 @@ std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj, con
     }
     if (obj["label"].is<const char*>()) {
         rec.label = obj["label"].as<const char*>();
+    } else if (!obj["label"].isUnbound() && !obj["label"].isNull()) {
+        SS_LOGW(TAG, "Ignoring stored pairing record field 'label': expected string");
     }
     // is<bool>() guard, like every other field: ArduinoJson's as<bool>() coerces any
     // non-boolean variant (e.g. a corrupt "used":"false" string) to true, which would
@@ -115,6 +117,8 @@ std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj, con
     // struct default (false) instead.
     if (obj["used"].is<bool>()) {
         rec.used = obj["used"].as<bool>();
+    } else if (!obj["used"].isUnbound() && !obj["used"].isNull()) {
+        SS_LOGW(TAG, "Ignoring stored pairing record field 'used': expected boolean");
     }
     return rec;
 }
@@ -137,11 +141,12 @@ void write_record_fields(TTarget& target, const SendspinPairingRecord& r) {
 }
 
 /// @brief Parses an accepted Pairing PSK from a JSON object.
-/// @param obj The object to read.
+/// @param obj    The object to read.
+/// @param reason Set to the rejection reason when the parse fails; untouched on success. Every
+///        rejection path sets it, for the callers that log it.
 /// @return The Pairing PSK, or nullopt when the object does not carry a usable one.
-std::optional<SendspinPairingPsk> psk_from_object(JsonObjectConst obj) {
-    const char* reason = "";
-    auto core = parse_psk_id_and_psk(obj, &reason);
+std::optional<SendspinPairingPsk> psk_from_object(JsonObjectConst obj, const char** reason) {
+    auto core = parse_psk_id_and_psk(obj, reason);
     if (!core.has_value()) {
         return std::nullopt;
     }
@@ -255,7 +260,12 @@ std::optional<SendspinPairingPsk> decode_pairing_psk(std::string_view bytes) {
     if (obj.isNull()) {
         return std::nullopt;
     }
-    return psk_from_object(obj);
+    const char* reason = "the codec cannot read it";
+    auto psk = psk_from_object(obj, &reason);
+    if (!psk.has_value()) {
+        SS_LOGW(TAG, "Rejecting stored pairing PSK: %s", reason);
+    }
+    return psk;
 }
 
 // ============================================================================
