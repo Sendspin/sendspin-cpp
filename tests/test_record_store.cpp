@@ -372,26 +372,35 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
 // find_index() keys the store on psk_id, so a record whose psk_id is already held replaces that
 // record in place instead of adding a second entry for the same credential. Reached here with a
 // different server_id, because the supersede-by-server_id retire below would otherwise clean up
-// a duplicate and hide the branch.
+// a duplicate and hide the branch. Asserted through the handshake resolve (which server the
+// psk_id now authenticates) and the persisted blob (what comes back after a reboot).
 TEST(RecordStore, StoreRecordReplacesTheRecordHoldingTheSamePskId) {
-    RecordStore store(nullptr);
+    InMemoryPersistenceProvider provider;
+    RecordStore store(&provider);
 
     SendspinPairingRecord first = make_client_record("server-A", "first");
+    const std::string psk_id = first.psk_id;
     ASSERT_TRUE(store.store_record_superseding(first, {}));
 
     SendspinPairingRecord second = first;
     second.server_id = "server-B";
     second.label = "second";
     ASSERT_TRUE(store.store_record_superseding(second, {}));
+    ASSERT_TRUE(store.persist_records());
 
-    EXPECT_EQ(store.records_.size(), 1u) << "one record per psk_id";
-    const auto* found = store.record_by_psk_id(first.psk_id);
-    ASSERT_NE(found, nullptr);
-    EXPECT_EQ(found->server_id, "server-B");
-    ASSERT_TRUE(found->label.has_value());
-    EXPECT_EQ(found->label.value(), "second");
-    EXPECT_EQ(store.record_by_server_id("server-A"), nullptr)
-        << "the replaced record must not stay bound to its old server_id";
+    auto resolved = store.resolve_by_psk_id(psk_id, PskCategory::LONG_TERM);
+    ASSERT_TRUE(resolved.has_value());
+    ASSERT_TRUE(resolved->counterparty_id.has_value());
+    EXPECT_EQ(resolved->counterparty_id.value(), "server-B")
+        << "the psk_id must authenticate the server that paired with it last, not the one it "
+           "replaced";
+
+    auto stored = decode_records_blob(provider.blob(persistence_keys::RECORDS));
+    ASSERT_TRUE(stored.has_value());
+    ASSERT_EQ(stored->size(), 1u) << "one record per psk_id";
+    EXPECT_EQ((*stored)[0].server_id, "server-B");
+    ASSERT_TRUE((*stored)[0].label.has_value());
+    EXPECT_EQ((*stored)[0].label.value(), "second");
 }
 
 // ============================================================================
@@ -539,11 +548,12 @@ TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
     const std::string first_psk_id = outcome0.record.psk_id;
 
     // Fill every remaining slot with other servers' records.
+    std::vector<std::string> other_psk_ids;
     for (size_t i = 1; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
         auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+        other_psk_ids.push_back(outcome.record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     }
-    ASSERT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS);
 
     // records_ runs least-recently-used first, so without this the re-pairing server's own
     // record is the eviction victim and an eviction is indistinguishable from the supersede.
@@ -552,14 +562,15 @@ TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
     auto outcome1 = store.resolve_pairing_outcome(existing_server);
     EXPECT_TRUE(store.store_record_superseding(outcome1.record, {}));
 
-    EXPECT_EQ(store.records_.size(), RecordStore::DEFAULT_MAX_RECORDS)
-        << "a supersede must not grow the store";
-    EXPECT_EQ(store.record_by_psk_id(first_psk_id), nullptr) << "the old record must be retired";
-    const auto* found = store.record_by_server_id(existing_server);
-    ASSERT_NE(found, nullptr);
-    EXPECT_EQ(found->psk_id, outcome1.record.psk_id);
-    for (size_t i = 1; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
-        EXPECT_NE(store.record_by_server_id("server-" + std::to_string(i)), nullptr)
+    // Every claim below is what a handshake sees: which psk_ids still authenticate, and as whom.
+    EXPECT_FALSE(store.resolve_by_psk_id(first_psk_id, PskCategory::LONG_TERM).has_value())
+        << "the superseded PSK must stop authenticating";
+    auto resolved = store.resolve_by_psk_id(outcome1.record.psk_id, PskCategory::LONG_TERM);
+    ASSERT_TRUE(resolved.has_value());
+    ASSERT_TRUE(resolved->counterparty_id.has_value());
+    EXPECT_EQ(resolved->counterparty_id.value(), existing_server);
+    for (const std::string& psk_id : other_psk_ids) {
+        EXPECT_TRUE(store.resolve_by_psk_id(psk_id, PskCategory::LONG_TERM).has_value())
             << "no other server's record may be evicted by a supersede";
     }
 }
