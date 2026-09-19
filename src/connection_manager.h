@@ -172,8 +172,9 @@ struct DeferredRelease {
 /// been dropped
 ///
 /// The provider write is an NVS commit on ESP: tens of milliseconds during which nothing else
-/// may enter the manager, including the role drains that resolve the current connection through
-/// current_shared(). Locked sections therefore only decide WHICH record (or server_id) the write
+/// may enter the manager: no network thread in on_new_connection(), and no off-main-loop caller
+/// resolving the current connection through current_shared(). Locked sections therefore only
+/// decide WHICH record (or server_id) the write
 /// covers, or, for PERSIST_RECORDS, apply the RAM half and stage the array write that owes it;
 /// flush_pending_record_ops() performs the writes with no lock held.
 struct PendingRecordOp {

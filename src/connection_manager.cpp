@@ -1261,9 +1261,10 @@ void ConnectionManager::loop() {
     }
 
     // Perform the provider writes the locked handlers decided on, outside the lock: an NVS commit
-    // under it would stall every other manager entry point, including the role drains that
-    // resolve the current connection through current_shared(). Ahead of the two flushes below so
-    // the blob is settled on flash before a session is told to leave or an admission replays.
+    // under it would stall every other manager entry point, during which no network thread could
+    // enter on_new_connection() and no off-main-loop caller could resolve the current connection
+    // through current_shared(). Ahead of the two flushes below so the blob is settled on flash
+    // before a session is told to leave or an admission replays.
     this->flush_pending_record_ops();
 
     // Admit the connection the promotion scan installed, outside the lock: the replay takes
