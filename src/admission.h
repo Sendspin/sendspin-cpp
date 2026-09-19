@@ -54,8 +54,7 @@ inline bool contains_activity(const std::vector<SendspinActivity>& activities,
     return false;
 }
 
-/// @brief Whether an activity set built from the two defined activities is allowed for the
-/// matched PSK category.
+/// @brief Whether an activity set is allowed for the matched PSK category.
 ///
 /// The table in messaging.md "server/activate":
 ///
@@ -67,9 +66,8 @@ inline bool contains_activity(const std::vector<SendspinActivity>& activities,
 ///
 ///   * only when the client has unpaired access enabled.
 ///
-/// So a long-term PSK admits playback and nothing else, while the two unpaired categories admit
-/// pairing outright and playback only on unpaired access. Members are unordered and unique, so
-/// the set is characterized by which of the two activities it contains.
+/// Members are unordered and unique, so the set is characterized by which of the two activities
+/// it contains.
 ///
 /// @param category       PSK category matched during the Noise handshake.
 /// @param has_playback   Whether the set contains 'playback'.
@@ -124,8 +122,7 @@ inline bool is_playback_capable(PskCategory category,
 ///
 /// Per messaging.md "Playback-capable connections", only a playback-capable connection may carry
 /// a non-empty active_roles, and it may do so even when PLAYBACK is not currently declared. This
-/// catches e.g. a Sentinel connection with has_roles=true and unpaired access disabled, which
-/// would attempt to use role protocol without being allowed playback.
+/// catches e.g. a Sentinel connection with has_roles=true and unpaired access disabled.
 ///
 /// @param category        PSK category matched during the Noise handshake.
 /// @param activities      Activities declared in the server/activate message.
@@ -143,10 +140,9 @@ inline bool admissible(PskCategory category, const std::vector<SendspinActivity>
 /// @brief Goodbye reason to close an inadmissible server/activate with.
 ///
 /// Separates "you are not paired yet" from "you may never do this", by the first-rule-wins order
-/// messaging.md "server/activate" gives: an activation that enabling unpaired access would have
-/// admitted is answered with pairing_required, anything else with unauthorized. Only an unpaired
-/// session can reach the pairing_required case, because unpaired_access is what gates the
-/// playback rows of the pairing-PSK and Sentinel categories and nothing in the long-term row.
+/// in messaging.md "server/activate": an activation that enabling unpaired access would have
+/// admitted gets pairing_required, anything else unauthorized. Only an unpaired session reaches
+/// pairing_required, since unpaired_access gates nothing in the long-term row.
 ///
 /// Callers must only use this for an activate that admissible() already rejected: for an
 /// admissible one the return value is meaningless.
@@ -172,7 +168,7 @@ inline SendspinGoodbyeReason inadmissible_reject_reason(
 /// @brief Rank a connection by its highest activity.
 ///
 /// connection.md "Multiple servers (server-initiated)" ranks playback above pairing and an empty
-/// set lowest, so playback=2 > pairing=1 > none=0. A connection declaring both ranks as playback.
+/// set lowest, so playback=2 > pairing=1 > none=0.
 ///
 /// @param activities Activities declared by the connection.
 /// @return Integer rank (0-2).
@@ -213,10 +209,9 @@ inline int activity_rank(const std::vector<SendspinActivity>& activities) {
 /// @param last_playback_server_id  The last-playback server_id (empty if unset).
 /// @param has_last_playback      Whether last_playback_server_id has been set.
 /// @param admitted_pairing_in_flight  Whether the admitted connection's pairing exchange is still
-///        in flight. Defaults to true, which is the plain reading of rule 2. Pass false only
-///        when the admitted side declares PAIRING but has
-///        already been acked with server/pair-finalize, so rule 2 stops shielding a pairing that
-///        has finished. Affects rule 2 alone; the rank comparisons are untouched.
+///        in flight. Defaults to true, the plain reading of rule 2. Pass false only when the
+///        admitted side declares PAIRING but has already been acked with server/pair-finalize,
+///        so rule 2 stops shielding a pairing that has finished.
 /// @return true if the incoming connection should become the admitted one.
 inline bool should_admit_connection(const std::vector<SendspinActivity>& incoming_activities,
                                     const std::string& incoming_server_id,

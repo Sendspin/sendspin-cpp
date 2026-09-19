@@ -70,11 +70,10 @@ static constexpr int64_t NURSERY_ESTABLISH_TIMEOUT_US = seconds_to_us(NURSERY_ES
 /// !current_connection_->is_operational(). current_connection_ is never non-operational for any
 /// other reason: a nursery entry is only ever promoted once it is already operational (see
 /// promote_or_arbitrate_nursery_entry()), and an in-progress pairing-code PAKE exchange keeps
-/// is_operational() true throughout (that flow has its own timeouts,
-/// PAIRING_ATTEMPT_TIMEOUT_US and
-/// pairing_window_open(); see connection_manager.cpp). Shares NURSERY_ESTABLISH_TIMEOUT_S's value
-/// by design (same "reach the next protocol milestone within a bounded window" semantics) but is
-/// named separately because it applies to the current slot, not the nursery.
+/// is_operational() true throughout (that flow has its own timeouts, PAIRING_ATTEMPT_TIMEOUT_US
+/// and pairing_window_open(); see connection_manager.cpp). Shares NURSERY_ESTABLISH_TIMEOUT_S's
+/// value by design (same "reach the next protocol milestone within a bounded window" semantics)
+/// but is named separately because it applies to the current slot, not the nursery.
 static constexpr double REPROVE_TIMEOUT_S = NURSERY_ESTABLISH_TIMEOUT_S;
 
 /// @brief Timeout in microseconds (derived from REPROVE_TIMEOUT_S).
@@ -252,8 +251,7 @@ struct ServerActivateEvent {
 ///
 /// conn->pairing_session().code_emitted / .window_shown are the sole record of whether a pairing
 /// code or pairing-window prompt is still showing, and every path that ends a pairing attempt
-/// clears
-/// that state (cleanup_connection_state() on the current-slot drop path,
+/// clears that state (cleanup_connection_state() on the current-slot drop path,
 /// clear_pairing_state()) before it gets a chance to dismiss the prompt. Capture the flags
 /// BEFORE that cleanup runs, then dismiss afterward (dismiss_pairing_ui(), or the client's
 /// note_*() calls on the stop() path) so the dismissal still happens even though the flags it
@@ -284,9 +282,8 @@ struct PairingUiSnapshot {
  * client/pair-finalize and is expected to rekey via one
  * (SendspinConnection::note_pairing_finalize_ack()). The invariant is restored once that
  * activation arrives. If it does not, the re-proving-deadline check (REPROVE_TIMEOUT_US) in
- * scan_reprove_watchdog(), called every tick from loop(), drops the connection rather than
- * leaving it wedged. For why
- * this state is tracked as independent flags rather than a single phase enum, see the
+ * scan_reprove_watchdog(), called every tick from loop(), drops the connection. For why this
+ * state is tracked as independent flags rather than a single phase enum, see the
  * lifecycle-flag axes note above SendspinConnection's atomic flag members in connection.h.
  *
  * Typical usage:
@@ -386,8 +383,7 @@ public:
     ///
     /// Takes conn_ptr_mutex_, which sits inside json_processing_mutex_ in the lock order
     /// (docs/conventions.md "Threading and cross-thread state"), so a handler running under the
-    /// JSON lock may call it; the admission replay (SendspinClient::admit_connection()) runs with
-    /// neither held.
+    /// JSON lock may call it.
     /// @return Pointer to the current connection, or nullptr if none.
     SendspinConnection* current() const {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
@@ -524,8 +520,8 @@ private:
     void process_activate_event(ServerActivateEvent& event);
 
     /// @brief Applies pair/abort events, then pairing-code message events, then
-    /// pairing-succeeded events, then pairing storage-failure events, then a pairing-window
-    /// confirm, in that order. Caller must hold conn_ptr_mutex_.
+    /// pairing-succeeded events, then a pairing-window confirm and then a cancel. Caller must
+    /// hold conn_ptr_mutex_.
     /// @param ev Drained events from swap_out_pending_events(); consumed in place.
     void drain_pairing_events(DrainedEvents& ev);
 
@@ -614,8 +610,7 @@ private:
     /// Caller must NOT hold conn_ptr_mutex_: admission replays the held role messages under
     /// SendspinClient's json_processing_mutex_, which the lock order in docs/conventions.md
     /// ("Threading and cross-thread state") places outside conn_ptr_mutex_. Staging and flushing
-    /// are both main-loop-only and the flush follows its staging in the same call, so a slot
-    /// cleared meanwhile leaves nothing to admit.
+    /// are both main-loop-only and happen in the same call, so the staged slot cannot go stale.
     void flush_pending_admission();
 
     /// @brief Appends `item` to a pending_*_events_ queue and sets has_pending_events_ in the
@@ -693,11 +688,9 @@ private:
     void on_connection_lost(SendspinConnection* conn);
     /// @brief Decides whether an incoming connection should be admitted over the current one.
     ///
-    /// Applies admission.h::should_admit_connection (activity-priority arbitration: playback >
-    /// pairing > empty, with last-played-server_id as the empty/empty tiebreak and an
-    /// in-flight pairing immune to displacement by incoming pairing/playback). Trust enforcement
-    /// (admission.h::admissible) is applied separately, before this is ever consulted, in
-    /// loop()'s server/activate handling.
+    /// Applies admission.h::should_admit_connection for the activity-priority arbitration. Trust
+    /// enforcement (admission.h::admissible) is applied separately, before this is ever consulted,
+    /// in loop()'s server/activate handling.
     /// @param current The existing active connection, or nullptr if none is admitted yet.
     /// @param new_conn The newly proven candidate connection. Must not be null.
     /// @return True if the new connection should become current, false to keep the existing one
@@ -827,18 +820,16 @@ private:
 
     /// @brief Handles a pair/abort event on the main loop.
     /// Cleans up pairing state. Per pairing.md "pair/abort", only closes the connection for reason
-    /// concurrent_attempt; every other reason leaves it open. A pair/abort that arrives after the
-    /// attempt has already ended (is_pairing_in_progress() false) is silently ignored (stale).
+    /// concurrent_attempt. A pair/abort that arrives after the attempt has already ended
+    /// (is_pairing_in_progress() false) is silently ignored (stale).
     /// @param conn The connection on which the abort arrived.
     /// @param reason The abort reason.
     void handle_pair_abort(SendspinConnection* conn, PairAbortReason reason);
 
     /// @brief Fires on_clear_pairing_code and/or on_open_pairing_window's counterpart for a
     /// pairing UI element that was left showing. Caller must hold conn_ptr_mutex_.
-    /// @param code_was_emitted Whether a pairing code was being emitted; if true, queues
-    ///        on_clear_pairing_code.
-    /// @param window_was_shown Whether the pairing-window gesture prompt was open; if true,
-    ///        queues on_close_pairing_window.
+    /// @param code_was_emitted Whether a pairing code was being emitted.
+    /// @param window_was_shown Whether the pairing-window gesture prompt was open.
     void dismiss_pairing_ui(bool code_was_emitted, bool window_was_shown);
 
     /// @brief Shared cleanup for every path that locally ends a pairing attempt on `conn`.
@@ -903,8 +894,7 @@ private:
     void handle_pair_confirm(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
     /// @brief Abort the current pairing-code session: send pair/abort, notify, and close the
-    /// connection only for reason concurrent_attempt (pairing.md "pair/abort"; every other reason
-    /// leaves the connection open).
+    /// connection only for reason concurrent_attempt (pairing.md "pair/abort").
     /// @param conn The connection to abort.
     /// @param reason The abort reason to send.
     void local_abort_pairing(SendspinConnection* conn, PairAbortReason reason);
@@ -943,7 +933,7 @@ private:
     /// already waiting in AWAIT_PAIRING_WINDOW, the window admits it immediately; otherwise it
     /// stands open for WINDOW_LIFETIME_US (5 minutes) awaiting a pairing activate. The gesture is
     /// also the deliberate operator action that clears a standing round limit
-    /// (pairing.md "Rounds"), so it resets the round count.
+    /// (pairing.md "Rounds").
     void open_pairing_window();
 
     /// @brief Whether the dynamic-pairing-code round limit currently holds attempts back:

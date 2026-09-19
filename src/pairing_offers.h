@@ -20,7 +20,7 @@
 /// descriptor"), and the `server/activate` admissibility check answers
 /// `pair/abort(method_not_supported)` for anything they leave out (messaging.md
 /// "server/activate"). A method the hello advertises but the activation path rejects would
-/// strand a server with nothing left to try, so the two read the same source.
+/// strand a server with nothing left to try.
 
 #pragma once
 
@@ -36,8 +36,7 @@ namespace sendspin {
 /// @brief Whether the client offers the Pairing PSK method.
 /// The method needs an actual Pairing PSK behind it (normally auto-provisioned on first boot):
 /// advertising it without one offers a server a flow whose handshake could only miss.
-/// @param config Client configuration, held for call-site symmetry with the siblings below; the
-///        method is configured entirely through the store.
+/// @param config Unused; kept for call-site symmetry, since the store alone configures the method.
 /// @param store Record store holding the pairing-config flags and the Pairing PSK.
 /// @return true when the method may be advertised and accepted.
 inline bool offers_pairing_psk(const SendspinClientConfig& /*config*/, const RecordStore& store) {
@@ -46,9 +45,8 @@ inline bool offers_pairing_psk(const SendspinClientConfig& /*config*/, const Rec
 
 /// @brief Whether the client offers the dynamic pairing code.
 /// pairing.md "client/hello pair-method descriptor" makes `out_channels` and `formats` required,
-/// and a descriptor left with no recognized format or no recognized channel is ignored outright,
-/// so a device that lists neither cannot offer the method: it has no way to emit the code it
-/// would have to derive.
+/// and a descriptor with no recognized channel or format is ignored outright, so a device that
+/// lists neither cannot offer the method.
 /// @param config Client configuration supplying the out-channels and emission formats.
 /// @param store Record store holding the pairing-config flags.
 /// @return true when the method may be advertised and accepted.
