@@ -260,6 +260,7 @@ std::optional<ServerPlayerCommandObject> parse_player_command(const std::string&
 // in-type but out-of-range, or out-of-type entirely, is dropped (warn-and-drop) rather than silently
 // wrapped into the narrow field.
 TEST(Protocol, PlayerCommandVolumeRangeValidation) {
+    // Control: an in-range volume is applied.
     auto valid = parse_player_command(R"({"command":"volume","volume":50})");
     ASSERT_TRUE(valid.has_value());
     ASSERT_TRUE(valid->volume.has_value());
@@ -278,6 +279,7 @@ TEST(Protocol, PlayerCommandVolumeRangeValidation) {
 
 // Booleans are strict: only genuine JSON true/false is accepted; a 0/1 integer is dropped.
 TEST(Protocol, PlayerCommandBooleanStrictness) {
+    // Control: a genuine JSON boolean is applied.
     auto real_bool = parse_player_command(R"({"command":"mute","mute":true})");
     ASSERT_TRUE(real_bool.has_value());
     ASSERT_TRUE(real_bool->mute.has_value());
@@ -290,6 +292,7 @@ TEST(Protocol, PlayerCommandBooleanStrictness) {
 
 // Integer fields reject a float representation, even one with an integral value.
 TEST(Protocol, PlayerCommandRejectsFloatForInteger) {
+    // Control: an integer is applied.
     auto valid = parse_player_command(R"({"command":"set_output_delay","output_delay_ms":250})");
     ASSERT_TRUE(valid.has_value());
     ASSERT_TRUE(valid->output_delay_ms.has_value());
@@ -350,6 +353,7 @@ TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
 // unrecognized one is dropped (leaving the field untouched) rather than clearing or storing garbage.
 TEST(Protocol, GroupUpdatePlaybackStateValidation) {
     {
+        // Control: a recognized wire string is applied.
         JsonDocument doc;
         JsonObject root;
         ASSERT_TRUE(
@@ -379,6 +383,7 @@ TEST(Protocol, ServerHelloRequiresName) {
     ServerHelloMessage msg;
     EXPECT_FALSE(process_server_hello_message(root, &msg));
 
+    // Control: the same envelope carrying a name parses.
     JsonDocument doc_ok;
     JsonObject root_ok;
     ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"srv"}})", doc_ok, root_ok));
