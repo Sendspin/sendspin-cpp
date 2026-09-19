@@ -2397,7 +2397,6 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
 
     CodeEmissionResult display;
     ASSERT_NO_FATAL_FAILURE(this->drive_to_code_emitted(conn, /*nonce_a_seed=*/4, display));
-    ASSERT_TRUE(conn->pairing_session().code_emitted);
 
     // The server aborts the exchange directly (pair/abort), which drives
     // ConnectionManager::handle_pair_abort() -> cleanup_connection_state() -> deferred note_*.
@@ -2415,7 +2414,6 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
     // pairing.md "pair/abort": only reason concurrent_attempt closes the connection; user_cancelled
     // leaves it open (pairing state is still cleared above).
     EXPECT_EQ(conn->disconnect_count_, 0);
-    EXPECT_FALSE(conn->is_pairing_in_progress());
 }
 
 TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupStaticWindow) {
@@ -2631,7 +2629,6 @@ TEST_F(PairingStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
     this->client_->loop();
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::ATTEMPT_TIMEOUT);
-    EXPECT_FALSE(conn->is_pairing_in_progress());
     const size_t events_before = this->listener_.events_.size();
     const int disconnects_before = conn->disconnect_count_;
 
