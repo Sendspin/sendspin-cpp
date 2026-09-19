@@ -964,14 +964,6 @@ void SendspinClient::update_state(SendspinClientState state) {
     this->publish_client_state(this->connection_manager_->current());
 }
 
-// ============================================================================
-// Role services (called by roles via SendspinClient pointer)
-// ============================================================================
-
-void SendspinClient::publish_state() {
-    this->publish_client_state(this->connection_manager_->current());
-}
-
 void SendspinClient::leave() {
     // messaging.md "Client to Server: client/leave". Not a role message, so it does not route
     // through send_text(): leaving the group is a client-level act that no role activation gates.
@@ -987,6 +979,14 @@ void SendspinClient::leave() {
     }
     SS_LOGI(TAG, "Leaving the group (client/leave)");
     conn->send_app_json(format_client_leave_message(), nullptr);
+}
+
+// ============================================================================
+// Role services (called by roles via SendspinClient pointer)
+// ============================================================================
+
+void SendspinClient::publish_state() {
+    this->publish_client_state(this->connection_manager_->current());
 }
 
 void SendspinClient::send_text(const std::string& text, const std::string& role_family) {
@@ -2130,12 +2130,12 @@ void SendspinClient::note_open_pairing_window() {
     this->event_state_->push_pairing_note({.type = PairingNoteType::OPEN_PAIRING_WINDOW});
 }
 
-void SendspinClient::note_trust_changed(ConnectionTrust trust) {
-    this->event_state_->push_pairing_note({.type = PairingNoteType::TRUST_CHANGED, .trust = trust});
-}
-
 void SendspinClient::note_close_pairing_window() {
     this->event_state_->push_pairing_note({.type = PairingNoteType::CLOSE_PAIRING_WINDOW});
+}
+
+void SendspinClient::note_trust_changed(ConnectionTrust trust) {
+    this->event_state_->push_pairing_note({.type = PairingNoteType::TRUST_CHANGED, .trust = trust});
 }
 
 void SendspinClient::confirm_pairing_window() {
