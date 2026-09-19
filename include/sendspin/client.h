@@ -742,6 +742,12 @@ private:
     /// @brief Cleans up playback state when the active streaming connection is removed
     void cleanup_connection_state();
 
+    /// @brief Persists a pairing record the network thread staged, if one is pending.
+    ///
+    /// The store may be null here: the destructor calls this on a client whose start() never
+    /// succeeded.
+    void flush_pending_records();
+
     /// @brief Drains the inbox: lifecycle events, role slots, and group updates, dispatching
     /// listener callbacks on the calling (main-loop) thread. Shared by loop() and stop().
     void drain_inbox();

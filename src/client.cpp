@@ -256,12 +256,7 @@ SendspinClient::~SendspinClient() {
     // The network thread is gone with the connection manager, so no new pairing-record write can
     // be staged; flush one still sitting in the slot (a pair-finalize that landed after the last
     // loop() tick) before the store goes away, so an orderly shutdown does not lose the pairing.
-    {
-        bool dirty = false;
-        if (this->event_state_->records_dirty_slot.take(dirty) && this->record_store_ != nullptr) {
-            this->record_store_->persist_records();
-        }
-    }
+    this->flush_pending_records();
     // Destroyed after the connection manager: every connection holds raw pointers into
     // identity_/record_store_ (see SendspinConnection::init_noise_handshake), so both must
     // outlive every connection the manager could still be tearing down.
@@ -500,6 +495,13 @@ void SendspinClient::loop() {
     this->drain_inbox();
 }
 
+void SendspinClient::flush_pending_records() {
+    bool dirty = false;
+    if (this->event_state_->records_dirty_slot.take(dirty) && this->record_store_ != nullptr) {
+        this->record_store_->persist_records();
+    }
+}
+
 void SendspinClient::drain_inbox() {
     // Releases a locked teardown handed over rather than performing inline: nothing here holds a
     // ConnectionManager lock, so the listener callback a last release fires may call back in.
@@ -524,10 +526,7 @@ void SendspinClient::drain_inbox() {
     // the slot write was visible. persist_records() logs the durability warning itself on a
     // rejected write, so the return value is deliberately ignored.
     if (inbox_bits & INBOX_TOPIC_RECORDS) {
-        bool dirty = false;
-        if (this->event_state_->records_dirty_slot.take(dirty) && this->record_store_ != nullptr) {
-            this->record_store_->persist_records();
-        }
+        this->flush_pending_records();
     }
 
     // --- Time sync events ---
