@@ -69,7 +69,7 @@ constexpr uint16_t STALE_START_TEST_PORT = 19037;
 constexpr uint16_t STALE_START_CONTROL_TEST_PORT = 19038;
 constexpr uint16_t INACTIVE_TRAFFIC_TEST_PORT = 19039;
 constexpr uint16_t VERSION_REPLACED_TEST_PORT = 19040;
-constexpr uint16_t ARTWORK_BUFFERS_TEST_PORT = 19041;
+constexpr uint16_t ARTWORK_BUFFERS_TEST_PORT = 19051;
 
 /// Bound on every pump/wait: generous next to the loopback round trips involved, so the verdict
 /// comes from the predicate rather than the clock.
@@ -95,23 +95,9 @@ std::string activate_json(const std::string& roles_json) {
            roles_json + "}}";
 }
 
-std::string stream_start_pcm_json() {
-    return R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":48000,)"
-           R"("channels":2,"bit_depth":16}}})";
-}
-
-std::string stream_start_visualizer_json() {
-    return R"({"type":"stream/start","payload":{"visualizer":{"types":["loudness"],"rate_max":30}}})";
-}
-
 std::string stream_start_artwork_json() {
     return R"({"type":"stream/start","payload":{"artwork":{"channels":[{"source":"album",)"
            R"("format":"jpeg","width":100,"height":100}]}}})";
-}
-
-std::string metadata_state_json(int64_t timestamp, const std::string& title) {
-    return R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
-           std::to_string(timestamp) + R"(,"title":")" + title + R"("}}})";
 }
 
 std::string color_state_json(int64_t timestamp) {
@@ -123,13 +109,6 @@ std::string controller_state_json(uint8_t volume) {
     return R"({"type":"server/state","payload":{"controller":{"supported_commands":["play"],)"
            R"("volume":)" +
            std::to_string(volume) + R"(,"muted":false,"repeat":"off","shuffle":false}}})";
-}
-
-PlayerRoleConfig make_player_config() {
-    PlayerRoleConfig player_cfg;
-    player_cfg.audio_formats.push_back({SendspinCodecFormat::PCM, 2, 48000, 16});
-    player_cfg.audio_buffer_capacity = 64 * 1024;
-    return player_cfg;
 }
 
 VisualizerRoleConfig make_visualizer_config() {
@@ -147,53 +126,6 @@ ArtworkRoleConfig make_artwork_config() {
     return config;
 }
 
-/// Counts the player lifecycle callbacks and audio writes; the write itself is a sink.
-class CountingPlayerListener : public PlayerRoleListener {
-public:
-    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
-        this->audio_writes.fetch_add(1);
-        return length;
-    }
-    void on_stream_start() override {
-        ++this->stream_starts;
-    }
-    void on_stream_end() override {
-        ++this->stream_ends;
-    }
-
-    std::atomic<size_t> audio_writes{0};
-    int stream_starts{0};
-    int stream_ends{0};
-};
-
-class RecordingMetadataListener : public MetadataRoleListener {
-public:
-    void on_metadata(const ServerMetadataStateObject& metadata) override {
-        ++this->updates;
-        this->last_title = metadata.title.value_or("");
-    }
-    void on_metadata_clear() override {
-        ++this->clears;
-    }
-
-    int updates{0};
-    int clears{0};
-    std::string last_title;
-};
-
-class RecordingColorListener : public ColorRoleListener {
-public:
-    void on_color(const ServerColorStateObject& /*color*/) override {
-        ++this->updates;
-    }
-    void on_color_clear() override {
-        ++this->clears;
-    }
-
-    int updates{0};
-    int clears{0};
-};
-
 class RecordingControllerListener : public ControllerRoleListener {
 public:
     void on_controller_state(const ServerStateControllerObject& state) override {
@@ -207,23 +139,6 @@ public:
     int updates{0};
     int clears{0};
     uint8_t last_volume{0};
-};
-
-class CountingVisualizerListener : public VisualizerRoleListener {
-public:
-    void on_loudness(int64_t /*client_timestamp*/, uint16_t /*loudness*/) override {
-        this->loudness.fetch_add(1);
-    }
-    void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) override {
-        ++this->stream_starts;
-    }
-    void on_visualizer_stream_end() override {
-        ++this->stream_ends;
-    }
-
-    std::atomic<size_t> loudness{0};
-    int stream_starts{0};
-    int stream_ends{0};
 };
 
 class RecordingArtworkListener : public ArtworkRoleListener {
@@ -245,39 +160,8 @@ public:
 };
 
 /// A paired fake server connected to the bundle's client on `port`.
-std::unique_ptr<FakeEncryptedServer> connect_paired_server(const PairedPeer& peer, uint16_t port,
-                                                           FakeEncryptedServerOptions options) {
-    return std::make_unique<FakeEncryptedServer>(server_url(port),
-                                                 std::string(NOISE_SUITE_CHACHAPOLY),
-                                                 peer.server_identity, peer.record.psk_id, peer.psk,
-                                                 std::move(options));
-}
-
-bool pump_until_synced(SendspinClient& client) {
-    return pump_until(
-        client, [&] { return client.is_connected() && client.is_time_synced(); }, PUMP_TIMEOUT_MS);
-}
-
 // Pumps until the peer has written at least `target` audio callbacks, feeding 20 ms PCM chunks
 // stamped a little ahead of now so the sync task has something to schedule.
-bool stream_audio_until(SendspinClient& client, FakeEncryptedServer& server,
-                        CountingPlayerListener& listener, size_t target) {
-    constexpr size_t PCM_20MS_BYTES = 48000 / 50 * 2 * 2;
-    int64_t next_ts = platform_time_us() + 50 * 1000;
-    return pump_until(
-        client,
-        [&] {
-            if (listener.audio_writes.load() >= target) {
-                return true;
-            }
-            server.send_audio(next_ts, PCM_20MS_BYTES);
-            next_ts += 20 * 1000;
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // real-time pacing
-            return false;
-        },
-        PUMP_TIMEOUT_MS);
-}
-
 // Pumps until `done`, feeding loudness frames stamped for immediate display.
 bool send_loudness_until(SendspinClient& client, FakeEncryptedServer& server,
                          const std::function<bool()>& done) {
@@ -293,19 +177,6 @@ bool send_loudness_until(SendspinClient& client, FakeEncryptedServer& server,
             return false;
         },
         PUMP_TIMEOUT_MS);
-}
-
-void put_be64(std::vector<uint8_t>& out, int64_t val) {
-    auto u = static_cast<uint64_t>(val);
-    for (int i = 7; i >= 0; --i) {
-        out.push_back(static_cast<uint8_t>((u >> (8 * i)) & 0xFF));
-    }
-}
-
-void put_be32(std::vector<uint8_t>& out, uint32_t val) {
-    for (int i = 3; i >= 0; --i) {
-        out.push_back(static_cast<uint8_t>((val >> (8 * i)) & 0xFF));
-    }
 }
 
 // roles/artwork/v1.md "Artwork (Binary)": [type][flags][timestamp][total_size], flags bit 1 set.
@@ -343,7 +214,7 @@ TEST(RoleDeactivation, RemovedPlayerStopsTheStreamAndLeavesTheOtherRolesAlone) {
 
     PairedClientBundle bundle(make_config(PLAYER_REMOVED_TEST_PORT));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_visualizer(make_visualizer_config()).set_listener(&visualizer_listener);
     client.add_metadata().set_listener(&metadata_listener);
     ASSERT_TRUE(bundle.start());
@@ -407,7 +278,7 @@ TEST(RoleDeactivation, RemovedVisualizerEndsTheStreamAndStopsDelivery) {
 
     PairedClientBundle bundle(make_config(VISUALIZER_REMOVED_TEST_PORT));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_visualizer(make_visualizer_config()).set_listener(&visualizer_listener);
     ASSERT_TRUE(bundle.start());
 
@@ -559,7 +430,7 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
 
     PairedClientBundle bundle(make_config(STATE_ROLES_REMOVED_TEST_PORT));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_metadata().set_listener(&metadata_listener);
     client.add_color().set_listener(&color_listener);
     client.add_controller().set_listener(&controller_listener);
@@ -671,7 +542,7 @@ TEST(RoleDeactivation, ActivationThatRemovesNoRoleTearsNothingDown) {
 
     PairedClientBundle bundle(make_config(NO_CHANGE_TEST_PORT));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_metadata().set_listener(&metadata_listener);
     client.add_color().set_listener(&color_listener);
     ASSERT_TRUE(bundle.start());
@@ -718,7 +589,7 @@ TEST(RoleDeactivation, ReAddedPlayerPublishesItsStateAndPlaysAgain) {
 
     PairedClientBundle bundle(make_config(READD_TEST_PORT));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_metadata();
     ASSERT_TRUE(bundle.start());
 
@@ -783,7 +654,7 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeARemovalNeverStarts) {
 
     PairedClientBundle bundle(make_config(STALE_START_TEST_PORT));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_metadata();
     ASSERT_TRUE(bundle.start());
 
@@ -832,7 +703,7 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeAKeepingActivateStillStarts) {
 
     PairedClientBundle bundle(make_config(STALE_START_CONTROL_TEST_PORT));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_metadata();
     ASSERT_TRUE(bundle.start());
 
@@ -894,7 +765,7 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
 
     PairedClientBundle bundle(make_config(INACTIVE_TRAFFIC_TEST_PORT));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_metadata().set_listener(&metadata_listener);
     client.add_color().set_listener(&color_listener);
     client.add_controller().set_listener(&controller_listener);
@@ -1016,7 +887,7 @@ TEST(RoleDeactivation, ReplacingARoleVersionRemovesTheVersionInUse) {
 
     PairedClientBundle bundle(make_config(VERSION_REPLACED_TEST_PORT));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&player_listener);
+    client.add_player(make_pcm_player_config()).set_listener(&player_listener);
     client.add_metadata().set_listener(&metadata_listener);
     ASSERT_TRUE(bundle.start());
 

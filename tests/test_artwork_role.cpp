@@ -17,6 +17,8 @@
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 #include <ArduinoJson.h>
+#include "test_util.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -34,22 +36,6 @@
 using namespace sendspin;
 
 namespace {
-
-// Appends val as 8 big-endian bytes (an announce's timestamp), mirroring put_be64 in
-// test_visualizer_role.cpp.
-void put_be64(std::vector<uint8_t>& out, int64_t val) {
-    auto u = static_cast<uint64_t>(val);
-    for (int i = 7; i >= 0; --i) {
-        out.push_back(static_cast<uint8_t>((u >> (8 * i)) & 0xFF));
-    }
-}
-
-// Appends val as 4 big-endian bytes (an announce's total_size).
-void put_be32(std::vector<uint8_t>& out, uint32_t val) {
-    for (int i = 3; i >= 0; --i) {
-        out.push_back(static_cast<uint8_t>((val >> (8 * i)) & 0xFF));
-    }
-}
 
 // Flag bits of roles/artwork/v1.md "Artwork (Binary)": bit 0 cancels, bit 1 announces, a part
 // sets neither.

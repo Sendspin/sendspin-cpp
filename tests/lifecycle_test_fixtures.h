@@ -27,12 +27,17 @@
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "noise_test_helpers.h"
+#include "test_util.h"
 #include "platform/base64.h"
 #include "platform/crypto.h"
 #include "platform/time.h"
 #include "sendspin/client.h"
+#include "sendspin/color_role.h"
+#include "sendspin/metadata_role.h"
 #include "sendspin/persistence_codec.h"
+#include "sendspin/player_role.h"
 #include "sendspin/types.h"
+#include "sendspin/visualizer_role.h"
 
 #include <ixwebsocket/IXConnectionState.h>
 #include <ixwebsocket/IXWebSocket.h>
@@ -1104,5 +1109,160 @@ private:
     // test thread calls send_tampered_frame().
     std::weak_ptr<ix::WebSocket> ws_;
 };
+
+
+// ============================================================================
+// Shared role listeners
+// ============================================================================
+//
+// One copy of each, because a per-file copy is where two suites quietly start disagreeing about
+// what the library does. Counts a listener updates from the main loop are plain ints: every
+// callback here except on_audio_write() and on_loudness() is fired from SendspinClient::loop(),
+// which in these suites is the test thread itself, so there is nothing to synchronize with. The
+// two that a role thread reaches are atomic.
+
+/// Counts the player lifecycle callbacks and audio writes; the write itself is a sink.
+class CountingPlayerListener : public PlayerRoleListener {
+public:
+    /// The sync task's own thread writes here, unlike the callbacks below.
+    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
+        this->audio_writes.fetch_add(1);
+        return length;
+    }
+    void on_stream_start() override {
+        ++this->stream_starts;
+    }
+    void on_stream_end() override {
+        ++this->stream_ends;
+    }
+
+    std::atomic<size_t> audio_writes{0};
+    int stream_starts{0};
+    int stream_ends{0};
+};
+
+/// Records what each metadata update carried, and counts the clears behind a teardown.
+class RecordingMetadataListener : public MetadataRoleListener {
+public:
+    void on_metadata(const ServerMetadataStateObject& metadata) override {
+        this->last_title = metadata.title.value_or("");
+        this->last_artist = metadata.artist.value_or("");
+        this->last_had_progress = metadata.progress.has_value();
+        ++this->updates;
+    }
+    void on_metadata_clear() override {
+        ++this->clears;
+    }
+
+    int updates{0};
+    int clears{0};
+    std::string last_title;
+    std::string last_artist;
+    bool last_had_progress{false};
+};
+
+/// The color twin of RecordingMetadataListener.
+class RecordingColorListener : public ColorRoleListener {
+public:
+    void on_color(const ServerColorStateObject& color) override {
+        this->last_primary = color.primary.value_or(RgbColor{});
+        ++this->updates;
+    }
+    void on_color_clear() override {
+        ++this->clears;
+    }
+
+    int updates{0};
+    int clears{0};
+    RgbColor last_primary{};
+};
+
+/// Counts visualizer frames and the stream lifecycle around them.
+class CountingVisualizerListener : public VisualizerRoleListener {
+public:
+    /// The visualizer drain thread delivers frames, unlike the stream callbacks below.
+    void on_loudness(int64_t /*client_timestamp*/, uint16_t /*loudness*/) override {
+        this->loudness.fetch_add(1);
+    }
+    void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) override {
+        ++this->stream_starts;
+    }
+    void on_visualizer_stream_end() override {
+        ++this->stream_ends;
+    }
+
+    std::atomic<size_t> loudness{0};
+    int stream_starts{0};
+    int stream_ends{0};
+};
+
+// ============================================================================
+// Shared message and config builders
+// ============================================================================
+
+inline std::string stream_start_pcm_json() {
+    return R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":48000,)"
+           R"("channels":2,"bit_depth":16}}})";
+}
+
+inline std::string stream_start_visualizer_json() {
+    return R"({"type":"stream/start","payload":{"visualizer":{"types":["loudness"],"rate_max":30}}})";
+}
+
+inline std::string metadata_state_json(int64_t timestamp, const std::string& title) {
+    return R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
+           std::to_string(timestamp) + R"(,"title":")" + title + R"("}}})";
+}
+
+/// The 48 kHz stereo PCM player the streaming suites drive, sized to hold a few seconds.
+inline PlayerRoleConfig make_pcm_player_config() {
+    PlayerRoleConfig player_cfg;
+    player_cfg.audio_formats.push_back({SendspinCodecFormat::PCM, 2, 48000, 16});
+    player_cfg.audio_buffer_capacity = 64 * 1024;
+    return player_cfg;
+}
+
+// ============================================================================
+// Shared drivers
+// ============================================================================
+
+/// Generous next to the loopback round trips involved, so a verdict comes from the predicate
+/// rather than the clock; a real hang is caught by the suite watchdog in main.cpp.
+inline constexpr int FIXTURE_PUMP_TIMEOUT_MS = 6000;
+
+/// Opens a fake server for a peer the client is already paired with.
+inline std::unique_ptr<FakeEncryptedServer> connect_paired_server(
+    const PairedPeer& peer, uint16_t port, FakeEncryptedServerOptions options = {}) {
+    return std::make_unique<FakeEncryptedServer>(
+        server_url(port), std::string(NOISE_SUITE_CHACHAPOLY), peer.server_identity,
+        peer.record.psk_id, peer.psk, std::move(options));
+}
+
+/// Pumps until the session is up and the time filter has converged, which is what the streaming
+/// tests need before a timestamped chunk means anything.
+inline bool pump_until_synced(SendspinClient& client) {
+    return pump_until(
+        client, [&] { return client.is_connected() && client.is_time_synced(); },
+        FIXTURE_PUMP_TIMEOUT_MS);
+}
+
+/// Feeds 20 ms PCM chunks, paced in real time, until the listener has taken `target` writes.
+inline bool stream_audio_until(SendspinClient& client, FakeEncryptedServer& server,
+                               CountingPlayerListener& listener, size_t target) {
+    constexpr size_t PCM_20MS_BYTES = 48000 / 50 * 2 * 2;
+    int64_t next_ts = platform_time_us() + 50 * 1000;
+    return pump_until(
+        client,
+        [&] {
+            if (listener.audio_writes.load() >= target) {
+                return true;
+            }
+            server.send_audio(next_ts, PCM_20MS_BYTES);
+            next_ts += 20 * 1000;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // real-time pacing
+            return false;
+        },
+        FIXTURE_PUMP_TIMEOUT_MS);
+}
 
 }  // namespace sendspin

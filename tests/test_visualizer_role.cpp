@@ -15,6 +15,8 @@
 #include "protocol_messages.h"
 #include "visualizer_role_impl.h"
 
+#include "test_util.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -27,14 +29,6 @@
 using namespace sendspin;
 
 namespace {
-
-// Appends val as 8 big-endian bytes (the server timestamp prefix of every visualizer message).
-void put_be64(std::vector<uint8_t>& out, int64_t val) {
-    auto u = static_cast<uint64_t>(val);
-    for (int i = 7; i >= 0; --i) {
-        out.push_back(static_cast<uint8_t>((u >> (8 * i)) & 0xFF));
-    }
-}
 
 void put_be16(std::vector<uint8_t>& out, uint16_t val) {
     out.push_back(static_cast<uint8_t>(val >> 8));

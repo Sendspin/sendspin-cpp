@@ -98,10 +98,18 @@ target_compile_options(sendspin_tests PRIVATE -Wall -Wextra)
 set_source_files_properties(test_pairing_state_machine.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 
-# test_encrypted_lifecycle.cpp uses it for one read: the unpair tests assert that the matched
-# record left the RecordStore for the current boot, and the client exposes no accessor for its
-# store. The persisted half of the same removal is observable through the test's persistence
-# provider without the flag.
+# test_encrypted_lifecycle.cpp reaches private state in three places, none of which has a public
+# surface to use instead:
+#   - RecordStore::resolve_by_psk_id(), for the unpair tests: whether the matched record still
+#     resolves for the current boot is what "revoked" means, and the client exposes no accessor
+#     for its store. (The persisted half of the same removal is observable through the test's
+#     persistence provider without the flag.)
+#   - ConnectionManager::current(), to name the connection a handoff test expects in the admitted
+#     slot rather than inferring it from side effects.
+#   - ConnectionManager::conn_ptr_mutex_ and SendspinClient::json_processing_mutex_, taken and
+#     probed directly by the lock-order test: holding the manager lock exactly where loop() holds
+#     it is what makes an admission that reaches for the JSON lock hang the test instead of a
+#     device.
 set_source_files_properties(test_encrypted_lifecycle.cpp PROPERTIES
     COMPILE_OPTIONS "-fno-access-control")
 

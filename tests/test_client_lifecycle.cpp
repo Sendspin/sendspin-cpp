@@ -80,13 +80,6 @@ SendspinClientConfig make_config(uint16_t port) {
 }
 
 /// A paired fake server connected to the bundle's client on `port`.
-std::unique_ptr<FakeEncryptedServer> connect_paired_server(const PairedPeer& peer, uint16_t port,
-                                                           FakeEncryptedServerOptions options = {}) {
-    return std::make_unique<FakeEncryptedServer>(server_url(port), std::string(NOISE_SUITE_CHACHAPOLY),
-                                                 peer.server_identity, peer.record.psk_id, peer.psk,
-                                                 std::move(options));
-}
-
 /// Reports whether anything is listening on the loopback port.
 bool port_accepts(uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -103,24 +96,6 @@ bool port_accepts(uint16_t port) {
 }
 
 /// Counts the player lifecycle callbacks and audio writes; the write itself is a sink.
-class CountingPlayerListener : public PlayerRoleListener {
-public:
-    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
-        this->audio_writes.fetch_add(1);
-        return length;
-    }
-    void on_stream_start() override {
-        ++this->stream_starts;
-    }
-    void on_stream_end() override {
-        ++this->stream_ends;
-    }
-
-    std::atomic<size_t> audio_writes{0};
-    int stream_starts{0};
-    int stream_ends{0};
-};
-
 /// Records on_metadata_clear() and, from inside it, tries to drive the lifecycle re-entrantly.
 class ReentrantMetadataListener : public MetadataRoleListener {
 public:
@@ -157,42 +132,12 @@ public:
     }
 };
 
-std::string stream_start_pcm_json() {
-    return R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":48000,)"
-           R"("channels":2,"bit_depth":16}}})";
-}
-
 std::string group_update_playing_json() {
     return R"({"type":"group/update","payload":{"playback_state":"playing"}})";
 }
 
-PlayerRoleConfig make_player_config() {
-    PlayerRoleConfig player_cfg;
-    player_cfg.audio_formats.push_back({SendspinCodecFormat::PCM, 2, 48000, 16});
-    player_cfg.audio_buffer_capacity = 64 * 1024;
-    return player_cfg;
-}
-
 // Pumps until the peer has written at least `target` audio callbacks, feeding 20 ms PCM chunks
 // stamped a little ahead of now so the sync task has something to schedule.
-bool stream_audio_until(SendspinClient& client, FakeEncryptedServer& server,
-                        CountingPlayerListener& listener, size_t target) {
-    constexpr size_t PCM_20MS_BYTES = 48000 / 50 * 2 * 2;
-    int64_t next_ts = platform_time_us() + 50 * 1000;
-    return pump_until(
-        client,
-        [&] {
-            if (listener.audio_writes.load() >= target) {
-                return true;
-            }
-            server.send_audio(next_ts, PCM_20MS_BYTES);
-            next_ts += 20 * 1000;
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // real-time pacing
-            return false;
-        },
-        PUMP_TIMEOUT_MS);
-}
-
 // ============================================================================
 // GoodbyeWait: the bound stop() relies on
 // ============================================================================
@@ -342,7 +287,7 @@ TEST(ClientLifecycle, StopEndsTheStreamAndRestartPlaysAgain) {
     config.time_burst_interval_ms = 100;  // Sync promptly after each (re)connect
     PairedClientBundle bundle(std::move(config));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&listener);
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
 
     FakeEncryptedServerOptions options;
     options.answer_time = true;
@@ -442,7 +387,7 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     CountingPlayerListener listener;
     PairedClientBundle bundle(make_config(ROLLBACK_TEST_PORT));
     SendspinClient& client = bundle.client();
-    client.add_player(make_player_config()).set_listener(&listener);
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
 
     VisualizerRoleConfig broken;
     broken.stream.types = {VisualizerDataType::LOUDNESS};
@@ -475,19 +420,6 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
 }
 
 /// Counts loudness deliveries; they fire on the visualizer drain thread.
-class CountingVisualizerListener : public VisualizerRoleListener {
-public:
-    void on_loudness(int64_t /*client_timestamp*/, uint16_t /*loudness*/) override {
-        this->loudness.fetch_add(1);
-    }
-
-    std::atomic<size_t> loudness{0};
-};
-
-std::string stream_start_visualizer_json() {
-    return R"({"type":"stream/start","payload":{"visualizer":{"types":["loudness"],"rate_max":30}}})";
-}
-
 VisualizerRoleConfig make_visualizer_config() {
     VisualizerRoleConfig config;
     config.stream.types = {VisualizerDataType::LOUDNESS};
@@ -498,12 +430,6 @@ VisualizerRoleConfig make_visualizer_config() {
 
 // Waits for a fresh peer that answers time messages to be established and synced: the drain
 // thread delivers nothing until the client is time synced.
-bool pump_until_synced(SendspinClient& client) {
-    return pump_until(
-        client, [&] { return client.is_connected() && client.is_time_synced(); },
-        PUMP_TIMEOUT_MS);
-}
-
 // Pumps until pred() holds, sending one loudness frame per iteration stamped `lead_us` ahead of
 // the current time (the drain thread drops a frame whose display time is well past). A frame
 // can be lost to the ring's documented wake race right after a stream/start (the drain thread

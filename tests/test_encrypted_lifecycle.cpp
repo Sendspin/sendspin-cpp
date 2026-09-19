@@ -35,6 +35,7 @@
 #include "record_store.h"
 #include "sendspin/client.h"
 #include "sendspin/config.h"
+#include "sendspin/color_role.h"
 #include "sendspin/controller_role.h"
 #include "sendspin/player_role.h"
 #include "sendspin/metadata_role.h"
@@ -97,6 +98,9 @@ constexpr uint16_t METADATA_SCHEDULE_TEST_PORT = 19018;
 constexpr uint16_t METADATA_PENDING_TEST_PORT = 19019;
 constexpr uint16_t LOSE_CAPABILITY_TEST_PORT = 19041;
 constexpr uint16_t REFUSED_ACTIVATE_TEST_PORT = 19042;
+constexpr uint16_t COLOR_SCHEDULE_TEST_PORT = 19043;
+constexpr uint16_t COLOR_PENDING_TEST_PORT = 19044;
+constexpr uint16_t COLOR_BOTH_DUE_TEST_PORT = 19045;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -285,52 +289,8 @@ private:
 // Tests
 // ============================================================================
 
-// Counts the player's stream lifecycle callbacks and audio writes; the write itself is a sink.
-class CountingPlayerListener : public PlayerRoleListener {
-public:
-    size_t on_audio_write(uint8_t* /*data*/, size_t length, uint32_t /*timeout_ms*/) override {
-        this->audio_writes.fetch_add(1);
-        return length;
-    }
-    void on_stream_start() override {
-        this->stream_starts.fetch_add(1);
-    }
-    void on_stream_end() override {
-        this->stream_ends.fetch_add(1);
-    }
-
-    std::atomic<size_t> audio_writes{0};
-    std::atomic<int> stream_starts{0};
-    std::atomic<int> stream_ends{0};
-};
-
 // Feeds 20 ms PCM chunks stamped a little ahead of now until the listener has written at least
 // `target` times, so the sync task has something to schedule.
-bool stream_audio_until(SendspinClient& client, FakeEncryptedServer& server,
-                        CountingPlayerListener& listener, size_t target) {
-    constexpr size_t PCM_20MS_BYTES = 48000 / 50 * 2 * 2;
-    int64_t next_ts = platform_time_us() + 50 * 1000;
-    return pump_until(
-        client,
-        [&] {
-            if (listener.audio_writes.load() >= target) {
-                return true;
-            }
-            server.send_audio(next_ts, PCM_20MS_BYTES);
-            next_ts += 20 * 1000;
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // real-time pacing
-            return false;
-        },
-        6000);
-}
-
-PlayerRoleConfig make_pcm_player_config() {
-    PlayerRoleConfig player_cfg;
-    player_cfg.audio_formats.push_back({SendspinCodecFormat::PCM, 2, 48000, 16});
-    player_cfg.audio_buffer_capacity = 64 * 1024;
-    return player_cfg;
-}
-
 // Seeds a client whose Pairing PSK is configured and whose unpaired access is on, which is what
 // messaging.md "server/activate" requires before a pairing-PSK connection may declare playback.
 SendspinPairingPsk seed_pairing_psk(PairingCapturePersistenceProvider& persistence, uint8_t base) {
@@ -1099,7 +1059,7 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
         R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":48000,)"
         R"("channels":2,"bit_depth":16}}})"));
     ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_starts.load() == 1; }, 6000));
+        client, [&] { return player_listener.stream_starts == 1; }, 6000));
     ASSERT_TRUE(stream_audio_until(client, server, player_listener, 1))
         << "audio never reached the player before the pairing activate";
 
@@ -1121,8 +1081,8 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
 
     // pairing.md "Entering and leaving pairing": the stream stays open and keeps playing, and no
     // stream/end or clear was synthesized for the activate.
-    EXPECT_EQ(player_listener.stream_starts.load(), 1);
-    EXPECT_EQ(player_listener.stream_ends.load(), 0) << "adding pairing must not end the stream";
+    EXPECT_EQ(player_listener.stream_starts, 1);
+    EXPECT_EQ(player_listener.stream_ends, 0) << "adding pairing must not end the stream";
     EXPECT_TRUE(stream_audio_until(client, server, player_listener, writes_before + 1))
         << "audio must keep reaching the player across the pairing activate";
 
@@ -1600,9 +1560,9 @@ TEST(EncryptedLifecycle, RefusedActivateDoesNotWidenTheReceiveGate) {
     ASSERT_TRUE(server.send_app_json(
         R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Still Active"}}})"));
     ASSERT_TRUE(pump_until(
-        client, [&] { return metadata_listener.updates.load() == 1; }, 4000))
+        client, [&] { return metadata_listener.updates == 1; }, 4000))
         << "the role the refused activation did not touch must keep receiving";
-    EXPECT_EQ(controller_listener.updates.load(), 0)
+    EXPECT_EQ(controller_listener.updates, 0)
         << "a refused activation left the controller role able to receive";
 
     // Control: an activation the client accepts puts the same role in service, and the same state
@@ -1614,7 +1574,7 @@ TEST(EncryptedLifecycle, RefusedActivateDoesNotWidenTheReceiveGate) {
         R"({"type":"server/state","payload":{"controller":{"supported_commands":["play"],)"
         R"("volume":42,"muted":false,"repeat":"off","shuffle":false}}})"));
     EXPECT_TRUE(pump_until(
-        client, [&] { return controller_listener.updates.load() == 1; }, 4000))
+        client, [&] { return controller_listener.updates == 1; }, 4000))
         << "an accepted activation must put the role in service";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -1683,7 +1643,7 @@ TEST(EncryptedLifecycle, ActivateThatLosesPlaybackCapabilityRemovesTheRoles) {
     ASSERT_TRUE(server.send_app_json(
         R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Playing"}}})"));
     ASSERT_TRUE(pump_until(
-        client, [&] { return metadata_listener.updates.load() == 1; }, 4000))
+        client, [&] { return metadata_listener.updates == 1; }, 4000))
         << "the metadata role never received its state while it was active";
 
     ASSERT_TRUE(server.trigger_rehandshake(pairing_psk.psk_id, pairing_psk.psk, "pr"))
@@ -1920,20 +1880,6 @@ public:
     }
 };
 
-class RecordingMetadataListener : public MetadataRoleListener {
-public:
-    std::atomic<int> updates{0};
-    std::string last_title;
-    std::string last_artist;
-    bool last_had_progress{false};
-    void on_metadata(const ServerMetadataStateObject& m) override {
-        this->last_title = m.title.value_or("");
-        this->last_artist = m.artist.value_or("");
-        this->last_had_progress = m.progress.has_value();
-        this->updates.fetch_add(1);
-    }
-};
-
 // A started client with a metadata role, and the one entry point the hold tests need: hand a JSON
 // message to the dispatch path as the connection's network thread would.
 class HoldTestClient {
@@ -2033,7 +1979,7 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
         << "Encrypted handshake/hello/activate did not complete";
 
     // The pre-activate server/state must have been dropped on the floor.
-    EXPECT_EQ(metadata_listener.updates.load(), 0)
+    EXPECT_EQ(metadata_listener.updates, 0)
         << "Role traffic from an unadmitted connection reached the metadata role (last_title='"
         << metadata_listener.last_title << "')";
 
@@ -2042,7 +1988,7 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     server.send_app_json(
         R"({"type":"server/state","payload":{"metadata":{"timestamp":2,"title":"Post-Admission OK"}}})");
     EXPECT_TRUE(pump_until(
-        client, [&] { return metadata_listener.updates.load() > 0; }, 4000))
+        client, [&] { return metadata_listener.updates > 0; }, 4000))
         << "Role traffic from the admitted connection was incorrectly dropped";
     EXPECT_EQ(metadata_listener.last_title, "Post-Admission OK");
 
@@ -2064,13 +2010,13 @@ TEST(EncryptedLifecycle, MetadataStateReplacesRatherThanMerges) {
         R"("artist":"Band","progress":{"track_progress":0,"track_duration":1000,)"
         R"("playback_speed":1000}}}})");
     bundle.pump();
-    ASSERT_EQ(bundle.listener.updates.load(), 1);
+    ASSERT_EQ(bundle.listener.updates, 1);
     EXPECT_EQ(bundle.listener.last_artist, "Band");
     EXPECT_TRUE(bundle.listener.last_had_progress);
 
     bundle.deliver(conn, metadata_state_json(2, "Second"));
     bundle.pump();
-    ASSERT_EQ(bundle.listener.updates.load(), 2);
+    ASSERT_EQ(bundle.listener.updates, 2);
     EXPECT_EQ(bundle.listener.last_title, "Second");
     EXPECT_EQ(bundle.listener.last_artist, "") << "an omitted artist must not carry forward";
     EXPECT_FALSE(bundle.listener.last_had_progress) << "an omitted progress clears the position";
@@ -2111,11 +2057,11 @@ TEST(EncryptedLifecycle, ImmediateMetadataSurvivesAScheduledStateInTheSameTick) 
         std::to_string(scheduled_at) + R"(,"title":"Next Track"}}})"));
 
     // Both cross the network thread while the main loop is parked, so a single drain takes them.
-    EXPECT_FALSE(wait_until([&] { return listener.updates.load() > 0; }, 300))
+    EXPECT_FALSE(wait_until([&] { return listener.updates > 0; }, 300))
         << "a state was applied without a main-loop tick";
     pump_for(client, 50);
 
-    EXPECT_EQ(listener.updates.load(), 1)
+    EXPECT_EQ(listener.updates, 1)
         << "the state describing the current track was dropped for the scheduled one";
     EXPECT_EQ(listener.last_title, "Now Playing");
 
@@ -2153,7 +2099,7 @@ TEST(EncryptedLifecycle, ANewerScheduledMetadataStateReplacesThePendingOne) {
         std::to_string(platform_time_us() + 30 * static_cast<int64_t>(US_PER_SECOND)) +
         R"(,"title":"First Pending"}}})"));
     pump_for(client, 100);
-    ASSERT_EQ(listener.updates.load(), 0) << "a future-dated state was applied early";
+    ASSERT_EQ(listener.updates, 0) << "a future-dated state was applied early";
 
     // Comes due shortly, so a client that kept the first pending state instead of replacing it
     // never fires at all.
@@ -2162,12 +2108,152 @@ TEST(EncryptedLifecycle, ANewerScheduledMetadataStateReplacesThePendingOne) {
         std::to_string(platform_time_us() + static_cast<int64_t>(US_PER_SECOND) / 4) +
         R"(,"title":"Second Pending"}}})"));
     ASSERT_TRUE(pump_until(
-        client, [&] { return listener.updates.load() > 0; }, 4000))
+        client, [&] { return listener.updates > 0; }, 4000))
         << "the scheduled state that replaced the pending one never fired";
 
     EXPECT_EQ(listener.last_title, "Second Pending");
-    EXPECT_EQ(listener.updates.load(), 1)
+    EXPECT_EQ(listener.updates, 1)
         << "the replaced pending state fired as well as the one that replaced it";
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// The color role schedules its palettes exactly as the metadata role schedules its states, so it
+// is held to the same two rules. First: an immediate palette and a scheduled one that land in the
+// same tick are both kept, and the one describing what is playing now is applied rather than
+// skipped in favor of the one timed to the next track (roles/color/v1.md "Scheduled color
+// updates").
+TEST(EncryptedLifecycle, ImmediateColorSurvivesAScheduledPaletteInTheSameTick) {
+    RecordingColorListener listener;
+
+    SendspinClientConfig config;
+    config.name = "Color Immediate Plus Scheduled Test Client";
+    config.server_port = COLOR_SCHEDULE_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    client.add_color().set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["color@v1"])";
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(COLOR_SCHEDULE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+
+    // Far enough ahead that the scheduled palette cannot come due while this test runs.
+    const int64_t scheduled_at = platform_time_us() + 30 * static_cast<int64_t>(US_PER_SECOND);
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/state","payload":{"color":{"timestamp":1,"primary":[10,20,30]}}})"));
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/state","payload":{"color":{"timestamp":)" +
+        std::to_string(scheduled_at) + R"(,"primary":[40,50,60]}}})"));
+
+    // Both cross the network thread while the main loop is parked, so a single drain takes them.
+    EXPECT_FALSE(wait_until([&] { return listener.updates > 0; }, 300))
+        << "a palette was applied without a main-loop tick";
+    pump_for(client, 50);
+
+    EXPECT_EQ(listener.updates, 1)
+        << "the palette for the current track was dropped for the scheduled one";
+    EXPECT_EQ(listener.last_primary, (std::array<uint8_t, 3>{10, 20, 30}));
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// Two palettes that are both already due in the same tick collapse to one: the older would be
+// superseded within the tick, so no consumer could observe it, and firing on_color() for it would
+// flash a palette the server has already replaced.
+TEST(EncryptedLifecycle, TwoDuePalettesInOneTickApplyOnlyTheLatest) {
+    RecordingColorListener listener;
+
+    SendspinClientConfig config;
+    config.name = "Color Both Due Test Client";
+    config.server_port = COLOR_BOTH_DUE_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    client.add_color().set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["color@v1"])";
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(COLOR_BOTH_DUE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/state","payload":{"color":{"timestamp":1,"primary":[10,20,30]}}})"));
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/state","payload":{"color":{"timestamp":2,"primary":[40,50,60]}}})"));
+
+    // Both cross the network thread while the main loop is parked, so a single drain takes them.
+    EXPECT_FALSE(wait_until([&] { return listener.updates > 0; }, 300))
+        << "a palette was applied without a main-loop tick";
+    pump_for(client, 50);
+
+    EXPECT_EQ(listener.updates, 1)
+        << "a palette that was superseded inside the same tick was still handed to the consumer";
+    EXPECT_EQ(listener.last_primary, (RgbColor{40, 50, 60}));
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+// Second: a palette whose timestamp is still in the future becomes the pending update, replacing
+// any held one, and only the survivor is applied when its moment arrives.
+TEST(EncryptedLifecycle, ANewerScheduledColorPaletteReplacesThePendingOne) {
+    RecordingColorListener listener;
+
+    SendspinClientConfig config;
+    config.name = "Color Pending Replace Test Client";
+    config.server_port = COLOR_PENDING_TEST_PORT;
+
+    PairedClientBundle bundle(config);
+    SendspinClient& client = bundle.client();
+    client.add_color().set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    FakeEncryptedServerOptions options;
+    options.first_roles_json = R"(["color@v1"])";
+    auto server = std::make_unique<FakeEncryptedServer>(
+        server_url(COLOR_PENDING_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
+        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
+        std::move(options));
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return client.is_connected(); }, 4000));
+
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/state","payload":{"color":{"timestamp":)" +
+        std::to_string(platform_time_us() + 30 * static_cast<int64_t>(US_PER_SECOND)) +
+        R"(,"primary":[10,20,30]}}})"));
+    pump_for(client, 100);
+    ASSERT_EQ(listener.updates, 0) << "a future-dated palette was applied early";
+
+    // Comes due shortly, so a client that kept the first pending palette instead of replacing it
+    // never fires at all.
+    ASSERT_TRUE(server->send_app_json(
+        R"({"type":"server/state","payload":{"color":{"timestamp":)" +
+        std::to_string(platform_time_us() + static_cast<int64_t>(US_PER_SECOND) / 4) +
+        R"(,"primary":[40,50,60]}}})"));
+    ASSERT_TRUE(pump_until(
+        client, [&] { return listener.updates > 0; }, 4000))
+        << "the scheduled palette that replaced the pending one never fired";
+
+    EXPECT_EQ(listener.last_primary, (std::array<uint8_t, 3>{40, 50, 60}));
+    EXPECT_EQ(listener.updates, 1)
+        << "the replaced pending palette fired as well as the one that replaced it";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -2182,7 +2268,7 @@ TEST(EncryptedLifecycle, RoleTrafficFromAnAdmittedConnectionIsApplied) {
     bundle.client_ref().admit_connection(&conn);
     bundle.deliver(conn, metadata_state_json(1, "Admitted"));
     bundle.pump();
-    EXPECT_EQ(bundle.listener.updates.load(), 1);
+    EXPECT_EQ(bundle.listener.updates, 1);
     EXPECT_EQ(bundle.listener.last_title, "Admitted");
 }
 
@@ -2195,11 +2281,11 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAnyActivateIsNotReplayedAtAdmission) {
     HoldTestConnection conn;
     bundle.deliver(conn, metadata_state_json(1, "Before Any Activate"));
     bundle.pump();
-    ASSERT_EQ(bundle.listener.updates.load(), 0);
+    ASSERT_EQ(bundle.listener.updates, 0);
 
     bundle.client_ref().admit_connection(&conn);
     bundle.pump();
-    EXPECT_EQ(bundle.listener.updates.load(), 0)
+    EXPECT_EQ(bundle.listener.updates, 0)
         << "role traffic that preceded every server/activate must not be replayed (last_title='"
         << bundle.listener.last_title << "')";
 }
@@ -2221,12 +2307,12 @@ TEST(EncryptedLifecycle, RoleTrafficBetweenActivateAndAdmissionIsReplayed) {
 
     bundle.deliver(conn, metadata_state_json(1, "Held Through Admission"));
     bundle.pump();
-    ASSERT_EQ(bundle.listener.updates.load(), 0)
+    ASSERT_EQ(bundle.listener.updates, 0)
         << "an unadmitted connection must not drive the roles, held or not";
 
     bundle.client_ref().admit_connection(&conn);
     bundle.pump();
-    EXPECT_EQ(bundle.listener.updates.load(), 1)
+    EXPECT_EQ(bundle.listener.updates, 1)
         << "the role message held across admission was never applied";
     EXPECT_EQ(bundle.listener.last_title, "Held Through Admission");
 }
@@ -2245,7 +2331,7 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsReplayedInArrivalOrder) {
 
     bundle.client_ref().admit_connection(&conn);
     bundle.pump();
-    EXPECT_EQ(bundle.listener.updates.load(), 1);
+    EXPECT_EQ(bundle.listener.updates, 1);
     EXPECT_EQ(bundle.listener.last_title, "Second")
         << "the held messages were replayed out of order";
 }
@@ -2268,7 +2354,7 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBounded) {
     bundle.pump();
     // The last title to survive the merge is the last one that fit the budget: everything the
     // peer sent past it was dropped rather than queued.
-    EXPECT_EQ(bundle.listener.updates.load(), 1);
+    EXPECT_EQ(bundle.listener.updates, 1);
     EXPECT_EQ(bundle.listener.last_title,
               "Title " + std::to_string(SendspinConnection::MAX_HELD_MESSAGES - 1));
 }
@@ -2339,7 +2425,7 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBoundedByBytesBeforeMessages) {
 
     bundle.client_ref().admit_connection(&conn);
     bundle.pump();
-    EXPECT_EQ(bundle.listener.updates.load(), 1);
+    EXPECT_EQ(bundle.listener.updates, 1);
     EXPECT_EQ(bundle.listener.last_title, std::string(title_len, 'b'))
         << "the last state inside the byte budget is the one that must replay";
 }
@@ -2369,7 +2455,7 @@ TEST(EncryptedLifecycle, EveryHeldMessageTypeReplaysThroughItsHandler) {
     bundle.client_ref().admit_connection(&conn);
 
     bundle.pump();
-    EXPECT_EQ(bundle.listener.updates.load(), 1) << "the replay did not run to completion";
+    EXPECT_EQ(bundle.listener.updates, 1) << "the replay did not run to completion";
     EXPECT_EQ(bundle.listener.last_title, "Replayed");
 }
 
@@ -2426,7 +2512,7 @@ TEST(EncryptedLifecycle, PairFinalizeDoesNotDeadlockAgainstAnAdmission) {
     manager.flush_pending_admission();
 
     bundle.pump();
-    EXPECT_EQ(bundle.listener.updates.load(), 1)
+    EXPECT_EQ(bundle.listener.updates, 1)
         << "the connection staged under the manager lock was never admitted";
     EXPECT_EQ(bundle.listener.last_title, "Held Across A Pair Finalize");
     EXPECT_TRUE(admitted->is_admitted());

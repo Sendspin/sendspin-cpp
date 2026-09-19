@@ -117,18 +117,17 @@ TEST(PlayerRoleTimingParameters, ConfiguredValuesAreReported) {
 }
 
 // Control: with nothing configured the player still reports both, at the documented defaults.
-// The lead-time default carries the sync task's priming silence and the extra startup silence as
-// terms, so it must exceed the startup silence it is derived from.
+// The numbers are spelled out rather than re-derived with pipeline_lead_time_ms(): that is the
+// production formula, so re-running it here would report whatever the terms became. 150 is 25 ms
+// of sync priming, 50 ms of default extra startup silence and 75 ms of pipeline start allowance
+// -- the lead this client asks every server for.
 TEST(PlayerRoleTimingParameters, DefaultsAreReported) {
     SendspinClient client(make_client_config("player-timing-default"));
     auto& player = client.add_player(make_player_config());
 
     ClientPlayerStateObject state = build_player_state(player);
-    EXPECT_EQ(state.required_lead_time_ms,
-              PlayerRoleConfig::pipeline_lead_time_ms(
-                  PlayerRoleConfig::DEFAULT_EXTRA_STARTUP_SILENCE_MS));
-    EXPECT_EQ(state.min_buffer_ms, PlayerRoleConfig::DEFAULT_MIN_BUFFER_MS);
-    EXPECT_GT(state.required_lead_time_ms, PlayerRoleConfig::DEFAULT_EXTRA_STARTUP_SILENCE_MS);
+    EXPECT_EQ(state.required_lead_time_ms, 150);
+    EXPECT_EQ(state.min_buffer_ms, 500);
 }
 
 // The reported lead time follows the pipeline it describes: raising the startup silence the sync
@@ -141,8 +140,8 @@ TEST(PlayerRoleTimingParameters, StartupSilenceRaisesTheReportedLeadTime) {
     auto& player = client.add_player(std::move(player_config));
 
     ClientPlayerStateObject state = build_player_state(player);
-    EXPECT_EQ(state.required_lead_time_ms, PlayerRoleConfig::pipeline_lead_time_ms(400));
-    EXPECT_GT(state.required_lead_time_ms, 400);
+    // 25 + 400 + 75: only the configured term moved.
+    EXPECT_EQ(state.required_lead_time_ms, 500);
 }
 
 // A configured value below what the pipeline spends is raised to it: the server extends lead only

@@ -13,7 +13,8 @@
 // limitations under the License.
 
 /// @file test_util.h
-/// @brief Shared test helpers: hex encoding/decoding for KAT comparisons.
+/// @brief Shared test helpers: hex encoding/decoding for KAT comparisons, and the big-endian
+/// appenders the binary role messages are built with.
 
 #pragma once
 
@@ -68,4 +69,19 @@ inline std::array<uint8_t, N> from_hex_arr(const char* s) {
     std::array<uint8_t, N> a{};
     std::memcpy(a.data(), v.data(), std::min(v.size(), N));
     return a;
+}
+
+/// Appends val as 8 big-endian bytes: the timestamp every binary role message starts with.
+inline void put_be64(std::vector<uint8_t>& out, int64_t val) {
+    auto u = static_cast<uint64_t>(val);
+    for (int i = 7; i >= 0; --i) {
+        out.push_back(static_cast<uint8_t>((u >> (8 * i)) & 0xFF));
+    }
+}
+
+/// Appends val as 4 big-endian bytes: an artwork announce's total_size.
+inline void put_be32(std::vector<uint8_t>& out, uint32_t val) {
+    for (int i = 3; i >= 0; --i) {
+        out.push_back(static_cast<uint8_t>((val >> (8 * i)) & 0xFF));
+    }
 }
