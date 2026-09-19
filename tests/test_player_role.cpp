@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -108,60 +109,50 @@ TEST(PlayerRoleFormats, StartAcceptsFlacOrPcmAmongOthers) {
 // ============================================================================
 
 // roles/player/v1.md "client/state player object": required_lead_time_ms and min_buffer_ms are
-// reported in every player state object. A configured lead time above what the pipeline spends
-// reaches the state object unchanged.
-TEST(PlayerRoleTimingParameters, ConfiguredValuesAreReported) {
-    PlayerRoleConfig player_config = make_player_config();
-    player_config.required_lead_time_ms = 321;
-    player_config.min_buffer_ms = 654;
+// reported in every player state object. The reported lead time follows the pipeline it
+// describes, so raising the startup silence the sync task inserts raises what the server is
+// asked to give, and a configured value below what the pipeline spends is raised to it: the
+// server extends lead only toward the reported number, so reporting less than the truth
+// truncates the stream start.
+//
+// The expected numbers are spelled out rather than re-derived with pipeline_lead_time_ms():
+// that is the production formula, so re-running it here would report whatever the terms became.
+// 150 is 25 ms of sync priming, 50 ms of default extra startup silence and 75 ms of pipeline
+// start allowance.
+TEST(PlayerRoleTimingParameters, ReportedLeadTimeIsTheLargerOfTheConfiguredValueAndThePipeline) {
+    struct Row {
+        const char* name;
+        std::optional<uint16_t> configured_lead_ms;
+        std::optional<uint16_t> configured_min_buffer_ms;
+        std::optional<uint16_t> extra_startup_silence_ms;
+        uint16_t expected_lead_ms;
+        uint16_t expected_min_buffer_ms;
+    };
+    const Row rows[] = {
+        {"Control: nothing configured reports the defaults", {}, {}, {}, 150, 500},
+        {"configured values above the pipeline are reported unchanged", 321, 654, {}, 321, 654},
+        {"startup silence raises the lead time", {}, {}, 400, 500, 500},
+        {"configured lead below the pipeline is raised to it", 10, {}, 400, 500, 500},
+    };
 
-    SendspinClient client(make_client_config("player-timing-configured"));
-    auto& player = client.add_player(std::move(player_config));
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        PlayerRoleConfig player_config = make_player_config();
+        player_config.required_lead_time_ms = row.configured_lead_ms;
+        if (row.configured_min_buffer_ms.has_value()) {
+            player_config.min_buffer_ms = *row.configured_min_buffer_ms;
+        }
+        if (row.extra_startup_silence_ms.has_value()) {
+            player_config.extra_startup_silence_ms = *row.extra_startup_silence_ms;
+        }
 
-    ClientPlayerStateObject state = build_player_state(player);
-    EXPECT_EQ(state.required_lead_time_ms, 321);
-    EXPECT_EQ(state.min_buffer_ms, 654);
-}
+        SendspinClient client(make_client_config("player-timing"));
+        auto& player = client.add_player(std::move(player_config));
 
-// Control: with nothing configured the player still reports both, at the documented defaults.
-// The numbers are spelled out rather than re-derived with pipeline_lead_time_ms(): that is the
-// production formula, so re-running it here would report whatever the terms became. 150 is 25 ms
-// of sync priming, 50 ms of default extra startup silence and 75 ms of pipeline start allowance.
-TEST(PlayerRoleTimingParameters, DefaultsAreReported) {
-    SendspinClient client(make_client_config("player-timing-default"));
-    auto& player = client.add_player(make_player_config());
-
-    ClientPlayerStateObject state = build_player_state(player);
-    EXPECT_EQ(state.required_lead_time_ms, 150);
-    EXPECT_EQ(state.min_buffer_ms, 500);
-}
-
-// The reported lead time follows the pipeline it describes: raising the startup silence the sync
-// task inserts raises what the server is asked to give, with no second setting to remember.
-TEST(PlayerRoleTimingParameters, StartupSilenceRaisesTheReportedLeadTime) {
-    PlayerRoleConfig player_config = make_player_config();
-    player_config.extra_startup_silence_ms = 400;
-
-    SendspinClient client(make_client_config("player-timing-startup-silence"));
-    auto& player = client.add_player(std::move(player_config));
-
-    ClientPlayerStateObject state = build_player_state(player);
-    // 25 + 400 + 75: only the configured term moved.
-    EXPECT_EQ(state.required_lead_time_ms, 500);
-}
-
-// A configured value below what the pipeline spends is raised to it: the server extends lead only
-// toward the reported number, so reporting less than the truth truncates the stream start.
-TEST(PlayerRoleTimingParameters, ConfiguredLeadTimeCannotUndercutThePipeline) {
-    PlayerRoleConfig player_config = make_player_config();
-    player_config.extra_startup_silence_ms = 400;
-    player_config.required_lead_time_ms = 10;
-
-    SendspinClient client(make_client_config("player-timing-undercut"));
-    auto& player = client.add_player(std::move(player_config));
-
-    ClientPlayerStateObject state = build_player_state(player);
-    EXPECT_EQ(state.required_lead_time_ms, PlayerRoleConfig::pipeline_lead_time_ms(400));
+        ClientPlayerStateObject state = build_player_state(player);
+        EXPECT_EQ(state.required_lead_time_ms, row.expected_lead_ms);
+        EXPECT_EQ(state.min_buffer_ms, row.expected_min_buffer_ms);
+    }
 }
 
 // The timing parameters describe the pipeline, not the delay knob: an inadjustable delay reports
@@ -516,20 +507,24 @@ TEST(PlayerRoleOutputDelay, SettingTheValueItAlreadyHasCostsNoWrite) {
 
 // A stored blob that parses cleanly but names a delay above the spec maximum is discarded rather
 // than loaded and then reported to the server. The configured initial value is not a fallback
-// here: it applies only when nothing was stored, so the delay stays at 0.
-TEST(PlayerRoleOutputDelay, PersistedValueOverTheSpecMaximumIsDiscarded) {
-    InMemoryPersistenceProvider provider;
-    provider.seed_blob(persistence_keys::OUTPUT_DELAY, to_bytes("60000"));
+// here: it applies only when nothing was stored, so a discarded blob leaves the delay at 0.
+TEST(PlayerRoleOutputDelay, PersistedValueIsLoadedOnlyWithinTheSpecRange) {
+    struct Row {
+        const char* name;
+        const char* stored;
+        uint16_t expected_delay_ms;
+    };
+    const Row rows[] = {
+        {"Control: at the spec maximum", "5000", MAX_OUTPUT_DELAY_MS},
+        {"above the spec maximum", "60000", 0},
+    };
 
-    DelayClient fixture(provider, /*initial_delay_ms=*/77);
-    EXPECT_EQ(fixture.player->get_output_delay_ms(), 0u);
-}
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        InMemoryPersistenceProvider provider;
+        provider.seed_blob(persistence_keys::OUTPUT_DELAY, to_bytes(row.stored));
 
-// Control: a stored value at the maximum is in range and is loaded.
-TEST(PlayerRoleOutputDelay, PersistedValueAtTheSpecMaximumIsLoaded) {
-    InMemoryPersistenceProvider provider;
-    provider.seed_blob(persistence_keys::OUTPUT_DELAY, to_bytes("5000"));
-
-    DelayClient fixture(provider, /*initial_delay_ms=*/77);
-    EXPECT_EQ(fixture.player->get_output_delay_ms(), MAX_OUTPUT_DELAY_MS);
+        DelayClient fixture(provider, /*initial_delay_ms=*/77);
+        EXPECT_EQ(fixture.player->get_output_delay_ms(), row.expected_delay_ms);
+    }
 }
