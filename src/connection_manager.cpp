@@ -673,8 +673,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     }
 
     // ==== Trust enforcement (admissibility check) ====
-    const bool unpaired_access = this->client_->record_store_ != nullptr &&
-                                 this->client_->record_store_->unpaired_access_enabled();
+    const bool unpaired_access = this->client_->record_store_->unpaired_access_enabled();
 
     // Compute the effective active_roles (sticky: nullopt keeps the prior set), except
     // when this activate omits active_roles and its activities are no longer
@@ -754,21 +753,19 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
         // flags AND the platform-capability configuration (a device that lists no
         // out-channel or emission format never offers dynamic_pairing_code,
         // regardless of the enabled flag).
+        const RecordStore& rs = *this->client_->record_store_;
+        const auto& cfg = this->client_->config_;
         bool offered = true;
-        if (this->client_->record_store_ != nullptr) {
-            const RecordStore& rs = *this->client_->record_store_;
-            const auto& cfg = this->client_->config_;
-            switch (method) {
-                case SendspinPairMethod::PAIRING_PSK:
-                    offered = offers_pairing_psk(cfg, rs);
-                    break;
-                case SendspinPairMethod::DYNAMIC_PAIRING_CODE:
-                    offered = offers_dynamic_pairing_code(cfg, rs);
-                    break;
-                case SendspinPairMethod::STATIC_PAIRING_CODE:
-                    offered = offers_static_pairing_code(cfg, rs);
-                    break;
-            }
+        switch (method) {
+            case SendspinPairMethod::PAIRING_PSK:
+                offered = offers_pairing_psk(cfg, rs);
+                break;
+            case SendspinPairMethod::DYNAMIC_PAIRING_CODE:
+                offered = offers_dynamic_pairing_code(cfg, rs);
+                break;
+            case SendspinPairMethod::STATIC_PAIRING_CODE:
+                offered = offers_static_pairing_code(cfg, rs);
+                break;
         }
         if (!category_ok || !offered) {
             SS_LOGW(TAG,
@@ -823,8 +820,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // re-handshake (see the comment below), and a server may start the next
     // re-handshake while this activate is still queued, so a second read here could
     // straddle a network-thread rewrite and disagree with the first.
-    if (is_first && event.conn->get_psk_category() == PskCategory::LONG_TERM &&
-        this->client_->record_store_ != nullptr) {
+    if (is_first && event.conn->get_psk_category() == PskCategory::LONG_TERM) {
         const std::string psk_id = event.conn->get_psk_id();
         if (!psk_id.empty()) {
             this->client_->record_store_->mark_record_used(psk_id);
@@ -1525,7 +1521,7 @@ bool ConnectionManager::send_hello_message(uint8_t remaining_attempts, SendspinC
         return true;
     }
 
-    if (conn == nullptr || !conn->is_connected()) {
+    if (!conn->is_connected()) {
         SS_LOGW(TAG, "Cannot send hello - not connected");
         return true;
     }
@@ -1666,8 +1662,7 @@ void ConnectionManager::drop_connections_using_psk_id(const std::string& psk_id,
         doomed.push_back(this->current_connection_);
     }
     for (const auto& entry : this->nursery_) {
-        if (entry.conn != nullptr && entry.conn.get() != except &&
-            entry.conn->get_psk_id() == psk_id) {
+        if (entry.conn.get() != except && entry.conn->get_psk_id() == psk_id) {
             doomed.push_back(entry.conn);
         }
     }
@@ -1928,10 +1923,6 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
     // Runs on the main loop (caller holds conn_ptr_mutex_). conn is the connection that just won
     // promotion into current_connection_ with a pairing activate (see
     // promote_or_arbitrate_nursery_entry).
-    if (conn == nullptr || this->client_->record_store_ == nullptr) {
-        SS_LOGE(TAG, "handle_enter_pairing: no connection or record_store");
-        return;
-    }
 
     // An attempt is in flight from here until it finalizes or aborts: pairing messages are only
     // routed while it is (pairing.md "Entering and leaving pairing"). Playback is untouched.
@@ -2088,9 +2079,6 @@ void ConnectionManager::handle_enter_pairing_psk(SendspinConnection* conn, uint3
 void ConnectionManager::handle_pair_abort(SendspinConnection* conn, PairAbortReason reason) {
     // Runs on the main loop (caller holds conn_ptr_mutex_). pair/abort received from the server
     // during pairing.
-    if (conn == nullptr) {
-        return;
-    }
 
     // A pair/abort that arrives after the receiver (us) has already ended the attempt (locally
     // aborted, or the server itself left pairing via a leftover server/activate) has no effect
@@ -2176,9 +2164,6 @@ void ConnectionManager::abort_pairing_attempt(SendspinConnection* conn,
 void ConnectionManager::handle_pairing_message(SendspinConnection* conn,
                                                const ServerPairingMessageEvent& event) {
     // Runs on the main loop. All CPace / nonce / hash state is main-loop-only.
-    if (conn == nullptr || this->client_->record_store_ == nullptr) {
-        return;
-    }
 
     // pairing.md "Entering and leaving pairing": a client that has aborted an attempt silently
     // discards pairing messages received before the next server/activate. is_pairing_in_progress()
@@ -2504,9 +2489,6 @@ void ConnectionManager::local_abort_pairing(SendspinConnection* conn, PairAbortR
     // Runs on the main loop (caller holds conn_ptr_mutex_). Ends the pairing-code session with a
     // pair/abort on the wire; per pairing.md "pair/abort" only concurrent_attempt also closes the
     // connection.
-    if (conn == nullptr) {
-        return;
-    }
 
     SS_LOGW(TAG, "local_abort_pairing: server_id=%s reason=%s", conn->get_server_id().c_str(),
             to_cstr(reason));
@@ -2722,9 +2704,6 @@ void ConnectionManager::note_pairing_window_attempt_failed() {
 void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
                                              const ServerUnpairEvent& event) {
     // Runs on the main loop (caller holds conn_ptr_mutex_).
-    if (conn == nullptr) {
-        return;
-    }
 
     // Only a session running on a long-term record is paired at all (messaging.md "server/unpair":
     // if the session is unpaired, ignore the message), so a pairing or Sentinel handshake has
@@ -2739,9 +2718,7 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
             conn->get_server_id().c_str(), event.matched_psk_id.c_str());
 
     // Drop the matched pairing record (messaging.md "server/unpair").
-    if (this->client_->record_store_ != nullptr) {
-        this->client_->record_store_->remove_record(event.matched_psk_id);
-    }
+    this->client_->record_store_->remove_record(event.matched_psk_id);
 
     // Any OTHER session running on the same record is no longer trusted either; see
     // drop_connections_using_psk_id(). `conn` itself is excluded and dropped below with the

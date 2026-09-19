@@ -288,6 +288,10 @@ struct PairingUiSnapshot {
  * state is tracked as independent flags rather than a single phase enum, see the
  * lifecycle-flag axes note above SendspinConnection's atomic flag members in connection.h.
  *
+ * Every path in this class runs between SendspinClient::start() and ::stop(), which is what
+ * "running" means for the client, so client_->record_store_ and client_->identity_ are non-null
+ * throughout and are not null-checked here.
+ *
  * Typical usage:
  *  1. Construct with a `SendspinClient*`.
  *  2. Call `start()` to open admission and create the WebSocket server.
@@ -805,7 +809,7 @@ private:
     /// Called on the main loop when an admitted server/activate declares the PAIRING activity
     /// with a pairing.method the client offers. PLAYBACK may ride along, and the activate need
     /// not be the connection's first.
-    /// @param conn The connection entering pairing.
+    /// @param conn The connection entering pairing. Must be non-null.
     void handle_enter_pairing(SendspinConnection* conn);
 
     /// @brief Runs the pairing-code branch of handle_enter_pairing(): populates the
@@ -832,7 +836,7 @@ private:
     /// Cleans up pairing state. Per pairing.md "pair/abort", only closes the connection for reason
     /// concurrent_attempt. A pair/abort that arrives after the attempt has already ended
     /// (is_pairing_in_progress() false) is silently ignored (stale).
-    /// @param conn The connection on which the abort arrived.
+    /// @param conn The connection on which the abort arrived. Must be non-null.
     /// @param reason The abort reason.
     void handle_pair_abort(SendspinConnection* conn, PairAbortReason reason);
 
@@ -877,7 +881,7 @@ private:
 
     /// @brief Handle a server pairing-code message on the main loop.
     /// Advances the PairingStep state machine for the connection.
-    /// @param conn The connection that received the message.
+    /// @param conn The connection that received the message. Must be non-null.
     /// @param event The parsed server pairing message.
     void handle_pairing_message(SendspinConnection* conn, const ServerPairingMessageEvent& event);
 
@@ -905,7 +909,7 @@ private:
 
     /// @brief Abort the current pairing-code session: send pair/abort, notify, and close the
     /// connection only for reason concurrent_attempt (pairing.md "pair/abort").
-    /// @param conn The connection to abort.
+    /// @param conn The connection to abort. Must be non-null.
     /// @param reason The abort reason to send.
     void local_abort_pairing(SendspinConnection* conn, PairAbortReason reason);
 
@@ -983,7 +987,7 @@ private:
     /// @brief Handles a server/unpair event on the main loop.
     /// Checks PSK category (LONG_TERM only), removes the matched record, and disconnects with
     /// the UNPAIRED reason.
-    /// @param conn The connection that received server/unpair.
+    /// @param conn The connection that received server/unpair. Must be non-null.
     /// @param event The server/unpair event.
     void handle_server_unpair(SendspinConnection* conn, const ServerUnpairEvent& event);
 
