@@ -905,8 +905,6 @@ void SyncTask::thread_entry(void* params) {
         // buffered_frames tracking.
         this_task->playback_progress_slot_.reset();
 
-        this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
-
         // Pin the connection whose time filter converts this stream's timestamps. The filter is
         // created once per connection (SendspinConnection::init_time_filter()) and never replaced,
         // and the admitted slot cannot be handed to another server without ending this stream
@@ -914,8 +912,13 @@ void SyncTask::thread_entry(void* params) {
         // outgoing connection before a promotion installs the successor. An in-band re-handshake
         // keeps the same connection object. Holding it for the stream keeps the per-chunk
         // conversion off conn_ptr_mutex_, and keeping a dropped connection alive a little longer
-        // is what the deferred-release design already expects (see DeferredRelease).
+        // is what the deferred-release design already expects (see DeferredRelease). Resolved
+        // before TASK_RUNNING is published, so a reader that sees the task running sees a stream
+        // whose pin is settled; nothing under the manager lock waits for TASK_RUNNING, so taking
+        // it here cannot stall the main loop.
         this_task->stream_connection_ = this_task->conn_manager_->current_shared();
+
+        this_task->event_flags_.set(EventGroupBits::TASK_RUNNING);
 
         this_task->player_impl_->enqueue_state_update(SendspinClientState::SYNCHRONIZED);
 
