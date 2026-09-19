@@ -1132,7 +1132,6 @@ void apply_pending_player_commands(TuiState& state, SendspinClient& client) {
     {
         std::lock_guard<std::mutex> lock(state.mutex);
         pending = state.pending_player;
-        state.pending_player = PendingPlayerCommands{};
     }
     if (client.player() == nullptr) {
         return;
@@ -1146,6 +1145,23 @@ void apply_pending_player_commands(TuiState& state, SendspinClient& client) {
     if (pending.output_delay_ms.has_value()) {
         client.player()->update_output_delay(pending.output_delay_ms.value());
     }
+    // Clear only what the setters above applied, and refresh the mirrors they moved in the same
+    // critical section. A keypress that lands while the setters run leaves a newer value here;
+    // clearing it unseen would send the next keypress back to a base the role has not reached
+    // yet, which turns a second volume-up into a volume-down.
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.pending_player.volume == pending.volume) {
+        state.pending_player.volume.reset();
+    }
+    if (state.pending_player.muted == pending.muted) {
+        state.pending_player.muted.reset();
+    }
+    if (state.pending_player.output_delay_ms == pending.output_delay_ms) {
+        state.pending_player.output_delay_ms.reset();
+    }
+    state.player_volume = client.player()->get_volume();
+    state.player_muted = client.player()->get_muted();
+    state.output_delay_ms = client.player()->get_output_delay_ms();
 #else
     (void)state;
     (void)client;
