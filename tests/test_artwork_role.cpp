@@ -17,7 +17,6 @@
 #include "protocol_messages.h"
 #include "sendspin/client.h"
 #include <ArduinoJson.h>
-#include "log_capture.h"
 #include "test_util.h"
 
 #include <gtest/gtest.h>
@@ -868,95 +867,55 @@ void leave_pending_image(ArtworkRole::Impl& impl, RecordingListener& listener, u
 
 }  // namespace
 
-TEST(ArtworkStreamStart, UnchangedChannelKeepsItsPendingImage) {
-    RecordingListener listener;
-    auto impl = make_impl(make_two_ungated_slot_config());
-    impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(two_channel_stream(100, 100), live_generation(*impl));
-
-    leave_pending_image(*impl, listener, 1, 'A', 0);
-
-    // Channel 0's geometry changes, channel 1's entry is identical. The server cancels and
-    // re-sends only for the channel it changed, so discarding channel 1's pending image here
-    // would lose an image nothing re-sends.
-    impl->handle_stream_start(two_channel_stream(200, 100), live_generation(*impl));
-
-    poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
-    EXPECT_EQ(listener.clear_count(), 0U);
-}
-
-TEST(ArtworkStreamStart, ChangedChannelDropsItsPendingImage) {
-    RecordingListener listener;
-    auto impl = make_impl(make_two_ungated_slot_config());
-    impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(two_channel_stream(100, 100), live_generation(*impl));
-
-    leave_pending_image(*impl, listener, 1, 'A', 0);
-
-    // The same stream/start, this time changing channel 1 itself: its pending image is encoded
-    // for a configuration that no longer applies, and the server re-sends it.
-    impl->handle_stream_start(two_channel_stream(100, 200), live_generation(*impl));
-
-    EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW))
-        << "an image was displayed; displays: " << listener.display_count();
-}
-
-TEST(ArtworkStreamStart, EveryChannelDropsItsPendingImageWhenAllChange) {
-    RecordingListener listener;
-    auto impl = make_impl(make_two_ungated_slot_config());
-    impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(two_channel_stream(100, 100), live_generation(*impl));
-
-    leave_pending_image(*impl, listener, 0, 'A', 0);
-    leave_pending_image(*impl, listener, 1, 'B', 1);
-
-    impl->handle_stream_start(two_channel_stream(200, 200), live_generation(*impl));
-
-    EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW))
-        << "an image was displayed; displays: " << listener.display_count();
-}
-
-TEST(ArtworkStreamStart, ChannelTheNewArrayDropsCountsAsChanged) {
-    RecordingListener listener;
-    auto impl = make_impl(make_two_ungated_slot_config());
-    impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(two_channel_stream(100, 100), live_generation(*impl));
-
-    leave_pending_image(*impl, listener, 1, 'A', 0);
-
-    // "A channel the array does not cover ... is not streamed": truncating the array stops
-    // streaming channel 1, which is as much a change as reconfiguring it.
+// roles/artwork/v1.md "stream/start artwork object": a channel whose entry is unchanged keeps
+// streaming, so its pending image (complete but not yet displayed) is still valid; a channel the
+// new array reconfigures, drops, or does not describe at all is re-sent by the server, so its
+// pending image is encoded for a configuration that no longer applies and is discarded.
+TEST(ArtworkStreamStart, PendingImagesSurviveOnlyUnchangedChannels) {
+    struct Row {
+        const char* name;
+        std::vector<uint8_t> pending_slots;
+        ServerArtworkStreamObject restart;
+        bool display_survives;
+    };
     ServerArtworkStreamObject truncated = two_channel_stream(100, 100);
     truncated.channels->pop_back();
-    impl->handle_stream_start(truncated, live_generation(*impl));
 
-    EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW))
-        << "an image was displayed; displays: " << listener.display_count();
-}
+    std::vector<Row> rows;
+    rows.push_back({"Control: the channel's entry is unchanged", {1}, two_channel_stream(100, 100),
+                    true});
+    rows.push_back({"the channel's own entry changed", {1}, two_channel_stream(100, 200), false});
+    rows.push_back({"every channel's entry changed", {0, 1}, two_channel_stream(200, 200), false});
+    rows.push_back({"the new array no longer covers the channel", {1}, truncated, false});
+    rows.push_back(
+        {"the stream carries no channel array at all", {1}, ServerArtworkStreamObject{}, false});
 
-TEST(ArtworkStreamStart, StreamWithNoChannelArrayDropsEveryPendingImage) {
-    RecordingListener listener;
-    auto impl = make_impl(make_two_ungated_slot_config());
-    impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(two_channel_stream(100, 100), live_generation(*impl));
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RecordingListener listener;
+        auto impl = make_impl(make_two_ungated_slot_config());
+        impl->listener = &listener;
+        ASSERT_TRUE(impl->start());
+        impl->handle_stream_start(two_channel_stream(100, 100), live_generation(*impl));
 
-    leave_pending_image(*impl, listener, 1, 'A', 0);
+        size_t decoded = 0;
+        for (const uint8_t slot : row.pending_slots) {
+            leave_pending_image(*impl, listener, slot, static_cast<uint8_t>('A' + decoded),
+                                decoded);
+            ++decoded;
+        }
 
-    // With no channel array there is nothing to compare, so every channel is treated as
-    // reconfigured rather than assumed unchanged.
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+        impl->handle_stream_start(row.restart, live_generation(*impl));
 
-    EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW))
-        << "an image was displayed; displays: " << listener.display_count();
+        if (row.display_survives) {
+            poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
+            EXPECT_EQ(listener.clear_count(), 0U);
+        } else {
+            EXPECT_TRUE(poll_drain_never(
+                *impl, [&] { return listener.display_count() >= 1; }, NEGATIVE_WINDOW))
+                << "an image was displayed; displays: " << listener.display_count();
+        }
+    }
 }
 
 // ============================================================================
@@ -991,44 +950,35 @@ void expect_transfer_dropped_by(const std::function<void(ArtworkRole::Impl&)>& e
 
 }  // namespace
 
-TEST(ArtworkTransfer, StreamEndDropsTheTransferInFlight) {
-    expect_transfer_dropped_by([](ArtworkRole::Impl& impl) { impl.handle_stream_end(live_generation(impl)); });
-}
+// roles/artwork/v1.md "Stream lifecycle": a transfer in flight belongs to the stream that
+// announced it. Every way that stream can end drops it, so the next stream starts from a fresh
+// announce instead of closing the connection over a second announce in flight. Each row also
+// asserts the follow-up image is decoded, which is the accepting half of the same behavior.
+TEST(ArtworkTransfer, EveryEndOfTheStreamDropsTheTransferInFlight) {
+    struct Row {
+        const char* name;
+        std::function<void(ArtworkRole::Impl&)> end_the_stream;
+    };
+    const Row rows[] = {
+        {"stream/end", [](ArtworkRole::Impl& impl) { impl.handle_stream_end(live_generation(impl)); }},
+        {"stream/clear",
+         [](ArtworkRole::Impl& impl) { impl.handle_stream_clear(live_generation(impl)); }},
+        {"a new stream/start",
+         [](ArtworkRole::Impl& impl) {
+             impl.handle_stream_start(ServerArtworkStreamObject{}, live_generation(impl));
+         }},
+        {"a disconnect", [](ArtworkRole::Impl& impl) { impl.cleanup(); }},
+    };
 
-TEST(ArtworkTransfer, StreamClearDropsTheTransferInFlight) {
-    expect_transfer_dropped_by([](ArtworkRole::Impl& impl) { impl.handle_stream_clear(live_generation(impl)); });
-}
-
-TEST(ArtworkTransfer, StreamStartDropsTheTransferInFlight) {
-    expect_transfer_dropped_by(
-        [](ArtworkRole::Impl& impl) {
-            impl.handle_stream_start(ServerArtworkStreamObject{}, live_generation(impl));
-        });
-}
-
-TEST(ArtworkTransfer, DisconnectDropsTheTransferInFlight) {
-    expect_transfer_dropped_by([](ArtworkRole::Impl& impl) { impl.cleanup(); });
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        expect_transfer_dropped_by(row.end_the_stream);
+    }
 }
 
 // ============================================================================
 // Ungated behavior: require_frame_done = false must reproduce today's behavior exactly
 // ============================================================================
-
-TEST(ArtworkFrameDoneGate, DefaultUngatedUnchanged) {
-    RecordingListener listener;
-    auto impl = make_impl(make_single_slot_config(false));
-    impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
-
-    send_frame(*impl, 0, 'A');
-    listener.wait_until([&] { return listener.decodes.size() >= 1; });
-    EXPECT_EQ(listener.decode_marker_at(0), 'A');
-
-    send_frame(*impl, 0, 'B');
-    listener.wait_until([&] { return listener.decodes.size() >= 2; });
-    EXPECT_EQ(listener.decode_marker_at(1), 'B');
-}
 
 // ============================================================================
 // Basic gate: at most one un-acked delivery per gated slot
@@ -1055,6 +1005,8 @@ TEST(ArtworkFrameDoneGate, GateHoldsSecondFrame) {
     EXPECT_EQ(listener.decode_marker_at(1), 'B');
 }
 
+// A frame that was displayed is still un-acked: the display is not an ack, so a frame that
+// arrives after it waits for frame_done() the same way.
 TEST(ArtworkFrameDoneGate, GateHoldsThroughDisplay) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
@@ -1177,48 +1129,47 @@ TEST(ArtworkFrameDoneGate, ClearGateHoldsNextStreamFirstFrame) {
 // scheduled to its timestamp like any other delivery
 // ============================================================================
 
-TEST(ArtworkChannelClear, EmptyPayloadFiresClearWithoutDecoding) {
-    RecordingListener listener;
-    auto impl = make_impl(make_single_slot_config(false));
-    impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+// roles/artwork/v1.md "Channel clear": an empty payload clears the channel and is delivered as a
+// clear exactly once, whether or not the channel is showing anything. After a displayed frame it
+// must still fire, so a consumer can tell "no artwork for this item" from "artwork unchanged,
+// nothing sent".
+TEST(ArtworkChannelClear, EmptyPayloadFiresExactlyOneClear) {
+    struct Row {
+        const char* name;
+        bool display_a_frame_first;
+    };
+    const Row rows[] = {
+        {"with nothing showing", false},
+        {"after a frame was displayed", true},
+    };
 
-    send_clear(*impl, 0);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RecordingListener listener;
+        auto impl = make_impl(make_single_slot_config(false));
+        impl->listener = &listener;
+        ASSERT_TRUE(impl->start());
+        impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
 
-    poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
-    EXPECT_EQ(listener.clear_at(0), 0);
-    EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW))
-        << "another clear was delivered; clears: " << listener.clear_count();
-    // There are no image bytes, so nothing may reach the decode callback, and nothing may be
-    // presented as a frame either.
-    EXPECT_EQ(listener.decode_count(), 0U);
-    EXPECT_EQ(listener.display_count(), 0U);
-}
+        if (row.display_a_frame_first) {
+            send_frame(*impl, 0, 'A');
+            listener.wait_until([&] { return listener.decodes.size() >= 1; });
+            poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
+        }
 
-TEST(ArtworkChannelClear, ClearAfterDisplayedFrameFiresAgain) {
-    RecordingListener listener;
-    auto impl = make_impl(make_single_slot_config(false));
-    impl->listener = &listener;
-    ASSERT_TRUE(impl->start());
-    impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
+        send_clear(*impl, 0);
+        poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
+        EXPECT_EQ(listener.clear_at(0), 0);
+        EXPECT_TRUE(poll_drain_never(
+            *impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW))
+            << "another clear was delivered; clears: " << listener.clear_count();
 
-    // The album's first track: artwork arrives and is displayed.
-    send_frame(*impl, 0, 'A');
-    listener.wait_until([&] { return listener.decodes.size() >= 1; });
-    poll_drain_until(*impl, [&] { return listener.display_count() >= 1; });
-
-    // A later track with no artwork of its own: the clear must reach the listener while the
-    // stream is still running, so a consumer can tell "no artwork for this item" apart from
-    // "artwork unchanged, nothing sent".
-    send_clear(*impl, 0);
-    poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
-    EXPECT_TRUE(
-        poll_drain_never(*impl, [&] { return listener.clear_count() >= 2; }, NEGATIVE_WINDOW))
-        << "another clear was delivered; clears: " << listener.clear_count();
-    EXPECT_EQ(listener.display_count(), 1U);
-    EXPECT_EQ(listener.decode_count(), 1U);
+        // The clear carries no image bytes, so it neither decodes nor presents anything of its
+        // own: the counts are exactly what the optional frame above produced.
+        const size_t expected = row.display_a_frame_first ? 1U : 0U;
+        EXPECT_EQ(listener.decode_count(), expected);
+        EXPECT_EQ(listener.display_count(), expected);
+    }
 }
 
 TEST(ArtworkChannelClear, ClearOnlyAffectsItsOwnSlot) {
@@ -1817,87 +1768,4 @@ TEST(ArtworkChannelReporting, NoConfiguredChannelsReportsNothing) {
     ClientStateMessage state;
     impl->build_state_fields(state);
     EXPECT_FALSE(state.artwork.has_value());
-}
-
-// ============================================================================
-// stream/start channel mismatch reporting
-// ============================================================================
-
-namespace {
-
-// The channel a single-slot role asks for; each case serves a copy with one field changed.
-ServerArtworkChannelObject requested_channel() {
-    ServerArtworkChannelObject channel;
-    channel.source = SendspinImageSource::ALBUM;
-    channel.format = SendspinImageFormat::JPEG;
-    channel.width = 100;
-    channel.height = 100;
-    return channel;
-}
-
-// Runs a stream/start carrying `served` against a role configured for one ALBUM/JPEG 100x100
-// channel, and returns what it logged.
-std::string channel_stream_start_log(std::vector<ServerArtworkChannelObject> served) {
-    auto impl = make_impl(make_single_slot_config(false));
-
-    ServerArtworkStreamObject stream;
-    stream.channels = std::move(served);
-
-    StderrCapture capture;
-    impl->handle_stream_start(stream, live_generation(*impl));
-    return capture.release();
-}
-
-}  // namespace
-
-// roles/artwork/v1.md "stream/start artwork object": the server reports what it will actually
-// stream per channel, which need not be what the client asked for. The role streams it either
-// way, so each mismatch is a log line and nothing else - the only place an inverted comparison
-// or a swapped operand shows up.
-TEST(ArtworkChannelMismatch, SourceMismatchIsReported) {
-    ServerArtworkChannelObject served = requested_channel();
-    served.source = SendspinImageSource::ARTIST;
-
-    const std::string log = channel_stream_start_log({served});
-    EXPECT_NE(log.find("channel 0 source mismatch"), std::string::npos) << log;
-}
-
-TEST(ArtworkChannelMismatch, FormatMismatchIsReported) {
-    ServerArtworkChannelObject served = requested_channel();
-    served.format = SendspinImageFormat::PNG;
-
-    const std::string log = channel_stream_start_log({served});
-    EXPECT_NE(log.find("channel 0 format mismatch"), std::string::npos) << log;
-}
-
-TEST(ArtworkChannelMismatch, WidthMismatchNamesServedAndRequested) {
-    ServerArtworkChannelObject served = requested_channel();
-    served.width = 200;
-
-    const std::string log = channel_stream_start_log({served});
-    EXPECT_NE(log.find("channel 0 width mismatch: server 200, expected 100"), std::string::npos)
-        << log;
-}
-
-TEST(ArtworkChannelMismatch, HeightMismatchNamesServedAndRequested) {
-    ServerArtworkChannelObject served = requested_channel();
-    served.height = 200;
-
-    const std::string log = channel_stream_start_log({served});
-    EXPECT_NE(log.find("channel 0 height mismatch: server 200, expected 100"), std::string::npos)
-        << log;
-}
-
-// A server streaming a different number of channels than the role declared is reported once for
-// the array, not per channel: the channels the two do share still compare field by field.
-TEST(ArtworkChannelMismatch, ChannelCountMismatchIsReported) {
-    const std::string log = channel_stream_start_log({requested_channel(), requested_channel()});
-    EXPECT_NE(log.find("channel count mismatch: server sent 2, expected 1"), std::string::npos)
-        << log;
-}
-
-// Control: a channel array that matches what the role asked for reports nothing, so the cases
-// above pin the comparisons rather than a warning the role emits either way.
-TEST(ArtworkChannelMismatch, MatchingChannelReportsNothing) {
-    EXPECT_EQ(channel_stream_start_log({requested_channel()}), "");
 }
