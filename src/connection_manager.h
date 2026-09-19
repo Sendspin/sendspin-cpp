@@ -168,10 +168,12 @@ struct DeferredRelease {
 /// The provider write is an NVS commit on ESP: tens of milliseconds during which nothing else
 /// may enter the manager, and the sync task takes conn_ptr_mutex_ per audio chunk through
 /// current_shared(). Locked sections therefore only decide WHICH record (or server_id) the write
-/// covers; flush_pending_record_ops() performs it, in staging order, with no lock held.
+/// covers, or, for PERSIST_RECORDS, apply the RAM half and stage the array write that owes it;
+/// flush_pending_record_ops() performs the writes with no lock held.
 struct PendingRecordOp {
     enum class Kind : uint8_t {
-        MARK_USED,        ///< RecordStore::mark_record_used(psk_id)
+        MARK_USED,        ///< RecordStore::note_record_used(psk_id); its durable half joins
+                          ///< the batch's persist_records()
         PERSIST_RECORDS,  ///< RecordStore::persist_records(); the RAM half ran under the lock
                           ///< (see handle_server_unpair())
         LAST_PLAYED,      ///< SendspinClient::write_last_played_server(server_id); the RAM half
@@ -257,7 +259,7 @@ struct HelloRetryState {
 /// @brief Deferred server/activate event, processed in ConnectionManager::loop()
 ///
 /// Pushed from SendspinClient::process_json_message() (network thread) so trust enforcement,
-/// RecordStore mutations (mark_record_used), and admission arbitration all happen on the main
+/// RecordStore mutations (note_record_used), and admission arbitration all happen on the main
 /// loop, never on the network thread. Carries the parsed payload rather than requiring the main
 /// loop to re-read connection state that a concurrent event could have changed.
 struct ServerActivateEvent {
@@ -652,7 +654,7 @@ private:
     /// @brief Appends a persistence-provider write to pending_record_ops_. Caller must hold
     /// conn_ptr_mutex_ and call flush_pending_record_ops() after dropping it.
     /// @param kind Which write to perform.
-    /// @param value The psk_id or server_id it covers.
+    /// @param value The psk_id or server_id it covers; empty for PERSIST_RECORDS.
     void stage_record_op(PendingRecordOp::Kind kind, std::string value);
 
     /// @brief Applies the staged ops' RAM halves in staging order, so a second op on the same
@@ -764,8 +766,9 @@ private:
     /// PLAYBACK activity, per the last-playback server of connection.md "Multiple servers
     /// (server-initiated)".
     /// No-op if conn is not the current connection, or does not declare PLAYBACK.
-    /// Caller must hold conn_ptr_mutex_: the RAM update runs here, under the lock arbitration
-    /// reads it with, and only the durable write is staged for flush_pending_record_ops().
+    /// Caller must hold conn_ptr_mutex_: the RAM update runs here, so arbitration later in the
+    /// same locked block sees it; only the durable write is staged for
+    /// flush_pending_record_ops().
     /// @param conn The connection to check (typically the connection an activate just applied to).
     void note_playback_activity(const SendspinConnection* conn);
 

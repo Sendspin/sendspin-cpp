@@ -2867,7 +2867,8 @@ namespace {
 
 // A persistence provider whose records write parks until the test releases it, standing in for an
 // NVS commit of tens of milliseconds. It serves the one seeded long-term record, so the peer
-// below resolves to PskCategory::LONG_TERM and its first activate reaches mark_record_used().
+// below resolves to PskCategory::LONG_TERM and its first activate reaches the flush's
+// persist_records().
 class BlockingRecordWriteProvider : public SendspinPersistenceProvider {
 public:
     explicit BlockingRecordWriteProvider(SendspinPairingRecord record)
@@ -2921,7 +2922,8 @@ private:
 // on ESP the write is an NVS commit that stalls code running from flash for tens of milliseconds,
 // so a write held under the lock is a stall of the audio path.
 //
-// The provider above holds that whole window open inside the first activate's mark_record_used().
+// The provider above holds that whole window open inside the persist_records() the first
+// activate's flush_pending_record_ops() performs.
 // A current_shared() caller issued in the window must still return: is_time_synced() is exactly
 // the call the sync task makes (SendspinClient::is_time_synced() -> current_shared()). It is
 // waited on with no timeout, so a regression hangs rather than turning a loaded runner into a

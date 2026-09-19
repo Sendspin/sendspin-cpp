@@ -30,7 +30,7 @@ item against the current code before acting on it; line numbers drift as phases 
   closes the connections relying on it with `client/goodbye` reason `pairing_required` cannot
   fire, because the setting cannot change while the client runs.
 - Record eviction order is least recently used, which the spec leaves to the implementation.
-  Recency is the order of `RecordStore::records_`, which `mark_record_used()` moves a touched
+  Recency is the order of `RecordStore::records_`, which `note_record_used()` moves a touched
   record to the back of; no new field or timestamp is stored.
 - That reorder stays in RAM: it runs on the first activate of every long-term session, so
   persisting it would rewrite the records blob once per connection in steady state, which on ESP
