@@ -555,16 +555,37 @@ TEST(RoleDeactivation, ReAddedPlayerPublishesItsStateAndPlaysAgain) {
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["metadata@v1"])")));
     pump_until(client, [&] { return player_listener.stream_ends == 1; });
 
-    const int states_before_readd = server->client_state_count();
+    const size_t states_before_readd = server->client_states().size();
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1","metadata@v1"])")));
-    pump_until(client, [&] { return server->client_state_count() > states_before_readd; });
+
+    // The teardown above returned the sync task to idle, which publishes a client/state of its
+    // own; that state carries no player object (publish_client_state() gates each role object on
+    // the connection's active roles) and may still be in flight here. Waiting for "one more
+    // state than before" would therefore be satisfied by it, so wait for a state published after
+    // the re-add that carries the object, and assert on that one. A re-add that publishes no such
+    // state hangs here and the suite watchdog names it, as everywhere else in this file.
+    std::string readd_state;
+    pump_until(client, [&] {
+        const std::vector<std::string> states = server->client_states();
+        for (size_t i = states_before_readd; i < states.size(); ++i) {
+            JsonDocument published;
+            if (deserializeJson(published, states[i]) != DeserializationError::Ok) {
+                continue;
+            }
+            if (published["payload"]["player"].is<JsonObjectConst>()) {
+                readd_state = states[i];
+                return true;
+            }
+        }
+        return false;
+    });
     {
         JsonDocument doc;
-        const std::vector<std::string> states = server->client_states();
-        ASSERT_FALSE(states.empty());
-        ASSERT_EQ(deserializeJson(doc, states.back()), DeserializationError::Ok);
-        EXPECT_TRUE(doc["payload"]["player"].is<JsonObjectConst>())
-            << "the re-added role's object was missing from the published state";
+        ASSERT_EQ(deserializeJson(doc, readd_state), DeserializationError::Ok);
+        JsonObjectConst player_object = doc["payload"]["player"];
+        EXPECT_TRUE(player_object["supported_commands"].is<JsonArrayConst>())
+            << "the re-added role's object was published without the commands the server needs";
+        EXPECT_TRUE(player_object["required_lead_time_ms"].is<uint16_t>());
     }
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
