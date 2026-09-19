@@ -823,8 +823,10 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     const bool roles_changed = roles_before != event.conn->get_active_roles();
 
     // First activate on a long-term PSK: mark the record used, which is what keeps the store's
-    // least-recently-used order meaningful. Safe here because RecordStore mutations stay on the
-    // main loop.
+    // least-recently-used order meaningful. Staged rather than applied here: the durable half is
+    // a provider write (see PendingRecordOp), and nothing between here and the flush reads the
+    // store's order. Eviction is the only reader of it, and it cannot take this record anyway
+    // while the connection that just activated is open (store_record_superseding()).
     //
     // Read the psk_id ONCE into a local. is_first is true again after every in-band
     // re-handshake (see the comment below), and a server may start the next
@@ -833,7 +835,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     if (is_first && event.conn->get_psk_category() == PskCategory::LONG_TERM) {
         const std::string psk_id = event.conn->get_psk_id();
         if (!psk_id.empty()) {
-            this->client_->record_store_->mark_record_used(psk_id);
+            this->stage_record_op(PendingRecordOp::Kind::MARK_USED, psk_id);
         }
     }
 
@@ -1241,10 +1243,18 @@ void ConnectionManager::loop() {
     // level-triggered on handshake flags set by network threads with no corresponding event
     // push, so loop() must keep running every tick a nursery connection exists.
     if (ev.any() || this->nursery_size_.load(std::memory_order_acquire) > 0) {
-        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-        this->drain_lifecycle_events(ev);
-        this->drain_pairing_events(ev);
-        this->drain_unpair_events(ev);
+        {
+            std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+            this->drain_lifecycle_events(ev);
+            this->drain_pairing_events(ev);
+            this->drain_unpair_events(ev);
+        }
+
+        // Perform the provider writes those handlers decided on, outside the lock: an NVS commit
+        // under it would stall the sync task, which takes it per audio chunk through
+        // current_shared(). Ahead of the two flushes below so a revoked record is gone before
+        // its session is told to leave, and so the store is settled before an admission replays.
+        this->flush_pending_record_ops();
     }
 
     // Admit the connection the promotion scan installed, outside the lock: the replay takes
@@ -1644,6 +1654,33 @@ void ConnectionManager::flush_pending_admission() {
     }
 }
 
+void ConnectionManager::stage_record_op(PendingRecordOp::Kind kind, std::string value) {
+    // Note: caller must hold conn_ptr_mutex_ and flush_pending_record_ops() after dropping it
+    this->pending_record_ops_.push_back({kind, std::move(value)});
+}
+
+void ConnectionManager::flush_pending_record_ops() {
+    // Note: caller must NOT hold conn_ptr_mutex_ (see PendingRecordOp)
+    std::vector<PendingRecordOp> ops;
+    {
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        ops.swap(this->pending_record_ops_);
+    }
+    for (const auto& op : ops) {
+        switch (op.kind) {
+            case PendingRecordOp::Kind::MARK_USED:
+                this->client_->record_store_->mark_record_used(op.value);
+                break;
+            case PendingRecordOp::Kind::REMOVE:
+                this->client_->record_store_->remove_record(op.value);
+                break;
+            case PendingRecordOp::Kind::LAST_PLAYED:
+                this->client_->write_last_played_server(op.value);
+                break;
+        }
+    }
+}
+
 std::vector<NurseryEntry>::iterator ConnectionManager::release_nursery_entry(
     std::vector<NurseryEntry>::iterator it, std::optional<SendspinGoodbyeReason> reason) {
     // Note: caller must hold conn_ptr_mutex_ and flush_deferred_releases() after dropping it
@@ -1848,9 +1885,11 @@ void ConnectionManager::note_playback_activity(const SendspinConnection* conn) {
     if (server_id.empty()) {
         return;
     }
-    // Delegate to SendspinClient::persist_last_played_server, which also updates this
-    // manager's last_played_server_id_ and persists via the provider.
-    this->client_->persist_last_played_server(server_id);
+    // The RAM half updates here, because should_switch_to_new_server() reads
+    // last_played_server_id_ under this same lock; only the durable write is staged.
+    if (this->client_->note_last_played_server(server_id)) {
+        this->stage_record_op(PendingRecordOp::Kind::LAST_PLAYED, server_id);
+    }
     SS_LOGD(TAG, "note_playback_activity: last_played_server_id updated to %s", server_id.c_str());
 }
 
@@ -2735,8 +2774,10 @@ void ConnectionManager::handle_server_unpair(SendspinConnection* conn,
     SS_LOGI(TAG, "server/unpair: dropping record and disconnecting (server_id=%s, psk_id=%s)",
             conn->get_server_id().c_str(), event.matched_psk_id.c_str());
 
-    // Drop the matched pairing record (messaging.md "server/unpair").
-    this->client_->record_store_->remove_record(event.matched_psk_id);
+    // Drop the matched pairing record (messaging.md "server/unpair"). Staged: the removal ends
+    // in a provider write (see PendingRecordOp), and the flush runs before the goodbyes below
+    // are sent, so the credential is gone by the time the peer learns the session ended.
+    this->stage_record_op(PendingRecordOp::Kind::REMOVE, event.matched_psk_id);
 
     // Any OTHER session running on the same record is no longer trusted either; see
     // drop_connections_using_psk_id(). `conn` itself is excluded and dropped below with the

@@ -57,6 +57,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -101,6 +103,7 @@ constexpr uint16_t REFUSED_ACTIVATE_TEST_PORT = 19042;
 constexpr uint16_t COLOR_SCHEDULE_TEST_PORT = 19043;
 constexpr uint16_t COLOR_PENDING_TEST_PORT = 19044;
 constexpr uint16_t COLOR_BOTH_DUE_TEST_PORT = 19045;
+constexpr uint16_t BLOCKING_RECORD_WRITE_TEST_PORT = 19046;
 
 // Starts with no pairing records (unpaired: only the Sentinel PSK resolves), but captures every
 // record persisted via save_blob(persistence_keys::RECORDS, ...), so the pairing-flow test below
@@ -2749,6 +2752,121 @@ TEST(EncryptedLifecycle, UnpairDropsEverySessionOnTheRecord) {
         client, [&] { return server_a.closed(); }, 4000))
         << "The unpaired session itself must be dropped";
     EXPECT_EQ(server_a.goodbye_reason().value_or(""), "unpaired");
+
+    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
+    pump_for(client, 100);
+}
+
+namespace {
+
+// A persistence provider whose records write parks until the test releases it, standing in for an
+// NVS commit of tens of milliseconds. It serves the one seeded long-term record, so the peer
+// below resolves to PskCategory::LONG_TERM and its first activate reaches mark_record_used().
+class BlockingRecordWriteProvider : public SendspinPersistenceProvider {
+public:
+    explicit BlockingRecordWriteProvider(SendspinPairingRecord record)
+        : records_{std::move(record)} {}
+
+    std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
+        if (key != persistence_keys::RECORDS) {
+            return std::nullopt;
+        }
+        std::string encoded = encode_pairing_records(this->records_);
+        return std::vector<uint8_t>(encoded.begin(), encoded.end());
+    }
+
+    bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
+        if (key != persistence_keys::RECORDS) {
+            return true;  // The keypair and pairing config must not park the tick.
+        }
+        std::unique_lock<std::mutex> lock(this->mutex_);
+        this->entered_ = true;
+        this->cv_.notify_all();
+        this->cv_.wait(lock, [&] { return this->released_; });
+        return true;
+    }
+
+    bool wait_until_entered(std::chrono::milliseconds budget) {
+        std::unique_lock<std::mutex> lock(this->mutex_);
+        return this->cv_.wait_for(lock, budget, [&] { return this->entered_; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            this->released_ = true;
+        }
+        this->cv_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<SendspinPairingRecord> records_;
+    bool entered_{false};
+    bool released_{false};
+};
+
+}  // namespace
+
+// The lifecycle handlers decide which record a write covers under conn_ptr_mutex_ and perform the
+// write after dropping it (PendingRecordOp / flush_pending_record_ops()). What that buys is here:
+// the sync task takes the same mutex for every decoded audio chunk through current_shared(), and
+// on ESP the write is an NVS commit that stalls code running from flash for tens of milliseconds,
+// so a write held under the lock is a stall of the audio path.
+//
+// The provider above holds that whole window open inside the first activate's mark_record_used().
+// A current_shared() caller issued in the window must still return: is_time_synced() is exactly
+// the call the sync task makes (SendspinClient::is_time_synced() -> current_shared()). The wait is
+// bounded and the provider is released before the probe is joined, so a regression fails here
+// rather than hanging the suite.
+TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
+    PairedPeer peer = make_paired_peer();
+    TestNetworkProvider network;
+    BlockingRecordWriteProvider persistence(peer.record);
+    SendspinClientConfig config;
+    config.name = "Blocking Record Write Test Client";
+    config.server_port = BLOCKING_RECORD_WRITE_TEST_PORT;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    pump_for(client, 50);
+
+    // The main loop runs on its own thread from here: it is the thread that parks in the write,
+    // so the probe below has to be a different one.
+    std::atomic<bool> pumping{true};
+    std::thread main_loop([&] {
+        while (pumping.load(std::memory_order_acquire)) {
+            client.loop();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    });
+
+    FakeEncryptedServer server(server_url(BLOCKING_RECORD_WRITE_TEST_PORT),
+                               std::string(NOISE_SUITE_CHACHAPOLY), peer.server_identity,
+                               peer.record.psk_id, peer.psk);
+    ASSERT_TRUE(persistence.wait_until_entered(std::chrono::milliseconds(6000)))
+        << "the first activate on a long-term record never reached the provider";
+
+    std::promise<void> probed;
+    std::future<void> probed_future = probed.get_future();
+    std::thread probe([&] {
+        client.is_time_synced();
+        probed.set_value();
+    });
+
+    const bool returned =
+        probed_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    // Release first, then join: a probe that did block must be let go so the failure is reported
+    // rather than hung on.
+    persistence.release();
+    probe.join();
+    pumping.store(false, std::memory_order_release);
+    main_loop.join();
+
+    EXPECT_TRUE(returned) << "current_shared() blocked on a persistence write";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);

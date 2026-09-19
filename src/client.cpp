@@ -1978,19 +1978,28 @@ void SendspinClient::load_last_played_server() {
 }
 
 void SendspinClient::persist_last_played_server(const std::string& server_id) {
+    if (this->note_last_played_server(server_id)) {
+        this->write_last_played_server(server_id);
+    }
+}
+
+bool SendspinClient::note_last_played_server(const std::string& server_id) {
     if (server_id.empty()) {
-        return;
+        return false;
     }
 
     // Skip the setter and the write when the server_id is unchanged (including the boot-time
     // value seeded by load_last_played_server()), bounding flash writes to one per actual
     // handoff instead of one per PLAYING transition.
     if (server_id == this->connection_manager_->last_played_server_id()) {
-        return;
+        return false;
     }
 
     this->connection_manager_->set_last_played_server_id(server_id);
+    return true;
+}
 
+void SendspinClient::write_last_played_server(const std::string& server_id) {
     if (this->persistence_provider_) {
         if (this->persistence_provider_->save_blob(
                 persistence_keys::LAST_PLAYED, reinterpret_cast<const uint8_t*>(server_id.data()),

@@ -162,6 +162,24 @@ struct DeferredRelease {
     std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: transport gone, just release
 };
 
+/// @brief A persistence-provider write decided under conn_ptr_mutex_ and performed after it has
+/// been dropped
+///
+/// The provider write is an NVS commit on ESP: tens of milliseconds during which nothing else
+/// may enter the manager, and the sync task takes conn_ptr_mutex_ per audio chunk through
+/// current_shared(). Locked sections therefore only decide WHICH record (or server_id) the write
+/// covers; flush_pending_record_ops() performs it, in staging order, with no lock held.
+struct PendingRecordOp {
+    enum class Kind : uint8_t {
+        MARK_USED,    ///< RecordStore::mark_record_used(psk_id)
+        REMOVE,       ///< RecordStore::remove_record(psk_id)
+        LAST_PLAYED,  ///< SendspinClient::write_last_played_server(server_id); the RAM half ran
+                      ///< under the lock (see note_playback_activity())
+    };
+    Kind kind{Kind::MARK_USED};
+    std::string value;  ///< psk_id for MARK_USED/REMOVE, server_id for LAST_PLAYED
+};
+
 /// @brief Disposition for the connection once abort_pairing_attempt() ends a pairing attempt.
 enum class PairingDropAction : uint8_t {
     KEEP_OPEN,           ///< Leave the connection open.
@@ -623,6 +641,21 @@ private:
     /// are both main-loop-only and happen in the same call, so the staged slot cannot go stale.
     void flush_pending_admission();
 
+    /// @brief Appends a persistence-provider write to pending_record_ops_. Caller must hold
+    /// conn_ptr_mutex_ and call flush_pending_record_ops() after dropping it.
+    /// @param kind Which write to perform.
+    /// @param value The psk_id or server_id it covers.
+    void stage_record_op(PendingRecordOp::Kind kind, std::string value);
+
+    /// @brief Performs the writes staged by the locked handlers, in staging order, so a second
+    /// op on the same record always lands after the first. Caller must NOT hold conn_ptr_mutex_
+    /// (see PendingRecordOp).
+    ///
+    /// Every staging site sits in loop()'s lifecycle block, which is where the single call to
+    /// this function sits too: nothing staged can outlive the tick that staged it, so this needs
+    /// no gate atomic and costs nothing on a tick that skips that block.
+    void flush_pending_record_ops();
+
     /// @brief Sets has_pending_events_, the lock-free gate loop() polls before acquiring
     /// conn_mutex_. It is the atomic's only writer outside swap_out_pending_events(), so nothing
     /// can be queued without arming the gate. Caller must hold conn_mutex_.
@@ -718,7 +751,8 @@ private:
     /// PLAYBACK activity, per the last-playback server of connection.md "Multiple servers
     /// (server-initiated)".
     /// No-op if conn is not the current connection, or does not declare PLAYBACK.
-    /// Caller must hold conn_ptr_mutex_.
+    /// Caller must hold conn_ptr_mutex_: the RAM update runs here, under the lock arbitration
+    /// reads it with, and only the durable write is staged for flush_pending_record_ops().
     /// @param conn The connection to check (typically the connection an activate just applied to).
     void note_playback_activity(const SendspinConnection* conn);
 
@@ -996,7 +1030,11 @@ private:
     mutable std::mutex conn_ptr_mutex_;               // Protects current_connection_, nursery_, and
                                                       // deferred_releases_
     std::vector<DeferredRelease> deferred_releases_;  // Queued releases; see DeferredRelease
-    std::vector<NurseryEntry> nursery_;               // Unproven connections awaiting establishment
+    // Provider writes decided by the locked lifecycle handlers, performed by
+    // flush_pending_record_ops() once conn_ptr_mutex_ is dropped; see PendingRecordOp. Written
+    // and read only under conn_ptr_mutex_, and emptied within the tick that filled it.
+    std::vector<PendingRecordOp> pending_record_ops_;
+    std::vector<NurseryEntry> nursery_;  // Unproven connections awaiting establishment
     // One entry per nursery connection awaiting its hello, cleared when the hello is sent or
     // the connection leaves the nursery.
     std::vector<HelloRetryState> hello_retries_;

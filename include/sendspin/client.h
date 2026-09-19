@@ -876,6 +876,17 @@ private:
     /// @brief Persists the server_id as the last played server
     void persist_last_played_server(const std::string& server_id);
 
+    /// @brief Applies the handoff preference in RAM, the half a caller holding
+    /// ConnectionManager::conn_ptr_mutex_ may run: arbitration reads last_played_server_id_
+    /// under that lock, so the RAM update must not be deferred with the write.
+    /// @return true when the value actually changed, so the caller owes a
+    ///         write_last_played_server() once its locks are dropped.
+    bool note_last_played_server(const std::string& server_id);
+
+    /// @brief Writes the last-played server_id through the persistence provider. Must run with
+    /// no library lock held: the provider call is a flash write on ESP.
+    void write_last_played_server(const std::string& server_id);
+
     // ========================================
     // Connection event handlers (called by ConnectionManager via friend access)
     // ========================================
