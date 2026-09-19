@@ -197,10 +197,12 @@ private:
 // Helpers shared by handshake tests
 // ============================================================================
 
-/// Build and return `server/init` JSON for the given server_id and version.
-static std::string make_server_init(const std::string& server_id, int version = 1) {
+/// Build and return `server/init` JSON for the given server_id and version. `type` is a
+/// parameter so a test can send the same payload under another envelope type.
+static std::string make_server_init(const std::string& server_id, int version = 1,
+                                    const char* type = "server/init") {
     JsonDocument doc;
-    doc["type"] = "server/init";
+    doc["type"] = type;
     doc["payload"]["server_id"] = server_id;
     doc["payload"]["version"] = version;
     std::string out;
@@ -832,17 +834,47 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
     EXPECT_EQ(nh.server_error_reason(), "malformed");
 }
 
-TEST(NoiseHandshakeDriver, MalformedServerInitAborts) {
+// Control: a frame of the expected type carrying a well-formed payload is accepted, and the
+// driver moves on to waiting for Noise message 1.
+TEST(NoiseHandshakeDriver, WellFormedServerInitIsAccepted) {
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
+    RecordStore rs(nullptr);
+
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    nh.build_client_init();
+
+    auto r = nh.on_text_frame(make_server_init(server_id.peer_id()),
+                              [](const std::string&) { return true; });
+    EXPECT_EQ(r, HandshakeFrameResult::NEED_MORE);
+}
+
+TEST(NoiseHandshakeDriver, UnexpectedTypeWhileAwaitingServerInitAborts) {
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
+    RecordStore rs(nullptr);
+
+    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+    nh.build_client_init();
+
+    // The payload is the one the control sends, so only the type field can produce the abort:
+    // a frame whose payload would pass must still be refused for arriving under another type.
+    auto r = nh.on_text_frame(make_server_init(server_id.peer_id(), /*version=*/1, "wrong/type"),
+                              [](const std::string&) { return true; });
+    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
+}
+
+TEST(NoiseHandshakeDriver, ServerInitWithAWrongLengthServerIdAborts) {
     Identity client_id = Identity::generate().value();
     RecordStore rs(nullptr);
 
     NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
     nh.build_client_init();
 
-    // Send a malformed server/init (wrong type field)
-    auto r = nh.on_text_frame("{\"type\":\"wrong/type\",\"payload\":{\"version\":1,\"server_id\":"
-                               "\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}}",
-                               [](const std::string&) { return true; });
+    // A peer id is PEER_ID_SIZE characters of base64url; anything else cannot name a key, and
+    // the value goes into the prologue, so it is checked before the handshake reads it.
+    auto r = nh.on_text_frame(make_server_init(std::string(PEER_ID_SIZE + 2, 'A')),
+                              [](const std::string&) { return true; });
     EXPECT_EQ(r, HandshakeFrameResult::ABORT);
 }
 
