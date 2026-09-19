@@ -70,6 +70,34 @@ TEST(Sha512, TwoBlockNistVector) {
               "501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909");
 }
 
+TEST(Sha512, PaddingBoundaryLengths) {
+    // 111 pads within the block, 112 forces the pad run across a block boundary, 128 fills a
+    // block exactly and pads a whole extra one. Digests from python3 hashlib.
+    struct Case {
+        size_t len;
+        const char* digest;
+    };
+    static const Case CASES[] = {
+        {111,
+         "3dfde1184fd99f233f98be4250f4edb9b535157909b668334370742204d97e04"
+         "7f1fd6a74bb5ba447f337286f421d9af957811f7ef62a458771457da126cb65e"},
+        {112,
+         "acc96c509e6d01787330a4c6a241e2cda9dcc2529dbe4288dbbcc3812133233c"
+         "4698831127cf6ed0b333632b22715a5ce53a0a1002a684367b71c98aa6d1d900"},
+        {128,
+         "31f33a52b36dc2e70c83b604fa999a5cabf33bf70e4556fbed7bff10870c1b7b"
+         "241dd3f15d1ade24599f068fc58ab51e0028b0f0c98895c23358e8dee032ce06"},
+    };
+    for (const auto& c : CASES) {
+        std::vector<uint8_t> data(c.len);
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = static_cast<uint8_t>(i * 7 + 1);
+        }
+        EXPECT_EQ(to_hex(sha512_oneshot(data.data(), data.size())), c.digest)
+            << "length " << c.len;
+    }
+}
+
 TEST(Sha512, StreamingByteByByteMatchesOneShot) {
     std::vector<uint8_t> data(1000);
     for (size_t i = 0; i < data.size(); ++i) {

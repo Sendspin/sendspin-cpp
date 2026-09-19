@@ -203,13 +203,16 @@ public:
         // zero for any input that fits in memory, so only the low 64 are non-trivial).
         const uint64_t bit_len = this->total_len_ * 8ULL;
 
-        // Append 0x80 then pad with zeros until the buffer is 112 mod 128 bytes.
-        static const uint8_t PAD_BYTE = 0x80;
-        this->update(&PAD_BYTE, 1);
-        static const uint8_t ZERO = 0x00;
-        while (this->buf_len_ != BLOCK - 16) {
-            this->update(&ZERO, 1);
+        // Append 0x80 then pad with zeros until the buffer is 112 mod 128 bytes. Written
+        // straight into buf_: the pad run is up to 127 bytes and total_len_ is already read.
+        this->buf_[this->buf_len_++] = 0x80;
+        if (this->buf_len_ > BLOCK - 16) {
+            std::memset(this->buf_ + this->buf_len_, 0, BLOCK - this->buf_len_);
+            this->process_block(this->buf_);
+            this->buf_len_ = 0;
         }
+        std::memset(this->buf_ + this->buf_len_, 0, (BLOCK - 16) - this->buf_len_);
+        this->buf_len_ = BLOCK - 16;
 
         // Append the 128-bit big-endian bit length (high 64 bits are zero) and flush.
         uint8_t len_block[16] = {0};
@@ -217,7 +220,7 @@ public:
             len_block[15 - i] = static_cast<uint8_t>((bit_len >> (i * 8)) & 0xFF);
         }
         this->update(len_block, sizeof(len_block));
-        // buf_len_ is now 0: the two updates above completed the final block.
+        // buf_len_ is now 0: that update completed the final block.
 
         std::array<uint8_t, SHA512_DIGEST_SIZE> digest{};
         for (int i = 0; i < 8; ++i) {
@@ -279,7 +282,10 @@ private:
             0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL,
         };
 
-        uint64_t w[80];
+        // FIPS 180-4 rolling message schedule: w[t] depends only on w[t-2], w[t-7], w[t-15]
+        // and w[t-16], so a 16-word window updated in place stands in for the full 80-word
+        // array and keeps 512 bytes off the frame of every SHA-512 on the pairing path.
+        uint64_t w[16];
         for (int t = 0; t < 16; ++t) {
             uint64_t v = 0;
             for (int j = 0; j < 8; ++j) {
@@ -287,18 +293,20 @@ private:
             }
             w[t] = v;
         }
-        for (int t = 16; t < 80; ++t) {
-            const uint64_t s0 = rotr(w[t - 15], 1) ^ rotr(w[t - 15], 8) ^ (w[t - 15] >> 7);
-            const uint64_t s1 = rotr(w[t - 2], 19) ^ rotr(w[t - 2], 61) ^ (w[t - 2] >> 6);
-            w[t] = w[t - 16] + s0 + w[t - 7] + s1;
-        }
 
         uint64_t a = this->h_[0], b = this->h_[1], c = this->h_[2], d = this->h_[3];
         uint64_t e = this->h_[4], f = this->h_[5], g = this->h_[6], h = this->h_[7];
         for (int t = 0; t < 80; ++t) {
+            if (t >= 16) {
+                const uint64_t wm15 = w[(t + 1) & 15];
+                const uint64_t wm2 = w[(t + 14) & 15];
+                const uint64_t s0 = rotr(wm15, 1) ^ rotr(wm15, 8) ^ (wm15 >> 7);
+                const uint64_t s1 = rotr(wm2, 19) ^ rotr(wm2, 61) ^ (wm2 >> 6);
+                w[t & 15] += s0 + w[(t + 9) & 15] + s1;
+            }
             const uint64_t big_s1 = rotr(e, 14) ^ rotr(e, 18) ^ rotr(e, 41);
             const uint64_t ch = (e & f) ^ (~e & g);
-            const uint64_t t1 = h + big_s1 + ch + K[t] + w[t];
+            const uint64_t t1 = h + big_s1 + ch + K[t] + w[t & 15];
             const uint64_t big_s0 = rotr(a, 28) ^ rotr(a, 34) ^ rotr(a, 39);
             const uint64_t maj = (a & b) ^ (a & c) ^ (b & c);
             const uint64_t t2 = big_s0 + maj;
