@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstddef>
 #include <optional>
 #include <string>
 
@@ -82,32 +83,54 @@ TEST(PairingCodeCommit, WrongNonceFailsVerify) {
                                             commitment->size()));
 }
 
-TEST(PairingCodeCommit, WrongNonceSizeReturnsNullopt) {
-    std::array<uint8_t, 16> short_nonce{};
-    EXPECT_FALSE(pairing_code_commit(short_nonce.data(), short_nonce.size()).has_value());
-    std::array<uint8_t, 33> long_nonce{};
-    EXPECT_FALSE(pairing_code_commit(long_nonce.data(), long_nonce.size()).has_value());
-    // Control: a nonce of exactly PAIRING_NONCE_SIZE bytes succeeds.
-    auto nonce = pairing_generate_nonce();
-    EXPECT_TRUE(pairing_code_commit(nonce.data(), nonce.size()).has_value());
-}
-
-// Either length argument fails the verify. The nonce clause cannot be seen on its own from here:
-// pairing_code_commit() rejects the same length, so removing the clause leaves this call
-// returning false anyway; this pins the composed contract rather than that one line.
-TEST(PairingCodeCommit, WrongArgumentSizesFailVerify) {
-    auto nonce = pairing_generate_nonce();
-    auto commitment = pairing_code_commit(nonce.data(), nonce.size());
+// The commit/verify length guards. pairing_code_commit() and pairing_code_verify_commit() are
+// one family: a commitment is only ever checked against the nonce that produced it, so both
+// lengths are guarded on both sides.
+TEST(PairingCodeCommit, LengthGuardsRejectWrongSizedArguments) {
+    const auto nonce = pairing_generate_nonce();
+    const auto commitment = pairing_code_commit(nonce.data(), nonce.size());
     ASSERT_TRUE(commitment.has_value());
 
-    std::array<uint8_t, 16> short_commit{};
-    EXPECT_FALSE(pairing_code_verify_commit(nonce.data(), nonce.size(), short_commit.data(), 16));
-    std::array<uint8_t, 16> short_nonce{};
-    EXPECT_FALSE(pairing_code_verify_commit(short_nonce.data(), short_nonce.size(),
-                                            commitment->data(), commitment->size()));
-    // Control: both arguments at their defined lengths verify.
-    EXPECT_TRUE(pairing_code_verify_commit(nonce.data(), nonce.size(), commitment->data(),
-                                           commitment->size()));
+    struct CommitRow {
+        const char* name;
+        size_t nonce_len;
+        bool expect_ok;
+    };
+    const std::array<uint8_t, 33> spare{};
+    const CommitRow commit_rows[] = {
+        {"commit/nonce-16-bytes", 16, false},
+        {"commit/nonce-33-bytes", 33, false},
+        {"commit/nonce-0-bytes", 0, false},
+        // Control: a nonce of exactly PAIRING_NONCE_SIZE bytes commits.
+        {"commit/nonce-PAIRING_NONCE_SIZE", PAIRING_NONCE_SIZE, true},
+    };
+    for (const CommitRow& row : commit_rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(pairing_code_commit(spare.data(), row.nonce_len).has_value(), row.expect_ok);
+    }
+
+    // The verify rows pin the composed contract, not one line: the nonce clause cannot be seen on
+    // its own from here, since pairing_code_commit() rejects the same length and the call would
+    // return false without it.
+    struct VerifyRow {
+        const char* name;
+        size_t nonce_len;
+        size_t commitment_len;
+        bool expect_ok;
+    };
+    const VerifyRow verify_rows[] = {
+        {"verify/short-commitment", PAIRING_NONCE_SIZE, 16, false},
+        {"verify/short-nonce", 16, PAIRING_COMMIT_SIZE, false},
+        {"verify/both-short", 16, 16, false},
+        // Control: both arguments at their defined lengths verify.
+        {"verify/both-defined-lengths", PAIRING_NONCE_SIZE, PAIRING_COMMIT_SIZE, true},
+    };
+    for (const VerifyRow& row : verify_rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(pairing_code_verify_commit(nonce.data(), row.nonce_len, commitment->data(),
+                                             row.commitment_len),
+                  row.expect_ok);
+    }
 }
 
 TEST(PairingCodeCommit, Kat) {
@@ -156,27 +179,33 @@ TEST(PairingCodeDigest, NonceOrderIsLoadBearing) {
     EXPECT_NE(*forward, *swapped);
 }
 
-TEST(PairingCodeDigest, WrongHashSizeReturnsNullopt) {
-    DeriveInputs in = kat_inputs();
-    std::array<uint8_t, 16> short_h{};
-    EXPECT_FALSE(pairing_code_digest(short_h.data(), short_h.size(), in.nonce_a.data(),
-                                     in.nonce_a.size(), in.nonce_b.data(), in.nonce_b.size())
-                     .has_value());
-    // Control: the same call with the full-length hash succeeds.
-    EXPECT_TRUE(digest_of(in).has_value());
-}
+// pairing_code_digest()'s length guards: the hash and both nonces are fixed-size inputs to the
+// derivation label (pairing.md "Dynamic Pairing Code Flow").
+TEST(PairingCodeDigest, LengthGuardsRejectWrongSizedArguments) {
+    const DeriveInputs in = kat_inputs();
+    const std::array<uint8_t, 32> spare{};
 
-TEST(PairingCodeDigest, WrongNonceSizeReturnsNullopt) {
-    DeriveInputs in = kat_inputs();
-    std::array<uint8_t, 16> short_nonce{};
-    EXPECT_FALSE(pairing_code_digest(in.h.data(), in.h.size(), short_nonce.data(),
-                                     short_nonce.size(), in.nonce_b.data(), in.nonce_b.size())
-                     .has_value());
-    EXPECT_FALSE(pairing_code_digest(in.h.data(), in.h.size(), in.nonce_a.data(),
-                                     in.nonce_a.size(), short_nonce.data(), short_nonce.size())
-                     .has_value());
-    // Control: both nonces at their full length succeed.
-    EXPECT_TRUE(digest_of(in).has_value());
+    struct Row {
+        const char* name;
+        size_t hash_len;
+        size_t nonce_a_len;
+        size_t nonce_b_len;
+        bool expect_ok;
+    };
+    const Row rows[] = {
+        {"short-hash", 16, PAIRING_NONCE_SIZE, PAIRING_NONCE_SIZE, false},
+        {"short-nonce_a", in.h.size(), 16, PAIRING_NONCE_SIZE, false},
+        {"short-nonce_b", in.h.size(), PAIRING_NONCE_SIZE, 16, false},
+        // Control: all three inputs at their defined lengths derive.
+        {"all-defined-lengths", in.h.size(), PAIRING_NONCE_SIZE, PAIRING_NONCE_SIZE, true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(pairing_code_digest(in.h.data(), row.hash_len, spare.data(), row.nonce_a_len,
+                                      spare.data(), row.nonce_b_len)
+                      .has_value(),
+                  row.expect_ok);
+    }
 }
 
 // ============================================================================
@@ -228,21 +257,28 @@ TEST(PairingCodeQrBytes, KatTakesTheFirst24DigestBytes) {
 // is_valid_static_pairing_code
 // ============================================================================
 
-TEST(StaticPairingCode, AcceptsEightDigits) {
-    EXPECT_TRUE(is_valid_static_pairing_code("12345678"));
-    EXPECT_TRUE(is_valid_static_pairing_code("00000000"));
-}
-
-TEST(StaticPairingCode, RejectsWrongLength) {
-    EXPECT_FALSE(is_valid_static_pairing_code("1234567"));
-    EXPECT_FALSE(is_valid_static_pairing_code("123456789"));
-    EXPECT_FALSE(is_valid_static_pairing_code(""));
-}
-
-TEST(StaticPairingCode, RejectsNonDigits) {
-    EXPECT_FALSE(is_valid_static_pairing_code("1234567a"));
-    EXPECT_FALSE(is_valid_static_pairing_code("1234-567"));
-    EXPECT_FALSE(is_valid_static_pairing_code(" 1234567"));
+// pairing.md "Static Pairing Code": exactly eight ASCII decimal digits, nothing else.
+TEST(StaticPairingCode, AcceptsExactlyEightAsciiDigits) {
+    struct Row {
+        const char* name;
+        const char* code;
+        bool expect_ok;
+    };
+    const Row rows[] = {
+        {"seven-digits", "1234567", false},
+        {"nine-digits", "123456789", false},
+        {"empty", "", false},
+        {"trailing-letter", "1234567a", false},
+        {"embedded-dash", "1234-567", false},
+        {"leading-space", " 1234567", false},
+        // Control: eight digits, including the all-zero code.
+        {"eight-digits", "12345678", true},
+        {"eight-zeros", "00000000", true},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_EQ(is_valid_static_pairing_code(row.code), row.expect_ok);
+    }
 }
 
 // ============================================================================
