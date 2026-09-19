@@ -119,19 +119,17 @@ namespace sendspin {
 
 VisualizerRole::Impl::Impl(VisualizerRoleConfig config, SendspinClient* client)
     : config(std::move(config)),
-      visualizer_support(std::move(this->config.support)),
+      visualizer_support(this->config.support),
       client(client),
       event_state(std::make_unique<EventState>()) {
-    if (this->visualizer_support.has_value()) {
-        this->drain_task = std::make_unique<DrainTask>();
+    this->drain_task = std::make_unique<DrainTask>();
 
-        // buffer_capacity is the total RAM budget for the ring buffer. Each entry carries an
-        // 8-byte ItemHeader aligned to 8 bytes, so with the small visualizer entries roughly a
-        // third of this storage holds actual wire data and the rest is per-entry overhead.
-        size_t capacity = this->visualizer_support->buffer_capacity;
-        if (this->drain_task->ring_storage.allocate(capacity)) {
-            this->drain_task->ring_buffer.create(capacity, this->drain_task->ring_storage.data());
-        }
+    // buffer_capacity is the total RAM budget for the ring buffer. Each entry carries an
+    // 8-byte ItemHeader aligned to 8 bytes, so with the small visualizer entries roughly a
+    // third of this storage holds actual wire data and the rest is per-entry overhead.
+    size_t capacity = this->visualizer_support.buffer_capacity;
+    if (this->drain_task->ring_storage.allocate(capacity)) {
+        this->drain_task->ring_buffer.create(capacity, this->drain_task->ring_storage.data());
     }
 }
 
@@ -227,23 +225,16 @@ void VisualizerRole::Impl::stop() const {
 }
 
 void VisualizerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
-    if (this->visualizer_support.has_value()) {
-        msg.supported_roles.push_back(SendspinRole::VISUALIZER);
-        // Advertise the effective wire-data capacity, not the raw RAM budget: the ring is sized at
-        // buffer_capacity bytes but per-entry overhead leaves only ~1/3 for wire data (see
-        // BUFFER_ADVERTISE_DIVISOR). The RAM allocation in the constructor still uses the full
-        // value.
-        VisualizerSupportObject advertised = this->visualizer_support.value();
-        advertised.buffer_capacity /= BUFFER_ADVERTISE_DIVISOR;
-        msg.visualizer_support = std::move(advertised);
-    }
+    msg.supported_roles.push_back(SendspinRole::VISUALIZER);
+    // Advertise the effective wire-data capacity, not the raw RAM budget: the ring is sized at
+    // buffer_capacity bytes but per-entry overhead leaves only ~1/3 for wire data (see
+    // BUFFER_ADVERTISE_DIVISOR). The RAM allocation in the constructor still uses the full value.
+    VisualizerSupportObject advertised = this->visualizer_support;
+    advertised.buffer_capacity /= BUFFER_ADVERTISE_DIVISOR;
+    msg.visualizer_support = advertised;
 }
 
 void VisualizerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
-    if (!this->visualizer_support.has_value()) {
-        return;
-    }
-
     ClientVisualizerStateObject visualizer_state{};
     visualizer_state.types = this->config.stream.types;
     visualizer_state.rate_max = this->config.stream.rate_max;

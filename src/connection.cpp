@@ -216,9 +216,10 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
     this->first_activate_received_.store(false, std::memory_order_release);
 
     // Clear the pairing-in-progress flag: the re-handshake is the server's signal that
-    // pairing finalized and it is rekeying onto the new long-term PSK.  The quiesce gate
-    // (pairing_in_progress) must be cleared here (network thread) before the new
-    // server/activate arrives, so the main loop can resume time sync and state publishing.
+    // pairing finalized and it is rekeying onto the new long-term PSK. Clearing it here
+    // (network thread) before the new server/activate arrives is what makes the main loop read
+    // that activate as a fresh one rather than a re-entry into the attempt, and discard any
+    // pairing message still in flight as stale.
     // Atomic store: written on network thread, read on main loop.
     this->pairing_in_progress_.store(false, std::memory_order_release);
 

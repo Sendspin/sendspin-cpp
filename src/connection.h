@@ -174,8 +174,8 @@ public:
     /// activities (see admission.h), so anything that drives shared client state (the roles)
     /// must gate on THIS, not on the handshake having succeeded.
     ///
-    /// Set/cleared only by ConnectionManager::set_current_connection() on the main loop; atomic
-    /// because the network thread reads it on the message-dispatch path.
+    /// Written on the main loop only (see set_admitted()); atomic because the network thread
+    /// reads it on the message-dispatch path.
     /// @return true while this connection is the admitted one.
     bool is_admitted() const {
         return this->admitted_.load(std::memory_order_acquire);
@@ -1187,7 +1187,8 @@ protected:
     /// True while a Pairing-PSK exchange is in progress on this connection.
     /// Written on the main loop (enter/abort) and by the network thread
     /// (handle_noise_rehandshake clears it when the re-handshake begins).
-    /// Read on the main loop (time-burst and publish_client_state quiesce gates).
+    /// Read on the main loop by ConnectionManager: the re-entry check in process_activate_event()
+    /// and the already-ended checks in handle_pair_abort() / handle_pairing_message().
     /// Atomic because of the network-thread write in handle_noise_rehandshake.
     std::atomic<bool> pairing_in_progress_{false};
 
@@ -1287,9 +1288,9 @@ protected:
     /// read on the network thread only. See note_activate_delivered().
     std::atomic<bool> activate_delivered_{false};
 
-    /// True while this connection occupies the manager's admitted (current) slot. Written only
-    /// by ConnectionManager::set_current_connection() on the main loop; read on the network
-    /// thread by the role-dispatch gate. See is_admitted().
+    /// True while this connection occupies the manager's admitted (current) slot. Written on the
+    /// main loop only (see set_admitted()); read on the network thread by the role-dispatch gate.
+    /// See is_admitted().
     std::atomic<bool> admitted_{false};
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).

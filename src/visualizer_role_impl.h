@@ -26,7 +26,6 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <thread>
 #include <vector>
 
@@ -152,7 +151,7 @@ struct VisualizerRole::Impl {
 
     // Struct fields
     VisualizerRoleConfig config;
-    std::optional<VisualizerSupportObject> visualizer_support;
+    VisualizerSupportObject visualizer_support;
 
     // Pointer fields
     SendspinClient* client;
