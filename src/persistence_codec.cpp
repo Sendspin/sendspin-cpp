@@ -48,17 +48,22 @@ struct PskIdAndBytes {
 };
 
 /// @brief Parses and validates the "psk_id"/"psk" fields common to a record and a Pairing PSK.
+/// @param obj    The object to read.
+/// @param reason Set to the rejection reason when the parse fails; untouched on success.
 /// @return nullopt if psk_id is missing/empty, psk is missing, or psk does not base64url-decode
 ///         to exactly 32 bytes.
-std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj) {
+std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj, const char** reason) {
     if (!obj["psk_id"].is<const char*>()) {
+        *reason = "psk_id is missing or not a string";
         return std::nullopt;
     }
     std::string psk_id = obj["psk_id"].as<const char*>();
     if (psk_id.empty()) {
+        *reason = "psk_id is empty";
         return std::nullopt;
     }
     if (!obj["psk"].is<const char*>()) {
+        *reason = "psk is missing or not a string";
         return std::nullopt;
     }
     // Decode straight from the JSON pool's char*, not a std::string copy of it: that copy would
@@ -66,6 +71,7 @@ std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj) {
     // wipe it on the way out.
     auto decoded = b64url_decode(obj["psk"].as<const char*>());
     if (!decoded.has_value() || decoded->size() != 32) {
+        *reason = "psk does not base64url-decode to 32 bytes";
         return std::nullopt;
     }
     PskIdAndBytes out;
@@ -77,8 +83,13 @@ std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj) {
 
 /// @brief Parses a pairing record from a JSON object (a top-level record blob, or one entry of
 /// a records array). Ignores an entry-local "v", if present.
-std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj) {
-    auto core = parse_psk_id_and_psk(obj);
+/// @param obj    The object to read.
+/// @param reason Set to the rejection reason when the parse fails; untouched on success. The one
+///        place that reports a skipped record prints what this leaves here, so every rejection
+///        names itself rather than being re-derived at the call site.
+/// @return The record, or nullopt when the object is not a usable one.
+std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj, const char** reason) {
+    auto core = parse_psk_id_and_psk(obj, reason);
     if (!core.has_value()) {
         return std::nullopt;
     }
@@ -89,10 +100,12 @@ std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj) {
     // check (connection.md "Pre-Shared Key"), so it is not a usable record: reject it here rather
     // than load a credential no handshake could ever accept.
     if (!obj["server_id"].is<const char*>()) {
+        *reason = "server_id is missing or not a string";
         return std::nullopt;
     }
     rec.server_id = obj["server_id"].as<const char*>();
     if (rec.server_id.empty()) {
+        *reason = "server_id is empty";
         return std::nullopt;
     }
     if (obj["label"].is<const char*>()) {
@@ -126,8 +139,11 @@ void write_record_fields(TTarget& target, const SendspinPairingRecord& r) {
 }
 
 /// @brief Parses an accepted Pairing PSK from a JSON object.
+/// @param obj The object to read.
+/// @return The Pairing PSK, or nullopt when the object does not carry a usable one.
 std::optional<SendspinPairingPsk> psk_from_object(JsonObjectConst obj) {
-    auto core = parse_psk_id_and_psk(obj);
+    const char* reason = "";
+    auto core = parse_psk_id_and_psk(obj, &reason);
     if (!core.has_value()) {
         return std::nullopt;
     }
@@ -175,7 +191,8 @@ std::optional<SendspinPairingRecord> decode_pairing_record(std::string_view byte
     if (obj.isNull()) {
         return std::nullopt;
     }
-    return record_from_object(obj);
+    const char* reason = "";
+    return record_from_object(obj, &reason);
 }
 
 std::string encode_pairing_records(const std::vector<SendspinPairingRecord>& v) {
@@ -200,23 +217,19 @@ std::optional<std::vector<SendspinPairingRecord>> decode_pairing_records(std::st
     std::vector<SendspinPairingRecord> out;
     for (JsonVariantConst entry : root["records"].as<JsonArrayConst>()) {
         JsonObjectConst obj = entry.as<JsonObjectConst>();
-        auto rec = record_from_object(obj);
+        const char* reason = "the codec cannot read it";
+        auto rec = record_from_object(obj, &reason);
         if (rec.has_value()) {
             out.push_back(std::move(rec.value()));
             continue;
         }
-        // A record the codec cannot accept is skipped so the rest of the blob still loads. Name
-        // the case a stored blob can actually hit: a record written before every PSK carried the
-        // server it was minted for (connection.md "Pre-Shared Key"), which nothing can match a
-        // handshake against now.
-        const bool has_server_id =
-            obj["server_id"].is<const char*>() && obj["server_id"].as<const char*>()[0] != '\0';
-        if (obj["psk_id"].is<const char*>() && !has_server_id) {
-            SS_LOGW(TAG,
-                    "Skipping stored pairing record %s: no server_id, so it cannot be bound to "
-                    "the server that holds it; that server has to pair again",
-                    obj["psk_id"].as<const char*>());
-        }
+        // A record the codec cannot accept is skipped so the rest of the blob still loads, and
+        // the reason record_from_object() rejected it is named here: a record with no server_id,
+        // say, can never satisfy the post-match server check (connection.md "Pre-Shared Key"),
+        // and the server that holds it has to pair again.
+        SS_LOGW(TAG, "Skipping stored pairing record %s: %s",
+                obj["psk_id"].is<const char*>() ? obj["psk_id"].as<const char*>() : "(no psk_id)",
+                reason);
     }
     return out;
 }

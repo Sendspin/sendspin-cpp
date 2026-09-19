@@ -94,7 +94,7 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
     rec.psk_id = r.psk_id;
     rec.psk = r.psk;
     rec.server_id = r.server_id.peer_id();
-    rs.store_record_superseding(std::move(rec));
+    rs.store_record_superseding(std::move(rec), {});
 
     // Run initial handshake via NoiseHandshake state machine
     NoiseHandshake nh(r.client_id, rs, suite_name);
@@ -313,7 +313,7 @@ static void run_rehandshake_test(const std::string& suite_name) {
     rec.psk_id = init.psk_id;
     rec.psk = init.psk;
     rec.server_id = init.server_id.peer_id();
-    rs.store_record_superseding(std::move(rec));
+    rs.store_record_superseding(std::move(rec), {});
 
     // Step 3: Run the re-handshake (same PSK, new session).
     auto rr_opt = run_rehandshake(suite_name, init, rs, init.psk, init.psk_id);
@@ -359,7 +359,7 @@ TEST(NoiseRehandshake, RehandshakeWithDifferentPsk_ChaChaPoly) {
     rec.psk_id = new_psk_id;
     rec.psk = new_psk;
     rec.server_id = init.server_id.peer_id();
-    rs.store_record_superseding(std::move(rec));
+    rs.store_record_superseding(std::move(rec), {});
 
     auto rr_opt = run_rehandshake(suite, init, rs, new_psk, new_psk_id);
     ASSERT_TRUE(rr_opt.has_value()) << "Re-handshake with different PSK failed";

@@ -22,6 +22,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -344,7 +345,7 @@ struct PlayerRoleConfig {
     /// @param extra_startup_silence_ms The configured extra startup silence.
     /// @return Lead time in milliseconds, saturated at the field's maximum.
     static constexpr uint16_t pipeline_lead_time_ms(uint16_t extra_startup_silence_ms) {
-        constexpr uint32_t MAX = 65535U;
+        constexpr uint32_t MAX = std::numeric_limits<uint16_t>::max();
         const uint32_t lead = static_cast<uint32_t>(INITIAL_SYNC_PRIMING_MS) +
                               extra_startup_silence_ms + PIPELINE_START_ALLOWANCE_MS;
         return static_cast<uint16_t>(lead < MAX ? lead : MAX);
@@ -400,8 +401,7 @@ struct PlayerRoleConfig {
 // ============================================================================
 
 /// @brief Image format for artwork
-/// roles/artwork/v1.md "client/state artwork object" defines exactly these two; a server flags a
-/// client that declares anything else.
+/// roles/artwork/v1.md "client/state artwork object" defines exactly these two formats.
 enum class SendspinImageFormat : uint8_t {
     JPEG,  // JPEG compressed image
     PNG,   // PNG image
@@ -414,14 +414,14 @@ enum class SendspinImageSource : uint8_t {
     NONE,    // No image
 };
 
-/// @brief Default ImageSlotPreference::max_image_bytes: 128 KiB per artwork channel, which holds
-/// any JPEG a 320x320 channel receives (a photographic one runs an order of magnitude under it,
-/// and a worst-case noisy one about 78 KB) with room for a larger channel, and bounds a
-/// four-channel role at 1 MiB of image buffers.
-static constexpr uint32_t ARTWORK_DEFAULT_MAX_IMAGE_BYTES = 128U * 1024U;
-
 /// @brief Preference for an image slot's format and resolution
 struct ImageSlotPreference {
+    /// @brief Default max_image_bytes: 128 KiB per artwork channel, which holds any JPEG a
+    /// 320x320 channel receives (a photographic one runs an order of magnitude under it, and a
+    /// worst-case noisy one about 78 KB) with room for a larger channel, and bounds a
+    /// four-channel role at 1 MiB of image buffers.
+    static constexpr uint32_t DEFAULT_MAX_IMAGE_BYTES = 128U * 1024U;
+
     SendspinImageSource source{};
     SendspinImageFormat format{};
     /// @brief Pixel dimensions the server delivers this channel's images at.
@@ -460,7 +460,7 @@ struct ImageSlotPreference {
     /// handed back when the role is torn down (a stop, a disconnect, or a server/activate that
     /// removes the role), then re-allocated by the next transfer. A channel with 0 here holds
     /// nothing at all.
-    uint32_t max_image_bytes{ARTWORK_DEFAULT_MAX_IMAGE_BYTES};
+    uint32_t max_image_bytes{DEFAULT_MAX_IMAGE_BYTES};
 };
 
 /// @brief Configuration for the artwork role

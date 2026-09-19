@@ -764,7 +764,7 @@ TEST(ArtworkImageCap, IsTheChannelsConfiguredBudget) {
 
     // An unset budget is the documented default rather than nothing.
     auto defaulted = make_impl(make_single_slot_config(false));
-    EXPECT_EQ(defaulted->image_cap(0), ARTWORK_DEFAULT_MAX_IMAGE_BYTES);
+    EXPECT_EQ(defaulted->image_cap(0), ImageSlotPreference::DEFAULT_MAX_IMAGE_BYTES);
 }
 
 TEST(ArtworkImageCap, ImageOverTheCapIsDiscardedAndItsSequenceTracked) {

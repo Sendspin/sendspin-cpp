@@ -112,13 +112,12 @@ struct ResolvedPsk {
 ///     must go through `resolve_by_psk_id`, the `*_snapshot` / `*_copy` variants, or the one
 ///     network-thread mutator, `store_record_superseding` (RAM-only there; its deferred
 ///     provider flush, `persist_records`, is main-loop-only).
-///   - The pointer/reference-returning getters (`record_by_psk_id`, `record_by_server_id`,
-///     `records`) are for internal-locked or single-threaded (main-loop-only) use ONLY;
+///   - The pointer/reference-returning getters (`record_by_psk_id`, `record_by_server_id`)
+///     are for internal-locked or single-threaded (main-loop-only) use ONLY;
 ///     callers must not retain a returned pointer or reference across any mutation, and must
 ///     never call them from the network thread.
 ///   - The pairing config (`pairing_psk_enabled_`, `unpaired_access_enabled_`,
-///     `dynamic_pairing_code_enabled_`, `static_pairing_code_enabled_`,
-///     `static_pairing_code_`)
+///     `dynamic_pairing_code_enabled_`, `static_pairing_code_enabled_`, `static_pairing_code_`)
 ///     is construction-time state: seeded from the persisted blob and the client config by the
 ///     constructor, then read-only for the object's life, so no lock is needed even for the
 ///     network-thread read of `pairing_psk_enabled_` inside `resolve_by_psk_id`.

@@ -65,7 +65,7 @@ std::optional<std::array<uint8_t, 32>> pairing_code_digest(const uint8_t* handsh
                                                            size_t nonce_a_len,
                                                            const uint8_t* nonce_b,
                                                            size_t nonce_b_len) {
-    if (hash_len != PAIRING_NONCE_SIZE || nonce_a_len != PAIRING_NONCE_SIZE ||
+    if (hash_len != SHA256_DIGEST_SIZE || nonce_a_len != PAIRING_NONCE_SIZE ||
         nonce_b_len != PAIRING_NONCE_SIZE) {
         return std::nullopt;
     }

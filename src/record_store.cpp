@@ -36,8 +36,7 @@ namespace {
 
 /// @brief Shared load -> string_view -> decode -> warn-on-failure -> secure_zero(blob) shape used
 /// by the RECORDS and PAIRING_PSK loaders below. STATIC_PAIRING_CODE (no decoder, no PSK bytes)
-/// and
-/// PAIR_CONFIG (no PSK bytes) differ enough to stay direct.
+/// and PAIR_CONFIG (no PSK bytes) differ enough to stay direct.
 /// @param decode_fail_suffix Appended to the "Stored "%s" blob failed to decode; " warning, so
 ///        each caller keeps its own original message verbatim.
 /// @return The decoded value, or nullopt if the blob was absent or failed to decode. The raw
@@ -68,10 +67,9 @@ std::optional<T> load_decode_wipe(SendspinPersistenceProvider& provider, const c
 RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                          bool initial_unpaired_access_enabled, size_t max_records)
     : provider_(provider), max_records_(std::max(max_records, MIN_MAX_RECORDS)) {
-    // Try loading persisted records and config first. Every blob here (except the static
-    // pairing code, which
-    // is raw UTF-8 bytes) is a codec-encoded blob; the provider itself is a pure byte store, so
-    // decoding happens entirely on this side of the interface.
+    // Try loading persisted records and config first. Every blob here (except the static pairing
+    // code, which is raw UTF-8 bytes) is a codec-encoded blob; the provider itself is a pure byte
+    // store, so decoding happens entirely on this side of the interface.
     bool loaded_config = false;
     if (this->provider_ != nullptr) {
         this->load_records_from_provider();
@@ -347,7 +345,7 @@ bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_us
             psk_ids_in_use.end()) {
             continue;
         }
-        SS_LOGI(TAG, "Evicting record %s for server_id=%s to make room for a new pairing",
+        SS_LOGW(TAG, "Evicting record %s for server_id=%s to make room for a new pairing",
                 psk_id.c_str(), this->records_[i].server_id.c_str());
         this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(i));
         return true;
