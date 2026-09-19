@@ -47,6 +47,7 @@
 #include "sendspin/config.h"
 #include "sendspin/persistence_codec.h"
 #include "sendspin/types.h"
+#include "wrap_test_helpers.h"
 
 #include <ArduinoJson.h>
 #include <gtest/gtest.h>
@@ -390,7 +391,7 @@ std::vector<uint8_t> ascii_bytes(const std::string& s) {
 }
 
 /// ADa = "server" (the (stand-in) server's own AD), ADb = "client" (the device's own AD);
-/// spec "PAKE".
+/// pairing.md "PAKE".
 std::vector<uint8_t> ad_server() {
     return ascii_bytes("server");
 }
@@ -797,7 +798,7 @@ protected:
     /// Complete the server/pair-auth leg of a pairing attempt already at PAIR_INIT: schedules+pumps
     /// server/pair-auth carrying `server`'s public share, asserts the device answered with
     /// client/pair-auth(pake_msg_2), then feeds that share into `server`'s CPace and returns the
-    /// resulting server_kc via `server_kc_out` (spec "PAKE"). Callers that need a genuine
+    /// resulting server_kc via `server_kc_out` (pairing.md "PAKE"). Callers that need a genuine
     /// server_kc for a successful PAIR_CONFIRM use this; the code-mismatch test fabricates its
     /// own bogus server_kc instead and drives PAIR_AUTH inline (it never calls derive()/tag()).
     void drive_pair_auth(FakeConnection* conn, ServerStandIn& server,
@@ -971,7 +972,7 @@ protected:
         std::memcpy(wrapped.data(), wrapped_bytes->data(), WRAPPED_VALUE_SIZE);
 
         ASSERT_TRUE(server.initiator.isk().has_value());
-        auto nonce_b = unwrap_value(NONCE_WRAP_LABEL, "ChaChaPoly", server.initiator.sid(),
+        auto nonce_b = unwrap_value_as_server(NONCE_WRAP_LABEL, "ChaChaPoly", server.initiator.sid(),
                                     server.initiator.isk().value(), wrapped);
         ASSERT_TRUE(nonce_b.has_value()) << "server-side unwrap of wrapped_nonce_B failed";
         EXPECT_TRUE(pairing_code_verify_commit(nonce_b->data(), nonce_b->size(), commit_b->data(),
@@ -1000,7 +1001,7 @@ protected:
         std::memcpy(wrapped_psk.data(), wrapped_bytes->data(), WRAPPED_VALUE_SIZE);
 
         ASSERT_TRUE(server.initiator.isk().has_value());
-        auto unwrapped = unwrap_value(PSK_WRAP_LABEL, "ChaChaPoly", server.initiator.sid(),
+        auto unwrapped = unwrap_value_as_server(PSK_WRAP_LABEL, "ChaChaPoly", server.initiator.sid(),
                                     server.initiator.isk().value(), wrapped_psk);
         ASSERT_TRUE(unwrapped.has_value()) << "server-side unwrap_psk failed";
         EXPECT_EQ(unwrapped->size(), 32u);
@@ -1418,7 +1419,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeAttemptTimeout) {
 // Dynamic pairing code: malformed server frame
 // =============================================================================
 
-// Spec "Protocol Errors": "a malformed or missing field ... is a protocol error: the detecting
+// pairing.md "Protocol Errors": "a malformed or missing field ... is a protocol error: the detecting
 // side closes the WebSocket without sending any application-level error message, and persists
 // nothing." This pins that behavior for the MALFORMED case in
 // ConnectionManager::handle_pairing_message: no pair/abort, and the connection closes.
@@ -1553,7 +1554,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameWithNoActiveSessionIsIg
 // Dynamic pairing code: CPace derive() failure on server/pair-auth (low-order/malformed share)
 // =============================================================================
 
-// Spec "Protocol Errors": "a CPace share with the wrong length or encoding a low-order point" is
+// pairing.md "Protocol Errors": "a CPace share with the wrong length or encoding a low-order point" is
 // a protocol error, not a pairing_code_mismatch: the detecting side closes the WebSocket without sending
 // any application-level error message, and persists nothing. A derive() failure happens on the
 // peer's raw share BEFORE the code-derived generator can even be compared, so it can never be
@@ -1891,7 +1892,7 @@ TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
     const std::array<uint8_t, 32> handshake_hash = conn->pairing_session().handshake_hash;
 
     // Operator confirms the pairing-window gesture: this must send client/pair-init with no
-    // commit_B, but WITH the required pairing_index (spec "Pairing index").
+    // commit_B, but WITH the required pairing_index (pairing.md "Pairing index").
     this->client_->confirm_pairing_window();
     this->client_->loop();
 
@@ -2232,7 +2233,7 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLEAR_CODE))
         << "on_clear_pairing_code must survive cleanup_connection_state()";
-    // Spec "pair/abort": only reason concurrent_attempt closes the connection; user_cancelled
+    // pairing.md "pair/abort": only reason concurrent_attempt closes the connection; user_cancelled
     // leaves it open (pairing state is still cleared above).
     EXPECT_EQ(conn->disconnect_count_, 0);
     EXPECT_FALSE(conn->is_pairing_in_progress());
@@ -2258,7 +2259,7 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupSta
     ASSERT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::CLOSE_WINDOW));
-    // Spec "pair/abort": only reason concurrent_attempt closes the connection.
+    // pairing.md "pair/abort": only reason concurrent_attempt closes the connection.
     EXPECT_EQ(conn->disconnect_count_, 0);
 }
 
@@ -2299,7 +2300,7 @@ TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingS
 }
 
 // =============================================================================
-// pairing_index counter (spec "Pairing index")
+// pairing_index counter (pairing.md "Pairing index")
 // =============================================================================
 
 // The pairing_index counter (sent on every client/pair-init and folded into the CPace sid)
@@ -2413,7 +2414,7 @@ TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
 }
 
 // =============================================================================
-// pair/abort close-vs-stay-open semantics (spec "pair/abort")
+// pair/abort close-vs-stay-open semantics (pairing.md "pair/abort")
 // =============================================================================
 
 // Reason concurrent_attempt is the ONE pair/abort reason whose sender (and, symmetrically, this
@@ -2680,7 +2681,7 @@ TEST_F(PairingStateMachineTest, PersistLastPlayedServerSkipsDuplicateWrite) {
 // ============================================================================
 
 // The configured hints describe where the shipped secrets were published, and ride every
-// client/hello (spec "client/hello pair-method descriptor").
+// client/hello (pairing.md "client/hello pair-method descriptor").
 TEST_F(PairingStateMachineTest, HelloAdvertisesConfiguredLocationsForShippedSecrets) {
     this->init_client(/*pairing_code_emission_supported=*/false,
                       /*pairing_window_supported=*/true, /*pairing_psk_locations=*/{"device"},

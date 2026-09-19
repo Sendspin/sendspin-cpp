@@ -70,13 +70,4 @@ std::optional<std::array<uint8_t, WRAPPED_VALUE_SIZE>> wrap_value(
     std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,
     const std::array<uint8_t, CPACE_ISK_SIZE>& isk, const std::array<uint8_t, 32>& value);
 
-/// @brief Open a field sealed by wrap_value(), recovering the 32-byte value.
-/// Kept for parity with aiosendspin's reference Python implementation; used by tests.
-/// @return The 32-byte value, or nullopt if the cipher is unrecognized or AEAD authentication
-/// fails (wrong key or corrupted input, which the spec treats as a protocol error).
-std::optional<std::array<uint8_t, 32>> unwrap_value(
-    std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,
-    const std::array<uint8_t, CPACE_ISK_SIZE>& isk,
-    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped);
-
 }  // namespace sendspin

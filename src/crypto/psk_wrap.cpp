@@ -67,29 +67,4 @@ std::optional<std::array<uint8_t, WRAPPED_VALUE_SIZE>> wrap_value(
     return out;
 }
 
-std::optional<std::array<uint8_t, 32>> unwrap_value(
-    std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,
-    const std::array<uint8_t, CPACE_ISK_SIZE>& isk,
-    const std::array<uint8_t, WRAPPED_VALUE_SIZE>& wrapped) {
-    if (cipher_name == nullptr) {
-        return std::nullopt;
-    }
-    auto k_wrap = derive_wrap_key(label, sid, isk);
-    if (!k_wrap.has_value()) {
-        return std::nullopt;
-    }
-    auto pt = aead_oneshot_decrypt(cipher_name, k_wrap->data(), k_wrap->size(), wrapped.data(),
-                                   wrapped.size());
-    secure_zero_container(k_wrap.value());
-    if (!pt.has_value() || pt->size() != 32) {
-        return std::nullopt;
-    }
-    std::array<uint8_t, 32> out{};
-    std::memcpy(out.data(), pt->data(), 32);
-    // `pt` holds the recovered value; the caller gets its own copy in `out`, so wipe this one.
-    // The caller owns wiping `out` once it has stored the PSK.
-    secure_zero_container(pt.value());
-    return out;
-}
-
 }  // namespace sendspin

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Wrapping (pairing.md "Wrapping") tests: K_wrap derivation and wrap_value/unwrap_value
+// Wrapping (pairing.md "Wrapping") tests: K_wrap derivation and wrap_value
 // round-trips.
 //
 // The two K_wrap KATs below were produced twice and compared: once from the spec formula written
@@ -25,6 +25,7 @@
 #include "crypto/psk_wrap.h"
 #include "platform/crypto.h"
 #include "test_util.h"
+#include "wrap_test_helpers.h"
 
 #include <gtest/gtest.h>
 
@@ -127,7 +128,7 @@ TEST(PskWrap, DifferentRoundsProduceDifferentKeys) {
 }
 
 // =============================================================================
-// wrap_value / unwrap_value round-trip
+// wrap_value round-trip against the server's unwrap
 // =============================================================================
 
 TEST(PskWrap, RoundTripChaChaPoly) {
@@ -143,7 +144,8 @@ TEST(PskWrap, RoundTripChaChaPoly) {
     EXPECT_EQ(wrapped->size(), WRAPPED_VALUE_SIZE);
     EXPECT_EQ(wrapped->size(), 48u);
 
-    auto unwrapped = unwrap_value(PSK_WRAP_LABEL, "ChaChaPoly", sid, isk, wrapped.value());
+    auto unwrapped = unwrap_value_as_server(PSK_WRAP_LABEL, "ChaChaPoly", sid, isk,
+                                            wrapped.value());
     ASSERT_TRUE(unwrapped.has_value());
     EXPECT_EQ(unwrapped.value(), psk);
 }
@@ -164,26 +166,12 @@ TEST(PskWrap, DifferentSidsProduceDifferentWrappedPsk) {
     ASSERT_TRUE(wrapped_b.has_value());
     EXPECT_NE(wrapped_a.value(), wrapped_b.value());
 
-    // Unwrapping with the wrong sid's key must fail (AEAD authentication failure), matching
-    // pairing.md "Protocol Errors"'s "a wrapped_psk that fails to decrypt" case.
-    auto unwrap_with_wrong_sid = unwrap_value(PSK_WRAP_LABEL, "ChaChaPoly", sid_b, isk, wrapped_a.value());
+    // A server holding the other round's sid derives a different K_wrap, so the field it would
+    // open is not the one this round sealed: pairing.md "Protocol Errors" makes a wrapped_psk
+    // that fails to decrypt a protocol error.
+    auto unwrap_with_wrong_sid =
+        unwrap_value_as_server(PSK_WRAP_LABEL, "ChaChaPoly", sid_b, isk, wrapped_a.value());
     EXPECT_FALSE(unwrap_with_wrong_sid.has_value());
-}
-
-TEST(PskWrap, UnwrapFailsOnCorruptedCiphertext) {
-    const auto sid = make_fixed_sid();
-    const auto isk = make_fixed_isk();
-    std::array<uint8_t, 32> psk{};
-    for (size_t i = 0; i < psk.size(); ++i) {
-        psk[i] = static_cast<uint8_t>(i);
-    }
-
-    auto wrapped = wrap_value(PSK_WRAP_LABEL, "ChaChaPoly", sid, isk, psk);
-    ASSERT_TRUE(wrapped.has_value());
-    wrapped.value()[0] ^= 0xFF;  // Flip a bit in the ciphertext.
-
-    auto unwrapped = unwrap_value(PSK_WRAP_LABEL, "ChaChaPoly", sid, isk, wrapped.value());
-    EXPECT_FALSE(unwrapped.has_value());
 }
 
 TEST(PskWrap, UnknownCipherNameFails) {
