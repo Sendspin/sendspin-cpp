@@ -204,8 +204,12 @@ void PlayerRole::Impl::update_output_delay(uint16_t delay_ms) {
     if (delay_ms > MAX_OUTPUT_DELAY_MS) {
         delay_ms = MAX_OUTPUT_DELAY_MS;
     }
-    this->output_delay_ms.store(delay_ms, std::memory_order_relaxed);
-    this->persist_output_delay();
+    // A server that re-sends the delay it already set, or a consumer control that lands on the
+    // current value, must not cost a flash write.
+    bool changed = this->output_delay_ms.exchange(delay_ms, std::memory_order_relaxed) != delay_ms;
+    if (changed) {
+        this->persist_output_delay();
+    }
     this->client->publish_state();
 }
 
@@ -265,7 +269,7 @@ void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
                            (AUDIO_BUFFER_ADVERTISE_DENOMINATOR - 1) /
                            AUDIO_BUFFER_ADVERTISE_DENOMINATOR,
     };
-    msg.player_v1_support = player_support;
+    msg.player_v1_support = std::move(player_support);
 }
 
 void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
@@ -287,7 +291,7 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
     if (adjustable) {
         player_state.supported_commands.push_back(SendspinPlayerCommand::SET_OUTPUT_DELAY);
     }
-    msg.player = player_state;
+    msg.player = std::move(player_state);
 }
 
 std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* data, size_t len) {
@@ -311,8 +315,9 @@ SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len,
     }
     if (chunk->audio_len == 0) {
         // A complete header carrying no frame is nothing to decode, and send_audio_chunk()
-        // would log it as an argument error rather than as the empty chunk it is.
-        SS_LOGW(TAG, "Audio chunk carries no encoded frame");
+        // would log it as an argument error rather than as the empty chunk it is. Verbose because
+        // this is the per-chunk network path.
+        SS_LOGV(TAG, "Audio chunk carries no encoded frame");
         return;
     }
     if (!this->send_audio_chunk(chunk->audio, chunk->audio_len, chunk->timestamp_us,
