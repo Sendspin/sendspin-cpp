@@ -58,33 +58,97 @@ bool parse(const std::string& json, JsonDocument& doc, JsonObject& root) {
 // Enum <-> wire-string round-trips
 // ============================================================================
 
-TEST(Protocol, CodecRoundTrip) {
-    EXPECT_EQ(codec_format_from_string("flac"), SendspinCodecFormat::FLAC);
-    EXPECT_EQ(codec_format_from_string("opus"), SendspinCodecFormat::OPUS);
-    EXPECT_EQ(codec_format_from_string("pcm"), SendspinCodecFormat::PCM);
-    EXPECT_STREQ(to_cstr(SendspinCodecFormat::FLAC), "flac");
-    EXPECT_FALSE(codec_format_from_string("mp3").has_value());  // unknown -> nullopt
-}
-
-// Every controller command must survive a to_cstr -> from_string round-trip. Catches typos in the
-// wire strings that would otherwise silently drop a command.
-TEST(Protocol, ControllerCommandRoundTrip) {
-    const SendspinControllerCommand commands[] = {
-        SendspinControllerCommand::PLAY,       SendspinControllerCommand::PAUSE,
-        SendspinControllerCommand::STOP,       SendspinControllerCommand::NEXT,
-        SendspinControllerCommand::PREVIOUS,   SendspinControllerCommand::VOLUME,
-        SendspinControllerCommand::MUTE,       SendspinControllerCommand::REPEAT_OFF,
-        SendspinControllerCommand::REPEAT_ONE, SendspinControllerCommand::REPEAT_ALL,
-        SendspinControllerCommand::SHUFFLE,    SendspinControllerCommand::UNSHUFFLE,
-        SendspinControllerCommand::SWITCH,     SendspinControllerCommand::SEEK,
-        SendspinControllerCommand::SEEK_RELATIVE,
+// Every enum the wire carries, with the string the spec spells for it. A to_cstr typo or a
+// from_string entry that maps the wrong way drops or misreads a field with no local symptom, so
+// each value is checked in both directions and each parser is shown rejecting an unrecognized
+// string rather than defaulting.
+TEST(Protocol, EnumWireStringsRoundTrip) {
+    // Checks to_cstr against the wire string, the parse back to the same value, and that the
+    // parser rejects `unknown`.
+    auto round_trip = [](const char* enum_name, auto rows, auto from_string, const char* unknown) {
+        SCOPED_TRACE(enum_name);
+        for (const auto& [value, wire] : rows) {
+            SCOPED_TRACE(wire);
+            EXPECT_STREQ(to_cstr(value), wire);
+            const auto parsed = from_string(wire);
+            ASSERT_TRUE(parsed.has_value());
+            EXPECT_EQ(parsed.value(), value);
+        }
+        EXPECT_FALSE(from_string(unknown).has_value());
     };
-    for (const auto cmd : commands) {
-        const auto parsed = controller_command_from_string(to_cstr(cmd));
-        ASSERT_TRUE(parsed.has_value()) << "no round-trip for " << to_cstr(cmd);
-        EXPECT_EQ(parsed.value(), cmd);
-    }
-    EXPECT_FALSE(controller_command_from_string("not_a_command").has_value());
+    // Enums the client only writes: no parser to round-trip through.
+    auto emitted_as = [](const char* enum_name, auto rows) {
+        SCOPED_TRACE(enum_name);
+        for (const auto& [value, wire] : rows) {
+            EXPECT_STREQ(to_cstr(value), wire);
+        }
+    };
+
+    round_trip("SendspinCodecFormat",
+               std::array{
+                   std::pair{SendspinCodecFormat::FLAC, "flac"},
+                   std::pair{SendspinCodecFormat::OPUS, "opus"},
+                   std::pair{SendspinCodecFormat::PCM, "pcm"},
+               },
+               codec_format_from_string, "mp3");
+
+    round_trip("SendspinControllerCommand",
+               std::array{
+                   std::pair{SendspinControllerCommand::PLAY, "play"},
+                   std::pair{SendspinControllerCommand::PAUSE, "pause"},
+                   std::pair{SendspinControllerCommand::STOP, "stop"},
+                   std::pair{SendspinControllerCommand::NEXT, "next"},
+                   std::pair{SendspinControllerCommand::PREVIOUS, "previous"},
+                   std::pair{SendspinControllerCommand::VOLUME, "volume"},
+                   std::pair{SendspinControllerCommand::MUTE, "mute"},
+                   std::pair{SendspinControllerCommand::REPEAT_OFF, "repeat_off"},
+                   std::pair{SendspinControllerCommand::REPEAT_ONE, "repeat_one"},
+                   std::pair{SendspinControllerCommand::REPEAT_ALL, "repeat_all"},
+                   std::pair{SendspinControllerCommand::SHUFFLE, "shuffle"},
+                   std::pair{SendspinControllerCommand::UNSHUFFLE, "unshuffle"},
+                   std::pair{SendspinControllerCommand::SWITCH, "switch"},
+                   std::pair{SendspinControllerCommand::SEEK, "seek"},
+                   std::pair{SendspinControllerCommand::SEEK_RELATIVE, "seek_relative"},
+               },
+               controller_command_from_string, "not_a_command");
+
+    round_trip("SendspinActivity",
+               std::array{
+                   std::pair{SendspinActivity::PLAYBACK, "playback"},
+                   std::pair{SendspinActivity::PAIRING, "pairing"},
+               },
+               activity_from_string, "unknown_activity");
+
+    round_trip("SendspinPairMethod",
+               std::array{
+                   std::pair{SendspinPairMethod::PAIRING_PSK, "pairing_psk"},
+                   std::pair{SendspinPairMethod::DYNAMIC_PAIRING_CODE, "dynamic_pairing_code"},
+                   std::pair{SendspinPairMethod::STATIC_PAIRING_CODE, "static_pairing_code"},
+               },
+               pair_method_from_string, "invalid_method");
+    EXPECT_FALSE(pair_method_from_string("").has_value());
+
+    round_trip("PairAbortReason",
+               std::array{
+                   std::pair{PairAbortReason::ATTEMPT_TIMEOUT, "attempt_timeout"},
+                   std::pair{PairAbortReason::CONCURRENT_ATTEMPT, "concurrent_attempt"},
+                   std::pair{PairAbortReason::METHOD_NOT_SUPPORTED, "method_not_supported"},
+                   std::pair{PairAbortReason::PAIRING_CODE_MISMATCH, "pairing_code_mismatch"},
+                   std::pair{PairAbortReason::USER_CANCELLED, "user_cancelled"},
+               },
+               pair_abort_reason_from_string, "not_a_reason");
+
+    emitted_as("SendspinGoodbyeReason",
+               std::array{
+                   std::pair{SendspinGoodbyeReason::UNAUTHORIZED, "unauthorized"},
+                   std::pair{SendspinGoodbyeReason::PAIRING_REQUIRED, "pairing_required"},
+                   std::pair{SendspinGoodbyeReason::CONCURRENT_ATTEMPT, "concurrent_attempt"},
+                   std::pair{SendspinGoodbyeReason::UNPAIRED, "unpaired"},
+                   std::pair{SendspinGoodbyeReason::ANOTHER_SERVER, "another_server"},
+                   std::pair{SendspinGoodbyeReason::SHUTDOWN, "shutdown"},
+                   std::pair{SendspinGoodbyeReason::RESTART, "restart"},
+                   std::pair{SendspinGoodbyeReason::USER_REQUEST, "user_request"},
+               });
 }
 
 // ============================================================================
@@ -209,25 +273,42 @@ TEST(Protocol, MetadataMissingTimestampIsRejected) {
     EXPECT_EQ(metadata.title.value(), "Kept");
 }
 
+// messaging.md "server/state color object": each component is an integer in [0, 255]. A component
+// that is out of range or not an integer drops the whole color it belongs to, and the palette the
+// message carried replaces the previous one wholesale, so a color it omits is cleared rather than
+// kept.
 TEST(Protocol, ColorObjectIsParsedIntoStateAndValidatesRanges) {
-    ServerColorStateObject color;
-    color.accent = RgbColor{1, 2, 3};
-    color.on_dark = RgbColor{9, 9, 9};
+    struct Row {
+        const char* name;
+        const char* accent_json;
+        bool accent_kept;
+    };
+    const Row rows[] = {
+        {"Control: components in range", "[1,2,3]", true},
+        {"component above the maximum", "[300,0,0]", false},
+        {"non-integer component", R"([10,"x",30])", false},
+    };
 
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"color":{"timestamp":7,)"
-                      R"("primary":[10,20,30],"accent":[300,0,0]}}})",
-                      doc, root));
-    ASSERT_TRUE(process_server_state_color(root, &color));
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        ServerColorStateObject color;
+        color.accent = RgbColor{1, 2, 3};
+        color.on_dark = RgbColor{9, 9, 9};
 
-    EXPECT_EQ(color.timestamp, 7);
-    ASSERT_TRUE(color.primary.has_value());
-    EXPECT_EQ(color.primary.value(), (RgbColor{10, 20, 30}));
-    // accent had an out-of-range component (300), so the whole color is dropped, and the palette
-    // it arrived in replaced the previous one.
-    EXPECT_FALSE(color.accent.has_value());
-    EXPECT_FALSE(color.on_dark.has_value());
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":"server/state","payload":{"color":{"timestamp":7,)"
+                                      R"("primary":[10,20,30],"accent":)") +
+                              row.accent_json + "}}}",
+                          doc, root));
+        ASSERT_TRUE(process_server_state_color(root, &color));
+
+        EXPECT_EQ(color.timestamp, 7);
+        ASSERT_TRUE(color.primary.has_value());
+        EXPECT_EQ(color.primary.value(), (RgbColor{10, 20, 30}));
+        EXPECT_EQ(color.accent.has_value(), row.accent_kept);
+        EXPECT_FALSE(color.on_dark.has_value()) << "the served palette replaces the previous one";
+    }
 }
 
 // ============================================================================
@@ -494,19 +575,6 @@ TEST(Protocol, StreamStartDropsSpectrumWithoutValidConfig) {
 
 // The color parser reads each component as a uint8, so a non-integer (or out-of-range) component
 // fails the type check and the whole color is left without a value.
-TEST(Protocol, ColorRejectsNonIntegerComponent) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"color":)"
-                      R"({"timestamp":1,"primary":[10,"x",30]}}})",
-                      doc, root));
-    ServerColorStateObject color;
-    ASSERT_TRUE(process_server_state_color(root, &color));
-    EXPECT_FALSE(color.primary.has_value());  // malformed component -> whole color dropped
-    // Control: the object still parsed, so its timestamp is there.
-    EXPECT_EQ(color.timestamp, 1);
-}
-
 // supported_commands is validated element-by-element. The controller role is frozen at v1, so an
 // unrecognized command is a non-compliant value that is dropped (and logged), while the valid
 // commands around it are kept in order.
@@ -551,29 +619,30 @@ TEST(Protocol, ControllerObjectReplacesEveryFieldItOmits) {
     EXPECT_FALSE(controller.seek_max_ms.has_value());
 }
 
-// seek_max_ms is parsed when the server includes it (the seekable upper bound for absolute seeks).
-TEST(Protocol, ControllerSeekMaxParsed) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
-                      R"({"supported_commands":["seek"],"seek_max_ms":215000}}})",
-                      doc, root));
-    ServerStateControllerObject controller;
-    ASSERT_TRUE(process_server_state_controller(root, &controller));
-    ASSERT_TRUE(controller.seek_max_ms.has_value());
-    EXPECT_EQ(*controller.seek_max_ms, 215000u);
-}
+// seek_max_ms is the seekable upper bound for absolute seeks: parsed when the server includes it,
+// and left absent when omitted so a consumer can tell "unknown range" from 0.
+TEST(Protocol, ControllerSeekMaxIsParsedOnlyWhenServed) {
+    struct Row {
+        const char* name;
+        const char* controller_json;
+        std::optional<uint32_t> expected;
+    };
+    const Row rows[] = {
+        {"Control: served", R"({"supported_commands":["seek"],"seek_max_ms":215000})", 215000u},
+        {"omitted", R"({"supported_commands":["seek_relative"]})", std::nullopt},
+    };
 
-// seek_max_ms stays absent (nullopt) when omitted, so consumers can tell "unknown range" from 0.
-TEST(Protocol, ControllerSeekMaxAbsentWhenOmitted) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
-                      R"({"supported_commands":["seek_relative"]}}})",
-                      doc, root));
-    ServerStateControllerObject controller;
-    ASSERT_TRUE(process_server_state_controller(root, &controller));
-    EXPECT_FALSE(controller.seek_max_ms.has_value());
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":"server/state","payload":{"controller":)") +
+                              row.controller_json + "}}",
+                          doc, root));
+        ServerStateControllerObject controller;
+        ASSERT_TRUE(process_server_state_controller(root, &controller));
+        EXPECT_EQ(controller.seek_max_ms, row.expected);
+    }
 }
 
 // ============================================================================
@@ -589,29 +658,27 @@ static std::string reference_time_message(int64_t v) {
     return std::string(buf);
 }
 
+// The hand-rolled clz-based formatter must match the oracle byte for byte: first the boundary
+// values a random draw practically never produces (digit-count edges, and INT64_MIN, whose
+// negation overflows), then thousands of pseudo-random int64s for the digit counts in between.
 TEST(Protocol, FormatTimeMessageMatchesSnprintf) {
-    const int64_t edge_cases[] = {0,   1,     -1,     9,         10,        99,
-                                  100, 12345, -12345, INT64_MAX, INT64_MIN, INT64_MIN + 1};
     char buf[TIME_MESSAGE_BUF_SIZE];
-    for (const int64_t v : edge_cases) {
-        const size_t n = format_client_time_message(buf, sizeof(buf), v);
-        ASSERT_GT(n, 0u) << "v=" << v;
-        EXPECT_EQ(std::string(buf, n), reference_time_message(v)) << "v=" << v;
-    }
-}
-
-// Property/fuzz style: thousands of pseudo-random int64s, all checked against the oracle. Catches
-// off-by-one digit-count bugs in the clz-based formatter that fixed cases might miss.
-TEST(Protocol, FormatTimeMessageFuzzAgainstSnprintf) {
-    std::mt19937_64 rng(0xC0FFEE);  // fixed seed -> deterministic, reproducible failures
-    std::uniform_int_distribution<int64_t> dist(INT64_MIN, INT64_MAX);
-
-    char buf[TIME_MESSAGE_BUF_SIZE];
-    for (int i = 0; i < 20000; ++i) {
-        const int64_t v = dist(rng);
+    auto check = [&buf](int64_t v) {
         const size_t n = format_client_time_message(buf, sizeof(buf), v);
         ASSERT_GT(n, 0u) << "v=" << v;
         ASSERT_EQ(std::string(buf, n), reference_time_message(v)) << "v=" << v;
+    };
+
+    const int64_t edge_cases[] = {0,   1,     -1,     9,         10,        99,
+                                  100, 12345, -12345, INT64_MAX, INT64_MIN, INT64_MIN + 1};
+    for (const int64_t v : edge_cases) {
+        check(v);
+    }
+
+    std::mt19937_64 rng(0xC0FFEE);  // fixed seed -> deterministic, reproducible failures
+    std::uniform_int_distribution<int64_t> dist(INT64_MIN, INT64_MAX);
+    for (int i = 0; i < 20000; ++i) {
+        check(dist(rng));
     }
 }
 
@@ -977,42 +1044,33 @@ TEST(Protocol, FormatClientStateOmitsArtworkWhenUnset) {
     EXPECT_TRUE(doc["payload"]["artwork"].isUnbound());
 }
 
-// messaging.md "client/state": the client-level field is the boolean `available`, not a multi-valued
-// state string. SYNCHRONIZED must serialize to available:true, and no legacy top-level "state"
-// key may appear (a strict-mode server hard-rejects client/state carrying an unknown field).
-TEST(Protocol, FormatClientStateSynchronizedIsAvailableTrue) {
-    ClientStateMessage msg;
-    msg.state = SendspinClientState::SYNCHRONIZED;
+// messaging.md "client/state": the client-level field is the boolean `available`, not a
+// multi-valued state string, and the spec has no separate error signal (see "External Source
+// Handling"). No legacy top-level "state" key may appear either: a strict-mode server hard-rejects
+// a client/state carrying an unknown field.
+TEST(Protocol, FormatClientStateReportsAvailabilityAsABoolean) {
+    struct Row {
+        const char* name;
+        SendspinClientState state;
+        bool expected_available;
+    };
+    const Row rows[] = {
+        {"Control: synchronized", SendspinClientState::SYNCHRONIZED, true},
+        {"error", SendspinClientState::ERROR, false},
+        {"external source", SendspinClientState::EXTERNAL_SOURCE, false},
+    };
 
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
-    EXPECT_TRUE(doc["payload"]["available"].as<bool>());
-    EXPECT_FALSE(doc["payload"]["state"].is<const char*>())
-        << "client/state must not carry the legacy top-level 'state' field";
-}
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        ClientStateMessage msg;
+        msg.state = row.state;
 
-// ERROR and EXTERNAL_SOURCE both report available:false: the current spec's client/state has no
-// separate error signal, only the available boolean (see "External Source Handling").
-TEST(Protocol, FormatClientStateErrorIsAvailableFalse) {
-    ClientStateMessage msg;
-    msg.state = SendspinClientState::ERROR;
-
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
-    EXPECT_FALSE(doc["payload"]["available"].as<bool>());
-    EXPECT_FALSE(doc["payload"]["state"].is<const char*>())
-        << "client/state must not carry the legacy top-level 'state' field";
-}
-
-TEST(Protocol, FormatClientStateExternalSourceIsAvailableFalse) {
-    ClientStateMessage msg;
-    msg.state = SendspinClientState::EXTERNAL_SOURCE;
-
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
-    EXPECT_FALSE(doc["payload"]["available"].as<bool>());
-    EXPECT_FALSE(doc["payload"]["state"].is<const char*>())
-        << "client/state must not carry the legacy top-level 'state' field";
+        JsonDocument doc;
+        ASSERT_FALSE(deserializeJson(doc, format_client_state_message(&msg)));
+        EXPECT_EQ(doc["payload"]["available"].as<bool>(), row.expected_available);
+        EXPECT_FALSE(doc["payload"]["state"].is<const char*>())
+            << "client/state must not carry the legacy top-level 'state' field";
+    }
 }
 
 // ============================================================================
@@ -1046,25 +1104,18 @@ TEST(Protocol, ClientHelloOmitsTrustLevel) {
     EXPECT_TRUE(doc["payload"]["unpaired_access"]["enabled"].is<bool>());
 }
 
-// unpaired_access.enabled is always emitted.
-TEST(Protocol, ClientHelloUnpairedAccessEnabled) {
-    ClientHelloMessage msg;
-    msg.name = "TestDevice";
-    msg.unpaired_access_enabled = true;
+// unpaired_access.enabled is always emitted, carrying whatever the client was configured with.
+TEST(Protocol, ClientHelloUnpairedAccessIsAlwaysEmitted) {
+    for (const bool enabled : {true, false}) {
+        SCOPED_TRACE(enabled ? "enabled" : "disabled");
+        ClientHelloMessage msg;
+        msg.name = "TestDevice";
+        msg.unpaired_access_enabled = enabled;
 
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
-    EXPECT_TRUE(doc["payload"]["unpaired_access"]["enabled"].as<bool>());
-}
-
-TEST(Protocol, ClientHelloUnpairedAccessDisabled) {
-    ClientHelloMessage msg;
-    msg.name = "TestDevice";
-    msg.unpaired_access_enabled = false;
-
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
-    EXPECT_FALSE(doc["payload"]["unpaired_access"]["enabled"].as<bool>());
+        JsonDocument doc;
+        ASSERT_FALSE(deserializeJson(doc, format_client_hello_message(&msg)));
+        EXPECT_EQ(doc["payload"]["unpaired_access"]["enabled"].as<bool>(), enabled);
+    }
 }
 
 // pairing.md "client/hello pair-method descriptor": supported_pair_methods is an object keyed by
@@ -1111,44 +1162,36 @@ TEST(Protocol, ClientHelloNoSupportedPairMethods) {
 // server/activate parse
 // ============================================================================
 
-TEST(Protocol, ServerActivateActivitiesOnly) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(
-        R"({"type":"server/activate","payload":{"activities":["playback"]}})", doc, root));
+// messaging.md "server/activate": activities is the list the server is turning on. An absent
+// active_roles stays nullopt (it is sticky, so an empty list would mean "no roles" instead).
+TEST(Protocol, ServerActivateParsesTheActivitiesList) {
+    struct Row {
+        const char* name;
+        const char* activities_json;
+        std::vector<SendspinActivity> expected;
+    };
+    const Row rows[] = {
+        {"Control: one activity", R"(["playback"])", {SendspinActivity::PLAYBACK}},
+        {"both activities",
+         R"(["playback","pairing"])",
+         {SendspinActivity::PLAYBACK, SendspinActivity::PAIRING}},
+        {"none", "[]", {}},
+    };
 
-    ServerActivateMessage msg;
-    ASSERT_TRUE(process_server_activate_message(root, &msg));
-    ASSERT_EQ(msg.activities.size(), 1u);
-    EXPECT_EQ(msg.activities[0], SendspinActivity::PLAYBACK);
-    EXPECT_FALSE(msg.active_roles.has_value())
-        << "absent active_roles must be nullopt (sticky)";
-    EXPECT_FALSE(msg.pairing_method.has_value());
-}
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":"server/activate","payload":{"activities":)") +
+                              row.activities_json + "}}",
+                          doc, root));
 
-TEST(Protocol, ServerActivateAllActivities) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(
-        R"({"type":"server/activate","payload":{"activities":["playback","pairing"]}})",
-        doc, root));
-
-    ServerActivateMessage msg;
-    ASSERT_TRUE(process_server_activate_message(root, &msg));
-    ASSERT_EQ(msg.activities.size(), 2u);
-    EXPECT_EQ(msg.activities[0], SendspinActivity::PLAYBACK);
-    EXPECT_EQ(msg.activities[1], SendspinActivity::PAIRING);
-}
-
-TEST(Protocol, ServerActivateEmptyActivities) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(
-        R"({"type":"server/activate","payload":{"activities":[]}})", doc, root));
-
-    ServerActivateMessage msg;
-    ASSERT_TRUE(process_server_activate_message(root, &msg));
-    EXPECT_TRUE(msg.activities.empty());
+        ServerActivateMessage msg;
+        ASSERT_TRUE(process_server_activate_message(root, &msg));
+        EXPECT_EQ(msg.activities, row.expected);
+        EXPECT_FALSE(msg.active_roles.has_value()) << "absent active_roles must be nullopt (sticky)";
+        EXPECT_FALSE(msg.pairing_method.has_value());
+    }
 }
 
 TEST(Protocol, ServerActivateWithActiveRoles) {
@@ -1263,59 +1306,6 @@ TEST(Protocol, ServerActivateMissingActivitiesFails) {
 }
 
 // ============================================================================
-// Activity enum round-trips
-// ============================================================================
-
-TEST(Protocol, ActivityToString) {
-    EXPECT_STREQ(to_cstr(SendspinActivity::PLAYBACK), "playback");
-    EXPECT_STREQ(to_cstr(SendspinActivity::PAIRING), "pairing");
-}
-
-TEST(Protocol, ActivityFromString) {
-    EXPECT_EQ(activity_from_string("playback"), SendspinActivity::PLAYBACK);
-    EXPECT_EQ(activity_from_string("pairing"), SendspinActivity::PAIRING);
-    EXPECT_FALSE(activity_from_string("unknown_activity").has_value());
-}
-
-// ============================================================================
-// PairMethod enum round-trips
-// ============================================================================
-
-TEST(Protocol, PairMethodToString) {
-    EXPECT_STREQ(to_cstr(SendspinPairMethod::PAIRING_PSK), "pairing_psk");
-    EXPECT_STREQ(to_cstr(SendspinPairMethod::DYNAMIC_PAIRING_CODE), "dynamic_pairing_code");
-    EXPECT_STREQ(to_cstr(SendspinPairMethod::STATIC_PAIRING_CODE), "static_pairing_code");
-}
-
-TEST(Protocol, PairMethodFromString) {
-    EXPECT_EQ(pair_method_from_string("pairing_psk"), SendspinPairMethod::PAIRING_PSK);
-    EXPECT_EQ(pair_method_from_string("dynamic_pairing_code"),
-              SendspinPairMethod::DYNAMIC_PAIRING_CODE);
-    EXPECT_EQ(pair_method_from_string("static_pairing_code"),
-              SendspinPairMethod::STATIC_PAIRING_CODE);
-    EXPECT_FALSE(pair_method_from_string("invalid_method").has_value());
-    EXPECT_FALSE(pair_method_from_string("").has_value());
-}
-
-// ============================================================================
-// SendspinGoodbyeReason
-// ============================================================================
-
-TEST(Protocol, GoodbyeReasonPairingValues) {
-    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::UNAUTHORIZED), "unauthorized");
-    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::PAIRING_REQUIRED), "pairing_required");
-    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::CONCURRENT_ATTEMPT), "concurrent_attempt");
-    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::UNPAIRED), "unpaired");
-}
-
-TEST(Protocol, GoodbyeReasonLifecycleValues) {
-    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::ANOTHER_SERVER), "another_server");
-    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::SHUTDOWN), "shutdown");
-    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::RESTART), "restart");
-    EXPECT_STREQ(to_cstr(SendspinGoodbyeReason::USER_REQUEST), "user_request");
-}
-
-// ============================================================================
 // Pairing-PSK protocol messages
 // ============================================================================
 
@@ -1351,70 +1341,36 @@ TEST(Protocol, DetermineMessageTypeHandshakeAndPairingTypes) {
     EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::UNKNOWN);
 }
 
-// PairAbortReason: every value survives a to_cstr -> from_string round-trip.
-TEST(Protocol, PairAbortReasonRoundTrip) {
-    const PairAbortReason reasons[] = {
-        PairAbortReason::ATTEMPT_TIMEOUT,
-        PairAbortReason::CONCURRENT_ATTEMPT,
-        PairAbortReason::METHOD_NOT_SUPPORTED,
-        PairAbortReason::PAIRING_CODE_MISMATCH,
-        PairAbortReason::USER_CANCELLED,
-    };
-    for (const auto reason : reasons) {
-        const char* wire = to_cstr(reason);
-        auto parsed = pair_abort_reason_from_string(wire);
-        ASSERT_TRUE(parsed.has_value()) << "no round-trip for " << wire;
-        EXPECT_EQ(parsed.value(), reason);
-    }
-    EXPECT_FALSE(pair_abort_reason_from_string("not_a_reason").has_value());
-}
-
-// format_client_pair_finalize_message: produces the exact wire shape.
-// The long_term_psk field must be exactly 43 chars (base64url of 32 bytes, no padding).
+// format_client_pair_finalize_message: the exact wire shape (pairing.md "Client -> Server:
+// client/pair-finalize"). long_term_psk is base64url of the 32-byte PSK with no padding, so it is
+// exactly 43 characters and decodes back to the bytes that went in.
 TEST(Protocol, FormatClientPairFinalizeWireShape) {
-    // Known 32-byte PSK: all-zeros for deterministic output.
-    std::array<uint8_t, 32> psk{};
-    const std::string out = format_client_pair_finalize_message(psk);
-
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_finalize produced invalid JSON";
-
-    EXPECT_STREQ(doc["type"], "client/pair-finalize");
-
-    // long_term_psk must be a 43-character base64url string (no padding).
-    ASSERT_TRUE(doc["payload"]["long_term_psk"].is<const char*>())
-        << "long_term_psk field missing or not a string";
-    const std::string psk_b64 = doc["payload"]["long_term_psk"].as<std::string>();
-    EXPECT_EQ(psk_b64.size(), 43u)
-        << "base64url of 32 bytes without padding must be exactly 43 chars";
-
-    // Verify the encoded value decodes back to the original 32-byte PSK.
-    auto decoded = b64url_decode(psk_b64);
-    ASSERT_TRUE(decoded.has_value()) << "long_term_psk is not valid base64url";
-    ASSERT_EQ(decoded->size(), 32u);
-    for (size_t i = 0; i < 32; ++i) {
-        EXPECT_EQ((*decoded)[i], psk[i]) << "decoded byte mismatch at index " << i;
+    std::array<uint8_t, 32> zeros{};
+    std::array<uint8_t, 32> counted{};
+    for (size_t i = 0; i < counted.size(); ++i) {
+        counted[i] = static_cast<uint8_t>(i + 1);  // 1..32
     }
-}
 
-TEST(Protocol, FormatClientPairFinalizeNonZeroPsk) {
-    std::array<uint8_t, 32> psk{};
-    for (size_t i = 0; i < 32; ++i) {
-        psk[i] = static_cast<uint8_t>(i + 1);  // 1..32
-    }
-    const std::string out = format_client_pair_finalize_message(psk);
+    for (const auto& psk : {zeros, counted}) {
+        SCOPED_TRACE(psk[0] == 0 ? "all-zero psk" : "counting psk");
+        const std::string out = format_client_pair_finalize_message(psk);
 
-    JsonDocument doc;
-    ASSERT_FALSE(deserializeJson(doc, out));
-    const std::string psk_b64 = doc["payload"]["long_term_psk"].as<std::string>();
-    EXPECT_EQ(psk_b64.size(), 43u);
+        JsonDocument doc;
+        ASSERT_FALSE(deserializeJson(doc, out)) << "format_client_pair_finalize produced invalid "
+                                                   "JSON";
+        EXPECT_STREQ(doc["type"], "client/pair-finalize");
 
-    // Decode and verify round-trip.
-    auto decoded = b64url_decode(psk_b64);
-    ASSERT_TRUE(decoded.has_value());
-    ASSERT_EQ(decoded->size(), 32u);
-    for (size_t i = 0; i < 32; ++i) {
-        EXPECT_EQ((*decoded)[i], psk[i]) << "round-trip mismatch at " << i;
+        ASSERT_TRUE(doc["payload"]["long_term_psk"].is<const char*>())
+            << "long_term_psk field missing or not a string";
+        const std::string psk_b64 = doc["payload"]["long_term_psk"].as<std::string>();
+        EXPECT_EQ(psk_b64.size(), 43u)
+            << "base64url of 32 bytes without padding must be exactly 43 chars";
+
+        auto decoded = b64url_decode(psk_b64);
+        ASSERT_TRUE(decoded.has_value()) << "long_term_psk is not valid base64url";
+        ASSERT_EQ(decoded->size(), psk.size());
+        EXPECT_TRUE(std::equal(decoded->begin(), decoded->end(), psk.begin()))
+            << "the encoded psk did not decode back to the bytes that went in";
     }
 }
 
