@@ -436,14 +436,16 @@ TEST(RecordStore, RecencyReorderIsNotPersisted) {
     provider.reject = false;
     RecordStore store(&provider, /*initial_unpaired_access_enabled=*/false,
                       RecordStore::MIN_MAX_RECORDS);
-    ASSERT_TRUE(store.store_record_superseding(make_client_record("server-A"), {}));
-    ASSERT_TRUE(store.store_record_superseding(make_client_record("server-B"), {}));
-    const std::string psk_a = store.record_by_server_id("server-A")->psk_id;
-    const std::string psk_b = store.record_by_server_id("server-B")->psk_id;
+    SendspinPairingRecord record_a = make_client_record("server-A");
+    SendspinPairingRecord record_b = make_client_record("server-B");
+    const std::string psk_a = record_a.psk_id;
+    const std::string psk_b = record_b.psk_id;
+    ASSERT_TRUE(store.store_record_superseding(std::move(record_a), {}));
+    ASSERT_TRUE(store.store_record_superseding(std::move(record_b), {}));
 
     // Fill the store, then touch the fillers so A and B sit at the front, oldest first.
     std::vector<std::string> filler_psk_ids;
-    for (size_t i = store.records_.size(); i < RecordStore::MIN_MAX_RECORDS; ++i) {
+    for (size_t i = 2; i < RecordStore::MIN_MAX_RECORDS; ++i) {
         auto record = make_client_record("filler-" + std::to_string(i));
         filler_psk_ids.push_back(record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(std::move(record), {}));
@@ -469,11 +471,11 @@ TEST(RecordStore, RecencyReorderIsNotPersisted) {
     // filler is.
     auto outcome = store.resolve_pairing_outcome("server-new");
     ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
-    EXPECT_EQ(store.record_by_server_id("filler-2"), nullptr)
+    EXPECT_FALSE(store.resolve_by_psk_id(filler_psk_ids.front(), PskCategory::LONG_TERM).has_value())
         << "the RAM-only order must still drive eviction";
-    EXPECT_NE(store.record_by_server_id("server-A"), nullptr)
+    EXPECT_TRUE(store.resolve_by_psk_id(psk_a, PskCategory::LONG_TERM).has_value())
         << "a record used since it was stored must not be the victim";
-    EXPECT_NE(store.record_by_server_id("server-B"), nullptr);
+    EXPECT_TRUE(store.resolve_by_psk_id(psk_b, PskCategory::LONG_TERM).has_value());
 }
 
 // note_record_used() is the recency signal: a record touched by a session must outlive an
