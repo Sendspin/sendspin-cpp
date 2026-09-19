@@ -384,9 +384,10 @@ public:
 
     /// @brief Returns the current active connection. Main-thread only.
     ///
-    /// Takes conn_ptr_mutex_, which the manager already holds across promotion and admission, so
-    /// this is unreachable from anything the admission replay runs (see
-    /// SendspinClient::admit_connection()).
+    /// Takes conn_ptr_mutex_, which sits inside json_processing_mutex_ in the lock order
+    /// (docs/conventions.md "Threading and cross-thread state"), so a handler running under the
+    /// JSON lock may call it; the admission replay (SendspinClient::admit_connection()) runs with
+    /// neither held.
     /// @return Pointer to the current connection, or nullptr if none.
     SendspinConnection* current() const {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
@@ -396,8 +397,8 @@ public:
     /// @brief Returns a shared_ptr to the current connection. Thread-safe.
     /// Role threads (sync task, artwork/visualizer drains) must use this instead of current():
     /// the shared_ptr keeps the connection alive for the duration of the caller's use even if the
-    /// main loop concurrently drops or replaces the current connection. It takes conn_ptr_mutex_,
-    /// so like current() it is unreachable from the admission replay.
+    /// main loop concurrently drops or replaces the current connection. It takes conn_ptr_mutex_
+    /// under the same lock order as current().
     /// @return Shared pointer to the current connection, or nullptr if none.
     std::shared_ptr<SendspinConnection> current_shared() const {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
