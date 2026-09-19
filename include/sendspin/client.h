@@ -194,7 +194,7 @@ public:
 /// and return, not add blocking of its own (a synchronous retry loop, a multi-second fsync
 /// chain). Held locks are on the call stack for the duration. A failed write should be reported
 /// by returning false rather than retried inline; the library already handles that (durability
-/// warnings) as described below on save_blob/erase_blob.
+/// warnings) as described below on save_blob.
 class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;
@@ -228,11 +228,11 @@ public:
     /// @brief Remove key. Absent counts as success. A false return means the value may
     /// survive a reboot.
     ///
-    /// The library never erases a key today: every blob it owns is either rewritten in place or
-    /// left alone (a record removal re-saves the shrunken array, so
-    /// `persistence_keys::RECORDS` stays present with a shorter array). Implement it anyway so
-    /// the store has a working delete for an application that wipes the library keyspace itself,
-    /// for example on a factory reset.
+    /// For the application's own use: the library never calls it. Every blob the library owns is
+    /// either rewritten in place or left alone (a record removal re-saves the shrunken array, so
+    /// `persistence_keys::RECORDS` stays present with a shorter array). The hook is here so an
+    /// application that wipes the library keyspace itself, for example on a factory reset, has a
+    /// working delete over the same store.
     /// @return true if the key is gone from the store, false if it may still be there.
     virtual bool erase_blob(const std::string& /*key*/) {
         return false;
