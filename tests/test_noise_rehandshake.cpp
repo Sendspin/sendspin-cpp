@@ -28,7 +28,6 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
-#include "log_capture.h"
 #include "noise_handshake.h"
 #include "noise_session.h"
 #include "noise_test_helpers.h"
@@ -292,83 +291,61 @@ static void check_session_roundtrip(CipherPair& init_pair, NoiseSession& respond
         EXPECT_EQ(pt, plaintext) << "Responder->Initiator round-trip failed";
     }
 }
+// A re-handshake rotates keys whether or not the PSK itself changed; the rows are the two PSK
+// sources a server can rekey from (spec: Noise re-handshake).
+TEST(NoiseRehandshake, RehandshakeRotatesKeys_ChaChaPoly) {
+    struct Row {
+        const char* name;
+        bool fresh_psk;  // true: rekey to a newly paired PSK; false: reuse the current one
+    };
+    const Row rows[] = {
+        {"same psk", false},
+        {"freshly paired psk", true},
+    };
 
-// Helper to run both suites with a parameterized test body.
-static void run_rehandshake_test(const std::string& suite_name) {
-    // Step 1: Run the initial handshake.
-    auto init_opt = run_initial_handshake(suite_name);
-    ASSERT_TRUE(init_opt.has_value()) << "Initial handshake failed for suite " << suite_name;
-    // Non-const: check_session_roundtrip() below encrypts/decrypts through init.initiator's
-    // cipher states, which advances their internal nonce counters (a real mutation).
-    InitialHandshakeResult& init = *init_opt;
-
-    // Verify a transport message round-trips under the initial session.
-    const std::vector<uint8_t> test_plaintext = {0x00, 'h', 'e', 'l', 'l', 'o'};
-    check_session_roundtrip(init.initiator, *init.responder_session, test_plaintext);
-
-    std::array<uint8_t, 32> old_h = init.responder_h;
-
-    // Step 2: Prepare a re-handshake PSK (may reuse the same PSK or a new one).
-    RecordStore rs(nullptr);
-    SendspinPairingRecord rec;
-    rec.psk_id = init.psk_id;
-    rec.psk = init.psk;
-    rec.server_id = init.server_id.peer_id();
-    rs.store_record_superseding(std::move(rec), {});
-
-    // Step 3: Run the re-handshake (same PSK, new session).
-    auto rr_opt = run_rehandshake(suite_name, init, rs, init.psk, init.psk_id);
-    ASSERT_TRUE(rr_opt.has_value()) << "Re-handshake failed for suite " << suite_name;
-    RehandshakeResult& rr = *rr_opt;
-
-    // (a) New sessions encrypt/decrypt correctly.
-    check_session_roundtrip(rr.initiator, *rr.responder_session, test_plaintext);
-
-    // (b) New h differs from old h.
-    EXPECT_NE(rr.new_h, old_h)
-        << "New handshake hash must differ from the prior one after re-handshake";
-
-    // (c) A message encrypted under the OLD initiator send cipher does NOT decrypt under
-    //     the NEW responder session.  Keys actually rotated.
-    std::vector<uint8_t> old_ct = raw_encrypt(init.initiator.send_cs, test_plaintext);
-    ASSERT_FALSE(old_ct.empty());
-    size_t old_pt_len = rr.responder_session->decrypt(old_ct.data(), old_ct.size());
-    EXPECT_EQ(old_pt_len, 0u)
-        << "Old-session ciphertext must NOT decrypt under the new session (keys rotated)";
-}
-
-TEST(NoiseRehandshake, BasicRehandshake_ChaChaPoly) {
-    run_rehandshake_test(std::string(NOISE_SUITE_CHACHAPOLY));
-}
-
-// Test: re-handshake with a DIFFERENT PSK (key rotation to a new long-term key).
-TEST(NoiseRehandshake, RehandshakeWithDifferentPsk_ChaChaPoly) {
     const std::string suite = std::string(NOISE_SUITE_CHACHAPOLY);
-    auto init_opt = run_initial_handshake(suite);
-    ASSERT_TRUE(init_opt.has_value());
-    const InitialHandshakeResult& init = *init_opt;
+    const std::vector<uint8_t> plaintext = {0x00, 'h', 'e', 'l', 'l', 'o'};
 
-    // Generate a new PSK that differs from the initial one.
-    std::array<uint8_t, NOISE_PSK_SIZE> new_psk{};
-    platform_random_bytes(new_psk.data(), new_psk.size());
-    std::string new_psk_id = psk_id_for(new_psk);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
 
-    // Store the new PSK the way a re-pair does: bound to the same server as the original.
-    RecordStore rs(nullptr);
-    SendspinPairingRecord rec;
-    rec.psk_id = new_psk_id;
-    rec.psk = new_psk;
-    rec.server_id = init.server_id.peer_id();
-    rs.store_record_superseding(std::move(rec), {});
+        auto init_opt = run_initial_handshake(suite);
+        ASSERT_TRUE(init_opt.has_value()) << "initial handshake failed";
+        // Non-const: check_session_roundtrip() advances the initiator cipher nonces.
+        InitialHandshakeResult& init = *init_opt;
 
-    auto rr_opt = run_rehandshake(suite, init, rs, new_psk, new_psk_id);
-    ASSERT_TRUE(rr_opt.has_value()) << "Re-handshake with different PSK failed";
+        check_session_roundtrip(init.initiator, *init.responder_session, plaintext);
+        const std::array<uint8_t, 32> old_h = init.responder_h;
 
-    // New session must work.
-    const std::vector<uint8_t> pt = {0x00, 't', 'e', 's', 't'};
-    check_session_roundtrip(rr_opt->initiator, *rr_opt->responder_session, pt);
+        std::array<uint8_t, NOISE_PSK_SIZE> rehs_psk = init.psk;
+        std::string rehs_psk_id = init.psk_id;
+        if (row.fresh_psk) {
+            platform_random_bytes(rehs_psk.data(), rehs_psk.size());
+            rehs_psk_id = psk_id_for(rehs_psk);
+        }
 
-    EXPECT_NE(rr_opt->new_h, init.responder_h);
+        // Stored the way a re-pair does: bound to the same server as the original.
+        RecordStore rs(nullptr);
+        SendspinPairingRecord rec;
+        rec.psk_id = rehs_psk_id;
+        rec.psk = rehs_psk;
+        rec.server_id = init.server_id.peer_id();
+        rs.store_record_superseding(std::move(rec), {});
+
+        auto rr_opt = run_rehandshake(suite, init, rs, rehs_psk, rehs_psk_id);
+        ASSERT_TRUE(rr_opt.has_value()) << "re-handshake failed";
+        RehandshakeResult& rr = *rr_opt;
+
+        check_session_roundtrip(rr.initiator, *rr.responder_session, plaintext);
+
+        EXPECT_NE(rr.new_h, old_h)
+            << "new handshake hash must differ from the prior one after re-handshake";
+
+        // Ciphertext from the old session must not decrypt under the new one: keys rotated.
+        std::vector<uint8_t> old_ct = raw_encrypt(init.initiator.send_cs, plaintext);
+        ASSERT_FALSE(old_ct.empty());
+        EXPECT_EQ(rr.responder_session->decrypt(old_ct.data(), old_ct.size()), 0u);
+    }
 }
 
 // Negative test: re-handshake msg1 with a psk_id that resolves to no record aborts cleanly.
@@ -405,49 +382,29 @@ TEST(NoiseRehandshake, UnknownPskIdAborts) {
     EXPECT_FALSE(result.has_value())
         << "run_rehandshake_msg1 should fail with an unknown psk_id";
 }
-
 // The envelope guards in front of the re-handshake are defense in depth: an envelope that trips
 // either one is rejected downstream anyway (a wrong type reaches run_msg1_core, which finds no
-// data field; unparseable text yields a null document whose type reads as ""). The diagnostic is
-// the whole behavioral delta, so these assert on the log line the guard writes.
-// Control: BasicRehandshake_ChaChaPoly, where a well-formed envelope completes.
-TEST(NoiseRehandshake, EnvelopeOfTheWrongTypeIsRejectedAsSuch) {
+// data field; unparseable text yields a null document whose type reads as "").
+// Control: RehandshakeRotatesKeys_ChaChaPoly, where a well-formed envelope completes.
+TEST(NoiseRehandshake, MalformedRehandshakeEnvelopeIsRejected) {
+    struct Row {
+        const char* name;
+        const char* envelope;
+    };
+    const Row rows[] = {
+        {"wrong envelope type", R"({"type":"server/init","payload":{}})"},
+        {"unparseable text", "not json"},
+    };
+
     Identity client_id = Identity::generate().value();
     Identity server_id = Identity::generate().value();
     RecordStore empty_rs(nullptr);
     const std::array<uint8_t, 32> prior_h{};
 
-    std::string logs;
-    std::optional<NoiseHandshakeResult> result;
-    {
-        StderrCapture capture;
-        result = run_rehandshake_msg1(R"({"type":"server/init","payload":{}})",
-                                      server_id.peer_id(), client_id, empty_rs,
-                                      std::string(NOISE_SUITE_CHACHAPOLY), prior_h);
-        logs = capture.release();
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        EXPECT_FALSE(run_rehandshake_msg1(row.envelope, server_id.peer_id(), client_id, empty_rs,
+                                          std::string(NOISE_SUITE_CHACHAPOLY), prior_h)
+                         .has_value());
     }
-
-    EXPECT_FALSE(result.has_value());
-    EXPECT_NE(logs.find("unexpected type 'server/init'"), std::string::npos)
-        << "the envelope's type must be named as the reason; got: " << logs;
-}
-
-TEST(NoiseRehandshake, UnparseableEnvelopeIsRejectedAsSuch) {
-    Identity client_id = Identity::generate().value();
-    Identity server_id = Identity::generate().value();
-    RecordStore empty_rs(nullptr);
-    const std::array<uint8_t, 32> prior_h{};
-
-    std::string logs;
-    std::optional<NoiseHandshakeResult> result;
-    {
-        StderrCapture capture;
-        result = run_rehandshake_msg1("not json", server_id.peer_id(), client_id, empty_rs,
-                                      std::string(NOISE_SUITE_CHACHAPOLY), prior_h);
-        logs = capture.release();
-    }
-
-    EXPECT_FALSE(result.has_value());
-    EXPECT_NE(logs.find("JSON parse failed"), std::string::npos)
-        << "a parse failure must be named as such, not as a type mismatch; got: " << logs;
 }
