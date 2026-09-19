@@ -15,8 +15,8 @@
 // Wrapping (pairing.md "Wrapping") tests: K_wrap derivation and wrap_value
 // round-trips.
 //
-// The two K_wrap KATs below were produced twice and compared: once from the spec formula written
-// out directly in Python (see the comment on each test) and once by running aiosendspin's
+// The two K_wrap KATs below were produced twice and compared: once from the spec formula in
+// Python (see the comment on each test) and once by running aiosendspin's
 // reference implementation (aiosendspin/noise/pairing.py: _wrap_key over _pake_sid) over the
 // same sid and ISK. The wrap/unwrap round-trip tests are self-consistency checks against our own
 // implementation (there is no independent reference for the AEAD step at KAT granularity without
@@ -81,8 +81,8 @@ std::vector<uint8_t> make_fixed_sid(uint32_t round = 1) {
 // derive_wrap_key() returns std::optional<std::array<uint8_t, 32>>: a failed
 // SHA-256 computation must not silently produce an all-zero K_wrap, since wrap_value() would then
 // seal the freshly minted PSK under a publicly derivable key. noise-c has no hook to force that
-// failure deterministically, so this KAT (and the has_value() check it starts with) is the
-// regression coverage available: it pins the success path and the optional-returning contract.
+// failure deterministically, so this KAT and the has_value() check it starts with are the
+// regression coverage available.
 TEST(PskWrap, KWrapKat) {
     const auto sid = make_fixed_sid();
     const auto isk = make_fixed_isk();
@@ -166,9 +166,8 @@ TEST(PskWrap, DifferentSidsProduceDifferentWrappedPsk) {
     ASSERT_TRUE(wrapped_b.has_value());
     EXPECT_NE(wrapped_a.value(), wrapped_b.value());
 
-    // A server holding the other round's sid derives a different K_wrap, so the field it would
-    // open is not the one this round sealed: pairing.md "Protocol Errors" makes a wrapped_psk
-    // that fails to decrypt a protocol error.
+    // The other round's sid derives a different K_wrap: pairing.md "Protocol Errors" makes a
+    // wrapped_psk that fails to decrypt a protocol error.
     auto unwrap_with_wrong_sid =
         unwrap_value_as_server(PSK_WRAP_LABEL, "ChaChaPoly", sid_b, isk, wrapped_a.value());
     EXPECT_FALSE(unwrap_with_wrong_sid.has_value());

@@ -20,8 +20,6 @@
 //       b'sendspin-pairing-code-derive-v1' + h + nonce_a + nonce_b).hexdigest())"
 // and once by running aiosendspin's reference implementation over the same inputs
 //   aiosendspin/noise/pairing_code.py: derive_digest / derive_digits / derive_qr_code
-// so a C++ value that matches these matches both the specification text and the server this
-// client pairs with.
 
 #include "crypto/pairing_code.h"
 #include "test_util.h"
@@ -76,7 +74,6 @@ TEST(PairingCodeCommit, RoundTripSucceeds) {
 TEST(PairingCodeCommit, WrongNonceFailsVerify) {
     auto nonce = pairing_generate_nonce();
     auto commitment = pairing_code_commit(nonce.data(), nonce.size());
-    // Flip one byte.
     nonce[0] ^= 0xFF;
     EXPECT_FALSE(pairing_code_verify_commit(nonce.data(), nonce.size(), commitment.data(),
                                             commitment.size()));
@@ -243,5 +240,5 @@ TEST(PairingNonce, GenerateProduces32Bytes) {
     auto n1 = pairing_generate_nonce();
     auto n2 = pairing_generate_nonce();
     EXPECT_EQ(n1.size(), PAIRING_NONCE_SIZE);
-    EXPECT_NE(n1, n2);  // two separate calls should produce different nonces
+    EXPECT_NE(n1, n2);
 }

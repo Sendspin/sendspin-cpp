@@ -128,15 +128,13 @@ public:
     // Test-only seam: canned handshake hash without a Noise session
 
     /// Report a fixed 32-byte handshake hash while leaving noise_session_ (and therefore
-    /// noise_active_) unset, so send_app_json() routes through send_text_message() as raw
-    /// JSON. Overrides the virtual base implementation (see connection.h).
+    /// noise_active_) unset, so send_app_json() routes through send_text_message() as raw JSON.
     std::optional<std::array<uint8_t, 32>> get_noise_handshake_hash() const override {
         return this->canned_hash_;
     }
 
     /// Report a canned Noise suite name without an active Noise session, so the wrapping
     /// (pairing.md "Wrapping") can resolve an AEAD cipher during the PAIR_CONFIRM step.
-    /// Overrides the virtual base implementation (see connection.h).
     const std::string& get_noise_suite_name() const override {
         return this->canned_suite_name_;
     }
@@ -316,8 +314,8 @@ private:
 // JSON helpers for asserting on captured outbound frames
 // ============================================================================
 
-/// Parse a captured outbound JSON string. Fails the calling test via ASSERT semantics through
-/// the returned bool so callers can `ASSERT_TRUE(parse_json(...))`.
+/// Parse a captured outbound JSON string. Returns false on malformed JSON, for ASSERT_TRUE at
+/// the call site.
 bool parse_json(const std::string& json, JsonDocument& doc, JsonObject& root) {
     if (deserializeJson(doc, json)) {
         return false;
@@ -407,9 +405,8 @@ struct ServerStandIn {
     CPace initiator;
     std::vector<uint8_t> prs;
 
-    /// Start the initiator over the PRS the operator entered and the sid for one round (label
-    /// || handshake hash || pairing_index || round). `pairing_index` defaults to 1, matching
-    /// what every single-enter_pairing() test in this file captures; `round` to the first round.
+    /// Start the initiator over the PRS the operator entered and the sid for one round; the
+    /// defaults are make_sid()'s (see its doc comment).
     bool start(const std::vector<uint8_t>& prs, const std::array<uint8_t, 32>& handshake_hash,
                uint32_t pairing_index = 1, uint32_t round = 1) {
         this->prs = prs;
@@ -587,8 +584,7 @@ protected:
     }
 
     /// Seam for arbitration checks: should_switch_to_new_server() and the last-playback fields
-    /// are private to ConnectionManager; per this file's access policy (see the fixture header
-    /// comment) the call routes through here.
+    /// are private to ConnectionManager.
     /// @param last_playback_server_id Sets last_played_server_id_; empty clears the has-value
     ///        flag, so rule 5's tiebreak is only armed when a non-empty id is passed.
     bool would_switch_to(SendspinConnection* current, SendspinConnection* incoming,
@@ -599,8 +595,7 @@ protected:
         return mgr.should_switch_to_new_server(current, incoming);
     }
 
-    /// Drives SendspinClient::persist_last_played_server(), private to SendspinClient; per this
-    /// file's access policy the call routes through here.
+    /// Drives SendspinClient::persist_last_played_server(), private to SendspinClient.
     void persist_last_played_server(const std::string& server_id) {
         this->client_->persist_last_played_server(server_id);
     }
@@ -664,8 +659,7 @@ protected:
     /// SendspinConnection::handle_noise_rehandshake() leaves it in after a session swap: awaiting
     /// its next server/activate, with the re-proving stamp refreshed. The real call needs a live
     /// Noise transport this harness has none of, and the flags are what the loop() scans under
-    /// test actually read. first_activate_received_ is private; per this file's access policy the
-    /// write routes through here.
+    /// test actually read. first_activate_received_ is private to SendspinConnection.
     void set_awaiting_activate(FakeConnection* conn, bool awaiting) {
         if (awaiting) {
             conn->set_provisional_time_us(platform_time_us());
@@ -829,9 +823,8 @@ protected:
     }
 
     /// Schedule a server/pair-confirm(server_kc) event for the injected connection and pump
-    /// loop(). Shared by every PAIR_CONFIRM step regardless of whether server_kc is genuine
-    /// (from drive_pair_auth) or deliberately wrong (a code-mismatch test's fabricated tag): the
-    /// dispatch is identical either way.
+    /// loop(). Shared by every PAIR_CONFIRM step: the dispatch is identical whether server_kc
+    /// is genuine or a code-mismatch test's fabricated tag.
     void schedule_pair_confirm(const std::array<uint8_t, CPACE_TAG_SIZE>& server_kc) {
         ServerPairingMessageEvent pair_confirm_event;
         pair_confirm_event.conn = this->current_connection_sp();
@@ -919,12 +912,11 @@ protected:
         ASSERT_EQ(last_pair_abort_reason(conn->sent_text_), "pairing_code_mismatch");
     }
 
-    /// Verify the client/pair-confirm frame (second-to-last: client/pair-finalize follows
-    /// immediately) carries client_kc and, only in the dynamic flow, wrapped_nonce_B; then
-    /// verify the last frame is client/pair-finalize. `expect_wrapped_nonce` distinguishes the
-    /// dynamic flow (which opens its commitment alongside the confirm) from the static one
-    /// (which sends no commit_B and so has nothing to open).
-    /// Callers assert the frame count first, since the required minimum differs by flow.
+    /// Verify the second-to-last frame, client/pair-confirm, carries client_kc and, only in the
+    /// dynamic flow, wrapped_nonce_B; then verify the last frame is client/pair-finalize.
+    /// `expect_wrapped_nonce` distinguishes the dynamic flow (which opens its commitment
+    /// alongside the confirm) from the static one (which sends no commit_B and so has nothing to
+    /// open). Callers assert the frame count first, since the required minimum differs by flow.
     void verify_pair_confirm_frame(const std::vector<std::string>& sent_text,
                                    bool expect_wrapped_nonce) {
         JsonDocument confirm_doc;
@@ -933,8 +925,7 @@ protected:
         ASSERT_TRUE(parse_json(confirm_frame, confirm_doc, confirm_root));
         EXPECT_STREQ(confirm_root["type"], "client/pair-confirm");
         EXPECT_TRUE(confirm_root["payload"]["client_kc"].is<const char*>());
-        // The opening never crosses the wire in the clear under any name (pairing.md
-        // "Wrapping"), so the plain nonce_B field must be absent in both flows.
+        // The opening never crosses the wire in the clear under any name (pairing.md "Wrapping").
         EXPECT_TRUE(confirm_root["payload"]["nonce_B"].isUnbound())
             << "nonce_B must never be sent unwrapped";
         if (expect_wrapped_nonce) {
@@ -1054,14 +1045,10 @@ TEST_F(PairingStateMachineTest, DynamicCodeHappyPath) {
 
     this->schedule_pair_confirm(server_kc);
 
-    // Device must emit client/pair-confirm (client_kc + wrapped_nonce_B) then
-    // client/pair-finalize.
     ASSERT_GE(conn->sent_text_.size(), 4u);
     ASSERT_NO_FATAL_FAILURE(
         this->verify_pair_confirm_frame(conn->sent_text_, /*expect_wrapped_nonce=*/true));
 
-    // Wrapping round-trips (pairing.md "Wrapping"): see each helper's doc comment for the
-    // rationale.
     ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_nonce_opens_commit(conn->sent_text_, server));
     ASSERT_NO_FATAL_FAILURE(this->verify_wrapped_psk_finalize(conn->sent_text_, server));
 
@@ -1521,8 +1508,7 @@ TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSile
     this->schedule_pairing_message_event(std::move(malformed_event));
     this->client_->loop();
 
-    // No pair/abort (or any other application-level message) is sent: sent_text_ still holds
-    // only the earlier client/pair-init.
+    // No pair/abort, or any other application-level message, is sent.
     ASSERT_EQ(conn->sent_text_.size(), 1u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
     // The close goes through drop_connection() with goodbye=std::nullopt (no client/goodbye
@@ -2605,9 +2591,7 @@ TEST_F(PairingStateMachineTest, PairingAttemptTimeoutScanSuppressedDuringFinaliz
 //
 // Asserted on the flag directly rather than end to end: disable_message_dispatch(), called a few
 // lines earlier in the same function, independently blocks dispatch from a dropped connection, so
-// an end-to-end test cannot tell a cleared flag from a stale one. That masking is why this is
-// defence in depth rather than the only barrier, and it is exactly why the invariant needs its
-// own test.
+// an end-to-end test cannot tell a cleared flag from a stale one.
 TEST_F(PairingStateMachineTest, DropClearsTheAdmittedFlag) {
     FakeConnection* conn = this->inject_current_connection("server-drop-admitted",
                                                            SendspinPairMethod::PAIRING_PSK);

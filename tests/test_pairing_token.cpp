@@ -14,9 +14,9 @@
 
 // Pairing Token (pairing.md "Pairing Token") tests.
 //
-// Both reference vectors below are taken verbatim from pairing.md, not independently re-derived
-// here: they are the specification's own worked examples, so reproducing them exactly is the
-// correctness bar. The version-0 vector is in "Pairing PSK Flow" (client_key = 0x00..0x1f,
+// Both reference vectors below are taken verbatim from pairing.md rather than re-derived here:
+// reproducing the specification's own worked examples exactly is the correctness bar.
+// The version-0 vector is in "Pairing PSK Flow" (client_key = 0x00..0x1f,
 // pairing_psk = 0xe0..0xff); the version-1 vector is in "QR-code emission"
 // (code = 0xe0..0xf7).
 
@@ -135,7 +135,7 @@ std::array<uint8_t, QR_PAIRING_CODE_SIZE> make_qr_code() {
 }  // namespace
 
 TEST(PairingCodeToken, SpecReferenceVector) {
-    // From pairing.md "QR-code emission", verbatim, for code = 0xe0 0xe1 ... 0xf7.
+    // From pairing.md "QR-code emission", verbatim.
     EXPECT_EQ(format_pairing_code_token(make_qr_code()),
               "SP:14DQ6FY7E4XTOP9HJ5LV6Z3PO57YPD4XT6T97N5Y");
 }

@@ -125,7 +125,7 @@ TEST(DynamicPairingCode, ParseServerPairInitWithoutNonceYieldsNoNonce) {
     EXPECT_FALSE(payload.nonce_a.has_value());
 }
 
-// An unrecognized extra field alongside nonce_A parses fine: it is simply ignored.
+// An unrecognized extra field alongside nonce_A is ignored.
 TEST(DynamicPairingCode, ParseServerPairInitExtraFieldIgnored) {
     std::array<uint8_t, 32> nonce_a{};
     const std::string json =
@@ -141,7 +141,7 @@ TEST(DynamicPairingCode, ParseServerPairInitExtraFieldIgnored) {
 }
 
 TEST(DynamicPairingCode, ParseServerPairInitWrongNonceLength) {
-    // Encode only 16 bytes (wrong size).
+    // 16 bytes instead of 32.
     std::array<uint8_t, 16> short_nonce{};
     const std::string nonce_b64 = b64url_encode(short_nonce.data(), short_nonce.size());
     expect_parse_rejects<ServerPairInitPayload>(process_server_pair_init_message,
@@ -250,12 +250,11 @@ TEST(DynamicPairingCode, FormatClientPairInitWireShape) {
 
     EXPECT_STREQ(doc["type"], "client/pair-init");
 
-    // commit_B must be a 43-char unpadded base64url string (32 bytes -> 43 chars).
+    // commit_B must be a 43-char unpadded base64url string.
     ASSERT_TRUE(doc["payload"]["commit_B"].is<const char*>());
     const std::string commit_b64 = doc["payload"]["commit_B"].as<std::string>();
     EXPECT_EQ(commit_b64.size(), 43u) << "base64url of 32 bytes without padding is 43 chars";
 
-    // Decode and verify round-trip.
     auto decoded = b64url_decode(commit_b64);
     ASSERT_TRUE(decoded.has_value()) << "commit_B is not valid base64url";
     ASSERT_EQ(decoded->size(), 32u);
@@ -314,7 +313,6 @@ TEST(DynamicPairingCode, FormatClientPairConfirmWireShape) {
 
     EXPECT_STREQ(doc["type"], "client/pair-confirm");
 
-    // client_kc: 64 bytes -> 86-char base64url without padding.
     ASSERT_TRUE(doc["payload"]["client_kc"].is<const char*>());
     const std::string kc_b64 = doc["payload"]["client_kc"].as<std::string>();
     EXPECT_EQ(kc_b64.size(), 86u) << "base64url of 64 bytes without padding is 86 chars";
@@ -364,7 +362,6 @@ static std::vector<uint8_t> make_test_sid(uint32_t pairing_index = 0, uint32_t r
     return sid;
 }
 
-// Convert a C string to a byte vector for CPace API calls.
 static std::vector<uint8_t> to_bytes(const char* s) {
     const size_t len = std::strlen(s);
     return std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(s),
@@ -379,10 +376,9 @@ static std::vector<uint8_t> ad_client() {
     return to_bytes("client");
 }
 
-/// What the round-trip pairs below need from a CPace(INITIATOR)/CPace(RESPONDER) exchange, with
-/// the correct ADa="server"/ADb="client" association: whether each side's confirmation tag
-/// verifies against the other's, plus the derived ISK/sid (only the matching-password tests
-/// check these, per PSK Wrapping).
+/// What the round-trip pairs below need from a CPace(INITIATOR)/CPace(RESPONDER) exchange with
+/// the correct ADa="server"/ADb="client" association. Only the matching-password tests check the
+/// ISK/sid (pairing.md "Wrapping").
 struct CPaceRoundTripResult {
     bool verify_ab{false};  // initiator.verify(tag_b)
     bool verify_ba{false};  // responder.verify(tag_a)
@@ -392,9 +388,8 @@ struct CPaceRoundTripResult {
 };
 
 // Runs a full CPace INITIATOR/RESPONDER exchange (start, cross-derive, tag, verify) with the
-// standard ADa="server"/ADb="client" association, differing only in the PRS each side uses and
-// the shared sid. The matching-vs-mismatched distinction under test lives entirely in the
-// returned verify_ab/verify_ba, which callers assert on themselves.
+// standard ADa="server"/ADb="client" association. Callers assert on the returned
+// verify_ab/verify_ba themselves.
 static CPaceRoundTripResult run_cpace_round_trip(const std::vector<uint8_t>& prs_a,
                                                   const std::vector<uint8_t>& prs_b,
                                                   const std::vector<uint8_t>& sid) {
@@ -433,11 +428,9 @@ TEST(DynamicPairingCodeCPace, RoundTripWithMatchingPassword) {
     const auto sid = make_test_sid(/*pairing_index=*/1);
     const auto prs = to_bytes("123456");
 
-    // Initiator (A = server role in the protocol) and responder (B = client role in the
-    // protocol) share the same password.
+    // A (initiator) is the server's role in the protocol, B (responder) the client's.
     auto result = run_cpace_round_trip(prs, prs, sid);
 
-    // Both sides produce a tag; each side can verify the other's.
     EXPECT_TRUE(result.verify_ab);
     EXPECT_TRUE(result.verify_ba);
 
@@ -455,7 +448,6 @@ TEST(DynamicPairingCodeCPace, RoundTripMismatchedPasswordFails) {
 
     auto result = run_cpace_round_trip(prs_a, prs_b, sid);
 
-    // With mismatched passwords, verification must fail.
     EXPECT_FALSE(result.verify_ab);
     EXPECT_FALSE(result.verify_ba);
 }
@@ -484,8 +476,6 @@ TEST(DynamicPairingCodeCPace, MismatchedAssociatedDataFailsVerify) {
     auto tag_a = initiator.tag();
     ASSERT_TRUE(tag_a.has_value());
 
-    // The responder expects the initiator's tag to authenticate (Ya, ADa="server"), but the
-    // initiator signed (Ya, ADa="client") instead, so verification must fail.
     EXPECT_FALSE(responder.verify(tag_a->data(), tag_a->size()));
 }
 
@@ -583,11 +573,8 @@ TEST(StaticPairingCode, ClientHelloLocationsHint) {
 // CPace round-trip using the static pairing-code sid construction
 // ============================================================================
 
-// The static pairing-code sid construction is identical to dynamic pairing code's (see
-// make_test_sid() above);
-// only the PRS source differs (a preconfigured static pairing code vs a derived one). This
-// exercises
-// the client (RESPONDER) against a stand-in server (INITIATOR) using the SAME 8-digit code.
+// The static pairing-code sid construction is identical to the dynamic one (see make_test_sid()
+// above); only the PRS source differs (a preconfigured static code vs a derived one).
 TEST(StaticPairingCodeCPace, RoundTripWithMatchingStaticCode) {
     const auto sid = make_test_sid();
     const auto prs = to_bytes("13572468");  // 8 decimal digits, per STATIC_PAIRING_CODE_DIGITS.
