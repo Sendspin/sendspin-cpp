@@ -333,7 +333,7 @@ TEST(PersistenceCodec, ConfigUsesTheStoredKeyNames) {
 }
 
 // A config blob written by an older build carries keys this codec no longer knows. They are
-// ignored like any other unknown field, and the fields it does know still come through.
+// ignored like any other unknown field.
 TEST(PersistenceCodec, ConfigDecodeIgnoresUnknownFields) {
     auto decoded = decode_pairing_config(
         R"({"v":1,"static_pin_enabled":true,"dynamic_pin_enabled":false,)"

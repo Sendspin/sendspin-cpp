@@ -219,9 +219,9 @@ std::unique_ptr<VisualizerRole::Impl> make_impl() {
     return impl;
 }
 
-// The teardown generation a handler would be handed by the receive gate on a role that has not
-// been torn down. The dispatch captures this value with its gate check and every point of effect
-// re-checks it, so a unit test driving a handler directly passes the live one.
+// The generation the receive gate hands a handler on a role that has not been torn down. The
+// dispatch captures it with the gate check and every point of effect re-checks it, so a unit test
+// driving a handler directly passes the live one.
 uint32_t live_generation(const VisualizerRole::Impl& impl) {
     return impl.cleanup_generation.load(std::memory_order_acquire);
 }
@@ -322,10 +322,9 @@ TEST(VisualizerHandleBinary, DropsUnnegotiatedType) {
 }
 
 // A teardown that lands after the receive gate admitted a message, while its handler is still
-// running, invalidates the whole handler: the generation the dispatch captured no longer matches,
-// so the stream is not re-armed for a role that has been stopped. Nothing here is timing-based:
-// the captured value is taken first and the teardown applied by hand, which is the interleaving
-// the network thread can otherwise produce on a live connection.
+// running, invalidates the whole handler: the generation the dispatch captured no longer matches.
+// Nothing here is timing-based: the captured value is taken first and the teardown applied by
+// hand, which is the interleaving the network thread can otherwise produce on a live connection.
 TEST(VisualizerHandleBinary, HandlersRefuseAGenerationATeardownOvertook) {
     auto impl = make_impl();
     impl->stream_active = false;

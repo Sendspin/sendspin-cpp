@@ -345,7 +345,7 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
 // Capacity and eviction (pairing.md "Pairing Records")
 // ============================================================================
 
-// Pairing at capacity must not fail: the store evicts a record instead, and the new one lands.
+// Pairing at capacity must not fail: the store evicts a record instead.
 TEST(RecordStore, CapacityEvictsRatherThanRefusingANewPairing) {
     RecordStore store(nullptr);
     for (size_t i = 0; i < RecordStore::DEFAULT_MAX_RECORDS; ++i) {
@@ -403,9 +403,8 @@ TEST(RecordStore, RecencyReorderIsNotPersisted) {
         << "a reorder alone must not rewrite the records blob";
 
     // Control: the reorder still happened in RAM. A and B were the two oldest records when the
-    // alternation began, and every touch moved them further back, so a pairing at capacity now
-    // takes the oldest filler instead. Without the rotate, A would still be at the front and
-    // would be the one evicted.
+    // alternation began, so without the rotate A would be the victim here; with it, the oldest
+    // filler is.
     auto outcome = store.resolve_pairing_outcome("server-new");
     ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
     EXPECT_EQ(store.record_by_server_id("filler-2"), nullptr)
@@ -458,7 +457,7 @@ TEST(RecordStore, EvictionSkipsRecordsBackingOpenConnections) {
         << "the next evictable record is taken instead";
 }
 
-// Fails closed only when literally every record at capacity backs an open connection. The
+// Fails closed only when every record at capacity backs an open connection. The
 // connection budget makes this unreachable in the library (see ConnectionManager's static
 // assertion), so the store is driven here directly.
 TEST(RecordStore, NothingEvictableRejectsTheRecord) {
@@ -570,8 +569,7 @@ TEST(RecordStore, ResolveByPskIdPairingPskSecond) {
 }
 
 // One psk_id held under two categories resolves to whichever the server declared: there is no
-// precedence between the candidate sets, only the declared category's set
-// (connection.md "Pre-Shared Key").
+// precedence between the candidate sets (connection.md "Pre-Shared Key").
 TEST(RecordStore, DeclaredCategoryPicksBetweenTwoPsksWithTheSamePskId) {
     InMemoryPersistenceProvider provider;
 

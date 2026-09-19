@@ -119,8 +119,7 @@ TEST(PlayerRoleTimingParameters, ConfiguredValuesAreReported) {
 // Control: with nothing configured the player still reports both, at the documented defaults.
 // The numbers are spelled out rather than re-derived with pipeline_lead_time_ms(): that is the
 // production formula, so re-running it here would report whatever the terms became. 150 is 25 ms
-// of sync priming, 50 ms of default extra startup silence and 75 ms of pipeline start allowance
-// of pipeline start allowance, the lead this client asks every server for.
+// of sync priming, 50 ms of default extra startup silence and 75 ms of pipeline start allowance.
 TEST(PlayerRoleTimingParameters, DefaultsAreReported) {
     SendspinClient client(make_client_config("player-timing-default"));
     auto& player = client.add_player(make_player_config());
@@ -158,8 +157,8 @@ TEST(PlayerRoleTimingParameters, ConfiguredLeadTimeCannotUndercutThePipeline) {
     EXPECT_EQ(state.required_lead_time_ms, PlayerRoleConfig::pipeline_lead_time_ms(400));
 }
 
-// The timing parameters describe the pipeline, not the delay knob: they are reported whether or
-// not the output delay is adjustable, and an inadjustable delay reports 0 without touching them.
+// The timing parameters describe the pipeline, not the delay knob: an inadjustable delay reports
+// 0 without touching them.
 TEST(PlayerRoleTimingParameters, ReportedWhileOutputDelayIsNotAdjustable) {
     SendspinClient client(make_client_config("player-timing-inadjustable"));
     auto& player = client.add_player(make_player_config());

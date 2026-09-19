@@ -69,15 +69,15 @@ std::vector<uint8_t> make_image(uint8_t marker, size_t length) {
     return image;
 }
 
-// The teardown generation a handler would be handed by the receive gate on a role that has not
-// been torn down. The dispatch captures this value with its gate check and every point of effect
-// re-checks it, so a unit test driving a handler directly passes the live one.
+// The generation the receive gate hands a handler on a role that has not been torn down. The
+// dispatch captures it with the gate check and every point of effect re-checks it, so a unit test
+// driving a handler directly passes the live one.
 uint32_t live_generation(const ArtworkRole::Impl& impl) {
     return impl.cleanup_generation.load(std::memory_order_acquire);
 }
 
-// Feeds one message to the role. Returns what handle_binary() reported: false means the message
-// is a protocol error and the connection must be closed.
+// Returns what handle_binary() reported: false means the message is a protocol error and the
+// connection must be closed.
 bool feed(ArtworkRole::Impl& impl, uint8_t slot, const std::vector<uint8_t>& body) {
     return impl.handle_binary(slot, body.data(), body.size());
 }
@@ -242,7 +242,6 @@ ArtworkRoleConfig make_single_slot_config(bool gated) {
 // 128 KiB image.
 constexpr size_t SMALL_IMAGE_CAP = 2048;
 
-// Builds a one-slot ArtworkRoleConfig whose channel holds at most `max_image_bytes`.
 ArtworkRoleConfig make_capped_slot_config(uint32_t max_image_bytes) {
     ArtworkRoleConfig config;
     config.preferred_formats.push_back({.source = SendspinImageSource::ALBUM,
@@ -380,8 +379,7 @@ void wait_slot_state(ArtworkRole::Impl& impl, Pred pred) {
 // ============================================================================
 
 // A teardown that lands after the receive gate admitted a stream/start, while the handler is
-// still running, invalidates it: the generation the dispatch captured no longer matches, so the
-// stream is not re-armed for a role that has been stopped and the ungated binary path stays shut.
+// still running, invalidates it: the generation the dispatch captured no longer matches.
 TEST(ArtworkStreamStart, RefusesAGenerationATeardownOvertook) {
     auto impl = make_impl(make_single_slot_config(false));
     const uint32_t captured = live_generation(*impl);
@@ -628,7 +626,7 @@ TEST(ArtworkMalformedSequence, SequenceRulesOnlyApplyWithinAnActiveStream) {
 
     // "Servers MUST NOT send artwork messages outside an active artwork stream." A well-formed
     // message that arrives anyway is ignored, not closed on: the sequence rules are scoped to an
-    // active stream and there is no sequence for it to break.
+    // active stream.
     EXPECT_TRUE(feed(*impl, 0, part_body(make_image('A', 20))));
     EXPECT_TRUE(feed(*impl, 0, {FLAG_CANCEL}));
     EXPECT_TRUE(

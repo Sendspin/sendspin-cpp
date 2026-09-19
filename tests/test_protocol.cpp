@@ -172,8 +172,7 @@ TEST(Protocol, MetadataObjectIsParsedIntoState) {
     EXPECT_EQ(metadata.progress->playback_speed, 1000u);
 }
 
-// A field the object omits has no value, whatever the target struct held before: the parse starts
-// from an empty state rather than overlaying the object on the previous one.
+// A field the object omits has no value, whatever the target struct held before.
 TEST(Protocol, MetadataObjectReplacesEveryFieldItOmits) {
     ServerMetadataStateObject metadata;
     metadata.title = "Old title";
@@ -205,7 +204,7 @@ TEST(Protocol, MetadataMissingTimestampIsRejected) {
     ServerMetadataStateObject metadata;
     metadata.title = "Kept";
     EXPECT_FALSE(process_server_state_metadata(root, &metadata));
-    // A rejected object leaves the caller's state untouched, so nothing half-parsed is displayed.
+    // A rejected object leaves the caller's state untouched.
     ASSERT_TRUE(metadata.title.has_value());
     EXPECT_EQ(metadata.title.value(), "Kept");
 }
@@ -226,7 +225,7 @@ TEST(Protocol, ColorObjectIsParsedIntoStateAndValidatesRanges) {
     ASSERT_TRUE(color.primary.has_value());
     EXPECT_EQ(color.primary.value(), (RgbColor{10, 20, 30}));
     // accent had an out-of-range component (300), so the whole color is dropped, and the palette
-    // it arrived in replaced the previous one: neither accent nor the omitted on_dark survives.
+    // it arrived in replaced the previous one.
     EXPECT_FALSE(color.accent.has_value());
     EXPECT_FALSE(color.on_dark.has_value());
 }
@@ -743,7 +742,7 @@ TEST(Protocol, FormatClientHelloDeviceInfoFieldsAbsent) {
 }
 
 // messaging.md "client/leave": the message carries no payload fields, but the envelope shape is
-// the same as every other message's, so a server parsing it finds the payload object it expects.
+// the same as every other message's.
 TEST(Protocol, FormatClientLeaveHasEmptyPayload) {
     JsonDocument doc;
     ASSERT_FALSE(deserializeJson(doc, format_client_leave_message()));
@@ -1012,7 +1011,6 @@ TEST(Protocol, ClientHelloPairMethodsAreKeyedByMethod) {
     // The key replaces the field: a descriptor that also named itself would look like an
     // unrecognized field to a server reading the descriptor.
     EXPECT_TRUE(methods["pairing_psk"]["method"].isUnbound());
-    // Each descriptor keeps its own values under its own key.
     EXPECT_STREQ(methods["pairing_psk"]["locations"][0], "device");
     EXPECT_TRUE(methods["static_pairing_code"]["locations"].isUnbound());
 }
@@ -1264,8 +1262,6 @@ TEST(Protocol, PairMethodFromString) {
               SendspinPairMethod::DYNAMIC_PAIRING_CODE);
     EXPECT_EQ(pair_method_from_string("static_pairing_code"),
               SendspinPairMethod::STATIC_PAIRING_CODE);
-    // An identifier the client does not know names no method at all, so a server offering only
-    // that one offers nothing this client can enter.
     EXPECT_FALSE(pair_method_from_string("invalid_method").has_value());
     EXPECT_FALSE(pair_method_from_string("").has_value());
 }
@@ -1372,7 +1368,6 @@ TEST(Protocol, FormatClientPairFinalizeNonZeroPsk) {
     }
 }
 
-// format_pair_abort_message: produces the correct wire shape for every reason.
 // format_client_pair_retry_message: the message that asks for another round carries an empty
 // payload object and nothing else (pairing.md "Client -> Server: client/pair-retry"). The
 // binding values are unchanged across rounds, so a field naming any of them would be wrong, not

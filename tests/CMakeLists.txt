@@ -65,7 +65,7 @@ set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS
 # state role's held scheduled update and its teardown generation (including a direct
 # handle_server_state() call with that generation), plus the queued-event probe that proves
 # ordering without a sleep (a role inbox's topic bits and the connection manager's pending-event
-# flag). It reads and drives those members directly instead of adding a seam.
+# flag).
 set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_player_role.cpp builds the client/state player object by calling the role's Impl directly,
