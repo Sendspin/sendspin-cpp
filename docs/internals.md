@@ -691,7 +691,7 @@ The client destructor performs steps 1 and 2 only, so a consumer that destroyed 
 
 ### High-performance release delivery
 
-`release_high_performance()` calls the listener inline. The last release can run inside `drop_connection()`, which holds `conn_ptr_mutex_` through `cleanup_connection_state()` (both the time-burst hold and the player's playback hold are released there), so the listener contract for `on_request_high_performance()` / `on_release_high_performance()` is that the body toggles the platform's networking mode and nothing else: it must not call back into the client or a role.
+`release_high_performance()` calls the listener inline, so the teardown paths that run under `conn_ptr_mutex_` do not use it: `cleanup_connection_state()` (the time-burst hold) and the player's `cleanup()` (the playback hold) hand their release to `release_high_performance_deferred()` instead, and `drain_inbox()` performs it at the head of the next drain, with no ConnectionManager lock held. The reference itself stays held until that flush, so an acquire between the deferral and the flush cannot be reordered ahead of the release. The listener contract for `on_request_high_performance()` / `on_release_high_performance()` is unchanged: the body toggles the platform's networking mode and nothing else.
 
 ### Graceful Disconnect
 

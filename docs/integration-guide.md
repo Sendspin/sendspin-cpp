@@ -717,7 +717,7 @@ A pairing attempt in flight is cut short the same way: `on_clear_pairing_code()`
 
 Listener callbacks fire from inside `stop()`, after every role and the group state have been reset, so a callback that reads the client through its getters sees the stopped state. One that calls `start()` gets `false` and starts nothing; one that calls `stop()`, `connect_to()`, or `disconnect()` is ignored. `is_started()` reads `false` throughout and is safe to call from any thread. Call `stop()` only from the main loop thread: from a role-thread callback it would join the calling thread.
 
-`on_request_high_performance()` and `on_release_high_performance()` can fire while the client holds an internal lock, so their bodies must only toggle the platform networking mode and must not call any client or role method.
+`on_request_high_performance()` and `on_release_high_performance()` fire from the main loop with no internal lock held, and their bodies should only toggle the platform networking mode rather than calling back into the client or a role.
 
 Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no teardown or clear callback. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
 
@@ -1297,8 +1297,8 @@ Configuration passed to `client.add_visualizer()`.
 | Field | Type | Description |
 |---|---|---|
 | `types` | `std::vector<VisualizerDataType>` | Data stream types to receive (`BEAT`, `LOUDNESS`, `F_PEAK`, `SPECTRUM`, `PEAK`); may be empty to request none |
-| `rate_max` | `uint16_t` | Maximum periodic frames per second; set to the display refresh rate |
-| `spectrum` | `std::optional<VisualizerSpectrumConfig>` | Spectrum analysis parameters; required when `SPECTRUM` is in `types` |
+| `rate_max` | `uint16_t` | Maximum periodic frames per second; set to the display refresh rate. Must be positive when `types` is non-empty, or `SendspinClient::start()` fails |
+| `spectrum` | `std::optional<VisualizerSpectrumConfig>` | Spectrum analysis parameters; required when `SPECTRUM` is in `types`, or `SendspinClient::start()` fails |
 
 `VisualizerSpectrumConfig` fields:
 
