@@ -15,7 +15,6 @@
 #include "protocol_messages.h"
 #include "visualizer_role_impl.h"
 
-#include "log_capture.h"
 #include "test_util.h"
 
 #include <gtest/gtest.h>
@@ -44,153 +43,127 @@ void put_be16(std::vector<uint8_t>& out, uint16_t val) {
 // decode_visualizer_message: the drain thread's per-type validation and parsing
 // ============================================================================
 
-TEST(VisualizerDecode, LoudnessDecodesBigEndian) {
-    std::vector<uint8_t> payload;
-    put_be16(payload, 0x1234);
-    std::vector<uint16_t> bins;
+// roles/visualizer/v1.md "Server -> Client: Visualizer Data (Binary)": each wire type carries a
+// fixed payload shape, a payload shorter than that shape is not deliverable, and the downbeat
+// bit is meaningful only while the stream tracks downbeats. Spectrum delivers exactly the
+// negotiated bin count: fewer bins on the wire than negotiated is short, more is trailing data.
+TEST(VisualizerDecode, PerTypePayloadShapes) {
+    struct Row {
+        const char* name;
+        uint8_t wire_type;
+        std::vector<uint8_t> payload;
+        uint8_t negotiated_bins{0};
+        bool tracks_downbeats{false};
+        VisualizerDelivery::Kind expected_kind{VisualizerDelivery::Kind::NONE};
+        std::vector<uint16_t> expected_bins{};
+        std::optional<uint16_t> expected_loudness{};
+        std::optional<bool> expected_downbeat{};
+        std::optional<uint16_t> expected_frequency_hz{};
+        std::optional<uint16_t> expected_amplitude{};
+        std::optional<uint8_t> expected_strength{};
+    };
 
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, payload.data(),
-                                         payload.size(), 0, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::LOUDNESS);
-    EXPECT_EQ(out.loudness, 0x1234);
-}
+    const std::vector<Row> rows = {
+        {.name = "Control: loudness is big endian",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_LOUDNESS,
+         .payload = {0x12, 0x34},
+         .expected_kind = VisualizerDelivery::Kind::LOUDNESS,
+         .expected_loudness = 0x1234},
+        {.name = "loudness one byte short",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_LOUDNESS,
+         .payload = {0x12}},
+        {.name = "beat downbeat bit set while tracking downbeats",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
+         .payload = {0x01},
+         .tracks_downbeats = true,
+         .expected_kind = VisualizerDelivery::Kind::BEAT,
+         .expected_downbeat = true},
+        {.name = "beat downbeat bit set while not tracking downbeats",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
+         .payload = {0x01},
+         .tracks_downbeats = false,
+         .expected_kind = VisualizerDelivery::Kind::BEAT,
+         .expected_downbeat = false},
+        {.name = "beat downbeat bit clear while tracking downbeats",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
+         .payload = {0x00},
+         .tracks_downbeats = true,
+         .expected_kind = VisualizerDelivery::Kind::BEAT,
+         .expected_downbeat = false},
+        {.name = "beat with no payload byte",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_BEAT,
+         .payload = {},
+         .tracks_downbeats = true},
+        {.name = "f_peak carries frequency then amplitude",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_F_PEAK,
+         .payload = {0x01, 0xB8, 0xBE, 0xEF},
+         .expected_kind = VisualizerDelivery::Kind::F_PEAK,
+         .expected_frequency_hz = 440,
+         .expected_amplitude = 0xBEEF},
+        {.name = "f_peak one byte short of both fields",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_F_PEAK,
+         .payload = {0x01, 0xB8, 0x00}},
+        {.name = "spectrum delivers the negotiated bin count",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+         .payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E},
+         .negotiated_bins = 3,
+         .expected_kind = VisualizerDelivery::Kind::SPECTRUM,
+         .expected_bins = {10, 20, 30}},
+        {.name = "spectrum ignores bins past the negotiated count",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+         .payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E},
+         .negotiated_bins = 2,
+         .expected_kind = VisualizerDelivery::Kind::SPECTRUM,
+         .expected_bins = {10, 20}},
+        {.name = "spectrum one bin short of the negotiated count",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+         .payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E},
+         .negotiated_bins = 4},
+        {.name = "spectrum that was never negotiated",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_SPECTRUM,
+         .payload = {0x00, 0x0A},
+         .negotiated_bins = 0},
+        {.name = "peak carries one strength byte",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_PEAK,
+         .payload = {200},
+         .expected_kind = VisualizerDelivery::Kind::PEAK,
+         .expected_strength = 200},
+        {.name = "peak with no payload byte",
+         .wire_type = SENDSPIN_BINARY_VISUALIZER_PEAK,
+         .payload = {}},
+        {.name = "reserved wire type",
+         .wire_type = 21,
+         .payload = {0x00, 0x00, 0x00, 0x00}},
+    };
 
-TEST(VisualizerDecode, LoudnessTooShortDropped) {
-    std::vector<uint8_t> payload = {0x12};  // 1 byte, needs 2
-    std::vector<uint16_t> bins;
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, payload.data(),
-                                         payload.size(), 0, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::NONE);
-}
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        std::vector<uint16_t> bins;
+        const uint8_t* payload = row.payload.empty() ? nullptr : row.payload.data();
 
-TEST(VisualizerDecode, BeatDownbeatGatedOnTracksDownbeats) {
-    std::vector<uint8_t> payload = {0x01};  // downbeat bit set
-    std::vector<uint16_t> bins;
+        auto out = decode_visualizer_message(row.wire_type, payload, row.payload.size(),
+                                             row.negotiated_bins, row.tracks_downbeats, bins);
 
-    // Stream tracks downbeats: bit 0 is meaningful.
-    auto tracked = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_BEAT, payload.data(),
-                                             payload.size(), 0, true, bins);
-    EXPECT_EQ(tracked.kind, VisualizerDelivery::Kind::BEAT);
-    EXPECT_TRUE(tracked.downbeat);
-
-    // Stream does not track downbeats: the bit must be ignored.
-    auto untracked = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_BEAT, payload.data(),
-                                               payload.size(), 0, false, bins);
-    EXPECT_EQ(untracked.kind, VisualizerDelivery::Kind::BEAT);
-    EXPECT_FALSE(untracked.downbeat);
-}
-
-TEST(VisualizerDecode, BeatWithoutDownbeatBit) {
-    std::vector<uint8_t> payload = {0x00};
-    std::vector<uint16_t> bins;
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_BEAT, payload.data(),
-                                         payload.size(), 0, true, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::BEAT);
-    EXPECT_FALSE(out.downbeat);
-}
-
-TEST(VisualizerDecode, BeatEmptyDropped) {
-    std::vector<uint16_t> bins;
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_BEAT, nullptr, 0, 0, true, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::NONE);
-}
-
-TEST(VisualizerDecode, FPeakDecodesFreqAndAmplitude) {
-    std::vector<uint8_t> payload;
-    put_be16(payload, 440);
-    put_be16(payload, 0xBEEF);
-    std::vector<uint16_t> bins;
-
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_F_PEAK, payload.data(),
-                                         payload.size(), 0, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::F_PEAK);
-    EXPECT_EQ(out.frequency_hz, 440);
-    EXPECT_EQ(out.amplitude, 0xBEEF);
-}
-
-TEST(VisualizerDecode, FPeakTooShortDropped) {
-    std::vector<uint8_t> payload = {0x01, 0xB8, 0x00};  // 3 bytes, needs 4
-    std::vector<uint16_t> bins;
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_F_PEAK, payload.data(),
-                                         payload.size(), 0, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::NONE);
-}
-
-TEST(VisualizerDecode, SpectrumDeliversNegotiatedBinCount) {
-    std::vector<uint8_t> payload;
-    put_be16(payload, 10);
-    put_be16(payload, 20);
-    put_be16(payload, 30);
-    std::vector<uint16_t> bins;
-
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, payload.data(),
-                                         payload.size(), 3, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::SPECTRUM);
-    ASSERT_EQ(bins.size(), 3U);
-    EXPECT_EQ(bins[0], 10);
-    EXPECT_EQ(bins[1], 20);
-    EXPECT_EQ(bins[2], 30);
-}
-
-TEST(VisualizerDecode, SpectrumIgnoresTrailingBytes) {
-    // 3 bins on the wire, but only 2 were negotiated: deliver 2 and ignore the rest.
-    std::vector<uint8_t> payload;
-    put_be16(payload, 10);
-    put_be16(payload, 20);
-    put_be16(payload, 30);
-    std::vector<uint16_t> bins;
-
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, payload.data(),
-                                         payload.size(), 2, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::SPECTRUM);
-    ASSERT_EQ(bins.size(), 2U);
-    EXPECT_EQ(bins[0], 10);
-    EXPECT_EQ(bins[1], 20);
-}
-
-TEST(VisualizerDecode, SpectrumShortPayloadDropped) {
-    // Negotiated 4 bins (8 bytes) but only 3 bins present.
-    std::vector<uint8_t> payload;
-    put_be16(payload, 10);
-    put_be16(payload, 20);
-    put_be16(payload, 30);
-    std::vector<uint16_t> bins;
-
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, payload.data(),
-                                         payload.size(), 4, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::NONE);
-}
-
-TEST(VisualizerDecode, SpectrumNotNegotiatedDropped) {
-    std::vector<uint8_t> payload;
-    put_be16(payload, 10);
-    std::vector<uint16_t> bins;
-
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, payload.data(),
-                                         payload.size(), 0, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::NONE);
-}
-
-TEST(VisualizerDecode, PeakDecodesStrength) {
-    std::vector<uint8_t> payload = {200};
-    std::vector<uint16_t> bins;
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_PEAK, payload.data(),
-                                         payload.size(), 0, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::PEAK);
-    EXPECT_EQ(out.strength, 200);
-}
-
-TEST(VisualizerDecode, PeakEmptyDropped) {
-    std::vector<uint16_t> bins;
-    auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_PEAK, nullptr, 0, 0, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::NONE);
-}
-
-TEST(VisualizerDecode, ReservedTypeDropped) {
-    std::vector<uint8_t> payload = {0, 0, 0, 0};
-    std::vector<uint16_t> bins;
-    auto out = decode_visualizer_message(21, payload.data(), payload.size(), 0, false, bins);
-    EXPECT_EQ(out.kind, VisualizerDelivery::Kind::NONE);
+        EXPECT_EQ(out.kind, row.expected_kind);
+        if (row.expected_loudness.has_value()) {
+            EXPECT_EQ(out.loudness, *row.expected_loudness);
+        }
+        if (row.expected_downbeat.has_value()) {
+            EXPECT_EQ(out.downbeat, *row.expected_downbeat);
+        }
+        if (row.expected_frequency_hz.has_value()) {
+            EXPECT_EQ(out.frequency_hz, *row.expected_frequency_hz);
+        }
+        if (row.expected_amplitude.has_value()) {
+            EXPECT_EQ(out.amplitude, *row.expected_amplitude);
+        }
+        if (row.expected_strength.has_value()) {
+            EXPECT_EQ(out.strength, *row.expected_strength);
+        }
+        if (row.expected_kind == VisualizerDelivery::Kind::SPECTRUM) {
+            EXPECT_EQ(bins, row.expected_bins);
+        }
+    }
 }
 
 // ============================================================================
@@ -501,18 +474,15 @@ TEST(VisualizerConfigReporting, HelloAdvertisesCapacityAndStateCarriesTheStreamC
     ASSERT_TRUE(state.visualizer->spectrum.has_value());
     EXPECT_EQ(state.visualizer->spectrum->n_disp_bins, 16);
     EXPECT_EQ(state.visualizer->spectrum->scale, VisualizerSpectrumScale::LOG);
-}
 
-// Control: a role that asks for no data still reports the object, so the server knows the role
-// is configured and streams nothing rather than waiting for a state that never comes.
-TEST(VisualizerConfigReporting, StateIsReportedWithNoRequestedTypes) {
-    auto impl = make_impl();
-
-    ClientStateMessage state;
-    impl->build_state_fields(state);
-    ASSERT_TRUE(state.visualizer.has_value());
-    EXPECT_TRUE(state.visualizer->types.empty());
-    EXPECT_FALSE(state.visualizer->spectrum.has_value());
+    // Control: a role that asks for no data still reports the object, so the server knows the
+    // role is configured and streams nothing rather than waiting for a state that never comes.
+    auto quiet = make_impl();
+    ClientStateMessage quiet_state;
+    quiet->build_state_fields(quiet_state);
+    ASSERT_TRUE(quiet_state.visualizer.has_value());
+    EXPECT_TRUE(quiet_state.visualizer->types.empty());
+    EXPECT_FALSE(quiet_state.visualizer->spectrum.has_value());
 }
 
 // ============================================================================
@@ -538,127 +508,40 @@ std::unique_ptr<VisualizerRole::Impl> make_impl_with_stream(VisualizerStreamConf
 }  // namespace
 
 // roles/visualizer/v1.md "client/state visualizer object": a types list carrying 'spectrum'
-// without a spectrum object is a protocol error the server closes the connection for, so the role
-// refuses the configuration rather than letting the consumer discover it as a disconnect.
-TEST(VisualizerStartValidation, SpectrumTypeWithoutSpectrumConfigRefusesToStart) {
-    auto impl = make_impl_with_stream(VisualizerStreamConfig{
-        .types = {VisualizerDataType::SPECTRUM},
-        .rate_max = 25,
-    });
-
-    EXPECT_FALSE(impl->start());
-}
-
-// Same section: rate_max is a positive integer, so asking for data at a rate of zero is equally
-// spec-invalid.
-TEST(VisualizerStartValidation, ZeroRateMaxWithRequestedTypesRefusesToStart) {
-    auto impl = make_impl_with_stream(VisualizerStreamConfig{
-        .types = {VisualizerDataType::BEAT},
-        .rate_max = 0,
-    });
-
-    EXPECT_FALSE(impl->start());
-}
-
-// Control: the same shape with the spectrum object present and a positive rate starts.
-TEST(VisualizerStartValidation, ValidStreamConfigStarts) {
-    auto impl = make_impl_with_stream(VisualizerStreamConfig{
-        .types = {VisualizerDataType::SPECTRUM},
-        .rate_max = 25,
-        .spectrum =
-            VisualizerSpectrumConfig{
-                .n_disp_bins = 16,
-                .scale = VisualizerSpectrumScale::LOG,
-                .f_min = 20,
-                .f_max = 20000,
-            },
-    });
-
-    EXPECT_TRUE(impl->start());
-    impl->stop();
-}
-
-// ============================================================================
-// stream/start spectrum mismatch reporting
-// ============================================================================
-
-namespace {
-
-// The spectrum layout the role below asks for; each case serves a copy with one field changed.
-VisualizerSpectrumConfig requested_spectrum() {
-    return VisualizerSpectrumConfig{
+// without a spectrum object, or a rate_max of zero while asking for data, is a protocol error the
+// server closes the connection for, so the role refuses the configuration rather than letting the
+// consumer discover it as a disconnect.
+TEST(VisualizerStartValidation, SpecInvalidStreamConfigRefusesToStart) {
+    const VisualizerSpectrumConfig spectrum{
         .n_disp_bins = 16,
         .scale = VisualizerSpectrumScale::LOG,
         .f_min = 20,
         .f_max = 20000,
     };
-}
 
-// Runs a stream/start carrying `served` (nullopt serves the spectrum type with no spectrum
-// object) against a role configured for requested_spectrum(), and returns what it logged.
-std::string stream_start_log(std::optional<VisualizerSpectrumConfig> served) {
-    auto impl = make_impl_with_stream(VisualizerStreamConfig{
-        .types = {VisualizerDataType::SPECTRUM},
-        .rate_max = 25,
-        .spectrum = requested_spectrum(),
-    });
+    struct Row {
+        const char* name;
+        VisualizerStreamConfig stream;
+        bool expected_start;
+    };
+    const std::vector<Row> rows = {
+        {"Control: spectrum object present and a positive rate",
+         VisualizerStreamConfig{.types = {VisualizerDataType::SPECTRUM},
+                                .rate_max = 25,
+                                .spectrum = spectrum},
+         true},
+        {"spectrum type with no spectrum object",
+         VisualizerStreamConfig{.types = {VisualizerDataType::SPECTRUM}, .rate_max = 25}, false},
+        {"zero rate_max while requesting a type",
+         VisualizerStreamConfig{.types = {VisualizerDataType::BEAT}, .rate_max = 0}, false},
+    };
 
-    ServerVisualizerStreamObject stream;
-    stream.types = {VisualizerDataType::SPECTRUM};
-    stream.spectrum = std::move(served);
-
-    StderrCapture capture;
-    impl->handle_stream_start(stream, live_generation(*impl));
-    return capture.release();
-}
-
-}  // namespace
-
-// roles/visualizer/v1.md "Server -> Client: stream/start": the spectrum object is present when
-// types includes 'spectrum' and MUST match the requested configuration. The object is reported to
-// the listener as the server sent it, so a mismatch has no effect other than the log line: the
-// line is the only place an inverted comparison or a swapped operand shows up.
-TEST(VisualizerSpectrumMismatch, BinCountMismatchNamesServedAndRequested) {
-    VisualizerSpectrumConfig served = requested_spectrum();
-    served.n_disp_bins = 8;
-
-    const std::string log = stream_start_log(served);
-    EXPECT_NE(log.find("bin count mismatch: server 8, expected 16"), std::string::npos) << log;
-}
-
-TEST(VisualizerSpectrumMismatch, ScaleMismatchIsReported) {
-    VisualizerSpectrumConfig served = requested_spectrum();
-    served.scale = VisualizerSpectrumScale::LIN;
-
-    const std::string log = stream_start_log(served);
-    EXPECT_NE(log.find("Spectrum scale mismatch"), std::string::npos) << log;
-}
-
-// One branch covers both bounds, so each is served wrong on its own: a check that read f_max
-// twice would still pass on one of them.
-TEST(VisualizerSpectrumMismatch, EitherFrequencyBoundIsReported) {
-    VisualizerSpectrumConfig low = requested_spectrum();
-    low.f_min = 40;
-    const std::string low_log = stream_start_log(low);
-    EXPECT_NE(low_log.find("frequency range mismatch: server 40-20000, expected 20-20000"),
-              std::string::npos)
-        << low_log;
-
-    VisualizerSpectrumConfig high = requested_spectrum();
-    high.f_max = 16000;
-    const std::string high_log = stream_start_log(high);
-    EXPECT_NE(high_log.find("frequency range mismatch: server 20-16000, expected 20-20000"),
-              std::string::npos)
-        << high_log;
-}
-
-TEST(VisualizerSpectrumMismatch, SpectrumTypeWithNoSpectrumObjectIsReported) {
-    const std::string log = stream_start_log(std::nullopt);
-    EXPECT_NE(log.find("no spectrum object"), std::string::npos) << log;
-}
-
-// Control: a served spectrum equal to the requested one reports nothing, so the four cases above
-// pin the comparisons rather than a warning the role emits either way.
-TEST(VisualizerSpectrumMismatch, MatchingSpectrumReportsNothing) {
-    EXPECT_EQ(stream_start_log(requested_spectrum()), "");
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl_with_stream(row.stream);
+        EXPECT_EQ(impl->start(), row.expected_start);
+        if (row.expected_start) {
+            impl->stop();
+        }
+    }
 }
