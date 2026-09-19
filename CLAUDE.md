@@ -18,6 +18,10 @@ The library provides `SendspinClient` as the main public API. It handles the ful
 - `SyncTask` (`sync_task.h`): decodes encoded audio, synchronizes to server timestamps, writes PCM via audio write callback
 - `SendspinConnection` (`connection.h`): abstract WebSocket connection base
 - `SendspinServerConnection` / `SendspinClientConnection`: platform-specific WebSocket transports (ESP uses `esp_websocket_client`/`esp_http_server`, host uses IXWebSocket)
+- `NoiseHandshake` (`noise_handshake.h`): drives the Noise KKpsk2 handshake frames on the network thread and resolves the PSK through `RecordStore`
+- `NoiseSession` (`noise_session.h`): noise-c wrapper holding the KKpsk2 handshake and transport cipher states
+- `NoiseTransport` (`noise_transport.h`): per-connection encrypted framing, owns fragmentation and reassembly around the session
+- `RecordStore` (`record_store.h`): pairing records, the Pairing PSK and the construction-time pairing config, seeded from the persistence provider
 - `Inbox` / `InboxSlot` (`inbox.h`): single-mutex mailbox for all main-loop-bound cross-thread state - atomic topic bitmask polled lock-free by `loop()`, plus a fixed event ring for ordered lifecycle/time events
 - `SendspinTimeFilter` (`time_filter.h`): 2D Kalman filter for NTP-style time sync
 - `SendspinTimeBurst` (`time_burst.h`): burst-based time message coordinator
@@ -34,17 +38,18 @@ The consuming platform (e.g., ESPHome) supplies the listener implementations plu
 ## Project layout
 
 ```text
-include/sendspin/     - Public API headers (client.h, config.h, types.h, *_role.h)
+include/sendspin/     - Public API headers (client.h, config.h, types.h, persistence_codec.h, *_role.h)
 src/                        - Cross-platform source files (.cpp) and private headers (.h)
+src/crypto/                 - Crypto primitives and Noise/pairing constants (CPace, pairing codes and tokens, PSK wrapping)
 src/platform/               - Platform abstraction headers and host-only source files
 src/esp/                    - ESP-IDF networking implementations and headers
 src/host/                   - Host (IXWebSocket) networking implementations and headers
 cmake/                      - CMake modules (sources.cmake, host.cmake)
-examples/common/            - Shared PortAudio audio sink used by host examples
+examples/common/            - Shared host-example helpers (PortAudio sink, file-backed persistence provider)
 examples/basic_client/      - Standalone host example with PortAudio audio output
 examples/tui_client/        - Terminal UI host example with PortAudio audio output
 tests/                      - Host unit tests (GoogleTest)
-docs/                       - integration-guide.md (consumer guide), internals.md (how the current code works), conventions.md (normative design standards)
+docs/                       - integration-guide.md (consumer guide), internals.md (how the current code works), conventions.md (normative design standards), rc1-migration.md (RC1 migration tracker)
 .claude/skills/             - Review checklists applying the standards to a diff (docs-sync, embedded-review, house-patterns, test-standards)
 ```
 
@@ -64,6 +69,7 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `time.h`: time utilities
 - `base64.h`: base64 encoding/decoding
 - `compiler.h`: compiler hints and platform-specific macros
+- `crypto.h`: SHA-256/SHA-512, HMAC-SHA-512, X25519, one-shot ChaChaPoly AEAD, CSPRNG, constant-time compare and secure zero, all over noise-c
 - `json_arena.h`: bounded internal-RAM bump-arena ArduinoJson allocator with PSRAM fallback
 - `network_info.h`: best-effort lookup of the local network interface MAC address
 - `types.h`: platform type abstractions
@@ -77,11 +83,11 @@ Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform d
 ## Build
 
 - **ESP-IDF**: Used as an IDF component via `idf_component.yml`. Sources defined in `cmake/sources.cmake`.
-- **Host (CMake)**: `cmake -B build && cmake --build build`. Fetches dependencies (ArduinoJson, micro-flac, micro-opus, IXWebSocket) via FetchContent.
+- **Host (CMake)**: `cmake -B build && cmake --build build`. Fetches dependencies (ArduinoJson, noise-c, micro-flac, micro-opus, IXWebSocket) via FetchContent.
 - **Tests**: `cmake -B build-tests -DSENDSPIN_BUILD_TESTS=ON -DENABLE_SANITIZERS=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tests --target sendspin_tests` and `ctest --test-dir build-tests --output-on-failure`.
 - **ThreadSanitizer tests**: `cmake -B build-tsan -DSENDSPIN_BUILD_TESTS=ON -DENABLE_TSAN=ON -DBUILD_EXAMPLES=OFF .`, then `cmake --build build-tsan --target sendspin_tests` and `TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure`. `ENABLE_TSAN` applies the thread sanitizer to every target, including the fetched dependencies, and cannot be combined with `ENABLE_SANITIZERS`.
-- **ESP dependencies**: ArduinoJson, esp_websocket_client, micro-flac, micro-opus, esp_http_server, mbedtls, pthread, esp_ringbuf
-- **Host dependencies**: ArduinoJson, micro-flac, micro-opus, IXWebSocket, pthreads
+- **ESP dependencies**: ArduinoJson, noise-c, esp_websocket_client, micro-flac, micro-opus, esp_http_server, mbedtls, pthread, esp_ringbuf, esp_hw_support
+- **Host dependencies**: ArduinoJson, noise-c, micro-flac, micro-opus, IXWebSocket, pthreads
 
 ## Coding conventions
 
