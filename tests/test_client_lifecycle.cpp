@@ -893,13 +893,12 @@ TEST(ClientLifecycle, TheStreamPinIsReleasedAtStreamEndAndFreedOnTheMainLoop) {
     client.stop();
 }
 
-// A stream that goes active with no current connection pins nothing, which reads as "not time
-// synced" for the rest of that stream: LOAD_CHUNK waits and no fed chunk is ever converted or
-// decoded, the same as a get_client_time() with no connection behind it. The check lands after
-// on_stream_end(), which the player holds until the sync task is idle, so the task is provably
-// done with the stream rather than merely slow. The pin is resolved again at the next stream, so
-// the one that follows the connect plays the same chunks through.
-TEST(ClientLifecycle, AStreamStartedWithNoConnectionDecodesNothingAndTheNextOnePlays) {
+// The pin is resolved once per stream, at the top of the sync task's outer loop, so a stream
+// that ran with nothing in the admitted slot does not poison the next one: the stream that
+// follows the connect resolves the pin again and plays its chunks through. The first stream is
+// setup, not a probe of the null-pin gate in handle_load_chunk() - it ends while the pipeline is
+// still priming, so that gate is never reached (see docs/rc1-migration.md, "Residual gaps").
+TEST(ClientLifecycle, TheStreamAfterAConnectResolvesThePinAgainAndPlays) {
     VirtualSinkListener listener;
     auto config = make_config(SYNC_PIN_NULL_TEST_PORT);
     config.time_burst_interval_ms = 100;
@@ -921,8 +920,7 @@ TEST(ClientLifecycle, AStreamStartedWithNoConnectionDecodesNothingAndTheNextOneP
     feed_marked_chunks(sync_task, platform_time_us() + PIN_CHUNK_LEAD_US, 8);
     impl.handle_stream_end(impl.cleanup_generation.load());
     pump_until(client, [&] { return listener.stream_ends == 1; });
-    EXPECT_FALSE(listener.decoded())
-        << "a stream with no connection behind it converted and decoded a chunk";
+    ASSERT_FALSE(listener.decoded()) << "the second stream's signal is not fresh";
 
     FakeEncryptedServerOptions options;
     options.answer_time = true;

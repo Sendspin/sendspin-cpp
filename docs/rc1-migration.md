@@ -282,6 +282,19 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   pin (stream end, a mid-stream `drop_connection()`, a network-thread flush) use the older
   listener on purpose, so they prove where the connection dies and not that a chunk decoded
   across the drop; no test combines a live decode with a drop.
+- The arrival timestamp a held message keeps across the pre-admission replay
+  (`replay_pre_admission_messages()` hands each message its recorded `arrival_us` rather than the
+  replay's own clock) is unobservable from any test. `dispatch_json_message()` threads that
+  timestamp to the hold buffer and to `process_server_time_message()` only, and `server/time` is
+  never held, so every holdable type (`server/state`, `server/command`, `stream/start`,
+  `stream/end`, `stream/clear`, `group/update`) ignores it. Replacing it with a fresh clock read
+  leaves the replay tests green.
+- The null-pin half of `handle_load_chunk()`'s time-sync gate is not reached by any test. A
+  stream started with nothing in the admitted slot ends while the sync task is still priming in
+  `INITIAL_SYNC`, and priming leaves only on a playback-progress notification, so the gate is
+  never entered; nothing short of a production seam makes the entry observable.
+  `ClientLifecycle.TheStreamAfterAConnectResolvesThePinAgainAndPlays` pins the per-stream pin
+  resolution around it, not the gate.
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.
