@@ -166,15 +166,16 @@ public:
     // State updates
     // ========================================
 
-    /// @brief Updates the volume and publishes client state to the server.
+    /// @brief Updates the volume and publishes client state to the server. Main loop only.
     /// @param volume New volume level
     void update_volume(uint8_t volume);
 
-    /// @brief Updates the mute state and publishes client state to the server.
+    /// @brief Updates the mute state and publishes client state to the server. Main loop only.
     /// @param muted true to mute, false to unmute
     void update_muted(bool muted);
 
     /// @brief Updates the stored output delay preference and publishes client state to the server.
+    /// Main loop only.
     ///
     /// The value is always persisted (if a persistence provider is set), independent of
     /// adjustability. If adjustability is currently disabled, the stored value has no
@@ -182,7 +183,7 @@ public:
     /// @param delay_ms Output delay in milliseconds
     void update_output_delay(uint16_t delay_ms);
 
-    /// @brief Enables or disables the output delay adjustment command.
+    /// @brief Enables or disables the output delay adjustment command. Main loop only.
     ///
     /// When disabled, the stored delay is not applied to audio sync timing and is reported
     /// as 0 in client state, per the Sendspin spec (a delay that is not exposed as a knob
