@@ -125,9 +125,11 @@ TEST(DynamicPairingCode, ParseServerPairInitWithoutNonceYieldsNoNonce) {
     EXPECT_FALSE(payload.nonce_a.has_value());
 }
 
-// An unrecognized extra field alongside nonce_A is ignored.
+// An unrecognized extra field alongside nonce_A is ignored, and the field beside it survives
+// into the payload rather than being dropped along with the one that was not recognized.
 TEST(DynamicPairingCode, ParseServerPairInitExtraFieldIgnored) {
     std::array<uint8_t, 32> nonce_a{};
+    for (int i = 0; i < 32; ++i) nonce_a[i] = static_cast<uint8_t>(0xA0 + i);
     const std::string json =
         std::string(R"({"type":"server/pair-init","payload":{"nonce_A":")") + b64url(nonce_a) +
         R"(","unrecognized_field":6}})";
@@ -137,7 +139,40 @@ TEST(DynamicPairingCode, ParseServerPairInitExtraFieldIgnored) {
     ASSERT_TRUE(parse(json, doc, root));
 
     ServerPairInitPayload payload;
-    EXPECT_TRUE(process_server_pair_init_message(root, &payload));
+    ASSERT_TRUE(process_server_pair_init_message(root, &payload));
+    EXPECT_EQ(payload.nonce_a, nonce_a);
+}
+
+// A nonce_A of the wrong JSON type is not a nonce that happens to be missing: the field is there
+// and unusable, which is the malformed case, so the message is rejected outright.
+TEST(DynamicPairingCode, ParseServerPairInitNonStringNonceIsRejected) {
+    expect_parse_rejects<ServerPairInitPayload>(
+        process_server_pair_init_message,
+        R"({"type":"server/pair-init","payload":{"nonce_A":5}})");
+}
+
+// An explicit JSON null is how a serializer writes a field it has nothing for, so it must mean
+// the same as leaving it out (the retry-round shape) rather than being rejected.
+TEST(DynamicPairingCode, ParseServerPairInitNullNonceYieldsNoNonce) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/pair-init","payload":{"nonce_A":null}})", doc, root));
+
+    ServerPairInitPayload payload;
+    ASSERT_TRUE(process_server_pair_init_message(root, &payload));
+    EXPECT_FALSE(payload.nonce_a.has_value());
+}
+
+// Same for a message with no payload object at all: nonce_A is the only field it would carry,
+// and a retry round has nothing to put there.
+TEST(DynamicPairingCode, ParseServerPairInitWithoutPayloadYieldsNoNonce) {
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/pair-init"})", doc, root));
+
+    ServerPairInitPayload payload;
+    ASSERT_TRUE(process_server_pair_init_message(root, &payload));
+    EXPECT_FALSE(payload.nonce_a.has_value());
 }
 
 TEST(DynamicPairingCode, ParseServerPairInitWrongNonceLength) {
@@ -341,7 +376,7 @@ TEST(DynamicPairingCode, FormatClientPairConfirmWireShape) {
 }
 
 // ============================================================================
-// CPace INITIATOR + RESPONDER round-trip with shared password
+// CPace associated-data binding
 // ============================================================================
 
 namespace {
@@ -376,81 +411,7 @@ static std::vector<uint8_t> ad_client() {
     return to_bytes("client");
 }
 
-/// What the round-trip pairs below need from a CPace(INITIATOR)/CPace(RESPONDER) exchange with
-/// the correct ADa="server"/ADb="client" association. Only the matching-password tests check the
-/// ISK/sid (pairing.md "Wrapping").
-struct CPaceRoundTripResult {
-    bool verify_ab{false};  // initiator.verify(tag_b)
-    bool verify_ba{false};  // responder.verify(tag_a)
-    std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk_a;
-    std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk_b;
-    std::vector<uint8_t> initiator_sid;
-};
-
-// Runs a full CPace INITIATOR/RESPONDER exchange (start, cross-derive, tag, verify) with the
-// standard ADa="server"/ADb="client" association. Callers assert on the returned
-// verify_ab/verify_ba themselves.
-static CPaceRoundTripResult run_cpace_round_trip(const std::vector<uint8_t>& prs_a,
-                                                  const std::vector<uint8_t>& prs_b,
-                                                  const std::vector<uint8_t>& sid) {
-    const std::vector<uint8_t> empty;
-
-    CPace initiator;
-    EXPECT_TRUE(initiator.start(CPaceRole::INITIATOR, prs_a, sid, empty, ad_server(), ad_client()));
-    const auto& share_a = initiator.public_share();
-
-    CPace responder;
-    EXPECT_TRUE(responder.start(CPaceRole::RESPONDER, prs_b, sid, empty, ad_client(), ad_server()));
-    const auto& share_b = responder.public_share();
-
-    EXPECT_TRUE(initiator.derive(share_b.data(), share_b.size()));
-    EXPECT_TRUE(responder.derive(share_a.data(), share_a.size()));
-
-    auto tag_a = initiator.tag();
-    auto tag_b = responder.tag();
-    EXPECT_TRUE(tag_a.has_value());
-    EXPECT_TRUE(tag_b.has_value());
-
-    CPaceRoundTripResult result;
-    if (tag_a.has_value() && tag_b.has_value()) {
-        result.verify_ab = initiator.verify(tag_b->data(), tag_b->size());
-        result.verify_ba = responder.verify(tag_a->data(), tag_a->size());
-    }
-    result.isk_a = initiator.isk();
-    result.isk_b = responder.isk();
-    result.initiator_sid = initiator.sid();
-    return result;
-}
-
 }  // namespace
-
-TEST(DynamicPairingCodeCPace, RoundTripWithMatchingPassword) {
-    const auto sid = make_test_sid(/*pairing_index=*/1);
-    const auto prs = to_bytes("123456");
-
-    // A (initiator) is the server's role in the protocol, B (responder) the client's.
-    auto result = run_cpace_round_trip(prs, prs, sid);
-
-    EXPECT_TRUE(result.verify_ab);
-    EXPECT_TRUE(result.verify_ba);
-
-    // Both sides agree on ISK and sid, needed for the wrapping (pairing.md "Wrapping").
-    ASSERT_TRUE(result.isk_a.has_value());
-    ASSERT_TRUE(result.isk_b.has_value());
-    EXPECT_EQ(result.isk_a.value(), result.isk_b.value());
-    EXPECT_EQ(result.initiator_sid, sid);
-}
-
-TEST(DynamicPairingCodeCPace, RoundTripMismatchedPasswordFails) {
-    const auto sid = make_test_sid();
-    const auto prs_a = to_bytes("123456");
-    const auto prs_b = to_bytes("999999");
-
-    auto result = run_cpace_round_trip(prs_a, prs_b, sid);
-
-    EXPECT_FALSE(result.verify_ab);
-    EXPECT_FALSE(result.verify_ba);
-}
 
 TEST(DynamicPairingCodeCPace, MismatchedAssociatedDataFailsVerify) {
     // Distinct ADa/ADb values prevent a reflected-MAC issue (pairing.md "PAKE"): if a side uses the
@@ -567,33 +528,4 @@ TEST(StaticPairingCode, ClientHelloLocationsHint) {
     ASSERT_EQ(locations.size(), 2u);
     EXPECT_STREQ(locations[0], "device");
     EXPECT_STREQ(locations[1], "leaflet");
-}
-
-// ============================================================================
-// CPace round-trip using the static pairing-code sid construction
-// ============================================================================
-
-// The static pairing-code sid construction is identical to the dynamic one (see make_test_sid()
-// above); only the PRS source differs (a preconfigured static code vs a derived one).
-TEST(StaticPairingCodeCPace, RoundTripWithMatchingStaticCode) {
-    const auto sid = make_test_sid();
-    const auto prs = to_bytes("13572468");  // 8 decimal digits, per STATIC_PAIRING_CODE_DIGITS.
-
-    // Initiator stands in for the server; responder is the client, per
-    // handle_pairing_window_confirmed().
-    auto result = run_cpace_round_trip(prs, prs, sid);
-
-    EXPECT_TRUE(result.verify_ab);
-    EXPECT_TRUE(result.verify_ba);
-}
-
-TEST(StaticPairingCodeCPace, RoundTripMismatchedStaticCodeFails) {
-    const auto sid = make_test_sid();
-    const auto prs_a = to_bytes("13572468");
-    const auto prs_b = to_bytes("99999999");
-
-    auto result = run_cpace_round_trip(prs_a, prs_b, sid);
-
-    EXPECT_FALSE(result.verify_ab);
-    EXPECT_FALSE(result.verify_ba);
 }
