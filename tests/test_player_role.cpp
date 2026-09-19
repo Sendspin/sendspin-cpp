@@ -19,6 +19,7 @@
 /// races a background consumer: the encoded ring and the inbox hold whatever a handler put there.
 /// The binary audio chunk header is parsed directly too.
 
+#include "fake_persistence.h"
 #include "inbox.h"
 #include "player_role_impl.h"  // build_state_fields(); private access, see tests/CMakeLists.txt
 #include "protocol_messages.h"
@@ -32,6 +33,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -434,4 +436,100 @@ TEST(PlayerTeardownGeneration, ServerCommandIsNotAppliedAfterATeardown) {
     ASSERT_TRUE(impl->event_state->command_slot.take(merged));
     ASSERT_TRUE(merged.player.has_value());
     EXPECT_EQ(merged.player->volume.value_or(0), 70);
+}
+
+// ============================================================================
+// Output delay: spec clamp, write avoidance, and the persisted-value range
+// ============================================================================
+
+namespace {
+
+// roles/player/v1.md "Output delay": the delay a player accepts is at most 5000 ms. Spelled out
+// rather than read from the production constant, which is what the clamp is being checked against.
+constexpr uint16_t MAX_OUTPUT_DELAY_MS = 5000;
+
+std::vector<uint8_t> to_bytes(const std::string& text) {
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+// A started client whose player persists through `provider`, with the delay knob adjustable so
+// get_output_delay_ms() reports the stored value rather than 0.
+struct DelayClient {
+    explicit DelayClient(InMemoryPersistenceProvider& provider, uint16_t initial_delay_ms = 0)
+        : client(make_client_config("player-output-delay")) {
+        this->client.set_persistence_provider(&provider);
+        PlayerRoleConfig config;
+        config.audio_formats = {{SendspinCodecFormat::PCM, 2, 44100, 16}};
+        config.initial_output_delay_ms = initial_delay_ms;
+        this->player = &this->client.add_player(std::move(config));
+        EXPECT_TRUE(this->client.start());
+        this->player->set_output_delay_adjustable(true);
+    }
+    ~DelayClient() {
+        this->client.stop();
+    }
+
+    SendspinClient client;
+    PlayerRole* player{nullptr};
+};
+
+std::string persisted_delay(const InMemoryPersistenceProvider& provider) {
+    auto blob = provider.blob(persistence_keys::OUTPUT_DELAY);
+    return blob.has_value() ? std::string(blob->begin(), blob->end()) : std::string();
+}
+
+}  // namespace
+
+// A server (or a consumer control) asking for more than the spec allows is held at the maximum
+// rather than accepted, so the player never reports a delay it may not run at.
+TEST(PlayerRoleOutputDelay, RequestOverTheSpecMaximumIsClamped) {
+    InMemoryPersistenceProvider provider;
+    DelayClient fixture(provider);
+
+    fixture.player->update_output_delay(60000);
+    EXPECT_EQ(fixture.player->get_output_delay_ms(), MAX_OUTPUT_DELAY_MS);
+    EXPECT_EQ(persisted_delay(provider), "5000") << "the clamped value must be what is stored";
+
+    // Control: a value inside the range reaches the player unchanged.
+    fixture.player->update_output_delay(MAX_OUTPUT_DELAY_MS - 1);
+    EXPECT_EQ(fixture.player->get_output_delay_ms(), MAX_OUTPUT_DELAY_MS - 1);
+}
+
+// A server that re-sends the delay it already set must not cost a flash write, which on device is
+// the difference between an idle session and one that wears NVS down.
+TEST(PlayerRoleOutputDelay, SettingTheValueItAlreadyHasCostsNoWrite) {
+    InMemoryPersistenceProvider provider;
+    DelayClient fixture(provider);
+
+    fixture.player->update_output_delay(1234);
+    const int writes = provider.save_attempts(persistence_keys::OUTPUT_DELAY);
+    ASSERT_GE(writes, 1);
+
+    fixture.player->update_output_delay(1234);
+    EXPECT_EQ(provider.save_attempts(persistence_keys::OUTPUT_DELAY), writes)
+        << "an unchanged output delay was written again";
+
+    // Control: a different value is written.
+    fixture.player->update_output_delay(1235);
+    EXPECT_EQ(provider.save_attempts(persistence_keys::OUTPUT_DELAY), writes + 1);
+}
+
+// A stored blob that parses cleanly but names a delay above the spec maximum is discarded rather
+// than loaded and then reported to the server. The configured initial value is not a fallback
+// here: it applies only when nothing was stored, so the delay stays at 0.
+TEST(PlayerRoleOutputDelay, PersistedValueOverTheSpecMaximumIsDiscarded) {
+    InMemoryPersistenceProvider provider;
+    provider.seed_blob(persistence_keys::OUTPUT_DELAY, to_bytes("60000"));
+
+    DelayClient fixture(provider, /*initial_delay_ms=*/77);
+    EXPECT_EQ(fixture.player->get_output_delay_ms(), 0u);
+}
+
+// Control: a stored value at the maximum is in range and is loaded.
+TEST(PlayerRoleOutputDelay, PersistedValueAtTheSpecMaximumIsLoaded) {
+    InMemoryPersistenceProvider provider;
+    provider.seed_blob(persistence_keys::OUTPUT_DELAY, to_bytes("5000"));
+
+    DelayClient fixture(provider, /*initial_delay_ms=*/77);
+    EXPECT_EQ(fixture.player->get_output_delay_ms(), MAX_OUTPUT_DELAY_MS);
 }
