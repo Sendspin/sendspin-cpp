@@ -71,10 +71,6 @@ constexpr uint16_t INACTIVE_TRAFFIC_TEST_PORT = 19039;
 constexpr uint16_t VERSION_REPLACED_TEST_PORT = 19040;
 constexpr uint16_t ARTWORK_BUFFERS_TEST_PORT = 19051;
 
-/// Bound on every pump/wait: generous next to the loopback round trips involved, so the verdict
-/// comes from the predicate rather than the clock.
-constexpr int PUMP_TIMEOUT_MS = 6000;
-
 /// How long a scenario pumps to give a callback that must NOT fire every chance to fire.
 constexpr int SETTLE_MS = 300;
 
@@ -109,14 +105,6 @@ std::string controller_state_json(uint8_t volume) {
     return R"({"type":"server/state","payload":{"controller":{"supported_commands":["play"],)"
            R"("volume":)" +
            std::to_string(volume) + R"(,"muted":false,"repeat":"off","shuffle":false}}})";
-}
-
-VisualizerRoleConfig make_visualizer_config() {
-    VisualizerRoleConfig config;
-    config.stream.types = {VisualizerDataType::LOUDNESS};
-    config.support.buffer_capacity = 4096;
-    config.stream.rate_max = 30;
-    return config;
 }
 
 ArtworkRoleConfig make_artwork_config() {
@@ -159,9 +147,6 @@ public:
     int last_clear_slot{-1};
 };
 
-/// A paired fake server connected to the bundle's client on `port`.
-// Pumps until the peer has written at least `target` audio callbacks, feeding 20 ms PCM chunks
-// stamped a little ahead of now so the sync task has something to schedule.
 // Pumps until `done`, feeding loudness frames stamped for immediate display.
 bool send_loudness_until(SendspinClient& client, FakeEncryptedServer& server,
                          const std::function<bool()>& done) {
@@ -176,7 +161,7 @@ bool send_loudness_until(SendspinClient& client, FakeEncryptedServer& server,
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             return false;
         },
-        PUMP_TIMEOUT_MS);
+        FIXTURE_PUMP_TIMEOUT_MS);
 }
 
 // roles/artwork/v1.md "Artwork (Binary)": [type][flags][timestamp][total_size], flags bit 1 set.
@@ -187,7 +172,7 @@ std::vector<uint8_t> artwork_announce(int64_t timestamp, uint32_t total_size) {
     return body;
 }
 
-// [type][flags][data], no flag bits set.
+// roles/artwork/v1.md "Artwork (Binary)": [type][flags][data], no flag bits set.
 std::vector<uint8_t> artwork_part(size_t length) {
     std::vector<uint8_t> body{SENDSPIN_BINARY_ARTWORK_IMAGE, 0x00};
     for (size_t i = 0; i < length; ++i) {
@@ -234,13 +219,13 @@ TEST(RoleDeactivation, RemovedPlayerStopsTheStreamAndLeavesTheOtherRolesAlone) {
             return player_listener.stream_starts == 1 && visualizer_listener.stream_starts == 1 &&
                    metadata_listener.updates == 1;
         },
-        PUMP_TIMEOUT_MS));
+        FIXTURE_PUMP_TIMEOUT_MS));
     ASSERT_TRUE(stream_audio_until(client, *server, player_listener, 1));
     ASSERT_TRUE(client.player()->impl_->sync_task->is_running());
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["visualizer@v1","metadata@v1"])")));
     ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_ends == 1; }, PUMP_TIMEOUT_MS))
+        client, [&] { return player_listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
         << "the removed player role never reported its stream ending";
     EXPECT_FALSE(client.player()->impl_->sync_task->is_running())
         << "the sync task kept decoding a stream the activation removed";
@@ -294,13 +279,13 @@ TEST(RoleDeactivation, RemovedVisualizerEndsTheStreamAndStopsDelivery) {
     ASSERT_TRUE(pump_until(
         client,
         [&] { return visualizer_listener.stream_starts == 1 && player_listener.stream_starts == 1; },
-        PUMP_TIMEOUT_MS));
+        FIXTURE_PUMP_TIMEOUT_MS));
     ASSERT_TRUE(send_loudness_until(
         client, *server, [&] { return visualizer_listener.loudness.load() >= 1; }));
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1"])")));
     ASSERT_TRUE(pump_until(
-        client, [&] { return visualizer_listener.stream_ends == 1; }, PUMP_TIMEOUT_MS))
+        client, [&] { return visualizer_listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
         << "the removed visualizer role never reported its stream ending";
     EXPECT_FALSE(client.visualizer()->impl_->stream_active.load())
         << "the visualizer still accepts frames for a role the activation removed";
@@ -322,11 +307,11 @@ TEST(RoleDeactivation, RemovedVisualizerEndsTheStreamAndStopsDelivery) {
     pump_for(client, 100);
 }
 
-// An activation that drops artwork@v1 clears every channel (roles/artwork/v1.md has an artwork
-// stream/end clear the current image and discard the pending one, and the removal applies the
-// same teardown) and drops the transfer that was in flight. Adding the role back gives a working
-// channel again: a whole image announced afterwards decodes, with none of the abandoned bytes in
-// it.
+// An activation that drops artwork@v1 clears every channel (roles/artwork/v1.md
+// "Artwork (Binary)" has an artwork stream/end clear the current image and discard the pending
+// one, and the removal applies the same teardown) and drops the transfer that was in flight.
+// Adding the role back gives a working channel again: a whole image announced afterwards decodes,
+// with none of the abandoned bytes in it.
 TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel) {
     constexpr uint32_t IMAGE_BYTES = 64;
     RecordingArtworkListener artwork_listener;
@@ -348,12 +333,12 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), IMAGE_BYTES)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(IMAGE_BYTES / 2)));
     ASSERT_TRUE(pump_until(
-        client, [&] { return client.artwork()->impl_->transfer.in_flight; }, PUMP_TIMEOUT_MS))
+        client, [&] { return client.artwork()->impl_->transfer.in_flight; }, FIXTURE_PUMP_TIMEOUT_MS))
         << "the half-sent image never registered as a transfer in flight";
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["metadata@v1"])")));
     ASSERT_TRUE(pump_until(
-        client, [&] { return artwork_listener.clears == 1; }, PUMP_TIMEOUT_MS))
+        client, [&] { return artwork_listener.clears == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
         << "the removed artwork role never cleared its channel";
     EXPECT_EQ(artwork_listener.last_clear_slot, 0);
     EXPECT_FALSE(client.artwork()->impl_->transfer.in_flight)
@@ -368,7 +353,7 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), IMAGE_BYTES)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(IMAGE_BYTES)));
     ASSERT_TRUE(pump_until(
-        client, [&] { return artwork_listener.decodes.load() == 1; }, PUMP_TIMEOUT_MS))
+        client, [&] { return artwork_listener.decodes.load() == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
         << "the re-added artwork role decoded nothing";
     EXPECT_EQ(artwork_listener.last_decode_length.load(), IMAGE_BYTES);
 
@@ -398,7 +383,7 @@ TEST(RoleDeactivation, StoppingTheArtworkRoleReleasesItsImageBuffers) {
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), IMAGE_BYTES)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(IMAGE_BYTES)));
     ASSERT_TRUE(pump_until(
-        client, [&] { return artwork_listener.decodes.load() == 1; }, PUMP_TIMEOUT_MS))
+        client, [&] { return artwork_listener.decodes.load() == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
         << "the image never decoded, so no buffer was ever claimed";
 
     auto* drain = client.artwork()->impl_->drain_task.get();
@@ -453,7 +438,7 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
             return metadata_listener.updates == 1 && color_listener.updates == 1 &&
                    controller_listener.updates == 1 && player_listener.stream_starts == 1;
         },
-        PUMP_TIMEOUT_MS));
+        FIXTURE_PUMP_TIMEOUT_MS));
     // What the receive gate would hand a metadata handler admitted right now, kept for the
     // overtaken-handler check at the end.
     const uint32_t metadata_generation =
@@ -470,7 +455,7 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
             return client.metadata()->impl_->held_state.has_value() &&
                    client.color()->impl_->held_state.has_value();
         },
-        PUMP_TIMEOUT_MS))
+        FIXTURE_PUMP_TIMEOUT_MS))
         << "the scheduled updates never reached the roles";
     ASSERT_EQ(metadata_listener.updates, 1) << "a scheduled update was applied early";
 
@@ -481,7 +466,7 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
             return metadata_listener.clears == 1 && color_listener.clears == 1 &&
                    controller_listener.clears == 1;
         },
-        PUMP_TIMEOUT_MS))
+        FIXTURE_PUMP_TIMEOUT_MS))
         << "a removed state role never told its listener";
 
     EXPECT_FALSE(client.metadata()->impl_->held_state.has_value())
@@ -523,7 +508,7 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
         std::move(current),
         client.metadata()->impl_->cleanup_generation.load(std::memory_order_acquire));
     ASSERT_TRUE(pump_until(
-        client, [&] { return metadata_listener.updates == 2; }, PUMP_TIMEOUT_MS));
+        client, [&] { return metadata_listener.updates == 2; }, FIXTURE_PUMP_TIMEOUT_MS));
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -558,7 +543,7 @@ TEST(RoleDeactivation, ActivationThatRemovesNoRoleTearsNothingDown) {
     ASSERT_TRUE(pump_until(
         client,
         [&] { return player_listener.stream_starts == 1 && metadata_listener.updates == 1; },
-        PUMP_TIMEOUT_MS));
+        FIXTURE_PUMP_TIMEOUT_MS));
 
     // Same set again.
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1","metadata@v1"])")));
@@ -601,18 +586,18 @@ TEST(RoleDeactivation, ReAddedPlayerPublishesItsStateAndPlaysAgain) {
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_starts == 1; }, PUMP_TIMEOUT_MS));
+        client, [&] { return player_listener.stream_starts == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
     ASSERT_TRUE(stream_audio_until(client, *server, player_listener, 1));
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["metadata@v1"])")));
     ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_ends == 1; }, PUMP_TIMEOUT_MS));
+        client, [&] { return player_listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
 
     const int states_before_readd = server->client_state_count();
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1","metadata@v1"])")));
     ASSERT_TRUE(pump_until(
         client, [&] { return server->client_state_count() > states_before_readd; },
-        PUMP_TIMEOUT_MS))
+        FIXTURE_PUMP_TIMEOUT_MS))
         << "the activation that added the player back published no client/state";
     {
         JsonDocument doc;
@@ -625,7 +610,7 @@ TEST(RoleDeactivation, ReAddedPlayerPublishesItsStateAndPlaysAgain) {
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_starts == 2; }, PUMP_TIMEOUT_MS))
+        client, [&] { return player_listener.stream_starts == 2; }, FIXTURE_PUMP_TIMEOUT_MS))
         << "the re-added player role never started a stream again";
     const size_t writes_before = player_listener.audio_writes.load();
     EXPECT_TRUE(stream_audio_until(client, *server, player_listener, writes_before + 1))
@@ -681,7 +666,7 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeARemovalNeverStarts) {
             return (client.player()->impl_->inbox->poll() & INBOX_TOPIC_EVENTS) != 0 &&
                    client.connection_manager_->has_pending_events_.load();
         },
-        PUMP_TIMEOUT_MS))
+        FIXTURE_PUMP_TIMEOUT_MS))
         << "the stream/start and the activate never both arrived";
 
     pump_for(client, SETTLE_MS);
@@ -729,11 +714,11 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeAKeepingActivateStillStarts) {
             return (client.player()->impl_->inbox->poll() & INBOX_TOPIC_EVENTS) != 0 &&
                    client.connection_manager_->has_pending_events_.load();
         },
-        PUMP_TIMEOUT_MS))
+        FIXTURE_PUMP_TIMEOUT_MS))
         << "the stream/start and the activate never both arrived";
 
     ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_starts == 1; }, PUMP_TIMEOUT_MS))
+        client, [&] { return player_listener.stream_starts == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
         << "an activation that removed nothing swallowed the queued stream/start";
     EXPECT_TRUE(stream_audio_until(client, *server, player_listener, 1));
 
@@ -793,14 +778,14 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
                    metadata_listener.updates == 1 && color_listener.updates == 1 &&
                    controller_listener.updates == 1;
         },
-        PUMP_TIMEOUT_MS));
+        FIXTURE_PUMP_TIMEOUT_MS));
     ASSERT_TRUE(stream_audio_until(client, *server, player_listener, 1));
     ASSERT_TRUE(send_loudness_until(
         client, *server, [&] { return visualizer_listener.loudness.load() >= 1; }));
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), 32)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(32)));
     ASSERT_TRUE(pump_until(
-        client, [&] { return artwork_listener.decodes.load() == 1; }, PUMP_TIMEOUT_MS));
+        client, [&] { return artwork_listener.decodes.load() == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
 
     // Every role out.
     ASSERT_TRUE(server->send_app_json(activate_json(R"([])")));
@@ -811,7 +796,7 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
                    metadata_listener.clears == 1 && color_listener.clears == 1 &&
                    controller_listener.clears == 1 && artwork_listener.clears == 1;
         },
-        PUMP_TIMEOUT_MS));
+        FIXTURE_PUMP_TIMEOUT_MS));
 
     const size_t writes_after_removal = player_listener.audio_writes.load();
     const size_t loudness_after_removal = visualizer_listener.loudness.load();
@@ -820,7 +805,7 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     ASSERT_TRUE(pump_until(
         client,
         [&] { return client.player()->impl_->sync_task->encoded_ring_buffer_->is_empty(); },
-        PUMP_TIMEOUT_MS));
+        FIXTURE_PUMP_TIMEOUT_MS));
 
     // The same traffic again, now for roles the server has removed.
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
@@ -867,14 +852,14 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     // whether or not its role is active. Last, because it ends the connection.
     ASSERT_TRUE(server->send_binary_body({SENDSPIN_BINARY_ARTWORK_IMAGE}));
     EXPECT_TRUE(pump_until(
-        client, [&] { return !client.is_connected(); }, PUMP_TIMEOUT_MS))
+        client, [&] { return !client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS))
         << "a malformed artwork message was excused because its role was inactive";
 
     pump_for(client, 100);
 }
 
 // ============================================================================
-// Removal without an explicit shrunken active_roles
+// Removal by version replacement
 // ============================================================================
 
 // messaging.md "server/activate": "Role removal includes ... replacement of an active role
@@ -903,12 +888,12 @@ TEST(RoleDeactivation, ReplacingARoleVersionRemovesTheVersionInUse) {
     ASSERT_TRUE(pump_until(
         client,
         [&] { return player_listener.stream_starts == 1 && metadata_listener.updates == 1; },
-        PUMP_TIMEOUT_MS));
+        FIXTURE_PUMP_TIMEOUT_MS));
     ASSERT_TRUE(stream_audio_until(client, *server, player_listener, 1));
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v2","metadata@v1"])")));
     ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_ends == 1; }, PUMP_TIMEOUT_MS))
+        client, [&] { return player_listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
         << "replacing player@v1 with a version the client does not implement left it running";
     EXPECT_FALSE(client.player()->impl_->sync_task->is_running());
     EXPECT_EQ(metadata_listener.clears, 0) << "a role the activation kept was torn down";

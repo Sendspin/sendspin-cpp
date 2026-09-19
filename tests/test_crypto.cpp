@@ -36,13 +36,13 @@
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
-// =============================================================================
+// ============================================================================
 // SHA-512 / HMAC-SHA-512 KATs
 //
 // Validate the self-contained SHA-512 in platform/crypto.h against FIPS 180-4 and
 // RFC 4231 known-answer vectors. These catch any transcription error in the round
 // constants or padding, and cover the multi-block and streaming paths.
-// =============================================================================
+// ============================================================================
 
 TEST(Sha512, EmptyString) {
     auto d = sha512_oneshot(reinterpret_cast<const uint8_t*>(""), 0);
@@ -103,14 +103,14 @@ TEST(HmacSha512, Rfc4231Case2) {
               "9758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737");
 }
 
-// =============================================================================
+// ============================================================================
 // SHA-256 (Sha256 class / sha256_oneshot) KATs
 //
 // noise-c's SHA256 backend has no test hook to force an allocation/finalize failure, so the
 // failure branch inside Sha256::ok() cannot be exercised here; the callers that must surface it
 // (psk_id_for, derive_psk_wrap_key/wrap_psk/unwrap_psk, SENTINEL_PSK) are covered through their
 // own std::optional-returning KATs in this file and test_psk_wrap.cpp.
-// =============================================================================
+// ============================================================================
 
 TEST(Sha256, KatAbc) {
     // NIST FIPS 180-4 SHA-256("abc"), via both the one-shot helper and the streaming class.
@@ -127,9 +127,9 @@ TEST(Sha256, KatAbc) {
     EXPECT_TRUE(h.ok()) << "ok() must stay true across a normal update()/finalize() cycle";
 }
 
-// =============================================================================
+// ============================================================================
 // Constants KATs  (mirrors test_constants.py)
-// =============================================================================
+// ============================================================================
 
 TEST(CryptoConstants, SentinelPskMatchesSpecHex) {
     // SENTINEL_PSK = SHA-256("sendspin-sentinel-psk-v1")
@@ -149,9 +149,9 @@ TEST(CryptoConstants, PskIdLabelIsLiteralUtf8NoNul) {
     EXPECT_EQ(PSK_ID_LABEL.find('\0'), std::string_view::npos);
 }
 
-// =============================================================================
+// ============================================================================
 // Base64url KATs  (mirrors test_keys.py)
-// =============================================================================
+// ============================================================================
 
 TEST(B64Url, RoundTrip) {
     std::array<uint8_t, 32> data{};
@@ -222,9 +222,9 @@ TEST(B64Url, DecodeRejectsEmbeddedWhitespace) {
     EXPECT_FALSE(b64url_decode("Zm9v Yg").has_value());
 }
 
-// =============================================================================
+// ============================================================================
 // PSK-ID derivation KATs  (mirrors test_keys.py)
-// =============================================================================
+// ============================================================================
 
 TEST(PskId, Is43CharsNoPadding) {
     std::array<uint8_t, NOISE_PSK_SIZE> all_zero{};
@@ -242,9 +242,9 @@ TEST(PskId, RejectsNon32ByteInput) {
     EXPECT_FALSE(psk_id_for(long_psk.data(), long_psk.size()).has_value());
 }
 
-// =============================================================================
+// ============================================================================
 // Identity KATs  (mirrors test_keys.py)
-// =============================================================================
+// ============================================================================
 
 TEST(Identity, GenerateShapes) {
     Identity id = Identity::generate().value();

@@ -71,7 +71,7 @@ inline std::array<uint8_t, N> from_hex_arr(const char* s) {
     return a;
 }
 
-/// Appends val as 8 big-endian bytes: the timestamp every binary role message starts with.
+/// Appends val as 8 big-endian bytes: the timestamp a binary role message carries.
 inline void put_be64(std::vector<uint8_t>& out, int64_t val) {
     auto u = static_cast<uint64_t>(val);
     for (int i = 7; i >= 0; --i) {

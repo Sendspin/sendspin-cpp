@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Unit tests for the admission/trust enforcement and arbitration functions: the allowed-activity
-// -set table and rejection order in messaging.md "server/activate", and the priority rules in
-// connection.md "Multiple servers (server-initiated)".
+// Unit tests for the admission/trust enforcement and arbitration functions:
+// the allowed-activity-set table and rejection order in messaging.md "server/activate", and the
+// priority rules in connection.md "Multiple servers (server-initiated)".
 
 #include "admission.h"
 #include "protocol_messages.h"

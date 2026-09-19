@@ -72,7 +72,10 @@ Each `test_*.cpp` file covers one unit of cross-platform logic:
 - `test_connection_lifecycle.cpp`: the connection nursery (prove-then-admit) over real loopback
   sockets: junk probes, slow peers, capacity, and the liveness timeout.
 - `test_encrypted_lifecycle.cpp`: the Noise transport end to end over loopback: re-handshake,
-  pairing over the pairing PSK, `server/unpair`, and pre-admission traffic.
+  pairing over the pairing PSK, `server/unpair`, pre-admission traffic and the held-message
+  replay with its two budgets, the admission lock order, `client/leave` gating, the
+  `client/state` role-object rules, the combined `['playback','pairing']` activate, and the
+  re-prove watchdog.
 - `test_client_lifecycle.cpp`: `start()`/`stop()`/restart: goodbyes, clear callbacks delivered
   inside `stop()`, re-entrancy from callbacks, role start rollback, and the high-performance
   hold.
@@ -90,6 +93,9 @@ The loopback tests share `lifecycle_test_fixtures.h`: `FakeEncryptedServer` and
 and `PairedClientBundle` wires a client to a seeded record store. Every connection is encrypted,
 so there is no cleartext fake; the fake sends its `server/hello` as soon as the handshake
 completes, before any `client/hello`, so that ordering is exercised by every test.
+
+`tests/wrap_test_helpers.h` holds the server side of pairing.md "Wrapping", so a test can open
+what the client sealed without the library carrying an inverse it never calls.
 
 These are white-box tests: they include private headers from `src/`, so the test target adds
 `src/` to its include path. To add a new test file, create `test_<unit>.cpp` here and add it to

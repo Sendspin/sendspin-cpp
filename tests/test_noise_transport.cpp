@@ -63,9 +63,9 @@ extern "C" {
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
-// =============================================================================
+// ============================================================================
 // Minimal in-process SendspinConnection for testing transport helpers
-// =============================================================================
+// ============================================================================
 
 /// @brief Concrete SendspinConnection that captures sent binary frames.
 /// Used to verify encrypt_and_send_frame / fragment_and_send output without a real WS socket.
@@ -193,9 +193,9 @@ private:
     std::mutex capture_mutex_;
 };
 
-// =============================================================================
+// ============================================================================
 // Helpers shared by handshake tests
-// =============================================================================
+// ============================================================================
 
 /// Build and return `server/init` JSON for the given server_id and version.
 static std::string make_server_init(const std::string& server_id, int version = 1) {
@@ -235,9 +235,9 @@ static std::optional<std::vector<uint8_t>> extract_noise_bytes(const std::string
 // HsGuard, CipherPair, and build_initiator (the raw noise-c KKpsk2 initiator builder playing
 // the "server" role) come from noise_test_helpers.h.
 
-// =============================================================================
+// ============================================================================
 // Full handshake loopback helper
-// =============================================================================
+// ============================================================================
 
 /// @brief Run a complete Noise KKpsk2 loopback handshake for one cipher suite.
 ///
@@ -394,9 +394,9 @@ static std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
     return result;
 }
 
-// =============================================================================
+// ============================================================================
 // Suite-parameterized full handshake tests
-// =============================================================================
+// ============================================================================
 
 TEST(NoiseHandshakeLoopback, KKpsk2ChaChaPoly_FullHandshake) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
@@ -406,9 +406,9 @@ TEST(NoiseHandshakeLoopback, KKpsk2ChaChaPoly_FullHandshake) {
     EXPECT_NE(r->initiator.recv_cs, nullptr);
 }
 
-// =============================================================================
+// ============================================================================
 // Handshake hash is available and non-zero after split
-// =============================================================================
+// ============================================================================
 
 TEST(NoiseHandshakeLoopback, HandshakeHashAvailable) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
@@ -418,9 +418,9 @@ TEST(NoiseHandshakeLoopback, HandshakeHashAvailable) {
     EXPECT_FALSE(all_zero) << "handshake_hash() should not be all-zero after successful handshake";
 }
 
-// =============================================================================
+// ============================================================================
 // Transport round-trip (both directions)
-// =============================================================================
+// ============================================================================
 
 /// @brief Encrypt with initiator send_cs, decrypt with NoiseSession (responder recv),
 /// and vice versa.
@@ -477,9 +477,9 @@ TEST(NoiseTransport, BinaryNonZeroTypeRoundTrip) {
     check_transport_roundtrip(*r, plaintext);
 }
 
-// =============================================================================
+// ============================================================================
 // Fragment and reassemble (TestConnection dispatch loop)
-// =============================================================================
+// ============================================================================
 
 // raw_decrypt() (from noise_test_helpers.h) decrypts one frame using the initiator recv cipher.
 
@@ -577,9 +577,9 @@ TEST(NoiseTransport, ReceiveEncryptedBinary_JsonDispatch) {
     EXPECT_EQ(dispatched_json, json);
 }
 
-// =============================================================================
+// ============================================================================
 // Fragmentation: payload just over MAX_TRANSPORT_PLAINTEXT
-// =============================================================================
+// ============================================================================
 
 TEST(NoiseTransport, FragmentOverMaxTransportPlaintext) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
@@ -613,9 +613,9 @@ TEST(NoiseTransport, FragmentOverMaxTransportPlaintext) {
     }
 }
 
-// =============================================================================
+// ============================================================================
 // Error cases: driver abort on bad inputs
-// =============================================================================
+// ============================================================================
 
 TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     Identity client_id = Identity::generate().value();
@@ -662,14 +662,10 @@ TEST(NoiseHandshakeDriver, CounterpartyMismatchAborts) {
     EXPECT_EQ(r2, HandshakeFrameResult::ABORT);
 }
 
-// =============================================================================
+// ============================================================================
 // psk_category in the Noise message 1 payload
-// =============================================================================
+// ============================================================================
 
-// Drives the handshake driver to Noise message 1 against a store holding one long-term record,
-// with the message 1 payload the caller supplies, and reports what the driver made of it. The
-// initiator always uses the record's PSK, so message 1 authenticates and the payload is the only
-// variable.
 /// What the driver made of one Noise message 1.
 struct Msg1Outcome {
     HandshakeFrameResult result{HandshakeFrameResult::ABORT};
@@ -680,6 +676,10 @@ struct Msg1Outcome {
     bool peer_read_msg2{false};
 };
 
+// Drives the handshake driver to Noise message 1 against a store holding one long-term record,
+// with the message 1 payload the caller supplies, and reports what the driver made of it. The
+// initiator always uses the record's PSK, so message 1 authenticates and the payload is the only
+// variable.
 Msg1Outcome run_msg1_with_payload(
     const std::function<std::string(const std::string& psk_id)>& make_payload,
     bool store_record = true) {
@@ -896,9 +896,9 @@ TEST(NoiseHandshakeDriver, WrongVersionAborts) {
     EXPECT_EQ(r, HandshakeFrameResult::ABORT);
 }
 
-// =============================================================================
+// ============================================================================
 // accept_plaintext: fragment sequence rules (messaging.md "Fragmentation")
-// =============================================================================
+// ============================================================================
 
 /// A receiver connection wired to a loopback handshake, with a helper that encrypts one
 /// plaintext frame with the peer's send cipher and feeds it in as if it had arrived off the
@@ -1222,9 +1222,9 @@ TEST(FragmentSequence, FirstFragmentInsideADiscardedSequenceCloses) {
     EXPECT_EQ(rx.json_dispatched_, 0);
 }
 
-// =============================================================================
+// ============================================================================
 // Pre-authentication receive-buffer cap (prepare_receive_buffer)
-// =============================================================================
+// ============================================================================
 
 TEST(ReceiveBufferCap, SingleFrameOverCapRejected) {
     // A single call declaring more than MAX_TRANSPORT_PLAINTEXT + 16 (the largest legitimate
@@ -1324,9 +1324,9 @@ TEST(NoiseTransportDispatch, HandshakeAbortClosesConnection) {
     EXPECT_TRUE(conn.sent_binary_.empty());
 }
 
-// =============================================================================
+// ============================================================================
 // End-to-end fragment + reassembly through the receive (decrypt) path
-// =============================================================================
+// ============================================================================
 
 // raw_encrypt() (from noise_test_helpers.h) encrypts one plaintext frame with the "server" send
 // cipher (advances its nonce).
@@ -1449,9 +1449,9 @@ TEST(NoiseTransport, FragmentReassembleBinaryReceive) {
     EXPECT_EQ(got, plaintext);  // full type-prefixed payload preserved
 }
 
-// =============================================================================
+// ============================================================================
 // Transport-mode decrypt failure: a tampered ciphertext is dropped, not dispatched
-// =============================================================================
+// ============================================================================
 
 TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
     // An AEAD failure in transport mode must not just drop the frame: the
@@ -1491,9 +1491,9 @@ TEST(NoiseTransport, TamperedCiphertextClosesConnection) {
     EXPECT_TRUE(conn.sent_binary_.empty());
 }
 
-// =============================================================================
+// ============================================================================
 // Fragmentation threshold: exactly at and one byte over MAX_TRANSPORT_PLAINTEXT
-// =============================================================================
+// ============================================================================
 
 TEST(NoiseTransport, FragmentBoundaryExactLimit) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
@@ -1615,13 +1615,13 @@ TEST(NoiseTransport, FragmentContinuationCapAtThreeFrames) {
         << "tail carries the single leftover byte behind its fragment type and flags";
 }
 
-// =============================================================================
+// ============================================================================
 // send_buf_ growth: the reused non-fragmented send buffer grows on demand instead of a fixed
 // MAX_TRANSPORT_PLAINTEXT + 16 allocation. There is no accessor for its capacity, so these
 // exercise growth indirectly: a sequence of increasing sizes (including a shrink back down,
 // which must not lose or corrupt data) and the exact MAX_TRANSPORT_PLAINTEXT boundary, all
 // round-tripping through encrypt/decrypt correctly on one shared transport instance.
-// =============================================================================
+// ============================================================================
 
 TEST(NoiseTransport, SendJson_GrowingSizesRoundTrip) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
@@ -1703,9 +1703,9 @@ TEST(NoiseTransport, SendBinaryRejectsTheFragmentMessageType) {
     EXPECT_EQ(conn.sent_binary_.size(), 1u);
 }
 
-// =============================================================================
+// ============================================================================
 // Malformed Noise message 1 aborts the handshake
-// =============================================================================
+// ============================================================================
 
 TEST(NoiseHandshakeDriver, MalformedMsg1EmptyAborts) {
     Identity client_id = Identity::generate().value();
@@ -1740,9 +1740,9 @@ TEST(NoiseHandshakeDriver, MalformedMsg1GarbageAborts) {
               HandshakeFrameResult::ABORT);
 }
 
-// =============================================================================
+// ============================================================================
 // Concurrent sends
-// =============================================================================
+// ============================================================================
 
 // The fragments of one logical message must reach the wire consecutively. A peer that sees a
 // non-fragment frame while a fragmented message is in flight treats it as a spec

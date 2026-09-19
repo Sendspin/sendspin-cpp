@@ -64,9 +64,9 @@
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
-// =============================================================================
+// ============================================================================
 // Test helpers
-// =============================================================================
+// ============================================================================
 
 /// Build an accepted Pairing PSK.
 static SendspinPairingPsk make_pairing_psk(const std::optional<std::string>& label = {}) {
@@ -110,9 +110,9 @@ public:
     int save_attempts{0};
 };
 
-// =============================================================================
+// ============================================================================
 // Basic construction / first-boot provisioning
-// =============================================================================
+// ============================================================================
 
 TEST(RecordStore, FirstBootProvisioningCreatesPairingPsk) {
     RecordStore store(nullptr);
@@ -179,9 +179,9 @@ TEST(RecordStore, FirstBootPskIdIsSentinelPskIdResolvable) {
     EXPECT_EQ(resolved->psk, SENTINEL_PSK);
 }
 
-// =============================================================================
+// ============================================================================
 // Booting from a blob store seeded purely via the public codec
-// =============================================================================
+// ============================================================================
 
 // A provider seeded entirely through sendspin/persistence_codec.h (no RecordStore involved)
 // must be read back as-is, with no first-boot re-provisioning: the seeded material is complete
@@ -231,9 +231,9 @@ TEST(RecordStore, CorruptRecordsBlobFallsBackToEmptyStore) {
     EXPECT_TRUE(store.pairing_psk().has_value());
 }
 
-// =============================================================================
+// ============================================================================
 // Records: reject wrong PSK size
-// =============================================================================
+// ============================================================================
 
 TEST(RecordStore, RecordsRejectWrongPskSize) {
     RecordStore store(nullptr);
@@ -251,9 +251,9 @@ TEST(RecordStore, RecordsRejectWrongPskSize) {
     EXPECT_FALSE(result2.has_value()) << "psk_id_for must reject > 32 bytes";
 }
 
-// =============================================================================
+// ============================================================================
 // store_record_superseding: at most one record per server_id
-// =============================================================================
+// ============================================================================
 
 // Re-pairing the same server_id twice (e.g. after the server was factory-reset and re-paired)
 // must revoke the prior per-server PSK rather than leaving it valid forever alongside the new
@@ -341,9 +341,9 @@ TEST(RecordStore, StoreRecordSupersedingIsRamOnlyUntilPersistRecords) {
     EXPECT_FALSE(rebooted.resolve_by_psk_id(replacement.psk_id, PskCategory::LONG_TERM).has_value());
 }
 
-// =============================================================================
+// ============================================================================
 // Capacity and eviction (pairing.md "Pairing Records")
-// =============================================================================
+// ============================================================================
 
 // Pairing at capacity must not fail: the store evicts a record instead, and the new one lands.
 TEST(RecordStore, CapacityEvictsRatherThanRefusingANewPairing) {
@@ -539,9 +539,9 @@ TEST(RecordStore, CapacityBelowTheProtocolFloorIsRaised) {
         << "nothing may be evicted before the floor is reached";
 }
 
-// =============================================================================
+// ============================================================================
 // resolve_by_psk_id: long-term first, then Pairing PSK, then Sentinel
-// =============================================================================
+// ============================================================================
 
 TEST(RecordStore, ResolveByPskIdLongTermFirst) {
     RecordStore store(nullptr);
@@ -650,9 +650,9 @@ TEST(RecordStore, ResolveByPskIdUnknownReturnsNullopt) {
     EXPECT_FALSE(resolved.has_value());
 }
 
-// =============================================================================
+// ============================================================================
 // record_by_server_id
-// =============================================================================
+// ============================================================================
 
 TEST(RecordStore, RecordByServerIdFindsStoredPubkeyRecord) {
     RecordStore store(nullptr);
@@ -669,9 +669,9 @@ TEST(RecordStore, RecordByServerIdFindsStoredPubkeyRecord) {
     EXPECT_EQ(store.record_by_server_id("server-Y"), nullptr);
 }
 
-// =============================================================================
+// ============================================================================
 // mark_record_used
-// =============================================================================
+// ============================================================================
 
 TEST(RecordStore, MarkRecordUsed) {
     RecordStore store(nullptr);
@@ -697,9 +697,9 @@ TEST(RecordStore, MarkRecordUsedOnAbsentPskIdIsNoOp) {
     store.mark_record_used("does-not-exist");
 }
 
-// =============================================================================
+// ============================================================================
 // remove_record and list
-// =============================================================================
+// ============================================================================
 
 TEST(RecordStore, RemoveRecordAndList) {
     RecordStore store(nullptr);
@@ -940,9 +940,9 @@ TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
 }
 
-// =============================================================================
+// ============================================================================
 // Pairing PSK lifecycle
-// =============================================================================
+// ============================================================================
 
 /// A persistence provider that hands back a Pairing PSK whose psk_id does not match its secret.
 class MismatchedPairingPskProvider : public SendspinPersistenceProvider {
@@ -988,9 +988,9 @@ TEST(RecordStore, LoadedPairingPskIdIsCorrected) {
         << "a loaded Pairing PSK must not trigger re-provisioning";
 }
 
-// =============================================================================
+// ============================================================================
 // Keypair persistence across "reboots" via FilePersistenceProvider
-// =============================================================================
+// ============================================================================
 
 class TempFile {
 public:
@@ -1269,9 +1269,9 @@ TEST(FilePersistenceProvider, PersistedFileIsOwnerOnly) {
         << "persisted file must be owner-read/write only, got mode " << mode_str;
 }
 
-// =============================================================================
+// ============================================================================
 // RecordStore with FilePersistenceProvider: first-boot provisioning persists
-// =============================================================================
+// ============================================================================
 
 TEST(RecordStoreWithFile, FirstBootProvisioningPersists) {
     TempFile tmp;
@@ -1334,9 +1334,9 @@ TEST(RecordStoreWithFile, RemoveRecordShrinksThePersistedBlob) {
     EXPECT_TRUE(found_b);
 }
 
-// =============================================================================
+// ============================================================================
 // Unpaired-access first-boot seed
-// =============================================================================
+// ============================================================================
 
 /// A persistence provider that hands back a canned pairing config, so a test can present a
 /// stored config without a first boot ever having written one. FilePersistenceProvider cannot:
@@ -1489,9 +1489,9 @@ TEST(RecordStoreWithFile, UnpairedAccessSeedDoesNotOverrideStoredConfig) {
     }
 }
 
-// =============================================================================
+// ============================================================================
 // resolve_pairing_outcome: normal and storage-exhausted paths
-// =============================================================================
+// ============================================================================
 
 // Normal case: storage is available -> returns {psk, record=set}.
 // The record must be bound to the given server_id/label and carry a psk_id matching the PSK.
@@ -1601,9 +1601,9 @@ TEST(RecordStore, RecordByPskIdCopyReturnsNulloptForAbsent) {
     EXPECT_FALSE(copy.has_value());
 }
 
-// =============================================================================
+// ============================================================================
 // Player output delay: ASCII-decimal round-trip via persistence_keys::OUTPUT_DELAY
-// =============================================================================
+// ============================================================================
 
 // update_output_delay() must persist an ASCII decimal string (not raw uint16_t bytes):
 // debuggable and endian-free, per persistence_keys::OUTPUT_DELAY's contract.
@@ -1668,7 +1668,8 @@ TEST(PlayerRoleOutputDelay, InvalidPersistedValueIsTreatedAsAbsent) {
 // ============================================================================
 
 // A STATIC_PAIRING_CODE blob that is not 8 decimal digits is rejected at load, exactly as
-// RECORDS and PAIRING_PSK are rejected by their decoders. Accepting it would leave the device advertising
+// RECORDS and PAIRING_PSK are rejected by their decoders. Accepting it would leave the device
+// advertising
 // static_pairing_code while feeding garbage PRS bytes to the PAKE.
 TEST(RecordStore, RejectsMalformedStoredStaticPairingCode) {
     for (const std::string& bad : {std::string("abcdefgh"), std::string("1234"),

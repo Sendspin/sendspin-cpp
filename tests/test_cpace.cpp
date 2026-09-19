@@ -36,9 +36,9 @@
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local
 
-// =============================================================================
+// ============================================================================
 // Building-block KATs
-// =============================================================================
+// ============================================================================
 
 // --- cpace_prepend_len ---
 // Reference: _prepend_len in cpace.py
@@ -302,9 +302,9 @@ TEST(CPacePrimitives, X25519ScalarMultGenerator) {
 
 // SHA-512/HMAC primitives are covered in test_crypto.cpp.
 
-// =============================================================================
+// ============================================================================
 // Full round-trip test: role A and role B with same PRS/sid
-// =============================================================================
+// ============================================================================
 
 // Helper: run a complete A-B exchange with FIXED scalars by invoking the
 // primitive functions directly (bypassing CPace::start's CSPRNG).
@@ -562,9 +562,9 @@ TEST(CPaceRoundTrip, DeriveIsRejectedTwice) {
     EXPECT_FALSE(side_a.derive(side_b.public_share().data(), CPACE_SHARE_SIZE));
 }
 
-// =============================================================================
+// ============================================================================
 // Low-order point rejection
-// =============================================================================
+// ============================================================================
 
 TEST(CPaceDeriveRejects, AllZeroPeerShare) {
     const std::vector<uint8_t> prs(reinterpret_cast<const uint8_t*>("test"),

@@ -38,9 +38,9 @@ using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local c
 
 namespace {
 
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Helpers
-// ---------------------------------------------------------------------------
+// ============================================================================
 
 /// Parse a JSON string into doc+root.  Returns false on malformed JSON.
 bool parse(const std::string& json, JsonDocument& doc, JsonObject& root) {
@@ -198,7 +198,8 @@ TEST(DynamicPairingCode, ParseServerPairAuthInvalidBase64) {
 // process_server_pair_confirm_message
 // ============================================================================
 
-// Control: the same parser accepts a well-formed server/pair-confirm, so each rejection below is the
+// Control: the same parser accepts a well-formed server/pair-confirm, so each rejection below is
+// the
 // field it names and not the parser refusing everything.
 TEST(DynamicPairingCode, ParseServerPairConfirmValid) {
     std::array<uint8_t, 64> server_kc{};
@@ -582,8 +583,10 @@ TEST(StaticPairingCode, ClientHelloLocationsHint) {
 // CPace round-trip using the static pairing-code sid construction
 // ============================================================================
 
-// The static pairing-code sid construction is identical to dynamic pairing code's (see make_test_sid() above);
-// only the PRS source differs (a preconfigured static pairing code vs a derived one). This exercises
+// The static pairing-code sid construction is identical to dynamic pairing code's (see
+// make_test_sid() above);
+// only the PRS source differs (a preconfigured static pairing code vs a derived one). This
+// exercises
 // the client (RESPONDER) against a stand-in server (INITIATOR) using the SAME 8-digit code.
 TEST(StaticPairingCodeCPace, RoundTripWithMatchingStaticCode) {
     const auto sid = make_test_sid();

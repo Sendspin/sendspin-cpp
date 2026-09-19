@@ -61,9 +61,9 @@ extern "C" {
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local convenience
 
-// =============================================================================
+// ============================================================================
 // Helpers
-// =============================================================================
+// ============================================================================
 
 // HsGuard, CipherPair, and build_initiator (the raw noise-c KKpsk2 initiator builder playing
 // the "server" role) come from noise_test_helpers.h.
@@ -169,9 +169,9 @@ static std::optional<InitialHandshakeResult> run_initial_handshake(const std::st
 // raw_encrypt() / raw_decrypt() (from noise_test_helpers.h) encrypt/decrypt one frame with a raw
 // noise-c cipher state.
 
-// =============================================================================
+// ============================================================================
 // Re-handshake loopback helper
-// =============================================================================
+// ============================================================================
 
 /// @brief Run a re-handshake on top of an already-split initial handshake.
 ///
@@ -264,9 +264,9 @@ static std::optional<RehandshakeResult> run_rehandshake(
     return rr;
 }
 
-// =============================================================================
+// ============================================================================
 // Tests
-// =============================================================================
+// ============================================================================
 
 /// @brief Verify a round-trip through a session: initiator->responder and responder->initiator.
 static void check_session_roundtrip(CipherPair& init_pair, NoiseSession& responder_session,

@@ -51,9 +51,9 @@ std::array<uint8_t, 32> make_pairing_psk() {
 
 }  // namespace
 
-// =============================================================================
+// ============================================================================
 // Spec reference vector
-// =============================================================================
+// ============================================================================
 
 TEST(PairingToken, PskSpecReferenceVector) {
     const auto client_key = make_client_key();
@@ -68,13 +68,13 @@ TEST(PairingToken, PskSpecReferenceVector) {
     EXPECT_EQ(token, expected);
 }
 
-// =============================================================================
+// ============================================================================
 // Structural invariants, over inputs the reference vector above does not cover
 //
 // Length / "SP:0" prefix / alphabet / absence of the digit '2' are already pinned byte-for-byte
 // by PskSpecReferenceVector for its own input, so asserting them again on that same token proves
 // nothing. They are checked here against other inputs, where they are not implied.
-// =============================================================================
+// ============================================================================
 
 namespace {
 
@@ -118,9 +118,9 @@ TEST(PairingToken, DifferentKeysProduceDifferentTokens) {
     EXPECT_NE(token_a, token_b);
 }
 
-// =============================================================================
+// ============================================================================
 // Version-1 tokens (the qr_code emission format)
-// =============================================================================
+// ============================================================================
 
 namespace {
 

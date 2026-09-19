@@ -115,7 +115,8 @@ public:
     // load_blob(RECORDS) is not overridden beyond the base class's nullopt default: "starts with
     // no pairing records" above, so restating it here would be a no-op override.
 
-    // Optionally pre-seed an accepted Pairing PSK (messaging.md "server/activate" section: pairing.method
+    // Optionally pre-seed an accepted Pairing PSK (messaging.md "server/activate" section:
+    // pairing.method
     // MUST be 'pairing_psk' if and only if the matched PSK IS the Pairing PSK; the client
     // enforces this via ConnectionManager::loop()'s pairing-method admissibility check).
     // The Pairing PSK Flow test below needs the fake server to connect using this PSK directly
@@ -289,8 +290,6 @@ private:
 // Tests
 // ============================================================================
 
-// Feeds 20 ms PCM chunks stamped a little ahead of now until the listener has written at least
-// `target` times, so the sync task has something to schedule.
 // Seeds a client whose Pairing PSK is configured and whose unpaired access is on, which is what
 // messaging.md "server/activate" requires before a pairing-PSK connection may declare playback.
 SendspinPairingPsk seed_pairing_psk(PairingCapturePersistenceProvider& persistence, uint8_t base) {
@@ -305,7 +304,6 @@ SendspinPairingPsk seed_pairing_psk(PairingCapturePersistenceProvider& persisten
     persistence.set_unpaired_access_enabled(true);
     return psk;
 }
-
 
 // Full encrypted lifecycle: accept -> Noise handshake -> hello -> server/activate -> operational,
 // then a server-initiated in-band re-handshake on the ADMITTED connection -> the connection must
@@ -585,7 +583,8 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     EXPECT_FALSE(pair_init->has_commit_b);
 
     // handle_enter_pairing's Pairing-PSK branch must fire on_pairing_started, exactly like the
-    // pairing-code branches do, so the started/succeeded/failed callback trio stays method-agnostic.
+    // pairing-code branches do, so the started/succeeded/failed callback trio stays
+    // method-agnostic.
     ASSERT_TRUE(listener.pairing_started_server_id().has_value())
         << "on_pairing_started was never fired for the pairing-token (Pairing-PSK) flow";
     EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());
@@ -953,7 +952,8 @@ TEST(EncryptedLifecycle, LeaveIsSentOnlyOnAnActivatedConnection) {
 }
 
 // An in-band re-handshake rewinds the connection to awaiting its next server/activate while it
-// keeps the admitted slot, and messaging.md "Overview" allows nothing but that activation until it
+// keeps the admitted slot, and connection.md "Re-handshake" allows nothing but that activation
+// until it
 // arrives. client/leave waits for it, and goes out once it lands.
 TEST(EncryptedLifecycle, LeaveWaitsForTheActivateThatFollowsAReHandshake) {
     SendspinClientConfig config;
@@ -1428,7 +1428,8 @@ TEST(EncryptedLifecycle, RoleTrafficWaitsForTheActivateThatFollowsAReHandshake) 
 }
 
 // A FIRST server/activate of ['playback', 'pairing'] is one of the sets the messaging.md
-// "server/activate" table allows. It has to do both things: announce the connection operational with its
+// "server/activate" table allows. It has to do both things: announce the connection operational
+// with its
 // roles (pairing.md "Entering and leaving pairing" leaves active_roles untouched) and start the
 // pairing attempt it admits, with the pairing_index that activate counted.
 TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing) {
@@ -1826,9 +1827,9 @@ TEST(EncryptedLifecycle, RehandshakeWithoutAnActivateIsDroppedByTheReproveWatchd
         << "the re-proving watchdog must close without a goodbye";
 }
 
-// =============================================================================
+// ============================================================================
 // Pre-admission hold harness
-// =============================================================================
+// ============================================================================
 
 // A SendspinConnection that exists only to carry the admission flags and the held-message queue:
 // nothing is sent, and no transport is ever attached. It lets a test open the window between a

@@ -59,9 +59,13 @@ add_executable(sendspin_tests
 # public surface reports; it reads the private members directly instead of adding a seam.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
-# test_role_deactivation.cpp reads what a removed role left behind (the sync task's run state, the
-# artwork transfer in flight, a state role's held scheduled update), none of which the public
-# surface reports; it reads the private members directly instead of adding a seam.
+# test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the
+# public surface does not expose: the sync task's run state and its encoded ring, the artwork
+# transfer in flight and its drain-side slot buffers, the visualizer's stream flag and ring, a
+# state role's held scheduled update and its teardown generation (including a direct
+# handle_server_state() call with that generation), plus the queued-event probe that proves
+# ordering without a sleep (a role inbox's topic bits and the connection manager's pending-event
+# flag). It reads and drives those members directly instead of adding a seam.
 set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_player_role.cpp builds the client/state player object by calling the role's Impl directly,

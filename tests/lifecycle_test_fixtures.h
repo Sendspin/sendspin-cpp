@@ -1110,13 +1110,12 @@ private:
     std::weak_ptr<ix::WebSocket> ws_;
 };
 
-
 // ============================================================================
 // Shared role listeners
 // ============================================================================
 //
 // One copy of each, because a per-file copy is where two suites quietly start disagreeing about
-// what the library does. Counts a listener updates from the main loop are plain ints: every
+// what the library does. Counts that a listener updates from the main loop are plain ints: every
 // callback here except on_audio_write() and on_loudness() is fired from SendspinClient::loop(),
 // which in these suites is the test thread itself, so there is nothing to synchronize with. The
 // two that a role thread reaches are atomic.
@@ -1212,6 +1211,15 @@ inline std::string stream_start_visualizer_json() {
 inline std::string metadata_state_json(int64_t timestamp, const std::string& title) {
     return R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
            std::to_string(timestamp) + R"(,"title":")" + title + R"("}}})";
+}
+
+/// The loudness-only visualizer the lifecycle suites drive, sized for a handful of frames.
+inline VisualizerRoleConfig make_visualizer_config() {
+    VisualizerRoleConfig config;
+    config.stream.types = {VisualizerDataType::LOUDNESS};
+    config.support.buffer_capacity = 4096;
+    config.stream.rate_max = 30;
+    return config;
 }
 
 /// The 48 kHz stereo PCM player the streaming suites drive, sized to hold a few seconds.

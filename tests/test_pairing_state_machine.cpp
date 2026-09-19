@@ -13,8 +13,10 @@
 // limitations under the License.
 
 // Integration harness: drives ConnectionManager's code pairing state machine end-to-end for
-// both the dynamic and static pairing code, including the abort / cleanup / connection-loss paths that
-// the dynamic/static pairing code unit tests (test_dynamic_pairing_code.cpp) do not reach. Those cover wire
+// both the dynamic and static pairing code, including the abort / cleanup / connection-loss paths
+// that
+// the dynamic/static pairing code unit tests (test_dynamic_pairing_code.cpp) do not reach. Those
+// cover wire
 // parse/format, the lockout counter, CPace round-trips, and the client/hello descriptor.
 //
 // The device under test is the CPace RESPONDER; the "server" side is simulated in-test with
@@ -68,9 +70,9 @@ using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local c
 
 namespace {
 
-// =============================================================================
+// ============================================================================
 // FakeConnection: minimal SendspinConnection stand-in
-// =============================================================================
+// ============================================================================
 
 /// @brief Concrete SendspinConnection that captures outbound frames and reports a canned
 /// Noise handshake hash without ever installing a real Noise session. Adapted from
@@ -154,9 +156,9 @@ private:
     bool connected_{true};
 };
 
-// =============================================================================
+// ============================================================================
 // RecordingListener: captures every pairing-related callback, in order
-// =============================================================================
+// ============================================================================
 
 enum class PairingEventKind {
     STARTED,
@@ -263,9 +265,9 @@ public:
     std::vector<PairingEvent> events_;
 };
 
-// =============================================================================
+// ============================================================================
 // Minimal fake providers
-// =============================================================================
+// ============================================================================
 
 /// Network provider that always reports "not ready", so ConnectionManager::loop() never
 /// starts the real WebSocket server: these tests inject connections directly and never
@@ -310,9 +312,9 @@ private:
     std::map<std::string, std::vector<uint8_t>> seeded_;
 };
 
-// =============================================================================
+// ============================================================================
 // JSON helpers for asserting on captured outbound frames
-// =============================================================================
+// ============================================================================
 
 /// Parse a captured outbound JSON string. Fails the calling test via ASSERT semantics through
 /// the returned bool so callers can `ASSERT_TRUE(parse_json(...))`.
@@ -361,9 +363,9 @@ std::string last_pair_abort_reason(const std::vector<std::string>& sent_text) {
     return "";
 }
 
-// =============================================================================
+// ============================================================================
 // Server-side ("stand-in initiator") frame builders, mirroring test_dynamic_pairing_code.cpp
-// =============================================================================
+// ============================================================================
 
 /// Build the sid CPace expects: "sendspin-pair-pake-v1" (21 bytes, no NUL) || 32-byte hash ||
 /// 4-byte big-endian pairing_index || 4-byte big-endian round (pairing.md "PAKE").
@@ -430,7 +432,7 @@ struct CodeEmissionResult {
 
 }  // namespace
 
-// =============================================================================
+// ============================================================================
 // Test fixture: builds a SendspinClient, injects a FakeConnection as
 // current_connection_, and provides helpers to drive the pairing state machine.
 //
@@ -441,7 +443,7 @@ struct CodeEmissionResult {
 // documents why the seam exists) rather than touching privates inline in
 // tests, so the private surface this harness depends on stays auditable in
 // one place.
-// =============================================================================
+// ============================================================================
 
 class PairingStateMachineTest : public ::testing::Test {
 protected:
@@ -618,7 +620,8 @@ protected:
         return this->client_->connection_manager_->current();
     }
 
-    /// Drive ConnectionManager's real teardown path for `conn`, through the private-access seam, taking
+    /// Drive ConnectionManager's real teardown path for `conn`, through the private-access seam,
+    /// taking
     /// the same lock and running the same deferred-release flush loop() would.
     void drop_connection(SendspinConnection* conn, SendspinGoodbyeReason goodbye) {
         {
@@ -1023,9 +1026,9 @@ protected:
     std::shared_ptr<SendspinConnection> injected_conn_;
 };
 
-// =============================================================================
+// ============================================================================
 // Dynamic pairing code: happy path
-// =============================================================================
+// ============================================================================
 
 TEST_F(PairingStateMachineTest, DynamicCodeHappyPath) {
     FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-1");
@@ -1146,12 +1149,12 @@ TEST_F(PairingStateMachineTest, AbortAfterConfirmDoesNotReclearAlreadyWithdrawnC
     EXPECT_EQ(this->listener_.last_failed_reason(), SendspinPairAbortReason::USER_CANCELLED);
 }
 
-// =============================================================================
+// ============================================================================
 // pairing.md "Rounds": a server_kc that does not verify means the operator entered a code this
 // device did not emit. The dynamic flow answers with another round rather than ending the
 // attempt, each round runs its own CPace under its own sid, and the attempt only fails once the
 // round limit is reached.
-// =============================================================================
+// ============================================================================
 
 TEST_F(PairingStateMachineTest, DynamicCodeMismatchAsksForAnotherRound) {
     FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-2");
@@ -1296,11 +1299,11 @@ TEST_F(PairingStateMachineTest, StandingRoundLimitHoldsTheNextAttemptForAGesture
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 }
 
-// =============================================================================
+// ============================================================================
 // pairing.md "Entering and leaving pairing": pairing runs alongside playback, so a declared
 // 'pairing' activity suppresses nothing. Traffic keeps flowing across an attempt and across the
 // retry window between a local abort and the server's next server/activate.
-// =============================================================================
+// ============================================================================
 
 TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
     FakeConnection* conn = this->enter_dynamic_code_pairing("server-dyn-suppress");
@@ -1357,9 +1360,9 @@ TEST_F(PairingStateMachineTest, TrafficContinuesWhileActivitiesDeclarePairing) {
         << "time sync must not stall when the connection leaves pairing either";
 }
 
-// =============================================================================
+// ============================================================================
 // The attempt timeout inside the re-handshake window
-// =============================================================================
+// ============================================================================
 
 // connection.md "Re-handshake": between Noise message 1 and the new server/activate the client
 // starts no application message but the handshake, and a pair/abort would be one. pairing.md
@@ -1392,9 +1395,9 @@ TEST_F(PairingStateMachineTest, AttemptTimeoutAbortWaitsForThePostRekeyActivate)
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
 }
 
-// =============================================================================
+// ============================================================================
 // Dynamic pairing code: attempt timeout
-// =============================================================================
+// ============================================================================
 
 TEST_F(PairingStateMachineTest, DynamicCodeAttemptTimeout) {
     FakeConnection* conn =
@@ -1415,19 +1418,13 @@ TEST_F(PairingStateMachineTest, DynamicCodeAttemptTimeout) {
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::CLEAR_CODE));
 }
 
-// =============================================================================
-// Dynamic pairing code: malformed server frame
-// =============================================================================
+// ============================================================================
+// Sequence violations
+// ============================================================================
 
-// pairing.md "Protocol Errors": "a malformed or missing field ... is a protocol error: the detecting
-// side closes the WebSocket without sending any application-level error message, and persists
-// nothing." This pins that behavior for the MALFORMED case in
-// ConnectionManager::handle_pairing_message: no pair/abort, and the connection closes.
-// =============================================================================
 // pairing.md "Sequence violations": a pairing message out of sequence for the selected method
 // and the current state is a protocol error, and "Protocol Errors" closes the connection
 // without any application-level message. No pair/abort names a reason for it.
-// =============================================================================
 
 TEST_F(PairingStateMachineTest, StaticCodeAttemptClosesOnServerPairInit) {
     // server/pair-init belongs to the dynamic flow alone: the static flow runs from
@@ -1501,6 +1498,15 @@ TEST_F(PairingStateMachineTest, OutOfSequenceServerPairConfirmClosesSilently) {
     EXPECT_TRUE(this->listener_.fired(PairingEventKind::FAILED));
 }
 
+// ============================================================================
+// Dynamic pairing code: malformed server frame
+// ============================================================================
+
+// pairing.md "Protocol Errors": "a malformed or missing field ... is a protocol error: the
+// detecting side closes the WebSocket without sending any application-level error message, and
+// persists nothing." This pins that behavior for the MALFORMED case in
+// ConnectionManager::handle_pairing_message: no pair/abort, and the connection closes.
+
 TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSilently) {
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-4", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
@@ -1531,7 +1537,8 @@ TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameDuringSessionClosesSile
 }
 
 TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameWithNoActiveSessionIsIgnored) {
-    // A connection with no active pairing-code session (pairing_session().step == IDLE) at all: a stray
+    // A connection with no active pairing-code session (pairing_session().step == IDLE) at all: a
+    // stray
     // malformed pairing frame must not tear anything down.
     FakeConnection* conn =
         this->inject_current_connection("server-dyn-5", SendspinPairMethod::DYNAMIC_PAIRING_CODE);
@@ -1550,12 +1557,14 @@ TEST_F(PairingStateMachineTest, DynamicCodeMalformedFrameWithNoActiveSessionIsIg
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::CLEAR_CODE));
 }
 
-// =============================================================================
+// ============================================================================
 // Dynamic pairing code: CPace derive() failure on server/pair-auth (low-order/malformed share)
-// =============================================================================
+// ============================================================================
 
-// pairing.md "Protocol Errors": "a CPace share with the wrong length or encoding a low-order point" is
-// a protocol error, not a pairing_code_mismatch: the detecting side closes the WebSocket without sending
+// pairing.md "Protocol Errors": "a CPace share with the wrong length or encoding a low-order point"
+// is
+// a protocol error, not a pairing_code_mismatch: the detecting side closes the WebSocket without
+// sending
 // any application-level error message, and persists nothing. A derive() failure happens on the
 // peer's raw share BEFORE the code-derived generator can even be compared, so it can never be
 // produced by an operator simply mistyping the code (that produces a well-formed shared secret
@@ -1688,11 +1697,11 @@ TEST_F(PairingStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
     EXPECT_EQ(conn->pairing_session().step, SendspinConnection::PairingStep::AWAIT_PAIRING_WINDOW);
 }
 
-// =============================================================================
+// ============================================================================
 // pairing.md "Pairing Window": what closes an open window. Starting an attempt does not; a
 // completed pairing, the fifth failed attempt, the drop of the connection the window is bound
 // to, an operator cancellation and the lifetime expiry all do.
-// =============================================================================
+// ============================================================================
 
 TEST_F(PairingStateMachineTest, WindowSurvivesFailedAttemptsUntilTheFifth) {
     const std::string code = "13572468";
@@ -1868,9 +1877,9 @@ TEST_F(PairingStateMachineTest, GatedAttemptWithoutWindowSupportSkipsPrompt) {
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
 }
 
-// =============================================================================
+// ============================================================================
 // Static pairing code: happy path
-// =============================================================================
+// ============================================================================
 
 TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
     this->configure_static_pairing_code("13572468");
@@ -1880,7 +1889,8 @@ TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
     this->enter_pairing(conn);
     this->client_->loop();
 
-    // Entering static pairing-code pairing (gesture-gated, no window open) sends client/pair-pending
+    // Entering static pairing-code pairing (gesture-gated, no window open) sends
+    // client/pair-pending
     // and surfaces the pairing-window prompt; nothing else is sent yet.
     ASSERT_EQ(conn->sent_text_.size(), 1u);
     EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-pending");
@@ -1931,11 +1941,12 @@ TEST_F(PairingStateMachineTest, StaticCodeHappyPath) {
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 }
 
-// =============================================================================
+// ============================================================================
 // Entered from a SUBSEQUENT activate
-// =============================================================================
+// ============================================================================
 
-// A device that first goes operational on an empty server/activate must still enter static pairing-code
+// A device that first goes operational on an empty server/activate must still enter static
+// pairing-code
 // pairing when the operator later triggers a SUBSEQUENT activate declaring [pairing].
 // ConnectionManager::loop() must enter pairing on ANY pairing activate on an already-admitted
 // connection, not only the first, or a later one is silently dropped as an ordinary "subsequent
@@ -2069,9 +2080,9 @@ TEST_F(PairingStateMachineTest, PairingActivateWithoutMethodIsAborted) {
     EXPECT_EQ(conn->disconnect_count_, 0) << "the connection must stay open after the abort";
 }
 
-// =============================================================================
+// ============================================================================
 // Static pairing code: mismatch
-// =============================================================================
+// ============================================================================
 
 TEST_F(PairingStateMachineTest, StaticCodeMismatchRecordsFailureAndAborts) {
     this->configure_static_pairing_code("13572468");
@@ -2121,9 +2132,9 @@ TEST_F(PairingStateMachineTest, StaticCodeMismatchRecordsFailureAndAborts) {
         << "the static flow runs no rounds to count";
 }
 
-// =============================================================================
+// ============================================================================
 // Static pairing code: the gesture wait is unbounded client-side
-// =============================================================================
+// ============================================================================
 
 // client/pair-pending does not start the attempt or its timeout (spec: the server applies its
 // own timeout and cancels via server/activate), so the wait for the gesture must not be
@@ -2161,9 +2172,9 @@ TEST_F(PairingStateMachineTest, GestureWaitHasNoClientTimeout) {
              this->listener_.first_index_of(PairingEventKind::CLOSE_WINDOW));
 }
 
-// =============================================================================
+// ============================================================================
 // Connection loss mid-pairing
-// =============================================================================
+// ============================================================================
 
 TEST_F(PairingStateMachineTest, ConnectionLossDuringStaticPairingWindowClosesWindow) {
     this->configure_static_pairing_code("13572468");
@@ -2205,9 +2216,9 @@ TEST_F(PairingStateMachineTest, ConnectionLossWhileEmittingCodeWithdrawsIt) {
              this->listener_.first_index_of(PairingEventKind::CLEAR_CODE));
 }
 
-// =============================================================================
+// ============================================================================
 // Abort ordering survives cleanup_connection_state()
-// =============================================================================
+// ============================================================================
 
 TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanup) {
     // A current-connection abort (pair/abort from the server) must still deliver
@@ -2263,9 +2274,9 @@ TEST_F(PairingStateMachineTest, CurrentConnectionAbortOrderingSurvivesCleanupSta
     EXPECT_EQ(conn->disconnect_count_, 0);
 }
 
-// =============================================================================
+// ============================================================================
 // Leftover activate: entering the operational state structurally clears pairing state
-// =============================================================================
+// ============================================================================
 
 // A server/activate in place of server/pair-finalize ends the pairing attempt without
 // finalizing; the spec requires persisting nothing and discarding any pending long_term_psk.
@@ -2299,9 +2310,9 @@ TEST_F(PairingStateMachineTest, LeftoverActivateDiscardsPendingRecordAndPairingS
     EXPECT_EQ(conn->pairing_session().attempt_deadline_us, 0);
 }
 
-// =============================================================================
+// ============================================================================
 // pairing_index counter (pairing.md "Pairing index")
-// =============================================================================
+// ============================================================================
 
 // The pairing_index counter (sent on every client/pair-init and folded into the CPace sid)
 // must keep incrementing across repeated pairing server/activate messages on the SAME
@@ -2413,9 +2424,9 @@ TEST_F(PairingStateMachineTest, RejectedActivateStillCountsTowardPairingIndex) {
            "rejected activate was not silently dropped from the count";
 }
 
-// =============================================================================
+// ============================================================================
 // pair/abort close-vs-stay-open semantics (pairing.md "pair/abort")
-// =============================================================================
+// ============================================================================
 
 // Reason concurrent_attempt is the ONE pair/abort reason whose sender (and, symmetrically, this
 // client on receipt) still closes the connection.
@@ -2468,10 +2479,10 @@ TEST_F(PairingStateMachineTest, StalePairAbortAfterLocalAbortHasNoEffect) {
     EXPECT_EQ(conn->disconnect_count_, disconnects_before);
 }
 
-// =============================================================================
+// ============================================================================
 // Re-proving watchdog (current_connection_ non-operational after a re-handshake or a
 // pair-finalize ack; see REPROVE_TIMEOUT_US in connection_manager.h)
-// =============================================================================
+// ============================================================================
 
 // SendspinConnection::note_pairing_finalize_ack() resets first_activate_received_ (so
 // is_operational() goes false) and re-arms provisional_time_us_, anticipating the server's
@@ -2541,7 +2552,8 @@ TEST_F(PairingStateMachineTest, ReproveWatchdogDoesNotDropConnectionAwaitingOper
     EXPECT_FALSE(this->listener_.fired(PairingEventKind::FAILED));
 }
 
-// The finalize-ack window above also has to defuse scan_pairing_attempt_timeout(): the pairing session is
+// The finalize-ack window above also has to defuse scan_pairing_attempt_timeout(): the pairing
+// session is
 // only reset by clear_pairing_state(), which runs once the post-rekey server/activate lands, not
 // by note_pairing_finalize_ack() itself. So its step and attempt_deadline_us are
 // still exactly what PAIR_CONFIRM left them while the rekey is in flight, and a slow rekey can

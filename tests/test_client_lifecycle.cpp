@@ -68,10 +68,6 @@ constexpr uint16_t VISUALIZER_TEST_PORT = 19018;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 19019;
 constexpr uint16_t PROVIDER_TEST_PORT = 19020;
 
-/// Bound on every pump/wait: generous next to the loopback round trips involved, so the verdict
-/// comes from the predicate rather than the clock.
-constexpr int PUMP_TIMEOUT_MS = 6000;
-
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
     config.name = "Client Lifecycle Test Client";
@@ -79,7 +75,6 @@ SendspinClientConfig make_config(uint16_t port) {
     return config;
 }
 
-/// A paired fake server connected to the bundle's client on `port`.
 /// Reports whether anything is listening on the loopback port.
 bool port_accepts(uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -95,7 +90,6 @@ bool port_accepts(uint16_t port) {
     return connected;
 }
 
-/// Counts the player lifecycle callbacks and audio writes; the write itself is a sink.
 /// Records on_metadata_clear() and, from inside it, tries to drive the lifecycle re-entrantly.
 class ReentrantMetadataListener : public MetadataRoleListener {
 public:
@@ -136,8 +130,6 @@ std::string group_update_playing_json() {
     return R"({"type":"group/update","payload":{"playback_state":"playing"}})";
 }
 
-// Pumps until the peer has written at least `target` audio callbacks, feeding 20 ms PCM chunks
-// stamped a little ahead of now so the sync task has something to schedule.
 // ============================================================================
 // GoodbyeWait: the bound stop() relies on
 // ============================================================================
@@ -193,7 +185,7 @@ TEST(ClientLifecycle, RestartYieldsALiveClient) {
 
         auto server = connect_paired_server(bundle.peer, RESTART_TEST_PORT);
         ASSERT_TRUE(pump_until(
-            client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
+            client, [&] { return client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS));
         auto info = client.get_server_information();
         ASSERT_TRUE(info.has_value());
         EXPECT_EQ(info->server_id, bundle.peer.server_identity.peer_id());
@@ -202,7 +194,7 @@ TEST(ClientLifecycle, RestartYieldsALiveClient) {
         ASSERT_TRUE(server->send_app_json(group_update_playing_json()));
         ASSERT_TRUE(pump_until(
             client, [&] { return client.get_group_state().playback_state.has_value(); },
-            PUMP_TIMEOUT_MS));
+            FIXTURE_PUMP_TIMEOUT_MS));
 
         client.stop();
 
@@ -211,7 +203,7 @@ TEST(ClientLifecycle, RestartYieldsALiveClient) {
         EXPECT_FALSE(client.get_server_information().has_value());
         EXPECT_FALSE(client.get_group_state().playback_state.has_value());
         // The peer received its goodbye and the close, in that order.
-        EXPECT_TRUE(wait_until([&] { return server->closed(); }, PUMP_TIMEOUT_MS));
+        EXPECT_TRUE(wait_until([&] { return server->closed(); }, FIXTURE_PUMP_TIMEOUT_MS));
         EXPECT_EQ(server->goodbye_reason().value_or(""), "shutdown");
 
         // Stopped means quiescent: pumping loop() must not bring the server back up.
@@ -257,7 +249,7 @@ TEST(ClientLifecycle, StopGoodbyesNurseryPeersToo) {
 
     auto established = connect_paired_server(bundle.peer, NURSERY_GOODBYE_TEST_PORT);
     ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
+        client, [&] { return client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS));
 
     // Runs on the Sentinel PSK, which RecordStore resolves unconditionally, so it needs no record
     // of its own; never activating keeps it in the nursery.
@@ -268,12 +260,12 @@ TEST(ClientLifecycle, StopGoodbyesNurseryPeersToo) {
                              std::string(NOISE_SUITE_CHACHAPOLY), mute_identity,
                              std::string(SENTINEL_PSK_ID), SENTINEL_PSK, mute_options);
     ASSERT_TRUE(pump_until(
-        client, [&] { return mute.client_hello_count() > 0; }, PUMP_TIMEOUT_MS));
+        client, [&] { return mute.client_hello_count() > 0; }, FIXTURE_PUMP_TIMEOUT_MS));
 
     client.stop();
 
     EXPECT_TRUE(wait_until([&] { return established->closed() && mute.closed(); },
-                           PUMP_TIMEOUT_MS));
+                           FIXTURE_PUMP_TIMEOUT_MS));
     EXPECT_EQ(established->goodbye_reason().value_or(""), "shutdown");
     EXPECT_EQ(mute.goodbye_reason().value_or(""), "shutdown");
 }
@@ -295,11 +287,11 @@ TEST(ClientLifecycle, StopEndsTheStreamAndRestartPlaysAgain) {
         ASSERT_TRUE(bundle.start());
         auto server = connect_paired_server(bundle.peer, STREAM_TEST_PORT, options);
         ASSERT_TRUE(pump_until(
-            client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
+            client, [&] { return client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS));
 
         ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
         ASSERT_TRUE(pump_until(
-            client, [&] { return listener.stream_starts == cycle + 1; }, PUMP_TIMEOUT_MS));
+            client, [&] { return listener.stream_starts == cycle + 1; }, FIXTURE_PUMP_TIMEOUT_MS));
         EXPECT_EQ(listener.stream_ends, cycle);
 
         // Audio flowing proves the sync task thread is alive in this cycle.
@@ -311,7 +303,7 @@ TEST(ClientLifecycle, StopEndsTheStreamAndRestartPlaysAgain) {
         // The clear callback was delivered inside stop(), not left for a loop() tick.
         EXPECT_EQ(listener.stream_ends, cycle + 1);
         EXPECT_EQ(listener.stream_starts, cycle + 1);
-        EXPECT_TRUE(wait_until([&] { return server->closed(); }, PUMP_TIMEOUT_MS));
+        EXPECT_TRUE(wait_until([&] { return server->closed(); }, FIXTURE_PUMP_TIMEOUT_MS));
         EXPECT_EQ(server->goodbye_reason().value_or(""), "shutdown");
     }
 }
@@ -330,12 +322,12 @@ TEST(ClientLifecycle, CallbackDuringStopCannotRecurse) {
     {
         auto server = connect_paired_server(bundle.peer, CALLBACK_TEST_PORT);
         ASSERT_TRUE(pump_until(
-            client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
+            client, [&] { return client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS));
         // Group state the callback must already see reset.
         ASSERT_TRUE(server->send_app_json(group_update_playing_json()));
         ASSERT_TRUE(pump_until(
             client, [&] { return client.get_group_state().playback_state.has_value(); },
-            PUMP_TIMEOUT_MS));
+            FIXTURE_PUMP_TIMEOUT_MS));
 
         client.stop();
 
@@ -344,14 +336,14 @@ TEST(ClientLifecycle, CallbackDuringStopCannotRecurse) {
         EXPECT_FALSE(listener.group_had_state_during_clear);
         EXPECT_FALSE(listener.start_result_during_clear);
         EXPECT_FALSE(client.is_started());
-        EXPECT_TRUE(wait_until([&] { return server->closed(); }, PUMP_TIMEOUT_MS));
+        EXPECT_TRUE(wait_until([&] { return server->closed(); }, FIXTURE_PUMP_TIMEOUT_MS));
     }
 
     // The refused start() inside the callback left the client stopped; a real start() works.
     ASSERT_TRUE(bundle.start());
     auto server = connect_paired_server(bundle.peer, CALLBACK_TEST_PORT);
     ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
+        client, [&] { return client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS));
     client.stop();
     EXPECT_EQ(listener.clears, 2);
 }
@@ -370,11 +362,11 @@ TEST(ClientLifecycle, DestructorGoodbyesPeersWithoutCallbacks) {
 
         server = connect_paired_server(bundle.peer, DESTRUCTOR_TEST_PORT);
         ASSERT_TRUE(pump_until(
-            client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
+            client, [&] { return client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS));
         // Client destroyed here while established.
     }
 
-    EXPECT_TRUE(wait_until([&] { return server->closed(); }, PUMP_TIMEOUT_MS));
+    EXPECT_TRUE(wait_until([&] { return server->closed(); }, FIXTURE_PUMP_TIMEOUT_MS));
     EXPECT_EQ(server->goodbye_reason().value_or(""), "shutdown");
 }
 
@@ -410,26 +402,15 @@ TEST(ClientLifecycle, FailedRoleStartRollsBackAndRetryStartsClean) {
     options.answer_time = true;
     auto server = connect_paired_server(bundle.peer, ROLLBACK_TEST_PORT, options);
     ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
+        client, [&] { return client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS));
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     ASSERT_TRUE(pump_until(
-        client, [&] { return listener.stream_starts == 1; }, PUMP_TIMEOUT_MS));
+        client, [&] { return listener.stream_starts == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
     EXPECT_TRUE(stream_audio_until(client, *server, listener, 1));  // The rolled-back player plays again
     client.stop();
     EXPECT_EQ(listener.stream_ends, 1);
 }
 
-/// Counts loudness deliveries; they fire on the visualizer drain thread.
-VisualizerRoleConfig make_visualizer_config() {
-    VisualizerRoleConfig config;
-    config.stream.types = {VisualizerDataType::LOUDNESS};
-    config.support.buffer_capacity = 4096;
-    config.stream.rate_max = 30;
-    return config;
-}
-
-// Waits for a fresh peer that answers time messages to be established and synced: the drain
-// thread delivers nothing until the client is time synced.
 // Pumps until pred() holds, sending one loudness frame per iteration stamped `lead_us` ahead of
 // the current time (the drain thread drops a frame whose display time is well past). A frame
 // can be lost to the ring's documented wake race right after a stream/start (the drain thread
@@ -448,7 +429,7 @@ bool send_loudness_until(SendspinClient& client, FakeEncryptedServer& server, in
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             return false;
         },
-        PUMP_TIMEOUT_MS);
+        FIXTURE_PUMP_TIMEOUT_MS);
 }
 
 // stop() joins the visualizer drain thread and flushes the frames it had buffered, and start()
@@ -482,7 +463,7 @@ TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
                                         [&] { return ring.items_waiting() >= 2; }));
         client.stop();
         EXPECT_TRUE(ring.is_empty());
-        EXPECT_TRUE(wait_until([&] { return server->closed(); }, PUMP_TIMEOUT_MS));
+        EXPECT_TRUE(wait_until([&] { return server->closed(); }, FIXTURE_PUMP_TIMEOUT_MS));
     }
     EXPECT_EQ(listener.loudness.load(), 0U);
 
@@ -523,22 +504,22 @@ TEST(ClientLifecycle, HighPerformanceRequestAndReleaseStayPaired) {
 
     auto server = connect_paired_server(bundle.peer, HIGH_PERF_TEST_PORT);
     ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, PUMP_TIMEOUT_MS));
+        client, [&] { return client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS));
     // The default fake server never answers client/time, so the burst stays open and the hold
     // stays held until the connection is lost.
     ASSERT_TRUE(pump_until(
-        client, [&] { return listener.requests == 1; }, PUMP_TIMEOUT_MS));
+        client, [&] { return listener.requests == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
     EXPECT_EQ(listener.releases, 0);
 
     server.reset();  // Peer goes away mid-burst: drop_connection releases the hold
     ASSERT_TRUE(pump_until(
-        client, [&] { return listener.releases == 1; }, PUMP_TIMEOUT_MS));
+        client, [&] { return listener.releases == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
     EXPECT_FALSE(client.is_connected());
 
     auto again = connect_paired_server(bundle.peer, HIGH_PERF_TEST_PORT);
     ASSERT_TRUE(pump_until(
         client, [&] { return client.is_connected() && listener.requests == 2; },
-        PUMP_TIMEOUT_MS));
+        FIXTURE_PUMP_TIMEOUT_MS));
     client.stop();
     EXPECT_EQ(listener.releases, 2);
 }
@@ -560,7 +541,7 @@ TEST(ClientLifecycle, DestructorReleasesHighPerformanceHold) {
         server = connect_paired_server(bundle.peer, DESTRUCTOR_HIGH_PERF_TEST_PORT);
         ASSERT_TRUE(pump_until(
             client, [&] { return client.is_connected() && listener.requests == 1; },
-            PUMP_TIMEOUT_MS));
+            FIXTURE_PUMP_TIMEOUT_MS));
         EXPECT_EQ(listener.releases, 0);
         // Client destroyed here mid-burst, with the hold open.
     }
