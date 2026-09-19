@@ -392,7 +392,7 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
 
         if (noise_active) {
             // Post-handshake TEXT frames are a protocol error.
-            SS_LOGW(TAG, "Unexpected TEXT frame after Noise handshake is complete; ignoring");
+            SS_LOGD(TAG, "Unexpected TEXT frame after Noise handshake is complete; ignoring");
             this->reset_websocket_payload();
             return;
         }
