@@ -181,13 +181,30 @@ public:
 /// NoiseTransport::session_mutex_'s job and is what ConcurrentSendsDoNotInterleaveFragments
 /// exercises. Frames land in sent_binary_ in the order they reached the sink, which is the
 /// order they would reach the wire.
+///
+/// The sink also answers whether the race it is part of actually happened: every frame big
+/// enough to be a fragment is counted as overlapped if a second sender had a send in flight as
+/// it was emitted. Without that count a round where the two senders never met would report
+/// success while proving nothing.
 class ConcurrentCaptureConnection : public TestConnection {
 public:
     SsErr send_binary_message(const uint8_t* data, size_t len, SendCompleteCallback cb,
                               bool allow_before_hello) override {
+        if (len > FRAGMENT_FRAME_MIN_BYTES && this->other_sends_in_flight_.load() > 0) {
+            ++this->overlapped_frames_;
+        }
         std::lock_guard<std::mutex> lock(this->capture_mutex_);
         return TestConnection::send_binary_message(data, len, cb, allow_before_hello);
     }
+
+    /// Any frame above this is a full fragment; the concurrent sender's messages are a few
+    /// dozen bytes.
+    static constexpr size_t FRAGMENT_FRAME_MIN_BYTES = 1024;
+
+    /// Raised by the concurrent sender around each send, so the count includes the time it
+    /// spends waiting on session_mutex_ rather than only the moment it reaches the sink.
+    std::atomic<int> other_sends_in_flight_{0};
+    std::atomic<int> overlapped_frames_{0};
 
 private:
     std::mutex capture_mutex_;
@@ -1794,16 +1811,17 @@ TEST(NoiseHandshakeDriver, MalformedMsg1GarbageAborts) {
 //
 // This test races a fragmenting send against a stream of small sends on one transport, then
 // replays the captured frames, in emission order, through an independent reassembly state
-// machine and requires it to find no protocol violation. It detects a regression
-// probabilistically (the interleave needs the two threads to collide in the gap), so it runs
-// several rounds; it never fails spuriously, because correct locking cannot produce a malformed
-// sequence at all.
+// machine and requires it to find no protocol violation. Two things make that race real rather
+// than hopeful: the fragmenting send does not start until the other sender is in its loop, and
+// the sink counts the fragment frames emitted while one of that sender's sends was in flight.
+// Under correct locking that send is parked on session_mutex_ for the whole message, so the
+// count is every frame; a round that counted none never raced and is failed as vacuous.
+// Elapsed time is not part of any verdict here, and correct locking cannot produce a malformed
+// sequence at all, so a slow machine cannot fail this test.
 TEST(NoiseTransport, ConcurrentSendsDoNotInterleaveFragments) {
     constexpr int ROUNDS = 4;
     // Fragments into roughly 14 frames at MAX_TRANSPORT_PLAINTEXT, giving many gaps to hit.
     constexpr size_t LARGE_JSON_BYTES = 900000;
-    // Overlap margin so the small sender is still running as the large send starts.
-    constexpr int MIN_SMALL_SENDS = 50;
 
     for (int round = 0; round < ROUNDS; ++round) {
         auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
@@ -1814,24 +1832,32 @@ TEST(NoiseTransport, ConcurrentSendsDoNotInterleaveFragments) {
 
         std::string large_json(LARGE_JSON_BYTES, 'A');
         std::atomic<bool> stop{false};
-
-        std::thread big_sender([&]() {
-            EXPECT_EQ(conn.send_encrypted_text(large_json), SsErr::OK);
-            stop.store(true, std::memory_order_release);
-        });
+        std::atomic<int> small_sends{0};
 
         std::thread small_sender([&]() {
             int i = 0;
-            while (!stop.load(std::memory_order_acquire) || i < MIN_SMALL_SENDS) {
+            while (!stop.load(std::memory_order_acquire)) {
+                conn.other_sends_in_flight_.fetch_add(1, std::memory_order_release);
                 conn.send_encrypted_text("{\"i\":" + std::to_string(i) + "}");
+                conn.other_sends_in_flight_.fetch_sub(1, std::memory_order_release);
                 ++i;
+                small_sends.store(i, std::memory_order_release);
             }
         });
 
-        big_sender.join();
+        // The fragmenting send runs on this thread, and only once the other sender is looping:
+        // a small sender that has not started yet cannot collide with anything.
+        while (small_sends.load(std::memory_order_acquire) == 0) {
+            std::this_thread::yield();
+        }
+        EXPECT_EQ(conn.send_encrypted_text(large_json), SsErr::OK);
+        stop.store(true, std::memory_order_release);
         small_sender.join();
 
         ASSERT_GE(conn.sent_binary_.size(), 2u);
+        EXPECT_GT(conn.overlapped_frames_.load(), 0)
+            << "round " << round << " emitted no fragment while a concurrent send was in "
+               "flight, so it raced nothing";
 
         // Decrypt in emission order with the peer's matching cipher. conn encrypted with the
         // responder session, so the initiator's recv cipher is its counterpart; the std::move
