@@ -315,6 +315,9 @@ TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
                       doc, root));
     StreamStartMessage msg;
     EXPECT_FALSE(process_stream_start_message(root, &msg));
+    // The rejected section is reset, so the codec, sample rate and bit depth that did parse do
+    // not survive into the caller's message beside the dropped channel count.
+    EXPECT_FALSE(msg.player.has_value());
 
     // Control: the same message with an in-range channel count is accepted.
     JsonDocument doc_ok;
