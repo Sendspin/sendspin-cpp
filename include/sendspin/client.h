@@ -718,9 +718,17 @@ public:
 
     /// @brief Releases a ref-counted high-performance networking request
     ///
-    /// The last release calls the listener inline, possibly under conn_ptr_mutex_ (the
-    /// connection-loss path); the listener contract forbids calling back into the client there.
+    /// The last release calls the listener inline, so only call this from a main-loop point that
+    /// holds no ConnectionManager lock. Teardown paths that run under conn_ptr_mutex_ (role
+    /// cleanup, cleanup_connection_state()) use release_high_performance_deferred() instead.
     void release_high_performance();
+
+    /// @brief Hands a high-performance release to the next drain instead of performing it here
+    ///
+    /// The reference stays held until flush_high_performance_releases() runs, so a release
+    /// deferred out of a locked teardown can never be reordered against an acquire that follows
+    /// it. Main loop only.
+    void release_high_performance_deferred();
 
 private:
     /// @brief Cleans up playback state when the active streaming connection is removed
@@ -729,6 +737,13 @@ private:
     /// @brief Drains the inbox: lifecycle events, role slots, and group updates, dispatching
     /// listener callbacks on the calling (main-loop) thread. Shared by loop() and stop().
     void drain_inbox();
+
+    /// @brief Performs the releases release_high_performance_deferred() handed over
+    ///
+    /// Runs at the head of drain_inbox(), which every main-loop pass reaches with no
+    /// ConnectionManager lock held, so the listener callback a last release fires is free to
+    /// call back into the client.
+    void flush_high_performance_releases();
 
     /// @brief Signals the drain roles, then goodbyes and closes every transport, joining the
     /// network threads. The shared first half of stop() and the destructor's teardown.
@@ -952,6 +967,9 @@ private:
     ConnectionTrust current_trust_{ConnectionTrust::NONE};
     bool high_performance_held_for_time_{false};
     std::atomic<uint8_t> high_performance_ref_count_{0};
+    /// Releases handed over by release_high_performance_deferred() and performed by the next
+    /// flush_high_performance_releases(). Main loop only.
+    uint8_t high_performance_releases_pending_{0};
     /// Where the client is in its lifecycle. Written only by start()/stop() on the main loop;
     /// atomic so is_started() can be read from any thread. STOPPING covers the whole of stop():
     /// start() is refused and stop()/connect_to()/disconnect() are ignored while it is set, so a

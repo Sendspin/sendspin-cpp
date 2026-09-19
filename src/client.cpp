@@ -237,6 +237,7 @@ SendspinClient::~SendspinClient() {
         // Every high-performance hold ends with the client. The release sites for the time hold
         // (cleanup_connection_state()) and the playback hold (the player's cleanup()) do not run
         // here, and nothing can acquire once the network threads are gone.
+        this->high_performance_releases_pending_ = 0;
         while (this->high_performance_ref_count_.load() > 0) {
             this->release_high_performance();
         }
@@ -514,6 +515,10 @@ void SendspinClient::loop() {
 }
 
 void SendspinClient::drain_inbox() {
+    // Releases a locked teardown handed over rather than performing inline: nothing here holds a
+    // ConnectionManager lock, so the listener callback a last release fires may call back in.
+    this->flush_high_performance_releases();
+
     // Process deferred events: all state mutations and user callbacks happen here, on the main
     // loop thread, to avoid cross-thread data races. Two poll() snapshots gate the work below:
     // inbox_bits (here) gates only the event-ring drain immediately following it; slot_bits
@@ -1036,9 +1041,22 @@ void SendspinClient::release_high_performance() {
     }
 }
 
+void SendspinClient::release_high_performance_deferred() {
+    if (this->high_performance_releases_pending_ < UINT8_MAX) {
+        ++this->high_performance_releases_pending_;
+    }
+}
+
 // ============================================================================
 // Private helpers
 // ============================================================================
+
+void SendspinClient::flush_high_performance_releases() {
+    while (this->high_performance_releases_pending_ > 0) {
+        --this->high_performance_releases_pending_;
+        this->release_high_performance();
+    }
+}
 
 void SendspinClient::cleanup_connection_state() {
     SS_LOGV(TAG, "Cleaning up connection state");
@@ -1103,9 +1121,11 @@ void SendspinClient::cleanup_connection_state() {
     }
 #endif
 
-    // Release high-performance networking for time sync
+    // Release high-performance networking for time sync. Deferred: the connection-loss path
+    // reaches this under ConnectionManager::conn_ptr_mutex_, and a listener callback must not
+    // run there.
     if (this->high_performance_held_for_time_) {
-        this->release_high_performance();
+        this->release_high_performance_deferred();
         this->high_performance_held_for_time_ = false;
     }
 }

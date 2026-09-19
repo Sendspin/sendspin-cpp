@@ -636,8 +636,10 @@ void PlayerRole::Impl::cleanup() {
     // Clear awaiting events too (main-thread only, no mutex needed)
     this->awaiting_sync_idle_events.clear();
 
+    // Deferred: cleanup() runs under ConnectionManager::conn_ptr_mutex_ on both the role-removal
+    // and the connection-loss path, and a listener callback must not run there.
     if (this->high_performance_requested_for_playback) {
-        this->client->release_high_performance();
+        this->client->release_high_performance_deferred();
         this->high_performance_requested_for_playback = false;
     }
 }
