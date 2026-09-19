@@ -56,7 +56,9 @@ add_executable(sendspin_tests
 )
 
 # test_client_lifecycle.cpp checks what a role's stop() left in its ring, which nothing on the
-# public surface reports; it reads the private members directly instead of adding a seam.
+# public surface reports, and installs a stand-in connection in ConnectionManager's admitted slot
+# (and drops it mid-publish) to pin publish_state()'s hold on it; it reads the private members
+# directly instead of adding a seam.
 set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_role_deactivation.cpp reads what a removed role left behind and drives the pieces the

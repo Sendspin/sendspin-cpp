@@ -20,6 +20,7 @@
 /// FakeEncryptedServer plays the Sendspin server over the real Noise transport and the test
 /// thread pumps client.loop().
 
+#include "connection.h"  // PublishingConnection stands in for a real connection
 #include "connection_manager.h"  // GoodbyeWait, GOODBYE_FLUSH_TIMEOUT_MS
 #include "crypto/constants.h"
 #include "crypto/keys.h"
@@ -46,6 +47,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -67,6 +69,7 @@ constexpr uint16_t HIGH_PERF_TEST_PORT = 19017;
 constexpr uint16_t VISUALIZER_TEST_PORT = 19018;
 constexpr uint16_t DESTRUCTOR_HIGH_PERF_TEST_PORT = 19019;
 constexpr uint16_t PROVIDER_TEST_PORT = 19020;
+constexpr uint16_t PUBLISH_STATE_TEST_PORT = 19021;
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
@@ -546,6 +549,111 @@ TEST(ClientLifecycle, DestructorReleasesHighPerformanceHold) {
         // Client destroyed here mid-burst, with the hold open.
     }
     EXPECT_EQ(listener.releases, 1);
+}
+
+// ============================================================================
+// publish_state() connection lifetime
+// ============================================================================
+
+/// Rendezvous state for PublishingConnection, owned by the test rather than by the connection so
+/// the send path can still reach it after the connection has been destroyed.
+struct PublishRendezvous {
+    std::promise<void> in_send;      // Signalled once the send is inside the connection
+    std::promise<void> slot_dropped;  // Signalled once the manager's slot is gone
+    std::vector<std::string> sent;
+    bool destroyed{false};
+    bool destroyed_during_send{false};
+};
+
+/// Connection stand-in that parks inside its own send until the test has dropped the connection
+/// manager's slot, then records whether it was destroyed while that send was still running.
+class PublishingConnection : public SendspinConnection {
+public:
+    explicit PublishingConnection(PublishRendezvous* rv) : rv_(rv) {}
+    ~PublishingConnection() override {
+        this->rv_->destroyed = true;
+    }
+
+    void start() override {}
+    void loop() override {}
+    void disconnect(SendspinGoodbyeReason, std::function<void()> on_complete) override {
+        if (on_complete) {
+            on_complete();
+        }
+    }
+    void close_transport_now() override {}
+    bool is_connected() const override {
+        return true;
+    }
+    bool send_time_message() override {
+        return true;
+    }
+    SsErr send_binary_message(const uint8_t*, size_t, SendCompleteCallback cb, bool) override {
+        if (cb) {
+            cb(true);
+        }
+        return SsErr::OK;
+    }
+
+    // No Noise session, so send_app_json() routes the client/state here as raw text.
+    SsErr send_text_message(const std::string& msg, SendCompleteCallback cb, bool) override {
+        // Everything this send needs after the drop lives on the stack: under the defect the
+        // object is gone by then, and touching a member would be the use-after-free rather than
+        // the assertion that names it.
+        PublishRendezvous* rv = this->rv_;
+        rv->sent.push_back(msg);
+        rv->in_send.set_value();
+        rv->slot_dropped.get_future().wait();
+        rv->destroyed_during_send = rv->destroyed;
+        if (cb) {
+            cb(true);
+        }
+        return SsErr::OK;
+    }
+
+private:
+    PublishRendezvous* rv_;
+};
+
+// publish_state() resolves the current connection as a shared_ptr, so a caller that is not the
+// main loop (a role thread, against its documented contract) cannot have the connection freed
+// under its send. The main loop drops the manager's slot while the publish is parked inside the
+// connection's own send: the shared_ptr publish_state() holds is then the last reference, so the
+// connection outlives the call and is destroyed only when it returns.
+TEST(ClientLifecycle, PublishStateOutlivesADropDuringTheSend) {
+    TestNetworkProvider network;
+    SendspinClient client(make_config(PUBLISH_STATE_TEST_PORT));
+    client.set_network_provider(&network);
+    ASSERT_TRUE(client.start());
+
+    PublishRendezvous rv;
+    {
+        auto conn = std::make_shared<PublishingConnection>(&rv);
+        conn->set_client_hello_sent(true);
+        conn->set_server_hello_received(true);
+        conn->apply_server_activate({SendspinActivity::PLAYBACK}, std::nullopt, std::nullopt,
+                                    std::nullopt);
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        client.connection_manager_->current_connection_ = std::move(conn);
+    }
+
+    std::thread role_thread([&client] { client.publish_state(); });
+    rv.in_send.get_future().wait();
+    {
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        client.connection_manager_->current_connection_.reset();
+    }
+    EXPECT_FALSE(rv.destroyed) << "the manager held the only other reference, so the publish's "
+                                  "own shared_ptr is what kept the connection alive";
+    rv.slot_dropped.set_value();
+    role_thread.join();
+
+    EXPECT_FALSE(rv.destroyed_during_send)
+        << "the connection was destroyed while its own send was running";
+    EXPECT_TRUE(rv.destroyed) << "the publish leaked the connection past its own call";
+    EXPECT_EQ(rv.sent.size(), 1u) << "the client/state never reached the connection";
+
+    client.stop();
 }
 
 }  // namespace

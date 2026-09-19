@@ -969,9 +969,10 @@ void SendspinClient::leave() {
 // ============================================================================
 
 void SendspinClient::publish_state() {
-    // current_shared() rather than current(): a role thread may call this, and the shared_ptr
-    // holds the connection alive across publish_client_state()'s gate reads and its send even if
-    // the main loop drops or replaces it meanwhile. Same reasoning as send_text().
+    // current_shared() rather than current(): current() drops conn_ptr_mutex_ before returning,
+    // so the raw pointer is only as good as the caller's own main-loop guarantee. Holding the
+    // shared_ptr makes the gate reads and the send safe regardless, as send_text() does. The
+    // state fields the publish reads are not covered by it: this is main loop only.
     auto conn = this->connection_manager_->current_shared();
     this->publish_client_state(conn.get());
 }
