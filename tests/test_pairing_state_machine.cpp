@@ -2836,29 +2836,33 @@ TEST_F(PairingStateMachineTest, FinalizedPairingIsNotEvictedByRankZeroLastPlayba
 // A single-server deployment repeats the same server_id on every PLAYING transition, so the
 // guard must skip the write (not just rely on the storage backend to dedup) once the id already
 // matches ConnectionManager's last-played state; a genuine handoff to a different server_id must
-// still go through.
+// still go through. The provider's write count is the whole observable: what the guard is
+// protecting is the flash the consumer's provider would spend.
 TEST_F(PairingStateMachineTest, PersistLastPlayedServerSkipsDuplicateWrite) {
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 0);
 
     this->persist_last_played_server("server-a");
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 1);
-    EXPECT_EQ(this->client_->connection_manager_->last_played_server_id(), "server-a");
 
     // Same server_id again (also covers the post-reboot case, where load_last_played_server()
     // already seeded this value via the same setter): no second write.
     this->persist_last_played_server("server-a");
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 1);
 
-    // A different server_id must still go through.
+    // A different server_id must still go through, and must become the value later calls are
+    // deduped against.
     this->persist_last_played_server("server-b");
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
-    EXPECT_EQ(this->client_->connection_manager_->last_played_server_id(), "server-b");
+    this->persist_last_played_server("server-b");
+    EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
 
     // An empty server_id is not a handoff to anything: it must neither be written nor become the
     // state a later real handoff is deduped against.
     this->persist_last_played_server("");
     EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2);
-    EXPECT_EQ(this->client_->connection_manager_->last_played_server_id(), "server-b");
+    this->persist_last_played_server("server-b");
+    EXPECT_EQ(this->persistence_provider_.save_attempts(persistence_keys::LAST_PLAYED), 2)
+        << "an empty id must not have displaced the deduped value";
 }
 
 // ============================================================================
