@@ -260,13 +260,15 @@ private:
 ///
 /// Shared by the role stream-event and cleared-event producers so the build/push/log-on-drop
 /// pattern stays uniform across roles. `what` names the dropped event in the log line; `code`
-/// carries the role-local enum value (0 when unused). `error_level` logs the drop at ERROR rather
-/// than WARN: use it for events whose loss wedges the stream (player START/END), not for the
-/// idempotent CLEARED events whose loss leaves merely recoverable stale state. `epoch` stamps the
-/// producing role's teardown generation onto the event; a role whose events must not outlive a
-/// teardown passes it and the consumer checks it with event_is_current().
+/// carries the role-local enum value (0 when unused). `epoch` stamps the producing role's
+/// teardown generation onto the event; a role whose events must not outlive a teardown passes it
+/// and the consumer checks it with event_is_current(). It is required, not defaulted: an event
+/// stamped 0 by omission reads as "the role was never torn down", which is exactly the check a
+/// stamped producer wanted. `error_level` logs the drop at ERROR rather than WARN: use it for
+/// events whose loss wedges the stream (player START/END), not for the idempotent CLEARED events
+/// whose loss leaves merely recoverable stale state.
 inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, const char* tag,
-                              const char* what, bool error_level = false, uint32_t epoch = 0) {
+                              const char* what, uint32_t epoch, bool error_level = false) {
     InboxEvent event{};
     event.type = type;
     event.code = code;

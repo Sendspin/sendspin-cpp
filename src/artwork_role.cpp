@@ -649,7 +649,7 @@ void ArtworkRole::Impl::handle_stream_clear(uint32_t generation) {
 void ArtworkRole::Impl::enqueue_stream_event(ArtworkEventType event, uint32_t generation) const {
     push_event_or_log(this->inbox, InboxEventType::ARTWORK_STREAM, static_cast<uint8_t>(event), TAG,
                       event == ArtworkEventType::STREAM_END ? "STREAM_END" : "STREAM_CLEAR",
-                      /*error_level=*/false, generation);
+                      generation);
 }
 
 // ============================================================================

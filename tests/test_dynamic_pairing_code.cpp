@@ -94,6 +94,8 @@ static std::string make_pair_confirm_json(const std::string& server_kc_b64) {
 // process_server_pair_init_message
 // ============================================================================
 
+// Control: the same parser accepts a well-formed server/pair-init, so each rejection below is the
+// field it names and not the parser refusing everything.
 TEST(DynamicPairingCode, ParseServerPairInitValid) {
     std::array<uint8_t, 32> nonce_a{};
     for (int i = 0; i < 32; ++i) nonce_a[i] = static_cast<uint8_t>(i);
@@ -156,6 +158,8 @@ TEST(DynamicPairingCode, ParseServerPairInitInvalidBase64) {
 // process_server_pair_auth_message
 // ============================================================================
 
+// Control: the same parser accepts a well-formed server/pair-auth, so each rejection below is the
+// field it names and not the parser refusing everything.
 TEST(DynamicPairingCode, ParseServerPairAuthValid) {
     std::array<uint8_t, 32> pake_msg_1{};
     for (int i = 0; i < 32; ++i) pake_msg_1[i] = static_cast<uint8_t>(i + 10);
@@ -194,6 +198,8 @@ TEST(DynamicPairingCode, ParseServerPairAuthInvalidBase64) {
 // process_server_pair_confirm_message
 // ============================================================================
 
+// Control: the same parser accepts a well-formed server/pair-confirm, so each rejection below is the
+// field it names and not the parser refusing everything.
 TEST(DynamicPairingCode, ParseServerPairConfirmValid) {
     std::array<uint8_t, 64> server_kc{};
     for (int i = 0; i < 64; ++i) server_kc[i] = static_cast<uint8_t>(i);

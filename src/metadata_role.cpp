@@ -206,8 +206,9 @@ void MetadataRole::Impl::cleanup() {
     this->metadata = {};
     this->held_state.reset();
 
+    // Unstamped: a clear is idempotent, so it is delivered whatever teardown overtook it.
     push_event_or_log(this->inbox, InboxEventType::METADATA_CLEARED, 0, TAG,
-                      "metadata cleared event");
+                      "metadata cleared event", /*epoch=*/0);
 }
 
 }  // namespace sendspin

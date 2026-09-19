@@ -887,6 +887,11 @@ private:
     /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
     void note_close_pairing_window();
 
+    /// @brief Queue an on_trust_changed notification for delivery from loop().
+    /// Same deferral as note_pairing_started: queued with conn_ptr_mutex_ held, fired unlocked.
+    /// Main loop only.
+    void note_trust_changed(ConnectionTrust trust);
+
     struct EventState;
 
     // Struct fields

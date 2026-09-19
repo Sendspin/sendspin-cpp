@@ -361,7 +361,7 @@ void VisualizerRole::Impl::enqueue_stream_event(VisualizerEventType event,
         name = "STREAM_END";
     }
     push_event_or_log(this->inbox, InboxEventType::VISUALIZER_STREAM, static_cast<uint8_t>(event),
-                      TAG, name, /*error_level=*/false, generation);
+                      TAG, name, generation);
 }
 
 // ============================================================================

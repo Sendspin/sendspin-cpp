@@ -673,8 +673,8 @@ void PlayerRole::Impl::enqueue_stream_event(PlayerStreamCallbackType event,
     // idempotent CLEARED events but understates a wedged player stream).
     push_event_or_log(
         this->inbox, InboxEventType::PLAYER_STREAM, static_cast<uint8_t>(event), TAG,
-        event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END",
-        /*error_level=*/true, generation);
+        event == PlayerStreamCallbackType::STREAM_START ? "STREAM_START" : "STREAM_END", generation,
+        /*error_level=*/true);
 }
 
 void PlayerRole::Impl::load_output_delay() {

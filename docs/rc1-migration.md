@@ -244,6 +244,22 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   with its bytes dropped. `roles/artwork/v1.md` "Artwork (Binary)" allows this (it is the
   "unavailable client" path) but sets no cap of its own, so a server that encodes an image larger
   than the channel's budget sees the channel keep its previous image rather than an error.
+- `dispatch_json_message()`'s stack frame on the network thread is unmeasured. The switch holds
+  around twenty message and payload structs in sibling `case` scopes plus a `JsonDocument`, and
+  the rc1 work added six of them (two `ServerPairingMessageEvent` copies, ~160 bytes each, in
+  each of the pair-init/pair-auth/pair-confirm cases). `-fstack-reuse=all` should overlap the
+  sibling scopes, but that is not a number, and this runs on the `esp_websocket_client` / httpd
+  task rather than the main loop. ESP on-device check: build the component with `-fstack-usage`
+  at the shipped optimization level and read `dispatch_json_message` out of `client.cpp.su`
+  (and `handle_pairing_message` out of `connection_manager.cpp.su`, whose confirm branch holds
+  three ~72-byte ISK copies live at once, deliberately). More than a few hundred bytes over the
+  pre-rc1 frame calls for moving each pairing case's parse-and-push into an out-of-line helper
+  that fills a caller-owned struct, the shape `begin_transfer()` uses in `artwork_role.cpp`.
+- The host suites bound their positive waits with `pump_until(pred, 6000)` at 165 sites, which
+  makes elapsed time part of the verdict where the conventions want a named hang from the suite
+  watchdog instead. Pre-existing and unchanged by the rc1 work, which leans on the idiom harder
+  than `main` did; the fix is an unbounded form for the positive waits, keeping the bounded one
+  for the must-not-happen windows where the bound is the point.
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.

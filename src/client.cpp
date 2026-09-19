@@ -1535,8 +1535,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             // stack is small on ESP-IDF. Scoping the sections lets the compiler reuse the same
             // slots, and a section is only parsed at all when its role is present.
 #ifdef SENDSPIN_ENABLE_CONTROLLER
-            if (this->controller_ != nullptr &&
-                role_accepts_traffic(conn, SendspinRole::CONTROLLER)) {
+            if (this->controller_ && role_accepts_traffic(conn, SendspinRole::CONTROLLER)) {
                 ServerStateControllerObject controller_state;
                 if (process_server_state_controller(root, &controller_state)) {
                     this->controller_->impl_->handle_server_state(
@@ -1548,7 +1547,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
 #endif
 
 #ifdef SENDSPIN_ENABLE_METADATA
-            if (this->metadata_ != nullptr && role_accepts_traffic(conn, SendspinRole::METADATA)) {
+            if (this->metadata_ && role_accepts_traffic(conn, SendspinRole::METADATA)) {
                 ServerMetadataStateObject metadata_state;
                 if (process_server_state_metadata(root, &metadata_state)) {
                     this->metadata_->impl_->handle_server_state(
@@ -1559,7 +1558,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
 #endif
 
 #ifdef SENDSPIN_ENABLE_COLOR
-            if (this->color_ != nullptr && role_accepts_traffic(conn, SendspinRole::COLOR)) {
+            if (this->color_ && role_accepts_traffic(conn, SendspinRole::COLOR)) {
                 ServerColorStateObject color_state;
                 if (process_server_state_color(root, &color_state)) {
                     this->color_->impl_->handle_server_state(
@@ -2020,8 +2019,7 @@ void SendspinClient::on_handshake_complete(SendspinConnection* conn) {
                                     ? ConnectionTrust::USER
                                     : ConnectionTrust::NONE;
         this->current_trust_ = trust;
-        this->event_state_->pairing_notes.push_back(
-            {.type = PairingNoteType::TRUST_CHANGED, .trust = trust});
+        this->note_trust_changed(trust);
     }
 }
 
@@ -2106,6 +2104,10 @@ void SendspinClient::note_clear_pairing_code() {
 
 void SendspinClient::note_open_pairing_window() {
     this->event_state_->push_pairing_note({.type = PairingNoteType::OPEN_PAIRING_WINDOW});
+}
+
+void SendspinClient::note_trust_changed(ConnectionTrust trust) {
+    this->event_state_->push_pairing_note({.type = PairingNoteType::TRUST_CHANGED, .trust = trust});
 }
 
 void SendspinClient::note_close_pairing_window() {

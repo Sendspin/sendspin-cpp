@@ -97,8 +97,9 @@ void ControllerRole::Impl::cleanup() {
     this->event_state->slot.reset();
     this->controller_state = {};
 
+    // Unstamped: a clear is idempotent, so it is delivered whatever teardown overtook it.
     push_event_or_log(this->inbox, InboxEventType::CONTROLLER_CLEARED, 0, TAG,
-                      "controller cleared event");
+                      "controller cleared event", /*epoch=*/0);
 }
 
 }  // namespace sendspin

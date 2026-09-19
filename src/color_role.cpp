@@ -151,7 +151,9 @@ void ColorRole::Impl::cleanup() {
     this->color = {};
     this->held_state.reset();
 
-    push_event_or_log(this->inbox, InboxEventType::COLOR_CLEARED, 0, TAG, "color cleared event");
+    // Unstamped: a clear is idempotent, so it is delivered whatever teardown overtook it.
+    push_event_or_log(this->inbox, InboxEventType::COLOR_CLEARED, 0, TAG, "color cleared event",
+                      /*epoch=*/0);
 }
 
 }  // namespace sendspin
