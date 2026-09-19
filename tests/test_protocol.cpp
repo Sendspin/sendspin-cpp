@@ -305,6 +305,20 @@ TEST(Protocol, PlayerCommandRejectsFloatForInteger) {
     EXPECT_FALSE(integral_float->output_delay_ms.has_value());
 }
 
+// messaging.md "server/command": the player object names its action in `command`. A command the
+// role does not define, and an object with no command at all, reject the whole object; the caller
+// (process_server_command_message) then drops the message, so the well-formed fields beside the
+// bad command never reach the role.
+TEST(Protocol, PlayerCommandUnknownOrAbsentCommandRejectsTheObject) {
+    EXPECT_FALSE(parse_player_command(R"({"command":"teleport","volume":50})").has_value());
+    EXPECT_FALSE(parse_player_command(R"({"volume":50})").has_value());
+
+    // Control: the same volume under a defined command is applied.
+    auto valid = parse_player_command(R"({"command":"volume","volume":50})");
+    ASSERT_TRUE(valid.has_value());
+    EXPECT_EQ(valid->volume.value_or(0), 50);
+}
+
 // A malformed required scalar in stream/start (channels out of range) is dropped, leaving the player
 // object incomplete, so the whole message is rejected instead of being accepted with a bogus value.
 TEST(Protocol, StreamStartRejectsOutOfRangeRequiredScalar) {
