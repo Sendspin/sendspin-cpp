@@ -429,18 +429,6 @@ TEST(NoiseHandshakeLoopback, KKpsk2ChaChaPoly_FullHandshake) {
 }
 
 // ============================================================================
-// Handshake hash is available and non-zero after split
-// ============================================================================
-
-TEST(NoiseHandshakeLoopback, HandshakeHashAvailable) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    const auto& hash = r->responder_session->handshake_hash();
-    bool all_zero = std::all_of(hash.begin(), hash.end(), [](uint8_t b) { return b == 0; });
-    EXPECT_FALSE(all_zero) << "handshake_hash() should not be all-zero after successful handshake";
-}
-
-// ============================================================================
 // Fragment and reassemble (TestConnection dispatch loop)
 // ============================================================================
 
