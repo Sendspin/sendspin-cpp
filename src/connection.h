@@ -216,8 +216,7 @@ public:
     /// decided on the main loop one tick later, so the messages in between would otherwise be
     /// lost (a one-shot server/state carries state that is never repeated). Holding them here
     /// keeps the admission gate: a connection that never wins admission never replays anything,
-    /// and its held messages die with it. Only messages that follow an activate are held; role
-    /// traffic from a peer that has not activated anything is dropped where it always was.
+    /// and its held messages die with it. Only messages that follow an activate are held.
     ///
     /// The storage has no lock of its own: every call, here and in
     /// replay_pre_admission_messages(), runs under SendspinClient's json_processing_mutex_, which
@@ -225,7 +224,7 @@ public:
     /// @param data Raw JSON text (not null-terminated).
     /// @param len Length of the JSON text in bytes.
     /// @param arrival_us Receive timestamp in microseconds.
-    /// @return true if the message was held, false if the budget is full and it was not.
+    /// @return true if the message was held, false when the budget is full.
     bool hold_pre_admission_message(const char* data, size_t len, int64_t arrival_us);
 
     /// @brief Passes each held role message to `visit`, in arrival order, then drops them all.
@@ -556,7 +555,7 @@ public:
         std::array<uint8_t, 32> nonce_b{};
         /// nonce_A from the attempt's first server/pair-init. pairing.md "Rounds" keeps the
         /// binding values, and so the pairing code, unchanged across an attempt's rounds, and a
-        /// later round's server/pair-init carries no nonce, so the first round's value stays here.
+        /// later round's server/pair-init carries no nonce.
         std::array<uint8_t, 32> nonce_a{};
         std::array<uint8_t, 32> handshake_hash{};
         /// The pairing code as CPace consumes it (PRS, pairing.md "PAKE"): the six or eight ASCII
@@ -584,11 +583,8 @@ public:
 
         /// @brief Wipes the pairing code and both binding nonces on destruction, the same
         /// discipline every PSK-bearing struct follows (see SendspinPairingRecord in config.h).
-        /// `prs` is the pairing code itself as CPace consumes it and lives on the heap, so
-        /// releasing that buffer unwiped would leave the code in freed memory after every
-        /// attempt, successful or not. `cpace` wipes its own scalar, MAC key and ISK here,
-        /// which is why clear_pairing_state() destroys this object rather than assigning over
-        /// it.
+        /// `prs` lives on the heap, so releasing it unwiped would leave the code in freed
+        /// memory after every attempt. `cpace` wipes its own scalar, MAC key and ISK here.
         ~PairingSession() {
             secure_zero_container(this->nonce_b);
             secure_zero_container(this->nonce_a);
@@ -597,9 +593,8 @@ public:
             }
         }
 
-        /// A session is per-connection state reached only by reference (pairing_session()), so
-        /// copying it is always a mistake: a copy would carry the code and the nonces into a
-        /// second buffer this destructor does not know about.
+        /// Reached only by reference (pairing_session()); a copy would carry the code and the
+        /// nonces into a second buffer nothing wipes.
         PairingSession(const PairingSession&) = delete;
         PairingSession& operator=(const PairingSession&) = delete;
     };
@@ -674,9 +669,7 @@ public:
         this->pending_pairing_slot_.reset();
         // Reset the pairing-code session (main-loop-only fields; no lock needed). Destroyed and
         // rebuilt in place rather than assigned over: assignment would overwrite the secrets
-        // instead of wiping them, and would never run ~PairingSession or ~CPace, which is where
-        // the pairing code, the binding nonces, the CPace scalar and the ISK are actually
-        // erased.
+        // instead of wiping them, and would never run ~PairingSession or ~CPace.
         std::destroy_at(&this->pairing_session_);
         std::construct_at(&this->pairing_session_);
     }
@@ -695,8 +688,8 @@ public:
     ///
     /// Runs on the network thread, where the activate is parsed, so a role the activation ADDS is
     /// already active for the receive gate when the traffic that legitimately follows it arrives:
-    /// messaging.md "server/state" has the server send a re-added role's state promptly, and it
-    /// does not wait for the client's next main-loop tick. Removals are deliberately not applied
+    /// messaging.md "server/state" has the server send a re-added role's state promptly, without
+    /// waiting for the client's next main-loop tick. Removals are deliberately not applied
     /// here: they take effect in apply_server_activate() on the main loop, in the same step that
     /// tears the removed roles down, so the gate and the teardown always agree on when a role
     /// stopped.
@@ -710,9 +703,8 @@ public:
     ///
     /// Main-loop only. note_activated_roles() adds a just-received activation's roles on the
     /// network thread, before admissibility is judged. An activation the main loop then rejects
-    /// while keeping the connection open never reaches apply_server_activate(), so the bits it
-    /// added are taken back here; otherwise the receive gate would go on admitting traffic for a
-    /// role this client never activated.
+    /// while keeping the connection open never reaches apply_server_activate(); without this the
+    /// receive gate would go on admitting traffic for a role this client never activated.
     /// @param refused_roles The active_roles of the refused activation (empty when it named none).
     void withdraw_activated_roles(const std::vector<std::string>& refused_roles) {
         this->publish_role_mask(active_role_mask(refused_roles));
@@ -722,12 +714,11 @@ public:
     /// name this library implements.
     ///
     /// The one activation test in the library: the receive gate, the send gate, the client/state
-    /// role objects and role removal all resolve a role the same way, since this reads the mask
-    /// active_role_mask() builds with the same exact-version test (role_in()) role removal
-    /// applies, so no two of them can disagree about whether a role is active. The mask is
-    /// rebuilt by apply_server_activate() and read atomically, so the
-    /// receive path may call it from the network thread while the main loop applies an
-    /// activation; active_roles_ itself is main-loop-only and must not be walked from there.
+    /// role objects and role removal all read the mask active_role_mask() builds with the same
+    /// exact-version test (role_in()) role removal applies, so none of them can disagree. The
+    /// mask is rebuilt by apply_server_activate() and read atomically, so the receive path may
+    /// call it from the network thread while the main loop applies an activation; active_roles_
+    /// itself is main-loop-only and must not be walked from there.
     /// @param role The role to test.
     bool is_role_active(SendspinRole role) const {
         return (this->active_role_mask_.load(std::memory_order_acquire) & role_mask_bit(role)) != 0;
@@ -985,9 +976,7 @@ protected:
     /// are read-modify-writes because the network thread ORs a newly arrived activation's roles
     /// in without waiting for the main loop: a plain store of the applied set would erase the
     /// bits of an activation that is delivered but not yet applied, and the receive gate would
-    /// then drop exactly the traffic a server sends immediately behind its activate. A bit this
-    /// step neither applies nor withdraws is left alone, for its own activation's publish to
-    /// decide.
+    /// then drop exactly the traffic a server sends immediately behind its activate.
     /// @param withdrawn Bits this step takes back (the roles it removed, or a refusal's roles).
     void publish_role_mask(uint16_t withdrawn) {
         this->active_role_mask_.fetch_and(static_cast<uint16_t>(~withdrawn),
@@ -1291,9 +1280,8 @@ protected:
     /// read from the main loop via is_noise_handshake_complete()).
     std::atomic<bool> noise_handshake_complete_{false};
 
-    /// True once a server/activate from this connection reached the dispatch path (network
-    /// thread), read by the same thread's gate and, on the main loop, nowhere. Separate from
-    /// first_activate_received_, which tracks activates the main loop has applied.
+    /// True once a server/activate from this connection reached the dispatch path. Written and
+    /// read on the network thread only. See note_activate_delivered().
     std::atomic<bool> activate_delivered_{false};
 
     /// True while this connection occupies the manager's admitted (current) slot. Written only

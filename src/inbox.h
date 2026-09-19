@@ -87,10 +87,9 @@ struct TimeResponsePayload {
 struct InboxEvent {
     InboxEventType type{};
     uint8_t code{0};  // Role-local enum value; 0 when unused
-    /// Teardown generation of the producing role at push time, 0 for events that have none.
-    /// The consumer compares it against the role's current generation and drops a mismatch, so an
-    /// event queued before a teardown cannot act after it (see event_is_current()). Occupies
-    /// padding the struct already had, so the ring does not grow.
+    /// Teardown generation of the producing role at push time, 0 for events that have none; the
+    /// consumer drops a mismatch so an event queued before a teardown cannot act after it (see
+    /// event_is_current()). Occupies padding the struct already had, so the ring does not grow.
     uint32_t epoch{0};
     TimeResponsePayload time;  // Valid only when type == InboxEventType::TIME_RESPONSE
 };
@@ -261,12 +260,11 @@ private:
 /// Shared by the role stream-event and cleared-event producers so the build/push/log-on-drop
 /// pattern stays uniform across roles. `what` names the dropped event in the log line; `code`
 /// carries the role-local enum value (0 when unused). `epoch` stamps the producing role's
-/// teardown generation onto the event; a role whose events must not outlive a teardown passes it
-/// and the consumer checks it with event_is_current(). It is required, not defaulted: an event
-/// stamped 0 by omission reads as "the role was never torn down", which is exactly the check a
-/// stamped producer wanted. `error_level` logs the drop at ERROR rather than WARN: use it for
-/// events whose loss wedges the stream (player START/END), not for the idempotent CLEARED events
-/// whose loss leaves merely recoverable stale state.
+/// teardown generation onto the event, for event_is_current() to check. It is required, not
+/// defaulted: an event stamped 0 by omission reads as "the role was never torn down", which is
+/// exactly the check a stamped producer wanted. `error_level` logs the drop at ERROR rather than
+/// WARN: use it for events whose loss wedges the stream (player START/END), not for the idempotent
+/// CLEARED events whose loss leaves merely recoverable stale state.
 inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, const char* tag,
                               const char* what, uint32_t epoch, bool error_level = false) {
     InboxEvent event{};

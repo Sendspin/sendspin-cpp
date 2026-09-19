@@ -141,9 +141,8 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
                     "Noise handshake aborted by server/error (reason='%s'); closing connection",
                     server_error.c_str());
         }
-        // Discard handshake state, then close per connection.md "Failure Handling": a
-        // handshake-phase failure closes the WebSocket without sending any application-level
-        // message.
+        // connection.md "Failure Handling": a handshake-phase failure closes the WebSocket
+        // without sending any application-level message.
         this->noise_handshake_.reset();
         this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
         return;
@@ -165,8 +164,8 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
         // which cannot be true before the Noise transport is active) see these values.
         this->set_noise_handshake_result(outcome->server_id, outcome->resolved_psk.category,
                                          outcome->resolved_psk.psk_id);
-        // Reset the pairing server/activate counter (pairing.md "Pairing index"): a fresh handshake
-        // starts a fresh count for the pairing_index / CPace-sid counter.
+        // pairing.md "Pairing index": a fresh handshake starts a fresh count for the
+        // pairing_index / CPace-sid counter.
         this->reset_pairing_index();
         // Install the cipher session; send_app_json() routes encrypted from here on.
         this->noise_transport_.activate(std::move(outcome->session));
@@ -258,14 +257,13 @@ bool SendspinConnection::handle_noise_rehandshake(const std::string& msg1_json) 
         this->psk_id_ = result->resolved_psk.psk_id;
     }
 
-    // Reset the pairing server/activate counter (pairing.md "Pairing index"): a re-handshake starts
-    // a fresh count for the pairing_index / CPace-sid counter, same as an initial handshake.
+    // pairing.md "Pairing index": a re-handshake starts a fresh count for the pairing_index /
+    // CPace-sid counter, same as an initial handshake.
     this->reset_pairing_index();
 
-    // connection.md "Re-handshake": neither server/hello nor client/hello is re-sent, so the
-    // hello handshake state carries over untouched. The server's first message under the new
-    // keys is server/activate, and first_activate_received_ (cleared above) is what this
-    // connection now waits on.
+    // connection.md "Re-handshake": neither hello is re-sent, so the hello state carries over
+    // untouched; the server's first message under the new keys is server/activate, which
+    // first_activate_received_ (cleared above) now waits on.
     SS_LOGI(TAG,
             "Noise re-handshake complete: server_id=%s psk_category=%d; awaiting server/activate",
             current_server_id.c_str(), static_cast<int>(this->get_psk_category()));
@@ -482,8 +480,8 @@ bool SendspinConnection::hold_pre_admission_message(const char* data, size_t len
 
 void SendspinConnection::replay_pre_admission_messages(const HeldMessageVisitor& visit) {
     const size_t count = this->held_count_;
-    // Cleared before the visits so a message the visitor somehow routes back here cannot be
-    // replayed twice or read from a buffer this call is already draining.
+    // Cleared before the visits so a message the visitor routes back here cannot be replayed
+    // twice or read from a buffer this call is already draining.
     this->held_count_ = 0;
     this->held_bytes_ = 0;
     for (size_t i = 0; i < count; ++i) {
@@ -491,8 +489,7 @@ void SendspinConnection::replay_pre_admission_messages(const HeldMessageVisitor&
         visit(reinterpret_cast<const char*>(this->held_messages_.data()) + extent.offset,
               extent.length, extent.arrival_us);
     }
-    // Nothing is held after admission, so the buffer goes back to the heap now rather than
-    // staying allocated for the rest of the session.
+    // Returned to the heap now rather than staying allocated for the rest of the session.
     this->held_messages_ = PlatformBuffer{};
 }
 
