@@ -53,7 +53,7 @@ extern const std::string SENTINEL_PSK_ID;
 // Cipher suite name (passed to noise_protocol_name_to_id)
 // ============================================================================
 
-/// @brief The only cipher suite the client proposes: ChaChaPoly20-Poly1305 (constant-time on
+/// @brief The only cipher suite the client proposes: ChaCha20-Poly1305 (constant-time on
 /// every target, no AES hardware dependency). The Sendspin client builds its Noise session from
 /// its own client/init proposal and never reads server/init's suite field back, so a single
 /// suite is sufficient; there is nothing to negotiate.
@@ -71,10 +71,10 @@ static constexpr int PROTOCOL_VERSION = 1;
 static constexpr size_t MAX_TRANSPORT_PLAINTEXT = 65535 - 16;  // = 65519
 
 /// @brief Buffer size for a single Noise handshake control message (msg1 decrypted payload,
-/// msg2 ciphertext): the spec payload is small (psk_id JSON, ~60 bytes; spec max ~256 bytes).
-/// 512 keeps a comfortable safety margin over that documented max without paying for a buffer
-/// sized like transport-mode traffic. noise-c bounds-checks against this capacity and returns
-/// an error rather than overflowing it if a peer's message does not fit (verified against
+/// msg2 ciphertext): the spec sets no bound, but the payload it defines is small (psk_id JSON,
+/// ~60 bytes). 512 leaves room for future fields without paying for a buffer sized like
+/// transport-mode traffic. noise-c bounds-checks against this capacity and returns an error
+/// rather than overflowing it if a peer's message does not fit (verified against
 /// noise_handshakestate_read_message()'s payload->max_size check), so a legitimate handshake
 /// message exceeding this size fails the handshake rather than corrupting memory.
 static constexpr size_t MAX_HANDSHAKE_MESSAGE_BYTES = 512;

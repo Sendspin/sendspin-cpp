@@ -70,7 +70,8 @@ public:
         /// True when this (empty) result is a messaging.md "Malformed sequences" protocol
         /// error: a first fragment while one is in flight, a non-first fragment with none in
         /// flight, a non-fragment message while one is in flight, a nonzero reserved flag bit,
-        /// or an orig_type of 1, rather than the benign "no complete message yet"
+        /// an orig_type of 1, a fragment frame missing its flags byte, or a first fragment
+        /// missing its orig_type, rather than the benign "no complete message yet"
         /// mid-reassembly state. The caller MUST close the connection when this is true.
         bool malformed{false};
     };

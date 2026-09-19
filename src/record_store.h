@@ -20,7 +20,9 @@
 /// `SendspinPersistenceProvider` for durability, and resolves `psk_id` ->
 /// PSK for the Noise handshake layer.
 ///
-/// Resolution order: long-term record -> accepted Pairing PSK -> Sentinel PSK.
+/// Resolution is scoped to the `psk_category` the server declared: a long-term record, the
+/// accepted Pairing PSK (when Pairing PSK access is enabled), or the Sentinel PSK. A psk_id
+/// held only under another category is a miss.
 ///
 /// The record types used here (`SendspinPairingRecord`, `SendspinPairingPsk`,
 /// `SendspinPairingConfig`) are the public types from `sendspin/config.h` so
@@ -111,6 +113,8 @@ struct ResolvedPsk {
 ///     must go through `resolve_by_psk_id`, the `*_snapshot` / `*_copy` variants, or the one
 ///     network-thread mutator, `store_record_superseding` (RAM-only there; its deferred
 ///     provider flush, `persist_records`, is main-loop-only).
+///   - One exception: `pairing_psk_` is provisioned by the constructor and never written
+///     again, so the reference getter `pairing_psk()` reads it without the lock.
 ///   - The pointer/reference-returning getters (`record_by_psk_id`, `record_by_server_id`)
 ///     are for internal-locked or single-threaded (main-loop-only) use ONLY;
 ///     callers must not retain a returned pointer or reference across any mutation, and must

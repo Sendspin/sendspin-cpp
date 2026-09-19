@@ -87,7 +87,7 @@ enum class CPaceRole : uint8_t {
 ///   // Step 1: start
 ///   CPace side;
 ///   std::vector<uint8_t> my_share;
-///   if (!side.start(CPaceRole::RESPONDER, prs, sid, {}, {}, {})) return false;
+///   if (!side.start(CPaceRole::RESPONDER, prs, sid, {}, ad, peer_ad)) return false;
 ///   my_share = side.public_share();
 ///
 ///   // Step 2: receive peer share, derive MAC key
@@ -101,7 +101,7 @@ class CPace {
 public:
     CPace() = default;
 
-    /// @brief Zeroizes the scalar and MAC key on destruction.
+    /// @brief Zeroizes the scalar, MAC key and ISK on destruction.
     ~CPace();
 
     /// @brief Begin a CPace run, sampling a scalar and computing the public share.
@@ -110,8 +110,8 @@ public:
     /// @param prs      Password-related string (the pairing code's bytes for Sendspin)
     /// @param sid      Session identifier
     /// @param ci       Channel identifier (empty for Sendspin)
-    /// @param ad       This side's associated data (empty for Sendspin)
-    /// @param peer_ad  Peer's associated data (empty for Sendspin)
+    /// @param ad       This side's associated data (ADb = "client" for the Sendspin client)
+    /// @param peer_ad  Peer's associated data (ADa = "server" for the Sendspin client)
     /// @return false if the random scalar or generator computation fails
     bool start(CPaceRole role, const std::vector<uint8_t>& prs, const std::vector<uint8_t>& sid,
                const std::vector<uint8_t>& ci, const std::vector<uint8_t>& ad,
@@ -124,7 +124,8 @@ public:
     }
 
     /// @brief Ingest the peer's public share and derive the confirmation MAC key.
-    /// @return false if the peer share is the wrong size or encodes a low-order point
+    /// @return false if start() has not succeeded, if derive() has already run (it is
+    ///         once-only), or if the peer share is the wrong size or encodes a low-order point
     bool derive(const uint8_t* peer_share, size_t peer_share_len);
 
     /// @brief Compute this side's confirmation tag (Ta for A, Tb for B).

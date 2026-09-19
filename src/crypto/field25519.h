@@ -190,8 +190,8 @@ inline Fp fp_reduce_full(const Fp& a) {
 //
 // We compute a * b as a 512-bit product then reduce mod p.
 // Reduction of a 512-bit number n mod (2^255-19):
-//   n = n_lo + n_hi * 2^255
-//   n mod p = n_lo + n_hi * 19   (because 2^255 = p + 19 => 2^255 mod p = 19)
+//   n = n_lo + n_hi * 2^256
+//   n mod p = n_lo + n_hi * 38   (because 2^255 = p + 19 => 2^256 mod p = 38)
 // The fold leaves a value below 2^256, which is 2p + 38, so the final step must be the
 // two-subtraction fp_reduce_full(), not a single conditional subtraction.
 // ============================================================================

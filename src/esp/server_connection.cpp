@@ -373,7 +373,8 @@ void SendspinServerConnection::async_send_frame(void* arg) {
     // Resolve the originating connection. weak_ptr.lock() yields the exact conn that queued this
     // work (or null if it has been destroyed), so a recycled sockfd can never redirect the frame
     // onto a different connection. Non-handshake frames are gated on client_hello_sent_ so nothing
-    // can precede the client/hello; allow_before_hello opts the hello and goodbye out of that gate.
+    // can precede the client/hello; allow_before_hello opts the pre-transport handshake frames, the
+    // Noise transport frames, and the client/hello and client/goodbye out of that gate.
     // The completion callback fires only when the frame is sent: it is skipped both when the gate
     // blocks the frame and when the connection is already gone (lock() is null).
     // allow_before_hello bypasses the gate but not the conn-alive requirement, so callers must not

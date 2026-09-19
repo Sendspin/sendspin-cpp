@@ -49,10 +49,12 @@ constexpr int64_t seconds_to_us(double s) {
     return static_cast<int64_t>(s * US_PER_SECOND);
 }
 
-/// @brief Deadline (seconds) for a nursery connection to complete the hello handshake, measured
-/// from delivery (inbound, already WS-upgraded) or initiation (outbound, before DNS/TCP resolve)
+/// @brief Deadline (seconds) for a nursery connection to become operational (hello handshake
+/// complete AND first server/activate applied; connection.md "Multiple servers
+/// (server-initiated)"), measured from delivery (inbound, already WS-upgraded) or initiation
+/// (outbound, before DNS/TCP resolve)
 ///
-/// Reaps peers that connect and then stall before completing the hello, and outbound sockets whose
+/// Reaps peers that connect and then stall before becoming operational, and outbound sockets whose
 /// transport never delivers a close (host IXWebSocket, issue #75). Sockets that never upgrade are
 /// closed in the platform layer before the manager sees them (ESP ws_server tick() at
 /// WS_UPGRADE_TIMEOUT_US; host IXWebSocket's 3 s handshake timeout).
@@ -494,9 +496,9 @@ private:
     /// would spam the log. Main-loop-only; acquires no manager mutex.
     void maybe_start_ws_server();
 
-    /// @brief Swaps every pending_*_events_ queue and the pairing-window confirm flag out into a
-    /// freshly returned DrainedEvents. Acquires conn_mutex_ internally, and only when the
-    /// has_pending_events_ acquire-load hint says there is something to swap; clears
+    /// @brief Swaps every pending_*_events_ queue and the pairing-window confirm and cancel flags
+    /// out into a freshly returned DrainedEvents. Acquires conn_mutex_ internally, and only
+    /// when the has_pending_events_ acquire-load hint says there is something to swap; clears
     /// has_pending_events_ under that same lock. Returns a default-constructed (empty)
     /// DrainedEvents when the hint was false.
     /// @return The drained events.
@@ -1015,9 +1017,10 @@ private:
     // 64-bit fields
     /// From resolve_liveness_timeout_ms(), in microseconds; 0 or negative disables the check.
     int64_t liveness_timeout_us_{0};
-    // Standing pairing window: platform_time_us() deadline until which the window admits one
-    // pairing attempt; 0 = closed. Opened by the operator gesture, consumed when client/pair-init
-    // is sent. Main-loop-only.
+    // Standing pairing window: platform_time_us() deadline until which the window admits
+    // attempts on pairing_window_conn_; 0 = closed. Opened by the operator gesture; cleared by
+    // close_pairing_window() on a completed pairing, the fifth failed attempt, the bound
+    // connection's drop or operator cancel, and by a client stop/restart. Main-loop-only.
     int64_t pairing_window_open_until_us_{0};
     /// Earliest time (us) to attempt another WS server start after a failure. Main-loop only.
     int64_t ws_server_start_retry_time_us_{0};
@@ -1049,10 +1052,11 @@ private:
     // Atomic fields (lock-free hints for loop() tick gating; ground truth remains the
     // mutex-protected containers/pointer above; see the "Tick cost" note on loop())
 
-    /// True while pending_connected_events_ or pending_disconnect_events_ holds an unswapped
-    /// entry. Set under conn_mutex_ at every push into either queue; cleared under conn_mutex_
-    /// once loop() has swapped both queues out. Lets loop() skip the conn_mutex_ acquisition
-    /// entirely when neither queue has anything pending.
+    /// True while any pending_*_events_ queue holds an unswapped entry or a pairing-window
+    /// gesture flag is set. Set under conn_mutex_ by every queue_pending() push and by the
+    /// pairing-window gesture schedulers; cleared under conn_mutex_ once
+    /// swap_out_pending_events() has swapped every queue and flag out. Lets loop() skip the
+    /// conn_mutex_ acquisition entirely when nothing is pending.
     std::atomic<bool> has_pending_events_{false};
 
     /// nursery_.size(), refreshed under conn_ptr_mutex_ immediately after every nursery_

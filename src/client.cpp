@@ -474,8 +474,8 @@ void SendspinClient::loop() {
 
     // Handle time synchronization for the active connection via burst strategy. Gate on
     // is_operational() (hello + first server/activate), not just non-null: an in-band
-    // re-handshake resets first_activate_received_ (and the hello flags) on the still-current
-    // connection, and a stale pre-re-handshake time exchange must not resume mid-rotation.
+    // re-handshake resets first_activate_received_ on the still-current connection, and a stale
+    // pre-re-handshake time exchange must not resume mid-rotation.
     // A declared PAIRING activity is not a gate here: pairing.md "Entering and leaving pairing"
     // runs pairing alongside playback, leaving streams open and their timeline unaffected, which
     // a player can only deliver with its time filter still converging.

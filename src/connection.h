@@ -674,12 +674,15 @@ public:
         std::construct_at(&this->pairing_session_);
     }
 
-    /// @brief Re-arm the provisional timeout after the server acks server/pair-finalize.
+    /// @brief Clear first_activate_received_ and re-arm the provisional timeout after the
+    /// server acks server/pair-finalize.
     ///
     /// After the server acks pair-finalize it rekeys via an in-band re-handshake. Re-arming the
     /// provisional timer means ConnectionManager::loop()'s re-proving-deadline check
     /// (REPROVE_TIMEOUT_US, gated on this connection being current and !is_operational()) will
-    /// drop the connection if the server acks but never re-handshakes. Runs on the network thread;
+    /// drop the connection if the server acks but never re-handshakes. It also sets
+    /// pairing_finalized_, so admission stops shielding this connection as an in-flight pairing
+    /// while activities_ still reads [PAIRING]. Runs on the network thread;
     /// provisional_time_us_ is atomic. Implemented in connection.cpp to avoid pulling
     /// platform/time.h into this header.
     void note_pairing_finalize_ack();

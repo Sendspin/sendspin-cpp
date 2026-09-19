@@ -118,8 +118,9 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(const std::string& msg1
 ///   3. For each incoming WS text frame call on_text_frame().
 ///   4. When on_text_frame() returns COMPLETE, take the result via take_result().
 ///
-/// Threading: runs entirely on the network thread.  PSK resolution via RecordStore
-/// is a read-only in-memory lookup; no mutex needed (see record_store.h comment).
+/// Threading: runs entirely on the network thread.  PSK resolution goes through
+/// RecordStore::resolve_by_psk_id(), which locks the store's mutex internally (see
+/// record_store.h).
 class NoiseHandshake {
 public:
     /// @brief Construct the handshake driver.
