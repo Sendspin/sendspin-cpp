@@ -996,7 +996,11 @@ void SendspinClient::send_text(const std::string& text, const std::string& role_
     // route through here. A declared PAIRING activity is not a gate: pairing.md "Entering and
     // leaving pairing" says an activate that adds it does not by itself affect active_roles, so
     // an active role keeps driving its own traffic across the attempt.
-    auto* conn = this->connection_manager_->current();
+    //
+    // current_shared() rather than current(): a role thread may call this, and the shared_ptr
+    // holds the connection alive across the gate reads and the send even if the main loop drops
+    // or replaces it meanwhile.
+    std::shared_ptr<SendspinConnection> conn = this->connection_manager_->current_shared();
     if (conn == nullptr || !conn->is_connected()) {
         return;
     }
