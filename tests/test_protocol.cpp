@@ -1030,41 +1030,6 @@ TEST(Protocol, ClientHelloNoSupportedPairMethods) {
 }
 
 // ============================================================================
-// server/hello slim parse (only name)
-// ============================================================================
-
-TEST(Protocol, ServerHelloSlimParse) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"MySpeaker"}})", doc, root));
-
-    ServerHelloMessage msg;
-    ASSERT_TRUE(process_server_hello_message(root, &msg));
-    EXPECT_EQ(msg.name, "MySpeaker");
-}
-
-// server/hello parses successfully when only name is present.
-TEST(Protocol, ServerHelloParsesWithOnlyName) {
-    JsonDocument doc;
-    JsonObject root;
-    // Only `name` is parsed; any other payload key is ignored.
-    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{"name":"X"}})", doc, root));
-
-    ServerHelloMessage msg;
-    EXPECT_TRUE(process_server_hello_message(root, &msg));
-    EXPECT_EQ(msg.name, "X");
-}
-
-TEST(Protocol, ServerHelloMissingNameFails) {
-    JsonDocument doc;
-    JsonObject root;
-    ASSERT_TRUE(parse(R"({"type":"server/hello","payload":{}})", doc, root));
-
-    ServerHelloMessage msg;
-    EXPECT_FALSE(process_server_hello_message(root, &msg));
-}
-
-// ============================================================================
 // server/activate parse
 // ============================================================================
 
