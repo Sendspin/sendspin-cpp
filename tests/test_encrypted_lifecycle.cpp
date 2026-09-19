@@ -2269,7 +2269,7 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBoundedByBytesBeforeMessages) {
 
     // The replay also ends the hold: both budgets read empty again and the MAX_HELD_BYTES
     // allocation goes back to the heap rather than staying held for the rest of the session.
-    EXPECT_EQ(conn.held_count_, 0u) << "the replay left the held messages countable again";
+    EXPECT_EQ(conn.held_count_, 0u) << "the replay left messages counted as held";
     EXPECT_EQ(conn.held_bytes_, 0u) << "the replay left the byte budget spent";
     EXPECT_EQ(conn.held_messages_.size(), 0u)
         << "the hold buffer stayed allocated after the replay";
