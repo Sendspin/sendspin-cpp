@@ -96,23 +96,25 @@ void run_fill_drain_cycles(size_t storage_size) {
     }
 }
 
-TEST(SpscRingBuffer, AlignedStorageSize) {
-    run_fill_drain_cycles(4096);
-}
+// Item offsets advance in ALIGNMENT multiples, so a storage size that is not a multiple of
+// the alignment used to corrupt data (unaligned filler credited back rounded up) or stall
+// forever (tail too small for a dummy header); create() rounds the usable size down.
+TEST(SpscRingBuffer, StorageSizesWrapWithoutCorruptionOrStall) {
+    struct Row {
+        const char* name;
+        size_t storage_size;
+    };
+    const Row rows[] = {
+        {"Control: aligned", 4096},
+        {"unaligned odd by one", 4097},
+        {"unaligned odd by four", 4100},
+        {"unaligned just under aligned", 4093},
+    };
 
-// Regression: storage sizes that are not a multiple of the 8-byte alignment used to
-// corrupt data (unaligned dummy-filler size credited back rounded up) or stall forever
-// (tail too small for a dummy header). create() now rounds the usable size down.
-TEST(SpscRingBuffer, UnalignedStorageSizeOddByOne) {
-    run_fill_drain_cycles(4097);
-}
-
-TEST(SpscRingBuffer, UnalignedStorageSizeOddByFour) {
-    run_fill_drain_cycles(4100);
-}
-
-TEST(SpscRingBuffer, UnalignedStorageSizeJustUnderAligned) {
-    run_fill_drain_cycles(4093);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        run_fill_drain_cycles(row.storage_size);
+    }
 }
 
 TEST(SpscRingBuffer, CreateRejectsTooSmallStorage) {
