@@ -636,6 +636,8 @@ public:
     // ========================================
 
     /// @brief Updates the client state (synchronized, error, external_source) and publishes
+    ///
+    /// Main loop only: the stored state it writes is the same state the publish reads.
     /// @param state The new client state to publish
     void update_state(SendspinClientState state);
 
@@ -700,6 +702,10 @@ public:
     // ========================================
 
     /// @brief Publishes the current client state to the active connection
+    ///
+    /// Main loop only, like the role setters that call it: the client state and the role fields
+    /// it serializes are main-loop state. The connection itself is resolved as a shared_ptr, so
+    /// the publish cannot outlive the slot even when a caller ignores that contract.
     void publish_state();
 
     /// @brief Sends a role-originated text message over the active connection
