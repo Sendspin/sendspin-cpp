@@ -42,9 +42,11 @@ enum class PlayerStreamCallbackType : uint8_t {
 /// @brief One binary audio chunk, split into the parts roles/player/v1.md "Audio Chunks
 /// (Binary)" defines after the message type byte.
 struct AudioChunk {
-    /// Server clock time when the first sample should be output (bytes 1-8, big-endian int64).
+    /// Server clock time when the first sample should be output (spec bytes 1-8, big-endian
+    /// int64, i.e. the first eight bytes of `data`).
     int64_t timestamp_us{0};
-    /// Encoded audio frame, starting at byte 13. Points into the caller's buffer.
+    /// Encoded audio frame, starting at spec byte 13 (offset 12 in `data`). Points into the
+    /// caller's buffer.
     const uint8_t* audio{nullptr};
     size_t audio_len{0};
 };
@@ -57,7 +59,8 @@ struct PlayerRole::Impl {
     /// @brief Splits one audio chunk's bytes (after the message type byte) into its timestamp
     /// and its encoded audio frame.
     ///
-    /// Bytes 9-12 carry `send_ahead`, the lead the server had in hand when it transmitted. It
+    /// Spec bytes 9-12 carry `send_ahead`, the lead the server had in hand when it transmitted.
+    /// It
     /// carries no scheduling meaning, so the chunk is parsed past it rather than through it.
     /// @param data Chunk bytes with the message type byte already stripped.
     /// @param len  Number of bytes at @p data.
