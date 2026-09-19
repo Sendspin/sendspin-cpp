@@ -936,11 +936,13 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
 #ifdef SENDSPIN_ENABLE_PLAYER
     // Player volume up. The setter is main loop only, so the new value is queued for the client
     // thread; the base is the last queued value so held keys accumulate rather than collapsing
-    // onto a value the client thread has not applied yet.
+    // onto a value the client thread has not applied yet. The fallback is the mirrored TuiState
+    // field rather than the role getter: the role's volume/muted are plain members written on
+    // the client thread, while these are refreshed there under state.mutex.
     if (event == Event::ArrowUp) {
         std::lock_guard<std::mutex> lock(state.mutex);
         set_highlight(state, "Up/Dn");
-        int vol = state.pending_player.volume.value_or(client.player()->get_volume());
+        int vol = state.pending_player.volume.value_or(state.player_volume);
         state.pending_player.volume = static_cast<uint8_t>(std::min(100, vol + 5));
         return true;
     }
@@ -949,7 +951,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
     if (event == Event::ArrowDown) {
         std::lock_guard<std::mutex> lock(state.mutex);
         set_highlight(state, "Up/Dn");
-        int vol = state.pending_player.volume.value_or(client.player()->get_volume());
+        int vol = state.pending_player.volume.value_or(state.player_volume);
         state.pending_player.volume = static_cast<uint8_t>(std::max(0, vol - 5));
         return true;
     }
@@ -988,8 +990,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
     if (event == Event::Character('m')) {
         std::lock_guard<std::mutex> lock(state.mutex);
         set_highlight(state, "m");
-        state.pending_player.muted =
-            !state.pending_player.muted.value_or(client.player()->get_muted());
+        state.pending_player.muted = !state.pending_player.muted.value_or(state.player_muted);
         return true;
     }
 #endif
@@ -1062,8 +1063,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
     if (event == Event::Character('.')) {
         std::lock_guard<std::mutex> lock(state.mutex);
         set_highlight(state, ", / .");
-        uint16_t delay =
-            state.pending_player.output_delay_ms.value_or(client.player()->get_output_delay_ms());
+        uint16_t delay = state.pending_player.output_delay_ms.value_or(state.output_delay_ms);
         state.pending_player.output_delay_ms = static_cast<uint16_t>(delay + 10);
         return true;
     }
@@ -1072,8 +1072,7 @@ static bool handle_key(const Event& event, SendspinClient& client, TuiState& sta
     if (event == Event::Character(',')) {
         std::lock_guard<std::mutex> lock(state.mutex);
         set_highlight(state, ", / .");
-        uint16_t delay =
-            state.pending_player.output_delay_ms.value_or(client.player()->get_output_delay_ms());
+        uint16_t delay = state.pending_player.output_delay_ms.value_or(state.output_delay_ms);
         state.pending_player.output_delay_ms = static_cast<uint16_t>(delay >= 10 ? delay - 10 : 0);
         return true;
     }
