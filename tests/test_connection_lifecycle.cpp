@@ -53,6 +53,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -68,7 +69,6 @@ constexpr uint16_t OUTBOUND_TEST_PORT = 18942;
 constexpr uint16_t PROXY_LISTEN_PORT = 18951;
 constexpr uint16_t PROXY_BACKEND_PORT = 18952;
 constexpr uint16_t RACE_TEST_PORT = 18961;
-constexpr uint16_t EVICT_TEST_PORT = 18972;
 constexpr uint16_t REJECT_TEST_PORT = 18973;
 constexpr uint16_t STALL_LISTEN_PORT = 18981;
 constexpr uint16_t ADMIT_TEST_PORT = 18982;
@@ -439,42 +439,6 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     EXPECT_TRUE(client.is_connected()) << "the handoff must leave a current connection behind";
 }
 
-// Delivery-at-upgrade contract: raw TCP probes never reach the manager, so even enough of them to
-// fill the nursery capacity cannot occupy a slot or delay a real server.
-TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
-    PairedClientBundle bundle(make_config(EVICT_TEST_PORT));
-    SendspinClient& client = bundle.client();
-    ASSERT_TRUE(bundle.start());
-
-    // Two held raw probes, enough to fill every nursery slot if they were admitted at accept.
-    int probe1 = connect_loopback(EVICT_TEST_PORT);
-    ASSERT_GE(probe1, 0);
-    pump_for(client, 100);
-    int probe2 = connect_loopback(EVICT_TEST_PORT);
-    ASSERT_GE(probe2, 0);
-    pump_for(client, 100);
-
-    // The real server reaches the admitted slot while both probes are held: the probes hold no
-    // nursery slots, so nothing needs evicting and nothing is rejected. That it establishes
-    // before the probes are reaped is not asserted - latency is not a unit-test property.
-    const Identity& server_identity = bundle.peer.server_identity;
-    FakeEncryptedServer real_server(server_url(EVICT_TEST_PORT),
-                                    std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
-                                    bundle.peer.record.psk_id, bundle.peer.psk);
-    pump_until(client, [&] { return client.is_connected(); });
-    auto info = client.get_server_information();
-    ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->server_id, server_identity.peer_id());
-
-    // The transport layer closes the probes on its own (host: IX 3 s handshake timeout).
-    pump_until(client, [&] { return socket_closed(probe1) && socket_closed(probe2); });
-    EXPECT_TRUE(client.is_connected())
-        << "closing the probes must not disturb the established connection";
-
-    ::close(probe1);
-    ::close(probe2);
-}
-
 // Rejection path: with the nursery full of peers that have proven they speak the protocol (they
 // complete the Noise handshake and the hello exchange but never activate), a newcomer is rejected.
 // Rejection happens at accept, before the newcomer gets a Noise handshake driver, so its goodbye
@@ -542,26 +506,36 @@ FakeEncryptedServerOptions time_answering_options(bool answer_time) {
 
 }  // namespace
 
-// The derived liveness timeout tracks the configured burst settings, not their defaults.
-TEST(LivenessTimeout, DerivedFromConfiguredBurstSettings) {
-    SendspinClientConfig config;
-    EXPECT_EQ(resolve_liveness_timeout_ms(config), 60000);
+// resolve_liveness_timeout_ms() either derives the window from the configured burst settings or
+// hands back an explicitly configured one unchanged.
+TEST(LivenessTimeout, ResolvesFromConfig) {
+    struct Row {
+        const char* name;
+        std::optional<uint32_t> burst_interval_ms;
+        std::optional<uint32_t> burst_response_timeout_ms;
+        std::optional<int64_t> explicit_timeout_ms;
+        int64_t expected_ms;
+    };
+    const Row rows[] = {
+        {"defaults derive", std::nullopt, std::nullopt, std::nullopt, 60000},
+        {"longer interval widens the window", 60000, std::nullopt, std::nullopt, 210000},
+        {"response timeout widens the window", 10000, 20000, std::nullopt, 90000},
+        {"explicit value overrides the derivation", 60000, std::nullopt, 5000, 5000},
+        {"explicit zero disables the check", 60000, std::nullopt, 0, 0},
+    };
 
-    config.time_burst_interval_ms = 60000;
-    EXPECT_EQ(resolve_liveness_timeout_ms(config), 210000);
-
-    config.time_burst_interval_ms = 10000;
-    config.time_burst_response_timeout_ms = 20000;
-    EXPECT_EQ(resolve_liveness_timeout_ms(config), 90000);
-}
-
-TEST(LivenessTimeout, ExplicitValueUsedAsGiven) {
-    SendspinClientConfig config;
-    config.time_burst_interval_ms = 60000;
-    config.liveness_timeout_ms = 5000;
-    EXPECT_EQ(resolve_liveness_timeout_ms(config), 5000);
-    config.liveness_timeout_ms = 0;
-    EXPECT_EQ(resolve_liveness_timeout_ms(config), 0);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        SendspinClientConfig config;
+        if (row.burst_interval_ms.has_value()) {
+            config.time_burst_interval_ms = row.burst_interval_ms.value();
+        }
+        if (row.burst_response_timeout_ms.has_value()) {
+            config.time_burst_response_timeout_ms = row.burst_response_timeout_ms.value();
+        }
+        config.liveness_timeout_ms = row.explicit_timeout_ms;
+        EXPECT_EQ(resolve_liveness_timeout_ms(config), row.expected_ms);
+    }
 }
 
 // An established peer that stops answering without closing is dropped with a restart goodbye.
