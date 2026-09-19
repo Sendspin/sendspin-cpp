@@ -283,17 +283,15 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     FakeEncryptedServer real_server(server_url(PROBE_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                     bundle.peer.record.psk_id, bundle.peer.psk);
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
 
     // The probe never completes a WebSocket handshake, so the transport layer closes it without
     // it ever reaching the manager (host: IXWebSocket's 3 s server-side handshake timeout; on
-    // ESP the ws_server tick would reap it at 5 s). Budget covers either bound plus margin.
-    EXPECT_TRUE(pump_until(
-        client, [&] { return socket_closed(probe_fd); }, 6500));
+    // ESP the ws_server tick would reap it at 5 s).
+    pump_until(client, [&] { return socket_closed(probe_fd); });
     ::close(probe_fd);
 
     // The established connection must have been untouched by the probe reap.
@@ -325,10 +323,9 @@ TEST(ConnectionLifecycle, SlowOutboundSurvivesUpgradeTier) {
     client.connect_to(server_url(PROXY_LISTEN_PORT));
 
     // The proxy holds the upgrade for 8 s, past every inbound-side upgrade deadline; the outbound
-    // tier must ride that out and still establish. Completion is the whole verdict: the bound
-    // only keeps a regression from waiting on the suite watchdog, it is not a timing assertion.
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 14000));
+    // tier must ride that out and still establish. Completion is the whole verdict, so the wait
+    // carries no bound of its own: a cut outbound clock never establishes and hangs here.
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
@@ -369,16 +366,14 @@ TEST(ConnectionLifecycle, InFlightOutboundDoesNotBlockInboundAdmission) {
     FakeEncryptedServer mute(server_url(ADMIT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                              mute_identity, std::string(SENTINEL_PSK_ID), SENTINEL_PSK,
                              unactivated_peer_options());
-    ASSERT_TRUE(pump_until(
-        client, [&] { return mute.client_hello_count() > 0; }, 4000));
+    pump_until(client, [&] { return mute.client_hello_count() > 0; });
 
     // The real server takes the second inbound slot; the stalled outbound must not consume it.
     const Identity& server_identity = bundle.peer.server_identity;
     FakeEncryptedServer real_server(server_url(ADMIT_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                     bundle.peer.record.psk_id, bundle.peer.psk);
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
@@ -416,13 +411,10 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     FakeEncryptedServer server_a(server_url(RACE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                                  identity_a, peer_a.record.psk_id, peer_a.psk,
                                  rank_zero_peer_options());
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] {
-            auto info = client.get_server_information();
-            return info.has_value() && info->server_id == identity_a.peer_id();
-        },
-        4000));
+    pump_until(client, [&] {
+        auto info = client.get_server_information();
+        return info.has_value() && info->server_id == identity_a.peer_id();
+    });
 
     // ...then server B establishes against the incumbent. Both sides of the comparison are
     // established; the last-played preference (server B) must win the handoff, and the later
@@ -430,17 +422,13 @@ TEST(ConnectionLifecycle, TwoServerRaceResolvedByPreference) {
     FakeEncryptedServer server_b(server_url(RACE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                                  identity_b, peer_b.record.psk_id, peer_b.psk,
                                  rank_zero_peer_options());
-    EXPECT_TRUE(pump_until(
-        client,
-        [&] {
-            auto info = client.get_server_information();
-            return info.has_value() && info->server_id == identity_b.peer_id();
-        },
-        4000));
+    pump_until(client, [&] {
+        auto info = client.get_server_information();
+        return info.has_value() && info->server_id == identity_b.peer_id();
+    });
 
     // The displaced incumbent is released with a goodbye, not left dangling.
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server_a.closed(); }, 4000));
+    pump_until(client, [&] { return server_a.closed(); });
     EXPECT_EQ(server_a.goodbye_reason().value_or(""), "another_server");
     EXPECT_FALSE(server_b.closed());
     EXPECT_TRUE(client.is_connected());
@@ -467,15 +455,13 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
     FakeEncryptedServer real_server(server_url(EVICT_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                     bundle.peer.record.psk_id, bundle.peer.psk);
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
 
     // The transport layer closes the probes on its own (host: IX 3 s handshake timeout).
-    EXPECT_TRUE(pump_until(
-        client, [&] { return socket_closed(probe1) && socket_closed(probe2); }, 6500));
+    pump_until(client, [&] { return socket_closed(probe1) && socket_closed(probe2); });
     EXPECT_TRUE(client.is_connected());
 
     ::close(probe1);
@@ -501,15 +487,13 @@ TEST(ConnectionLifecycle, FullNurseryOfLivePeersRejectsNewcomer) {
     FakeEncryptedServer mute_b(server_url(REJECT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                                identity_b, std::string(SENTINEL_PSK_ID), SENTINEL_PSK,
                                unactivated_peer_options());
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] { return mute_a.client_hello_count() > 0 && mute_b.client_hello_count() > 0; }, 4000));
+    pump_until(client,
+               [&] { return mute_a.client_hello_count() > 0 && mute_b.client_hello_count() > 0; });
 
     const Identity& late_identity = bundle.peer.server_identity;
     FakeEncryptedServer late(server_url(REJECT_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                              late_identity, bundle.peer.record.psk_id, bundle.peer.psk);
-    EXPECT_TRUE(pump_until(
-        client, [&] { return late.closed(); }, 4000));
+    pump_until(client, [&] { return late.closed(); });
     EXPECT_EQ(late.goodbye_reason().value_or(""), "another_server");
     EXPECT_FALSE(client.is_connected());
     EXPECT_FALSE(mute_a.closed());
@@ -580,15 +564,11 @@ TEST(ConnectionLifecycle, SilentEstablishedPeerIsDropped) {
     FakeEncryptedServer silent(server_url(LIVENESS_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                                identity, bundle.peer.record.psk_id, bundle.peer.psk,
                                time_answering_options(false));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return silent.got_client_time(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
+    pump_until(client, [&] { return silent.got_client_time(); });
 
-    EXPECT_TRUE(pump_until(
-        client, [&] { return !client.is_connected(); }, 4000));
-    EXPECT_TRUE(pump_until(
-        client, [&] { return silent.closed(); }, 4000));
+    pump_until(client, [&] { return !client.is_connected(); });
+    pump_until(client, [&] { return silent.closed(); });
     EXPECT_EQ(silent.goodbye_reason().value_or(""), "restart");
     EXPECT_FALSE(client.get_server_information().has_value());
 }
@@ -603,10 +583,8 @@ TEST(ConnectionLifecycle, AnsweringPeerSurvivesLivenessTimeout) {
     FakeEncryptedServer live(server_url(LIVENESS_CONTROL_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
                              identity, bundle.peer.record.psk_id, bundle.peer.psk,
                              time_answering_options(true));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return live.got_client_time(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
+    pump_until(client, [&] { return live.got_client_time(); });
 
     pump_for(client, 1200);  // Four liveness windows
     EXPECT_TRUE(client.is_connected());
@@ -629,10 +607,8 @@ TEST(ConnectionLifecycle, DisabledLivenessKeepsSilentPeer) {
                                std::string(NOISE_SUITE_CHACHAPOLY), identity,
                                bundle.peer.record.psk_id, bundle.peer.psk,
                                time_answering_options(false));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return silent.got_client_time(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
+    pump_until(client, [&] { return silent.got_client_time(); });
 
     pump_for(client, 300);  // Several time messages go unanswered
     EXPECT_TRUE(client.is_connected());

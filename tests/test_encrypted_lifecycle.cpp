@@ -324,9 +324,7 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
                                server_identity, bundle.peer.record.psk_id, bundle.peer.psk);
 
     // Initial handshake + hello + activate must bring the connection operational.
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Initial encrypted handshake/hello/activate did not complete";
+    pump_until(client, [&] { return client.is_connected(); });
     auto info = client.get_server_information();
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
@@ -339,14 +337,10 @@ TEST(EncryptedLifecycle, InBandRehandshakeResumesOperational) {
     // Immediately after the swap the connection must go non-operational: first_activate_received_
     // is reset. This is the expected transient dip described in connection_manager.h's invariant
     // comment, not a failure.
-    EXPECT_TRUE(pump_until(
-        client, [&] { return !client.is_connected(); }, 2000))
-        << "Connection should go non-operational immediately after the re-handshake swap";
+    pump_until(client, [&] { return !client.is_connected(); });
 
     // The post-swap server/activate alone brings it back.
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Connection did not resume operational status after the in-band re-handshake";
+    pump_until(client, [&] { return client.is_connected(); });
     EXPECT_EQ(server.client_hello_count(), 1) << "client/hello must not be re-sent";
     EXPECT_EQ(server.activate_count(), 2) << "the server's first message under the new keys";
     // server_id is unchanged (same server, new session keys).
@@ -396,18 +390,14 @@ TEST(EncryptedLifecycle, AeadFailureOnOutboundConnectionDoesNotCrash) {
 
     client.connect_to(server_url(AEAD_FAILURE_OUTBOUND_PORT));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Initial encrypted handshake/hello/activate did not complete";
+    pump_until(client, [&] { return client.is_connected(); });
 
     // Send one tampered ciphertext frame. If close_silently() ever regresses back to calling
     // disconnect() on the network thread here, the test process crashes via std::terminate()
     // instead of reaching the assertions below.
     ASSERT_TRUE(server.send_tampered_frame());
 
-    EXPECT_TRUE(pump_until(
-        client, [&] { return !client.is_connected(); }, 4000))
-        << "An AEAD failure must tear down the connection (reported lost)";
+    pump_until(client, [&] { return !client.is_connected(); });
 
     // Give any duplicate loss-report/close event a chance to arrive and confirm it is tolerated
     // (drop_connection() no-ops on a connection it no longer manages) rather than double-freeing
@@ -446,9 +436,7 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
                                server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
                                options);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Initial encrypted handshake/hello/activate did not complete";
+    pump_until(client, [&] { return client.is_connected(); });
 
     // Re-handshake down to the Sentinel PSK (unpaired access is disabled by default, so
     // ["playback"] is inadmissible for it).
@@ -456,9 +444,7 @@ TEST(EncryptedLifecycle, PostRehandshakeInadmissibleActivateDrops) {
 
     // The connection must be dropped (never come back operational) once the inadmissible
     // server/activate is processed, and the fake server must observe the WS close.
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server.closed(); }, 4000))
-        << "Connection was not dropped after an inadmissible post-re-handshake server/activate";
+    pump_until(client, [&] { return server.closed(); });
     EXPECT_FALSE(client.is_connected());
 
     auto reason = server.goodbye_reason();
@@ -491,9 +477,7 @@ TEST(EncryptedLifecycle, HelloAdvertisesPairingMethods) {
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                bundle.peer.record.psk_id, bundle.peer.psk);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Initial encrypted handshake/hello/activate did not complete";
+    pump_until(client, [&] { return client.is_connected(); });
 
     std::vector<std::string> methods = server.hello_pair_methods();
     auto advertises = [&methods](const std::string& name) {
@@ -566,9 +550,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 
     // handle_enter_pairing (PAIRING_PSK branch) fires as soon as the pairing activate is admitted
     // and sends client/pair-finalize; the fake server acks it immediately in handle_binary().
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.learned_psk_id().has_value(); }, 4000))
-        << "client/pair-finalize (with a freshly generated long_term_psk) was never observed";
+    pump_until(client, [&] { return server.learned_psk_id().has_value(); });
 
     // pairing.md "Pairing PSK Flow": the client sends client/pair-init immediately before
     // client/pair-finalize. The init starts the attempt and carries the index of the pairing
@@ -591,17 +573,13 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
     // The server's ack commits the record to RAM synchronously on the network thread (see
     // client.cpp's SERVER_PAIR_FINALIZE handler); the durable save_blob(RECORDS) this waits for
     // is the deferred flush from the next loop() tick (RecordStore::persist_records()).
-    ASSERT_TRUE(pump_until(
-        client, [&] { return persistence.captured_record().has_value(); }, 4000))
-        << "Pairing record was never persisted";
+    pump_until(client, [&] { return persistence.captured_record().has_value(); });
     auto captured = persistence.captured_record();
     ASSERT_TRUE(captured.has_value());
     EXPECT_EQ(captured->psk_id, server.learned_psk_id().value());
     EXPECT_EQ(captured->server_id, server_identity.peer_id());
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return listener.pairing_succeeded_server_id().has_value(); }, 4000))
-        << "on_pairing_succeeded was never fired";
+    pump_until(client, [&] { return listener.pairing_succeeded_server_id().has_value(); });
     EXPECT_EQ(listener.pairing_succeeded_server_id().value(), server_identity.peer_id());
 
     // The application must see the exchange begin before it sees it end. The ordering is
@@ -623,9 +601,7 @@ TEST(EncryptedLifecycle, PairingPskFlowPersistsAndUpgradesTrust) {
 
     // The connection must resume operational under the new session, now with LONG_TERM/USER trust
     // instead of the PAIRING/none trust it started with.
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Connection did not resume operational after the post-pairing re-handshake";
+    pump_until(client, [&] { return client.is_connected(); });
     EXPECT_TRUE(listener.trust_ever_reached(ConnectionTrust::USER))
         << "Trust was never upgraded to USER after pairing completed";
     EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER)
@@ -702,18 +678,14 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                long_term_peer.record.psk_id, long_term_peer.psk, options);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Initial LONG_TERM handshake/hello/activate did not complete";
+    pump_until(client, [&] { return client.is_connected(); });
     EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER);
 
     // Becoming operational the first time legitimately sends one client/state; only traffic
     // AFTER this point is what the regression check below cares about. Pump a little longer to
     // let that legitimate message actually arrive (is_connected() flips as soon as the activate
     // is applied, slightly before the resulting client/state is sent and received).
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.client_state_count() > 0; }, 2000))
-        << "Sanity check: the initial admission must publish client/state";
+    pump_until(client, [&] { return server.client_state_count() > 0; });
     const int state_count_before_repair = server.client_state_count();
 
     // Re-handshake the LIVE, admitted connection onto the pairing PSK, exactly like the server
@@ -725,9 +697,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
     // The fixed client must reply with client/pair-finalize instead of hard-stalling; the
     // pre-fix client never sends it (it sends client/state instead, which a real server treats
     // as a protocol violation).
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.learned_psk_id().has_value(); }, 4000))
-        << "client/pair-finalize was never sent for the post-rehandshake pairing activate";
+    pump_until(client, [&] { return server.learned_psk_id().has_value(); });
 
     // The re-pairing activate starts its attempt the same way: pair-init first, then the
     // finalize (pairing.md "Pairing PSK Flow"). Its pairing index counts the pairing activates
@@ -753,9 +723,7 @@ TEST(EncryptedLifecycle, ReactivatePairingOnAlreadyAdmittedConnectionSendsPairFi
         << "on_pairing_started was never fired for the re-pairing activate";
     EXPECT_EQ(listener.pairing_started_server_id().value(), server_identity.peer_id());
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return listener.pairing_succeeded_server_id().has_value(); }, 4000))
-        << "on_pairing_succeeded was never fired";
+    pump_until(client, [&] { return listener.pairing_succeeded_server_id().has_value(); });
     EXPECT_EQ(server.client_state_count(), state_count_before_repair)
         << "client/state must still not have been sent once pairing succeeded (the connection "
            "goes operational only after the follow-up re-handshake completes)";
@@ -813,15 +781,10 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                configured_pairing_psk.psk_id, pairing_psk_bytes, options);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.learned_psk_id().has_value(); }, 4000))
-        << "client/pair-finalize was never observed";
+    pump_until(client, [&] { return server.learned_psk_id().has_value(); });
 
     // The pairing must be reported successful on the RAM commit alone.
-    ASSERT_TRUE(pump_until(
-        client, [&] { return listener.pairing_succeeded_server_id().has_value(); }, 4000))
-        << "on_pairing_succeeded must fire even though the persistence provider rejects the "
-           "record";
+    pump_until(client, [&] { return listener.pairing_succeeded_server_id().has_value(); });
     EXPECT_EQ(listener.pairing_succeeded_server_id().value(), server_identity.peer_id());
     EXPECT_FALSE(persistence.captured_record().has_value())
         << "A rejected record must not be captured (provider returned false)";
@@ -840,10 +803,7 @@ TEST(EncryptedLifecycle, PairingPskFlowRejectedPersistStillCompletesPairing) {
     ASSERT_TRUE(learned_psk.has_value() && learned_psk_id.has_value());
     ASSERT_TRUE(server.trigger_rehandshake(learned_psk_id.value(), learned_psk.value()));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Connection must resume operational: the RAM-committed record resolves the rekey "
-           "even though the durable write was rejected";
+    pump_until(client, [&] { return client.is_connected(); });
     EXPECT_EQ(client.get_current_trust(), ConnectionTrust::USER)
         << "Trust must upgrade to USER on the RAM-committed record";
 
@@ -884,9 +844,7 @@ TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
     });
     ws.start();
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return opened.load(); }, 4000))
-        << "Raw peer never completed the WebSocket upgrade";
+    pump_until(client, [&] { return opened.load(); });
 
     // No client/init, no handshake: straight to a player-shaped binary frame (type byte 4 =
     // player role, slot 0, followed by what would be an 8-byte timestamp and a payload).
@@ -894,9 +852,7 @@ TEST(EncryptedLifecycle, BinaryFrameBeforeNoiseHandshakeClosesConnection) {
         "\x04\x00\x00\x00\x00\x00\x00\x00\x00\xde\xad\xbe\xef", 13);
     ws.sendBinary(binary_frame);
 
-    EXPECT_TRUE(pump_until(
-        client, [&] { return closed.load(); }, 4000))
-        << "An unauthenticated binary frame must close the connection, not be dispatched";
+    pump_until(client, [&] { return closed.load(); });
 
     ws.stop();
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -928,8 +884,7 @@ TEST(EncryptedLifecycle, LeaveIsSentOnlyOnAnActivatedConnection) {
 
     // Handshake and hello complete, but the connection is never activated, so it stays in the
     // nursery and has no group.
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server->client_hello_count() > 0; }, 4000));
+    pump_until(client, [&] { return server->client_hello_count() > 0; });
     client.leave();
     pump_for(client, 50);
     EXPECT_EQ(server->client_leave_count(), 0)
@@ -939,12 +894,9 @@ TEST(EncryptedLifecycle, LeaveIsSentOnlyOnAnActivatedConnection) {
     ASSERT_TRUE(server->send_app_json(
         R"({"type":"server/activate","payload":{"activities":["playback"],)"
         R"("active_roles":["player@v1"]}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     client.leave();
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server->client_leave_count() == 1; }, 4000))
-        << "client/leave was not sent on an admitted, activated connection";
+    pump_until(client, [&] { return server->client_leave_count() == 1; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -973,16 +925,12 @@ TEST(EncryptedLifecycle, LeaveWaitsForTheActivateThatFollowsAReHandshake) {
         R"({"type":"server/activate","payload":{"activities":["playback"],)"
         R"("active_roles":["player@v1"]}})";
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server->client_hello_count() > 0; }, 4000));
+    pump_until(client, [&] { return server->client_hello_count() > 0; });
     ASSERT_TRUE(server->send_app_json(playback_activate));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
 
     ASSERT_TRUE(server->trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return !client.is_connected(); }, 4000))
-        << "the connection never rewound to awaiting its post-rekey activate";
+    pump_until(client, [&] { return !client.is_connected(); });
     EXPECT_EQ(server->client_hello_count(), 1)
         << "connection.md \"Re-handshake\": client/hello is not re-sent";
 
@@ -993,12 +941,9 @@ TEST(EncryptedLifecycle, LeaveWaitsForTheActivateThatFollowsAReHandshake) {
 
     // Control: the same call goes out once that activation arrives.
     ASSERT_TRUE(server->send_app_json(playback_activate));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     client.leave();
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server->client_leave_count() == 1; }, 4000))
-        << "client/leave was not sent once the connection was activated again";
+    pump_until(client, [&] { return server->client_leave_count() == 1; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1040,59 +985,46 @@ TEST(EncryptedLifecycle, PlaybackKeepsRunningWhenAnActivateAddsPairing) {
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                pairing_psk.psk_id, pairing_psk.psk, options);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.client_hello_count() > 0; }, 4000));
+    pump_until(client, [&] { return server.client_hello_count() > 0; });
 
     // Playback first, on the Pairing PSK: allowed because unpaired access is enabled.
     ASSERT_TRUE(server.send_app_json(
         R"({"type":"server/activate","payload":{"activities":["playback"],)"
         R"("active_roles":["player@v1","controller@v1"]}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
 
     // A real player stream, so "streams stay open" is observed rather than argued.
     ASSERT_TRUE(server.send_app_json(
         R"({"type":"stream/start","payload":{"player":{"codec":"pcm","sample_rate":48000,)"
         R"("channels":2,"bit_depth":16}}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_starts == 1; }, 6000));
-    ASSERT_TRUE(stream_audio_until(client, server, player_listener, 1))
-        << "audio never reached the player before the pairing activate";
+    pump_until(client, [&] { return player_listener.stream_starts == 1; });
+    stream_audio_until(client, server, player_listener, 1);
 
     controller.send_command({.command = SendspinControllerCommand::PLAY});
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.controller_commands().size() == 1; }, 4000));
+    pump_until(client, [&] { return server.controller_commands().size() == 1; });
     client.leave();
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.client_leave_count() == 1; }, 4000));
+    pump_until(client, [&] { return server.client_leave_count() == 1; });
 
     // The same connection now also declares pairing, keeping its roles.
     const size_t writes_before = player_listener.audio_writes.load();
     ASSERT_TRUE(server.send_app_json(
         R"({"type":"server/activate","payload":{"activities":["playback","pairing"],)"
         R"("active_roles":["player@v1","controller@v1"],"pairing":{"method":"pairing_psk"}}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.pair_init().has_value(); }, 4000))
-        << "a combined playback+pairing activate must enter the pairing path";
+    pump_until(client, [&] { return server.pair_init().has_value(); });
 
     // pairing.md "Entering and leaving pairing": the stream stays open and keeps playing, and no
     // stream/end or clear was synthesized for the activate.
     EXPECT_EQ(player_listener.stream_starts, 1);
     EXPECT_EQ(player_listener.stream_ends, 0) << "adding pairing must not end the stream";
-    EXPECT_TRUE(stream_audio_until(client, server, player_listener, writes_before + 1))
-        << "audio must keep reaching the player across the pairing activate";
+    stream_audio_until(client, server, player_listener, writes_before + 1);
 
     EXPECT_TRUE(client.is_connected())
         << "adding pairing must not take the connection out of its operational state";
     controller.send_command({.command = SendspinControllerCommand::PAUSE});
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.controller_commands().size() == 2; }, 4000))
-        << "adding pairing must not stop an active role's traffic";
+    pump_until(client, [&] { return server.controller_commands().size() == 2; });
     EXPECT_EQ(server.controller_commands().back(), "pause");
     client.leave();
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server.client_leave_count() == 2; }, 4000))
-        << "adding pairing must not affect group membership";
+    pump_until(client, [&] { return server.client_leave_count() == 2; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1130,9 +1062,7 @@ TEST(EncryptedLifecycle, AnActivateThatReselectsPairingStartsTheNewAttempt) {
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                pairing_psk.psk_id, pairing_psk.psk, options);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.pair_init().has_value(); }, 4000))
-        << "the first attempt never started";
+    pump_until(client, [&] { return server.pair_init().has_value(); });
     ASSERT_EQ(server.pair_init()->pairing_index, 1U);
 
     // A second pairing activate on the same connection, while the first attempt is still in
@@ -1141,10 +1071,7 @@ TEST(EncryptedLifecycle, AnActivateThatReselectsPairingStartsTheNewAttempt) {
         R"({"type":"server/activate","payload":{"activities":["pairing"],)"
         R"("active_roles":[],"pairing":{"method":"pairing_psk"}}})"));
 
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server.pair_init()->pairing_index == 2U; }, 4000))
-        << "an activate that selects pairing again must start the attempt it admits, not leave "
-           "the server waiting for a client/pair-init that never comes";
+    pump_until(client, [&] { return server.pair_init()->pairing_index == 2U; });
     EXPECT_TRUE(server.pair_abort_reasons().empty()) << "re-selecting pairing is not an abort";
     EXPECT_TRUE(server.pair_init_preceded_finalize())
         << "the new attempt opens with client/pair-init, like any other";
@@ -1174,9 +1101,7 @@ TEST(EncryptedLifecycle, ControllerCommandsWaitForTheRoleToBeActive) {
         bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
         std::move(options));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "the connection never reached the admitted state";
+    pump_until(client, [&] { return client.is_connected(); });
 
     controller.send_command({.command = SendspinControllerCommand::PLAY});
     pump_for(client, 100);
@@ -1188,14 +1113,10 @@ TEST(EncryptedLifecycle, ControllerCommandsWaitForTheRoleToBeActive) {
     ASSERT_TRUE(server->send_app_json(
         R"({"type":"server/activate","payload":{"activities":["playback"],)"
         R"("active_roles":["player@v1","controller@v1"]}})"));
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] {
-            controller.send_command({.command = SendspinControllerCommand::PLAY});
-            return !server->controller_commands().empty();
-        },
-        4000))
-        << "a controller command was dropped while controller@v1 was active";
+    pump_until(client, [&] {
+        controller.send_command({.command = SendspinControllerCommand::PLAY});
+        return !server->controller_commands().empty();
+    });
     EXPECT_EQ(server->controller_commands().front(), "play");
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -1264,9 +1185,7 @@ TEST(EncryptedLifecycle, ClientStateCarriesAnObjectForEachActiveRole) {
         bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
         std::move(options));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server->client_state_count() > 0; }, 4000))
-        << "the client sent no client/state after the activation";
+    pump_until(client, [&] { return server->client_state_count() > 0; });
 
     JsonDocument doc;
     ASSERT_TRUE(parse_last_client_state(*server, doc));
@@ -1310,9 +1229,7 @@ TEST(EncryptedLifecycle, ActivateThatAddsARoleSendsItsClientState) {
         bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
         std::move(options));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server->client_state_count() > 0; }, 4000))
-        << "the client sent no client/state after the first activation";
+    pump_until(client, [&] { return server->client_state_count() > 0; });
     const int states_after_admission = server->client_state_count();
     {
         JsonDocument doc;
@@ -1333,9 +1250,7 @@ TEST(EncryptedLifecycle, ActivateThatAddsARoleSendsItsClientState) {
     ASSERT_TRUE(server->send_app_json(
         R"({"type":"server/activate","payload":{"activities":["playback"],)"
         R"("active_roles":["player@v1","artwork@v1"]}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server->client_state_count() > states_after_admission; }, 4000))
-        << "the activation that added artwork@v1 published no client/state";
+    pump_until(client, [&] { return server->client_state_count() > states_after_admission; });
 
     JsonDocument doc;
     ASSERT_TRUE(parse_last_client_state(*server, doc));
@@ -1352,9 +1267,7 @@ TEST(EncryptedLifecycle, ActivateThatAddsARoleSendsItsClientState) {
     ASSERT_TRUE(server->send_app_json(
         R"({"type":"server/activate","payload":{"activities":["playback"],)"
         R"("active_roles":["player@v1"]}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server->client_state_count() > states_before_removal; }, 4000))
-        << "the activation that removed artwork@v1 published no client/state";
+    pump_until(client, [&] { return server->client_state_count() > states_before_removal; });
     JsonDocument after_removal;
     ASSERT_TRUE(parse_last_client_state(*server, after_removal));
     EXPECT_TRUE(after_removal["payload"]["artwork"].isUnbound())
@@ -1389,21 +1302,15 @@ TEST(EncryptedLifecycle, RoleTrafficWaitsForTheActivateThatFollowsAReHandshake) 
         R"({"type":"server/activate","payload":{"activities":["playback"],)"
         R"("active_roles":["controller@v1"]}})";
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server->client_hello_count() > 0; }, 4000));
+    pump_until(client, [&] { return server->client_hello_count() > 0; });
     ASSERT_TRUE(server->send_app_json(controller_activate));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     controller.send_command({.command = SendspinControllerCommand::PLAY});
-    ASSERT_TRUE(pump_until(
-        client, [&] { return !server->controller_commands().empty(); }, 4000))
-        << "the controller role never became usable in the first place";
+    pump_until(client, [&] { return !server->controller_commands().empty(); });
     const size_t before_rekey = server->controller_commands().size();
 
     ASSERT_TRUE(server->trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return !client.is_connected(); }, 4000))
-        << "the connection never rewound to awaiting its post-rekey activate";
+    pump_until(client, [&] { return !client.is_connected(); });
 
     controller.send_command({.command = SendspinControllerCommand::PAUSE});
     pump_for(client, 100);
@@ -1413,12 +1320,9 @@ TEST(EncryptedLifecycle, RoleTrafficWaitsForTheActivateThatFollowsAReHandshake) 
     // Control: the same command goes out once that activation arrives, so the gate is the
     // re-handshake window and not the role, which stayed active across it.
     ASSERT_TRUE(server->send_app_json(controller_activate));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
     controller.send_command({.command = SendspinControllerCommand::PAUSE});
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server->controller_commands().size() > before_rekey; }, 4000))
-        << "a controller command was dropped after the post-rekey activate arrived";
+    pump_until(client, [&] { return server->controller_commands().size() > before_rekey; });
     EXPECT_EQ(server->controller_commands().back(), "pause");
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -1461,9 +1365,7 @@ TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing)
     // The pairing half: the attempt starts, and its pairing_index is the one the activate
     // counted. A client that does not recognize the combined set as a pairing activate never
     // bumps the counter and reports 0 here.
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.pair_init().has_value(); }, 4000))
-        << "a first combined activate must enter the pairing path";
+    pump_until(client, [&] { return server.pair_init().has_value(); });
     EXPECT_EQ(server.pair_init()->pairing_index, 1U)
         << "the combined activate must be counted like any other pairing server/activate";
 
@@ -1471,16 +1373,12 @@ TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing)
     // the operational path does.
     EXPECT_TRUE(client.is_connected())
         << "a first combined activate must announce the connection operational";
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.client_state_count() > 0; }, 4000))
-        << "a first combined activate must publish client/state";
+    pump_until(client, [&] { return server.client_state_count() > 0; });
 
     // ...and its role is active, which is what active_roles surviving the pairing activity means
     // in practice.
     controller.send_command({.command = SendspinControllerCommand::PLAY});
-    EXPECT_TRUE(pump_until(
-        client, [&] { return !server.controller_commands().empty(); }, 4000))
-        << "the roles the combined activate declared must be active";
+    pump_until(client, [&] { return !server.controller_commands().empty(); });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1535,9 +1433,7 @@ TEST(EncryptedLifecycle, RefusedActivateDoesNotWidenTheReceiveGate) {
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                pairing_psk.psk_id, pairing_psk.psk, options);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "the unpaired-access playback connection never came up";
+    pump_until(client, [&] { return client.is_connected(); });
 
     // A later activation that names the controller role and selects a method the client does not
     // offer: refused with pair/abort, connection kept, nothing activated.
@@ -1545,9 +1441,7 @@ TEST(EncryptedLifecycle, RefusedActivateDoesNotWidenTheReceiveGate) {
         R"({"type":"server/activate","payload":{"activities":["playback","pairing"],)"
         R"("active_roles":["metadata@v1","controller@v1"],)"
         R"("pairing":{"method":"dynamic_pairing_code","format":"digits"}}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return !server.pair_abort_reasons().empty(); }, 4000))
-        << "an activation naming an unoffered method must be answered with pair/abort";
+    pump_until(client, [&] { return !server.pair_abort_reasons().empty(); });
     EXPECT_FALSE(server.closed());
 
     ASSERT_TRUE(server.send_app_json(
@@ -1555,9 +1449,7 @@ TEST(EncryptedLifecycle, RefusedActivateDoesNotWidenTheReceiveGate) {
         R"("volume":42,"muted":false,"repeat":"off","shuffle":false}}})"));
     ASSERT_TRUE(server.send_app_json(
         R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Still Active"}}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return metadata_listener.updates == 1; }, 4000))
-        << "the role the refused activation did not touch must keep receiving";
+    pump_until(client, [&] { return metadata_listener.updates == 1; });
     EXPECT_EQ(controller_listener.updates, 0)
         << "a refused activation left the controller role able to receive";
 
@@ -1569,9 +1461,7 @@ TEST(EncryptedLifecycle, RefusedActivateDoesNotWidenTheReceiveGate) {
     ASSERT_TRUE(server.send_app_json(
         R"({"type":"server/state","payload":{"controller":{"supported_commands":["play"],)"
         R"("volume":42,"muted":false,"repeat":"off","shuffle":false}}})"));
-    EXPECT_TRUE(pump_until(
-        client, [&] { return controller_listener.updates == 1; }, 4000))
-        << "an accepted activation must put the role in service";
+    pump_until(client, [&] { return controller_listener.updates == 1; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1633,25 +1523,17 @@ TEST(EncryptedLifecycle, ActivateThatLosesPlaybackCapabilityRemovesTheRoles) {
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                long_term_peer.record.psk_id, long_term_peer.psk, options);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "the initial long-term handshake never completed";
+    pump_until(client, [&] { return client.is_connected(); });
     ASSERT_TRUE(server.send_app_json(
         R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Playing"}}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return metadata_listener.updates == 1; }, 4000))
-        << "the metadata role never received its state while it was active";
+    pump_until(client, [&] { return metadata_listener.updates == 1; });
 
     ASSERT_TRUE(server.trigger_rehandshake(pairing_psk.psk_id, pairing_psk.psk, "pr"))
         << "failed to start the in-band re-handshake onto the pairing PSK";
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return metadata_listener.clears.load() == 1; }, 4000))
-        << "losing playback capability left the role's state in place";
+    pump_until(client, [&] { return metadata_listener.clears.load() == 1; });
     EXPECT_EQ(client.metadata()->get_track_duration_ms(), 0U);
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server.pair_init().has_value(); }, 4000))
-        << "the activation that removed the roles must still enter the pairing it admits";
+    pump_until(client, [&] { return server.pair_init().has_value(); });
     EXPECT_TRUE(client.is_connected()) << "an admissible activation closed the connection";
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -1690,27 +1572,20 @@ TEST(EncryptedLifecycle, CombinedActivateAfterARehandshakeGoesOperationalAndEnte
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                long_term_peer.record.psk_id, long_term_peer.psk, options);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "the initial long-term handshake never completed";
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.client_state_count() > 0; }, 2000));
+    pump_until(client, [&] { return client.is_connected(); });
+    pump_until(client, [&] { return server.client_state_count() > 0; });
     const int state_count_before_rekey = server.client_state_count();
 
     ASSERT_TRUE(server.trigger_rehandshake(pairing_psk.psk_id, pairing_psk.psk, "pr"))
         << "failed to start the in-band re-handshake onto the pairing PSK";
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.pair_init().has_value(); }, 4000))
-        << "the post-rekey combined activate must enter the pairing path";
+    pump_until(client, [&] { return server.pair_init().has_value(); });
     EXPECT_EQ(server.pair_init()->pairing_index, 1U)
         << "a re-handshake resets the counter, so the activate that follows it is the first";
 
     EXPECT_TRUE(client.is_connected())
         << "the post-rekey combined activate must bring the connection back operational";
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server.client_state_count() > state_count_before_rekey; }, 4000))
-        << "the post-rekey combined activate must publish client/state";
+    pump_until(client, [&] { return server.client_state_count() > state_count_before_rekey; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1748,9 +1623,7 @@ TEST(EncryptedLifecycle, CombinedActivateWithAnUnofferedMethodAborts) {
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                pairing_psk.psk_id, pairing_psk.psk, options);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return !server.pair_abort_reasons().empty(); }, 4000))
-        << "a combined activate naming an unoffered method must be answered with pair/abort";
+    pump_until(client, [&] { return !server.pair_abort_reasons().empty(); });
     EXPECT_EQ(server.pair_abort_reasons().front(), "method_not_supported");
     EXPECT_FALSE(server.pair_init().has_value()) << "no attempt may start on a refused method";
 
@@ -1783,18 +1656,14 @@ TEST(EncryptedLifecycle, RehandshakeWithoutAnActivateIsDroppedByTheReproveWatchd
         bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
         std::move(options));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server->client_hello_count() > 0; }, 4000));
+    pump_until(client, [&] { return server->client_hello_count() > 0; });
     ASSERT_TRUE(server->send_app_json(
         R"({"type":"server/activate","payload":{"activities":["playback"],)"
         R"("active_roles":["player@v1"]}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
 
     ASSERT_TRUE(server->trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return !client.is_connected(); }, 4000))
-        << "the connection never rewound to awaiting its post-rekey activate";
+    pump_until(client, [&] { return !client.is_connected(); });
 
     // The state the watchdog keys on, as handle_noise_rehandshake() left it: the hello flags
     // carried over the swap, only the activation rewound, and the stamp was refreshed.
@@ -1811,15 +1680,12 @@ TEST(EncryptedLifecycle, RehandshakeWithoutAnActivateIsDroppedByTheReproveWatchd
         << "a connection still inside REPROVE_TIMEOUT must be given time to be activated";
 
     conn->set_provisional_time_us(platform_time_us() - REPROVE_TIMEOUT_US - 1);
-    EXPECT_TRUE(pump_until(
-        client, [&] { return client.connection_manager_->current() == nullptr; }, 4000))
-        << "a server that rekeys and never activates must be dropped, not left wedged";
+    pump_until(client, [&] { return client.connection_manager_->current() == nullptr; });
 
     // connection.md "Re-handshake" allows no application message between Noise message 1 and the
     // new activation, so the close carries no client/goodbye. Waiting for the socket to close
     // first means a goodbye that was sent has had its chance to arrive.
-    EXPECT_TRUE(wait_until([&] { return server->closed(); }, 4000))
-        << "the dropped connection was never closed";
+    wait_until([&] { return server->closed(); });
     EXPECT_FALSE(server->goodbye_reason().has_value())
         << "the re-proving watchdog must close without a goodbye";
 }
@@ -1967,9 +1833,7 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
                                std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
                                bundle.peer.record.psk_id, bundle.peer.psk, options);
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Encrypted handshake/hello/activate did not complete";
+    pump_until(client, [&] { return client.is_connected(); });
 
     // The pre-activate server/state must have been dropped on the floor.
     EXPECT_EQ(metadata_listener.updates, 0)
@@ -1980,9 +1844,7 @@ TEST(EncryptedLifecycle, RoleTrafficBeforeAdmissionIsIgnored) {
     // refusing on admission and not just dropping metadata wholesale.
     server.send_app_json(
         R"({"type":"server/state","payload":{"metadata":{"timestamp":2,"title":"Post-Admission OK"}}})");
-    EXPECT_TRUE(pump_until(
-        client, [&] { return metadata_listener.updates > 0; }, 4000))
-        << "Role traffic from the admitted connection was incorrectly dropped";
+    pump_until(client, [&] { return metadata_listener.updates > 0; });
     EXPECT_EQ(metadata_listener.last_title, "Post-Admission OK");
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -2037,8 +1899,7 @@ TEST(EncryptedLifecycle, ImmediateMetadataSurvivesAScheduledStateInTheSameTick) 
         bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
         std::move(options));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
 
     // Far enough ahead that the scheduled state cannot come due while this test runs.
     const int64_t scheduled_at = platform_time_us() + 30 * static_cast<int64_t>(US_PER_SECOND);
@@ -2049,7 +1910,7 @@ TEST(EncryptedLifecycle, ImmediateMetadataSurvivesAScheduledStateInTheSameTick) 
         std::to_string(scheduled_at) + R"(,"title":"Next Track"}}})"));
 
     // Both cross the network thread while the main loop is parked, so a single drain takes them.
-    EXPECT_FALSE(wait_until([&] { return listener.updates > 0; }, 300))
+    EXPECT_TRUE(never_within([&] { return listener.updates > 0; }, 300))
         << "a state was applied without a main-loop tick";
     pump_for(client, 50);
 
@@ -2083,8 +1944,7 @@ TEST(EncryptedLifecycle, ANewerScheduledMetadataStateReplacesThePendingOne) {
         bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
         std::move(options));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
 
     ASSERT_TRUE(server->send_app_json(
         R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
@@ -2099,9 +1959,7 @@ TEST(EncryptedLifecycle, ANewerScheduledMetadataStateReplacesThePendingOne) {
         R"({"type":"server/state","payload":{"metadata":{"timestamp":)" +
         std::to_string(platform_time_us() + static_cast<int64_t>(US_PER_SECOND) / 4) +
         R"(,"title":"Second Pending"}}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return listener.updates > 0; }, 4000))
-        << "the scheduled state that replaced the pending one never fired";
+    pump_until(client, [&] { return listener.updates > 0; });
 
     EXPECT_EQ(listener.last_title, "Second Pending");
     EXPECT_EQ(listener.updates, 1)
@@ -2134,8 +1992,7 @@ TEST(EncryptedLifecycle, ImmediateColorSurvivesAScheduledPaletteInTheSameTick) {
         bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
         std::move(options));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
 
     // Far enough ahead that the scheduled palette cannot come due while this test runs.
     const int64_t scheduled_at = platform_time_us() + 30 * static_cast<int64_t>(US_PER_SECOND);
@@ -2146,7 +2003,7 @@ TEST(EncryptedLifecycle, ImmediateColorSurvivesAScheduledPaletteInTheSameTick) {
         std::to_string(scheduled_at) + R"(,"primary":[40,50,60]}}})"));
 
     // Both cross the network thread while the main loop is parked, so a single drain takes them.
-    EXPECT_FALSE(wait_until([&] { return listener.updates > 0; }, 300))
+    EXPECT_TRUE(never_within([&] { return listener.updates > 0; }, 300))
         << "a palette was applied without a main-loop tick";
     pump_for(client, 50);
 
@@ -2180,8 +2037,7 @@ TEST(EncryptedLifecycle, TwoDuePalettesInOneTickApplyOnlyTheLatest) {
         bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
         std::move(options));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
 
     ASSERT_TRUE(server->send_app_json(
         R"({"type":"server/state","payload":{"color":{"timestamp":1,"primary":[10,20,30]}}})"));
@@ -2189,7 +2045,7 @@ TEST(EncryptedLifecycle, TwoDuePalettesInOneTickApplyOnlyTheLatest) {
         R"({"type":"server/state","payload":{"color":{"timestamp":2,"primary":[40,50,60]}}})"));
 
     // Both cross the network thread while the main loop is parked, so a single drain takes them.
-    EXPECT_FALSE(wait_until([&] { return listener.updates > 0; }, 300))
+    EXPECT_TRUE(never_within([&] { return listener.updates > 0; }, 300))
         << "a palette was applied without a main-loop tick";
     pump_for(client, 50);
 
@@ -2222,8 +2078,7 @@ TEST(EncryptedLifecycle, ANewerScheduledColorPaletteReplacesThePendingOne) {
         bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
         std::move(options));
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000));
+    pump_until(client, [&] { return client.is_connected(); });
 
     ASSERT_TRUE(server->send_app_json(
         R"({"type":"server/state","payload":{"color":{"timestamp":)" +
@@ -2238,9 +2093,7 @@ TEST(EncryptedLifecycle, ANewerScheduledColorPaletteReplacesThePendingOne) {
         R"({"type":"server/state","payload":{"color":{"timestamp":)" +
         std::to_string(platform_time_us() + static_cast<int64_t>(US_PER_SECOND) / 4) +
         R"(,"primary":[40,50,60]}}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return listener.updates > 0; }, 4000))
-        << "the scheduled palette that replaced the pending one never fired";
+    pump_until(client, [&] { return listener.updates > 0; });
 
     EXPECT_EQ(listener.last_primary, (std::array<uint8_t, 3>{40, 50, 60}));
     EXPECT_EQ(listener.updates, 1)
@@ -2643,14 +2496,10 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
     FakeEncryptedServer server(server_url(UNPAIR_RECORD_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), unpairing_identity,
                                unpairing_record.psk_id, unpairing_record.psk);
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "The paired session never reached operational";
+    pump_until(client, [&] { return client.is_connected(); });
 
     ASSERT_TRUE(server.send_app_json(R"({"type":"server/unpair","payload":{}})"));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server.closed(); }, 4000))
-        << "The unpaired session was never dropped";
+    pump_until(client, [&] { return server.closed(); });
     EXPECT_EQ(server.goodbye_reason().value_or(""), "unpaired");
 
     // The record is gone for this boot: it no longer resolves a handshake at all.
@@ -2977,9 +2826,7 @@ TEST(EncryptedLifecycle, UnpairOnAnUnpairedSessionChangesNothing) {
     FakeEncryptedServer server(server_url(UNPAIR_SENTINEL_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), sentinel_identity,
                                std::string(SENTINEL_PSK_ID), SENTINEL_PSK);
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "The unpaired session never reached operational";
+    pump_until(client, [&] { return client.is_connected(); });
 
     ASSERT_TRUE(server.send_app_json(R"({"type":"server/unpair","payload":{}})"));
     pump_for(client, 500);
@@ -3039,9 +2886,7 @@ TEST(EncryptedLifecycle, UnpairDropsEverySessionOnTheRecord) {
     FakeEncryptedServer server_a(server_url(REVOCATION_SWEEP_TEST_PORT),
                                  std::string(NOISE_SUITE_CHACHAPOLY), identity, psk_id, psk,
                                  options_a);
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.is_connected(); }, 4000))
-        << "Session A did not reach operational";
+    pump_until(client, [&] { return client.is_connected(); });
 
     // B: completes the Noise handshake (so its psk_id is resolved and cached on the connection)
     // but never sends server/activate, so it sits in the nursery as a second live session.
@@ -3050,19 +2895,13 @@ TEST(EncryptedLifecycle, UnpairDropsEverySessionOnTheRecord) {
     FakeEncryptedServer server_b(server_url(REVOCATION_SWEEP_TEST_PORT),
                                  std::string(NOISE_SUITE_CHACHAPOLY), identity, psk_id, psk,
                                  options_b);
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server_b.client_hello_count() > 0; }, 4000))
-        << "Second session never completed its Noise handshake / hello";
+    pump_until(client, [&] { return server_b.client_hello_count() > 0; });
     ASSERT_FALSE(server_b.closed()) << "Second session closed before the unpair";
 
     ASSERT_TRUE(server_a.send_app_json(R"({"type":"server/unpair","payload":{}})"));
 
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server_b.closed(); }, 4000))
-        << "server/unpair left another live session on the same record running";
-    EXPECT_TRUE(pump_until(
-        client, [&] { return server_a.closed(); }, 4000))
-        << "The unpaired session itself must be dropped";
+    pump_until(client, [&] { return server_b.closed(); });
+    pump_until(client, [&] { return server_a.closed(); });
     EXPECT_EQ(server_a.goodbye_reason().value_or(""), "unpaired");
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -3099,9 +2938,11 @@ public:
         return true;
     }
 
-    bool wait_until_entered(std::chrono::milliseconds budget) {
+    /// No bound: the write either reaches the provider or the test hangs and the watchdog in
+    /// tests/main.cpp names it.
+    void wait_until_entered() {
         std::unique_lock<std::mutex> lock(this->mutex_);
-        return this->cv_.wait_for(lock, budget, [&] { return this->entered_; });
+        this->cv_.wait(lock, [&] { return this->entered_; });
     }
 
     void release() {
@@ -3161,23 +3002,19 @@ TEST(EncryptedLifecycle, ARecordWriteDoesNotHoldTheManagerLock) {
     FakeEncryptedServer server(server_url(BLOCKING_RECORD_WRITE_TEST_PORT),
                                std::string(NOISE_SUITE_CHACHAPOLY), peer.server_identity,
                                peer.record.psk_id, peer.psk);
-    // Bounded wait for progress, not a pass/fail bound on the property under test.
-    const bool entered = persistence.wait_until_entered(std::chrono::milliseconds(6000));
-    EXPECT_TRUE(entered) << "the first activate on a long-term record never reached the provider";
+    persistence.wait_until_entered();
 
-    if (entered) {
-        std::promise<void> probed;
-        std::future<void> probed_future = probed.get_future();
-        std::thread probe([&] {
-            client.is_time_synced();
-            probed.set_value();
-        });
+    std::promise<void> probed;
+    std::future<void> probed_future = probed.get_future();
+    std::thread probe([&] {
+        client.is_time_synced();
+        probed.set_value();
+    });
 
-        // The provider is still parked here, so a current_shared() that waits on the manager lock
-        // hangs on this get().
-        probed_future.get();
-        probe.join();
-    }
+    // The provider is still parked here, so a current_shared() that waits on the manager lock
+    // hangs on this get().
+    probed_future.get();
+    probe.join();
 
     persistence.release();
     pumping.store(false, std::memory_order_release);

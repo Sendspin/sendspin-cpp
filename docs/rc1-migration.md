@@ -271,12 +271,6 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   is inlined). More than a few hundred bytes over the pre-rc1 frame calls for moving each pairing
   case's parse-and-push into an out-of-line helper that fills a caller-owned struct, the shape
   `begin_transfer()` uses in `artwork_role.cpp`.
-- The host suites bound their positive waits with a `pump_until(pred, <ms>)` deadline at about
-  154 sites (mostly 4000 ms, 46 of them via `FIXTURE_PUMP_TIMEOUT_MS` = 6000), which makes
-  elapsed time part of the verdict where the conventions want a named hang from the suite
-  watchdog instead. Pre-existing and unchanged by the rc1 work, which leans on the idiom harder
-  than `main` did; the fix is an unbounded form for the positive waits, keeping the bounded one
-  for the must-not-happen windows where the bound is the point.
 - No test drove the sync task past `INITIAL_SYNC` until the stream-pin tests landed.
   `CountingPlayerListener::on_audio_write()` never calls `PlayerRole::notify_audio_played()`, and
   `handle_initial_sync()` leaves priming only once `process_playback_progress()` has seen frames

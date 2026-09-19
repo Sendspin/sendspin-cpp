@@ -148,20 +148,17 @@ public:
 };
 
 // Pumps until `done`, feeding loudness frames stamped for immediate display.
-bool send_loudness_until(SendspinClient& client, FakeEncryptedServer& server,
+void send_loudness_until(SendspinClient& client, FakeEncryptedServer& server,
                          const std::function<bool()>& done) {
-    return pump_until(
-        client,
-        [&] {
-            if (done()) {
-                return true;
-            }
-            server.send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, platform_time_us(),
-                               std::string("\x00\x10", 2));
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            return false;
-        },
-        FIXTURE_PUMP_TIMEOUT_MS);
+    pump_until(client, [&] {
+        if (done()) {
+            return true;
+        }
+        server.send_binary(SENDSPIN_BINARY_VISUALIZER_LOUDNESS, platform_time_us(),
+                           std::string("\x00\x10", 2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return false;
+    });
 }
 
 // roles/artwork/v1.md "Artwork (Binary)": [type][flags][timestamp][total_size], flags bit 1 set.
@@ -207,25 +204,20 @@ TEST(RoleDeactivation, RemovedPlayerStopsTheStreamAndLeavesTheOtherRolesAlone) {
     options.answer_time = true;
     options.first_roles_json = R"(["player@v1","visualizer@v1","metadata@v1"])";
     auto server = connect_paired_server(bundle.peer, PLAYER_REMOVED_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
     ASSERT_TRUE(server->send_app_json(metadata_state_json(1, "Before Removal")));
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] {
-            return player_listener.stream_starts == 1 && visualizer_listener.stream_starts == 1 &&
-                   metadata_listener.updates == 1;
-        },
-        FIXTURE_PUMP_TIMEOUT_MS));
-    ASSERT_TRUE(stream_audio_until(client, *server, player_listener, 1));
+    pump_until(client, [&] {
+        return player_listener.stream_starts == 1 && visualizer_listener.stream_starts == 1 &&
+               metadata_listener.updates == 1;
+    });
+    stream_audio_until(client, *server, player_listener, 1);
     ASSERT_TRUE(client.player()->impl_->sync_task->is_running());
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["visualizer@v1","metadata@v1"])")));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
-        << "the removed player role never reported its stream ending";
+    pump_until(client, [&] { return player_listener.stream_ends == 1; });
     EXPECT_FALSE(client.player()->impl_->sync_task->is_running())
         << "the sync task kept decoding a stream the activation removed";
 
@@ -245,9 +237,8 @@ TEST(RoleDeactivation, RemovedPlayerStopsTheStreamAndLeavesTheOtherRolesAlone) {
     EXPECT_EQ(metadata_listener.clears, 0) << "a role the activation kept lost its state";
     EXPECT_EQ(metadata_listener.last_title, "Before Removal");
     const size_t loudness_before = visualizer_listener.loudness.load();
-    EXPECT_TRUE(send_loudness_until(client, *server, [&] {
-        return visualizer_listener.loudness.load() > loudness_before;
-    })) << "the visualizer stream stopped delivering when the player was removed";
+    send_loudness_until(client, *server,
+                        [&] { return visualizer_listener.loudness.load() > loudness_before; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -271,21 +262,17 @@ TEST(RoleDeactivation, RemovedVisualizerEndsTheStreamAndStopsDelivery) {
     options.first_roles_json = R"(["player@v1","visualizer@v1"])";
     auto server =
         connect_paired_server(bundle.peer, VISUALIZER_REMOVED_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     ASSERT_TRUE(server->send_app_json(stream_start_visualizer_json()));
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] { return visualizer_listener.stream_starts == 1 && player_listener.stream_starts == 1; },
-        FIXTURE_PUMP_TIMEOUT_MS));
-    ASSERT_TRUE(send_loudness_until(
-        client, *server, [&] { return visualizer_listener.loudness.load() >= 1; }));
+    pump_until(client, [&] {
+        return visualizer_listener.stream_starts == 1 && player_listener.stream_starts == 1;
+    });
+    send_loudness_until(client, *server, [&] { return visualizer_listener.loudness.load() >= 1; });
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1"])")));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return visualizer_listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
-        << "the removed visualizer role never reported its stream ending";
+    pump_until(client, [&] { return visualizer_listener.stream_ends == 1; });
     EXPECT_FALSE(client.visualizer()->impl_->stream_active.load())
         << "the visualizer still accepts frames for a role the activation removed";
 
@@ -326,19 +313,15 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
     options.answer_time = true;
     options.first_roles_json = R"(["artwork@v1","metadata@v1"])";
     auto server = connect_paired_server(bundle.peer, ARTWORK_REMOVED_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_artwork_json()));
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), IMAGE_BYTES)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(IMAGE_BYTES / 2)));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return client.artwork()->impl_->transfer.in_flight; }, FIXTURE_PUMP_TIMEOUT_MS))
-        << "the half-sent image never registered as a transfer in flight";
+    pump_until(client, [&] { return client.artwork()->impl_->transfer.in_flight; });
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["metadata@v1"])")));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return artwork_listener.clears == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
-        << "the removed artwork role never cleared its channel";
+    pump_until(client, [&] { return artwork_listener.clears == 1; });
     EXPECT_EQ(artwork_listener.last_clear_slot, 0);
     EXPECT_FALSE(client.artwork()->impl_->transfer.in_flight)
         << "the in-flight transfer survived the removal";
@@ -351,9 +334,7 @@ TEST(RoleDeactivation, RemovedArtworkDropsTheInFlightTransferAndClearsTheChannel
     ASSERT_TRUE(server->send_app_json(stream_start_artwork_json()));
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), IMAGE_BYTES)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(IMAGE_BYTES)));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return artwork_listener.decodes.load() == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
-        << "the re-added artwork role decoded nothing";
+    pump_until(client, [&] { return artwork_listener.decodes.load() == 1; });
     EXPECT_EQ(artwork_listener.last_decode_length.load(), IMAGE_BYTES);
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -376,14 +357,12 @@ TEST(RoleDeactivation, StoppingTheArtworkRoleReleasesItsImageBuffers) {
     options.answer_time = true;
     options.first_roles_json = R"(["artwork@v1"])";
     auto server = connect_paired_server(bundle.peer, ARTWORK_BUFFERS_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_artwork_json()));
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), IMAGE_BYTES)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(IMAGE_BYTES)));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return artwork_listener.decodes.load() == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
-        << "the image never decoded, so no buffer was ever claimed";
+    pump_until(client, [&] { return artwork_listener.decodes.load() == 1; });
 
     auto* drain = client.artwork()->impl_->drain_task.get();
     ASSERT_NE(drain, nullptr);
@@ -425,19 +404,16 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     options.first_roles_json = R"(["player@v1","metadata@v1","color@v1","controller@v1"])";
     auto server =
         connect_paired_server(bundle.peer, STATE_ROLES_REMOVED_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     ASSERT_TRUE(server->send_app_json(metadata_state_json(1, "Now Playing")));
     ASSERT_TRUE(server->send_app_json(color_state_json(1)));
     ASSERT_TRUE(server->send_app_json(controller_state_json(42)));
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] {
-            return metadata_listener.updates == 1 && color_listener.updates == 1 &&
-                   controller_listener.updates == 1 && player_listener.stream_starts == 1;
-        },
-        FIXTURE_PUMP_TIMEOUT_MS));
+    pump_until(client, [&] {
+        return metadata_listener.updates == 1 && color_listener.updates == 1 &&
+               controller_listener.updates == 1 && player_listener.stream_starts == 1;
+    });
     // What the receive gate would hand a metadata handler admitted right now, kept for the
     // overtaken-handler check at the end.
     const uint32_t metadata_generation =
@@ -448,25 +424,17 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     const int64_t scheduled_ts = platform_time_us() + NEVER_DUE_LEAD_US;
     ASSERT_TRUE(server->send_app_json(metadata_state_json(scheduled_ts, "Up Next")));
     ASSERT_TRUE(server->send_app_json(color_state_json(scheduled_ts)));
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] {
-            return client.metadata()->impl_->held_state.has_value() &&
-                   client.color()->impl_->held_state.has_value();
-        },
-        FIXTURE_PUMP_TIMEOUT_MS))
-        << "the scheduled updates never reached the roles";
+    pump_until(client, [&] {
+        return client.metadata()->impl_->held_state.has_value() &&
+               client.color()->impl_->held_state.has_value();
+    });
     ASSERT_EQ(metadata_listener.updates, 1) << "a scheduled update was applied early";
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1"])")));
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] {
-            return metadata_listener.clears == 1 && color_listener.clears == 1 &&
-                   controller_listener.clears == 1;
-        },
-        FIXTURE_PUMP_TIMEOUT_MS))
-        << "a removed state role never told its listener";
+    pump_until(client, [&] {
+        return metadata_listener.clears == 1 && color_listener.clears == 1 &&
+               controller_listener.clears == 1;
+    });
 
     EXPECT_FALSE(client.metadata()->impl_->held_state.has_value())
         << "the removed metadata role kept its scheduled update";
@@ -484,8 +452,7 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     EXPECT_EQ(color_listener.updates, 1);
     EXPECT_EQ(controller_listener.updates, 1);
     EXPECT_EQ(player_listener.stream_ends, 0) << "a role the activation kept was torn down";
-    EXPECT_TRUE(stream_audio_until(client, *server, player_listener, 1))
-        << "the player stopped playing when the state roles were removed";
+    stream_audio_until(client, *server, player_listener, 1);
 
     // The gate is checked once on the network thread while the handler it admits runs on, so a
     // teardown can land in between. The handler re-checks the generation the gate captured, which
@@ -506,8 +473,7 @@ TEST(RoleDeactivation, RemovedStateRolesDiscardCurrentAndScheduledState) {
     client.metadata()->impl_->handle_server_state(
         std::move(current),
         client.metadata()->impl_->cleanup_generation.load(std::memory_order_acquire));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return metadata_listener.updates == 2; }, FIXTURE_PUMP_TIMEOUT_MS));
+    pump_until(client, [&] { return metadata_listener.updates == 2; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -535,14 +501,13 @@ TEST(RoleDeactivation, ActivationThatRemovesNoRoleTearsNothingDown) {
     options.answer_time = true;
     options.first_roles_json = R"(["player@v1","metadata@v1"])";
     auto server = connect_paired_server(bundle.peer, NO_CHANGE_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     ASSERT_TRUE(server->send_app_json(metadata_state_json(1, "Now Playing")));
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] { return player_listener.stream_starts == 1 && metadata_listener.updates == 1; },
-        FIXTURE_PUMP_TIMEOUT_MS));
+    pump_until(client, [&] {
+        return player_listener.stream_starts == 1 && metadata_listener.updates == 1;
+    });
 
     // Same set again.
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1","metadata@v1"])")));
@@ -581,23 +546,18 @@ TEST(RoleDeactivation, ReAddedPlayerPublishesItsStateAndPlaysAgain) {
     options.answer_time = true;
     options.first_roles_json = R"(["player@v1","metadata@v1"])";
     auto server = connect_paired_server(bundle.peer, READD_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_starts == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
-    ASSERT_TRUE(stream_audio_until(client, *server, player_listener, 1));
+    pump_until(client, [&] { return player_listener.stream_starts == 1; });
+    stream_audio_until(client, *server, player_listener, 1);
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["metadata@v1"])")));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
+    pump_until(client, [&] { return player_listener.stream_ends == 1; });
 
     const int states_before_readd = server->client_state_count();
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1","metadata@v1"])")));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return server->client_state_count() > states_before_readd; },
-        FIXTURE_PUMP_TIMEOUT_MS))
-        << "the activation that added the player back published no client/state";
+    pump_until(client, [&] { return server->client_state_count() > states_before_readd; });
     {
         JsonDocument doc;
         const std::vector<std::string> states = server->client_states();
@@ -608,12 +568,9 @@ TEST(RoleDeactivation, ReAddedPlayerPublishesItsStateAndPlaysAgain) {
     }
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_starts == 2; }, FIXTURE_PUMP_TIMEOUT_MS))
-        << "the re-added player role never started a stream again";
+    pump_until(client, [&] { return player_listener.stream_starts == 2; });
     const size_t writes_before = player_listener.audio_writes.load();
-    EXPECT_TRUE(stream_audio_until(client, *server, player_listener, writes_before + 1))
-        << "the re-added player role never played again";
+    stream_audio_until(client, *server, player_listener, writes_before + 1);
     EXPECT_EQ(player_listener.stream_ends, 1);
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
@@ -646,7 +603,7 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeARemovalNeverStarts) {
     options.answer_time = true;
     options.first_roles_json = R"(["player@v1","metadata@v1"])";
     auto server = connect_paired_server(bundle.peer, STALE_START_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     // From here on the test thread does not pump: everything below queues up client-side.
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
@@ -660,13 +617,10 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeARemovalNeverStarts) {
 
     // Both halves are in: the START sits in the event ring, the activate in the manager's pending
     // events. The next loop() tick applies the activate first and drains the ring second.
-    ASSERT_TRUE(wait_until(
-        [&] {
-            return (client.player()->impl_->inbox->poll() & INBOX_TOPIC_EVENTS) != 0 &&
-                   client.connection_manager_->has_pending_events_.load();
-        },
-        FIXTURE_PUMP_TIMEOUT_MS))
-        << "the stream/start and the activate never both arrived";
+    wait_until([&] {
+        return (client.player()->impl_->inbox->poll() & INBOX_TOPIC_EVENTS) != 0 &&
+               client.connection_manager_->has_pending_events_.load();
+    });
 
     pump_for(client, SETTLE_MS);
     EXPECT_EQ(player_listener.stream_starts, 0)
@@ -696,7 +650,7 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeAKeepingActivateStillStarts) {
     options.first_roles_json = R"(["player@v1"])";
     auto server =
         connect_paired_server(bundle.peer, STALE_START_CONTROL_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     constexpr size_t PCM_20MS_BYTES = 48000 / 50 * 2 * 2;
@@ -708,18 +662,13 @@ TEST(RoleDeactivation, StreamStartQueuedBeforeAKeepingActivateStillStarts) {
     // Adds metadata, keeps the player: the queued START is for a role that is still active.
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v1","metadata@v1"])")));
 
-    ASSERT_TRUE(wait_until(
-        [&] {
-            return (client.player()->impl_->inbox->poll() & INBOX_TOPIC_EVENTS) != 0 &&
-                   client.connection_manager_->has_pending_events_.load();
-        },
-        FIXTURE_PUMP_TIMEOUT_MS))
-        << "the stream/start and the activate never both arrived";
+    wait_until([&] {
+        return (client.player()->impl_->inbox->poll() & INBOX_TOPIC_EVENTS) != 0 &&
+               client.connection_manager_->has_pending_events_.load();
+    });
 
-    ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_starts == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
-        << "an activation that removed nothing swallowed the queued stream/start";
-    EXPECT_TRUE(stream_audio_until(client, *server, player_listener, 1));
+    pump_until(client, [&] { return player_listener.stream_starts == 1; });
+    stream_audio_until(client, *server, player_listener, 1);
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -760,7 +709,7 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     options.answer_time = true;
     auto server =
         connect_paired_server(bundle.peer, INACTIVE_TRAFFIC_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     // Control: every path works while the roles are active.
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
@@ -769,41 +718,33 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     ASSERT_TRUE(server->send_app_json(metadata_state_json(1, "Active")));
     ASSERT_TRUE(server->send_app_json(color_state_json(1)));
     ASSERT_TRUE(server->send_app_json(controller_state_json(11)));
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] {
+    pump_until(
+        client, [&] {
             return player_listener.stream_starts == 1 && visualizer_listener.stream_starts == 1 &&
                    metadata_listener.updates == 1 && color_listener.updates == 1 &&
                    controller_listener.updates == 1;
-        },
-        FIXTURE_PUMP_TIMEOUT_MS));
-    ASSERT_TRUE(stream_audio_until(client, *server, player_listener, 1));
-    ASSERT_TRUE(send_loudness_until(
-        client, *server, [&] { return visualizer_listener.loudness.load() >= 1; }));
+        });
+    stream_audio_until(client, *server, player_listener, 1);
+    send_loudness_until(client, *server, [&] { return visualizer_listener.loudness.load() >= 1; });
     ASSERT_TRUE(server->send_binary_body(artwork_announce(platform_time_us(), 32)));
     ASSERT_TRUE(server->send_binary_body(artwork_part(32)));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return artwork_listener.decodes.load() == 1; }, FIXTURE_PUMP_TIMEOUT_MS));
+    pump_until(client, [&] { return artwork_listener.decodes.load() == 1; });
 
     // Every role out.
     ASSERT_TRUE(server->send_app_json(activate_json(R"([])")));
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] {
+    pump_until(
+        client, [&] {
             return player_listener.stream_ends == 1 && visualizer_listener.stream_ends == 1 &&
                    metadata_listener.clears == 1 && color_listener.clears == 1 &&
                    controller_listener.clears == 1 && artwork_listener.clears == 1;
-        },
-        FIXTURE_PUMP_TIMEOUT_MS));
+        });
 
     const size_t writes_after_removal = player_listener.audio_writes.load();
     const size_t loudness_after_removal = visualizer_listener.loudness.load();
     // The sync task is idle and its ring drained, so anything the binary path still accepted for
     // the removed player would show up here rather than at the audio output.
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] { return client.player()->impl_->sync_task->encoded_ring_buffer_->is_empty(); },
-        FIXTURE_PUMP_TIMEOUT_MS));
+    pump_until(client,
+               [&] { return client.player()->impl_->sync_task->encoded_ring_buffer_->is_empty(); });
 
     // The same traffic again, now for roles the server has removed.
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
@@ -849,9 +790,7 @@ TEST(RoleDeactivation, TrafficForARemovedRoleIsIgnoredWithoutClosing) {
     // an artwork message that is malformed as a message is the protocol error the role closes on
     // whether or not its role is active. Last, because it ends the connection.
     ASSERT_TRUE(server->send_binary_body({SENDSPIN_BINARY_ARTWORK_IMAGE}));
-    EXPECT_TRUE(pump_until(
-        client, [&] { return !client.is_connected(); }, FIXTURE_PUMP_TIMEOUT_MS))
-        << "a malformed artwork message was excused because its role was inactive";
+    pump_until(client, [&] { return !client.is_connected(); });
 
     pump_for(client, 100);
 }
@@ -879,20 +818,17 @@ TEST(RoleDeactivation, ReplacingARoleVersionRemovesTheVersionInUse) {
     options.first_roles_json = R"(["player@v1","metadata@v1"])";
     auto server =
         connect_paired_server(bundle.peer, VERSION_REPLACED_TEST_PORT, std::move(options));
-    ASSERT_TRUE(pump_until_synced(client));
+    pump_until_synced(client);
 
     ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
     ASSERT_TRUE(server->send_app_json(metadata_state_json(1, "Before Replacement")));
-    ASSERT_TRUE(pump_until(
-        client,
-        [&] { return player_listener.stream_starts == 1 && metadata_listener.updates == 1; },
-        FIXTURE_PUMP_TIMEOUT_MS));
-    ASSERT_TRUE(stream_audio_until(client, *server, player_listener, 1));
+    pump_until(client, [&] {
+        return player_listener.stream_starts == 1 && metadata_listener.updates == 1;
+    });
+    stream_audio_until(client, *server, player_listener, 1);
 
     ASSERT_TRUE(server->send_app_json(activate_json(R"(["player@v2","metadata@v1"])")));
-    ASSERT_TRUE(pump_until(
-        client, [&] { return player_listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
-        << "replacing player@v1 with a version the client does not implement left it running";
+    pump_until(client, [&] { return player_listener.stream_ends == 1; });
     EXPECT_FALSE(client.player()->impl_->sync_task->is_running());
     EXPECT_EQ(metadata_listener.clears, 0) << "a role the activation kept was torn down";
     EXPECT_EQ(metadata_listener.last_title, "Before Replacement");

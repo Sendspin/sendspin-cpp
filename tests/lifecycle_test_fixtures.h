@@ -123,34 +123,50 @@ private:
     std::string last_played_server_id_;
 };
 
-inline bool pump_until(SendspinClient& client, const std::function<bool()>& pred, int timeout_ms) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
+/// Pumps client.loop() until pred() is true. No timeout: a regression hangs here and the suite
+/// watchdog reports it by name.
+inline void pump_until(SendspinClient& client, const std::function<bool()>& pred) {
+    for (;;) {
         client.loop();
         if (pred()) {
-            return true;
+            return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    return false;
 }
 
+/// Pumps client.loop() for a fixed window. Only for spacing events or "must not happen" checks:
+/// a window that is too short can miss a regression, never fail a correct run.
 inline void pump_for(SendspinClient& client, int duration_ms) {
-    pump_until(
-        client, [] { return false; }, duration_ms);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(duration_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        client.loop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 /// Waits for pred() without pumping the client: for observations on a fake peer after the client
 /// has been stopped or destroyed, when loop() is not the thing that would satisfy the predicate.
-inline bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+/// Unbounded, for the same reason as pump_until.
+inline void wait_until(const std::function<bool()>& pred) {
+    while (!pred()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+/// Reports whether pred() stayed false for a fixed window, without pumping the client. Only for
+/// "must not happen" checks on a monotonic observation: a window that is too short can miss a
+/// regression, never fail a correct run. A predicate that must become true waits on wait_until
+/// instead, where elapsed time is not part of the verdict.
+inline bool never_within(const std::function<bool()>& pred, int duration_ms) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(duration_ms);
     while (std::chrono::steady_clock::now() < deadline) {
         if (pred()) {
-            return true;
+            return false;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
-    return false;
+    return true;
 }
 
 /// A fresh long-term pairing record, the PSK behind it, and the server identity the record is
@@ -1228,10 +1244,6 @@ inline PlayerRoleConfig make_pcm_player_config() {
 // Shared drivers
 // ============================================================================
 
-/// Generous next to the loopback round trips involved, so a verdict comes from the predicate
-/// rather than the clock; a real hang is caught by the suite watchdog in main.cpp.
-inline constexpr int FIXTURE_PUMP_TIMEOUT_MS = 6000;
-
 inline std::unique_ptr<FakeEncryptedServer> connect_paired_server(
     const PairedPeer& peer, uint16_t port, FakeEncryptedServerOptions options = {}) {
     return std::make_unique<FakeEncryptedServer>(
@@ -1241,29 +1253,24 @@ inline std::unique_ptr<FakeEncryptedServer> connect_paired_server(
 
 /// Pumps until the session is up and the time filter has converged, which is what the streaming
 /// tests need before a timestamped chunk means anything.
-inline bool pump_until_synced(SendspinClient& client) {
-    return pump_until(
-        client, [&] { return client.is_connected() && client.is_time_synced(); },
-        FIXTURE_PUMP_TIMEOUT_MS);
+inline void pump_until_synced(SendspinClient& client) {
+    pump_until(client, [&] { return client.is_connected() && client.is_time_synced(); });
 }
 
 /// Feeds 20 ms PCM chunks, paced in real time, until the listener has taken `target` writes.
-inline bool stream_audio_until(SendspinClient& client, FakeEncryptedServer& server,
+inline void stream_audio_until(SendspinClient& client, FakeEncryptedServer& server,
                                CountingPlayerListener& listener, size_t target) {
     constexpr size_t PCM_20MS_BYTES = 48000 / 50 * 2 * 2;
     int64_t next_ts = platform_time_us() + 50 * 1000;
-    return pump_until(
-        client,
-        [&] {
-            if (listener.audio_writes.load() >= target) {
-                return true;
-            }
-            server.send_audio(next_ts, PCM_20MS_BYTES);
-            next_ts += 20 * 1000;
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // real-time pacing
-            return false;
-        },
-        FIXTURE_PUMP_TIMEOUT_MS);
+    pump_until(client, [&] {
+        if (listener.audio_writes.load() >= target) {
+            return true;
+        }
+        server.send_audio(next_ts, PCM_20MS_BYTES);
+        next_ts += 20 * 1000;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));  // real-time pacing
+        return false;
+    });
 }
 
 }  // namespace sendspin
