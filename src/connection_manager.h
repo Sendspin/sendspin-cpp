@@ -854,7 +854,7 @@ private:
     /// @param conn               Connection whose pairing attempt is ending. Must be non-null.
     /// @param wire_abort_reason  If set, sends pair/abort(wire_abort_reason) to the peer first
     ///        (best-effort). Leave nullopt when the abort was received from the peer, or when
-    ///        the spec's Protocol Errors handling forbids sending one.
+    ///        pairing.md "Protocol Errors" forbids sending one.
     /// @param drop_action        Whether/how the connection is closed. KEEP_OPEN leaves it open.
     ///        CLOSE_SILENTLY drops it via drop_connection() without a client/goodbye.
     ///        CLOSE_WITH_GOODBYE drops it via drop_connection() using goodbye_reason.

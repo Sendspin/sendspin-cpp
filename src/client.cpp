@@ -873,7 +873,7 @@ MetadataRole& SendspinClient::add_metadata() {
 
 #ifdef SENDSPIN_ENABLE_COLOR
 // cppcheck-suppress unusedFunction
-// Public API: live entry point the reference examples don't happen to exercise, not dead code.
+// Public API: live entry point the bundled examples don't happen to exercise, not dead code.
 ColorRole& SendspinClient::add_color() {
     if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         SS_LOGW(TAG, "add_color() called while started");
@@ -886,7 +886,7 @@ ColorRole& SendspinClient::add_color() {
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
 // cppcheck-suppress unusedFunction
-// Public API: live entry point the reference examples don't happen to exercise, not dead code.
+// Public API: live entry point the bundled examples don't happen to exercise, not dead code.
 ArtworkRole& SendspinClient::add_artwork(ArtworkRoleConfig config) {
     if (this->lifecycle_.load(std::memory_order_relaxed) != LifecycleState::STOPPED) {
         SS_LOGW(TAG, "add_artwork() called while started");

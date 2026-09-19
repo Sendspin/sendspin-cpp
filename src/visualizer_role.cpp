@@ -524,9 +524,10 @@ void VisualizerRole::Impl::signal_clear_marker() const {
 void VisualizerRole::Impl::discard_to_clear_marker() const {
     // Drain-thread side of a clear boundary: discard entries up to and including the marker.
     // Stopping at the marker preserves frames the network thread enqueued after the clear,
-    // which per spec must survive. If the buffer empties without a marker, either the marker
-    // could not be enqueued or it was already consumed in normal flow (it is a 1-byte entry,
-    // dropped by the drain loop's minimum-size check); nothing is left to discard either way.
+    // which messaging.md "stream/clear" requires to survive. If the buffer empties without a
+    // marker, either the marker could not be enqueued or it was already consumed in normal flow (it
+    // is a 1-byte entry, dropped by the drain loop's minimum-size check); nothing is left to
+    // discard either way.
     if (!this->drain_task) {
         return;
     }

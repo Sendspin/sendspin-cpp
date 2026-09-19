@@ -213,8 +213,8 @@ inline int activity_rank(const std::vector<SendspinActivity>& activities) {
 /// @param last_playback_server_id  The last-playback server_id (empty if unset).
 /// @param has_last_playback      Whether last_playback_server_id has been set.
 /// @param admitted_pairing_in_flight  Whether the admitted connection's pairing exchange is still
-///        in flight. Defaults to true, which is the plain reading of rule 2 and preserves the
-///        reference behavior. Pass false only when the admitted side declares PAIRING but has
+///        in flight. Defaults to true, which is the plain reading of rule 2. Pass false only
+///        when the admitted side declares PAIRING but has
 ///        already been acked with server/pair-finalize, so rule 2 stops shielding a pairing that
 ///        has finished. Affects rule 2 alone; the rank comparisons are untouched.
 /// @return true if the incoming connection should become the admitted one.

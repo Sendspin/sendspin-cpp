@@ -141,8 +141,9 @@ void SendspinConnection::handle_noise_handshake_text(const std::string& text) {
                     "Noise handshake aborted by server/error (reason='%s'); closing connection",
                     server_error.c_str());
         }
-        // Discard handshake state, then close per spec Failure Handling: a handshake-phase
-        // failure closes the WebSocket without sending any application-level message.
+        // Discard handshake state, then close per connection.md "Failure Handling": a
+        // handshake-phase failure closes the WebSocket without sending any application-level
+        // message.
         this->noise_handshake_.reset();
         this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);
         return;
