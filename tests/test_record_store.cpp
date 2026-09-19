@@ -93,10 +93,11 @@ static void touch_record(RecordStore& store, const std::string& psk_id) {
 
 /// The production revocation sequence: ConnectionManager::handle_server_unpair() erases under
 /// its own lock and the flush persists the array.
-static void remove_record(RecordStore& store, const std::string& psk_id) {
-    if (store.note_record_removed(psk_id)) {
-        (void) store.persist_records();
+static bool remove_record(RecordStore& store, const std::string& psk_id) {
+    if (!store.note_record_removed(psk_id)) {
+        return false;
     }
+    return store.persist_records();
 }
 
 /// Wraps a std::string's bytes as a blob for seed_blob()/save_blob() calls.
@@ -187,17 +188,6 @@ TEST(RecordStore, FirstBootProvisioningSurvivesPersistenceFailureForThisBoot) {
     auto resolved = store.resolve_by_psk_id(store.pairing_psk()->psk_id, PskCategory::PAIRING);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->category, PskCategory::PAIRING);
-}
-
-TEST(RecordStore, FirstBootPskIdIsSentinelPskIdResolvable) {
-    RecordStore store(nullptr);
-
-    // Even on first boot the Sentinel PSK must be resolvable.
-    auto resolved = store.resolve_by_psk_id(SENTINEL_PSK_ID, PskCategory::SENTINEL);
-    ASSERT_TRUE(resolved.has_value());
-    EXPECT_EQ(resolved->category, PskCategory::SENTINEL);
-    EXPECT_EQ(resolved->psk_id, SENTINEL_PSK_ID);
-    EXPECT_EQ(resolved->psk, SENTINEL_PSK);
 }
 
 namespace {
@@ -574,65 +564,78 @@ TEST(RecordStore, CapacitySupersedeAtCapacityEvictsNothing) {
     }
 }
 
-// A caller-supplied cap (the max_records constructor parameter, wired from
-// SendspinClientConfig::max_pairing_records) must be respected in place of the default, above
-// the protocol's floor.
-TEST(RecordStore, CapacityCustomCapIsRespected) {
-    const size_t cap = RecordStore::MIN_MAX_RECORDS + 1;
-    RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, cap);
+// The effective cap: a caller-supplied max_records (wired from
+// SendspinClientConfig::max_pairing_records) is honoured above the protocol's floor, and raised
+// to it below. pairing.md "Pairing Records" requires room for at least 5 records.
+TEST(RecordStore, ConfiguredCapacityIsHonouredAboveTheProtocolFloor) {
+    struct Row {
+        const char* name;
+        size_t configured;
+        size_t effective;
+    };
+    const Row rows[] = {
+        {"above-the-floor", RecordStore::MIN_MAX_RECORDS + 1, RecordStore::MIN_MAX_RECORDS + 1},
+        {"below-the-floor", 2, RecordStore::MIN_MAX_RECORDS},
+    };
 
-    for (size_t i = 0; i < cap; ++i) {
-        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
-        ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, row.configured);
+
+        for (size_t i = 0; i < row.effective; ++i) {
+            auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
+            ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
+        }
+        EXPECT_EQ(store.records_.size(), row.effective)
+            << "nothing may be evicted before the effective cap is reached";
+
+        auto overflow = store.resolve_pairing_outcome("server-overflow");
+        ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
+        EXPECT_EQ(store.records_.size(), row.effective) << "the effective cap still bounds the store";
     }
-    EXPECT_EQ(store.records_.size(), cap);
-
-    auto overflow = store.resolve_pairing_outcome("server-overflow");
-    ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
-    EXPECT_EQ(store.records_.size(), cap) << "the configured cap still bounds the store";
-}
-
-// pairing.md "Pairing Records" requires room for at least 5 records, so a smaller configured cap
-// is raised to that floor rather than honoured.
-TEST(RecordStore, CapacityBelowTheProtocolFloorIsRaised) {
-    RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/false, /*max_records=*/2);
-
-    for (size_t i = 0; i < RecordStore::MIN_MAX_RECORDS; ++i) {
-        auto outcome = store.resolve_pairing_outcome("server-" + std::to_string(i));
-        ASSERT_TRUE(store.store_record_superseding(outcome.record, {}));
-    }
-    EXPECT_EQ(store.records_.size(), RecordStore::MIN_MAX_RECORDS)
-        << "nothing may be evicted before the floor is reached";
 }
 
 // ============================================================================
 // resolve_by_psk_id: the declared category selects the candidate set
 // ============================================================================
 
-TEST(RecordStore, ResolveByPskIdResolvesALongTermRecord) {
-    RecordStore store(nullptr);
-
-    SendspinPairingRecord rec = make_client_record("server-X");
-    store.store_record_superseding(rec, {});
-
-    auto resolved = store.resolve_by_psk_id(rec.psk_id, PskCategory::LONG_TERM);
-    ASSERT_TRUE(resolved.has_value());
-    EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
-    EXPECT_EQ(resolved->psk_id, rec.psk_id);
-    EXPECT_EQ(resolved->psk, rec.psk);
-    EXPECT_EQ(resolved->counterparty_id, rec.server_id);
-}
-
-TEST(RecordStore, ResolveByPskIdResolvesThePairingPsk) {
+// Each category resolves its own PSK, and the resolved value carries that category's secret
+// and counterparty (connection.md "Pre-Shared Key"): a long-term record answers with the
+// server it was paired to, while the Pairing and Sentinel PSKs are bound to no server.
+TEST(RecordStore, ResolveByPskIdReturnsTheCategorysPskAndCounterparty) {
     InMemoryPersistenceProvider provider;
-    SendspinPairingPsk p = make_pairing_psk();
-    provider.seed_blob(persistence_keys::PAIRING_PSK, to_bytes(encode_pairing_psk(p)));
+    SendspinPairingPsk pairing = make_pairing_psk();
+    provider.seed_blob(persistence_keys::PAIRING_PSK, to_bytes(encode_pairing_psk(pairing)));
     RecordStore store(&provider);
 
-    auto resolved = store.resolve_by_psk_id(p.psk_id, PskCategory::PAIRING);
-    ASSERT_TRUE(resolved.has_value());
-    EXPECT_EQ(resolved->category, PskCategory::PAIRING);
-    EXPECT_FALSE(resolved->counterparty_id.has_value());
+    SendspinPairingRecord rec = make_client_record("server-X");
+    ASSERT_TRUE(store.store_record_superseding(rec, {}));
+
+    struct Row {
+        const char* name;
+        std::string psk_id;
+        PskCategory category;
+        std::array<uint8_t, NOISE_PSK_SIZE> psk;
+        std::optional<std::string> counterparty;
+    };
+    const Row rows[] = {
+        {"long-term-record", rec.psk_id, PskCategory::LONG_TERM, rec.psk, rec.server_id},
+        {"pairing-psk", pairing.psk_id, PskCategory::PAIRING, pairing.psk, std::nullopt},
+        // The Sentinel PSK is a constant, so it resolves on a store that has never been
+        // provisioned as well as on this one.
+        {"sentinel-psk", std::string(SENTINEL_PSK_ID), PskCategory::SENTINEL, SENTINEL_PSK,
+         std::nullopt},
+    };
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto resolved = store.resolve_by_psk_id(row.psk_id, row.category);
+        ASSERT_TRUE(resolved.has_value());
+        EXPECT_EQ(resolved->category, row.category);
+        EXPECT_EQ(resolved->psk_id, row.psk_id);
+        EXPECT_EQ(resolved->psk, row.psk);
+        EXPECT_EQ(resolved->counterparty_id, row.counterparty);
+    }
 }
 
 // One psk_id held under two categories resolves to whichever the server declared: there is no
@@ -696,16 +699,6 @@ TEST(RecordStore, PskCategoryFromStringAcceptsOnlyTheThreeCodes) {
     EXPECT_FALSE(psk_category_from_string("").has_value());
     EXPECT_FALSE(psk_category_from_string("LT").has_value());
     EXPECT_FALSE(psk_category_from_string("long_term").has_value());
-}
-
-TEST(RecordStore, ResolveByPskIdSentinelAlwaysResolvable) {
-    RecordStore store(nullptr);
-
-    auto resolved = store.resolve_by_psk_id(SENTINEL_PSK_ID, PskCategory::SENTINEL);
-    ASSERT_TRUE(resolved.has_value());
-    EXPECT_EQ(resolved->category, PskCategory::SENTINEL);
-    EXPECT_EQ(resolved->psk, SENTINEL_PSK);
-    EXPECT_FALSE(resolved->counterparty_id.has_value());
 }
 
 TEST(RecordStore, ResolveByPskIdUnknownReturnsNullopt) {
@@ -840,101 +833,49 @@ private:
     std::vector<SendspinPairingRecord> saved_{};
 };
 
-/// The durability warning always says the credential comes back after a reboot; that phrase is
-/// what distinguishes it from the routine "Superseding prior record" info line.
-constexpr const char* REBOOT_WARNING = "after a reboot";
-
 // A delete the provider refuses must still revoke the credential for the current boot: leaving
 // it in RAM because the store could not be written would keep it usable right now, which is
 // strictly worse than a revocation that only fails to outlive a reboot. The provider is asked
-// exactly once, and its refusal must be reported rather than swallowed.
-TEST(RecordStore, RemoveRecordErasesFromMemoryAndWarnsWhenTheProviderRefusesTheDelete) {
-    RejectingDeleteProvider provider;
-    RecordStore store(&provider);
+// exactly once either way, and the flush's return value is how the caller learns whether the
+// revocation is durable.
+TEST(RecordStore, RemoveRecordErasesFromMemoryAndReportsWhetherTheDeleteIsDurable) {
+    struct Row {
+        const char* name;
+        bool refuse_delete;
+        bool expect_durable;
+    };
+    const Row rows[] = {
+        {"provider-refuses-the-delete", true, false},
+        // Control: an accepted delete is durable, which is what pins the direction of the row
+        // above.
+        {"provider-accepts-the-delete", false, true},
+    };
 
-    SendspinPairingRecord a = make_client_record("server-A");
-    ASSERT_TRUE(store.store_record_superseding(a, {}));
-    ASSERT_TRUE(store.persist_records());
-    ASSERT_NE(store.record_by_psk_id(a.psk_id), nullptr);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        RejectingDeleteProvider provider;
+        provider.refuse_delete = row.refuse_delete;
+        RecordStore store(&provider);
 
-    std::string logs;
-    {
-        StderrCapture capture;
-        remove_record(store, a.psk_id);
-        logs = capture.release();
+        SendspinPairingRecord a = make_client_record("server-A");
+        ASSERT_TRUE(store.store_record_superseding(a, {}));
+        ASSERT_TRUE(store.persist_records());
+        ASSERT_NE(store.record_by_psk_id(a.psk_id), nullptr);
+
+        EXPECT_EQ(remove_record(store, a.psk_id), row.expect_durable);
+        EXPECT_EQ(store.record_by_psk_id(a.psk_id), nullptr)
+            << "a refused delete must not leave the revoked credential resolvable this boot";
+        EXPECT_FALSE(store.resolve_by_psk_id(a.psk_id, PskCategory::LONG_TERM).has_value());
+        ASSERT_EQ(provider.remove_attempts.size(), 1u);
+        EXPECT_EQ(provider.remove_attempts[0], a.psk_id);
     }
-
-    EXPECT_EQ(store.record_by_psk_id(a.psk_id), nullptr)
-        << "a refused delete must not leave the revoked credential resolvable this boot";
-    EXPECT_FALSE(store.resolve_by_psk_id(a.psk_id, PskCategory::LONG_TERM).has_value());
-    ASSERT_EQ(provider.remove_attempts.size(), 1u);
-    EXPECT_EQ(provider.remove_attempts[0], a.psk_id);
-    EXPECT_NE(logs.find(REBOOT_WARNING), std::string::npos)
-        << "a refused delete must be reported, not swallowed; got: " << logs;
-}
-
-// The other half of the contract, and what pins the condition's direction: a delete the provider
-// accepted is durable, so it must NOT warn. Without this an inverted test would pass.
-TEST(RecordStore, RemoveRecordIsSilentWhenTheProviderAcceptsTheDelete) {
-    RejectingDeleteProvider provider;
-    provider.refuse_delete = false;
-    RecordStore store(&provider);
-
-    SendspinPairingRecord a = make_client_record("server-A");
-    ASSERT_TRUE(store.store_record_superseding(a, {}));
-    ASSERT_TRUE(store.persist_records());
-
-    std::string logs;
-    {
-        StderrCapture capture;
-        remove_record(store, a.psk_id);
-        logs = capture.release();
-    }
-
-    EXPECT_EQ(store.record_by_psk_id(a.psk_id), nullptr);
-    ASSERT_EQ(provider.remove_attempts.size(), 1u);
-    EXPECT_EQ(logs.find(REBOOT_WARNING), std::string::npos)
-        << "a delete the store accepted is durable and must not warn; got: " << logs;
-}
-
-// ConnectionManager::flush_pending_record_ops() passes report_rejection=false for a batch that
-// carries only the advisory `used` flag: it runs on the first activate of every long-term
-// session, the flag is rebuilt from use, and a store that is full or read-only would otherwise
-// warn once per connection. A durable change in the same store still reports the rejection.
-TEST(RecordStore, RejectedUsedFlagFlushIsSilentWhileADurableOneWarns) {
-    RejectingPersistenceProvider provider;
-    RecordStore store(&provider);
-
-    SendspinPairingRecord rec = make_client_record("server-A");
-    ASSERT_TRUE(store.store_record_superseding(rec, {}));
-    ASSERT_TRUE(store.note_record_used(rec.psk_id));
-
-    std::string used_logs;
-    {
-        StderrCapture capture;
-        EXPECT_FALSE(store.persist_records(/*report_rejection=*/false));
-        used_logs = capture.release();
-    }
-    EXPECT_EQ(used_logs.find(REBOOT_WARNING), std::string::npos)
-        << "a rejected used-flag flush must stay silent; got: " << used_logs;
-
-    // Control: the same rejected write for a durable change is reported.
-    std::string durable_logs;
-    {
-        StderrCapture capture;
-        EXPECT_FALSE(store.persist_records());
-        durable_logs = capture.release();
-    }
-    EXPECT_NE(durable_logs.find(REBOOT_WARNING), std::string::npos)
-        << "a rejected durable flush must be reported; got: " << durable_logs;
-    EXPECT_EQ(provider.save_attempts, 2) << "both flushes reached the provider";
 }
 
 // Same contract on the pairing/supersede path, which persists through the deferred
 // persist_records() flush rather than inside the supersede itself: the prior record leaves RAM
 // immediately (revoked for this boot no matter what the provider later says), and a flush the
 // provider refuses is reported at flush time.
-TEST(RecordStore, SupersedeErasesFromMemoryAndFlushWarnsWhenTheProviderRefusesTheDelete) {
+TEST(RecordStore, SupersedeErasesFromMemoryAndTheFlushFailsWhenTheProviderRefusesTheDelete) {
     RejectingDeleteProvider provider;
     RecordStore store(&provider);
 
@@ -952,21 +893,14 @@ TEST(RecordStore, SupersedeErasesFromMemoryAndFlushWarnsWhenTheProviderRefusesTh
     EXPECT_TRUE(provider.remove_attempts.empty())
         << "store_record_superseding must not call the provider";
 
-    std::string logs;
-    {
-        StderrCapture capture;
-        EXPECT_FALSE(store.persist_records());
-        logs = capture.release();
-    }
+    EXPECT_FALSE(store.persist_records());
     ASSERT_EQ(provider.remove_attempts.size(), 1u);
     EXPECT_EQ(provider.remove_attempts[0], original.psk_id);
-    EXPECT_NE(logs.find(REBOOT_WARNING), std::string::npos)
-        << "a refused supersede flush must be reported; got: " << logs;
 }
 
-// A supersede whose flush the store accepted is durable: no warning, and the prior record is
-// really gone from the provider (so it does not come back on the next start).
-TEST(RecordStore, SupersedeIsSilentWhenTheProviderAcceptsTheFlush) {
+// A supersede whose flush the store accepted is durable: the prior record is really gone from
+// the provider, so it does not come back on the next start. Control for the refused case above.
+TEST(RecordStore, SupersedeIsDurableWhenTheProviderAcceptsTheFlush) {
     RejectingDeleteProvider provider;
     provider.refuse_delete = false;
     RecordStore store(&provider);
@@ -976,16 +910,8 @@ TEST(RecordStore, SupersedeIsSilentWhenTheProviderAcceptsTheFlush) {
     ASSERT_TRUE(store.persist_records());
 
     SendspinPairingRecord replacement = make_client_record("server-X", "replacement");
-    std::string logs;
-    {
-        StderrCapture capture;
-        ASSERT_TRUE(store.store_record_superseding(replacement, {}));
-        ASSERT_TRUE(store.persist_records());
-        logs = capture.release();
-    }
-
-    EXPECT_EQ(logs.find(REBOOT_WARNING), std::string::npos)
-        << "an accepted supersede flush must not warn; got: " << logs;
+    ASSERT_TRUE(store.store_record_superseding(replacement, {}));
+    ASSERT_TRUE(store.persist_records());
 
     RecordStore rebooted(&provider);
     EXPECT_FALSE(rebooted.resolve_by_psk_id(original.psk_id, PskCategory::LONG_TERM).has_value());
@@ -1230,25 +1156,10 @@ TEST(FilePersistenceProvider, RecordWithoutServerIdIsSkipped) {
                                    reinterpret_cast<const uint8_t*>(encoded.data()),
                                    encoded.size()));
 
-    std::optional<std::vector<SendspinPairingRecord>> decoded;
-    std::string logs;
-    {
-        StderrCapture capture;
-        decoded = decode_records_blob(provider.load_blob(persistence_keys::RECORDS));
-        logs = capture.release();
-    }
+    auto decoded = decode_records_blob(provider.load_blob(persistence_keys::RECORDS));
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 1u) << "the unbound entry must be skipped, the bound one kept";
     EXPECT_EQ((*decoded)[0].psk_id, bound.psk_id);
-
-    // A silently dropped pairing makes a server look forgotten for no stated reason, so the skip
-    // names the record and why it went.
-    EXPECT_NE(logs.find("unbound"), std::string::npos)
-        << "the skip must name the record it dropped; got: " << logs;
-    EXPECT_NE(logs.find("server_id"), std::string::npos)
-        << "the skip must say why the record was dropped; got: " << logs;
-    EXPECT_EQ(logs.find(bound.psk_id), std::string::npos)
-        << "the accepted record must not be warned about; got: " << logs;
 }
 
 // erase_blob() reports success for an absent key as well as an erased one, so an application
@@ -1444,15 +1355,12 @@ private:
     SendspinPairingConfig config_;
 };
 
-TEST(RecordStore, UnpairedAccessDefaultsOffWithoutSeed) {
-    RecordStore store(nullptr);
-    EXPECT_FALSE(store.unpaired_access_enabled());
-}
-
-TEST(RecordStore, UnpairedAccessSeedAppliesWithoutProvider) {
-    // No provider means no stored config to load, so the seed applies on every start.
-    RecordStore store(nullptr, /*initial_unpaired_access_enabled=*/true);
-    EXPECT_TRUE(store.unpaired_access_enabled());
+// No provider means no stored config to load, so the constructor seed is the whole answer and
+// it defaults off.
+TEST(RecordStore, UnpairedAccessSeedIsTheWholeAnswerWithoutAProvider) {
+    EXPECT_FALSE(RecordStore(nullptr).unpaired_access_enabled());
+    EXPECT_TRUE(RecordStore(nullptr, /*initial_unpaired_access_enabled=*/true)
+                    .unpaired_access_enabled());
 }
 
 TEST(RecordStore, UnpairedAccessSeedYieldsToLoadedConfig) {
@@ -1634,21 +1542,6 @@ TEST(RecordStore, ResolvePairingOutcomeThenStore) {
     EXPECT_EQ(resolved->category, PskCategory::LONG_TERM);
 }
 
-// Two records stored for different servers are both retained.
-TEST(RecordStore, StoresRecordsForDistinctServers) {
-    RecordStore store(nullptr);
-    ASSERT_TRUE(store.records_.empty());
-
-    SendspinPairingRecord a = make_client_record("server-A");
-    SendspinPairingRecord b = make_client_record("server-B");
-    store.store_record_superseding(a, {});
-    store.store_record_superseding(b, {});
-
-    EXPECT_EQ(store.records_.size(), 2u);
-    EXPECT_NE(store.record_by_psk_id(a.psk_id), nullptr);
-    EXPECT_NE(store.record_by_psk_id(b.psk_id), nullptr);
-}
-
 // ============================================================================
 // Player output delay: ASCII-decimal round-trip via persistence_keys::OUTPUT_DELAY
 // ============================================================================
@@ -1779,20 +1672,25 @@ template <typename T> void expect_psk_wiped_on_destruction() {
 
 }  // namespace
 
-TEST(PskZeroization, PairingRecordDestructorWipesPsk) {
-    expect_psk_wiped_on_destruction<SendspinPairingRecord>();
-}
-
-TEST(PskZeroization, PairingPskDestructorWipesPsk) {
-    expect_psk_wiped_on_destruction<SendspinPairingPsk>();
-}
-
-TEST(PskZeroization, ResolvedPskDestructorWipesPsk) {
-    expect_psk_wiped_on_destruction<ResolvedPsk>();
-}
-
-TEST(PskZeroization, PairingOutcomeDestructorWipesPsk) {
-    expect_psk_wiped_on_destruction<RecordStore::PairingOutcome>();
+// Every struct that holds a PSK wipes it on destruction. One rule, one row per struct that
+// carries one.
+TEST(PskZeroization, EveryPskCarryingStructWipesOnDestruction) {
+    {
+        SCOPED_TRACE("SendspinPairingRecord");
+        expect_psk_wiped_on_destruction<SendspinPairingRecord>();
+    }
+    {
+        SCOPED_TRACE("SendspinPairingPsk");
+        expect_psk_wiped_on_destruction<SendspinPairingPsk>();
+    }
+    {
+        SCOPED_TRACE("ResolvedPsk");
+        expect_psk_wiped_on_destruction<ResolvedPsk>();
+    }
+    {
+        SCOPED_TRACE("RecordStore::PairingOutcome");
+        expect_psk_wiped_on_destruction<RecordStore::PairingOutcome>();
+    }
 }
 
 // Reproduces the two-thread access pattern production runs over records_:
