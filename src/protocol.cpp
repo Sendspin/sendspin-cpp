@@ -280,57 +280,59 @@ static void parse_color_field(JsonVariantConst var, const char* name,
 // Message type determination
 
 SendspinServerToClientMessageType determine_message_type(JsonObject root) {
-    if (!root["type"].is<const char*>()) {
+    // Compared in place against the arena's NUL-terminated string: extracting an
+    // std::string here would heap-allocate for every type name longer than the SSO limit.
+    const char* type_str = root["type"].as<const char*>();
+    if (type_str == nullptr) {
         return SendspinServerToClientMessageType::UNKNOWN;
     }
 
-    const std::string type_str = root["type"].as<std::string>();
-    if (type_str == "server/hello") {
+    if (std::strcmp(type_str, "server/hello") == 0) {
         return SendspinServerToClientMessageType::SERVER_HELLO;
     }
-    if (type_str == "server/activate") {
+    if (std::strcmp(type_str, "server/activate") == 0) {
         return SendspinServerToClientMessageType::SERVER_ACTIVATE;
     }
-    if (type_str == "server/time") {
+    if (std::strcmp(type_str, "server/time") == 0) {
         return SendspinServerToClientMessageType::SERVER_TIME;
     }
-    if (type_str == "server/state") {
+    if (std::strcmp(type_str, "server/state") == 0) {
         return SendspinServerToClientMessageType::SERVER_STATE;
     }
-    if (type_str == "server/command") {
+    if (std::strcmp(type_str, "server/command") == 0) {
         return SendspinServerToClientMessageType::SERVER_COMMAND;
     }
-    if (type_str == "stream/start") {
+    if (std::strcmp(type_str, "stream/start") == 0) {
         return SendspinServerToClientMessageType::STREAM_START;
     }
-    if (type_str == "stream/end") {
+    if (std::strcmp(type_str, "stream/end") == 0) {
         return SendspinServerToClientMessageType::STREAM_END;
     }
-    if (type_str == "stream/clear") {
+    if (std::strcmp(type_str, "stream/clear") == 0) {
         return SendspinServerToClientMessageType::STREAM_CLEAR;
     }
-    if (type_str == "group/update") {
+    if (std::strcmp(type_str, "group/update") == 0) {
         return SendspinServerToClientMessageType::GROUP_UPDATE;
     }
-    if (type_str == "noise/handshake") {
+    if (std::strcmp(type_str, "noise/handshake") == 0) {
         return SendspinServerToClientMessageType::NOISE_HANDSHAKE;
     }
-    if (type_str == "server/pair-finalize") {
+    if (std::strcmp(type_str, "server/pair-finalize") == 0) {
         return SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE;
     }
-    if (type_str == "pair/abort") {
+    if (std::strcmp(type_str, "pair/abort") == 0) {
         return SendspinServerToClientMessageType::PAIR_ABORT;
     }
-    if (type_str == "server/unpair") {
+    if (std::strcmp(type_str, "server/unpair") == 0) {
         return SendspinServerToClientMessageType::SERVER_UNPAIR;
     }
-    if (type_str == "server/pair-init") {
+    if (std::strcmp(type_str, "server/pair-init") == 0) {
         return SendspinServerToClientMessageType::SERVER_PAIR_INIT;
     }
-    if (type_str == "server/pair-auth") {
+    if (std::strcmp(type_str, "server/pair-auth") == 0) {
         return SendspinServerToClientMessageType::SERVER_PAIR_AUTH;
     }
-    if (type_str == "server/pair-confirm") {
+    if (std::strcmp(type_str, "server/pair-confirm") == 0) {
         return SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM;
     }
 
