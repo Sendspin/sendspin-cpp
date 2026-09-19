@@ -1025,8 +1025,10 @@ void ConnectionManager::drain_unpair_events(DrainedEvents& ev) {
 
 void ConnectionManager::loop_managed_connections() {
     // Call loop on active connections using shared_ptr copies to avoid holding the lock. The
-    // nursery is bounded (NURSERY_CAPACITY inbound + 1 outbound), so a fixed array avoids a
-    // per-tick heap allocation while connections are being set up.
+    // nursery holds at most NURSERY_CAPACITY inbound entries (on_new_connection() rejects an
+    // inbound peer at that count) plus one outbound (connect_to() releases any previous outbound
+    // entry before pushing its own), so NURSERY_CAPACITY + 1 covers every entry and a fixed array
+    // avoids a per-tick heap allocation while connections are being set up.
     std::shared_ptr<SendspinConnection> current_copy;
     std::array<std::shared_ptr<SendspinConnection>, NURSERY_CAPACITY + 1> nursery_copies;
     size_t nursery_count = 0;
