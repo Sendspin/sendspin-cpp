@@ -80,9 +80,13 @@ static constexpr size_t MAX_TRANSPORT_PLAINTEXT = 65535 - 16;  // = 65519
 static constexpr size_t MAX_HANDSHAKE_MESSAGE_BYTES = 512;
 
 /// @brief Per-connection reassembly buffer cap: 1 MiB.
-/// The largest legitimate fragmented message is album artwork (a single JPEG/PNG image);
-/// typical artwork payloads for embedded display targets are well under 1 MiB. The cap bounds
-/// how large a message an authenticated peer can force this connection to reassemble. The
+/// Artwork is never fragmented: roles/artwork/v1.md "Artwork (Binary)" caps a message at
+/// MAX_TRANSPORT_PLAINTEXT so it fits one Noise transport message. The message that can
+/// legitimately need fragmentation is the player audio chunk, which roles/player/v1.md
+/// "Audio Chunks (Binary)" leaves unbounded per chunk; only the outstanding total is bounded,
+/// by the buffer_capacity this client advertises. The cap bounds how large a message a peer
+/// that has reached transport mode can force this connection to reassemble - which includes a
+/// peer holding only the Sentinel PSK, so it is not a bound on authenticated peers alone. The
 /// buffer behind it grows geometrically and keeps its capacity for the connection's life, so
 /// the worst-case steady-state pin is the cap plus the orig_type byte, which reasm_reserve()
 /// clamps the growth to.

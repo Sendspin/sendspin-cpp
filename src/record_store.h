@@ -124,6 +124,9 @@ struct ResolvedPsk {
 ///   - `resolve_by_psk_id` runs on the network thread (Noise handshake and re-handshake)
 ///     under `mutex_` so a network-thread resolve cannot race a main-loop mutation of
 ///     `records_` / `pairing_psk_`.
+///   - `mutex_` is held across the provider's blob write on the persisting paths
+///     (`persist_records`, `remove_record`, `mark_record_used`, all main-loop-only), so such a
+///     resolve blocks for the length of that write - an NVS commit on ESP.
 class RecordStore {
 public:
     /// @brief Default cap on the number of long-term records retained; see

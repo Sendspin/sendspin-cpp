@@ -217,6 +217,10 @@ Not implemented, deliberately:
   required after `client-stream/end`.
 - Run the docs-sync, house-patterns, embedded-review and test-standards reviews, then update the
   ESPHome hub.
+- Run `-fstack-usage` on the target at the shipped optimization level for the pairing chain
+  (`handle_pairing_message` -> `CPace::derive` / `CPace::compute_mac` -> `hmac_sha512` ->
+  `Sha512::update`) and for `dispatch_json_message()`, and record the loop-thread budget the
+  integration guide now points at. See "Residual gaps" for the `dispatch_json_message()` detail.
 
 ## To raise upstream
 

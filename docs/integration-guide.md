@@ -1089,6 +1089,9 @@ Most listener callbacks fire on the main loop thread (the thread calling `client
 `SendspinPersistenceProvider` calls are on the main loop thread for every key (see the
 `SendspinPersistenceProvider` section above).
 
+The pairing exchange (CPace and SHA-512) also runs on the thread that calls `loop()`, so that
+thread's stack has to carry the deepest crypto frame, not just the listener callbacks.
+
 ## Minimal Example
 
 A minimal integration that receives and discards audio:
