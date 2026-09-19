@@ -277,6 +277,14 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   watchdog instead. Pre-existing and unchanged by the rc1 work, which leans on the idiom harder
   than `main` did; the fix is an unbounded form for the positive waits, keeping the bounded one
   for the must-not-happen windows where the bound is the point.
+- No test drove the sync task past `INITIAL_SYNC` until the stream-pin tests landed.
+  `CountingPlayerListener::on_audio_write()` never calls `PlayerRole::notify_audio_played()`, and
+  `handle_initial_sync()` leaves priming only once `process_playback_progress()` has seen frames
+  played, so every suite using that listener parks the task in `INITIAL_SYNC` and has never
+  reached `handle_load_chunk()`, `decode_chunk()`, `handle_synchronize_audio()` or
+  `handle_transfer_audio()`. `VirtualSinkListener` (`tests/test_client_lifecycle.cpp`) is the
+  first fixture that satisfies the playback-progress invariant; the older listener's tests still
+  do not, so they assert nothing about the per-chunk path.
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.
