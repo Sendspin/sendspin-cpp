@@ -207,6 +207,10 @@ std::string encode_pairing_records(const std::vector<SendspinPairingRecord>& v) 
         write_record_fields(obj, r);
     }
     std::string out;
+    // The records blob is the one multi-kilobyte document this codec writes; reserving the
+    // measured size avoids the geometric growth that would transiently hold old plus new (and
+    // would shed the intermediate buffers, which carry base64 PSK text, unwiped).
+    out.reserve(measureJson(doc) + 1);
     serializeJson(doc, out);
     return out;
 }
