@@ -1770,6 +1770,17 @@ void ConnectionManager::queue_deferred_release(std::shared_ptr<SendspinConnectio
     this->refresh_deferred_size_hint();
 }
 
+void ConnectionManager::release_from_role_thread(std::shared_ptr<SendspinConnection> conn) {
+    if (conn == nullptr) {
+        return;
+    }
+    // No goodbye: the manager already sent one if the connection was dropped, and a role thread
+    // never speaks for the session. One lock take per stream, on the role thread, and no flush
+    // here (see the header): the destructor must run on the main loop.
+    std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+    this->queue_deferred_release(std::move(conn), std::nullopt);
+}
+
 void ConnectionManager::flush_deferred_releases() {
     // Note: caller must NOT hold conn_ptr_mutex_ (see DeferredRelease)
     //
@@ -1789,7 +1800,10 @@ void ConnectionManager::flush_deferred_releases() {
     // and the pushing call's own subsequent gate check then correctly observes 0 and skips a
     // lock it no longer needs. loop() also calls this function unconditionally twice per tick
     // (after the lifecycle block and after the nursery reap), so nothing pushed stays queued
-    // past the next tick.
+    // past the next tick. release_from_role_thread() is the one push site that deliberately does
+    // not call this function on its own thread, since the point of the hand-over is to keep the
+    // destructor off that thread; it relies on those per-tick calls and on the one
+    // SendspinClient::stop() makes after joining the role threads.
     if (this->deferred_size_.load(std::memory_order_acquire) == 0) {
         return;
     }

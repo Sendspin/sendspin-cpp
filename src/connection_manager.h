@@ -158,10 +158,11 @@ struct NurseryEntry {
 /// and any block stalls every other manager entry point. Locked sections only queue releases;
 /// flush_deferred_releases() performs them lock-free.
 ///
-/// A role thread may still hold its own reference when the flush drops this one (the sync task
-/// pins the connection whose time filter its stream uses). The destructor then runs on that
-/// thread instead, which is equally fine: the transport thread it joins is never a role thread,
-/// and a role thread holds no manager lock while it releases.
+/// A role thread that holds its own reference (the sync task pins the connection whose time
+/// filter its stream uses) does not destroy it either: it hands the reference back through
+/// release_from_role_thread(), which queues it here, so the destructor always runs on the main
+/// loop. The join inside it would otherwise land on the audio thread, adding the transport
+/// teardown to a stack sized for Opus decode and stalling playback for as long as the join takes.
 struct DeferredRelease {
     std::shared_ptr<SendspinConnection> conn;      ///< The manager's last reference
     std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: transport gone, just release
@@ -425,16 +426,40 @@ public:
     }
 
     /// @brief Returns a shared_ptr to the current connection. Thread-safe.
-    /// Role threads (the artwork/visualizer/metadata drains) must use this instead of current():
-    /// the shared_ptr keeps the connection alive for the duration of the caller's use even if the
-    /// main loop concurrently drops or replaces the current connection. It takes conn_ptr_mutex_
-    /// under the same lock order as current(). The sync task resolves it once per stream through
-    /// SendspinClient::pin_current_connection() rather than once per audio chunk.
+    /// The visualizer's drain thread, the public accessors on SendspinClient (callable from any
+    /// thread) and the sync task's once-per-stream pin must use this instead of current(): the
+    /// shared_ptr keeps the connection alive for the duration of the caller's use even if the
+    /// main loop concurrently drops or replaces the current connection. The main-loop drains
+    /// (artwork, metadata, color) come through here too. It takes conn_ptr_mutex_ under the same
+    /// lock order as current().
     /// @return Shared pointer to the current connection, or nullptr if none.
     std::shared_ptr<SendspinConnection> current_shared() const {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         return this->current_connection_;
     }
+
+    /// @brief Takes a role thread's connection reference back so the main loop destroys it.
+    /// Thread-safe.
+    ///
+    /// A role thread that outlives the manager's own reference (the sync task's stream pin) would
+    /// otherwise run ~SendspinConnection itself, which joins the transport thread: see
+    /// DeferredRelease. The reference is queued instead and destroyed by the next
+    /// flush_deferred_releases(), so this is the one deferred-release push site that does not
+    /// flush on its own thread. loop() flushes twice per tick, and SendspinClient::stop() flushes
+    /// once more after it has joined the role threads, so a hand-over can outlive its stream by
+    /// at most one tick and never outlives the run.
+    /// @param conn The reference to hand over; empty on return (moved from). Null is a no-op.
+    void release_from_role_thread(std::shared_ptr<SendspinConnection> conn);
+
+    /// @brief Performs the queued goodbye sends and connection releases from deferred_releases_.
+    /// Caller must NOT hold conn_ptr_mutex_ (see DeferredRelease). Safe to call from any thread;
+    /// a queued release is performed exactly once. Called after every locked section that can
+    /// queue a release, by loop() as a backstop, and by SendspinClient::stop() after the role
+    /// threads are joined (see release_from_role_thread()).
+    ///
+    /// Early-returns without locking when deferred_size_ reads 0; see the definition for the
+    /// soundness argument.
+    void flush_deferred_releases();
 
     /// @brief psk_ids backing a currently-open connection, provisional or admitted. Thread-safe.
     /// These are the records a completed pairing must not evict (pairing.md "Pairing Records").
@@ -717,15 +742,6 @@ private:
     ///        already gone so no goodbye should be attempted.
     void queue_deferred_release(std::shared_ptr<SendspinConnection> conn,
                                 std::optional<SendspinGoodbyeReason> reason);
-
-    /// @brief Performs the queued goodbye sends and connection releases from deferred_releases_.
-    /// Caller must NOT hold conn_ptr_mutex_ (see DeferredRelease). Safe to call from any thread;
-    /// a queued release is performed exactly once. Called after every locked section that can
-    /// queue a release; loop() also calls it as a backstop.
-    ///
-    /// Early-returns without locking when deferred_size_ reads 0; see the definition for the
-    /// soundness argument.
-    void flush_deferred_releases();
 
     // ========================================
     // Hello handshake

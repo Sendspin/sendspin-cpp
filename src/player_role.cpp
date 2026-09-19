@@ -217,6 +217,10 @@ void PlayerRole::Impl::update_output_delay(uint16_t delay_ms) {
 // Impl: Internal integration methods
 // ============================================================================
 
+void PlayerRole::Impl::attach_connection_manager(ConnectionManager& manager) {
+    this->sync_task->attach_connection_manager(manager);
+}
+
 void PlayerRole::Impl::attach_inbox(Inbox& inbox) {
     this->inbox = &inbox;
     this->event_state->stream_params_slot.bind(inbox, INBOX_TOPIC_PLAYER_STREAM_PARAMS);
@@ -243,7 +247,7 @@ bool PlayerRole::Impl::start() {
     // Init once (event flags, ring buffer); the thread is created on every start(), including a
     // restart after stop(), which joined the previous one.
     if (!this->sync_task->is_initialized() &&
-        !this->sync_task->init(this, this->client, this->config.audio_buffer_capacity)) {
+        !this->sync_task->init(this, this->config.audio_buffer_capacity)) {
         SS_LOGE(TAG, "Failed to initialize sync task");
         return false;
     }

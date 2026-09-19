@@ -307,7 +307,6 @@ class RecordStore;
 class SendspinArenaAllocator;
 class SendspinConnection;
 class SendspinTimeBurst;
-class SyncTask;
 struct Identity;
 
 /**
@@ -363,7 +362,6 @@ struct Identity;
  */
 class SendspinClient {
     friend class ConnectionManager;
-    friend class SyncTask;
 
 public:
     explicit SendspinClient(SendspinClientConfig config);
@@ -864,23 +862,6 @@ private:
     /// than pass the bare current() pointer, which the main loop may drop meanwhile.
     /// @param conn The connection to publish to
     void publish_client_state(SendspinConnection* conn);
-
-    // ========================================
-    // Connection access
-    // ========================================
-
-    /// @brief Returns a shared_ptr to the current connection for a role thread to hold across a
-    /// whole stream. Thread-safe.
-    ///
-    /// The sync task resolves this once per stream instead of calling get_client_time() /
-    /// is_time_synced() per chunk, so its per-chunk timestamp conversion touches only the time
-    /// filter's own mutex rather than conn_ptr_mutex_. A connection's filter is created once in
-    /// SendspinConnection::init_time_filter() and never replaced, and the admitted slot cannot be
-    /// swapped without ending the stream first (ConnectionManager::drop_connection() runs
-    /// cleanup_connection_state() before the promotion installs a successor), so the pin stays
-    /// the right filter for as long as the stream lives.
-    /// @return Shared pointer to the current connection, or nullptr if none.
-    std::shared_ptr<SendspinConnection> pin_current_connection() const;
 
     // ========================================
     // Persistence & identity

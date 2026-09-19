@@ -32,7 +32,7 @@
 
 namespace sendspin {
 
-class SendspinClient;
+class ConnectionManager;
 class SendspinConnection;
 
 /// @brief Timing feedback from the audio output: frames played and the finish timestamp
@@ -118,12 +118,19 @@ public:
     SyncTask() = default;
     ~SyncTask();
 
+    /// @brief Supplies the connection manager the stream pin is resolved from and handed back to
+    /// Call once at role registration, before start(). The manager outlives the task: the client
+    /// destroys its roles before it destroys the manager.
+    /// @param manager The owning client's connection manager.
+    void attach_connection_manager(ConnectionManager& manager) {
+        this->conn_manager_ = &manager;
+    }
+
     /// @brief Initializes queues and creates the encoded ring buffer
     /// @param player_impl The owning PlayerRole::Impl, used for delay, listener, and state updates.
-    /// @param client The owning SendspinClient, used for shared services.
     /// @param buffer_size Size of the encoded audio ring buffer in bytes.
     /// @return true on success, false on allocation failure.
-    bool init(PlayerRole::Impl* player_impl, SendspinClient* client, size_t buffer_size);
+    bool init(PlayerRole::Impl* player_impl, size_t buffer_size);
 
     /// @brief Creates and starts the persistent sync background thread
     /// Call once after init(). The thread idles until a codec header arrives in the ring buffer.
@@ -266,6 +273,10 @@ protected:
     /// @brief Resets SyncContext between streams without deallocating buffers
     void reset_context(SyncContext& sync_context);
 
+    /// @brief Gives the stream pin back to the connection manager, which destroys it on the main
+    /// loop. No-op when no pin is held, so it costs no lock.
+    void release_stream_pin();
+
     /// @brief Processes playback progress messages from the speaker to update buffered_frames and
     /// playtime.
     void process_playback_progress(SyncContext& sync_context);
@@ -278,13 +289,14 @@ protected:
     std::thread sync_thread_;
 
     // Pointer fields
-    SendspinClient* client_{nullptr};
+    ConnectionManager* conn_manager_{nullptr};
     std::unique_ptr<SendspinAudioRingBuffer> encoded_ring_buffer_;
     PlayerRole::Impl* player_impl_{nullptr};
     /// The connection whose time filter converts this stream's timestamps, resolved once when the
-    /// stream goes active and released when it ends. Sync-thread only, so it needs no lock; the
-    /// per-chunk conversion then touches only the filter's own mutex. Null when no connection was
-    /// current at stream start, which reads as "not time synced" for the rest of that stream.
+    /// stream goes active and handed back when it ends (see release_stream_pin()). Sync-thread
+    /// only, so it needs no lock; the per-chunk conversion then touches only the filter's own
+    /// mutex. Null when no connection was current at stream start, which reads as "not time
+    /// synced" for the rest of that stream.
     std::shared_ptr<SendspinConnection> stream_connection_;
 };
 

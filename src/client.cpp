@@ -364,6 +364,12 @@ void SendspinClient::stop() {
     // 3. Role threads. Each role discards its ring/queue content after its own join.
     this->stop_role_threads();
 
+    // The sync task hands its stream pin back rather than destroying the connection on the audio
+    // thread (ConnectionManager::release_from_role_thread()), and a hand-over during the join
+    // above lands after the manager's own stop() swept the queue. Drain it here: loop() is a
+    // no-op from now on, so this is the last flush of the run.
+    this->connection_manager_->flush_deferred_releases();
+
     // 4. Reset per-connection and role state exactly as a lost connection does. With every
     //    producer thread joined, the state this leaves behind is the state a restart begins
     //    from. The group slot is reset here too, so the drain below cannot repopulate
@@ -827,6 +833,7 @@ PlayerRole& SendspinClient::add_player(PlayerRoleConfig config) {
     this->player_ =
         std::make_unique<PlayerRole>(std::move(config), this, this->persistence_provider_);
     this->player_->impl_->attach_inbox(this->event_state_->inbox);
+    this->player_->impl_->attach_connection_manager(*this->connection_manager_);
     return *this->player_;
 }
 #endif
@@ -916,9 +923,11 @@ bool SendspinClient::is_connected() const {
 }
 
 bool SendspinClient::is_time_synced() const {
-    // current_shared(): called from role threads (the artwork/visualizer/metadata drains), so the
-    // shared_ptr must keep the connection alive while it is dereferenced. The sync task does not
-    // come through here; it holds its own pin for the stream (pin_current_connection()).
+    // current_shared(): called off the main loop - the visualizer's drain thread and, through the
+    // public accessors, any consumer thread - so the shared_ptr must keep the connection alive
+    // while it is dereferenced. The main-loop drains (artwork, metadata, color) come through here
+    // too. The sync task does not; it holds its own pin for the stream
+    // (SyncTask::stream_connection_).
     auto conn = this->connection_manager_->current_shared();
     return conn != nullptr && conn->is_time_synced();
 }
@@ -927,10 +936,6 @@ int64_t SendspinClient::get_client_time(int64_t server_time) const {
     // current_shared(): called from role threads; see is_time_synced().
     auto conn = this->connection_manager_->current_shared();
     return conn != nullptr ? conn->get_client_time(server_time) : 0;
-}
-
-std::shared_ptr<SendspinConnection> SendspinClient::pin_current_connection() const {
-    return this->connection_manager_->current_shared();
 }
 
 std::optional<ServerInformationObject> SendspinClient::get_server_information() const {

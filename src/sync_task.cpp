@@ -16,6 +16,7 @@
 
 #include "audio_utils.h"
 #include "connection.h"
+#include "connection_manager.h"
 #include "constants.h"
 #include "platform/logging.h"
 #include "platform/thread.h"
@@ -91,9 +92,8 @@ SyncTask::~SyncTask() {
     this->stop();
 }
 
-bool SyncTask::init(PlayerRole::Impl* player_impl, SendspinClient* client, size_t buffer_size) {
+bool SyncTask::init(PlayerRole::Impl* player_impl, size_t buffer_size) {
     this->player_impl_ = player_impl;
-    this->client_ = client;
 
     if (!this->event_flags_.create()) {
         SS_LOGE(TAG, "Couldn't create event flags.");
@@ -734,7 +734,21 @@ void SyncTask::discard_to_clear_marker(SyncContext& sync_context) {
     this->apply_stream_clear(sync_context);
 }
 
+void SyncTask::release_stream_pin() {
+    if (this->stream_connection_ == nullptr) {
+        return;
+    }
+    // Hand it to the manager rather than dropping it here: ~SendspinConnection joins the
+    // transport thread, which must not run on the audio thread (see DeferredRelease). One lock
+    // take per stream.
+    this->conn_manager_->release_from_role_thread(std::move(this->stream_connection_));
+}
+
 void SyncTask::reset_context(SyncContext& sync_context) {
+    // The per-stream release runs before the task reports idle, where its position is
+    // load-bearing; this is the chokepoint that keeps a future early exit from leaking a pin.
+    this->release_stream_pin();
+
     // Reset SyncContext between streams without deallocating buffers.
     sync_context.encoded_entry = nullptr;
     sync_context.decoded_timestamp = 0;
@@ -901,7 +915,7 @@ void SyncTask::thread_entry(void* params) {
         // keeps the same connection object. Holding it for the stream keeps the per-chunk
         // conversion off conn_ptr_mutex_, and keeping a dropped connection alive a little longer
         // is what the deferred-release design already expects (see DeferredRelease).
-        this_task->stream_connection_ = this_task->client_->pin_current_connection();
+        this_task->stream_connection_ = this_task->conn_manager_->current_shared();
 
         this_task->player_impl_->enqueue_state_update(SendspinClientState::SYNCHRONIZED);
 
@@ -946,10 +960,12 @@ void SyncTask::thread_entry(void* params) {
             }
         }
 
-        // Release the stream's pin before the task reports idle, so a connection dropped during
-        // the stream is freed on the next flush rather than outliving it. Every outer-loop exit
-        // below this point goes through here.
-        this_task->stream_connection_.reset();
+        // Give the pin back before the task reports idle, so a connection dropped during the
+        // stream is freed on the next flush rather than outliving it. The position matters: the
+        // STREAM_END drain gate keys on is_running(), so the pin must be gone before the task
+        // reads idle. Every outer-loop exit below this point goes through here; reset_context()
+        // repeats the call at the top of the next iteration as a backstop.
+        this_task->release_stream_pin();
 
         // Return any borrowed ring buffer entry
         if (sync_context.encoded_entry != nullptr) {
