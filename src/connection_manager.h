@@ -389,8 +389,9 @@ public:
     /// section below; each step keeps its own locking.
     ///
     /// Tick cost: most steps are gated on one of the atomic hints in "Atomic fields" below
-    /// (has_pending_events_, nursery_size_, has_current_, deferred_size_), so they pay only the
-    /// atomic loads needed to decide there is nothing to do. flush_pending_admission(),
+    /// (has_pending_events_, nursery_size_, has_current_, deferred_size_,
+    /// pending_record_ops_size_), so they pay only the atomic loads needed to decide there is
+    /// nothing to do. flush_pending_admission(),
     /// scan_pairing_attempt_timeout(), and scan_reprove_watchdog() take conn_ptr_mutex_
     /// unconditionally, so an idle tick costs three acquisitions while disconnected and five
     /// while connected (adding the current/nursery copy ahead of the conn->loop() calls and the
@@ -622,6 +623,12 @@ private:
     /// atomic can never drift from the container. Caller must hold conn_ptr_mutex_.
     void refresh_deferred_size_hint();
 
+    /// @brief Refreshes pending_record_ops_size_ from pending_record_ops_.size(). Every
+    /// pending_record_ops_ mutation site calls this immediately afterward, in the same critical
+    /// section, so the hint atomic can never drift from the container. Caller must hold
+    /// conn_ptr_mutex_.
+    void refresh_record_ops_size_hint();
+
     /// @brief Appends an entry to the nursery and refreshes nursery_size_ (via
     /// refresh_nursery_size_hint()) in the same critical section, so the hint atomic can never
     /// drift from nursery_.size(). Caller must hold conn_ptr_mutex_.
@@ -652,9 +659,11 @@ private:
     /// op on the same record always lands after the first. Caller must NOT hold conn_ptr_mutex_
     /// (see PendingRecordOp).
     ///
-    /// Every staging site sits in loop()'s lifecycle block, which is where the single call to
-    /// this function sits too: nothing staged can outlive the tick that staged it, so this needs
-    /// no gate atomic and costs nothing on a tick that skips that block.
+    /// Called unconditionally once per tick, like flush_pending_admission() and
+    /// flush_deferred_releases(): a staging site added outside loop()'s lifecycle block must not
+    /// be able to leave a write sitting in the vector, which for a revocation would mean a
+    /// credential silently surviving the reboot. Early-returns without locking when
+    /// pending_record_ops_size_ reads 0, so an idle tick pays one acquire-load.
     void flush_pending_record_ops();
 
     /// @brief Sets has_pending_events_, the lock-free gate loop() polls before acquiring
@@ -1131,6 +1140,12 @@ private:
     /// flush_deferred_releases() early-return without locking when nothing is queued. Every
     /// refresh goes through refresh_deferred_size_hint().
     std::atomic<size_t> deferred_size_{0};
+
+    /// pending_record_ops_.size(), refreshed under conn_ptr_mutex_ after every push (see
+    /// stage_record_op()) and after the drain swap in flush_pending_record_ops(). Lets that flush
+    /// early-return without locking when nothing is staged. Every refresh goes through
+    /// refresh_record_ops_size_hint().
+    std::atomic<size_t> pending_record_ops_size_{0};
 };
 
 }  // namespace sendspin

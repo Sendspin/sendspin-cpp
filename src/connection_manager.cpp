@@ -1243,19 +1243,17 @@ void ConnectionManager::loop() {
     // level-triggered on handshake flags set by network threads with no corresponding event
     // push, so loop() must keep running every tick a nursery connection exists.
     if (ev.any() || this->nursery_size_.load(std::memory_order_acquire) > 0) {
-        {
-            std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
-            this->drain_lifecycle_events(ev);
-            this->drain_pairing_events(ev);
-            this->drain_unpair_events(ev);
-        }
-
-        // Perform the provider writes those handlers decided on, outside the lock: an NVS commit
-        // under it would stall the sync task, which takes it per audio chunk through
-        // current_shared(). Ahead of the two flushes below so the blob is settled on flash before
-        // a session is told to leave or an admission replays.
-        this->flush_pending_record_ops();
+        std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
+        this->drain_lifecycle_events(ev);
+        this->drain_pairing_events(ev);
+        this->drain_unpair_events(ev);
     }
+
+    // Perform the provider writes the locked handlers decided on, outside the lock: an NVS commit
+    // under it would stall the sync task, which takes it per audio chunk through
+    // current_shared(). Ahead of the two flushes below so the blob is settled on flash before a
+    // session is told to leave or an admission replays.
+    this->flush_pending_record_ops();
 
     // Admit the connection the promotion scan installed, outside the lock: the replay takes
     // SendspinClient's json_processing_mutex_, which is the outer lock of the pair. Ahead of the
@@ -1610,6 +1608,12 @@ void ConnectionManager::refresh_deferred_size_hint() {
     this->deferred_size_.store(this->deferred_releases_.size(), std::memory_order_release);
 }
 
+void ConnectionManager::refresh_record_ops_size_hint() {
+    // Note: caller must hold conn_ptr_mutex_
+    this->pending_record_ops_size_.store(this->pending_record_ops_.size(),
+                                         std::memory_order_release);
+}
+
 void ConnectionManager::push_nursery_entry(NurseryEntry entry) {
     // Note: caller must hold conn_ptr_mutex_
     this->nursery_.push_back(std::move(entry));
@@ -1657,14 +1661,24 @@ void ConnectionManager::flush_pending_admission() {
 void ConnectionManager::stage_record_op(PendingRecordOp::Kind kind, std::string value) {
     // Note: caller must hold conn_ptr_mutex_ and flush_pending_record_ops() after dropping it
     this->pending_record_ops_.push_back({kind, std::move(value)});
+    this->refresh_record_ops_size_hint();
 }
 
 void ConnectionManager::flush_pending_record_ops() {
     // Note: caller must NOT hold conn_ptr_mutex_ (see PendingRecordOp)
+    //
+    // Lock-free early return on the same terms as flush_deferred_releases(): the hint mirrors
+    // pending_record_ops_.size() and is refreshed only under conn_ptr_mutex_, at every push and
+    // at the swap below, so observing 0 means the vector was empty as of that acquire-load. A
+    // staged op is performed exactly once, by whichever call swaps it out.
+    if (this->pending_record_ops_size_.load(std::memory_order_acquire) == 0) {
+        return;
+    }
     std::vector<PendingRecordOp> ops;
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         ops.swap(this->pending_record_ops_);
+        this->refresh_record_ops_size_hint();
     }
     for (const auto& op : ops) {
         switch (op.kind) {
