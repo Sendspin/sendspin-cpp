@@ -51,17 +51,25 @@ bool parse(const std::string& json, JsonDocument& doc, JsonObject& root) {
     return true;
 }
 
-/// Parses `json` and asserts that `parse_fn` rejects it. Collapses the malformed-payload
-/// rejection tests below to their JSON literal.
+/// Runs one row of a parser's malformed-payload table: `json` must be valid JSON, and `parse_fn`
+/// must accept or reject it as `expect_ok` says.
 template <typename Payload>
-void expect_parse_rejects(bool (*parse_fn)(JsonObject, Payload*), const std::string& json) {
+void expect_parse(bool (*parse_fn)(JsonObject, Payload*), const std::string& json,
+                  bool expect_ok) {
     JsonDocument doc;
     JsonObject root;
     ASSERT_TRUE(parse(json, doc, root));
 
     Payload payload;
-    EXPECT_FALSE(parse_fn(root, &payload));
+    EXPECT_EQ(parse_fn(root, &payload), expect_ok);
 }
+
+/// A row of one parser's malformed-payload table.
+struct ParseRow {
+    const char* name;
+    std::string json;
+    bool expect_ok;
+};
 
 /// base64url-encode a fixed-size array for building test JSON strings.
 template <size_t N>
@@ -94,21 +102,34 @@ static std::string make_pair_confirm_json(const std::string& server_kc_b64) {
 // process_server_pair_init_message
 // ============================================================================
 
-// Control: the same parser accepts a well-formed server/pair-init, so each rejection below is the
-// field it names and not the parser refusing everything.
-TEST(DynamicPairingCode, ParseServerPairInitValid) {
+// The server/pair-init parser's malformed-field family. A field that is present and unusable is
+// the malformed case; a field that is absent is a different rule, covered by the
+// ...YieldsNoNonce tests below.
+TEST(DynamicPairingCode, ParseServerPairInitRejectsMalformedNonce) {
     std::array<uint8_t, 32> nonce_a{};
     for (int i = 0; i < 32; ++i) nonce_a[i] = static_cast<uint8_t>(i);
+    std::array<uint8_t, 16> short_nonce{};
 
-    const std::string json = make_pair_init_json(b64url(nonce_a));
+    const ParseRow rows[] = {
+        {"nonce_A-not-a-string", R"({"type":"server/pair-init","payload":{"nonce_A":5}})", false},
+        {"nonce_A-16-bytes", make_pair_init_json(b64url(short_nonce)), false},
+        {"nonce_A-not-base64",
+         R"({"type":"server/pair-init","payload":{"nonce_A":"!!!not_base64!!!"}})", false},
+        // Control: a 32-byte base64url nonce_A.
+        {"nonce_A-well-formed", make_pair_init_json(b64url(nonce_a)), true},
+    };
+    for (const ParseRow& row : rows) {
+        SCOPED_TRACE(row.name);
+        expect_parse<ServerPairInitPayload>(process_server_pair_init_message, row.json,
+                                            row.expect_ok);
+    }
 
+    // The accepted nonce reaches the payload unchanged.
     JsonDocument doc;
     JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
+    ASSERT_TRUE(parse(make_pair_init_json(b64url(nonce_a)), doc, root));
     ServerPairInitPayload payload;
     ASSERT_TRUE(process_server_pair_init_message(root, &payload));
-
     EXPECT_EQ(payload.nonce_a, nonce_a);
 }
 
@@ -143,14 +164,6 @@ TEST(DynamicPairingCode, ParseServerPairInitExtraFieldIgnored) {
     EXPECT_EQ(payload.nonce_a, nonce_a);
 }
 
-// A nonce_A of the wrong JSON type is not a nonce that happens to be missing: the field is there
-// and unusable, which is the malformed case, so the message is rejected outright.
-TEST(DynamicPairingCode, ParseServerPairInitNonStringNonceIsRejected) {
-    expect_parse_rejects<ServerPairInitPayload>(
-        process_server_pair_init_message,
-        R"({"type":"server/pair-init","payload":{"nonce_A":5}})");
-}
-
 // An explicit JSON null is how a serializer writes a field it has nothing for, so it must mean
 // the same as leaving it out (the retry-round shape) rather than being rejected.
 TEST(DynamicPairingCode, ParseServerPairInitNullNonceYieldsNoNonce) {
@@ -175,99 +188,68 @@ TEST(DynamicPairingCode, ParseServerPairInitWithoutPayloadYieldsNoNonce) {
     EXPECT_FALSE(payload.nonce_a.has_value());
 }
 
-TEST(DynamicPairingCode, ParseServerPairInitWrongNonceLength) {
-    // 16 bytes instead of 32.
-    std::array<uint8_t, 16> short_nonce{};
-    const std::string nonce_b64 = b64url_encode(short_nonce.data(), short_nonce.size());
-    expect_parse_rejects<ServerPairInitPayload>(process_server_pair_init_message,
-                                                 make_pair_init_json(nonce_b64));
-}
-
-TEST(DynamicPairingCode, ParseServerPairInitInvalidBase64) {
-    expect_parse_rejects<ServerPairInitPayload>(
-        process_server_pair_init_message,
-        R"({"type":"server/pair-init","payload":{"nonce_A":"!!!not_base64!!!"}})");
-}
-
 // ============================================================================
 // process_server_pair_auth_message
 // ============================================================================
 
-// Control: the same parser accepts a well-formed server/pair-auth, so each rejection below is the
-// field it names and not the parser refusing everything.
-TEST(DynamicPairingCode, ParseServerPairAuthValid) {
+// The server/pair-auth parser's malformed-field family over its single required field.
+TEST(DynamicPairingCode, ParseServerPairAuthRejectsMalformedPakeMsg1) {
     std::array<uint8_t, 32> pake_msg_1{};
     for (int i = 0; i < 32; ++i) pake_msg_1[i] = static_cast<uint8_t>(i + 10);
+    std::array<uint8_t, 16> short_share{};
 
-    const std::string json = make_pair_auth_json(b64url(pake_msg_1));
+    const ParseRow rows[] = {
+        {"pake_msg_1-missing", R"({"type":"server/pair-auth","payload":{}})", false},
+        {"pake_msg_1-16-bytes", make_pair_auth_json(b64url(short_share)), false},
+        {"pake_msg_1-not-base64",
+         R"({"type":"server/pair-auth","payload":{"pake_msg_1":"!!!not_valid!!!"}})", false},
+        // Control: a 32-byte base64url pake_msg_1.
+        {"pake_msg_1-well-formed", make_pair_auth_json(b64url(pake_msg_1)), true},
+    };
+    for (const ParseRow& row : rows) {
+        SCOPED_TRACE(row.name);
+        expect_parse<ServerPairAuthPayload>(process_server_pair_auth_message, row.json,
+                                            row.expect_ok);
+    }
 
     JsonDocument doc;
     JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
+    ASSERT_TRUE(parse(make_pair_auth_json(b64url(pake_msg_1)), doc, root));
     ServerPairAuthPayload payload;
     ASSERT_TRUE(process_server_pair_auth_message(root, &payload));
     EXPECT_EQ(payload.pake_msg_1, pake_msg_1);
-}
-
-TEST(DynamicPairingCode, ParseServerPairAuthMissingField) {
-    expect_parse_rejects<ServerPairAuthPayload>(process_server_pair_auth_message,
-                                                 R"({"type":"server/pair-auth","payload":{}})");
-}
-
-TEST(DynamicPairingCode, ParseServerPairAuthWrongFieldLength) {
-    // 16 bytes instead of 32.
-    std::array<uint8_t, 16> short_share{};
-    const std::string b64 = b64url_encode(short_share.data(), short_share.size());
-    expect_parse_rejects<ServerPairAuthPayload>(process_server_pair_auth_message,
-                                                 make_pair_auth_json(b64));
-}
-
-TEST(DynamicPairingCode, ParseServerPairAuthInvalidBase64) {
-    expect_parse_rejects<ServerPairAuthPayload>(
-        process_server_pair_auth_message,
-        R"({"type":"server/pair-auth","payload":{"pake_msg_1":"!!!not_valid!!!"}})");
 }
 
 // ============================================================================
 // process_server_pair_confirm_message
 // ============================================================================
 
-// Control: the same parser accepts a well-formed server/pair-confirm, so each rejection below is
-// the
-// field it names and not the parser refusing everything.
-TEST(DynamicPairingCode, ParseServerPairConfirmValid) {
+// The server/pair-confirm parser's malformed-field family; server_kc is 64 bytes, not 32.
+TEST(DynamicPairingCode, ParseServerPairConfirmRejectsMalformedServerKc) {
     std::array<uint8_t, 64> server_kc{};
     for (int i = 0; i < 64; ++i) server_kc[i] = static_cast<uint8_t>(i);
+    std::array<uint8_t, 32> short_kc{};
 
-    const std::string json = make_pair_confirm_json(b64url(server_kc));
+    const ParseRow rows[] = {
+        {"server_kc-missing", R"({"type":"server/pair-confirm","payload":{}})", false},
+        {"server_kc-32-bytes", make_pair_confirm_json(b64url(short_kc)), false},
+        {"server_kc-not-base64",
+         R"({"type":"server/pair-confirm","payload":{"server_kc":"!!!not_valid!!!"}})", false},
+        // Control: a 64-byte base64url server_kc.
+        {"server_kc-well-formed", make_pair_confirm_json(b64url(server_kc)), true},
+    };
+    for (const ParseRow& row : rows) {
+        SCOPED_TRACE(row.name);
+        expect_parse<ServerPairConfirmPayload>(process_server_pair_confirm_message, row.json,
+                                               row.expect_ok);
+    }
 
     JsonDocument doc;
     JsonObject root;
-    ASSERT_TRUE(parse(json, doc, root));
-
+    ASSERT_TRUE(parse(make_pair_confirm_json(b64url(server_kc)), doc, root));
     ServerPairConfirmPayload payload;
     ASSERT_TRUE(process_server_pair_confirm_message(root, &payload));
     EXPECT_EQ(payload.server_kc, server_kc);
-}
-
-TEST(DynamicPairingCode, ParseServerPairConfirmMissingField) {
-    expect_parse_rejects<ServerPairConfirmPayload>(
-        process_server_pair_confirm_message, R"({"type":"server/pair-confirm","payload":{}})");
-}
-
-TEST(DynamicPairingCode, ParseServerPairConfirmWrongFieldLength) {
-    // 32 bytes instead of 64.
-    std::array<uint8_t, 32> short_kc{};
-    const std::string b64 = b64url_encode(short_kc.data(), short_kc.size());
-    expect_parse_rejects<ServerPairConfirmPayload>(process_server_pair_confirm_message,
-                                                    make_pair_confirm_json(b64));
-}
-
-TEST(DynamicPairingCode, ParseServerPairConfirmInvalidBase64) {
-    expect_parse_rejects<ServerPairConfirmPayload>(
-        process_server_pair_confirm_message,
-        R"({"type":"server/pair-confirm","payload":{"server_kc":"!!!not_valid!!!"}})");
 }
 
 // ============================================================================
