@@ -70,9 +70,9 @@ public:
     /// @brief Called when the library needs high-performance networking (e.g., disable WiFi
     /// power saving)
     ///
-    /// Toggle the platform's networking mode and return. This callback and its release can fire
-    /// while the client holds an internal lock (the last release runs inside the connection-loss
-    /// path), so the body must not call any SendspinClient or role method.
+    /// Toggle the platform's networking mode and return. Fires on the main loop thread (and, for
+    /// a hold still outstanding, from ~SendspinClient()); the body must not call any
+    /// SendspinClient or role method.
     virtual void on_request_high_performance() {}
 
     /// @brief Called when the library no longer needs high-performance networking
@@ -104,7 +104,11 @@ public:
     /// @brief Called when a pairing exchange is aborted (by the server or by the protocol)
     ///
     /// server_id identifies the server whose pairing was aborted. reason explains why.
-    /// The connection is closed immediately after this callback.
+    /// The connection usually stays open after this callback, so the server can re-activate
+    /// pairing or resume normal operation on it (pairing.md "pair/abort"). It is closed for
+    /// CONCURRENT_ATTEMPT, and for the UNKNOWN reason reported on a pairing protocol error (a
+    /// malformed or out-of-sequence pairing message), which closes the socket with no
+    /// application-level message.
     /// Fires on the main loop.
     virtual void on_pairing_failed(const std::string& /*server_id*/,
                                    SendspinPairAbortReason /*reason*/) {}
@@ -181,8 +185,10 @@ public:
 /// therefore needs no locking of its own. (The one library write that originates on the network
 /// thread, the pairing record committed at server/pair-finalize, is staged internally and
 /// flushed to `save_blob(persistence_keys::RECORDS, ...)` from the next `loop()` tick.)
-/// `save_blob(persistence_keys::KEYPAIR, ...)` is the one write that happens exactly once, at
-/// startup during `start()`, rather than in response to a runtime event.
+/// First-boot provisioning writes from inside `start()` rather than in response to a runtime
+/// event: `KEYPAIR` when no valid keypair is stored, `PAIRING_PSK` when no Pairing PSK is
+/// stored, and `PAIR_CONFIG` when no pairing config decoded. A `start()` that loads all three
+/// writes nothing.
 ///
 /// Re-entrancy: implementations must NOT call back into the library (SendspinClient or any of
 /// its objects) from inside load_blob/save_blob/erase_blob. The library invokes these methods
@@ -337,7 +343,9 @@ struct Identity;
  * config.manufacturer = "Acme";
  * config.software_version = "1.0.0";
  * SendspinClient client(config);
- * auto& player = client.add_player(PlayerRoleConfig{});
+ * PlayerRoleConfig player_config;
+ * player_config.audio_formats = {{SendspinCodecFormat::FLAC, 2, 44100, 16}};
+ * auto& player = client.add_player(player_config);
  * player.set_listener(&player_listener);
  * client.add_controller();
  * client.set_network_provider(&network_provider);
@@ -574,6 +582,7 @@ public:
     /// alongside `pairing_psk`, for an operator to transfer into a server via copy/paste or QR
     /// code to begin the Pairing PSK flow. Clients offering `pairing_psk` SHOULD surface this
     /// token rather than the bare PSK.
+    /// Main loop only.
     /// @param pairing_psk The 32-byte Sendspin Pairing PSK to encode alongside this client's
     ///                    identity.
     /// @return The 107-character token string, or nullopt if no identity has been initialized
@@ -585,12 +594,15 @@ public:
     /// The Pairing PSK is provisioned automatically on first boot and persisted, so this token
     /// is stable for the lifetime of the stored key: display it (or its QR code) for the
     /// operator to transfer into a server that is setting this client up.
+    /// Main loop only.
     /// @return The 107-character token string, or nullopt before start() or when no
     ///         Pairing PSK is configured.
     [[nodiscard]] std::optional<std::string> pairing_token() const;
 
-    /// @brief Returns true if there is an active connection with completed handshake
-    /// @return true if connected with a completed handshake, false otherwise
+    /// @brief Returns true if there is an active connection whose handshake completed and whose
+    /// first server/activate has arrived
+    /// @return true if connected with a completed handshake whose first server/activate has
+    ///         arrived, false otherwise
     bool is_connected() const;
 
     /// @brief Returns the server information from the active connection's hello handshake
@@ -651,8 +663,11 @@ public:
     /// @brief Signals that the operator performed the device pairing-window gesture.
     /// Thread-safe. Opens a pairing window (pairing.md "Pairing Window"): a gesture-gated attempt
     /// already waiting proceeds immediately; otherwise the window stands open for 5 minutes and
-    /// admits pairing attempts on one connection without a further gesture. The gesture is also
-    /// the deliberate operator action that clears a standing dynamic-pairing-code round limit.
+    /// admits pairing attempts on one connection without a further gesture. It closes before
+    /// those 5 minutes are up when a pairing under it succeeds, when the connection it is bound
+    /// to is lost, after five attempts fail verification, or on cancel_pairing_window(). The
+    /// gesture is also the deliberate operator action that clears a standing
+    /// dynamic-pairing-code round limit.
     void confirm_pairing_window();
 
     /// @brief Signals that the operator cancelled the pairing window.
@@ -826,9 +841,10 @@ private:
     /// @brief Loads or generates the static X25519 identity keypair via the persistence
     /// provider. Sets identity_ on success. Called once from start(), before the
     /// connection manager can hand the identity out to any connection.
-    /// @return false if the stored key was corrupt/wrong-length or key generation failed (e.g.
-    /// noise-c allocation failure); identity_ is left null in that case and the caller
-    /// (start()) must not proceed. Never leaves identity_ set to an all-zero keypair.
+    /// @return false only if key generation failed (e.g. noise-c allocation failure); a corrupt
+    /// or wrong-length stored key is discarded and a fresh identity generated in its place (the
+    /// device must then re-pair). identity_ is left null on false and the caller (start()) must
+    /// not proceed. Never leaves identity_ set to an all-zero keypair.
     bool load_or_generate_identity();
 
     /// @brief Loads the last played server_id from persistence

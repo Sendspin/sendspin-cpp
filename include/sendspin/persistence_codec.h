@@ -81,9 +81,9 @@
 ///
 /// `RECORDS` always holds the WHOLE records array as one blob (`encode_pairing_records()` /
 /// `decode_pairing_records()`), not one entry per record: an encoded record is roughly 250
-/// bytes, so an 8-record store comes out around 2 KB, comfortably under a typical NVS entry's
-/// ~4 KB limit. This also sidesteps needing `psk_id` (43 characters, base64url of a 32-byte key)
-/// as a storage key, which would not fit an NVS key at all.
+/// bytes, so the default 12-record store comes out around 3 KB, comfortably under a typical NVS
+/// entry's ~4 KB limit. This also sidesteps needing `psk_id` (43 characters, base64url of a
+/// 32-byte key) as a storage key, which would not fit an NVS key at all.
 
 #pragma once
 
