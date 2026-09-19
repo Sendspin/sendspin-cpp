@@ -43,11 +43,10 @@ static constexpr std::string_view PAIRING_CODE_DERIVE_LABEL{"sendspin-pairing-co
 
 /// @brief Domain-separation label prepended to nonce_B in pairing_code_commit(), so the
 /// commitment hash cannot be reused across a different protocol context.
-/// commit_B = SHA-256(PAIRING_COMMIT_LABEL || nonce_B).
 static constexpr std::string_view PAIRING_COMMIT_LABEL{"sendspin-pair-commit-v1"};
 
-/// @brief Length of a dynamic pairing code in the `digits` emission format. Fixed by
-/// pairing.md "Dynamic Pairing Code Flow"; there is nothing to negotiate.
+/// @brief Length of a dynamic pairing code in the `digits` emission format, fixed by
+/// pairing.md "Dynamic Pairing Code Flow".
 static constexpr int DYNAMIC_PAIRING_CODE_DIGITS = 6;
 
 /// @brief Length of a dynamic pairing code in the `qr_code` emission format: the first bytes of
@@ -64,7 +63,6 @@ static constexpr int STATIC_PAIRING_CODE_DIGITS = 8;
 
 /// @brief Return whether `code` is exactly STATIC_PAIRING_CODE_DIGITS decimal digits
 /// @param code The configured static pairing code.
-/// @return true when the code is usable as a static pairing code.
 inline bool is_valid_static_pairing_code(const std::string& code) {
     if (code.size() != static_cast<size_t>(STATIC_PAIRING_CODE_DIGITS)) {
         return false;
@@ -78,7 +76,6 @@ inline bool is_valid_static_pairing_code(const std::string& code) {
 }
 
 /// @brief Generate a fresh 32-byte CSPRNG nonce (nonce_A or nonce_B)
-/// @return The nonce bytes.
 std::array<uint8_t, PAIRING_NONCE_SIZE> pairing_generate_nonce();
 
 /// @brief Compute the commitment commit_B = SHA-256(PAIRING_COMMIT_LABEL || nonce)
@@ -94,14 +91,13 @@ std::array<uint8_t, PAIRING_COMMIT_SIZE> pairing_code_commit(const uint8_t* nonc
 /// @param nonce_len      Length of `nonce`.
 /// @param commitment     The commitment the peer sent.
 /// @param commitment_len Length of `commitment`.
-/// @return true when the nonce opens the commitment.
 bool pairing_code_verify_commit(const uint8_t* nonce, size_t nonce_len, const uint8_t* commitment,
                                 size_t commitment_len);
 
 /// @brief Derive the dynamic pairing code's digest from the Noise handshake hash and both nonces.
 ///
-/// digest = SHA-256(PAIRING_CODE_DERIVE_LABEL || handshake_hash || nonce_a || nonce_b), the
-/// literal label's UTF-8 bytes followed by the three 32-byte raw values, in that order
+/// digest = SHA-256(PAIRING_CODE_DERIVE_LABEL || handshake_hash || nonce_a || nonce_b): the
+/// label's literal UTF-8 bytes followed by the three 32-byte raw values
 /// (pairing.md "Dynamic Pairing Code Flow").
 /// @param handshake_hash The Noise handshake hash.
 /// @param hash_len       Length of `handshake_hash`, which must be SHA256_DIGEST_SIZE.
@@ -119,13 +115,11 @@ std::optional<std::array<uint8_t, 32>> pairing_code_digest(const uint8_t* handsh
 /// @brief Reduce a pairing-code digest to the `digits` emission format: the digest read as an
 /// unsigned big-endian 256-bit integer modulo 10^6, left-padded to exactly six ASCII digits
 /// @param digest The derivation digest.
-/// @return The six-digit code.
 std::string pairing_code_digits(const std::array<uint8_t, 32>& digest);
 
 /// @brief Take the `qr_code` emission format's pairing code from a digest: its first
 /// QR_PAIRING_CODE_SIZE bytes, raw
 /// @param digest The derivation digest.
-/// @return The raw pairing-code bytes.
 std::array<uint8_t, QR_PAIRING_CODE_SIZE> pairing_code_qr_bytes(
     const std::array<uint8_t, 32>& digest);
 
@@ -133,7 +127,6 @@ std::array<uint8_t, QR_PAIRING_CODE_SIZE> pairing_code_qr_bytes(
 /// (pairing.md "PAKE"). Shared by both the dynamic `digits` format and the static pairing code,
 /// which encode their codes identically.
 /// @param code The decimal pairing code.
-/// @return The code's ASCII digits, as CPace consumes them.
 inline std::vector<uint8_t> pairing_code_digits_prs(const std::string& code) {
     return std::vector<uint8_t>(code.begin(), code.end());
 }

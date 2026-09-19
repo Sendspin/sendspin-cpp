@@ -250,10 +250,9 @@ private:
     MemoryLocation buffer_location_{MemoryLocation::PREFER_EXTERNAL};
 
     /// True when the in-flight message's data is being thrown away rather than buffered: its
-    /// orig_type is a reserved ID nothing implements, it outgrew
-    /// MAX_REASSEMBLED_MESSAGE_BYTES, or the buffer could not be grown for it. The sequence is
-    /// still tracked to its last fragment; the message is simply never dispatched. Network
-    /// thread only.
+    /// orig_type is a reserved ID nothing implements, it outgrew MAX_REASSEMBLED_MESSAGE_BYTES,
+    /// or the buffer could not be grown for it. The sequence is still tracked to its last
+    /// fragment, but the message is never dispatched. Network thread only.
     bool reasm_discarding_{false};
 
     /// True while a fragmented message is in flight, whether it is being reassembled or

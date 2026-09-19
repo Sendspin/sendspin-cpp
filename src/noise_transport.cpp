@@ -75,9 +75,8 @@ SsErr NoiseTransport::encrypt_and_send_frame_locked(uint8_t* buf, size_t buf_cap
 }
 
 SsErr NoiseTransport::fragment_and_send_locked(const uint8_t* plaintext, size_t plaintext_len) {
-    // messaging.md "Fragmentation": every fragment is a type-1 message. The first carries
-    // [1][flags][orig_type][data] and the rest [1][flags][data], with flags bit 1 marking the
-    // first fragment and bit 0 the last. plaintext[0] = orig_type; plaintext[1..] = data.
+    // messaging.md "Fragmentation": every fragment is a type-1 message, the first also carrying
+    // orig_type. plaintext[0] = orig_type; plaintext[1..] = data.
     const uint8_t orig_type = plaintext[0];
     const uint8_t* data = plaintext + 1;
     const size_t data_len = plaintext_len - 1;
@@ -93,7 +92,6 @@ SsErr NoiseTransport::fragment_and_send_locked(const uint8_t* plaintext, size_t 
         return SsErr::FAIL;
     }
 
-    // First frame: [1][FIRST (| LAST)][orig_type][data[:first_cap]]
     size_t first_chunk = (data_len < first_cap) ? data_len : first_cap;
     frame_buf.data()[0] = MSG_TYPE_FRAGMENT;
     frame_buf.data()[1] = static_cast<uint8_t>(
@@ -180,8 +178,8 @@ SsErr NoiseTransport::send_binary(const uint8_t* data, size_t len) {
     if (len == 0) {
         return SsErr::FAIL;
     }
-    // messaging.md "Fragmentation": a sender MUST NOT use 1 as orig_type, and the transport owns
-    // that ID outright, so a role may never claim it for a message of its own.
+    // messaging.md "Fragmentation": a sender MUST NOT use 1 as orig_type; the transport owns
+    // that ID.
     if (data[0] == MSG_TYPE_FRAGMENT) {
         SS_LOGE(TAG, "send_binary: message type 1 belongs to the fragmentation layer");
         return SsErr::FAIL;
@@ -306,8 +304,6 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         }
         // The ignore rules let a receiver discard the data of a message whose orig_type it does
         // not implement instead of allocating for it, as long as it keeps tracking the sequence.
-        // messaging.md "Binary Message ID Structure" reserves IDs 2-3, so no message can ever
-        // carry one.
         this->reasm_in_progress_ = true;
         this->reasm_discarding_ =
             (orig_type >= MSG_TYPE_RESERVED_FIRST && orig_type <= MSG_TYPE_RESERVED_LAST);
@@ -364,8 +360,8 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
     if (discarded) {
         return {};
     }
-    // reasm_buf_ holds [orig_type][data...]; the returned pointer stays valid until the next
-    // accept_plaintext() call (the next first fragment overwrites it).
+    // The returned pointer stays valid until the next accept_plaintext() call (the next first
+    // fragment overwrites it).
     return {this->reasm_buf_.data(), complete_len};
 }
 

@@ -30,8 +30,8 @@ std::optional<std::array<uint8_t, 32>> derive_wrap_key(
     if (!h.ok()) {
         // noise_hashstate_new_by_name() failed (allocation failure or missing algorithm); h is
         // a no-op in this state and finalize() would silently yield an all-zero digest. Returning
-        // that as K_wrap would let wrap_value() seal the sealed value under a publicly derivable
-        // key, defeating the wrapping (pairing.md "Wrapping"), so fail loudly instead.
+        // that as K_wrap would let wrap_value() seal its value under a publicly derivable key,
+        // defeating the wrapping (pairing.md "Wrapping"), so fail loudly instead.
         return std::nullopt;
     }
     h.update(label, label_len);

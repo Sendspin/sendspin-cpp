@@ -159,8 +159,7 @@ public:
     ///
     /// messaging.md "server/error": the server sends one in place of server/init when it cannot
     /// accept our client/init. The message is unauthenticated, so connection.md "Failure Handling"
-    /// makes the reason a hint for logging and operator display, which is what the connection does
-    /// with it when it closes over the resulting ABORT.
+    /// makes the reason a hint for logging and operator display.
     const std::string& server_error_reason() const {
         return this->server_error_reason_;
     }
@@ -202,7 +201,7 @@ private:
     /// Result available after COMPLETE.
     std::optional<NoiseHandshakeResult> result_;
 
-    /// Reason from a received server/error; empty until one arrives. See server_error_reason().
+    /// Reason from a received server/error. See server_error_reason().
     std::string server_error_reason_;
 
     /// server_id decoded from server/init (43-char base64url).

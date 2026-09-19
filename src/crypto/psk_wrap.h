@@ -40,7 +40,7 @@
 namespace sendspin {
 
 /// @brief Size in bytes of a wrapped 32-byte value (the value + a 16-byte AEAD tag). Both
-/// `wrapped_psk` and `wrapped_nonce_B` seal exactly 32 bytes, so one size covers both.
+/// `wrapped_psk` and `wrapped_nonce_B` seal exactly 32 bytes.
 static constexpr size_t WRAPPED_VALUE_SIZE = 32 + 16;
 
 /// @brief Domain-separation label for the `wrapped_psk` key (pairing.md "Wrapping").

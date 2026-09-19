@@ -84,8 +84,8 @@ static constexpr size_t MAX_HANDSHAKE_MESSAGE_BYTES = 512;
 /// typical artwork payloads for embedded display targets are well under 1 MiB. The cap bounds
 /// how large a message an authenticated peer can force this connection to reassemble. The
 /// buffer behind it grows geometrically and keeps its capacity for the connection's life, so
-/// the worst-case steady-state pin is the first doubling that clears the cap, up to just under
-/// 2 MiB.
+/// the worst-case steady-state pin is the cap plus the orig_type byte, which reasm_reserve()
+/// clamps the growth to.
 static constexpr size_t MAX_REASSEMBLED_MESSAGE_BYTES = 1UL * 1024UL * 1024UL;
 
 // ============================================================================
@@ -112,8 +112,8 @@ static constexpr uint8_t FRAGMENT_FLAG_FIRST = 0x02;
 static constexpr uint8_t FRAGMENT_FLAGS_RESERVED = 0xFC;
 
 /// @brief First and last binary message ID that messaging.md "Binary Message ID Structure"
-/// reserves for future use. No role is ever assigned one, so a fragmented message claiming a
-/// reserved ID as its orig_type is an unimplemented message the receiver ignores.
+/// reserves for future use, so a fragmented message claiming one as its orig_type is an
+/// unimplemented message the receiver ignores.
 static constexpr uint8_t MSG_TYPE_RESERVED_FIRST = 2;
 static constexpr uint8_t MSG_TYPE_RESERVED_LAST = 3;
 

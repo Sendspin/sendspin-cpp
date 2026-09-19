@@ -61,8 +61,7 @@ std::string format_pairing_token(const std::array<uint8_t, 32>& client_key,
                                  const std::array<uint8_t, 32>& pairing_psk);
 
 /// @brief Build a version-1 pairing token carrying a dynamic pairing code, the form the
-/// `qr_code` emission format presents (pairing.md "Dynamic Pairing Code Flow", QR-code
-/// emission).
+/// `qr_code` emission format presents (pairing.md "Dynamic Pairing Code Flow").
 /// @param code The 24-byte pairing code taken from the derivation digest.
 /// @return The 43-character token string (e.g. "SP:14DQ...").
 std::string format_pairing_code_token(const std::array<uint8_t, QR_PAIRING_CODE_SIZE>& code);

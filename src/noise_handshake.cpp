@@ -137,8 +137,7 @@ static const char* to_cstr(HandshakeKind kind) {
 /// binding, bind the resolved PSK onto the same session, and write msg2.
 ///
 /// Used by the initial handshake (`NoiseHandshake::handle_msg1`) and the in-band re-handshake
-/// (`run_rehandshake_msg1`); what differs between them is carried by `kind` and the prologue,
-/// plus how msg2 is delivered to the peer, which the caller does after this returns.
+/// (`run_rehandshake_msg1`), which supply the prologue and deliver msg2 themselves.
 ///
 /// @param kind          Which handshake this msg1 belongs to.
 /// @param identity      Our static X25519 identity.
@@ -206,8 +205,8 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
     }
 
     // messaging.md "noise/handshake": the payload declares which category the server is using the
-    // referenced PSK as. A payload without one, or with a code outside the three defined, is a
-    // malformed payload, which connection.md "Failure Handling" makes a silent failure.
+    // referenced PSK as. A missing or unknown code is a malformed payload, which connection.md
+    // "Failure Handling" makes a silent failure.
     const char* psk_category_code = payload_doc["psk_category"] | "";
     auto psk_category = psk_category_from_string(std::string(psk_category_code));
     if (!psk_category.has_value()) {
@@ -220,10 +219,9 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
 
     auto resolved = record_store.resolve_by_psk_id(std::string(psk_id), psk_category.value());
     if (resolved.has_value()) {
-        // Post-match check (connection.md "Pre-Shared Key"): every long-term PSK is persisted with
-        // the server_id it was minted for, and the match only counts when that is the server
-        // actually reached. The Pairing and Sentinel PSKs are bound to no server and skip it. A
-        // failure here is a misbinding rather than a lookup miss, so it fails the handshake in
+        // Post-match check (connection.md "Pre-Shared Key"): every long-term PSK is persisted
+        // with the server_id it was minted for. The Pairing and Sentinel PSKs are bound to no
+        // server and skip it. A misbinding is not a lookup miss, so it fails the handshake in
         // both kinds (connection.md "Sentinel Fallback").
         if (resolved->category == PskCategory::LONG_TERM &&
             resolved->counterparty_id != server_id) {
@@ -246,8 +244,7 @@ std::optional<Msg1CoreResult> run_msg1_core(HandshakeKind kind, const Identity& 
             return std::nullopt;
         }
     } else {
-        // A miss during a re-handshake is a silent failure: the fallback applies to the initial
-        // handshake alone (connection.md "Sentinel Fallback").
+        // connection.md "Sentinel Fallback" applies to the initial handshake alone.
         SS_LOGW(TAG, "%s: no '%s' PSK for psk_id='%s', aborting", log_prefix, psk_category_code,
                 psk_id);
         return std::nullopt;
@@ -312,8 +309,8 @@ std::string NoiseHandshake::build_client_init() {
 }
 
 void NoiseHandshake::take_server_error(JsonObjectConst root, const char* log_context) {
-    // The handshake aborts either way; recognizing the message is what turns that abort from "the
-    // peer sent something unparseable" into the server's own account of why it refused.
+    // The handshake aborts either way; recognizing the message is what gives the abort the
+    // server's own account of the refusal.
     this->server_error_reason_ = root["payload"]["reason"] | "";
     SS_LOGE(TAG, "%s: server/error, reason='%s'; the server refused the connection", log_context,
             this->server_error_reason_.c_str());
@@ -327,8 +324,8 @@ HandshakeFrameResult NoiseHandshake::on_text_frame(
         return HandshakeFrameResult::ABORT;
     }
 
-    // One parse per frame: the type decides what this is, and the handlers work from the parsed
-    // envelope rather than deserializing the same bytes again.
+    // One parse per frame: the handlers work from the parsed envelope instead of deserializing
+    // the same bytes again.
     JsonDocument doc = make_json_document();
     if (deserializeJson(doc, text) || doc.isNull()) {
         SS_LOGE(TAG, "on_text_frame: JSON parse failed");

@@ -31,7 +31,7 @@ std::array<uint8_t, PAIRING_NONCE_SIZE> pairing_generate_nonce() {
 }
 
 // ============================================================================
-// pairing_code_commit: SHA-256(PAIRING_COMMIT_LABEL || nonce), domain-separated via the label
+// pairing_code_commit
 // ============================================================================
 
 std::array<uint8_t, PAIRING_COMMIT_SIZE> pairing_code_commit(const uint8_t* nonce,
@@ -42,7 +42,7 @@ std::array<uint8_t, PAIRING_COMMIT_SIZE> pairing_code_commit(const uint8_t* nonc
 }
 
 // ============================================================================
-// pairing_code_verify_commit: constant-time compare SHA-256(LABEL || nonce) vs commitment
+// pairing_code_verify_commit
 // ============================================================================
 
 bool pairing_code_verify_commit(const uint8_t* nonce, size_t nonce_len, const uint8_t* commitment,
@@ -56,8 +56,6 @@ bool pairing_code_verify_commit(const uint8_t* nonce, size_t nonce_len, const ui
 
 // ============================================================================
 // pairing_code_digest
-//
-// digest = SHA-256(PAIRING_CODE_DERIVE_LABEL || handshake_hash || nonce_a || nonce_b)
 // ============================================================================
 
 std::optional<std::array<uint8_t, 32>> pairing_code_digest(const uint8_t* handshake_hash,
@@ -86,8 +84,8 @@ std::optional<std::array<uint8_t, 32>> pairing_code_digest(const uint8_t* handsh
     h.update(nonce_b, nonce_b_len);
     auto digest = h.finalize();
     if (!h.ok()) {
-        // A mid-stream update()/finalize() failure after a successful construction; same
-        // rationale as the ok() check above: do not derive a code from a zero digest.
+        // A mid-stream update()/finalize() failure; same rationale as the ok() check above:
+        // do not derive a code from a zero digest.
         return std::nullopt;
     }
     return digest;
@@ -104,10 +102,10 @@ std::string pairing_code_digits(const std::array<uint8_t, 32>& digest) {
         modulus *= 10;
     }
 
-    // Reduce the big-endian 256-bit digest modulo 10^6 by Horner's method: process bytes from
-    // most to least significant, acc = (acc * 256 + byte) mod modulus. acc stays below modulus
-    // after every step, so the intermediate stays below modulus * 256 and well inside uint64_t;
-    // no 128-bit arithmetic is needed (and 32-bit targets such as Xtensa have no __int128).
+    // Reduce the big-endian 256-bit digest modulo 10^6 by Horner's method. acc stays below
+    // modulus after every step, so the intermediate stays below modulus * 256 and well inside
+    // uint64_t; no 128-bit arithmetic is needed (Xtensa and other 32-bit targets have no
+    // __int128).
     uint64_t acc = 0;
     for (size_t i = 0; i < SHA256_DIGEST_SIZE; ++i) {
         acc = (acc * 256 + digest[i]) % modulus;

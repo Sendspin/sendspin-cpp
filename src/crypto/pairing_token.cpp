@@ -65,9 +65,8 @@ std::string base32_encode(const uint8_t* data, size_t len) {
     return out;
 }
 
-/// @brief Wrap a payload as a pairing token of the given version: the "SP:" prefix, the version
-/// character, and the base32 body with its padding stripped and every '2' transliterated to '9'
-/// (pairing.md "Pairing Token"). Shared by both versions so their bodies cannot diverge.
+/// @brief Wrap a payload as a pairing token of the given version (pairing.md "Pairing Token").
+/// Shared by both versions so their bodies cannot diverge.
 std::string format_token(char version, const uint8_t* payload, size_t payload_len) {
     std::string body = base32_encode(payload, payload_len);
 
