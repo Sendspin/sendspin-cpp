@@ -284,7 +284,10 @@ Known and accepted for now, recorded so they are not rediscovered as surprises:
   reached `handle_load_chunk()`, `decode_chunk()`, `handle_synchronize_audio()` or
   `handle_transfer_audio()`. `VirtualSinkListener` (`tests/test_client_lifecycle.cpp`) is the
   first fixture that satisfies the playback-progress invariant; the older listener's tests still
-  do not, so they assert nothing about the per-chunk path.
+  do not, so they assert nothing about the per-chunk path. The lifetime tests around the stream
+  pin (stream end, a mid-stream `drop_connection()`, a network-thread flush) use the older
+  listener on purpose, so they prove where the connection dies and not that a chunk decoded
+  across the drop; no test combines a live decode with a drop.
 - `SendspinClient::send_text()` gained a required role-family argument when role-originated sends
   started gating on activation. It is a public method under "Role services", so a consumer calling
   it directly must pass the role the message belongs to.
