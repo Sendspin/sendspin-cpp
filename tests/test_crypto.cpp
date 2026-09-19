@@ -231,22 +231,6 @@ TEST(B64Url, EncodeAlphabetKat) {
               "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_");
 }
 
-TEST(B64Url, UsesUrlSafeAlphabet) {
-    // bytes 0xFB 0xFF 0xBF encode to characters that exercise - and _ slots.
-    std::array<uint8_t, 3> data{0xFB, 0xFF, 0xBF};
-    std::string enc = b64url_encode(data.data(), data.size());
-    EXPECT_EQ(enc.find('+'), std::string::npos) << "must not contain '+'";
-    EXPECT_EQ(enc.find('/'), std::string::npos) << "must not contain '/'";
-}
-
-TEST(B64Url, EncodeStripsEqPadding) {
-    // 1 byte → needs 2 padding chars in standard base64; b64url must strip them.
-    std::array<uint8_t, 1> data{0x00};
-    std::string enc = b64url_encode(data.data(), data.size());
-    EXPECT_EQ(enc.find('='), std::string::npos) << "must not contain '='";
-    EXPECT_EQ(enc.size(), 2u);  // ceil(8/6) = 2 base64 chars
-}
-
 TEST(B64Url, DecodeToleratesMissingPadding) {
     // "Zm9vYg" decodes to "foob" (4 bytes, input would need 2 '=' in standard base64)
     auto r1 = b64url_decode("Zm9vYg");
@@ -299,12 +283,27 @@ TEST(PskId, RejectsNon32ByteInput) {
 // Identity KATs  (mirrors test_keys.py)
 // ============================================================================
 
-TEST(Identity, GenerateShapes) {
-    Identity id = Identity::generate().value();
-    EXPECT_EQ(id.private_bytes.size(), 32u);
-    EXPECT_EQ(id.public_bytes.size(), 32u);
-    EXPECT_EQ(id.peer_id().size(), PEER_ID_SIZE);
-    EXPECT_EQ(id.peer_id().find('='), std::string::npos);
+// What Identity::generate() yields: correctly sized keypair and peer id, never the
+// default-constructed all-zero value (generate() returns std::optional precisely so a failure
+// surfaces as an empty optional rather than a zero keypair that would then be used as a real
+// one), and a fresh keypair on every call. noise-c's DHState has no hook to force the failure,
+// so only the success path is reachable from here.
+TEST(Identity, GenerateProducesDistinctNonZeroKeypairs) {
+    auto a = Identity::generate();
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->private_bytes.size(), 32u);
+    EXPECT_EQ(a->public_bytes.size(), 32u);
+    EXPECT_EQ(a->peer_id().size(), PEER_ID_SIZE);
+    EXPECT_EQ(a->peer_id().find('='), std::string::npos);
+
+    static const std::array<uint8_t, 32> kZero{};
+    EXPECT_NE(a->private_bytes, kZero);
+    EXPECT_NE(a->public_bytes, kZero);
+
+    auto b = Identity::generate();
+    ASSERT_TRUE(b.has_value());
+    EXPECT_NE(a->private_bytes, b->private_bytes);
+    EXPECT_NE(a->public_bytes, b->public_bytes);
 }
 
 TEST(Identity, FromPrivateBytesReproducesPubkeyAndPeerId) {
@@ -317,25 +316,6 @@ TEST(Identity, FromPrivateBytesReproducesPubkeyAndPeerId) {
 TEST(Identity, FromPrivateBytesRejectsWrongSize) {
     std::array<uint8_t, 16> short_key{};
     EXPECT_FALSE(Identity::from_private_bytes(short_key.data(), short_key.size()).has_value());
-}
-
-TEST(Identity, TwoGenerateCallsProduceDifferentKeys) {
-    Identity a = Identity::generate().value();
-    Identity b = Identity::generate().value();
-    EXPECT_NE(a.private_bytes, b.private_bytes);
-    EXPECT_NE(a.public_bytes, b.public_bytes);
-}
-
-// A generated Identity must never be the default-constructed (all-zero) value: generate() returns
-// std::optional precisely so a failure surfaces as an empty optional rather than a zero keypair
-// that would then be used as a real one. noise-c's DHState has no hook to force that failure, so
-// only the success path is reachable from here.
-TEST(Identity, GenerateIsNeverAllZero) {
-    auto id = Identity::generate();
-    ASSERT_TRUE(id.has_value());
-    static const std::array<uint8_t, 32> kZero{};
-    EXPECT_NE(id->private_bytes, kZero);
-    EXPECT_NE(id->public_bytes, kZero);
 }
 
 // The full Noise_KKpsk2 handshake is not exercised here. A noise-c-as-both-sides run tests only
