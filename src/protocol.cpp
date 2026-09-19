@@ -238,17 +238,6 @@ static void parse_metadata_string_field(JsonVariantConst var, const char* name,
     }
 }
 
-// Parses a single uint16 field of a server/state metadata object. Same semantics as above; a
-// present value that is not a uint16 (0-65535) is logged and skipped.
-static void parse_metadata_uint16_field(JsonVariantConst var, const char* name,
-                                        std::optional<uint16_t>* out) {
-    if (var.is<uint16_t>()) {
-        *out = var.as<uint16_t>();
-    } else if (!var.isUnbound() && !var.isNull()) {
-        SS_LOGW(TAG, "Ignoring field '%s': expected integer in [0, 65535]", name);
-    }
-}
-
 // Parses a single `[R, G, B]` color field of a server/state color object. A field the object does
 // not carry, or carries malformed (logged), leaves `out` without a value. Each component is read
 // as a uint8, so its type check is also its range check.
@@ -404,23 +393,10 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
     activate_msg->pairing_format = std::nullopt;
     JsonVariantConst pairing_var = root["payload"]["pairing"];
     if (pairing_var.is<JsonObjectConst>()) {
-        JsonVariantConst method_var = pairing_var["method"];
-        if (method_var.is<const char*>()) {
-            activate_msg->pairing_method = pair_method_from_string(method_var.as<std::string>());
-            if (!activate_msg->pairing_method.has_value()) {
-                SS_LOGW(TAG, "server/activate pairing object names an unknown method: %s",
-                        method_var.as<const char*>());
-            }
-        }
-        JsonVariantConst format_var = pairing_var["format"];
-        if (format_var.is<const char*>()) {
-            activate_msg->pairing_format =
-                pairing_code_format_from_string(format_var.as<std::string>());
-            if (!activate_msg->pairing_format.has_value()) {
-                SS_LOGW(TAG, "server/activate pairing object names an unknown format: %s",
-                        format_var.as<const char*>());
-            }
-        }
+        activate_msg->pairing_method =
+            read_enum_field(pairing_var["method"], "pairing.method", pair_method_from_string);
+        activate_msg->pairing_format = read_enum_field(pairing_var["format"], "pairing.format",
+                                                       pairing_code_format_from_string);
         // The server's `languages` (BCP 47 tags, descending operator preference) hints at what
         // the operator understands (messaging.md "server/hello"). Its only use here would be
         // spoken pairing-code emission (pairing.md "Digits emission"), which this library does
@@ -561,8 +537,12 @@ bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* m
     parse_metadata_string_field(metadata_object["album"], "album", &metadata->album);
     parse_metadata_string_field(metadata_object["artwork_url"], "artwork_url",
                                 &metadata->artwork_url);
-    parse_metadata_uint16_field(metadata_object["year"], "year", &metadata->year);
-    parse_metadata_uint16_field(metadata_object["track"], "track", &metadata->track);
+    if (auto v = read_uint_field<uint16_t>(metadata_object["year"], "year")) {
+        metadata->year = v;
+    }
+    if (auto v = read_uint_field<uint16_t>(metadata_object["track"], "track")) {
+        metadata->track = v;
+    }
 
     // roles/metadata/v1.md "server/state metadata object": omitting progress clears the client's
     // position, which the full-state reset above already did.
@@ -809,13 +789,6 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
 
 // Message formatting
 
-static void write_visualizer_spectrum(JsonObject vis_json, const VisualizerSpectrumConfig& spec) {
-    vis_json["spectrum"]["n_disp_bins"] = spec.n_disp_bins;
-    vis_json["spectrum"]["scale"] = to_cstr(spec.scale);
-    vis_json["spectrum"]["f_min"] = spec.f_min;
-    vis_json["spectrum"]["f_max"] = spec.f_max;
-}
-
 std::string format_client_hello_message(const ClientHelloMessage* msg) {
     JsonDocument doc = make_json_document();
     JsonObject root = doc.to<JsonObject>();
@@ -951,7 +924,11 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
         }
         vis_json["rate_max"] = vis.rate_max;
         if (vis.spectrum.has_value()) {
-            write_visualizer_spectrum(vis_json, vis.spectrum.value());
+            const VisualizerSpectrumConfig& spec = vis.spectrum.value();
+            vis_json["spectrum"]["n_disp_bins"] = spec.n_disp_bins;
+            vis_json["spectrum"]["scale"] = to_cstr(spec.scale);
+            vis_json["spectrum"]["f_min"] = spec.f_min;
+            vis_json["spectrum"]["f_max"] = spec.f_max;
         }
     }
 
@@ -1158,7 +1135,9 @@ std::string format_client_pair_finalize_wrapped_message(
     root["type"] = "client/pair-finalize";
     // Pairing-code flows only (pairing.md "Wrapping"); exactly one of long_term_psk/wrapped_psk
     // is present per message.
-    root["payload"]["wrapped_psk"] = b64url_encode(wrapped_psk.data(), wrapped_psk.size());
+    std::string wrapped_b64 = b64url_encode(wrapped_psk.data(), wrapped_psk.size());
+    root["payload"]["wrapped_psk"] = wrapped_b64;
+    secure_zero(wrapped_b64.data(), wrapped_b64.size());
 
     std::string output;
     serializeJson(doc, output);
