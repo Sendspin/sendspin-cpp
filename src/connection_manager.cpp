@@ -668,9 +668,6 @@ void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
 }
 
 void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
-    if (!event.conn) {
-        return;
-    }
     const bool in_nursery = this->find_in_nursery(event.conn.get()) != this->nursery_.end();
     const bool is_current = event.conn.get() == this->current_connection_.get();
     if (!in_nursery && !is_current) {
@@ -964,7 +961,11 @@ void ConnectionManager::drain_pairing_events(DrainedEvents& ev) {
     // leftover-activate case is handled inline in the subsequent-activate branch of
     // drain_lifecycle_events(), so neither needs a deferred event here.)
     for (auto& event : ev.pair_aborts) {
-        if (!event.conn || event.conn.get() != this->current_connection_.get()) {
+        if (event.conn.get() != this->current_connection_.get()) {
+            SS_LOGD(TAG,
+                    "Discarding pair/abort (reason=%s) for server_id=%s: not the current "
+                    "connection",
+                    to_cstr(event.reason), event.conn->get_server_id().c_str());
             continue;
         }
         this->handle_pair_abort(event.conn.get(), event.reason);
@@ -975,7 +976,11 @@ void ConnectionManager::drain_pairing_events(DrainedEvents& ev) {
     // connection that already won promotion into current_connection_ (see the pairing
     // branch in promote_or_arbitrate_nursery_entry()).
     for (auto& event : ev.pairing_messages) {
-        if (!event.conn || event.conn.get() != this->current_connection_.get()) {
+        if (event.conn.get() != this->current_connection_.get()) {
+            SS_LOGD(TAG,
+                    "Discarding pairing message (kind=%d) for server_id=%s: not the current "
+                    "connection",
+                    static_cast<int>(event.kind), event.conn->get_server_id().c_str());
             continue;
         }
         this->handle_pairing_message(event.conn.get(), event);
@@ -1017,7 +1022,9 @@ void ConnectionManager::drain_unpair_events(DrainedEvents& ev) {
     // drops one from a peer the client is not actually running a session with. Rare, and it
     // costs that peer nothing but a repeat once it holds the session.
     for (auto& event : ev.server_unpairs) {
-        if (!event.conn || event.conn.get() != this->current_connection_.get()) {
+        if (event.conn.get() != this->current_connection_.get()) {
+            SS_LOGD(TAG, "Discarding server/unpair for server_id=%s: not the current connection",
+                    event.conn->get_server_id().c_str());
             continue;
         }
         this->handle_server_unpair(event.conn.get(), event);
