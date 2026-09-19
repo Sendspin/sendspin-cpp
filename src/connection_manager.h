@@ -449,8 +449,8 @@ public:
     // Handoff support
     // ========================================
 
-    /// @brief Sets the last-played server_id for handoff preference decisions.
-    /// @param server_id The server_id string of the last-played server.
+    /// @brief Sets the last-played server_id for handoff preference decisions. Main loop only.
+    /// @param server_id The server_id string of the last-played server; empty clears it.
     void set_last_played_server_id(const std::string& server_id);
 
     /// @brief Returns the current last-played server_id. Main loop only.

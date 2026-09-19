@@ -1781,11 +1781,11 @@ void ConnectionManager::drop_connection(SendspinConnection* conn,
     }
 
     if (auto it = this->find_in_nursery(conn); it != this->nursery_.end()) {
-        // Dropping an unproven connection: no client-state cleanup (it was never admitted). Code
-        // sessions only ever exist on the current connection (see the pairing-events comment
-        // above, in loop()), but dismiss any prompt defensively, for symmetry with the other
-        // drop paths. Snapshot before release for the same reason as the current-slot path above
-        // (see PairingUiSnapshot).
+        // Dropping an unproven connection: no client-state cleanup (it was never admitted). A
+        // code session only ever exists on the current connection (see the pairing-events
+        // comment above, in loop()), so no prompt can be showing here; the dismissal is kept for
+        // symmetry with the other drop paths and costs two bool reads. Snapshot before release
+        // for the same reason as the current-slot path above (see PairingUiSnapshot).
         const PairingUiSnapshot ui = snapshot_pairing_ui(conn);
         this->release_nursery_entry(it, goodbye);
         this->dismiss_pairing_ui(ui.code_was_emitted, ui.window_was_shown);
