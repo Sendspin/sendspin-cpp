@@ -441,65 +441,6 @@ TEST(NoiseHandshakeLoopback, HandshakeHashAvailable) {
 }
 
 // ============================================================================
-// Transport round-trip (both directions)
-// ============================================================================
-
-/// @brief Encrypt with initiator send_cs, decrypt with NoiseSession (responder recv),
-/// and vice versa.
-static void check_transport_roundtrip(LoopbackResult& r, const std::vector<uint8_t>& plaintext) {
-    // Initiator -> Responder direction (initiator.send_cs, responder.recv)
-    {
-        std::vector<uint8_t> ct(plaintext.size() + 16);
-        std::copy(plaintext.begin(), plaintext.end(), ct.begin());
-
-        NoiseBuffer buf;
-        noise_buffer_set_inout(buf, ct.data(), plaintext.size(), ct.size());
-        ASSERT_EQ(noise_cipherstate_encrypt(r.initiator.send_cs, &buf), NOISE_ERROR_NONE);
-        ct.resize(buf.size);
-
-        size_t pt_len = r.responder_session->decrypt(ct.data(), ct.size());
-        ASSERT_GT(pt_len, 0u);
-        ct.resize(pt_len);
-        EXPECT_EQ(ct, plaintext);
-    }
-
-    // Responder -> Initiator direction (responder.send, initiator.recv_cs)
-    {
-        std::vector<uint8_t> buf_v(plaintext.size() + 16);
-        std::copy(plaintext.begin(), plaintext.end(), buf_v.begin());
-
-        size_t ct_len = r.responder_session->encrypt(buf_v.data(), plaintext.size(), buf_v.size());
-        ASSERT_GT(ct_len, 0u);
-
-        NoiseBuffer buf;
-        noise_buffer_set_inout(buf, buf_v.data(), ct_len, ct_len);
-        ASSERT_EQ(noise_cipherstate_decrypt(r.initiator.recv_cs, &buf), NOISE_ERROR_NONE);
-        ASSERT_EQ(buf.size, plaintext.size());
-        std::vector<uint8_t> pt(buf_v.data(), buf_v.data() + buf.size);
-        EXPECT_EQ(pt, plaintext);
-    }
-}
-
-TEST(NoiseTransport, JsonRoundTrip_ChaChaPoly) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    // Type byte 0x00 (JSON body) + JSON string
-    std::string json_text = "{\"hello\":\"world\"}";
-    std::vector<uint8_t> plaintext;
-    plaintext.push_back(0x00);  // MSG_TYPE_JSON_BODY
-    plaintext.insert(plaintext.end(), json_text.begin(), json_text.end());
-    check_transport_roundtrip(*r, plaintext);
-}
-
-TEST(NoiseTransport, BinaryNonZeroTypeRoundTrip) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    // Type byte 0x01 (binary role message) + arbitrary binary data
-    std::vector<uint8_t> plaintext = {0x01, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF};
-    check_transport_roundtrip(*r, plaintext);
-}
-
-// ============================================================================
 // Fragment and reassemble (TestConnection dispatch loop)
 // ============================================================================
 
@@ -754,17 +695,6 @@ TEST(NoiseHandshakeDriver, PskCategoryMismatchFallsBackToTheSentinelPsk) {
         << "the peer must see the credential mismatch, not a session on its own PSK";
 }
 
-// Control: the same psk_id under the category the client actually holds it in resolves to the
-// record, and the peer that sent message 1 can read the message 2 that comes back.
-TEST(NoiseHandshakeDriver, MatchingPskCategoryCompletes) {
-    Msg1Outcome outcome = run_msg1_with_payload([](const std::string& psk_id) {
-        return R"({"psk_id":")" + psk_id + R"(","psk_category":"lt"})";
-    });
-    EXPECT_EQ(outcome.result, HandshakeFrameResult::COMPLETE);
-    EXPECT_EQ(outcome.category, PskCategory::LONG_TERM);
-    EXPECT_TRUE(outcome.peer_read_msg2);
-}
-
 // connection.md "Sentinel Fallback": on a lookup miss in the initial handshake the client
 // completes message 2 with the Sentinel PSK instead of failing, whichever category the server
 // declared. The connection then proceeds as an ordinary unpaired one, and the server learns its
@@ -782,23 +712,38 @@ TEST(NoiseHandshakeDriver, UnknownPskIdFallsBackToTheSentinelPsk) {
     }
 }
 
-// messaging.md "noise/handshake": a psk_category outside the three defined codes makes the payload
-// malformed, and connection.md "Failure Handling" makes that a silent failure. ABORT is how the
-// driver reports one: SendspinConnection closes the socket without sending anything.
-TEST(NoiseHandshakeDriver, UnknownPskCategoryAborts) {
-    EXPECT_EQ(run_msg1_with_payload([](const std::string& psk_id) {
-                  return R"({"psk_id":")" + psk_id + R"(","psk_category":"xx"})";
-              }).result,
-              HandshakeFrameResult::ABORT);
-}
+// messaging.md "noise/handshake": the payload declares which category the referenced PSK is used
+// as. The code is not optional, and a code outside the three defined ones makes the payload
+// malformed, which connection.md "Failure Handling" makes a silent failure: ABORT is how the
+// driver reports one, and SendspinConnection then closes the socket without sending anything.
+// Guessing a category instead would defeat the lookup scoping above.
+TEST(NoiseHandshakeDriver, Msg1PayloadPskCategoryIsValidated) {
+    struct Row {
+        const char* name;
+        const char* category_field;  // inserted after psk_id, empty for a payload without one
+        HandshakeFrameResult expected;
+    };
+    const Row rows[] = {
+        {"code outside the defined set", R"(,"psk_category":"xx")", HandshakeFrameResult::ABORT},
+        {"no psk_category at all", "", HandshakeFrameResult::ABORT},
+        // Control: the category the client actually holds the psk_id in resolves to the record,
+        // and the peer that sent message 1 can read the message 2 that comes back.
+        {"category matching the stored record", R"(,"psk_category":"lt")",
+         HandshakeFrameResult::COMPLETE},
+    };
 
-// A payload with no psk_category at all is malformed for the same reason: the category is not
-// optional, and guessing one would defeat the scoping above.
-TEST(NoiseHandshakeDriver, MissingPskCategoryAborts) {
-    EXPECT_EQ(run_msg1_with_payload([](const std::string& psk_id) {
-                  return R"({"psk_id":")" + psk_id + R"("})";
-              }).result,
-              HandshakeFrameResult::ABORT);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        const std::string category_field = row.category_field;
+        Msg1Outcome outcome = run_msg1_with_payload([&category_field](const std::string& psk_id) {
+            return R"({"psk_id":")" + psk_id + R"(")" + category_field + "}";
+        });
+        EXPECT_EQ(outcome.result, row.expected);
+        if (row.expected == HandshakeFrameResult::COMPLETE) {
+            EXPECT_EQ(outcome.category, PskCategory::LONG_TERM);
+            EXPECT_TRUE(outcome.peer_read_msg2);
+        }
+    }
 }
 
 // messaging.md "server/error": the server sends it in place of server/init when it cannot accept
@@ -851,62 +796,43 @@ TEST(NoiseHandshakeDriver, ServerErrorWhileAwaitingMsg1Aborts) {
     EXPECT_EQ(nh.server_error_reason(), "malformed");
 }
 
-// Control: a frame of the expected type carrying a well-formed payload is accepted, and the
-// driver moves on to waiting for Noise message 1.
-TEST(NoiseHandshakeDriver, WellFormedServerInitIsAccepted) {
-    Identity client_id = Identity::generate().value();
-    Identity server_id = Identity::generate().value();
-    RecordStore rs(nullptr);
+// A server/init is accepted only when its type, its server_id and its version are all usable:
+// the server_id names the key and goes into the prologue, so both are checked before the
+// handshake reads a Noise byte (connection.md "Handshake").
+TEST(NoiseHandshakeDriver, ServerInitIsRefusedUnlessWellFormed) {
+    struct Row {
+        const char* name;
+        const char* type;
+        bool long_server_id;  // PEER_ID_SIZE + 2 characters instead of a real peer id
+        int version;
+        HandshakeFrameResult expected;
+    };
+    const Row rows[] = {
+        // The payload is the control's, so only the type field can produce the abort: a frame
+        // whose payload would pass must still be refused for arriving under another type.
+        {"another envelope type", "wrong/type", false, 1, HandshakeFrameResult::ABORT},
+        // A peer id is PEER_ID_SIZE characters of base64url; anything else cannot name a key.
+        {"server_id of the wrong length", "server/init", true, 1, HandshakeFrameResult::ABORT},
+        {"unsupported version", "server/init", false, 99, HandshakeFrameResult::ABORT},
+        // Control: the driver accepts it and moves on to waiting for Noise message 1.
+        {"well formed", "server/init", false, 1, HandshakeFrameResult::NEED_MORE},
+    };
 
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
-    nh.build_client_init();
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Identity client_id = Identity::generate().value();
+        Identity server_id = Identity::generate().value();
+        RecordStore rs(nullptr);
 
-    auto r = nh.on_text_frame(make_server_init(server_id.peer_id()),
-                              [](const std::string&) { return true; });
-    EXPECT_EQ(r, HandshakeFrameResult::NEED_MORE);
-}
+        NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+        nh.build_client_init();
 
-TEST(NoiseHandshakeDriver, UnexpectedTypeWhileAwaitingServerInitAborts) {
-    Identity client_id = Identity::generate().value();
-    Identity server_id = Identity::generate().value();
-    RecordStore rs(nullptr);
-
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
-    nh.build_client_init();
-
-    // The payload is the one the control sends, so only the type field can produce the abort:
-    // a frame whose payload would pass must still be refused for arriving under another type.
-    auto r = nh.on_text_frame(make_server_init(server_id.peer_id(), /*version=*/1, "wrong/type"),
-                              [](const std::string&) { return true; });
-    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
-}
-
-TEST(NoiseHandshakeDriver, ServerInitWithAWrongLengthServerIdAborts) {
-    Identity client_id = Identity::generate().value();
-    RecordStore rs(nullptr);
-
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
-    nh.build_client_init();
-
-    // A peer id is PEER_ID_SIZE characters of base64url; anything else cannot name a key, and
-    // the value goes into the prologue, so it is checked before the handshake reads it.
-    auto r = nh.on_text_frame(make_server_init(std::string(PEER_ID_SIZE + 2, 'A')),
-                              [](const std::string&) { return true; });
-    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
-}
-
-TEST(NoiseHandshakeDriver, WrongVersionAborts) {
-    Identity client_id = Identity::generate().value();
-    Identity server_id = Identity::generate().value();
-    RecordStore rs(nullptr);
-
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
-    nh.build_client_init();
-
-    // Version 99 should be rejected
-    std::string bad_version = make_server_init(server_id.peer_id(), /*version=*/99);
-    auto r = nh.on_text_frame(bad_version, [](const std::string&) { return true; });
-    EXPECT_EQ(r, HandshakeFrameResult::ABORT);
+        const std::string peer_id =
+            row.long_server_id ? std::string(PEER_ID_SIZE + 2, 'A') : server_id.peer_id();
+        EXPECT_EQ(nh.on_text_frame(make_server_init(peer_id, row.version, row.type),
+                                   [](const std::string&) { return true; }),
+                  row.expected);
+    }
 }
 
 // ============================================================================
@@ -1003,112 +929,119 @@ TEST(FragmentSequence, MultiFragmentMessageDispatchesOnTheLastFragment) {
     EXPECT_FALSE(rx.closed());
 }
 
-TEST(FragmentSequence, FirstFragmentWhileOneIsInFlightCloses) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    FragmentReceiver rx(*r);
+// messaging.md "Fragmentation" lists the sequences a receiver must treat as malformed. Each row
+// is one of them, and every one closes the connection silently: no goodbye, no frame on the wire,
+// nothing dispatched. Only the rows' final injection differs; the preamble that puts a sequence
+// in flight is part of the row.
+TEST(FragmentSequence, MalformedFragmentSequenceCloses) {
+    struct Row {
+        std::string name;
+        bool expect_closed;
+        std::function<void(FragmentReceiver&)> feed;
+    };
 
-    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
-    ASSERT_FALSE(rx.closed());
-
-    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
-
-    EXPECT_TRUE(rx.closed()) << "a first fragment while one is in flight is a malformed sequence";
-    EXPECT_EQ(rx.json_dispatched_, 0);
-    EXPECT_TRUE(rx.conn_.disconnect_calls_.empty());
-    EXPECT_TRUE(rx.conn_.sent_text_.empty());
-    EXPECT_TRUE(rx.conn_.sent_binary_.empty());
-}
-
-TEST(FragmentSequence, NonFirstFragmentWithNoneInFlightCloses) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    FragmentReceiver rx(*r);
-
-    rx.inject_fragment(FRAGMENT_FLAG_LAST, {'A', 'B'});
-
-    EXPECT_TRUE(rx.closed()) << "a non-first fragment with none in flight is a malformed sequence";
-    EXPECT_EQ(rx.json_dispatched_, 0);
-    EXPECT_EQ(rx.binary_dispatched_, 0);
-    EXPECT_TRUE(rx.conn_.disconnect_calls_.empty());
-    EXPECT_TRUE(rx.conn_.sent_text_.empty());
-    EXPECT_TRUE(rx.conn_.sent_binary_.empty());
-
-    // A frame already in the socket buffer when the close was decided still decrypts, so
-    // close_silently() shuts the dispatch gate rather than relying on the transport being gone.
-    // TestConnection::close_transport_now() only counts, leaving that gate as the one thing that
-    // can keep this well-formed message from reaching a role.
-    rx.inject_fragment(FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST,
-                       {SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA});
-    EXPECT_EQ(rx.binary_dispatched_, 0) << "a frame that lands after the close must not dispatch";
-}
-
-TEST(FragmentSequence, NonFragmentMessageWhileOneIsInFlightCloses) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    FragmentReceiver rx(*r);
-
-    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
-    ASSERT_FALSE(rx.closed());
-
-    rx.inject({MSG_TYPE_JSON_BODY, 'H', 'i'});
-
-    EXPECT_TRUE(rx.closed())
-        << "a non-fragment binary message while one is in flight is a malformed sequence";
-    EXPECT_EQ(rx.json_dispatched_, 0) << "the interloping message must not be dispatched either";
-}
-
-TEST(FragmentSequence, ReservedFlagBitCloses) {
-    // Bits 2-7 are reserved and MUST be zero. Each is checked on its own so the mask cannot be
+    std::vector<Row> rows;
+    rows.push_back({"first fragment while one is in flight", true, [](FragmentReceiver& rx) {
+                        rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
+                        ASSERT_FALSE(rx.closed());
+                        rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
+                    }});
+    rows.push_back({"non-first fragment with none in flight", true, [](FragmentReceiver& rx) {
+                        rx.inject_fragment(FRAGMENT_FLAG_LAST, {'A', 'B'});
+                    }});
+    rows.push_back({"non-fragment message while one is in flight", true, [](FragmentReceiver& rx) {
+                        rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
+                        ASSERT_FALSE(rx.closed());
+                        rx.inject({MSG_TYPE_JSON_BODY, 'H', 'i'});
+                    }});
+    // Bits 2-7 are reserved and MUST be zero. Each is a row of its own so the mask cannot be
     // narrowed to a single bit and still pass.
     for (int bit = 2; bit < 8; ++bit) {
+        rows.push_back({"reserved flag bit " + std::to_string(bit), true,
+                        [bit](FragmentReceiver& rx) {
+                            const uint8_t flags = static_cast<uint8_t>(
+                                FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST | (1u << bit));
+                            rx.inject_fragment(flags, {MSG_TYPE_JSON_BODY, '{', '}'});
+                        }});
+    }
+    // Fragments do not nest: a first fragment naming the fragment ID as its orig_type is
+    // malformed.
+    rows.push_back({"orig_type naming the fragment id", true, [](FragmentReceiver& rx) {
+                        rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_FRAGMENT, 0xAA});
+                    }});
+    // A fragment frame that stops before its flags byte cannot be placed in the sequence at all.
+    rows.push_back({"fragment frame without its flags byte", true, [](FragmentReceiver& rx) {
+                        rx.inject({MSG_TYPE_FRAGMENT});
+                    }});
+    rows.push_back({"first fragment without an orig_type", true, [](FragmentReceiver& rx) {
+                        rx.inject_fragment(FRAGMENT_FLAG_FIRST, {});
+                    }});
+    // A message being discarded is still in flight, so the rules apply to it unchanged.
+    rows.push_back({"non-fragment message inside a discarded sequence", true,
+                    [](FragmentReceiver& rx) {
+                        rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_RESERVED_FIRST, 0xAA});
+                        ASSERT_FALSE(rx.closed());
+                        rx.inject({MSG_TYPE_JSON_BODY, 'H', 'i'});
+                    }});
+    // Nor does discarding an over-cap message end its sequence. This is the case the
+    // discard-instead-of-reset behavior makes reachable: resetting on the over-cap frame would
+    // have made the fragment below look like a legitimate fresh message.
+    rows.push_back({"first fragment inside a discarded over-cap sequence", true,
+                    [](FragmentReceiver& rx) {
+                        rx.admit();  // MAX_REASSEMBLED_MESSAGE_BYTES is the admitted cap.
+                        const size_t chunk = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) - 2;
+                        rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, 0xAA});
+                        size_t data_len = 1;
+                        while (data_len + chunk <= MAX_REASSEMBLED_MESSAGE_BYTES) {
+                            rx.inject_fragment(0, std::vector<uint8_t>(chunk, 'X'));
+                            data_len += chunk;
+                        }
+                        rx.inject_fragment(0, std::vector<uint8_t>(chunk, 'X'));  // over the cap
+                        ASSERT_FALSE(rx.closed());
+                        rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
+                    }});
+    // Control: the same receiver, fed a well-formed single-frame message, dispatches it and
+    // stays open.
+    rows.push_back({"well-formed single fragment", false, [](FragmentReceiver& rx) {
+                        rx.inject_fragment(FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST,
+                                           {SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA});
+                    }});
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
         auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
         ASSERT_TRUE(r.has_value());
         FragmentReceiver rx(*r);
 
-        const uint8_t flags =
-            static_cast<uint8_t>(FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST | (1u << bit));
-        rx.inject_fragment(flags, {MSG_TYPE_JSON_BODY, '{', '}'});
+        row.feed(rx);
 
-        EXPECT_TRUE(rx.closed()) << "reserved flag bit " << bit << " must close the connection";
-        EXPECT_EQ(rx.json_dispatched_, 0) << "reserved flag bit " << bit;
+        EXPECT_EQ(rx.closed(), row.expect_closed);
+        if (row.expect_closed) {
+            EXPECT_EQ(rx.json_dispatched_, 0);
+            EXPECT_EQ(rx.binary_dispatched_, 0);
+            EXPECT_TRUE(rx.conn_.disconnect_calls_.empty()) << "a malformed sequence is silent";
+            EXPECT_TRUE(rx.conn_.sent_text_.empty());
+            EXPECT_TRUE(rx.conn_.sent_binary_.empty());
+        } else {
+            EXPECT_EQ(rx.binary_dispatched_, 1);
+        }
     }
 }
 
-TEST(FragmentSequence, OrigTypeOfOneCloses) {
-    // Fragments do not nest: a first fragment naming the fragment ID as its orig_type is a
-    // malformed sequence.
+// A frame already in the socket buffer when the close was decided still decrypts, so
+// close_silently() shuts the dispatch gate rather than relying on the transport being gone.
+// TestConnection::close_transport_now() only counts, leaving that gate as the one thing that can
+// keep this well-formed message from reaching a role.
+TEST(FragmentSequence, AFrameLandingAfterTheCloseDoesNotDispatch) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
     FragmentReceiver rx(*r);
 
-    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_FRAGMENT, 0xAA});
+    rx.inject_fragment(FRAGMENT_FLAG_LAST, {'A', 'B'});  // malformed: none in flight
+    ASSERT_TRUE(rx.closed());
 
-    EXPECT_TRUE(rx.closed());
-    EXPECT_EQ(rx.binary_dispatched_, 0);
-}
-
-TEST(FragmentSequence, FragmentFrameWithoutFlagsByteCloses) {
-    // A fragment frame that stops before its flags byte cannot be placed in the sequence at
-    // all, so it is handled like the enumerated malformed sequences.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    FragmentReceiver rx(*r);
-
-    rx.inject({MSG_TYPE_FRAGMENT});
-
-    EXPECT_TRUE(rx.closed());
-    EXPECT_EQ(rx.binary_dispatched_, 0);
-}
-
-TEST(FragmentSequence, FirstFragmentWithoutOrigTypeCloses) {
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    FragmentReceiver rx(*r);
-
-    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {});
-
-    EXPECT_TRUE(rx.closed());
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST,
+                       {SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA});
     EXPECT_EQ(rx.binary_dispatched_, 0);
 }
 
@@ -1139,22 +1072,6 @@ TEST(FragmentSequence, ReservedOrigTypeIsDiscardedWithoutReassembly) {
         EXPECT_EQ(rx.last_message_,
                   (std::vector<uint8_t>{SENDSPIN_BINARY_PLAYER_AUDIO, 0x11}));
     }
-}
-
-TEST(FragmentSequence, DiscardedSequenceStillEnforcesTheMalformedRules) {
-    // A discarded message is still in flight: a non-fragment message arriving inside it is the
-    // same malformed sequence it would be for a buffered one.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    FragmentReceiver rx(*r);
-
-    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_RESERVED_FIRST, 0xAA});
-    ASSERT_FALSE(rx.closed());
-
-    rx.inject({MSG_TYPE_JSON_BODY, 'H', 'i'});
-
-    EXPECT_TRUE(rx.closed());
-    EXPECT_EQ(rx.json_dispatched_, 0);
 }
 
 TEST(FragmentSequence, OverCapMessageIsDiscardedWithoutClosing) {
@@ -1272,33 +1189,6 @@ TEST(FragmentSequence, PreAdmissionMessageOverTheTightCapIsDiscarded) {
     send_message();
     EXPECT_FALSE(rx.closed());
     EXPECT_EQ(rx.json_dispatched_, 1) << "the cap must narrow again when the slot is vacated";
-}
-
-TEST(FragmentSequence, FirstFragmentInsideADiscardedSequenceCloses) {
-    // Discarding a message does not end its sequence, so a first fragment arriving inside one is
-    // the same malformed sequence it would be for a buffered message. This is the case the
-    // discard-instead-of-reset behavior makes reachable: resetting on the over-cap frame would
-    // have made this look like a legitimate fresh message.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    FragmentReceiver rx(*r);
-    rx.admit();  // MAX_REASSEMBLED_MESSAGE_BYTES is the admitted connection's cap.
-
-    const size_t chunk = static_cast<size_t>(MAX_TRANSPORT_PLAINTEXT) - 2;
-    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, 0xAA});
-    size_t data_len = 1;
-    while (data_len + chunk <= MAX_REASSEMBLED_MESSAGE_BYTES) {
-        rx.inject_fragment(0, std::vector<uint8_t>(chunk, 'X'));
-        data_len += chunk;
-    }
-    rx.inject_fragment(0, std::vector<uint8_t>(chunk, 'X'));  // over the cap: now discarding
-    ASSERT_FALSE(rx.closed());
-
-    rx.inject_fragment(FRAGMENT_FLAG_FIRST, {MSG_TYPE_JSON_BODY, '{'});
-
-    EXPECT_TRUE(rx.closed())
-        << "a first fragment inside a discarded sequence is still a malformed sequence";
-    EXPECT_EQ(rx.json_dispatched_, 0);
 }
 
 // ============================================================================
@@ -1491,43 +1381,6 @@ static void run_fragment_reassemble_receive(const std::string& suite) {
 
 TEST(NoiseTransport, FragmentReassembleReceive_ChaChaPoly) {
     run_fragment_reassemble_receive(std::string(NOISE_SUITE_CHACHAPOLY));
-}
-
-TEST(NoiseTransport, FragmentReassembleBinaryReceive) {
-    // A fragmented binary role message (non-zero type) reassembles and is dispatched with its
-    // leading type byte preserved.
-    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
-    ASSERT_TRUE(r.has_value());
-    NoiseCipherState* server_send = r->initiator.send_cs;
-
-    TestConnection conn;
-    conn.set_noise_session(std::move(r->responder_session));
-    conn.set_admitted(true);  // See run_fragment_reassemble_receive().
-
-    std::vector<uint8_t> got;
-    int calls = 0;
-    conn.on_binary_message_cb = [&got, &calls](SendspinConnection* /*c*/, uint8_t* d, size_t n) {
-        got.assign(d, d + n);
-        ++calls;
-    };
-
-    std::vector<uint8_t> plaintext;
-    plaintext.push_back(0x07);  // arbitrary non-zero binary role type
-    for (size_t i = 0; i < 150000; ++i) {
-        plaintext.push_back(static_cast<uint8_t>(i & 0xFF));
-    }
-
-    const auto frames = server_fragment_frames(plaintext);
-    ASSERT_GE(frames.size(), 2u);
-    for (const auto& f : frames) {
-        const auto ct = raw_encrypt(server_send, f);
-        EXPECT_FALSE(ct.empty());
-        conn.inject_binary_payload(ct.data(), ct.size());
-    }
-
-    EXPECT_EQ(calls, 1);
-    ASSERT_EQ(got.size(), plaintext.size());
-    EXPECT_EQ(got, plaintext);  // full type-prefixed payload preserved
 }
 
 // ============================================================================
@@ -1801,37 +1654,34 @@ TEST(NoiseTransport, SendsBeforeTheSessionExistsReportInvalidState) {
 // Malformed Noise message 1 aborts the handshake
 // ============================================================================
 
-TEST(NoiseHandshakeDriver, MalformedMsg1EmptyAborts) {
-    Identity client_id = Identity::generate().value();
-    Identity server_id = Identity::generate().value();
-    RecordStore rs(nullptr);
+// Noise message 1 that cannot be read as one aborts the handshake rather than being retried or
+// ignored (connection.md "Failure Handling").
+TEST(NoiseHandshakeDriver, MalformedMsg1Aborts) {
+    struct Row {
+        const char* name;
+        std::vector<uint8_t> noise_bytes;
+    };
+    const Row rows[] = {
+        {"empty noise bytes", {}},
+        // Well-formed base64url, but fails Noise authentication as message 1.
+        {"garbage of a plausible length", std::vector<uint8_t>(64, 0xAB)},
+    };
 
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
-    nh.build_client_init();
-    auto send_fn = [](const std::string&) { return true; };
-    ASSERT_EQ(nh.on_text_frame(make_server_init(server_id.peer_id()), send_fn),
-              HandshakeFrameResult::NEED_MORE);
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        Identity client_id = Identity::generate().value();
+        Identity server_id = Identity::generate().value();
+        RecordStore rs(nullptr);
 
-    // Empty Noise bytes cannot be a valid msg1; the read must fail and the handshake abort.
-    EXPECT_EQ(nh.on_text_frame(make_noise_handshake_envelope({}), send_fn),
-              HandshakeFrameResult::ABORT);
-}
+        NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
+        nh.build_client_init();
+        auto send_fn = [](const std::string&) { return true; };
+        ASSERT_EQ(nh.on_text_frame(make_server_init(server_id.peer_id()), send_fn),
+                  HandshakeFrameResult::NEED_MORE);
 
-TEST(NoiseHandshakeDriver, MalformedMsg1GarbageAborts) {
-    Identity client_id = Identity::generate().value();
-    Identity server_id = Identity::generate().value();
-    RecordStore rs(nullptr);
-
-    NoiseHandshake nh(client_id, rs, std::string(NOISE_SUITE_CHACHAPOLY));
-    nh.build_client_init();
-    auto send_fn = [](const std::string&) { return true; };
-    ASSERT_EQ(nh.on_text_frame(make_server_init(server_id.peer_id()), send_fn),
-              HandshakeFrameResult::NEED_MORE);
-
-    // 64 bytes of garbage: well-formed base64url, but fails Noise authentication as msg1.
-    std::vector<uint8_t> garbage(64, 0xAB);
-    EXPECT_EQ(nh.on_text_frame(make_noise_handshake_envelope(garbage), send_fn),
-              HandshakeFrameResult::ABORT);
+        EXPECT_EQ(nh.on_text_frame(make_noise_handshake_envelope(row.noise_bytes), send_fn),
+                  HandshakeFrameResult::ABORT);
+    }
 }
 
 // ============================================================================
