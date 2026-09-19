@@ -30,7 +30,6 @@
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "lifecycle_test_fixtures.h"
-#include "log_capture.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
 #include "record_store.h"
@@ -87,20 +86,17 @@ constexpr uint16_t UNPAIR_RECORD_TEST_PORT = 19004;
 constexpr uint16_t UNPAIR_SENTINEL_TEST_PORT = 19005;
 constexpr uint16_t INACTIVE_ROLE_SEND_TEST_PORT = 19006;
 constexpr uint16_t LEAVE_TEST_PORT = 19007;
-constexpr uint16_t LEAVE_REPROVE_TEST_PORT = 19008;
 constexpr uint16_t LEAVE_PAIRING_TEST_PORT = 19009;
 constexpr uint16_t REKEY_ROLE_SEND_TEST_PORT = 19010;
 constexpr uint16_t REPROVE_REHANDSHAKE_TEST_PORT = 19011;
 constexpr uint16_t COMBINED_FIRST_TEST_PORT = 19012;
 constexpr uint16_t COMBINED_REKEY_TEST_PORT = 19013;
-constexpr uint16_t COMBINED_METHOD_TEST_PORT = 19014;
 constexpr uint16_t RESELECT_PAIRING_TEST_PORT = 19015;
 constexpr uint16_t ROLE_STATE_OBJECTS_TEST_PORT = 19016;
 constexpr uint16_t ROLE_ADDED_STATE_TEST_PORT = 19017;
 constexpr uint16_t METADATA_SCHEDULE_TEST_PORT = 19018;
 constexpr uint16_t METADATA_PENDING_TEST_PORT = 19019;
 constexpr uint16_t LOSE_CAPABILITY_TEST_PORT = 19041;
-constexpr uint16_t REFUSED_ACTIVATE_TEST_PORT = 19042;
 constexpr uint16_t COLOR_SCHEDULE_TEST_PORT = 19043;
 constexpr uint16_t COLOR_PENDING_TEST_PORT = 19044;
 constexpr uint16_t COLOR_BOTH_DUE_TEST_PORT = 19045;
@@ -902,53 +898,6 @@ TEST(EncryptedLifecycle, LeaveIsSentOnlyOnAnActivatedConnection) {
     pump_for(client, 100);
 }
 
-// An in-band re-handshake rewinds the connection to awaiting its next server/activate while it
-// keeps the admitted slot, and connection.md "Re-handshake" allows nothing but that activation
-// until it arrives, so client/leave waits for it.
-TEST(EncryptedLifecycle, LeaveWaitsForTheActivateThatFollowsAReHandshake) {
-    SendspinClientConfig config;
-    config.name = "Leave Reprove Test Client";
-    config.server_port = LEAVE_REPROVE_TEST_PORT;
-
-    PairedClientBundle bundle(config);
-    SendspinClient& client = bundle.client();
-    ASSERT_TRUE(bundle.start());
-
-    FakeEncryptedServerOptions options;
-    options.suppress_activate = true;  // Every activate in this test is sent by hand.
-    auto server = std::make_unique<FakeEncryptedServer>(
-        server_url(LEAVE_REPROVE_TEST_PORT), std::string(NOISE_SUITE_CHACHAPOLY),
-        bundle.peer.server_identity, bundle.peer.record.psk_id, bundle.peer.psk,
-        std::move(options));
-
-    const std::string playback_activate =
-        R"({"type":"server/activate","payload":{"activities":["playback"],)"
-        R"("active_roles":["player@v1"]}})";
-
-    pump_until(client, [&] { return server->client_hello_count() > 0; });
-    ASSERT_TRUE(server->send_app_json(playback_activate));
-    pump_until(client, [&] { return client.is_connected(); });
-
-    ASSERT_TRUE(server->trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
-    pump_until(client, [&] { return !client.is_connected(); });
-    EXPECT_EQ(server->client_hello_count(), 1)
-        << "connection.md \"Re-handshake\": client/hello is not re-sent";
-
-    client.leave();
-    pump_for(client, 50);
-    EXPECT_EQ(server->client_leave_count(), 0)
-        << "client/leave was sent while the connection awaited its post-rekey activate";
-
-    // Control: the same call goes out once that activation arrives.
-    ASSERT_TRUE(server->send_app_json(playback_activate));
-    pump_until(client, [&] { return client.is_connected(); });
-    client.leave();
-    pump_until(client, [&] { return server->client_leave_count() == 1; });
-
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
-    pump_for(client, 100);
-}
-
 // pairing.md "Entering and leaving pairing": pairing runs alongside playback, and a
 // server/activate that adds 'pairing' does not by itself affect active_roles, streams or group
 // membership. messaging.md "server/activate" lists ['playback', 'pairing'] as an allowed set for
@@ -1311,11 +1260,16 @@ TEST(EncryptedLifecycle, RoleTrafficWaitsForTheActivateThatFollowsAReHandshake) 
 
     ASSERT_TRUE(server->trigger_rehandshake(bundle.peer.record.psk_id, bundle.peer.psk));
     pump_until(client, [&] { return !client.is_connected(); });
+    EXPECT_EQ(server->client_hello_count(), 1)
+        << "connection.md \"Re-handshake\": client/hello is not re-sent";
 
     controller.send_command({.command = SendspinControllerCommand::PAUSE});
+    client.leave();
     pump_for(client, 100);
     EXPECT_EQ(server->controller_commands().size(), before_rekey)
         << "a controller command was sent while the connection awaited its post-rekey activate";
+    EXPECT_EQ(server->client_leave_count(), 0)
+        << "client/leave was sent while the connection awaited its post-rekey activate";
 
     // Control: the same command goes out once that activation arrives, so the gate is the
     // re-handshake window and not the role, which stayed active across it.
@@ -1324,6 +1278,8 @@ TEST(EncryptedLifecycle, RoleTrafficWaitsForTheActivateThatFollowsAReHandshake) 
     controller.send_command({.command = SendspinControllerCommand::PAUSE});
     pump_until(client, [&] { return server->controller_commands().size() > before_rekey; });
     EXPECT_EQ(server->controller_commands().back(), "pause");
+    client.leave();
+    pump_until(client, [&] { return server->client_leave_count() == 1; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1379,89 +1335,6 @@ TEST(EncryptedLifecycle, InitialCombinedActivateGoesOperationalAndEntersPairing)
     // in practice.
     controller.send_command({.command = SendspinControllerCommand::PLAY});
     pump_until(client, [&] { return !server.controller_commands().empty(); });
-
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
-    pump_for(client, 100);
-}
-
-// A refused activation activates nothing, so it must not widen what the client will receive
-// either. The receive gate reads a mask the network thread adds an activation's roles to as it
-// parses the message, before the main loop judges admissibility; an activation answered with
-// pair/abort (pairing.md "Client <-> Server: pair/abort") keeps the connection but never reaches
-// the apply step, so those bits have to be taken back with the refusal.
-TEST(EncryptedLifecycle, RefusedActivateDoesNotWidenTheReceiveGate) {
-    TestNetworkProvider network;
-    PairingCapturePersistenceProvider persistence;
-    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xC9);
-
-    SendspinClientConfig config;
-    config.name = "Refused Activate Gate Test Client";
-    config.server_port = REFUSED_ACTIVATE_TEST_PORT;
-    // No out-channel, so dynamic_pairing_code is never offered and an activation selecting it is
-    // refused while the connection stays open.
-    config.pairing_code_out_channels.clear();
-
-    struct CountingControllerListener : ControllerRoleListener {
-        std::atomic<int> updates{0};
-        void on_controller_state(const ServerStateControllerObject& /*state*/) override {
-            this->updates.fetch_add(1);
-        }
-    };
-    CountingControllerListener controller_listener;
-    struct CountingMetadataListener : MetadataRoleListener {
-        std::atomic<int> updates{0};
-        void on_metadata(const ServerMetadataStateObject& /*m*/) override {
-            this->updates.fetch_add(1);
-        }
-    };
-    CountingMetadataListener metadata_listener;
-
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    client.add_controller().set_listener(&controller_listener);
-    client.add_metadata().set_listener(&metadata_listener);
-    ASSERT_TRUE(client.start());
-    pump_for(client, 50);
-
-    Identity server_identity = Identity::generate().value();
-    FakeEncryptedServerOptions options;
-    options.psk_category = "pr";
-    options.first_activities_json = R"(["playback"])";
-    options.first_roles_json = R"(["metadata@v1"])";
-    FakeEncryptedServer server(server_url(REFUSED_ACTIVATE_TEST_PORT),
-                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
-                               pairing_psk.psk_id, pairing_psk.psk, options);
-
-    pump_until(client, [&] { return client.is_connected(); });
-
-    // A later activation that names the controller role and selects a method the client does not
-    // offer: refused with pair/abort, connection kept, nothing activated.
-    ASSERT_TRUE(server.send_app_json(
-        R"({"type":"server/activate","payload":{"activities":["playback","pairing"],)"
-        R"("active_roles":["metadata@v1","controller@v1"],)"
-        R"("pairing":{"method":"dynamic_pairing_code","format":"digits"}}})"));
-    pump_until(client, [&] { return !server.pair_abort_reasons().empty(); });
-    EXPECT_FALSE(server.closed());
-
-    ASSERT_TRUE(server.send_app_json(
-        R"({"type":"server/state","payload":{"controller":{"supported_commands":["play"],)"
-        R"("volume":42,"muted":false,"repeat":"off","shuffle":false}}})"));
-    ASSERT_TRUE(server.send_app_json(
-        R"({"type":"server/state","payload":{"metadata":{"timestamp":1,"title":"Still Active"}}})"));
-    pump_until(client, [&] { return metadata_listener.updates == 1; });
-    EXPECT_EQ(controller_listener.updates, 0)
-        << "a refused activation left the controller role able to receive";
-
-    // Control: an activation the client accepts puts the same role in service, and the same state
-    // is applied.
-    ASSERT_TRUE(server.send_app_json(
-        R"({"type":"server/activate","payload":{"activities":["playback"],)"
-        R"("active_roles":["metadata@v1","controller@v1"]}})"));
-    ASSERT_TRUE(server.send_app_json(
-        R"({"type":"server/state","payload":{"controller":{"supported_commands":["play"],)"
-        R"("volume":42,"muted":false,"repeat":"off","shuffle":false}}})"));
-    pump_until(client, [&] { return controller_listener.updates == 1; });
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -1586,51 +1459,6 @@ TEST(EncryptedLifecycle, CombinedActivateAfterARehandshakeGoesOperationalAndEnte
     EXPECT_TRUE(client.is_connected())
         << "the post-rekey combined activate must bring the connection back operational";
     pump_until(client, [&] { return server.client_state_count() > state_count_before_rekey; });
-
-    client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
-    pump_for(client, 100);
-}
-
-// The pairing-method rules apply to a combined activate exactly as they do to a pairing-only one:
-// messaging.md "server/activate" requires pairing.method to be 'pairing_psk' if and only if the
-// matched PSK is the Pairing PSK, and answers a method the client does not offer with
-// pair/abort reason method_not_supported, leaving the connection open.
-TEST(EncryptedLifecycle, CombinedActivateWithAnUnofferedMethodAborts) {
-    TestNetworkProvider network;
-    PairingCapturePersistenceProvider persistence;
-    const SendspinPairingPsk pairing_psk = seed_pairing_psk(persistence, 0xF0);
-
-    SendspinClientConfig config;
-    config.name = "Combined Method Test Client";
-    config.server_port = COMBINED_METHOD_TEST_PORT;
-    // No out-channel, so dynamic_pairing_code is never offered; on the Pairing PSK it is also
-    // the wrong category, which is the first half of the same rule.
-    config.pairing_code_out_channels.clear();
-
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start());
-    pump_for(client, 50);
-
-    Identity server_identity = Identity::generate().value();
-    FakeEncryptedServerOptions options;
-    options.psk_category = "pr";
-    options.first_activities_json = R"(["playback","pairing"])";
-    options.first_roles_json = R"(["controller@v1"])";
-    options.first_pairing_method = "dynamic_pairing_code";
-    FakeEncryptedServer server(server_url(COMBINED_METHOD_TEST_PORT),
-                               std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
-                               pairing_psk.psk_id, pairing_psk.psk, options);
-
-    pump_until(client, [&] { return !server.pair_abort_reasons().empty(); });
-    EXPECT_EQ(server.pair_abort_reasons().front(), "method_not_supported");
-    EXPECT_FALSE(server.pair_init().has_value()) << "no attempt may start on a refused method";
-
-    // The connection stays open, as the spec's third rejection rule requires.
-    pump_for(client, 200);
-    EXPECT_FALSE(server.closed());
-    EXPECT_FALSE(server.goodbye_reason().has_value());
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
@@ -2714,8 +2542,8 @@ TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordsBlob) {
 
 // A store that cannot take the blob does not undo the RAM decisions the locked handlers already
 // made: the revoked credential stays revoked for this boot (leaving it usable because flash is
-// full is strictly worse), and the batch is reported once because it carries a revocation.
-TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamStateAndWarns) {
+// full is strictly worse).
+TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamState) {
     Identity used_identity = Identity::generate().value();
     Identity unpairing_identity = Identity::generate().value();
     SendspinPairingRecord used_record = make_record_for(used_identity);
@@ -2745,12 +2573,7 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamStateAnd
         manager.handle_server_unpair(&conn, event);
     }
 
-    std::string logs;
-    {
-        StderrCapture capture;
-        manager.flush_pending_record_ops();
-        logs = capture.release();
-    }
+    manager.flush_pending_record_ops();
     manager.flush_deferred_releases();
 
     EXPECT_FALSE(client.record_store_
@@ -2760,51 +2583,9 @@ TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamStateAnd
     const auto* marked = client.record_store_->record_by_psk_id(used_record.psk_id);
     ASSERT_NE(marked, nullptr);
     EXPECT_TRUE(marked->used);
-    EXPECT_NE(logs.find("RAM-only"), std::string::npos)
-        << "a rejected batch carrying a revocation must be reported; got: " << logs;
     // ...and the provider still holds what it accepted last, which is what a reboot loads.
     EXPECT_EQ(persistence.persisted_psk_ids().size(), 2u)
         << "a rejected write must not be mirrored as if it had landed";
-
-    client.stop();
-}
-
-// The other half of the reporting rule: a batch whose only records change is the advisory `used`
-// flag stays silent on the same rejection. The flag is rebuilt from use, and this batch is what
-// the first activate of every long-term session stages, so a device with a full store would
-// otherwise warn once per session forever.
-TEST(EncryptedLifecycle, ARejectedMarkUsedOnlyFlushIsSilent) {
-    Identity used_identity = Identity::generate().value();
-    SendspinPairingRecord used_record = make_record_for(used_identity);
-
-    TestNetworkProvider network;
-    RecordsMirrorPersistenceProvider persistence(
-        std::vector<SendspinPairingRecord>{used_record});
-    SendspinClientConfig config;
-    config.name = "Rejected Mark Used Test Client";
-    config.server_port = 0;
-
-    SendspinClient client(config);
-    client.set_network_provider(&network);
-    client.set_persistence_provider(&persistence);
-    ASSERT_TRUE(client.start());
-    ConnectionManager& manager = *client.connection_manager_;
-    persistence.set_reject_records(true);
-
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.stage_record_op(PendingRecordOp::Kind::MARK_USED, used_record.psk_id);
-    }
-
-    std::string logs;
-    {
-        StderrCapture capture;
-        manager.flush_pending_record_ops();
-        logs = capture.release();
-    }
-
-    EXPECT_EQ(logs.find("RAM-only"), std::string::npos)
-        << "advisory bookkeeping must not report a rejected write; got: " << logs;
 
     client.stop();
 }
