@@ -188,15 +188,19 @@ public:
 /// stored, and `PAIR_CONFIG` when no pairing config could be decoded.
 ///
 /// Re-entrancy: implementations must NOT call back into the library (SendspinClient or any of
-/// its objects) from inside load_blob/save_blob/erase_blob. The library invokes these methods
-/// while holding internal locks (e.g. the record store's mutex around a `RECORDS` save), so a
-/// callback into the library from a provider method can deadlock.
+/// its objects) from inside load_blob/save_blob/erase_blob. Every call is made from the middle
+/// of a library step that is part-way through updating the state the call is about, and the
+/// library is not re-entrant there. No internal lock is held across the call: the record store
+/// encodes its blob under its mutex and saves after dropping it, and the connection manager
+/// stages the writes its lifecycle handlers decide on and performs them once `conn_ptr_mutex_`
+/// is dropped.
 ///
-/// Blocking: for the same reason, an implementation must perform one bounded storage operation
-/// and return, not add blocking of its own (a synchronous retry loop, a multi-second fsync
-/// chain). Held locks are on the call stack for the duration. A failed write should be reported
-/// by returning false rather than retried inline; the library already handles that (durability
-/// warnings) as described below on save_blob.
+/// Blocking: an implementation must perform one bounded storage operation and return, not add
+/// blocking of its own (a synchronous retry loop, a multi-second fsync chain). The main loop is
+/// stopped for the duration, so everything it drives (audio scheduling, time sync, role
+/// callbacks) waits with it. A failed write should be reported by returning false rather than
+/// retried inline; the library already handles that (durability warnings) as described below on
+/// save_blob.
 class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;

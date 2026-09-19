@@ -484,6 +484,9 @@ Every method is invoked on the main loop thread, for every key, so a provider ne
 of its own. (The one library write that originates on the network thread -- the pairing record
 committed when a pairing finalizes -- is staged internally and flushed to
 `save_blob(persistence_keys::RECORDS, ...)` from the next `loop()` tick.)
+No internal library lock is held across the call, so a slow write does not stall the audio path
+or a Noise handshake -- but it does stop the main loop for its duration, so the call must be one
+bounded storage operation, and it must not call back into the client.
 First-boot provisioning writes from inside `start()` rather than in response to a runtime
 event: `save_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stored,
 `save_blob(persistence_keys::PAIRING_PSK, ...)` when no Pairing PSK is stored, and
