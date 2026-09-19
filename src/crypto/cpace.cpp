@@ -205,7 +205,7 @@ std::array<uint8_t, CPACE_FIELD_BYTES> cpace_calculate_generator(const uint8_t* 
 }
 
 // ============================================================================
-// x25519_scalar_mult: draft-irtf-cfrg-cpace-21 scalar_mult
+// x25519_scalar_mult: RFC 7748 X25519
 //
 // Uses noise-c's dhstate to perform RFC 7748 X25519 WITH scalar clamping.
 // The clamping is done by the underlying x25519() call in dh-curve25519.c.

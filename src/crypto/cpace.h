@@ -196,7 +196,7 @@ std::vector<uint8_t> cpace_generator_string(const uint8_t* prs, size_t prs_len, 
 std::array<uint8_t, CPACE_FIELD_BYTES> cpace_elligator2(
     const std::array<uint8_t, CPACE_FIELD_BYTES>& r_le);
 
-/// @brief Decode a 32-byte little-endian value, clearing the top bit.  Mirrors _decode_u.
+/// @brief Decode a 32-byte little-endian value, clearing the top bit (RFC 7748).
 std::array<uint8_t, CPACE_FIELD_BYTES> cpace_decode_u(const uint8_t* value, size_t len);
 
 /// @brief Compute the CPace generator point.  Mirrors draft-irtf-cfrg-cpace-21

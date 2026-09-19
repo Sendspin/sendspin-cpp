@@ -473,8 +473,8 @@ struct ArtworkRoleConfig {
     /// them for the CPU.
     static constexpr unsigned DEFAULT_ARTWORK_PRIORITY = 2U;
 
-    unsigned priority{DEFAULT_ARTWORK_PRIORITY};  ///< FreeRTOS priority for the decode thread
-                                                  ///< (ESP-IDF only)
+    unsigned priority{DEFAULT_ARTWORK_PRIORITY};
+    ///< (ESP-IDF only)
 };
 
 // ============================================================================
@@ -543,8 +543,8 @@ struct VisualizerRoleConfig {
     /// them for the CPU.
     static constexpr unsigned DEFAULT_VISUALIZER_PRIORITY = 2U;
 
-    unsigned priority{DEFAULT_VISUALIZER_PRIORITY};  ///< FreeRTOS priority for the drain thread
-                                                     ///< (ESP-IDF only)
+    unsigned priority{DEFAULT_VISUALIZER_PRIORITY};
+    ///< (ESP-IDF only)
 };
 
 }  // namespace sendspin

@@ -14,7 +14,9 @@ checklists in `.claude/skills/` apply these standards to a diff.
   roles establish.
 - All main-loop-bound cross-thread state goes through the `Inbox`
   (`src/inbox.h`). Do not add new mutex-protected endpoints polled by
-  `loop()`.
+  `loop()`. The one exemption is `ConnectionManager`'s `pending_*_events_`
+  queues, which predate the rule and carry payloads the POD ring cannot: one
+  mutex, one gate atomic, one swap. Do not add a second.
 - The Inbox event ring is for ordered lifecycle events only (stream start and
   end, cleared, connection events). Latest-wins state (player state, metadata,
   progress) belongs on a collapsing `InboxSlot`, never the ring: a flood of

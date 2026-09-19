@@ -108,8 +108,7 @@ SsErr SendspinServerConnection::send_ws_frame(bool is_binary, const uint8_t* dat
     }
 
     if (!success) {
-        // SS_LOGE requires a compile-time literal format string (it is concatenated with the log
-        // prefix at compile time), so the differing wording is an if/else rather than a ternary.
+        // SS_LOGE needs a literal format string, so the two wordings are an if/else.
         if (is_binary) {
             SS_LOGE(TAG, "Failed to send binary message");
         } else {

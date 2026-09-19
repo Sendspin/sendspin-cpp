@@ -1211,9 +1211,8 @@ namespace {
 ///
 /// False for the establishment and trust-negotiation traffic a connection must be able to send
 /// before it is admitted (hello, activate, time, in-band re-handshake), and for the pairing
-/// messages, which carry their own gating on the main loop. Those are listed one by one, and the
-/// default gates, so a message type added later is refused from an unadmitted connection until
-/// someone decides otherwise here.
+/// messages, which carry their own gating on the main loop. The switch is exhaustive, so a
+/// message type added later must be listed here.
 bool requires_admitted_connection(SendspinServerToClientMessageType type) {
     switch (type) {
         case SendspinServerToClientMessageType::SERVER_HELLO:
@@ -1235,9 +1234,8 @@ bool requires_admitted_connection(SendspinServerToClientMessageType type) {
         case SendspinServerToClientMessageType::STREAM_CLEAR:
         case SendspinServerToClientMessageType::GROUP_UPDATE:
             return true;
-        default:
-            return true;
     }
+    return true;  // Unreachable for a valid enumerator; a new one fails to compile above.
 }
 
 }  // namespace
@@ -1603,9 +1601,9 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             break;
         }
         case SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE: {
-            // server/pair-finalize: server acked our client/pair-finalize. The sanctioned
+            // server/pair-finalize: server acked our client/pair-finalize. A sanctioned
             // exception to the receive-path rule (conventions.md "Threading and cross-thread
-            // state"), for the reason below.
+            // state"):
             // Commit the pending pairing record to RAM synchronously HERE (network thread), NOT
             // deferred to the main loop: the server rekeys onto the new long-term PSK immediately
             // after this ack, and its re-handshake msg1 (the next message on this same thread)

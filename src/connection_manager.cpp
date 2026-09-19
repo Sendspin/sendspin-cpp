@@ -2638,6 +2638,7 @@ bool ConnectionManager::pairing_round_limit_reached() const {
 }
 
 void ConnectionManager::handle_pairing_window_confirmed() {
+    // Without a record store there is nothing to pair with, so the gesture is ignored.
     if (this->client_->record_store_ == nullptr) {
         return;
     }

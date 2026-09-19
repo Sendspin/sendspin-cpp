@@ -289,9 +289,9 @@ struct PairingUiSnapshot {
  * state is tracked as independent flags rather than a single phase enum, see the
  * lifecycle-flag axes note above SendspinConnection's atomic flag members in connection.h.
  *
- * Every path in this class runs between SendspinClient::start() and ::stop(), which is what
- * "running" means for the client, so client_->record_store_ and client_->identity_ are non-null
- * throughout and are not null-checked here.
+ * Every event-driven path here runs between SendspinClient::start() and ::stop(), so
+ * client_->record_store_ and client_->identity_ are non-null and are not null-checked, except
+ * where a site says why.
  *
  * Typical usage:
  *  1. Construct with a `SendspinClient*`.
@@ -621,8 +621,8 @@ private:
     void flush_pending_admission();
 
     /// @brief Sets has_pending_events_, the lock-free gate loop() polls before acquiring
-    /// conn_mutex_. The atomic's only writer outside swap_out_pending_events(), so a pending
-    /// event can never be queued without arming the gate. Caller must hold conn_mutex_.
+    /// conn_mutex_. It is the atomic's only writer outside swap_out_pending_events(), so nothing
+    /// can be queued without arming the gate. Caller must hold conn_mutex_.
     void mark_pending() {
         this->has_pending_events_.store(true, std::memory_order_release);
     }
