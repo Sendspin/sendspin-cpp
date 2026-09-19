@@ -107,7 +107,18 @@ SsErr SendspinServerConnection::send_ws_frame(bool is_binary, const uint8_t* dat
         on_complete(success);
     }
 
-    return success ? SsErr::OK : SsErr::FAIL;
+    if (!success) {
+        // SS_LOGE requires a compile-time literal format string (it is concatenated with the log
+        // prefix at compile time), so the differing wording is an if/else rather than a ternary.
+        if (is_binary) {
+            SS_LOGE(TAG, "Failed to send binary message");
+        } else {
+            SS_LOGE(TAG, "Failed to send text message");
+        }
+        return SsErr::FAIL;
+    }
+
+    return SsErr::OK;
 }
 
 bool SendspinServerConnection::send_time_message() {
@@ -139,7 +150,9 @@ void SendspinServerConnection::handle_message(const std::string& data, bool is_b
         uint8_t* dest = this->prepare_receive_buffer(data.size());
         if (dest == nullptr) {
             // Dispatching would hand a stale/partial buffer to the protocol layer. Drop the
-            // connection instead: the close event tears the slot down on the main loop.
+            // connection instead: the close event tears the slot down on the main loop. The
+            // payload is reset here because the ws_server close path does not do it, unlike the
+            // client connections' close handling.
             SS_LOGE(TAG, "Allocation failed, dropping connection");
             this->disable_message_dispatch();
             this->reset_websocket_payload();
