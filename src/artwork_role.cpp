@@ -634,6 +634,9 @@ void ArtworkRole::Impl::handle_stream_end(uint32_t generation) {
 }
 
 void ArtworkRole::Impl::handle_stream_clear(uint32_t generation) {
+    // No accepts(generation) gate, unlike the player's and visualizer's clear: both effects below
+    // are a subset of cleanup()'s, so a clear that lands after a teardown changes nothing. The
+    // queued event still carries the generation and the drain discards it.
     this->stream_active = false;
     this->discard_all_pending();
 
