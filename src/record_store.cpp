@@ -457,13 +457,12 @@ void RecordStore::remove_record(const std::string& psk_id) {
     }
 }
 
-void RecordStore::mark_record_used(const std::string& psk_id) {
-    std::string encoded;
+bool RecordStore::note_record_used(const std::string& psk_id) {
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
         const size_t idx = this->find_index(psk_id);
         if (idx == NPOS) {
-            return;
+            return false;
         }
 
         // Keeps records_ least-recently-used first for eviction (see evict_one_locked).
@@ -482,9 +481,20 @@ void RecordStore::mark_record_used(const std::string& psk_id) {
         //
         // The `used` flag is durable, so its first flip is written.
         if (this->records_.back().used) {
-            return;
+            return false;
         }
         this->records_.back().used = true;
+    }
+    return true;
+}
+
+void RecordStore::mark_record_used(const std::string& psk_id) {
+    if (!this->note_record_used(psk_id)) {
+        return;
+    }
+    std::string encoded;
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
         encoded = this->encode_records_locked();
     }
     // Best-effort: the flag is advisory bookkeeping, so a rejected write is not reported.

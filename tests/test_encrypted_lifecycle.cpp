@@ -2554,7 +2554,14 @@ public:
         }
         std::lock_guard<std::mutex> lock(this->mutex_);
         this->records_ = std::move(decoded.value());
+        ++this->records_saves_;
         return true;
+    }
+
+    /// @brief How many times the records blob has been written.
+    [[nodiscard]] size_t records_saves() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->records_saves_;
     }
 
     /// @brief The psk_ids the store would load on the next boot.
@@ -2571,6 +2578,7 @@ public:
 private:
     mutable std::mutex mutex_;
     std::vector<SendspinPairingRecord> records_;
+    size_t records_saves_{0};
     bool unpaired_access_enabled_{false};
 };
 
@@ -2637,6 +2645,58 @@ TEST(EncryptedLifecycle, UnpairRemovesOnlyTheMatchedRecordFromStoreAndStorage) {
 
     client.disconnect(SendspinGoodbyeReason::SHUTDOWN);
     pump_for(client, 100);
+}
+
+// Every records op rewrites the whole array, so a tick carrying more than one of them must still
+// reach the provider once: on ESP each save is an NVS erase cycle, and flash wear is a budget
+// (docs/conventions.md, "Embedded resource discipline"). The two ops here are the pair a real tick
+// carries, staged by the activate drain and the unpair drain in the same locked block, on two
+// different records so both halves genuinely need the write.
+TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteTheBlobOnce) {
+    Identity used_identity = Identity::generate().value();
+    Identity unpairing_identity = Identity::generate().value();
+    SendspinPairingRecord used_record = make_record_for(used_identity);
+    SendspinPairingRecord unpairing_record = make_record_for(unpairing_identity);
+
+    TestNetworkProvider network;
+    RecordsMirrorPersistenceProvider persistence(
+        std::vector<SendspinPairingRecord>{used_record, unpairing_record});
+    SendspinClientConfig config;
+    config.name = "Coalesced Record Write Test Client";
+    // No listening port is used: the manager is driven directly.
+    config.server_port = 0;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    ConnectionManager& manager = *client.connection_manager_;
+    const size_t saves_before = persistence.records_saves();
+
+    HoldTestConnection conn;
+    ServerUnpairEvent event;
+    event.matched_psk_id = unpairing_record.psk_id;
+    event.psk_category = PskCategory::LONG_TERM;
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        // What process_activate_event() stages on the first activate of a long-term session.
+        manager.stage_record_op(PendingRecordOp::Kind::MARK_USED, used_record.psk_id);
+        manager.handle_server_unpair(&conn, event);
+    }
+
+    manager.flush_pending_record_ops();
+    manager.flush_deferred_releases();
+
+    EXPECT_EQ(persistence.records_saves() - saves_before, 1u)
+        << "the tick's record ops must land as one blob write";
+    // Control: the one blob carries both changes, so this is coalescing rather than a lost write.
+    EXPECT_EQ(persistence.persisted_psk_ids(), std::vector<std::string>{used_record.psk_id})
+        << "the written blob must hold exactly the surviving record";
+    const auto* marked = client.record_store_->record_by_psk_id(used_record.psk_id);
+    ASSERT_NE(marked, nullptr);
+    EXPECT_TRUE(marked->used) << "the mark-used op was dropped instead of coalesced";
+
+    client.stop();
 }
 
 // The revocation itself is not deferred, only its blob write. handle_server_unpair() erases the

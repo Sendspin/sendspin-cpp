@@ -221,7 +221,18 @@ public:
     /// No-op if absent.
     void remove_record(const std::string& psk_id);
 
-    /// @brief Flag the record at psk_id as used and make it the most recently used one.
+    /// @brief Flag the record at psk_id as used and make it the most recently used one in RAM,
+    /// leaving the durable half to a later persist_records(). No-op if absent.
+    ///
+    /// The RAM-only half of mark_record_used(), for a caller batching several mutations behind
+    /// one blob write.
+    /// @param psk_id The record to flag.
+    /// @return true when the durable `used` flag flipped, and the array therefore needs
+    ///         persisting; false when only the RAM recency order moved (see mark_record_used()).
+    [[nodiscard]] bool note_record_used(const std::string& psk_id);
+
+    /// @brief Flag the record at psk_id as used, make it the most recently used one, and persist
+    /// the flag's first flip.
     ///
     /// `records_` is kept least-recently-used first, the order eviction reads (see
     /// store_record_superseding). The reorder stays in RAM; only the first flip of the durable

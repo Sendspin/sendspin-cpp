@@ -1680,18 +1680,25 @@ void ConnectionManager::flush_pending_record_ops() {
         ops.swap(this->pending_record_ops_);
         this->refresh_record_ops_size_hint();
     }
+    // Every records op rewrites the WHOLE array, so applying their RAM halves first and saving
+    // once expresses the same final state in one NVS erase cycle instead of one per op. The
+    // last-played value is a different key and keeps its own write.
+    bool records_dirty = false;
     for (const auto& op : ops) {
         switch (op.kind) {
             case PendingRecordOp::Kind::MARK_USED:
-                this->client_->record_store_->mark_record_used(op.value);
+                records_dirty |= this->client_->record_store_->note_record_used(op.value);
                 break;
             case PendingRecordOp::Kind::PERSIST_RECORDS:
-                this->client_->record_store_->persist_records();
+                records_dirty = true;
                 break;
             case PendingRecordOp::Kind::LAST_PLAYED:
                 this->client_->write_last_played_server(op.value);
                 break;
         }
+    }
+    if (records_dirty) {
+        this->client_->record_store_->persist_records();
     }
 }
 
