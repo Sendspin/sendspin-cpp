@@ -1215,6 +1215,14 @@ TEST(FragmentSequence, PreAdmissionMessageOverTheTightCapIsDiscarded) {
         << "the admitted connection must reassemble a message the 1 MiB cap admits";
     EXPECT_EQ(rx.last_message_.size(), chunk * chunks) << "the JSON body is the message minus "
                                                           "its orig_type byte";
+
+    // Losing the slot narrows the cap again. A dropped connection keeps receiving through its
+    // deferred-release window, which is the whole point: it must not be able to hold the
+    // admitted connection's buffer once it is no longer the admitted connection.
+    rx.conn_.set_admitted(false);
+    send_message();
+    EXPECT_FALSE(rx.closed());
+    EXPECT_EQ(rx.json_dispatched_, 1) << "the cap must narrow again when the slot is vacated";
 }
 
 TEST(FragmentSequence, FirstFragmentInsideADiscardedSequenceCloses) {
