@@ -2270,7 +2270,9 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBoundedByBytesBeforeMessages) {
 
 // Control: the replay runs every held type's real handler to completion. One message of each
 // type, replayed in one admission, so a handler that throws the replay off (or blocks in it)
-// takes the metadata message behind it down with it.
+// takes the metadata message behind it down with it. The group name and the metadata title are
+// what say the handlers ran rather than being walked past: a held type whose arm does nothing is
+// invisible to the trailing message alone.
 TEST(EncryptedLifecycle, EveryHeldMessageTypeReplaysThroughItsHandler) {
     HoldTestClient bundle("Replay Handler Test Client");
 
@@ -2295,6 +2297,9 @@ TEST(EncryptedLifecycle, EveryHeldMessageTypeReplaysThroughItsHandler) {
     bundle.pump();
     EXPECT_EQ(bundle.listener.updates, 1) << "the replay did not run to completion";
     EXPECT_EQ(bundle.listener.last_title, "Replayed");
+    ASSERT_TRUE(bundle.client_ref().get_group_state().group_name.has_value())
+        << "the replayed group/update never reached its handler";
+    EXPECT_EQ(*bundle.client_ref().get_group_state().group_name, "Kitchen");
 }
 
 // The two locks the client holds are ordered json_processing_mutex_ then conn_ptr_mutex_
