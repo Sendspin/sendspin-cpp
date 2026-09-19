@@ -548,10 +548,10 @@ bool RecordStore::persist_config() {
 // not in records_ when the encode ran) and is repaired by the persist_records() flush the insert
 // schedules onto the main loop.
 //
-// A resolve landing in the same gap sees the new RAM state while flash still holds the old blob.
-// That window is not new: records_ is mutated before save_blob() is ever called, and a provider
-// may reject the write outright, so RAM is the authority for the current boot either way and the
-// blob only decides what comes back after a reboot.
+// A resolve landing in the gap sees the new RAM state while flash still holds the old blob. That
+// is the answer it wants: RAM is the authority for the current boot, since a provider may reject
+// the write outright and leave the same divergence permanently, and the blob only decides what
+// comes back after a reboot.
 //
 // store_record_superseding() is the exception: it mutates records_
 // WITHOUT persisting at all, because it runs on the network thread where the provider may not be
