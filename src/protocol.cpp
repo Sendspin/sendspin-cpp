@@ -1211,9 +1211,11 @@ bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* pa
     // an absent field parses to an absent value; the state machine decides whether that is right
     // for the round it is in (pairing.md "Rounds"). A present field that does not decode to 32
     // bytes is malformed, like any other.
-    payload->nonce_a = std::nullopt;
     JsonVariantConst nonce_var = root["payload"]["nonce_A"];
     if (nonce_var.isUnbound() || nonce_var.isNull()) {
+        if (payload != nullptr) {
+            payload->nonce_a = std::nullopt;
+        }
         return true;
     }
     if (!nonce_var.is<const char*>()) {
@@ -1224,6 +1226,9 @@ bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* pa
     if (!decoded.has_value() || decoded->size() != 32) {
         SS_LOGE(TAG, "server/pair-init: nonce_A is not 32 base64url-encoded bytes");
         return false;
+    }
+    if (payload == nullptr) {
+        return true;
     }
     std::array<uint8_t, 32> nonce_a{};
     std::memcpy(nonce_a.data(), decoded->data(), nonce_a.size());
