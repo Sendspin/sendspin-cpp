@@ -30,6 +30,7 @@
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "lifecycle_test_fixtures.h"
+#include "log_capture.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
 #include "record_store.h"
@@ -2528,6 +2529,13 @@ public:
         this->unpaired_access_enabled_ = enabled;
     }
 
+    /// Stands in for a store that cannot take the records blob at all (full or read-only NVS).
+    /// A rejected write counts as neither a save nor a change to what the next boot loads.
+    void set_reject_records(bool reject) {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        this->reject_records_ = reject;
+    }
+
     std::optional<std::vector<uint8_t>> load_blob(const std::string& key) override {
         if (key == persistence_keys::PAIR_CONFIG) {
             SendspinPairingConfig config;
@@ -2544,6 +2552,11 @@ public:
     }
 
     bool save_blob(const std::string& key, const uint8_t* data, size_t len) override {
+        if (key == persistence_keys::LAST_PLAYED) {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            this->last_played_.assign(reinterpret_cast<const char*>(data), len);
+            return true;
+        }
         if (key != persistence_keys::RECORDS) {
             return true;  // The keypair and pair config are not under test here.
         }
@@ -2553,6 +2566,9 @@ public:
             return false;
         }
         std::lock_guard<std::mutex> lock(this->mutex_);
+        if (this->reject_records_) {
+            return false;
+        }
         this->records_ = std::move(decoded.value());
         ++this->records_saves_;
         return true;
@@ -2562,6 +2578,12 @@ public:
     [[nodiscard]] size_t records_saves() const {
         std::lock_guard<std::mutex> lock(this->mutex_);
         return this->records_saves_;
+    }
+
+    /// @brief The last-played server_id the store holds.
+    [[nodiscard]] std::string last_played() const {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        return this->last_played_;
     }
 
     /// @brief The psk_ids the store would load on the next boot.
@@ -2580,6 +2602,8 @@ private:
     std::vector<SendspinPairingRecord> records_;
     size_t records_saves_{0};
     bool unpaired_access_enabled_{false};
+    bool reject_records_{false};
+    std::string last_played_{};
 };
 
 /// Build a LONG_TERM record for `identity` with a random PSK.
@@ -2699,14 +2723,195 @@ TEST(EncryptedLifecycle, SeveralRecordOpsInOneTickWriteTheBlobOnce) {
     client.stop();
 }
 
+// The `used` flag is written once, on its first flip: a MARK_USED op for a record already
+// flagged carries no durable change, so the flush must not spend an NVS erase cycle on it. This
+// runs on the first activate of every long-term session, so a write here would be one per
+// connection in steady state.
+TEST(EncryptedLifecycle, AMarkUsedOpThatFlipsNothingWritesNoBlob) {
+    Identity used_identity = Identity::generate().value();
+    SendspinPairingRecord used_record = make_record_for(used_identity);
+
+    TestNetworkProvider network;
+    RecordsMirrorPersistenceProvider persistence(
+        std::vector<SendspinPairingRecord>{used_record});
+    SendspinClientConfig config;
+    config.name = "Repeat Mark Used Test Client";
+    // No listening port is used: the manager is driven directly.
+    config.server_port = 0;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    ConnectionManager& manager = *client.connection_manager_;
+
+    // Control: the first flip is durable, so it does write.
+    const size_t saves_before_first = persistence.records_saves();
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.stage_record_op(PendingRecordOp::Kind::MARK_USED, used_record.psk_id);
+    }
+    manager.flush_pending_record_ops();
+    EXPECT_EQ(persistence.records_saves() - saves_before_first, 1u)
+        << "the first flip of the durable used flag must reach the provider";
+
+    const size_t saves_before_repeat = persistence.records_saves();
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.stage_record_op(PendingRecordOp::Kind::MARK_USED, used_record.psk_id);
+    }
+    manager.flush_pending_record_ops();
+
+    EXPECT_EQ(persistence.records_saves(), saves_before_repeat)
+        << "a mark-used op that flips nothing must not rewrite the records blob";
+    const auto* marked = client.record_store_->record_by_psk_id(used_record.psk_id);
+    ASSERT_NE(marked, nullptr);
+    EXPECT_TRUE(marked->used) << "the RAM flag must still be set";
+
+    client.stop();
+}
+
+// The last-played server_id lives under its own key, so a tick that stages only that write must
+// leave the records blob alone: the two are coalesced separately, and rewriting the array for a
+// handoff would be an NVS erase cycle nothing asked for.
+TEST(EncryptedLifecycle, ALastPlayedOnlyFlushWritesNoRecordsBlob) {
+    Identity paired_identity = Identity::generate().value();
+    SendspinPairingRecord paired_record = make_record_for(paired_identity);
+
+    TestNetworkProvider network;
+    RecordsMirrorPersistenceProvider persistence(
+        std::vector<SendspinPairingRecord>{paired_record});
+    SendspinClientConfig config;
+    config.name = "Last Played Only Test Client";
+    config.server_port = 0;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    ConnectionManager& manager = *client.connection_manager_;
+    const size_t saves_before = persistence.records_saves();
+
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.stage_record_op(PendingRecordOp::Kind::LAST_PLAYED, paired_record.server_id);
+    }
+    manager.flush_pending_record_ops();
+
+    EXPECT_EQ(persistence.records_saves(), saves_before)
+        << "a last-played write must not drag the records blob along";
+    // Control: the op was performed rather than dropped.
+    EXPECT_EQ(persistence.last_played(), paired_record.server_id)
+        << "the staged last-played write never reached the provider";
+
+    client.stop();
+}
+
+// A store that cannot take the blob does not undo the RAM decisions the locked handlers already
+// made: the revoked credential stays revoked for this boot (leaving it usable because flash is
+// full is strictly worse), and the batch is reported once because it carries a revocation.
+TEST(EncryptedLifecycle, ACoalescedFlushRejectedByTheProviderKeepsTheRamStateAndWarns) {
+    Identity used_identity = Identity::generate().value();
+    Identity unpairing_identity = Identity::generate().value();
+    SendspinPairingRecord used_record = make_record_for(used_identity);
+    SendspinPairingRecord unpairing_record = make_record_for(unpairing_identity);
+
+    TestNetworkProvider network;
+    RecordsMirrorPersistenceProvider persistence(
+        std::vector<SendspinPairingRecord>{used_record, unpairing_record});
+    SendspinClientConfig config;
+    config.name = "Rejected Coalesced Write Test Client";
+    config.server_port = 0;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    ConnectionManager& manager = *client.connection_manager_;
+    persistence.set_reject_records(true);
+
+    HoldTestConnection conn;
+    ServerUnpairEvent event;
+    event.matched_psk_id = unpairing_record.psk_id;
+    event.psk_category = PskCategory::LONG_TERM;
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.stage_record_op(PendingRecordOp::Kind::MARK_USED, used_record.psk_id);
+        manager.handle_server_unpair(&conn, event);
+    }
+
+    std::string logs;
+    {
+        StderrCapture capture;
+        manager.flush_pending_record_ops();
+        logs = capture.release();
+    }
+    manager.flush_deferred_releases();
+
+    EXPECT_FALSE(client.record_store_
+                     ->resolve_by_psk_id(unpairing_record.psk_id, PskCategory::LONG_TERM)
+                     .has_value())
+        << "a rejected write must not resurrect the revoked record for this boot";
+    const auto* marked = client.record_store_->record_by_psk_id(used_record.psk_id);
+    ASSERT_NE(marked, nullptr);
+    EXPECT_TRUE(marked->used);
+    EXPECT_NE(logs.find("RAM-only"), std::string::npos)
+        << "a rejected batch carrying a revocation must be reported; got: " << logs;
+    // ...and the provider still holds what it accepted last, which is what a reboot loads.
+    EXPECT_EQ(persistence.persisted_psk_ids().size(), 2u)
+        << "a rejected write must not be mirrored as if it had landed";
+
+    client.stop();
+}
+
+// The other half of the reporting rule: a batch whose only records change is the advisory `used`
+// flag stays silent on the same rejection. The flag is rebuilt from use, and this batch is what
+// the first activate of every long-term session stages, so a device with a full store would
+// otherwise warn once per session forever.
+TEST(EncryptedLifecycle, ARejectedMarkUsedOnlyFlushIsSilent) {
+    Identity used_identity = Identity::generate().value();
+    SendspinPairingRecord used_record = make_record_for(used_identity);
+
+    TestNetworkProvider network;
+    RecordsMirrorPersistenceProvider persistence(
+        std::vector<SendspinPairingRecord>{used_record});
+    SendspinClientConfig config;
+    config.name = "Rejected Mark Used Test Client";
+    config.server_port = 0;
+
+    SendspinClient client(config);
+    client.set_network_provider(&network);
+    client.set_persistence_provider(&persistence);
+    ASSERT_TRUE(client.start());
+    ConnectionManager& manager = *client.connection_manager_;
+    persistence.set_reject_records(true);
+
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.stage_record_op(PendingRecordOp::Kind::MARK_USED, used_record.psk_id);
+    }
+
+    std::string logs;
+    {
+        StderrCapture capture;
+        manager.flush_pending_record_ops();
+        logs = capture.release();
+    }
+
+    EXPECT_EQ(logs.find("RAM-only"), std::string::npos)
+        << "advisory bookkeeping must not report a rejected write; got: " << logs;
+
+    client.stop();
+}
+
 // The revocation itself is not deferred, only its blob write. handle_server_unpair() erases the
 // record under conn_ptr_mutex_, so a Noise re-handshake on the revoked psk_id, which resolves
 // against the store on the network thread, misses it from that instant rather than for as long as
 // the writes staged ahead of it take to commit (an NVS commit each, tens of milliseconds, on ESP).
 //
-// Driving the handler directly is what pins that: the resolve below sits between the locked
-// section and flush_pending_record_ops(), which is exactly the window a staged erase would still
-// be resolvable in.
+// Driving the handler directly is what pins that: the resolve below runs inside the locked
+// section itself, which is where an erase deferred to flush_pending_record_ops() would still be
+// resolvable.
 TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     HoldTestClient bundle("Unpair Revocation Window Test Client");
     SendspinClient& client = bundle.client_ref();
@@ -2722,19 +2927,20 @@ TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     ServerUnpairEvent event;
     event.matched_psk_id = record.psk_id;
     event.psk_category = PskCategory::LONG_TERM;
+    std::optional<ResolvedPsk> resolved;
     {
         std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
         manager.handle_server_unpair(&conn, event);
+        // The handshake thread's lookup, issued while the manager lock is still held: it takes
+        // only RecordStore::mutex_, so it neither waits on nor deadlocks against this scope.
+        std::thread network([&] {
+            resolved =
+                client.record_store_->resolve_by_psk_id(record.psk_id, PskCategory::LONG_TERM);
+        });
+        network.join();
     }
-
-    // The handshake thread's lookup, with nothing flushed yet.
-    std::optional<ResolvedPsk> resolved;
-    std::thread network([&] {
-        resolved = client.record_store_->resolve_by_psk_id(record.psk_id, PskCategory::LONG_TERM);
-    });
-    network.join();
     EXPECT_FALSE(resolved.has_value())
-        << "the revoked record still resolved a handshake before the flush ran";
+        << "the revoked record still resolved a handshake while the unpair handler held the lock";
 
     // Control: only the RAM half ran under the lock. The durable half is still owed, so this is
     // a split rather than a provider write smuggled into the locked section.

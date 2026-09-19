@@ -31,6 +31,7 @@
 #include "crypto/constants.h"
 #include "crypto/keys.h"
 #include "fake_persistence.h"
+#include "log_capture.h"
 #include "file_persistence_provider.h"
 #include "platform/crypto.h"
 #include "platform/logging.h"
@@ -782,36 +783,6 @@ public:
 
 private:
     std::vector<SendspinPairingRecord> saved_{};
-};
-
-/// Captures stderr (where the host SS_LOG* macros write) for the duration of its scope, so a
-/// test can assert on the durability warning itself. The warning IS the behavioral delta of the
-/// bool return: without asserting on it, a reverted or inverted condition passes unnoticed,
-/// because the in-memory erase and the reload-after-reboot were already unconditional before.
-class StderrCapture {
-public:
-    StderrCapture() : prior_level_(platform_get_log_level()) {
-        platform_set_log_level(SS_LOG_WARN);
-        testing::internal::CaptureStderr();
-    }
-    ~StderrCapture() {
-        if (!released_) {
-            static_cast<void>(testing::internal::GetCapturedStderr());
-        }
-        platform_set_log_level(prior_level_);
-    }
-    StderrCapture(const StderrCapture&) = delete;
-    StderrCapture& operator=(const StderrCapture&) = delete;
-
-    /// Stops capturing and returns everything written so far.
-    std::string release() {
-        released_ = true;
-        return testing::internal::GetCapturedStderr();
-    }
-
-private:
-    int prior_level_;
-    bool released_{false};
 };
 
 /// The durability warning always says the credential comes back after a reboot; that phrase is
