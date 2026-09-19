@@ -1750,10 +1750,13 @@ TEST_F(PairingStateMachineTest, ExpiredStandingWindowDoesNotAdmit) {
 }
 
 // ============================================================================
-// The durations pairing.md recommends, read off the deadlines the client arms. Each is bracketed
-// against the real clock either side of the arming call, so nothing re-derives the expected value
-// from the constant under test. Ten seconds of slack: the property is "minutes, not seconds", and
-// a narrower bracket would turn a scheduling stall into a red build.
+// The durations pairing.md recommends, read off the deadlines the client arms. The constants are
+// file-static in connection_manager.cpp, so the expected values below are transcribed from the
+// spec rather than read back from the code under test. Bracketing the real clock either side of
+// the arming call makes the comparison exact rather than approximate: a deadline armed at any t
+// in [before, after] satisfies both bounds, so no amount of scheduling stall can fail these.
+// The armed deadline is a private read because nothing a peer or a listener observes tells a
+// five-minute window from a five-second one without waiting it out.
 // ============================================================================
 
 // pairing.md "Pairing Window": five minutes from the operator's gesture.
@@ -1765,8 +1768,8 @@ TEST_F(PairingStateMachineTest, PairingWindowRunsForFiveMinutes) {
 
     const int64_t armed = this->window_deadline();
     ASSERT_GT(armed, 0);
-    EXPECT_GE(armed - after, 290LL * US_PER_SECOND);
-    EXPECT_LE(armed - before, 310LL * US_PER_SECOND);
+    EXPECT_GE(armed, before + 300LL * US_PER_SECOND);
+    EXPECT_LE(armed, after + 300LL * US_PER_SECOND);
 }
 
 // pairing.md "Entering and leaving pairing": two minutes from the attempt's first message,
@@ -1782,8 +1785,8 @@ TEST_F(PairingStateMachineTest, PairingAttemptRunsForTwoMinutes) {
 
     const int64_t deadline = conn->pairing_session().attempt_deadline_us;
     ASSERT_GT(deadline, 0);
-    EXPECT_GE(deadline - after, 110LL * US_PER_SECOND);
-    EXPECT_LE(deadline - before, 130LL * US_PER_SECOND);
+    EXPECT_GE(deadline, before + 120LL * US_PER_SECOND);
+    EXPECT_LE(deadline, after + 120LL * US_PER_SECOND);
 }
 
 // ============================================================================
