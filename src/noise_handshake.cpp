@@ -86,10 +86,10 @@ namespace {
 /// @param expected_type  Required value of the envelope's "type" field.
 /// @param log_context    Prefix used for the failure log line (caller's function name).
 /// @return The parsed document on success, or nullopt.
-std::optional<JsonDocument> parse_json_envelope(const std::string& text, const char* expected_type,
+std::optional<JsonDocument> parse_json_envelope(std::string_view text, const char* expected_type,
                                                 const char* log_context) {
     JsonDocument doc = make_json_document();
-    DeserializationError err = deserializeJson(doc, text);
+    DeserializationError err = deserializeJson(doc, text.data(), text.size());
     if (err || doc.isNull()) {
         SS_LOGE(TAG, "%s: JSON parse failed", log_context);
         return std::nullopt;
@@ -431,7 +431,7 @@ bool NoiseHandshake::handle_msg1(JsonObjectConst root,
 // Re-handshake helper
 // ============================================================================
 
-std::optional<NoiseHandshakeResult> run_rehandshake_msg1(const std::string& msg1_json,
+std::optional<NoiseHandshakeResult> run_rehandshake_msg1(std::string_view msg1_json,
                                                          const std::string& server_id,
                                                          const Identity& identity,
                                                          const RecordStore& record_store,

@@ -223,7 +223,7 @@ private:
     /// Accumulates the reassembled message as [orig_type][data...] while a fragmented
     /// message is in flight; on completion accept_plaintext() returns a pointer into this
     /// buffer, valid until the next accept_plaintext() call. Grows with the largest
-    /// fragmented message received (e.g. album artwork) and retains its capacity, so it is
+    /// fragmented message received (a player audio chunk) and retains its capacity, so it is
     /// placed per buffer_location_ (PSRAM-preferring by default on ESP). Network thread only.
     PlatformBuffer reasm_buf_;
 
@@ -254,7 +254,7 @@ private:
     size_t reasm_len_{0};
 
     // 8-bit fields
-    /// Memory placement for reasm_buf_ and the fragmentation frame buffer.
+    /// Memory placement for reasm_buf_, send_buf_ and the fragmentation frame buffer.
     MemoryLocation buffer_location_{MemoryLocation::PREFER_EXTERNAL};
 
     /// True when the in-flight message's data is being thrown away rather than buffered: its

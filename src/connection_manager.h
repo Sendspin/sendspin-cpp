@@ -481,10 +481,8 @@ private:
     // sequence and the flush_deferred_releases() calls between steps.
 
     /// @brief Snapshot of every deferred queue, filled by one swap under conn_mutex_ in
-    /// swap_out_pending_events(). Held in drained_events_ rather than on loop()'s frame so the
-    /// swap hands the queues back buffers that keep their capacity, instead of freeing the
-    /// drained ones every tick that carries events. Private to ConnectionManager; never exposed
-    /// outside it.
+    /// swap_out_pending_events(). Lives in drained_events_ so the swap hands the queues back
+    /// buffers that keep their capacity. Private to ConnectionManager; never exposed outside it.
     struct DrainedEvents {
         std::vector<std::shared_ptr<SendspinConnection>> connected, disconnected;
         std::vector<ServerActivateEvent> activates;
@@ -508,12 +506,11 @@ private:
     void maybe_start_ws_server();
 
     /// @brief Swaps every pending_*_events_ queue and the pairing-window confirm and cancel flags
-    /// out into drained_events_. Acquires conn_mutex_ internally, and only when the
-    /// has_pending_events_ acquire-load hint says there is something to swap; clears
-    /// has_pending_events_ under that same lock. drained_events_ is left empty when the hint was
-    /// false. The caller clears drained_events_ once it has processed them, which is also what
-    /// leaves it empty for the next call.
-    void swap_out_pending_events();
+    /// out into `ev`, which must be empty (the swap hands the queues back its buffers). Acquires
+    /// conn_mutex_ internally, and only when the has_pending_events_ acquire-load hint says there
+    /// is something to swap; clears has_pending_events_ under that same lock.
+    /// @param ev Destination, left empty when the hint was false.
+    void swap_out_pending_events(DrainedEvents& ev);
 
     /// @brief Applies disconnect events, then connected events, then in-band re-handshake
     /// re-arms, then server/activate events (trust enforcement, pairing-method admissibility,

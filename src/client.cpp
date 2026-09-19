@@ -1516,8 +1516,7 @@ void SendspinClient::dispatch_json_message(SendspinConnection* conn, const char*
             // cross-thread state"): the swap must stay ordered with decrypt on this thread.
             if (conn != nullptr) {
                 SS_LOGI(TAG, "noise/handshake received in-band: starting re-handshake");
-                std::string msg1_json(data, len);
-                if (!conn->handle_noise_rehandshake(msg1_json)) {
+                if (!conn->handle_noise_rehandshake(std::string_view(data, len))) {
                     SS_LOGW(TAG, "noise/handshake re-handshake failed; closing connection");
                     // Do not leave a half-swapped session. UNAUTHORIZED is the closest available
                     // reason for a crypto failure, though close_silently() never transmits it

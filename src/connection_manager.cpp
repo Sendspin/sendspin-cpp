@@ -60,8 +60,7 @@ static const std::vector<std::string> EMPTY_ROLES{};
 /// gate cannot be widened by an activation the client refused.
 ///
 /// Answering here rather than ignoring the activate matters: a server that never hears back sits
-/// waiting for the device forever, with nothing on either side to explain the stall. Every refusal
-/// logs through this one format string.
+/// waiting for the device forever, with nothing on either side to explain the stall.
 /// @param event The activation being refused.
 /// @param why What the activation asked for that the client cannot act on.
 /// @param method The pairing method the activation named, for the diagnostic.
@@ -302,7 +301,8 @@ ConnectionManager::~ConnectionManager() {
     // Move everything out under the locks, destroy outside them: a connection destructor can join
     // its transport thread (see DeferredRelease), which must not happen while a lock is held.
     // The two mutexes guard disjoint state and are taken in separate scopes, never nested.
-    this->swap_out_pending_events();
+    DrainedEvents dropped;
+    this->swap_out_pending_events(dropped);
 
     std::shared_ptr<SendspinConnection> current;
     // cppcheck-suppress variableScope
@@ -331,7 +331,6 @@ ConnectionManager::~ConnectionManager() {
     }
     // Locals and the swapped-out events release here, outside both locks. Queued goodbyes are
     // skipped on destruction; shutdown drops slots without a send.
-    this->drained_events_.clear();
 }
 
 // ============================================================================
@@ -599,8 +598,8 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
 
     // Drop every deferred event those closes (or the last ticks) queued: the connections they
     // name are gone, and a pairing event has no session to act on.
-    this->swap_out_pending_events();
-    this->drained_events_.clear();
+    DrainedEvents dropped;
+    this->swap_out_pending_events(dropped);
     // Locals release here, outside every lock. An outbound connection's destructor stops its
     // transport synchronously; deferring that is not an option (see DeferredRelease).
     return ui;
@@ -622,15 +621,12 @@ void ConnectionManager::maybe_start_ws_server() {
     }
 }
 
-void ConnectionManager::swap_out_pending_events() {
-    DrainedEvents& ev = this->drained_events_;
+void ConnectionManager::swap_out_pending_events(DrainedEvents& ev) {
     // Skip the conn_mutex_ acquisition entirely when the hint says all queues are
     // empty. Sound because every push site sets has_pending_events_ = true under
     // conn_mutex_ before releasing it (see the field's doc comment in connection_manager.h).
     if (this->has_pending_events_.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
-        // ev is empty here, so each queue receives an empty vector that keeps whatever capacity
-        // the last drain left it.
         ev.connected.swap(this->pending_connected_events_);
         ev.disconnected.swap(this->pending_disconnect_events_);
         ev.activates.swap(this->pending_activate_events_);
@@ -1237,7 +1233,7 @@ void ConnectionManager::loop() {
     // Process deferred connection lifecycle events: one conn_mutex_ swap, then (when there is
     // something to do) one conn_ptr_mutex_ section applying lifecycle, pairing, and unpair
     // events in order.
-    this->swap_out_pending_events();
+    this->swap_out_pending_events(this->drained_events_);
     DrainedEvents& ev = this->drained_events_;
 
     // Also runs whenever the nursery is non-empty even with no swapped-out events: the
@@ -1303,8 +1299,7 @@ void ConnectionManager::loop() {
     // Send the goodbye and release the connection if the re-proving watchdog above dropped one.
     this->flush_deferred_releases();
 
-    // Release this tick's drained events, outside every lock and after the flushes above, and
-    // keep their buffers for the next tick.
+    // Release this tick's drained events, outside every lock and after the flushes above.
     ev.clear();
 }
 

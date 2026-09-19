@@ -35,10 +35,11 @@ namespace detail {
 /// dead-store elimination on a buffer that is about to go out of scope (a plain assignment to a
 /// value never read again is legal for the compiler to delete outright).
 ///
-/// This is a public-header-safe duplicate of `secure_zero()` in the private `platform/crypto.h`
-/// (the same primitive `Identity::~Identity()` in `crypto/keys.cpp` and `psk_wrap.cpp` use for
-/// their own secrets): `config.h` is a public header and must not include a `src/`-private one,
-/// so the three-line loop is repeated here rather than shared. Keep the two in sync.
+/// This is a public-header-safe duplicate of `secure_zero()` in the private
+/// `platform/secure_zero.h` (the same primitive `Identity::~Identity()` in `crypto/keys.cpp` and
+/// `psk_wrap.cpp` use for their own secrets): `config.h` is a public header and must not include a
+/// `src/`-private one, so the three-line loop is repeated here rather than shared. Keep the two in
+/// sync.
 inline void secure_zero_psk(std::array<uint8_t, 32>& psk) {
     volatile uint8_t* vp = psk.data();
     for (size_t i = 0; i < psk.size(); ++i) {

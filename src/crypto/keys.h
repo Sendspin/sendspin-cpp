@@ -66,7 +66,7 @@ struct Identity {
     std::array<uint8_t, X25519_KEY_SIZE> private_bytes{};
     std::array<uint8_t, X25519_KEY_SIZE> public_bytes{};
 
-    /// @brief Wipes `private_bytes` on destruction (see secure_zero in platform/crypto.h).
+    /// @brief Wipes `private_bytes` on destruction (see secure_zero in platform/secure_zero.h).
     ///
     /// This is the same discipline ~CPace() applies to its ephemeral secrets. It bounds how long
     /// a *stale* copy of the long-term key outlives its use: the temporaries that

@@ -974,8 +974,8 @@ bool process_server_command_message(JsonObject root, ServerCommandMessage* cmd_m
 /// @brief Parses the metadata section of a server/state JSON message
 ///
 /// The server/state sections are parsed individually rather than into one aggregate struct: the
-/// caller runs on the network task, whose stack is fixed on ESP-IDF
-/// (SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE) and also carries the in-band re-handshake, and
+/// caller runs on the network task, whose stack is bounded on ESP-IDF (at least
+/// SendspinClientConfig::DEFAULT_HTTPD_STACK_SIZE) and also carries the in-band re-handshake, and
 /// an aggregate would keep every section's storage live in the caller's frame for the whole parse.
 /// Each function fills a caller-owned struct in place and reports whether that section was present.
 ///

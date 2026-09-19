@@ -154,9 +154,8 @@ SsErr NoiseTransport::send_json(const char* json, size_t len) {
                                              len);
     }
 
-    // Need fragmentation. Rare (large messages only) and unbounded in size (up to
-    // MAX_REASSEMBLED_MESSAGE_BYTES), so it is not a candidate for the fixed-size reused
-    // send_buf_; fragment_and_send_locked() allocates its own frame buffer instead.
+    // Need fragmentation. Rare (large messages only) and larger than send_buf_'s cap, so
+    // fragment_and_send_locked() allocates its own frame buffer instead.
     std::lock_guard<std::mutex> lock(this->session_mutex_);
     return this->fragment_and_send_locked(MSG_TYPE_JSON_BODY,
                                           reinterpret_cast<const uint8_t*>(json), len);

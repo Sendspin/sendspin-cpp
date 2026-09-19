@@ -41,6 +41,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -290,7 +291,7 @@ public:
     /// @param msg1_json  The decrypted noise/handshake JSON string (msg1 envelope).
     /// @return true on success (session swapped; a post-swap server/activate is expected next).
     ///         false on any failure (caller should close the WebSocket).
-    bool handle_noise_rehandshake(const std::string& msg1_json);
+    bool handle_noise_rehandshake(std::string_view msg1_json);
 
     /// @brief Encrypt and send a JSON string as a Noise transport binary frame.
     /// Thin delegate to NoiseTransport::send_json().
@@ -324,8 +325,9 @@ public:
     /// @return SsErr::OK if queued/sent, error code otherwise.
     /// @note The encrypted path blocks on the Noise session mutex, which the network thread also
     ///       holds across its own sends. On an ESP outbound connection that send blocks for up to
-    ///       WEBSOCKET_SEND_TIMEOUT_MS, so a call from loop() can stall that long (and for a
-    ///       fragmented message, once per frame, since the lock spans the whole fragment loop).
+    ///       the transport's 10 ms send timeout (src/esp/client_connection.cpp), so a call from
+    ///       loop() can stall that long, once per frame for a fragmented message since the lock
+    ///       spans the whole fragment loop.
     SsErr send_app_json(const std::string& json, SendCompleteCallback cb = nullptr,
                         bool allow_before_hello = false);
 

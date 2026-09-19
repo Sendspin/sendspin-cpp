@@ -49,6 +49,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace sendspin {
@@ -98,7 +99,7 @@ enum class HandshakeFrameResult {
 /// @param prior_h        32-byte handshake hash from the prior session (used as prologue).
 /// @return Populated NoiseHandshakeResult (session + msg2_text to send) on success,
 ///         or nullopt on any failure (caller should close the WebSocket).
-std::optional<NoiseHandshakeResult> run_rehandshake_msg1(const std::string& msg1_json,
+std::optional<NoiseHandshakeResult> run_rehandshake_msg1(std::string_view msg1_json,
                                                          const std::string& server_id,
                                                          const Identity& identity,
                                                          const RecordStore& record_store,

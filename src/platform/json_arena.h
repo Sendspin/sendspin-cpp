@@ -52,8 +52,9 @@ namespace sendspin {
  * escaped to PSRAM - those are released by deallocate() on document teardown like any other block.
  *
  * ArduinoJson::Allocator has no "document destroyed" hook, only per-block deallocate(), so reset()
- * is driven by the code that owns the JsonDocument. NOT thread-safe - use one instance per thread
- * (the protocol parser uses a single SendspinClient-owned instance on the network task).
+ * is driven by the code that owns the JsonDocument. NOT thread-safe: the protocol parser's single
+ * SendspinClient-owned instance is driven from the network task and, on the admission replay, from
+ * the main loop, serialized by json_processing_mutex_ rather than by thread affinity.
  *
  * If the backing buffer cannot be allocated (out of internal RAM), the arena still works: every
  * allocation simply falls back to the PSRAM-preferring path, i.e. it behaves like

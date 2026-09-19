@@ -801,8 +801,8 @@ private:
 
     /// @brief Defers a pairing message that failed to parse to the main loop.
     ///
-    /// Shared by the three server/pair-* arms of dispatch_json_message(), which differ only in
-    /// the payload they parse.
+    /// Shared by the pair-init, pair-auth and pair-confirm arms of dispatch_json_message(), which
+    /// differ only in the payload they parse.
     /// @param conn The connection that received the message
     /// @param type_name Wire type name of the message that failed to parse
     void schedule_malformed_pairing_message(SendspinConnection* conn, const char* type_name);
