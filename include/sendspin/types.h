@@ -106,8 +106,8 @@ enum class SendspinPairAbortReason : uint8_t {
 /// Advertised as `out_channels` on the `dynamic_pairing_code` descriptor in client/hello
 /// (pairing.md "client/hello pair-method descriptor").
 enum class SendspinPairingCodeChannel : uint8_t {
-    DISPLAY,  // The code is shown on a display.
-    SPEAKER,  // The code is spoken through an audio output.
+    DISPLAY,
+    SPEAKER,  // The code is spoken, not tone-encoded.
 };
 
 /// @brief Emission format of a dynamic pairing code (pairing.md "Dynamic Pairing Code Flow").

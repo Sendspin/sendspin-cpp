@@ -59,7 +59,7 @@ inline void secure_zero_psk(std::array<uint8_t, 32>& psk) {
 struct SendspinPairingRecord {
     std::string psk_id;
     std::array<uint8_t, 32> psk{};
-    std::string server_id;  ///< peer_id of the server this PSK is bound to.
+    std::string server_id;  ///< peer_id form.
     std::optional<std::string> label;
     bool used{false};
 
@@ -178,9 +178,8 @@ struct SendspinClientConfig {
     /// @brief First-boot default for unpaired (Sentinel) access.
     /// Seeds `SendspinPairingConfig::unpaired_access_enabled` only on a genuine first boot; the
     /// seeded value is then written through the persistence provider. Once a config exists the
-    /// stored value always wins, so unpaired access stays off across reboots once it is turned
-    /// off. With no persistence provider there is no stored config, so this value applies on
-    /// every start.
+    /// stored value always wins. With no persistence provider there is no stored config, so this
+    /// value applies on every start.
     /// A config that fails to load does not count as a first boot when any provisioned material
     /// (a pairing record or the Pairing PSK) survived: the seed is skipped and unpaired access
     /// stays disabled, so a damaged config fails closed. See the integration guide.
@@ -279,8 +278,7 @@ struct SendspinClientConfig {
     /// When non-zero, the JSON document used to parse each incoming protocol message is allocated
     /// from a fixed internal-RAM buffer of this size instead of PSRAM, cutting PSRAM traffic on the
     /// network task; messages too large for the budget fall back to PSRAM. Costs this many bytes of
-    /// internal RAM permanently. The default covers the steady-state protocol traffic,
-    /// including the FLAC stream-start header; large track-metadata messages may exceed it and fall
+    /// internal RAM permanently. Large track-metadata messages may exceed the default and fall
     /// back to PSRAM, but those arrive only once per song. Set to 0 to disable the arena and keep
     /// the PSRAM-only behaviour. Smaller values just fall back more often. On host there is no
     /// PSRAM distinction, so the arena is a fixed scratch buffer for the parse (still allocated and
@@ -313,10 +311,9 @@ struct PlayerRoleConfig {
     static constexpr size_t DEFAULT_AUDIO_BUFFER_CAPACITY = 1000000U;  ///< ~1MB default buffer
     /// @brief Formats the player supports, in priority order (the first is preferred).
     ///
-    /// Must list at least one flac or pcm entry: those are the codecs every server supports, so
-    /// a list without one leaves servers unable to stream to the player
-    /// (roles/player/v1.md "client/hello player@v1 support object"). Opus entries may be listed
-    /// in addition. SendspinClient::start() fails and logs if the list does not meet this.
+    /// Must list at least one flac or pcm entry: those are the codecs every server supports
+    /// (roles/player/v1.md "client/hello player@v1 support object"). SendspinClient::start()
+    /// fails and logs otherwise.
     std::vector<AudioSupportedFormatObject> audio_formats{};
     size_t audio_buffer_capacity{DEFAULT_AUDIO_BUFFER_CAPACITY};
     int32_t fixed_delay_us{0};
@@ -358,7 +355,7 @@ struct PlayerRoleConfig {
     /// give less.
     ///
     /// Unset reports `pipeline_lead_time_ms(extra_startup_silence_ms)`, so raising the startup
-    /// silence raises the lead the server gives without a second setting to remember. Set it to
+    /// silence raises the lead the server gives. Set it to
     /// cover an output whose own startup latency the allowance above does not reach; the reported
     /// value is never below what the pipeline spends, since the server extends lead only toward
     /// the number it is given. This library reports a configured or derived value, not a measured
@@ -448,18 +445,16 @@ struct ImageSlotPreference {
     /// @brief Largest encoded image this channel will hold, in bytes. An image the server
     /// announces as larger is refused before any of it is allocated: the transfer is followed to
     /// its end with its bytes dropped (which the protocol requires of a client that discards
-    /// image data) and the channel keeps whatever it was showing, so a server that encodes far
-    /// larger than the geometry it was asked for leaves the channel unchanged rather than
-    /// exhausting the heap. The default is a per-channel budget, not an upper bound on any
-    /// possible encoding: at the dimensions a display client of this class asks for (320x320 and
-    /// below) a JPEG runs well under it, while a high-entropy PNG at the same size can exceed
-    /// it. Raise it for a channel whose images are genuinely larger; the role logs every image it
-    /// refuses, with the cap it was measured against. Two buffers are held per channel, so the
-    /// role's image memory is bounded by twice this value per configured channel, and only while
-    /// the role is running: a buffer grows to the largest image its channel received and is
-    /// handed back when the role is torn down (a stop, a disconnect, or a server/activate that
-    /// removes the role), then re-allocated by the next transfer. A channel with 0 here holds
-    /// nothing at all.
+    /// image data) and the channel keeps whatever it was showing, rather than the heap being
+    /// exhausted. The default is a per-channel budget, not an upper bound on any possible
+    /// encoding: at the dimensions a display client of this class asks for (320x320 and below) a
+    /// JPEG runs well under it, while a high-entropy PNG at the same size can exceed it. Raise it
+    /// for a channel whose images are genuinely larger; the role logs every image it refuses,
+    /// with the cap it was measured against. Two buffers are held per channel, so the role's
+    /// image memory is bounded by twice this value per configured channel, and only while the
+    /// role is running: a buffer grows to the largest image its channel received and is handed
+    /// back when the role is torn down (a stop, a disconnect, or a server/activate that removes
+    /// the role), then re-allocated by the next transfer. A channel with 0 here holds nothing.
     uint32_t max_image_bytes{DEFAULT_MAX_IMAGE_BYTES};
 };
 

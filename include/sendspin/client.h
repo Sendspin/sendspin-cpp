@@ -123,11 +123,11 @@ public:
     /// `code` carries the code in the format the server selected, and `format` names it:
     ///   DIGITS:  the six contiguous decimal digits (e.g. "042735"). pairing.md "Pairing Code
     ///            Presentation" asks for a `3-3` grouping when the code is shown or spoken; the
-    ///            grouping is presentation-only, so the separator is the application's to add.
+    ///            separator is the application's to add.
     ///   QR_CODE: the version-1 pairing token (e.g. "SP:14DQ..."), to be rendered verbatim as a
     ///            QR code with no URI scheme or wrapper around it.
     /// Fires on the main loop, at most once per pairing attempt: the code is unchanged across
-    /// the attempt's rounds, so an emission that persists (a display) keeps standing. Always
+    /// the attempt's rounds. Always
     /// followed by on_clear_pairing_code when the attempt concludes (success, failure, or abort).
     /// Only called when SendspinClientConfig::pairing_code_out_channels and
     /// ::pairing_code_formats are both non-empty.
@@ -137,8 +137,7 @@ public:
     /// @brief Called to withdraw the emitted dynamic pairing code.
     ///
     /// Fires on the main loop after every pairing attempt that triggered
-    /// on_display_pairing_code, regardless of outcome. Always called after
-    /// on_display_pairing_code, never before it.
+    /// on_display_pairing_code, regardless of outcome.
     virtual void on_clear_pairing_code() {}
 
     /// @brief Called when the operator must perform the device pairing-window gesture to allow a
@@ -147,7 +146,7 @@ public:
     ///
     /// Fires on the main loop. Only called when SendspinClientConfig::pairing_window_supported
     /// is true; a device offering dynamic_pairing_code should therefore also implement this
-    /// gesture UI, or an attempt held back by the round limit stalls until the server cancels it.
+    /// gesture UI, or such an attempt stalls until the server cancels it.
     /// Always followed by on_close_pairing_window when the attempt concludes. The application
     /// confirms the gesture by calling SendspinClient::confirm_pairing_window().
     virtual void on_open_pairing_window() {}
@@ -228,11 +227,10 @@ public:
     /// @brief Remove key. Absent counts as success. A false return means the value may
     /// survive a reboot.
     ///
-    /// For the application's own use: the library never calls it. Every blob the library owns is
-    /// either rewritten in place or left alone (a record removal re-saves the shrunken array, so
-    /// `persistence_keys::RECORDS` stays present with a shorter array). The hook is here so an
-    /// application that wipes the library keyspace itself, for example on a factory reset, has a
-    /// working delete over the same store.
+    /// The library never calls it: every blob it owns is either rewritten in place or left alone
+    /// (a record removal re-saves the shrunken array, so `persistence_keys::RECORDS` stays
+    /// present with a shorter array). It is here for an application that wipes the library
+    /// keyspace itself, for example on a factory reset.
     /// @return true if the key is gone from the store, false if it may still be there.
     virtual bool erase_blob(const std::string& /*key*/) {
         return false;
@@ -267,8 +265,7 @@ inline constexpr const char* RECORDS = "records";
 inline constexpr const char* PAIRING_PSK = "pairing_psk";
 
 /// Raw UTF-8 bytes: the configured static pairing code (8 decimal digits). The stored key string
-/// is `static_pin`: this keyspace is a storage format in its own right, fixed independently of
-/// the protocol field names.
+/// is part of the storage format, fixed independently of the protocol field names.
 inline constexpr const char* STATIC_PAIRING_CODE = "static_pin";
 
 /// Codec blob: the `SendspinPairingConfig` (`encode_pairing_config()` / `decode_pairing_config()`).
@@ -278,8 +275,7 @@ inline constexpr const char* PAIR_CONFIG = "pair_config";
 inline constexpr const char* LAST_PLAYED = "last_played";
 
 /// ASCII decimal string (e.g. "150"): the player's output delay in milliseconds. The stored key
-/// string is `static_delay`: this keyspace is a storage format in its own right, fixed
-/// independently of the protocol field names.
+/// string is part of the storage format, fixed independently of the protocol field names.
 inline constexpr const char* OUTPUT_DELAY = "static_delay";
 
 }  // namespace persistence_keys
@@ -633,9 +629,9 @@ public:
     /// @param state The new client state to publish
     void update_state(SendspinClientState state);
 
-    /// @brief Leaves the current group with client/leave. Main loop only.
+    /// @brief Leaves the current group with messaging.md "client/leave". Main loop only.
     ///
-    /// Sends messaging.md "client/leave": the client no longer wants to take part in its group's
+    /// The client no longer wants to take part in its group's
     /// playback, for example while it plays a local source it can be interrupted out of. The
     /// server treats it as it treats a client becoming unavailable: this client ends up alone in
     /// a stopped group, and rejoins only when an operator switches it back. Leaving does not
@@ -700,8 +696,8 @@ public:
     /// time, goodbye, leave, pairing) do not come through here.
     ///
     /// Dropped unless that role is active on the connection: messaging.md "server/activate"
-    /// tolerates inactive-role objects on the server side precisely because a client that has
-    /// received the role removal stops sending them. The family names the version this library
+    /// tolerates inactive-role objects on the server side because a client that has received
+    /// the role removal stops sending them. The family names the version this library
     /// implements, and the activation test is on that exact versioned name, the same test the
     /// receive path applies. Also held, like client/state, while a re-handshake awaits the
     /// server/activate that follows it.
@@ -785,11 +781,6 @@ private:
     };
 
     /// @brief Parses and routes one JSON message. The caller holds json_processing_mutex_.
-    /// @param conn The connection that received the message
-    /// @param data Pointer to the raw JSON text (not null-terminated; valid for the duration of the
-    /// call only)
-    /// @param len Length of the JSON text in bytes
-    /// @param timestamp Receive timestamp in microseconds
     /// @param origin Whether the admission gate still applies to this message
     void dispatch_json_message(SendspinConnection* conn, const char* data, size_t len,
                                int64_t timestamp,
@@ -807,9 +798,7 @@ private:
     /// cross-thread state"): json_processing_mutex_ outside conn_ptr_mutex_, which is the order
     /// the live receive path already needs, since a server/pair-finalize handler asks the manager
     /// for the open connections' psk_ids while the JSON lock is held. A replayed message may
-    /// therefore reach back into the manager without deadlocking, though the receive-path rule
-    /// keeps it from doing so: the role handlers write to Inbox slots and role buffers, and a
-    /// handler that needs the connection or a listener defers it to drain_events().
+    /// therefore reach back into the manager without deadlocking.
     /// @param conn The connection entering the admitted slot
     void admit_connection(SendspinConnection* conn);
 
@@ -903,8 +892,7 @@ private:
     void note_close_pairing_window();
 
     /// @brief Queue an on_trust_changed notification for delivery from loop().
-    /// Same deferral as note_pairing_started: queued with conn_ptr_mutex_ held, fired unlocked.
-    /// Main loop only.
+    /// Same deferral as note_pairing_started. Main loop only.
     void note_trust_changed(ConnectionTrust trust);
 
     struct EventState;

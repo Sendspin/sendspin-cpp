@@ -75,7 +75,7 @@ public:
  * @brief Color role that receives audio-derived colors from the server
  *
  * Maintains a local shadow of the server's color palette. Each palette the server sends carries
- * the full state, so it replaces the shadow outright and a color it leaves out has no value. The
+ * the full state, so it replaces the shadow outright. The
  * palette is delivered to the listener on the main loop thread once the synchronized client clock
  * reaches its `timestamp` (or immediately if there is no active connection).
  *

@@ -44,10 +44,9 @@ class SendspinClient;
 ///  - A payload (a frame, or the server's per-channel clear for that slot) arriving while a
 ///    delivery is un-acked is buffered latest-wins and delivered only after frame_done(slot), and
 ///    then owes its own frame_done(). It waits behind the outstanding delivery rather than
-///    replacing it, so a consumer presenting a delivery is never interrupted. A delivery that has
-///    not yet reached on_image_display() is the exception: the server announcing a newer image
-///    replaces it outright (see the last paragraph), and the buffered payload follows once that
-///    release reopens the gate.
+///    replacing it, so a consumer presenting a delivery is never interrupted. A delivery not yet
+///    displayed is the exception: it is released outright (see the last paragraph) and the
+///    buffered payload follows.
 ///  - A stream end or stream clear is a lifecycle event, not a payload, so it is never buffered:
 ///    it fires on_image_clear() immediately for every configured slot, discards anything buffered,
 ///    and replaces whatever delivery was outstanding. Exactly one frame_done() is owed afterward
@@ -93,12 +92,11 @@ public:
 
     /// @brief Called on the main loop thread when artwork should be cleared for a slot
     ///
-    /// Fires on stream end or stream clear for each configured slot, when the connection to the
-    /// server is lost, and when a server/activate takes the artwork role out of the session's
-    /// active roles (both also every slot, with any in-flight transfer dropped), and for a single
-    /// slot when the server clears that channel (the artwork
-    /// for the current item is gone, e.g. a track with no album art). A per-channel clear is
-    /// scheduled to its server timestamp exactly like on_image_display(),
+    /// Fires for every configured slot on stream end or stream clear, on connection loss, and
+    /// when a server/activate takes the artwork role out of the session's active roles (the last
+    /// two also drop any in-flight transfer). Fires for a single slot when the server clears that
+    /// channel (the artwork for the current item is gone, e.g. a track with no album art). A
+    /// per-channel clear is scheduled to its server timestamp exactly like on_image_display(),
     /// ImageSlotPreference::display_offset_ms included, so it lands on the item boundary rather
     /// than as soon as it arrives.
     ///
