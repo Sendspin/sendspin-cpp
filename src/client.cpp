@@ -943,7 +943,9 @@ std::optional<ServerInformationObject> SendspinClient::get_server_information() 
 
 void SendspinClient::update_state(SendspinClientState state) {
     this->state_ = state;
-    this->publish_client_state(this->connection_manager_->current());
+    // current_shared() rather than current(): see publish_state().
+    auto conn = this->connection_manager_->current_shared();
+    this->publish_client_state(conn.get());
 }
 
 void SendspinClient::leave() {
@@ -967,7 +969,11 @@ void SendspinClient::leave() {
 // ============================================================================
 
 void SendspinClient::publish_state() {
-    this->publish_client_state(this->connection_manager_->current());
+    // current_shared() rather than current(): a role thread may call this, and the shared_ptr
+    // holds the connection alive across publish_client_state()'s gate reads and its send even if
+    // the main loop drops or replaces it meanwhile. Same reasoning as send_text().
+    auto conn = this->connection_manager_->current_shared();
+    this->publish_client_state(conn.get());
 }
 
 void SendspinClient::send_text(const std::string& text, const std::string& role_family) {

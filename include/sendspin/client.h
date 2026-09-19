@@ -843,6 +843,11 @@ private:
     // ========================================
 
     /// @brief Publishes the current client state to the specified connection
+    ///
+    /// Takes no lock of its own: its main-loop callers already hold conn_ptr_mutex_. The caller
+    /// therefore owns `conn`'s lifetime for the duration of the call; one resolving the current
+    /// connection from outside that lock must hold it as a shared_ptr (current_shared()) rather
+    /// than pass the bare current() pointer, which the main loop may drop meanwhile.
     /// @param conn The connection to publish to
     void publish_client_state(SendspinConnection* conn);
 
