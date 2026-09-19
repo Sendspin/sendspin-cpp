@@ -984,6 +984,14 @@ TEST(FragmentSequence, NonFirstFragmentWithNoneInFlightCloses) {
     EXPECT_TRUE(rx.conn_.disconnect_calls_.empty());
     EXPECT_TRUE(rx.conn_.sent_text_.empty());
     EXPECT_TRUE(rx.conn_.sent_binary_.empty());
+
+    // A frame already in the socket buffer when the close was decided still decrypts, so
+    // close_silently() shuts the dispatch gate rather than relying on the transport being gone.
+    // TestConnection::close_transport_now() only counts, leaving that gate as the one thing that
+    // can keep this well-formed message from reaching a role.
+    rx.inject_fragment(FRAGMENT_FLAG_FIRST | FRAGMENT_FLAG_LAST,
+                       {SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA});
+    EXPECT_EQ(rx.binary_dispatched_, 0) << "a frame that lands after the close must not dispatch";
 }
 
 TEST(FragmentSequence, NonFragmentMessageWhileOneIsInFlightCloses) {
