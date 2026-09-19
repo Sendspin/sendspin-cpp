@@ -75,8 +75,12 @@ set_source_files_properties(test_client_lifecycle.cpp PROPERTIES COMPILE_OPTIONS
 # flag).
 set_source_files_properties(test_role_deactivation.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
-# test_player_role.cpp builds the client/state player object by calling the role's Impl directly,
-# which is the only way to see that object without a connected server.
+# test_player_role.cpp drives PlayerRole::Impl directly - no client, no sync-task thread - which
+# is the only way to see the client/state player object without a connected server and the only
+# way to hand a handler a stale teardown generation. Reached: Impl's handle_stream_start(),
+# handle_binary(), handle_stream_clear(), handle_server_command(), cleanup(), attach_inbox(),
+# cleanup_generation and event_state's latest-wins slots; SyncTask::init() and its
+# encoded_ring_buffer_, which is what says a refused handler buffered nothing.
 set_source_files_properties(test_player_role.cpp PROPERTIES COMPILE_OPTIONS -fno-access-control)
 
 # test_record_store.cpp reads records_ directly and calls the store's private locked-context

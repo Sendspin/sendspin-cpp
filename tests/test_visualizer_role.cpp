@@ -639,15 +639,17 @@ TEST(VisualizerSpectrumMismatch, ScaleMismatchIsReported) {
 TEST(VisualizerSpectrumMismatch, EitherFrequencyBoundIsReported) {
     VisualizerSpectrumConfig low = requested_spectrum();
     low.f_min = 40;
-    EXPECT_NE(stream_start_log(low).find("frequency range mismatch: server 40-20000, expected "
-                                         "20-20000"),
-              std::string::npos);
+    const std::string low_log = stream_start_log(low);
+    EXPECT_NE(low_log.find("frequency range mismatch: server 40-20000, expected 20-20000"),
+              std::string::npos)
+        << low_log;
 
     VisualizerSpectrumConfig high = requested_spectrum();
     high.f_max = 16000;
-    EXPECT_NE(stream_start_log(high).find("frequency range mismatch: server 20-16000, expected "
-                                          "20-20000"),
-              std::string::npos);
+    const std::string high_log = stream_start_log(high);
+    EXPECT_NE(high_log.find("frequency range mismatch: server 20-16000, expected 20-20000"),
+              std::string::npos)
+        << high_log;
 }
 
 TEST(VisualizerSpectrumMismatch, SpectrumTypeWithNoSpectrumObjectIsReported) {

@@ -606,10 +606,10 @@ TEST(RecordStore, CapacityBelowTheProtocolFloorIsRaised) {
 }
 
 // ============================================================================
-// resolve_by_psk_id: long-term first, then Pairing PSK, then Sentinel
+// resolve_by_psk_id: the declared category selects the candidate set
 // ============================================================================
 
-TEST(RecordStore, ResolveByPskIdLongTermFirst) {
+TEST(RecordStore, ResolveByPskIdResolvesALongTermRecord) {
     RecordStore store(nullptr);
 
     SendspinPairingRecord rec = make_client_record("server-X");
@@ -623,7 +623,7 @@ TEST(RecordStore, ResolveByPskIdLongTermFirst) {
     EXPECT_EQ(resolved->counterparty_id, rec.server_id);
 }
 
-TEST(RecordStore, ResolveByPskIdPairingPskSecond) {
+TEST(RecordStore, ResolveByPskIdResolvesThePairingPsk) {
     InMemoryPersistenceProvider provider;
     SendspinPairingPsk p = make_pairing_psk();
     provider.seed_blob(persistence_keys::PAIRING_PSK, to_bytes(encode_pairing_psk(p)));

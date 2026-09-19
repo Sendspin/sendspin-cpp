@@ -1854,8 +1854,9 @@ TEST(NoiseHandshakeDriver, MalformedMsg1GarbageAborts) {
 // machine and requires it to find no protocol violation. Two things make that race real rather
 // than hopeful: the fragmenting send does not start until the other sender is in its loop, and
 // the sink counts the fragment frames emitted while one of that sender's sends was in flight.
-// Under correct locking that send is parked on session_mutex_ for the whole message, so the
-// count is every frame; a round that counted none never raced and is failed as vacuous.
+// Under correct locking that send is parked on session_mutex_ for the whole message, so a
+// fragment emitted while one of that sender's sends is in flight proves the two met; a round
+// that counted none never raced and is failed as vacuous.
 // Elapsed time is not part of any verdict here, and correct locking cannot produce a malformed
 // sequence at all, so a slow machine cannot fail this test.
 TEST(NoiseTransport, ConcurrentSendsDoNotInterleaveFragments) {

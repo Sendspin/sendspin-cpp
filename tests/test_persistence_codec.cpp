@@ -48,10 +48,6 @@ std::string well_formed_record_entry() {
            base64url_encode(make_psk(0x11).data(), 32) + R"("})";
 }
 
-std::string well_formed_record_blob() {
-    return well_formed_record_entry();
-}
-
 std::string well_formed_records_blob() {
     return R"({"v":1,"records":[)" + well_formed_record_entry() + "]}";
 }
@@ -141,7 +137,7 @@ TEST(PersistenceCodec, RecordDecodeBestEffortOnFutureVersion) {
 TEST(PersistenceCodec, RecordDecodeRejectsParseFailure) {
     EXPECT_FALSE(decode_pairing_record("not json").has_value());
     // Control: well-formed JSON for the same decoder.
-    EXPECT_TRUE(decode_pairing_record(well_formed_record_blob()).has_value());
+    EXPECT_TRUE(decode_pairing_record(well_formed_record_entry()).has_value());
 }
 
 TEST(PersistenceCodec, RecordDecodeRejectsMissingPskId) {

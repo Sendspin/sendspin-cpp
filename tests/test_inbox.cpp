@@ -244,10 +244,12 @@ TEST(Inbox, EventEpochRoundtripsPerEvent) {
     EXPECT_EQ(out[2].epoch, 8u);
 }
 
-// push_event_or_log() stamps the epoch its caller passes, and event_is_current() dispatches only
-// the event whose epoch still matches the role's teardown generation. Together they are the
-// discard that keeps a lifecycle event queued before a teardown from acting after it.
-TEST(Inbox, OnlyTheEventStampedWithTheCurrentGenerationIsDispatched) {
+// push_event_or_log() stamps the epoch its caller passes, and event_is_current() admits only the
+// event whose epoch still matches the role's teardown generation. Together they are the discard
+// that keeps a lifecycle event queued before a teardown from acting after it; the dispatch that
+// acts on the predicate is covered by
+// RoleDeactivation.StreamStartQueuedBeforeARemovalNeverStarts.
+TEST(Inbox, OnlyTheEventStampedWithTheCurrentGenerationPassesTheCurrencyCheck) {
     Inbox inbox;
 
     push_event_or_log(&inbox, InboxEventType::PLAYER_STREAM, /*code=*/1, "test", "STREAM_START",

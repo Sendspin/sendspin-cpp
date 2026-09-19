@@ -278,8 +278,9 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     EXPECT_FALSE(client.is_connected())
         << "a raw TCP probe must never become the current connection";
 
-    // A real server connects while the probe is held: it must establish promptly, not after the
-    // probe's deadline.
+    // A real server connects while the probe is held: the held probe must not keep it out of the
+    // admitted slot. That it establishes before the probe is reaped is not asserted - latency is
+    // not a unit-test property.
     const Identity& server_identity = bundle.peer.server_identity;
     FakeEncryptedServer real_server(server_url(PROBE_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
@@ -453,8 +454,9 @@ TEST(ConnectionLifecycle, HeldProbesNeverOccupyNursery) {
     ASSERT_GE(probe2, 0);
     pump_for(client, 100);
 
-    // The real server must establish promptly: the probes hold no nursery slots, so nothing
-    // needs evicting and nothing is rejected.
+    // The real server reaches the admitted slot while both probes are held: the probes hold no
+    // nursery slots, so nothing needs evicting and nothing is rejected. That it establishes
+    // before the probes are reaped is not asserted - latency is not a unit-test property.
     const Identity& server_identity = bundle.peer.server_identity;
     FakeEncryptedServer real_server(server_url(EVICT_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
