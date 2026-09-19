@@ -2096,6 +2096,15 @@ TEST_F(PairingStateMachineTest, SubsequentActivateEntersPairingForEitherCodeMeth
         EXPECT_EQ(conn->pairing_session().step, row.expected_step);
         ASSERT_EQ(conn->sent_text_.size(), 1u);
         EXPECT_EQ(last_frame_type(conn->sent_text_), row.expected_frame);
+
+        if (row.gesture_gated) {
+            // Confirming the window sends the empty client/pair-init, proving the gated flow is
+            // live and not just prompting.
+            this->client_->confirm_pairing_window();
+            this->client_->loop();
+            ASSERT_EQ(conn->sent_text_.size(), 2u);
+            EXPECT_EQ(last_frame_type(conn->sent_text_), "client/pair-init");
+        }
     }
 }
 
