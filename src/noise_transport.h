@@ -208,7 +208,12 @@ private:
     /// @return false on allocation failure.
     bool grow_buffer(PlatformBuffer& buf, size_t needed, size_t cap, const char* what);
 
-    /// @brief Grows reasm_buf_ to at least `needed` bytes. See grow_buffer().
+    /// @brief The reassembly cap in force: MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES until the
+    /// owning connection is admitted, MAX_REASSEMBLED_MESSAGE_BYTES after. Network thread only.
+    size_t reasm_cap() const;
+
+    /// @brief Grows reasm_buf_ to at least `needed` bytes, capped at the cap in force plus the
+    /// orig_type byte. See grow_buffer().
     bool reasm_reserve(size_t needed);
 
     /// @brief Grows send_buf_ to at least `needed` bytes, capped at MAX_TRANSPORT_PLAINTEXT + 16

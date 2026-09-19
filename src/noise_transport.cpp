@@ -326,9 +326,7 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
         // Sentinel PSK, and nothing that legitimately arrives then approaches the tighter cap
         // (the pre-admission JSON hold budget, MAX_HELD_BYTES, is half of it), so that cap
         // applies until the connection wins the admitted slot.
-        const size_t cap = this->admitted_.load(std::memory_order_acquire)
-                               ? MAX_REASSEMBLED_MESSAGE_BYTES
-                               : MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES;
+        const size_t cap = this->reasm_cap();
         if (this->reasm_len_ - 1 + data_len > cap) {
             SS_LOGW(TAG, "fragmented message exceeds %zu bytes; discarding the rest of it", cap);
             this->reasm_discarding_ = true;
@@ -381,14 +379,20 @@ bool NoiseTransport::grow_buffer(PlatformBuffer& buf, size_t needed, size_t cap,
     return ok;
 }
 
+size_t NoiseTransport::reasm_cap() const {
+    return this->admitted_.load(std::memory_order_acquire)
+               ? MAX_REASSEMBLED_MESSAGE_BYTES
+               : MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES;
+}
+
 bool NoiseTransport::reasm_reserve(size_t needed) {
-    // Capped at MAX_REASSEMBLED_MESSAGE_BYTES + 1: the caller's own size check (accept_plaintext)
-    // admits a `needed` of exactly that much, one byte of orig_type plus the largest message it
-    // will reassemble. Without the cap the doubling step above that admitted size would reserve
-    // ~2 MiB per connection, retained for the connection's life, which a peer picks by choosing
-    // its fragment sizes.
-    return this->grow_buffer(this->reasm_buf_, needed, MAX_REASSEMBLED_MESSAGE_BYTES + 1,
-                             "reassembly");
+    // Capped at the cap in force + 1: the caller's own size check (accept_plaintext) admits a
+    // `needed` of exactly that much, one byte of orig_type plus the largest message that cap will
+    // reassemble. Both read the cap from reasm_cap() so the clamp cannot be wider than the check.
+    // Without the clamp the doubling step above the admitted size would reserve ~2 MiB per
+    // connection, retained for the connection's life, which a peer picks by choosing its fragment
+    // sizes.
+    return this->grow_buffer(this->reasm_buf_, needed, this->reasm_cap() + 1, "reassembly");
 }
 
 bool NoiseTransport::ensure_send_buf(size_t needed) {

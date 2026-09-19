@@ -1228,6 +1228,12 @@ TEST(FragmentSequence, PreAdmissionMessageOverTheTightCapIsDiscarded) {
     EXPECT_FALSE(rx.closed()) << "exceeding the pre-admission cap must not close the connection";
     EXPECT_EQ(rx.json_dispatched_, 0)
         << "a message over the pre-admission cap was reassembled and dispatched";
+    // The pin matters as much as the dispatch: the buffer keeps whatever the growth step
+    // reserved for the connection's life, so a clamp left at the admitted cap would let this
+    // sequence park a multiple of the tight cap in a nursery slot.
+    EXPECT_LE(rx.conn_.noise_transport_.reasm_buf_.size(),
+              MAX_PRE_ADMISSION_REASSEMBLED_MESSAGE_BYTES + 1)
+        << "the reassembly buffer outgrew the cap in force before admission";
 
     // Control: the same message on the same connection, once it holds the admitted slot.
     rx.admit();
