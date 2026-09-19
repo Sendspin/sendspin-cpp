@@ -48,6 +48,9 @@ static const char* const TAG = "sendspin.conn_mgr";
 static constexpr int64_t WS_SERVER_START_RETRY_MS = 5000LL;
 static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * US_PER_MS;
 
+/// @brief Stands in for an active_roles set the server left out or the client refuses to keep.
+static const std::vector<std::string> EMPTY_ROLES{};
+
 /// @brief Refuses an activation the client cannot act on, leaving the connection open
 ///
 /// pairing.md "Client <-> Server: pair/abort" answers a method or format the client does not offer
@@ -57,10 +60,9 @@ static constexpr int64_t WS_SERVER_START_RETRY_US = WS_SERVER_START_RETRY_MS * U
 /// gate cannot be widened by an activation the client refused.
 /// @param event The activation being refused.
 static void refuse_activate(const ServerActivateEvent& event) {
-    static const std::vector<std::string> NO_ROLES{};
     SendspinConnection* conn = event.conn.get();
     conn->withdraw_activated_roles(event.active_roles.has_value() ? event.active_roles.value()
-                                                                  : NO_ROLES);
+                                                                  : EMPTY_ROLES);
     conn->send_app_json(format_pair_abort_message(PairAbortReason::METHOD_NOT_SUPPORTED), nullptr);
 }
 
@@ -157,10 +159,12 @@ static constexpr uint32_t PAIRING_ROUND_LIMIT = 20;
 /// sid = LABEL || h || pairing_index || round, each counter a big-endian uint32.
 static constexpr char PAKE_SID_LABEL[] = "sendspin-pair-pake-v1";
 
-/// @brief CPace ADa/ADb (spec "PAKE"): distinct associated data per side fixes a reflected-MAC
-/// issue. The server is CPace role A, the client is role B.
+/// @brief CPace ADa/ADb (pairing.md "PAKE"): distinct associated data per side fixes a
+/// reflected-MAC issue. The server is CPace role A, the client is role B.
 static constexpr char PAKE_AD_SERVER[] = "server";  // ADa
 static constexpr char PAKE_AD_CLIENT[] = "client";  // ADb
+
+namespace {
 
 /// @brief A CPace ISK held for the length of one handler and wiped when it goes out of scope.
 ///
@@ -171,6 +175,7 @@ static constexpr char PAKE_AD_CLIENT[] = "client";  // ADb
 /// surrounding code already does for K_wrap itself and for every PSK-bearing struct.
 class ScopedIsk {
 public:
+    /// @brief Takes ownership of an ISK and wipes the caller's copy
     /// @param isk The ISK to take ownership of. Taken by value and wiped, so the caller's
     ///        temporary does not outlive this copy.
     explicit ScopedIsk(std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> isk)
@@ -190,9 +195,14 @@ public:
         }
     }
 
+    /// @brief Whether an ISK was handed over
+    /// @return true when a value is held.
     [[nodiscard]] bool has_value() const {
         return this->value_.has_value();
     }
+
+    /// @brief The held ISK
+    /// @return Reference to the held bytes, valid until this object goes out of scope.
     [[nodiscard]] const std::array<uint8_t, CPACE_ISK_SIZE>& value() const {
         return this->value_.value();
     }
@@ -200,6 +210,8 @@ public:
 private:
     std::optional<std::array<uint8_t, CPACE_ISK_SIZE>> value_;
 };
+
+}  // namespace
 
 /// @brief Append `value` to `out` as a big-endian uint32, the encoding pairing.md "PAKE" gives
 /// both of the sid's counters.
@@ -681,7 +693,6 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // activate can legally narrow activities without re-sending an empty active_roles).
     const bool playback_capable =
         is_playback_capable(event.conn->get_psk_category(), event.activities, unpaired_access);
-    static const std::vector<std::string> EMPTY_ROLES{};
     const std::vector<std::string>& effective_roles =
         event.active_roles.has_value()
             ? event.active_roles.value()
@@ -759,7 +770,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
             const auto& cfg = this->client_->config_;
             switch (method) {
                 case SendspinPairMethod::PAIRING_PSK:
-                    offered = rs.pairing_psk_enabled() && rs.pairing_psk().has_value();
+                    offered = offers_pairing_psk(cfg, rs);
                     break;
                 case SendspinPairMethod::DYNAMIC_PAIRING_CODE:
                     offered = offers_dynamic_pairing_code(cfg, rs);
@@ -1620,7 +1631,6 @@ void ConnectionManager::flush_pending_admission() {
     {
         std::lock_guard<std::mutex> lock(this->conn_ptr_mutex_);
         conn = std::move(this->pending_admission_);
-        this->pending_admission_.reset();
     }
     if (conn != nullptr) {
         this->client_->admit_connection(conn.get());
