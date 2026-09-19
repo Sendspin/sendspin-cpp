@@ -103,7 +103,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
     }
 
     // Register the WebSocket handler. IDF >= 5.5.5 / 6.0.1 does not dispatch the upgrade GET to
-    // the handler (issue #70); registering the handler itself as the post-handshake callback
+    // the handler; registering the handler itself as the post-handshake callback
     // restores that dispatch, so httpd invokes it with the same GET request at the same lifecycle
     // position and the handler's HTTP_GET branch is the single upgrade signal on every IDF version.
     // There is no fallback path: no version fires both (skip-GET builds return before invoking the

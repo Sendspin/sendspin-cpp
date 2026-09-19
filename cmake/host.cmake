@@ -148,8 +148,7 @@ function(sendspin_configure_host TARGET_LIB SOURCE_DIR)
     endif()
 
     # Build the noise_c static library with the reference backend.
-    # noise-c is a C library; suppress any pedantic/extra warnings so our own
-    # -Wall -Wextra -Wpedantic flags don't bleed into it (it's a separate target).
+    # noise-c is a separate target, so our own -Wall -Wextra -Wpedantic flags do not reach it.
     add_library(noise_c STATIC
         # Protocol state machine
         ${noise_c_SOURCE_DIR}/src/protocol/cipherstate.c

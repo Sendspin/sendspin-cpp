@@ -76,7 +76,7 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `spsc_ring_buffer.h`: single-producer/single-consumer ring buffer (ESP: FreeRTOS `xRingbuffer`, host: mutex/condition variable)
 - `thread_safe_queue.h`: thread-safe queue (ESP: FreeRTOS queue, host: mutex/condition variable)
 - `event_flags.h`: event flag group (ESP: FreeRTOS event group, host: mutex/condition variable)
-- `shadow_slot.h`: mutex-protected slot for publishing state between two non-main-loop threads (e.g. the sync task's playback-progress slot); main-loop-bound traffic goes through the inbox (`inbox.h`) instead
+- `shadow_slot.h`: mutex-protected single-writer/single-reader slot between two threads (e.g. the sync task's playback-progress slot, the connection's pending-pairing slot); state the main loop reads goes through the inbox (`inbox.h`) instead
 
 Core source files in `src/` have no `#ifdef ESP_PLATFORM` guards; all platform differences are isolated to the platform layer and the `src/esp/`/`src/host/` directories.
 

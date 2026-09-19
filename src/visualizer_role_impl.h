@@ -101,7 +101,8 @@ struct VisualizerRole::Impl {
     void build_hello_fields(ClientHelloMessage& msg);
     void build_state_fields(ClientStateMessage& msg) const;
     // Each handler takes the teardown generation the receive gate captured when it admitted the
-    // message and re-checks it where it takes effect; see accepts().
+    // message and re-checks it where it takes effect; see accepts(). handle_stream_end() skips
+    // the check: cleanup() performs everything it does.
     void handle_binary(uint8_t binary_type, const uint8_t* data, size_t len, uint32_t generation);
     void handle_stream_start(const ServerVisualizerStreamObject& stream, uint32_t generation);
     void handle_stream_end(uint32_t generation);

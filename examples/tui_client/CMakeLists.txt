@@ -50,7 +50,7 @@ endif()
 
 if(PORTAUDIO_FOUND)
     target_sources(tui_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common/portaudio_sink.cpp)
-    target_include_directories(tui_client PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common ${PORTAUDIO_INCLUDE_DIRS})
+    target_include_directories(tui_client PRIVATE ${PORTAUDIO_INCLUDE_DIRS})
     target_link_directories(tui_client PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
     target_link_libraries(tui_client PRIVATE ${PORTAUDIO_LINK_LIBRARIES})
     target_compile_definitions(tui_client PRIVATE SENDSPIN_HAS_PORTAUDIO=1)
