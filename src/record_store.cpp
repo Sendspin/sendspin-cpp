@@ -421,7 +421,7 @@ bool RecordStore::persist_records(bool report_rejection) {
         SS_LOGW(TAG,
                 "Provider rejected the pairing-record write; the store's contents are RAM-only "
                 "for this boot: records added since the last accepted write will not survive a "
-                "reboot, and records dropped since it will be valid again after one");
+                "reboot, and records dropped since it will be valid again after a reboot");
     }
     return false;
 }
