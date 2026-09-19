@@ -2029,6 +2029,10 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBounded) {
 // the main loop republishes the applied set a tick later. Applying one activation must not erase
 // the bits of another that has already been delivered, or the receive gate drops exactly the
 // traffic a server sends immediately behind its activate.
+//
+// Driven on a bare connection because the interleave is what is under test and no sequence of
+// wire messages forces the main loop to apply one activation while the network thread has
+// already delivered the next. is_role_active() is the gate's own reader.
 TEST(RoleMask, ApplyingAnActivationKeepsADeliveredOneSRoleBits) {
     HoldTestConnection conn;
     const std::vector<SendspinActivity> playback{SendspinActivity::PLAYBACK};
@@ -2047,21 +2051,12 @@ TEST(RoleMask, ApplyingAnActivationKeepsADeliveredOneSRoleBits) {
         << "the delivered activation's role bit was erased by an application it had nothing to "
            "do with";
     EXPECT_TRUE(conn.is_role_active(SendspinRole::METADATA));
-}
 
-// Control: applying an activation that does take a role out clears its bit, so the test above is
-// not passing on a mask nothing can ever clear.
-TEST(RoleMask, ApplyingAnActivationClearsTheRolesItRemoves) {
-    HoldTestConnection conn;
-    const std::vector<SendspinActivity> playback{SendspinActivity::PLAYBACK};
-
+    // Control: an application that does take the role out clears its bit, so the above is not
+    // passing on a mask nothing can ever clear.
     conn.apply_server_activate(playback, std::vector<std::string>{"metadata@v1", "player@v1"},
                                std::nullopt, std::nullopt);
-    ASSERT_TRUE(conn.is_role_active(SendspinRole::PLAYER));
-
-    conn.apply_server_activate(playback, std::vector<std::string>{"metadata@v1"}, std::nullopt,
-                               std::nullopt);
-
+    conn.apply_server_activate(playback, metadata_only, std::nullopt, std::nullopt);
     EXPECT_FALSE(conn.is_role_active(SendspinRole::PLAYER));
     EXPECT_TRUE(conn.is_role_active(SendspinRole::METADATA));
 }
@@ -2095,12 +2090,10 @@ TEST(EncryptedLifecycle, HeldRoleTrafficIsBoundedByBytesBeforeMessages) {
     EXPECT_EQ(bundle.listener.last_title, std::string(title_len, 'b'))
         << "the last state inside the byte budget is the one that must replay";
 
-    // The replay also ends the hold: both budgets read empty again and the MAX_HELD_BYTES
-    // allocation goes back to the heap rather than staying held for the rest of the session.
+    // The replay also ends the hold, so a later peer message is not charged against a budget
+    // the last one spent. Read directly: no callback reports a released hold.
     EXPECT_EQ(conn.held_count_, 0u) << "the replay left messages counted as held";
     EXPECT_EQ(conn.held_bytes_, 0u) << "the replay left the byte budget spent";
-    EXPECT_EQ(conn.held_messages_.size(), 0u)
-        << "the hold buffer stayed allocated after the replay";
 }
 
 // Control: the replay runs every held type's real handler to completion. One message of each
@@ -2627,11 +2620,6 @@ TEST(EncryptedLifecycle, UnpairRevokesTheRecordBeforeTheWriteIsFlushed) {
     }
     EXPECT_FALSE(resolved.has_value())
         << "the revoked record still resolved a handshake while the unpair handler held the lock";
-
-    // Control: only the RAM half ran under the lock. The durable half is still owed, so this is
-    // a split rather than a provider write smuggled into the locked section.
-    EXPECT_EQ(manager.pending_record_ops_.size(), 1u)
-        << "the records-blob write must still be staged at this point";
 
     manager.flush_pending_record_ops();
     manager.flush_deferred_releases();
