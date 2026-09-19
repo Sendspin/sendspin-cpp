@@ -430,9 +430,11 @@ void send_loudness_until(SendspinClient& client, FakeEncryptedServer& server, in
 // stop() joins the visualizer drain thread and flushes the frames it had buffered, and start()
 // clears the stop command, so a restart begins with an empty ring and a thread that delivers.
 // The old frames are stamped far into the future, so the first session's thread parks on the
-// first one with the rest buffered behind it when stop() runs; the ring is read directly after
-// the stop because the restarted thread would silently drop leftovers before the new peer is
-// time synced, and the new session's stream/start would discard them at its clear marker.
+// first one with the rest buffered behind it when stop() runs.
+//
+// The ring is read directly because nothing a caller or peer observes distinguishes a drained
+// ring from an abandoned one: the restarted thread drops leftovers before the new peer is time
+// synced, and the new session's stream/start would discard them at its clear marker anyway.
 TEST(ClientLifecycle, StopFlushesBufferedVisualizerFramesAndRestartDelivers) {
     constexpr int64_t OLD_FRAME_LEAD_US = 5 * 1000 * 1000;
 
