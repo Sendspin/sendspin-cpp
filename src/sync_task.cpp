@@ -745,8 +745,9 @@ void SyncTask::release_stream_pin() {
 }
 
 void SyncTask::reset_context(SyncContext& sync_context) {
-    // The per-stream release runs before the task reports idle, where its position is
-    // load-bearing; this is the chokepoint that keeps a future early exit from leaking a pin.
+    // Backstop only: an outer-loop path that skipped the release after the inner loop must not
+    // carry a pin into the next stream. This runs after TASK_IDLE is published, so it does not
+    // stand in for the ordered release in thread_entry().
     this->release_stream_pin();
 
     // Reset SyncContext between streams without deallocating buffers.
@@ -963,18 +964,21 @@ void SyncTask::thread_entry(void* params) {
             }
         }
 
+        // Return any borrowed ring buffer entry. Ahead of the pin hand-over below, which blocks
+        // on the manager lock: a network thread can be parked on ring space for as long as
+        // HEADER_SEND_TIMEOUT_MS and this task is its only drainer, so the task holds nothing of
+        // its own when it takes that lock.
+        if (sync_context.encoded_entry != nullptr) {
+            this_task->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
+            sync_context.encoded_entry = nullptr;
+        }
+
         // Give the pin back before the task reports idle, so a connection dropped during the
         // stream is freed on the next flush rather than outliving it. The position matters: the
         // STREAM_END drain gate keys on is_running(), so the pin must be gone before the task
         // reads idle. Every outer-loop exit below this point goes through here; reset_context()
         // repeats the call at the top of the next iteration as a backstop.
         this_task->release_stream_pin();
-
-        // Return any borrowed ring buffer entry
-        if (sync_context.encoded_entry != nullptr) {
-            this_task->encoded_ring_buffer_->return_chunk(sync_context.encoded_entry);
-            sync_context.encoded_entry = nullptr;
-        }
 
         if (this_task->event_flags_.get() & COMMAND_STOP) {
             break;
