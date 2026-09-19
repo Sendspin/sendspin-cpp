@@ -401,7 +401,10 @@ static std::optional<LoopbackResult> run_loopback_handshake(const std::string& s
 TEST(NoiseHandshakeLoopback, KKpsk2ChaChaPoly_FullHandshake) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value()) << "ChaChaPoly loopback handshake failed";
-    EXPECT_TRUE(r->responder_session->handshake_complete());
+    // The split() outcome has no public observable; the transport ciphers it installs are the
+    // state production code goes on to use.
+    EXPECT_NE(r->responder_session->send_cipher_, nullptr);
+    EXPECT_NE(r->responder_session->recv_cipher_, nullptr);
     EXPECT_NE(r->initiator.send_cs, nullptr);
     EXPECT_NE(r->initiator.recv_cs, nullptr);
 }

@@ -80,10 +80,6 @@ std::string Identity::peer_id() const {
     return b64url_encode(this->public_bytes.data(), this->public_bytes.size());
 }
 
-std::string Identity::private_b64u() const {
-    return b64url_encode(this->private_bytes.data(), this->private_bytes.size());
-}
-
 std::optional<Identity> Identity::generate() {
     // Use noise-c's DHState to generate a fresh Curve25519 keypair.
     // This routes through noise-c's reference backend on both platforms.

@@ -273,14 +273,6 @@ TEST(Identity, TwoGenerateCallsProduceDifferentKeys) {
     EXPECT_NE(a.public_bytes, b.public_bytes);
 }
 
-TEST(Identity, PrivateB64uRoundTripsViaDecode) {
-    Identity id = Identity::generate().value();
-    auto decoded = b64url_decode(id.private_b64u());
-    ASSERT_TRUE(decoded.has_value());
-    EXPECT_EQ(decoded->size(), 32u);
-    EXPECT_EQ(std::memcmp(decoded->data(), id.private_bytes.data(), 32), 0);
-}
-
 // A generated Identity must never be the default-constructed (all-zero) value: generate() returns
 // std::optional precisely so a failure surfaces as an empty optional rather than a zero keypair
 // that would then be used as a real one. noise-c's DHState has no hook to force that failure, so

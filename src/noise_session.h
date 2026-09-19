@@ -119,12 +119,6 @@ public:
     /// @return true on success; transport mode is now active.
     bool write_msg2_and_split(std::vector<uint8_t>& msg2_out);
 
-    /// @brief Return true once split() has been called successfully.
-    /// Test-observability accessor only; production code tracks handshake completion elsewhere.
-    bool handshake_complete() const {
-        return this->send_cipher_ != nullptr && this->recv_cipher_ != nullptr;
-    }
-
     /// @brief The 32-byte Noise handshake hash `h` (available after split).
     const std::array<uint8_t, 32>& handshake_hash() const {
         return this->handshake_hash_;

@@ -86,10 +86,6 @@ struct Identity {
     /// @brief The base64url-encoded public key (Sendspin client_id / server_id).
     [[nodiscard]] std::string peer_id() const;
 
-    /// @brief The base64url-encoded private key (for persistence).
-    /// Used by tests.
-    [[nodiscard]] std::string private_b64u() const;
-
     // ========================================
     // Factory methods
     // ========================================
