@@ -484,8 +484,11 @@ Every method is invoked on the main loop thread, for every key, so a provider ne
 of its own. (The one library write that originates on the network thread -- the pairing record
 committed when a pairing finalizes -- is staged internally and flushed to
 `save_blob(persistence_keys::RECORDS, ...)` from the next `loop()` tick.)
-`save_blob(persistence_keys::KEYPAIR, ...)` is the one startup-time write: it fires once,
-during `start()`, rather than in response to a runtime event.
+First-boot provisioning writes from inside `start()` rather than in response to a runtime
+event: `save_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stored,
+`save_blob(persistence_keys::PAIRING_PSK, ...)` when no Pairing PSK is stored, and
+`save_blob(persistence_keys::PAIR_CONFIG, ...)` when no pairing config decoded. A `start()`
+that loads all three writes nothing.
 
 #### Keyspace
 
@@ -808,6 +811,10 @@ persistence_provider.save_blob(persistence_keys::PAIRING_PSK,
                                 reinterpret_cast<const uint8_t*>(blob.data()), blob.size());
 ```
 
+`client.format_pairing_token(psk.psk)` builds the token for any 32-byte PSK rather than the
+stored one, which is what a provisioning tool needs to print the token for the key it pinned.
+It returns `nullopt` before `start()`, since the token also carries the client's identity.
+
 After pairing completes, `on_pairing_succeeded` fires and the long-term record is stored
 by the library as a `persistence_keys::RECORDS` blob. Subsequent boots load that same blob;
 no further provisioning is needed.
@@ -968,7 +975,7 @@ controller.send_command({.command = SendspinControllerCommand::SEEK_RELATIVE, .o
 
 Fields that do not match the command are ignored when the message is serialized. The server clamps seeks to the seekable range and ignores any command not present in the controller state's `supported_commands`.
 
-A command is sent only while the server has `controller@v1` among the connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued. That gate lives in `SendspinClient::send_text()`, which every role-originated message goes through and which therefore takes the role family (`"controller"`, `"visualizer"`) alongside the message; the client's own messages do not use it.
+A command is sent only while the server has `controller@v1` among the connection's active roles. Calls made before the first `server/activate`, or after one that removes the role, are dropped rather than queued. That gate lives in `SendspinClient::send_text()`, which every role-originated message goes through and which therefore takes the role family (`"controller"`) alongside the message; the client's own messages do not use it.
 
 ## Accessing Roles
 
@@ -1331,10 +1338,33 @@ successful in-band re-handshake. See [Trust Levels](#trust-levels).
 | `CONCURRENT_ATTEMPT` | The server rejected pairing because another pairing is in progress |
 | `METHOD_NOT_SUPPORTED` | The proposed pairing method is not supported by the client |
 | `PAIRING_CODE_MISMATCH` | The pairing code entered does not match the one this client emitted |
-| `USER_CANCELLED` | The pairing was cancelled by the user (on the server side) |
-| `UNKNOWN` | Unrecognized abort reason from the server |
+| `USER_CANCELLED` | The pairing was cancelled by the user: by the server, or locally by `cancel_pairing_window()` while an attempt was waiting for the gesture |
+| `UNKNOWN` | Unrecognized abort reason from the server, or a client-local protocol error (which also closes the connection) |
 
-Delivered via `SendspinClientListener::on_pairing_failed`.
+Delivered via `SendspinClientListener::on_pairing_failed`. An activation naming a pairing
+method or format the client does not offer is answered with a `pair/abort` carrying
+`method_not_supported` and no listener callback at all; the connection stays open.
+
+### SendspinPairingCodeChannel
+
+| Value | Description |
+|---|---|
+| `DISPLAY` | The code is shown on a display |
+| `SPEAKER` | The code is spoken, not tone-encoded |
+
+Listed in `SendspinClientConfig::pairing_code_out_channels` and advertised as the
+`dynamic_pairing_code` descriptor's `out_channels`.
+
+### SendspinPairingCodeFormat
+
+| Value | Description |
+|---|---|
+| `DIGITS` | Six decimal digits the operator types into the server |
+| `QR_CODE` | A pairing token the operator scans from a rendered QR code |
+
+Listed in `SendspinClientConfig::pairing_code_formats` and advertised as the
+`dynamic_pairing_code` descriptor's `formats`; the server picks one of them and the chosen
+format arrives as the `format` argument of `on_display_pairing_code`.
 
 ### SendspinCodecFormat
 
