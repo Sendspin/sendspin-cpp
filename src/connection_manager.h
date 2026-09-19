@@ -230,8 +230,9 @@ struct HelloRetryState {
     std::shared_ptr<SendspinConnection> conn;  ///< Connection awaiting hello
     int64_t retry_time_us{0};  ///< Next retry time in microseconds (0 = no pending retry)
     static constexpr uint32_t INITIAL_RETRY_DELAY_MS = 100U;  ///< Initial backoff delay in ms
+    static constexpr uint8_t MAX_ATTEMPTS = 3;                ///< Hello sends before giving up
     uint32_t delay_ms{INITIAL_RETRY_DELAY_MS};                ///< Current backoff delay
-    uint8_t attempts{3};                                      ///< Remaining retry attempts
+    uint8_t attempts{MAX_ATTEMPTS};                           ///< Remaining retry attempts
 };
 
 /// @brief Deferred server/activate event, processed in ConnectionManager::loop()

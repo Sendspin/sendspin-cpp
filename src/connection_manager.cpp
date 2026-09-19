@@ -1469,28 +1469,23 @@ void ConnectionManager::on_new_connection(std::shared_ptr<SendspinServerConnecti
 
 void ConnectionManager::initiate_hello(SendspinConnection* conn) {
     // Note: caller must hold conn_ptr_mutex_
-    // Arm a per-connection hello retry: send on the next tick, 3 attempts. If an entry for this
-    // connection already exists (a duplicate connected event for the same connection would land
-    // here twice), re-arm it in place instead of pushing a second one, so a connection never gets
-    // two timers.
+    // Arm a per-connection hello retry: send on the next tick, HelloRetryState::MAX_ATTEMPTS
+    // attempts. If an entry for this connection already exists (a duplicate connected event for
+    // the same connection would land here twice), re-arm it in place instead of pushing a second
+    // one, so a connection never gets two timers. The member initializers supply the delay and
+    // the attempt count on both paths.
     auto conn_sp = conn->shared_from_this();
     const int64_t retry_time_us = platform_time_us();
 
     for (auto& retry : this->hello_retries_) {
         if (retry.conn == conn_sp) {
-            retry.delay_ms = HelloRetryState::INITIAL_RETRY_DELAY_MS;
-            retry.attempts = 3;
-            retry.retry_time_us = retry_time_us;
+            retry = HelloRetryState{.conn = std::move(conn_sp), .retry_time_us = retry_time_us};
             return;
         }
     }
 
-    HelloRetryState retry;
-    retry.conn = std::move(conn_sp);
-    retry.delay_ms = HelloRetryState::INITIAL_RETRY_DELAY_MS;
-    retry.attempts = 3;
-    retry.retry_time_us = retry_time_us;
-    this->hello_retries_.push_back(std::move(retry));
+    this->hello_retries_.push_back(
+        HelloRetryState{.conn = std::move(conn_sp), .retry_time_us = retry_time_us});
 }
 
 void ConnectionManager::remove_hello_retry(const SendspinConnection* conn) {
