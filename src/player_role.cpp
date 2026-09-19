@@ -419,7 +419,10 @@ void PlayerRole::Impl::handle_stream_clear(uint32_t generation) const {
 
 void PlayerRole::Impl::handle_server_command(const ServerCommandMessage& cmd,
                                              uint32_t generation) const {
-    if (!cmd.player.has_value() || !this->accepts(generation)) {
+    if (!this->accepts(generation)) {
+        return;
+    }
+    if (!cmd.player.has_value()) {
         SS_LOGV(TAG, "Server command has no player commands");
         return;
     }
