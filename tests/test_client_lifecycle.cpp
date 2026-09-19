@@ -78,6 +78,7 @@ constexpr uint16_t SYNC_PIN_RELEASE_TEST_PORT = 19023;
 constexpr uint16_t SYNC_PIN_NULL_TEST_PORT = 19024;
 constexpr uint16_t SYNC_PIN_STOP_TEST_PORT = 19025;
 constexpr uint16_t SYNC_PIN_DROP_TEST_PORT = 19026;
+constexpr uint16_t SYNC_PIN_MIDSTREAM_TEST_PORT = 19027;
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
@@ -1071,6 +1072,51 @@ TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandOverForTheLoop) {
         << "the connection was destroyed on a thread other than the one that pumps loop()";
 
     client.stop();
+}
+
+// The drop the design is about: the server's session is taken away mid-stream, so the manager
+// queues its own release WITH a goodbye while the sync task still holds the pin, and one
+// connection is named by two queue entries. The pin is live by construction - nothing has ended
+// the stream, and the task cannot reach its release without the lock held here - so the goodbye
+// entry is the one that speaks for the session and the hand-over only drops a reference. What
+// the test reads afterwards is that the wire saw exactly one goodbye and that the destructor ran
+// on the thread that pumps loop(), never on the audio thread.
+TEST(ClientLifecycle, AMidStreamDropGoodbyesOnceAndFreesOnTheLoop) {
+    PinObservation observation;  // Outlives the client (see the stop test)
+    CountingPlayerListener listener;
+    TestNetworkProvider network;
+    SendspinClient client(make_config(SYNC_PIN_MIDSTREAM_TEST_PORT));
+    client.set_network_provider(&network);
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
+    ASSERT_TRUE(client.start());
+
+    auto conn = std::make_shared<PinnedConnection>(&observation);
+    SendspinConnection* dropped = conn.get();
+    ASSERT_TRUE(pin_stream_on(client, std::move(conn)));
+
+    ConnectionManager& manager = *client.connection_manager_;
+    {
+        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+        manager.drop_connection(dropped, SendspinGoodbyeReason::ANOTHER_SERVER);
+        ASSERT_EQ(manager.deferred_releases_.size(), 1u);
+        EXPECT_EQ(manager.deferred_releases_[0].conn.get(), dropped);
+        EXPECT_TRUE(manager.deferred_releases_[0].goodbye.has_value())
+            << "the drop queued no goodbye, so the session was never told it was over";
+    }
+    manager.flush_deferred_releases();
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return listener.stream_ends == 1; }, FIXTURE_PUMP_TIMEOUT_MS))
+        << "the drop never ended the player's stream";
+    ASSERT_TRUE(pump_until(
+        client, [&] { return observation.destroyed.load(); }, FIXTURE_PUMP_TIMEOUT_MS))
+        << "the dropped connection outlived the stream that pinned it";
+    EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
+        << "the sync task freed the connection on its own thread";
+    EXPECT_EQ(observation.goodbyes.load(), 1) << "the two queue entries each sent a goodbye";
+
+    client.stop();
+    EXPECT_EQ(observation.goodbyes.load(), 1) << "stop() goodbyed a connection already released";
 }
 
 }  // namespace
