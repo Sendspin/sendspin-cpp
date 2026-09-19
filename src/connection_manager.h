@@ -480,8 +480,11 @@ private:
     // lock contract; see loop()'s definition in connection_manager.cpp for the exact call
     // sequence and the flush_deferred_releases() calls between steps.
 
-    /// @brief Stack-local snapshot of every deferred queue, filled by one swap under conn_mutex_
-    /// in swap_out_pending_events(). Private to ConnectionManager; never exposed outside it.
+    /// @brief Snapshot of every deferred queue, filled by one swap under conn_mutex_ in
+    /// swap_out_pending_events(). Held in drained_events_ rather than on loop()'s frame so the
+    /// swap hands the queues back buffers that keep their capacity, instead of freeing the
+    /// drained ones every tick that carries events. Private to ConnectionManager; never exposed
+    /// outside it.
     struct DrainedEvents {
         std::vector<std::shared_ptr<SendspinConnection>> connected, disconnected;
         std::vector<ServerActivateEvent> activates;
@@ -494,6 +497,9 @@ private:
 
         /// @brief True if any queue above has an entry, or a window gesture is set.
         bool any() const;
+
+        /// @brief Empties every queue and clears both gestures, keeping the queues' capacity.
+        void clear();
     };
 
     /// @brief Starts the WS server once the network becomes ready. A persistent failure (e.g. the
@@ -502,12 +508,12 @@ private:
     void maybe_start_ws_server();
 
     /// @brief Swaps every pending_*_events_ queue and the pairing-window confirm and cancel flags
-    /// out into a freshly returned DrainedEvents. Acquires conn_mutex_ internally, and only
-    /// when the has_pending_events_ acquire-load hint says there is something to swap; clears
-    /// has_pending_events_ under that same lock. Returns a default-constructed (empty)
-    /// DrainedEvents when the hint was false.
-    /// @return The drained events.
-    DrainedEvents swap_out_pending_events();
+    /// out into drained_events_. Acquires conn_mutex_ internally, and only when the
+    /// has_pending_events_ acquire-load hint says there is something to swap; clears
+    /// has_pending_events_ under that same lock. drained_events_ is left empty when the hint was
+    /// false. The caller clears drained_events_ once it has processed them, which is also what
+    /// leaves it empty for the next call.
+    void swap_out_pending_events();
 
     /// @brief Applies disconnect events, then connected events, then in-band re-handshake
     /// re-arms, then server/activate events (trust enforcement, pairing-method admissibility,
@@ -1004,6 +1010,9 @@ private:
     std::vector<ServerUnpairEvent> pending_server_unpair_events_;
     std::vector<ServerPairingMessageEvent> pending_pairing_message_events_;
     std::vector<std::string> pending_pairing_succeeded_events_;  // server_ids to notify
+    // The queues above, swapped out for the current tick's drain and cleared once it is done.
+    // Main-loop-only; see DrainedEvents.
+    DrainedEvents drained_events_;
 
     // Pointer fields
     SendspinClient* client_;

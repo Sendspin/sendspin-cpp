@@ -302,7 +302,7 @@ ConnectionManager::~ConnectionManager() {
     // Move everything out under the locks, destroy outside them: a connection destructor can join
     // its transport thread (see DeferredRelease), which must not happen while a lock is held.
     // The two mutexes guard disjoint state and are taken in separate scopes, never nested.
-    DrainedEvents pending = this->swap_out_pending_events();
+    this->swap_out_pending_events();
 
     std::shared_ptr<SendspinConnection> current;
     // cppcheck-suppress variableScope
@@ -329,8 +329,9 @@ ConnectionManager::~ConnectionManager() {
         this->refresh_nursery_size_hint();
         this->refresh_deferred_size_hint();
     }
-    // Locals release here. Queued goodbyes are skipped on destruction; shutdown drops slots
-    // without a send.
+    // Locals and the swapped-out events release here, outside both locks. Queued goodbyes are
+    // skipped on destruction; shutdown drops slots without a send.
+    this->drained_events_.clear();
 }
 
 // ============================================================================
@@ -510,6 +511,18 @@ bool ConnectionManager::DrainedEvents::any() const {
            this->pairing_window_confirm || this->pairing_window_cancel;
 }
 
+void ConnectionManager::DrainedEvents::clear() {
+    this->connected.clear();
+    this->disconnected.clear();
+    this->activates.clear();
+    this->pair_aborts.clear();
+    this->server_unpairs.clear();
+    this->pairing_messages.clear();
+    this->pairing_succeeded.clear();
+    this->pairing_window_confirm = false;
+    this->pairing_window_cancel = false;
+}
+
 PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
     // Close admission and detach every managed connection under the lock. Nothing is sent or
     // released here (see DeferredRelease): the goodbyes below run outside the lock, and a
@@ -586,7 +599,8 @@ PairingUiSnapshot ConnectionManager::stop(SendspinGoodbyeReason reason) {
 
     // Drop every deferred event those closes (or the last ticks) queued: the connections they
     // name are gone, and a pairing event has no session to act on.
-    DrainedEvents dropped = this->swap_out_pending_events();
+    this->swap_out_pending_events();
+    this->drained_events_.clear();
     // Locals release here, outside every lock. An outbound connection's destructor stops its
     // transport synchronously; deferring that is not an option (see DeferredRelease).
     return ui;
@@ -608,13 +622,15 @@ void ConnectionManager::maybe_start_ws_server() {
     }
 }
 
-ConnectionManager::DrainedEvents ConnectionManager::swap_out_pending_events() {
-    DrainedEvents ev;
+void ConnectionManager::swap_out_pending_events() {
+    DrainedEvents& ev = this->drained_events_;
     // Skip the conn_mutex_ acquisition entirely when the hint says all queues are
     // empty. Sound because every push site sets has_pending_events_ = true under
     // conn_mutex_ before releasing it (see the field's doc comment in connection_manager.h).
     if (this->has_pending_events_.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(this->conn_mutex_);
+        // ev is empty here, so each queue receives an empty vector that keeps whatever capacity
+        // the last drain left it.
         ev.connected.swap(this->pending_connected_events_);
         ev.disconnected.swap(this->pending_disconnect_events_);
         ev.activates.swap(this->pending_activate_events_);
@@ -626,7 +642,6 @@ ConnectionManager::DrainedEvents ConnectionManager::swap_out_pending_events() {
         ev.pairing_window_cancel = std::exchange(this->pending_pairing_window_cancel_, false);
         this->has_pending_events_.store(false, std::memory_order_release);
     }
-    return ev;
 }
 
 void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
@@ -1222,7 +1237,8 @@ void ConnectionManager::loop() {
     // Process deferred connection lifecycle events: one conn_mutex_ swap, then (when there is
     // something to do) one conn_ptr_mutex_ section applying lifecycle, pairing, and unpair
     // events in order.
-    DrainedEvents ev = this->swap_out_pending_events();
+    this->swap_out_pending_events();
+    DrainedEvents& ev = this->drained_events_;
 
     // Also runs whenever the nursery is non-empty even with no swapped-out events: the
     // noise-completion scan in scan_hello_and_nursery() (called further down) is
@@ -1286,6 +1302,10 @@ void ConnectionManager::loop() {
     this->scan_reprove_watchdog();
     // Send the goodbye and release the connection if the re-proving watchdog above dropped one.
     this->flush_deferred_releases();
+
+    // Release this tick's drained events, outside every lock and after the flushes above, and
+    // keep their buffers for the next tick.
+    ev.clear();
 }
 
 // ============================================================================
