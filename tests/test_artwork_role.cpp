@@ -1736,10 +1736,14 @@ TEST(ArtworkDisplayDeadline, LatenessReportsPastDeadlineSlip) {
 }
 
 TEST(ArtworkDisplayDeadline, LargeOffsetDoesNotOverflow) {
-    // INT32_MIN/MAX offsets must be widened to 64-bit before the ms-to-us multiply.
+    // INT32_MIN/MAX offsets must be widened to 64-bit before the ms-to-us multiply. The exact
+    // shifted overdue is what says so: a sign check passes for a narrowed product too, and would
+    // leave the widening resting on UBSan.
     const int64_t now = 10'000'000;
-    EXPECT_GE(ArtworkRole::Impl::display_overdue_us(now + US_PER_MS, INT32_MAX, now), 0);
-    EXPECT_LT(ArtworkRole::Impl::display_overdue_us(now - US_PER_MS, INT32_MIN, now), 0);
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now + US_PER_MS, INT32_MAX, now),
+              int64_t{INT32_MAX} * US_PER_MS - US_PER_MS);
+    EXPECT_EQ(ArtworkRole::Impl::display_overdue_us(now - US_PER_MS, INT32_MIN, now),
+              int64_t{INT32_MIN} * US_PER_MS + US_PER_MS);
 }
 
 // ============================================================================
@@ -1756,6 +1760,12 @@ TEST(ArtworkDisplayLateness, ZeroIsReservedForNoConnection) {
     EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(0, 0), 0u);                  // no connection
     EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, US_PER_MS - 1), 1u);      // connected, <1ms
     EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, 600 * US_PER_MS), 600u);  // connected slip
+}
+
+TEST(ArtworkDisplayLateness, HugeLatenessSaturatesAtUint32Max) {
+    // A pathological far-past deadline can exceed UINT32_MAX ms (~49 days); the ms value must
+    // saturate there rather than wrap when narrowed to uint32_t.
+    EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, INT64_MAX), UINT32_MAX);
 }
 
 // ============================================================================
@@ -1809,12 +1819,6 @@ TEST(ArtworkChannelReporting, NoConfiguredChannelsReportsNothing) {
     EXPECT_FALSE(state.artwork.has_value());
 }
 
-TEST(ArtworkDisplayLateness, HugeLatenessSaturatesAtUint32Max) {
-    // A pathological far-past deadline can exceed UINT32_MAX ms (~49 days); the ms value must
-    // saturate there rather than wrap when narrowed to uint32_t.
-    EXPECT_EQ(ArtworkRole::Impl::display_lateness_ms(1, INT64_MAX), UINT32_MAX);
-}
-
 // ============================================================================
 // stream/start channel mismatch reporting
 // ============================================================================
@@ -1848,8 +1852,8 @@ std::string channel_stream_start_log(std::vector<ServerArtworkChannelObject> ser
 
 // roles/artwork/v1.md "stream/start artwork object": the server reports what it will actually
 // stream per channel, which need not be what the client asked for. The role streams it either
-// way, so each mismatch is a log line and nothing else - which is why the operand rename that
-// reached these width and height comparisons changed them with nothing watching.
+// way, so each mismatch is a log line and nothing else - the only place an inverted comparison
+// or a swapped operand shows up.
 TEST(ArtworkChannelMismatch, SourceMismatchIsReported) {
     ServerArtworkChannelObject served = requested_channel();
     served.source = SendspinImageSource::ARTIST;
