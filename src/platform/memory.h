@@ -18,7 +18,7 @@
 
 #pragma once
 
-#include "platform/crypto.h"
+#include "platform/secure_zero.h"
 #include "sendspin/types.h"
 #include <ArduinoJson.h>
 

@@ -15,6 +15,7 @@
 #include "platform/base64.h"
 #include "platform/logging.h"
 #include "platform/memory.h"
+#include "platform/secure_zero.h"
 #include "protocol_messages.h"
 #include "sendspin/color_role.h"
 #include "sendspin/config.h"
