@@ -421,11 +421,12 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
                         format_var.as<const char*>());
             }
         }
-        // The server's `languages` (BCP 47 tags, descending operator preference) is an
-        // informational hint for SPOKEN pairing-code emission only (pairing.md "Digits
-        // emission"). This client hands the code to the listener as text and emits nothing
-        // itself, so the hint is deliberately not parsed; a client adding speaker emission
-        // should read it from server/hello and apply RFC 4647 Lookup matching.
+        // The server's `languages` (BCP 47 tags, descending operator preference) is a hint
+        // about the languages the operator understands, informing any operator-facing output
+        // (messaging.md "server/hello"). The one place this library could use it is spoken
+        // pairing-code emission (pairing.md "Digits emission"), which it does not implement, so
+        // the hint is deliberately not parsed; a client adding speaker emission should read it
+        // from server/hello and apply RFC 4647 Lookup matching.
     }
 
     return true;

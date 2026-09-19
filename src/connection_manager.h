@@ -782,7 +782,9 @@ private:
     /// satisfies this; start() warns when a configured value does not.
     static constexpr size_t NURSERY_CAPACITY = 2;
 
-    /// @brief Maximum connections open at once: the admitted one plus a full nursery.
+    /// @brief Maximum connections open at once: the admitted one plus the nursery bound, which
+    /// is NURSERY_CAPACITY + 1 because an outbound entry does not count against the capacity
+    /// (see NURSERY_CAPACITY above).
     static constexpr size_t MAX_OPEN_CONNECTIONS = NURSERY_CAPACITY + 2;
 
     // pairing.md "Pairing Records" requires the client to cap its concurrently open paired
@@ -797,8 +799,9 @@ private:
     // ========================================
 
     /// @brief Enters the pairing exchange for the given connection.
-    /// Called on the main loop when a server/activate with activities=["pairing"] and
-    /// pairing.method=PAIRING_PSK is admitted as the first activate.
+    /// Called on the main loop when an admitted server/activate declares the PAIRING activity
+    /// with a pairing.method the client offers. PLAYBACK may ride along, and the activate need
+    /// not be the connection's first.
     /// @param conn The connection entering pairing.
     void handle_enter_pairing(SendspinConnection* conn);
 
@@ -813,9 +816,11 @@ private:
                                    const std::string& server_id,
                                    SendspinPairMethod selected_method);
 
-    /// @brief Runs the Pairing-PSK branch of handle_enter_pairing(): resolves the pairing outcome
-    /// and sends client/pair-finalize with the long-term PSK in the clear.
+    /// @brief Runs the Pairing-PSK branch of handle_enter_pairing(): resolves the pairing
+    /// outcome and sends client/pair-init followed by client/pair-finalize with the long-term
+    /// PSK in the clear.
     /// @param conn The connection entering pairing.
+    /// @param pairing_index Current pairing_index counter, captured by handle_enter_pairing().
     /// @param server_id conn->get_server_id(), captured by handle_enter_pairing().
     void handle_enter_pairing_psk(SendspinConnection* conn, uint32_t pairing_index,
                                   const std::string& server_id);
@@ -936,7 +941,7 @@ private:
 
     /// @brief Open the pairing window on the main loop (operator gesture). If an attempt is
     /// already waiting in AWAIT_PAIRING_WINDOW, the window admits it immediately; otherwise it
-    /// stands open for WINDOW_LIFETIME (5 minutes) awaiting a pairing activate. The gesture is
+    /// stands open for WINDOW_LIFETIME_US (5 minutes) awaiting a pairing activate. The gesture is
     /// also the deliberate operator action that clears a standing round limit
     /// (pairing.md "Rounds"), so it resets the round count.
     void open_pairing_window();
@@ -957,16 +962,18 @@ private:
     void handle_pairing_window_cancelled();
 
     /// @brief Close the pairing window: clear its deadline, the connection it is bound to, and
-    /// its failed-attempt count. Idempotent, and silent when no window is open.
+    /// its failed-attempt count. Idempotent, and silent when no window is open. Main-loop-only.
     void close_pairing_window();
 
     /// @brief Whether an open window admits an attempt on `conn`. The window admits attempts
     /// only on the connection that carried its first (pairing.md "Pairing Window"), so a second
-    /// server cannot ride a gesture the operator made for another one.
+    /// server cannot ride a gesture the operator made for another one. Main-loop-only.
+    /// @param conn The connection whose attempt is being judged.
+    /// @return true when the window admits an attempt on `conn`.
     [[nodiscard]] bool pairing_window_admits(const SendspinConnection* conn) const;
 
     /// @brief Count one attempt under the current window whose server_kc verification failed,
-    /// closing the window on the fifth (pairing.md "Pairing Window").
+    /// closing the window on the fifth (pairing.md "Pairing Window"). Main-loop-only.
     void note_pairing_window_attempt_failed();
 
     // ========================================

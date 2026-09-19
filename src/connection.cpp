@@ -421,9 +421,9 @@ SS_HOT void SendspinConnection::dispatch_completed_message(bool is_text, int64_t
         NoiseTransport::CompleteMessage msg =
             this->noise_transport_.accept_plaintext(this->websocket_payload_.data(), pt_len);
         if (msg.malformed) {
-            // messaging.md "Malformed sequences": a fragment that starts, continues, or types a
-            // message the sequence cannot accept is a protocol error that MUST close the
-            // connection.
+            // messaging.md "Malformed sequences" is a protocol error the receiver MUST close the
+            // connection for; NoiseTransport::CompleteMessage::malformed enumerates the five
+            // sequences that set it.
             SS_LOGW(TAG, "Malformed fragment sequence; closing connection");
             this->reset_websocket_payload();
             this->close_silently(SendspinGoodbyeReason::UNAUTHORIZED);

@@ -710,7 +710,7 @@ public:
     /// main-loop-only role set.
     /// @param text The text message to send
     /// @param role_family Role family the message belongs to, without the version suffix
-    ///                    ("controller", "visualizer")
+    ///                    (e.g. "controller")
     void send_text(const std::string& text, const std::string& role_family);
 
     /// @brief Acquires a ref-counted high-performance networking request

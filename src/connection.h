@@ -182,8 +182,9 @@ public:
     }
 
     /// @brief Mark this connection as occupying (or vacating) the admitted slot.
-    /// ConnectionManager::set_current_connection() is the only caller, through
-    /// SendspinClient::admit_connection() when admitting.
+    /// Set by SendspinClient::admit_connection(); cleared by ConnectionManager, from
+    /// set_current_connection(), drop_connection(), and stop().
+    /// @param admitted Whether this connection now occupies the admitted slot.
     void set_admitted(bool admitted) {
         this->admitted_.store(admitted, std::memory_order_release);
     }
@@ -229,6 +230,7 @@ public:
 
     /// @brief Passes each held role message to `visit`, in arrival order, then drops them all.
     /// Same locking contract as hold_pre_admission_message().
+    /// @param visit Called once per held message, with the message bytes and its arrival time.
     void replay_pre_admission_messages(const HeldMessageVisitor& visit);
 
     // ========================================
@@ -720,8 +722,10 @@ public:
     /// name this library implements.
     ///
     /// The one activation test in the library: the receive gate, the send gate, the client/state
-    /// role objects and role removal all go through it, so no two of them can disagree about
-    /// whether a role is active. Reads an atomic mask rebuilt by apply_server_activate(), so the
+    /// role objects and role removal all resolve a role the same way, since this reads the mask
+    /// active_role_mask() builds with the same exact-version test (role_in()) role removal
+    /// applies, so no two of them can disagree about whether a role is active. The mask is
+    /// rebuilt by apply_server_activate() and read atomically, so the
     /// receive path may call it from the network thread while the main loop applies an
     /// activation; active_roles_ itself is main-loop-only and must not be walked from there.
     /// @param role The role to test.

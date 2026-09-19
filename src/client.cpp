@@ -153,6 +153,7 @@ bool role_accepts_traffic(const SendspinConnection* conn, SendspinRole role) {
 /// @param before The active roles the activation replaces.
 /// @param after The active roles the activation established.
 /// @param role The role to test.
+/// @return true when the activation takes `role` out of the active set.
 bool role_removed(const std::vector<std::string>& before, const std::vector<std::string>& after,
                   SendspinRole role) {
     if (!role_in(before, role) || role_in(after, role)) {

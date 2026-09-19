@@ -321,8 +321,9 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
     const uint32_t total_size = be32_to_host(body + 1 + 8);
 
     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
-    // "The server MUST NOT announce an image, on any channel, while a transfer is in flight":
-    // one of the malformed sequences the client closes on.
+    // roles/artwork/v1.md "Artwork (Binary)": "The server MUST NOT announce an image, on any
+    // channel, while a transfer is in flight": one of the malformed sequences the client closes
+    // on.
     if (this->transfer.in_flight) {
         SS_LOGW(TAG, "Artwork announce for slot %u while slot %u is mid-transfer", slot,
                 this->transfer.slot);
@@ -411,8 +412,8 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::append_part(uint8_t slot, 
     // out from under it while it still owns the notification for that generation.
     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
     auto& t = this->transfer;
-    // "a part received with no transfer in flight or on a channel other than the in-flight
-    // transfer's" is a malformed sequence.
+    // roles/artwork/v1.md "Artwork (Binary)": "a part received with no transfer in flight or on
+    // a channel other than the in-flight transfer's" is a malformed sequence.
     if (!t.in_flight || t.slot != slot) {
         SS_LOGW(TAG, "Artwork part for slot %u with no transfer in flight on it", slot);
         return TransferOutcome::MALFORMED;
@@ -479,9 +480,10 @@ bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
         return false;
     }
 
-    // "Servers MUST NOT send artwork messages outside an active artwork stream." One that arrives
-    // anyway is ignored rather than closed on: the sequence rules below are scoped to an active
-    // stream, and there is no sequence to be part of yet.
+    // roles/artwork/v1.md "Artwork (Binary)": "Servers MUST NOT send artwork messages outside an
+    // active artwork stream." One that arrives anyway is ignored rather than closed on: the
+    // sequence rules below are scoped to an active stream, and there is no sequence to be part of
+    // yet.
     if (!this->stream_active) {
         return true;
     }
@@ -554,8 +556,9 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
     // carries the epoch it was decoded under, so drain_events() drops the ones whose channel
     // moved on whether or not they have been folded into the main-thread holds yet.
     {
-        // "A stream/start that changes a channel's configuration likewise discards that channel's
-        // pending image, and the server re-sends the image if it still applies." The discard is
+        // roles/artwork/v1.md "stream/start artwork object": "A stream/start that changes a
+        // channel's configuration likewise discards that channel's pending image, and the server
+        // re-sends the image if it still applies." The discard is
         // scoped to the channels whose configuration this stream/start changed: a channel the
         // server left alone keeps the image it already scheduled, which the server will neither
         // cancel nor re-send. Bumping those channels' epochs is the discard (see slot_epochs), and
@@ -615,9 +618,10 @@ uint8_t ArtworkRole::Impl::changed_channel_mask(const ServerArtworkStreamObject&
 
     uint8_t changed = 0;
     for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
-        // "The channels array is positional from channel 0 and never longer than 4. A channel the
-        // array does not cover ... is not streamed", so a channel one array covers and the other
-        // does not has changed, as has one whose source, format, width or height differs.
+        // roles/artwork/v1.md "stream/start artwork object": "The channels array is positional
+        // from channel 0 and never longer than 4. A channel the array does not cover ... is not
+        // streamed", so a channel one array covers and the other does not has changed, as has one
+        // whose source, format, width or height differs.
         const bool had = slot < before.size();
         const bool has = slot < now.size();
         if (had != has || (had && !same_channel(before[slot], now[slot]))) {

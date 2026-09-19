@@ -93,9 +93,10 @@ public:
 
     /// @brief Called on the main loop thread when artwork should be cleared for a slot
     ///
-    /// Fires on stream end or stream clear for each configured slot, when a server/activate takes
-    /// the artwork role out of the session's active roles (also every slot, with any in-flight
-    /// transfer dropped), and for a single slot when the server clears that channel (the artwork
+    /// Fires on stream end or stream clear for each configured slot, when the connection to the
+    /// server is lost, and when a server/activate takes the artwork role out of the session's
+    /// active roles (both also every slot, with any in-flight transfer dropped), and for a single
+    /// slot when the server clears that channel (the artwork
     /// for the current item is gone, e.g. a track with no album art). A per-channel clear is
     /// scheduled to its server timestamp exactly like on_image_display(),
     /// ImageSlotPreference::display_offset_ms included, so it lands on the item boundary rather

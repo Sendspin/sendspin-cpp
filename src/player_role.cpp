@@ -278,7 +278,7 @@ void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
         adjustable ? this->output_delay_ms.load(std::memory_order_relaxed) : 0;
     // Never below what the pipeline itself spends: the server extends lead only toward the
     // reported number, so a configured value under that floor would truncate the stream start
-    // (roles/player/v1.md "Timing parameters").
+    // (roles/player/v1.md "Server Audio Send Constraints").
     player_state.required_lead_time_ms =
         std::max(this->config.required_lead_time_ms.value_or(0),
                  PlayerRoleConfig::pipeline_lead_time_ms(this->config.extra_startup_silence_ms));

@@ -142,14 +142,15 @@ inline const char* to_cstr(SendspinRole role) {
     }
 }
 
-/// @brief Whether a versioned role name is in an active_roles set.
-/// @param active_roles The set to search, as the server wrote it.
-/// @param role The role to look for, compared against its full versioned name ("player@v1").
+/// @brief Whether a versioned role name is in an active_roles set
 ///
 /// The comparison is on the exact versioned name this library implements, not the family, because
 /// messaging.md "server/activate" counts "replacement of an active role version" as removal of the
 /// version that was active: a client offered `player@v1` that is handed `player@v2` implements
 /// neither the new version's behavior nor, any longer, the old one's.
+/// @param active_roles The set to search, as the server wrote it.
+/// @param role The role to look for, compared against its full versioned name ("player@v1").
+/// @return true when `active_roles` names this exact versioned role.
 inline bool role_in(const std::vector<std::string>& active_roles, SendspinRole role) {
     const char* name = to_cstr(role);
     for (const auto& active : active_roles) {
@@ -181,10 +182,14 @@ inline std::optional<SendspinRole> role_for_family(const std::string& family) {
     return std::nullopt;
 }
 
-/// @brief Bit that represents `role` in an active-role mask.
+/// @brief Bit that represents `role` in an active-role mask
+/// @param role The role to map.
+/// @return Single-bit mask value for `role`.
 inline uint16_t role_mask_bit(SendspinRole role) {
     return static_cast<uint16_t>(1U << static_cast<uint8_t>(role));
 }
+
+static_assert(static_cast<uint8_t>(SendspinRole::COUNT) <= 16, "role mask is a uint16_t");
 
 /// @brief Builds the mask of roles this library implements that `active_roles` names.
 ///
@@ -319,9 +324,10 @@ inline const char* to_cstr(SendspinPairingCodeChannel channel) {
     }
 }
 
-/// @brief Reason a pairing attempt was aborted (pairing.md "Client <-> Server: pair/abort").
-/// The Pairing PSK flow emits only method_not_supported; pairing_code_mismatch is emitted by the
-/// code-based flows, and every reason is parsed when the server sends it.
+/// @brief Reason a pairing attempt was aborted (pairing.md "Client <-> Server: pair/abort")
+/// The client emits every reason: pairing_code_mismatch comes from the code-based flows, the rest
+/// from the shared attempt handling. The spec lets a server send pairing_code_mismatch or
+/// user_cancelled, and the full set is parsed so an unexpected one is still named.
 enum class PairAbortReason : uint8_t {
     ATTEMPT_TIMEOUT,        // attempt_timeout
     CONCURRENT_ATTEMPT,     // concurrent_attempt
@@ -1112,8 +1118,8 @@ bool process_server_pair_confirm_message(JsonObject root, ServerPairConfirmPaylo
 std::string format_client_pair_pending_message(uint32_t pairing_index);
 
 /// @brief Formats a client/pair-init message as a JSON string.
-/// Starts the dynamic-pairing-code attempt; carries commit_B = SHA-256(LABEL || nonce_B) and the
-/// required pairing_index counter (pairing.md "Pairing index").
+/// Starts the dynamic-pairing-code attempt; carries commit_B = SHA-256(PAIRING_COMMIT_LABEL ||
+/// nonce_B) and the required pairing_index counter (pairing.md "Pairing index").
 /// @param commit_b 32-byte commit_B value to embed (base64url-encoded on the wire).
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
 ///                      handshake (see SendspinConnection::get_pairing_index()).
@@ -1123,9 +1129,8 @@ std::string format_client_pair_init_message(const std::array<uint8_t, 32>& commi
 
 /// @brief Formats a client/pair-init message with only pairing_index.
 /// The form used by every flow that carries no commit_B: the static pairing code, sent after the
-/// operator
-/// confirms the pairing-window gesture and before starting CPace RESPONDER, and Pairing PSK,
-/// sent immediately before client/pair-finalize (pairing.md "Pairing PSK Flow").
+/// operator confirms the pairing-window gesture and before starting CPace RESPONDER, and Pairing
+/// PSK, sent immediately before client/pair-finalize (pairing.md "Pairing PSK Flow").
 /// @param pairing_index Count of pairing server/activate messages received since the last Noise
 ///                      handshake.
 /// @return JSON string for the client/pair-init message with only pairing_index set.
