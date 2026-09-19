@@ -261,26 +261,33 @@ private:
 
 }  // namespace
 
-// A raw TCP probe (port scan / health check) held open against the client's WS server must not
-// keep a real server from connecting and establishing immediately, and the probe socket must be
-// closed within roughly the nursery upgrade deadline.
+// Raw TCP probes (port scan / health check) held open against the client's WS server must not
+// keep a real server from connecting and establishing immediately, and the probe sockets must be
+// closed within roughly the nursery upgrade deadline. Enough probes are held to fill every
+// nursery slot (ConnectionManager::NURSERY_CAPACITY is 2): if a raw socket took a slot at accept
+// the real server would find the nursery full and be rejected, and the transport's socket budget
+// (NURSERY_CAPACITY + 2) has to have room for it alongside them.
 TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     PairedClientBundle bundle(make_config(PROBE_TEST_PORT));
     SendspinClient& client = bundle.client();
     // The WS server starts synchronously on the first loop() once the network reports ready.
     ASSERT_TRUE(bundle.start());
 
-    // Hold a raw TCP connection open without ever speaking WebSocket.
-    int probe_fd = connect_loopback(PROBE_TEST_PORT);
-    ASSERT_GE(probe_fd, 0);
-    pump_for(client, 200);  // give the transport time to accept it; the probe never reaches the
-                            // manager (junk is closed inside the transport layer)
+    // Hold a nursery's worth of raw TCP connections open without ever speaking WebSocket.
+    constexpr size_t HELD_PROBES = 2;  // ConnectionManager::NURSERY_CAPACITY (private)
+    int probe_fds[HELD_PROBES];
+    for (size_t i = 0; i < HELD_PROBES; ++i) {
+        probe_fds[i] = connect_loopback(PROBE_TEST_PORT);
+        ASSERT_GE(probe_fds[i], 0);
+        pump_for(client, 100);  // give the transport time to accept it; the probe never reaches
+                                // the manager (junk is closed inside the transport layer)
+    }
     EXPECT_FALSE(client.is_connected())
         << "a raw TCP probe must never become the current connection";
 
-    // A real server connects while the probe is held: the held probe must not keep it out of the
-    // admitted slot. That it establishes before the probe is reaped is not asserted - latency is
-    // not a unit-test property.
+    // A real server connects while the probes are held: they hold no nursery slots, so nothing
+    // needs evicting and the newcomer reaches the admitted slot. That it establishes before the
+    // probes are reaped is not asserted - latency is not a unit-test property.
     const Identity& server_identity = bundle.peer.server_identity;
     FakeEncryptedServer real_server(server_url(PROBE_TEST_PORT),
                                     std::string(NOISE_SUITE_CHACHAPOLY), server_identity,
@@ -290,15 +297,24 @@ TEST(ConnectionLifecycle, JunkProbeDoesNotBlockRealServer) {
     ASSERT_TRUE(info.has_value());
     EXPECT_EQ(info->server_id, server_identity.peer_id());
 
-    // The probe never completes a WebSocket handshake, so the transport layer closes it without
-    // it ever reaching the manager (host: IXWebSocket's 3 s server-side handshake timeout; on
-    // ESP the ws_server tick would reap it at 5 s).
-    pump_until(client, [&] { return socket_closed(probe_fd); });
-    ::close(probe_fd);
+    // The probes never complete a WebSocket handshake, so the transport layer closes them without
+    // them ever reaching the manager (host: IXWebSocket's 3 s server-side handshake timeout; on
+    // ESP the ws_server tick would reap them at 5 s).
+    pump_until(client, [&] {
+        for (size_t i = 0; i < HELD_PROBES; ++i) {
+            if (!socket_closed(probe_fds[i])) {
+                return false;
+            }
+        }
+        return true;
+    });
+    for (size_t i = 0; i < HELD_PROBES; ++i) {
+        ::close(probe_fds[i]);
+    }
 
     // The established connection must have been untouched by the probe reap.
     EXPECT_TRUE(client.is_connected())
-        << "reaping the held probe must not disturb the established connection";
+        << "reaping the held probes must not disturb the established connection";
 }
 
 // An outbound connect_to() through a slow network (upgrade stalled ~8 s, past every short
