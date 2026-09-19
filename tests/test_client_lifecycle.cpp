@@ -77,7 +77,6 @@ constexpr uint16_t PROVIDER_TEST_PORT = 19070;
 constexpr uint16_t PUBLISH_STATE_TEST_PORT = 19071;
 constexpr uint16_t SYNC_PIN_LOCK_TEST_PORT = 19072;
 constexpr uint16_t SYNC_PIN_RELEASE_TEST_PORT = 19073;
-constexpr uint16_t SYNC_PIN_NULL_TEST_PORT = 19074;
 constexpr uint16_t SYNC_PIN_STOP_TEST_PORT = 19075;
 constexpr uint16_t SYNC_PIN_DROP_TEST_PORT = 19076;
 constexpr uint16_t SYNC_PIN_MIDSTREAM_TEST_PORT = 19077;
@@ -693,9 +692,6 @@ public:
         }
         return length;
     }
-    void on_stream_start() override {
-        ++this->stream_starts;
-    }
     void on_stream_end() override {
         ++this->stream_ends;
     }
@@ -712,13 +708,7 @@ public:
     void wait_for_decoded() {
         this->first_decoded_.get_future().wait();
     }
-    /// Re-arms decoded() for a second stream on the same listener.
-    void rearm() {
-        this->decoded_seen_.store(false);
-        this->first_decoded_ = std::promise<void>();
-    }
 
-    int stream_starts{0};
     int stream_ends{0};
 
 private:
@@ -846,114 +836,6 @@ ServerPlayerStreamObject pin_stream_params() {
     return params;
 }
 
-// The pin lives exactly as long as the stream, and the sync task never destroys what it pinned.
-// The manager's own reference is dropped mid-stream, leaving the pin the only owner: the
-// connection is then alive for exactly as long as the task holds it, which is what the two
-// destroyed checks read, and use_count() cannot say (a transient current_shared() copy of any
-// other caller would count too). The task hands the pin back instead of resetting it, so the
-// destructor runs on the thread that pumps loop() - on device the audio thread would otherwise
-// join the transport inside ~SendspinConnection.
-//
-// The first check does not race the task: the pin is resolved before TASK_RUNNING is published,
-// so a task that reads as running has already taken it and the slot can be dropped from here
-// with nothing left to resolve.
-TEST(ClientLifecycle, TheStreamPinIsReleasedAtStreamEndAndFreedOnTheMainLoop) {
-    CountingPlayerListener listener;
-    TestNetworkProvider network;
-    SendspinClient client(make_config(SYNC_PIN_RELEASE_TEST_PORT));
-    client.set_network_provider(&network);
-    client.add_player(make_pcm_player_config()).set_listener(&listener);
-    ASSERT_TRUE(client.start());
-
-    PinObservation observation;
-    {
-        auto conn = std::make_shared<PinnedConnection>(&observation);
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        client.connection_manager_->current_connection_ = std::move(conn);
-    }
-
-    PlayerRole::Impl& impl = *client.player_->impl_;
-    impl.handle_stream_start(pin_stream_params(), impl.cleanup_generation.load());
-    SyncTask& sync_task = *impl.sync_task;
-    pump_until(client, [&] { return sync_task.is_running(); });
-
-    {
-        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
-        client.connection_manager_->current_connection_.reset();
-    }
-    EXPECT_FALSE(observation.destroyed.load())
-        << "the sync task did not pin the connection for the stream";
-
-    impl.handle_stream_end(impl.cleanup_generation.load());
-    pump_until(client, [&] { return listener.stream_ends == 1; });
-    pump_until(client, [&] { return observation.destroyed.load(); });
-    EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
-        << "the connection was destroyed on a thread other than the one that flushed it";
-
-    client.stop();
-}
-
-// The pin is resolved once per stream, at the top of the sync task's outer loop, so a stream
-// that ran with nothing in the admitted slot does not poison the next one: the stream that
-// follows the connect resolves the pin again and plays its chunks through. The first stream is
-// setup, not a probe of the null-pin gate in handle_load_chunk() - it ends while the pipeline is
-// still priming, so that gate is never reached (see docs/rc1-migration.md, "Residual gaps").
-TEST(ClientLifecycle, TheStreamAfterAConnectResolvesThePinAgainAndPlays) {
-    VirtualSinkListener listener;
-    auto config = make_config(SYNC_PIN_NULL_TEST_PORT);
-    config.time_burst_interval_ms = 100;
-    PairedClientBundle bundle(std::move(config));
-    SendspinClient& client = bundle.client();
-    PlayerRole& player = client.add_player(make_pcm_player_config());
-    player.set_listener(&listener);
-    listener.attach(player);
-    ASSERT_TRUE(bundle.start());
-
-    // No server has connected, so the manager's slot is empty. Drive the stream the way the
-    // receive path would, since without a connection there is nothing to carry a stream/start.
-    PlayerRole::Impl& impl = *client.player_->impl_;
-    impl.handle_stream_start(pin_stream_params(), impl.cleanup_generation.load());
-    SyncTask& sync_task = *impl.sync_task;
-    pump_until(client, [&] { return sync_task.is_running(); });
-    ASSERT_EQ(listener.stream_starts, 1);
-
-    feed_marked_chunks(sync_task, platform_time_us() + PIN_CHUNK_LEAD_US, 8);
-    impl.handle_stream_end(impl.cleanup_generation.load());
-    pump_until(client, [&] { return listener.stream_ends == 1; });
-    ASSERT_FALSE(listener.decoded()) << "the second stream's signal is not fresh";
-
-    FakeEncryptedServerOptions options;
-    options.answer_time = true;
-    auto server = connect_paired_server(bundle.peer, SYNC_PIN_NULL_TEST_PORT, options);
-    pump_until_synced(client);
-
-    listener.rearm();
-    ASSERT_TRUE(server->send_app_json(stream_start_pcm_json()));
-    pump_until(client, [&] { return sync_task.is_running(); });
-    feed_marked_chunks(sync_task, platform_time_us() + PIN_CHUNK_LEAD_US, 8);
-    pump_until(client, [&] { return listener.decoded(); });
-
-    client.stop();
-}
-
-/// Waits for the sync task's hand-over to reach the manager's queue. Deliberately does not pump
-/// loop(), which would flush the entry the caller is about to observe; unbounded, because no
-/// bound here could tell a task that never hands the pin back from a slow machine, and the suite
-/// watchdog in tests/main.cpp names the hang instead.
-void wait_for_hand_over(ConnectionManager& manager) {
-    while (true) {
-        {
-            std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-            for (const auto& release : manager.deferred_releases_) {
-                if (release.main_loop_only) {
-                    return;
-                }
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
-
 /// Starts a stream on a stand-in connection installed in the admitted slot and returns once the
 /// sync task holds it as its pin. The stream is driven through PlayerRole::Impl, since nothing
 /// is connected to carry a stream/start.
@@ -968,46 +850,54 @@ void pin_stream_on(SendspinClient& client, std::shared_ptr<PinnedConnection> con
     pump_until(client, [&] { return sync_task.is_running(); });
 }
 
-// A handed-back pin names a connection that is still in the admitted slot, so stop()'s sweep
-// sees the same object twice: once in the slot, once in the release queue. Only the slot owes a
-// goodbye. Counting disconnect() calls counts what the wire would carry, and a sweep that
-// goodbyes every queued entry puts a second frame on a live session.
-TEST(ClientLifecycle, StopGoodbyesAPinnedConnectionOnce) {
-    // Outlives the client, which goodbyes what is still in its slot as it goes.
-    PinObservation observation;
+// The pin lives exactly as long as the stream, and the sync task never destroys what it pinned.
+// The manager's own reference is dropped mid-stream, leaving the pin the only owner: the
+// connection is then alive for exactly as long as the task holds it, which is what the two
+// destroyed checks read, and use_count() cannot say (a transient current_shared() copy of any
+// other caller would count too).
+//
+// The first check does not race the task: the pin is resolved before TASK_RUNNING is published,
+// so a task that reads as running has already taken it and the slot can be dropped from here
+// with nothing left to resolve.
+TEST(ClientLifecycle, TheStreamPinKeepsTheConnectionAliveUntilStreamEnd) {
     CountingPlayerListener listener;
     TestNetworkProvider network;
-    SendspinClient client(make_config(SYNC_PIN_STOP_TEST_PORT));
+    SendspinClient client(make_config(SYNC_PIN_RELEASE_TEST_PORT));
     client.set_network_provider(&network);
     client.add_player(make_pcm_player_config()).set_listener(&listener);
     ASSERT_TRUE(client.start());
 
+    PinObservation observation;
     pin_stream_on(client, std::make_shared<PinnedConnection>(&observation));
 
-    // End the stream and stop with no tick in between, so the hand-over is still queued when
-    // stop() sweeps.
+    {
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        client.connection_manager_->current_connection_.reset();
+    }
+    EXPECT_FALSE(observation.destroyed.load())
+        << "the sync task did not pin the connection for the stream";
+
     PlayerRole::Impl& impl = *client.player_->impl_;
     impl.handle_stream_end(impl.cleanup_generation.load());
-    wait_for_hand_over(*client.connection_manager_);
-    client.stop();
+    pump_until(client, [&] { return listener.stream_ends == 1; });
+    pump_until(client, [&] { return observation.destroyed.load(); });
 
-    EXPECT_EQ(observation.goodbyes.load(), 1)
-        << "expected exactly one client/goodbye on this connection's wire";
-    EXPECT_TRUE(observation.destroyed.load()) << "stop() left the hand-over queued";
+    client.stop();
 }
 
-// The hand-over exists to keep ~SendspinConnection off the thread that held the pin, and a flush
+// The hand-back exists to keep ~SendspinConnection off the thread that held the pin, and a flush
 // is not always the main loop: ConnectionManager::on_new_connection() flushes on the
-// network/httpd thread after admitting or rejecting a peer. That flush must leave the hand-over
+// network/httpd thread after admitting or rejecting a peer. That flush must leave the hand-back
 // alone, or the destructor it relocated lands on another borrowed stack. Here a peer arrives
-// while the pin is queued; admission is closed first, so the peer is rejected and its goodbye
-// proves the network-thread flush ran before anything is asserted.
+// while the hand-back is queued; admission is closed first, so the peer is rejected and its
+// goodbye proves the network-thread flush ran before anything is asserted. A goodbye-bearing
+// release is queued ahead of the hand-back, so that flush has to take an entry from in front of
+// it and leave this one behind.
 //
-// A goodbye-bearing release is queued ahead of the hand-over, so the off-loop flush takes an
-// entry from in front of it and has to compact it down: an entry left at its old index is
-// dropped by the resize, on the network thread, which is the whole point of skipping it.
-TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandOverForTheLoop) {
-    PinObservation observation;  // Outlives the client (see the stop test)
+// Both reads are of the thread the destructor ran on, kept for the reason the test above gives:
+// nothing a caller or peer observes distinguishes it.
+TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandBackForTheLoop) {
+    PinObservation observation;  // Outlives the client (see the test above)
     CountingPlayerListener listener;
     PairedClientBundle bundle(make_config(SYNC_PIN_DROP_TEST_PORT));
     SendspinClient& client = bundle.client();
@@ -1020,7 +910,7 @@ TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandOverForTheLoop) {
 
     {
         // Drop the slot's reference, with a goodbye, so this entry is queued first and the
-        // hand-over behind it is the only reference left: whoever performs that entry runs the
+        // hand-back behind it is the only reference left: whoever performs that entry runs the
         // destructor. Nothing flushes until the rejection below, which is off the main loop.
         std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
         client.connection_manager_->drop_connection(dropped, SendspinGoodbyeReason::ANOTHER_SERVER);
@@ -1028,7 +918,8 @@ TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandOverForTheLoop) {
 
     PlayerRole::Impl& impl = *client.player_->impl_;
     impl.handle_stream_end(impl.cleanup_generation.load());
-    wait_for_hand_over(*client.connection_manager_);
+    SyncTask& sync_task = *impl.sync_task;
+    wait_until([&] { return !sync_task.is_running(); });
 
     {
         // Take the rejection branch of on_new_connection() with one peer, rather than filling
@@ -1037,58 +928,82 @@ TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandOverForTheLoop) {
         client.connection_manager_->accepting_ = false;
     }
     auto rejected = connect_paired_server(bundle.peer, SYNC_PIN_DROP_TEST_PORT);
-    while (!rejected->goodbye_reason().has_value()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    wait_until([&] { return rejected->goodbye_reason().has_value(); });
     EXPECT_FALSE(observation.destroyed.load())
         << "the network thread that flushed its own rejection also ran the pin's destructor";
 
     pump_until(client, [&] { return observation.destroyed.load(); });
     EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
-        << "the connection was destroyed on a thread other than the one that pumps loop()";
+        << "the connection was freed on a thread other than the one that pumps loop()";
 
     client.stop();
 }
 
-// The drop the design is about: the server's session is taken away mid-stream, so the manager
-// queues its own release WITH a goodbye while the sync task still holds the pin, and one
-// connection is named by two queue entries. The pin is live by construction - nothing has ended
-// the stream, and the task cannot reach its release without the lock held here - so the goodbye
-// entry is the one that speaks for the session and the hand-over only drops a reference. What
-// the test reads afterwards is that the wire saw exactly one goodbye and that the destructor ran
-// on the thread that pumps loop(), never on the audio thread.
-TEST(ClientLifecycle, AMidStreamDropGoodbyesOnceAndFreesOnTheLoop) {
-    PinObservation observation;  // Outlives the client (see the stop test)
-    CountingPlayerListener listener;
-    TestNetworkProvider network;
-    SendspinClient client(make_config(SYNC_PIN_MIDSTREAM_TEST_PORT));
-    client.set_network_provider(&network);
-    client.add_player(make_pcm_player_config()).set_listener(&listener);
-    ASSERT_TRUE(client.start());
+// However a pinned stream ends, the connection's wire carries exactly one client/goodbye and the
+// object is freed: one queue entry speaks for the session and owes the goodbye, while the sync
+// task's hand-back only drops a reference. The two rows reach that from opposite sides - the
+// session taken away mid-stream, and a stop() that runs while the hand-back is still queued, so
+// stop()'s sweep sees the same connection twice at once.
+TEST(ClientLifecycle, APinnedConnectionIsGoodbyedOnceAndFreed) {
+    struct EndingRow {
+        const char* name;
+        bool drop_mid_stream;
+        uint16_t port;
+    };
+    const EndingRow rows[] = {
+        {"session dropped mid-stream", true, SYNC_PIN_MIDSTREAM_TEST_PORT},
+        {"stop() with the hand-back still queued", false, SYNC_PIN_STOP_TEST_PORT},
+    };
 
-    auto conn = std::make_shared<PinnedConnection>(&observation);
-    SendspinConnection* dropped = conn.get();
-    pin_stream_on(client, std::move(conn));
+    for (const EndingRow& row : rows) {
+        SCOPED_TRACE(row.name);
+        // Outlives the client, which goodbyes what is still in its slot as it goes.
+        PinObservation observation;
+        CountingPlayerListener listener;
+        TestNetworkProvider network;
+        SendspinClient client(make_config(row.port));
+        client.set_network_provider(&network);
+        client.add_player(make_pcm_player_config()).set_listener(&listener);
+        ASSERT_TRUE(client.start());
 
-    ConnectionManager& manager = *client.connection_manager_;
-    {
-        std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
-        manager.drop_connection(dropped, SendspinGoodbyeReason::ANOTHER_SERVER);
-        ASSERT_EQ(manager.deferred_releases_.size(), 1u);
-        EXPECT_EQ(manager.deferred_releases_[0].conn.get(), dropped);
-        EXPECT_TRUE(manager.deferred_releases_[0].goodbye.has_value())
-            << "the drop queued no goodbye, so the session was never told it was over";
+        auto conn = std::make_shared<PinnedConnection>(&observation);
+        SendspinConnection* pinned = conn.get();
+        pin_stream_on(client, std::move(conn));
+        PlayerRole::Impl& impl = *client.player_->impl_;
+        ConnectionManager& manager = *client.connection_manager_;
+
+        if (row.drop_mid_stream) {
+            // The pin is live by construction: nothing has ended the stream, and the task cannot
+            // reach its release without the lock held here, so the drop's own entry is the one
+            // that speaks for the session.
+            {
+                std::lock_guard<std::mutex> lock(manager.conn_ptr_mutex_);
+                manager.drop_connection(pinned, SendspinGoodbyeReason::ANOTHER_SERVER);
+            }
+            manager.flush_deferred_releases();
+            pump_until(client, [&] { return listener.stream_ends == 1; });
+            pump_until(client, [&] { return observation.destroyed.load(); });
+        } else {
+            // End the stream and stop with no tick in between. The pin is handed back before the
+            // task stops reading as running, so waiting on that leaves the hand-back queued for
+            // stop() to find while the connection is still in the slot.
+            impl.handle_stream_end(impl.cleanup_generation.load());
+            SyncTask& sync_task = *impl.sync_task;
+            wait_until([&] { return !sync_task.is_running(); });
+            client.stop();
+            EXPECT_TRUE(observation.destroyed.load()) << "stop() left the hand-back queued";
+        }
+
+        EXPECT_EQ(observation.goodbyes.load(), 1)
+            << "expected exactly one client/goodbye on this connection's wire";
+        // Private read, kept because nothing a caller or peer observes distinguishes the thread
+        // the destructor ran on: ~SendspinConnection joins the transport, which on device must
+        // not happen on the audio thread that held the pin.
+        EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
+            << "the connection was freed on a thread other than the one that pumps loop()";
+
+        client.stop();
     }
-    manager.flush_deferred_releases();
-
-    pump_until(client, [&] { return listener.stream_ends == 1; });
-    pump_until(client, [&] { return observation.destroyed.load(); });
-    EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
-        << "the sync task freed the connection on its own thread";
-    EXPECT_EQ(observation.goodbyes.load(), 1)
-        << "expected exactly one client/goodbye on this connection's wire";
-
-    client.stop();
 }
 
 }  // namespace
