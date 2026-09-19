@@ -20,7 +20,7 @@
 /// FakeEncryptedServer plays the Sendspin server over the real Noise transport and the test
 /// thread pumps client.loop().
 
-#include "connection.h"  // PublishingConnection stands in for a real connection
+#include "connection.h"  // StubConnection stands in for a real connection
 #include "connection_manager.h"  // GoodbyeWait, GOODBYE_FLUSH_TIMEOUT_MS
 #include "crypto/constants.h"
 #include "crypto/keys.h"
@@ -76,6 +76,8 @@ constexpr uint16_t PUBLISH_STATE_TEST_PORT = 19021;
 constexpr uint16_t SYNC_PIN_LOCK_TEST_PORT = 19022;
 constexpr uint16_t SYNC_PIN_RELEASE_TEST_PORT = 19023;
 constexpr uint16_t SYNC_PIN_NULL_TEST_PORT = 19024;
+constexpr uint16_t SYNC_PIN_STOP_TEST_PORT = 19025;
+constexpr uint16_t SYNC_PIN_DROP_TEST_PORT = 19026;
 
 SendspinClientConfig make_config(uint16_t port) {
     SendspinClientConfig config;
@@ -571,15 +573,12 @@ struct PublishRendezvous {
     bool destroyed_during_send{false};
 };
 
-/// Connection stand-in that parks inside its own send until the test has dropped the connection
-/// manager's slot, then records whether it was destroyed while that send was still running.
-class PublishingConnection : public SendspinConnection {
+/// Connection stand-in with every transport override inert: nothing is sent anywhere, a send
+/// completes inline and reports success, and the connection always reads as connected. Tests that
+/// install one in the manager's slot derive from it and override only the one call they are about
+/// to observe.
+class StubConnection : public SendspinConnection {
 public:
-    explicit PublishingConnection(PublishRendezvous* rv) : rv_(rv) {}
-    ~PublishingConnection() override {
-        this->rv_->destroyed = true;
-    }
-
     void start() override {}
     void loop() override {}
     void disconnect(SendspinGoodbyeReason, std::function<void()> on_complete) override {
@@ -599,6 +598,22 @@ public:
             cb(true);
         }
         return SsErr::OK;
+    }
+    SsErr send_text_message(const std::string&, SendCompleteCallback cb, bool) override {
+        if (cb) {
+            cb(true);
+        }
+        return SsErr::OK;
+    }
+};
+
+/// Parks inside its own send until the test has dropped the connection manager's slot, then
+/// records whether it was destroyed while that send was still running.
+class PublishingConnection : public StubConnection {
+public:
+    explicit PublishingConnection(PublishRendezvous* rv) : rv_(rv) {}
+    ~PublishingConnection() override {
+        this->rv_->destroyed = true;
     }
 
     // No Noise session, so send_app_json() routes the client/state here as raw text.
@@ -817,14 +832,15 @@ TEST(ClientLifecycle, SyncTaskDecodesAChunkWhileTheManagerLockIsHeld) {
 /// What the test learns about the pinned connection after it is gone; owned by the test, since
 /// the connection is what reports its own destruction.
 struct PinObservation {
+    std::atomic<int> goodbyes{0};
     std::thread::id destroyed_on{};
     std::atomic<bool> destroyed{false};  // Published last: orders the id above for the reader
 };
 
-/// Connection stand-in that records where it was destroyed. Nothing is ever sent to it: the test
-/// drives the stream through the player's own handlers, so the connection exists only to be
-/// pinned and then freed.
-class PinnedConnection : public SendspinConnection {
+/// Connection stand-in that records where it was destroyed and how many goodbyes it was asked
+/// for. The tests drive the stream through the player's own handlers, so no message traffic
+/// reaches it: it exists to be pinned, goodbyed and freed.
+class PinnedConnection : public StubConnection {
 public:
     explicit PinnedConnection(PinObservation* obs) : obs_(obs) {}
     ~PinnedConnection() override {
@@ -832,31 +848,12 @@ public:
         this->obs_->destroyed.store(true);
     }
 
-    void start() override {}
-    void loop() override {}
+    // Counts what the wire would carry: one disconnect() is one goodbye frame.
     void disconnect(SendspinGoodbyeReason, std::function<void()> on_complete) override {
+        this->obs_->goodbyes.fetch_add(1);
         if (on_complete) {
             on_complete();
         }
-    }
-    void close_transport_now() override {}
-    bool is_connected() const override {
-        return true;
-    }
-    bool send_time_message() override {
-        return true;
-    }
-    SsErr send_binary_message(const uint8_t*, size_t, SendCompleteCallback cb, bool) override {
-        if (cb) {
-            cb(true);
-        }
-        return SsErr::OK;
-    }
-    SsErr send_text_message(const std::string&, SendCompleteCallback cb, bool) override {
-        if (cb) {
-            cb(true);
-        }
-        return SsErr::OK;
     }
 
 private:
@@ -880,6 +877,10 @@ ServerPlayerStreamObject pin_stream_params() {
 // other caller would count too). The task hands the pin back instead of resetting it, so the
 // destructor runs on the thread that pumps loop() - on device the audio thread would otherwise
 // join the transport inside ~SendspinConnection.
+//
+// The first check does not race the task: the pin is resolved before TASK_RUNNING is published,
+// so a task that reads as running has already taken it and the slot can be dropped from here
+// with nothing left to resolve.
 TEST(ClientLifecycle, TheStreamPinIsReleasedAtStreamEndAndFreedOnTheMainLoop) {
     CountingPlayerListener listener;
     TestNetworkProvider network;
@@ -915,7 +916,7 @@ TEST(ClientLifecycle, TheStreamPinIsReleasedAtStreamEndAndFreedOnTheMainLoop) {
         client, [&] { return observation.destroyed.load(); }, FIXTURE_PUMP_TIMEOUT_MS))
         << "the stream's pin outlived the stream";
     EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
-        << "the connection was destroyed on the sync task's thread, not on the loop";
+        << "the connection was destroyed on a thread other than the one that flushed it";
 
     client.stop();
 }
@@ -966,6 +967,108 @@ TEST(ClientLifecycle, AStreamStartedWithNoConnectionDecodesNothingAndTheNextOneP
     EXPECT_TRUE(pump_until(
         client, [&] { return listener.decoded(); }, FIXTURE_PUMP_TIMEOUT_MS))
         << "the second stream never resolved a pin of its own";
+
+    client.stop();
+}
+
+/// Waits for the sync task's hand-over to reach the manager's queue. Deliberately does not pump
+/// loop(), which would flush the entry the caller is about to observe; unbounded, because no
+/// bound here could tell a task that never hands the pin back from a slow machine, and the suite
+/// watchdog in tests/main.cpp names the hang instead.
+void wait_for_hand_over(ConnectionManager& manager) {
+    while (manager.deferred_size_.load(std::memory_order_acquire) == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+/// Starts a stream on a stand-in connection installed in the admitted slot and returns once the
+/// sync task holds it as its pin. The stream is driven through PlayerRole::Impl, since nothing
+/// is connected to carry a stream/start.
+bool pin_stream_on(SendspinClient& client, std::shared_ptr<PinnedConnection> conn) {
+    {
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        client.connection_manager_->current_connection_ = std::move(conn);
+    }
+    PlayerRole::Impl& impl = *client.player_->impl_;
+    impl.handle_stream_start(pin_stream_params(), impl.cleanup_generation.load());
+    SyncTask& sync_task = *impl.sync_task;
+    return pump_until(
+        client, [&] { return sync_task.is_running(); }, FIXTURE_PUMP_TIMEOUT_MS);
+}
+
+// A handed-back pin names a connection that is still in the admitted slot, so stop()'s sweep
+// sees the same object twice: once in the slot, once in the release queue. Only the slot owes a
+// goodbye. Counting disconnect() calls counts what the wire would carry, and a sweep that
+// goodbyes every queued entry puts a second frame on a live session.
+TEST(ClientLifecycle, StopGoodbyesAPinnedConnectionOnce) {
+    // Outlives the client, which goodbyes what is still in its slot as it goes.
+    PinObservation observation;
+    CountingPlayerListener listener;
+    TestNetworkProvider network;
+    SendspinClient client(make_config(SYNC_PIN_STOP_TEST_PORT));
+    client.set_network_provider(&network);
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
+    ASSERT_TRUE(client.start());
+
+    ASSERT_TRUE(pin_stream_on(client, std::make_shared<PinnedConnection>(&observation)));
+
+    // End the stream and stop with no tick in between, so the hand-over is still queued when
+    // stop() sweeps.
+    PlayerRole::Impl& impl = *client.player_->impl_;
+    impl.handle_stream_end(impl.cleanup_generation.load());
+    wait_for_hand_over(*client.connection_manager_);
+    client.stop();
+
+    EXPECT_EQ(observation.goodbyes.load(), 1)
+        << "the queued hand-over was goodbyed on top of the slot's own goodbye";
+    EXPECT_TRUE(observation.destroyed.load()) << "stop() left the hand-over queued";
+}
+
+// The hand-over exists to keep ~SendspinConnection off the thread that held the pin, and a flush
+// is not always the main loop: ConnectionManager::on_new_connection() flushes on the
+// network/httpd thread after admitting or rejecting a peer. That flush must leave the hand-over
+// alone, or the destructor it relocated lands on another borrowed stack. Here a peer arrives
+// while the pin is queued; admission is closed first, so the peer is rejected and its goodbye
+// proves the network-thread flush ran before anything is asserted.
+TEST(ClientLifecycle, ANetworkThreadFlushLeavesTheHandOverForTheLoop) {
+    PinObservation observation;  // Outlives the client (see the stop test)
+    CountingPlayerListener listener;
+    PairedClientBundle bundle(make_config(SYNC_PIN_DROP_TEST_PORT));
+    SendspinClient& client = bundle.client();
+    client.add_player(make_pcm_player_config()).set_listener(&listener);
+    ASSERT_TRUE(bundle.start());
+
+    ASSERT_TRUE(pin_stream_on(client, std::make_shared<PinnedConnection>(&observation)));
+
+    PlayerRole::Impl& impl = *client.player_->impl_;
+    impl.handle_stream_end(impl.cleanup_generation.load());
+    wait_for_hand_over(*client.connection_manager_);
+
+    {
+        // Drop the slot's reference so the queued hand-over is the only one left: whoever
+        // performs that entry runs the destructor.
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        client.connection_manager_->current_connection_.reset();
+    }
+
+    {
+        // Take the rejection branch of on_new_connection() with one peer, rather than filling
+        // the nursery with peers whose handshakes would race each other.
+        std::lock_guard<std::mutex> lock(client.connection_manager_->conn_ptr_mutex_);
+        client.connection_manager_->accepting_ = false;
+    }
+    auto rejected = connect_paired_server(bundle.peer, SYNC_PIN_DROP_TEST_PORT);
+    while (!rejected->goodbye_reason().has_value()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_FALSE(observation.destroyed.load())
+        << "the network thread that flushed its own rejection also ran the pin's destructor";
+
+    ASSERT_TRUE(pump_until(
+        client, [&] { return observation.destroyed.load(); }, FIXTURE_PUMP_TIMEOUT_MS))
+        << "the hand-over the network-thread flush skipped was never performed";
+    EXPECT_EQ(observation.destroyed_on, std::this_thread::get_id())
+        << "the connection was destroyed on a thread other than the one that pumps loop()";
 
     client.stop();
 }
