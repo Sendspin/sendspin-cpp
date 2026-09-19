@@ -81,8 +81,8 @@ SsErr NoiseTransport::fragment_and_send_locked(const uint8_t* plaintext, size_t 
     const uint8_t* data = plaintext + 1;
     const size_t data_len = plaintext_len - 1;
 
-    const size_t first_cap = MAX_TRANSPORT_PLAINTEXT - 3;  // 65516
-    const size_t cont_cap = MAX_TRANSPORT_PLAINTEXT - 2;   // 65517
+    const size_t first_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_FIRST_HEADER_SIZE;
+    const size_t cont_cap = MAX_TRANSPORT_PLAINTEXT - FRAGMENT_CONT_HEADER_SIZE;
 
     // Buffer reused for each frame (plaintext + 16-byte tag room). ~64 KB, so placed per
     // buffer_location_ (PSRAM-preferring by default on ESP) rather than internal RAM.
@@ -96,9 +96,9 @@ SsErr NoiseTransport::fragment_and_send_locked(const uint8_t* plaintext, size_t 
     frame_buf.data()[0] = MSG_TYPE_FRAGMENT;
     frame_buf.data()[1] = static_cast<uint8_t>(
         FRAGMENT_FLAG_FIRST | ((first_chunk == data_len) ? FRAGMENT_FLAG_LAST : 0));
-    frame_buf.data()[2] = orig_type;
-    std::memcpy(frame_buf.data() + 3, data, first_chunk);
-    size_t first_frame_len = 3 + first_chunk;
+    frame_buf.data()[FRAGMENT_CONT_HEADER_SIZE] = orig_type;
+    std::memcpy(frame_buf.data() + FRAGMENT_FIRST_HEADER_SIZE, data, first_chunk);
+    size_t first_frame_len = FRAGMENT_FIRST_HEADER_SIZE + first_chunk;
 
     SsErr err =
         this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), first_frame_len);
@@ -114,8 +114,8 @@ SsErr NoiseTransport::fragment_and_send_locked(const uint8_t* plaintext, size_t 
 
         frame_buf.data()[0] = MSG_TYPE_FRAGMENT;
         frame_buf.data()[1] = is_last ? FRAGMENT_FLAG_LAST : 0;
-        std::memcpy(frame_buf.data() + 2, data + offset, chunk);
-        size_t cont_frame_len = 2 + chunk;
+        std::memcpy(frame_buf.data() + FRAGMENT_CONT_HEADER_SIZE, data + offset, chunk);
+        size_t cont_frame_len = FRAGMENT_CONT_HEADER_SIZE + chunk;
 
         err =
             this->encrypt_and_send_frame_locked(frame_buf.data(), frame_buf.size(), cont_frame_len);
@@ -260,7 +260,7 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
 
     // A fragment frame with no flags byte carries no place in the sequence at all, so it cannot
     // be tracked; treat it like the enumerated malformed sequences and close.
-    if (len < 2) {
+    if (len < FRAGMENT_CONT_HEADER_SIZE) {
         SS_LOGW(TAG, "fragment frame missing its flags byte; malformed sequence");
         this->reasm_reset();
         return {nullptr, 0, true};
@@ -289,12 +289,12 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
             this->reasm_reset();
             return {nullptr, 0, true};
         }
-        if (len < 3) {
+        if (len < FRAGMENT_FIRST_HEADER_SIZE) {
             SS_LOGW(TAG, "first fragment missing its orig_type; malformed sequence");
             this->reasm_reset();
             return {nullptr, 0, true};
         }
-        const uint8_t orig_type = plaintext[2];
+        const uint8_t orig_type = plaintext[FRAGMENT_CONT_HEADER_SIZE];
         // messaging.md "Malformed sequences": an orig_type of 1. Fragments do not nest.
         if (orig_type == MSG_TYPE_FRAGMENT) {
             SS_LOGW(TAG, "first fragment declares orig_type 1; malformed sequence");
@@ -317,8 +317,8 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
                 this->reasm_discarding_ = true;
             }
         }
-        data = plaintext + 3;
-        data_len = len - 3;
+        data = plaintext + FRAGMENT_FIRST_HEADER_SIZE;
+        data_len = len - FRAGMENT_FIRST_HEADER_SIZE;
     } else {
         // messaging.md "Malformed sequences": a non-first fragment received with none in flight.
         if (!this->reasm_in_progress_) {
@@ -327,8 +327,8 @@ NoiseTransport::CompleteMessage NoiseTransport::accept_plaintext(uint8_t* plaint
             this->reasm_reset();
             return {nullptr, 0, true};
         }
-        data = plaintext + 2;
-        data_len = len - 2;
+        data = plaintext + FRAGMENT_CONT_HEADER_SIZE;
+        data_len = len - FRAGMENT_CONT_HEADER_SIZE;
     }
 
     if (!this->reasm_discarding_) {

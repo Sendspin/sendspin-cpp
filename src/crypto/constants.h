@@ -111,6 +111,11 @@ static constexpr uint8_t FRAGMENT_FLAG_FIRST = 0x02;
 /// be zero. A frame setting any of them is a malformed sequence.
 static constexpr uint8_t FRAGMENT_FLAGS_RESERVED = 0xFC;
 
+/// @brief Fragment header size in bytes: [1][flags] for a continuation frame, plus the
+/// orig_type byte for a frame carrying FRAGMENT_FLAG_FIRST.
+static constexpr size_t FRAGMENT_CONT_HEADER_SIZE = 2;
+static constexpr size_t FRAGMENT_FIRST_HEADER_SIZE = FRAGMENT_CONT_HEADER_SIZE + 1;
+
 /// @brief First and last binary message ID that messaging.md "Binary Message ID Structure"
 /// reserves for future use, so a fragmented message claiming one as its orig_type is an
 /// unimplemented message the receiver ignores.
