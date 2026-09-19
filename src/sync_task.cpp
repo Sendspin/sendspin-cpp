@@ -738,9 +738,8 @@ void SyncTask::release_stream_pin() {
     if (this->stream_connection_ == nullptr) {
         return;
     }
-    // Hand it to the manager rather than dropping it here: ~SendspinConnection joins the
-    // transport thread, which must not run on the audio thread (see DeferredRelease). One lock
-    // take per stream.
+    // Hand it to the manager rather than dropping it here: the destructor must not run on the
+    // audio thread (see DeferredRelease). One lock take per stream.
     this->conn_manager_->release_from_role_thread(std::move(this->stream_connection_));
 }
 

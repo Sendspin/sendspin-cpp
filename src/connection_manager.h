@@ -160,9 +160,11 @@ struct NurseryEntry {
 ///
 /// A role thread that holds its own reference (the sync task pins the connection whose time
 /// filter its stream uses) does not destroy it either: it hands the reference back through
-/// release_from_role_thread(), which queues it here with main_loop_only set. The join inside the
-/// destructor would otherwise land on the audio thread, adding the transport teardown to a stack
-/// sized for Opus decode and stalling playback for as long as the join takes.
+/// release_from_role_thread(), which queues it here with main_loop_only set. An outbound
+/// connection's destructor joins its transport thread (see above), which would otherwise land on
+/// the audio thread: the transport teardown on a stack sized for Opus decode, and a stall as long
+/// as the join. The inbound destructors are trivial, so the hand-over costs them only the one
+/// conn_ptr_mutex_ take per stream and keeps one rule for both.
 struct DeferredRelease {
     std::shared_ptr<SendspinConnection> conn;  ///< A reference to drop; not necessarily the last
     std::optional<SendspinGoodbyeReason> goodbye;  ///< nullopt: no goodbye owed, just release
@@ -177,9 +179,9 @@ struct DeferredRelease {
 /// The provider write is an NVS commit on ESP: tens of milliseconds during which nothing else
 /// may enter the manager: no network thread in on_new_connection(), and no off-main-loop caller
 /// resolving the current connection through current_shared(). Locked sections therefore only
-/// decide WHICH record (or server_id) the write
-/// covers, or, for PERSIST_RECORDS, apply the RAM half and stage the array write that owes it;
-/// flush_pending_record_ops() performs the writes with no lock held.
+/// decide WHICH record (or server_id) the write covers, or, for PERSIST_RECORDS, apply the RAM
+/// half and stage the array write that owes it; flush_pending_record_ops() performs the writes
+/// with no lock held.
 struct PendingRecordOp {
     enum class Kind : uint8_t {
         MARK_USED,        ///< RecordStore::note_record_used(psk_id); its durable half joins
