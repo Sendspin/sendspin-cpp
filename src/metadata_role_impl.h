@@ -107,11 +107,6 @@ struct MetadataRole::Impl {
     // ========================================
 
     // Struct fields
-    /// @brief Teardown generation, bumped by cleanup(). The receive gate captures it when it
-    /// admits a message and every point of effect re-checks it (see accepts()), so state written
-    /// by a handler a teardown overtook is refused. Atomic because the network thread reads it.
-    std::atomic<uint32_t> cleanup_generation{0};
-
     ServerMetadataStateObject metadata{};
     // State taken from the inbox slot, awaiting its server-clock deadline. Main-thread only:
     // written and read exclusively from drain_events()/cleanup() on the loop thread.
@@ -122,6 +117,12 @@ struct MetadataRole::Impl {
     std::unique_ptr<EventState> event_state;
     Inbox* inbox{nullptr};
     MetadataRoleListener* listener{nullptr};
+
+    // 32-bit fields
+    /// @brief Teardown generation, bumped by cleanup(). The receive gate captures it when it
+    /// admits a message and every point of effect re-checks it (see accepts()), so state written
+    /// by a handler a teardown overtook is refused. Atomic because the network thread reads it.
+    std::atomic<uint32_t> cleanup_generation{0};
 };
 
 }  // namespace sendspin

@@ -163,14 +163,15 @@ struct VisualizerRole::Impl {
     VisualizerRoleListener* listener{nullptr};
 
     // Atomic fields (written by network thread, read by drain thread / cleanup)
-    std::atomic<uint8_t> spectrum_bin_count{0};
-    std::atomic<bool> tracks_downbeats{false};
-    std::atomic<bool> stream_active{false};
     /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event queued
     /// afterwards. At the drain an event whose stamp no longer matches is discarded, so an event
     /// queued before a teardown cannot act after it (see event_is_current() in inbox.h). Atomic
-    /// because enqueue_stream_event() reads it from the network thread.
+    /// because the network thread reads it (see accepts()).
     std::atomic<uint32_t> cleanup_generation{0};
+
+    std::atomic<uint8_t> spectrum_bin_count{0};
+    std::atomic<bool> tracks_downbeats{false};
+    std::atomic<bool> stream_active{false};
     // Bitmask of negotiated wire types, bit N = wire type SENDSPIN_BINARY_VISUALIZER_FIRST + N.
     // Written by handle_stream_start and read by handle_binary on the same network thread, so
     // admission is always judged against the config in force when a message arrives; atomic only

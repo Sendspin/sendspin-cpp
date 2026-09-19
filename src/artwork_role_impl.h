@@ -365,7 +365,7 @@ struct ArtworkRole::Impl {
     /// @brief Teardown generation, bumped by cleanup() and stamped onto every stream event queued
     /// afterwards. At the drain an event whose stamp no longer matches is discarded, so an event
     /// queued before a teardown cannot act after it (see event_is_current() in inbox.h). Atomic
-    /// because enqueue_stream_event() reads it from the network thread.
+    /// because the network thread reads it (see accepts()).
     std::atomic<uint32_t> cleanup_generation{0};
 
     /// @brief Per-channel delivery epoch, bumped whenever the channel's pending image is

@@ -1052,7 +1052,37 @@ protected:
     // Noise transport state
     // ========================================
 
+    /// Extent of one held role message within held_messages_.
+    struct HeldMessageExtent {
+        size_t offset{};
+        size_t length{};
+        int64_t arrival_us{};
+    };
+
+    /// Pre-admission hold budgets, covering the burst a server can send between its
+    /// server/activate and the client's next loop() tick: one server/state per role this client
+    /// can carry (player, controller, metadata, artwork, visualizer, color), plus the
+    /// stream/start and group/update that can follow the same activation. The byte budget is
+    /// four steady-state protocol messages' worth (SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE
+    /// is one), which those eight fit comfortably: role state objects run to a few hundred bytes
+    /// each. Whichever budget runs out first, the message is dropped with a warning rather than
+    /// letting an unadmitted peer grow held_messages_ without bound.
+    static constexpr size_t MAX_HELD_MESSAGES = 8;
+    static constexpr size_t MAX_HELD_BYTES = 4 * SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE;
+
     // Struct fields
+
+    /// Extents of the messages held in held_messages_, in arrival order.
+    std::array<HeldMessageExtent, MAX_HELD_MESSAGES> held_extents_{};
+
+    /// Role messages received before admission, replayed in order when the connection is
+    /// admitted. See hold_pre_admission_message().
+    ///
+    /// The buffer is allocated on the first hold and freed by the replay (or with the
+    /// connection), so it costs nothing on a connection that is admitted before the server says
+    /// anything. Worst case is one buffer per live connection, NURSERY_CAPACITY (2) plus the
+    /// current slot, i.e. 24 KB of SPIRAM-preferring heap, held only across the admission window.
+    PlatformBuffer held_messages_;
 
     /// Encrypted transport: owns the cipher session, its mutex, outbound fragmentation,
     /// and inbound reassembly. See noise_transport.h for the threading contract.
@@ -1100,6 +1130,13 @@ protected:
     const uint64_t instance_id{next_instance_id()};
 
     // size_t fields
+
+    /// Bytes of held_messages_ in use, against MAX_HELD_BYTES.
+    size_t held_bytes_{0};
+
+    /// Messages held in held_extents_, against MAX_HELD_MESSAGES.
+    size_t held_count_{0};
+
     size_t websocket_write_offset_{0};
 
     // String fields
@@ -1259,36 +1296,6 @@ protected:
     /// by ConnectionManager::set_current_connection() on the main loop; read on the network
     /// thread by the role-dispatch gate. See is_admitted().
     std::atomic<bool> admitted_{false};
-
-    /// Extent of one held role message within held_messages_.
-    struct HeldMessageExtent {
-        size_t offset{};
-        size_t length{};
-        int64_t arrival_us{};
-    };
-
-    /// Role messages received before admission, replayed in order when the connection is
-    /// admitted. See hold_pre_admission_message().
-    ///
-    /// The slot count covers the burst a server can send between its server/activate and the
-    /// client's next loop() tick: one server/state per role this client can carry (player,
-    /// controller, metadata, artwork, visualizer, color), plus the stream/start and group/update
-    /// that can follow the same activation. The byte budget is four steady-state protocol
-    /// messages' worth (SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE is one), which those eight
-    /// fit comfortably: role state objects run to a few hundred bytes each. Whichever budget runs
-    /// out first, the message is dropped with a warning rather than letting an unadmitted peer
-    /// grow this without bound.
-    ///
-    /// The buffer is allocated on the first hold and freed by the replay (or with the
-    /// connection), so it costs nothing on a connection that is admitted before the server says
-    /// anything. Worst case is one buffer per live connection, NURSERY_CAPACITY (2) plus the
-    /// current slot, i.e. 24 KB of SPIRAM-preferring heap, held only across the admission window.
-    static constexpr size_t MAX_HELD_MESSAGES = 8;
-    static constexpr size_t MAX_HELD_BYTES = 4 * SendspinClientConfig::DEFAULT_JSON_ARENA_SIZE;
-    PlatformBuffer held_messages_;
-    std::array<HeldMessageExtent, MAX_HELD_MESSAGES> held_extents_{};
-    size_t held_count_{0};
-    size_t held_bytes_{0};
 
     /// true once the transport delivered the connected event (WebSocket upgrade completed).
     /// Written from the transport connected callback (network thread), read by the manager's

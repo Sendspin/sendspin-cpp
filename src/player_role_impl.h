@@ -175,8 +175,8 @@ struct PlayerRole::Impl {
     // purposes. At the drain it decides whether a ring event is still current: an event queued
     // before the teardown must not act after it, or a STREAM_START would re-arm the sync task for
     // a stream that is gone. Within drain_events() it also detects a listener callback that
-    // re-entered teardown while the STREAM_START tail was running. Atomic because
-    // enqueue_stream_event() reads it from the network thread.
+    // re-entered teardown while the STREAM_START tail was running. Atomic because the network
+    // thread reads it (see accepts()).
     std::atomic<uint32_t> cleanup_generation{0};
 
     // 16-bit fields

@@ -995,28 +995,15 @@ private:
     std::vector<ServerUnpairEvent> pending_server_unpair_events_;
     std::vector<ServerPairingMessageEvent> pending_pairing_message_events_;
     std::vector<std::string> pending_pairing_succeeded_events_;  // server_ids to notify
-    bool pending_pairing_window_confirm_{false};                 // Pairing-window gesture confirm
-    bool pending_pairing_window_cancel_{false};                  // Pairing-window operator cancel
-    // Standing pairing window: platform_time_us() deadline until which the window admits one
-    // pairing attempt; 0 = closed. Opened by the operator gesture, consumed when client/pair-init
-    // is sent. Main-loop-only.
-    int64_t pairing_window_open_until_us_{0};
-    // The connection carrying the window's first attempt, or nullptr while the window has
-    // admitted none. Compared, never dereferenced, and cleared whenever the window closes, so a
-    // released connection's address cannot be mistaken for a live one. Main-loop-only.
-    const SendspinConnection* pairing_window_conn_{nullptr};
-    // Attempts under the current window that ended in a failed server_kc verification. Reset
-    // when a window opens. Main-loop-only.
-    uint32_t pairing_window_failed_attempts_{0};
-    // Dynamic-pairing-code rounds run since the last verified server_kc (pairing.md "Rounds").
-    // Not partitioned by server_id or source address, and not persisted: the limit gates how
-    // fast an attacker can guess within one boot, which a reboot does not shorten. Main-loop-only
-    // (every round begins and ends in a main-loop pairing handler).
-    uint32_t pairing_rounds_since_verified_kc_{0};
 
     // Pointer fields
     SendspinClient* client_;
     std::shared_ptr<SendspinConnection> current_connection_;
+    // The connection carrying the window's first attempt, or nullptr while the window has
+    // admitted none. Compared, never dereferenced, and cleared whenever the window closes, so a
+    // released connection's address cannot be mistaken for a live one. Main-loop-only.
+    const SendspinConnection* pairing_window_conn_{nullptr};
+
     /// The connection the last set_current_connection() installed, waiting for
     /// flush_pending_admission() to admit it once conn_ptr_mutex_ is dropped. Null between a
     /// flush and the next assignment, and reset by a clearing assignment. Written and read only
@@ -1030,8 +1017,23 @@ private:
     // 64-bit fields
     /// From resolve_liveness_timeout_ms(), in microseconds; 0 or negative disables the check.
     int64_t liveness_timeout_us_{0};
+    // Standing pairing window: platform_time_us() deadline until which the window admits one
+    // pairing attempt; 0 = closed. Opened by the operator gesture, consumed when client/pair-init
+    // is sent. Main-loop-only.
+    int64_t pairing_window_open_until_us_{0};
     /// Earliest time (us) to attempt another WS server start after a failure. Main-loop only.
     int64_t ws_server_start_retry_time_us_{0};
+
+    // 32-bit fields
+    // Dynamic-pairing-code rounds run since the last verified server_kc (pairing.md "Rounds").
+    // Not partitioned by server_id or source address, and not persisted: the limit gates how
+    // fast an attacker can guess within one boot, which a reboot does not shorten. Main-loop-only
+    // (every round begins and ends in a main-loop pairing handler).
+    uint32_t pairing_rounds_since_verified_kc_{0};
+
+    // Attempts under the current window that ended in a failed server_kc verification. Reset
+    // when a window opens. Main-loop-only.
+    uint32_t pairing_window_failed_attempts_{0};
 
     // 8-bit fields
     bool has_last_played_server_{false};
@@ -1039,6 +1041,12 @@ private:
     /// on_new_connection(), on the network thread), so a peer delivered after stop() closed
     /// admission is rejected rather than admitted into a nursery stop() has already emptied.
     bool accepting_{false};
+
+    /// Pairing-window operator cancel, scheduled from any thread and consumed by loop().
+    bool pending_pairing_window_cancel_{false};
+
+    /// Pairing-window gesture confirm, scheduled from any thread and consumed by loop().
+    bool pending_pairing_window_confirm_{false};
 
     // Atomic fields (lock-free hints for loop() tick gating; ground truth remains the
     // mutex-protected containers/pointer above; see the "Tick cost" note on loop())
