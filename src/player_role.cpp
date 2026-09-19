@@ -256,10 +256,6 @@ void PlayerRole::Impl::stop() const {
 }
 
 void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
-    if (this->config.audio_formats.empty()) {
-        return;
-    }
-
     msg.supported_roles.push_back(SendspinRole::PLAYER);
 
     // Advertise 80% of the buffer capacity to account for ring buffer metadata overhead
@@ -274,10 +270,6 @@ void PlayerRole::Impl::build_hello_fields(ClientHelloMessage& msg) {
 }
 
 void PlayerRole::Impl::build_state_fields(ClientStateMessage& msg) const {
-    if (this->config.audio_formats.empty()) {
-        return;
-    }
-
     ClientPlayerStateObject player_state{};
     player_state.volume = this->volume;
     player_state.muted = this->muted;
@@ -312,7 +304,7 @@ std::optional<AudioChunk> PlayerRole::Impl::parse_audio_chunk(const uint8_t* dat
 
 SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len,
                                             uint32_t generation) const {
-    if (this->config.audio_formats.empty() || !this->accepts(generation)) {
+    if (!this->accepts(generation)) {
         return;
     }
     auto chunk = parse_audio_chunk(data, len);
@@ -334,12 +326,6 @@ SS_HOT void PlayerRole::Impl::handle_binary(const uint8_t* data, size_t len,
 
 void PlayerRole::Impl::handle_stream_start(const ServerPlayerStreamObject& player_obj,
                                            uint32_t generation) const {
-    if (this->config.audio_formats.empty()) {
-        // No audio formats, just defer stream start callback
-        this->enqueue_stream_event(PlayerStreamCallbackType::STREAM_START, generation);
-        return;
-    }
-
     bool header_sent = false;
 
     if (!player_obj.bit_depth.has_value() || !player_obj.channels.has_value() ||
@@ -549,8 +535,7 @@ void PlayerRole::Impl::drain_events() {
                     // Request high-performance networking for playback (deferred from the
                     // network thread's handle_stream_start so the listener callback and the
                     // pairing flag stay on the main thread)
-                    if (!this->config.audio_formats.empty() &&
-                        !this->high_performance_requested_for_playback) {
+                    if (!this->high_performance_requested_for_playback) {
                         this->client->acquire_high_performance();
                         this->high_performance_requested_for_playback = true;
                     }
