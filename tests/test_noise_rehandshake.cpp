@@ -382,3 +382,47 @@ TEST(NoiseRehandshake, UnknownPskIdAborts) {
     EXPECT_FALSE(result.has_value())
         << "run_rehandshake_msg1 should fail with an unknown psk_id";
 }
+
+// The envelope type in front of the re-handshake is checked before msg1 is read: run_msg1_core()
+// looks only at payload.data, so a real msg1 relabeled as another message would otherwise be
+// processed as a re-handshake.
+TEST(NoiseRehandshake, RehandshakeEnvelopeTypeIsChecked) {
+    const std::string suite = std::string(NOISE_SUITE_CHACHAPOLY);
+    auto init_opt = run_initial_handshake(suite);
+    ASSERT_TRUE(init_opt.has_value());
+    const InitialHandshakeResult& init = *init_opt;
+
+    RecordStore rs(nullptr);
+    SendspinPairingRecord rec;
+    rec.psk_id = init.psk_id;
+    rec.psk = init.psk;
+    rec.server_id = init.server_id.peer_id();
+    rs.store_record_superseding(std::move(rec), {});
+
+    const std::array<uint8_t, 32>& prior_h = init.responder_h;
+    NoiseHandshakeState* init_hs_raw =
+        build_initiator(suite, init.server_id.private_bytes.data(),
+                        init.server_id.public_bytes.data(), init.client_id.public_bytes.data(),
+                        init.psk.data(), prior_h.data(), prior_h.size());
+    ASSERT_NE(init_hs_raw, nullptr);
+    HsGuard guard(init_hs_raw);
+
+    const std::string msg1_json = build_msg1_envelope(init_hs_raw, init.psk_id);
+    ASSERT_FALSE(msg1_json.empty());
+
+    JsonDocument doc;
+    ASSERT_FALSE(deserializeJson(doc, msg1_json));
+    doc["type"] = "server/init";
+    std::string relabeled;
+    serializeJson(doc, relabeled);
+
+    EXPECT_FALSE(run_rehandshake_msg1(relabeled, init.server_id.peer_id(), init.client_id, rs,
+                                      suite, prior_h)
+                     .has_value());
+
+    // Control: the same msg1 under its own type completes, so the rejection is the type and not
+    // the message.
+    EXPECT_TRUE(run_rehandshake_msg1(msg1_json, init.server_id.peer_id(), init.client_id, rs,
+                                     suite, prior_h)
+                    .has_value());
+}
