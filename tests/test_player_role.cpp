@@ -348,85 +348,80 @@ StreamEventCounts drain_stream_events(PlayerRole::Impl& impl) {
 
 }  // namespace
 
-// The codec-header send inside handle_stream_start blocks for up to HEADER_SEND_TIMEOUT_MS, which
-// is the widest window a teardown can land in between the receive gate admitting the message and
-// this handler publishing its stream. A teardown that did land has already ended the stream and
-// queued its own STREAM_END, so publishing here would re-arm the sync task on the header just
-// written with no audio behind it. The header itself is written before the check, which is why
-// the check has to exist rather than the send being skipped.
-TEST(PlayerTeardownGeneration, StreamStartPublishesNothingAfterATeardown) {
-    auto impl = make_impl();
-    const uint32_t captured = live_generation(*impl);
+// Every point of effect re-checks the generation the receive gate captured with the message,
+// because a teardown can land while the handler is still running: the codec-header send inside
+// handle_stream_start blocks for up to HEADER_SEND_TIMEOUT_MS, the widest such window, and the
+// header is written before the check, which is why the check has to exist rather than the send
+// being skipped. A stale handler that took effect would re-arm the sync task on a header with no
+// audio behind it, buffer audio for a stream the teardown already ended, or place a seek marker
+// in it.
+//
+// Each handler's effect is main-loop state that the role publishes rather than a callback, so the
+// inbox slots and the encoded ring are read directly: with no main loop running there is nothing
+// a caller or peer can observe that distinguishes a refused handler from one that never ran.
+TEST(PlayerTeardownGeneration, StaleGenerationIsRefusedAtEveryPointOfEffect) {
+    struct Row {
+        const char* name;
+        void (*drive)(PlayerRole::Impl&, uint32_t);
+        bool (*took_effect)(PlayerRole::Impl&);
+    };
 
-    impl->cleanup();
-    ASSERT_EQ(drain_stream_events(*impl).ends, 1) << "cleanup() queued no STREAM_END";
+    const Row rows[] = {
+        {"stream/start",
+         [](PlayerRole::Impl& impl, uint32_t generation) {
+             impl.handle_stream_start(pcm_stream_params(), generation);
+         },
+         [](PlayerRole::Impl& impl) {
+             ServerPlayerStreamObject published;
+             const bool published_params = impl.event_state->stream_params_slot.take(published);
+             const bool queued_start = drain_stream_events(impl).starts > 0;
+             if (published_params) {
+                 EXPECT_EQ(published.sample_rate.value_or(0), 44100u);
+             }
+             return published_params || queued_start;
+         }},
+        {"audio chunk",
+         [](PlayerRole::Impl& impl, uint32_t generation) {
+             const std::vector<uint8_t> chunk = audio_chunk();
+             impl.handle_binary(chunk.data(), chunk.size(), generation);
+         },
+         [](PlayerRole::Impl& impl) { return !impl.sync_task->encoded_ring_buffer_->is_empty(); }},
+        // stream/clear enqueues the marker that tells the sync task where the discarded pre-seek
+        // audio ends, so a stale one would place that boundary in an ended stream.
+        {"stream/clear",
+         [](PlayerRole::Impl& impl, uint32_t generation) { impl.handle_stream_clear(generation); },
+         [](PlayerRole::Impl& impl) { return !impl.sync_task->encoded_ring_buffer_->is_empty(); }},
+        {"server/command",
+         [](PlayerRole::Impl& impl, uint32_t generation) {
+             impl.handle_server_command(volume_command(70), generation);
+         },
+         [](PlayerRole::Impl& impl) {
+             ServerCommandMessage merged;
+             if (!impl.event_state->command_slot.take(merged)) {
+                 return false;
+             }
+             EXPECT_TRUE(merged.player.has_value());
+             EXPECT_EQ(merged.player->volume.value_or(0), 70);
+             return true;
+         }},
+    };
 
-    impl->handle_stream_start(pcm_stream_params(), captured);
+    for (const auto& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        const uint32_t captured = live_generation(*impl);
 
-    ServerPlayerStreamObject published;
-    EXPECT_FALSE(impl->event_state->stream_params_slot.take(published))
-        << "a stale stream/start published its params to the main loop";
-    EXPECT_EQ(drain_stream_events(*impl).starts, 0)
-        << "a stale stream/start queued a STREAM_START";
+        impl->cleanup();
+        ASSERT_EQ(drain_stream_events(*impl).ends, 1) << "cleanup() queued no STREAM_END";
+        ASSERT_TRUE(impl->sync_task->encoded_ring_buffer_->is_empty());
 
-    // Control: the same stream/start with the generation the role now reports is published.
-    impl->handle_stream_start(pcm_stream_params(), live_generation(*impl));
-    EXPECT_TRUE(impl->event_state->stream_params_slot.take(published));
-    EXPECT_EQ(published.sample_rate.value_or(0), 44100u);
-    EXPECT_EQ(drain_stream_events(*impl).starts, 1);
-}
+        row.drive(*impl, captured);
+        EXPECT_FALSE(row.took_effect(*impl)) << "a stale message reached the main loop";
 
-TEST(PlayerTeardownGeneration, AudioChunkIsNotBufferedAfterATeardown) {
-    auto impl = make_impl();
-    const uint32_t captured = live_generation(*impl);
-
-    impl->cleanup();
-    ASSERT_TRUE(impl->sync_task->encoded_ring_buffer_->is_empty());
-
-    const std::vector<uint8_t> chunk = audio_chunk();
-    impl->handle_binary(chunk.data(), chunk.size(), captured);
-    EXPECT_TRUE(impl->sync_task->encoded_ring_buffer_->is_empty())
-        << "a stale audio chunk was buffered for a stopped stream";
-
-    // Control: the same chunk with the generation the role now reports is buffered.
-    impl->handle_binary(chunk.data(), chunk.size(), live_generation(*impl));
-    EXPECT_FALSE(impl->sync_task->encoded_ring_buffer_->is_empty());
-}
-
-// stream/clear enqueues the marker that tells the sync task where the discarded pre-seek audio
-// ends. A stale one would place that boundary in a stream the teardown already ended.
-TEST(PlayerTeardownGeneration, StreamClearEnqueuesNoMarkerAfterATeardown) {
-    auto impl = make_impl();
-    const uint32_t captured = live_generation(*impl);
-
-    impl->cleanup();
-    ASSERT_TRUE(impl->sync_task->encoded_ring_buffer_->is_empty());
-
-    impl->handle_stream_clear(captured);
-    EXPECT_TRUE(impl->sync_task->encoded_ring_buffer_->is_empty())
-        << "a stale stream/clear enqueued its seek marker";
-
-    // Control: the same stream/clear with the generation the role now reports enqueues it.
-    impl->handle_stream_clear(live_generation(*impl));
-    EXPECT_FALSE(impl->sync_task->encoded_ring_buffer_->is_empty());
-}
-
-TEST(PlayerTeardownGeneration, ServerCommandIsNotAppliedAfterATeardown) {
-    auto impl = make_impl();
-    const uint32_t captured = live_generation(*impl);
-
-    impl->cleanup();
-
-    impl->handle_server_command(volume_command(70), captured);
-    ServerCommandMessage merged;
-    EXPECT_FALSE(impl->event_state->command_slot.take(merged))
-        << "a stale server/command reached the main loop";
-
-    // Control: the same command with the generation the role now reports is applied.
-    impl->handle_server_command(volume_command(70), live_generation(*impl));
-    ASSERT_TRUE(impl->event_state->command_slot.take(merged));
-    ASSERT_TRUE(merged.player.has_value());
-    EXPECT_EQ(merged.player->volume.value_or(0), 70);
+        // Control: the same message with the generation the role now reports takes effect.
+        row.drive(*impl, live_generation(*impl));
+        EXPECT_TRUE(row.took_effect(*impl));
+    }
 }
 
 // ============================================================================
