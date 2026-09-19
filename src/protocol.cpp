@@ -603,6 +603,11 @@ bool process_server_state_controller(JsonObject root,
     }
     const JsonObject controller_object = root["payload"]["controller"];
 
+    // messaging.md "server/state": every message carries the full state of each role object it
+    // includes, so an included controller object is parsed into a fresh state rather than
+    // overlaid on what came before (matching the metadata and color parsers).
+    *controller_state = ServerStateControllerObject{};
+
     // Parse supported_commands array. The controller role is frozen at v1, so an unrecognized
     // command is a non-compliant value rather than a forward-compatible one: drop and log it.
     if (controller_object["supported_commands"].is<JsonArray>()) {

@@ -490,6 +490,32 @@ TEST(Protocol, ControllerSupportedCommandsValidation) {
     EXPECT_EQ(commands[1], SendspinControllerCommand::MUTE);
 }
 
+// A field the object omits goes back to its default, whatever the target struct held before, the
+// same way the metadata and color objects replace what they omit.
+TEST(Protocol, ControllerObjectReplacesEveryFieldItOmits) {
+    ServerStateControllerObject controller;
+    controller.volume = 50;
+    controller.muted = true;
+    controller.repeat = SendspinRepeatMode::ALL;
+    controller.shuffle = true;
+    controller.seek_max_ms = 215000;
+
+    JsonDocument doc;
+    JsonObject root;
+    ASSERT_TRUE(parse(R"({"type":"server/state","payload":{"controller":)"
+                      R"({"supported_commands":["play"]}}})",
+                      doc, root));
+    ASSERT_TRUE(process_server_state_controller(root, &controller));
+
+    ASSERT_EQ(controller.supported_commands.size(), 1u);
+    EXPECT_EQ(controller.supported_commands[0], SendspinControllerCommand::PLAY);
+    EXPECT_EQ(controller.volume, 0);
+    EXPECT_FALSE(controller.muted);
+    EXPECT_EQ(controller.repeat, SendspinRepeatMode::OFF);
+    EXPECT_FALSE(controller.shuffle);
+    EXPECT_FALSE(controller.seek_max_ms.has_value());
+}
+
 // seek_max_ms is parsed when the server includes it (the seekable upper bound for absolute seeks).
 TEST(Protocol, ControllerSeekMaxParsed) {
     JsonDocument doc;
