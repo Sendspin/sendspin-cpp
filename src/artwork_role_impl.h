@@ -86,9 +86,8 @@ struct ArtworkNotification {
 ///
 /// roles/artwork/v1.md "Artwork (Binary)" allows at most one transfer in flight per role: it
 /// begins at an announce and ends when the accumulated part data reaches `total_size`, when a
-/// cancel abandons it, or when the stream it belongs to goes away. One role-wide record is
-/// therefore enough, and a second announce arriving while `in_flight` is set is the
-/// malformed-sequence rule rather than a second record.
+/// cancel abandons it, or when the stream it belongs to goes away. A second announce arriving
+/// while `in_flight` is set is the malformed-sequence rule rather than a second record.
 ///
 /// Guarded by DrainTask::slot_mutex: written from the network thread (handle_binary() and the
 /// stream lifecycle handlers) and cleared from the main loop by cleanup().
@@ -203,7 +202,7 @@ struct ArtworkRole::Impl {
     // images; a nonzero held_display_mask means displays folded in on a prior tick are still
     // waiting out their server-clock deadlines (see held_display_ts): the deadline itself sets
     // no inbox bit, so a nonzero mask must be polled every tick until each slot fires or is
-    // dropped for a stream-epoch mismatch.
+    // dropped for a slot-epoch mismatch.
     bool needs_drain(uint32_t pending_bits) const {
         return (pending_bits & INBOX_TOPIC_ARTWORK_DISPLAY) != 0 || this->held_display_mask != 0;
     }
@@ -215,7 +214,6 @@ struct ArtworkRole::Impl {
     /// lost connection, never quiesces the network thread). The dispatch captures this counter with
     /// the gate and hands it back here at each point of effect, so a teardown inside that window
     /// invalidates the whole handler instead of only the part that ran before it.
-    /// @param generation The counter value captured when the message was admitted.
     bool accepts(uint32_t generation) const {
         return generation == this->cleanup_generation.load(std::memory_order_acquire);
     }
@@ -245,8 +243,7 @@ struct ArtworkRole::Impl {
     bool signal_stop() const;
     void stop() const;
     /// @brief Hands back every per-slot image buffer that the decode thread is not reading.
-    /// Main thread, under slot_mutex. Called where the role stops holding an image at all: the
-    /// teardown in cleanup() and the thread join in stop().
+    /// Main thread, under slot_mutex. Called from cleanup() and stop().
     void release_idle_slot_buffers() const;
     /// Queues a stream lifecycle event stamped with `generation`, which the drain compares
     /// against the live counter before dispatching it.
@@ -279,8 +276,7 @@ struct ArtworkRole::Impl {
     // True if `slot` is within range and configured with require_frame_done.
     bool ack_enabled(uint8_t slot) const;
     // Largest encoded image the role will hold for `slot`: the channel's configured
-    // ImageSlotPreference::max_image_bytes, or 0 for a slot the role declared no channel for, so
-    // an image the role never asked for is never held.
+    // ImageSlotPreference::max_image_bytes, or 0 for a slot the role declared no channel for.
     uint32_t image_cap(uint8_t slot) const;
     // Format the decode callback reports for `slot`: the one the channel was configured with, so
     // the array index stays authoritative for slot mapping (see the Impl constructor).
@@ -288,10 +284,10 @@ struct ArtworkRole::Impl {
     // Discards the slot's pending image by bumping its epoch, and abandons the in-flight transfer
     // if it is that slot's. Both a cancel message and a fresh announce need exactly this.
     void discard_pending(uint8_t slot);
-    // Discards every channel's pending image: bumps all the epochs, drops any transfer in flight,
-    // and forgets the streamed configuration so the next stream/start compares against nothing.
-    // A stream end or clear and a disconnect each end the whole stream this way; a stream/start
-    // discards only the channels it changed (see changed_channel_mask()).
+    // Discards every channel's pending image, and forgets the streamed configuration so the next
+    // stream/start compares against nothing. A stream end or clear and a disconnect each end the
+    // whole stream this way; a stream/start discards only the channels it changed (see
+    // changed_channel_mask()).
     void discard_all_pending();
     // Which channels this stream/start changed the configuration of, as a slot bitmask. Every
     // channel counts as changed when either side has no channel array to compare. Caller holds
@@ -332,7 +328,7 @@ struct ArtworkRole::Impl {
     // Struct fields
     ArtworkRoleConfig config;
     std::vector<ArtworkChannelFormatObject> artwork_channels;
-    // The role's single image transfer in flight; guarded by DrainTask::slot_mutex.
+    // Guarded by DrainTask::slot_mutex; see ArtworkTransfer.
     ArtworkTransfer transfer;
     // The channel array of the stream/start in force, kept so the next one can be compared
     // against it: only the channels whose configuration changes lose their pending image.

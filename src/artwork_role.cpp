@@ -31,15 +31,14 @@ static const char* const TAG = "sendspin.artwork";
 // Constants
 // ============================================================================
 
-/// @brief Largest artwork message, in bytes, per roles/artwork/v1.md "Artwork (Binary)": one
-/// Noise transport message without fragmentation, so it is that bound.
+/// @brief Largest artwork message, in bytes: one Noise transport message without fragmentation,
+/// per roles/artwork/v1.md "Artwork (Binary)"
 static constexpr size_t ARTWORK_MAX_MESSAGE_SIZE = sendspin::MAX_TRANSPORT_PLAINTEXT;
 
 /// @brief Size of an announce message: type, flags, the 8-byte timestamp, the 4-byte total_size
 static constexpr size_t ARTWORK_ANNOUNCE_SIZE = 14;
 
-/// @brief Flags byte bits. Bit 0 marks a cancel and bit 1 an announce; a part sets neither and
-/// bits 2-7 are reserved and must be zero.
+/// @brief Flags byte bits: a part sets neither cancel nor announce, and bits 2-7 must be zero
 static constexpr uint8_t ARTWORK_FLAG_CANCEL = 0x01;
 static constexpr uint8_t ARTWORK_FLAG_ANNOUNCE = 0x02;
 static constexpr uint8_t ARTWORK_FLAGS_RESERVED = 0xFC;
@@ -98,7 +97,7 @@ ArtworkRole::Impl::Impl(ArtworkRoleConfig config, SendspinClient* client)
         const auto& pref = this->config.preferred_formats[i];
         this->artwork_channels.push_back({pref.source, pref.format, pref.width, pref.height});
         // Said once here rather than once per refused image: a channel budgeted 0 bytes is
-        // announced to the server like any other but can never hold what the server sends.
+        // still announced to the server.
         if (pref.max_image_bytes == 0 && pref.source != SendspinImageSource::NONE) {
             SS_LOGW(TAG, "Artwork channel %zu holds no image: max_image_bytes is 0", i);
         }
@@ -161,8 +160,7 @@ void ArtworkRole::Impl::stop() const {
     // took, so a restart does not decode the previous session's images.
     this->drain_task->notify_queue.reset();
 
-    // ...and the only reader of the image buffers, so every one of them is idle now, whatever
-    // the last decode left behind.
+    // ...and the only reader of the image buffers, so every one of them is idle now.
     {
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
         for (auto& sb : this->drain_task->slot_buffers) {
@@ -277,8 +275,7 @@ void ArtworkRole::Impl::wake_drain_thread() const {
 // ============================================================================
 
 uint32_t ArtworkRole::Impl::image_cap(uint8_t slot) const {
-    // A channel the role never declared is one it never asked for an image on, so it holds
-    // nothing; every other channel holds what its consumer budgeted for it.
+    // A channel the role never declared never asked for an image, so it holds nothing.
     if (slot >= this->config.preferred_formats.size()) {
         return 0;
     }
@@ -323,8 +320,7 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
 
     std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
     // roles/artwork/v1.md "Artwork (Binary)": "The server MUST NOT announce an image, on any
-    // channel, while a transfer is in flight": one of the malformed sequences the client closes
-    // on.
+    // channel, while a transfer is in flight".
     if (this->transfer.in_flight) {
         SS_LOGW(TAG, "Artwork announce for slot %u while slot %u is mid-transfer", slot,
                 this->transfer.slot);
@@ -337,9 +333,7 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
 
     // "An announce with total_size 0 completes immediately, with no parts", and is how the server
     // clears a channel. There are no bytes to stage, so no buffer is claimed and the notification
-    // travels with data_length == 0 (see ArtworkNotification). It still goes through the decode
-    // thread rather than straight to the main loop, so it stays ordered behind any image already
-    // queued for this slot and takes the same ack-gate path a frame does.
+    // travels with data_length == 0 (see ArtworkNotification).
     if (total_size == 0) {
         complete = ArtworkNotification{slot, 0, 0, timestamp, this->image_format(slot), 0, epoch};
         return TransferOutcome::COMPLETED;
@@ -348,8 +342,7 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
     // "During an active stream, unavailable clients SHOULD discard otherwise valid image data and
     // MUST NOT close solely for its arrival": an image the role will not hold is refused here,
     // before a byte of it is allocated, and the transfer runs to its end holding nothing. A role
-    // with no listener has nowhere to put an image either, so it takes the same path rather than
-    // allocating for a delivery nobody receives.
+    // with no listener has nowhere to put an image either, so it takes the same path.
     const uint32_t cap = this->image_cap(slot);
     if (total_size > cap || this->listener == nullptr) {
         if (this->listener != nullptr) {
@@ -368,17 +361,16 @@ ArtworkRole::Impl::TransferOutcome ArtworkRole::Impl::begin_transfer(
 
     auto& sb = this->drain_task->slot_buffers[slot];
     uint8_t write_idx = sb.write_idx;
-    // If the decode thread is actively using this buffer, claim the other one. If the decode
-    // thread is using the other one, this write_idx is already safe.
+    // Claim the other buffer if the decode thread is reading this one.
     if (sb.drain_active && sb.drain_buf_idx == write_idx) {
         write_idx ^= 1;
     }
 
-    // Size the buffer to the announced image. allocate() rather than realloc(): none of the
-    // buffer's contents survive a transfer, so there is nothing to copy forward. The buffer is
-    // only ever grown, so a channel settles at its largest image and later transfers reuse it
-    // without touching the allocator. Image data prefers SPIRAM, where it is decoded from once
-    // and never touched on a timing-critical path.
+    // allocate() rather than realloc(): none of the buffer's contents survive a transfer, so
+    // there is nothing to copy forward. The buffer is only ever grown, so a channel settles at
+    // its largest image and later transfers reuse it without touching the allocator. Image data
+    // prefers SPIRAM, where it is decoded from once and never touched on a timing-critical
+    // path.
     auto& buf = sb.buffers[write_idx];
     if (buf.size() < total_size && !buf.allocate(total_size, MemoryLocation::PREFER_EXTERNAL)) {
         SS_LOGE(TAG, "Failed to allocate artwork buffer for slot %u (%" PRIu32 " bytes)", slot,
@@ -452,8 +444,7 @@ bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
     // roles/artwork/v1.md "Artwork (Binary)" splits its closing rules in two. The
     // malformed-message rules judge the shape of the bytes alone and are not scoped to a stream,
     // so they run first; the malformed-sequence rules are scoped to an active artwork stream and
-    // run below the stream gate. `len` is the message length less its type byte, which the caller
-    // has already stripped.
+    // run below the stream gate.
     if (len < 1 || len + 1 > ARTWORK_MAX_MESSAGE_SIZE) {
         SS_LOGW(TAG, "Artwork message of %zu bytes is outside the 2 to %zu byte range", len + 1,
                 ARTWORK_MAX_MESSAGE_SIZE);
@@ -483,8 +474,7 @@ bool ArtworkRole::Impl::handle_binary(uint8_t slot, const uint8_t* data, size_t 
 
     // roles/artwork/v1.md "Artwork (Binary)": "Servers MUST NOT send artwork messages outside an
     // active artwork stream." One that arrives anyway is ignored rather than closed on: the
-    // sequence rules below are scoped to an active stream, and there is no sequence to be part of
-    // yet.
+    // sequence rules below are scoped to an active stream.
     if (!this->stream_active) {
         return true;
     }
@@ -559,11 +549,10 @@ void ArtworkRole::Impl::handle_stream_start(const ServerArtworkStreamObject& str
     {
         // roles/artwork/v1.md "stream/start artwork object": "A stream/start that changes a
         // channel's configuration likewise discards that channel's pending image, and the server
-        // re-sends the image if it still applies." The discard is
-        // scoped to the channels whose configuration this stream/start changed: a channel the
-        // server left alone keeps the image it already scheduled, which the server will neither
-        // cancel nor re-send. Bumping those channels' epochs is the discard (see slot_epochs), and
-        // it also makes any notification still queued for them stale to the decode thread.
+        // re-sends the image if it still applies." A channel the server left alone keeps the
+        // image it already scheduled, which the server will neither cancel nor re-send. Bumping
+        // the changed channels' epochs is the discard (see slot_epochs), and it also makes any
+        // notification still queued for them stale to the decode thread.
         //
         // The comparison and the store of the new array are inside the lock because
         // streamed_channels is also cleared by cleanup(), which the main loop runs on a live
@@ -621,8 +610,7 @@ uint8_t ArtworkRole::Impl::changed_channel_mask(const ServerArtworkStreamObject&
     for (uint8_t slot = 0; slot < ARTWORK_MAX_SLOTS; ++slot) {
         // roles/artwork/v1.md "stream/start artwork object": "The channels array is positional
         // from channel 0 and never longer than 4. A channel the array does not cover ... is not
-        // streamed", so a channel one array covers and the other does not has changed, as has one
-        // whose source, format, width or height differs.
+        // streamed", so coverage differing between the two arrays is itself a change.
         const bool had = slot < before.size();
         const bool has = slot < now.size();
         if (had != has || (had && !same_channel(before[slot], now[slot]))) {
@@ -748,9 +736,8 @@ void ArtworkRole::Impl::drain_events() {
         if (!(this->held_display_mask & bit)) {
             continue;
         }
-        // Drop a display whose channel has since moved past it: a stream restart with no
-        // intervening end/clear, a cancel, or a fresh announce bumps the epoch but cannot reach
-        // these main-thread holds to cancel the display directly.
+        // Drop a display whose channel has since moved past it: the epoch bump cannot reach these
+        // main-thread holds to cancel the display directly (see held_display_epoch).
         if (this->held_display_epoch[slot] !=
             this->slot_epochs[slot].load(std::memory_order_relaxed)) {
             this->held_display_mask &= static_cast<uint8_t>(~bit);
@@ -829,11 +816,11 @@ void ArtworkRole::Impl::cleanup() {
     this->event_state->display_slot.reset();
 
     // discard_all_pending() bumped every slot epoch, so no transfer is in flight and nothing
-    // that is still decoding can deliver: the image buffers go back to the heap.
+    // that is still decoding can deliver.
     this->release_idle_slot_buffers();
 
-    // Enqueue a clean STREAM_END - handle_stream_ring_event() will fire the on_image_clear()
-    // callbacks (enqueue_stream_event() logs if the ring is too full to take it).
+    // handle_stream_ring_event() fires the on_image_clear() callbacks (enqueue_stream_event()
+    // logs if the ring is too full to take it).
     this->enqueue_stream_event(ArtworkEventType::STREAM_END, generation);
 }
 
@@ -873,7 +860,7 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
 
     // A per-channel clear (see handle_binary) names no buffer, so it skips the buffer validation
     // and the decode callback below. Everything else is deliberately shared with a frame: the same
-    // stream-epoch staleness check, the same ack gate (a clear is a delivery owing exactly one
+    // slot-epoch staleness check, the same ack gate (a clear is a delivery owing exactly one
     // frame_done()), and the same timestamp-scheduled hand-off to the main loop, which fires
     // on_image_clear() rather than on_image_display() when the deadline is reached.
     const bool is_clear = notif.data_length == 0;
@@ -884,9 +871,8 @@ void ArtworkRole::Impl::process_notification(const ArtworkNotification& notif) {
         // Validate the notification is still current before touching the buffer: a newer
         // transfer (epoch changed) or a newer write to the same buffer (write_generation
         // changed) means this notification is stale and the bytes it names may have already
-        // been overwritten by the network thread, or are about to be. Skip it instead of
-        // risking a torn read; a fresher notification for the same slot is already queued or
-        // on its way.
+        // been overwritten by the network thread, or are about to be. A fresher notification
+        // for the same slot is already queued or has itself been parked.
         std::lock_guard<std::mutex> lock(this->drain_task->slot_mutex);
         auto& sb = this->drain_task->slot_buffers[slot];
 
