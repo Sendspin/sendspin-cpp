@@ -40,7 +40,7 @@ Press Ctrl+C to stop.
 
 ## Pairing
 
-Every connection is encrypted, so a server has to pair with the client before it can stream. On startup the client prints its `client_id` and its Pairing PSK token to stderr; paste the token into a server that pairs via `pairing_psk`. A server that pairs with a code instead makes the client print a six-digit code to enter on the server. With `-s CODE` the client offers that 8-digit static code rather than a generated one.
+The example does not enable unpaired access, so a server has to pair with the client before it can stream. On startup the client prints its `client_id` and its Pairing PSK token to stderr; paste the token into a server that pairs via `pairing_psk`. A server that pairs with a code instead makes the client print a six-digit code to enter on the server. With `-s CODE` the client offers that 8-digit static code rather than a generated one.
 
 The example has no physical pairing-window button, so `SIGUSR1` stands in for the gesture that opens the pairing window and `SIGUSR2` cancels it.
 

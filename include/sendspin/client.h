@@ -70,15 +70,14 @@ public:
     /// @brief Called when the library needs high-performance networking (e.g., disable WiFi
     /// power saving)
     ///
-    /// Toggle the platform's networking mode and return. Fires on the main loop thread (and, for
-    /// a hold still outstanding, from ~SendspinClient()); the body must not call any
-    /// SendspinClient or role method.
+    /// Toggle the platform's networking mode and return. Fires on the main loop thread; the body
+    /// must not call any SendspinClient or role method.
     virtual void on_request_high_performance() {}
 
     /// @brief Called when the library no longer needs high-performance networking
     ///
     /// Same contract as on_request_high_performance(): toggle the platform mode only, never call
-    /// back into the client.
+    /// back into the client. Also fires from ~SendspinClient() for a hold still outstanding.
     virtual void on_release_high_performance() {}
 
     // ========================================
@@ -106,9 +105,8 @@ public:
     /// server_id identifies the server whose pairing was aborted. reason explains why.
     /// The connection usually stays open after this callback, so the server can re-activate
     /// pairing or resume normal operation on it (pairing.md "pair/abort"). It is closed for
-    /// CONCURRENT_ATTEMPT, and for the UNKNOWN reason reported on a pairing protocol error (a
-    /// malformed or out-of-sequence pairing message), which closes the socket with no
-    /// application-level message.
+    /// CONCURRENT_ATTEMPT, and closed without any further message for the UNKNOWN reported on a
+    /// pairing protocol error (a malformed or out-of-sequence pairing message).
     /// Fires on the main loop.
     virtual void on_pairing_failed(const std::string& /*server_id*/,
                                    SendspinPairAbortReason /*reason*/) {}
@@ -187,8 +185,7 @@ public:
 /// flushed to `save_blob(persistence_keys::RECORDS, ...)` from the next `loop()` tick.)
 /// First-boot provisioning writes from inside `start()` rather than in response to a runtime
 /// event: `KEYPAIR` when no valid keypair is stored, `PAIRING_PSK` when no Pairing PSK is
-/// stored, and `PAIR_CONFIG` when no pairing config decoded. A `start()` that loads all three
-/// writes nothing.
+/// stored, and `PAIR_CONFIG` when no pairing config could be decoded.
 ///
 /// Re-entrancy: implementations must NOT call back into the library (SendspinClient or any of
 /// its objects) from inside load_blob/save_blob/erase_blob. The library invokes these methods

@@ -69,7 +69,7 @@ Headers in `src/platform/` use `#ifdef ESP_PLATFORM` to provide unified APIs acr
 - `time.h`: time utilities
 - `base64.h`: base64 encoding/decoding
 - `compiler.h`: compiler hints and platform-specific macros
-- `crypto.h`: SHA-256/SHA-512, HMAC-SHA-512, X25519, one-shot ChaChaPoly AEAD, CSPRNG, constant-time compare and secure zero, all over noise-c
+- `crypto.h`: SHA-256/SHA-512, HMAC-SHA-512, X25519, one-shot ChaChaPoly AEAD, CSPRNG, constant-time compare and secure zero
 - `json_arena.h`: bounded internal-RAM bump-arena ArduinoJson allocator with PSRAM fallback
 - `network_info.h`: best-effort lookup of the local network interface MAC address
 - `types.h`: platform type abstractions

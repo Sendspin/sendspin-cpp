@@ -487,8 +487,7 @@ committed when a pairing finalizes -- is staged internally and flushed to
 First-boot provisioning writes from inside `start()` rather than in response to a runtime
 event: `save_blob(persistence_keys::KEYPAIR, ...)` when no valid keypair is stored,
 `save_blob(persistence_keys::PAIRING_PSK, ...)` when no Pairing PSK is stored, and
-`save_blob(persistence_keys::PAIR_CONFIG, ...)` when no pairing config decoded. A `start()`
-that loads all three writes nothing.
+`save_blob(persistence_keys::PAIR_CONFIG, ...)` when no pairing config could be decoded.
 
 #### Keyspace
 
@@ -722,7 +721,7 @@ Listener callbacks fire from inside `stop()`, after every role and the group sta
 
 `on_request_high_performance()` and `on_release_high_performance()` fire from the main loop with no internal lock held, and their bodies should only toggle the platform networking mode rather than calling back into the client or a role.
 
-Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no teardown or clear callback. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
+Destroying a running client performs the transport half of `stop()` (goodbye, bounded wait, close, join) and dispatches no role teardown or clear callback; the only listener call is `on_release_high_performance()` for a hold still outstanding. Role-thread callbacks (`on_audio_write()`, `on_image_decode()`, visualizer deliveries) can still run until the destructor joins their role, so listeners must outlive the client as described in Step 5. Call `stop()` first when the clear callbacks matter.
 
 ## Encryption and Pairing
 

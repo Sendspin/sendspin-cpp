@@ -51,6 +51,6 @@ Press `q` to quit.
 
 ## Pairing
 
-Every connection is encrypted, so a server has to pair with the client before it can stream. The Server panel shows the connection's trust and, when a server pairs with a code, the six-digit code to enter there. A Pairing Token panel holds the Pairing PSK token to paste into a server that pairs via `pairing_psk`, and disappears once the connection is paired.
+The example does not enable unpaired access, so a server has to pair with the client before it can stream. The Server panel shows the connection's trust and, when a server pairs with a code, the six-digit code to enter there. A Pairing Token panel holds the Pairing PSK token to paste into a server that pairs via `pairing_psk`, and disappears once the connection is paired.
 
 Identity and pairing records are stored in `~/.sendspin_tui.json`, separate from basic_client's file; delete it to re-provision the client from scratch.
