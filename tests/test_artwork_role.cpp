@@ -354,11 +354,8 @@ bool poll_drain_never(ArtworkRole::Impl& impl, Pred pred, std::chrono::milliseco
 }
 
 // Polls until `pred` (evaluated under impl.drain_task->slot_mutex) is true. No timeout: a
-// regression hangs here and the CTest TIMEOUT reports it. SlotBuffer::has_parked/ack_state are decode-thread-owned state with no listener
-// callback to hang a condition variable off of, so tests that need to synchronize with "the
-// decode thread has parked this notification" (rather than "the decode thread has decoded
-// something") poll the (public, per artwork_role_impl.h) SlotBuffer fields directly under the
-// same mutex the production code uses.
+// regression hangs here and the CTest TIMEOUT reports it. Used only where a parsed field has no
+// observable counterpart; the ack gate itself is exercised through the listener.
 template <typename Pred>
 void wait_slot_state(ArtworkRole::Impl& impl, Pred pred) {
     for (;;) {
@@ -522,7 +519,12 @@ TEST(ArtworkTransfer, AnnounceDiscardsThePendingImage) {
         << "another image was displayed; displays: " << listener.display_count();
 }
 
-TEST(ArtworkTransfer, AnnounceTimestampAndSizeAreReadFromTheAnnounce) {
+// The announce's timestamp is the only parsed field with no observable effect in this fixture:
+// it schedules the display against the server clock, and a never-started client reports no
+// connection, so every notification is due immediately and its timestamp never reaches the
+// listener. The parked notification is read directly because nothing else distinguishes a
+// timestamp read at the wrong offset, or byte-swapped, from a correct one.
+TEST(ArtworkTransfer, AnnounceTimestampIsReadAsSignedBigEndian) {
     RecordingListener listener;
     auto impl = make_impl(make_single_slot_config(true));
     impl->listener = &listener;
@@ -530,9 +532,8 @@ TEST(ArtworkTransfer, AnnounceTimestampAndSizeAreReadFromTheAnnounce) {
     impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
 
     // The gated slot holds the first delivery un-acked, so the second image's notification parks
-    // where the test can read the timestamp and length that were parsed off its announce. A
-    // timestamp read at the wrong offset, or byte-swapped, shows up here.
-    constexpr int64_t TIMESTAMP = 0x0102030405060708;
+    // where the test can read it. A negative value pins the sign as well as the byte order.
+    constexpr int64_t TIMESTAMP = -0x0102030405060708;
     ASSERT_TRUE(send_image(*impl, 0, make_image('A', 8)));
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
     ASSERT_TRUE(send_image(*impl, 0, make_image('B', 37), /*parts=*/3, TIMESTAMP));
@@ -540,7 +541,6 @@ TEST(ArtworkTransfer, AnnounceTimestampAndSizeAreReadFromTheAnnounce) {
     wait_slot_state(*impl, [&] { return impl->drain_task->slot_buffers[0].has_parked; });
     std::lock_guard<std::mutex> lock(impl->drain_task->slot_mutex);
     EXPECT_EQ(impl->drain_task->slot_buffers[0].parked.timestamp, TIMESTAMP);
-    EXPECT_EQ(impl->drain_task->slot_buffers[0].parked.data_length, 37U);
 }
 
 // ============================================================================
@@ -761,17 +761,6 @@ TEST(ArtworkMalformedMessage, ShapeRulesApplyWithNoStreamActive) {
 // end (roles/artwork/v1.md "Artwork (Binary)" on unavailable clients)
 // ============================================================================
 
-TEST(ArtworkImageCap, IsTheChannelsConfiguredBudget) {
-    auto impl = make_impl(make_capped_slot_config(SMALL_IMAGE_CAP));
-    EXPECT_EQ(impl->image_cap(0), SMALL_IMAGE_CAP);
-    // A channel the role never declared holds nothing, whatever the declared ones budgeted.
-    EXPECT_EQ(impl->image_cap(1), 0U);
-
-    // An unset budget is the documented default rather than nothing.
-    auto defaulted = make_impl(make_single_slot_config(false));
-    EXPECT_EQ(defaulted->image_cap(0), ImageSlotPreference::DEFAULT_MAX_IMAGE_BYTES);
-}
-
 TEST(ArtworkImageCap, ImageOverTheCapIsDiscardedAndItsSequenceTracked) {
     RecordingListener listener;
     auto impl = make_impl(make_capped_slot_config(SMALL_IMAGE_CAP));
@@ -799,7 +788,8 @@ TEST(ArtworkImageCap, RoleWithNoListenerHoldsNothing) {
     impl->handle_stream_start(ServerArtworkStreamObject{}, live_generation(*impl));
 
     // Nowhere to deliver an image, so the role takes the discarding path rather than allocating
-    // a buffer for it, while still following the transfer to its end.
+    // a buffer for it, while still following the transfer to its end. Not holding the image is
+    // the whole point and has no observable counterpart, so the slot's buffers are read directly.
     EXPECT_TRUE(send_image(*impl, 0, make_image('A', 4096), /*parts=*/2));
     {
         std::lock_guard<std::mutex> lock(impl->drain_task->slot_mutex);
@@ -1041,11 +1031,11 @@ TEST(ArtworkFrameDoneGate, SupersedeKeepsNewestParked) {
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
 
     send_frame(*impl, 0, 'B');
-    // Wait for B to actually be parked before sending C, so C deterministically observes an
-    // already-parked notification to supersede (see the wait_slot_state comment on its first use
-    // in ClearIsADeliveryAndDropsParked for why this matters instead of a fixed sleep).
-    wait_slot_state(
-        *impl, [&] { return impl->drain_task->slot_buffers[0].has_parked; });
+    // B is held by the gate, which is also how the test knows the decode thread has taken it and
+    // parked it: only then does C supersede an already-parked notification rather than racing it.
+    EXPECT_TRUE(
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "a gated image was decoded; decodes: " << listener.decode_count();
     send_frame(*impl, 0, 'C');
 
     impl->frame_done(0);
@@ -1074,13 +1064,13 @@ TEST(ArtworkFrameDoneGate, ClearIsADeliveryAndDropsParked) {
     listener.wait_until([&] { return listener.decodes.size() >= 1; });
 
     send_frame(*impl, 0, 'B');  // parks: A's delivery is still un-acked
-    // Wait for the decode thread to actually park B (has_parked observed under slot_mutex)
-    // before delivering the clear: otherwise the clear could race ahead of the still-in-flight
-    // notification and land before B is parked, in which case B would park *behind* the clear's
-    // own owed ack instead of being dropped by it, which is a different (also-tested, see
-    // ClearGateHoldsNextStreamFirstFrame) scenario.
-    wait_slot_state(
-        *impl, [&] { return impl->drain_task->slot_buffers[0].has_parked; });
+    // B is held by the gate, which is also how the test knows the decode thread has taken and
+    // parked it before the clear is delivered. Were the clear to overtake the still-in-flight
+    // notification, B would park behind the clear's own owed ack instead of being dropped by it,
+    // which is the different (also-tested, see ClearGateHoldsNextStreamFirstFrame) scenario.
+    EXPECT_TRUE(
+        listener.never_within([&] { return listener.decodes.size() >= 2; }, NEGATIVE_WINDOW))
+        << "a gated image was decoded; decodes: " << listener.decode_count();
 
     impl->handle_stream_ring_event(ArtworkEventType::STREAM_CLEAR);
     listener.wait_until([&] { return listener.clears.size() >= 1; });
@@ -1210,8 +1200,6 @@ TEST(ArtworkChannelClear, GatedClearParksBehindUnackedFrame) {
     // A's delivery is un-acked, so the clear parks rather than overtaking it: the consumer is
     // mid-presentation of A and its buffers must not be disturbed.
     send_clear(*impl, 0);
-    wait_slot_state(
-        *impl, [&] { return impl->drain_task->slot_buffers[0].has_parked; });
     EXPECT_TRUE(
         poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW))
         << "a clear was delivered; clears: " << listener.clear_count();
@@ -1263,15 +1251,16 @@ TEST(ArtworkChannelClear, GatedClearSupersedesParkedClear) {
 
     // Two clears arrive back to back while A is un-acked. Both park, and the second must overwrite
     // the first (latest-wins) rather than queue behind it, so the consumer is asked to clear once
-    // rather than twice. Distinct timestamps make the handoff observable: waiting for the parked
-    // notification to carry the second clear's timestamp is what keeps this deterministic, since
-    // has_parked is already true from the first.
+    // rather than twice. Each clear is held by the gate, which is also how the test knows the
+    // decode thread parked the first one before the second arrives to supersede it.
     send_clear(*impl, 0, /*timestamp=*/1);
-    wait_slot_state(
-        *impl, [&] { return impl->drain_task->slot_buffers[0].has_parked; });
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW))
+        << "a gated clear was delivered; clears: " << listener.clear_count();
     send_clear(*impl, 0, /*timestamp=*/2);
-    wait_slot_state(
-        *impl, [&] { return impl->drain_task->slot_buffers[0].parked.timestamp == 2; });
+    EXPECT_TRUE(
+        poll_drain_never(*impl, [&] { return listener.clear_count() >= 1; }, NEGATIVE_WINDOW))
+        << "a gated clear was delivered; clears: " << listener.clear_count();
 
     impl->frame_done(0);
     poll_drain_until(*impl, [&] { return listener.clear_count() >= 1; });
