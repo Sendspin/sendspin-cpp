@@ -189,9 +189,10 @@ public:
 ///
 /// Re-entrancy: implementations must NOT call back into the library (SendspinClient or any of
 /// its objects) from inside load_blob/save_blob/erase_blob. Every call is made from the middle
-/// of a library step that is part-way through updating the state the call is about: `stop()`
-/// called from inside `save_blob()` during the connection manager's staged-write flush, for one,
-/// destroys the manager while that flush is still walking its staged ops. No internal lock is held
+/// of a library step that is part-way through updating the state the call is about: the first
+/// load_blob()/save_blob() calls arrive from the record store's constructor inside start(),
+/// before the client's record_store_ pointer is assigned, so a call back into the library there
+/// reaches a client whose store does not exist yet. No internal lock is held
 /// across the call: the record store encodes its blob under its mutex and saves after dropping it,
 /// and the connection manager stages the writes its lifecycle handlers decide on and performs them
 /// once `conn_ptr_mutex_` is dropped.
