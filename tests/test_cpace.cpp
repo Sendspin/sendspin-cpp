@@ -40,51 +40,41 @@ using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local
 // Building-block KATs
 // ============================================================================
 
-// --- cpace_prepend_len ---
-// Reference: _prepend_len in cpace.py
-// Expected values extracted from running the Python reference.
+// --- cpace_prepend_len / cpace_lv_cat ---
+// Reference: _prepend_len / _lv_cat in cpace.py. Expected values from running the Python
+// reference.
 
-TEST(CPacePrimitives, PrependLenEmpty) {
-    // _prepend_len(b'') = b'\x00'
-    auto result = cpace_prepend_len(nullptr, 0);
-    ASSERT_EQ(result.size(), 1u);
-    EXPECT_EQ(result[0], 0x00u);
-}
+TEST(CPacePrimitives, EncodingPrimitiveKats) {
+    struct Row {
+        const char* name;
+        std::vector<uint8_t> data;
+        std::string expected_hex;
+    };
+    const std::vector<uint8_t> dsi(reinterpret_cast<const uint8_t*>("CPace255"),
+                                   reinterpret_cast<const uint8_t*>("CPace255") + 8);
+    // A length of 128 needs two varint bytes: 0x80 = (128 & 0x7F) | 0x80, then 0x01 = 128 >> 7.
+    std::string long_expected = "8001";
+    for (int i = 0; i < 128; ++i) {
+        long_expected += "78";
+    }
+    const Row rows[] = {
+        {"empty", {}, "00"},
+        {"one-byte", {0x41}, "0141"},
+        {"eight-byte-dsi", dsi, "084350616365323535"},
+        {"128-bytes-needs-two-varint-bytes", std::vector<uint8_t>(128, 0x78), long_expected},
+    };
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto result = cpace_prepend_len(row.data.empty() ? nullptr : row.data.data(),
+                                        row.data.size());
+        EXPECT_EQ(to_hex(result), row.expected_hex);
+    }
 
-TEST(CPacePrimitives, PrependLenOneByte) {
-    // _prepend_len(b'A') = b'\x01A'
-    const uint8_t data[] = {0x41};
-    auto result = cpace_prepend_len(data, 1);
-    EXPECT_EQ(to_hex(result), "0141");
-}
-
-TEST(CPacePrimitives, PrependLenDsi) {
-    // _prepend_len(b'CPace255') = b'\x08CPace255'
-    const uint8_t* dsi = reinterpret_cast<const uint8_t*>("CPace255");
-    auto result = cpace_prepend_len(dsi, 8);
-    EXPECT_EQ(to_hex(result), "084350616365323535");
-}
-
-TEST(CPacePrimitives, PrependLenMultiByteLength) {
-    // _prepend_len(b'\x78' * 128): length 128 needs two varint bytes
-    // Expected first 3 bytes: 0x80 0x01 0x78
-    std::vector<uint8_t> data(128, 0x78);
-    auto result = cpace_prepend_len(data.data(), 128);
-    ASSERT_GE(result.size(), 3u);
-    EXPECT_EQ(result[0], 0x80u);  // (128 & 0x7F) | 0x80
-    EXPECT_EQ(result[1], 0x01u);  // 128 >> 7
-    EXPECT_EQ(result[2], 0x78u);  // first data byte
-    EXPECT_EQ(result.size(), 130u);  // 2 prefix + 128 data
-}
-
-// --- cpace_lv_cat ---
-
-TEST(CPacePrimitives, LvCatHelloWorld) {
-    // _lv_cat(b'hello', b'world') = b'\x05hello\x05world'
+    // _lv_cat is prepend_len applied to each element and concatenated:
+    // _lv_cat(b'hello', b'world') = b'\x05hello\x05world'.
     const uint8_t* hello = reinterpret_cast<const uint8_t*>("hello");
     const uint8_t* world = reinterpret_cast<const uint8_t*>("world");
-    auto result = cpace_lv_cat({{hello, 5}, {world, 5}});
-    EXPECT_EQ(to_hex(result), "0568656c6c6f05776f726c64");
+    EXPECT_EQ(to_hex(cpace_lv_cat({{hello, 5}, {world, 5}})), "0568656c6c6f05776f726c64");
 }
 
 // --- cpace_generator_string ---
@@ -126,21 +116,6 @@ TEST(CPacePrimitives, DecodeUClearsTopBit) {
 // --- cpace_elligator2 ---
 // Expected values from Python: _elligator2(r_int)
 
-TEST(CPacePrimitives, Elligator2ZeroInput) {
-    // _elligator2(0) = b'\x00' * 32, per the Python reference.
-    std::array<uint8_t, 32> r{};  // r = 0
-    auto result = cpace_elligator2(r);
-    EXPECT_EQ(to_hex(result), "0000000000000000000000000000000000000000000000000000000000000000");
-}
-
-TEST(CPacePrimitives, Elligator2OneInput) {
-    // _elligator2(1): expected from Python reference.
-    std::array<uint8_t, 32> r{};
-    r[0] = 1;  // r = 1 in little-endian
-    auto result = cpace_elligator2(r);
-    EXPECT_EQ(to_hex(result), "9cdb525555555555555555555555555555555555555555555555555555555555");
-}
-
 TEST(CPacePrimitives, Elligator2FixedInput) {
     // r_val = 0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
     // r_le: efcdab9078563412efcdab9078563412efcdab9078563412efcdab9078563412
@@ -151,14 +126,20 @@ TEST(CPacePrimitives, Elligator2FixedInput) {
 }
 
 TEST(CPacePrimitives, Elligator2FieldArithmeticStress) {
-    // Extra vectors stressing field reduction/carry across varied bit patterns (all-ones,
-    // alternating). The all-ones input exercises modular reduction of a value above p.
+    // The degenerate inputs plus vectors stressing field reduction/carry across varied bit
+    // patterns (all-ones, alternating). The all-ones input exercises modular reduction of a
+    // value above p.
     // Expected outputs extracted from the Python reference _elligator2(int.from_bytes(x, 'little')).
     struct V {
         const char* in_le;
         const char* out;
     };
     const V vectors[] = {
+        // r = 0 and r = 1, the two degenerate inputs.
+        {"0000000000000000000000000000000000000000000000000000000000000000",
+         "0000000000000000000000000000000000000000000000000000000000000000"},
+        {"0100000000000000000000000000000000000000000000000000000000000000",
+         "9cdb525555555555555555555555555555555555555555555555555555555555"},
         {"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
          "6edfd66733be3f52309983805b9fcdf8fe48c1640e026e7d36e3fb2305933908"},
         {"dededededededededededededededededededededededededededededededede",
