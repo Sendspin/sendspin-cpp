@@ -528,9 +528,9 @@ TEST(NoiseTransport, SendEncryptedText_SmallJson_ChaChaPoly) {
     EXPECT_EQ(recovered, json);
 }
 
-// send_app_json routes plaintext before a transport session exists and encrypted afterwards. The
-// routing decision reads the atomic noise_active_ flag (set alongside the session), not the
-// noise_session_ unique_ptr.
+// send_app_json routes plaintext before a transport session exists and encrypted afterwards, on
+// NoiseTransport::is_active(). The two frames below are the whole contract: the handshake leg
+// goes out in the clear, everything after it is a sealed frame.
 TEST(NoiseTransport, SendAppJson_RoutesRawBeforeSessionEncryptedAfter) {
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
@@ -966,7 +966,7 @@ public:
 };
 
 TEST(FragmentSequence, SingleFragmentCarryingBothFlagsDispatches) {
-    // Control for every malformed case below: one frame with FIRST and LAST set is a complete,
+    // Control: for every malformed case below, one frame with FIRST and LAST set is a complete,
     // well-formed fragmented message and must dispatch its orig_type payload intact.
     auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
     ASSERT_TRUE(r.has_value());
@@ -1755,6 +1755,46 @@ TEST(NoiseTransport, SendBinaryRejectsTheFragmentMessageType) {
     const std::vector<uint8_t> role_typed = {SENDSPIN_BINARY_PLAYER_AUDIO, 0xAA, 0xBB};
     EXPECT_EQ(conn.test_send_binary(role_typed.data(), role_typed.size()), SsErr::OK);
     EXPECT_EQ(conn.sent_binary_.size(), 1u);
+}
+
+TEST(NoiseTransport, SendBinaryRejectsAnEmptyPayload) {
+    // A zero-length binary message has no type byte, so there is nothing to check ID 1 against
+    // and nothing for a receiver to route. It is refused before the type read rather than sealed
+    // and put on the wire.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+
+    TestConnection conn;
+    conn.set_noise_session(std::move(r->responder_session));
+
+    const std::vector<uint8_t> payload = {SENDSPIN_BINARY_PLAYER_AUDIO};
+    EXPECT_EQ(conn.test_send_binary(payload.data(), 0), SsErr::FAIL);
+    EXPECT_TRUE(conn.sent_binary_.empty()) << "an empty binary message reached the wire";
+
+    // Control: the same buffer with its one byte counted is sent.
+    EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::OK);
+    EXPECT_EQ(conn.sent_binary_.size(), 1u);
+}
+
+TEST(NoiseTransport, SendsBeforeTheSessionExistsReportInvalidState) {
+    // Both transport sends are guarded on is_active(): with no session installed there is no
+    // cipher to seal with, and the caller is told the state is wrong rather than having its
+    // message sent in the clear or dropped silently.
+    TestConnection conn;
+
+    const std::string json = R"({"type":"client/state"})";
+    EXPECT_EQ(conn.send_encrypted_text(json), SsErr::INVALID_STATE);
+    const std::vector<uint8_t> payload = {SENDSPIN_BINARY_PLAYER_AUDIO, 0x01};
+    EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::INVALID_STATE);
+    EXPECT_TRUE(conn.sent_binary_.empty());
+
+    // Control: with a session installed the same two calls seal and send.
+    auto r = run_loopback_handshake(std::string(NOISE_SUITE_CHACHAPOLY));
+    ASSERT_TRUE(r.has_value());
+    conn.set_noise_session(std::move(r->responder_session));
+    EXPECT_EQ(conn.send_encrypted_text(json), SsErr::OK);
+    EXPECT_EQ(conn.test_send_binary(payload.data(), payload.size()), SsErr::OK);
+    EXPECT_EQ(conn.sent_binary_.size(), 2u);
 }
 
 // ============================================================================
