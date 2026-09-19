@@ -28,6 +28,7 @@
 
 #include "crypto/constants.h"
 #include "crypto/keys.h"
+#include "log_capture.h"
 #include "noise_handshake.h"
 #include "noise_session.h"
 #include "noise_test_helpers.h"
@@ -403,4 +404,50 @@ TEST(NoiseRehandshake, UnknownPskIdAborts) {
                                        empty_rs, suite, prior_h);
     EXPECT_FALSE(result.has_value())
         << "run_rehandshake_msg1 should fail with an unknown psk_id";
+}
+
+// The envelope guards in front of the re-handshake are defense in depth: an envelope that trips
+// either one is rejected downstream anyway (a wrong type reaches run_msg1_core, which finds no
+// data field; unparseable text yields a null document whose type reads as ""). The diagnostic is
+// the whole behavioral delta, so these assert on the log line the guard writes.
+// Control: BasicRehandshake_ChaChaPoly, where a well-formed envelope completes.
+TEST(NoiseRehandshake, EnvelopeOfTheWrongTypeIsRejectedAsSuch) {
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
+    RecordStore empty_rs(nullptr);
+    const std::array<uint8_t, 32> prior_h{};
+
+    std::string logs;
+    std::optional<NoiseHandshakeResult> result;
+    {
+        StderrCapture capture;
+        result = run_rehandshake_msg1(R"({"type":"server/init","payload":{}})",
+                                      server_id.peer_id(), client_id, empty_rs,
+                                      std::string(NOISE_SUITE_CHACHAPOLY), prior_h);
+        logs = capture.release();
+    }
+
+    EXPECT_FALSE(result.has_value());
+    EXPECT_NE(logs.find("unexpected type 'server/init'"), std::string::npos)
+        << "the envelope's type must be named as the reason; got: " << logs;
+}
+
+TEST(NoiseRehandshake, UnparseableEnvelopeIsRejectedAsSuch) {
+    Identity client_id = Identity::generate().value();
+    Identity server_id = Identity::generate().value();
+    RecordStore empty_rs(nullptr);
+    const std::array<uint8_t, 32> prior_h{};
+
+    std::string logs;
+    std::optional<NoiseHandshakeResult> result;
+    {
+        StderrCapture capture;
+        result = run_rehandshake_msg1("not json", server_id.peer_id(), client_id, empty_rs,
+                                      std::string(NOISE_SUITE_CHACHAPOLY), prior_h);
+        logs = capture.release();
+    }
+
+    EXPECT_FALSE(result.has_value());
+    EXPECT_NE(logs.find("JSON parse failed"), std::string::npos)
+        << "a parse failure must be named as such, not as a type mismatch; got: " << logs;
 }
