@@ -91,7 +91,7 @@ void RecordStore::load_records_from_provider() {
     // blob itself could not be parsed. Continue with an empty store rather than refusing to
     // start. load_decode_wipe() logs the warning and wipes the raw blob on both paths; the raw
     // blob is base64 PSK text (even when it failed to decode), mirroring the save-path wipes in
-    // persist_records_locked().
+    // save_encoded_records().
     auto decoded = load_decode_wipe<std::vector<SendspinPairingRecord>>(
         *this->provider_, persistence_keys::RECORDS, decode_pairing_records,
         "starting with an empty store");
@@ -405,8 +405,12 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
 }
 
 bool RecordStore::persist_records() {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    if (this->persist_records_locked()) {
+    std::string encoded;
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        encoded = this->encode_records_locked();
+    }
+    if (this->save_encoded_records(encoded)) {
         return true;
     }
     // One warning covers both halves of a deferred supersede: the freshly paired record is
@@ -422,18 +426,22 @@ bool RecordStore::persist_records() {
 }
 
 void RecordStore::remove_record(const std::string& psk_id) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    size_t idx = this->find_index(psk_id);
-    if (idx == NPOS) {
-        return;
+    std::string encoded;
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        size_t idx = this->find_index(psk_id);
+        if (idx == NPOS) {
+            return;
+        }
+        this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(idx));
+        encoded = this->encode_records_locked();
     }
-    this->records_.erase(this->records_.begin() + static_cast<ptrdiff_t>(idx));
     // Erased from RAM regardless of the store's answer: the operator (or the pairing exchange)
     // asked for this credential to stop working, and keeping it in RAM because the store could
     // not be written would leave it usable right now, which is strictly worse. But a write that
     // did not reach the store means the record comes back at the next start, so say so loudly
     // instead of reporting a revocation that silently half-happened.
-    if (!this->persist_records_locked()) {
+    if (!this->save_encoded_records(encoded)) {
         SS_LOGW(TAG,
                 "Removed record %s but the provider did not persist the updated store; it is "
                 "gone for this boot only and will be valid again after a reboot",
@@ -442,32 +450,37 @@ void RecordStore::remove_record(const std::string& psk_id) {
 }
 
 void RecordStore::mark_record_used(const std::string& psk_id) {
-    std::lock_guard<std::mutex> lock(this->mutex_);
-    const size_t idx = this->find_index(psk_id);
-    if (idx == NPOS) {
-        return;
-    }
+    std::string encoded;
+    {
+        std::lock_guard<std::mutex> lock(this->mutex_);
+        const size_t idx = this->find_index(psk_id);
+        if (idx == NPOS) {
+            return;
+        }
 
-    // Keeps records_ least-recently-used first for eviction (see evict_one_locked).
-    const size_t last = this->records_.size() - 1;
-    if (idx != last) {
-        std::rotate(this->records_.begin() + static_cast<ptrdiff_t>(idx),
-                    this->records_.begin() + static_cast<ptrdiff_t>(idx) + 1, this->records_.end());
-    }
+        // Keeps records_ least-recently-used first for eviction (see evict_one_locked).
+        const size_t last = this->records_.size() - 1;
+        if (idx != last) {
+            std::rotate(this->records_.begin() + static_cast<ptrdiff_t>(idx),
+                        this->records_.begin() + static_cast<ptrdiff_t>(idx) + 1,
+                        this->records_.end());
+        }
 
-    // The recency order stays in RAM. This runs on the first activate of EVERY long-term
-    // session, so persisting the reorder would rewrite the whole records blob per connection in
-    // steady state: on ESP, an NVS erase cycle per connection for advisory bookkeeping. The
-    // order is rebuilt from use, so a reboot only loses the ordering among records nothing has
-    // connected on since.
-    //
-    // The `used` flag is durable, so its first flip is written.
-    if (this->records_.back().used) {
-        return;
+        // The recency order stays in RAM. This runs on the first activate of EVERY long-term
+        // session, so persisting the reorder would rewrite the whole records blob per connection
+        // in steady state: on ESP, an NVS erase cycle per connection for advisory bookkeeping.
+        // The order is rebuilt from use, so a reboot only loses the ordering among records
+        // nothing has connected on since.
+        //
+        // The `used` flag is durable, so its first flip is written.
+        if (this->records_.back().used) {
+            return;
+        }
+        this->records_.back().used = true;
+        encoded = this->encode_records_locked();
     }
-    this->records_.back().used = true;
     // Best-effort: the flag is advisory bookkeeping, so a rejected write is not reported.
-    this->persist_records_locked();
+    this->save_encoded_records(encoded);
 }
 
 // ============================================================================
@@ -520,12 +533,25 @@ bool RecordStore::persist_config() {
 // ============================================================================
 //
 // records_ is guarded by mutex_ (see the class comment in record_store.h). Every mutation that
-// touches records_ AND needs to persist it follows one uniform discipline: mutate records_ in
-// place, then encode the WHOLE array and save it while STILL HOLDING mutex_
-// (persist_records_locked(), below), so the encoded snapshot is always exactly what is in memory
-// at the moment of the write. This adds no new deadlock class: providers are already called
-// under mutex_ at other call sites in this file (mark_record_used), and no provider
-// implementation calls back into RecordStore.
+// touches records_ AND needs to persist it follows one uniform discipline: mutate records_ and
+// encode the WHOLE array under mutex_ (encode_records_locked()), then DROP the lock and hand the
+// encoded blob to the provider (save_encoded_records()). The provider write is an NVS commit on
+// ESP, tens of milliseconds long, and resolve_by_psk_id() takes this same mutex on the network
+// thread for every handshake, so holding it across the write would block a handshake for the
+// length of a flash commit.
+//
+// Encode and save do not need to be atomic with respect to each other. All three persisting
+// paths (persist_records, remove_record, mark_record_used) are main-loop-only, so their
+// encode/save pairs are serialized by thread confinement and two blobs cannot land out of order.
+// The only writer that can slip into the gap is a network-thread store_record_superseding(),
+// which is RAM-only: the saved blob then predates that insert, which was already true (it was
+// not in records_ when the encode ran) and is repaired by the persist_records() flush the insert
+// schedules onto the main loop.
+//
+// A resolve landing in the same gap sees the new RAM state while flash still holds the old blob.
+// That window is not new: records_ is mutated before save_blob() is ever called, and a provider
+// may reject the write outright, so RAM is the authority for the current boot either way and the
+// blob only decides what comes back after a reboot.
 //
 // store_record_superseding() is the exception: it mutates records_
 // WITHOUT persisting at all, because it runs on the network thread where the provider may not be
@@ -534,17 +560,23 @@ bool RecordStore::persist_config() {
 // retire together.
 //
 // Precondition: the caller holds mutex_.
-bool RecordStore::persist_records_locked() {
+std::string RecordStore::encode_records_locked() const {
+    if (this->provider_ == nullptr) {
+        return {};
+    }
+    return encode_pairing_records(this->records_);
+}
+
+bool RecordStore::save_encoded_records(std::string& encoded) {
     if (this->provider_ == nullptr) {
         return true;
     }
-    std::string encoded = encode_pairing_records(this->records_);
     const bool ok = this->provider_->save_blob(persistence_keys::RECORDS,
                                                reinterpret_cast<const uint8_t*>(encoded.data()),
                                                encoded.size());
     // The encoded blob is base64 PSK text for every stored record; wipe it now that save_blob()
-    // has its own copy (or has rejected it), rather than leaving it for the string's destructor
-    // to free unwiped. This is the one blob write on every records_ mutation path (see the
+    // has its own copy (or has rejected it), rather than leaving it for the caller's string to
+    // be freed unwiped. This is the one blob write on every records_ mutation path (see the
     // locking-discipline comment above), so it covers store/remove/mark-used/supersede alike.
     secure_zero(encoded.data(), encoded.size());
     return ok;

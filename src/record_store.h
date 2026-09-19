@@ -124,9 +124,11 @@ struct ResolvedPsk {
 ///   - `resolve_by_psk_id` runs on the network thread (Noise handshake and re-handshake)
 ///     under `mutex_` so a network-thread resolve cannot race a main-loop mutation of
 ///     `records_` / `pairing_psk_`.
-///   - `mutex_` is held across the provider's blob write on the persisting paths
-///     (`persist_records`, `remove_record`, `mark_record_used`, all main-loop-only), so such a
-///     resolve blocks for the length of that write - an NVS commit on ESP.
+///   - No provider call is ever made under `mutex_`. The persisting paths (`persist_records`,
+///     `remove_record`, `mark_record_used`, all main-loop-only) encode the blob under the lock
+///     and save it after dropping it, so a network-thread resolve never waits out an NVS commit.
+///     See the locking-discipline comment in `record_store.cpp` for why the two halves do not
+///     have to be atomic.
 class RecordStore {
 public:
     /// @brief Default cap on the number of long-term records retained; see
@@ -360,14 +362,23 @@ private:
     ///         not go on to persist a record the config cannot reference.
     bool persist_config();
 
-    /// @brief Encode records_ (the WHOLE array) and save it under persistence_keys::RECORDS.
+    /// @brief Encode records_ (the WHOLE array) for persistence_keys::RECORDS.
     ///
     /// MUST be called with mutex_ already held (the "_locked" suffix), so the encoded snapshot
-    /// is always exactly what is in memory at the moment of the write. Every mutation path that
-    /// touches records_ and needs to persist it goes through this one helper; see the locking
-    /// discipline comment above its definition in the .cpp for why this is safe.
+    /// is exactly what is in memory at that moment.
+    /// @return The blob to save, or an empty string when there is no provider (nothing to save).
+    [[nodiscard]] std::string encode_records_locked() const;
+
+    /// @brief Save a blob from encode_records_locked() under persistence_keys::RECORDS and wipe
+    /// it.
+    ///
+    /// MUST be called with mutex_ NOT held: the provider write is flash I/O. Every mutation path
+    /// that touches records_ and needs to persist it goes through this pair of helpers; see the
+    /// locking-discipline comment above their definitions in the .cpp for why splitting the
+    /// encode from the save is safe.
+    /// @param encoded The encoded blob; wiped in place before returning.
     /// @return true on success (or when there is no provider); false on a rejected write.
-    bool persist_records_locked();
+    bool save_encoded_records(std::string& encoded);
 
     // Struct fields
     /// Guards `records_` and `pairing_psk_` against a network-thread `resolve_by_psk_id`

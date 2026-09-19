@@ -47,12 +47,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1773,4 +1777,84 @@ TEST(RecordStoreConcurrency, ResolvePairingOutcomeDoesNotRaceRecordStores) {
     }
 
     writer.join();
+}
+
+// The persisting paths must not hold mutex_ across the provider's blob write. resolve_by_psk_id()
+// takes that same mutex on the NETWORK thread for every Noise handshake, and on ESP the write is
+// an NVS commit of tens of milliseconds; holding the lock across it stalls a handshake for the
+// length of a flash commit (the post-pairing re-handshake is adjacent to such a write by
+// construction, see docs/internals.md "Pairing").
+//
+// The provider below parks inside save_blob() until this test releases it, which is the whole of
+// that commit window held open. A resolve issued in that window must still return. The wait is
+// bounded and the latch is released before the probe is joined, so a regression fails here
+// instead of hanging the suite.
+namespace {
+
+class BlockingRecordsProvider : public SendspinPersistenceProvider {
+public:
+    bool save_blob(const std::string& key, const uint8_t* /*data*/, size_t /*len*/) override {
+        if (key != persistence_keys::RECORDS) {
+            return true;  // Only the records write is under test; provisioning must not park.
+        }
+        std::unique_lock<std::mutex> lock(this->mutex_);
+        this->entered_ = true;
+        this->cv_.notify_all();
+        this->cv_.wait(lock, [&] { return this->released_; });
+        return true;
+    }
+
+    bool wait_until_entered(std::chrono::milliseconds budget) {
+        std::unique_lock<std::mutex> lock(this->mutex_);
+        return this->cv_.wait_for(lock, budget, [&] { return this->entered_; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            this->released_ = true;
+        }
+        this->cv_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool entered_{false};
+    bool released_{false};
+};
+
+}  // namespace
+
+TEST(RecordStoreConcurrency, ResolveRunsWhileARecordsWriteIsInFlight) {
+    BlockingRecordsProvider provider;
+    RecordStore store(&provider, /*initial_unpaired_access_enabled=*/true, /*max_records=*/8);
+
+    SendspinPairingRecord record = make_client_record("blocking-write-server");
+    const std::string psk_id = record.psk_id;
+    ASSERT_TRUE(store.store_record_superseding(std::move(record), {}));
+
+    // The main loop's deferred flush of that RAM-only insert: the one call that reaches the
+    // provider here.
+    std::thread writer([&] { store.persist_records(); });
+    ASSERT_TRUE(provider.wait_until_entered(std::chrono::milliseconds(4000)))
+        << "the flush never reached the provider";
+
+    std::promise<bool> resolved;
+    std::future<bool> resolved_future = resolved.get_future();
+    std::thread probe([&] {
+        resolved.set_value(
+            store.resolve_by_psk_id(psk_id, PskCategory::LONG_TERM).has_value());
+    });
+
+    const bool returned =
+        resolved_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    // Release first, then join: a resolve that did block must be let go so the failure is
+    // reported rather than hung on.
+    provider.release();
+    probe.join();
+    writer.join();
+
+    EXPECT_TRUE(returned) << "a handshake resolve blocked on the provider's records write";
+    EXPECT_TRUE(resolved_future.get()) << "the resolve returned, but missed the stored record";
 }
