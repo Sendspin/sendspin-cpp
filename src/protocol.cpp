@@ -228,8 +228,7 @@ static bool process_server_player_command_object(const JsonObject player_object,
 }
 
 // Parses a single string field of a server/state metadata object. A field the object does not
-// carry has no value, so `out` is left at its default (empty). A present value that is not a
-// string is logged and skipped, which leaves the field without a value as well.
+// carry, or carries with the wrong type (logged), leaves `out` without a value.
 static void parse_metadata_string_field(JsonVariantConst var, const char* name,
                                         std::optional<std::string>* out) {
     if (var.is<const char*>()) {
@@ -251,14 +250,12 @@ static void parse_metadata_uint16_field(JsonVariantConst var, const char* name,
 }
 
 // Parses a single `[R, G, B]` color field of a server/state color object. A field the object does
-// not carry has no value, so `out` is left at its default (empty); a malformed value is logged and
-// skipped, which leaves the field without a value as well. Each component is read as a uint8, so
-// its type check is also its range check.
+// not carry, or carries malformed (logged), leaves `out` without a value. Each component is read
+// as a uint8, so its type check is also its range check.
 static void parse_color_field(JsonVariantConst var, const char* name,
                               std::optional<RgbColor>* out) {
-    // An explicit null is treated as an absent field rather than a wrong-typed one: the object
-    // carries no value for it either way, and roles/color/v1.md defines no null form to log
-    // against.
+    // An explicit null is treated as an absent field rather than a wrong-typed one:
+    // roles/color/v1.md defines no null form to log against.
     if (var.isUnbound() || var.isNull()) {
         return;
     }
@@ -424,12 +421,11 @@ bool process_server_activate_message(JsonObject root, ServerActivateMessage* act
                         format_var.as<const char*>());
             }
         }
-        // The server's `languages` (BCP 47 tags, descending operator preference) is a hint
-        // about the languages the operator understands, informing any operator-facing output
-        // (messaging.md "server/hello"). The one place this library could use it is spoken
-        // pairing-code emission (pairing.md "Digits emission"), which it does not implement, so
-        // the hint is deliberately not parsed; a client adding speaker emission should read it
-        // from server/hello and apply RFC 4647 Lookup matching.
+        // The server's `languages` (BCP 47 tags, descending operator preference) hints at what
+        // the operator understands (messaging.md "server/hello"). Its only use here would be
+        // spoken pairing-code emission (pairing.md "Digits emission"), which this library does
+        // not implement, so it is not parsed; a client adding speaker emission should read it
+        // from server/hello and match per RFC 4647 Lookup.
     }
 
     return true;
@@ -554,7 +550,7 @@ bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* m
     }
     // messaging.md "server/state": every message carries the full state of each role object it
     // includes, so an included metadata object is parsed into a fresh state rather than overlaid
-    // on what came before. A field the object omits has no value.
+    // on what came before.
     *metadata = ServerMetadataStateObject{};
     metadata->timestamp = metadata_object["timestamp"].as<int64_t>();
 
@@ -569,7 +565,7 @@ bool process_server_state_metadata(JsonObject root, ServerMetadataStateObject* m
     parse_metadata_uint16_field(metadata_object["track"], "track", &metadata->track);
 
     // roles/metadata/v1.md "server/state metadata object": omitting progress clears the client's
-    // position, which falls out of the full-state parse above leaving it without a value.
+    // position, which the full-state reset above already did.
     if (metadata_object["progress"].is<JsonObject>()) {
         JsonObject progress_object = metadata_object["progress"];
         MetadataProgressObject progress{};
@@ -602,7 +598,7 @@ bool process_server_state_color(JsonObject root, ServerColorStateObject* color) 
         return false;
     }
     // messaging.md "server/state": an included color object carries the full palette, so it is
-    // parsed into a fresh state and a color it omits has no value.
+    // parsed into a fresh state.
     *color = ServerColorStateObject{};
     color->timestamp = color_object["timestamp"].as<int64_t>();
 
@@ -813,7 +809,6 @@ bool process_stream_clear_message(JsonObject root, StreamClearMessage* clear_msg
 
 // Message formatting
 
-// Writes a spectrum config as the "spectrum" key of the client/state visualizer object.
 static void write_visualizer_spectrum(JsonObject vis_json, const VisualizerSpectrumConfig& spec) {
     vis_json["spectrum"]["n_disp_bins"] = spec.n_disp_bins;
     vis_json["spectrum"]["scale"] = to_cstr(spec.scale);
@@ -844,10 +839,9 @@ std::string format_client_hello_message(const ClientHelloMessage* msg) {
         }
     }
     // pairing.md "client/hello pair-method descriptor": supported_pair_methods is an object keyed
-    // by pairing method identifier, each value the method's descriptor. It is REQUIRED on the wire
-    // (messaging.md "client/hello": every client implements at least pairing_psk, so the field can
-    // never be legitimately absent), so the object is emitted even in a degenerate configuration
-    // with every method disabled.
+    // by pairing method identifier, each value the method's descriptor. It is REQUIRED (every
+    // client implements at least pairing_psk, messaging.md "client/hello"), so the object is
+    // emitted even when every method is disabled.
     {
         JsonObject methods_obj = root["payload"]["supported_pair_methods"].to<JsonObject>();
         for (const auto& desc : msg->supported_pair_methods) {
@@ -910,11 +904,10 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/state";
-    // messaging.md "client/state": the payload's client-level field is the boolean `available`, not
-    // a multi-valued state string. `available` is true only once the client is operational and
-    // ready to participate in playback (SYNCHRONIZED); every other internal state (ERROR,
-    // EXTERNAL_SOURCE) reports false, matching "External Source Handling"'s available:false
-    // contract for a client whose output the server cannot currently use.
+    // messaging.md "client/state": the payload's client-level field is the boolean `available`,
+    // not a multi-valued state string. It is true only when the client is operational
+    // (SYNCHRONIZED); every other internal state (ERROR, EXTERNAL_SOURCE) reports false, matching
+    // "External Source Handling"'s available:false contract.
     root["payload"]["available"] = (msg->state == SendspinClientState::SYNCHRONIZED);
 
     if (msg->player.has_value()) {
@@ -938,8 +931,7 @@ std::string format_client_state_message(const ClientStateMessage* msg) {
             JsonObject channel_obj = channels_list.add<JsonObject>();
             channel_obj["source"] = to_cstr(channel.source);
             // roles/artwork/v1.md "client/state artwork object": format, width and height are
-            // required unless the channel's source is 'none', which streams nothing and so has
-            // no format or size to deliver.
+            // required unless the channel's source is 'none'.
             if (channel.source != SendspinImageSource::NONE) {
                 channel_obj["format"] = to_cstr(channel.format);
                 channel_obj["width"] = channel.width;
@@ -1164,8 +1156,8 @@ std::string format_client_pair_finalize_wrapped_message(
     JsonObject root = doc.to<JsonObject>();
 
     root["type"] = "client/pair-finalize";
-    // Encode the 48-byte wrapped PSK as 64-char base64url (no padding). Pairing-code flows only
-    // (pairing.md "Wrapping"); exactly one of long_term_psk/wrapped_psk is present per message.
+    // Pairing-code flows only (pairing.md "Wrapping"); exactly one of long_term_psk/wrapped_psk
+    // is present per message.
     root["payload"]["wrapped_psk"] = b64url_encode(wrapped_psk.data(), wrapped_psk.size());
 
     std::string output;
@@ -1213,8 +1205,7 @@ bool process_pair_abort_message(JsonObject root, PairAbortMessage* abort_msg) {
 bool process_server_pair_init_message(JsonObject root, ServerPairInitPayload* payload) {
     // nonce_A (base64url, 43 chars -> 32 bytes) is present in the attempt's first round only, so
     // an absent field parses to an absent value; the state machine decides whether that is right
-    // for the round it is in (pairing.md "Rounds"). A present field that does not decode to 32
-    // bytes is malformed, like any other.
+    // for the round it is in (pairing.md "Rounds").
     JsonVariantConst nonce_var = root["payload"]["nonce_A"];
     if (nonce_var.isUnbound() || nonce_var.isNull()) {
         if (payload != nullptr) {
@@ -1355,8 +1346,8 @@ std::string format_client_pair_confirm_message(
     root["type"] = "client/pair-confirm";
     root["payload"]["client_kc"] = b64url_encode(client_kc.data(), client_kc.size());
     // The commitment opening crosses the wire sealed under the CPace output, never in the clear
-    // (pairing.md "Wrapping"): an observer that cannot complete the PAKE learns nothing about
-    // nonce_B, and so cannot reconstruct the pairing code from the handshake it watched.
+    // (pairing.md "Wrapping"): an observer that cannot complete the PAKE cannot reconstruct the
+    // pairing code from the handshake it watched.
     root["payload"]["wrapped_nonce_B"] =
         b64url_encode(wrapped_nonce_b.data(), wrapped_nonce_b.size());
 

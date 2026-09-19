@@ -149,7 +149,7 @@ inline const char* to_cstr(SendspinRole role) {
 /// version that was active: a client offered `player@v1` that is handed `player@v2` implements
 /// neither the new version's behavior nor, any longer, the old one's.
 /// @param active_roles The set to search, as the server wrote it.
-/// @param role The role to look for, compared against its full versioned name ("player@v1").
+/// @param role The role to look for.
 /// @return true when `active_roles` names this exact versioned role.
 inline bool role_in(const std::vector<std::string>& active_roles, SendspinRole role) {
     const char* name = to_cstr(role);
@@ -163,9 +163,8 @@ inline bool role_in(const std::vector<std::string>& active_roles, SendspinRole r
 
 /// @brief The role this library implements for a family name, if it implements one.
 ///
-/// One version per family is implemented, so a family name identifies a role exactly. This is
-/// what lets a caller that only knows the family ("controller", from the role that produced a
-/// message) reach the same exact-version test the receive gate and role removal use.
+/// One version per family is implemented, so a family name identifies a role exactly; a caller
+/// that knows only the family can then use the same exact-version test as the receive gate.
 /// @param family Role family name without the "@vN" suffix.
 /// @return The matching role, or nullopt if this library implements no role in that family.
 inline std::optional<SendspinRole> role_for_family(const std::string& family) {
@@ -867,8 +866,7 @@ struct ServerActivateMessage {
     std::optional<SendspinPairMethod> pairing_method;
     /// From payload.pairing.format: the emission format the server picked for a dynamic pairing
     /// code. nullopt when the message carries no format or names an unrecognized one; required
-    /// on the wire when pairing_method is dynamic_pairing_code, absent otherwise
-    /// (messaging.md "server/activate").
+    /// on the wire when pairing_method is dynamic_pairing_code (messaging.md "server/activate").
     std::optional<SendspinPairingCodeFormat> pairing_format;
 };
 
@@ -909,7 +907,6 @@ struct PairAbortMessage {
 /// client/pair-retry reuses the binding values already in hand and carries none
 /// (pairing.md "Server -> Client: server/pair-init").
 struct ServerPairInitPayload {
-    /// 32-byte server nonce decoded from base64url, absent after the first round.
     std::optional<std::array<uint8_t, 32>> nonce_a;
 };
 

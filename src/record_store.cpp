@@ -67,9 +67,8 @@ std::optional<T> load_decode_wipe(SendspinPersistenceProvider& provider, const c
 RecordStore::RecordStore(SendspinPersistenceProvider* provider,
                          bool initial_unpaired_access_enabled, size_t max_records)
     : provider_(provider), max_records_(std::max(max_records, MIN_MAX_RECORDS)) {
-    // Try loading persisted records and config first. Every blob here (except the static pairing
-    // code, which is raw UTF-8 bytes) is a codec-encoded blob; the provider itself is a pure byte
-    // store, so decoding happens entirely on this side of the interface.
+    // Every blob here except the static pairing code (raw UTF-8) is codec-encoded: the provider
+    // is a pure byte store, so decoding happens entirely on this side of the interface.
     bool loaded_config = false;
     if (this->provider_ != nullptr) {
         this->load_records_from_provider();
@@ -126,10 +125,9 @@ void RecordStore::load_static_pairing_code_from_provider() {
                                 code_blob->size());
         // Validate on load, the same way RECORDS and PAIRING_PSK are validated by their
         // decoders: the code is provisioned into the store out of band, so this is the only
-        // place the library gets to check it.
-        // Accepting it would leave the device advertising static_pairing_code while feeding
-        // malformed PRS bytes to the PAKE, which can only ever produce pairing_code_mismatch, a
-        // pairing that deterministically fails with nothing in the logs pointing at storage.
+        // place the library gets to check it. Accepting a malformed code would advertise
+        // static_pairing_code and then fail every pairing with pairing_code_mismatch, with
+        // nothing in the logs pointing at storage.
         if (is_valid_static_pairing_code(loaded_code)) {
             this->static_pairing_code_ = std::move(loaded_code);
         } else {
@@ -166,8 +164,7 @@ void RecordStore::seed_first_boot_config(bool loaded_config, bool initial_unpair
     }
 
     // First-boot seed: the application's configured default for unpaired access applies only on
-    // a genuine first boot. A loaded config always wins, so unpaired access stays off across
-    // reboots once it has been turned off. The value is persisted below.
+    // a genuine first boot; a loaded config always wins.
     //
     // !loaded_config alone is NOT sufficient evidence of a first boot, and getting that wrong
     // fails open. loaded_config stays false both when the persistence_keys::PAIR_CONFIG blob was
@@ -192,15 +189,15 @@ void RecordStore::seed_first_boot_config(bool loaded_config, bool initial_unpair
         this->unpaired_access_enabled_ = initial_unpaired_access_enabled;
     }
     // Scope note: only unpaired_access_enabled_ is protected this way, and deliberately so. It
-    // defaults to false, so declining to seed it can only ever withhold a permission; it
-    // cannot break a working device. The sibling flags (pairing_psk_enabled_,
-    // dynamic_pairing_code_enabled_) default to TRUE, so a config that fails to load does resurrect
-    // a pairing method an operator had turned off, and the write below persists that. Forcing those
-    // to false here is not a correct fix: a provider that seeds records or a Pairing PSK without
-    // implementing config persistence at all returns nullopt for exactly the same reason a damaged
-    // one does, and disabling pairing for it would break a legitimate integration. Closing that
-    // hole properly needs the provider interface to distinguish "never stored" from "could not be
-    // read" (a tri-state load result) rather than more guessing here.
+    // defaults to false, so declining to seed it can only ever withhold a permission. The sibling
+    // flags (pairing_psk_enabled_, dynamic_pairing_code_enabled_) default to TRUE, so a config that
+    // fails to load does resurrect a pairing method an operator had turned off, and the write below
+    // persists that. Forcing those to false here is not a correct fix: a provider that seeds
+    // records or a Pairing PSK without implementing config persistence at all returns nullopt for
+    // exactly the same reason a damaged one does, and disabling pairing for it would break a
+    // legitimate integration. Closing that hole properly needs the provider interface to
+    // distinguish "never stored" from "could not be read" (a tri-state load result) rather than
+    // more guessing here.
     //
     // No lock needed here: the constructor runs before this object is reachable by any other
     // thread.
@@ -208,12 +205,12 @@ void RecordStore::seed_first_boot_config(bool loaded_config, bool initial_unpair
 }
 
 void RecordStore::provision_pairing_psk_if_needed() {
-    // Pairing PSK provisioning: pairing_psk is the one pairing method every client must
-    // implement (messaging.md "client/hello"), so a client with no Pairing PSK would advertise a
-    // method it cannot complete. Generate one when absent and persist it; the operator transfers it
-    // to a server as a pairing token (SendspinClient::pairing_token()). The key is stable across
-    // reboots once persisted; if persistence fails it is RAM-only for this boot, so a token
-    // printed then will not survive a reboot (a warning is logged when this happens).
+    // pairing_psk is the one pairing method every client must implement (messaging.md
+    // "client/hello"), so a client with no Pairing PSK would advertise a method it cannot
+    // complete. The operator transfers the generated key to a server as a pairing token
+    // (SendspinClient::pairing_token()). It is stable across reboots once persisted; if
+    // persistence fails it is RAM-only for this boot, so a token printed then will not survive a
+    // reboot.
     if (!this->pairing_psk_.has_value()) {
         std::array<uint8_t, NOISE_PSK_SIZE> psk{};
         platform_random_bytes(psk.data(), psk.size());
@@ -334,11 +331,10 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
 }
 
 bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_use) {
-    // records_ runs least-recently-used first (mark_record_used moves a touched record to the
-    // back, in RAM), so the first record no open connection is resolving against is the victim
-    // pairing.md "Pairing Records" leaves to the implementation. A record backing an open
-    // connection, provisional or admitted, is off limits there: evicting it would strand a
-    // live session on a PSK this store no longer holds.
+    // records_ runs least-recently-used first (see mark_record_used), so the first record no open
+    // connection is resolving against is the victim pairing.md "Pairing Records" leaves to the
+    // implementation. Evicting one that backs an open connection would strand a live session on a
+    // PSK this store no longer holds.
     for (size_t i = 0; i < this->records_.size(); ++i) {
         const std::string& psk_id = this->records_[i].psk_id;
         if (std::find(psk_ids_in_use.begin(), psk_ids_in_use.end(), psk_id) !=
@@ -355,11 +351,9 @@ bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_us
 
 bool RecordStore::store_record_superseding(SendspinPairingRecord record,
                                            const std::vector<std::string>& psk_ids_in_use) {
-    // RAM-only: this runs on the NETWORK thread (the server/pair-finalize
-    // ack handler), where the record must become resolvable before the handler returns (the
-    // server's follow-up re-handshake is the next message on that thread) but the provider may
-    // not be called (its contract is main-loop-only). The caller schedules persist_records() on
-    // the main loop; see the class doc.
+    // RAM-only: this runs on the NETWORK thread (the server/pair-finalize ack handler), where the
+    // record must become resolvable before the handler returns: the server's follow-up
+    // re-handshake is the next message on that thread. See the header for the rest.
     std::lock_guard<std::mutex> lock(this->mutex_);
 
     size_t idx = this->find_index(record.psk_id);
@@ -391,9 +385,8 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
     }
 
     // Retire any OTHER record still bound to this server_id: pairing mints a fresh per-server
-    // PSK that REPLACES whatever that server held before, and leaving the prior record in place
-    // would let re-pairing accumulate a second working PSK for the same server, so "rotation"
-    // never revokes anything.
+    // PSK that REPLACES whatever that server held before, so leaving the prior record in place
+    // would let re-pairing accumulate a second working PSK for the same server.
     const std::string superseded_server_id = this->records_[idx].server_id;
     for (size_t i = 0; i < this->records_.size();) {
         if (i != idx && this->records_[i].server_id == superseded_server_id) {
@@ -455,8 +448,7 @@ void RecordStore::mark_record_used(const std::string& psk_id) {
         return;
     }
 
-    // Move the record to the back, making records_ least-recently-used first for eviction
-    // (see evict_one_locked).
+    // Keeps records_ least-recently-used first for eviction (see evict_one_locked).
     const size_t last = this->records_.size() - 1;
     if (idx != last) {
         std::rotate(this->records_.begin() + static_cast<ptrdiff_t>(idx),
@@ -465,19 +457,16 @@ void RecordStore::mark_record_used(const std::string& psk_id) {
 
     // The recency order stays in RAM. This runs on the first activate of EVERY long-term
     // session, so persisting the reorder would rewrite the whole records blob per connection in
-    // steady state: two servers taking turns would each push the other off the back and write
-    // again, which on ESP is an NVS erase cycle per connection for bookkeeping this function
-    // itself treats as advisory. The order is rebuilt from use as sessions come and go, so what
-    // a reboot loses is the ordering among records nothing has connected on yet since, which
-    // only decides which of two equally idle records is evicted first.
+    // steady state: on ESP, an NVS erase cycle per connection for advisory bookkeeping. The
+    // order is rebuilt from use, so a reboot only loses the ordering among records nothing has
+    // connected on since.
     //
     // The `used` flag is durable, so its first flip is written.
     if (this->records_.back().used) {
         return;
     }
     this->records_.back().used = true;
-    // Best-effort: a rejected write here is not reported, since the flag is advisory
-    // bookkeeping rather than a revocation whose durability the caller depends on.
+    // Best-effort: the flag is advisory bookkeeping, so a rejected write is not reported.
     this->persist_records_locked();
 }
 

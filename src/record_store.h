@@ -57,8 +57,7 @@ enum class PskCategory : uint8_t {
 
 /// @brief Parses the psk_category code carried in the Noise message 1 payload.
 ///
-/// messaging.md "noise/handshake": 'lt' (long-term), 'pr' (pairing), 'sn' (Sentinel). Anything
-/// else is not a category the protocol defines.
+/// messaging.md "noise/handshake": 'lt' (long-term), 'pr' (pairing), 'sn' (Sentinel).
 /// @param code The wire code.
 /// @return The category, or nullopt if the code is not one of the three.
 inline std::optional<PskCategory> psk_category_from_string(const std::string& code) {
@@ -192,9 +191,8 @@ public:
         return r ? std::optional<SendspinPairingRecord>(*r) : std::nullopt;
     }
 
-    /// @brief Store a long-term record in RAM, retiring any OTHER record bound to the same
-    /// server_id. Replaces any existing record with the same psk_id, and leaves records for
-    /// other psk_ids alone.
+    /// @brief Store a long-term record in RAM, replacing any record with the same psk_id and
+    /// retiring any OTHER record bound to the same server_id.
     ///
     /// This is the pairing-completion form: pairing mints a fresh per-server PSK that
     /// REPLACES whatever that server held before, so leaving the prior record in place
@@ -207,17 +205,16 @@ public:
     /// this via INBOX_TOPIC_RECORDS); until that flush lands, the mutation is RAM-only.
     ///
     /// A pairing never fails for lack of record storage (pairing.md "Pairing Records"): a
-    /// net-new record that arrives at capacity evicts the least recently used record that no
-    /// currently-open connection is resolving against. Recency is the order of `records_`,
-    /// which mark_record_used() moves a record to the back of, so the front is the least
-    /// recently used.
+    /// net-new record that arrives at capacity evicts the least recently used record (recency is
+    /// the order of `records_`; see mark_record_used) that no currently-open connection is
+    /// resolving against.
     /// @param record The freshly paired record to store.
     /// @param psk_ids_in_use psk_ids backing a currently-open connection, provisional or
     ///        admitted, none of which may be evicted. The connection budget keeps this list
     ///        shorter than the capacity (see RecordStore::MIN_MAX_RECORDS), so a victim always
     ///        exists.
     /// @return true when the record is stored in RAM; false only when every record at capacity
-    /// is in use, which the connection budget makes unreachable.
+    /// is in use.
     bool store_record_superseding(SendspinPairingRecord record,
                                   const std::vector<std::string>& psk_ids_in_use = {});
 
@@ -233,10 +230,10 @@ public:
 
     /// @brief Flag the record at psk_id as used and make it the most recently used one.
     ///
-    /// `records_` is kept in least-recently-used-first order by moving the touched record to the
-    /// back, which is the order eviction reads (see store_record_superseding). The reorder stays
-    /// in RAM; only the first flip of the durable `used` flag is persisted, so recency across a
-    /// reboot is approximate (see the definition for why). No-op if absent.
+    /// `records_` is kept least-recently-used first, the order eviction reads (see
+    /// store_record_superseding). The reorder stays in RAM; only the first flip of the durable
+    /// `used` flag is persisted, so recency across a reboot is approximate (see the definition
+    /// for why). No-op if absent.
     void mark_record_used(const std::string& psk_id);
 
     // ========================================
@@ -306,10 +303,8 @@ public:
 
     /// @brief Mint a pairing outcome: a fresh PSK bound to server_id and the record holding it.
     ///
-    /// Minting cannot fail on a full store: a pairing never fails for lack of record storage
-    /// (pairing.md "Pairing Records"). A re-pair supersedes the record its server already holds,
-    /// and a net-new record at capacity evicts one where it is stored, by
-    /// store_record_superseding().
+    /// Minting cannot fail on a full store: store_record_superseding() supersedes a re-pair's
+    /// existing record and evicts for a net-new one (pairing.md "Pairing Records").
     [[nodiscard]] PairingOutcome resolve_pairing_outcome(
         const std::string& server_id, const std::optional<std::string>& label = std::nullopt);
 

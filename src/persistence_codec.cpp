@@ -84,9 +84,8 @@ std::optional<PskIdAndBytes> parse_psk_id_and_psk(JsonObjectConst obj, const cha
 /// @brief Parses a pairing record from a JSON object (a top-level record blob, or one entry of
 /// a records array). Ignores an entry-local "v", if present.
 /// @param obj    The object to read.
-/// @param reason Set to the rejection reason when the parse fails; untouched on success. The one
-///        place that reports a skipped record prints what this leaves here, so every rejection
-///        names itself rather than being re-derived at the call site.
+/// @param reason Set to the rejection reason when the parse fails; untouched on success. The
+///        caller logs it verbatim, so every rejection path sets it.
 /// @return The record, or nullopt when the object is not a usable one.
 std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj, const char** reason) {
     auto core = parse_psk_id_and_psk(obj, reason);
@@ -97,8 +96,7 @@ std::optional<SendspinPairingRecord> record_from_object(JsonObjectConst obj, con
     rec.psk_id = std::move(core->psk_id);
     rec.psk = core->psk;
     // A record whose PSK is not bound to a server can never satisfy the post-match server_id
-    // check (connection.md "Pre-Shared Key"), so it is not a usable record: reject it here rather
-    // than load a credential no handshake could ever accept.
+    // check (connection.md "Pre-Shared Key"), so it is not loaded.
     if (!obj["server_id"].is<const char*>()) {
         *reason = "server_id is missing or not a string";
         return std::nullopt;
@@ -223,10 +221,8 @@ std::optional<std::vector<SendspinPairingRecord>> decode_pairing_records(std::st
             out.push_back(std::move(rec.value()));
             continue;
         }
-        // A record the codec cannot accept is skipped so the rest of the blob still loads, and
-        // the reason record_from_object() rejected it is named here: a record with no server_id,
-        // say, can never satisfy the post-match server check (connection.md "Pre-Shared Key"),
-        // and the server that holds it has to pair again.
+        // A record the codec cannot accept is skipped so the rest of the blob still loads; the
+        // reason is logged because the server that holds such a record has to pair again.
         SS_LOGW(TAG, "Skipping stored pairing record %s: %s",
                 obj["psk_id"].is<const char*>() ? obj["psk_id"].as<const char*>() : "(no psk_id)",
                 reason);
@@ -272,8 +268,7 @@ std::string encode_pairing_config(const SendspinPairingConfig& c) {
     doc["pairing_psk_enabled"] = c.pairing_psk_enabled;
     doc["unpaired_access_enabled"] = c.unpaired_access_enabled;
     // The stored key strings are "dynamic_pin_enabled" / "static_pin_enabled": this blob is a
-    // storage format in its own right, fixed independently of the protocol's field names, so the
-    // key strings are fixed while the struct's fields follow the spec's terminology.
+    // storage format in its own right, fixed independently of the protocol's field names.
     doc["dynamic_pin_enabled"] = c.dynamic_pairing_code_enabled;
     doc["static_pin_enabled"] = c.static_pairing_code_enabled;
     std::string out;
@@ -300,8 +295,7 @@ std::optional<SendspinPairingConfig> decode_pairing_config(std::string_view byte
     if (obj["static_pin_enabled"].is<bool>()) {
         cfg.static_pairing_code_enabled = obj["static_pin_enabled"].as<bool>();
     }
-    // Keys this version does not define are ignored, the same way a missing key leaves the
-    // struct's default in place.
+    // Keys this version does not define are ignored.
     return cfg;
 }
 
