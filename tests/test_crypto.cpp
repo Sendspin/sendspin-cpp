@@ -229,6 +229,12 @@ TEST(B64Url, EncodeAlphabetKat) {
     ASSERT_EQ(data.size(), 48u);
     EXPECT_EQ(b64url_encode(data.data(), data.size()),
               "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_");
+
+    // 48 bytes is len % 3 == 0, so the padding strip never runs above. One byte is the two-pad
+    // case (the only other lengths tested are 32-byte psk ids, which pad once), so it is the only
+    // input that needs the strip to run more than once. It also covers the '/' to '_' swap.
+    const std::array<uint8_t, 1> two_pad_input = {0xFF};
+    EXPECT_EQ(b64url_encode(two_pad_input.data(), two_pad_input.size()), "_w");
 }
 
 TEST(B64Url, DecodeToleratesMissingPadding) {
