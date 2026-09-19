@@ -124,9 +124,9 @@ struct ResolvedPsk {
 ///   - `resolve_by_psk_id` runs on the network thread (Noise handshake and re-handshake)
 ///     under `mutex_` so a network-thread resolve cannot race a main-loop mutation of
 ///     `records_` / `pairing_psk_`.
-///   - No provider call is ever made under `mutex_`. The persisting paths (`persist_records`,
-///     `remove_record`, `mark_record_used`, all main-loop-only) encode the blob under the lock
-///     and save it after dropping it, so a network-thread resolve never waits out an NVS commit.
+///   - No provider call is ever made under `mutex_`. The one persisting path
+///     (`persist_records`, main-loop-only) encodes the blob under the lock and saves it after
+///     dropping it, so a network-thread resolve never waits out an NVS commit.
 ///     See the locking-discipline comment in `record_store.cpp` for why the two halves do not
 ///     have to be atomic.
 class RecordStore {
@@ -188,7 +188,7 @@ public:
     ///
     /// A pairing never fails for lack of record storage (pairing.md "Pairing Records"): a
     /// net-new record that arrives at capacity evicts the least recently used record (recency is
-    /// the order of `records_`; see mark_record_used) that no currently-open connection is
+    /// the order of `records_`; see note_record_used) that no currently-open connection is
     /// resolving against.
     /// @param record The freshly paired record to store.
     /// @param psk_ids_in_use psk_ids backing a currently-open connection, provisional or
@@ -217,28 +217,17 @@ public:
     /// @return true when a record was erased, and the array therefore needs persisting.
     [[nodiscard]] bool note_record_removed(const std::string& psk_id);
 
-    /// @brief Remove the long-term record identified by psk_id and persist the array.
-    /// No-op if absent.
-    void remove_record(const std::string& psk_id);
-
     /// @brief Flag the record at psk_id as used and make it the most recently used one in RAM,
     /// leaving the durable half to a later persist_records(). No-op if absent.
     ///
-    /// The RAM-only half of mark_record_used(), for a caller batching several mutations behind
-    /// one blob write.
-    /// @param psk_id The record to flag.
-    /// @return true when the durable `used` flag flipped, and the array therefore needs
-    ///         persisting; false when only the RAM recency order moved (see mark_record_used()).
-    [[nodiscard]] bool note_record_used(const std::string& psk_id);
-
-    /// @brief Flag the record at psk_id as used, make it the most recently used one, and persist
-    /// the flag's first flip.
-    ///
     /// `records_` is kept least-recently-used first, the order eviction reads (see
     /// store_record_superseding). The reorder stays in RAM; only the first flip of the durable
-    /// `used` flag is persisted, so recency across a reboot is approximate (see the definition
-    /// for why). No-op if absent.
-    void mark_record_used(const std::string& psk_id);
+    /// `used` flag is worth persisting, so recency across a reboot is approximate (see the
+    /// definition for why).
+    /// @param psk_id The record to flag.
+    /// @return true when the durable `used` flag flipped, and the array therefore needs
+    ///         persisting; false when only the RAM recency order moved.
+    [[nodiscard]] bool note_record_used(const std::string& psk_id);
 
     // ========================================
     // Pairing PSK (the one the client accepts to admit a new server)

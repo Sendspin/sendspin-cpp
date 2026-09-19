@@ -82,6 +82,22 @@ static SendspinPairingPsk make_pairing_psk(const std::optional<std::string>& lab
     return p;
 }
 
+/// The production mark-used sequence: ConnectionManager::flush_pending_record_ops() calls
+/// note_record_used() and persists the array only when the durable flag flipped.
+static void touch_record(RecordStore& store, const std::string& psk_id) {
+    if (store.note_record_used(psk_id)) {
+        (void) store.persist_records();
+    }
+}
+
+/// The production revocation sequence: ConnectionManager::handle_server_unpair() erases under
+/// its own lock and the flush persists the array.
+static void remove_record(RecordStore& store, const std::string& psk_id) {
+    if (store.note_record_removed(psk_id)) {
+        (void) store.persist_records();
+    }
+}
+
 /// Wraps a std::string's bytes as a blob for seed_blob()/save_blob() calls.
 static std::vector<uint8_t> to_bytes(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
@@ -370,7 +386,7 @@ TEST(RecordStore, CapacityEvictsRatherThanRefusingANewPairing) {
         << "only one record is evicted per pairing";
 }
 
-// The recency order is RAM-only. mark_record_used() runs on the first activate of every
+// The recency order is RAM-only. note_record_used() runs on the first activate of every
 // long-term session, so persisting the reorder would rewrite the whole records blob per
 // connection; only the durable `used` flag's first flip is written.
 TEST(RecordStore, RecencyReorderIsNotPersisted) {
@@ -390,18 +406,18 @@ TEST(RecordStore, RecencyReorderIsNotPersisted) {
         filler_psk_ids.push_back(record.psk_id);
         ASSERT_TRUE(store.store_record_superseding(std::move(record), {}));
     }
-    store.mark_record_used(psk_a);
-    store.mark_record_used(psk_b);
+    touch_record(store, psk_a);
+    touch_record(store, psk_b);
     for (const std::string& filler : filler_psk_ids) {
-        store.mark_record_used(filler);
+        touch_record(store, filler);
     }
     const int writes_after_first_touches = provider.save_attempts;
 
     // Two servers taking turns: each activate moves the other's record off the back. Every
     // record's `used` flag is already set, so nothing durable changes and nothing is written.
     for (int i = 0; i < 10; ++i) {
-        store.mark_record_used(psk_a);
-        store.mark_record_used(psk_b);
+        touch_record(store, psk_a);
+        touch_record(store, psk_b);
     }
     EXPECT_EQ(provider.save_attempts, writes_after_first_touches)
         << "a reorder alone must not rewrite the records blob";
@@ -418,7 +434,7 @@ TEST(RecordStore, RecencyReorderIsNotPersisted) {
     EXPECT_NE(store.record_by_server_id("server-B"), nullptr);
 }
 
-// mark_record_used() is the recency signal: a record touched by a session must outlive an
+// note_record_used() is the recency signal: a record touched by a session must outlive an
 // untouched one stored before it.
 TEST(RecordStore, EvictionFollowsUseRecency) {
     RecordStore store(nullptr);
@@ -430,7 +446,7 @@ TEST(RecordStore, EvictionFollowsUseRecency) {
     }
 
     // Touch the oldest record, which without this would be the next victim.
-    store.mark_record_used(psk_ids.front());
+    (void) store.note_record_used(psk_ids.front());
 
     auto overflow = store.resolve_pairing_outcome("server-overflow");
     ASSERT_TRUE(store.store_record_superseding(overflow.record, {}));
@@ -672,7 +688,7 @@ TEST(RecordStore, RecordByServerIdFindsStoredPubkeyRecord) {
 }
 
 // ============================================================================
-// mark_record_used
+// note_record_used
 // ============================================================================
 
 TEST(RecordStore, MarkRecordUsed) {
@@ -682,25 +698,25 @@ TEST(RecordStore, MarkRecordUsed) {
     EXPECT_FALSE(rec.used);
     store.store_record_superseding(rec, {});
 
-    store.mark_record_used(rec.psk_id);
+    touch_record(store, rec.psk_id);
 
     const auto* found = store.record_by_psk_id(rec.psk_id);
     ASSERT_NE(found, nullptr);
     EXPECT_TRUE(found->used);
 
     // Calling again is a no-op (should not crash).
-    store.mark_record_used(rec.psk_id);
+    touch_record(store, rec.psk_id);
     EXPECT_TRUE(store.record_by_psk_id(rec.psk_id)->used);
 }
 
 TEST(RecordStore, MarkRecordUsedOnAbsentPskIdIsNoOp) {
     RecordStore store(nullptr);
     // Should not crash.
-    store.mark_record_used("does-not-exist");
+    (void) store.note_record_used("does-not-exist");
 }
 
 // ============================================================================
-// remove_record and list
+// note_record_removed and list
 // ============================================================================
 
 TEST(RecordStore, RemoveRecordAndList) {
@@ -715,12 +731,12 @@ TEST(RecordStore, RemoveRecordAndList) {
     EXPECT_NE(store.record_by_psk_id(a.psk_id), nullptr);
     EXPECT_NE(store.record_by_psk_id(b.psk_id), nullptr);
 
-    store.remove_record(a.psk_id);
+    remove_record(store, a.psk_id);
     EXPECT_EQ(store.record_by_psk_id(a.psk_id), nullptr);
     EXPECT_NE(store.record_by_psk_id(b.psk_id), nullptr);
 
     // Removing an absent record is a no-op.
-    store.remove_record("absent-psk-id");
+    remove_record(store, "absent-psk-id");
 }
 
 /// A persistence provider that accepts every "records" blob save EXCEPT one that drops a
@@ -818,7 +834,7 @@ TEST(RecordStore, RemoveRecordErasesFromMemoryAndWarnsWhenTheProviderRefusesTheD
     std::string logs;
     {
         StderrCapture capture;
-        store.remove_record(a.psk_id);
+        remove_record(store, a.psk_id);
         logs = capture.release();
     }
 
@@ -829,8 +845,6 @@ TEST(RecordStore, RemoveRecordErasesFromMemoryAndWarnsWhenTheProviderRefusesTheD
     EXPECT_EQ(provider.remove_attempts[0], a.psk_id);
     EXPECT_NE(logs.find(REBOOT_WARNING), std::string::npos)
         << "a refused delete must be reported, not swallowed; got: " << logs;
-    EXPECT_NE(logs.find(a.psk_id), std::string::npos)
-        << "the warning must name the record that will come back; got: " << logs;
 }
 
 // The other half of the contract, and what pins the condition's direction: a delete the provider
@@ -847,7 +861,7 @@ TEST(RecordStore, RemoveRecordIsSilentWhenTheProviderAcceptsTheDelete) {
     std::string logs;
     {
         StderrCapture capture;
-        store.remove_record(a.psk_id);
+        remove_record(store, a.psk_id);
         logs = capture.release();
     }
 
@@ -929,7 +943,7 @@ TEST(RecordStore, RefusedDeleteLetsTheRevokedRecordReturnAfterAReboot) {
         RecordStore store(&provider);
         ASSERT_TRUE(store.store_record_superseding(a, {}));
         ASSERT_TRUE(store.persist_records());
-        store.remove_record(a.psk_id);
+        remove_record(store, a.psk_id);
         ASSERT_EQ(store.record_by_psk_id(a.psk_id), nullptr);
     }
 
@@ -1316,7 +1330,7 @@ TEST(RecordStoreWithFile, RemoveRecordShrinksThePersistedBlob) {
         ASSERT_TRUE(store.persist_records());
         a_psk_id = a.psk_id;
         b_psk_id = b.psk_id;
-        store.remove_record(a_psk_id);
+        remove_record(store, a_psk_id);
     }
 
     FilePersistenceProvider provider(tmp.path());

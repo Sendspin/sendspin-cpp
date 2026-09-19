@@ -331,7 +331,7 @@ const SendspinPairingRecord* RecordStore::record_by_server_id(const std::string&
 }
 
 bool RecordStore::evict_one_locked(const std::vector<std::string>& psk_ids_in_use) {
-    // records_ runs least-recently-used first (see mark_record_used), so the first record no open
+    // records_ runs least-recently-used first (see note_record_used), so the first record no open
     // connection is resolving against is the victim pairing.md "Pairing Records" leaves to the
     // implementation. Evicting one that backs an open connection would strand a live session on a
     // PSK this store no longer holds.
@@ -435,28 +435,6 @@ bool RecordStore::note_record_removed(const std::string& psk_id) {
     return true;
 }
 
-void RecordStore::remove_record(const std::string& psk_id) {
-    if (!this->note_record_removed(psk_id)) {
-        return;
-    }
-    std::string encoded;
-    {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        encoded = this->encode_records_locked();
-    }
-    // Erased from RAM regardless of the store's answer: the operator (or the pairing exchange)
-    // asked for this credential to stop working, and keeping it in RAM because the store could
-    // not be written would leave it usable right now, which is strictly worse. But a write that
-    // did not reach the store means the record comes back at the next start, so say so loudly
-    // instead of reporting a revocation that silently half-happened.
-    if (!this->save_encoded_records(encoded)) {
-        SS_LOGW(TAG,
-                "Removed record %s but the provider did not persist the updated store; it is "
-                "gone for this boot only and will be valid again after a reboot",
-                psk_id.c_str());
-    }
-}
-
 bool RecordStore::note_record_used(const std::string& psk_id) {
     {
         std::lock_guard<std::mutex> lock(this->mutex_);
@@ -486,19 +464,6 @@ bool RecordStore::note_record_used(const std::string& psk_id) {
         this->records_.back().used = true;
     }
     return true;
-}
-
-void RecordStore::mark_record_used(const std::string& psk_id) {
-    if (!this->note_record_used(psk_id)) {
-        return;
-    }
-    std::string encoded;
-    {
-        std::lock_guard<std::mutex> lock(this->mutex_);
-        encoded = this->encode_records_locked();
-    }
-    // Best-effort: the flag is advisory bookkeeping, so a rejected write is not reported.
-    this->save_encoded_records(encoded);
 }
 
 // ============================================================================
@@ -558,9 +523,9 @@ bool RecordStore::persist_config() {
 // thread for every handshake, so holding it across the write would block a handshake for the
 // length of a flash commit.
 //
-// Encode and save do not need to be atomic with respect to each other. All three persisting
-// paths (persist_records, remove_record, mark_record_used) are main-loop-only, so their
-// encode/save pairs are serialized by thread confinement and two blobs cannot land out of order.
+// Encode and save do not need to be atomic with respect to each other. persist_records(), the
+// one path that saves, is main-loop-only, so its encode/save pairs are serialized by thread
+// confinement and two blobs cannot land out of order.
 // The only writer that can slip into the gap is a network-thread store_record_superseding(),
 // which is RAM-only: the saved blob then predates that insert, which was already true (it was
 // not in records_ when the encode ran) and is repaired by the persist_records() flush the insert
