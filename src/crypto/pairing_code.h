@@ -81,9 +81,9 @@ std::array<uint8_t, PAIRING_NONCE_SIZE> pairing_generate_nonce();
 /// @brief Compute the commitment commit_B = SHA-256(PAIRING_COMMIT_LABEL || nonce)
 /// @param nonce     The nonce to commit to.
 /// @param nonce_len Length of `nonce`, which must be PAIRING_NONCE_SIZE.
-/// @return The commitment bytes; all-zero when the hash fails.
-std::array<uint8_t, PAIRING_COMMIT_SIZE> pairing_code_commit(const uint8_t* nonce,
-                                                             size_t nonce_len);
+/// @return The commitment bytes, or std::nullopt if `nonce_len` is wrong or the hash fails.
+std::optional<std::array<uint8_t, PAIRING_COMMIT_SIZE>> pairing_code_commit(const uint8_t* nonce,
+                                                                            size_t nonce_len);
 
 /// @brief Return true if SHA-256(PAIRING_COMMIT_LABEL || nonce) equals commitment
 /// (constant-time)

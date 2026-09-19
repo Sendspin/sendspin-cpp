@@ -34,11 +34,28 @@ std::array<uint8_t, PAIRING_NONCE_SIZE> pairing_generate_nonce() {
 // pairing_code_commit
 // ============================================================================
 
-std::array<uint8_t, PAIRING_COMMIT_SIZE> pairing_code_commit(const uint8_t* nonce,
-                                                             size_t nonce_len) {
+std::optional<std::array<uint8_t, PAIRING_COMMIT_SIZE>> pairing_code_commit(const uint8_t* nonce,
+                                                                            size_t nonce_len) {
+    if (nonce_len != PAIRING_NONCE_SIZE) {
+        return std::nullopt;
+    }
+
     const auto* label = reinterpret_cast<const uint8_t*>(PAIRING_COMMIT_LABEL.data());
     size_t label_len = PAIRING_COMMIT_LABEL.size();
-    return sha256_oneshot(label, label_len, nonce, nonce_len);
+
+    Sha256 h;
+    if (!h.ok()) {
+        // Same rationale as pairing_code_digest(): a failed hash state finalizes to an all-zero
+        // digest, and an all-zero commit_B would go out on the wire as a binding commitment.
+        return std::nullopt;
+    }
+    h.update(label, label_len);
+    h.update(nonce, nonce_len);
+    auto commitment = h.finalize();
+    if (!h.ok()) {
+        return std::nullopt;
+    }
+    return commitment;
 }
 
 // ============================================================================
@@ -51,7 +68,10 @@ bool pairing_code_verify_commit(const uint8_t* nonce, size_t nonce_len, const ui
         return false;
     }
     auto computed = pairing_code_commit(nonce, nonce_len);
-    return constant_time_equal(computed.data(), commitment, PAIRING_COMMIT_SIZE);
+    if (!computed.has_value()) {
+        return false;
+    }
+    return constant_time_equal(computed->data(), commitment, PAIRING_COMMIT_SIZE);
 }
 
 // ============================================================================

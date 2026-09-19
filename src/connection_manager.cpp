@@ -2556,10 +2556,17 @@ void ConnectionManager::start_pairing_attempt(SendspinConnection* conn) {
         // handle_pair_init() rather than here.
         ps.nonce_b = pairing_generate_nonce();
         auto commit_b = pairing_code_commit(ps.nonce_b.data(), ps.nonce_b.size());
+        if (!commit_b.has_value()) {
+            SS_LOGE(TAG, "start_pairing_attempt: commitment derivation failed for server_id=%s",
+                    server_id.c_str());
+            this->local_abort_pairing(conn, PairAbortReason::METHOD_NOT_SUPPORTED);
+            return;
+        }
 
         SS_LOGI(TAG, "Sending client/pair-init (dynamic_pairing_code) for server_id=%s",
                 server_id.c_str());
-        conn->send_app_json(format_client_pair_init_message(commit_b, ps.pairing_index), nullptr);
+        conn->send_app_json(format_client_pair_init_message(commit_b.value(), ps.pairing_index),
+                            nullptr);
 
         ps.step = SendspinConnection::PairingStep::AWAIT_SERVER_PAIR_INIT;
         ps.attempt_deadline_us = platform_time_us() + PAIRING_ATTEMPT_TIMEOUT_US;

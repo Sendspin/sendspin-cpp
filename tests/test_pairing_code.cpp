@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 using namespace sendspin;  // NOLINT(google-build-using-namespace): test-local
@@ -67,16 +68,28 @@ std::optional<std::array<uint8_t, 32>> digest_of(const DeriveInputs& in) {
 TEST(PairingCodeCommit, RoundTripSucceeds) {
     auto nonce = pairing_generate_nonce();
     auto commitment = pairing_code_commit(nonce.data(), nonce.size());
-    EXPECT_TRUE(pairing_code_verify_commit(nonce.data(), nonce.size(), commitment.data(),
-                                           commitment.size()));
+    ASSERT_TRUE(commitment.has_value());
+    EXPECT_TRUE(pairing_code_verify_commit(nonce.data(), nonce.size(), commitment->data(),
+                                           commitment->size()));
 }
 
 TEST(PairingCodeCommit, WrongNonceFailsVerify) {
     auto nonce = pairing_generate_nonce();
     auto commitment = pairing_code_commit(nonce.data(), nonce.size());
+    ASSERT_TRUE(commitment.has_value());
     nonce[0] ^= 0xFF;
-    EXPECT_FALSE(pairing_code_verify_commit(nonce.data(), nonce.size(), commitment.data(),
-                                            commitment.size()));
+    EXPECT_FALSE(pairing_code_verify_commit(nonce.data(), nonce.size(), commitment->data(),
+                                            commitment->size()));
+}
+
+TEST(PairingCodeCommit, WrongNonceSizeReturnsNullopt) {
+    std::array<uint8_t, 16> short_nonce{};
+    EXPECT_FALSE(pairing_code_commit(short_nonce.data(), short_nonce.size()).has_value());
+    std::array<uint8_t, 33> long_nonce{};
+    EXPECT_FALSE(pairing_code_commit(long_nonce.data(), long_nonce.size()).has_value());
+    // Control: a nonce of exactly PAIRING_NONCE_SIZE bytes succeeds.
+    auto nonce = pairing_generate_nonce();
+    EXPECT_TRUE(pairing_code_commit(nonce.data(), nonce.size()).has_value());
 }
 
 TEST(PairingCodeCommit, WrongCommitmentSizeFailsVerify) {
@@ -95,7 +108,8 @@ TEST(PairingCodeCommit, Kat) {
         nonce[static_cast<size_t>(i)] = static_cast<uint8_t>(i);
     }
     auto commitment = pairing_code_commit(nonce.data(), nonce.size());
-    EXPECT_EQ(to_hex(commitment),
+    ASSERT_TRUE(commitment.has_value());
+    EXPECT_EQ(to_hex(*commitment),
               "ea08c0aee3c421ace702f31591b3d213e8c371a8a8e3b0be3fd405ed841755a3");
 }
 
