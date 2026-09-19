@@ -375,23 +375,28 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, s
         std::copy(key, key + key_len, k.begin());
     }
 
-    // Inner hash: SHA-512((k XOR ipad) || data)
-    std::array<uint8_t, BLOCK> ipad{};
-    for (size_t i = 0; i < BLOCK; ++i) {
-        ipad[i] = k[i] ^ 0x36u;
+    // One pad buffer serves both passes, and scoping the inner Sha512 lets the compiler reuse
+    // its slot for the outer one: together they keep ~336 bytes off this frame, which sits on
+    // the loop thread under the pairing exchange.
+    std::array<uint8_t, BLOCK> pad{};
+    std::array<uint8_t, SHA512_DIGEST_SIZE> inner_hash{};
+    {
+        // Inner hash: SHA-512((k XOR ipad) || data)
+        for (size_t i = 0; i < BLOCK; ++i) {
+            pad[i] = k[i] ^ 0x36u;
+        }
+        Sha512 inner;
+        inner.update(pad.data(), BLOCK);
+        inner.update(data, data_len);
+        inner_hash = inner.finalize();
     }
-    Sha512 inner;
-    inner.update(ipad.data(), BLOCK);
-    inner.update(data, data_len);
-    auto inner_hash = inner.finalize();
 
     // Outer hash: SHA-512((k XOR opad) || inner_hash)
-    std::array<uint8_t, BLOCK> opad{};
     for (size_t i = 0; i < BLOCK; ++i) {
-        opad[i] = k[i] ^ 0x5Cu;
+        pad[i] = k[i] ^ 0x5Cu;
     }
     Sha512 outer;
-    outer.update(opad.data(), BLOCK);
+    outer.update(pad.data(), BLOCK);
     outer.update(inner_hash.data(), SHA512_DIGEST_SIZE);
     return outer.finalize();
 }
