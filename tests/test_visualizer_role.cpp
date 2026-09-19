@@ -336,6 +336,63 @@ TEST(VisualizerHandleBinary, HandlersRefuseAGenerationATeardownOvertook) {
     EXPECT_EQ(entry[0], SENDSPIN_BINARY_VISUALIZER_BEAT);
 }
 
+// roles/visualizer/v1.md "Server -> Client: stream/start": the served spectrum object, not the
+// requested one, governs how many bins each frame carries, and a stream that names the spectrum
+// type without a spectrum object delivers no spectrum at all. The count handle_stream_start
+// caches is only observable through the drain thread, which needs a live client and time sync, so
+// the rows read it back out of the Impl and run the decode the drain runs with it.
+TEST(VisualizerSpectrumWiring, StreamStartCachesTheServedBinCount) {
+    struct Row {
+        const char* name;
+        std::optional<uint8_t> served_bins;  // nullopt: types names spectrum with no object
+        VisualizerDelivery::Kind expected_kind;
+        std::vector<uint16_t> expected_bins;
+    };
+    const Row rows[] = {
+        {"Control: the served count matches the requested one",
+         4,
+         VisualizerDelivery::Kind::SPECTRUM,
+         {10, 20, 30, 40}},
+        {"a served count below the requested one still governs",
+         2,
+         VisualizerDelivery::Kind::SPECTRUM,
+         {10, 20}},
+        {"the spectrum type with no spectrum object drops every frame",
+         std::nullopt,
+         VisualizerDelivery::Kind::NONE,
+         {}},
+    };
+
+    // Four bins on the wire, the requested count.
+    const std::vector<uint8_t> payload = {0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E, 0x00, 0x28};
+
+    for (const Row& row : rows) {
+        SCOPED_TRACE(row.name);
+        auto impl = make_impl();
+        impl->config.stream.spectrum = VisualizerSpectrumConfig{
+            .n_disp_bins = 4, .scale = VisualizerSpectrumScale::MEL, .f_min = 40, .f_max = 16000};
+
+        ServerVisualizerStreamObject stream;
+        stream.types = {VisualizerDataType::SPECTRUM};
+        if (row.served_bins.has_value()) {
+            stream.spectrum = VisualizerSpectrumConfig{.n_disp_bins = row.served_bins.value(),
+                                                       .scale = VisualizerSpectrumScale::MEL,
+                                                       .f_min = 40,
+                                                       .f_max = 16000};
+        }
+        impl->handle_stream_start(stream, live_generation(*impl));
+
+        std::vector<uint16_t> bins;
+        auto out = decode_visualizer_message(SENDSPIN_BINARY_VISUALIZER_SPECTRUM, payload.data(),
+                                             payload.size(), impl->spectrum_bin_count,
+                                             impl->tracks_downbeats, bins);
+        EXPECT_EQ(out.kind, row.expected_kind);
+        if (out.kind == VisualizerDelivery::Kind::SPECTRUM) {
+            EXPECT_EQ(bins, row.expected_bins);
+        }
+    }
+}
+
 TEST(VisualizerHandleBinary, StreamStartNegotiatesTypes) {
     // handle_stream_start derives the admission mask from the advertised types.
     auto impl = make_impl();
