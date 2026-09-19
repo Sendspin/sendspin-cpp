@@ -1270,17 +1270,36 @@ TEST(Protocol, GoodbyeReasonLifecycleValues) {
 // Pairing-PSK protocol messages
 // ============================================================================
 
-// Determine message type recognizes the two new pairing types.
-TEST(Protocol, DetermineMessageTypePairingTypes) {
+// Every handshake and pairing type string the dispatch recognizes, spelled out as the wire
+// spells it. Reached any other way these literals are only exercised by whole encrypted-lifecycle
+// scenarios, where a typo in one surfaces as a stalled handshake rather than as a wrong type.
+TEST(Protocol, DetermineMessageTypeHandshakeAndPairingTypes) {
+    const struct {
+        const char* type;
+        SendspinServerToClientMessageType expected;
+    } cases[] = {
+        {"noise/handshake", SendspinServerToClientMessageType::NOISE_HANDSHAKE},
+        {"server/pair-init", SendspinServerToClientMessageType::SERVER_PAIR_INIT},
+        {"server/pair-auth", SendspinServerToClientMessageType::SERVER_PAIR_AUTH},
+        {"server/pair-confirm", SendspinServerToClientMessageType::SERVER_PAIR_CONFIRM},
+        {"server/pair-finalize", SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE},
+        {"server/unpair", SendspinServerToClientMessageType::SERVER_UNPAIR},
+        {"pair/abort", SendspinServerToClientMessageType::PAIR_ABORT},
+    };
+
+    for (const auto& test_case : cases) {
+        JsonDocument doc;
+        JsonObject root;
+        ASSERT_TRUE(parse(std::string(R"({"type":")") + test_case.type + R"("})", doc, root));
+        EXPECT_EQ(determine_message_type(root), test_case.expected) << test_case.type;
+    }
+
+    // Control: a type string no entry matches is UNKNOWN, so the table above pins the exact
+    // strings rather than a prefix any near-miss would satisfy.
     JsonDocument doc;
     JsonObject root;
-
-    ASSERT_TRUE(parse(R"({"type":"server/pair-finalize"})", doc, root));
-    EXPECT_EQ(determine_message_type(root),
-              SendspinServerToClientMessageType::SERVER_PAIR_FINALIZE);
-
-    ASSERT_TRUE(parse(R"({"type":"pair/abort"})", doc, root));
-    EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::PAIR_ABORT);
+    ASSERT_TRUE(parse(R"({"type":"server/pair-elsewhere"})", doc, root));
+    EXPECT_EQ(determine_message_type(root), SendspinServerToClientMessageType::UNKNOWN);
 }
 
 // PairAbortReason: every value survives a to_cstr -> from_string round-trip.
