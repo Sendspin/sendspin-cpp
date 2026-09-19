@@ -484,9 +484,11 @@ TEST(VisualizerConfigReporting, HelloAdvertisesCapacityAndStateCarriesTheStreamC
     ASSERT_EQ(hello.supported_roles.size(), 1u);
     EXPECT_EQ(hello.supported_roles[0], SendspinRole::VISUALIZER);
     ASSERT_TRUE(hello.visualizer_support.has_value());
-    // The advertised capacity is the effective wire-data fraction of the ring's RAM budget.
-    EXPECT_LT(hello.visualizer_support->buffer_capacity, 6144u);
-    EXPECT_GT(hello.visualizer_support->buffer_capacity, 0u);
+    // The advertised capacity is the effective wire-data fraction of the ring's RAM budget: a
+    // third of it, since the smallest entries store at about three times their wire size. The
+    // server's flow control is sized from this number, so the fraction is spelled out rather
+    // than bounded.
+    EXPECT_EQ(hello.visualizer_support->buffer_capacity, 2048u);
 
     ClientStateMessage state;
     impl->build_state_fields(state);
