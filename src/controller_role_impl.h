@@ -38,6 +38,9 @@ struct ControllerRole::Impl {
     // ========================================
 
     struct EventState {
+        // Latest-wins only, unlike metadata and color: messaging.md "server/state" scopes a
+        // deferred timestamp to those two objects, so ServerStateControllerObject carries none and
+        // this role needs neither their PendingXStates pair nor their held_state deadline poll.
         InboxSlot<ServerStateControllerObject> slot;
     };
 
