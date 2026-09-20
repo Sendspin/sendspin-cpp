@@ -85,28 +85,28 @@ public:
     /// @param data Pointer to the decoded PCM audio data
     /// @param length Number of bytes to write; always a whole number of PCM frames
     /// @param timeout_ms Maximum time to wait for the write to complete
-    /// @return Number of bytes actually written. Partial writes are allowed but MUST be a
+    /// @return Number of bytes actually written. Partial writes are allowed but must be a
     /// whole number of PCM frames (a multiple of channels * bytes-per-sample): the sync task
     /// counts played frames from this value, so a mid-frame count drifts the playtime estimate
     /// and starts the next write mid-frame.
     virtual size_t on_audio_write(uint8_t* data, size_t length, uint32_t timeout_ms) = 0;
 
-    /// @brief Called when a new audio stream starts. Fires on the main loop thread
+    /// @brief Called when a new audio stream starts
     virtual void on_stream_start() {}
 
-    /// @brief Called when the audio stream ends. Fires on the main loop thread
+    /// @brief Called when the audio stream ends
     ///
     /// Also fires when a server/activate takes the player role out of the session's active roles,
     /// which stops the decode and discards the buffered audio rather than letting it finish.
     virtual void on_stream_end() {}
 
-    /// @brief Called when the volume is changed by the server. Fires on the main loop thread
+    /// @brief Called when the volume is changed by the server
     virtual void on_volume_changed(uint8_t /*volume*/) {}
 
-    /// @brief Called when the mute state is changed by the server. Fires on the main loop thread
+    /// @brief Called when the mute state is changed by the server
     virtual void on_mute_changed(bool /*muted*/) {}
 
-    /// @brief Called when the output delay is changed by the server. Fires on the main loop thread
+    /// @brief Called when the output delay is changed by the server
     virtual void on_output_delay_changed(uint16_t /*delay_ms*/) {}
 };
 
@@ -178,8 +178,7 @@ public:
     /// Main loop only.
     ///
     /// The value is always persisted (if a persistence provider is set), independent of
-    /// adjustability. If adjustability is currently disabled, the stored value has no
-    /// effect on sync timing until adjustability is re-enabled.
+    /// adjustability.
     /// @param delay_ms Output delay in milliseconds
     void update_output_delay(uint16_t delay_ms);
 
@@ -197,23 +196,18 @@ public:
     // ========================================
 
     /// @brief Returns a reference to the current stream parameters
-    /// @return Const reference to the active stream parameters.
     const ServerPlayerStreamObject& get_current_stream_params() const;
 
-    /// @brief Returns the fixed delay in microseconds (from config)
-    /// @return Fixed pipeline delay in microseconds.
+    /// @brief Returns the fixed pipeline delay in microseconds (from config)
     int32_t get_fixed_delay_us() const;
 
     /// @brief Returns true if currently muted
-    /// @return true if muted, false otherwise.
     bool get_muted() const;
 
-    /// @brief Returns the effective output delay in milliseconds
-    /// @return Output delay in milliseconds, or 0 if the delay is not adjustable.
+    /// @brief Returns the effective output delay in milliseconds, or 0 if it is not adjustable
     uint16_t get_output_delay_ms() const;
 
-    /// @brief Returns the current volume level
-    /// @return Current volume level (0-100).
+    /// @brief Returns the current volume level (0-100)
     uint8_t get_volume() const;
 
 private:
