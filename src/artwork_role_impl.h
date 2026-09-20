@@ -110,18 +110,12 @@ struct ArtworkTransfer {
 
 /// @brief Double-buffered image storage for a single artwork slot
 ///
-/// All fields here are guarded by DrainTask::slot_mutex (shared across all slots; artwork is
-/// not a hot path so contention is negligible). The network thread and decode thread both read
-/// and write these fields, so they must never be touched outside that lock:
-///  - write_idx: which buffer the network thread writes to next.
-///  - drain_active / drain_buf_idx: which buffer the decode thread is currently decoding.
-///  - write_generation[i]: bumped every time buffers[i] is overwritten by the network thread.
-///    The decode thread compares this against the generation stamped on the notification it
-///    dequeued to detect whether the buffer was overwritten again before it could be claimed.
-///  - ack_state: only meaningful when the slot has require_frame_done set (see ack_enabled());
-///    tracks whether a delivery is currently un-acked for the slot (see SlotAckState).
-///  - has_parked / parked: while ack_state is not IDLE, at most one newer notification is parked
-///    here (latest-wins) instead of being decoded; it is replayed once the gate reopens.
+/// Every field is guarded by DrainTask::slot_mutex and written by both the network and decode
+/// threads. write_generation[i] is bumped whenever buffers[i] is overwritten, so the decode
+/// thread can compare it against the generation stamped on the notification it dequeued and skip
+/// a buffer that was reused before it could be claimed. ack_state is meaningful only for a slot
+/// with require_frame_done (see ack_enabled()); while it is not IDLE, at most one newer
+/// notification is parked here, latest-wins, and replayed once the gate reopens.
 struct SlotBuffer {
     PlatformBuffer buffers[2];
     uint8_t write_idx{0};
@@ -187,13 +181,12 @@ struct ArtworkRole::Impl {
     void build_state_fields(ClientStateMessage& msg) const;
     /// @brief Handles one artwork binary message, the type byte already stripped by the caller.
     /// @param slot Artwork channel the message's type byte named (0-3).
-    /// @param data The message from its flags byte on.
-    /// @param len Length of `data`, one less than the message's own length.
+    /// @param data The message from its flags byte on; `len` is one less than the message's own.
     /// @return false when the message is a protocol error per roles/artwork/v1.md "Artwork
-    /// (Binary)" and the caller MUST close the connection; true when it was processed or ignored.
+    /// (Binary)" and the caller must close the connection; true when processed or ignored.
     bool handle_binary(uint8_t slot, const uint8_t* data, size_t len);
-    // The lifecycle handlers take the teardown generation the receive gate captured when it
-    // admitted the message and re-check it where they take effect; see accepts().
+    // The lifecycle handlers re-check the admitting generation where they take effect; see
+    // accepts().
     void handle_stream_start(const ServerArtworkStreamObject& stream, uint32_t generation);
     void handle_stream_end(uint32_t generation);
     void handle_stream_clear(uint32_t generation);
