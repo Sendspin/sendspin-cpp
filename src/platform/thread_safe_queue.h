@@ -13,8 +13,16 @@
 // limitations under the License.
 
 /// @file thread_safe_queue.h
-/// @brief Platform-abstracted bounded thread-safe queue backed by a FreeRTOS queue on ESP and a
-/// mutex/condition-variable deque on host
+/// @brief Bounded FIFO queue that is safe to use from multiple threads: a FreeRTOS queue on ESP,
+/// a mutex/condition-variable deque on host
+///
+/// Blocking send() and receive() wait up to a caller-specified timeout when the queue is full or
+/// empty; a non-blocking overwrite() path serves single-item mailbox use.
+///
+/// A blocking receive() can be interrupted from any thread with wake_receiver(), so callers must
+/// treat a false return as "re-check state and retry", not as proof the timeout elapsed. Blocking
+/// receive() assumes a single consumer thread: with several concurrent receivers, one send may
+/// wake only one of them.
 
 #pragma once
 
@@ -32,36 +40,7 @@
 
 namespace sendspin {
 
-/**
- * @brief Bounded FIFO queue that is safe to use from multiple threads
- *
- * Backed by a FreeRTOS queue on ESP and a mutex/condition-variable deque on host.
- * Blocking send() and receive() calls wait up to a caller-specified timeout when
- * the queue is full or empty. A non-blocking overwrite() path is available for
- * single-item mailbox use.
- *
- * A blocking receive() can be interrupted from any thread with wake_receiver(): the
- * blocked (or next blocking) receive returns false immediately without consuming an
- * item. Callers must therefore treat a false return as "re-check state and retry",
- * not as proof the timeout elapsed. Blocking receive() assumes a single consumer
- * thread: with multiple concurrent receivers, one send may wake only one of them.
- *
- * Usage:
- * 1. Declare a ThreadSafeQueue<T> member and call create() with the desired depth
- * 2. Push items with send() from producer threads
- * 3. Pop items with receive() from consumer threads
- * 4. Call reset() to discard all pending items if needed
- *
- * @code
- * ThreadSafeQueue<int> q;
- * q.create(8);
- *
- * q.send(42, 100);
- *
- * int val;
- * q.receive(val, UINT32_MAX);
- * @endcode
- */
+/// @brief Bounded thread-safe FIFO queue (ESP-IDF implementation)
 template <typename T>
 class ThreadSafeQueue {
 public:
@@ -80,9 +59,7 @@ public:
     ThreadSafeQueue& operator=(const ThreadSafeQueue&) = delete;
 
     /// @brief Creates the queue with the given maximum depth
-    /// @param max_depth Maximum number of items the queue can hold.
     /// @param memory_caps ESP-IDF memory capability flags (e.g., MALLOC_CAP_SPIRAM).
-    /// @return true on success.
     bool create(size_t max_depth, uint32_t memory_caps = 0) {
         if (memory_caps != 0) {
             this->handle_ = xQueueCreateWithCaps(max_depth, sizeof(T), memory_caps);
@@ -101,16 +78,13 @@ public:
         return true;
     }
 
-    /// @brief Returns true if the queue has been successfully created
-    /// @return true if the queue is ready for use.
+    /// @brief Whether the queue has been created
     bool is_created() const {
         return this->handle_ != nullptr;
     }
 
     /// @brief Sends an item to the back of the queue; blocks up to timeout_ms if full
-    /// @param item Item to send.
     /// @param timeout_ms Milliseconds to wait if the queue is full (UINT32_MAX = wait forever).
-    /// @return true if the item was sent successfully.
     bool send(const T& item, uint32_t timeout_ms) {
         bool ok = xQueueSend(this->handle_, &item, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
         if (ok) {
@@ -146,26 +120,19 @@ public:
         return xQueueReceive(this->handle_, &item, 0) == pdTRUE;
     }
 
-    /// @brief Wakes the consumer out of a blocking receive() without providing an item
-    ///
-    /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
-    /// collapse into one, and a wake that races an arriving item may be absorbed by that
-    /// item's delivery, so callers must re-check their stop/command state after every
-    /// receive() return, not only after false returns. Safe to call from any thread.
+    /// @brief Wakes the consumer out of a blocking receive(); one-shot, redundant wakes
+    /// collapse, and a wake racing an arriving item may be absorbed by that item's delivery.
+    /// Safe to call from any thread.
     void wake_receiver() {
         xSemaphoreGive(this->items_or_wake_sem_);
     }
 
     /// @brief Peeks at the front item without removing it; returns false if empty
-    /// @param[out] item Populated with the front item on success.
-    /// @return true if the queue was non-empty.
     bool peek(T& item) const {
         return xQueuePeek(this->handle_, &item, 0) == pdTRUE;
     }
 
     /// @brief Overwrites the back item (or enqueues if empty); never blocks
-    /// @param item Item to write.
-    /// @return true on success.
     bool overwrite(const T& item) {
         bool ok = xQueueOverwrite(this->handle_, &item) == pdTRUE;
         if (ok) {
@@ -199,35 +166,7 @@ private:
 
 namespace sendspin {
 
-/**
- * @brief Bounded FIFO queue that is safe to use from multiple threads
- *
- * Backed by a mutex/condition-variable deque on host. Blocking send() and receive()
- * calls wait up to a caller-specified timeout when the queue is full or empty. A
- * non-blocking overwrite() path is available for single-item mailbox use.
- *
- * A blocking receive() can be interrupted from any thread with wake_receiver(): the
- * blocked (or next blocking) receive returns false immediately without consuming an
- * item. Callers must therefore treat a false return as "re-check state and retry",
- * not as proof the timeout elapsed. Blocking receive() assumes a single consumer
- * thread: with multiple concurrent receivers, one send may wake only one of them.
- *
- * Usage:
- * 1. Declare a ThreadSafeQueue<T> member and call create() with the desired depth
- * 2. Push items with send() from producer threads
- * 3. Pop items with receive() from consumer threads
- * 4. Call reset() to discard all pending items if needed
- *
- * @code
- * ThreadSafeQueue<int> q;
- * q.create(8);
- *
- * q.send(42, 100);
- *
- * int val;
- * q.receive(val, UINT32_MAX);
- * @endcode
- */
+/// @brief Bounded thread-safe FIFO queue (host implementation)
 template <typename T>
 class ThreadSafeQueue {
 public:
@@ -239,25 +178,20 @@ public:
     ThreadSafeQueue& operator=(const ThreadSafeQueue&) = delete;
 
     /// @brief Creates the queue with the given maximum depth
-    /// @param max_depth Maximum number of items the queue can hold.
     /// @param memory_caps Ignored on host.
-    /// @return true on success.
     bool create(size_t max_depth, uint32_t /*memory_caps*/ = 0) {
         this->max_depth_ = max_depth;
         this->created_ = true;
         return true;
     }
 
-    /// @brief Returns true if the queue has been successfully created
-    /// @return true if the queue is ready for use.
+    /// @brief Whether the queue has been created
     bool is_created() const {
         return this->created_;
     }
 
     /// @brief Sends an item to the back of the queue; blocks up to timeout_ms if full
-    /// @param item Item to send.
     /// @param timeout_ms Milliseconds to wait if the queue is full (UINT32_MAX = wait forever).
-    /// @return true if the item was sent successfully.
     bool send(const T& item, uint32_t timeout_ms) {
         std::unique_lock<std::mutex> lock(this->mtx_);
         if (this->items_.size() >= this->max_depth_) {
@@ -309,12 +243,9 @@ public:
         return true;
     }
 
-    /// @brief Wakes the consumer out of a blocking receive() without providing an item
-    ///
-    /// One-shot: the blocked (or next blocking) receive() returns early. Redundant wakes
-    /// collapse into one, and a wake that races an arriving item may be absorbed by that
-    /// item's delivery, so callers must re-check their stop/command state after every
-    /// receive() return, not only after false returns. Safe to call from any thread.
+    /// @brief Wakes the consumer out of a blocking receive(); one-shot, redundant wakes
+    /// collapse, and a wake racing an arriving item may be absorbed by that item's delivery.
+    /// Safe to call from any thread.
     void wake_receiver() {
         {
             std::lock_guard<std::mutex> lock(this->mtx_);
@@ -324,8 +255,6 @@ public:
     }
 
     /// @brief Peeks at the front item without removing it; returns false if empty
-    /// @param[out] item Populated with the front item on success.
-    /// @return true if the queue was non-empty.
     bool peek(T& item) const {
         std::lock_guard<std::mutex> lock(this->mtx_);
         if (this->items_.empty()) {
@@ -336,8 +265,6 @@ public:
     }
 
     /// @brief Overwrites the back item (or enqueues if empty); never blocks
-    /// @param item Item to write.
-    /// @return true on success.
     bool overwrite(const T& item) {
         std::lock_guard<std::mutex> lock(this->mtx_);
         if (this->items_.empty()) {
