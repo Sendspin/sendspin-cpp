@@ -33,30 +33,23 @@ class SendspinClient;
 /// thread-safe with respect to the other callbacks. on_image_display() and on_image_clear()
 /// fire on the main loop thread.
 ///
-/// ACK GATE (opt-in per slot via ImageSlotPreference::require_frame_done): a "delivery" is
-/// either a frame (on_image_decode() followed later by on_image_display()) or a clear
-/// (on_image_clear()). Call ArtworkRole::frame_done(slot) exactly once for every
-/// on_image_display() and on_image_clear() that slot receives. An extra call is a harmless no-op,
-/// but a missed one wedges the slot forever: there is no timeout.
-///
-/// For an ack-enabled slot, at most one un-acked delivery is ever in flight. The two ways a clear
-/// reaches the gate differ, so they are worth keeping apart:
+/// ACK GATE (opt-in per slot via ImageSlotPreference::require_frame_done): a "delivery" is either
+/// a frame (on_image_decode() then on_image_display()) or a clear (on_image_clear()). Call
+/// ArtworkRole::frame_done(slot) once for every on_image_display() and on_image_clear() a gated
+/// slot receives. An extra call is a no-op; a missed one wedges the slot, since there is no
+/// timeout. At most one un-acked delivery is in flight:
 ///  - A payload (a frame, or the server's per-channel clear for that slot) arriving while a
-///    delivery is un-acked is buffered latest-wins and delivered only after frame_done(slot), and
-///    then owes its own frame_done(). It waits behind the outstanding delivery rather than
-///    replacing it, so a consumer presenting a delivery is never interrupted. A delivery not yet
-///    displayed is the exception: it is released outright (see the last paragraph) and the
-///    buffered payload follows.
-///  - A stream end or stream clear is a lifecycle event, not a payload, so it is never buffered:
-///    it fires on_image_clear() immediately for every configured slot, discards anything buffered,
-///    and replaces whatever delivery was outstanding. Exactly one frame_done() is owed afterward
-///    whatever was in flight, including when it lands on an un-acked per-channel clear, which
-///    fires on_image_clear() again and still owes exactly one ack.
+///    delivery is un-acked is buffered latest-wins and delivered after frame_done(slot), then owes
+///    its own. It waits behind the outstanding delivery rather than replacing it, so a consumer
+///    presenting a delivery is never interrupted.
+///  - A stream end or clear is a lifecycle event, not a payload: it fires on_image_clear()
+///    immediately for every configured slot, discards anything buffered, replaces whatever was
+///    outstanding, and owes one frame_done() afterwards.
 ///
-/// A frame that was decoded but never displayed is released automatically whenever its display
-/// can no longer fire: a stream restart, and the server replacing or cancelling that image before
-/// its display was due. A delivery that already reached on_image_display()/on_image_clear() stays
-/// gated until frame_done() is called.
+/// A frame decoded but never displayed is released automatically when its display can no longer
+/// fire (a stream restart; the server replacing or cancelling the image before its display was
+/// due). A delivery that reached on_image_display()/on_image_clear() stays gated until
+/// frame_done().
 class ArtworkRoleListener {
 public:
     virtual ~ArtworkRoleListener() = default;
@@ -81,13 +74,12 @@ public:
     /// finishes decoding before the pending display fires, the older pending display is
     /// superseded and only the newer one is delivered.
     /// @param slot The artwork slot index.
-    /// @param lateness_ms How far past the (offset-shifted) deadline this display fired. Displays
-    /// are best-effort: an image that arrives or decodes after its deadline fires as soon as it
-    /// is ready, and lateness_ms reports the slip so a consumer can compensate (e.g. shorten a
-    /// cross-fade by the lateness so it still ends on schedule, or snap instantly on a huge
-    /// value). On-time displays report a few milliseconds of main-loop polling granularity, never
-    /// exactly 0, so treat small values as on time. Reports 0 when there is no connection, since
-    /// no deadline exists.
+    /// @param lateness_ms How far past the (offset-shifted) deadline this display fired, so a
+    /// consumer can compensate (e.g. shorten a cross-fade by the lateness). Displays are
+    /// best-effort: an image that arrives or decodes after its deadline fires as soon as it is
+    /// ready. On-time displays report a few milliseconds of main-loop polling granularity, so
+    /// treat small values as on time. Reports 0 when there is no connection, since no deadline
+    /// exists.
     virtual void on_image_display(uint8_t /*slot*/, uint32_t /*lateness_ms*/) {}
 
     /// @brief Called on the main loop thread when artwork should be cleared for a slot
@@ -122,9 +114,8 @@ public:
  * declares larger than the slot's ImageSlotPreference::max_image_bytes is refused rather than
  * buffered, so a slot's memory is bounded by the budget the consumer set for it.
  *
- * A slot may opt into a back-pressure gate via ImageSlotPreference::require_frame_done: see
- * the ArtworkRoleListener class comment for the ack contract. Call frame_done() once the
- * consumer has finished presenting a delivery for such a slot.
+ * A slot may opt into a back-pressure gate via ImageSlotPreference::require_frame_done; see
+ * ArtworkRoleListener for the ack contract.
  *
  * Usage:
  * 1. Implement ArtworkRoleListener with on_image_decode() and on_image_display()
@@ -139,9 +130,7 @@ public:
  *         decoded_images[slot] = decode(data, length, format);
  *     }
  *     void on_image_display(uint8_t slot, uint32_t lateness_ms) override {
- *         // Slot 0 has require_frame_done set, so this starts a cross-fade; frame_done() is
- *         // called once the fade finishes instead of immediately. Shortening the fade by the
- *         // lateness keeps it ending on schedule even when the image arrived late.
+ *         // Slot 0 is ack-gated: frame_done() is called when the fade finishes.
  *         display.start_fade(slot, decoded_images[slot], FADE_MS - std::min(lateness_ms, FADE_MS));
  *     }
  *     void on_image_clear(uint8_t slot) override {
@@ -176,9 +165,7 @@ public:
     ArtworkRole(ArtworkRoleConfig config, SendspinClient* client);
     ~ArtworkRole();
 
-    /// @brief Sets the listener for artwork events
-    /// @note The listener must outlive this role.
-    /// @param listener Pointer to the listener implementation; must outlive this role
+    /// @brief Sets the listener for artwork events; it must outlive this role
     void set_listener(ArtworkRoleListener* listener);
 
     /// @brief Acknowledges the most recent delivery for an ack-gated slot, releasing the gate
