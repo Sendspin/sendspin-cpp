@@ -886,8 +886,8 @@ struct ServerPairConfirmPayload {
 // Protocol functions
 // ============================================================================
 
-// Every process_*() below takes the parsed JSON object and fills a caller-owned struct in place,
-// returning false on a missing or malformed required field.
+// Every process_*() below takes the parsed JSON object and fills the caller-owned output it is
+// handed, returning false on a missing or malformed required field.
 
 /// @brief Determines the message type of an incoming server-to-client JSON message; UNKNOWN if
 /// not recognized

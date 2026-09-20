@@ -1175,8 +1175,9 @@ protected:
     std::atomic<PskCategory> psk_category_{PskCategory::SENTINEL};
 
     /// Hello handshake state. Atomic because it is set from the send-completion callback (the httpd
-    /// worker thread on ESP) and the disconnect handlers (network thread), while
-    /// is_handshake_complete() and the pre-hello send gate read it from other threads.
+    /// worker thread on ESP) and the disconnect handlers (network thread), which only the outbound
+    /// transports install: a dropped inbound connection is torn down, not reused. Read by
+    /// is_handshake_complete() and the pre-hello send gate from other threads.
     std::atomic<bool> client_hello_sent_{false};
 
     /// True once the Noise transport handshake has completed (set on the network thread,

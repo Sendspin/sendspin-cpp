@@ -397,8 +397,9 @@ enum class SendspinImageSource : uint8_t {
 /// @brief Preference for an image slot's format and resolution
 struct ImageSlotPreference {
     /// @brief Default max_image_bytes: 128 KiB per artwork channel, which holds any JPEG a
-    /// 320x320 channel receives, with room for a larger channel, and bounds a four-channel role
-    /// at 1 MiB of image buffers. That budget assumes PSRAM: on a part without
+    /// 320x320 channel receives (a noisy worst case measures about 78 KB, though a high-entropy
+    /// PNG at that size can exceed the default), with room for a larger channel, and bounds a
+    /// four-channel role at 1 MiB of image buffers. That budget assumes PSRAM: on a part without
     /// it, lower this per channel to what internal RAM can spare, or the first announce of an
     /// image the heap cannot hold is refused and the channel shows nothing.
     static constexpr uint32_t DEFAULT_MAX_IMAGE_BYTES = 128U * 1024U;
@@ -430,12 +431,12 @@ struct ImageSlotPreference {
     /// announces as larger is refused before any of it is allocated: the transfer is followed to
     /// its end with its bytes dropped and the channel keeps whatever it was showing, rather than
     /// the heap being exhausted. Raise it for a channel whose images are genuinely larger; the
-    /// role logs every image it refuses,
-    /// with the cap it was measured against. Two buffers are held per channel, so the role's
-    /// image memory is bounded by twice this value per configured channel, and only while the
-    /// role is running: a buffer grows to the largest image its channel received and is handed
-    /// back when the role is torn down (a stop, a disconnect, or a server/activate that removes
-    /// the role), then re-allocated by the next transfer. A channel with 0 here holds nothing.
+    /// role logs every image it refuses, with the cap it was measured against. Two buffers are held
+    /// per channel, so the role's image memory is bounded by twice this value per configured
+    /// channel, and only while the role is running: a buffer grows to the largest image its channel
+    /// received and is handed back when the role is torn down (a stop, a disconnect, or a
+    /// server/activate that removes the role), then re-allocated by the next transfer. A channel
+    /// with 0 here holds nothing.
     uint32_t max_image_bytes{DEFAULT_MAX_IMAGE_BYTES};
 };
 

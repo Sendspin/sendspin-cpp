@@ -87,8 +87,10 @@ int64_t resolve_liveness_timeout_ms(const SendspinClientConfig& config);
 ///
 /// stop() waits this long times the number of goodbyes it issued: on the ESP server path every
 /// goodbye is queued to the single httpd worker and handed to lwIP in turn, so a fixed bound
-/// would let the last of several peers lose its goodbye to the close. Send completion is
-/// best-effort, so this caps how long stop() blocks, never a guarantee the goodbye arrived.
+/// would let the last of several peers lose its goodbye to the close. Per goodbye that is a few
+/// scheduler quanta for the worker to dequeue the frame; the host transports send synchronously,
+/// so the wait resolves before it starts. Send completion is best-effort, so this caps how long
+/// stop() blocks, never a guarantee the goodbye arrived.
 static constexpr uint32_t GOODBYE_FLUSH_TIMEOUT_MS = 50;
 
 /// @brief Counts the goodbye sends stop() is waiting on
@@ -280,7 +282,7 @@ struct PairingUiSnapshot {
  * decisions, and performs graceful disconnection with deferred cleanup.
  *
  * Connections prove themselves before they are trusted: every new connection enters a bounded
- * nursery and leaves it only by completing the hello handshake AND being admitted by its first
+ * nursery and leaves it only by completing the hello handshake and being admitted by its first
  * server/activate (promotion, or a fair arbitration against the incumbent) or by missing the
  * establish deadline (reaped). The prove stage starts with the Noise handshake:
  * accept/connect -> Noise handshake complete -> hello handshake complete -> first
@@ -339,7 +341,7 @@ public:
     /// cleanup is the caller's job: this only detaches connections. Main-loop thread only.
     /// @param reason The goodbye reason sent to every connected peer.
     /// @return The pairing prompts the dropped connections left showing. The caller dismisses
-    ///         them (SendspinClient::note_clear_pairing_code() / note_close_pairing_window()) AFTER
+    ///         them (SendspinClient::note_clear_pairing_code() / note_close_pairing_window()) after
     ///         its own cleanup_connection_state(), which would otherwise wipe the queued notes.
     PairingUiSnapshot stop(SendspinGoodbyeReason reason);
 
@@ -598,7 +600,8 @@ private:
     /// @brief Refreshes pending_record_ops_size_ from pending_record_ops_.size().
     void refresh_record_ops_size_hint();
 
-    /// @brief Appends an entry to nursery_ and refreshes the hint.
+    /// @brief Appends an entry to nursery_ and refreshes the hint. Caller must hold
+    /// conn_ptr_mutex_.
     void push_nursery_entry(NurseryEntry entry);
 
     /// @brief Assigns current_connection_ and refreshes has_current_. Pass nullptr to clear the
@@ -608,7 +611,7 @@ private:
     void set_current_connection(std::shared_ptr<SendspinConnection> conn);
 
     /// @brief Admits the connection staged by the last set_current_connection(), if any.
-    /// Caller must NOT hold conn_ptr_mutex_: admission replays the held role messages under
+    /// Caller must not hold conn_ptr_mutex_: admission replays the held role messages under
     /// SendspinClient's json_processing_mutex_, which the lock order in docs/conventions.md
     /// ("Threading and cross-thread state") places outside conn_ptr_mutex_. Staging and flushing
     /// are both main-loop-only and happen in the same call, so the staged slot cannot go stale.
@@ -669,7 +672,8 @@ private:
     // ========================================
     // Hello handshake
     // ========================================
-    /// @brief Arms the hello retry state so loop() will send the hello on its next tick.
+    /// @brief Arms the hello retry state so loop() will send the hello on its next tick. Caller
+    /// must hold conn_ptr_mutex_.
     /// Only ever called for a nursery member: a connection sends exactly one client/hello, while
     /// it is proving itself.
     /// @param conn The connection to send the hello to.
@@ -680,7 +684,8 @@ private:
     /// @return True if done (sent or connection invalid), false if the send failed and should
     /// retry.
     bool send_hello_message(uint8_t remaining_attempts, SendspinConnection* conn);
-    /// @brief Removes any pending hello-retry entry associated with the given connection.
+    /// @brief Removes any pending hello-retry entry associated with the given connection. Caller
+    /// must hold conn_ptr_mutex_.
     /// @param conn The connection whose retry state should be dropped.
     void remove_hello_retry(const SendspinConnection* conn);
     /// @brief Returns true if conn already has a pending hello-retry entry. Caller must hold
@@ -794,6 +799,7 @@ private:
     // ========================================
     // Pairing main-loop handlers
     // ========================================
+    // Every function in this section runs on the main loop with conn_ptr_mutex_ held.
 
     /// @brief Enters the pairing exchange for the given connection.
     /// Called on the main loop when an admitted server/activate declares the PAIRING activity
@@ -861,6 +867,7 @@ private:
     // ========================================
     // Pairing-code main-loop handlers
     // ========================================
+    // Every function in this section runs on the main loop with conn_ptr_mutex_ held.
 
     /// @brief Handle a server pairing-code message on the main loop: advances the PairingStep
     /// state machine for the connection. `conn` must be non-null.
@@ -964,6 +971,7 @@ private:
     // ========================================
     // Unpair main-loop handler
     // ========================================
+    // Every function in this section runs on the main loop with conn_ptr_mutex_ held.
 
     /// @brief Handles a server/unpair event on the main loop: checks PSK category (LONG_TERM
     /// only), removes the matched record, and disconnects with the UNPAIRED reason. `conn` must

@@ -683,14 +683,14 @@ void ConnectionManager::drain_lifecycle_events(DrainedEvents& ev) {
     }
 
     // server/activate events: trust enforcement, operational gating, and admission
-    // arbitration. ALL decisions (admissibility, arbitration, RecordStore mutations)
+    // arbitration. All decisions (admissibility, arbitration, RecordStore mutations)
     // happen here on the main loop thread, never on the network thread.
     for (auto& event : ev.activates) {
         this->process_activate_event(event);
     }
 
     // Promotion/arbitration scan: handles every nursery entry that has proven itself
-    // (is_operational(): hello handshake complete AND first server/activate applied and
+    // (is_operational(): hello handshake complete and first server/activate applied and
     // admissible; trust was already checked above, for every activate event, including
     // ones that arrived before the hello completed). Level-triggered rather than
     // edge-triggered on the activate events just processed, because hello completion is
@@ -764,7 +764,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // may have drifted from the supported_pair_methods advertised at hello time. When
     // it is not, reply pair/abort(method_not_supported) and leave the connection open
     // (unlike the reasons above, this does not close the connection).
-    // A pairing activate that names NO usable method (pairing object absent, or a
+    // A pairing activate that names no usable method (pairing object absent, or a
     // method string this client does not recognize; process_server_activate_message
     // logs the raw value) cannot start any flow.
     if (is_pairing_activate && !event.pairing_method.has_value()) {
@@ -779,7 +779,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
                                  (event.conn->get_psk_category() == PskCategory::PAIRING);
         // "Currently offered" mirrors exactly what build_hello_message() advertises
         // in supported_pair_methods (client.cpp): the RecordStore's live enabled
-        // flags AND the platform-capability configuration (a device that lists no
+        // flags and the platform-capability configuration (a device that lists no
         // out-channel or emission format never offers dynamic_pairing_code,
         // regardless of the enabled flag).
         const RecordStore& rs = *this->client_->record_store_;
@@ -835,7 +835,7 @@ void ConnectionManager::process_activate_event(ServerActivateEvent& event) {
     // store's order. Eviction is the only reader of it, and it cannot take this record anyway
     // while the connection that just activated is open (store_record_superseding()).
     //
-    // Read the psk_id ONCE into a local. is_first is true again after every in-band
+    // Read the psk_id once into a local. is_first is true again after every in-band
     // re-handshake (see the comment below), and a server may start the next
     // re-handshake while this activate is still queued, so a second read here could
     // straddle a network-thread rewrite and disagree with the first.
@@ -1585,7 +1585,7 @@ void ConnectionManager::set_current_connection(std::shared_ptr<SendspinConnectio
     // connection is being re-set.
     //
     // This only covers an occupant still sitting in the slot. drop_connection() moves the
-    // outgoing connection out BEFORE calling here, so it clears the flag itself; keep the two
+    // outgoing connection out before calling here, so it clears the flag itself; keep the two
     // in step if either changes.
     if (this->current_connection_ != nullptr && this->current_connection_ != conn) {
         this->current_connection_->set_admitted(false);
@@ -1633,7 +1633,7 @@ void ConnectionManager::flush_pending_record_ops() {
         ops.swap(this->pending_record_ops_);
         this->refresh_record_ops_size_hint();
     }
-    // Every records op rewrites the WHOLE array, so applying their RAM halves first and saving
+    // Every records op rewrites the whole array, so applying their RAM halves first and saving
     // once expresses the same final state in one NVS erase cycle instead of one per op. The
     // last-played value is a different key and keeps its own write.
     bool records_dirty = false;
@@ -1911,7 +1911,7 @@ std::vector<NurseryEntry>::iterator ConnectionManager::promote_or_arbitrate_nurs
         SS_LOGI(TAG, "Admission arbitration: reject incoming (keep current)");
         // Pairing connections receive pair/abort first (the reference dismissal for a displaced
         // pairing attempt); the subsequent goodbye from queue_deferred_release is a benign
-        // over-send.
+        // over-send, since the transport layer has no close-without-goodbye path to use instead.
         if (conn->has_activity(SendspinActivity::PAIRING)) {
             conn->send_app_json(format_pair_abort_message(PairAbortReason::CONCURRENT_ATTEMPT),
                                 nullptr);
@@ -1976,7 +1976,7 @@ void ConnectionManager::handle_enter_pairing(SendspinConnection* conn) {
 
     // The pairing server/activate counter (pairing.md "Pairing index") was already bumped by the
     // caller at the point this activate was received (see the activate-events loop in
-    // drain_lifecycle_events()). Do NOT bump again here: this handler can also be reached well
+    // drain_lifecycle_events()). Do not bump again here: this handler can also be reached well
     // after reception (the "subsequent activate transitions into pairing" branch applies the
     // activate first, then calls this), so bumping here would double-count or use a stale value.
     // The current value is captured into the pairing session below for the code-based branches
@@ -2367,7 +2367,7 @@ void ConnectionManager::handle_pair_auth(SendspinConnection* conn,
 
     // Derive the MAC key from the server's share (pake_msg_1).
     // A derive failure means the peer share has the wrong length or encodes a
-    // low-order point (a malformed or hostile share), NOT a wrong code: a wrong code
+    // low-order point (a malformed or hostile share), not a wrong code: a wrong code
     // still produces a well-formed, non-low-order shared secret that only fails the
     // confirm-tag check in handle_pair_confirm().
     //

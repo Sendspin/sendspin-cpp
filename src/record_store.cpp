@@ -359,7 +359,8 @@ bool RecordStore::store_record_superseding(SendspinPairingRecord record,
         if (!will_supersede_existing && !this->has_capacity_locked() &&
             !this->evict_one_locked(psk_ids_in_use)) {
             // Only reachable if every record at capacity backs an open connection, which the
-            // connection budget rules out (see MIN_MAX_RECORDS).
+            // connection budget rules out (see MIN_MAX_RECORDS). Fails closed: the connection
+            // drops when the server rekeys onto a PSK this store cannot resolve.
             SS_LOGW(TAG, "Storage full (%zu/%zu) and nothing evictable; rejecting record %s",
                     this->records_.size(), this->max_records_, incoming_psk_id.c_str());
             return false;

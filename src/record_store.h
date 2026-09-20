@@ -107,8 +107,9 @@ struct ResolvedPsk {
 /// goes through `resolve_by_psk_id` (network thread, Noise handshake and re-handshake) or the
 /// one network-thread mutator, `store_record_superseding`, which is RAM-only and defers its
 /// provider flush, `persist_records`, to the main loop. The pairing config and `pairing_psk_`
-/// are seeded by the constructor and never written again, so their getters need no lock. No
-/// provider call is ever made under `mutex_`.
+/// are seeded by the constructor and never written again, so `pairing_psk()` and the config
+/// getters are the one exception: they read without the lock. No provider call is ever made
+/// under `mutex_`.
 class RecordStore {
 public:
     /// @brief Default cap on retained long-term records; mirrors
