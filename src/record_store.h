@@ -210,7 +210,6 @@ public:
     // Pairing PSK (the one the client accepts to admit a new server)
     // ========================================
 
-    /// @brief Return the accepted Pairing PSK, if any.
     [[nodiscard]] const std::optional<SendspinPairingPsk>& pairing_psk() const {
         return this->pairing_psk_;
     }
@@ -219,17 +218,14 @@ public:
     // Pairing config
     // ========================================
 
-    /// @brief Return whether Pairing-PSK pairing is enabled.
     [[nodiscard]] bool pairing_psk_enabled() const {
         return this->pairing_psk_enabled_;
     }
 
-    /// @brief Return whether unpaired (Sentinel) access is allowed.
     [[nodiscard]] bool unpaired_access_enabled() const {
         return this->unpaired_access_enabled_;
     }
 
-    /// @brief Return whether dynamic-pairing-code pairing is enabled.
     [[nodiscard]] bool dynamic_pairing_code_enabled() const {
         return this->dynamic_pairing_code_enabled_;
     }
@@ -238,12 +234,10 @@ public:
     // Static pairing code
     // ========================================
 
-    /// @brief Return the configured static pairing code, if any.
     [[nodiscard]] const std::optional<std::string>& static_pairing_code() const {
         return this->static_pairing_code_;
     }
 
-    /// @brief Return whether static-pairing-code pairing is enabled.
     [[nodiscard]] bool static_pairing_code_enabled() const {
         return this->static_pairing_code_enabled_;
     }
