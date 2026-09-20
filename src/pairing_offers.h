@@ -33,12 +33,14 @@
 
 namespace sendspin {
 
+// Each predicate below reads the client config and the record store's pairing-config flags, and
+// returns true when the method may be advertised and accepted.
+
 /// @brief Whether the client offers the Pairing PSK method.
+/// `config` is unused; it is taken for call-site symmetry, since the store alone configures this
+/// method.
 /// The method needs an actual Pairing PSK behind it (normally auto-provisioned on first boot):
 /// advertising it without one offers a server a flow whose handshake could only miss.
-/// @param config Unused; kept for call-site symmetry, since the store alone configures the method.
-/// @param store Record store holding the pairing-config flags and the Pairing PSK.
-/// @return true when the method may be advertised and accepted.
 inline bool offers_pairing_psk(const SendspinClientConfig& /*config*/, const RecordStore& store) {
     return store.pairing_psk_enabled() && store.pairing_psk().has_value();
 }
@@ -47,9 +49,6 @@ inline bool offers_pairing_psk(const SendspinClientConfig& /*config*/, const Rec
 /// pairing.md "client/hello pair-method descriptor" makes `out_channels` and `formats` required,
 /// and a descriptor with no recognized channel or format is ignored outright, so a device that
 /// lists neither cannot offer the method.
-/// @param config Client configuration supplying the out-channels and emission formats.
-/// @param store Record store holding the pairing-config flags.
-/// @return true when the method may be advertised and accepted.
 inline bool offers_dynamic_pairing_code(const SendspinClientConfig& config,
                                         const RecordStore& store) {
     return store.dynamic_pairing_code_enabled() && !config.pairing_code_out_channels.empty() &&
@@ -62,9 +61,6 @@ inline bool offers_dynamic_pairing_code(const SendspinClientConfig& config,
 /// messaging.md "client/hello" permits at most one pairing-code method in
 /// `supported_pair_methods`, and pairing.md "Methods" prefers the dynamic code wherever an
 /// out-channel exists.
-/// @param config Client configuration supplying the pairing-window capability.
-/// @param store Record store holding the pairing-config flags and the static code.
-/// @return true when the method may be advertised and accepted.
 inline bool offers_static_pairing_code(const SendspinClientConfig& config,
                                        const RecordStore& store) {
     return config.pairing_window_supported && store.static_pairing_code_enabled() &&
@@ -75,9 +71,6 @@ inline bool offers_static_pairing_code(const SendspinClientConfig& config,
 /// A nullopt format is one the activation omitted or named unrecognizably, which is equally not
 /// offered (messaging.md "server/activate" requires the field on a dynamic_pairing_code
 /// activation).
-/// @param config Client configuration supplying the advertised `formats` list.
-/// @param format Format the activation selected, or nullopt when it named none.
-/// @return true when the client advertises `format`.
 inline bool offers_pairing_code_format(const SendspinClientConfig& config,
                                        const std::optional<SendspinPairingCodeFormat>& format) {
     return format.has_value() &&

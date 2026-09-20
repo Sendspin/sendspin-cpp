@@ -121,21 +121,19 @@ public:
     /// @brief Supplies the connection manager the stream pin is resolved from and handed back to
     /// Call once at role registration, before start(). The manager outlives the task: the client
     /// destroys its roles before it destroys the manager.
-    /// @param manager The owning client's connection manager.
     void attach_connection_manager(ConnectionManager& manager) {
         this->conn_manager_ = &manager;
     }
 
     /// @brief Initializes queues and creates the encoded ring buffer
-    /// @param player_impl The owning PlayerRole::Impl, used for delay, listener, and state updates.
-    /// @param buffer_size Size of the encoded audio ring buffer in bytes.
-    /// @return true on success, false on allocation failure.
+    /// @param player_impl The owning PlayerRole::Impl, used for delay, listener, and state
+    ///        updates.
+    /// @return false on allocation failure.
     bool init(PlayerRole::Impl* player_impl, size_t buffer_size);
 
     /// @brief Creates and starts the persistent sync background thread
     /// Call once after init(). The thread idles until a codec header arrives in the ring buffer.
     /// @param task_stack_in_psram Whether to allocate the task stack in PSRAM (ESP-IDF only).
-    /// @return true if thread started successfully, false otherwise.
     bool start(bool task_stack_in_psram, unsigned priority);
 
     /// @brief Signals the task to stop, joins the thread, and discards buffered audio
@@ -143,17 +141,15 @@ public:
     /// the thread is not running. Main-loop thread only: joins the sync thread.
     void stop();
 
-    /// @brief Returns true if init() has been called successfully
-    /// @return true if the sync task has been initialized, false otherwise.
+    /// @brief Whether init() has been called successfully
     bool is_initialized() const {
         // Both members are checked so a partially failed init() (flags created, ring buffer
         // allocation failed) leaves every signal/query path safely inert.
         return this->event_flags_.is_created() && this->encoded_ring_buffer_ != nullptr;
     }
 
-    /// @brief Returns true if the sync task is actively processing a stream
-    /// Returns false when idle (waiting for a stream) or stopped.
-    /// @return true if actively decoding and syncing a stream.
+    /// @brief Whether the sync task is actively decoding and syncing a stream; false when idle
+    /// (waiting for a stream) or stopped.
     bool is_running() const {
         // Guarded so callers may query before init(); reading uncreated event flags is a
         // null-handle crash on ESP
@@ -184,24 +180,20 @@ public:
 
     /// @brief Writes an encoded audio chunk into the ring buffer
     /// Called from the client's audio chunk callback (may be any thread).
-    /// @param data Pointer to the audio data.
-    /// @param data_size Size of the audio data in bytes.
     /// @param timestamp Server timestamp for this chunk.
-    /// @param chunk_type Type of audio chunk.
-    /// @param timeout_ms Milliseconds to wait if buffer is full (UINT32_MAX = wait forever).
-    /// @return true if successfully written, false if buffer full or error.
+    /// @param timeout_ms Milliseconds to wait if the buffer is full (UINT32_MAX = wait forever).
+    /// @return false if the buffer is full or on error.
     bool write_audio_chunk(const uint8_t* data, size_t data_size, int64_t timestamp,
                            ChunkType chunk_type, uint32_t timeout_ms);
 
     /// @brief Called by the audio output when it has played audio frames
     /// Thread-safe: may be called from any context.
-    /// @param frames Number of audio frames played.
     /// @param timestamp Client timestamp when the audio finished playing.
     void notify_audio_played(uint32_t frames, int64_t timestamp);
 
 protected:
-    /// @brief Entry point for the persistent sync background thread
-    /// @param params Pointer to the owning SyncTask instance.
+    /// @brief Entry point for the persistent sync background thread; `params` is the owning
+    /// SyncTask.
     static void thread_entry(void* params);
 
     /// @brief Handles the INITIAL_SYNC state: feeds zeros to prime the audio pipeline
