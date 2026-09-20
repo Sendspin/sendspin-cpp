@@ -70,14 +70,14 @@ public:
     /// @brief Called when the library needs high-performance networking (e.g., disable WiFi
     /// power saving)
     ///
-    /// Toggle the platform's networking mode and return. Fires on the main loop thread; the body
-    /// must not call any SendspinClient or role method.
+    /// Toggle the platform's networking mode and return; the body must not call any
+    /// SendspinClient or role method.
     virtual void on_request_high_performance() {}
 
     /// @brief Called when the library no longer needs high-performance networking
     ///
-    /// Same contract as on_request_high_performance(): toggle the platform mode only, never call
-    /// back into the client. Also fires from ~SendspinClient() for a hold still outstanding.
+    /// Same contract as on_request_high_performance(). Also fires from ~SendspinClient() for a
+    /// hold still outstanding.
     virtual void on_release_high_performance() {}
 
     // ========================================
@@ -87,35 +87,30 @@ public:
     /// @brief Called when a server begins a pairing exchange
     ///
     /// server_id is the base64url public key of the server entering pairing. Fires once per
-    /// attempt regardless of the selected method (Pairing PSK, dynamic pairing code, or static
-    /// pairing code); the exchange completes when on_pairing_succeeded or on_pairing_failed fires.
-    /// Fires on the main loop.
+    /// attempt whatever the method; the exchange ends at on_pairing_succeeded or
+    /// on_pairing_failed.
     virtual void on_pairing_started(const std::string& /*server_id*/) {}
 
     /// @brief Called when a pairing exchange completes and a long-term record is stored
     ///
     /// server_id is the base64url public key of the newly paired server. After this
-    /// callback the server re-handshakes on the new long-term PSK. Subsequent
-    /// connections from this server will report ConnectionTrust::USER.
-    /// Fires on the main loop.
+    /// callback the server re-handshakes on the new long-term PSK. Subsequent connections from
+    /// this server will report ConnectionTrust::USER.
     virtual void on_pairing_succeeded(const std::string& /*server_id*/) {}
 
     /// @brief Called when a pairing exchange is aborted (by the server or by the protocol)
     ///
-    /// server_id identifies the server whose pairing was aborted. reason explains why.
     /// The connection usually stays open after this callback, so the server can re-activate
     /// pairing or resume normal operation on it (pairing.md "pair/abort"). It is closed for
     /// CONCURRENT_ATTEMPT, and closed without any further message for the UNKNOWN reported on a
     /// pairing protocol error (a malformed or out-of-sequence pairing message).
-    /// Fires on the main loop.
     virtual void on_pairing_failed(const std::string& /*server_id*/,
                                    SendspinPairAbortReason /*reason*/) {}
 
     /// @brief Called when the active connection's trust level is known after handshake
     ///
-    /// Fires on the main loop when the active connection's trust level becomes known: on the
-    /// initial handshake and after each successful re-handshake (for example, after pairing).
-    /// trust reflects the PSK category matched during the Noise handshake:
+    /// Fires on the initial handshake and after each successful re-handshake (for example, after
+    /// pairing). trust reflects the PSK category matched during the Noise handshake:
     ///   ConnectionTrust::USER:  long-term record (paired server)
     ///   ConnectionTrust::NONE:  Sentinel or Pairing PSK (unpaired access)
     virtual void on_trust_changed(ConnectionTrust /*trust*/) {}
@@ -128,9 +123,8 @@ public:
     ///            separator is the application's to add.
     ///   QR_CODE: the version-1 pairing token (e.g. "SP:14DQ..."), to be rendered verbatim as a
     ///            QR code with no URI scheme or wrapper around it.
-    /// Fires on the main loop, at most once per pairing attempt: the code is unchanged across
-    /// the attempt's rounds. Always
-    /// followed by on_clear_pairing_code when the attempt concludes (success, failure, or abort).
+    /// Fires at most once per pairing attempt: the code is unchanged across the attempt's rounds,
+    /// and is always followed by on_clear_pairing_code.
     /// Only called when SendspinClientConfig::pairing_code_out_channels and
     /// ::pairing_code_formats are both non-empty.
     virtual void on_display_pairing_code(const std::string& /*code*/,
@@ -138,16 +132,16 @@ public:
 
     /// @brief Called to withdraw the emitted dynamic pairing code.
     ///
-    /// Fires on the main loop after every pairing attempt that triggered
-    /// on_display_pairing_code, regardless of outcome.
+    /// Fires after every pairing attempt that triggered on_display_pairing_code, whatever its
+    /// outcome.
     virtual void on_clear_pairing_code() {}
 
     /// @brief Called when the operator must perform the device pairing-window gesture to allow a
     /// gesture-gated pairing attempt (pairing.md "Pairing Window"): every static_pairing_code
     /// attempt, and a dynamic_pairing_code attempt held back by the round limit.
     ///
-    /// Fires on the main loop. Only called when SendspinClientConfig::pairing_window_supported
-    /// is true; a device offering dynamic_pairing_code should therefore also implement this
+    /// Only called when SendspinClientConfig::pairing_window_supported is true; a device
+    /// offering dynamic_pairing_code should therefore also implement this
     /// gesture UI, or such an attempt stalls until the server cancels it.
     /// Always followed by on_close_pairing_window when the attempt concludes. The application
     /// confirms the gesture by calling SendspinClient::confirm_pairing_window().
@@ -179,30 +173,18 @@ public:
 /// Every method has a default no-op / nullopt implementation so a platform can opt in
 /// incrementally.
 ///
-/// Threading: every method is invoked on the main loop thread, for every key. A provider
-/// therefore needs no locking of its own. (The one library write that originates on the network
-/// thread, the pairing record committed at server/pair-finalize, is staged internally and
-/// flushed to `save_blob(persistence_keys::RECORDS, ...)` from the next `loop()` tick.)
-/// First-boot provisioning writes from inside `start()` rather than in response to a runtime
-/// event: `KEYPAIR` when no valid keypair is stored, `PAIRING_PSK` when no Pairing PSK is
-/// stored, and `PAIR_CONFIG` when no pairing config could be decoded.
+/// Threading: every method is invoked on the main loop thread, for every key, so a provider needs
+/// no locking of its own. First-boot provisioning writes from inside `start()` rather than in
+/// response to a runtime event: `KEYPAIR`, `PAIRING_PSK`, and `PAIR_CONFIG` when none is stored.
 ///
-/// Re-entrancy: implementations must NOT call back into the library (SendspinClient or any of
-/// its objects) from inside load_blob/save_blob/erase_blob. Every call is made from the middle
-/// of a library step that is part-way through updating the state the call is about: the first
-/// load_blob()/save_blob() calls arrive from the record store's constructor inside start(),
-/// before the client's record_store_ pointer is assigned, so a call back into the library there
-/// reaches a client whose store does not exist yet. No internal lock is held
-/// across the call: the record store encodes its blob under its mutex and saves after dropping it,
-/// and the connection manager stages the writes its lifecycle handlers decide on and performs them
-/// once `conn_ptr_mutex_` is dropped.
+/// Re-entrancy: implementations must not call back into the library from inside
+/// load_blob/save_blob/erase_blob. Every call is made from the middle of a library step that is
+/// part-way through updating the state the call is about. No internal lock is held across the
+/// call.
 ///
-/// Blocking: an implementation must perform one bounded storage operation and return, not add
-/// blocking of its own (a synchronous retry loop, a multi-second fsync chain). The main loop is
-/// stopped for the duration, so everything it drives (audio scheduling, time sync, role
-/// callbacks) waits with it. A failed write should be reported by returning false rather than
-/// retried inline; the library already handles that (durability warnings) as described below on
-/// save_blob.
+/// Blocking: perform one bounded storage operation and return. The main loop is stopped for the
+/// duration, so audio scheduling, time sync and role callbacks wait with it. Report a failed
+/// write by returning false rather than retrying inline.
 class SendspinPersistenceProvider {
 public:
     virtual ~SendspinPersistenceProvider() = default;
@@ -213,21 +195,15 @@ public:
         return std::nullopt;
     }
 
-    /// @brief Persist bytes under key. Returning true means DURABLY stored (the library gates
+    /// @brief Persist bytes under key. Returning true means durably stored (the library gates
     /// revocation durability on it for removals from the "records" key).
     ///
-    /// A rejected write is reported, not retried: the in-memory state it was meant to capture
-    /// stays authoritative for the current boot, and the library logs a warning naming what will
-    /// be lost (or come back) at the next reboot. Specifically, for
-    /// `persistence_keys::RECORDS`: a rejected write of a just-paired record leaves the pairing
-    /// working for this boot only (`on_pairing_succeeded` still fires); a rejected write of a
-    /// removal means the store still holds the old array and will hand the revoked record back
-    /// at the next boot, silently making the revoked PSK valid again (the revoked record is
-    /// always dropped from RAM regardless of this return value, so a `false` does not undo
-    /// that).
-    /// A provider that cannot report durability synchronously (one that queues the write) should
-    /// return true and surface its own write failures; the library's warnings are only as
-    /// accurate as this return value, so report failure honestly rather than swallowing it.
+    /// A rejected write is reported, not retried: the in-memory state stays authoritative for
+    /// this boot and the library logs what will be lost at the next reboot. The case that matters
+    /// is a rejected removal from `persistence_keys::RECORDS`: the store still holds the old array
+    /// and hands the revoked record back at the next boot, silently making the revoked PSK valid
+    /// again (the record is dropped from RAM either way). A provider that queues writes should
+    /// return true and surface its own failures.
     /// @return true on success, false on failure.
     virtual bool save_blob(const std::string& /*key*/, const uint8_t* /*data*/, size_t /*len*/) {
         return false;
@@ -236,10 +212,9 @@ public:
     /// @brief Remove key. Absent counts as success. A false return means the value may
     /// survive a reboot.
     ///
-    /// The library never calls it: every blob it owns is either rewritten in place or left alone
-    /// (a record removal re-saves the shrunken array, so `persistence_keys::RECORDS` stays
-    /// present with a shorter array). It is here for an application that wipes the library
-    /// keyspace itself, for example on a factory reset.
+    /// The library never calls it: every blob it owns is rewritten in place or left alone. It is
+    /// here for an application that wipes the library keyspace itself, for example on a factory
+    /// reset.
     /// @return true if the key is gone from the store, false if it may still be there.
     virtual bool erase_blob(const std::string& /*key*/) {
         return false;
@@ -265,9 +240,8 @@ namespace persistence_keys {
 /// 32 raw bytes: the static X25519 private key. No codec, no encoding.
 inline constexpr const char* KEYPAIR = "keypair";
 
-/// Codec blob: the WHOLE `SendspinPairingRecord` array (`encode_pairing_records()` /
-/// `decode_pairing_records()`). Stays present once any record exists, including an empty array
-/// after the last record is removed; see `persistence_keys` doc above.
+/// Codec blob: the whole `SendspinPairingRecord` array (`encode_pairing_records()` /
+/// `decode_pairing_records()`). Stays present once any record exists, including as an empty array.
 inline constexpr const char* RECORDS = "records";
 
 /// Codec blob: the accepted `SendspinPairingPsk` (`encode_pairing_psk()` / `decode_pairing_psk()`).
@@ -283,8 +257,7 @@ inline constexpr const char* PAIR_CONFIG = "pair_config";
 /// Raw UTF-8 bytes: the server_id (base64url public key) of the last server that played audio.
 inline constexpr const char* LAST_PLAYED = "last_played";
 
-/// ASCII decimal string (e.g. "150"): the player's output delay in milliseconds. The stored key
-/// string is part of the storage format, fixed independently of the protocol field names.
+/// ASCII decimal string (e.g. "150"): the player's output delay in milliseconds.
 inline constexpr const char* OUTPUT_DELAY = "static_delay";
 
 }  // namespace persistence_keys
@@ -316,15 +289,6 @@ struct Identity;
  * audio playback, and all Sendspin protocol interactions. Roles are added at runtime
  * and each receives events via a listener interface. Only roles that are added will
  * participate in the protocol.
- *
- * Usage:
- * 1. Fill in a SendspinClientConfig with the device identity fields
- * 2. Construct a SendspinClient with that config
- * 3. Add roles via add_player(), add_controller(), add_metadata(), etc.
- * 4. Set listeners on each role and set the network provider on the client
- * 5. Call start() to start the role threads and the WebSocket server
- * 6. Call loop() periodically from the platform main loop
- * 7. Call stop() to goodbye every peer and tear everything down; start() again to restart
  *
  * @code
  * struct MyPlayerListener : PlayerRoleListener {
@@ -368,11 +332,9 @@ public:
     ~SendspinClient();
 
     /// @brief Sets the library-wide log level (host builds only, no-op on ESP-IDF)
-    /// @param level The desired log level
     static void set_log_level(LogLevel level);
 
     /// @brief Returns the current log level (host builds only, INFO on ESP-IDF)
-    /// @return The current log level
     static LogLevel get_log_level();
 
     // ========================================
@@ -395,9 +357,8 @@ public:
     /// on_image_clear(), on_metadata_clear(), ...) before returning. A pairing prompt still
     /// showing is dismissed the same way (on_clear_pairing_code() / on_close_pairing_window()),
     /// and a pairing record staged by a pair-finalize is persisted first. No-op when stopped.
-    /// Calling start() afterwards restarts the client on the same identity and record store
-    /// (both are rebuilt only if the persistence provider changed in between); start, stop, and
-    /// start again can be repeated indefinitely.
+    /// Calling start() afterwards restarts on the same identity and record store, unless the
+    /// persistence provider changed in between. Start/stop cycles may be repeated indefinitely.
     ///
     /// Blocking is bounded by the goodbye wait, the transports' own close, and any listener
     /// callback already running on a role thread, which the join cannot interrupt. The
@@ -431,9 +392,8 @@ public:
     /// @brief Initiates a client connection to a Sendspin server at the given URL
     ///
     /// Ignored (with a warning) unless the client is running, including from a callback fired
-    /// inside stop(). Running implies a successful start(), which is where the static identity
-    /// and record store the Noise handshake needs are created; a connection built before that
-    /// would fault once its WebSocket upgrade completed. Must be called from the main loop
+    /// inside stop(). start() is where the identity and record store the Noise handshake needs
+    /// are created. Must be called from the main loop
     /// thread: it tears down and replaces connection state (time filter, dispatch, client state)
     /// directly rather than deferring to loop(), so calling it concurrently with loop() would
     /// race those mutations.
@@ -444,8 +404,7 @@ public:
     ///
     /// Ignored unless the client is running, including from a callback fired inside stop().
     /// Must be called from the main loop thread: the blocking transport close runs outside the
-    /// manager lock, so a call from another thread could race loop()'s own release of the same
-    /// connection (two concurrent transport stops).
+    /// manager lock, so another thread could race loop()'s own release of the same connection.
     /// @param reason The goodbye reason to send
     void disconnect(SendspinGoodbyeReason reason);
 
@@ -493,76 +452,64 @@ public:
 
 #ifdef SENDSPIN_ENABLE_ARTWORK
     /// @brief Returns the artwork role, or nullptr if not added
-    /// @return Pointer to the artwork role, or nullptr
     // cppcheck-suppress unusedFunction
     // Public API: live entry point the reference examples don't happen to exercise, not dead code.
     ArtworkRole* artwork() {
         return this->artwork_.get();
     }
     /// @brief Returns the artwork role (const), or nullptr if not added
-    /// @return Const pointer to the artwork role, or nullptr
     const ArtworkRole* artwork() const {
         return this->artwork_.get();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_COLOR
     /// @brief Returns the color role, or nullptr if not added
-    /// @return Pointer to the color role, or nullptr
     ColorRole* color() {
         return this->color_.get();
     }
     /// @brief Returns the color role (const), or nullptr if not added
-    /// @return Const pointer to the color role, or nullptr
     const ColorRole* color() const {
         return this->color_.get();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_CONTROLLER
     /// @brief Returns the controller role, or nullptr if not added
-    /// @return Pointer to the controller role, or nullptr
     ControllerRole* controller() {
         return this->controller_.get();
     }
     /// @brief Returns the controller role (const), or nullptr if not added
-    /// @return Const pointer to the controller role, or nullptr
     const ControllerRole* controller() const {
         return this->controller_.get();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_METADATA
     /// @brief Returns the metadata role, or nullptr if not added
-    /// @return Pointer to the metadata role, or nullptr
     MetadataRole* metadata() {
         return this->metadata_.get();
     }
     /// @brief Returns the metadata role (const), or nullptr if not added
-    /// @return Const pointer to the metadata role, or nullptr
     const MetadataRole* metadata() const {
         return this->metadata_.get();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_PLAYER
     /// @brief Returns the player role, or nullptr if not added
-    /// @return Pointer to the player role, or nullptr
     PlayerRole* player() {
         return this->player_.get();
     }
     /// @brief Returns the player role (const), or nullptr if not added
-    /// @return Const pointer to the player role, or nullptr
     const PlayerRole* player() const {
         return this->player_.get();
     }
 #endif
 #ifdef SENDSPIN_ENABLE_VISUALIZER
     /// @brief Returns the visualizer role, or nullptr if not added
-    /// @return Pointer to the visualizer role, or nullptr
     // cppcheck-suppress unusedFunction
-    // Public API: live entry point the reference examples don't happen to exercise, not dead code.
+    // Public API, not dead code.
     VisualizerRole* visualizer() {
         return this->visualizer_.get();
     }
     /// @brief Returns the visualizer role (const), or nullptr if not added
-    /// @return Const pointer to the visualizer role, or nullptr
     const VisualizerRole* visualizer() const {
         return this->visualizer_.get();
     }
@@ -587,8 +534,7 @@ public:
     /// code to begin the Pairing PSK flow. Clients offering `pairing_psk` SHOULD surface this
     /// token rather than the bare PSK.
     /// Main loop only.
-    /// @param pairing_psk The 32-byte Sendspin Pairing PSK to encode alongside this client's
-    ///                    identity.
+    /// @param pairing_psk The 32-byte Sendspin Pairing PSK.
     /// @return The 107-character token string, or nullopt if no identity has been initialized
     ///         yet (before start() is called).
     [[nodiscard]] std::optional<std::string> format_pairing_token(
@@ -605,16 +551,13 @@ public:
 
     /// @brief Returns true if there is an active connection whose handshake completed and whose
     /// first server/activate has arrived
-    /// @return true if connected with a completed handshake whose first server/activate has
-    ///         arrived, false otherwise
     bool is_connected() const;
 
-    /// @brief Returns the server information from the active connection's hello handshake
-    /// @return ServerInformationObject if connected with a completed handshake, nullopt otherwise
+    /// @brief Returns the server information from the active connection's hello handshake, or
+    /// nullopt when no handshake has completed
     std::optional<ServerInformationObject> get_server_information() const;
 
     /// @brief Returns true if the time filter has received at least one measurement
-    /// @return true if time synchronization has been established, false otherwise
     bool is_time_synced() const;
 
     /// @brief Converts a server timestamp to the equivalent client timestamp
@@ -622,15 +565,13 @@ public:
     /// @return Equivalent client-side timestamp in microseconds
     int64_t get_client_time(int64_t server_time) const;
 
-    /// @brief Returns the current group state
-    /// @return The current GroupUpdateObject (fields are optional and may be unset)
+    /// @brief Returns the current group state; fields are optional and may be unset
     const GroupUpdateObject& get_group_state() const {
         return this->group_state_;
     }
 
     /// @brief Returns the trust level of the active connection. Main loop only.
-    /// The same value SendspinClientListener::on_trust_changed reports, queryable at any
-    /// time (e.g. for redrawing a UI without caching the callback's argument).
+    /// The same value SendspinClientListener::on_trust_changed reports, queryable at any time.
     /// @return The active connection's ConnectionTrust; ConnectionTrust::NONE when no
     ///         connection is active or the handshake has not completed
     ConnectionTrust get_current_trust() const {
@@ -649,8 +590,8 @@ public:
 
     /// @brief Leaves the current group with messaging.md "client/leave". Main loop only.
     ///
-    /// The client no longer wants to take part in its group's
-    /// playback, for example while it plays a local source it can be interrupted out of. The
+    /// The client no longer wants to take part in its group's playback, for example while
+    /// playing a local source. The
     /// server treats it as it treats a client becoming unavailable: this client ends up alone in
     /// a stopped group, and rejoins only when an operator switches it back. Leaving does not
     /// change availability, so the server may still take the client over for new playback; a
@@ -672,8 +613,7 @@ public:
     /// admits pairing attempts on one connection without a further gesture. It closes before
     /// those 5 minutes are up when a pairing under it succeeds, when the connection it is bound
     /// to is lost, after five attempts fail verification, or on cancel_pairing_window(). The
-    /// gesture is also the deliberate operator action that clears a standing
-    /// dynamic-pairing-code round limit.
+    /// gesture also clears a standing dynamic-pairing-code round limit.
     void confirm_pairing_window();
 
     /// @brief Signals that the operator cancelled the pairing window.
@@ -717,14 +657,13 @@ public:
     /// @brief Sends a role-originated text message over the active connection
     ///
     /// Every message sent on a role's behalf carries the role it belongs to, so the activation
-    /// gate below cannot be forgotten at a call site. The client's own messages (hello, state,
-    /// time, goodbye, leave, pairing) do not come through here.
+    /// gate cannot be forgotten at a call site. The client's own messages do not come through
+    /// here.
     ///
     /// Dropped unless that role is active on the connection: messaging.md "server/activate"
-    /// tolerates inactive-role objects on the server side because a client that has received
-    /// the role removal stops sending them. The family names the version this library
-    /// implements, and the activation test is on that exact versioned name, the same test the
-    /// receive path applies. Also held, like client/state, while a re-handshake awaits the
+    /// tolerates inactive-role objects server-side because a client that received the role
+    /// removal stops sending them. The activation test is on the versioned name, the same test
+    /// the receive path applies. Also held, like client/state, while a re-handshake awaits the
     /// server/activate that follows it.
     ///
     /// Callable from any thread: the gate reads the connection's published role mask, not the
@@ -739,9 +678,8 @@ public:
 
     /// @brief Releases a ref-counted high-performance networking request
     ///
-    /// The last release calls the listener inline, so only call this from a main-loop point that
-    /// holds no ConnectionManager lock. Teardown paths that run under conn_ptr_mutex_ (role
-    /// cleanup, cleanup_connection_state()) use release_high_performance_deferred() instead.
+    /// The last release calls the listener inline, so only call this where no ConnectionManager
+    /// lock is held; locked teardown paths use release_high_performance_deferred().
     void release_high_performance();
 
     /// @brief Hands a high-performance release to the next drain instead of performing it here
@@ -767,9 +705,8 @@ private:
 
     /// @brief Performs the releases release_high_performance_deferred() handed over
     ///
-    /// Runs at the head of drain_inbox(), which every main-loop pass reaches with no
-    /// ConnectionManager lock held, so the listener callback a last release fires is free to
-    /// call back into the client.
+    /// Runs at the head of drain_inbox(), with no ConnectionManager lock held, so a last
+    /// release's listener callback may call back into the client.
     void flush_high_performance_releases();
 
     /// @brief Signals the drain roles, then goodbyes and closes every transport, joining the
@@ -796,12 +733,8 @@ private:
     /// @brief Processes a JSON message from a connection
     ///
     /// Called on the connection's network thread. Takes the JSON processing mutex and hands off
-    /// to dispatch_json_message().
-    /// @param conn The connection that received the message
-    /// @param data Pointer to the raw JSON text (not null-terminated; valid for the duration of the
-    /// call only)
-    /// @param len Length of the JSON text in bytes
-    /// @param timestamp Receive timestamp in microseconds
+    /// to dispatch_json_message(). `data` is not null-terminated and is valid for the duration
+    /// of the call only.
     void process_json_message(SendspinConnection* conn, const char* data, size_t len,
                               int64_t timestamp);
 
@@ -815,8 +748,6 @@ private:
     ///
     /// Shared by the pair-init, pair-auth and pair-confirm arms of dispatch_json_message(), which
     /// differ only in the payload they parse.
-    /// @param conn The connection that received the message
-    /// @param type_name Wire type name of the message that failed to parse
     void schedule_malformed_pairing_message(SendspinConnection* conn, const char* type_name);
 
     /// @brief Parses and routes one JSON message. The caller holds json_processing_mutex_.
@@ -833,21 +764,13 @@ private:
     /// arrival order, ahead of anything that arrives afterwards.
     ///
     /// THREADING: takes json_processing_mutex_, so the caller must hold no ConnectionManager
-    /// lock. That is the lock order the whole client obeys (docs/conventions.md, "Threading and
-    /// cross-thread state"): json_processing_mutex_ outside conn_ptr_mutex_, which is the order
-    /// the live receive path already needs, since a server/pair-finalize handler asks the manager
-    /// for the open connections' psk_ids while the JSON lock is held. A replayed message may
-    /// therefore reach back into the manager without deadlocking.
-    /// @param conn The connection entering the admitted slot
+    /// lock. That is the library-wide lock order (docs/conventions.md, "Threading and
+    /// cross-thread state"): json_processing_mutex_ outside conn_ptr_mutex_.
     void admit_connection(SendspinConnection* conn);
 
     /// @brief Processes a binary message from a connection
     /// Every binary message is role-bound, so this is dropped unless `conn` holds the admitted
-    /// slot; see the admission gate in dispatch_json_message() for why finishing the Noise
-    /// handshake is not enough on its own.
-    /// @param conn The connection the message arrived on
-    /// @param payload Pointer to the raw binary data
-    /// @param len Length of the binary data in bytes
+    /// slot.
     void process_binary_message(SendspinConnection* conn, const uint8_t* payload, size_t len);
 
     // ========================================
@@ -856,11 +779,8 @@ private:
 
     /// @brief Publishes the current client state to the specified connection
     ///
-    /// Takes no lock of its own: its main-loop callers already hold conn_ptr_mutex_. The caller
-    /// therefore owns `conn`'s lifetime for the duration of the call; one resolving the current
-    /// connection from outside that lock must hold it as a shared_ptr (current_shared()) rather
-    /// than pass the bare current() pointer, which the main loop may drop meanwhile.
-    /// @param conn The connection to publish to
+    /// Takes no lock of its own: its main-loop callers already hold conn_ptr_mutex_, which is
+    /// what keeps `conn` alive for the call.
     void publish_client_state(SendspinConnection* conn);
 
     // ========================================
@@ -873,7 +793,7 @@ private:
     /// @return false only if key generation failed (e.g. noise-c allocation failure); a corrupt
     /// or wrong-length stored key is discarded and a fresh identity generated in its place (the
     /// device must then re-pair). identity_ is left null on false and the caller (start()) must
-    /// not proceed. Never leaves identity_ set to an all-zero keypair.
+    /// not proceed.
     bool load_or_generate_identity();
 
     /// @brief Loads the last played server_id from persistence
@@ -891,8 +811,8 @@ private:
     ///         write_last_played_server() once its locks are dropped.
     bool note_last_played_server(const std::string& server_id);
 
-    /// @brief Writes the last-played server_id through the persistence provider. Must run with
-    /// no library lock held: the provider call is a flash write on ESP.
+    /// @brief Writes the last-played server_id through the persistence provider. No library lock
+    /// may be held: on ESP this is a flash write.
     void write_last_played_server(const std::string& server_id);
 
     // ========================================
@@ -918,39 +838,33 @@ private:
     void apply_role_removals(const std::vector<std::string>& roles_before,
                              const std::vector<std::string>& roles_after);
 
-    /// @brief Queue an on_pairing_started notification for delivery from loop()
-    /// Called by ConnectionManager while conn_ptr_mutex_ is held; the callback itself fires
-    /// later from loop() so it runs unlocked. Main loop only.
+    // Pairing and trust notifications. Each is called by ConnectionManager on the main loop,
+    // most while conn_ptr_mutex_ is held, and queues the listener callback for delivery from
+    // loop() so it fires unlocked. note_pairing_succeeded() runs after the network thread's
+    // schedule_pairing_succeeded() event has been drained (ConnectionManager::loop()).
+
+    /// @brief Queue an on_pairing_started notification
     void note_pairing_started(const std::string& server_id);
 
-    /// @brief Queue an on_pairing_succeeded notification for delivery from loop()
-    /// Called by ConnectionManager on the main loop once the network thread's
-    /// schedule_pairing_succeeded() event has been drained (see ConnectionManager::loop()).
-    /// Main loop only.
+    /// @brief Queue an on_pairing_succeeded notification
     void note_pairing_succeeded(const std::string& server_id);
 
-    /// @brief Queue an on_pairing_failed notification for delivery from loop()
-    /// Same deferral as note_pairing_started. Main loop only.
+    /// @brief Queue an on_pairing_failed notification
     void note_pairing_failed(const std::string& server_id, SendspinPairAbortReason reason);
 
-    /// @brief Queue an on_display_pairing_code notification for delivery from loop().
-    /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
+    /// @brief Queue an on_display_pairing_code notification
     void note_display_pairing_code(const std::string& code, SendspinPairingCodeFormat format);
 
-    /// @brief Queue an on_clear_pairing_code notification for delivery from loop().
-    /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
+    /// @brief Queue an on_clear_pairing_code notification
     void note_clear_pairing_code();
 
-    /// @brief Queue an on_open_pairing_window notification for delivery from loop().
-    /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
+    /// @brief Queue an on_open_pairing_window notification
     void note_open_pairing_window();
 
-    /// @brief Queue an on_close_pairing_window notification for delivery from loop().
-    /// Called by ConnectionManager while conn_ptr_mutex_ is held. Main loop only.
+    /// @brief Queue an on_close_pairing_window notification
     void note_close_pairing_window();
 
-    /// @brief Queue an on_trust_changed notification for delivery from loop().
-    /// Same deferral as note_pairing_started. Main loop only.
+    /// @brief Queue an on_trust_changed notification
     void note_trust_changed(ConnectionTrust trust);
 
     struct EventState;
