@@ -59,7 +59,6 @@ struct VisualizerDelivery {
 /// factored out so it can be unit tested independently of the client and drain thread.
 /// @param wire_type        SENDSPIN_BINARY_VISUALIZER_* type byte.
 /// @param payload          Bytes following the entry's wire-type byte and 8-byte timestamp.
-/// @param payload_len      Number of payload bytes available.
 /// @param configured_bins  Negotiated spectrum n_disp_bins (0 if SPECTRUM was not negotiated).
 /// @param tracks_downbeats Whether the active stream reports downbeats.
 /// @param spectrum_out     Scratch vector reused for SPECTRUM bins; resized to configured_bins.

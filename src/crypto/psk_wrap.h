@@ -53,8 +53,6 @@ static constexpr std::string_view NONCE_WRAP_LABEL{"sendspin-pair-nonce-wrap-v1"
 
 /// @brief Derive K_wrap = SHA-256(label || sid || isk)
 /// @param label Per-field wrap label (PSK_WRAP_LABEL or NONCE_WRAP_LABEL).
-/// @param sid   CPace session id (see CPace::sid()).
-/// @param isk   CPace intermediate session key (see CPace::isk()).
 /// @return The 32-byte key, or std::nullopt if the underlying SHA-256 computation fails (e.g.
 ///         noise-c allocation failure); callers must not treat that as a recoverable all-zero
 ///         key.
@@ -66,9 +64,6 @@ std::optional<std::array<uint8_t, 32>> derive_wrap_key(
 /// 12-byte all-zero nonce, and empty associated data.
 /// @param label       Per-field wrap label (PSK_WRAP_LABEL or NONCE_WRAP_LABEL).
 /// @param cipher_name Noise-c cipher name for the connection's negotiated suite.
-/// @param sid         CPace session id (see CPace::sid()).
-/// @param isk         CPace intermediate session key (see CPace::isk()).
-/// @param value       32-byte value to wrap.
 /// @return The 48-byte wrapped field (ciphertext || tag), or nullopt on a cipher failure.
 std::optional<std::array<uint8_t, WRAPPED_VALUE_SIZE>> wrap_value(
     std::string_view label, const char* cipher_name, const std::vector<uint8_t>& sid,

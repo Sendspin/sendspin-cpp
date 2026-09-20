@@ -63,7 +63,6 @@ struct PlayerRole::Impl {
     /// Spec bytes 9-12 carry `send_ahead`, the lead the server had in hand when it transmitted;
     /// it carries no scheduling meaning, so the chunk is parsed past it.
     /// @param data Chunk bytes with the message type byte already stripped.
-    /// @param len  Number of bytes at @p data.
     /// @return The split chunk, or nullopt when @p len is too short to hold the header.
     static std::optional<AudioChunk> parse_audio_chunk(const uint8_t* data, size_t len);
 
