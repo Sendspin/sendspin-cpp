@@ -15,17 +15,14 @@
 /// @file persistence_codec.h
 /// @brief Storage-format codec for the persistence structs in sendspin/config.h
 ///
-/// `SendspinPersistenceProvider` (sendspin/client.h) is a plain blob store: `load_blob()` /
-/// `save_blob()` / `erase_blob()` move opaque bytes in and out of NVS/Preferences (ESP) or a
-/// file (host), keyed by the fixed constants in `persistence_keys`. The library itself is the
-/// only caller of this codec: for the `persistence_keys::RECORDS`, `PAIRING_PSK`, and
-/// `PAIR_CONFIG` keys, it turns `SendspinPairingRecord` / `SendspinPairingPsk` /
-/// `SendspinPairingConfig` into the JSON text blob a provider actually stores, and back. A
-/// provider implementation never needs to (and must not) parse these blobs. This header is
-/// exposed publicly so a custom provider (or a test) can inspect or seed that content in the
-/// same format the library itself produces, not so providers hand-roll their own encoding.
+/// `SendspinPersistenceProvider` (sendspin/client.h) is a plain blob store. The library is the
+/// only caller of this codec: for the `persistence_keys::RECORDS`, `PAIRING_PSK` and
+/// `PAIR_CONFIG` keys it turns `SendspinPairingRecord` / `SendspinPairingPsk` /
+/// `SendspinPairingConfig` into the JSON blob a provider stores, and back. A provider must not
+/// parse these blobs itself. It is public so a custom provider or a test can inspect or seed that
+/// content in the same format.
 ///
-/// This is a STORAGE codec, intentionally independent of the Sendspin protocol wire format.
+/// This is a storage codec, independent of the Sendspin protocol wire format.
 ///
 /// ## Wire format
 ///
@@ -52,9 +49,8 @@
 /// ## Decode semantics
 ///
 /// - A missing "v" is treated as version 1 (every blob written before "v" existed still
-///   decodes). A "v" greater than `RECORD_CODEC_VERSION` still decodes on a best-effort basis:
-///   unknown fields are ignored, so a blob written by a newer library version round-trips
-///   through an older one instead of being rejected outright.
+///   decodes). A "v" greater than `RECORD_CODEC_VERSION` still decodes on a best-effort basis
+///   rather than being rejected.
 /// - Unknown/extra fields are ignored everywhere. Missing optional fields take the struct's
 ///   default value.
 /// - `decode_pairing_record()` / `decode_pairing_psk()` return `std::nullopt` when: the JSON
@@ -63,7 +59,7 @@
 ///   without which the PSK could never pass the post-match server check.
 /// - `decode_pairing_records()` returns `std::nullopt` only when the JSON fails to parse or the
 ///   root has no array "records" field. An individual entry that fails record validation is
-///   SKIPPED rather than failing the whole decode: a provider should not lose its entire store
+///   skipped rather than failing the whole decode: a provider should not lose its entire store
 ///   to one corrupt entry.
 /// - `decode_pairing_config()` returns `std::nullopt` only when the JSON fails to parse or the
 ///   root is not an object. Missing fields take the `SendspinPairingConfig` struct's defaults.
@@ -72,18 +68,14 @@
 ///
 /// ## Keyspace
 ///
-/// The storage key is not a provider's choice: it is one of the fixed constants in
-/// `persistence_keys` (sendspin/client.h): `RECORDS`, `PAIRING_PSK`, and `PAIR_CONFIG` for the
-/// three struct types this header encodes, plus `KEYPAIR`, `STATIC_PAIRING_CODE`, `LAST_PLAYED`
-/// and `OUTPUT_DELAY` for the raw-byte / ASCII-decimal keys the library also persists. Every key is
-/// at most 12 characters, comfortably under a typical NVS key's 15-character limit; see
-/// `persistence_keys`'s doc comment for the full list and what each one holds.
+/// Storage keys are the fixed constants in `persistence_keys` (sendspin/client.h), not a
+/// provider's choice.
 ///
-/// `RECORDS` always holds the WHOLE records array as one blob (`encode_pairing_records()` /
-/// `decode_pairing_records()`), not one entry per record: an encoded record is roughly 250
-/// bytes, so the default 12-record store comes out around 3 KB, comfortably under a typical NVS
-/// entry's ~4 KB limit. This also sidesteps needing `psk_id` (43 characters, base64url of a
-/// 32-byte key) as a storage key, which would not fit an NVS key at all.
+/// `RECORDS` holds the whole records array as one blob (`encode_pairing_records()` /
+/// `decode_pairing_records()`) rather than one entry per record: an encoded record is roughly 250
+/// bytes, so the default 12-record store comes out around 3 KB, under a typical NVS entry's ~4 KB
+/// limit. It also sidesteps needing `psk_id` (43 characters) as a storage key, which would not fit
+/// an NVS key at all.
 
 #pragma once
 
@@ -98,66 +90,46 @@
 
 namespace sendspin {
 
-/// Storage-format version stamped into encoded blobs. Decoders treat a missing "v" as 1
-/// and ignore unknown fields, so blobs round-trip across firmware versions as fields are
-/// added.
+/// Storage-format version stamped into encoded blobs; see "Decode semantics" above.
 inline constexpr int RECORD_CODEC_VERSION = 1;
 
 /// @brief Encodes a pairing record to its JSON storage format.
-/// @param r The record to encode.
-/// @return The encoded JSON text.
 std::string encode_pairing_record(const SendspinPairingRecord& r);
 
 /// @brief Decodes a pairing record from its JSON storage format.
-/// @param bytes The encoded JSON text.
-/// @return The decoded record, or std::nullopt on parse failure or an invalid psk_id/psk (see
-///         "Decode semantics" above).
+/// @return The decoded record, or std::nullopt on parse failure or an invalid psk_id/psk.
 std::optional<SendspinPairingRecord> decode_pairing_record(std::string_view bytes);
 
 /// @brief Encodes a vector of pairing records to their JSON storage format (a single blob
 /// holding the whole array, suitable for a provider that stores the record list as one entry).
-/// @param v The records to encode.
-/// @return The encoded JSON text.
 std::string encode_pairing_records(const std::vector<SendspinPairingRecord>& v);
 
 /// @brief Decodes a vector of pairing records from its JSON storage format. Entries that fail
-/// record validation are skipped rather than failing the whole decode (see "Decode semantics"
-/// above).
-/// @param bytes The encoded JSON text.
-/// @return The decoded records (possibly fewer than were encoded, if some entries were
-///         corrupt), or std::nullopt on parse failure or a missing/non-array "records" field.
+/// record validation are skipped rather than failing the whole decode.
+/// @return The decoded records (possibly fewer than were encoded, if some entries were corrupt),
+///         or std::nullopt on parse failure or a missing/non-array "records" field.
 std::optional<std::vector<SendspinPairingRecord>> decode_pairing_records(std::string_view bytes);
 
 /// @brief Encodes the accepted Pairing PSK to its JSON storage format.
-/// @param p The Pairing PSK to encode.
-/// @return The encoded JSON text.
 std::string encode_pairing_psk(const SendspinPairingPsk& p);
 
 /// @brief Decodes the accepted Pairing PSK from its JSON storage format.
-/// @param bytes The encoded JSON text.
-/// @return The decoded Pairing PSK, or std::nullopt on parse failure or an invalid psk_id/psk
-///         (see "Decode semantics" above).
+/// @return The decoded Pairing PSK, or std::nullopt on parse failure or an invalid psk_id/psk.
 std::optional<SendspinPairingPsk> decode_pairing_psk(std::string_view bytes);
 
 /// @brief Encodes the pairing policy config to its JSON storage format.
-/// @param c The config to encode.
-/// @return The encoded JSON text.
 std::string encode_pairing_config(const SendspinPairingConfig& c);
 
 /// @brief Decodes the pairing policy config from its JSON storage format. Missing fields take
 /// the SendspinPairingConfig struct's defaults.
-/// @param bytes The encoded JSON text.
 /// @return The decoded config, or std::nullopt on parse failure or a non-object root.
 std::optional<SendspinPairingConfig> decode_pairing_config(std::string_view bytes);
 
 /// @brief Encodes bytes to base64url, no `=` padding (RFC 4648 section 5).
-/// @param data Input bytes.
-/// @param len Number of bytes.
 /// @return ASCII string using only `A-Z a-z 0-9 - _`.
 std::string base64url_encode(const uint8_t* data, size_t len);
 
 /// @brief Decodes base64url, tolerating missing or present `=` padding (RFC 4648 section 5).
-/// @param s The base64url text.
 /// @return The decoded bytes, or std::nullopt if s contains a character outside the base64url
 ///         alphabet.
 std::optional<std::vector<uint8_t>> base64url_decode(std::string_view s);
