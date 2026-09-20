@@ -32,14 +32,10 @@ namespace sendspin {
 namespace detail {
 
 /// @brief Overwrite a 32-byte PSK with zeroes through a volatile pointer, so the write survives
-/// dead-store elimination on a buffer that is about to go out of scope (a plain assignment to a
-/// value never read again is legal for the compiler to delete outright).
+/// dead-store elimination on a buffer about to go out of scope.
 ///
-/// This is a public-header-safe duplicate of `secure_zero()` in the private
-/// `platform/secure_zero.h` (the same primitive `Identity::~Identity()` in `crypto/keys.cpp` and
-/// `psk_wrap.cpp` use for their own secrets): `config.h` is a public header and must not include a
-/// `src/`-private one, so the three-line loop is repeated here rather than shared. Keep the two in
-/// sync.
+/// Duplicates `secure_zero()` in the private `platform/secure_zero.h`: config.h is public and must
+/// not include a `src/`-private header. Keep the two in sync.
 inline void secure_zero_psk(std::array<uint8_t, 32>& psk) {
     volatile uint8_t* vp = psk.data();
     for (size_t i = 0; i < psk.size(); ++i) {
@@ -71,15 +67,10 @@ struct SendspinPairingRecord {
     SendspinPairingRecord& operator=(SendspinPairingRecord&&) = default;
 
     /// @brief Wipes `psk` on destruction: defense in depth against a stale copy (a rollback
-    /// snapshot, a superseded/moved-from element, a temporary) outliving its use. It does NOT
-    /// protect the live record: the PSK is durably plaintext in `RecordStore::records_` and in
-    /// the persisted blob for as long as the record is paired, by design (see persist_records_
-    /// locked() in record_store.cpp). The copy/move members are defaulted explicitly (rather than
-    /// left to go through this destructor's precedent of suppressing them, as `Identity` does):
-    /// records move through `std::vector`/`std::optional` on real paths
-    /// (store_record_superseding's insert/replace, decode_pairing_records' push_back,
-    /// resolve_pairing_outcome's PairingOutcome), so keeping those moves real (not copies)
-    /// matters here.
+    /// snapshot, a superseded element, a temporary) outliving its use. It does not protect the
+    /// live record, whose PSK is plaintext in `RecordStore::records_` and in the persisted blob
+    /// for as long as the record is paired, by design. The copy/move members are defaulted
+    /// explicitly so records keep moving (not copying) through vector/optional.
     ~SendspinPairingRecord() {
         detail::secure_zero_psk(this->psk);
     }
@@ -98,8 +89,7 @@ struct SendspinPairingPsk {
     SendspinPairingPsk& operator=(const SendspinPairingPsk&) = default;
     SendspinPairingPsk& operator=(SendspinPairingPsk&&) = default;
 
-    /// @brief Wipes `psk` on destruction; see SendspinPairingRecord::~SendspinPairingRecord()
-    /// above for the full rationale (same discipline, same public/private header constraint).
+    /// @brief Wipes `psk` on destruction; see SendspinPairingRecord for the rationale.
     ~SendspinPairingPsk() {
         detail::secure_zero_psk(this->psk);
     }
@@ -194,9 +184,8 @@ struct SendspinClientConfig {
     /// held for a given psk_id or server_id evicts nothing, since that never grows the store.
     static constexpr size_t DEFAULT_MAX_PAIRING_RECORDS = 12;
 
-    /// @brief Maximum number of long-term pairing records the store will retain. See
-    /// DEFAULT_MAX_PAIRING_RECORDS for the rationale behind the default. The protocol requires
-    /// room for at least 5, so a smaller value is raised to that floor.
+    /// @brief Maximum number of long-term pairing records the store will retain. The protocol
+    /// requires room for at least 5, so a smaller value is raised to that floor.
     size_t max_pairing_records{DEFAULT_MAX_PAIRING_RECORDS};
 
     bool httpd_psram_stack{false};  ///< Allocate httpd task stack in PSRAM (ESP-IDF only)
@@ -217,7 +206,7 @@ struct SendspinClientConfig {
     size_t httpd_stack_size{DEFAULT_HTTPD_STACK_SIZE};  ///< HTTP server task stack size in bytes
                                                         ///< (ESP-IDF only). Values below
                                                         ///< DEFAULT_HTTPD_STACK_SIZE are clamped
-                                                        ///< up to it; raising it is allowed.
+                                                        ///< up to it.
     unsigned websocket_priority{5};  ///< FreeRTOS priority for the WebSocket client task
                                      ///< (ESP-IDF only)
 
@@ -229,8 +218,7 @@ struct SendspinClientConfig {
     size_t websocket_stack_size{
         DEFAULT_WEBSOCKET_STACK_SIZE};  ///< esp_websocket_client task stack size in bytes
                                         ///< (ESP-IDF only). Values below
-                                        ///< DEFAULT_WEBSOCKET_STACK_SIZE are clamped up to it;
-                                        ///< raising it is allowed.
+                                        ///< DEFAULT_WEBSOCKET_STACK_SIZE are clamped up to it.
 
     static constexpr uint16_t DEFAULT_SERVER_PORT = 8928U;  ///< Default WebSocket server port
 
@@ -279,12 +267,9 @@ struct SendspinClientConfig {
     /// @brief Size in bytes of an internal-RAM scratch arena for parsing incoming JSON messages.
     /// When non-zero, the JSON document used to parse each incoming protocol message is allocated
     /// from a fixed internal-RAM buffer of this size instead of PSRAM, cutting PSRAM traffic on the
-    /// network task; messages too large for the budget fall back to PSRAM. Costs this many bytes of
-    /// internal RAM permanently. Large track-metadata messages may exceed the default and fall
-    /// back to PSRAM, but those arrive only once per song. Set to 0 to disable the arena and keep
-    /// the PSRAM-only behaviour. Smaller values just fall back more often. On host there is no
-    /// PSRAM distinction, so the arena is a fixed scratch buffer for the parse (still allocated and
-    /// used; harmless).
+    /// network task; messages too large for the budget fall back to PSRAM. Costs this many bytes
+    /// of internal RAM permanently; smaller values just fall back more often. Set to 0 to disable
+    /// the arena. On host there is no PSRAM distinction and the arena is a plain scratch buffer.
     size_t json_arena_size{DEFAULT_JSON_ARENA_SIZE};
 };
 
@@ -339,9 +324,8 @@ struct PlayerRoleConfig {
 
     /// @brief Startup lead the decode pipeline itself spends before the first chunk can play in
     /// full, for a given `extra_startup_silence_ms`: the priming silence, the extra startup
-    /// silence, and the pipeline start allowance. A deliberate overestimate: the extra silence
-    /// replaces whatever priming silence is still unsent, so those two terms overlap in part.
-    /// @param extra_startup_silence_ms The configured extra startup silence.
+    /// silence, and the pipeline start allowance. An overestimate: the extra silence replaces
+    /// whatever priming silence is still unsent, so those two terms overlap in part.
     /// @return Lead time in milliseconds, saturated at the field's maximum.
     static constexpr uint16_t pipeline_lead_time_ms(uint16_t extra_startup_silence_ms) {
         constexpr uint32_t MAX = std::numeric_limits<uint16_t>::max();
@@ -357,11 +341,9 @@ struct PlayerRoleConfig {
     /// give less.
     ///
     /// Unset reports `pipeline_lead_time_ms(extra_startup_silence_ms)`, so raising the startup
-    /// silence raises the lead the server gives. Set it to
-    /// cover an output whose own startup latency the allowance above does not reach; the reported
-    /// value is never below what the pipeline spends, since the server extends lead only toward
-    /// the number it is given. This library reports a configured or derived value, not a measured
-    /// one.
+    /// silence raises the lead the server gives. Set it to cover an output whose own startup
+    /// latency the allowance above does not reach. This library reports a configured or derived
+    /// value, not a measured one.
     std::optional<uint16_t> required_lead_time_ms{};
 
     /// @brief Default ongoing buffer requested from the server. Sized to ride out the
@@ -374,8 +356,7 @@ struct PlayerRoleConfig {
     /// a stream to absorb network jitter and decode timing variance
     /// (roles/player/v1.md "client/state player object"). Mostly relevant for live streams, where
     /// the server has little audio in hand. The audio it represents must fit
-    /// `audio_buffer_capacity` at the highest-bitrate format in `audio_formats`. This library
-    /// reports the configured value rather than one measured from chunk arrival delay.
+    /// `audio_buffer_capacity` at the highest-bitrate format in `audio_formats`.
     uint16_t min_buffer_ms{DEFAULT_MIN_BUFFER_MS};
 
     bool psram_stack{false};  ///< Allocate sync task stack in PSRAM (ESP-IDF only)
@@ -416,9 +397,8 @@ enum class SendspinImageSource : uint8_t {
 /// @brief Preference for an image slot's format and resolution
 struct ImageSlotPreference {
     /// @brief Default max_image_bytes: 128 KiB per artwork channel, which holds any JPEG a
-    /// 320x320 channel receives (a photographic one runs an order of magnitude under it, and a
-    /// worst-case noisy one about 78 KB) with room for a larger channel, and bounds a
-    /// four-channel role at 1 MiB of image buffers. That budget assumes PSRAM: on a part without
+    /// 320x320 channel receives, with room for a larger channel, and bounds a four-channel role
+    /// at 1 MiB of image buffers. That budget assumes PSRAM: on a part without
     /// it, lower this per channel to what internal RAM can spare, or the first announce of an
     /// image the heap cannot hold is refused and the channel shows nothing.
     static constexpr uint32_t DEFAULT_MAX_IMAGE_BYTES = 128U * 1024U;
@@ -448,12 +428,9 @@ struct ImageSlotPreference {
 
     /// @brief Largest encoded image this channel will hold, in bytes. An image the server
     /// announces as larger is refused before any of it is allocated: the transfer is followed to
-    /// its end with its bytes dropped (which the protocol requires of a client that discards
-    /// image data) and the channel keeps whatever it was showing, rather than the heap being
-    /// exhausted. The default is a per-channel budget, not an upper bound on any possible
-    /// encoding: at the dimensions a display client of this class asks for (320x320 and below) a
-    /// JPEG runs well under it, while a high-entropy PNG at the same size can exceed it. Raise it
-    /// for a channel whose images are genuinely larger; the role logs every image it refuses,
+    /// its end with its bytes dropped and the channel keeps whatever it was showing, rather than
+    /// the heap being exhausted. Raise it for a channel whose images are genuinely larger; the
+    /// role logs every image it refuses,
     /// with the cap it was measured against. Two buffers are held per channel, so the role's
     /// image memory is bounded by twice this value per configured channel, and only while the
     /// role is running: a buffer grows to the largest image its channel received and is handed
@@ -472,15 +449,14 @@ struct ArtworkRoleConfig {
     bool psram_stack{false};  ///< Allocate decode thread stack in PSRAM (ESP-IDF only)
 
     /// @brief Default FreeRTOS priority for the image decode thread (ESP-IDF only). Image
-    /// decoding is best-effort work with seconds of slack, so it sits below the network and
-    /// httpd tasks (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY) rather than competing with
-    /// them for the CPU.
+    /// decoding is best-effort work with seconds of slack, so it sits below the network and httpd
+    /// tasks (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY).
     static constexpr unsigned DEFAULT_ARTWORK_PRIORITY = 2U;
     static_assert(DEFAULT_ARTWORK_PRIORITY < SendspinClientConfig::DEFAULT_HTTPD_PRIORITY,
                   "The artwork decode thread must stay below the httpd task");
 
+    /// @brief FreeRTOS priority for the image decode thread (ESP-IDF only)
     unsigned priority{DEFAULT_ARTWORK_PRIORITY};
-    ///< (ESP-IDF only)
 };
 
 // ============================================================================
@@ -505,8 +481,7 @@ enum class VisualizerSpectrumScale : uint8_t {
 
 /// @brief Spectrum visualization parameters: bin count, frequency range, and scale
 struct VisualizerSpectrumConfig {
-    /// @brief Number of display bins (bars on a graphical equalizer). Capped at 255 by the
-    /// uint8_t width; typical equalizer bin counts are well below this
+    /// @brief Number of display bins (bars on a graphical equalizer)
     uint8_t n_disp_bins;
     VisualizerSpectrumScale scale;
     uint16_t f_min;
@@ -544,15 +519,14 @@ struct VisualizerRoleConfig {
     bool psram_stack{false};  ///< Allocate drain thread stack in PSRAM (ESP-IDF only)
 
     /// @brief Default FreeRTOS priority for the visualization drain thread (ESP-IDF only).
-    /// Delivering visualization frames is best-effort work, so it sits below the network and
-    /// httpd tasks (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY) rather than competing with
-    /// them for the CPU.
+    /// Delivering frames is best-effort work, so it sits below the network and httpd tasks
+    /// (SendspinClientConfig::DEFAULT_HTTPD_PRIORITY).
     static constexpr unsigned DEFAULT_VISUALIZER_PRIORITY = 2U;
     static_assert(DEFAULT_VISUALIZER_PRIORITY < SendspinClientConfig::DEFAULT_HTTPD_PRIORITY,
                   "The visualization drain thread must stay below the httpd task");
 
+    /// @brief FreeRTOS priority for the visualization drain thread (ESP-IDF only)
     unsigned priority{DEFAULT_VISUALIZER_PRIORITY};
-    ///< (ESP-IDF only)
 };
 
 }  // namespace sendspin
