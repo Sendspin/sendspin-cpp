@@ -114,12 +114,6 @@ class InboxSlot;
  * lock order: code holding any other lock in this library must not then lock the Inbox, only
  * the reverse.
  *
- * Usage:
- * 1. Declare an Inbox member and bind each InboxSlot<T> to it with a distinct INBOX_TOPIC_* bit
- * 2. Producer threads call InboxSlot::write()/merge() or Inbox::push_event()
- * 3. The main loop calls poll() once per tick and drains any topic whose bit is set
- * 4. Call reset_events() (or InboxSlot::reset()) to discard pending content on disconnect
- *
  * @code
  * Inbox inbox;
  * InboxSlot<GroupUpdateObject> group_slot(inbox, INBOX_TOPIC_GROUP);
@@ -150,13 +144,10 @@ public:
 
     /// @brief Lock-free hint for which topics currently have pending content
     ///
-    /// Intended to be read once per main-loop tick without locking. Ground truth is always the
-    /// per-endpoint content guarded by the mutex: a bit observed here can go stale the instant
-    /// after this call returns (a producer thread may set or another consumer may clear it), so
-    /// callers must still tolerate a drain call finding nothing (bit was cleared) and must not
-    /// skip a drain call just because poll() raced and momentarily missed a freshly-set bit, as
-    /// the next tick's poll() will observe it.
-    /// @return Bitmask (OR of INBOX_TOPIC_* bits) of topics with pending content as of the load.
+    /// Read once per main-loop tick without locking. Ground truth is the mutex-guarded
+    /// per-endpoint content, so a bit here can go stale the instant this returns: a drain call
+    /// must tolerate finding nothing, and a freshly-set bit this load missed is picked up by the
+    /// next tick's poll().
     uint32_t poll() const {
         return this->pending_.load(std::memory_order_acquire);
     }
@@ -185,9 +176,6 @@ public:
     /// those are copied. The INBOX_TOPIC_EVENTS bit is cleared only when the ring is fully
     /// drained; a partial drain (max_count smaller than the pending count) leaves the bit set so
     /// the remaining events are not silently missed on the next poll().
-    /// @param[out] out Buffer to receive up to max_count events, oldest first.
-    /// @param max_count Capacity of `out`, in elements.
-    /// @return Number of events copied into `out`.
     size_t take_events(InboxEvent* out, size_t max_count) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         size_t n = std::min(max_count, this->count_);
@@ -223,9 +211,7 @@ private:
 
     /// @brief Records `bit` as owned by a slot (called from InboxSlot::bind())
     ///
-    /// Enforces the exclusive-ownership invariant documented on InboxSlot: a bit claimed by two
-    /// live slots would let draining one clear the other's wakeup. Loud (assertion failure) in
-    /// debug builds; release builds keep today's behavior.
+    /// Enforces InboxSlot's exclusive-ownership invariant; asserts in debug, no-op in release.
     void claim_bit(uint32_t bit) {
         std::lock_guard<std::mutex> lock(this->mutex_);
         assert((this->claimed_bits_ & bit) == 0 && "INBOX_TOPIC bit already claimed by a slot");
@@ -248,23 +234,19 @@ private:
     size_t head_{0};
 
     // 32-bit fields
-    // Bits owned by a live InboxSlot, plus the ring's own bit. Guarded by mutex_; exists to
-    // catch a copy-pasted bind() reusing a bit, which would otherwise compile clean and drop
-    // wakeups intermittently in production.
+    // Bits owned by a live InboxSlot, plus the ring's own bit. Guarded by mutex_; catches a
+    // copy-pasted bind() reusing a bit, which would otherwise drop wakeups intermittently.
     uint32_t claimed_bits_{INBOX_TOPIC_EVENTS};
     std::atomic<uint32_t> pending_{0};
 };
 
 /// @brief Pushes a payload-free lifecycle event, logging a drop if the ring is full
 ///
-/// Shared by the role stream-event and cleared-event producers so the build/push/log-on-drop
-/// pattern stays uniform across roles. `what` names the dropped event in the log line; `code`
-/// carries the role-local enum value (0 when unused). `epoch` stamps the producing role's
-/// teardown generation onto the event, for event_is_current() to check. It is required, not
-/// defaulted: an event stamped 0 by omission reads as "the role was never torn down", which is
-/// exactly the check a stamped producer wanted. `error_level` logs the drop at ERROR rather than
-/// WARN: use it for events whose loss wedges the stream (player START/END), not for the idempotent
-/// CLEARED events whose loss leaves merely recoverable stale state.
+/// Shared by the role stream-event and cleared-event producers. `epoch` stamps the producing
+/// role's teardown generation onto the event for event_is_current() to check; it is required,
+/// not defaulted, because an event stamped 0 by omission reads as "the role was never torn
+/// down". `error_level` logs the drop at ERROR rather than WARN: use it for events whose loss
+/// wedges the stream (player START/END), not for the idempotent CLEARED events.
 inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, const char* tag,
                               const char* what, uint32_t epoch, bool error_level = false) {
     InboxEvent event{};
@@ -286,12 +268,7 @@ inline void push_event_or_log(Inbox* inbox, InboxEventType type, uint8_t code, c
 /// it is stopped (a lost connection, or a server/activate that removes the role), so an event the
 /// ring still holds from before that teardown carries the older generation and must not be acted
 /// on: delivering a stream START queued before a teardown would re-arm the producer the teardown
-/// just stopped. Logs the discard; a role's events are few and this runs only on the main loop.
-/// @param event_epoch Epoch carried by the drained event.
-/// @param role_epoch The producing role's current teardown generation.
-/// @param tag Log tag of the consumer.
-/// @param what Names the discarded event in the log line.
-/// @return true when the event may be dispatched.
+/// just stopped.
 inline bool event_is_current(uint32_t event_epoch, uint32_t role_epoch, const char* tag,
                              const char* what) {
     if (event_epoch == role_epoch) {
@@ -313,13 +290,6 @@ inline bool event_is_current(uint32_t event_epoch, uint32_t role_epoch, const ch
  * with its dirty flag. A topic bit must be owned by exactly one slot (or the event ring).
  * Sharing a bit between two slots would let draining one clear the bit while the other still
  * has pending content, silently losing that endpoint's next wakeup.
- *
- * Usage:
- * 1. Default-construct and call bind() exactly once before any producer/consumer use, or use
- *    the Inbox-taking constructor to bind at construction time
- * 2. Producer threads call write() (latest-wins) or merge() (accumulate) to publish state
- * 3. The consumer calls take() after observing the slot's topic bit set in Inbox::poll()
- * 4. Call reset() to discard a pending value, e.g. on disconnect
  *
  * @code
  * Inbox inbox;
@@ -345,10 +315,9 @@ public:
         // Release the bit claim so a replacement slot (e.g. a role re-added before start) can
         // bind it. Requires the bound Inbox to outlive this slot.
         if (this->inbox_ != nullptr) {
-            // Clear the owned topic bit if a value is still pending. release_bit() only drops the
-            // claim; without this a slot destroyed while dirty would leave its bit set in
-            // pending_ forever, so a phantom wakeup no live slot can clear, and one a replacement
-            // slot would inherit while its own dirty_ is false.
+            // Clear the owned topic bit if a value is still pending. release_bit() only drops
+            // the claim; without this a slot destroyed while dirty would leave its bit set in
+            // pending_ forever, a phantom wakeup a replacement slot inherits but never clears.
             {
                 std::lock_guard<std::mutex> lock(this->inbox_->mutex_);
                 if (this->dirty_) {
@@ -368,8 +337,8 @@ public:
     /// Must be called exactly once before any other method is used.
     /// @param inbox Shared Inbox whose mutex this slot locks for every operation. Must outlive
     /// this slot (the destructor releases the bit claim).
-    /// @param topic_bit Single INBOX_TOPIC_* bit this slot owns; must not be shared with any
-    /// other slot or with the event ring. Ownership is debug-asserted via Inbox::claim_bit().
+    /// @param topic_bit Single INBOX_TOPIC_* bit this slot exclusively owns; debug-asserted via
+    /// Inbox::claim_bit().
     void bind(Inbox& inbox, uint32_t topic_bit) {
         assert(topic_bit != 0 && (topic_bit & (topic_bit - 1)) == 0 &&
                "InboxSlot topic_bit must be exactly one bit");
@@ -409,8 +378,7 @@ public:
     }
 
     /// @brief Move the accumulated value out if dirty
-    /// @param[out] out Receives the stored value if the slot is dirty.
-    /// @return true if a value was taken, false if the slot was clean (or unbound).
+    /// @return true if a value was taken, false if the slot was clean or unbound.
     bool take(T& out) {
         if (!this->check_bound()) {
             return false;
@@ -438,10 +406,7 @@ public:
     }
 
 private:
-    /// @brief Asserts (debug) and reports whether bind() has been called
-    ///
-    /// Using a slot before bind() is a programming error: loud (assertion failure) in debug
-    /// builds, a safe no-op/false in release builds.
+    /// Using a slot before bind() is a programming error: loud in debug, a safe false in release.
     bool check_bound() const {
         assert(this->inbox_ != nullptr && "InboxSlot used before bind()");
         return this->inbox_ != nullptr;
