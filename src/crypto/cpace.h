@@ -84,21 +84,8 @@ enum class CPaceRole : uint8_t {
 
 /// @brief One side of a CPace-X25519-SHA512 exchange with mutual confirmation.
 ///
-/// Usage:
-/// @code
-///   // Step 1: start
-///   CPace side;
-///   std::vector<uint8_t> my_share;
-///   if (!side.start(CPaceRole::RESPONDER, prs, sid, {}, ad, peer_ad)) return false;
-///   my_share = side.public_share();
-///
-///   // Step 2: receive peer share, derive MAC key
-///   if (!side.derive(peer_share)) return false;
-///
-///   // Step 3: exchange tags
-///   auto my_tag = side.tag();         // send to peer
-///   if (!side.verify(peer_tag)) return false;  // verify peer tag
-/// @endcode
+/// Driven in three steps: start() samples the scalar and yields public_share(), derive() takes
+/// the peer's share and computes the MAC key, then tag() and verify() exchange confirmation.
 class CPace {
 public:
     CPace() = default;

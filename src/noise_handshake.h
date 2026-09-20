@@ -112,19 +112,15 @@ std::optional<NoiseHandshakeResult> run_rehandshake_msg1(std::string_view msg1_j
 
 /// @brief Noise handshake state machine for the Sendspin client (Noise responder).
 ///
-/// Usage:
-///   1. Construct with Identity and RecordStore.
-///   2. Call send_client_init() to send the first cleartext frame.
-///   3. For each incoming WS text frame call on_text_frame().
-///   4. When on_text_frame() returns COMPLETE, take the result via take_result().
+/// build_client_init() produces the first cleartext frame, on_text_frame() takes each incoming
+/// text frame, and take_result() yields the session once that returns COMPLETE.
 ///
-/// Threading: runs entirely on the network thread.  PSK resolution goes through
+/// Threading: runs entirely on the network thread. PSK resolution goes through
 /// RecordStore::resolve_by_psk_id(), which locks the store's mutex internally (see
 /// record_store.h).
 class NoiseHandshake {
 public:
     /// @brief Construct the handshake driver.
-    /// @param identity     Our static X25519 identity.
     /// @param record_store Record store for psk_id resolution (read-only on network thread).
     /// @param suite_name   Noise suite name (NOISE_SUITE_CHACHAPOLY; see crypto/constants.h).
     NoiseHandshake(const Identity& identity, const RecordStore& record_store,
@@ -142,17 +138,14 @@ public:
     // Drive the state machine
     // ========================================
 
-    /// @brief Serialize and return the client/init TEXT frame.
+    /// @brief Serialize and return the client/init TEXT frame, or an empty string on error.
     /// Call this immediately after the WS connection is open, before reading frames.
-    /// @return Serialized JSON string ready to send, or empty on error.
     std::string build_client_init();
 
     /// @brief Process one incoming WS text frame.
     /// Must be called in sequence: server/init, then noise/handshake msg1.
-    /// @param text     The raw text content of the received WS frame.
     /// @param send_fn  Callable that sends a TEXT frame to the peer.
     ///                 Signature: `bool send_fn(const std::string& text)`.
-    /// @return NEED_MORE, COMPLETE, or ABORT.
     HandshakeFrameResult on_text_frame(const std::string& text,
                                        const std::function<bool(const std::string&)>& send_fn);
 
