@@ -46,14 +46,7 @@ namespace sendspin {
 /// @brief Number of bytes in a SHA-256 digest.
 static constexpr size_t SHA256_DIGEST_SIZE = 32;
 
-/// @brief Compute a SHA-256 digest over one or more input spans.
-///
-/// Usage:
-/// @code
-///   auto digest = sha256_oneshot(label.data(), label.size(), psk.data(), psk.size());
-/// @endcode
-///
-/// For a single buffer, use sha256_oneshot(data, len).
+/// @brief Streaming SHA-256. For one or two buffers, use the sha256_oneshot() overloads below.
 class Sha256 {
 public:
     Sha256() {
@@ -145,27 +138,11 @@ static constexpr size_t SHA512_DIGEST_SIZE = 64;
 
 /// @brief Self-contained streaming SHA-512 (FIPS 180-4).
 ///
-/// Implemented here rather than through noise-c so both host and ESP use one code
-/// path with no external dependency. Two noise-c paths were considered and both are
-/// closed on the esphome-libs fork (checked at the pinned tag v0.1.13 and at the
-/// newer v0.1.14/v0.1.15):
-///   - The hashstate registry has no SHA-512 backend at all: no
-///     src/backend/ref/hash-sha512.c or src/backend/sodium/hash-sha512.c file exists
-///     in the fork, so noise_hashstate_new_by_name("SHA512") cannot succeed.
-///   - The raw src/crypto/sha2/sha512.c/.h primitive is compiled into the ESP-IDF
-///     component's source list and its header is exported from the component's
-///     include dirs, but the entire body of both files is gated behind
-///     #if NOISE_USE_REFERENCE_SHA512. That macro has no default in
-///     include/noise/defines.h (unlike NOISE_USE_REFERENCE_SHA256 and
-///     NOISE_USE_LIBSODIUM, which do), and the fork's ESP-IDF CMakeLists.txt never
-///     defines it and ships no Kconfig option to do so. On ESP the primitive
-///     therefore compiles to an empty translation unit with no callable functions.
-///     The host build avoids this only because cmake/host.cmake builds its own
-///     noise_c CMake target from the fetched source and can freely set
-///     NOISE_USE_REFERENCE_SHA512=1 on it; a REQUIRES'd ESP-IDF component gives no
-///     equivalent hook to set a definition on someone else's compilation.
-/// This class can move onto the raw noise-c primitive once the fork defines
-/// NOISE_USE_REFERENCE_SHA512 for its ESP-IDF component (one line plus a release).
+/// Implemented here rather than through noise-c because neither noise-c path reaches SHA-512 on
+/// ESP: the esphome-libs fork ships no SHA-512 hashstate backend, and its raw
+/// src/crypto/sha2/sha512.c is gated behind NOISE_USE_REFERENCE_SHA512, which has no default and
+/// which a REQUIRES'd ESP-IDF component offers no hook to define. This class can move onto the
+/// noise-c primitive once the fork defines that macro for its component.
 /// Uses only uint64_t arithmetic, so it builds on 32-bit targets (Xtensa/ESP32).
 /// Validated against FIPS/RFC 4231 known-answer tests in tests/test_crypto.cpp.
 class Sha512 {
@@ -352,9 +329,7 @@ inline std::array<uint8_t, SHA512_DIGEST_SIZE> sha512_oneshot(const uint8_t* dat
 // ============================================================================
 
 /// @brief Compute HMAC-SHA-512(key, data) via the standard ipad/opad construction.
-///
-/// Block size for SHA-512 is 128 bytes.  If key is longer than 128 bytes it is
-/// first hashed down to 64 bytes.  Returns a 64-byte MAC.
+/// A key longer than the 128-byte SHA-512 block is first hashed down to 64 bytes.
 inline std::array<uint8_t, SHA512_DIGEST_SIZE> hmac_sha512(const uint8_t* key, size_t key_len,
                                                            const uint8_t* data, size_t data_len) {
     static constexpr size_t BLOCK = 128;  // SHA-512 block size
