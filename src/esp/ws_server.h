@@ -49,54 +49,18 @@ struct PendingUpgrade {
 /**
  * @brief WebSocket server listener for Sendspin
  *
- * Manages the ESP-IDF HTTP server (httpd) that listens for incoming WebSocket
- * connections from Sendspin servers. The authoritative owner of each accepted
- * SendspinServerConnection is the httpd session itself: open_callback() pins a
- * shared_ptr onto the session via httpd_sess_set_ctx with a free_fn deleter, and
- * the websocket_handler / queued workers look the connection up at run time via
- * httpd_sess_get_ctx. ConnectionManager receives the same shared_ptr as a secondary
- * observer for routing and handoff decisions.
+ * Manages the ESP-IDF httpd that listens for incoming WebSocket connections. The authoritative
+ * owner of each accepted SendspinServerConnection is the httpd session: open_callback() pins a
+ * shared_ptr via httpd_sess_set_ctx with a free_fn deleter, and the handlers look it back up
+ * with httpd_sess_get_ctx. ConnectionManager holds the same shared_ptr as a secondary observer.
  *
- * Delivery contract: a connection is delivered to the NewConnectionCallback only once its
- * WebSocket upgrade has been observed, so the rest of the library never sees sockets that might
- * not speak WebSocket. Accepted-but-not-yet-upgraded sessions wait in a pending table until the
- * upgrade signal fires: the HTTP_GET branch of websocket_handler. IDF <= 5.5.4 / 6.0.0 dispatches
- * the upgrade GET to the handler natively; IDF >= 5.5.5 / 6.0.1 reaches the same branch through
- * ws_post_handshake_cb, which is registered as websocket_handler itself and invoked with the same
- * GET request at the same lifecycle position. The component's Kconfig selects
- * CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT wherever it exists. tick() reaps sessions still
- * undelivered after WS_UPGRADE_TIMEOUT_US; httpd has no handshake timeout of its own and
- * max_open_sockets is small, so a held-open raw TCP probe would otherwise pin a socket slot
- * indefinitely.
- *
- * Capabilities:
- * - Accepts incoming WebSocket connections on a configurable dedicated port
- * - Routes WebSocket messages directly via the session-pinned shared_ptr (no cross-thread
- *   find-by-sockfd lookup is needed)
- * - Manages open/close callbacks to notify the client of connection lifecycle events
- * - Supports up to max_connections simultaneous sockets (default:
- *   SendspinClientConfig::DEFAULT_SERVER_MAX_CONNECTIONS) so a second server can connect while
- *   one is already active (handoff) and a surplus peer can still be greeted with a goodbye
- *
- * Usage:
- * 1. Construct with a SendspinClient pointer (passed to start())
- * 2. Register callbacks via set_new_connection_callback() and set_connection_closed_callback()
- *    (set_find_connection_callback() is a no-op stub on ESP, kept for symmetry with the host build)
- * 3. Call start() to begin listening for incoming connections
- * 4. Call tick() periodically (the ConnectionManager loop does this) to reap sessions whose
- *    upgrade never completed
- * 5. Call stop() to shut down the server
- *
- * @code
- * SendspinWsServer ws_server;
- * ws_server.set_new_connection_callback([&](std::shared_ptr<SendspinServerConnection> conn) {
- *     client.on_new_server_connection(std::move(conn));
- * });
- * ws_server.set_connection_closed_callback([&](std::shared_ptr<SendspinServerConnection> conn) {
- *     client.on_server_connection_closed(std::move(conn));
- * });
- * ws_server.start(&client, true, 5);
- * @endcode
+ * Delivery contract: a connection reaches the NewConnectionCallback only once its WebSocket
+ * upgrade has been observed in the HTTP_GET branch of websocket_handler, so the rest of the
+ * library never sees a socket that might not speak WebSocket; until then it waits in the pending
+ * table. IDF >= 5.5.5 / 6.0.1 reaches that branch through ws_post_handshake_cb instead of native
+ * GET dispatch; the component's Kconfig selects CONFIG_HTTPD_WS_POST_HANDSHAKE_CB_SUPPORT
+ * wherever it exists. tick() reaps sessions still undelivered after WS_UPGRADE_TIMEOUT_US, since
+ * httpd has no handshake timeout of its own and max_open_sockets is small.
  */
 class SendspinWsServer {
 public:
@@ -138,21 +102,13 @@ public:
     void tick();
 
     /// @brief Sets the callback to invoke when a socket closes
-    /// @param callback The callback function.
     void set_connection_closed_callback(ConnectionClosedCallback&& callback) {
         this->connection_closed_callback_ = std::move(callback);
     }
 
-    /// @brief Sets callback to find a connection by socket fd
-    ///
-    /// On ESP this is a no-op: `websocket_handler` runs on the httpd task and looks the connection
-    /// up directly via `httpd_sess_get_ctx`, which is also where the connection's authoritative
-    /// owner lives. The setter is kept for API symmetry with the host build.
-    /// @param callback Ignored.
+    /// @brief No-op on ESP: `websocket_handler` runs on the httpd task and looks the connection
+    /// up via `httpd_sess_get_ctx`. Kept as an instance method for symmetry with the host build.
     // cppcheck-suppress functionStatic
-    // Instance method by API design, matching the host build's stateful
-    // set_find_connection_callback() (see src/host/ws_server.h): both platforms expose the same
-    // shape so callers do not need to special-case one over the other.
     void set_find_connection_callback(FindConnectionCallback&& /*callback*/) {}
 
     /// @brief Configures the maximum number of simultaneous connections
@@ -165,41 +121,32 @@ public:
     }
 
     /// @brief Sets the TCP port the WebSocket server listens on
-    /// @param port Port number.
     void set_port(uint16_t port) {
         this->server_port_ = port;
     }
 
     /// @brief Overrides the ESP-IDF httpd control port
     /// Defaults to 0 (uses ESP_HTTPD_DEF_CTRL_PORT + 1 to avoid conflict with web_server).
-    /// @param ctrl_port Control port number; 0 = use default.
     void set_ctrl_port(uint16_t ctrl_port) {
         this->ctrl_port_ = ctrl_port;
     }
 
     /// @brief Sets the callback to invoke when a new connection is accepted
-    /// @param callback The callback function.
     void set_new_connection_callback(NewConnectionCallback&& callback) {
         this->new_connection_callback_ = std::move(callback);
     }
 
-    /// @brief Checks if the server is currently running
-    /// @return true if the server is started, false otherwise.
+    /// @brief Whether the server is currently running
     bool is_started() const {
         return this->server_ != nullptr;
     }
 
 protected:
-    /// @brief Callback invoked when a new client opens a connection
-    /// Creates a SendspinServerConnection and notifies the client.
-    /// @param handle The httpd server handle.
-    /// @param sockfd The socket file descriptor for the new connection.
-    /// @return ESP_OK on success.
+    /// @brief Callback invoked when a new client opens a connection; creates a
+    /// SendspinServerConnection and adds it to the pending table.
     static esp_err_t open_callback(httpd_handle_t handle, int sockfd);
 
     /// @brief Callback invoked when a client closes a connection
-    /// @param handle The httpd server handle.
-    /// @param sockfd The socket file descriptor being closed.
     static void close_callback(httpd_handle_t handle, int sockfd);
 
     /// @brief WebSocket message handler registered with httpd. Doubles as the
@@ -211,12 +158,10 @@ protected:
     /// @brief Pops the pending entry for @p sockfd and delivers its connection, marked
     /// WS-upgraded, to the new-connection callback. No-op if the session was already closed or
     /// reaped; the pending-table pop resolves a delivery racing the tick() reap exactly-once.
-    /// @param sockfd The socket file descriptor whose upgrade was observed.
     void deliver_upgraded(int sockfd);
 
-    /// @brief Removes the pending entry for @p sockfd and returns its connection.
-    /// @param sockfd The socket file descriptor to look up.
-    /// @return The pending connection, or nullptr if the session was not pending.
+    /// @brief Removes the pending entry for @p sockfd and returns its connection, or nullptr
+    /// if the session was not pending.
     std::shared_ptr<SendspinServerConnection> pop_pending(int sockfd);
 
     // Struct fields
@@ -228,26 +173,21 @@ protected:
     /// @brief Accepted sessions whose WebSocket upgrade has not yet been observed
     std::vector<PendingUpgrade> pending_;
 
-    /// @brief Callback to notify the client when a socket closes
     ConnectionClosedCallback connection_closed_callback_;
 
-    /// @brief Callback to notify the client of new connections
     NewConnectionCallback new_connection_callback_;
 
     // Pointer fields
 
-    /// @brief Pointer to the SendspinClient (stored as user context for callbacks)
+    /// @brief Stored as the httpd user context for the static callbacks
     SendspinClient* client_{nullptr};
 
-    /// @brief The HTTP server handle
     httpd_handle_t server_{nullptr};
 
     // Numeric fields
 
-    /// @brief Maximum number of simultaneous connections (see set_max_connections)
     uint8_t max_connections_{SendspinClientConfig::DEFAULT_SERVER_MAX_CONNECTIONS};
 
-    /// @brief TCP port the WebSocket server listens on
     uint16_t server_port_{SendspinClientConfig::DEFAULT_SERVER_PORT};
 
     /// @brief httpd control port override (0 = use ESP_HTTPD_DEF_CTRL_PORT + 1)

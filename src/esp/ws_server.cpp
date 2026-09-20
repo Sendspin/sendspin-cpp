@@ -32,11 +32,8 @@ namespace sendspin {
 // SendspinWsServer
 // ============================================================================
 //
-// httpd server that accepts incoming WebSocket connections. open_callback() creates each
-// SendspinServerConnection and parks it in the pending table; it is delivered to the
-// SendspinClient only once its WebSocket upgrade is observed (see the delivery contract in
-// ws_server.h). close_callback() cleans up the socket and drops a still-pending entry; tick()
-// closes sessions still undelivered after WS_UPGRADE_TIMEOUT_US.
+// httpd server accepting incoming WebSocket connections. See the delivery contract in
+// ws_server.h.
 
 static const char* const TAG = "sendspin.ws_server";
 
@@ -102,7 +99,7 @@ bool SendspinWsServer::start(SendspinClient* client, bool task_stack_in_psram,
         return false;
     }
 
-    // Register the WebSocket handler. IDF >= 5.5.5 / 6.0.1 does not dispatch the upgrade GET to
+    // IDF >= 5.5.5 / 6.0.1 does not dispatch the upgrade GET to
     // the handler; registering the handler itself as the post-handshake callback
     // restores that dispatch, so httpd invokes it with the same GET request at the same lifecycle
     // position and the handler's HTTP_GET branch is the single upgrade signal on every IDF version.
@@ -139,11 +136,9 @@ void SendspinWsServer::stop() {
         this->server_ = nullptr;
     }
 
-    // httpd_stop tore down every session (each close_callback dropped its pending entry), so
-    // this is normally already empty; clear defensively so a restart begins from a clean table.
-    // Declared above the lock (not narrowed into it, despite cppcheck's variableScope
-    // suggestion) so its shared_ptr entries release after pending_mutex_ is dropped, matching
-    // the same lock-scope-extension pattern documented in ConnectionManager::~ConnectionManager.
+    // httpd_stop tore down every session, so this is normally already empty; clear defensively
+    // so a restart begins from a clean table. Declared above the lock so its shared_ptr entries
+    // release after pending_mutex_ is dropped.
     // cppcheck-suppress variableScope
     std::vector<PendingUpgrade> stale;
     {
@@ -157,13 +152,11 @@ void SendspinWsServer::tick() {
         return;
     }
 
-    // Pure age-based reap: any session still undelivered past the deadline is closed, whether it
-    // never spoke WebSocket (a raw probe) or its upgrade signal failed to fire (only possible if a
-    // future IDF breaks the post-handshake callback; see the tripwire in start()). Sparing
-    // "upgraded but undelivered" sessions here would turn that failure into a silent permanent
-    // wedge of httpd's small socket pool; closing them makes it a visible close-and-retry loop
-    // instead. Pop under the lock, close outside it; the pop also means a delivery racing this reap
-    // resolves exactly-once (the loser finds no entry and no-ops).
+    // Pure age-based reap: any session still undelivered past the deadline is closed. Sparing
+    // "upgraded but undelivered" sessions would turn a broken post-handshake callback into a
+    // silent wedge of httpd's small socket pool instead of a visible close-and-retry loop. Pop
+    // under the lock, close outside it; the pop also resolves a delivery racing this reap
+    // exactly-once (the loser finds no entry and no-ops).
     std::vector<std::shared_ptr<SendspinServerConnection>> to_reap;
     const int64_t now_us = esp_timer_get_time();
     {
@@ -278,11 +271,8 @@ void SendspinWsServer::close_callback(httpd_handle_t handle, int sockfd) {
     }
 
     // Notify ConnectionManager so it can drop its observer shared_ptr. Passing the connection
-    // (from the session slot) rather than the sockfd keys the event on identity: by the time the
-    // manager drains it on the main loop the fd may already be recycled onto a new session. The
-    // slot keeps the connection alive until httpd invokes its free_fn next, so any in-flight
-    // workers still looking it up via httpd_sess_get_ctx see a valid object. For a never-delivered
-    // session the manager finds no managed match and no-ops.
+    // rather than the sockfd keys the event on identity (see the typedef). The session slot keeps
+    // it alive until httpd invokes the free_fn, so in-flight workers still see a valid object.
     if (server != nullptr && server->connection_closed_callback_ && slot != nullptr &&
         *slot != nullptr) {
         server->connection_closed_callback_(*slot);
@@ -317,11 +307,9 @@ SS_HOT esp_err_t SendspinWsServer::websocket_handler(httpd_req_t* req) {
     SendspinWsServer* server =
         static_cast<SendspinWsServer*>(httpd_get_global_user_ctx(req->handle));
 
-    // Upgrade GET: the sole upgrade signal, on every IDF version. Old IDF (<= 5.5.4 / 6.0.0)
-    // dispatches the initial GET here natively after completing the handshake; new IDF reaches
-    // this branch via ws_post_handshake_cb, which is registered as this same function and
-    // invoked with the same GET request. Frames are processed strictly after this request cycle
-    // on the same httpd task, so delivery always precedes the first frame.
+    // Upgrade GET: the sole upgrade signal on every IDF version (see start()). Frames are
+    // processed strictly after this request cycle on the same httpd task, so delivery always
+    // precedes the first frame.
     if (req->method == HTTP_GET) {
         if (server != nullptr) {
             server->deliver_upgraded(sockfd);
