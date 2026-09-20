@@ -60,41 +60,38 @@ class VisualizerRoleListener {
 public:
     virtual ~VisualizerRoleListener() = default;
 
-    /// @brief Called with an overall A-weighted loudness value. Fires on the drain thread
+    /// @brief Called with an overall A-weighted loudness value
     virtual void on_loudness(int64_t /*client_timestamp*/, uint16_t /*loudness*/) {}
 
-    /// @brief Called on musical beat events. Fires on the drain thread
+    /// @brief Called on musical beat events
     /// @param downbeat True if this beat is a bar start; always false unless the stream
     ///                 was started with tracks_downbeats
     virtual void on_beat(int64_t /*client_timestamp*/, bool /*downbeat*/) {}
 
-    /// @brief Called with the dominant FFT frequency. Fires on the drain thread
+    /// @brief Called with the dominant FFT frequency
     /// @param frequency_hz Dominant frequency in Hz (0 = no peak detected)
     /// @param amplitude Amplitude of the dominant frequency (0 when no peak detected)
     virtual void on_f_peak(int64_t /*client_timestamp*/, uint16_t /*frequency_hz*/,
                            uint16_t /*amplitude*/) {}
 
-    /// @brief Called with spectrum magnitudes per display bin, low to high frequency.
-    /// Fires on the drain thread
+    /// @brief Called with spectrum magnitudes per display bin, low to high frequency
     /// @note The vector is reused across calls; copy it if it must outlive the callback
     virtual void on_spectrum(int64_t /*client_timestamp*/, const std::vector<uint16_t>& /*bins*/) {}
 
-    /// @brief Called on energy onset (transient) events, independent of musical timing.
-    /// Fires on the drain thread
+    /// @brief Called on energy onset (transient) events, independent of musical timing
     /// @param strength Onset strength 0-255 for scaling flash intensity
     virtual void on_peak(int64_t /*client_timestamp*/, uint8_t /*strength*/) {}
 
-    /// @brief Called when a visualizer stream starts or its configuration changes.
-    /// Fires on the main loop thread
+    /// @brief Called when a visualizer stream starts or its configuration changes
     virtual void on_visualizer_stream_start(const ServerVisualizerStreamObject& /*stream*/) {}
 
-    /// @brief Called when a visualizer stream ends. Fires on the main loop thread
+    /// @brief Called when a visualizer stream ends
     ///
     /// Also fires when a server/activate takes the visualizer role out of the session's active
     /// roles, which discards the buffered frames along with the stream.
     virtual void on_visualizer_stream_end() {}
 
-    /// @brief Called when a visualizer stream is cleared. Fires on the main loop thread
+    /// @brief Called when a visualizer stream is cleared
     virtual void on_visualizer_stream_clear() {}
 };
 
@@ -147,8 +144,7 @@ public:
     VisualizerRole(VisualizerRoleConfig config, SendspinClient* client);
     ~VisualizerRole();
 
-    /// @brief Sets the listener for visualizer events
-    /// @note The listener must outlive this role
+    /// @brief Sets the listener for visualizer events; it must outlive this role
     void set_listener(VisualizerRoleListener* listener);
 
 private:
